@@ -312,7 +312,7 @@ async fn main() {
         let da_seq_clone = Arc::clone(&da_sequencer);
         let node_chain_sync = Arc::clone(&chain_sync);
         let server_node_id = node_id.clone();
-        let handler_storage = Arc::clone(&storage); // CRITICAL FIX: Clone for handler closure
+        let handler_storage = Arc::clone(&storage);
 
         tokio::spawn(async move {
             network::start_server(
@@ -370,6 +370,67 @@ async fn main() {
                     }
                 },
             ).await;
+        });
+    }
+
+    // === PERSISTENT P2P MAINTENANCE (AUTO-RECONNECT) ===
+    {
+        let peers_clone_reconnect = Arc::clone(&peers);
+        let storage_clone_reconnect = Arc::clone(&storage);
+        let node_id_reconnect = node_id.clone();
+        let bootnodes_clone = bootnodes.clone();
+        let my_port = port;
+
+        tokio::spawn(async move {
+            println!("🛡️ P2P Maintenance Service started (Auto-Reconnect every 15s)");
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+                
+                // 1. Reconnect to Bootnodes
+                for bootnode_str in &bootnodes_clone {
+                     // Format: /ip4/IP/tcp/PORT
+                     // Simple parse for prototype (assuming /ip4/ format)
+                     let parts: Vec<&str> = bootnode_str.split('/').collect();
+                     if parts.len() >= 5 {
+                         let ip = parts[2];
+                         let port_str = parts[4];
+                         if let Ok(p) = port_str.parse::<u16>() {
+                             // Don't connect to self
+                             if p != my_port {
+                                 network::handshake(
+                                     &node_id_reconnect,
+                                     ip,
+                                     p,
+                                     my_port,
+                                     Arc::clone(&peers_clone_reconnect),
+                                     Arc::clone(&storage_clone_reconnect)
+                                 );
+                             }
+                         }
+                     }
+                }
+                
+                // 2. Reconnect to Saved Peers (from Storage)
+                let saved_peers = storage_clone_reconnect.scan_peer_addrs();
+                for (_pid, addr_str) in saved_peers {
+                    // addr_str is "IP:PORT"
+                    let parts: Vec<&str> = addr_str.split(':').collect();
+                    if parts.len() == 2 {
+                        let ip = parts[0];
+                        let p = parts[1].parse::<u16>().unwrap_or(0);
+                        if p != 0 && p != my_port {
+                            network::handshake(
+                                 &node_id_reconnect,
+                                 ip,
+                                 p,
+                                 my_port,
+                                 Arc::clone(&peers_clone_reconnect),
+                                 Arc::clone(&storage_clone_reconnect)
+                             );
+                        }
+                    }
+                }
+            }
         });
     }
 

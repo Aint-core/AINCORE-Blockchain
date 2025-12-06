@@ -357,6 +357,119 @@ async fn get_block_handler(
     }
 }
 
+// GET /get_latest_blocks?limit=10
+#[derive(Deserialize)]
+struct LimitQuery {
+    limit: Option<u64>,
+}
+
+async fn get_latest_blocks_handler(
+    query: web::Query<LimitQuery>,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    let limit = query.limit.unwrap_or(10).min(50); // Max 50 blocks
+    let latest_height = data.storage.get_chain_height();
+    
+    let mut blocks = Vec::new();
+    let start_index = latest_height.saturating_sub(limit);
+    
+    for i in (start_index + 1..=latest_height).rev() {
+        let key = format!("block_{}", i);
+        if let Ok(Some(block_json)) = data.storage.get(&key) {
+            if let Ok(block_obj) = serde_json::from_str::<serde_json::Value>(&block_json) {
+                blocks.push(block_obj);
+            }
+        }
+    }
+    
+    HttpResponse::Ok().json(blocks)
+}
+
+// GET /get_validators
+async fn get_validators_handler(data: web::Data<AppState>) -> impl Responder {
+    // For prototype, we return active peers + genesis validators
+    // In production this would query the staking contract/module
+    
+    let peers = data.peers.lock().unwrap();
+    let peer_count = peers.len();
+    
+    // Mock validator list based on connected peers (since PoS module is complex to query directly here)
+    // Real implementation would query StakingContract::get_active_validators()
+    
+    let validators = serde_json::json!({
+        "active_validators_count": peer_count + 1, // +1 including self
+        "total_staked": (peer_count + 1) * 1000,   // Mock 1000 AIN per validator
+        "validators": [
+            {
+                "address": "Node1_Genesis_Validator",
+                "stake": 1000,
+                "status": "Active"
+            },
+            {
+                "address": "Node2_MacMini",
+                "stake": 1000,
+                "status": if peer_count > 0 { "Active" } else { "Offline" }
+            }
+        ]
+    });
+    
+    HttpResponse::Ok().json(validators)
+}
+
+// GET /get_network_info
+async fn get_network_info_handler(data: web::Data<AppState>) -> impl Responder {
+    let peers = data.peers.lock().unwrap();
+    let consensus = data.consensus.lock().unwrap();
+    let height = data.storage.get_chain_height();
+    
+    let info = serde_json::json!({
+        "node_id": consensus.node_id,
+        "version": "0.1.0-alpha",
+        "peer_count": peers.len(),
+        "latest_block": height,
+        "current_round": consensus.current_round,
+        "network": "AINCORE Mainnet (Prototype)",
+        "protocol_version": 1
+    });
+    
+    HttpResponse::Ok().json(info)
+}
+
+
+// GET /get_transaction?hash=...
+#[derive(Deserialize)]
+struct TxQuery {
+    hash: String,
+}
+
+async fn get_transaction_handler(
+    query: web::Query<TxQuery>,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    let target_hash = &query.hash;
+    let latest_height = data.storage.get_chain_height();
+    
+    // Naive scan (in production, use an indexer DB!)
+    // Limit scan to last 1000 blocks to avoid timeout
+    let start_index = latest_height.saturating_sub(1000);
+    
+    for i in (start_index..=latest_height).rev() {
+        let key = format!("block_{}", i);
+        if let Ok(Some(block_json)) = data.storage.get(&key) {
+            // Check if block contains the string of the hash? 
+            // Better: parse block and check header.tx_hash
+            // For now, simpler string check to be fast
+            if block_json.contains(target_hash) {
+                 return HttpResponse::Ok()
+                    .content_type("application/json")
+                    .body(block_json); // Return the whole block containing the TX for now
+            }
+        }
+    }
+    
+    HttpResponse::NotFound().body("Transaction not found in recent blocks")
+}
+
 async fn metrics_handler() -> impl Responder {
     HttpResponse::Ok()
         .content_type("text/plain; version=0.0.4")
@@ -403,6 +516,10 @@ pub async fn start_api_server(
                     .route("/rpc", web::post().to(json_rpc_handler))
                     .route("/get_chain_height", web::get().to(get_chain_height_handler))
                     .route("/get_block", web::get().to(get_block_handler))
+                    .route("/get_latest_blocks", web::get().to(get_latest_blocks_handler))
+                    .route("/get_validators", web::get().to(get_validators_handler))
+                    .route("/get_network_info", web::get().to(get_network_info_handler))
+                    .route("/get_transaction", web::get().to(get_transaction_handler))
             })
             .bind(("0.0.0.0", api_port))?
             .run(),

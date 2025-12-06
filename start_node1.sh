@@ -24,7 +24,7 @@ echo ""
 
 # Start node in background
 echo "🔨 Starting node..."
-./target/release/node --port 9000 --rpc-port 8000 --datadir data_node1 > node1.log 2>&1 &
+./target/release/node --port 9000 --rpc-port 8000 --datadir data_node1 --bootnodes /ip4/192.168.18.89/tcp/9001 > node1.log 2>&1 &
 NODE_PID=$!
 
 echo "✅ Node started with PID: $NODE_PID"
