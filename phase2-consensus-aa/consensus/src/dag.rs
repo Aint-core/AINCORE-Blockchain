@@ -94,21 +94,16 @@ impl DagConsensus {
 
         // Simple Quorum: 2n/3 + 1. For prototype with 1 node, 1 is enough.
         // In real system, check against validator set size.
-        // Simple Quorum: 2n/3 + 1. For prototype with 1 node, 1 is enough.
-        // In real system, check against validator set size.
         let mut quorum = if prev_round == 0 { 0 } else { 1 }; 
         
         println!("DEBUG: try_create_vertex: Round {}, Parents: {}, Quorum: {}", self.current_round, parents.len(), quorum);
 
-        // SPLIT-BRAIN PREVENTION:
-        // Do not create vertices if we are alone, UNLESS we are the Genesis bootstrapping node.
+        // SPLIT-BRAIN PREVENTION & OBSERVER MODE:
         
-        let genesis_id = "8f7d00f56518177823e32849fa9e5f83"; // Legacy hardcode
+        let genesis_id = "8f7d00f56518177823e32849fa9e5f83"; 
         let is_genesis_id = self.node_id == genesis_id;
 
         // DYNAMIC CHECK: Are we an Active Validator?
-        // If yes, we are trusted to produce blocks/bootstrap.
-        // Observers (new nodes) are NOT validators yet, so they will be blocked.
         let validators = self.get_validator_set();
         let is_active_validator = validators.contains(&self.node_id);
 
@@ -120,17 +115,24 @@ impl DagConsensus {
              }
         };
 
-        // If no peers, we block mining, UNLESS we are Genesis or an Active Validator.
-        if !has_peers && !is_genesis_id && !is_active_validator {
+        // RULE 1: If I am NOT a validator, I am an Observer. Observers CANNOT mine.
+        if !is_active_validator {
              if self.current_round % 10 == 0 || self.current_round < 5 {
-                 println!("⚠️  [Consensus] WAITING FOR PEERS... (I am not Validator: {}). Forced Quorum increase.", self.node_id);
-                 println!("   Please check your connection or bootnodes.");
+                 println!("⚠️  [Consensus] Observer Mode: I am not in Validator Set. Waiting to sync/register... (Round {})", self.current_round);
              }
-             // FORCE QUORUM TO INFINITY TO BLOCK MINING
-             quorum = 9999;
+             quorum = 9999; // Block mining
+        } 
+        // RULE 2: If I AM a validator, but I have NO peers (and not Singleton/Genesis), I must stop to avoid Split-Brain.
+        else if !has_peers && !is_genesis_id {
+             // Check if we are really the only validator in the set
+             let is_singleton = validators.len() == 1; 
+             
+             if !is_singleton {
+                  println!("⚠️  [Consensus] Validator Isolated! Stopping mining to prevent fork. Waiting for peers...");
+                  quorum = 9999; // Block mining
+             }
         }
 
-        // Standard logic for Genesis or Connected Nodes
         // Standard logic for Genesis or Connected Nodes
         if parents.len() >= quorum {
             // 2. Create Payload (Fetch from Mempool)
