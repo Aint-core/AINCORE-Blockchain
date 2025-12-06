@@ -105,7 +105,7 @@ fn main() -> anyhow::Result<()> {
             let mut sequence_number = 0;
             if let Some(obj) = balance_res.as_object() {
                 if let Some(data_bytes) = obj.get("data").and_then(|v| v.as_array()) {
-                    let bytes: Vec<u8> = data_bytes.iter().map(|b| b.as_u64().unwrap() as u8).collect();
+                    let bytes: Vec<u8> = data_bytes.iter().map(|b| b.as_u64().unwrap_or(0) as u8).collect();
                     if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                         sequence_number = account_data["sequence_number"].as_u64().unwrap_or(0);
                     }
@@ -150,7 +150,7 @@ fn main() -> anyhow::Result<()> {
             let mut btc_balance = 0;
             if let Some(obj) = res.as_object() {
                 if let Some(data_bytes) = obj.get("data").and_then(|v| v.as_array()) {
-                    let bytes: Vec<u8> = data_bytes.iter().map(|b| b.as_u64().unwrap() as u8).collect();
+                    let bytes: Vec<u8> = data_bytes.iter().map(|b| b.as_u64().unwrap_or(0) as u8).collect();
                     // Attempt to decode as generic Value first to find "balance" fields
                     if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                         if let Some(b) = account_data.get("balance").and_then(|v| v.as_u64()) {
@@ -178,7 +178,7 @@ fn main() -> anyhow::Result<()> {
 
             if let Some(obj) = balance_res.as_object() {
                 if let Some(data_bytes) = obj.get("data").and_then(|v| v.as_array()) {
-                    let bytes: Vec<u8> = data_bytes.iter().map(|b| b.as_u64().unwrap() as u8).collect();
+                    let bytes: Vec<u8> = data_bytes.iter().map(|b| b.as_u64().unwrap_or(0) as u8).collect();
                     if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                         current_balance = account_data["balance"].as_u64().unwrap_or(0);
                         sequence_number = account_data["sequence_number"].as_u64().unwrap_or(0);
@@ -331,7 +331,7 @@ fn main() -> anyhow::Result<()> {
             let mut sequence_number = 0;
             if let Some(obj) = res.as_object() {
                 if let Some(data_bytes) = obj.get("data").and_then(|v| v.as_array()) {
-                    let bytes: Vec<u8> = data_bytes.iter().map(|b| b.as_u64().unwrap() as u8).collect();
+                    let bytes: Vec<u8> = data_bytes.iter().map(|b| b.as_u64().unwrap_or(0) as u8).collect();
                     if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                         current_balance = account_data["balance"].as_u64().unwrap_or(0);
                         sequence_number = account_data["sequence_number"].as_u64().unwrap_or(0);
