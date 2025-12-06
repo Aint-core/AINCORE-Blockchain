@@ -338,13 +338,23 @@ async fn main() {
                     } else if let Some(content) = msg.strip_prefix("SYNC_REQUEST:") {
                         if let Ok(req) = serde_json::from_str::<SyncRequest>(content) {
                             let resp = node_chain_sync.handle_sync_request(req.clone());
-                            if let Ok(resp_str) = serde_json::to_string(&resp) {
-                                let reply_msg = format!("SYNC_RESPONSE:{}", resp_str);
-                                let target_addr = format!("127.0.0.1:{}", req.sender_port);
-                                let _ = network::send_message(&target_addr, &reply_msg);
+                            
+                            // CRITICAL FIX: Send response back to requester
+                            let resp_json = serde_json::to_string(&resp).unwrap_or_default();
+                            let response_msg = format!("SYNC_RESPONSE:{}", resp_json);
+                            
+                            // Send to requester's IP:port
+                            let requester_ip = node_storage.get_peer_ip(&req.sender_id).unwrap_or_else(|| "127.0.0.1".to_string());
+                            let requester_addr = format!("{}:{}", requester_ip, req.sender_port);
+                            
+                            if let Err(e) = network::send_message(&requester_addr, &response_msg) {
+                                eprintln!("❌ Failed to send sync response to {}: {}", requester_addr, e);
+                            } else {
+                                println!("✅ Sent {} blocks to {}", resp.blocks.len(), requester_addr);
                             }
                         }
                     } else if let Some(content) = msg.strip_prefix("SYNC_RESPONSE:") {
+                        // CRITICAL FIX: Handle sync response
                         match serde_json::from_str::<SyncResponse>(content) {
                             Ok(resp) => node_chain_sync.handle_sync_response(resp),
                             Err(e) => eprintln!("❌ [Server] Failed to parse SYNC_RESPONSE: {}", e),
