@@ -165,18 +165,34 @@ fn handle_rpc_method(
             // params: [limit] (optional, default 10)
             let limit = params.get(0).and_then(|v| v.as_u64()).unwrap_or(10);
             
+            // FIXED: Explicitly handle latest_height parsing with logging
             let latest_height: u64 = match data.storage.get("latest_height") {
-                Ok(Some(h)) => h.parse::<u64>().unwrap_or(0),
-                _ => 0,
+                Ok(Some(h)) => {
+                    match h.parse::<u64>() {
+                        Ok(val) => val,
+                        Err(e) => {
+                            println!("❌ [RPC] Failed to parse latest_height '{}': {}", h, e);
+                            0
+                        }
+                    }
+                },
+                Ok(None) => {
+                    println!("⚠️ [RPC] latest_height key not found in storage");
+                    0
+                },
+                Err(e) => {
+                    println!("❌ [RPC] Storage error reading latest_height: {}", e);
+                    0
+                }
             };
             
-            println!("🔍 [API] aincore_getBlocks: latest_height = {}", latest_height);
+            println!("🔍 [RPC] aincore_getBlocks: Head={}, Limit={}", latest_height, limit);
             
             let mut blocks = Vec::new();
             let start = latest_height;
             let start_index = latest_height.saturating_sub(limit);
             
-            for i in (start_index..=start).rev() {
+            for i in (start_index + 1..=latest_height).rev() {
                 let key = format!("block_{}", i);
                 if let Ok(Some(block_json)) = data.storage.get(&key) {
                     if let Ok(block_obj) = serde_json::from_str::<serde_json::Value>(&block_json) {
@@ -367,21 +383,39 @@ async fn get_latest_blocks_handler(
     query: web::Query<LimitQuery>,
     data: web::Data<AppState>,
 ) -> impl Responder {
-    let limit = query.limit.unwrap_or(10).min(50); // Max 50 blocks
-    let latest_height = data.storage.get_chain_height();
+    let limit = query.limit.unwrap_or(10).min(50); 
+    
+    // Explicitly fetch latest_height as string then parse, to match other handlers
+    let latest_height: u64 = match data.storage.get("latest_height") {
+        Ok(Some(h)) => h.parse::<u64>().unwrap_or(0),
+        _ => {
+            println!("⚠️ [API] get_latest_blocks: 'latest_height' key not found or error. Returning empty.");
+            return HttpResponse::Ok().json(serde_json::json!([]));
+        }
+    };
+    
+    println!("🔍 [API] get_latest_blocks: Head={}, Limit={}", latest_height, limit);
     
     let mut blocks = Vec::new();
     let start_index = latest_height.saturating_sub(limit);
     
+    // Loop inclusive
     for i in (start_index + 1..=latest_height).rev() {
         let key = format!("block_{}", i);
-        if let Ok(Some(block_json)) = data.storage.get(&key) {
-            if let Ok(block_obj) = serde_json::from_str::<serde_json::Value>(&block_json) {
-                blocks.push(block_obj);
-            }
+        match data.storage.get(&key) {
+             Ok(Some(block_json)) => {
+                 if let Ok(block_obj) = serde_json::from_str::<serde_json::Value>(&block_json) {
+                     blocks.push(block_obj);
+                 } else {
+                     println!("❌ [API] Failed to parse block_{}", i);
+                 }
+             },
+             Ok(None) => println!("⚠️ [API] Block key {} missing in DB", key),
+             Err(e) => println!("❌ [API] DB Error reading {}: {}", key, e),
         }
     }
     
+    println!("✅ [API] Returning {} blocks", blocks.len());
     HttpResponse::Ok().json(blocks)
 }
 

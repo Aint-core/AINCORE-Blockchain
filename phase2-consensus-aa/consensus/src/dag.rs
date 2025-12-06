@@ -319,9 +319,15 @@ impl DagConsensus {
         let msg = format!("DAG_VERTEX:{}", serialized);
         
         if let Ok(peers) = self.peers.lock() {
-            for (_, port) in peers.iter() {
-                let addr = format!("127.0.0.1:{}", port);
-                let _ = send_message(&addr, &msg);
+            for (peer_id, port) in peers.iter() {
+                // FIXED: Resolve valid IP from storage instead of hardcoded localhost
+                let ip = self.storage.get_peer_ip(peer_id).unwrap_or_else(|| "127.0.0.1".to_string());
+                let addr = format!("{}:{}", ip, port);
+                
+                // Don't send to self (redundant check but safe)
+                if *peer_id != self.node_id {
+                    let _ = send_message(&addr, &msg);
+                }
             }
         }
     }
