@@ -143,28 +143,61 @@ impl AINCOREVM {
         }
         
         // Scheme 1: CRYSTALS-Dilithium5 (Post-Quantum)
-        // Dilithium5 signature size is 4627 bytes (detached)
+        // Post-Quantum Cryptography (PQC) Signature Verification
+        // Uses CRYSTALS-Dilithium5 (NIST Standard)
         if signature.len() == 4627 {
-             // println!("🛡️ [Native AA] ⚛️ Quantum-Resistant Signature Detected (Dilithium5) for {}", sender);
+             // println!("🔐 [Native AA] Detected PQC Signature (Dilithium5)");
              
              // 1. Fetch Dilithium Public Key from Account Resource
              // For prototype: We expect the Public Key to be stored at "pqc_pubkey_{sender}"
              // In production, this would be in the Account struct.
              let pk_key = format!("pqc_pubkey_{}", sender);
-             let pk_bytes = match self.storage.db.get(&pk_key) {
+             let public_key = match self.storage.db.get(&pk_key) {
                  Ok(Some(hex_pk)) => hex::decode(hex_pk).unwrap_or_default(),
                  _ => {
-                     println!("⚠️ [Native AA] PQC Public Key not found for {}", sender);
+                     eprintln!("⚠️ [Native AA] PQC Public Key not found for {}", sender);
                      return Ok(false);
                  }
              };
 
-             if pk_bytes.len() != pqcrypto_dilithium::dilithium5::public_key_bytes() {
-                 println!("⚠️ [Native AA] Invalid PQC Public Key length for {}", sender);
+             // 1. Extract Public Key (2592 bytes)
+             if public_key.len() != 2592 {
+                 eprintln!("❌ [Native AA] Invalid Dilithium5 Public Key Size: {} (expected 2592)", public_key.len());
+                 return Ok(false);
+             }
+             
+             let pk_bytes = public_key;
+             
+             // Validate payload size
+             if _payload.len() > 10000 {
+                 eprintln!("❌ [Native AA] Payload too large for PQC verification");
                  return Ok(false);
              }
 
-             // 2. Verify Signature
+             // 2. Verify Signature (CRITICAL FIX: Safe error handling)
+             let pk = match pqcrypto_dilithium::dilithium5::PublicKey::from_bytes(&pk_bytes) {
+                 Ok(key) => key,
+                 Err(_) => {
+                     eprintln!("❌ [Native AA] Invalid Dilithium5 public key format");
+                     return Ok(false);
+                 }
+             };
+             
+             let sig = match pqcrypto_dilithium::dilithium5::DetachedSignature::from_bytes(signature) {
+                 Ok(s) => s,
+                 Err(_) => {
+                     eprintln!("❌ [Native AA] Invalid Dilithium5 signature format");
+                     return Ok(false);
+                 }
+             };
+             
+             match pqcrypto_dilithium::dilithium5::verify_detached_signature(&sig, _payload, &pk) {
+                 Ok(_) => {
+                     // println!("✅ [Native AA] PQC Signature Verified!");
+                     return Ok(true);
+                 },
+                 Err(_) => {
+                     eprintln!("❌ [Native AA] PQC Signature Verification FAILED");
                      return Ok(false);
                  }
              }
