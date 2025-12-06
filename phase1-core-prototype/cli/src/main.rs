@@ -339,8 +339,8 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             
-            let required_stake = 1000 * 1_000_000_000_000_000_000;
-            if current_balance < required_stake {
+            let required_stake: u128 = 1000 * 1_000_000_000_000_000_000;
+            if u128::from(current_balance) < required_stake {
                 anyhow::bail!("❌ Insufficient Balance! Need 1000 AIN. You have: {}", current_balance);
             }
             
