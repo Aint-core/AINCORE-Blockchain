@@ -39,37 +39,72 @@ impl ChainSync {
 
     /// Sinkronisasi awal dengan peers
     pub fn sync_from_peers(&self) {
-        let peers_map = match self.peers.lock() {
-            Ok(p) => p,
-            Err(e) => e.into_inner(), // Poison recovery
-        };
+        println!("🔄 [ChainSync] Starting RPC-based blockchain sync...");
+        
+        let peers_map = self.peers.lock().unwrap();
         if peers_map.is_empty() {
-            println!("⚠️ [ChainSync] No peers available for sync.");
+            println!("📡 [ChainSync] No peers available for sync.");
             return;
         }
 
-        let from_height = self.get_local_height();
-        let request = SyncRequest { 
-            from_height,
-            sender_id: self.node_id.clone(),
-            sender_port: self.my_port,
-        };
-        let serialized = serde_json::to_string(&request).unwrap_or_default();
-        if serialized.is_empty() { return; }
-        let msg = format!("SYNC_REQUEST:{}", serialized);
+        let my_height = self.storage.get_chain_height();
+        println!("📊 [ChainSync] My chain height: {}", my_height);
 
         for (peer_id, peer_port) in peers_map.iter() {
-            // CRITICAL FIX: Get peer IP from storage instead of hardcoded localhost
-            let peer_ip = self.storage.get_peer_ip(peer_id).unwrap_or_else(|| "127.0.0.1".to_string());
+            // Get peer IP from storage
+            let peer_ip = self.storage.get_peer_ip(peer_id)
+                .unwrap_or_else(|| "127.0.0.1".to_string());
             
-            println!("📡 [ChainSync] Requesting missing blocks from peer {} ({}:{})", peer_id, peer_ip, peer_port);
-            let addr = format!("{}:{}", peer_ip, peer_port);
-            if let Err(e) = send_message(&addr, &msg) {
-                println!("❌ [ChainSync] Failed to send request to {}: {}", addr, e);
-            } else {
-                println!("✅ [ChainSync] Request sent to {}", addr);
+            // Calculate RPC port (P2P port - 1000)
+            // 9000 -> 8000, 9001 -> 8001
+            let rpc_port = if *peer_port >= 9000 { peer_port - 1000 } else { 8000 };
+            let rpc_url = format!("http://{}:{}", peer_ip, rpc_port);
+            
+            println!("🌐 [ChainSync] Syncing from peer {} ({}:{})", peer_id, peer_ip, rpc_port);
+            
+            // Get peer's chain height via RPC
+            match reqwest::blocking::get(&format!("{}/get_chain_height", rpc_url)) {
+                Ok(resp) => {
+                    if let Ok(text) = resp.text() {
+                        if let Ok(peer_height) = text.trim().parse::<u64>() {
+                            println!("📊 [ChainSync] Peer height: {}, downloading {} blocks...", 
+                                peer_height, peer_height.saturating_sub(my_height));
+                            
+                            // Download missing blocks
+                            let mut synced_count = 0;
+                            for h in (my_height + 1)..=peer_height {
+                                match reqwest::blocking::get(&format!("{}/get_block?height={}", rpc_url, h)) {
+                                    Ok(block_resp) => {
+                                        if let Ok(block_json) = block_resp.text() {
+                                            // Save block to storage
+                                            if let Err(e) = self.storage.save_block_json(h, &block_json) {
+                                                eprintln!("❌ Failed to save block #{}: {}", h, e);
+                                            } else {
+                                                synced_count += 1;
+                                                if synced_count % 100 == 0 {
+                                                    println!("📦 [ChainSync] Synced {} blocks...", synced_count);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("❌ Failed to fetch block #{}: {}", h, e);
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            if synced_count > 0 {
+                                println!("✅ [ChainSync] Successfully synced {} blocks from {}", synced_count, peer_ip);
+                            }
+                            return; // Successfully synced from this peer
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ [ChainSync] Failed to get height from {}: {}", peer_ip, e);
+                }
             }
-
         }
     }
 

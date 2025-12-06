@@ -134,6 +134,22 @@ impl StateDB {
         self.db.write(batch)
     }
 
+    /// Get current blockchain height
+    pub fn get_chain_height(&self) -> u64 {
+        match self.get("latest_height") {
+            Ok(Some(h)) => h.parse::<u64>().unwrap_or(0),
+            _ => 0,
+        }
+    }
+    
+    /// Save block as JSON string
+    pub fn save_block_json(&self, height: u64, block_json: &str) -> Result<(), rocksdb::Error> {
+        let key = format!("block_{}", height);
+        self.put(&key, block_json)?;
+        self.put("latest_height", &height.to_string())?;
+        Ok(())
+    }
+
     pub fn get_object(&self, object_id: &str) -> Option<Object> {
         let key = format!("obj:{}", object_id);
         match self.db.get(key) {
