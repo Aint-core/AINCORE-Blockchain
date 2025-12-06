@@ -86,7 +86,8 @@ fn handle_rpc_method(
             };
 
             if let Some(tx_str) = tx_str_opt {
-                let mut mempool = data.mempool.lock().unwrap();
+                let mut mempool = data.mempool.lock()
+                    .map_err(|e| JsonRpcError { code: -32000, message: format!("Mempool lock error: {}", e) })?;
                 mempool.add_transaction(tx_str.clone());
                 
                 // Calculate Hash
@@ -212,7 +213,8 @@ fn handle_rpc_method(
             Ok(serde_json::json!(keys))
         },
         "aincore_getMiningStats" => {
-            let peers = data.peers.lock().unwrap();
+            let peers = data.peers.lock()
+                .map_err(|e| JsonRpcError { code: -32000, message: format!("Peers lock error: {}", e) })?;
             // Mock data for now, but active_miners is real (connected peers)
             Ok(serde_json::json!({
                 "active_miners": peers.len(),
@@ -230,7 +232,8 @@ fn handle_rpc_method(
                 params.get(3).and_then(|v| v.as_str()),
                 params.get(4).and_then(|v| v.as_u64())
             ) {
-                 let governance = data.governance.lock().unwrap();
+                 let governance = data.governance.lock()
+                     .map_err(|e| JsonRpcError { code: -32000, message: format!("Governance lock error: {}", e) })?;
                  match governance.create_proposal(id.to_string(), title.to_string(), desc.to_string(), proposer.to_string(), duration) {
                      Ok(pid) => Ok(serde_json::json!({ "status": "created", "proposal_id": pid })),
                      Err(e) => Err(JsonRpcError { code: -32000, message: e }),
@@ -246,7 +249,8 @@ fn handle_rpc_method(
                 params.get(1).and_then(|v| v.as_str()),
                 params.get(2).and_then(|v| v.as_bool())
             ) {
-                 let governance = data.governance.lock().unwrap();
+                 let governance = data.governance.lock()
+                     .map_err(|e| JsonRpcError { code: -32000, message: format!("Governance lock error: {}", e) })?;
                  // weight is calculated internally now, passing 0 as placeholder
                  match governance.vote(pid, voter.to_string(), approve, 0) {
                      Ok(_) => Ok(serde_json::json!({ "status": "voted" })),

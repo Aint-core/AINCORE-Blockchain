@@ -55,11 +55,13 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
         
         // Update balance manually (since AccountManager creates with 0)
         use aa::AccountData;
-        let mut data: AccountData = serde_json::from_slice(&account_obj.data).unwrap();
+        let mut data: AccountData = serde_json::from_slice(&account_obj.data)
+            .expect("Genesis: Failed to deserialize account data");
         
         // ZERO PRE-MINE: Start with 0 balance.
         data.balance = 0; 
-        account_obj.data = serde_json::to_vec(&data).unwrap();
+        account_obj.data = serde_json::to_vec(&data)
+            .expect("Genesis: Failed to serialize account data");
         storage.put_object(&account_obj).expect("Failed to write genesis account");
         println!("💰 Created Genesis Account: {} (Balance: {})", genesis_addr, data.balance);
 
@@ -127,7 +129,8 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
         let key = "resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::staking::ValidatorSet";
         
         // Serialize to BCS
-        let bytes = bcs::to_bytes(&validator_set).unwrap();
+        let bytes = bcs::to_bytes(&validator_set)
+            .expect("Genesis: Failed to serialize ValidatorSet");
         let hex_bytes = hex::encode(bytes);
         storage.put(key, &hex_bytes).expect("Failed to write validator set");
         println!("🛡️  Initialized Genesis Validator Set (Bootstrap Stake: 1000 AIN)");
@@ -146,7 +149,8 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
         };
         // Key: resource_..._0x1::epoch::Epoch
         let epoch_key = "resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::epoch::Epoch";
-        let epoch_bytes = bcs::to_bytes(&epoch).unwrap();
+        let epoch_bytes = bcs::to_bytes(&epoch)
+            .expect("Genesis: Failed to serialize Epoch");
         storage.put(epoch_key, &hex::encode(epoch_bytes)).expect("Failed to write epoch");
         println!("⏳ Initialized Genesis Epoch (0)");
 
@@ -177,7 +181,8 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
         
         // Key: resource_..._0x1::governance::GovernanceState
         let gov_key = "resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::governance::GovernanceState";
-        let gov_bytes = bcs::to_bytes(&gov_state).unwrap();
+        let gov_bytes = bcs::to_bytes(&gov_state)
+            .expect("Genesis: Failed to serialize GovernanceState");
         storage.put(gov_key, &hex::encode(gov_bytes)).expect("Failed to write gov state");
         println!("⚖️  Initialized Governance Module");
 
@@ -214,7 +219,8 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
         // Initialize DeviceRegistry
         let device_registry = DeviceRegistry { devices: vec![] };
         let dr_key = "resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::universal_mining::DeviceRegistry";
-        let dr_bytes = bcs::to_bytes(&device_registry).unwrap();
+        let dr_bytes = bcs::to_bytes(&device_registry)
+            .expect("Genesis: Failed to serialize DeviceRegistry");
         storage.put(dr_key, &hex::encode(dr_bytes)).expect("Failed to write device registry");
 
         // Initialize OracleConfig
@@ -227,7 +233,8 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
         // The validator addresses are "9b47...".
         // So we should add the first validator to the feeder list.
         if let Some((first_addr, _)) = genesis_validators.first() {
-             let bytes = hex::decode(first_addr).unwrap();
+             let bytes = hex::decode(first_addr)
+                 .expect("Genesis: Invalid hex address format");
              let mut arr = [0u8; 16];
              arr.copy_from_slice(&bytes);
              feeders.push(move_core_types::account_address::AccountAddress::new(arr));
@@ -241,7 +248,8 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
             active_proofs: vec![],
         };
         let oc_key = "resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::universal_mining::OracleConfig";
-        let oc_bytes = bcs::to_bytes(&oracle_config).unwrap();
+        let oc_bytes = bcs::to_bytes(&oracle_config)
+            .expect("Genesis: Failed to serialize OracleConfig");
         storage.put(oc_key, &hex::encode(oc_bytes)).expect("Failed to write oracle config");
         println!("🔮 Initialized Decentralized Oracle (Feeders: 1)");
 
