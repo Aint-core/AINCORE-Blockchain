@@ -101,11 +101,15 @@ impl DagConsensus {
         println!("DEBUG: try_create_vertex: Round {}, Parents: {}, Quorum: {}", self.current_round, parents.len(), quorum);
 
         // SPLIT-BRAIN PREVENTION:
-        // Do not create vertices if we are alone, UNLESS we are the Genesis bootstrapping node (port 9000 convention or explicit flag).
-        // Genesis Node ID: 8f7d00f56518177823e32849fa9e5f83 (Hardcoded from mainnet genesis)
+        // Do not create vertices if we are alone, UNLESS we are the Genesis bootstrapping node.
         
-        let genesis_id = "8f7d00f56518177823e32849fa9e5f83";
-        let is_genesis_node = self.node_id == genesis_id;
+        let genesis_id = "8f7d00f56518177823e32849fa9e5f83"; // Legacy hardcode
+        let is_genesis_id = self.node_id == genesis_id;
+
+        // DYNAMIC CHECK: Are we the ONLY validator in the network?
+        // If yes, we are the Mainnet Authority/Genesis, so we MUST mine alone.
+        let validators = self.get_validator_set();
+        let is_singleton_validator = validators.len() == 1 && validators.contains(&self.node_id);
 
         let has_peers = {
              if let Ok(p) = self.peers.lock() {
@@ -115,9 +119,10 @@ impl DagConsensus {
              }
         };
 
-        if !has_peers && !is_genesis_node {
+        // If no peers, we block mining, UNLESS we are the declared Genesis or the Only Validator.
+        if !has_peers && !is_genesis_id && !is_singleton_validator {
              if self.current_round % 10 == 0 || self.current_round < 5 {
-                 println!("⚠️  [Consensus] WAITING FOR PEERS... (I am not Genesis: {}). Forced Quorum increase.", self.node_id);
+                 println!("⚠️  [Consensus] WAITING FOR PEERS... (I am not Genesis/Singleton: {}). Forced Quorum increase.", self.node_id);
                  println!("   Please check your connection or bootnodes.");
              }
              // FORCE QUORUM TO INFINITY TO BLOCK MINING
