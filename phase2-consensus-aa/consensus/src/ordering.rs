@@ -136,13 +136,24 @@ impl OrderingEngine {
         }
 
         // Sort by Round (ASC) then Hash (ASC) for deterministic order
+        // CRITICAL FIX: Remove expect() panics, use safe error handling
         history.sort_by(|a, b| {
-            let va = dag.get(a).expect("Critical: Vertex A missing from DAG during sorting");
-            let vb = dag.get(b).expect("Critical: Vertex B missing from DAG during sorting");
-            if va.round != vb.round {
-                va.round.cmp(&vb.round)
-            } else {
-                a.cmp(b)
+            // Safe retrieval with fallback
+            let va_opt = dag.get(a);
+            let vb_opt = dag.get(b);
+            
+            match (va_opt, vb_opt) {
+                (Some(va), Some(vb)) => {
+                    if va.round != vb.round {
+                        va.round.cmp(&vb.round)
+                    } else {
+                        // FORK CHOICE RULE: Lowest hash wins (deterministic tie-breaking)
+                        a.cmp(b)
+                    }
+                },
+                (Some(_), None) => std::cmp::Ordering::Less,    // A exists, B missing → A first
+                (None, Some(_)) => std::cmp::Ordering::Greater, // B exists, A missing → B first
+                (None, None) => std::cmp::Ordering::Equal,      // Both missing → equal
             }
         });
 
