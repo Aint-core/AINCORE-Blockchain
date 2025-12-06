@@ -96,7 +96,7 @@ impl DagConsensus {
         // In real system, check against validator set size.
         let mut quorum = if prev_round == 0 { 0 } else { 1 }; 
         
-        println!("DEBUG: try_create_vertex: Round {}, Parents: {}, Quorum: {}", self.current_round, parents.len(), quorum);
+        // println!("DEBUG: try_create_vertex: Round {}, Parents: {}, Quorum: {}", self.current_round, parents.len(), quorum);
 
         // SPLIT-BRAIN PREVENTION & OBSERVER MODE:
         
