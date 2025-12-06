@@ -165,16 +165,6 @@ impl AINCOREVM {
              }
 
              // 2. Verify Signature
-             let pk = pqcrypto_dilithium::dilithium5::PublicKey::from_bytes(&pk_bytes).unwrap();
-             let sig = pqcrypto_dilithium::dilithium5::DetachedSignature::from_bytes(signature).unwrap();
-             
-             match pqcrypto_dilithium::dilithium5::verify_detached_signature(&sig, _payload, &pk) {
-                 Ok(_) => {
-                     // println!("✅ [Native AA] PQC Signature Verified!");
-                     return Ok(true);
-                 },
-                 Err(_) => {
-                     println!("❌ [Native AA] PQC Signature Verification FAILED");
                      return Ok(false);
                  }
              }
