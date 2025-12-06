@@ -414,6 +414,16 @@ async fn main() {
     // CRITICAL FIX: Wait for peer servers to be ready (they start async)
     tokio::time::sleep(Duration::from_secs(3)).await;
     chain_sync.sync_from_peers();
+    
+    // === PERIODIC BACKGROUND SYNC ===
+    // Retry sync every 30 seconds to download remaining blocks
+    let chain_sync_periodic = Arc::clone(&chain_sync);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            chain_sync_periodic.sync_from_peers();
+        }
+    });
 
     println!("\n🎬 Main Execution Loop started (Consensus running in background)...\n");
     println!("👤 Node Identity: {}", node_addr_hex);
