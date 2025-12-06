@@ -331,6 +331,32 @@ async fn health() -> impl Responder {
     HttpResponse::Ok().body("OK")
 }
 
+// === RPC-BASED SYNC ENDPOINTS ===
+
+async fn get_chain_height_handler(data: web::Data<AppState>) -> impl Responder {
+    let height = data.storage.get_chain_height();
+    HttpResponse::Ok().body(height.to_string())
+}
+
+#[derive(Deserialize)]
+struct BlockQuery {
+    height: u64,
+}
+
+async fn get_block_handler(
+    query: web::Query<BlockQuery>,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    let key = format!("block_{}", query.height);
+    match data.storage.get(&key) {
+        Ok(Some(block_json)) => HttpResponse::Ok()
+            .content_type("application/json")
+            .body(block_json),
+        Ok(None) => HttpResponse::NotFound().body("Block not found"),
+        Err(e) => HttpResponse::InternalServerError().body(format!("Error: {}", e)),
+    }
+}
+
 async fn metrics_handler() -> impl Responder {
     HttpResponse::Ok()
         .content_type("text/plain; version=0.0.4")
@@ -375,6 +401,8 @@ pub async fn start_api_server(
                     .route("/health", web::get().to(health))
                     .route("/metrics", web::get().to(metrics_handler))
                     .route("/rpc", web::post().to(json_rpc_handler))
+                    .route("/get_chain_height", web::get().to(get_chain_height_handler))
+                    .route("/get_block", web::get().to(get_block_handler))
             })
             .bind(("0.0.0.0", api_port))?
             .run(),
