@@ -125,10 +125,8 @@ impl DagConsensus {
         }
 
         // Standard logic for Genesis or Connected Nodes
+        // Standard logic for Genesis or Connected Nodes
         if parents.len() >= quorum {
-            // ... (proceed to create vertex)
-        }
-            
             // 2. Create Payload (Fetch from Mempool)
             let mut payload = Vec::new();
             if let Ok(mut mp) = self.mempool.lock() {
