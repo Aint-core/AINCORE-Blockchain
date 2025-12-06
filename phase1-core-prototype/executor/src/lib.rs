@@ -468,7 +468,7 @@ impl Executor {
                      
                      let module_id = ModuleId::new(
                          AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]), 
-                         Identifier::new("staking").unwrap()
+                         Identifier::new("staking").expect("staking identifier is valid")
                      );
                      
                      let sender_addr = AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)).unwrap_or(AccountAddress::ZERO);

@@ -155,7 +155,10 @@ impl DagConsensus {
             let mut vertex = Vertex {
                 round: self.current_round,
                 author: self.node_id.clone(),
-                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or(std::time::Duration::from_secs(0))
+                    .as_secs(),
                 payload,
                 parents,
                 hash: String::new(), 
