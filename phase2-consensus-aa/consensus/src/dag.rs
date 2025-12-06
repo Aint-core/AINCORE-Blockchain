@@ -94,16 +94,14 @@ impl DagConsensus {
 
         // Simple Quorum: 2n/3 + 1. For prototype with 1 node, 1 is enough.
         // In real system, check against validator set size.
-        let quorum = if prev_round == 0 { 0 } else { 1 }; 
+        // Simple Quorum: 2n/3 + 1. For prototype with 1 node, 1 is enough.
+        // In real system, check against validator set size.
+        let mut quorum = if prev_round == 0 { 0 } else { 1 }; 
         
         println!("DEBUG: try_create_vertex: Round {}, Parents: {}, Quorum: {}", self.current_round, parents.len(), quorum);
 
         // SPLIT-BRAIN PREVENTION:
         // Do not create vertices if we are alone, UNLESS we are the Genesis bootstrapping node (port 9000 convention or explicit flag).
-        // Since we don't have a specific "is_genesis" flag here easily, we check if we have peers.
-        // SPLIT-BRAIN PREVENTION (FINAL FIX):
-        // Blocks mining if NO peers are connected, UNLESS we are the designated Genesis Node.
-        // This prevents new nodes from accidentally fork-mining their own private chain.
         // Genesis Node ID: 8f7d00f56518177823e32849fa9e5f83 (Hardcoded from mainnet genesis)
         
         let genesis_id = "8f7d00f56518177823e32849fa9e5f83";
@@ -119,10 +117,11 @@ impl DagConsensus {
 
         if !has_peers && !is_genesis_node {
              if self.current_round % 10 == 0 || self.current_round < 5 {
-                 println!("⚠️  [Consensus] WAITING FOR PEERS... (I am not Genesis: {})", self.node_id);
+                 println!("⚠️  [Consensus] WAITING FOR PEERS... (I am not Genesis: {}). Forced Quorum increase.", self.node_id);
                  println!("   Please check your connection or bootnodes.");
              }
-             return; // STRICT BLOCK: Do not create private chain.
+             // FORCE QUORUM TO INFINITY TO BLOCK MINING
+             quorum = 9999;
         }
 
         // Standard logic for Genesis or Connected Nodes
