@@ -338,8 +338,11 @@ async fn main() {
                             guard.handle_incoming_batch(stripped);
                         }
                     } else if let Some(content) = msg.strip_prefix("SYNC_REQUEST:") {
+                        println!("🔍 [DEBUG] SYNC_REQUEST handler triggered!");
                         if let Ok(req) = serde_json::from_str::<SyncRequest>(content) {
+                            println!("🔍 [DEBUG] Parsed SYNC_REQUEST from {}", req.sender_id);
                             let resp = node_chain_sync.handle_sync_request(req.clone());
+                            println!("🔍 [DEBUG] Got {} blocks from handle_sync_request", resp.blocks.len());
                             
                             // CRITICAL FIX: Send response back to requester
                             let resp_json = serde_json::to_string(&resp).unwrap_or_default();
@@ -348,12 +351,15 @@ async fn main() {
                             // Send to requester's IP:port
                             let requester_ip = storage_clone.get_peer_ip(&req.sender_id).unwrap_or_else(|| "127.0.0.1".to_string());
                             let requester_addr = format!("{}:{}", requester_ip, req.sender_port);
+                            println!("🔍 [DEBUG] Sending to {}", requester_addr);
                             
                             if let Err(e) = network::send_message(&requester_addr, &response_msg) {
                                 eprintln!("❌ Failed to send sync response to {}: {}", requester_addr, e);
                             } else {
                                 println!("✅ Sent {} blocks to {}", resp.blocks.len(), requester_addr);
                             }
+                        } else {
+                            println!("❌ [DEBUG] Failed to parse SYNC_REQUEST");
                         }
                     } else if let Some(content) = msg.strip_prefix("SYNC_RESPONSE:") {
                         // CRITICAL FIX: Handle sync response
