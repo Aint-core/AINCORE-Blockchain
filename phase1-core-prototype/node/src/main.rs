@@ -169,7 +169,7 @@ async fn main() {
     }).collect();
     
     // === INISIALISASI P2P NETWORK (Start early to bind port) ===
-    let (_p2p_tx, mut p2p_rx) = match start_p2p(normalized_bootnodes, Arc::clone(&storage), enable_mdns, enable_nat).await {
+    let (_p2p_tx, mut p2p_rx) = match start_p2p(normalized_bootnodes.clone(), Arc::clone(&storage), enable_mdns, enable_nat).await {
         Ok((tx, rx)) => {
             println!("🌐 P2P gossip network started (libp2p running in background)");
             (tx, rx)
@@ -181,6 +181,23 @@ async fn main() {
     };
 
     // === HANDSHAKE KE PEERS (legacy - optional now) ===
+    // CRITICAL FIX: Parse bootnodes to extract IP and port for legacy TCP handshake
+    if !normalized_bootnodes.is_empty() {
+        println!("🔗 Attempting legacy TCP handshake with {} bootnodes", normalized_bootnodes.len());
+        for bootnode in &normalized_bootnodes {
+            // Parse bootnode address: /ip4/192.168.18.90/tcp/9000 or /dns4/example.com/tcp/9000
+            let parts: Vec<&str> = bootnode.split('/').collect();
+            if parts.len() >= 5 {
+                let ip_or_dns = parts[2]; // "192.168.18.90" or "example.com"
+                if let Ok(port) = parts[4].parse::<u16>() {
+                    println!("🔗 Trying legacy TCP handshake to {}:{}", ip_or_dns, port);
+                    handshake(&node_id, ip_or_dns, port, port, Arc::clone(&peers), Arc::clone(&storage));
+                    thread::sleep(Duration::from_millis(500));
+                }
+            }
+        }
+    }
+    
     if !initial_peers.is_empty() {
         println!("🔗 Connecting to {} initial peers (legacy TCP): {:?}", initial_peers.len(), initial_peers);
         for peer_port in &initial_peers {
@@ -188,7 +205,7 @@ async fn main() {
             handshake(&node_id, "127.0.0.1", *peer_port, port, Arc::clone(&peers), Arc::clone(&storage));
             thread::sleep(Duration::from_millis(100));
         }
-    } else {
+    } else if normalized_bootnodes.is_empty() {
         println!("📍 No initial legacy peers provided.");
     }
 
