@@ -101,6 +101,14 @@ impl DagConsensus {
         // SPLIT-BRAIN PREVENTION:
         // Do not create vertices if we are alone, UNLESS we are the Genesis bootstrapping node (port 9000 convention or explicit flag).
         // Since we don't have a specific "is_genesis" flag here easily, we check if we have peers.
+        // SPLIT-BRAIN PREVENTION (FINAL FIX):
+        // Blocks mining if NO peers are connected, UNLESS we are the designated Genesis Node.
+        // This prevents new nodes from accidentally fork-mining their own private chain.
+        // Genesis Node ID: 8f7d00f56518177823e32849fa9e5f83 (Hardcoded from mainnet genesis)
+        
+        let genesis_id = "8f7d00f56518177823e32849fa9e5f83";
+        let is_genesis_node = self.node_id == genesis_id;
+
         let has_peers = {
              if let Ok(p) = self.peers.lock() {
                  !p.is_empty()
@@ -109,32 +117,18 @@ impl DagConsensus {
              }
         };
 
-        // If we are strictly alone (0 peers) and not Round 1/Genesis, we should likely Sync instead of Mine.
-        // But for robust bootstrapping, we allow mining if we are "Node 1".
-        // Heuristic: If we have 0 peers and we have NO existing blockchain (Round 1), we might be genesis.
-        // If we have 0 peers but we are at Round 100, we are definitely partitioned.
+        if !has_peers && !is_genesis_node {
+             if self.current_round % 10 == 0 || self.current_round < 5 {
+                 println!("⚠️  [Consensus] WAITING FOR PEERS... (I am not Genesis: {})", self.node_id);
+                 println!("   Please check your connection or bootnodes.");
+             }
+             return; // STRICT BLOCK: Do not create private chain.
+        }
 
-        // Fix: If parents < quorum, we definitely wait.
-        // Added Check: If parents >= quorum, we proceed.
-        // BUT: If quorum is 1 (Self) and we have 0 Peers, we are creating a private fork.
-        // We urge the node to wait for peers if it's a fresh start.
-        
+        // Standard logic for Genesis or Connected Nodes
         if parents.len() >= quorum {
-            // Extra check: If we are mining solely on our own previous vertex (Quorum 1) and have NO peers,
-            // we might be in a partitioned state.
-            if parents.len() == 1 && !has_peers && self.current_round > 1 {
-                 if self.current_round % 10 == 0 {
-                     println!("⚠️  [Consensus] Mining in isolation (0 peers). Attempting to find network...");
-                 }
-                 // Allow mining to continue for demo stability, but warn user.
-                 // Ideally: return; to force sync.
-                 // For User Issue: STARTING A NEW CHAIN.
-                 // If we are fresh (Round 1) and have 0 peers, we start a new chain.
-                 // We should BLOCK checking for peers here if we want to force sync.
-                 
-                 // If User specifically requests "Connect to X", they shouldn't mine until connected.
-                 // Let's enforce: Must have peers if we are NOT the heavy genesis (approx check).
-            }
+            // ... (proceed to create vertex)
+        }
             
             // 2. Create Payload (Fetch from Mempool)
             let mut payload = Vec::new();
