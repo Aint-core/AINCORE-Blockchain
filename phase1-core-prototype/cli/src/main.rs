@@ -61,6 +61,8 @@ enum Commands {
         #[command(subcommand)]
         command: KeysSubcommand,
     },
+    /// Register as a Validator (Stakes 1000 AIN)
+    RegisterValidator,
 }
 
 #[derive(Subcommand)]
@@ -316,6 +318,50 @@ fn main() -> anyhow::Result<()> {
             KeysSubcommand::Import { priv_key, out } => {
                 KeysCmd::import(&priv_key, &out)?;
             }
+        }
+        Commands::RegisterValidator => {
+            let wallet = Wallet::load_or_create(Path::new(&cli.keyfile))?;
+            let sender = wallet.address();
+            
+            println!("🔒 Registering Validator for address: {}", sender);
+            
+            // Check Balance
+            let res = client.call("aincore_getBalance", json!([sender]))?;
+            let mut current_balance = 0;
+            let mut sequence_number = 0;
+            if let Some(obj) = res.as_object() {
+                if let Some(data_bytes) = obj.get("data").and_then(|v| v.as_array()) {
+                    let bytes: Vec<u8> = data_bytes.iter().map(|b| b.as_u64().unwrap() as u8).collect();
+                    if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        current_balance = account_data["balance"].as_u64().unwrap_or(0);
+                        sequence_number = account_data["sequence_number"].as_u64().unwrap_or(0);
+                    }
+                }
+            }
+            
+            let required_stake = 1000 * 1_000_000_000_000_000_000;
+            if current_balance < required_stake {
+                anyhow::bail!("❌ Insufficient Balance! Need 1000 AIN. You have: {}", current_balance);
+            }
+            
+            let payload = "register_validator".to_string();
+            let message = format!("{}:{}", payload, sequence_number);
+            let signature = wallet.sign(message.as_bytes());
+            
+            let tx_json = json!({
+                "chain_id": "AINCORE-MAINNET-1",
+                "sender": sender,
+                "public_key": wallet.public_key(),
+                "input_objects": [],
+                "payload": payload,
+                "gas_limit": 50000,
+                "gas_price": 1,
+                "sequence_number": sequence_number,
+                "signature": signature
+            });
+            
+            let res = client.call("aincore_sendTransaction", json!([tx_json.to_string()]))?;
+            println!("✅ Validator Registration Submitted: {}", res);
         }
     }
 

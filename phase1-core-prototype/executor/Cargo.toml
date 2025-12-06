@@ -14,3 +14,4 @@ move-core-types = { git = "https://github.com/move-language/move", branch = "apt
 move-binary-format = { git = "https://github.com/move-language/move", branch = "aptos-v1.3.0" }
 rayon = "1.8"
 ed25519-dalek = "2.0"
+bcs = "0.1"

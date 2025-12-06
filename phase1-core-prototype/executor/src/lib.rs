@@ -438,9 +438,73 @@ impl Executor {
                          }
                      }
                  }
+            } else if tx.payload == "register_validator" {
+                 // === STAKING LOGIC ===
+                 // Payload: "register_validator"
+                 // Invokes 0x1::staking::join_validator_set(account, stake_amount, pubkey)
+                 
+                 // 1. Prepare Arguments
+                 let stake_amount: u128 = 1000u128 * 1_000_000_000_000_000_000; // 1000 AIN
+                 
+                 // Decode Public Key
+                 if let Ok(pubkey_bytes) = hex::decode(&tx.public_key) {
+                     // Prepare BCS Args
+                     // Arg0: &signer (Handled by VM automatically for Entry Function first arg if it's signer)
+                     // Wait, VM expects Signer to be injected via sending session??
+                     // execute_entry_function signature: 
+                     // fun join_validator_set(account: &signer, stake_amount: u128, public_key: vector<u8>)
+                     // The VM automatically binds the first &signer argument to the txn sender.
+                     // So we only provide args for stake_amount and public_key.
+                     
+                     let arg_stake = bcs::to_bytes(&stake_amount).unwrap_or_default();
+                     let arg_pubkey = bcs::to_bytes(&pubkey_bytes).unwrap_or_default();
+                     
+                     let args = vec![arg_stake, arg_pubkey];
+                     let ty_args = vec![];
+                     
+                     use move_core_types::language_storage::ModuleId;
+                     use move_core_types::identifier::Identifier;
+                     use move_core_types::account_address::AccountAddress;
+                     
+                     let module_id = ModuleId::new(
+                         AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]), 
+                         Identifier::new("staking").unwrap()
+                     );
+                     
+                     let sender_addr = AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)).unwrap_or(AccountAddress::ZERO);
+                     
+                     match self.vm.execute_public_entry_function(
+                         module_id, 
+                         "join_validator_set", 
+                         ty_args, 
+                         args, 
+                         tx.gas_limit,
+                         sender_addr // Note: We might need to handle signature verification inside VM if we pass it, but we verified outside.
+                     ) {
+                         Ok((gas_used, vm_changes, _)) => {
+                             for (k, v) in vm_changes {
+                                 updates.push((k, v));
+                             }
+                             println!("✅ Staking Successful! Validator Joined: {}", tx.sender);
+                             
+                             // Deduct Gas (Refund Logic same as script)
+                             if gas_used < tx.gas_limit {
+                                 let refund_amount = (tx.gas_limit - gas_used) * tx.gas_price;
+                                 if refund_amount > 0 {
+                                     account_data.balance += refund_amount; 
+                                     if let Ok(refunded_data) = serde_json::to_vec(&account_data) {
+                                         payer_obj.data = refunded_data;
+                                         updates.push((format!("obj:{}", payer_obj.id.to_string()), Some(serde_json::to_string(&payer_obj).unwrap_or_else(|_| "{}".to_string()))));
+                                     }
+                                 }
+                             }
+                         },
+                         Err(e) => {
+                             println!("❌ Staking Failed: {}", e);
+                         }
+                     }
+                 }
             }
-            
-            // Move Script Execution (Standard)
             if let Ok(script_bytes) = hex::decode(&tx.payload) {
                  match self.vm.execute_script(script_bytes, vec![], tx.gas_limit) {
                      Ok((gas_used, vm_changes, _)) => {

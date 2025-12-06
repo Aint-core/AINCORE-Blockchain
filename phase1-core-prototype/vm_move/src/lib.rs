@@ -199,6 +199,33 @@ impl AINCOREVM {
         Ok((gas_meter.gas_used(), vm_changes, vec![])) // Events ignored for now
     }
 
+    pub fn execute_public_entry_function(
+        &self, 
+        module: ModuleId, 
+        function: &str, 
+        ty_args: Vec<move_core_types::language_storage::TypeTag>, 
+        args: Vec<Vec<u8>>, 
+        gas_limit: u64,
+        sender: AccountAddress
+    ) -> Result<(u64, Vec<(String, Option<String>)>, Vec<move_core_types::language_storage::ModuleId>)> {
+        let mut session = self.vm.new_session(&self.storage);
+        let mut gas_meter = AINCOREGasMeter::new(gas_limit);
+        
+        session.execute_entry_function(
+            &module,
+            &move_core_types::identifier::Identifier::new(function)?,
+            ty_args,
+            args,
+            &mut gas_meter,
+        )?;
+        
+        // Commit changes to ChangeSet
+        let (changeset, _events) = session.finish()?;
+        let vm_changes = self.changeset_to_kv(changeset)?;
+        
+        Ok((gas_meter.gas_used(), vm_changes, vec![]))
+    }
+
     fn changeset_to_kv(&self, changeset: move_core_types::effects::ChangeSet) -> Result<Vec<(String, Option<String>)>> {
         let mut updates = Vec::new();
         for (addr, account_changes) in changeset.into_inner() {
