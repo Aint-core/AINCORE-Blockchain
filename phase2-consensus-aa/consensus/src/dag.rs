@@ -106,10 +106,11 @@ impl DagConsensus {
         let genesis_id = "8f7d00f56518177823e32849fa9e5f83"; // Legacy hardcode
         let is_genesis_id = self.node_id == genesis_id;
 
-        // DYNAMIC CHECK: Are we the ONLY validator in the network?
-        // If yes, we are the Mainnet Authority/Genesis, so we MUST mine alone.
+        // DYNAMIC CHECK: Are we an Active Validator?
+        // If yes, we are trusted to produce blocks/bootstrap.
+        // Observers (new nodes) are NOT validators yet, so they will be blocked.
         let validators = self.get_validator_set();
-        let is_singleton_validator = validators.len() == 1 && validators.contains(&self.node_id);
+        let is_active_validator = validators.contains(&self.node_id);
 
         let has_peers = {
              if let Ok(p) = self.peers.lock() {
@@ -119,10 +120,10 @@ impl DagConsensus {
              }
         };
 
-        // If no peers, we block mining, UNLESS we are the declared Genesis or the Only Validator.
-        if !has_peers && !is_genesis_id && !is_singleton_validator {
+        // If no peers, we block mining, UNLESS we are Genesis or an Active Validator.
+        if !has_peers && !is_genesis_id && !is_active_validator {
              if self.current_round % 10 == 0 || self.current_round < 5 {
-                 println!("⚠️  [Consensus] WAITING FOR PEERS... (I am not Genesis/Singleton: {}). Forced Quorum increase.", self.node_id);
+                 println!("⚠️  [Consensus] WAITING FOR PEERS... (I am not Validator: {}). Forced Quorum increase.", self.node_id);
                  println!("   Please check your connection or bootnodes.");
              }
              // FORCE QUORUM TO INFINITY TO BLOCK MINING
