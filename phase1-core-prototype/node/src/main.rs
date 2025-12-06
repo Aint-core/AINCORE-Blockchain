@@ -181,10 +181,25 @@ async fn main() {
     };
 
     // === HANDSHAKE KE PEERS (legacy - optional now) ===
-    if !initial_peers.is_empty() {
+    // Try to handshake with stored peers
+    let stored_peers = storage.get_all_peers();
+    if !stored_peers.is_empty() {
+        println!("🔗 Connecting to {} stored peers (legacy TCP): {:?}", stored_peers.len(), stored_peers);
+        for (peer_id, peer_port) in stored_peers {
+            // Extract IP from peer_id if it contains IP, otherwise use localhost for legacy peers
+            let peer_ip = if peer_id.contains('.') || peer_id.contains(':') {
+                // peer_id might be "IP:PORT" format, extract IP
+                peer_id.split(':').next().unwrap_or("127.0.0.1")
+            } else {
+                "127.0.0.1" // Legacy format, assume localhost
+            };
+            handshake(&node_id, peer_ip, peer_port, port, Arc::clone(&peers), Arc::clone(&storage));
+            thread::sleep(Duration::from_millis(100));
+        }
+    } else if !initial_peers.is_empty() {
         println!("🔗 Connecting to {} initial peers (legacy TCP): {:?}", initial_peers.len(), initial_peers);
         for peer_port in &initial_peers {
-            handshake(&node_id, *peer_port, port, Arc::clone(&peers), Arc::clone(&storage));
+            handshake(&node_id, "127.0.0.1", *peer_port, port, Arc::clone(&peers), Arc::clone(&storage));
             thread::sleep(Duration::from_millis(100));
         }
     } else {

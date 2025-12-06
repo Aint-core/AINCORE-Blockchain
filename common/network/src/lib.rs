@@ -156,13 +156,14 @@ pub fn send_message(peer_addr: &str, message: &str) -> Result<(), Box<dyn std::e
 
 pub fn handshake(
     node_id: &str,  // ID node kita sendiri
+    peer_ip: &str,  // IP address peer target (FIXED: was hardcoded to 127.0.0.1)
     peer_port: u16, // Port peer target
     my_port: u16,   // Port kita sendiri
     peers: Arc<Mutex<HashMap<String, u16>>>,
     storage: Arc<StateDB>,
 ) {
-    // 1. Connect ke peer
-    let peer_addr = format!("127.0.0.1:{}", peer_port);
+    // 1. Connect ke peer (FIXED: now uses peer_ip parameter)
+    let peer_addr = format!("{}:{}", peer_ip, peer_port);
     
     match std::net::TcpStream::connect(&peer_addr) {
         Ok(mut stream) => {
