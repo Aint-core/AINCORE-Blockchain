@@ -312,6 +312,7 @@ async fn main() {
         let da_seq_clone = Arc::clone(&da_sequencer);
         let node_chain_sync = Arc::clone(&chain_sync);
         let server_node_id = node_id.clone();
+        let handler_storage = Arc::clone(&storage); // CRITICAL FIX: Clone for handler closure
 
         tokio::spawn(async move {
             network::start_server(
@@ -320,6 +321,7 @@ async fn main() {
                 node_peers,
                 Arc::clone(&node_storage),
                 move |msg: String| {
+                    let storage_clone = Arc::clone(&handler_storage); // CRITICAL FIX: Available in closure
                     println!("📨 [Server] Received msg: {:.50}...", msg);
                     if msg.starts_with("TX:") {
                         if let Ok(guard) = node_consensus.lock() {
@@ -344,7 +346,7 @@ async fn main() {
                             let response_msg = format!("SYNC_RESPONSE:{}", resp_json);
                             
                             // Send to requester's IP:port
-                            let requester_ip = node_storage.get_peer_ip(&req.sender_id).unwrap_or_else(|| "127.0.0.1".to_string());
+                            let requester_ip = storage_clone.get_peer_ip(&req.sender_id).unwrap_or_else(|| "127.0.0.1".to_string());
                             let requester_addr = format!("{}:{}", requester_ip, req.sender_port);
                             
                             if let Err(e) = network::send_message(&requester_addr, &response_msg) {
