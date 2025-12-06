@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'aincore'
+    static_configs:
+      - targets: ['aincore-validator-1:8037']

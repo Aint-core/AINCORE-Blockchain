@@ -1,0 +1,11 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crypto = { path = "./crypto" }
+network = { path = "./network" }
+storage = { path = "./storage" }
+config = { path = "./config" }
+

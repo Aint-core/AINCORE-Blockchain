@@ -1,0 +1,14 @@
+✅ Connected to AINCORE Node & Indexer
+🔑 Loaded Genesis Account: c4b14ae227ec4e1f661dbb0d15039f1c
+💰 Genesis Balance: 999997200
+👤 Generated New Wallet: 7c7a514ec5020234eb91f3c39e9d6430
+💰 New Wallet Initial Balance: 0
+💸 Sending 500 NEC to New Wallet...
+🔢 Sender Sequence Number: 0
+✅ Transaction Sent! Hash: 94e236c55812ee2c2001682d1095a56cb2ffdc9f7f7c4284332aa93ce34c5df4
+⏳ Waiting for confirmation...
+💰 New Wallet Final Balance: 500
+🎉 Balance Check PASSED!
+📜 Checking Transaction History via Indexer...
+Found 4 transactions for Genesis Account.
+🎉 Indexer Check PASSED! Found transaction: 4_c4b14ae227ec4e1f661dbb0d15039f1c

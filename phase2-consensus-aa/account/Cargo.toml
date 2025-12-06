@@ -1,0 +1,8 @@
+[package]
+name = "account"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# crypto = { path = "../../common/crypto" } # Aktifkan jika diperlukan nanti
+serde = { version = "1.0", features = ["derive"] }

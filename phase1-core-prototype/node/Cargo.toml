@@ -1,0 +1,69 @@
+[package]
+name = "node"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# --- Core modules ---
+executor = { path = "../executor" }
+mempool = { path = "../mempool" }
+storage = { path = "../../common/storage" }
+network = { path = "../../common/network" }
+config = { path = "../../common/config" }
+
+# --- Phase 2 & 3 ---
+consensus = { path = "../../phase2-consensus-aa/consensus" }
+blockchain = { path = "../../phase2-consensus-aa/blockchain" }
+account = { path = "../../phase2-consensus-aa/account" }
+chain_sync = { path = "../../phase3-chain-sync" }
+
+# --- Phase 4 ---
+da_sequencer = { path = "../../phase4-da-sequencer" }
+aincore-da = { path = "../../aincore-da" }
+
+# --- Phase 5 ---
+governance = { path = "../../phase5-privacy-governance/governance" }
+
+# --- Utility & Frameworks ---
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+ed25519-dalek = { version = "2.0", features = ["rand_core"] }
+
+hex = "0.4"
+rand = "0.8"
+aa = { path = "../../phase2-consensus-aa/aa" }
+move-binary-format = { git = "https://github.com/move-language/move", branch = "aptos-v1.3.0" }
+move-core-types = { git = "https://github.com/move-language/move", branch = "aptos-v1.3.0" }
+bcs = "0.1"
+
+
+
+# --- Async & Web API ---
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+actix-web = "4.4"
+actix-rt = "2.9"
+actix-cors = "0.6"
+rocksdb = "0.21.0"
+
+# --- P2P Layer ---
+libp2p = { version = "0.54", features = [
+    "tcp",
+    "yamux",
+    "noise",
+    "gossipsub",
+    "mdns",
+    "identify",
+    "kad",
+    "tokio",
+    "dns",
+    "macros",
+    "autonat",
+    "dcutr",
+    "relay"
+] }
+futures = "0.3"
+prometheus = "0.13"
+lazy_static = "1.4"

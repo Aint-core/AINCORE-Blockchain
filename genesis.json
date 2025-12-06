@@ -1,0 +1,34 @@
+{
+    "chain_id": "aincore-mainnet-1",
+    "genesis_time": "2025-12-02T12:00:00Z",
+    "initial_validators": [
+        {
+            "name": "Validator 1",
+            "address": "0000000000000000000000000000000000000000000000000000000000000001",
+            "stake": 1000000,
+            "public_key": "0000000000000000000000000000000000000000000000000000000000000001"
+        }
+    ],
+    "initial_distribution": [
+        {
+            "address": "0000000000000000000000000000000000000000000000000000000000000001",
+            "amount": 1000000000
+        },
+        {
+            "address": "0000000000000000000000000000000000000000000000000000000000000002",
+            "amount": 500000000
+        },
+        {
+            "address": "78408539d56f032543a44c0b8f33944c",
+            "amount": 1000000000
+        }
+    ],
+    "governance": {
+        "voting_period": 100,
+        "proposal_deposit": 1000
+    },
+    "da_config": {
+        "celestia_namespace_id": "0000000000000001",
+        "celestia_rpc": "http://celestia-node:26659"
+    }
+}

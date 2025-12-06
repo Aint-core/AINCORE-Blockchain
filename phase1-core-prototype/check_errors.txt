@@ -1,0 +1,404 @@
+    Checking vm_move v0.1.0 (/Users/macbookpro/Documents/aincore/phase1-core-prototype/vm_move)
+error[E0407]: method `balance` is not a member of trait `GasMeter`
+  --> phase1-core-prototype/vm_move/src/gas.rs:59:5
+   |
+59 | /     fn balance(&self) -> InternalGas {
+60 | |         InternalGas::new(self.gas_limit.saturating_sub(self.gas_consumed))
+61 | |     }
+   | |_____^ not a member of trait `GasMeter`
+
+error[E0407]: method `charge_jump` is not a member of trait `GasMeter`
+   --> phase1-core-prototype/vm_move/src/gas.rs:184:5
+    |
+184 |       fn charge_jump(
+    |       ^  ----------- help: there is an associated function with a similar name: `charge_pop`
+    |  _____|
+    | |
+185 | |         &mut self,
+186 | |         _target_pc: move_binary_format::file_format::CodeOffset,
+187 | |     ) -> move_vm_types::gas::GasResult {
+188 | |         self.charge(self.schedule.instruction_cost).map_err(|e| e.into())
+189 | |     }
+    | |_____^ not a member of trait `GasMeter`
+
+error[E0407]: method `charge_br_true` is not a member of trait `GasMeter`
+   --> phase1-core-prototype/vm_move/src/gas.rs:191:5
+    |
+191 | /     fn charge_br_true(
+192 | |         &mut self,
+193 | |         _target_pc: move_binary_format::file_format::CodeOffset,
+194 | |         _val: impl move_vm_types::views::ValueView,
+195 | |     ) -> move_vm_types::gas::GasResult {
+196 | |         self.charge(self.schedule.instruction_cost).map_err(|e| e.into())
+197 | |     }
+    | |_____^ not a member of trait `GasMeter`
+
+error[E0407]: method `charge_br_false` is not a member of trait `GasMeter`
+   --> phase1-core-prototype/vm_move/src/gas.rs:199:5
+    |
+199 | /     fn charge_br_false(
+200 | |         &mut self,
+201 | |         _target_pc: move_binary_format::file_format::CodeOffset,
+202 | |         _val: impl move_vm_types::views::ValueView,
+203 | |     ) -> move_vm_types::gas::GasResult {
+204 | |         self.charge(self.schedule.instruction_cost).map_err(|e| e.into())
+205 | |     }
+    | |_____^ not a member of trait `GasMeter`
+
+error[E0407]: method `charge_ret` is not a member of trait `GasMeter`
+   --> phase1-core-prototype/vm_move/src/gas.rs:214:5
+    |
+214 |       fn charge_ret(
+    |       ^  ---------- help: there is an associated function with a similar name: `charge_eq`
+    |  _____|
+    | |
+215 | |         &mut self,
+216 | |         _vals: impl ExactSizeIterator<Item = impl move_vm_types::views::ValueView>,
+217 | |     ) -> move_vm_types::gas::GasResult {
+218 | |         self.charge(self.schedule.instruction_cost).map_err(|e| e.into())
+219 | |     }
+    | |_____^ not a member of trait `GasMeter`
+
+error[E0407]: method `charge_abort` is not a member of trait `GasMeter`
+   --> phase1-core-prototype/vm_move/src/gas.rs:221:5
+    |
+221 |       fn charge_abort(
+    |       ^  ------------ help: there is an associated function with a similar name: `charge_pop`
+    |  _____|
+    | |
+222 | |         &mut self,
+223 | |         _code: impl move_vm_types::views::ValueView,
+224 | |     ) -> move_vm_types::gas::GasResult {
+225 | |          self.charge(self.schedule.instruction_cost).map_err(|e| e.into())
+226 | |     }
+    | |_____^ not a member of trait `GasMeter`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+  --> phase1-core-prototype/vm_move/src/gas.rs:63:113
+   |
+63 |     fn charge_simple_instr(&mut self, _instr: move_binary_format::file_format::Bytecode) -> move_vm_types::gas::GasResult {
+   |                                                                                                                 ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+  --> phase1-core-prototype/vm_move/src/gas.rs:70:30
+   |
+70 |     ) -> move_vm_types::gas::GasResult {
+   |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+  --> phase1-core-prototype/vm_move/src/gas.rs:83:30
+   |
+83 |     ) -> move_vm_types::gas::GasResult {
+   |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+  --> phase1-core-prototype/vm_move/src/gas.rs:94:30
+   |
+94 |     ) -> move_vm_types::gas::GasResult {
+   |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:105:30
+    |
+105 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:112:30
+    |
+112 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:119:30
+    |
+119 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:126:30
+    |
+126 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:133:30
+    |
+133 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:141:30
+    |
+141 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:149:30
+    |
+149 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:156:30
+    |
+156 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:164:30
+    |
+164 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:172:30
+    |
+172 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:180:30
+    |
+180 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:187:30
+    |
+187 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:195:30
+    |
+195 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:203:30
+    |
+203 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:210:30
+    |
+210 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:217:30
+    |
+217 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:224:30
+    |
+224 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:232:30
+    |
+232 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:240:30
+    |
+240 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:250:30
+    |
+250 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:259:30
+    |
+259 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:267:30
+    |
+267 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:277:30
+    |
+277 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+error[E0412]: cannot find type `GasResult` in module `move_vm_types::gas`
+   --> phase1-core-prototype/vm_move/src/gas.rs:284:30
+    |
+284 |     ) -> move_vm_types::gas::GasResult {
+    |                              ^^^^^^^^^ not found in `move_vm_types::gas`
+
+warning: unused import: `InternalGasPerByte`
+ --> phase1-core-prototype/vm_move/src/gas.rs:2:32
+  |
+2 |     gas_algebra::{InternalGas, InternalGasPerByte, NumBytes},
+  |                                ^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+error[E0049]: method `charge_native_function` has 0 type parameters but its trait declaration has 2 type parameters
+   --> phase1-core-prototype/vm_move/src/gas.rs:67:30
+    |
+ 67 |       fn charge_native_function(
+    |                                ^ found 0 type parameters
+    |
+   ::: /Users/macbookpro/.cargo/git/checkouts/move-5734c3a45f62af74/c453c90/language/move-vm/types/src/gas.rs:219:5
+    |
+219 | /     fn charge_native_function(
+220 | |         &mut self,
+221 | |         amount: InternalGas,
+222 | |         ret_vals: Option<impl ExactSizeIterator<Item = impl ValueView>>,
+223 | |     ) -> PartialVMResult<()>;
+    | |_____________________________- expected 2 type parameters
+
+error[E0049]: method `charge_load_resource` has 0 type parameters but its trait declaration has 1 type parameter
+   --> phase1-core-prototype/vm_move/src/gas.rs:77:28
+    |
+ 77 |       fn charge_load_resource(
+    |                              ^ found 0 type parameters
+    |
+   ::: /Users/macbookpro/.cargo/git/checkouts/move-5734c3a45f62af74/c453c90/language/move-vm/types/src/gas.rs:208:5
+    |
+208 | /     fn charge_load_resource(
+209 | |         &mut self,
+210 | |         loaded: Option<(NumBytes, impl ValueView)>,
+211 | |     ) -> PartialVMResult<()>;
+    | |_____________________________- expected 1 type parameter
+
+error[E0195]: lifetime parameters or bounds on method `charge_vec_pack` do not match the trait declaration
+   --> phase1-core-prototype/vm_move/src/gas.rs:228:23
+    |
+228 |     fn charge_vec_pack(
+    |                       ^ lifetimes do not match method in trait
+
+error[E0049]: method `charge_vec_len` has 2 type parameters but its trait declaration has 1 type parameter
+   --> phase1-core-prototype/vm_move/src/gas.rs:238:14
+    |
+238 |         _ty: impl move_vm_types::views::TypeView,
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |              |
+    |              found 2 type parameters
+    |              `impl Trait` introduces an implicit type parameter
+239 |         _val: impl move_vm_types::views::ValueView,
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `impl Trait` introduces an implicit type parameter
+    |
+   ::: /Users/macbookpro/.cargo/git/checkouts/move-5734c3a45f62af74/c453c90/language/move-vm/types/src/gas.rs:169:5
+    |
+169 |     fn charge_vec_len(&mut self, ty: impl TypeView) -> PartialVMResult<()>;
+    |     ----------------------------------------------------------------------- expected 1 type parameter
+
+error[E0049]: method `charge_vec_borrow` has 3 type parameters but its trait declaration has 1 type parameter
+   --> phase1-core-prototype/vm_move/src/gas.rs:247:14
+    |
+247 |           _ty: impl move_vm_types::views::TypeView,
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |                |
+    |                found 3 type parameters
+    |                `impl Trait` introduces an implicit type parameter
+248 |           _src_val: impl move_vm_types::views::ValueView,
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `impl Trait` introduces an implicit type parameter
+249 |           _idx_val: impl move_vm_types::views::ValueView,
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `impl Trait` introduces an implicit type parameter
+    |
+   ::: /Users/macbookpro/.cargo/git/checkouts/move-5734c3a45f62af74/c453c90/language/move-vm/types/src/gas.rs:171:5
+    |
+171 | /     fn charge_vec_borrow(
+172 | |         &mut self,
+173 | |         is_mut: bool,
+174 | |         ty: impl TypeView,
+175 | |         is_success: bool,
+176 | |     ) -> PartialVMResult<()>;
+    | |_____________________________- expected 1 type parameter
+
+error[E0049]: method `charge_vec_push_back` has 3 type parameters but its trait declaration has 2 type parameters
+   --> phase1-core-prototype/vm_move/src/gas.rs:256:14
+    |
+256 |           _ty: impl move_vm_types::views::TypeView,
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |                |
+    |                found 3 type parameters
+    |                `impl Trait` introduces an implicit type parameter
+257 |           _val: impl move_vm_types::views::ValueView,
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `impl Trait` introduces an implicit type parameter
+258 |           _new_val: impl move_vm_types::views::ValueView,
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `impl Trait` introduces an implicit type parameter
+    |
+   ::: /Users/macbookpro/.cargo/git/checkouts/move-5734c3a45f62af74/c453c90/language/move-vm/types/src/gas.rs:178:5
+    |
+178 | /     fn charge_vec_push_back(
+179 | |         &mut self,
+180 | |         ty: impl TypeView,
+181 | |         val: impl ValueView,
+182 | |     ) -> PartialVMResult<()>;
+    | |_____________________________- expected 2 type parameters
+
+error[E0049]: method `charge_vec_swap` has 4 type parameters but its trait declaration has 1 type parameter
+   --> phase1-core-prototype/vm_move/src/gas.rs:273:14
+    |
+273 |         _ty: impl move_vm_types::views::TypeView,
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |              |
+    |              found 4 type parameters
+    |              `impl Trait` introduces an implicit type parameter
+274 |         _val: impl move_vm_types::views::ValueView,
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `impl Trait` introduces an implicit type parameter
+275 |         _idx1: impl move_vm_types::views::ValueView,
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `impl Trait` introduces an implicit type parameter
+276 |         _idx2: impl move_vm_types::views::ValueView,
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `impl Trait` introduces an implicit type parameter
+    |
+   ::: /Users/macbookpro/.cargo/git/checkouts/move-5734c3a45f62af74/c453c90/language/move-vm/types/src/gas.rs:199:5
+    |
+199 |     fn charge_vec_swap(&mut self, ty: impl TypeView) -> PartialVMResult<()>;
+    |     ------------------------------------------------------------------------ expected 1 type parameter
+
+error[E0276]: impl has stricter requirements than trait
+   --> phase1-core-prototype/vm_move/src/gas.rs:283:23
+    |
+283 |         _locals: impl ExactSizeIterator<Item = impl move_vm_types::views::ValueView>,
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ impl has extra requirement `impl ExactSizeIterator<Item = impl move_vm_types::views::ValueView>: ExactSizeIterator`
+
+error[E0046]: not all trait items implemented, missing: `balance_internal`, `charge_ld_const_after_deserialization`, `charge_borrow_global`, `charge_exists`, `charge_move_from`, `charge_move_to`, `charge_vec_unpack`, `charge_native_function_before_execution`
+  --> phase1-core-prototype/vm_move/src/gas.rs:58:1
+   |
+58 | impl GasMeter for AINCOREGasMeter {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `balance_internal`, `charge_ld_const_after_deserialization`, `charge_borrow_global`, `charge_exists`, `charge_move_from`, `charge_move_to`, `charge_vec_unpack`, `charge_native_function_before_execution` in implementation
+   |
+   = help: implement the missing item: `fn balance_internal(&self) -> GasQuantity<InternalGasUnit> { todo!() }`
+   = help: implement the missing item: `fn charge_ld_const_after_deserialization<impl ValueView>(&mut self, _: impl ValueView) -> Result<(), PartialVMError> where impl ValueView: ValueView { todo!() }`
+   = help: implement the missing item: `fn charge_borrow_global<impl TypeView>(&mut self, _: bool, _: bool, _: impl TypeView, _: bool) -> Result<(), PartialVMError> where impl TypeView: TypeView { todo!() }`
+   = help: implement the missing item: `fn charge_exists<impl TypeView>(&mut self, _: bool, _: impl TypeView, _: bool) -> Result<(), PartialVMError> where impl TypeView: TypeView { todo!() }`
+   = help: implement the missing item: `fn charge_move_from<impl TypeView, impl ValueView>(&mut self, _: bool, _: impl TypeView, _: Option<impl ValueView>) -> Result<(), PartialVMError> where impl TypeView: TypeView, impl ValueView: ValueView { todo!() }`
+   = help: implement the missing item: `fn charge_move_to<impl TypeView, impl ValueView>(&mut self, _: bool, _: impl TypeView, _: impl ValueView, _: bool) -> Result<(), PartialVMError> where impl TypeView: TypeView, impl ValueView: ValueView { todo!() }`
+   = help: implement the missing item: `fn charge_vec_unpack<impl TypeView, impl ValueView, impl ExactSizeIterator<Item = impl ValueView>>(&mut self, _: impl TypeView, _: GasQuantity<Arg>, _: impl ExactSizeIterator<Item = impl ValueView>) -> Result<(), PartialVMError> where impl TypeView: TypeView, impl ValueView: ValueView, impl ExactSizeIterator<Item = impl ValueView>: ExactSizeIterator { todo!() }`
+   = help: implement the missing item: `fn charge_native_function_before_execution<impl TypeView, impl ExactSizeIterator<Item = impl TypeView>, impl ValueView, impl ExactSizeIterator<Item = impl ValueView>>(&mut self, _: impl ExactSizeIterator<Item = impl TypeView>, _: impl ExactSizeIterator<Item = impl ValueView>) -> Result<(), PartialVMError> where impl TypeView: TypeView, impl ExactSizeIterator<Item = impl TypeView>: ExactSizeIterator, impl ValueView: ValueView, impl ExactSizeIterator<Item = impl ValueView>: ExactSizeIterator { todo!() }`
+
+error[E0599]: no variant or associated item named `EXECUTION_LIMIT_EXCEEDED` found for enum `StatusCode` in the current scope
+  --> phase1-core-prototype/vm_move/src/gas.rs:50:29
+   |
+50 |             Err(StatusCode::EXECUTION_LIMIT_EXCEEDED)
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^ variant or associated item not found in `StatusCode`
+   |
+help: there is a variant with a similar name
+   |
+50 -             Err(StatusCode::EXECUTION_LIMIT_EXCEEDED)
+50 +             Err(StatusCode::EXECUTION_LIMIT_REACHED
+   |
+
+Some errors have detailed explanations: E0046, E0049, E0195, E0276, E0407, E0412, E0599.
+For more information about an error, try `rustc --explain E0046`.
+warning: `vm_move` (lib) generated 1 warning
+error: could not compile `vm_move` (lib) due to 44 previous errors; 1 warning emitted

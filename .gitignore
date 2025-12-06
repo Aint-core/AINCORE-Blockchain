@@ -1,0 +1,25 @@
+# Rust Build Artifacts
+target/
+**/*.rs.bk
+
+# Data Directories (Local State)
+data/
+data_*/
+db/
+*.db
+
+# Logs
+*.log
+logs/
+
+# Secrets (Keys)
+*.key
+wallet.key
+node_identity.key
+
+# Local Configs
+vault_address.txt
+.env
+
+# MacOS
+.DS_Store

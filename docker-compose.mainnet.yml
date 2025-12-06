@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  aincore-node:
+    image: aincore:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aincore-validator-1
+    restart: always
+    ports:
+      - "9002:9002" # P2P
+      - "8002:8002" # API
+    volumes:
+      - ./aincore_data:/root/.aincore/data
+      - ./genesis.json:/root/.aincore/genesis.json
+    environment:
+      - AINCORE_PORT=9002
+      - AINCORE_API_PORT=8002
+      - AINCORE_PEERS=
+      - RUST_LOG=info
+    command: [ "node", "--port", "9002" ]
+    networks:
+      - aincore-net
+
+  # Optional: Prometheus for monitoring
+  prometheus:
+    image: prom/prometheus
+    container_name: aincore-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "19090:9090"
+    networks:
+      - aincore-net
+
+  # Indexer Service
+  aincore-indexer:
+    image: aincore:latest
+    container_name: aincore-indexer
+    command: [ "indexer" ]
+    environment:
+      - NODE_RPC_URL=http://aincore-node:8002/rpc
+      - RUST_LOG=info
+    ports:
+      - "3001:3001"
+    depends_on:
+      - aincore-node
+    networks:
+      - aincore-net
+
+  # Celestia Light Node (DA Layer)
+  celestia-light:
+    image: ghcr.io/celestiaorg/celestia-node:v0.12.0
+    container_name: celestia-light
+    command: [ "celestia", "light", "start", "--core.ip", "consensus.celestia.org", "--p2p.network", "arabica" ]
+    ports:
+      - "26658:26658" # RPC
+    networks:
+      - aincore-net
+
+networks:
+  aincore-net:
+    driver: bridge

@@ -1,0 +1,98 @@
+version: "2"
+run:
+  timeout: 5m
+linters:
+  enable:
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - copyloopvar
+    - dogsled
+    - dupl
+    - dupword
+    - errorlint
+    - gocheckcompilerdirectives
+    - goconst
+    - gocritic
+    - gosec
+    - lll
+    - loggercheck
+    - misspell
+    - nakedret
+    - nilerr
+    - nilnil
+    - nolintlint
+    - prealloc
+    - protogetter
+    - revive
+    - staticcheck
+    - unconvert
+    - wastedassign
+    - whitespace
+  settings:
+    dogsled:
+      max-blank-identifiers: 3
+    dupl:
+      threshold: 200
+    gosec:
+      excludes:
+        - G115
+    misspell:
+      locale: US
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - gosec
+          - revive
+        path: _test\.go
+      - linters:
+          - revive
+        path: libs/utils
+      - linters:
+          - lll
+        source: https://
+      - linters:
+          - revive
+        text: "var-naming: avoid meaningless package names"
+        path: "libs/utils"
+      - linters:
+          - revive
+        text: "var-naming: don't use an underscore in package name"
+        path: "share/shwap/p2p/shrex/shrex_getter"
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+issues:
+  max-same-issues: 50
+formatters:
+  enable:
+    - gofmt
+    - gofumpt
+    - goimports
+    - golines
+  settings:
+    gofumpt:
+      extra-rules: true
+    goimports:
+      local-prefixes:
+        - github.com/celestiaorg/celestia-node
+    golines:
+      # Target maximum line length.
+      # Default: 100
+      max-len: 200
+      # Shorten single-line comments.
+      # Default: false
+      shorten-comments: true
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

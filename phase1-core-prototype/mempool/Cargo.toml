@@ -1,0 +1,10 @@
+[package]
+name = "mempool"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+network = { path = "../../common/network" }
+executor = { path = "../executor" }
+hex = "0.4"
+sha2 = "0.10"
