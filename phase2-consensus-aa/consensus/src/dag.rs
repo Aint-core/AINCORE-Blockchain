@@ -92,20 +92,30 @@ impl DagConsensus {
             parents.push("genesis".to_string());
         }
 
-        // Simple Quorum: 2n/3 + 1. For prototype with 1 node, 1 is enough.
-        // In real system, check against validator set size.
-        let mut quorum = if prev_round == 0 { 0 } else { 1 }; 
-        
-        // println!("DEBUG: try_create_vertex: Round {}, Parents: {}, Quorum: {}", self.current_round, parents.len(), quorum);
-
-        // SPLIT-BRAIN PREVENTION & OBSERVER MODE:
-        
-        let genesis_id = "8f7d00f56518177823e32849fa9e5f83"; 
-        let is_genesis_id = self.node_id == genesis_id;
-
-        // DYNAMIC CHECK: Are we an Active Validator?
+        // DYNAMIC CHECK: Get active validator set FIRST (needed for quorum calculation)
         let validators = self.get_validator_set();
         let is_active_validator = validators.contains(&self.node_id);
+        
+        // BFT QUORUM CALCULATION: 2f+1 where f = (n-1)/3
+        // This ensures we can tolerate f Byzantine nodes
+        let n = validators.len().max(1); // Prevent division by zero
+        let f = (n - 1) / 3; // Byzantine tolerance
+        let bft_quorum = (2 * f) + 1;
+        
+        // For genesis round (round 0), we need 0 parents (bootstrap)
+        // For subsequent rounds, we need BFT quorum of parents
+        let mut quorum = if prev_round == 0 { 
+            0 
+        } else { 
+            bft_quorum.max(1) // At minimum 1 parent required
+        };
+        
+        println!("🔒 [Consensus] Round {}: Validators={}, BFT_Quorum={}, Parents={}", 
+                 self.current_round, n, quorum, parents.len());
+
+        // SPLIT-BRAIN PREVENTION & OBSERVER MODE:
+        let genesis_id = "8f7d00f56518177823e32849fa9e5f83"; 
+        let is_genesis_id = self.node_id == genesis_id;
 
         let has_peers = {
              if let Ok(p) = self.peers.lock() {
