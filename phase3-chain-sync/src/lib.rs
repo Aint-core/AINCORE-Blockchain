@@ -59,8 +59,11 @@ impl ChainSync {
         let msg = format!("SYNC_REQUEST:{}", serialized);
 
         for (peer_id, peer_port) in peers_map.iter() {
-            println!("📡 [ChainSync] Requesting missing blocks from peer {} (port {})", peer_id, peer_port);
-            let addr = format!("127.0.0.1:{}", peer_port);
+            // CRITICAL FIX: Get peer IP from storage instead of hardcoded localhost
+            let peer_ip = self.storage.get_peer_ip(peer_id).unwrap_or_else(|| "127.0.0.1".to_string());
+            
+            println!("📡 [ChainSync] Requesting missing blocks from peer {} ({}:{})", peer_id, peer_ip, peer_port);
+            let addr = format!("{}:{}", peer_ip, peer_port);
             if let Err(e) = send_message(&addr, &msg) {
                 println!("❌ [ChainSync] Failed to send request to {}: {}", addr, e);
             } else {

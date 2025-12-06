@@ -195,12 +195,17 @@ pub fn handshake(
                                 }
                             }
                             
-                            // Simpan ke storage
+                            // Simpan ke storage (port)
                             if let Err(e) = storage.save_peer(&peer_node_id, confirmed_peer_port) {
                                  eprintln!("❌ Failed to save peer to DB: {}", e);
                             }
                             
-                            println!("🔗 Connected to peer {} (port {})", peer_node_id, confirmed_peer_port);
+                            // CRITICAL FIX: Save peer IP for ChainSync
+                            if let Err(e) = storage.save_peer_ip(&peer_node_id, peer_ip) {
+                                eprintln!("❌ Failed to save peer IP to DB: {}", e);
+                            }
+                            
+                            println!("🔗 Connected to peer {} ({}:{})", peer_node_id, peer_ip, confirmed_peer_port);
                         }
                     } else {
                         eprintln!("⚠️ Unexpected handshake response from {}: {}", peer_addr, response);

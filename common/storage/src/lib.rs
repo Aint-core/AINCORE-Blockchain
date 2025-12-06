@@ -60,7 +60,7 @@ impl StateDB {
                 
                 if k.starts_with("peer:") {
                     let val_str = String::from_utf8(value.to_vec()).unwrap_or_default();
-                    if let Ok(port) = val_str.parse::<u16>() {
+                    if let Ok(port) = val_str.parse::< u16>() {
                         peers.push((k.replace("peer:", ""), port));
                     }
                 }
@@ -68,6 +68,20 @@ impl StateDB {
         }
 
         peers
+    }
+
+    // === PEER IP TRACKING (for multi-node sync) ===
+    pub fn save_peer_ip(&self, node_id: &str, ip: &str) -> std::result::Result<(), rocksdb::Error> {
+        let key = format!("peer_ip:{}", node_id);
+        self.put(&key, ip)
+    }
+
+    pub fn get_peer_ip(&self, node_id: &str) -> Option<String> {
+        if let Ok(Some(ip)) = self.get(&format!("peer_ip:{}", node_id)) {
+            Some(ip)
+        } else {
+            None
+        }
     }
 
     pub fn save_peer_addr(&self, peer_id: &str, multiaddr: &str) -> std::result::Result<(), rocksdb::Error> {
