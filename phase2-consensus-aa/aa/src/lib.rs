@@ -22,7 +22,8 @@ impl AccountManager {
             balance: 0,
             btc_balance: 0,
         };
-        let data_bytes = serde_json::to_vec(&data).unwrap();
+        let data_bytes = serde_json::to_vec(&data)
+            .expect("AA: Failed to serialize AccountData");
         
         Object::new(
             address.clone(),
@@ -42,23 +43,43 @@ impl AccountManager {
         };
 
         // 2. Decode Public Key
-        let pub_key_bytes = match hex::decode(&account_data.public_key) {
+        let pub_key_bytes_vec = match hex::decode(&account_data.public_key) {
             Ok(b) => b,
             Err(_) => return false,
         };
         
-        let verifying_key = match VerifyingKey::from_bytes(pub_key_bytes.as_slice().try_into().unwrap()) {
+        // CRITICAL FIX: Safe Ed25519 signature verification (VULN-CRYPTO-001)
+        let pub_key_array: [u8; 32] = match pub_key_bytes_vec.as_slice().try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                eprintln!("❌ [AA] Invalid Ed25519 public key length");
+                return false;
+            }
+        };
+        
+        let verifying_key = match VerifyingKey::from_bytes(&pub_key_array) {
             Ok(k) => k,
-            Err(_) => return false,
+            Err(_) => {
+                eprintln!("❌ [AA] Invalid Ed25519 public key format");
+                return false;
+            }
         };
 
         // 3. Decode Signature
-        let sig_bytes = match hex::decode(signature_hex) {
+        let sig_bytes_vec = match hex::decode(signature_hex) {
             Ok(b) => b,
             Err(_) => return false,
         };
         
-        let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+        let sig_array: [u8; 64] = match sig_bytes_vec.as_slice().try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                eprintln!("❌ [AA] Invalid Ed25519 signature length");
+                return false;
+            }
+        };
+        
+        let signature = Signature::from_bytes(&sig_array);
 
 
         // 4. Verify
