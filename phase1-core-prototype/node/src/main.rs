@@ -405,6 +405,8 @@ async fn main() {
     
     // Trigger initial sync
     println!("🔄 Starting initial chain sync...");
+    // CRITICAL FIX: Wait for peer servers to be ready (they start async)
+    tokio::time::sleep(Duration::from_secs(3)).await;
     chain_sync.sync_from_peers();
 
     println!("\n🎬 Main Execution Loop started (Consensus running in background)...\n");
