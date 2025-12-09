@@ -46,12 +46,16 @@ impl AINCOREGasMeter {
     }
 
     fn charge(&mut self, amount: u64) -> Result<(), PartialVMError> {
-        if self.gas_consumed + amount > self.gas_limit {
-            self.gas_consumed = self.gas_limit;
-            Err(PartialVMError::new(StatusCode::EXECUTION_LIMIT_REACHED))
-        } else {
-            self.gas_consumed += amount;
-            Ok(())
+        // ATOMIC AUDIT FIX: Use checked_add to prevent overflow wrapping in Release mode
+        match self.gas_consumed.checked_add(amount) {
+            Some(new_consumed) if new_consumed <= self.gas_limit => {
+                self.gas_consumed = new_consumed;
+                Ok(())
+            }
+            _ => {
+                self.gas_consumed = self.gas_limit;
+                Err(PartialVMError::new(StatusCode::EXECUTION_LIMIT_REACHED))
+            }
         }
     }
 }

@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use storage::StateDB;
 use mempool::Mempool;
 use executor::{Executor};
-use ed25519_dalek::{Signer, Verifier, SigningKey, VerifyingKey, Signature};
+// Use crypto crate for everything
+use crypto::{hash_hex, Signer, Verifier, SigningKey, VerifyingKey, Signature}; 
 use rand::rngs::OsRng;
 use rand::RngCore;
 
@@ -37,12 +38,14 @@ impl Block {
     pub fn new(height: u64, parent_hash: String, transactions: Vec<String>, proposer: String) -> Self {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(std::time::Duration::from_secs(0))
             .as_secs();
 
         // Simple hash calculation (SHA256)
-        let input = format!("{}{}{}", parent_hash, timestamp, proposer);
-        let hash = sha256::digest(input);
+        // CRITICAL FIX: Use deterministic inputs for hash (including timestamp, but timestamp MUST be fixed by proposer)
+        let input = format!("{}{}{}", parent_hash, height, proposer);
+        // Use crypto::hash_hex instead of sha256::digest
+        let hash = hash_hex(input.as_bytes());
 
         Block {
             header: BlockHeader {
@@ -80,7 +83,7 @@ pub struct SimpleConsensus {
     keypair: SigningKey, // The Node's Private Key
     peers: Arc<Mutex<HashMap<String, u16>>>, // PeerID -> Port
     mempool: Arc<Mutex<Mempool>>,
-    _db: Arc<StateDB>, // Unused field, kept for compatibility
+    db: Arc<StateDB>, // Active DB access for PoS
     executor: Arc<Executor>,
     
     // State
@@ -113,7 +116,7 @@ impl SimpleConsensus {
             keypair,
             peers,
             mempool,
-            _db: db.clone(),
+            db: db.clone(),
             executor: Arc::new(Executor::new(db)),
             current_round: 0,
             votes: Arc::new(Mutex::new(HashMap::new())),
@@ -250,6 +253,20 @@ impl SimpleConsensus {
              return;
         }
 
+        // === TIMESTAMP VERIFICATION (Future Block Protection) ===
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or(std::time::Duration::from_secs(0)).as_secs();
+        if proposal.block.header.timestamp > now + 5 {
+             println!("⚠️ [Node {}] REJECTED Future Block (Ts: {}, Now: {})", self.node_id, proposal.block.header.timestamp, now);
+             return;
+        }
+
+        // === REAL MODE: VALIDATOR CHECK ===
+        let validators = self.db.get_active_validators();
+        if !validators.iter().any(|(pk, _)| pk == &proposal.proposer_id) {
+             println!("⚠️ [Node {}] Ignored PROPOSAL from non-validator: {}", self.node_id, proposal.proposer_id);
+             return;
+        }
+
         {
             let mut proposals_lock = self.pending_proposals.lock().unwrap();
             proposals_lock.insert(proposal.block.header.hash.clone(), proposal.clone());
@@ -263,6 +280,19 @@ impl SimpleConsensus {
              println!("⛔ [Node {}] INVALID SIGNATURE on Vote from {}", self.node_id, vote.voter_id);
              return; 
         }
+
+        // === REAL MODE: VALIDATOR SET CHECK ===
+        // Fetch active validators from StateDB
+        let validators = self.db.get_active_validators();
+        
+        // 1. Check if voter is a validator
+        let _voter_weight = match validators.iter().find(|(pk, _)| pk == &vote.voter_id) {
+            Some((_, weight)) => *weight,
+            None => {
+                println!("⚠️ [Node {}] Ignored vote from non-validator: {}", self.node_id, vote.voter_id);
+                return;
+            }
+        };
 
         let block_hash = vote.block_hash.clone();
         let mut should_commit = false;
@@ -279,16 +309,18 @@ impl SimpleConsensus {
             
             if !current_votes.iter().any(|v| v.voter_id == vote.voter_id) {
                  current_votes.push(vote);
-                 let vote_count = current_votes.len();
-                 let peers_count = match self.peers.lock() {
-                     Ok(g) => g.len(),
-                     Err(_) => 0, // Default to 0 if poisoned, safer than panic
-                 };
-                 let total_nodes = peers_count + 1;
-                 let quorum = (total_nodes / 2) + 1;
+                 
+                 // 2. Calculate Stake-Based Quorum
+                 let total_stake: u64 = validators.iter().map(|(_, w)| w).sum();
+                 let current_stake_weight: u64 = current_votes.iter()
+                    .filter_map(|v| validators.iter().find(|(pk, _)| pk == &v.voter_id).map(|(_, w)| *w))
+                    .sum();
 
-                 if vote_count >= quorum {
-                      println!("🎉 [Node {}] Quorum Reached ({}/{}) for Block {}", self.node_id, vote_count, total_nodes, block_hash);
+                 // BFT Quorum: 2/3 + 1
+                 let quorum_threshold = (total_stake * 2) / 3 + 1;
+
+                 if current_stake_weight >= quorum_threshold {
+                      println!("🎉 [Node {}] BFT Quorum Reached ({}/{} Stake) for Block {}", self.node_id, current_stake_weight, total_stake, block_hash);
                       should_commit = true;
                  }
             }

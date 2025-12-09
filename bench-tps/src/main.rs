@@ -1,12 +1,11 @@
 use colored::*;
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey};
 use futures::future::join_all;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::rngs::OsRng;
 use reqwest::Client;
 use serde_json::json;
 use std::time::Instant;
-use tokio::time::{sleep, Duration};
 
 const RPC_URL: &str = "http://localhost:8002/rpc"; // Target Node 2
 const TOTAL_TXS: usize = 1000; // Number of transactions to spam
@@ -52,7 +51,14 @@ async fn main() {
         let pubkey = hex::encode(kp.verifying_key().as_bytes());
         // Simple payload: "transfer:TO_ADDRESS:AMOUNT:NONCE"
         let payload = format!("transfer:{}:1:{}", pubkey, i); 
-        let signature = kp.sign(payload.as_bytes());
+        
+        // PROTOCOL UPDATE: Chain Binding Signature
+        // Format: CHAIN_ID:PAYLOAD:SEQ
+        let chain_id = "AINCORE-MAINNET-1";
+        let seq = i as u64;
+        let message = format!("{}:{}:{}", chain_id, payload, seq);
+        
+        let signature = kp.sign(message.as_bytes());
         let sig_hex = hex::encode(signature.to_bytes());
 
         let body = json!({

@@ -36,6 +36,12 @@ impl Mempool {
             return;
         }
 
+        // 1. Check Transaction Size to prevent RAM DoS
+        if tx.len() > 100 * 1024 { // 100KB Limit
+             println!("⚠️ Transaction too large ({} bytes). limit 100KB.", tx.len());
+             return;
+        }
+
         if self.pending_txs.len() >= MAX_PENDING_TXS {
              println!("⚠️ Mempool Full ({}/{}) - Rejecting transaction {}", self.pending_txs.len(), MAX_PENDING_TXS, tx_hash);
              return;
@@ -50,7 +56,6 @@ impl Mempool {
         self.seen_txs.insert(tx_hash);
         self.pending_txs.push_back(tx.clone());
         
-        let _ = std::fs::write("debug_mempool_add.log", format!("Added: {}\n", tx));
         println!("📥 Added transaction to mempool: {}", self.pending_txs.len());
     }
 
@@ -63,14 +68,15 @@ impl Mempool {
                 count += 1;
             }
         }
-        if !transactions.is_empty() {
-             let _ = std::fs::write("debug_mempool_get.log", format!("Got {} txs\n", transactions.len()));
-        }
         transactions
     }
 
     pub fn is_empty(&self) -> bool {
         self.pending_txs.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.pending_txs.len()
     }
 }
 

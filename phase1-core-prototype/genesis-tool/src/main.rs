@@ -28,7 +28,7 @@ fn main() {
     println!("👤 Genesis Address: {}", args.genesis_addr);
 
     // Open (or create) the database
-    let storage = Arc::new(StateDB::open(&args.db_path));
+    let storage = Arc::new(StateDB::open(&args.db_path).expect("Failed to open DB"));
 
     // Initialize Genesis
     genesis::initialize_genesis(&storage, &args.stdlib_path, &args.genesis_addr);

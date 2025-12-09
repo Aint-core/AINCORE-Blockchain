@@ -156,6 +156,10 @@ pub async fn start_p2p(bootnodes: Vec<String>, storage: Arc<StateDB>, enable_mdn
     let addr: Multiaddr = "/ip4/0.0.0.0/tcp/0".parse()?;
     Swarm::listen_on(&mut swarm, addr)?;
 
+    // === LiDAR DDoS Protection ===
+    let mut lidar_tracker: std::collections::HashMap<PeerId, (std::time::Instant, u32)> = std::collections::HashMap::new();
+    const MAX_MSG_PER_SEC: u32 = 100; // Production Grade Limit
+
     // === Event Loop ===
     tokio::spawn(async move {
         loop {
@@ -182,7 +186,7 @@ pub async fn start_p2p(bootnodes: Vec<String>, storage: Arc<StateDB>, enable_mdn
                         }
                     }
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Kademlia(KademliaEvent::RoutingUpdated { peer, addresses, .. })) => {
-                        // println!("🕸️  Kademlia Routing Updated: {:?}", peer);
+                        println!("🕸️  Kademlia Routing Updated: peer={:?} addrs={:?}", peer, addresses);
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
                         
                         // Persist peer (save first known address)
@@ -190,9 +194,30 @@ pub async fn start_p2p(bootnodes: Vec<String>, storage: Arc<StateDB>, enable_mdn
                              let _ = storage.save_peer_addr(&peer.to_string(), &addr.to_string());
                         }
                     }
-                    SwarmEvent::Behaviour(P2PBehaviourEvent::Gossipsub(GossipsubEvent::Message { propagation_source: _peer_id, message_id: _, message })) => {
+                    SwarmEvent::Behaviour(P2PBehaviourEvent::Gossipsub(GossipsubEvent::Message { propagation_source: peer_id, message_id: _, message })) => {
+                        // 🛡️ LiDAR PROTECTION LOGIC
+                        let now = std::time::Instant::now();
+                        let (last_time, count) = lidar_tracker.entry(peer_id).or_insert((now, 0));
+                        
+                        if now.duration_since(*last_time) > std::time::Duration::from_secs(1) {
+                            // Reset window
+                            *last_time = now;
+                            *count = 0;
+                        }
+
+                        *count += 1;
+
+                        if *count > MAX_MSG_PER_SEC {
+                            println!("⛔ LiDAR DETECTED ATTACK: Banning Peer {:?} (Rate: {}/s)", peer_id, *count);
+                            // Ban action: Disconnect
+                            let _ = swarm.disconnect_peer_id(peer_id);
+                            // Optional: Blacklist in Gossipsub to prevent reconnect
+                            swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
+                            continue; // DROP MESSAGE
+                        }
+
                         let msg_content = String::from_utf8_lossy(&message.data).to_string();
-                        // println!("📨 Received P2P message from {:?}: {}", _peer_id, msg_content);
+                        // println!("📨 Received P2P message from {:?}: {}", peer_id, msg_content);
                         if let Err(e) = tx_in.send(msg_content).await {
                             eprintln!("❌ Failed to send P2P msg to main loop: {}", e);
                         }

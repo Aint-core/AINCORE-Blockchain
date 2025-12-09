@@ -19,13 +19,28 @@ pub struct VoteRecord {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EconomicParams {
+    pub base_reward: Option<u64>,
+    pub halving_interval: Option<u64>,
+    pub burn_percentage: Option<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum GovernanceAction {
+    UpdateFederationKey(String), // New Federation Address
+    UpdateEconomicParams(EconomicParams),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Proposal {
     pub id: String,
     pub title: String,
     pub description: String,
     pub proposer: String,
+    pub action: Option<GovernanceAction>, // Executable Action
     pub start_time: u64,
     pub end_time: u64,
+    pub execution_time: Option<u64>, // TimeLock: Earliest execution time
     pub yes_votes: u64,
     pub no_votes: u64,
     pub status: ProposalStatus,
@@ -34,7 +49,8 @@ pub struct Proposal {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum ProposalStatus {
     Active,
-    Passed,
+    Passed,   // Vote Succeeded, but waiting for TimeLock
+    Queued,   // (Optional intermediate state)
     Rejected,
     Executed,
 }
@@ -49,23 +65,25 @@ pub struct Vote {
 
 pub struct GovernanceManager {
     db: Arc<StateDB>,
-    // In-memory cache for active proposals (could be fully DB backed)
 }
 
 impl GovernanceManager {
     pub fn new(db: Arc<StateDB>) -> Self {
         Self { db }
     }
-
-    pub fn create_proposal(&self, id: String, title: String, description: String, proposer: String, duration_seconds: u64) -> Result<String, String> {
+    
+    // Updated Signature: Added action parameter
+    pub fn create_proposal(&self, id: String, title: String, description: String, proposer: String, duration_seconds: u64, action: Option<GovernanceAction>) -> Result<String, String> {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         let proposal = Proposal {
             id: id.clone(),
             title,
             description,
             proposer,
+            action,
             start_time: now,
             end_time: now + duration_seconds,
+            execution_time: None,
             yes_votes: 0,
             no_votes: 0,
             status: ProposalStatus::Active,
@@ -78,6 +96,7 @@ impl GovernanceManager {
     pub fn vote(&self, proposal_id: &str, voter: String, approve: bool, _weight_arg: u64) -> Result<(), String> {
         let mut proposal = self.get_proposal(proposal_id).ok_or("Proposal not found")?;
         
+        // 1. Check Time
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         if now > proposal.end_time {
              return Err("Voting period ended".to_string());
@@ -86,23 +105,19 @@ impl GovernanceManager {
              return Err("Proposal not active".to_string());
         }
 
-        // 1. Check for Double Voting
+        // 2. Check for Double Voting
         let receipt_key = format!("vote_receipt:{}:{}", proposal_id, voter);
         if self.db.get(&receipt_key).map_err(|e| e.to_string())?.is_some() {
             return Err("Double voting detected: User has already voted on this proposal".to_string());
         }
 
-        // 2. Fetch User Balance for Weight
-        // We need to fetch the Account Object
+        // 3. Fetch User Balance for Weight
         let account_obj = self.db.get_object(&voter).ok_or("Voter account not found")?;
+        
         let account_data: AccountData = serde_json::from_slice(&account_obj.data).map_err(|_| "Failed to parse account data")?;
         
-        // Weight is strictly based on balance
         let weight = account_data.balance;
-        
-        if weight == 0 {
-            return Err("Voter has no stake".to_string());
-        }
+        if weight == 0 { return Err("Voter has no stake".to_string()); }
 
         if approve {
             proposal.yes_votes += weight;
@@ -110,7 +125,7 @@ impl GovernanceManager {
             proposal.no_votes += weight;
         }
         
-        // 3. Save Vote Receipt
+        // 4. Save Vote Receipt
         let receipt = VoteRecord {
             proposal_id: proposal_id.to_string(),
             voter: voter.clone(),
@@ -119,8 +134,7 @@ impl GovernanceManager {
         let receipt_json = serde_json::to_string(&receipt).map_err(|e| e.to_string())?;
         self.db.put(&receipt_key, &receipt_json).map_err(|e| e.to_string())?;
 
-        // 4. Update Proposal
-
+        // 5. Save Proposal
         self.save_proposal(&proposal)?;
         Ok(())
     }
@@ -133,7 +147,12 @@ impl GovernanceManager {
         
         if now >= proposal.end_time && proposal.status == ProposalStatus::Active {
              if proposal.yes_votes > proposal.no_votes {
-                 proposal.status = ProposalStatus::Passed;
+                 // TIMELOCK ENFORCEMENT
+                 // 24 Hours Delay
+                 const TIMELOCK_DELAY: u64 = 86400; 
+                 proposal.status = ProposalStatus::Queued;
+                 proposal.execution_time = Some(now + TIMELOCK_DELAY);
+                 println!("🔒 Proposal {} Passed! Entring Timelock until {}", proposal_id, now + TIMELOCK_DELAY);
              } else {
                  proposal.status = ProposalStatus::Rejected;
              }
@@ -143,23 +162,44 @@ impl GovernanceManager {
         Ok(proposal.status.clone())
     }
 
+    pub fn execute_proposal(&self, proposal_id: &str) -> Result<(), String> {
+        let mut proposal = self.get_proposal(proposal_id).ok_or("Proposal not found")?;
+        
+        if proposal.status != ProposalStatus::Queued {
+             return Err("Proposal is not in Queued state".to_string());
+        }
+
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let ready_time = proposal.execution_time.unwrap_or(u64::MAX);
+
+        if now < ready_time {
+             let wait = ready_time - now;
+             return Err(format!("Timelock Active! Wait {} seconds.", wait));
+        }
+
+        // EXECUTE ACTION
+        if let Some(action) = &proposal.action {
+            match action {
+                GovernanceAction::UpdateFederationKey(new_key) => {
+                    println!("🏛️ GOVERNANCE EXECUTION: Updating Federation Key to {}", new_key);
+                    self.db.set_federation_key(new_key).map_err(|e| e.to_string())?;
+                },
+                GovernanceAction::UpdateEconomicParams(params) => {
+                    println!("🏛️ GOVERNANCE EXECUTION: Updating Economic Params {:?}", params);
+                    self.db.update_economic_config(params.base_reward, params.halving_interval, params.burn_percentage).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+
+        proposal.status = ProposalStatus::Executed;
+        println!("🚀 Proposal {} EXECUTED (Timelock passed)", proposal_id);
+        
+        self.save_proposal(&proposal)?;
+        Ok(())
+    }
+
     fn save_proposal(&self, proposal: &Proposal) -> Result<(), String> {
         let val = serde_json::to_string(proposal).map_err(|e| e.to_string())?;
-        // Use generic put if available, or create specific helper
-        // Since StateDB put is raw K-V...
-        // We need accessibility to `db` put. 
-        // Assuming StateDB has `put(key, val)`
-        // NOTE: StateDB API might be `put_object` or `db.put`. 
-        // Let's check StateDB API.
-        // Assuming we can use raw DB access or `put_object` wrapper.
-        // For now, assume a `put_raw` exists or we use internal db.
-        // Actually, StateDB exposes `db` as public? No, usually encapsulated.
-        // We will assume `put_object` wrapper or verify via `storage` crate.
-        
-        // Let's try to frame it as an Object?
-        // Or assume we add `put_raw` to StateDB? Not ideal to change Storage again.
-        // Let's wrap Proposal in an Object!
-        
         use storage::object::{Object, ObjectID, Owner};
         let obj = Object {
              id: ObjectID::new(proposal.id.clone()),

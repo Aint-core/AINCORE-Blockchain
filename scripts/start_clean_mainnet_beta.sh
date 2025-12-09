@@ -12,7 +12,7 @@ rm -rf vault_address.txt
 
 echo "🛠️  Building Project (Ensuring latest binary)..."
 # We assume it's arguably built, but let's be safe.
-# cargo build --release --bin node # Skipped to save time if already built manually
+cargo build --release --bin node
 
 echo "🚀 Starting Cluster via Simulate Script..."
 ./scripts/simulate_cluster.sh

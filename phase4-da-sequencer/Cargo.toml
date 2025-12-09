@@ -4,14 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+storage = { path = "../common/storage" }
+network = { path = "../common/network" }
+crypto = { path = "../common/crypto" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.11", features = ["blocking", "json"] }
-storage = { path = "../common/storage" }
-network = { path = "../common/network" }
 hex = "0.4"
 base64 = "0.21"
-celestia-rpc = "0.15.0"
-celestia-types = "0.17.0"
 tokio = { version = "1.0", features = ["full"] }
+
+# Sovereign DA dependencies
+zstd = "0.13"
+reed-solomon-erasure = "6.0"
+rand = "0.8"

@@ -18,7 +18,7 @@ mod tests {
 
     fn setup_dag(suffix: &str) -> (DagConsensus, String) {
         let path = get_test_db_path(suffix);
-        let db = Arc::new(StateDB::open(&path));
+        let db = Arc::new(StateDB::open(&path).unwrap());
         let mempool = Arc::new(Mutex::new(Mempool::new()));
         let executor = Arc::new(Executor::new(Arc::clone(&db)));
         let peers = Arc::new(Mutex::new(HashMap::new()));

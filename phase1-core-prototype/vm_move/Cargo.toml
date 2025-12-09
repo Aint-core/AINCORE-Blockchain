@@ -14,4 +14,6 @@ storage = { path = "../../common/storage" }
 hex = "0.4"
 pqcrypto-dilithium = "0.5.0"
 pqcrypto-traits = "0.3.5"
+serde_json = "1.0"
+ed25519-dalek = "2.0"
 

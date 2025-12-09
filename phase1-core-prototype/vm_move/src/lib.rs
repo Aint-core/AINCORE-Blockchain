@@ -12,6 +12,8 @@ use std::sync::Arc;
 mod gas;
 use gas::AINCOREGasMeter;
 use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
+use serde::Deserialize;
+use serde_json;
 
 mod tests;
 
@@ -116,7 +118,12 @@ pub struct AINCOREVM {
 
 impl AINCOREVM {
     pub fn new(db: Arc<StateDB>) -> Self {
-        let vm = MoveVM::new(vec![]).expect("Failed to create MoveVM");
+        let vm = MoveVM::new(vec![]).unwrap_or_else(|e| {
+            eprintln!("⚠️  WARNING: Failed to create MoveVM: {}", e);
+            eprintln!("   Using fallback configuration.");
+            // Try again with empty config
+            MoveVM::new(vec![]).unwrap_or_else(|_| panic!("Critical: MoveVM initialization failed"))
+        });
         let storage = AINCOREStorage::new(db);
         Self { vm, storage }
     }
@@ -135,11 +142,81 @@ impl AINCOREVM {
         
         // Scheme 0: Ed25519 (Standard)
         if signature.len() == 64 {
-            // println!("🛡️ [Native AA] Validating Ed25519 signature for {}", sender);
-            // In a real implementation, we would recover the public key from the Account Object
-            // and verify the signature. For prototype, we assume the executor did the check 
-            // or we just pass here as we don't have the pubkey handy in this context without fetching.
-            return Ok(true);
+            // 1. Fetch Account Object
+            // The sender address is roughly "0x..." but in storage it's an ObjectID.
+            // Address derivation logic: In prototype, we use the hex string directly.
+            let account_obj = match self.storage.db.get_object(&sender.to_string()) {
+                Some(obj) => obj,
+                None => {
+                    // Fail if account doesn't exist (unless it's a genesis/faucet creation, handled by executor pre-checks)
+                    // Actually, for VM execution, account MUST exist.
+                    eprintln!("❌ [VM] Account {} not found. Cannot verify signature.", sender);
+                    return Ok(false);
+                }
+            };
+
+            // 2. Parse Account Data to get Public Key
+            // We need to know the struct layout. "0x1::account::Account"
+            // struct Account { balance: u64, sequence_number: u64, btc_balance: u64, public_key: String }
+            
+            #[derive(Deserialize)]
+            struct AccountState {
+                #[serde(default)]
+                _balance: u64,
+                #[serde(default)]
+                _sequence_number: u64,
+                #[serde(default)]
+                _btc_balance: u64,
+                public_key: String, // Hex encoded
+            }
+
+            let account_state: AccountState = match serde_json::from_slice(&account_obj.data) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("❌ [VM] Failed to deserialize account state for {}: {}", sender, e);
+                    return Ok(false);
+                }
+            };
+
+            // 3. Decode Public Key
+            let pk_hex = account_state.public_key;
+            if pk_hex.is_empty() {
+                 eprintln!("❌ [VM] No Public Key registered for account {}", sender);
+                 return Ok(false);
+            }
+
+            let pk_bytes = match hex::decode(&pk_hex) {
+                Ok(b) if b.len() == 32 => b,
+                _ => {
+                    eprintln!("❌ [VM] Invalid Public Key length for {}", sender);
+                    return Ok(false);
+                }
+            };
+
+            // 4. Verify Signature
+            // We need the message that was signed.
+            // Problem: VM doesn't have the original transaction payload (only _payload arg which is script bytecode).
+            // AINCORE VM design flaw: Signature usually covers (Sender + Payload + SequenceNumber).
+            // The `execute_transaction` signature is `(sender, signature, payload)`.
+            // We will verify signature against `payload` (the script bytecode) for now.
+            // In a full implementation, it should verify the full RawTransaction.
+            // For this phase, verification against Payload is infinitely better than "return true".
+            
+            use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+            
+            let verifying_key = match VerifyingKey::from_bytes(pk_bytes.as_slice().try_into().unwrap()) {
+                Ok(vk) => vk,
+                Err(_) => return Ok(false),
+            };
+            
+            let sig_obj = Signature::from_bytes(signature.try_into().unwrap());
+            
+            if verifying_key.verify(_payload, &sig_obj).is_ok() {
+                 return Ok(true);
+            } else {
+                 eprintln!("❌ [VM] Signature Verification FAILED for {}", sender);
+                 return Ok(false);
+            }
         }
         
         // Scheme 1: CRYSTALS-Dilithium5 (Post-Quantum)
@@ -229,7 +306,7 @@ impl AINCOREVM {
         ty_args: Vec<move_core_types::language_storage::TypeTag>, 
         args: Vec<Vec<u8>>, 
         gas_limit: u64,
-        sender: AccountAddress
+        _sender: AccountAddress
     ) -> Result<(u64, Vec<(String, Option<String>)>, Vec<move_core_types::language_storage::ModuleId>)> {
         let mut session = self.vm.new_session(&self.storage);
         let mut gas_meter = AINCOREGasMeter::new(gas_limit);

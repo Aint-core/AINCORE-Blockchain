@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use tokio::time::{sleep, Duration};
 
 use log::{info, error};
-use serde_json::Value;
 use std::env;
 
 fn get_rpc_url() -> String {

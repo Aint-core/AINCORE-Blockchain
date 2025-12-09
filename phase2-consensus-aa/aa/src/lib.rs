@@ -47,7 +47,7 @@ impl AccountManager {
             Ok(b) => b,
             Err(_) => return false,
         };
-        
+
         // CRITICAL FIX: Safe Ed25519 signature verification (VULN-CRYPTO-001)
         let pub_key_array: [u8; 32] = match pub_key_bytes_vec.as_slice().try_into() {
             Ok(bytes) => bytes,

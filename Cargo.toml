@@ -22,9 +22,9 @@ members = [
     # --- Phase 3: Chain Synchronization ---
     "phase3-chain-sync",
     # --- Phase 4: Chain Synchronization ---
-    "phase4-da-sequencer", "phase1-core-prototype/genesis-tool", "indexer", "bench-tps", "aincore-da", "phase21-depin/bridge-rust",
+    "phase4-da-sequencer", "phase1-core-prototype/genesis-tool", "indexer", "bench-tps", "phase21-depin/bridge-rust",
     "phase5-privacy-governance/governance",
-    "phase5-bridge",
+    "phase5-privacy-governance/privacy",
 ]
 
 resolver = "2"

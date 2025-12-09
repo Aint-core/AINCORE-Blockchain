@@ -16,8 +16,8 @@ setup_node() {
     KEY=$2
     DATADIR="data_$ID"
     mkdir -p $DATADIR
-    if [ ! -f "$DATADIR/node_identity.key" ]; then
-        echo $KEY | xxd -r -p > $DATADIR/node_identity.key
+    if [ ! -f "$DATADIR/node.key" ]; then
+        echo $KEY | xxd -r -p > $DATADIR/node.key
         echo "🔑 Key created for Node $ID"
     else
         echo "🔑 Key exists for Node $ID"

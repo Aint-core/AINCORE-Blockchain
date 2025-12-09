@@ -2,6 +2,32 @@ use rocksdb::{DB, IteratorMode};
 pub use rocksdb; // Export for consumers
 pub mod object;
 use object::Object;
+use std::fmt;
+
+#[derive(Debug, Clone)]
+pub enum StorageError {
+    DatabaseOpen(String),
+    DatabaseOperation(String),
+    SerializationError(String),
+}
+
+impl fmt::Display for StorageError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            StorageError::DatabaseOpen(msg) => write!(f, "Failed to open database: {}", msg),
+            StorageError::DatabaseOperation(msg) => write!(f, "Database operation failed: {}", msg),
+            StorageError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for StorageError {}
+
+impl From<rocksdb::Error> for StorageError {
+    fn from(err: rocksdb::Error) -> Self {
+        StorageError::DatabaseOperation(err.to_string())
+    }
+}
 
 
 pub struct StateDB {
@@ -9,9 +35,19 @@ pub struct StateDB {
 }
 
 impl StateDB {
-    pub fn open(path: &str) -> Self {
-        let db = DB::open_default(path).expect("Gagal membuka database RocksDB. Pastikan tidak ada proses lain yang menggunakan direktori ini dan Anda memiliki izin akses.");
-        Self { db }
+    /// Open database with proper error handling
+    /// 
+    /// Returns Err if:
+    /// - Database is locked by another process
+    /// - Insufficient permissions
+    /// - Corrupted database files
+    pub fn open(path: &str) -> Result<Self, StorageError> {
+        let db = DB::open_default(path)
+            .map_err(|e| StorageError::DatabaseOpen(format!(
+                "Path: {}, Error: {}. Ensure no other process is using this directory and you have write permissions.",
+                path, e
+            )))?;
+        Ok(Self { db })
     }
 
     pub fn put(&self, key: &str, value: &str) -> std::result::Result<(), rocksdb::Error> {
@@ -162,5 +198,98 @@ impl StateDB {
             }
             _ => None,
         }
+    }
+    
+    /// Index transaction for fast lookup: tx_hash → block_height
+    /// 
+    /// This enables O(1) transaction lookups instead of O(n) DAG scan.
+    /// Call this after successfully executing a block.
+    pub fn index_transaction(&self, tx_hash: &str, block_height: u64) -> Result<(), rocksdb::Error> {
+        let key = format!("tx_index:{}", tx_hash);
+        self.put(&key, &block_height.to_string())
+    }
+    
+    /// Get block height for a transaction hash (O(1) lookup)
+    /// 
+    /// Returns None if transaction not found in index.
+    pub fn get_tx_block_height(&self, tx_hash: &str) -> Option<u64> {
+        let key = format!("tx_index:{}", tx_hash);
+        self.get(&key).ok()?.and_then(|h| h.parse().ok())
+    }
+
+    // === PHASE 9: DECENTRALIZED CONFIG ===
+    pub fn get_federation_key(&self) -> String {
+        // Default Genesis Key (Hardcoded Fallback)
+        const GENESIS_FED_ADDR: &str = "c9c32c8d0607850e6d89c8f048dd3a94";
+        
+        match self.get("sys:config:federation_addr") {
+            Ok(Some(k)) => k,
+            _ => GENESIS_FED_ADDR.to_string(),
+        }
+    }
+
+    pub fn set_federation_key(&self, new_key: &str) -> std::result::Result<(), rocksdb::Error> {
+        self.put("sys:config:federation_addr", new_key)
+    }
+
+    // === PHASE 10: ECONOMIC MODEL ===
+    
+    pub fn get_base_reward(&self) -> u64 {
+        const DEFAULT_REWARD: u64 = 50;
+        match self.get("sys:config:base_reward") {
+            Ok(Some(v)) => v.parse().unwrap_or(DEFAULT_REWARD),
+            _ => DEFAULT_REWARD,
+        }
+    }
+    
+    pub fn get_halving_interval(&self) -> u64 {
+        const DEFAULT_INTERVAL: u64 = 2_100_000;
+        match self.get("sys:config:halving_interval") {
+            Ok(Some(v)) => v.parse().unwrap_or(DEFAULT_INTERVAL),
+            _ => DEFAULT_INTERVAL,
+        }
+    }
+    
+    pub fn get_burn_percentage(&self) -> u8 {
+        const DEFAULT_BURN: u8 = 10; // 10%
+        match self.get("sys:config:burn_percentage") {
+            Ok(Some(v)) => v.parse().unwrap_or(DEFAULT_BURN),
+            _ => DEFAULT_BURN,
+        }
+    }
+
+    pub fn update_economic_config(&self, reward: Option<u64>, interval: Option<u64>, burn: Option<u8>) -> std::result::Result<(), rocksdb::Error> {
+        if let Some(r) = reward { self.put("sys:config:base_reward", &r.to_string())?; }
+        if let Some(i) = interval { self.put("sys:config:halving_interval", &i.to_string())?; }
+        if let Some(b) = burn { self.put("sys:config:burn_percentage", &b.to_string())?; }
+        Ok(())
+    }
+
+    // === PHASE 12: VALIDATOR SET (SYBIL PROTECTION) ===
+    
+    // Scan method clearly not optimal for Mainnet, but "Real" enough for < 1000 validators.
+    // In full prod, we'd use a separate column family or index.
+    pub fn get_active_validators(&self) -> Vec<(String, u64)> {
+         // Logic: Check a "sys:validators" list.
+         // If empty/missing, fallback to Genesis Validator (Federation Key) with 100 weight.
+         if let Ok(Some(json)) = self.get("sys:validators") {
+             if let Ok(vals) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
+                 return vals;
+             }
+         }
+         
+         // Fallback: Genesis Validator
+         vec![("c9c32c8d0607850e6d89c8f048dd3a94".to_string(), 100)]
+    }
+
+    pub fn update_validator_weight(&self, pubkey: &str, weight: u64) -> std::result::Result<(), rocksdb::Error> {
+         let mut vals = self.get_active_validators();
+         if let Some(v) = vals.iter_mut().find(|v| v.0 == pubkey) {
+             v.1 = weight;
+         } else {
+             vals.push((pubkey.to_string(), weight));
+         }
+         let json = serde_json::to_string(&vals).unwrap_or_default();
+         self.put("sys:validators", &json)
     }
 }

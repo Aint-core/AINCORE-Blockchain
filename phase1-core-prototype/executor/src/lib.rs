@@ -13,7 +13,9 @@ pub struct Transaction {
     pub chain_id: String, // Replay Protection
     pub sender: String, // Account Object ID
     pub input_objects: Vec<String>, // Object IDs
-    pub payload: String,
+    pub payload: String, // Scripts (0x..) or Native (transfer:)
+    #[serde(default)]
+    pub args: Vec<String>, // Arguments for Script
     pub gas_limit: u64,
     pub gas_price: u64,
     #[serde(default)]
@@ -53,7 +55,7 @@ impl Executor {
         for raw in &txs_json {
             match serde_json::from_str::<Transaction>(raw) {
                 Ok(tx) => parsed_txs.push((tx, raw.clone())),
-                Err(e) => println!("❌ Failed to parse transaction in parallel batch: {} (Error: {})", raw, e),
+                Err(e) => { /* Silently ignore parse errors in hot loop, or log trace */ },
             }
         }
 
@@ -101,7 +103,7 @@ impl Executor {
         let mut total_fees = 0;
 
         for (i, batch) in batches.iter().enumerate() {
-            println!("   ⚡ Executing Batch {} ({} txs)", i + 1, batch.len());
+            // println!("   ⚡ Executing Batch {} ({} txs)", i + 1, batch.len());
             
             // Execute in parallel to get updates
             let results: Vec<Option<Vec<(String, Option<String>)>>> = batch.par_iter().map(|(_tx, raw)| {
@@ -110,34 +112,82 @@ impl Executor {
 
             // 4. Commit Batch Atomically
             let mut write_batch = WriteBatch::default();
+            let mut batch_hasher = sha2::Sha256::new();
+            use sha2::Digest;
 
             for res in results {
                 if let Some(updates) = res {
                     for (key, val_opt) in updates {
                          if let Some(val) = val_opt {
                              write_batch.put(key.as_bytes(), val.as_bytes());
+                             batch_hasher.update(key.as_bytes());
+                             batch_hasher.update(val.as_bytes());
                          } else {
                              write_batch.delete(key.as_bytes());
+                             batch_hasher.update(key.as_bytes()); // Hash key for delete
+                             batch_hasher.update(b"DELETE");
                          }
                     }
                     total_fees += 1; // Simplistic fee counting
                 }
             }
             
+            // Calc Batch Hash
+            let batch_hash = batch_hasher.finalize();
+            
+            // Update Global State Root
+            // Get previous root
+            let prev_root = self.db.get("sys:state_root").unwrap_or(None).unwrap_or("0000000000000000000000000000000000000000000000000000000000000000".to_string());
+            let mut global_hasher = sha2::Sha256::new();
+            global_hasher.update(hex::decode(&prev_root).unwrap_or(vec![0u8; 32]));
+            global_hasher.update(batch_hash);
+            let new_root = hex::encode(global_hasher.finalize());
+            
+            // println!("🌳 State Root Updated: {} -> {}", &prev_root[0..8], &new_root[0..8]);
+            write_batch.put("sys:state_root", new_root.as_bytes());
+
             if let Err(e) = self.db.write_batch(write_batch) {
-                 println!("❌ CRITICAL: Failed to commit batch {}: {}", i, e);
+                 eprintln!("❌ FATAL: RocksDB Write Batch Failed: {}", e);
+                 panic!("CRITICAL: database write failure - stopping node to prevent state corruption.");
             }
         }
 
         // 5. Apply Block Rewards (Inflation + Fees)
-        // Reward goes to the Proposer (Miner)
-        let reward_amount = BLOCK_REWARD + total_fees;
+        // PHASE 10: ECONOMIC UPGRADE (Halving + Fee Burning)
+        // A. Basic Params
+        let current_height = self.db.get_chain_height();
+        let base_reward = self.db.get_base_reward();
+        let halving_interval = self.db.get_halving_interval();
+        
+        // B. Halving Logic
+        let halvings = current_height / halving_interval;
+        let mut block_inflation = base_reward >> halvings; // Bitwise right shift for division by 2^halvings
+        
+        // PHASE 15: ANTI-LAZY PENALTY
+        // If block is empty (Heartbeat), slash reward by 90%.
+        if txs_json.is_empty() {
+            println!("💤 Lazy Block (0 Txs) detected. Slashing reward by 90%.");
+            block_inflation = block_inflation / 10;
+        }
+
+        // C. Fee Logic & Burning
+        let burn_pct = self.db.get_burn_percentage() as u64;
+        let burnt_fees = (total_fees * burn_pct) / 100;
+        let miner_fees = total_fees - burnt_fees;
+        
+        // D. Total Miner Reward
+        let reward_amount = block_inflation + miner_fees;
+        
+        if burnt_fees > 0 {
+             println!("🔥 BURNING {} Fees ({}% of {})", burnt_fees, burn_pct, total_fees);
+        }
         
         // We use the first 32 chars of the hex public key as the address (simplified model)
         // Or if proposer_hex IS the address (which it is in our consensus), we use it directly.
         let miner_addr = if proposer_hex.len() > 32 { &proposer_hex[0..32] } else { proposer_hex };
 
-        println!("💰 Distributing Block Reward: {} AIN to Miner {}", reward_amount, miner_addr);
+        println!("💰 Distributing Block Reward: {} AIN (Inf: {}, Fees: {}) to Miner {}", 
+            reward_amount, block_inflation, miner_fees, miner_addr);
 
         // Fetch Miner Object
         let mut miner_obj = match self.db.get_object(miner_addr) {
@@ -163,15 +213,19 @@ impl Executor {
 
         // Update Balance
         if let Ok(mut data) = serde_json::from_slice::<aa::AccountData>(&miner_obj.data) {
-            data.balance += reward_amount;
-            if let Ok(new_data) = serde_json::to_vec(&data) {
-                miner_obj.data = new_data;
-                // Commit Reward
-                if let Err(e) = self.db.put_object(&miner_obj) {
-                     eprintln!("❌ Failed to save mining reward: {}", e);
-                } else {
-                     println!("✅ Reward Credited. New Balance: {}", data.balance);
+            if let Some(new_balance) = data.balance.checked_add(reward_amount) {
+                data.balance = new_balance;
+                if let Ok(new_data) = serde_json::to_vec(&data) {
+                    miner_obj.data = new_data;
+                    // ...
+                    if let Err(e) = self.db.put_object(&miner_obj) {
+                         eprintln!("❌ Failed to save mining reward: {}", e);
+                    } else {
+                         println!("✅ Reward Credited. New Balance: {}", data.balance);
+                    }
                 }
+            } else {
+                eprintln!("❌ CRITICAL: Miner balance overflow! Reward discarded to prevent corruption.");
             }
         }
 
@@ -191,6 +245,9 @@ impl Executor {
         deps.push(tx.sender.clone());
         for obj in &tx.input_objects {
             deps.push(obj.clone());
+            if deps.len() > 128 { // QUANTUM AUDIT FIX: Limit deps to prevent Scheduler DoS
+                 break;
+            }
         }
         if tx.payload.starts_with("transfer:") {
             let parts: Vec<&str> = tx.payload.split(':').collect();
@@ -250,7 +307,7 @@ impl Executor {
             };
             
             let signature = Signature::from_bytes(&sig_bytes);
-            let message = format!("{}:{}", tx.payload, tx.sequence_number);
+            let message = format!("{}:{}:{}", tx.chain_id, tx.payload, tx.sequence_number);
             
             if verifying_key.verify(message.as_bytes(), &signature).is_err() {
                 println!("❌ Invalid Signature Verification");
@@ -299,12 +356,21 @@ impl Executor {
                 return None;
             }
             
-            // Deduct Gas
-            account_data.balance -= gas_cost;
+            // Deduct Gas (Checked)
+            if let Some(new_balance) = account_data.balance.checked_sub(gas_cost) {
+                account_data.balance = new_balance;
+            } else {
+                 println!("❌ Insufficient Balance for Gas (Overflow Check)");
+                 return None;
+            }
+
             // Special: If payer is sender, we MUST increment seq number here?
-            // Usually seq number bumps only on success, but gas verification is success.
             if payer_addr == tx.sender {
-                 account_data.sequence_number += 1;
+                 if let Some(new_seq) = account_data.sequence_number.checked_add(1) {
+                     account_data.sequence_number = new_seq;
+                 } else {
+                     return None; // Sequence overflow
+                 }
             }
             
             // Save Payer Update
@@ -314,9 +380,72 @@ impl Executor {
                 updates.push((format!("obj:{}", payer_obj.id.to_string()), Some(serde_json::to_string(&payer_obj).unwrap_or_else(|_| "{}".to_string()))));
             }
 
-            // 4. Execute Payload
-            // 4. Execute Payload
-            if tx.payload.starts_with("transfer:") {
+            // 4. Execution Payload
+            if tx.payload.starts_with("0x") {
+                 // === PHASE 8: TRUE VM EXECUTION ===
+                 // Parse Script Bytecode
+                 if let Ok(script_bytes) = hex::decode(&tx.payload[2..]) {
+                     // Parse Args (assume string hex args for now)
+                     let mut vm_args = Vec::new();
+                     for arg in &tx.args {
+                         if let Ok(b) = hex::decode(arg) {
+                             vm_args.push(b);
+                         }
+                     }
+                     
+                     println!("🔧 VM: Executing Move Script ({} bytes, {} args)", script_bytes.len(), vm_args.len());
+                     
+                     match self.vm.execute_script(script_bytes, vm_args, tx.gas_limit) {
+                         Ok((gas_used, vm_changes, _)) => {
+                             println!("✅ VM Execution Success. Gas: {}", gas_used);
+                             // Gas Refund (Checked)
+                             if gas_used < tx.gas_limit {
+                                 let refund = (tx.gas_limit - gas_used) * tx.gas_price;
+                                 if refund > 0 {
+                                     if let Some(new_balance) = account_data.balance.checked_add(refund) {
+                                         account_data.balance = new_balance;
+                                     }
+                                 }
+                             }
+
+                             // Must verify that all written keys were declared in input_objects (or are the sender)
+                             let mut unauthorized_access = false;
+                             let mut allowed_keys = std::collections::HashSet::new();
+                             allowed_keys.insert(tx.sender.clone());
+                             for obj in &tx.input_objects {
+                                 allowed_keys.insert(obj.clone());
+                             }
+
+                             for (key, _val) in &vm_changes {
+                                 let is_allowed = allowed_keys.iter().any(|allowed| key.contains(allowed));
+                                 if !is_allowed {
+                                     println!("❌ CRITICAL SECURITY: Script attempted to modify unauthorized object: {}", key);
+                                     unauthorized_access = true;
+                                     break;
+                                 }
+                             }
+
+                             if unauthorized_access {
+                                  println!("⛔ Transaction REJECTED due to Unauthorized Write Access");
+                             } else {
+                                  // Must save account data if refund happens
+                                  if let Ok(new_data) = serde_json::to_vec(&account_data) {
+                                       payer_obj.data = new_data;
+                                       updates.push((format!("obj:{}", payer_obj.id.to_string()), Some(serde_json::to_string(&payer_obj).unwrap_or_else(|_| "{}".to_string()))));
+                                  }
+                                  
+                                  // Push VM changes
+                                  for (k, v) in vm_changes {
+                                      updates.push((k, v));
+                                  }
+                             }
+                        },
+                        Err(e) => {
+                             println!("❌ VM Execution Failed: {}", e);
+                        }
+                    }
+                 }
+            } else if tx.payload.starts_with("transfer:") {
                 // ... Transfer Logic ...
                 let parts: Vec<&str> = tx.payload.split(':').collect();
                 if parts.len() == 3 {
@@ -326,41 +455,47 @@ impl Executor {
                     if amount > 0 {
                           // Check balance for transfer (after gas)
                           if account_data.balance >= amount {
-                              account_data.balance -= amount;
-                              
-                              // Update Payer/Sender (Sender-side deduction)
-                              if let Ok(new_data) = serde_json::to_vec(&account_data) {
-                                  let mut final_sender_obj = payer_obj.clone(); 
-                                  final_sender_obj.data = new_data;
-                                  updates.push((format!("obj:{}", final_sender_obj.id.to_string()), Some(serde_json::to_string(&final_sender_obj).unwrap_or_else(|_| "{}".to_string()))));
-                              }
-
-                              // Credit Recipient
-                              let mut recipient_obj = match self.db.get_object(recipient_addr) {
-                                  Some(obj) => obj,
-                                  None => {
-                                      use storage::object::{Object, ObjectID, Owner};
-                                      Object {
-                                          id: ObjectID::new(recipient_addr.to_string()),
-                                          data: serde_json::to_vec(&aa::AccountData {
-                                              balance: 0,
-                                              sequence_number: 0,
-                                              btc_balance: 0, // Init BTC Balance
-                                              public_key: "".to_string(),
-                                          }).unwrap_or_else(|_| vec![]),
-                                          owner: Owner::Address(recipient_addr.to_string()),
-                                          type_struct: "0x1::account::Account".to_string(),
-                                          version: 0,
-                                      }
+                              // Deduct from sender (Checked)
+                              if let Some(new_balance) = account_data.balance.checked_sub(amount) {
+                                  account_data.balance = new_balance;
+                                  
+                                  // Update Payer/Sender (Sender-side deduction)
+                                  if let Ok(new_data) = serde_json::to_vec(&account_data) {
+                                      let mut final_sender_obj = payer_obj.clone(); 
+                                      final_sender_obj.data = new_data;
+                                      updates.push((format!("obj:{}", final_sender_obj.id.to_string()), Some(serde_json::to_string(&final_sender_obj).unwrap_or_else(|_| "{}".to_string()))));
                                   }
-                              };
-                              
-                              if let Ok(mut rec_data) = serde_json::from_slice::<aa::AccountData>(&recipient_obj.data) {
-                                   rec_data.balance += amount;
-                                   if let Ok(new_rec_data) = serde_json::to_vec(&rec_data) {
-                                       recipient_obj.data = new_rec_data;
-                                       updates.push((format!("obj:{}", recipient_obj.id.to_string()), Some(serde_json::to_string(&recipient_obj).unwrap_or_else(|_| "{}".to_string()))));
-                                   }
+
+                                  // Credit Recipient
+                                  let mut recipient_obj = match self.db.get_object(recipient_addr) {
+                                      Some(obj) => obj,
+                                      None => {
+                                          use storage::object::{Object, ObjectID, Owner};
+                                          Object {
+                                              id: ObjectID::new(recipient_addr.to_string()),
+                                              data: serde_json::to_vec(&aa::AccountData {
+                                                  balance: 0,
+                                                  sequence_number: 0,
+                                                  btc_balance: 0, // Init BTC Balance
+                                                  public_key: "".to_string(),
+                                              }).unwrap_or_else(|_| vec![]),
+                                              owner: Owner::Address(recipient_addr.to_string()),
+                                              type_struct: "0x1::account::Account".to_string(),
+                                              version: 0,
+                                          }
+                                      }
+                                  };
+                                  
+                                  if let Ok(mut rec_data) = serde_json::from_slice::<aa::AccountData>(&recipient_obj.data) {
+                                       // Credit receiver (Checked)
+                                       if let Some(new_rec_balance) = rec_data.balance.checked_add(amount) {
+                                            rec_data.balance = new_rec_balance;
+                                            if let Ok(new_rec_data) = serde_json::to_vec(&rec_data) {
+                                                recipient_obj.data = new_rec_data;
+                                                updates.push((format!("obj:{}", recipient_obj.id.to_string()), Some(serde_json::to_string(&recipient_obj).unwrap_or_else(|_| "{}".to_string()))));
+                                            }
+                                       }
+                                  }
                               }
                           } else {
                               println!("❌ Insufficient Balance for Transfer");
@@ -370,9 +505,10 @@ impl Executor {
             } else if tx.payload.starts_with("mint_btc:") {
                  // === MINT BTC LOGIC ===
                  // Payload: "mint_btc:AMOUNT:RECIPIENT"
-                 const FEDERATION_ADDR: &str = "c9c32c8d0607850e6d89c8f048dd3a94";
+                 // PHASE 9: DECENTRALIZED FEDERATION KEY LOOKUP
+                 let federation_addr = self.db.get_federation_key();
 
-                 if tx.sender == FEDERATION_ADDR {
+                 if tx.sender == federation_addr {
                      let parts: Vec<&str> = tx.payload.split(':').collect();
                      if parts.len() == 3 {
                          let amount: u64 = parts[1].parse().unwrap_or(0);
@@ -417,10 +553,15 @@ impl Executor {
                  // Payload: "submit_proof:DEVICE_ID:BQI"
                  let parts: Vec<&str> = tx.payload.split(':').collect();
                  if parts.len() >= 3 {
-                     let _device_id = parts[1];
+                     let device_id = parts[1];
                      let bqi: u64 = parts[2].parse().unwrap_or(0);
                      
-                     if bqi > 100 {
+                     // SYNERGY CHECK: The Sender MUST be the Device (or owner)
+                     // Simplified: Sender Hex must match Device ID (assuming Device ID is address)
+                     if device_id != tx.sender {
+                         println!("❌ DePIN spoofing attempt! Sender {} tried to submit for Device {}", tx.sender, device_id);
+                         account_data.sequence_number += 1; // Burn gas/seq
+                     } else if bqi > 100 {
                          println!("❌ Invalid BQI Score: {}", bqi);
                      } else {
                          // Reward Logic: Max 1 AIN (1_000_000 units) * BQI%
@@ -479,13 +620,29 @@ impl Executor {
                          ty_args, 
                          args, 
                          tx.gas_limit,
-                         sender_addr // Note: We might need to handle signature verification inside VM if we pass it, but we verified outside.
+                         sender_addr 
                      ) {
                          Ok((gas_used, vm_changes, _)) => {
                              for (k, v) in vm_changes {
                                  updates.push((k, v));
                              }
                              println!("✅ Staking Successful! Validator Joined: {}", tx.sender);
+                             
+                             // === PREMATURE SYSTEM FIX: SYNC NATIVE CONSENSUS ===
+                             // Problem: Move VM updates state, but Consensus uses 'sys:validators'
+                             // Fix: Native Hook to update 'sys:validators'
+                             if let Ok(mut vals) = serde_json::from_str::<Vec<(String, u64)>>(
+                                 &self.db.get("sys:validators").unwrap_or(None).unwrap_or("[]".to_string())
+                             ) {
+                                 if !vals.iter().any(|(k, _)| k == &tx.sender) {
+                                     // Add with default weight (stake amount related, but simplified to 100)
+                                     vals.push((tx.sender.clone(), 100));
+                                     if let Ok(json) = serde_json::to_string(&vals) {
+                                         println!("🔗 Native Hook: Syncing Validator Set -> Consensus Engine");
+                                         updates.push(("sys:validators".to_string(), Some(json)));
+                                     }
+                                 }
+                             }
                              
                              // Deduct Gas (Refund Logic same as script)
                              if gas_used < tx.gas_limit {
@@ -546,7 +703,7 @@ mod tests {
     #[test]
     fn test_transaction_deserialization() {
         // Updated JSON with chain_id
-        let json = r#"{"chain_id":"AINCORE-MAINNET-1","sender":"c4b14ae227ec4e1f661dbb0d15039f1c","input_objects":[],"payload":"transfer:9e1289745b7ebd72cb17064a2c44458f:11","gas_limit":10000,"gas_price":1,"signature":"bf3714c3b74c954cd88d5e076cc2335ab389cd3e0bc9cec55fbc9d3c62edcc3ad5720868385f45e87bf257c3dcd0083c0737c60f4839ccc949e8e68e214e5c02"}"#;
+        let json = r#"{"chain_id":"AINCORE-MAINNET-1","sender":"c4b14ae227ec4e1f661dbb0d15039f1c","input_objects":[],"payload":"transfer:9e1289745b7ebd72cb17064a2c44458f:11","args":[],"gas_limit":10000,"gas_price":1,"signature":"bf3714c3b74c954cd88d5e076cc2335ab389cd3e0bc9cec55fbc9d3c62edcc3ad5720868385f45e87bf257c3dcd0083c0737c60f4839ccc949e8e68e214e5c02"}"#;
         
         let tx: Result<Transaction, _> = serde_json::from_str(json);
         match tx {

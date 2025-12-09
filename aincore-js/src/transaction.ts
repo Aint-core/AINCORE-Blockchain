@@ -9,6 +9,7 @@ export class Transaction {
     sequenceNumber: number; // Replay Protection
     publicKey: string;
     signature: string;
+    chainId: string; // Replay Protection
     paymaster?: string;
     paymasterSignature?: string;
 
@@ -21,6 +22,7 @@ export class Transaction {
         this.sequenceNumber = 0;
         this.publicKey = '';
         this.signature = '';
+        this.chainId = 'AINCORE-MAINNET-1';
     }
 
     /**
@@ -35,19 +37,21 @@ export class Transaction {
     }
 
     /**
+     * Set Chain ID (e.g. for Testnet)
+     */
+    setChainId(chainId: string) {
+        this.chainId = chainId;
+    }
+
+    /**
      * Sign the transaction
      */
     sign(signer: Keypair) {
         if (signer.address !== this.sender) {
             throw new Error('Signer does not match sender');
         }
-        // Include sequence number in signature payload
-        // Note: In a real system, we should serialize the whole struct.
-        // For now, we just sign the payload as before, BUT the Executor checks the sequence number separately.
-        // WAIT! If we don't sign the sequence number, an attacker can change it!
-        // We MUST include sequence number in the signed message.
-        // Let's update the sign method to sign "payload + sequence_number"
-        const message = `${this.payload}:${this.sequenceNumber}`;
+        // Include sequence number AND Chain ID in signature payload (REPLAY PROTECTION)
+        const message = `${this.chainId}:${this.payload}:${this.sequenceNumber}`;
         this.signature = signer.sign(Buffer.from(message));
         this.publicKey = signer.publicKey;
     }
@@ -65,6 +69,7 @@ export class Transaction {
      */
     toString(): string {
         const json: any = {
+            chain_id: this.chainId,
             sender: this.sender,
             input_objects: this.inputObjects,
             payload: this.payload,

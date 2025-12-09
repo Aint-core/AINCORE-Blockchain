@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use crypto::hash; // Use crypto module's hash function
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub mod accumulator;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BlockHeader {
@@ -25,7 +24,7 @@ impl Block {
         let tx_hash = calculate_tx_hash(&transactions);
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
+            .unwrap_or(std::time::Duration::from_secs(0))
             .as_secs();
 
         let mut header = BlockHeader {
@@ -49,22 +48,22 @@ impl Block {
 
 // Fungsi bantu untuk menghitung hash dari daftar transaksi
 fn calculate_tx_hash(transactions: &[String]) -> String {
-    let mut hasher = Sha256::new();
+    let mut data = Vec::new();
     for tx in transactions {
-        hasher.update(tx.as_bytes());
+        data.extend_from_slice(tx.as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    hex::encode(hash(&data))
 }
 
 // Fungsi bantu untuk menghitung hash dari header blok
 fn calculate_header_hash(header: &BlockHeader) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(header.height.to_string().as_bytes());
-    hasher.update(header.prev_hash.as_bytes());
-    hasher.update(header.tx_hash.as_bytes());
-    hasher.update(header.proposer_id.as_bytes());
-    hasher.update(header.timestamp.to_string().as_bytes());
-    format!("{:x}", hasher.finalize())
+    let mut data = Vec::new();
+    data.extend_from_slice(&header.height.to_string().as_bytes());
+    data.extend_from_slice(header.prev_hash.as_bytes());
+    data.extend_from_slice(header.tx_hash.as_bytes());
+    data.extend_from_slice(header.proposer_id.as_bytes());
+    data.extend_from_slice(&header.timestamp.to_string().as_bytes());
+    hex::encode(hash(&data))
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -81,7 +80,7 @@ impl Vertex {
     pub fn new(round: u64, author: String, parents: Vec<String>, payload: Vec<String>) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
+            .unwrap_or(std::time::Duration::from_secs(0))
             .as_secs();
             
         let mut v = Vertex {
@@ -97,16 +96,16 @@ impl Vertex {
     }
 
     pub fn calculate_hash(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.round.to_string().as_bytes());
-        hasher.update(self.author.as_bytes());
+        let mut data = Vec::new();
+        data.extend_from_slice(&self.round.to_string().as_bytes());
+        data.extend_from_slice(self.author.as_bytes());
         for p in &self.parents {
-            hasher.update(p.as_bytes());
+            data.extend_from_slice(p.as_bytes());
         }
         for tx in &self.payload {
-            hasher.update(tx.as_bytes());
+            data.extend_from_slice(tx.as_bytes());
         }
-        hasher.update(self.timestamp.to_string().as_bytes());
-        format!("{:x}", hasher.finalize())
+        data.extend_from_slice(&self.timestamp.to_string().as_bytes());
+        hex::encode(hash(&data))
     }
 }

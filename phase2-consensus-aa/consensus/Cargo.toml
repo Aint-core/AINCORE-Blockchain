@@ -6,21 +6,19 @@ edition = "2021"
 [dependencies]
 storage = { path = "../../common/storage" }
 network = { path = "../../common/network" }
+crypto = { path = "../../common/crypto" }
 executor = { path = "../../phase1-core-prototype/executor" }
 mempool = { path = "../../phase1-core-prototype/mempool" }
 config = { path = "../../common/config" }
-blockchain = { path = "../blockchain" } # Tambahkan ini
+blockchain = { path = "../blockchain" }
+da_sequencer = { path = "../../phase4-da-sequencer" }
 serde = { version = "1.0", features = ["derive"] }
-tokio = { version = "1.0", features = ["full"] } # Jika nanti butuh async
-# --- Tambahkan ini ---
-serde_json = "1.0" # Tambahkan ini
-sha2 = "0.10"       # Tambahkan ini jika blockchain crate menggunakannya dan consensus perlu akses
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
 rand = "0.8"
 bcs = "0.1"
-move-core-types = { git = "https://github.com/move-language/move", branch = "aptos-v1.3.0" }
 hex = "0.4"
 rayon = "1.7"
-ed25519-dalek = { version = "2.2.0", features = ["std", "fast"] }
-sha256 = "1.6.0"
-da_sequencer = { path = "../../phase4-da-sequencer" }
-# -------------------
+# Note: Cryptography now consolidated in common/crypto
+# ed25519-dalek removed - use crypto crate
+# sha256 removed - use crypto crate

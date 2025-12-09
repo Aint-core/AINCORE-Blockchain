@@ -206,11 +206,19 @@ module 0x1::universal_mining {
         };
 
         if (found) {
-            let base_reward = 1000000;
+            let base_reward = 1000000; // 1 AIN
             let reward_amount = (base_reward * bqi_score) / 100;
+            
             if (reward_amount > 0) {
-                 let coins = coin::mint<AincoreCoin>(reward_amount);
-                 coin::deposit<AincoreCoin>(owner, coins);
+                 // FIXED: Use Staking Module to mint (enforces Supply Cap)
+                 let coins = 0x1::staking::mint_reward(reward_amount);
+                 
+                 // If cap reached, value is 0
+                 if (coin::value(&coins) > 0) {
+                     coin::deposit<AincoreCoin>(owner, coins);
+                 } else {
+                     coin::burn(coins); // Destroy empty coin
+                 }
             }
         }
     }

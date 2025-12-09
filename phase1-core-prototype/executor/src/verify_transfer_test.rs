@@ -39,6 +39,7 @@ mod tests {
             sender: sender.clone(),
             input_objects: vec![],
             payload: format!("transfer:{}:100", recipient),
+            args: vec![],
             gas_limit: 10,
             gas_price: 1,
             sequence_number: 0, // Correct SeqNum

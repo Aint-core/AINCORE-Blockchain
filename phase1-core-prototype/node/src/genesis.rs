@@ -2,13 +2,56 @@ use std::sync::Arc; // Force rebuild
 use storage::StateDB;
 use std::fs;
 use move_binary_format::CompiledModule;
+use std::fmt;
 
-pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_addr_hex: &str) {
+#[derive(Debug)]
+pub enum GenesisError {
+    SerializationError(String),
+    StorageError(String),
+    InvalidData(String),
+}
+
+impl fmt::Display for GenesisError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            GenesisError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
+            GenesisError::StorageError(msg) => write!(f, "Storage error: {}", msg),
+            GenesisError::InvalidData(msg) => write!(f, "Invalid data: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for GenesisError {}
+
+impl From<serde_json::Error> for GenesisError {
+    fn from(err: serde_json::Error) -> Self {
+        GenesisError::SerializationError(err.to_string())
+    }
+}
+
+impl From<rocksdb::Error> for GenesisError {
+    fn from(err: rocksdb::Error) -> Self {
+        GenesisError::StorageError(err.to_string())
+    }
+}
+
+impl From<hex::FromHexError> for GenesisError {
+    fn from(err: hex::FromHexError) -> Self {
+        GenesisError::InvalidData(format!("Hex decode error: {}", err))
+    }
+}
+
+impl From<bcs::Error> for GenesisError {
+    fn from(err: bcs::Error) -> Self {
+        GenesisError::SerializationError(format!("BCS error: {}", err))
+    }
+}
+pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_addr_hex: &str) -> Result<(), GenesisError> {
     // Check if genesis is already initialized
     match storage.get("genesis_initialized") {
         Ok(Some(_)) => {
             println!("✨ Genesis already initialized.");
-            return;
+            return Ok(());
         }
         _ => {}
     }
@@ -56,13 +99,13 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
         // Update balance manually (since AccountManager creates with 0)
         use aa::AccountData;
         let mut data: AccountData = serde_json::from_slice(&account_obj.data)
-            .expect("Genesis: Failed to deserialize account data");
+            ?;
         
         // ZERO PRE-MINE: Start with 0 balance.
         data.balance = 0; 
         account_obj.data = serde_json::to_vec(&data)
-            .expect("Genesis: Failed to serialize account data");
-        storage.put_object(&account_obj).expect("Failed to write genesis account");
+            ?;
+        storage.put_object(&account_obj)?;
         println!("💰 Created Genesis Account: {} (Balance: {})", genesis_addr, data.balance);
 
 
@@ -86,28 +129,26 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
             current_epoch: u64, // Added current_epoch
         }
 
-        // === GENESIS CEREMONY: 4 INITIAL VALIDATORS ===
-        // Addresses generated for the user's 4 computers
+        // === GENESIS CEREMONY: SINGLE BOOTSTRAP VALIDATOR ===
+        // Use the address provided via CLI (e.g., from 'node.key')
         let genesis_validators = vec![
-            ("9b472159b3555c77f5dc43512862ae21", "9b472159b3555c77f5dc43512862ae21"), // PC 1
-            ("e1d895a946252a40acb29b6d05c41f8f", "e1d895a946252a40acb29b6d05c41f8f"), // PC 2
-            ("457fc0313ff8f6bcd76f69d4a3a6bbf6", "457fc0313ff8f6bcd76f69d4a3a6bbf6"), // PC 3
-            ("bf960011662109496e7603e09a410e65", "bf960011662109496e7603e09a410e65"), // PC 4
+            (genesis_addr_hex.to_string(), genesis_addr_hex.to_string()),
         ];
 
         let mut validator_configs = Vec::new();
-        let bootstrap_stake_per_node = 250_000_000_000_000_000_000u128; // 250 AIN each (Total 1000)
-        let total_bootstrap_stake = bootstrap_stake_per_node * 4;
+        // Bootstrap stake: 1 Million AIN
+        let bootstrap_stake_per_node = 1_000_000_000_000_000; 
+        let total_bootstrap_stake = bootstrap_stake_per_node * genesis_validators.len() as u128;
 
         for (addr_hex, pubkey_hex) in &genesis_validators {
             // Create Account for Validator
-            let mut acc = AccountManager::create_account(addr_hex.to_string(), pubkey_hex.to_string());
+            let acc = AccountManager::create_account(addr_hex.to_string(), pubkey_hex.to_string());
             // Balance is 0 (Stake is locked in ValidatorSet)
-            storage.put_object(&acc).expect("Failed to write validator account");
-            println!("👤 Created Genesis Validator: {}", addr_hex);
+            storage.put_object(&acc)?;
+            println!("👤 Created Genesis Validator Account: {}", addr_hex);
 
-            // Create Config
-            let bytes = hex::decode(addr_hex).expect("Invalid hex");
+            // Create Config (Move Resource)
+            let bytes = hex::decode(addr_hex)?;
             let mut addr_array = [0u8; move_core_types::account_address::AccountAddress::LENGTH];
             addr_array.copy_from_slice(&bytes);
             let account_addr = move_core_types::account_address::AccountAddress::new(addr_array);
@@ -117,6 +158,18 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
                 stake: Coin { value: bootstrap_stake_per_node },
                 public_key: hex::decode(pubkey_hex).unwrap_or_default(),
             });
+        }
+        
+        // === SYNC NATIVE CONSENSUS STATE (CRITICAL FIX) ===
+        // Write 'sys:validators' so the Rust Consensus Engine knows who is allowed to mine.
+        // Format: Vec<(String, u64)> -> (PubKey, Weight)
+        let native_validators: Vec<(String, u64)> = genesis_validators.iter()
+            .map(|(addr, _)| (addr.clone(), 100)) // Weight 100
+            .collect();
+            
+        if let Ok(json) = serde_json::to_string(&native_validators) {
+            storage.put("sys:validators", &json)?;
+            println!("🔗 Native Consensus State Synced: {} Validator(s)", native_validators.len());
         }
 
         let validator_set = ValidatorSet {
@@ -130,9 +183,9 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
         
         // Serialize to BCS
         let bytes = bcs::to_bytes(&validator_set)
-            .expect("Genesis: Failed to serialize ValidatorSet");
+            ?;
         let hex_bytes = hex::encode(bytes);
-        storage.put(key, &hex_bytes).expect("Failed to write validator set");
+        storage.put(key, &hex_bytes)?;
         println!("🛡️  Initialized Genesis Validator Set (Bootstrap Stake: 1000 AIN)");
 
         // === Initialize Epoch ===
@@ -150,8 +203,8 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
         // Key: resource_..._0x1::epoch::Epoch
         let epoch_key = "resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::epoch::Epoch";
         let epoch_bytes = bcs::to_bytes(&epoch)
-            .expect("Genesis: Failed to serialize Epoch");
-        storage.put(epoch_key, &hex::encode(epoch_bytes)).expect("Failed to write epoch");
+            ?;
+        storage.put(epoch_key, &hex::encode(epoch_bytes))?;
         println!("⏳ Initialized Genesis Epoch (0)");
 
         // === Initialize Governance ===
@@ -182,8 +235,8 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
         // Key: resource_..._0x1::governance::GovernanceState
         let gov_key = "resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::governance::GovernanceState";
         let gov_bytes = bcs::to_bytes(&gov_state)
-            .expect("Genesis: Failed to serialize GovernanceState");
-        storage.put(gov_key, &hex::encode(gov_bytes)).expect("Failed to write gov state");
+            ?;
+        storage.put(gov_key, &hex::encode(gov_bytes))?;
         println!("⚖️  Initialized Governance Module");
 
         // === Initialize Universal Mining (Oracle & DeviceRegistry) ===
@@ -220,8 +273,8 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
         let device_registry = DeviceRegistry { devices: vec![] };
         let dr_key = "resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::universal_mining::DeviceRegistry";
         let dr_bytes = bcs::to_bytes(&device_registry)
-            .expect("Genesis: Failed to serialize DeviceRegistry");
-        storage.put(dr_key, &hex::encode(dr_bytes)).expect("Failed to write device registry");
+            ?;
+        storage.put(dr_key, &hex::encode(dr_bytes))?;
 
         // Initialize OracleConfig
         // We add the Genesis Validator (0x1) as the first trusted feeder
@@ -234,7 +287,7 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
         // So we should add the first validator to the feeder list.
         if let Some((first_addr, _)) = genesis_validators.first() {
              let bytes = hex::decode(first_addr)
-                 .expect("Genesis: Invalid hex address format");
+                 ?;
              let mut arr = [0u8; 16];
              arr.copy_from_slice(&bytes);
              feeders.push(move_core_types::account_address::AccountAddress::new(arr));
@@ -249,12 +302,18 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
         };
         let oc_key = "resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::universal_mining::OracleConfig";
         let oc_bytes = bcs::to_bytes(&oracle_config)
-            .expect("Genesis: Failed to serialize OracleConfig");
-        storage.put(oc_key, &hex::encode(oc_bytes)).expect("Failed to write oracle config");
-        println!("🔮 Initialized Decentralized Oracle (Feeders: 1)");
-
-        storage.put("genesis_initialized", "true").expect("Failed to mark genesis complete");
+            ?;
+        storage.put(oc_key, &hex::encode(oc_bytes))?;
+        println!("🔮 Initialized Oracle Config");
+        
+        storage.put("genesis_initialized", "true")?;
+        println!("✅ Genesis Initialization Complete!");
+        
+        Ok(())
     } else {
-        eprintln!("❌ Failed to read Stdlib bytecode directory: {}. Make sure you ran the compiler tool first!", stdlib_path);
+        Err(GenesisError::InvalidData(format!(
+            "Failed to read Stdlib bytecode directory: {}. Make sure you ran the compiler tool first!",
+            stdlib_path
+        )))
     }
 }

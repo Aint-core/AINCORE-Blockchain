@@ -229,6 +229,21 @@ module 0x1::staking {
         };
     }
 
+    /// Safe Minting for Ecosystem Rewards (DePIN/Mining)
+    /// Enforces MAX_SUPPLY hard cap.
+    public fun mint_reward(amount: u128): Coin<AincoreCoin> acquires ValidatorSet {
+        let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
+        
+        // Hard Cap Check
+        if (validator_set.total_supply + amount > MAX_SUPPLY) {
+            // Cap reached: Return 0 value coin (No reward)
+            return coin::mint<AincoreCoin>(0)
+        };
+        
+        validator_set.total_supply = validator_set.total_supply + amount;
+        coin::mint<AincoreCoin>(amount)
+    }
+
     /// Slash a validator (burn stake and remove)
     public fun slash_validator(account: &signer, validator_addr: address) acquires ValidatorSet {
         let addr = signer::address_of(account);

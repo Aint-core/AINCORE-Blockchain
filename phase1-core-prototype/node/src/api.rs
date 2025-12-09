@@ -2,6 +2,13 @@ use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use network::PeerList;
+use actix_governor::{Governor, GovernorConfigBuilder};
+use actix_web::middleware::Logger;
+
+// Input validation constants
+const MAX_BLOCK_HEIGHT: u64 = 1_000_000_000;
+const MAX_LIMIT: u64 = 1000;
+const MAX_STRING_LENGTH: usize = 1_048_576; // 1MB
 
 // --- Shared State ---
 use consensus::DagConsensus;
@@ -88,7 +95,7 @@ async fn json_rpc_handler(
             };
 
             if let Some(tx_str) = tx_str_opt {
-                let mut mempool = data.mempool.lock().unwrap();
+                let mut mempool = data.mempool.lock().unwrap_or_else(|e| e.into_inner());
                 mempool.add_transaction(tx_str.clone());
                 // std::fs::write("debug_api.log", format!("Received TX: {}\n", tx_str)).ok();
                 
@@ -105,8 +112,8 @@ async fn json_rpc_handler(
             }
         },
         "aincore_nodeStatus" => {
-             let consensus = data.consensus.lock().unwrap();
-             let peers = data.peers.lock().unwrap();
+             let consensus = data.consensus.lock().unwrap_or_else(|e| e.into_inner());
+             let peers = data.peers.lock().unwrap_or_else(|e| e.into_inner());
              Ok(serde_json::json!({
                  "node_id": consensus.node_id,
                  "current_round": consensus.current_round,
@@ -118,16 +125,16 @@ async fn json_rpc_handler(
              }))
         },
         "aincore_getDag" => {
-            let consensus = data.consensus.lock().unwrap();
-            let dag = consensus.dag.lock().unwrap();
+            let consensus = data.consensus.lock().unwrap_or_else(|e| e.into_inner());
+            let dag = consensus.dag.lock().unwrap_or_else(|e| e.into_inner());
             let vertices: Vec<_> = dag.values().cloned().collect();
             Ok(serde_json::json!(vertices))
         },
         "aincore_getTransaction" => {
             // params: [tx_hash]
             if let Some(target_hash) = params.get(0).and_then(|v| v.as_str()) {
-                let consensus = data.consensus.lock().unwrap();
-                let dag = consensus.dag.lock().unwrap();
+                let consensus = data.consensus.lock().unwrap_or_else(|e| e.into_inner());
+                let dag = consensus.dag.lock().unwrap_or_else(|e| e.into_inner());
                 
                 let mut found_tx = None;
                 
@@ -164,6 +171,19 @@ async fn json_rpc_handler(
         "aincore_getBlocks" => {
             // params: [limit] (optional, default 10)
             let limit = params.get(0).and_then(|v| v.as_u64()).unwrap_or(10);
+            
+            // INPUT VALIDATION: Limit max blocks to prevent DoS
+            if limit > MAX_LIMIT {
+                return HttpResponse::BadRequest().json(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32602,
+                        message: format!("Limit too large: {} exceeds maximum {}", limit, MAX_LIMIT),
+                    }),
+                    id: req.id.clone(),
+                });
+            }
             
             let latest_height: u64 = match data.storage.get("latest_height") {
                 Ok(Some(h)) => h.parse::<u64>().unwrap_or(0),
@@ -264,6 +284,13 @@ pub async fn start_api_server(
         mempool,
         storage,
     });
+    
+    // Rate limiter: 100 requests per second per IP
+    let governor_conf = GovernorConfigBuilder::default()
+        .per_second(100)
+        .burst_size(200)
+        .finish()
+        .unwrap();
 
     // gunakan tokio::task::LocalSet agar runtime single-thread tidak butuh Send
     let local = tokio::task::LocalSet::new();
@@ -275,6 +302,8 @@ pub async fn start_api_server(
                 
                 App::new()
                     .wrap(cors)
+                    .wrap(Governor::new(&governor_conf))
+                    .wrap(Logger::default())
                     .app_data(app_state.clone())
                     .route("/health", web::get().to(health))
                     .route("/metrics", web::get().to(metrics_handler))

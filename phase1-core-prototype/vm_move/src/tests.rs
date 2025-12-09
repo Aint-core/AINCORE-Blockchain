@@ -19,7 +19,7 @@ mod tests {
 
         // 1. Setup VM
         let path = get_test_db_path("pqc");
-        let db = Arc::new(StateDB::open(&path));
+        let db = Arc::new(StateDB::open(&path).expect("Failed to open DB"));
         let vm = AINCOREVM::new(Arc::clone(&db));
         let sender = AccountAddress::random();
 
@@ -55,7 +55,7 @@ mod tests {
     fn test_standard_ed25519_detection() {
         // 1. Setup VM
         let path = get_test_db_path("ed25519");
-        let db = Arc::new(StateDB::open(&path));
+        let db = Arc::new(StateDB::open(&path).expect("Failed to open DB"));
         let vm = AINCOREVM::new(db);
         let sender = AccountAddress::random();
 
@@ -78,7 +78,7 @@ mod tests {
     fn test_invalid_signature_scheme() {
         // 1. Setup VM
         let path = get_test_db_path("invalid");
-        let db = Arc::new(StateDB::open(&path));
+        let db = Arc::new(StateDB::open(&path).expect("Failed to open DB"));
         let vm = AINCOREVM::new(db);
         let sender = AccountAddress::random();
 

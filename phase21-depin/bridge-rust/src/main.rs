@@ -46,7 +46,11 @@ async fn main() {
         // Fallback to Env Var (Legacy/Unsafe)
         match env::var("EVM_PRIVATE_KEY") {
             Ok(k) => {
-                info!("⚠️  WARNING: Using EVM_PRIVATE_KEY from environment. Use --keystore for production.");
+                info!("🚨 CRITICAL SECURITY WARNING: Using EVM_PRIVATE_KEY from environment variables.");
+                info!("🚨 IN PRODUCTION, THIS KEY WILL BE LEAKED IN PROCESS DUMPS.");
+                info!("🚨 USE --keystore INSTEAD.");
+                // sleep to make them read it
+                tokio::time::sleep(Duration::from_secs(3)).await;
                 k
             }
             Err(_) => {

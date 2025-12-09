@@ -10,6 +10,7 @@ mempool = { path = "../mempool" }
 storage = { path = "../../common/storage" }
 network = { path = "../../common/network" }
 config = { path = "../../common/config" }
+crypto = { path = "../../common/crypto" }
 
 # --- Phase 2 & 3 ---
 consensus = { path = "../../phase2-consensus-aa/consensus" }
@@ -19,7 +20,7 @@ chain_sync = { path = "../../phase3-chain-sync" }
 
 # --- Phase 4 ---
 da_sequencer = { path = "../../phase4-da-sequencer" }
-aincore-da = { path = "../../aincore-da" }
+
 
 # --- Phase 5 ---
 governance = { path = "../../phase5-privacy-governance/governance" }
@@ -46,6 +47,7 @@ tokio-stream = "0.1"
 actix-web = "4.4"
 actix-rt = "2.9"
 actix-cors = "0.6"
+actix-governor = "0.4"
 rocksdb = "0.21.0"
 
 # --- P2P Layer ---

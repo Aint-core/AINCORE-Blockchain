@@ -15,5 +15,5 @@ anyhow = "1.0"
 log = "0.4"
 env_logger = "0.10"
 keystore = { path = "../../common/keystore" }
+crypto = { path = "../../common/crypto" }
 rpassword = "7.0"
-

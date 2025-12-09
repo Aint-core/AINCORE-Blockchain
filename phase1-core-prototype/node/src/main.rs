@@ -101,22 +101,44 @@ async fn main() {
 
     // === INISIALISASI NODE IDENTITY ===
     use ed25519_dalek::{SigningKey};
-    // Load or Generate Keypair
-    let _ = std::fs::create_dir_all(&datadir); // Ensure data dir exists
-    let key_path_buf = std::path::Path::new(&datadir).join("node_identity.key");
-    let key_path = key_path_buf.to_str().expect("Invalid path");
     
-    let signing_key = if key_path_buf.exists() {
-        println!("🔑 Loading node identity from {}", key_path);
-        let bytes = std::fs::read(key_path).expect("Failed to read node key");
-        SigningKey::from_bytes(bytes.as_slice().try_into().expect("Invalid key length"))
+    // Load or Generate Keypair
+    let _ = std::fs::create_dir_all(&datadir);
+    let datadir_path = std::path::PathBuf::from(&datadir);
+    // Load or generate node key with error handling
+    let key_path_buf = datadir_path.join("node.key");
+    let key_path = match key_path_buf.to_str() {
+        Some(p) => p,
+        None => {
+            eprintln!("❌ FATAL: Invalid key path (non-UTF8)");
+            std::process::exit(1);
+        }
+    };
+    
+    let signing_key = if std::path::Path::new(key_path).exists() {
+        match std::fs::read(key_path) {
+            Ok(bytes) => {
+                match bytes.as_slice().try_into() {
+                    Ok(key_bytes) => SigningKey::from_bytes(key_bytes),
+                    Err(_) => {
+                        eprintln!("❌ FATAL: Invalid key length in {}", key_path);
+                        eprintln!("   Expected 32 bytes, got {}", bytes.len());
+                        eprintln!("   Try deleting the key file to regenerate.");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ FATAL: Failed to read node key from {}: {}", key_path, e);
+                std::process::exit(1);
+            }
+        }
     } else {
-        println!("🔑 Generating new node identity and saving to {}", key_path);
-        use rand::rngs::OsRng;
-        let mut csprng = OsRng;
-        let key = SigningKey::generate(&mut csprng);
-        std::fs::write(key_path, key.to_bytes()).expect("Failed to save node key");
-        key
+        eprintln!("❌ FATAL: 'node.key' not found in {}", datadir);
+        eprintln!("🔒 MAINNET SECURITY ENFORCEMENT:");
+        eprintln!("   Nodes MUST generate keys securely offline.");
+        eprintln!("   Use: `aincore-cli keygen --out {}`", key_path);
+        std::process::exit(1);
     };
 
     let verifying_key = signing_key.verifying_key();
@@ -126,7 +148,20 @@ async fn main() {
     let node_id = node_addr_hex.clone(); // Use address as node_id for consensus matching
 
     let db_path = format!("{}/validator_{}.db", datadir, port);
-    let storage = Arc::new(StateDB::open(&db_path));
+    // Open Database with error handling
+    let storage = match StateDB::open(&db_path) {
+        Ok(db) => Arc::new(db),
+        Err(e) => {
+            eprintln!("❌ FATAL: Failed to open database at '{}'", db_path);
+            eprintln!("   Error: {}", e);
+            eprintln!("   ");
+            eprintln!("   Possible solutions:");
+            eprintln!("   1. Ensure no other AINCORE node is running");
+            eprintln!("   2. Check file permissions on the data directory");
+            eprintln!("   3. Try removing the database: rm -rf {}", db_path);
+            std::process::exit(1);
+        }
+    };
     let peers = Arc::new(Mutex::new(std::collections::HashMap::<String, u16>::new()));
 
     println!("🚀 AINCORE node {} running on port {}", node_id, port);
@@ -167,6 +202,11 @@ async fn main() {
             }
         }
     }).collect();
+    
+    println!("🕸️  Kademlia DHT: Feeding {} bootnodes to Routing Table", normalized_bootnodes.len());
+    if !normalized_bootnodes.is_empty() {
+         println!("   - Example: {}", normalized_bootnodes[0]);
+    }
     
     // === INISIALISASI P2P NETWORK (Start early to bind port) ===
     let (_p2p_tx, mut p2p_rx) = match start_p2p(normalized_bootnodes.clone(), Arc::clone(&storage), enable_mdns, enable_nat).await {
@@ -217,7 +257,15 @@ async fn main() {
     } else {
         "vm_move/stdlib/bytecode" // Fallback if running from phase1 dir
     };
-    genesis::initialize_genesis(&storage, stdlib_path, &node_addr_hex);
+    // Initialize Genesis with error handling
+    if let Err(e) = genesis::initialize_genesis(&storage, stdlib_path, &node_addr_hex) {
+        eprintln!("❌ FATAL: Genesis initialization failed: {}", e);
+        eprintln!("   This usually means:");
+        eprintln!("   1. Stdlib bytecode is missing or corrupted");
+        eprintln!("   2. Database write permissions issue");
+        eprintln!("   3. Invalid genesis configuration");
+        std::process::exit(1);
+    }
 
     let executor = Arc::new(Executor::new(Arc::clone(&storage)));
     let mempool = Arc::new(Mutex::new(Mempool::new()));
@@ -242,19 +290,10 @@ async fn main() {
         Arc::clone(&storage),
     ));
 
-    // === INITIALIZE DA PUBLISHER (REAL) ===
-    // We use the aincore-da crate.
-    // In production, this URL should come from config/args.
-    let _da_publisher = match aincore_da::DAPublisher::new("http://localhost:26658").await {
-        Ok(p) => {
-            println!("🌌 Connected to Celestia Node at http://localhost:26658");
-            Some(Arc::new(p))
-        },
-        Err(e) => {
-            println!("⚠️ Failed to connect to Celestia: {}. DA will be disabled.", e);
-            None
-        }
-    };
+    // === DA PLAYER (SOVEREIGN ONLY) ===
+    // Celestia integration removed per user request for Sovereign DA (privacy).
+    // The internal DASequencer (initialized above) handles all DA duties via Erasure Coding + P2P.
+    println!("🛡️ Running in SOVEREIGN DA mode (No external DA dependency)");
 
     println!("⚙️ DagConsensus initialized (Narwhal-lite)");
     println!("🧩 DA Sequencer initialized.");
@@ -474,7 +513,12 @@ async fn main() {
     println!("🔄 Starting initial chain sync...");
     // CRITICAL FIX: Wait for peer servers to be ready (they start async)
     tokio::time::sleep(Duration::from_secs(3)).await;
-    chain_sync.sync_from_peers();
+    
+    // Spawn initial sync as task
+    let chain_sync_initial = Arc::clone(&chain_sync);
+    tokio::spawn(async move {
+        chain_sync_initial.sync_from_peers().await;
+    });
     
     // === PERIODIC BACKGROUND SYNC ===
     // Retry sync every 30 seconds to download remaining blocks
@@ -482,7 +526,7 @@ async fn main() {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            chain_sync_periodic.sync_from_peers();
+            chain_sync_periodic.sync_from_peers().await;
         }
     });
 

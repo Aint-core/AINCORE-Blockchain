@@ -1,7 +1,6 @@
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use serde::Serialize;
-use serde_json::json;
 
 #[derive(Serialize)]
 struct Transaction {
@@ -9,6 +8,7 @@ struct Transaction {
     sender: String,
     input_objects: Vec<String>,
     payload: String,
+    args: Vec<String>,
     gas_limit: u64,
     gas_price: u64,
     sequence_number: u64,
@@ -18,7 +18,7 @@ struct Transaction {
 
 fn main() {
     // 1. Generate Keypair
-    let mut csprng = OsRng;
+    let csprng = OsRng;
     let signing_key = SigningKey::generate(&mut OsRng);
     let verifying_key = signing_key.verifying_key();
     
@@ -46,6 +46,7 @@ fn main() {
         sender: sender_addr,
         input_objects: vec![], // No input objects for simple tests or ignored
         payload,
+        args: vec![],
         gas_limit: 10000,
         gas_price: 1,
         sequence_number,

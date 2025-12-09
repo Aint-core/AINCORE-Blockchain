@@ -13,6 +13,12 @@ impl ObjectID {
     }
 }
 
+impl std::fmt::Display for ObjectID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Owner {
     Address(String), // Owned by a user/address

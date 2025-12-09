@@ -113,4 +113,11 @@ export class Connection {
             return [];
         }
     }
+
+    /**
+     * Get current gas price
+     */
+    async getGasPrice(): Promise<number> {
+        return await this.request('aincore_getGasPrice', []);
+    }
 }

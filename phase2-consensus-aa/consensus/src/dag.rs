@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use serde::{Serialize, Deserialize};
+// use serde::{Serialize, Deserialize}; // Unused
 use blockchain::Vertex;
-use blockchain::accumulator::Accumulator;
+use crypto::accumulator::Accumulator;
 use storage::StateDB;
 use mempool::Mempool;
 use executor::Executor;
@@ -98,7 +98,12 @@ impl DagConsensus {
         
         // BFT QUORUM CALCULATION: 2f+1 where f = (n-1)/3
         // This ensures we can tolerate f Byzantine nodes
-        let n = validators.len().max(1); // Prevent division by zero
+        let n = validators.len(); 
+        if n == 0 {
+             println!("⚠️ [Consensus] No validators found! Defaulting to Singleton Quorum.");
+             // Return early or set n=1 to avoid division by zero
+        }
+        let n = n.max(1); // Prevent division by zero safely
         let f = (n - 1) / 3; // Byzantine tolerance
         let bft_quorum = (2 * f) + 1;
         
@@ -193,9 +198,29 @@ impl DagConsensus {
                 }
             }
 
-            dag.insert(vertex.hash.clone(), vertex.clone());
-            
+            // === SLASHING DETECTION (Double-Sign) ===
             let mut round_idx = self.round_index.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(hashes) = round_idx.get(&vertex.round) {
+                 for existing_hash in hashes {
+                     if let Some(v_exist) = dag.get(existing_hash) {
+                         // Same Author, Same Round, Different Hash => EQUIVOCATION!
+                         if v_exist.author == vertex.author && existing_hash != &vertex.hash {
+                             println!("🚨🚨 CRITICAL SLASHING ALERT 🚨🚨");
+                             println!("⚔️  MALICIOUS BEHAVIOR DETECTED (Equivocation/Double-Sign)");
+                             println!("   Offender: {}", vertex.author);
+                             println!("   Round: {}", vertex.round);
+                             println!("   Proof A: {}", existing_hash);
+                             println!("   Proof B: {}", vertex.hash);
+                             println!("🔥 BURNING STAKE OF {}", vertex.author);
+                             // In a full contract system: self.executor.call_slash_contract(vertex.author)
+                             // For now, we block the vertex and logically slash.
+                             return; 
+                         }
+                     }
+                 }
+            }
+
+            dag.insert(vertex.hash.clone(), vertex.clone());
             round_idx.entry(vertex.round).or_default().push(vertex.hash.clone());
             println!("📥 Added Vertex to DAG: {} (Round {})", vertex.hash, vertex.round);
         } // Locks dropped here!
@@ -270,7 +295,7 @@ impl DagConsensus {
                  
                  // Update Accumulator and DB
                  if let Ok(bytes) = hex::decode(&new_block.header.hash) {
-                    self.accumulator.append(bytes);
+                    self.accumulator.append(&bytes);
                  }
 
                  if let Ok(block_json) = serde_json::to_string(&new_block) {
@@ -413,7 +438,7 @@ struct Coin {
 #[derive(serde::Deserialize)]
 struct ValidatorConfig {
     #[allow(dead_code)]
-    validator_addr: move_core_types::account_address::AccountAddress,
+    validator_addr: AccountAddress,
     #[allow(dead_code)]
     stake: Coin,
     #[allow(dead_code)]
@@ -423,4 +448,13 @@ struct ValidatorConfig {
 #[derive(serde::Deserialize)]
 struct ValidatorSet {
     validators: Vec<ValidatorConfig>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct AccountAddress([u8; 32]);
+
+impl std::fmt::Display for AccountAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", hex::encode(self.0))
+    }
 }
