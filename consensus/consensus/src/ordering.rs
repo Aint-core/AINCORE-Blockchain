@@ -147,6 +147,10 @@ impl OrderingEngine {
         self.committed_rounds.insert(anchor_round);
         self.committed_sequence.extend(sequence.clone());
         
+        // 6. Update VDF random beacon with committed anchor hash
+        // This ensures unpredictable randomness for future leader selection
+        self.update_random_beacon(anchor_vertex_hash.as_bytes());
+        
         Some(sequence)
     }
 

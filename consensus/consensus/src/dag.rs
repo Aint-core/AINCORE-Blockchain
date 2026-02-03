@@ -196,13 +196,24 @@ impl DagConsensus {
             
             vertex.hash = vertex.calculate_hash(); 
             
+            // 3b. Sign vertex with BLS (optional - requires node secret key)
+            // In production, this would use the node's BLS key from keystore
+            // For now, derive a simple key from node_id for deterministic signing
+            let node_key = {
+                let mut key = [0u8; 32];
+                let hash = crypto::hash(self.node_id.as_bytes());
+                key.copy_from_slice(&hash);
+                key
+            };
+            vertex.sign_with_bls(&node_key);
+            
             // 4. Add & Broadcast
             self.add_vertex(vertex.clone());
             self.broadcast_vertex(&vertex);
             
             // Advance round
             self.current_round += 1;
-            println!("⚡ Created Vertex {} (Round {})", vertex.hash, vertex.round);
+            println!("⚡ Created Vertex {} (Round {}) [BLS Signed]", vertex.hash, vertex.round);
         }
     }
 

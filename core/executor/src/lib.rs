@@ -348,6 +348,22 @@ impl Executor {
                 return None;
             }
 
+            // 2b. Verify ZKP proof if present (optional STARK proof verification)
+            if let Some(ref proof_hex) = tx.zkp_proof {
+                if !proof_hex.is_empty() {
+                    // Log that we have a ZKP proof attached
+                    println!("🔐 Transaction has ZKP proof ({} bytes)", proof_hex.len() / 2);
+                    
+                    // In production, this would verify the STARK proof:
+                    // use crypto::zkp::{STARKVerifier, STARKProofData};
+                    // let proof_bytes = hex::decode(proof_hex)?;
+                    // let proof = STARKProofData::from_bytes(&proof_bytes)?;
+                    // if !verifier.verify(&proof) { return None; }
+                    
+                    // For now, presence of proof is logged for future integration
+                }
+            }
+
             // 2.5 Replay Protection
             let sender_data_check: aa::AccountData = match serde_json::from_slice(&sender_obj.data) {
                 Ok(d) => d,
