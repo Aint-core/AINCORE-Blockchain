@@ -10,7 +10,22 @@ AINCORE is a high-performance Layer-1 Blockchain featuring:
 
 ---
 
-## 🚀 QUICK START
+## � DOCUMENTATION
+
+Complete developer documentation is available in the [`/docs`](./docs) folder:
+
+| Guide | Description |
+|-------|-------------|
+| [📘 Technical Documentation](./docs/TECHNICAL_DOCUMENTATION.md) | Architecture, getting started, core components |
+| [📗 Move Development Guide](./docs/MOVE_DEVELOPMENT_GUIDE.md) | Smart contract development with tutorials |
+| [📕 Consensus Deep Dive](./docs/CONSENSUS_DEEP_DIVE.md) | DAG & Bullshark internals |
+| [📙 Node Operator Guide](./docs/NODE_OPERATOR_GUIDE.md) | Running and maintaining validators |
+| [📔 Crypto Module Guide](./docs/CRYPTO_MODULE_GUIDE.md) | Cryptography primitives reference |
+| [📓 API Reference](./docs/API_REFERENCE.md) | Complete JSON-RPC API documentation |
+
+---
+
+## �🚀 QUICK START
 ### 1. Start the Full Cluster
 We have created a **Master Script** that compiles and launches the Node, Bridge, and Sequencer.
 ```bash
@@ -77,16 +92,25 @@ For querying transaction history (Explorer Backend).
 ---
 
 ## 🧩 SYSTEM ARCHITECTURE (The "Folder Map")
+## 🧩 SYSTEM ARCHITECTURE (The "Folder Map")
 Since development is split across folders, here is where everything lives:
 
 | Component | Port | Path | Status |
 | :--- | :--- | :--- | :--- |
-| **Core Node** | `:8001` (RPC) | `phase1-core-prototype/node` | 🟢 Active |
-| **Consensus** | Internal | `phase2-consensus-aa` | 🟢 Wired |
+| **Core Node** | `:8001` (RPC) | `core/node` | 🟢 Active |
+| **Consensus** | Internal | `consensus` | 🟢 Wired (Bullshark) |
+| **Data Avail** | Internal | `da` | 🟢 Active (P2P Sharding) |
 | **Indexer** | `:3001` (API) | `indexer` | 🟢 Active |
-| **Bridge** | Internal | `phase21-depin/bridge-rust` | 🟢 Active |
+| **Bridge** | Internal | `depin/bridge-rust` | 🟢 Active |
 | **Monitor** | Terminal | `monitor` | 🟢 Active |
-| **Privacy** | N/A | `phase5-privacy-governance` | 🔴 **Unwired** |
+| **Privacy** | N/A | `governance` | 🟡 **In Development** |
+
+---
+
+## 🚀 NEW FEATURES (Jan 2026)
+- **Sovereign DA Layer:** Fully operational Data Availability with P2P Sharding.
+- **Light Client API:** Verifiable Merkle proofs for shard inclusion (`get_shard_proof`).
+- **Logic Hardening:** Complete audit of VM, Consensus, and Networking layers.
 
 ---
 
