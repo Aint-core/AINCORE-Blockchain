@@ -15,7 +15,7 @@ pub mod bls;
 pub mod threshold;
 pub mod accumulator;
 pub mod mpc;
-pub mod fhe;
+
 pub mod vdf;
 pub mod multi_sig;
 pub mod transport;
@@ -23,8 +23,7 @@ pub mod transport;
 // Blockchain features
 pub mod account_abstraction;
 pub mod bridges;
-pub mod privacy;
-pub mod gpu;
+
 pub mod rollup;
 pub mod recursive;
 
@@ -33,8 +32,7 @@ pub use ecdsa::{ECDSACrypto, ECDSAError};
 pub use multi_sig::{MultiSigVerifier, SignatureScheme, MultiSigError};
 pub use zkp::{SNARKProver, SNARKError, STARKProver, STARKError, HashPreimageCircuit};
 pub use vdf::{VDFEngine, VDFError};
-pub use fhe::FheEngine;
-pub use tfhe::FheUint64;
+
 pub use mpc::{MPCProtocol, MPCError};
 pub use threshold::threshold_bls::{FrostParticipant, BlsSigner, aggregate_frost, aggregate_bls};
 pub use bls::{BLSEngine, BLSError};

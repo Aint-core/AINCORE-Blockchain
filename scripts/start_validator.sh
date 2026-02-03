@@ -29,7 +29,7 @@ if [ ! -f "./target/release/bridge-service" ]; then
     echo "🌉 Building Bridge Service..."
     # Assuming bridge-rust is part of workspace or needs explicit path.
     # Safe bet: explicit path build if workspace structure is complex
-    cargo build --release --manifest-path phase21-depin/bridge-rust/Cargo.toml
+    cargo build --release --manifest-path depin/bridge-rust/Cargo.toml
 fi
 
 # 2. Check Data Dir

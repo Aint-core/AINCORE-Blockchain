@@ -3,6 +3,16 @@
 # "The Perfect Launch Button"
 # Resets all data and starts fresh to ensure decentralized oracle genesis.
 
+echo "⚠️  DANGER: This script will WIPE ALL MAINNET DATA (Reset Genesis)."
+echo "⚠️  DANGER: This script will WIPE ALL MAINNET DATA (Reset Genesis)."
+echo "Typing 'DELETE' confirms you understand that this action is IRREVERSIBLE."
+read -p "Type 'DELETE' to confirm: " confirmation
+
+if [[ "$confirmation" != "DELETE" ]]; then
+    echo "❌ Safety Check Failed. Aborted."
+    exit 1
+fi
+
 echo "🔥 Wiping old data (Genesis Reset)..."
 pkill -f "target/release/node"
 sleep 2

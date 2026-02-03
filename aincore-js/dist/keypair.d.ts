@@ -35,4 +35,16 @@ export declare class Keypair {
      * Sign a message (bytes)
      */
     sign(message: Uint8Array): string;
+    /**
+     * Verify a signature against a message
+     */
+    verify(message: Uint8Array, signatureHex: string): boolean;
+    /**
+     * Generate a new random mnemonic phrase (24 words)
+     */
+    static generateMnemonic(): string;
+    /**
+     * Validate a mnemonic phrase
+     */
+    static validateMnemonic(mnemonic: string): boolean;
 }

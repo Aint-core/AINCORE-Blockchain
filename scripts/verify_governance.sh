@@ -8,6 +8,13 @@ DATA_DIR="data_test_gov"
 
 echo "🧹 Cleaning up previous test data..."
 pkill -f "target/debug/node" || true
+echo "🔥 Deleting governance data..."
+read -p "⚠️  WARNING: This will delete governance data. Are you sure? (y/N) " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "❌ Cleanup cancelled."
+    exit 1
+fi
 rm -rf $DATA_DIR
 rm -rf data/validator_*.db
 mkdir -p $DATA_DIR

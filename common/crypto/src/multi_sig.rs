@@ -137,13 +137,16 @@ impl MultiSigVerifier {
             .map_err(|e| MultiSigError::Ed25519Error(e.to_string()))
     }
     
-    /// Verify Dilithium5 signature
+    /// Verify Dilithium5 signature (Post-Quantum)
     fn verify_dilithium5(
         &self,
         public_key: &[u8],
-        _message: &[u8],
+        message: &[u8],
         signature: &[u8],
     ) -> Result<bool, MultiSigError> {
+        use pqcrypto_dilithium::dilithium5;
+        use pqcrypto_traits::sign::{PublicKey, DetachedSignature};
+        
         // Validate lengths
         if public_key.len() != 2592 {
             return Err(MultiSigError::InvalidPublicKeyLength(2592, public_key.len()));
@@ -152,12 +155,19 @@ impl MultiSigVerifier {
             return Err(MultiSigError::InvalidSignatureLength(4627, signature.len()));
         }
         
-        // Note: Actual Dilithium5 verification is in vm_move module
-        // This is a placeholder that returns an error
-        // In production, this would call the actual Dilithium5 verification
-        Err(MultiSigError::Dilithium5Error(
-            "Dilithium5 verification not yet integrated into crypto module".to_string()
-        ))
+        // Parse public key
+        let pk = dilithium5::PublicKey::from_bytes(public_key)
+            .map_err(|_| MultiSigError::Dilithium5Error("Invalid public key format".to_string()))?;
+        
+        // Parse signature
+        let sig = dilithium5::DetachedSignature::from_bytes(signature)
+            .map_err(|_| MultiSigError::Dilithium5Error("Invalid signature format".to_string()))?;
+        
+        // Verify signature
+        match dilithium5::verify_detached_signature(&sig, message, &pk) {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
     }
     
     /// Verify secp256k1 ECDSA signature

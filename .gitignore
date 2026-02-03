@@ -1,14 +1,16 @@
 # Rust Build Artifacts
+# System Files
+.DS_Store
+Thumbs.db
+
+# Build Artifacts
 target/
-**/*.rs.bk
+build/
+node_modules/
+dist/
+.next/
 
-# Data Directories (Local State)
-data/
-data_*/
-db/
-*.db
-
-# Logs
+# Logs & Data
 *.log
 logs/
 

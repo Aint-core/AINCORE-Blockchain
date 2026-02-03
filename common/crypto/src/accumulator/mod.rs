@@ -113,7 +113,7 @@ impl Accumulator {
         leaf: &[u8],
         proof: &[[u8; 32]],
         index: usize,
-        total_leaves: usize // Needed to know structure
+        _total_leaves: usize // Needed to know structure
     ) -> bool {
         let mut current_hash = hash_leaf(leaf);
         let mut current_index = index;

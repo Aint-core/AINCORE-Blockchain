@@ -100,5 +100,29 @@ class Keypair {
         const signature = nacl.sign.detached(message, this._keypair.secretKey);
         return Buffer.from(signature).toString('hex');
     }
+    /**
+     * Verify a signature against a message
+     */
+    verify(message, signatureHex) {
+        try {
+            const signature = Buffer.from(signatureHex, 'hex');
+            return nacl.sign.detached.verify(message, signature, this._keypair.publicKey);
+        }
+        catch {
+            return false;
+        }
+    }
+    /**
+     * Generate a new random mnemonic phrase (24 words)
+     */
+    static generateMnemonic() {
+        return bip39.generateMnemonic(256); // 256 bits = 24 words
+    }
+    /**
+     * Validate a mnemonic phrase
+     */
+    static validateMnemonic(mnemonic) {
+        return bip39.validateMnemonic(mnemonic);
+    }
 }
 exports.Keypair = Keypair;

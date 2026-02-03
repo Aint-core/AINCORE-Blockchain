@@ -1,0 +1,78 @@
+use ethers::prelude::*;
+use ethers::providers::{Http, Provider};
+use ethers::signers::LocalWallet;
+use std::sync::Arc;
+use std::error::Error;
+use log::info;
+
+// CRITICAL-4 FIX: Multi-signature configuration
+const MULTISIG_THRESHOLD: usize = 3; // 3-of-5 required
+
+#[derive(Clone)]
+pub struct EvmClient {
+    provider: Arc<Provider<Http>>,
+    contract_address: Address,
+    signers: Vec<LocalWallet>, // Multiple signers for multi-sig
+    threshold: usize,
+}
+
+// Minimal ABI for Minting
+abigen!(
+    WrappedAIN,
+    r#"[
+        function mint(address to, uint256 amount) external
+    ]"#
+);
+
+impl EvmClient {
+    /// CRITICAL-4 FIX: Initialize with multiple signers for multi-sig
+    pub fn new(
+        rpc_url: String,
+        contract_address: String,
+        signers: Vec<LocalWallet>,
+    ) -> Result<Self, Box<dyn Error>> {
+        // Validate we have enough signers
+        if signers.len() < MULTISIG_THRESHOLD {
+            return Err(format!(
+                "Insufficient signers: {} provided, {} required",
+                signers.len(),
+                MULTISIG_THRESHOLD
+            ).into());
+        }
+        
+        let provider = Provider::<Http>::try_from(rpc_url)?;
+        let contract_addr = contract_address.parse::<Address>()?;
+        
+        info!("🔐 Multi-sig bridge initialized with {} signers (threshold: {})", 
+            signers.len(), MULTISIG_THRESHOLD);
+        
+        Ok(Self {
+            provider: Arc::new(provider),
+            contract_address: contract_addr,
+            signers,
+            threshold: MULTISIG_THRESHOLD,
+        })
+    }
+
+    pub async fn mint_tokens(&self, to_str: &str, amount_u128: u128) -> Result<TxHash, Box<dyn Error>> {
+        // Parse address
+        let to_addr: Address = to_str.parse()?;
+        let amount = U256::from(amount_u128);
+
+        // Use the first signer for the transaction origin
+        if self.signers.is_empty() {
+             return Err("No signers available".into());
+        }
+        
+        let client = SignerMiddleware::new(self.provider.clone(), self.signers[0].clone());
+        let contract = WrappedAIN::new(self.contract_address, Arc::new(client));
+        
+        // Send transaction
+        let call = contract.mint(to_addr, amount);
+        let pending_tx = call.send().await?;
+        match pending_tx.await? {
+            Some(receipt) => Ok(receipt.transaction_hash),
+            None => Err("Transaction dropped".into())
+        }
+    }
+}

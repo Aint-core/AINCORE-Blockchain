@@ -325,11 +325,14 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "keystore",
+ "pqcrypto-dilithium",
+ "pqcrypto-traits",
  "rand 0.8.5",
  "reqwest",
  "rpassword",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
 ]
 
@@ -1102,6 +1105,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "btc-bridge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1544,6 +1559,9 @@ dependencies = [
 [[package]]
 name = "config"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "consensus"
@@ -1822,6 +1840,8 @@ dependencies = [
  "ff",
  "group",
  "hex",
+ "pqcrypto-dilithium",
+ "pqcrypto-traits",
  "rand 0.8.5",
  "secp256k1",
  "sha2 0.10.9",
@@ -5841,17 +5861,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "privacy"
-version = "0.1.0"
-dependencies = [
- "crypto",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "winterfell",
-]
-
-[[package]]
 name = "proc-macro-crate"
 version = "1.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7938,8 +7947,10 @@ dependencies = [
  "move-vm-types",
  "pqcrypto-dilithium",
  "pqcrypto-traits",
+ "rand 0.8.5",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "storage",
 ]
 

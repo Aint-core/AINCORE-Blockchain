@@ -292,4 +292,46 @@ impl StateDB {
          let json = serde_json::to_string(&vals).unwrap_or_default();
          self.put("sys:validators", &json)
     }
+
+    // === DAG CHECKPOINT SYSTEM (Aptos/Sui Style) ===
+    
+    /// Save DAG checkpoint for fast recovery
+    /// Called every N rounds (e.g., 100) to enable O(1) startup
+    pub fn save_dag_checkpoint(&self, round: u64, vertices_json: &str) -> std::result::Result<(), rocksdb::Error> {
+        // Save checkpoint data
+        self.put(&format!("dag:checkpoint:{}", round), vertices_json)?;
+        // Update latest checkpoint pointer
+        self.put("dag:checkpoint:latest", &round.to_string())?;
+        Ok(())
+    }
+    
+    /// Get latest checkpoint round
+    pub fn get_latest_checkpoint_round(&self) -> u64 {
+        match self.get("dag:checkpoint:latest") {
+            Ok(Some(r)) => r.parse().unwrap_or(0),
+            _ => 0,
+        }
+    }
+    
+    /// Load DAG checkpoint data
+    pub fn get_dag_checkpoint(&self, round: u64) -> Option<String> {
+        match self.get(&format!("dag:checkpoint:{}", round)) {
+            Ok(Some(data)) => Some(data),
+            _ => None,
+        }
+    }
+    
+    /// Prune old checkpoints (keep last N)
+    pub fn prune_old_checkpoints(&self, current_round: u64, keep_count: u64) -> std::result::Result<(), rocksdb::Error> {
+        if current_round <= keep_count {
+            return Ok(());
+        }
+        let oldest_to_keep = current_round - keep_count;
+        // Simple cleanup: delete checkpoints older than threshold
+        // Note: This is a best-effort cleanup, not a full scan
+        for old_round in (0..oldest_to_keep).rev().take(10) {
+            let _ = self.delete(&format!("dag:checkpoint:{}", old_round));
+        }
+        Ok(())
+    }
 }

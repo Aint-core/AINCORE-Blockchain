@@ -7,24 +7,37 @@ members = [
     "common/storage",
     "common/config",
     "common/keystore",
-    # --- Phase 1: Core Prototype ---
-    "phase1-core-prototype/node",
-    "phase1-core-prototype/mempool",
-    "phase1-core-prototype/executor",
-    "phase1-core-prototype/vm_move",
-    "phase1-core-prototype/cli",
-    "phase1-core-prototype/move_compiler_tool",
+    # --- Core: Node, VM, Executor ---
+    "core/node",
+    "core/mempool",
+    "core/executor",
+    "core/vm_move",
+    "core/cli",
+    "core/move_compiler_tool",
+    "core/genesis-tool",
 
-    # --- Phase 2: Consensus & Blockchain ---
-    "phase2-consensus-aa/consensus",
-    "phase2-consensus-aa/blockchain",
-    "phase2-consensus-aa/account",
-    # --- Phase 3: Chain Synchronization ---
-    "phase3-chain-sync",
-    # --- Phase 4: Chain Synchronization ---
-    "phase4-da-sequencer", "phase1-core-prototype/genesis-tool", "indexer", "bench-tps", "phase21-depin/bridge-rust",
-    "phase5-privacy-governance/governance",
-    "phase5-privacy-governance/privacy",
+    # --- Consensus & Account ---
+    "consensus/consensus",
+    "consensus/blockchain",
+    "consensus/account",
+    "consensus/aa",
+    
+    # --- Chain Synchronization ---
+    "sync",
+    
+    # --- Data Availability ---
+    "da",
+    
+    # --- Governance ---
+    "governance/governance",
+    
+    # --- DePIN, Bridge, Oracle ---
+    "depin/bridge-rust",
+    "depin/btc-bridge",
+    
+    # --- Tools ---
+    "indexer",
+    "bench-tps",
 ]
 
 resolver = "2"

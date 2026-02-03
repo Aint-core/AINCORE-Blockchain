@@ -13,6 +13,13 @@ echo "🧹 Cleaning up previous processes and data..."
 # Use more specific patterns to avoid killing IDE/System node processes
 pkill -f "target/debug/node" || true
 pkill -f "target/debug/indexer" || true
+echo "🔥 Deleting indexer data..."
+read -p "⚠️  WARNING: This will delete indexer data. Are you sure? (y/N) " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "❌ Cleanup cancelled."
+    exit 1
+fi
 rm -rf data/*.db
 rm -f indexer.db
 

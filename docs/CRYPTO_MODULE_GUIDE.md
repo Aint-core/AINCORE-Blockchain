@@ -355,9 +355,90 @@ assert_eq!(decrypted, plaintext);
 
 ---
 
+## Post-Quantum Cryptography (PQC)
+
+AINCORE supports quantum-resistant signatures using CRYSTALS-Dilithium5 (NIST Standard).
+
+### Generate PQC Keypair
+
+```bash
+# Using CLI
+aincore-cli pqc-keygen --out ./pqc_keys
+
+# Output:
+# Post-Quantum Keypair Generated (Dilithium5)
+# Public Key:  ./pqc_keys/pqc_pubkey.bin (2592 bytes)
+# Private Key: ./pqc_keys/pqc_privkey.bin (4896 bytes)
+# Address:     a1b2c3d4e5f6...
+```
+
+### Dilithium5 Specifications
+
+| Property | Value |
+|----------|-------|
+| Public Key Size | 2592 bytes |
+| Private Key Size | 4896 bytes |
+| Signature Size | 4627 bytes |
+| Security Level | NIST Level 5 (256-bit) |
+| Quantum Resistant | YES |
+
+### Using Dilithium5 in Code
+
+```rust
+use pqcrypto_dilithium::dilithium5;
+use pqcrypto_traits::sign::{PublicKey, SecretKey, DetachedSignature};
+
+// Generate keypair
+let (pk, sk) = dilithium5::keypair();
+
+// Sign message
+let message = b"Quantum-safe transaction";
+let signature = dilithium5::detached_sign(message, &sk);
+
+// Verify signature
+let is_valid = dilithium5::verify_detached_signature(
+    &signature, message, &pk
+).is_ok();
+```
+
+### Registering PQC Public Key
+
+To use PQC signatures, register your public key on-chain:
+
+```bash
+# Store PQC public key (hex encoded)
+aincore-cli store-pqc-key --pubkey-file ./pqc_keys/pqc_pubkey.bin
+```
+
+### Multi-Signature Verification
+
+The `MultiSigVerifier` automatically detects and verifies Dilithium5 signatures:
+
+```rust
+use crypto::multi_sig::{MultiSigVerifier, SignatureScheme};
+
+let verifier = MultiSigVerifier::new();
+
+// Verify Dilithium5 signature
+let result = verifier.verify(
+    SignatureScheme::Dilithium5,
+    &public_key,    // 2592 bytes
+    &message,
+    &signature,     // 4627 bytes
+)?;
+
+// Auto-detect scheme by signature length
+let scheme = verifier.auto_detect_scheme(&signature);
+// Returns SignatureScheme::Dilithium5 for 4627-byte signatures
+```
+
+---
+
 ## References
 
 - [Ed25519 Paper](https://ed25519.cr.yp.to/)
 - [BLS Signatures](https://crypto.stanford.edu/~dabo/pubs/papers/BLSmultisig.html)
 - [Winterfell STARK](https://github.com/facebook/winterfell)
 - [Poseidon Hash](https://www.poseidon-hash.info/)
+- [CRYSTALS-Dilithium](https://pq-crystals.org/dilithium/)
+- [NIST PQC Standards](https://csrc.nist.gov/projects/post-quantum-cryptography)

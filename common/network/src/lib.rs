@@ -4,7 +4,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::net::IpAddr;
 use std::time::Instant;
 
+// Reserved for future rate limiting implementation
+#[allow(dead_code)]
 const MAX_CONNECTIONS: usize = 100;
+#[allow(dead_code)]
 const MAX_CONN_PER_IP_MIN: usize = 60; 
 
 struct ConnectionGuard {
@@ -40,7 +43,9 @@ where
 
     let handler = Arc::new(handler); 
     let active_connections = Arc::new(AtomicUsize::new(0));
-    let ip_limiter: Arc<Mutex<HashMap<IpAddr, (usize, Instant)>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Reserved for future IP-based rate limiting
+    let _ip_limiter: Arc<Mutex<HashMap<IpAddr, (usize, Instant)>>> = Arc::new(Mutex::new(HashMap::new()));
+
     
     // My Identity Key (Ephemeral for now, ideally persistent Identity Key + Ephemeral Session Key)
     // For simplicity of this upgrade, we generate a fresh Ephemeral Key per connection session accept
@@ -88,7 +93,7 @@ where
             // Use nonces. Server -> Client (Even nonces?), Client -> Server (Odd nonces?)
             // Or simplified: receive nonce prefixed to message.
             
-            let nonce_recv_counter = 0u64;
+            let _nonce_recv_counter = 0u64;
             
             // println!("🔐 Secure Session Established with {}", addr);
             

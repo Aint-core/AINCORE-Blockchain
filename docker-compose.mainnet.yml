@@ -49,15 +49,6 @@ services:
     networks:
       - aincore-net
 
-  # Celestia Light Node (DA Layer)
-  celestia-light:
-    image: ghcr.io/celestiaorg/celestia-node:v0.12.0
-    container_name: celestia-light
-    command: [ "celestia", "light", "start", "--core.ip", "consensus.celestia.org", "--p2p.network", "arabica" ]
-    ports:
-      - "26658:26658" # RPC
-    networks:
-      - aincore-net
 
 networks:
   aincore-net:

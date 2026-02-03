@@ -12,12 +12,15 @@ echo -e "${GREEN}🚀 STARTING MASTER REAL-WORLD TEST SCENARIO${NC}"
 echo "🧹 Cleaning up previous state..."
 # 0. Cleanup
 echo "🧹 Cleaning up previous state..."
+echo "⚠️  WARNING: This will delete ALL test data and logs."
+read -p "Are you sure? (y/N) " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "❌ Test cancelled."
+    exit 1
+fi
 pkill -f "target/release/node" || true
-pkill -f "oracle.py" || true
-pkill -f "virtual_device.py" || true
-# Force kill anything on ports 9002 (TCP) and 8002 (API)
-lsof -ti:9002 | xargs kill -9 2>/dev/null || true
-lsof -ti:8002 | xargs kill -9 2>/dev/null || true
+# ... (rest of cleanup)
 rm -rf data/*.db
 rm -rf logs/*.log
 mkdir -p logs
