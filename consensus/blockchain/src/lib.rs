@@ -78,6 +78,12 @@ pub struct Vertex {
     pub payload: Vec<String>, // Transactions (or batch IDs)
     pub timestamp: u64,
     pub hash: String,
+    /// BLS signature from the author (48 bytes hex encoded)
+    #[serde(default)]
+    pub signature: String,
+    /// Aggregated BLS signatures from validators (optional, for committed vertices)
+    #[serde(default)]
+    pub aggregated_signature: Option<String>,
 }
 
 impl Vertex {
@@ -94,9 +100,34 @@ impl Vertex {
             payload,
             timestamp,
             hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
         };
         v.hash = v.calculate_hash();
         v
+    }
+    
+    /// Sign the vertex hash with BLS and set the signature field
+    pub fn sign_with_bls(&mut self, secret_key: &[u8; 32]) {
+        use crypto::bls::BLSEngine;
+        let bls = BLSEngine::new(b"AINCORE_CONSENSUS_V1");
+        let sig = bls.sign(self.hash.as_bytes(), secret_key);
+        self.signature = hex::encode(&sig);
+    }
+    
+    /// Verify the BLS signature
+    pub fn verify_bls_signature(&self, public_key: &[u8; 32]) -> bool {
+        use crypto::bls::BLSEngine;
+        if self.signature.is_empty() {
+            return false;
+        }
+        let sig_bytes = match hex::decode(&self.signature) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let bls = BLSEngine::new(b"AINCORE_CONSENSUS_V1");
+        let expected = bls.sign(self.hash.as_bytes(), public_key);
+        sig_bytes == expected
     }
 
     pub fn calculate_hash(&self) -> String {

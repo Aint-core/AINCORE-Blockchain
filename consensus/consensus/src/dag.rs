@@ -189,7 +189,9 @@ impl DagConsensus {
                     .as_secs(),
                 payload,
                 parents,
-                hash: String::new(), 
+                hash: String::new(),
+                signature: String::new(),
+                aggregated_signature: None,
             };
             
             vertex.hash = vertex.calculate_hash(); 

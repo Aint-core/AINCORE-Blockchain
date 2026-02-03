@@ -33,6 +33,10 @@ pub struct Transaction {
     pub paymaster: Option<String>, // Optional: Address of gas payer
     #[serde(default)]
     pub paymaster_signature: Option<String>, // Optional: Signature from paymaster
+    
+    // === ZKP Proof Field (Scalability) ===
+    #[serde(default)]
+    pub zkp_proof: Option<String>, // Optional: STARK proof for computation (hex encoded)
 }
 
 pub struct Executor {

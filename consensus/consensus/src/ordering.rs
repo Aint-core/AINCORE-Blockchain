@@ -1,4 +1,5 @@
 use blockchain::Vertex;
+use crypto::vdf::VDFEngine;
 
 use std::collections::{HashMap, HashSet};
 
@@ -10,14 +11,37 @@ use std::collections::{HashMap, HashSet};
 pub struct OrderingEngine {
     pub committed_rounds: HashSet<u64>,
     pub committed_sequence: Vec<String>, // List of Vertex Hashes in order
+    /// VDF engine for random beacon (unpredictable leader election)
+    vdf_engine: Option<VDFEngine>,
+    /// Last VDF output for randomness
+    last_vdf_output: Vec<u8>,
 }
 
 impl OrderingEngine {
     pub fn new() -> Self {
+        // Initialize VDF with moderate difficulty (adjustable for faster/slower)
+        let vdf = VDFEngine::new(50).ok();
+        
         Self {
             committed_rounds: HashSet::new(),
             committed_sequence: Vec::new(),
+            vdf_engine: vdf,
+            last_vdf_output: vec![0u8; 32],
         }
+    }
+    
+    /// Update random beacon using VDF (called after each commit)
+    pub fn update_random_beacon(&mut self, seed: &[u8]) {
+        if let Some(ref vdf) = self.vdf_engine {
+            if let Ok((output, _proof)) = vdf.compute(seed) {
+                self.last_vdf_output = output;
+            }
+        }
+    }
+    
+    /// Get random bytes from beacon for leader selection
+    pub fn get_random_beacon(&self) -> &[u8] {
+        &self.last_vdf_output
     }
 
     /// Mencoba melakukan commit pada ronde tertentu
