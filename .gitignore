@@ -14,6 +14,12 @@ dist/
 *.log
 logs/
 
+# Node Data (RocksDB)
+data/
+aincore_data/
+testnet_data/
+*.db
+
 # Secrets (Keys)
 *.key
 wallet.key

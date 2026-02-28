@@ -6,7 +6,7 @@ use storage::StateDB;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AccountData {
-    pub balance: u64,
+    pub balance: u128, // L3 FIX: Match staking module's u128 coin representation
     pub sequence_number: u64,
     pub public_key: String,
 }
@@ -41,8 +41,8 @@ pub struct Proposal {
     pub start_time: u64,
     pub end_time: u64,
     pub execution_time: Option<u64>, // TimeLock: Earliest execution time
-    pub yes_votes: u64,
-    pub no_votes: u64,
+    pub yes_votes: u128, // L3 FIX: Match u128 balance type
+    pub no_votes: u128,
     pub status: ProposalStatus,
 }
 
@@ -60,7 +60,7 @@ pub struct Vote {
     pub proposal_id: String,
     pub voter: String,
     pub approve: bool,
-    pub weight: u64, // Stake amount
+    pub weight: u128, // L3 FIX: Stake amount in u128 to match coin module
 }
 
 pub struct GovernanceManager {

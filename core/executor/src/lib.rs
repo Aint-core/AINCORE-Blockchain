@@ -5,7 +5,11 @@ use storage::rocksdb::WriteBatch;
 use vm_move::AINCOREVM;
 use rayon::prelude::*;
 
-const CHAIN_ID: &str = "AINCORE-MAINNET-1";
+/// Chain ID loaded from environment, defaults to TESTNET for safety.
+/// Set AINCORE_CHAIN_ID=AINCORE-MAINNET-1 explicitly for production.
+fn get_chain_id() -> String {
+    std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-TESTNET-1".to_string())
+}
 // REMOVED: const BLOCK_REWARD: u64 = 50; 
 // V3 CONSTANTS
 const MAX_SUPPLY: u128 = 150_000_000 * 1_000_000_000_000_000_000; // 150 Million AIN
@@ -299,8 +303,9 @@ impl Executor {
         
         if let Ok(tx) = serde_json::from_str::<Transaction>(tx_json) {
             // 0. Verify Chain ID
-            if tx.chain_id != CHAIN_ID {
-                println!("❌ Invalid Chain ID: Expected {}, Got {}", CHAIN_ID, tx.chain_id);
+            let expected_chain = get_chain_id();
+            if tx.chain_id != expected_chain {
+                println!("❌ Invalid Chain ID: Expected {}, Got {}", expected_chain, tx.chain_id);
                 return None;
             }
 

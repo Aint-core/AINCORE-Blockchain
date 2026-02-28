@@ -106,7 +106,6 @@ async fn main() {
     let peers = Arc::new(Mutex::new(std::collections::HashMap::<String, u16>::new()));
 
     println!("🚀 AINCORE node {} running on port {}", node_id, port);
-    println!("🚀 DEBUG: I AM THE NEW CODE (RwLock Optimized)");
     println!("🌐 Listening on TCP port {}", port);
 
     // === LOAD PERSISTED PEERS ===

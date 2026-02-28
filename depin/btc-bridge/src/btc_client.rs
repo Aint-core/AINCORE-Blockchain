@@ -1,28 +1,8 @@
 use anyhow::Result;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
-pub struct BitcoinTx {
-    pub hash: String,
-    pub inputs: Vec<TxInput>,
-    pub out: Vec<TxOutput>,
-    #[serde(default)]
-    pub block_height: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct TxInput {
-    pub prev_out: Option<TxOutput>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct TxOutput {
-    pub value: u64, // Satoshis
-    pub addr: Option<String>,
-    pub script: String,
-}
-
+/// BTC client for monitoring deposits to the multisig address.
+/// Uses blockchain.info API for lightweight monitoring.
 pub struct BtcClient {
     client: Client,
     address: String,

@@ -6,22 +6,26 @@ use tokio::time::{sleep, Duration};
 use btc_client::BtcClient;
 use aincore_client::AincoreClient;
 use storage::Storage;
+use std::env;
 
-// Configuration (Hardcoded for prototype phase)
-// Configuration (Updated for Deployment)
-const MULTISIG_ADDRESS: &str = "bc1q5d40e477b2bb3cc9d9f5508de1fb0456aincore"; // Generated Multisig
-const AINCORE_RPC: &str = "http://localhost:8002"; // Updated Port
-const BRIDGE_KEY: &str = "03a768d1830ddb64823af79c3017f7a9e21da2de39eee3d7444203d014a156ea"; // Generated Key
 const CONFIRMATIONS: u64 = 6;
 
 #[tokio::main]
 async fn main() {
+    // SECURITY: Load all sensitive config from environment variables
+    let multisig_address = env::var("BTC_MULTISIG_ADDRESS")
+        .expect("BTC_MULTISIG_ADDRESS env var is required");
+    let aincore_rpc = env::var("AINCORE_RPC")
+        .unwrap_or_else(|_| "http://localhost:8002".to_string());
+    let bridge_key = env::var("BRIDGE_KEY")
+        .expect("BRIDGE_KEY env var is required. Never hardcode private keys!");
+
     println!("🌉 BTC Bridge Service Starting...");
-    println!("👀 Monitoring BTC Address: {}", MULTISIG_ADDRESS);
+    println!("👀 Monitoring BTC Address: {}", multisig_address);
     println!("🔐 Required Confirmations: {}", CONFIRMATIONS);
 
-    let btc = BtcClient::new(MULTISIG_ADDRESS.to_string());
-    let aincore = AincoreClient::new(AINCORE_RPC.to_string(), BRIDGE_KEY.to_string());
+    let btc = BtcClient::new(multisig_address);
+    let aincore = AincoreClient::new(aincore_rpc, bridge_key);
     let mut db = Storage::new("processed_txs.json");
 
     loop {

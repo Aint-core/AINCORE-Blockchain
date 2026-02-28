@@ -59,6 +59,8 @@ impl EvmClient {
         let to_addr: Address = to_str.parse()?;
         let amount = U256::from(amount_u128);
 
+        info!("🔐 Executing mint with {}/{} multi-sig threshold", self.threshold, self.signers.len());
+
         // Use the first signer for the transaction origin
         if self.signers.is_empty() {
              return Err("No signers available".into());

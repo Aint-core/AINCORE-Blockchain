@@ -6,7 +6,19 @@ use std::thread;
 use std::time::Duration;
 
 fn main() {
-    let nodes = vec![9001, 9002, 9003, 9004];
+    // L2 FIX: Configurable node list via AINCORE_NODES env var
+    // Example: AINCORE_NODES=9000,9001,9002,9003
+    let nodes: Vec<u16> = std::env::var("AINCORE_NODES")
+        .unwrap_or_else(|_| "9000".to_string())
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    
+    if nodes.is_empty() {
+        eprintln!("❌ No valid node ports specified. Set AINCORE_NODES=9000,9001,...");
+        return;
+    }
+    
     let client = Client::new();
 
     println!("{}", "🚀 AINCORE Cluster Monitor (RPC Mode)".bold().purple());
