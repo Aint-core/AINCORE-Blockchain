@@ -32,4 +32,10 @@ module 0x1::epoch {
         let epoch = borrow_global_mut<Epoch>(@0x1);
         epoch.epoch_duration = new_duration;
     }
+
+    /// Get current timestamp (epoch_start_time + epoch_number * duration as proxy)
+    public fun now_seconds(): u64 acquires Epoch {
+        let epoch = borrow_global<Epoch>(@0x1);
+        epoch.epoch_start_time + (epoch.epoch_number * epoch.epoch_duration)
+    }
 }

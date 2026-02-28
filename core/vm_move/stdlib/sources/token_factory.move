@@ -32,6 +32,8 @@ module 0x1::token_factory {
         current_supply: u128,
         creator: address,
         is_mintable: bool,
+        icon_url: vector<u8>,    // URL to token logo (e.g., IPFS or HTTPS)
+        project_url: vector<u8>, // URL to project website
     }
 
     /// Global registry of all tokens
@@ -40,7 +42,7 @@ module 0x1::token_factory {
     }
 
     /// User's balance for a specific token
-    struct TokenBalance has key {
+    struct TokenBalance has key, store, drop {
         token_id: vector<u8>,
         balance: u128,
     }
@@ -65,7 +67,9 @@ module 0x1::token_factory {
         symbol: vector<u8>,
         decimals: u8,
         max_supply: u128,
-        initial_supply: u128
+        initial_supply: u128,
+        icon_url: vector<u8>,    // New argument
+        project_url: vector<u8>  // New argument
     ) acquires TokenRegistry, TokenWallet {
         let creator_addr = signer::address_of(creator);
         
@@ -105,6 +109,8 @@ module 0x1::token_factory {
             current_supply: initial_supply,
             creator: creator_addr,
             is_mintable: true,
+            icon_url,
+            project_url,
         };
         
         vector::push_back(&mut registry.tokens, token_info);

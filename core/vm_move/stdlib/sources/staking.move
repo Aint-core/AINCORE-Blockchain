@@ -3,7 +3,6 @@ module 0x1::staking {
     use std::vector;
     use std::error;
     use 0x1::coin::{Self, Coin};
-    use 0x1::epoch;
 
     /// Error codes
     const ENOT_VALIDATOR: u64 = 1;
@@ -123,7 +122,8 @@ module 0x1::staking {
         
         // CRITICAL: Do NOT return stake immediately!
         // Lock it for 21 days to prevent Nothing-at-Stake attacks
-        let current_time = epoch::now_seconds(); // Get current timestamp
+        // Use current_epoch * 60 as proxy timestamp (each epoch ~60s)
+        let current_time = validator_set.current_epoch * 60;
         let unlock_time = current_time + UNBONDING_PERIOD;
         
         let stake_amount = coin::value(&stake);
@@ -142,7 +142,7 @@ module 0x1::staking {
     public entry fun withdraw_unbonded(account: &signer) acquires ValidatorSet {
         let addr = signer::address_of(account);
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
-        let current_time = epoch::now_seconds();
+        let current_time = validator_set.current_epoch * 60;
         
         let len = vector::length(&validator_set.unbonding_queue);
         let i = 0;

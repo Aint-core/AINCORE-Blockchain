@@ -63,7 +63,9 @@ module 0x1::treasury {
             treasury.price_usd_cents = 100; // Fallback safety
         };
 
-        let ain_amount = (amount_usd_cents as u128 * 1000000000000000000) / (treasury.price_usd_cents as u128);
+        let amount_u128 = (amount_usd_cents as u128);
+        let price_u128 = (treasury.price_usd_cents as u128);
+        let ain_amount = (amount_u128 * 1000000000000000000) / price_u128;
         
         // Check reserve
         assert!(coin::value(&treasury.reserve) >= ain_amount, error::invalid_state(EINSUFFICIENT_FUNDS));

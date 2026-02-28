@@ -253,6 +253,8 @@ module my_addr::my_token {
             b"MTK",          // symbol
             8,               // decimals
             1000000000,      // initial_supply
+            b"https://ipfs.io/ipfs/QmHash...", // icon_url
+            b"https://myproject.com",         // project_url
         );
     }
     
@@ -565,6 +567,42 @@ curl -X POST http://localhost:8001/rpc \
 - [Move Language Book](https://move-language.github.io/move/)
 - [AINCORE Stdlib Source](../core/vm_move/stdlib/sources/)
 - [Sample Contracts](../examples/move/)
+
+---
+
+## Managing Token Assets (Images)
+
+Since blockchain storage is expensive, images (logos) are stored on IPFS.
+
+### 1. Upload Image to IPFS
+We provide a helper script in `aincore-js/upload_ipfs.ts`.
+
+**Prerequisites:**
+- Sign up at [Pinata](https://pinata.cloud) (Free Tier)
+- Get API Key & Secret
+
+```bash
+# Export API Keys
+export PINATA_API_KEY="your_api_key"
+export PINATA_SECRET_API_KEY="your_secret_key"
+
+# Upload
+npx ts-node aincore-js/upload_ipfs.ts ./my_logo.png
+```
+
+**Output:**
+```
+✅ Upload Successful!
+CID: QmXyZ...
+URL: https://gateway.pinata.cloud/ipfs/QmXyZ...
+```
+
+### 2. Use URL in Create Token
+Pass the resulting URL as `icon_url` (as bytes).
+
+```move
+token_factory::create_token(..., b"https://gateway.pinata.cloud/ipfs/QmXyZ...", ...);
+```
 
 ---
 

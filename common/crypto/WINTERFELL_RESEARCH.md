@@ -18,7 +18,7 @@
 
 ---
 
-## 🔍 Research Progress
+##  Research Progress
 
 ### Day 1: Initial Exploration
 - [/] Located winterfell source

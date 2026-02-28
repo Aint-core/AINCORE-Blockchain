@@ -199,6 +199,8 @@ export class Transaction {
         decimals: number,
         maxSupply: bigint,
         initialSupply: bigint,
+        iconUrl: string,
+        projectUrl: string,
         sequenceNumber: number = 0
     ): Transaction {
         if (decimals < 0 || decimals > 18) {
@@ -209,7 +211,7 @@ export class Transaction {
         }
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = `create_token:${name}:${symbol}:${decimals}:${maxSupply.toString()}:${initialSupply.toString()}`;
+        tx.payload = `create_token:${name}:${symbol}:${decimals}:${maxSupply.toString()}:${initialSupply.toString()}:${iconUrl}:${projectUrl}`;
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }

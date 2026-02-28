@@ -52,10 +52,7 @@ module 0x1::wbtc {
         let config = borrow_global_mut<BridgeConfig>(@0x1);
         assert!(bridge_addr == config.authority, error::permission_denied(ENOT_BRIDGE_AUTHORITY));
         
-        // Register recipient if not registered
-        if (!coin::balance<WBTC>(to) > 0) {
-            // User needs to register first, or we skip
-        };
+        // Note: Recipient must call register() first to hold wBTC
         
         // Mint wBTC
         let wbtc_coin = coin::mint<WBTC>(amount);

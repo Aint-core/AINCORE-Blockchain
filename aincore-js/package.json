@@ -14,10 +14,12 @@
   "dependencies": {
     "axios": "^1.13.2",
     "bip39": "^3.1.0",
+    "dotenv": "^17.2.4",
     "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
     "@types/bip39": "^2.4.2",
+    "@types/dotenv": "^6.1.1",
     "@types/node": "^24.10.1",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"

@@ -193,10 +193,14 @@ async fn main() {
     // === INISIALISASI MODUL INTI ===
     // Pass node_addr_hex as genesis address
     // Fix path to point to phase1-core-prototype/vm_move/stdlib/bytecode
-    let stdlib_path = if std::path::Path::new("phase1-core-prototype/vm_move/stdlib/bytecode").exists() {
-        "phase1-core-prototype/vm_move/stdlib/bytecode"
+    let stdlib_path = if std::path::Path::new("core/vm_move/stdlib/bytecode").exists() {
+        "core/vm_move/stdlib/bytecode"
+    } else if std::path::Path::new("vm_move/stdlib/bytecode").exists() {
+        "vm_move/stdlib/bytecode"
+    } else if std::path::Path::new("/root/.aincore/vm_move/stdlib/bytecode").exists() {
+        "/root/.aincore/vm_move/stdlib/bytecode" // Docker container path
     } else {
-        "vm_move/stdlib/bytecode" // Fallback if running from phase1 dir
+        "core/vm_move/stdlib/bytecode" // Default, will error with clear message if missing
     };
     // Initialize Genesis with error handling
     if let Err(e) = genesis::initialize_genesis(&storage, stdlib_path, &node_addr_hex) {
