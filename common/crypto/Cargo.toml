@@ -36,8 +36,8 @@ winterfell = "0.9"
 # Full STARK implementation in progress - Phase 1
 
 # Advanced Privacy (Phase 3)
-# FHE Implementation: ElGamal on BLS12-381 G1 (Built-in)
-tfhe = { version = "0.7", features = ["boolean", "shortint", "integer", "aarch64-unix"] }
+# FHE: ElGamal on BLS12-381 G1 (native implementation in mpc/mod.rs)
+# tfhe crate removed: unused in source and aarch64-specific
 
 # Randomness & Consensus (Phase 4)
 # VDF implementation - using simple hash-based approach
