@@ -75,11 +75,21 @@ async fn main() {
             }
         }
     } else {
-        eprintln!("❌ FATAL: 'node.key' not found in {}", datadir);
-        eprintln!("🔒 MAINNET SECURITY ENFORCEMENT:");
-        eprintln!("   Nodes MUST generate keys securely offline.");
-        eprintln!("   Use: `aincore-cli keygen --out {}`", key_path);
-        std::process::exit(1);
+        // Auto-generate key for testnet (key persists via Docker volume)
+        println!("⚠️  node.key not found in {} — generating new keypair...", datadir);
+        let mut csprng = rand::rngs::OsRng;
+        let new_key = SigningKey::generate(&mut csprng);
+        match std::fs::write(key_path, new_key.to_bytes()) {
+            Ok(_) => {
+                println!("✅ Generated new node key: {}", key_path);
+                println!("🔑 Public Key: {}", hex::encode(new_key.verifying_key().to_bytes()));
+            }
+            Err(e) => {
+                eprintln!("❌ FATAL: Failed to save generated key: {}", e);
+                std::process::exit(1);
+            }
+        }
+        new_key
     };
 
     let verifying_key = signing_key.verifying_key();
