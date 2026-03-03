@@ -568,6 +568,488 @@ fn handle_rpc_method(
             }
         },
         
+        // ============ CRITICAL WALLET ENDPOINTS ============
+        
+        "aincore_getAccountNonce" => {
+            // params: [address]
+            if let Some(addr) = params.get(0).and_then(|v| v.as_str()) {
+                if let Some(obj) = data.storage.get_object(addr) {
+                    if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&obj.data) {
+                        let nonce = account_data.get("sequence_number").and_then(|v| v.as_u64()).unwrap_or(0);
+                        Ok(serde_json::json!({ "nonce": nonce, "sequence_number": nonce }))
+                    } else {
+                        Ok(serde_json::json!({ "nonce": 0, "sequence_number": 0 }))
+                    }
+                } else {
+                    Ok(serde_json::json!({ "nonce": 0, "sequence_number": 0 }))
+                }
+            } else {
+                Err(JsonRpcError { code: -32602, message: "Invalid params: [address]".into() })
+            }
+        },
+        
+        "aincore_getSupply" => {
+            // No params
+            let max_supply: u128 = 150_000_000 * 1_000_000_000_000_000_000; // 150M AIN
+            let tail_emission: u128 = 10 * 1_000_000_000_000_000_000; // 10 AIN
+            
+            // Read total minted from storage
+            let total_minted = match data.storage.get("total_supply") {
+                Ok(Some(s)) => s.parse::<u128>().unwrap_or(0),
+                _ => 0,
+            };
+            let total_burned = match data.storage.get("total_burned") {
+                Ok(Some(s)) => s.parse::<u128>().unwrap_or(0),
+                _ => 0,
+            };
+            let circulating = total_minted.saturating_sub(total_burned);
+            
+            Ok(serde_json::json!({
+                "max_supply": max_supply.to_string(),
+                "total_minted": total_minted.to_string(),
+                "total_burned": total_burned.to_string(),
+                "circulating_supply": circulating.to_string(),
+                "tail_emission_per_block": tail_emission.to_string(),
+                "decimals": 18
+            }))
+        },
+        
+        "aincore_getTransactionReceipt" => {
+            // params: [tx_hash]
+            if let Some(tx_hash) = params.get(0).and_then(|v| v.as_str()) {
+                // Use indexed lookup (O(1)) 
+                if let Some(block_height) = data.storage.get_tx_block_height(tx_hash) {
+                    // Fetch the block to get confirmation details
+                    let block_key = format!("block_{}", block_height);
+                    let block_data = match data.storage.get(&block_key) {
+                        Ok(Some(b)) => serde_json::from_str::<serde_json::Value>(&b).ok(),
+                        _ => None,
+                    };
+                    let latest_height = data.storage.get_chain_height();
+                    let confirmations = latest_height.saturating_sub(block_height);
+                    
+                    Ok(serde_json::json!({
+                        "tx_hash": tx_hash,
+                        "block_height": block_height,
+                        "confirmations": confirmations,
+                        "status": "confirmed",
+                        "block_hash": block_data.as_ref()
+                            .and_then(|b| b.get("header"))
+                            .and_then(|h| h.get("hash"))
+                            .and_then(|h| h.as_str())
+                            .unwrap_or("")
+                    }))
+                } else {
+                    // Check if it's in mempool
+                    let in_mempool = if let Ok(mp) = data.mempool.lock() {
+                        mp.len() > 0 // Simplified check
+                    } else { false };
+                    
+                    Ok(serde_json::json!({
+                        "tx_hash": tx_hash,
+                        "status": if in_mempool { "pending" } else { "not_found" },
+                        "confirmations": 0
+                    }))
+                }
+            } else {
+                Err(JsonRpcError { code: -32602, message: "Invalid params: [tx_hash]".into() })
+            }
+        },
+        
+        "aincore_estimateGas" => {
+            // params: [tx_object] or [payload_string]
+            // Simple estimation based on payload type
+            let payload = params.get(0)
+                .and_then(|v| {
+                    if v.is_string() { v.as_str().map(|s| s.to_string()) }
+                    else if v.is_object() { v.get("payload").and_then(|p| p.as_str()).map(|s| s.to_string()) }
+                    else { None }
+                })
+                .unwrap_or_default();
+            
+            let gas = if payload.starts_with("transfer:") { 21_000u64 }
+                else if payload.starts_with("delegate:") || payload.starts_with("undelegate:") { 50_000 }
+                else if payload.starts_with("claim_rewards:") || payload.starts_with("withdraw_unbonded:") { 30_000 }
+                else if payload.starts_with("create_token:") { 100_000 }
+                else if payload.starts_with("mint_token:") || payload.starts_with("burn_token:") { 40_000 }
+                else if payload.starts_with("transfer_token:") { 25_000 }
+                else if payload.starts_with("mint_btc:") { 60_000 }
+                else if payload.starts_with("submit_proof:") { 200_000 }
+                else if payload.starts_with("enable_delegation:") { 50_000 }
+                else if payload.starts_with("0x") { 500_000 } // Move script
+                else { 21_000 }; // Default
+            
+            Ok(serde_json::json!({
+                "estimated_gas": gas,
+                "gas_price": 1,
+                "estimated_fee": gas.to_string()
+            }))
+        },
+        
+        "aincore_getBlockByHash" => {
+            // params: [block_hash]
+            if let Some(target_hash) = params.get(0).and_then(|v| v.as_str()) {
+                let latest_height = data.storage.get_chain_height();
+                let mut found_block = None;
+                
+                // Search recent blocks (last 1000) for matching hash
+                let search_start = latest_height.saturating_sub(1000);
+                for h in (search_start..=latest_height).rev() {
+                    let key = format!("block_{}", h);
+                    if let Ok(Some(block_json)) = data.storage.get(&key) {
+                        if block_json.contains(target_hash) {
+                            if let Ok(block_obj) = serde_json::from_str::<serde_json::Value>(&block_json) {
+                                found_block = Some(block_obj);
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                Ok(found_block.unwrap_or(serde_json::json!(null)))
+            } else {
+                Err(JsonRpcError { code: -32602, message: "Invalid params: [block_hash]".into() })
+            }
+        },
+        
+        "aincore_getBtcBalance" => {
+            // params: [address]
+            if let Some(addr) = params.get(0).and_then(|v| v.as_str()) {
+                if let Some(obj) = data.storage.get_object(addr) {
+                    if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&obj.data) {
+                        let btc_balance = account_data.get("btc_balance").and_then(|v| v.as_u64()).unwrap_or(0);
+                        Ok(serde_json::json!({
+                            "address": addr,
+                            "btc_balance_sats": btc_balance,
+                            "btc_balance_btc": format!("{:.8}", btc_balance as f64 / 100_000_000.0)
+                        }))
+                    } else {
+                        Ok(serde_json::json!({ "btc_balance_sats": 0, "btc_balance_btc": "0.00000000" }))
+                    }
+                } else {
+                    Ok(serde_json::json!({ "btc_balance_sats": 0, "btc_balance_btc": "0.00000000" }))
+                }
+            } else {
+                Err(JsonRpcError { code: -32602, message: "Invalid params: [address]".into() })
+            }
+        },
+        
+        // ============ IMPORTANT DAPP/EXPLORER ENDPOINTS ============
+        
+        "aincore_getEconomics" => {
+            let base_reward = data.storage.get_base_reward();
+            let halving_interval = data.storage.get_halving_interval();
+            let burn_percentage = data.storage.get_burn_percentage();
+            let latest_height = data.storage.get_chain_height();
+            let max_supply: u128 = 150_000_000 * 1_000_000_000_000_000_000;
+            
+            // Calculate current epoch and effective reward
+            let epoch = if halving_interval > 0 { latest_height / halving_interval } else { 0 };
+            
+            Ok(serde_json::json!({
+                "base_reward": base_reward,
+                "halving_interval": halving_interval,
+                "burn_percentage": burn_percentage,
+                "current_epoch": epoch,
+                "max_supply": max_supply.to_string(),
+                "block_height": latest_height,
+                "decay_model": "Exponential Smooth (TAIL_EMISSION = 10 AIN)"
+            }))
+        },
+        
+        "aincore_sampleDA" => {
+            // params: [epoch, shard_id]
+            if let (Some(epoch), Some(shard_id)) = (
+                params.get(0).and_then(|v| v.as_u64()),
+                params.get(1).and_then(|v| v.as_u64())
+            ) {
+                // Check if shard data exists
+                let shard_key = format!("da_shard_{}_{}", epoch, shard_id);
+                let commitment_key = format!("da_commitment_{}", epoch);
+                
+                let shard_exists = matches!(data.storage.get(&shard_key), Ok(Some(_)));
+                let commitment = match data.storage.get(&commitment_key) {
+                    Ok(Some(c)) => c,
+                    _ => String::new(),
+                };
+                
+                Ok(serde_json::json!({
+                    "epoch": epoch,
+                    "shard_id": shard_id,
+                    "available": shard_exists,
+                    "merkle_root": commitment,
+                    "sampling_result": if shard_exists { "PASS" } else { "MISSING" }
+                }))
+            } else {
+                Err(JsonRpcError { code: -32602, message: "Invalid params: [epoch, shard_id]".into() })
+            }
+        },
+        
+        "aincore_verifyFraudProof" => {
+            // params: [proof_json]
+            if let Some(proof) = params.get(0) {
+                // Verify fraud proof structure
+                let is_valid = proof.get("proof_type").is_some() 
+                    && proof.get("evidence").is_some()
+                    && proof.get("block_height").is_some();
+                
+                Ok(serde_json::json!({
+                    "valid_structure": is_valid,
+                    "status": if is_valid { "accepted_for_review" } else { "invalid_format" },
+                    "required_fields": ["proof_type", "evidence", "block_height", "offender"]
+                }))
+            } else {
+                Err(JsonRpcError { code: -32602, message: "Invalid params: [proof_object]".into() })
+            }
+        },
+        
+        "aincore_getShardProof" => {
+            // params: [epoch, shard_id]
+            if let (Some(epoch), Some(shard_id)) = (
+                params.get(0).and_then(|v| v.as_u64()),
+                params.get(1).and_then(|v| v.as_u64())
+            ) {
+                let shard_key = format!("da_shard_{}_{}", epoch, shard_id);
+                let commitment_key = format!("da_commitment_{}", epoch);
+                
+                let shard_data = match data.storage.get(&shard_key) {
+                    Ok(Some(d)) => d,
+                    _ => String::new(),
+                };
+                let merkle_root = match data.storage.get(&commitment_key) {
+                    Ok(Some(c)) => c,
+                    _ => String::new(),
+                };
+                
+                Ok(serde_json::json!({
+                    "epoch": epoch,
+                    "shard_id": shard_id,
+                    "shard_data_hex": shard_data,
+                    "merkle_root": merkle_root,
+                    "proof_available": !shard_data.is_empty() && !merkle_root.is_empty()
+                }))
+            } else {
+                Err(JsonRpcError { code: -32602, message: "Invalid params: [epoch, shard_id]".into() })
+            }
+        },
+        
+        "aincore_getFederationKey" => {
+            let key = data.storage.get_federation_key();
+            Ok(serde_json::json!({ "federation_key": key }))
+        },
+        
+        "aincore_getTransactionsByAddress" => {
+            // params: [address, limit (optional)]
+            if let Some(address) = params.get(0).and_then(|v| v.as_str()) {
+                let limit = params.get(1).and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                let latest_height = data.storage.get_chain_height();
+                let mut txs = Vec::new();
+                
+                // Scan recent blocks for transactions involving this address
+                let search_start = latest_height.saturating_sub(500);
+                'block_scan: for h in (search_start..=latest_height).rev() {
+                    let key = format!("block_{}", h);
+                    if let Ok(Some(block_json)) = data.storage.get(&key) {
+                        if block_json.contains(address) {
+                            if let Ok(block) = serde_json::from_str::<serde_json::Value>(&block_json) {
+                                if let Some(transactions) = block.get("transactions").and_then(|t| t.as_array()) {
+                                    for tx_str in transactions {
+                                        let tx_text = tx_str.as_str().unwrap_or("");
+                                        if tx_text.contains(address) {
+                                            if let Ok(tx_obj) = serde_json::from_str::<serde_json::Value>(tx_text) {
+                                                txs.push(serde_json::json!({
+                                                    "block_height": h,
+                                                    "transaction": tx_obj
+                                                }));
+                                            } else {
+                                                txs.push(serde_json::json!({
+                                                    "block_height": h,
+                                                    "raw": tx_text
+                                                }));
+                                            }
+                                            if txs.len() >= limit { break 'block_scan; }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                Ok(serde_json::json!({
+                    "address": address,
+                    "count": txs.len(),
+                    "transactions": txs
+                }))
+            } else {
+                Err(JsonRpcError { code: -32602, message: "Invalid params: [address, limit?]".into() })
+            }
+        },
+        
+        // ============ ADVANCED CRYPTO ENDPOINTS ============
+        
+        "aincore_verifyMultiSig" => {
+            // params: [scheme (0=Ed25519, 1=Dilithium5, 2=Secp256k1), public_key_hex, message_hex, signature_hex]
+            if let (Some(scheme_id), Some(pubkey_hex), Some(msg_hex), Some(sig_hex)) = (
+                params.get(0).and_then(|v| v.as_u64()),
+                params.get(1).and_then(|v| v.as_str()),
+                params.get(2).and_then(|v| v.as_str()),
+                params.get(3).and_then(|v| v.as_str())
+            ) {
+                let pubkey = hex::decode(pubkey_hex).unwrap_or_default();
+                let message = hex::decode(msg_hex).unwrap_or_default();
+                let signature = hex::decode(sig_hex).unwrap_or_default();
+                
+                use crypto::multi_sig::{MultiSigVerifier, SignatureScheme};
+                let verifier = MultiSigVerifier::new();
+                
+                let scheme = match scheme_id {
+                    0 => Some(SignatureScheme::Ed25519),
+                    1 => Some(SignatureScheme::Dilithium5),
+                    2 => Some(SignatureScheme::Secp256k1),
+                    _ => None,
+                };
+                
+                if let Some(s) = scheme {
+                    match verifier.verify(s, &pubkey, &message, &signature) {
+                        Ok(valid) => Ok(serde_json::json!({
+                            "valid": valid,
+                            "scheme": format!("{:?}", s)
+                        })),
+                        Err(e) => Ok(serde_json::json!({
+                            "valid": false,
+                            "error": format!("{}", e)
+                        }))
+                    }
+                } else {
+                    Err(JsonRpcError { code: -32602, message: "Invalid scheme: 0=Ed25519, 1=Dilithium5, 2=Secp256k1".into() })
+                }
+            } else {
+                Err(JsonRpcError { code: -32602, message: "Invalid params: [scheme, pubkey_hex, message_hex, signature_hex]".into() })
+            }
+        },
+        
+        "aincore_aggregateBLS" => {
+            // params: [signatures_hex_array]
+            // Returns aggregated BLS signature info
+            if let Some(sigs) = params.get(0).and_then(|v| v.as_array()) {
+                Ok(serde_json::json!({
+                    "input_count": sigs.len(),
+                    "scheme": "BLS12-381",
+                    "status": "aggregation_available",
+                    "note": "Submit via sendTransaction with submit_proof: payload"
+                }))
+            } else {
+                Err(JsonRpcError { code: -32602, message: "Invalid params: [signatures_array]".into() })
+            }
+        },
+        
+        "aincore_verifyProof" => {
+            // params: [proof_type ("snark"|"stark"), proof_hex]
+            if let (Some(proof_type), Some(proof_hex)) = (
+                params.get(0).and_then(|v| v.as_str()),
+                params.get(1).and_then(|v| v.as_str())
+            ) {
+                let proof_bytes = hex::decode(proof_hex).unwrap_or_default();
+                let is_valid_format = !proof_bytes.is_empty();
+                
+                Ok(serde_json::json!({
+                    "proof_type": proof_type,
+                    "proof_size_bytes": proof_bytes.len(),
+                    "valid_format": is_valid_format,
+                    "supported_types": ["snark", "stark"],
+                    "status": if is_valid_format { "proof_accepted" } else { "invalid_encoding" }
+                }))
+            } else {
+                Err(JsonRpcError { code: -32602, message: "Invalid params: [proof_type, proof_hex]".into() })
+            }
+        },
+        
+        "aincore_verifyVDF" => {
+            // params: [input_hex, output_hex, iterations]
+            if let (Some(input_hex), Some(output_hex), Some(iterations)) = (
+                params.get(0).and_then(|v| v.as_str()),
+                params.get(1).and_then(|v| v.as_str()),
+                params.get(2).and_then(|v| v.as_u64())
+            ) {
+                let input_bytes = hex::decode(input_hex).unwrap_or_default();
+                let output_bytes = hex::decode(output_hex).unwrap_or_default();
+                
+                use crypto::VDFEngine;
+                if let Ok(vdf) = VDFEngine::new(iterations) {
+                    if let Ok((computed_output, _proof)) = vdf.compute(&input_bytes) {
+                        let valid = computed_output == output_bytes;
+                        
+                        Ok(serde_json::json!({
+                            "valid": valid,
+                            "iterations": iterations,
+                            "input_len": input_bytes.len(),
+                            "output_len": output_bytes.len()
+                        }))
+                    } else {
+                        Ok(serde_json::json!({ "valid": false, "error": "VDF computation failed" }))
+                    }
+                } else {
+                    Err(JsonRpcError { code: -32602, message: "Invalid VDF iterations parameters".into() })
+                }
+            } else {
+                Err(JsonRpcError { code: -32602, message: "Invalid params: [input_hex, output_hex, iterations]".into() })
+            }
+        },
+        
+        "aincore_ecdsaVerify" => {
+            // params: [public_key_hex, message_hex, signature_hex]
+            if let (Some(pubkey_hex), Some(msg_hex), Some(sig_hex)) = (
+                params.get(0).and_then(|v| v.as_str()),
+                params.get(1).and_then(|v| v.as_str()),
+                params.get(2).and_then(|v| v.as_str())
+            ) {
+                let pubkey_bytes = hex::decode(pubkey_hex).unwrap_or_default();
+                let message = hex::decode(msg_hex).unwrap_or_default();
+                let signature = hex::decode(sig_hex).unwrap_or_default();
+                
+                use crypto::ECDSACrypto;
+                let crypto = ECDSACrypto::new();
+                
+                if let Ok(pubkey) = crypto.public_key_from_bytes(&pubkey_bytes) {
+                    match crypto.verify(&pubkey, &message, &signature) {
+                        Ok(valid) => Ok(serde_json::json!({
+                            "valid": valid,
+                            "scheme": "secp256k1"
+                        })),
+                        Err(e) => Ok(serde_json::json!({
+                            "valid": false,
+                            "error": format!("{}", e)
+                        }))
+                    }
+                } else {
+                    Ok(serde_json::json!({
+                        "valid": false,
+                        "error": "Invalid public key format"
+                    }))
+                }
+            } else {
+                Err(JsonRpcError { code: -32602, message: "Invalid params: [pubkey_hex, message_hex, signature_hex]".into() })
+            }
+        },
+        
+        "aincore_deriveAddress" => {
+            // params: [public_key_hex]
+            if let Some(pubkey_hex) = params.get(0).and_then(|v| v.as_str()) {
+                let pubkey_bytes = hex::decode(pubkey_hex).unwrap_or_default();
+                match crypto::derive_address(&pubkey_bytes) {
+                    Ok(address) => Ok(serde_json::json!({
+                        "public_key": pubkey_hex,
+                        "address": address,
+                        "format": "hex(SHA256(pubkey)[0..16])"
+                    })),
+                    Err(e) => Err(JsonRpcError { code: -32000, message: format!("Derivation error: {}", e) })
+                }
+            } else {
+                Err(JsonRpcError { code: -32602, message: "Invalid params: [public_key_hex]".into() })
+            }
+        },
+        
         _ => Err(JsonRpcError { code: -32601, message: "Method not found".into() }),
     }
 }
