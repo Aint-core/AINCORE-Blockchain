@@ -84,7 +84,7 @@ impl ChainSync {
             
             // 1. Establish Secure Connection (With MitM Check)
             match secure_connect(&peer_ip, *peer_port, &self.node_id, self.my_port, Some(peer_id)).await {
-                Ok((mut stream, shared_key)) => {
+                Ok((mut stream, shared_key, _peer_node_id)) => {
                     println!("🔐 Secure Channel Established with {}", peer_id);
                     
                     // 2. Request Chain Height

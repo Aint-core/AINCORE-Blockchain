@@ -244,7 +244,7 @@ impl DASequencer {
                 for (peer_id, port) in peers_snapshot.iter() {
                     let peer_ip = storage_clone.get_peer_ip(peer_id).unwrap_or("127.0.0.1".to_string());
                     match secure_connect(&peer_ip, *port, &node_id_clone, 0, None).await {
-                        Ok((mut stream, shared_key)) => {
+                        Ok((mut stream, shared_key, _peer_node_id)) => {
                             let _ = send_encrypted_msg(&mut stream, &shared_key, &full_msg).await;
                         }
                         Err(e) => eprintln!("❌ [DA] Connection failed: {}", e),
@@ -278,7 +278,7 @@ impl DASequencer {
             // Ephemeral encrypted connection for broadcast
             // Optimization: Maintain persistent connections in a ConnectionPool
             match secure_connect(&peer_ip, *port, &self.node_id, 0, Some(peer_id)).await {
-                Ok((mut stream, shared_key)) => {
+                Ok((mut stream, shared_key, _peer_node_id)) => {
                     if let Err(e) = send_encrypted_msg(&mut stream, &shared_key, &full_msg).await {
                         eprintln!("❌ [DA] Failed to send to {}: {}", peer_id, e);
                     } else {

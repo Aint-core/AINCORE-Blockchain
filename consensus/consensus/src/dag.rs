@@ -484,7 +484,12 @@ impl DagConsensus {
         // Fallback to peers list if staking not initialized or empty
         let mut validators = Vec::new();
         if let Ok(peers) = self.peers.lock() {
-            validators = peers.keys().cloned().collect();
+            // Only include peers with valid node IDs (32 hex chars = 16-byte address)
+            // This filters out "gossip_node", "__broadcast__", "verified_peer", etc.
+            validators = peers.keys()
+                .filter(|k| k.len() == 32 && k.chars().all(|c| c.is_ascii_hexdigit()))
+                .cloned()
+                .collect();
         }
         validators.push(self.node_id.clone());
         validators.sort();

@@ -133,13 +133,22 @@ where
                              if parts.len() >= 3 {
                                  let peer_id = parts[1].to_string();
                                  let peer_port = parts[2].trim().parse::<u16>().unwrap_or(0);
-                                 // Add peer...
-                                 peers_clone.lock().unwrap().insert(peer_id.clone(), peer_port);
-                                 let _ = db_clone.save_peer(&peer_id, peer_port);
                                  
-                                 // Reply Encrypted
+                                 // Reply first (always, even for broadcast connections)
                                  let reply = format!("WELCOME:{}:{}", node_id_clone, port);
                                  let _ = send_encrypted(&mut socket, &shared_key, &reply).await;
+                                 
+                                 // Skip broadcast-only connections (port 0 or internal identities)
+                                 if peer_id.starts_with("__") || peer_port == 0 {
+                                     continue; // Don't register as peer/validator
+                                 }
+                                 
+                                 // Add peer with actual remote IP from socket
+                                 let remote_ip = addr.ip().to_string();
+                                 peers_clone.lock().unwrap().insert(peer_id.clone(), peer_port);
+                                 let _ = db_clone.save_peer(&peer_id, peer_port);
+                                 let _ = db_clone.save_peer_ip(&peer_id, &remote_ip);
+                                 println!("🤝 Peer registered: {} ({}:{})", peer_id, remote_ip, peer_port);
                              }
                         } else {
                             handler_clone(msg);
@@ -182,7 +191,7 @@ pub async fn secure_connect(
     my_node_id: &str,
     my_port: u16,
     expected_peer_id: Option<&str>, // QUANTUM FIX: MitM Protection
-) -> Result<(tokio::net::TcpStream, [u8; 32]), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(tokio::net::TcpStream, [u8; 32], String), Box<dyn std::error::Error + Send + Sync>> {
     let peer_addr = format!("{}:{}", peer_ip, peer_port);
     let mut stream = tokio::net::TcpStream::connect(&peer_addr).await?;
 
@@ -222,18 +231,19 @@ pub async fn secure_connect(
         return Err("Invalid Handshake Response".into());
     }
 
+    // Extract peer node ID from WELCOME:NODE_ID:PORT
+    let parts: Vec<&str> = resp.split(':').collect();
+    let peer_node_id = if parts.len() >= 2 { parts[1].to_string() } else { "unknown".to_string() };
+
     // QUANTUM AUDIT VERIFICATION
     if let Some(expected) = expected_peer_id {
-        let parts: Vec<&str> = resp.split(':').collect();
-        if parts.len() < 2 { return Err("Malformed Welcome Message".into()); }
-        let server_id = parts[1];
-        if server_id != expected {
-             eprintln!("🚨 MitM DETECTED! Expected Node {}, Got {}", expected, server_id);
-             return Err(format!("Identity Mismatch! Expected {}, Got {}", expected, server_id).into());
+        if peer_node_id != expected {
+             eprintln!("🚨 MitM DETECTED! Expected Node {}, Got {}", expected, peer_node_id);
+             return Err(format!("Identity Mismatch! Expected {}, Got {}", expected, peer_node_id).into());
         }
     }
 
-    Ok((stream, shared))
+    Ok((stream, shared, peer_node_id))
 }
 
 // Keep synchronous handshake wrapper for backward compatibility if needed, 
@@ -252,16 +262,17 @@ pub fn handshake(
      std::thread::spawn(move || {
          let rt = tokio::runtime::Runtime::new().unwrap();
          rt.block_on(async move {
-             if let Ok((_stream, _shared)) = secure_connect(&peer_ip, peer_port, &node_id, my_port, None).await {
-                 println!("🔒 Encryption Handshake Verified with {}:{}", peer_ip, peer_port);
-                 // In a real persistent system, we would move `stream` to a loop here.
-                 // For now, satisfy the "Handshake works" requirement.
-                 if let Ok(mut p) = peers.lock() {
-                     p.insert("verified_peer".to_string(), peer_port);
+             match secure_connect(&peer_ip, peer_port, &node_id, my_port, None).await {
+                 Ok((_stream, _shared, peer_node_id)) => {
+                     println!("🔒 Encryption Handshake Verified with {}:{} (Node: {})", peer_ip, peer_port, peer_node_id);
+                     if let Ok(mut p) = peers.lock() {
+                         p.insert(peer_node_id.clone(), peer_port);
+                     }
+                     let _ = storage.save_peer_ip(&peer_node_id, &peer_ip);
                  }
-                 let _ = storage.save_peer_ip("verified_peer", &peer_ip);
-             } else {
-                 eprintln!("❌ Secure Handshake Failed with {}:{}", peer_ip, peer_port);
+                 Err(e) => {
+                     eprintln!("❌ Secure Handshake Failed with {}:{}: {}", peer_ip, peer_port, e);
+                 }
              }
          });
      });
@@ -321,8 +332,8 @@ pub fn send_message(addr: &str, msg: &str) -> std::io::Result<()> {
          if let Some((ip, p_str)) = addr.split_once(':') {
              if let Ok(port) = p_str.parse::<u16>() {
                  // Attempt secure connect with timeout
-                 if let Ok(res) = tokio::time::timeout(std::time::Duration::from_secs(3), secure_connect(ip, port, "gossip_node", 0, None)).await {
-                     if let Ok((mut stream, shared)) = res {
+                 if let Ok(res) = tokio::time::timeout(std::time::Duration::from_secs(3), secure_connect(ip, port, "__broadcast__", 0, None)).await {
+                     if let Ok((mut stream, shared, _peer_id)) = res {
                          let _ = send_encrypted_msg(&mut stream, &shared, &msg).await;
                      }
                  }
