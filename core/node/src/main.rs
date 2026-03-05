@@ -129,6 +129,11 @@ async fn main() {
         }
     }
 
+    if bootnodes.is_empty() {
+        println!("🌐 No bootnodes provided. Using default AINCORE public seed node...");
+        bootnodes.push("/dns4/seed.aincore.network/tcp/9000".to_string());
+    }
+
     // === NORMALIZE BOOTNODES ===
     let normalized_bootnodes: Vec<String> = bootnodes.iter().map(|s| {
         if s.starts_with("/") {

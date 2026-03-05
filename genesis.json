@@ -1,0 +1,17 @@
+{
+    "chain_id": "AINCORE-TESTNET-1",
+    "validators": [
+        {
+            "address": "9931cc77959bca374a9c2fedfb21310d",
+            "public_key": "9931cc77959bca374a9c2fedfb21310d",
+            "stake": "500000000000000000000000"
+        },
+        {
+            "address": "4a18d1a129996d9a0d8ea4facbfa12b1",
+            "public_key": "4a18d1a129996d9a0d8ea4facbfa12b1",
+            "stake": "500000000000000000000000"
+        }
+    ],
+    "treasury_reserve": "50000000000000000000000",
+    "epoch_duration": 10
+}

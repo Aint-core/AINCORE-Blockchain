@@ -465,36 +465,34 @@ impl DagConsensus {
     }
 
     pub fn get_validator_set(&self) -> Vec<String> {
-        // Key for ValidatorSet at 0x1
-        // Address: 0000000000000000000000000000000000000000000000000000000000000001
-        // StructTag: 0x1::staking::ValidatorSet
-        let key = "resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::staking::ValidatorSet";
+        // 1. FAST PATH: Native Consensus State sync'd from Move VM (sys:validators)
+        if let Ok(Some(json)) = self.storage.get("sys:validators") {
+            if let Ok(vals) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
+                let mut validators: Vec<String> = vals.into_iter().map(|(addr, _)| addr).collect();
+                validators.sort();
+                validators.dedup();
+                return validators;
+            }
+        }
         
+        // 2. SLOW PATH: Read BCS ValidatorSet Resource directly
+        let key = "resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::staking::ValidatorSet";
         if let Ok(Some(bytes_hex)) = self.storage.get(key) {
             if let Ok(bytes) = hex::decode(bytes_hex) {
                 if let Ok(val_set) = bcs::from_bytes::<ValidatorSet>(&bytes) {
-                    // Convert addresses to strings (hex without 0x)
-                    return val_set.validators.iter()
+                    let mut validators: Vec<String> = val_set.validators.iter()
                         .map(|v| v.validator_addr.to_string()) 
                         .collect();
+                    validators.sort();
+                    validators.dedup();
+                    return validators;
                 }
             }
         }
         
-        // Fallback to peers list if staking not initialized or empty
-        let mut validators = Vec::new();
-        if let Ok(peers) = self.peers.lock() {
-            // Only include peers with valid node IDs (32 hex chars = 16-byte address)
-            // This filters out "gossip_node", "__broadcast__", "verified_peer", etc.
-            validators = peers.keys()
-                .filter(|k| k.len() == 32 && k.chars().all(|c| c.is_ascii_hexdigit()))
-                .cloned()
-                .collect();
-        }
-        validators.push(self.node_id.clone());
-        validators.sort();
-        validators.dedup();
-        validators
+        // STRICT ENFORCEMENT: No fallback to P2P peer list!
+        // If staking is completely missing and we aren't Genesis, we must not mine.
+        Vec::new()
     }
 }
 

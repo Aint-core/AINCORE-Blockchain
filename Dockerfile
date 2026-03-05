@@ -33,6 +33,9 @@ COPY --from=builder /usr/src/aincore/target/release/indexer /usr/local/bin/index
 RUN mkdir -p /root/.aincore/vm_move/stdlib/bytecode
 COPY --from=builder /usr/src/aincore/core/vm_move/stdlib/bytecode /root/.aincore/vm_move/stdlib/bytecode
 
+# Copy the Genesis configuration
+COPY --from=builder /usr/src/aincore/genesis.json /root/.aincore/genesis.json
+
 # Expose P2P, API, and Indexer ports
 EXPOSE 9002 8002 3001
 

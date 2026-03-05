@@ -26,6 +26,21 @@ impl Default for Mempool {
 
 impl Mempool {
     pub fn add_transaction(&mut self, tx: String) {
+        // === CHAIN ID VALIDATION ===
+        let expected_chain = std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-TESTNET-1".to_string());
+        
+        // Parse the transaction to enforce Chain ID early
+        use executor::Transaction;
+        if let Ok(parsed_tx) = serde_json::from_str::<Transaction>(&tx) {
+            if parsed_tx.chain_id != expected_chain {
+                println!("❌ [Mempool] Rejected tx: Invalid Chain ID (Expected {}, Got {})", expected_chain, parsed_tx.chain_id);
+                return;
+            }
+        } else {
+             println!("❌ [Mempool] Rejected tx: Invalid JSON format");
+             return;
+        }
+
         // Calculate Hash for Deduplication
         let mut hasher = Sha256::new();
         hasher.update(tx.as_bytes());

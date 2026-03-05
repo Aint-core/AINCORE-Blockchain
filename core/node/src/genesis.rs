@@ -129,35 +129,87 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
             current_epoch: u64, // Added current_epoch
         }
 
-        // === GENESIS CEREMONY: SINGLE BOOTSTRAP VALIDATOR ===
-        // Use the address provided via CLI (e.g., from 'node.key')
-        let genesis_validators = vec![
-            (genesis_addr_hex.to_string(), genesis_addr_hex.to_string()),
-        ];
+        // === GENESIS CEREMONY ===
+        // Using genesis.json if present, fallback to local single node if not.
+        #[derive(serde::Deserialize)]
+        struct GenesisValidatorConfig {
+            address: String,
+            public_key: String,
+            stake: String,
+        }
 
+        #[derive(serde::Deserialize)]
+        struct GenesisFile {
+            #[allow(dead_code)]
+            chain_id: String,
+            validators: Vec<GenesisValidatorConfig>,
+            treasury_reserve: String,
+            epoch_duration: u64,
+        }
+
+        let genesis_paths = ["genesis.json", "/usr/src/aincore/genesis.json", "/root/.aincore/genesis.json", "../genesis.json", "../../genesis.json"];
+        let mut loaded_genesis = None;
+        for path in &genesis_paths {
+            if let Ok(contents) = fs::read_to_string(path) {
+                if let Ok(config) = serde_json::from_str::<GenesisFile>(&contents) {
+                    println!("📄 Loaded genesis config from {}", path);
+                    loaded_genesis = Some(config);
+                    break;
+                }
+            }
+        }
+
+        let mut genesis_validators = Vec::new();
         let mut validator_configs = Vec::new();
-        // Bootstrap stake: 1 Million AIN (1,000,000 * 10^18)
-        let bootstrap_stake_per_node: u128 = 1_000_000_000_000_000_000_000_000; 
-        let total_bootstrap_stake = bootstrap_stake_per_node * genesis_validators.len() as u128;
+        let mut total_bootstrap_stake: u128 = 0;
+        let treasury_reserve_amount: u128;
+        let genesis_epoch_duration: u64;
 
-        for (addr_hex, pubkey_hex) in &genesis_validators {
-            // Create Account for Validator
-            let acc = AccountManager::create_account(addr_hex.to_string(), pubkey_hex.to_string());
-            // Balance is 0 (Stake is locked in ValidatorSet)
-            storage.put_object(&acc)?;
-            println!("👤 Created Genesis Validator Account: {}", addr_hex);
+        if let Some(config) = loaded_genesis {
+            treasury_reserve_amount = config.treasury_reserve.parse().unwrap_or(50_000 * 1_000_000_000_000_000_000);
+            genesis_epoch_duration = config.epoch_duration;
+            for val in config.validators {
+                let stake = val.stake.parse().unwrap_or(500_000 * 1_000_000_000_000_000_000);
+                genesis_validators.push((val.address.clone(), val.public_key.clone()));
+                total_bootstrap_stake += stake;
+                
+                let bytes = hex::decode(&val.address)?;
+                let mut addr_array = [0u8; move_core_types::account_address::AccountAddress::LENGTH];
+                addr_array.copy_from_slice(&bytes);
+                let account_addr = move_core_types::account_address::AccountAddress::new(addr_array);
 
-            // Create Config (Move Resource)
-            let bytes = hex::decode(addr_hex)?;
+                validator_configs.push(ValidatorConfig {
+                    validator_addr: account_addr,
+                    stake: Coin { value: stake },
+                    public_key: hex::decode(&val.public_key).unwrap_or_default(),
+                });
+                
+                let acc = AccountManager::create_account(val.address.clone(), val.public_key.clone());
+                storage.put_object(&acc)?;
+                println!("👤 Created Genesis Validator Account: {} (Stake: {})", val.address, stake);
+            }
+        } else {
+            println!("⚠️ genesis.json not found! Falling back to single-node bootstrap using local key.");
+            genesis_validators.push((genesis_addr_hex.to_string(), genesis_addr_hex.to_string()));
+            let stake = 1_000_000 * 1_000_000_000_000_000_000_000_000;
+            total_bootstrap_stake = stake;
+            treasury_reserve_amount = 50_000 * 1_000_000_000_000_000_000;
+            genesis_epoch_duration = 10;
+            
+            let bytes = hex::decode(genesis_addr_hex)?;
             let mut addr_array = [0u8; move_core_types::account_address::AccountAddress::LENGTH];
             addr_array.copy_from_slice(&bytes);
             let account_addr = move_core_types::account_address::AccountAddress::new(addr_array);
 
             validator_configs.push(ValidatorConfig {
                 validator_addr: account_addr,
-                stake: Coin { value: bootstrap_stake_per_node },
-                public_key: hex::decode(pubkey_hex).unwrap_or_default(),
+                stake: Coin { value: stake },
+                public_key: hex::decode(genesis_addr_hex).unwrap_or_default(),
             });
+            
+            let acc = AccountManager::create_account(genesis_addr_hex.to_string(), genesis_addr_hex.to_string());
+            storage.put_object(&acc)?;
+            println!("👤 Created Genesis Validator Account: {}", genesis_addr_hex);
         }
         
         // === SYNC NATIVE CONSENSUS STATE (CRITICAL FIX) ===
@@ -198,14 +250,14 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
         let epoch = Epoch {
             epoch_number: 0,
             epoch_start_time: 0,
-            epoch_duration: 10,
+            epoch_duration: genesis_epoch_duration,
         };
         // Key: resource_..._0x1::epoch::Epoch
         let epoch_key = "resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::epoch::Epoch";
         let epoch_bytes = bcs::to_bytes(&epoch)
             ?;
         storage.put(epoch_key, &hex::encode(epoch_bytes))?;
-        println!("⏳ Initialized Genesis Epoch (0)");
+        println!("⏳ Initialized Genesis Epoch (0) with duration {}s", genesis_epoch_duration);
 
         // === Initialize Governance ===
         #[derive(serde::Serialize)]
@@ -317,7 +369,7 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
         }
         
         let treasury = Treasury {
-            reserve: Coin { value: 0 }, // 0 AIN (Funded by Miners manually)
+            reserve: Coin { value: treasury_reserve_amount }, // Funded by Genesis File or Fallback
             total_sold: 0,
             price_usd_cents: 100, // $1.00 Start Price
         };
