@@ -110,7 +110,9 @@ where
                 }
                 
                 let mut encrypted_msg = vec![0u8; msg_len];
-                if tokio::time::timeout(std::time::Duration::from_secs(30), socket.read_exact(&mut encrypted_msg)).await.is_err() { 
+                // Increase timeout for payload read to 120s to ensure we don't drop large blocks mid-transfer over WAN
+                if tokio::time::timeout(std::time::Duration::from_secs(120), socket.read_exact(&mut encrypted_msg)).await.is_err() { 
+                     eprintln!("⚠️ Timeout reading payload from {}", addr);
                      break; 
                 }
                 
