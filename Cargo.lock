@@ -1953,6 +1953,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "derive_keys"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+]
+
+[[package]]
 name = "derive_more"
 version = "0.99.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4548,6 +4556,7 @@ dependencies = [
  "executor",
  "hex",
  "network",
+ "serde_json",
  "sha2 0.10.9",
 ]
 

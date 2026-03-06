@@ -37,7 +37,7 @@ members = [
     
     # --- Tools ---
     "indexer",
-    "bench-tps",
+    "bench-tps", "utils/derive_keys",
 ]
 
 resolver = "2"

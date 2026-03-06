@@ -16,6 +16,7 @@ logs/
 
 # Node Data (RocksDB)
 data/
+data_*/
 aincore_data/
 testnet_data/
 *.db
