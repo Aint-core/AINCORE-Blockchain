@@ -164,7 +164,7 @@ async fn main() {
     }
     
     // === INISIALISASI P2P NETWORK (Start early to bind port) ===
-    let (_p2p_tx, mut p2p_rx) = match start_p2p(normalized_bootnodes.clone(), Arc::clone(&storage), enable_mdns, enable_nat).await {
+    let (_p2p_tx, mut p2p_rx) = match start_p2p(port, normalized_bootnodes.clone(), Arc::clone(&storage), enable_mdns, enable_nat).await {
         Ok((tx, rx)) => {
             println!("🌐 P2P gossip network started (libp2p running in background)");
             (tx, rx)

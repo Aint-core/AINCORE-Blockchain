@@ -27,7 +27,7 @@ use libp2p::swarm::behaviour::toggle::Toggle;
 
 // === START P2P ===
 // Returns: (Sender to broadcast, Receiver for incoming messages)
-pub async fn start_p2p(bootnodes: Vec<String>, storage: Arc<StateDB>, enable_mdns: bool, enable_nat: bool) -> Result<(mpsc::Sender<String>, mpsc::Receiver<String>), Box<dyn Error>> {
+pub async fn start_p2p(port: u16, bootnodes: Vec<String>, storage: Arc<StateDB>, enable_mdns: bool, enable_nat: bool) -> Result<(mpsc::Sender<String>, mpsc::Receiver<String>), Box<dyn Error>> {
     let (tx_out, mut rx_in) = mpsc::channel::<String>(64); // Main -> P2P
     let (tx_in, rx_out) = mpsc::channel::<String>(64);     // P2P -> Main
 
@@ -152,8 +152,9 @@ pub async fn start_p2p(bootnodes: Vec<String>, storage: Arc<StateDB>, enable_mdn
         }
     }
 
-    // === Listen on local random port ===
-    let addr: Multiaddr = "/ip4/0.0.0.0/tcp/0".parse()?;
+    // === Listen on configured libp2p port (port + 100 to avoid conflict with legacy TCP) ===
+    let libp2p_port = port + 100;
+    let addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", libp2p_port).parse()?;
     Swarm::listen_on(&mut swarm, addr)?;
 
     // === LiDAR DDoS Protection ===
