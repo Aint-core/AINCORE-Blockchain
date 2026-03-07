@@ -158,13 +158,31 @@ async fn main() {
         }
     }).collect();
     
-    println!("🕸️  Kademlia DHT: Feeding {} bootnodes to Routing Table", normalized_bootnodes.len());
-    if !normalized_bootnodes.is_empty() {
-         println!("   - Example: {}", normalized_bootnodes[0]);
+    // === LIBP2P BOOTNODES (Port + 100) ===
+    let libp2p_bootnodes: Vec<String> = normalized_bootnodes.iter().map(|s| {
+        let parts: Vec<&str> = s.split('/').collect();
+        if parts.len() >= 5 && parts[3] == "tcp" {
+            if let Ok(p) = parts[4].parse::<u16>() {
+                let new_port = p + 100;
+                let mut new_parts = parts.clone();
+                let port_str = new_port.to_string();
+                new_parts[4] = &port_str;
+                return new_parts.join("/");
+            }
+        }
+        s.clone()
+    }).collect();
+
+    println!("🕸️  Kademlia DHT: Feeding {} bootnodes to Routing Table", libp2p_bootnodes.len());
+    if !libp2p_bootnodes.is_empty() {
+         println!("   - Example Libp2p: {}", libp2p_bootnodes[0]);
+         if let Some(first_legacy) = normalized_bootnodes.first() {
+             println!("   - Example Legacy: {}", first_legacy);
+         }
     }
     
     // === INISIALISASI P2P NETWORK (Start early to bind port) ===
-    let (_p2p_tx, mut p2p_rx) = match start_p2p(port, normalized_bootnodes.clone(), Arc::clone(&storage), enable_mdns, enable_nat).await {
+    let (_p2p_tx, mut p2p_rx) = match start_p2p(port, libp2p_bootnodes, Arc::clone(&storage), enable_mdns, enable_nat).await {
         Ok((tx, rx)) => {
             println!("🌐 P2P gossip network started (libp2p running in background)");
             (tx, rx)
