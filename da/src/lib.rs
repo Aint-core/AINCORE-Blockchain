@@ -206,52 +206,31 @@ impl DASequencer {
             batches.insert(self.epoch, batch.clone());
         }
 
-        // Broadcast to peers via Encrypted P2P (Spawned)
+        // Broadcast to peers using the highly optimized GOSSIP_RUNTIME in network module
         let batch_clone = batch.clone();
-        let node_id_clone = self.node_id.clone();
         let peers_clone = self.peers.clone();
         let storage_clone = self.storage.clone();
         
-        std::thread::spawn(move || {
-             let rt = match tokio::runtime::Runtime::new() {
-                 Ok(r) => r,
-                 Err(e) => {
-                     eprintln!("❌ [DA] FAILED TO START RUNTIME: {}", e);
-                     return;
-                 }
-             };
-             rt.block_on(async move {
-                 // Reconstruct a temporary sequencer context or just call logic directly
-                 // We can't call self.broadcast_batch because 'self' is not Send/Sync safely here across thread boundary 
-                 // without Arc.
-                 // We replicate broadcast logic or simple helper. 
-                 // Implementing "broadcast_batch_static" or similar.
-                 
-                let peers_snapshot = if let Ok(peers) = peers_clone.lock() {
-                    peers.clone()
-                } else {
-                    HashMap::new()
-                };
-                
-                let msg = match serde_json::to_string(&batch_clone) {
-                    Ok(m) => m,
-                    Err(_) => return,
-                };
-                let full_msg = format!("DA_COMMIT:{}", msg);
+        let msg = match serde_json::to_string(&batch_clone) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let full_msg = format!("DA_COMMIT:{}", msg);
 
-                println!("📡 [DA Sequencer] Broadcasting batch to {} peers...", peers_snapshot.len());
+        let peers_snapshot = if let Ok(peers) = peers_clone.lock() {
+            peers.clone()
+        } else {
+            HashMap::new()
+        };
 
-                for (peer_id, port) in peers_snapshot.iter() {
-                    let peer_ip = storage_clone.get_peer_ip(peer_id).unwrap_or("127.0.0.1".to_string());
-                    match secure_connect(&peer_ip, *port, &node_id_clone, 0, None).await {
-                        Ok((mut stream, shared_key, _peer_node_id)) => {
-                            let _ = send_encrypted_msg(&mut stream, &shared_key, &full_msg).await;
-                        }
-                        Err(e) => eprintln!("❌ [DA] Connection failed: {}", e),
-                    }
-                }
-             });
-        });
+        if !peers_snapshot.is_empty() {
+             println!("📡 [DA Sequencer] Broadcasting batch to {} peers...", peers_snapshot.len());
+             for (peer_id, port) in peers_snapshot.iter() {
+                 let peer_ip = storage_clone.get_peer_ip(peer_id).unwrap_or_else(|| "127.0.0.1".to_string());
+                 let addr = format!("{}:{}", peer_ip, port);
+                 let _ = network::send_message(&addr, &full_msg);
+             }
+        }
     }
 
     /// Broadcast DA batch ke seluruh peers using Encrypted Transport

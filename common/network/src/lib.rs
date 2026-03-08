@@ -261,22 +261,19 @@ pub fn handshake(
      let node_id = node_id.to_string();
      let peer_ip = peer_ip.to_string();
      
-     std::thread::spawn(move || {
-         let rt = tokio::runtime::Runtime::new().unwrap();
-         rt.block_on(async move {
-             match secure_connect(&peer_ip, peer_port, &node_id, my_port, None).await {
-                 Ok((_stream, _shared, peer_node_id)) => {
-                     println!("🔒 Encryption Handshake Verified with {}:{} (Node: {})", peer_ip, peer_port, peer_node_id);
-                     if let Ok(mut p) = peers.lock() {
-                         p.insert(peer_node_id.clone(), peer_port);
-                     }
-                     let _ = storage.save_peer_ip(&peer_node_id, &peer_ip);
+     GOSSIP_RUNTIME.spawn(async move {
+         match secure_connect(&peer_ip, peer_port, &node_id, my_port, None).await {
+             Ok((_stream, _shared, peer_node_id)) => {
+                 println!("🔒 Encryption Handshake Verified with {}:{} (Node: {})", peer_ip, peer_port, peer_node_id);
+                 if let Ok(mut p) = peers.lock() {
+                     p.insert(peer_node_id.clone(), peer_port);
                  }
-                 Err(e) => {
-                     eprintln!("❌ Secure Handshake Failed with {}:{}: {}", peer_ip, peer_port, e);
-                 }
+                 let _ = storage.save_peer_ip(&peer_node_id, &peer_ip);
              }
-         });
+             Err(e) => {
+                 eprintln!("❌ Secure Handshake Failed with {}:{}: {}", peer_ip, peer_port, e);
+             }
+         }
      });
 }
 
