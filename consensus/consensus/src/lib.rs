@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::thread;
+// std::thread no longer needed - broadcast uses network::send_message (bounded GOSSIP_RUNTIME)
 use serde::{Deserialize, Serialize};
 use storage::StateDB;
 use mempool::Mempool;
@@ -377,15 +377,14 @@ impl SimpleConsensus {
                 return;
             }
         };
-        for (_peer_id, port) in peers.iter() {
-             let msg_clone = message.to_string();
-             let port_clone = *port;
-             thread::spawn(move || {
-                 if let Ok(mut stream) = std::net::TcpStream::connect(format!("127.0.0.1:{}", port_clone)) {
-                     use std::io::Write;
-                     let _ = stream.write_all(msg_clone.as_bytes());
-                 }
-             });
+        for (peer_id, port) in peers.iter() {
+             // Look up peer IP from storage, fallback to 127.0.0.1 for local
+             let peer_ip = self.db.get_peer_ip(peer_id).unwrap_or_else(|| "127.0.0.1".to_string());
+             let addr = format!("{}:{}", peer_ip, port);
+             // Use network::send_message which routes through the bounded GOSSIP_RUNTIME
+             // and performs proper encrypted DH handshake (fixes both thread exhaustion
+             // and Decryption Failed errors from sending raw unencrypted TCP)
+             let _ = network::send_message(&addr, message);
         }
     }
     
