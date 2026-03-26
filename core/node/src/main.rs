@@ -423,22 +423,21 @@ async fn main() {
                 }
                 
                 // 2. Reconnect to Saved Peers (from Storage)
-                let saved_peers = storage_clone_reconnect.scan_peer_addrs();
-                for (_pid, addr_str) in saved_peers {
-                    let parts: Vec<&str> = addr_str.split(':').collect();
-                    if parts.len() == 2 {
-                        let ip = parts[0];
-                        let p = parts[1].parse::<u16>().unwrap_or(0);
-                        if p != 0 && p != my_port {
-                            network::handshake(
-                                 &node_id_reconnect,
-                                 ip,
-                                 p,
-                                 my_port,
-                                 Arc::clone(&peers_clone_reconnect),
-                                 Arc::clone(&storage_clone_reconnect)
-                             );
-                        }
+                // FIXED: Use scan_peers() which stores valid (peer_id, port) pairs,
+                // NOT scan_peer_addrs() which stores libp2p multiaddrs with ephemeral ports
+                let saved_peers = storage_clone_reconnect.scan_peers();
+                for (peer_id, peer_port) in saved_peers {
+                    if peer_port != 0 && peer_port != my_port {
+                        let ip = storage_clone_reconnect.get_peer_ip(&peer_id)
+                            .unwrap_or_else(|| "127.0.0.1".to_string());
+                        network::handshake(
+                             &node_id_reconnect,
+                             &ip,
+                             peer_port,
+                             my_port,
+                             Arc::clone(&peers_clone_reconnect),
+                             Arc::clone(&storage_clone_reconnect)
+                         );
                     }
                 }
             }
