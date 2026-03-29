@@ -11,6 +11,14 @@ pub struct MerkleTree {
 impl MerkleTree {
     /// Build Merkle tree from shard hashes
     pub fn new(shards: &[Vec<u8>]) -> Self {
+        if shards.is_empty() {
+            return Self {
+                leaves: vec![],
+                root: [0u8; 32],
+                levels: vec![],
+            };
+        }
+
         // Hash each shard to create leaves
         let leaves: Vec<[u8; 32]> = shards
             .iter()

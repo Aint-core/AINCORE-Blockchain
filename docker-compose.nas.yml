@@ -1,0 +1,113 @@
+# ============================================================
+# AINCORE Blockchain — TerraMaster F2-423 NAS Deployment
+# ============================================================
+# Hardware: Intel Celeron N4505 (2C/2T), 4GB DDR4, 2x SATA Bay
+# 
+# Usage:
+#   docker compose -f docker-compose.nas.yml up -d --build
+#   docker compose -f docker-compose.nas.yml logs -f aincore-node
+#   docker compose -f docker-compose.nas.yml down
+# ============================================================
+
+services:
+  # ──────────────────────────────────────────────
+  # Core Validator Node
+  # ──────────────────────────────────────────────
+  aincore-node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aincore:latest
+    container_name: aincore-validator
+    restart: unless-stopped
+    ports:
+      - "9002:9002"   # P2P Consensus
+      - "8002:8002"   # REST API / RPC
+    volumes:
+      - aincore-data:/root/.aincore/data
+      - ./genesis.json:/root/.aincore/genesis.json:ro
+    environment:
+      - AINCORE_PORT=9002
+      - AINCORE_API_PORT=8002
+      - AINCORE_PEERS=
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    command: ["node", "--port", "9002"]
+    # NAS Resource Limits (F2-423: 2 cores, 4GB RAM)
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"        # Leave 0.5 core for TOS + system
+          memory: 2560M      # 2.5GB — leave 1.5GB for TOS/indexer/OS
+        reservations:
+          cpus: "1.0"
+          memory: 1024M
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8002/health", "||", "exit", "1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    networks:
+      - aincore-net
+
+  # ──────────────────────────────────────────────
+  # Indexer (Block Explorer Backend)
+  # ──────────────────────────────────────────────
+  aincore-indexer:
+    image: aincore:latest
+    container_name: aincore-indexer
+    restart: unless-stopped
+    command: ["indexer"]
+    environment:
+      - NODE_RPC_URL=http://aincore-node:8002/rpc
+      - RUST_LOG=info
+    ports:
+      - "3001:3001"   # Indexer API
+    depends_on:
+      aincore-node:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    networks:
+      - aincore-net
+
+  # ──────────────────────────────────────────────
+  # Watchtower (Auto-update containers)
+  # ──────────────────────────────────────────────
+  watchtower:
+    image: containrrr/watchtower
+    container_name: aincore-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=86400    # Check daily
+      - WATCHTOWER_LABEL_ENABLE=false
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 64M
+
+volumes:
+  aincore-data:
+    driver: local
+
+networks:
+  aincore-net:
+    driver: bridge

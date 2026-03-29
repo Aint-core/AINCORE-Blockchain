@@ -108,7 +108,13 @@ impl ChainSync {
                                          sender_id: self.node_id.clone(),
                                          sender_port: self.my_port,
                                      };
-                                     let req_json = serde_json::to_string(&sync_req).unwrap();
+                                     let req_json = match serde_json::to_string(&sync_req) {
+                                         Ok(j) => j,
+                                         Err(e) => {
+                                             eprintln!("❌ [ChainSync] Failed to serialize sync request: {}", e);
+                                             continue;
+                                         }
+                                     };
                                      let msg = format!("SYNC_REQ:{}", req_json);
                                      
                                      if send_encrypted_msg(&mut stream, &shared_key, &msg).await.is_err() { continue; }

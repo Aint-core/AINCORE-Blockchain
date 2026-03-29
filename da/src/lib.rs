@@ -347,10 +347,15 @@ impl DASequencer {
             .map_err(|_| "Storage error")?
             .ok_or("Epoch metadata not found")?;
         
-        let shard_count: usize = serde_json::from_str::<serde_json::Value>(&meta)
+        let mut shard_count: usize = serde_json::from_str::<serde_json::Value>(&meta)
             .ok()
             .and_then(|v| v["shards"].as_u64())
             .unwrap_or(32) as usize;
+            
+        // CRITICAL FIX: Cap shard_count to prevent OOM DoS allocation attacks
+        if shard_count > 128 {
+            shard_count = 128;
+        }
         
         // 2. Load shards from storage
         for i in 0..shard_count {

@@ -3,6 +3,8 @@ module 0x1::governance {
     use std::vector;
     use std::error;
     use 0x1::epoch;
+    use 0x1::coin;
+    use 0x1::staking::AincoreCoin;
 
     /// Error codes
     const EPROPOSAL_NOT_FOUND: u64 = 1;
@@ -14,8 +16,8 @@ module 0x1::governance {
         id: u64,
         proposer: address,
         description: vector<u8>,
-        votes_for: u64,
-        votes_against: u64,
+        votes_for: u128, // CRITICAL FIX: Upgrade to u128 (u64 maxes out at 18.4 AIN!)
+        votes_against: u128,
         executed: bool,
         action_type: u8, // 1 = Change Epoch Duration
         action_value: u64, // New duration
@@ -41,6 +43,13 @@ module 0x1::governance {
         action_value: u64
     ) acquires GovernanceState {
         let addr = signer::address_of(account);
+        
+        // --- PHASE 8 SECURITY: BURN 10,000 AIN PROPOSAL FEE ---
+        // 10,000 AIN represented in 18 decimals
+        let fee_amount: u128 = 10000000000000000000000; 
+        let fee_coins = coin::withdraw<AincoreCoin>(account, fee_amount);
+        coin::burn(fee_coins); // Permanently destroy the fee to prevent spam
+
         let state = borrow_global_mut<GovernanceState>(@0x1);
         
         let proposal = Proposal {
@@ -65,6 +74,11 @@ module 0x1::governance {
         agree: bool
     ) acquires GovernanceState {
         let addr = signer::address_of(account);
+        
+        // Fetch Voter's Balance (Voting Weight)
+        let weight = (coin::balance<AincoreCoin>(addr) as u128); 
+        assert!(weight > 0, error::invalid_argument(EINSUFFICIENT_VOTES));
+
         let state = borrow_global_mut<GovernanceState>(@0x1);
         
         // Find proposal
@@ -84,11 +98,11 @@ module 0x1::governance {
                     j = j + 1;
                 };
 
-                // Add vote (1 vote per person for prototype)
+                // Add vote weight (1 token = 1 vote representation)
                 if (agree) {
-                    p.votes_for = p.votes_for + 1;
+                    p.votes_for = p.votes_for + weight;
                 } else {
-                    p.votes_against = p.votes_against + 1;
+                    p.votes_against = p.votes_against + weight;
                 };
                 vector::push_back(&mut p.voters, addr);
                 return
@@ -107,8 +121,12 @@ module 0x1::governance {
             if (p.id == proposal_id) {
                 assert!(!p.executed, error::invalid_state(EPROPOSAL_EXECUTED));
                 
-                // Simple threshold: > 0 votes for (for testing)
-                assert!(p.votes_for > 0, error::invalid_state(EINSUFFICIENT_VOTES));
+                // --- PHASE 8 SECURITY: ENFORCE 1M AIN MINIMUM QUORUM ---
+                let min_quorum: u128 = 1000000000000000000000000; // 1,000,000 AIN
+                assert!(p.votes_for + p.votes_against >= min_quorum, error::invalid_state(EINSUFFICIENT_VOTES));
+                
+                // Ensure Majority
+                assert!(p.votes_for > p.votes_against, error::invalid_state(EINSUFFICIENT_VOTES));
 
                 if (p.action_type == 1) {
                     // Change Epoch Duration

@@ -24,6 +24,11 @@ mod tests {
         let peers = Arc::new(Mutex::new(HashMap::new()));
         let node_id = "node_1".to_string();
 
+        // Seed the validator set so the test node is an active validator
+        // (without this, try_create_vertex enters Observer Mode and creates 0 vertices)
+        // Format: Vec<(String, u64)> = [(address, stake_amount)]
+        let _ = db.put("sys:validators", r#"[["node_1", 1000]]"#);
+
         (DagConsensus::new(node_id, peers, mempool, executor, db, None), path)
     }
 

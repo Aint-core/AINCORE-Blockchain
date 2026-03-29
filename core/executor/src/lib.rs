@@ -642,13 +642,22 @@ impl Executor {
                      } else if bqi > 100 {
                          println!("❌ Invalid BQI Score: {}", bqi);
                      } else {
-                         // Reward Logic: Max 1 AIN (1_000_000 units) * BQI%
-                         // Simplified: Reward directly to Sender (Miner)
-                         let base_reward: u128 = 1_000_000;
+                         // Reward Logic: Max 0.36 AIN * BQI%
+                         // Using true 18-decimal scaling (V3 Standard)
+                         let base_reward: u128 = 360_000_000_000_000_000; 
                          let reward: u128 = (base_reward * bqi as u128) / 100;
                          
                          account_data.balance += reward;
-                         println!("🫁 DePIN Mining: BQI {} -> Reward {} AIN", bqi, reward);
+                         
+                         // CRITICAL FIX: Track inflation into Global Supply to maintain Logarithmic Decay accuracy
+                         let mut total_supply: u128 = match self.db.get("sys:total_supply") {
+                             Ok(Some(s)) => s.parse().unwrap_or(0),
+                             _ => 0, 
+                         };
+                         total_supply += reward;
+                         let _ = self.db.put("sys:total_supply", &total_supply.to_string());
+                         
+                         println!("🫁 Breath Value DePIN Mining: BQI {} -> Reward {} Wei", bqi, reward);
                          
                          // Save updated balance (Payer/Sender)
                          if let Ok(new_data) = serde_json::to_vec(&account_data) {
