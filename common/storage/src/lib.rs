@@ -182,11 +182,17 @@ impl StateDB {
         }
     }
     
-    /// Save block as JSON string
+    /// Save block as JSON string — atomically updates height AND hash
     pub fn save_block_json(&self, height: u64, block_json: &str) -> Result<(), rocksdb::Error> {
         let key = format!("block_{}", height);
         self.put(&key, block_json)?;
         self.put("latest_height", &height.to_string())?;
+        // Extract hash from block JSON and persist it for consensus continuity
+        if let Ok(block) = serde_json::from_str::<serde_json::Value>(block_json) {
+            if let Some(hash) = block["header"]["hash"].as_str() {
+                self.put("latest_block_hash", hash)?;
+            }
+        }
         Ok(())
     }
 

@@ -132,7 +132,7 @@ impl DagConsensus {
         
         // For genesis round (round 0), we need 0 parents (bootstrap)
         // For subsequent rounds, we need BFT quorum of parents
-        let mut quorum = if prev_round == 0 { 
+        let quorum = if prev_round == 0 { 
             0 
         } else { 
             bft_quorum.max(1) // At minimum 1 parent required
@@ -142,8 +142,8 @@ impl DagConsensus {
                  self.current_round, n, quorum, parents.len());
 
         // SPLIT-BRAIN PREVENTION & OBSERVER MODE:
-        let genesis_id = "8f7d00f56518177823e32849fa9e5f83"; 
-        let is_genesis_id = self.node_id == genesis_id;
+        // Dynamic singleton detection: if exactly 1 validator and it's us, we are the genesis/bootstrap node
+        let is_singleton = validators.len() == 1 && is_active_validator;
 
         let has_peers = {
              if let Ok(p) = self.peers.lock() {
@@ -160,15 +160,10 @@ impl DagConsensus {
              }
              return;
         } 
-        // RULE 2: If I AM a validator, but I have NO peers (and not Singleton/Genesis), I must stop to avoid Split-Brain.
-        else if !has_peers && !is_genesis_id {
-             // Check if we are really the only validator in the set
-             let is_singleton = validators.len() == 1; 
-             
-             if !is_singleton {
-                  println!("⚠️  [Consensus] Validator Isolated! Stopping mining to prevent fork. Waiting for peers...");
-                  return;
-             }
+        // RULE 2: If I AM a validator, but I have NO peers (and not Singleton), I must stop to avoid Split-Brain.
+        else if !has_peers && !is_singleton {
+             println!("⚠️  [Consensus] Validator Isolated! Stopping mining to prevent fork. Waiting for peers...");
+             return;
         }
 
         // Standard logic for Genesis or Connected Nodes
@@ -461,6 +456,26 @@ impl DagConsensus {
         let removed_count = initial_size - dag.len();
         if removed_count > 0 {
             println!("🧹 Garbage Collection: Pruned {} vertices older than round {} from Disk & Memory", removed_count, min_round);
+        }
+    }
+
+    /// Reload chain tip from storage after external state changes (e.g. sync)
+    /// This prevents consensus from forking by building on stale state.
+    pub fn reload_chain_tip(&mut self) {
+        let new_height = match self.storage.get("latest_height") {
+            Ok(Some(h)) => h.parse::<u64>().unwrap_or(0),
+            _ => 0,
+        };
+        let new_hash = match self.storage.get("latest_block_hash") {
+            Ok(Some(h)) => h,
+            _ => "genesis".to_string(),
+        };
+        
+        if new_height > self.latest_block_height {
+            println!("🔄 [Consensus] Chain tip reloaded: Block #{} -> #{} (Hash: {:.8}..)", 
+                     self.latest_block_height, new_height, new_hash);
+            self.latest_block_height = new_height;
+            self.latest_block_hash = new_hash;
         }
     }
 

@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use blockchain::Block;
 use storage::StateDB;
-use crypto::hash_hex;
 use network::{secure_connect, send_encrypted_msg, read_encrypted_msg};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,17 +65,19 @@ impl ChainSync {
     }
 
     /// Unified Sync: Uses Persistent Encrypted Connection
-    pub async fn sync_from_peers(&self) {
+    /// Returns the final synced height (0 if no sync happened)
+    pub async fn sync_from_peers(&self) -> u64 {
         println!("🔄 [ChainSync] Starting Encrypted P2P Sync...");
         
         let peers_map = self.peers.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if peers_map.is_empty() {
             println!("📡 [ChainSync] No peers available.");
-            return;
+            return 0;
         }
 
         let my_height = self.get_local_height();
         println!("📊 [ChainSync] Local Height: {}", my_height);
+        let mut final_height = my_height;
 
         for (peer_id, peer_port) in peers_map.iter() {
             let peer_ip = self.storage.get_peer_ip(peer_id).unwrap_or_else(|| "127.0.0.1".to_string());
@@ -102,31 +103,44 @@ impl ChainSync {
                                  println!("📊 [ChainSync] Peer Height: {}", peer_height);
                                  
                                  if peer_height > my_height {
-                                     // 3. Request Blocks Batch
-                                     let sync_req = SyncRequest {
-                                         from_height: my_height,
-                                         sender_id: self.node_id.clone(),
-                                         sender_port: self.my_port,
-                                     };
-                                     let req_json = match serde_json::to_string(&sync_req) {
-                                         Ok(j) => j,
-                                         Err(e) => {
-                                             eprintln!("❌ [ChainSync] Failed to serialize sync request: {}", e);
-                                             continue;
-                                         }
-                                     };
-                                     let msg = format!("SYNC_REQ:{}", req_json);
-                                     
-                                     if send_encrypted_msg(&mut stream, &shared_key, &msg).await.is_err() { continue; }
-                                     
-                                     // 4. Receive Blocks Stream (simplified as single batch response for now)
-                                     if let Ok(data_resp) = read_encrypted_msg(&mut stream, &shared_key).await {
-                                         if let Some(json_data) = data_resp.strip_prefix("SYNC_RESP:") {
-                                             if let Ok(sync_resp) = serde_json::from_str::<SyncResponse>(json_data) {
-                                                 self.process_blocks(sync_resp.blocks, my_height);
+                                     // 3. Request Blocks — loop in batches until caught up
+                                     let mut current = my_height;
+                                     while current < peer_height {
+                                         let sync_req = SyncRequest {
+                                             from_height: current,
+                                             sender_id: self.node_id.clone(),
+                                             sender_port: self.my_port,
+                                         };
+                                         let req_json = match serde_json::to_string(&sync_req) {
+                                             Ok(j) => j,
+                                             Err(e) => {
+                                                 eprintln!("❌ [ChainSync] Failed to serialize sync request: {}", e);
+                                                 break;
                                              }
-                                         }
+                                         };
+                                         let msg = format!("SYNC_REQ:{}", req_json);
+                                         
+                                         if send_encrypted_msg(&mut stream, &shared_key, &msg).await.is_err() { break; }
+                                         
+                                         // 4. Receive Blocks Batch
+                                         if let Ok(data_resp) = read_encrypted_msg(&mut stream, &shared_key).await {
+                                             if let Some(json_data) = data_resp.strip_prefix("SYNC_RESP:") {
+                                                 if let Ok(sync_resp) = serde_json::from_str::<SyncResponse>(json_data) {
+                                                     if sync_resp.blocks.is_empty() {
+                                                         break; // No more blocks
+                                                     }
+                                                     let synced = self.process_blocks(sync_resp.blocks, current);
+                                                     if synced <= current {
+                                                         break; // No progress made
+                                                     }
+                                                     current = synced;
+                                                     final_height = synced;
+                                                 } else { break; }
+                                             } else { break; }
+                                         } else { break; }
                                      }
+                                 } else {
+                                     println!("✅ [ChainSync] Already caught up with peer {}", peer_id);
                                  }
                              }
                          }
@@ -137,14 +151,22 @@ impl ChainSync {
                 }
             }
         }
+        final_height
     }
     
-    fn process_blocks(&self, blocks: Vec<Block>, current_height: u64) {
+    /// Process synced blocks — returns the final height reached
+    fn process_blocks(&self, blocks: Vec<Block>, current_height: u64) -> u64 {
         let mut last_processed = current_height;
         let executor = executor::Executor::new(std::sync::Arc::clone(&self.storage));
-        for block in blocks {
-             // 5. SECURITY: Validate block before processing
-             // In real impl, we fetch prev block hash from DB to validate chain link
+        let total_blocks = blocks.len();
+        
+        for (i, block) in blocks.iter().enumerate() {
+             // Skip blocks we already have
+             if block.header.height <= current_height {
+                 continue;
+             }
+             
+             // SECURITY: Validate block before processing
              let prev_hash = if block.header.height > 1 {
                  let prev_key = format!("block_{}", block.header.height - 1);
                  self.storage.get(&prev_key).ok().flatten()
@@ -155,25 +177,32 @@ impl ChainSync {
                  "genesis".to_string()
              };
              
-             if let Err(e) = self.validate_block(&block, block.header.height, &prev_hash) {
+             if let Err(e) = self.validate_block(block, block.header.height, &prev_hash) {
                  eprintln!("🚨 [SECURITY] Block #{} validation FAILED: {}", block.header.height, e);
-                 break; // Stop processing batch on first failure
+                 break;
              }
              
-             // 5.5. STATE COMPLIANCE: Execute through the VM/Executor to prevent blind DB writes
+             // Execute transactions through the VM/Executor
              executor.execute_block_parallel(block.transactions.clone(), &block.header.proposer_id);
              
              if let Ok(json) = serde_json::to_string(&block) {
+                 // save_block_json now atomically updates height + hash
                  if let Err(e) = self.storage.save_block_json(block.header.height, &json) {
                      eprintln!("❌ DB Error: {}", e);
                  } else {
                      last_processed = block.header.height;
                  }
              }
+             
+             // Progress logging for large syncs
+             if total_blocks > 10 && (i + 1) % 50 == 0 {
+                 println!("📦 [ChainSync] Progress: {}/{} blocks processed", i + 1, total_blocks);
+             }
         }
         if last_processed > current_height {
-            println!("✅ [ChainSync] Synced up to block {}", last_processed);
+            println!("✅ [ChainSync] Synced up to block #{} (+{} blocks)", last_processed, last_processed - current_height);
         }
+        last_processed
     }
 
     /// Handle incoming encrypted message (called by Network Server Handler)

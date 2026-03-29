@@ -487,23 +487,59 @@ async fn main() {
     // === MAIN LOOP (EXECUTION & DA ONLY) ===
     // Consensus is now running in background!
     
-    // Trigger initial sync
+    // === INITIAL SYNC + AUTO-REGISTRATION ===
     println!("🔄 Starting initial chain sync...");
     tokio::time::sleep(Duration::from_secs(3)).await;
     
-    // Spawn initial sync as task
+    // Spawn initial sync as task — then register as validator if needed
     let chain_sync_initial = Arc::clone(&chain_sync);
+    let consensus_post_sync = Arc::clone(&consensus);
+    let storage_post_sync = Arc::clone(&storage);
+    let node_id_post_sync = node_id.clone();
     tokio::spawn(async move {
-        chain_sync_initial.sync_from_peers().await;
+        let synced_height = chain_sync_initial.sync_from_peers().await;
+        
+        // Reload consensus chain tip to prevent fork
+        if synced_height > 0 {
+            if let Ok(mut c) = consensus_post_sync.write() {
+                c.reload_chain_tip();
+            }
+        }
+        
+        // Auto-register as validator if not already in the set
+        let already_validator = {
+            if let Ok(Some(json)) = storage_post_sync.get("sys:validators") {
+                if let Ok(vals) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
+                    vals.iter().any(|(addr, _)| addr == &node_id_post_sync)
+                } else { false }
+            } else { false }
+        };
+        
+        if !already_validator {
+            println!("🔑 [AutoReg] Node {} not in validator set — registering...", node_id_post_sync);
+            if let Err(e) = storage_post_sync.update_validator_weight(&node_id_post_sync, 100) {
+                eprintln!("❌ [AutoReg] Failed to register: {}", e);
+            } else {
+                println!("✅ [AutoReg] Node registered as Validator (Weight: 100)");
+            }
+        } else {
+            println!("✅ [AutoReg] Already a validator in the set");
+        }
     });
     
     // === PERIODIC BACKGROUND SYNC ===
-    // Retry sync every 30 seconds to download remaining blocks
     let chain_sync_periodic = Arc::clone(&chain_sync);
+    let consensus_periodic = Arc::clone(&consensus);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            chain_sync_periodic.sync_from_peers().await;
+            let synced_height = chain_sync_periodic.sync_from_peers().await;
+            // Reload consensus chain tip after every sync
+            if synced_height > 0 {
+                if let Ok(mut c) = consensus_periodic.write() {
+                    c.reload_chain_tip();
+                }
+            }
         }
     });
 

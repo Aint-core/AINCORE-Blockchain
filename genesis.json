@@ -5,6 +5,11 @@
             "address": "7b3d4b70417dd4b7f832cc457a0e3675",
             "public_key": "7b3d4b70417dd4b7f832cc457a0e3675d601dd4b7b86ad8e1181634885bdc36e",
             "stake": "1000000000000000000000000"
+        },
+        {
+            "address": "5d40e477b2bb3cc9d9f5508de1fb0456",
+            "public_key": "5d40e477b2bb3cc9d9f5508de1fb04562ded56ecee15d6114c23a782cfd5a29f",
+            "stake": "1000000000000000000000000"
         }
     ],
     "treasury_reserve": "50000000000000000000000",
