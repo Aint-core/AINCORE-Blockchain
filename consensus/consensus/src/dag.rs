@@ -24,6 +24,7 @@ pub struct DagConsensus {
     pub latest_block_hash: String,
     pub accumulator: Accumulator,
     pub da_sequencer: Option<Arc<Mutex<DASequencer>>>, // Added DA Sequencer
+    pub p2p_tx: Option<tokio::sync::mpsc::Sender<String>>, // Added P2P Libp2p Channel
 }
 
 impl DagConsensus {
@@ -33,7 +34,8 @@ impl DagConsensus {
         mempool: Arc<Mutex<Mempool>>,
         executor: Arc<Executor>,
         storage: Arc<StateDB>,
-        da_sequencer: Option<Arc<Mutex<DASequencer>>>, // Added arg
+        da_sequencer: Option<Arc<Mutex<DASequencer>>>, 
+        p2p_tx: Option<tokio::sync::mpsc::Sender<String>>, // Corrected to Sender
     ) -> Self {
         let mut dag_map = HashMap::new();
         let mut round_idx_map: HashMap<u64, Vec<String>> = HashMap::new();
@@ -98,6 +100,7 @@ impl DagConsensus {
             latest_block_hash,
             accumulator: Accumulator::new(),
             da_sequencer,
+            p2p_tx,
         }
     }
 
@@ -392,7 +395,6 @@ impl DagConsensus {
     }
 
     fn broadcast_vertex(&self, vertex: &Vertex) {
-        use network::send_message;
         let serialized = match serde_json::to_string(vertex) {
             Ok(s) => s,
             Err(e) => {
@@ -402,6 +404,18 @@ impl DagConsensus {
         };
         let msg = format!("DAG_VERTEX:{}", serialized);
         
+        // 1. Broadccast via Libp2p Gossipsub (Preferred Method)
+        if let Some(tx) = &self.p2p_tx {
+            let msg_clone = msg.clone();
+            let tx_clone = tx.clone();
+            // Important: Use spawn because Sender::send is async
+            tokio::spawn(async move {
+                let _ = tx_clone.send(msg_clone).await;
+            });
+        }
+
+        // 2. Broadcast via Legacy TCP (Fallback/Syncing Nodes without Libp2p connected)
+        use network::send_message;
         if let Ok(peers) = self.peers.lock() {
             for (peer_id, port) in peers.iter() {
                 // FIXED: Resolve valid IP from storage instead of hardcoded localhost

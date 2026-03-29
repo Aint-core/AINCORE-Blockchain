@@ -254,6 +254,8 @@ async fn main() {
     ));
 
     // CRITICAL: Use RwLock for DAG Consensus
+    let p2p_tx_clone = Some(_p2p_tx.clone()); // Pass the libp2p transmitter
+    
     let consensus = Arc::new(RwLock::new(DagConsensus::new(
         node_id.clone(),
         Arc::clone(&peers),
@@ -261,6 +263,7 @@ async fn main() {
         Arc::clone(&executor),
         Arc::clone(&storage),
         Some(Arc::clone(&da_sequencer)), // Wired DA Sequencer!
+        p2p_tx_clone, // Add Libp2p gossip channel
     )));
 
     let chain_sync = Arc::new(ChainSync::new(
