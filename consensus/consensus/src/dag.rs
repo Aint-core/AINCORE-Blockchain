@@ -119,6 +119,14 @@ impl DagConsensus {
         let validators = self.get_validator_set();
         let is_active_validator = validators.contains(&self.node_id);
         
+        // DEBUG: Show exact comparison (remove after fix)
+        if !is_active_validator && self.current_round <= 3 {
+            println!("🔍 [DEBUG] My node_id: '{}' (len={})", self.node_id, self.node_id.len());
+            for (i, v) in validators.iter().enumerate() {
+                println!("🔍 [DEBUG] Validator[{}]: '{}' (len={}) match={}", i, v, v.len(), v == &self.node_id);
+            }
+        }
+        
         // BFT QUORUM CALCULATION: 2f+1 where f = (n-1)/3
         // This ensures we can tolerate f Byzantine nodes
         let n = validators.len(); 
