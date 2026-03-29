@@ -13,3 +13,4 @@ crypto = { path = "../common/crypto" }
 executor = { path = "../core/executor" }
 tokio = { version = "1.0", features = ["full"] }
 rand = "0.8"
+hex = "0.4"

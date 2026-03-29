@@ -31,17 +31,17 @@ impl ChainSync {
     }
     
     fn verify_block_hash(&self, block: &Block) -> Result<bool, String> {
-        let mut hash_input = String::new();
-        hash_input.push_str(&block.header.height.to_string());
-        hash_input.push_str(&block.header.prev_hash);
-        hash_input.push_str(&block.header.timestamp.to_string());
-        hash_input.push_str(&block.header.proposer_id);
+        // Must match blockchain::calculate_header_hash exactly:
+        // height + prev_hash + tx_hash + proposer_id + round + timestamp
+        let mut data = Vec::new();
+        data.extend_from_slice(block.header.height.to_string().as_bytes());
+        data.extend_from_slice(block.header.prev_hash.as_bytes());
+        data.extend_from_slice(block.header.tx_hash.as_bytes());
+        data.extend_from_slice(block.header.proposer_id.as_bytes());
+        data.extend_from_slice(block.header.round.to_string().as_bytes());
+        data.extend_from_slice(block.header.timestamp.to_string().as_bytes());
         
-        for tx in &block.transactions {
-            hash_input.push_str(tx);
-        }
-        
-        let computed_hash = hash_hex(hash_input.as_bytes());
+        let computed_hash = hex::encode(crypto::hash(&data));
         
         if computed_hash == block.header.hash {
             Ok(true)
