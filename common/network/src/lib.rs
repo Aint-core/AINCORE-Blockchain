@@ -171,6 +171,30 @@ where
                                  let reply = format!("WELCOME:{}:{}", node_id_clone, port);
                                  let _ = send_encrypted(&mut socket, &shared_key, &reply).await;
                              }
+                        } else if msg == "GET_HEIGHT" {
+                            // Respond with chain height over the encrypted channel
+                            let height = db_clone.get_chain_height();
+                            let resp = format!("HEIGHT:{}", height);
+                            let _ = send_encrypted(&mut socket, &shared_key, &resp).await;
+                        } else if let Some(req_json) = msg.strip_prefix("SYNC_REQ:") {
+                            // Handle sync request inline (avoid circular dep with chain_sync)
+                            if let Ok(req) = serde_json::from_str::<serde_json::Value>(req_json) {
+                                let from_height = req["from_height"].as_u64().unwrap_or(0);
+                                let local_height = db_clone.get_chain_height();
+                                let end = std::cmp::min(local_height, from_height + 500);
+                                let mut blocks_json = Vec::new();
+                                for h in (from_height + 1)..=end {
+                                    let key = format!("block_{}", h);
+                                    if let Ok(Some(data)) = db_clone.get(&key) {
+                                        if let Ok(block) = serde_json::from_str::<serde_json::Value>(&data) {
+                                            blocks_json.push(block);
+                                        }
+                                    }
+                                }
+                                let resp = serde_json::json!({"blocks": blocks_json});
+                                let msg = format!("SYNC_RESP:{}", resp);
+                                let _ = send_encrypted(&mut socket, &shared_key, &msg).await;
+                            }
                         } else {
                             handler_clone(msg);
                         }
