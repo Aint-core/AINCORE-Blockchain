@@ -1,30 +1,10 @@
 {
-    "chain_id": "AINCORE-TESTNET-1",
+    "chain_id": "AINCORE-MAINNET-1",
     "validators": [
-        {
-            "address": "9b472159b3555c77f5dc43512862ae21",
-            "public_key": "9b472159b3555c77f5dc43512862ae21abe8d7d4a3038a7af2c4041c2f61fcbf",
-            "stake": "500000000000000000000000"
-        },
-        {
-            "address": "e1d895a946252a40acb29b6d05c41f8f",
-            "public_key": "e1d895a946252a40acb29b6d05c41f8fd519e321afab5e1c71f0acd7d82a538a",
-            "stake": "500000000000000000000000"
-        },
-        {
-            "address": "457fc0313ff8f6bcd76f69d4a3a6bbf6",
-            "public_key": "457fc0313ff8f6bcd76f69d4a3a6bbf64f77445bfec39fbe56d3371c6548a789",
-            "stake": "500000000000000000000000"
-        },
-        {
-            "address": "bf960011662109496e7603e09a410e65",
-            "public_key": "bf960011662109496e7603e09a410e65ee4639941798e944b63d3f1b94fb1ba6",
-            "stake": "500000000000000000000000"
-        },
         {
             "address": "7b3d4b70417dd4b7f832cc457a0e3675",
             "public_key": "7b3d4b70417dd4b7f832cc457a0e3675d601dd4b7b86ad8e1181634885bdc36e",
-            "stake": "500000000000000000000000"
+            "stake": "1000000000000000000000000"
         }
     ],
     "treasury_reserve": "50000000000000000000000",
