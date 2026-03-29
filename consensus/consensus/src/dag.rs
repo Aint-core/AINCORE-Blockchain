@@ -158,7 +158,7 @@ impl DagConsensus {
              if self.current_round % 10 == 0 || self.current_round < 5 {
                  println!("⚠️  [Consensus] Observer Mode: I am not in Validator Set. Waiting to sync/register... (Round {})", self.current_round);
              }
-             quorum = 9999; // Block mining
+             return;
         } 
         // RULE 2: If I AM a validator, but I have NO peers (and not Singleton/Genesis), I must stop to avoid Split-Brain.
         else if !has_peers && !is_genesis_id {
@@ -167,7 +167,7 @@ impl DagConsensus {
              
              if !is_singleton {
                   println!("⚠️  [Consensus] Validator Isolated! Stopping mining to prevent fork. Waiting for peers...");
-                  quorum = 9999; // Block mining
+                  return;
              }
         }
 

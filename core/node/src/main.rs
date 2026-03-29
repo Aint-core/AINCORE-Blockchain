@@ -194,6 +194,8 @@ async fn main() {
     };
 
     // === HANDSHAKE KE PEERS (legacy - optional now) ===
+    let node_signing_key = Arc::new(signing_key.clone());
+    
     // CRITICAL FIX: Parse bootnodes to extract IP and port for legacy TCP handshake
     if !normalized_bootnodes.is_empty() {
         println!("🔗 Attempting legacy TCP handshake with {} bootnodes", normalized_bootnodes.len());
@@ -204,7 +206,7 @@ async fn main() {
                 let ip_or_dns = parts[2]; // "192.168.18.90" or "example.com"
                 if let Ok(port) = parts[4].parse::<u16>() {
                     println!("🔗 Trying legacy TCP handshake to {}:{}", ip_or_dns, port);
-                    handshake(&node_id, ip_or_dns, port, port, Arc::clone(&peers), Arc::clone(&storage));
+                    handshake(&node_id, ip_or_dns, port, port, Arc::clone(&peers), Arc::clone(&storage), Arc::clone(&node_signing_key));
                     thread::sleep(Duration::from_millis(500));
                 }
             }
@@ -215,7 +217,7 @@ async fn main() {
         println!("🔗 Connecting to {} initial peers (legacy TCP): {:?}", initial_peers.len(), initial_peers);
         for peer_port in &initial_peers {
             // FIXED: Now accepts peer_ip parameter (localhost for legacy peers)
-            handshake(&node_id, "127.0.0.1", *peer_port, port, Arc::clone(&peers), Arc::clone(&storage));
+            handshake(&node_id, "127.0.0.1", *peer_port, port, Arc::clone(&peers), Arc::clone(&storage), Arc::clone(&node_signing_key));
             thread::sleep(Duration::from_millis(100));
         }
     } else if normalized_bootnodes.is_empty() {
@@ -336,6 +338,7 @@ async fn main() {
         let node_chain_sync = Arc::clone(&chain_sync);
         let server_node_id = node_id.clone();
         let handler_storage = Arc::clone(&storage);
+        let node_signing_key_server = Arc::clone(&node_signing_key);
 
         tokio::spawn(async move {
             network::start_server(
@@ -343,6 +346,7 @@ async fn main() {
                 server_node_id,
                 node_peers,
                 Arc::clone(&node_storage),
+                node_signing_key_server,
                 move |msg: String| {
                     let storage_clone = Arc::clone(&handler_storage);
                     println!("📨 [Server] Received msg: {:.50}...", msg);
@@ -395,6 +399,7 @@ async fn main() {
         let node_id_reconnect = node_id.clone();
         let bootnodes_clone = bootnodes.clone();
         let my_port = port;
+        let signing_key_reconnect = Arc::clone(&node_signing_key);
 
         tokio::spawn(async move {
             println!("🛡️ P2P Maintenance Service started (Auto-Reconnect every 15s)");
@@ -415,7 +420,8 @@ async fn main() {
                                      p,
                                      my_port,
                                      Arc::clone(&peers_clone_reconnect),
-                                     Arc::clone(&storage_clone_reconnect)
+                                     Arc::clone(&storage_clone_reconnect),
+                                     Arc::clone(&signing_key_reconnect)
                                  );
                              }
                          }
@@ -436,7 +442,8 @@ async fn main() {
                              peer_port,
                              my_port,
                              Arc::clone(&peers_clone_reconnect),
-                             Arc::clone(&storage_clone_reconnect)
+                             Arc::clone(&storage_clone_reconnect),
+                             Arc::clone(&signing_key_reconnect)
                          );
                     }
                 }

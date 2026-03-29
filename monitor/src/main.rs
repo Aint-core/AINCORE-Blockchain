@@ -19,7 +19,10 @@ fn main() {
         return;
     }
     
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap_or_else(|_| Client::new());
 
     println!("{}", "🚀 AINCORE Cluster Monitor (RPC Mode)".bold().purple());
     println!("{}", "─────────────────────────────────────────────".dimmed());

@@ -10,4 +10,6 @@ storage = { path = "../common/storage" }
 network = { path = "../common/network" }
 blockchain = { path = "../consensus/blockchain" }
 crypto = { path = "../common/crypto" }
+executor = { path = "../core/executor" }
 tokio = { version = "1.0", features = ["full"] }
+rand = "0.8"

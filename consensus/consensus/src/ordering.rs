@@ -69,13 +69,13 @@ impl OrderingEngine {
         }
 
         // CRITICAL-1 FIX: View Change Mechanism
-        // Try up to MAX_LEADER_ATTEMPTS different leaders before giving up
-        const MAX_LEADER_ATTEMPTS: u32 = 3;
+        // Try all validators if necessary (continuous round-robin fallback)
+        let max_attempts = if validators.is_empty() { 3 } else { validators.len() as u32 };
         
         let mut anchor_vertex_hash: Option<&String> = None;
         let mut successful_leader = String::new();
         
-        for attempt in 0..MAX_LEADER_ATTEMPTS {
+        for attempt in 0..max_attempts {
             let leader_id = self.get_leader_with_fallback(anchor_round, validators, attempt);
             
             // Try to find this leader's vertex in anchor round
@@ -98,7 +98,7 @@ impl OrderingEngine {
                 }
             }
             
-            if attempt < MAX_LEADER_ATTEMPTS - 1 {
+            if attempt < max_attempts - 1 {
                 println!("⚠️  Leader {} not found in anchor round {}, trying backup...", leader_id, anchor_round);
             }
         }
@@ -107,7 +107,7 @@ impl OrderingEngine {
             h
         } else {
             println!("🚨 CRITICAL: All {} leader attempts failed for anchor round {} - possible network partition", 
-                MAX_LEADER_ATTEMPTS, anchor_round);
+                max_attempts, anchor_round);
             return None;
         };
 

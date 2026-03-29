@@ -1261,7 +1261,9 @@ version = "0.1.0"
 dependencies = [
  "blockchain",
  "crypto",
+ "executor",
  "network",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "storage",
@@ -1858,6 +1860,7 @@ dependencies = [
  "base64 0.21.7",
  "chrono",
  "crypto",
+ "ed25519-dalek",
  "hex",
  "network",
  "rand 0.8.5",
@@ -4553,6 +4556,7 @@ checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 name = "mempool"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "executor",
  "hex",
  "network",
@@ -4970,6 +4974,8 @@ name = "network"
 version = "0.1.0"
 dependencies = [
  "crypto",
+ "ed25519-dalek",
+ "hex",
  "once_cell",
  "rand 0.8.5",
  "rocksdb",

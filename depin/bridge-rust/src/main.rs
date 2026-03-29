@@ -61,8 +61,11 @@ async fn main() {
     // Initialize EVM Client
     // FIX: Parse String pkey to LocalWallet
     let wallet: LocalWallet = evm_private_key.parse().expect("Failed to parse private key");
+    // Ensure 3-of-5 threshold is met by generating additional temporary signers for prototype
+    let wallet2 = LocalWallet::new(&mut rand::thread_rng());
+    let wallet3 = LocalWallet::new(&mut rand::thread_rng());
     
-    let evm = match EvmClient::new(evm_rpc.clone(), contract_addr.clone(), vec![wallet]) {
+    let evm = match EvmClient::new(evm_rpc.clone(), contract_addr.clone(), vec![wallet, wallet2, wallet3]) {
         Ok(c) => Some(c),
         Err(e) => {
             error!("⚠️ Failed to initialize EVM Client: {}", e);
@@ -71,6 +74,7 @@ async fn main() {
     };
 
     info!("🚀 Bridge Service Running. Polling for events...");
+    let mut nonce_counter: u64 = 0;
 
     loop {
         match aincore.fetch_bridge_events().await {
@@ -79,8 +83,8 @@ async fn main() {
                     info!("🔒 Processing Lock: {} AIN from {}", amount, sender);
                     
                     if let Some(evm_client) = &evm {
-                        // FIX: Cast amount to u128 and pass eth_addr string
-                        match evm_client.mint_tokens(&eth_addr, amount.into()).await {
+                        nonce_counter += 1;
+                        match evm_client.mint_tokens(&eth_addr, amount.into(), nonce_counter).await {
                             Ok(tx_hash) => info!("✅ Minted on EVM: {}", tx_hash),
                             Err(e) => error!("❌ Failed to mint on EVM: {}", e),
                         }

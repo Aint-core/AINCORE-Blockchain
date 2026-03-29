@@ -5,7 +5,6 @@ use std::net::IpAddr;
 use std::time::Instant;
 
 // Reserved for future rate limiting implementation
-#[allow(dead_code)]
 const MAX_CONNECTIONS: usize = 100;
 #[allow(dead_code)]
 const MAX_CONN_PER_IP_MIN: usize = 60; 
@@ -28,10 +27,19 @@ pub type PeerList = Arc<Mutex<HashMap<String, u16>>>;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub async fn start_server<F>(port: u16, node_id: String, peers: PeerList, db: Arc<StateDB>, handler: F)
+pub async fn start_server<F>(
+    port: u16, 
+    node_id: String, 
+    peers: PeerList, 
+    db: Arc<StateDB>, 
+    my_signing_key: Arc<ed25519_dalek::SigningKey>,
+    handler: F
+)
 where
     F: Fn(String) + Send + Sync + 'static, 
 {
+    use ed25519_dalek::{Signer, Verifier, Signature, VerifyingKey};
+
     let listener = match TcpListener::bind(("0.0.0.0", port)).await {
         Ok(l) => l,
         Err(e) => {
@@ -43,14 +51,7 @@ where
 
     let handler = Arc::new(handler); 
     let active_connections = Arc::new(AtomicUsize::new(0));
-    // Reserved for future IP-based rate limiting
-    let _ip_limiter: Arc<Mutex<HashMap<IpAddr, (usize, Instant)>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    
-    // My Identity Key (Ephemeral for now, ideally persistent Identity Key + Ephemeral Session Key)
-    // For simplicity of this upgrade, we generate a fresh Ephemeral Key per connection session accept
-    // In a full implementation, we'd sign this with our long-term Identity Key.
-    
     loop {
         let (mut socket, addr) = match listener.accept().await {
             Ok(s) => s,
@@ -60,7 +61,11 @@ where
             }
         };
 
-        // ... [Limit Checks Omitted for Brevity - kept same logic roughly] ...
+        if active_connections.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+             eprintln!("⚠️ Max TCP Connections reached ({}). Rejecting {}", MAX_CONNECTIONS, addr);
+             continue;
+        }
+
         let active_counter = active_connections.clone();
         active_counter.fetch_add(1, Ordering::Relaxed);
         
@@ -68,89 +73,103 @@ where
         let peers_clone = peers.clone();
         let db_clone = db.clone();
         let handler_clone = handler.clone();
+        let signing_key_clone = Arc::clone(&my_signing_key);
 
         tokio::spawn(async move {
             let _guard = ConnectionGuard { counter: active_counter };
             let (my_secret, my_public) = TransportEngine::generate_ephemeral();
             
             // 1. HANDSHAKE INITIATION (Receiver Side)
-            // Wait for Client Hello containing their Public Key
             let mut buf = [0u8; 32];
             if socket.read_exact(&mut buf).await.is_err() {
-                return; // Fail silent
+                return; 
             }
-            let client_public = buf; // 32 bytes
+            let client_public = buf;
 
-            // 2. Send Server Public Key
-            if socket.write_all(my_public.as_bytes()).await.is_err() {
+            // 2. Compute Signature over Ephemeral Keys
+            let mut msg_to_sign = Vec::new();
+            msg_to_sign.extend_from_slice(my_public.as_bytes());
+            msg_to_sign.extend_from_slice(&client_public);
+            let my_signature = signing_key_clone.sign(&msg_to_sign);
+            
+            let my_identity_bytes = signing_key_clone.verifying_key().to_bytes();
+
+            // 3. Send Server Hello (Ephemeral Pub, Server Pub Identity, Signature)
+            let mut server_hello = Vec::new();
+            server_hello.extend_from_slice(my_public.as_bytes());
+            server_hello.extend_from_slice(&my_identity_bytes);
+            server_hello.extend_from_slice(&my_signature.to_bytes());
+            
+            if socket.write_all(&server_hello).await.is_err() {
                 return;
             }
             
-            // 3. Compute Shared Secret
+            // 4. Compute Shared Secret
             let shared_key = TransportEngine::diffie_hellman(my_secret, &client_public);
             
-            // 🛡️ ENCRYPTED SESSION ESTABLISHED
-            // Use nonces. Server -> Client (Even nonces?), Client -> Server (Odd nonces?)
-            // Or simplified: receive nonce prefixed to message.
-            
-            let _nonce_recv_counter = 0u64;
-            
-            // println!("🔐 Secure Session Established with {}", addr);
-            
             // Loop for Encrypted Messages
-            let mut len_buf = [0u8; 4]; // Length prefix
+            let mut len_buf = [0u8; 4]; 
             loop {
-                // Read Length with Timeout
                 if tokio::time::timeout(std::time::Duration::from_secs(60), socket.read_exact(&mut len_buf)).await.is_err() { break; }
                 let msg_len = u32::from_be_bytes(len_buf) as usize;
                 
-                if msg_len > 10 * 1024 * 1024 { // 10MB Max Block Size
+                if msg_len > 10 * 1024 * 1024 { 
                      eprintln!("⚠️ Message too large from {}", addr);
                      break;
                 }
                 
                 let mut encrypted_msg = vec![0u8; msg_len];
-                // Increase timeout for payload read to 120s to ensure we don't drop large blocks mid-transfer over WAN
                 if tokio::time::timeout(std::time::Duration::from_secs(120), socket.read_exact(&mut encrypted_msg)).await.is_err() { 
-                     eprintln!("⚠️ Timeout reading payload from {}", addr);
                      break; 
                 }
                 
-                // Extract Nonce (First 12 bytes)
                 if msg_len < 12 { break; }
                 let nonce = &encrypted_msg[0..12];
                 let ciphertext = &encrypted_msg[12..];
                 
-                // Decrypt
                 let mut nonce_arr = [0u8; 12];
                 nonce_arr.copy_from_slice(nonce);
                 
                 match TransportEngine::decrypt(&shared_key, &nonce_arr, ciphertext) {
                     Ok(plaintext) => {
                         let msg = String::from_utf8_lossy(&plaintext).to_string();
-                        // Handle internal protocol
                         if msg.starts_with("HELLO:") {
-                             // Handle Peer Logic ...
                              let parts: Vec<&str> = msg.split(':').collect();
-                             if parts.len() >= 3 {
+                             if parts.len() >= 5 {
                                  let peer_id = parts[1].to_string();
                                  let peer_port = parts[2].trim().parse::<u16>().unwrap_or(0);
+                                 let peer_pubkey_hex = parts[3].to_string();
+                                 let peer_sig_hex = parts[4].to_string();
                                  
-                                 // Reply first (always, even for broadcast connections)
-                                 let reply = format!("WELCOME:{}:{}", node_id_clone, port);
-                                 let _ = send_encrypted(&mut socket, &shared_key, &reply).await;
-                                 
-                                 // Skip broadcast-only connections (port 0 or internal identities)
-                                 if peer_id.starts_with("__") || peer_port == 0 {
-                                     continue; // Don't register as peer/validator
+                                 // Verify Client Signature
+                                 if let (Ok(pubkey_bytes), Ok(sig_bytes)) = (hex::decode(&peer_pubkey_hex), hex::decode(&peer_sig_hex)) {
+                                     if pubkey_bytes.len() == 32 && sig_bytes.len() == 64 {
+                                         if let Ok(verifying_key) = VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
+                                             let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+                                             let mut verify_msg = Vec::new();
+                                             verify_msg.extend_from_slice(&client_public);
+                                             verify_msg.extend_from_slice(my_public.as_bytes());
+                                             
+                                             if verifying_key.verify(&verify_msg, &signature).is_ok() {
+                                                 // Signature Valid! Register Peer.
+                                                 let expected_node_id = hex::encode(&pubkey_bytes)[0..32].to_string();
+                                                 if expected_node_id == peer_id && !peer_id.starts_with("__") && peer_port != 0 {
+                                                     let remote_ip = addr.ip().to_string();
+                                                     peers_clone.lock().unwrap().insert(peer_id.clone(), peer_port);
+                                                     let _ = db_clone.save_peer(&peer_id, peer_port);
+                                                     let _ = db_clone.save_peer_ip(&peer_id, &remote_ip);
+                                                     println!("🤝 Authenticated Peer registered: {} ({}:{})", peer_id, remote_ip, peer_port);
+                                                 }
+                                             } else {
+                                                 eprintln!("🚨 Invalid Client Signature from {}", addr);
+                                                 break;
+                                             }
+                                         }
+                                     }
                                  }
                                  
-                                 // Add peer with actual remote IP from socket
-                                 let remote_ip = addr.ip().to_string();
-                                 peers_clone.lock().unwrap().insert(peer_id.clone(), peer_port);
-                                 let _ = db_clone.save_peer(&peer_id, peer_port);
-                                 let _ = db_clone.save_peer_ip(&peer_id, &remote_ip);
-                                 println!("🤝 Peer registered: {} ({}:{})", peer_id, remote_ip, peer_port);
+                                 let reply = format!("WELCOME:{}:{}", node_id_clone, port);
+                                 let _ = send_encrypted(&mut socket, &shared_key, &reply).await;
                              }
                         } else {
                             handler_clone(msg);
@@ -192,24 +211,54 @@ pub async fn secure_connect(
     peer_port: u16,
     my_node_id: &str,
     my_port: u16,
-    expected_peer_id: Option<&str>, // QUANTUM FIX: MitM Protection
+    expected_peer_id: Option<&str>,
+    my_signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<(tokio::net::TcpStream, [u8; 32], String), Box<dyn std::error::Error + Send + Sync>> {
+    use ed25519_dalek::{Signer, Verifier, Signature, VerifyingKey};
+
     let peer_addr = format!("{}:{}", peer_ip, peer_port);
     let mut stream = tokio::net::TcpStream::connect(&peer_addr).await?;
 
-    // 1. Client Hello (Send Public Key)
+    // 1. Client Hello (Send Ephemeral Public Key)
     let (my_secret, my_public) = TransportEngine::generate_ephemeral();
     stream.write_all(my_public.as_bytes()).await?;
 
-    // 2. Server Hello (Read Public Key)
+    // 2. Server Hello (Read Ephemeral Pub, Server Pub Identity, Signature)
+    let mut server_hello = [0u8; 32 + 32 + 64];
+    stream.read_exact(&mut server_hello).await?;
+    
     let mut server_pub = [0u8; 32];
-    stream.read_exact(&mut server_pub).await?;
+    server_pub.copy_from_slice(&server_hello[0..32]);
+    let mut server_identity_bytes = [0u8; 32];
+    server_identity_bytes.copy_from_slice(&server_hello[32..64]);
+    let mut sig_bytes = [0u8; 64];
+    sig_bytes.copy_from_slice(&server_hello[64..128]);
 
-    // 3. Shared Secret
+    // 2a. Verify Server Identity Signature
+    let server_verifying_key = VerifyingKey::from_bytes(&server_identity_bytes)?;
+    let server_signature = Signature::from_bytes(&sig_bytes);
+    
+    let mut msg_to_verify = Vec::new();
+    msg_to_verify.extend_from_slice(&server_pub);
+    msg_to_verify.extend_from_slice(my_public.as_bytes());
+    if server_verifying_key.verify(&msg_to_verify, &server_signature).is_err() {
+        return Err("Server Authentication Failed: Invalid Signature".into());
+    }
+
+    // 3. Compute Shared Secret
     let shared = TransportEngine::diffie_hellman(my_secret, &server_pub);
 
-    // 4. Send Encrypted Identity
-    let hello_msg = format!("HELLO:{}:{}", my_node_id, my_port);
+    // 4. Client Authentication (Sign and Send Encrypted Identity)
+    let mut msg_to_sign = Vec::new();
+    msg_to_sign.extend_from_slice(my_public.as_bytes());
+    msg_to_sign.extend_from_slice(&server_pub);
+    let my_signature = my_signing_key.sign(&msg_to_sign);
+    
+    let my_identity_hex = hex::encode(my_signing_key.verifying_key().to_bytes());
+    let sig_hex = hex::encode(my_signature.to_bytes());
+    
+    // HELLO:<node_id>:<port>:<pubkey_hex>:<sig_hex>
+    let hello_msg = format!("HELLO:{}:{}:{}:{}", my_node_id, my_port, my_identity_hex, sig_hex);
     send_encrypted(&mut stream, &shared, &hello_msg).await?;
 
     // 5. Read Encrypted Welcome
@@ -233,9 +282,14 @@ pub async fn secure_connect(
         return Err("Invalid Handshake Response".into());
     }
 
-    // Extract peer node ID from WELCOME:NODE_ID:PORT
     let parts: Vec<&str> = resp.split(':').collect();
     let peer_node_id = if parts.len() >= 2 { parts[1].to_string() } else { "unknown".to_string() };
+
+    let server_addr_expected = hex::encode(server_identity_bytes)[0..32].to_string();
+    if peer_node_id != server_addr_expected {
+         eprintln!("🚨 MitM DETECTED! Expected Node Id {}, Got {}", server_addr_expected, peer_node_id);
+         return Err("Identity Mismatch: Node ID does not match the authenticated Public Key!".into());
+    }
 
     // QUANTUM AUDIT VERIFICATION
     if let Some(expected) = expected_peer_id {
@@ -257,12 +311,13 @@ pub fn handshake(
     my_port: u16,   
     peers: Arc<Mutex<HashMap<String, u16>>>,
     storage: Arc<StateDB>,
+    my_signing_key: Arc<ed25519_dalek::SigningKey>,
 ) {
      let node_id = node_id.to_string();
      let peer_ip = peer_ip.to_string();
      
      GOSSIP_RUNTIME.spawn(async move {
-         match secure_connect(&peer_ip, peer_port, &node_id, my_port, None).await {
+         match secure_connect(&peer_ip, peer_port, &node_id, my_port, None, &my_signing_key).await {
              Ok((_stream, _shared, peer_node_id)) => {
                  println!("🔒 Encryption Handshake Verified with {}:{} (Node: {})", peer_ip, peer_port, peer_node_id);
                  if let Ok(mut p) = peers.lock() {
@@ -330,8 +385,16 @@ pub fn send_message(addr: &str, msg: &str) -> std::io::Result<()> {
     GOSSIP_RUNTIME.spawn(async move {
          if let Some((ip, p_str)) = addr.split_once(':') {
              if let Ok(port) = p_str.parse::<u16>() {
+                 // Generate ephemeral signing key for broadcast
+                 use rand::rngs::OsRng;
+                 let mut csprng = OsRng;
+                 let ephemeral_signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
+                 
                  // Attempt secure connect with timeout
-                 if let Ok(res) = tokio::time::timeout(std::time::Duration::from_secs(3), secure_connect(ip, port, "__broadcast__", 0, None)).await {
+                 if let Ok(res) = tokio::time::timeout(
+                     std::time::Duration::from_secs(3), 
+                     secure_connect(ip, port, "__broadcast__", 0, None, &ephemeral_signing_key)
+                 ).await {
                      if let Ok((mut stream, shared, _peer_id)) = res {
                          let _ = send_encrypted_msg(&mut stream, &shared, &msg).await;
                      }

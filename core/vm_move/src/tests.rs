@@ -32,10 +32,11 @@ mod tests {
 
         // 4. Sign a message
         let payload = b"Hello Quantum World";
-        let sig = pqcrypto_dilithium::dilithium5::detached_sign(payload, &sk);
+        let full_message = format!("AINCORE-TESTNET-1:{}:{}:0", sender.to_string(), hex::encode(payload));
+        let sig = pqcrypto_dilithium::dilithium5::detached_sign(full_message.as_bytes(), &sk);
 
         // 5. Execute Transaction
-        let result = vm.execute_transaction(sender, sig.as_bytes(), payload);
+        let result = vm.execute_transaction("AINCORE-TESTNET-1", sender, 0, sig.as_bytes(), payload);
 
         // 6. Verify Success
         assert!(result.is_ok());
@@ -43,7 +44,7 @@ mod tests {
         
         // 7. Verify Failure with Wrong Message
         let wrong_payload = b"Hacked Message";
-        let result_fail = vm.execute_transaction(sender, sig.as_bytes(), wrong_payload);
+        let result_fail = vm.execute_transaction("AINCORE-TESTNET-1", sender, 0, sig.as_bytes(), wrong_payload);
         assert!(result_fail.is_ok());
         assert!(!result_fail.unwrap(), "PQC Verification should fail for wrong payload");
 
@@ -94,8 +95,12 @@ mod tests {
         let payload = b"test_payload";
         let signature = signing_key.sign(payload);
         
-        // 6. Execute
-        let result = vm.execute_transaction(sender, signature.to_bytes().as_slice(), payload);
+        // 6. Execute (Note: using exactly what was signed to pass verification)
+        // Re-sign with the full formatted message to avoid test failures:
+        let full_message = format!("AINCORE-TESTNET-1:{}:{}:0", sender.to_string(), hex::encode(payload));
+        let signature = signing_key.sign(full_message.as_bytes());
+        
+        let result = vm.execute_transaction("AINCORE-TESTNET-1", sender, 0, signature.to_bytes().as_slice(), payload);
 
         // 7. Verify - May fail if Object structure differs, that's OK for unit test
         // The important thing is that ED25519 path is reached
@@ -121,7 +126,7 @@ mod tests {
         let payload = vec![];
 
         // 3. Execute
-        let result = vm.execute_transaction(sender, &dummy_sig, &payload);
+        let result = vm.execute_transaction("TESTNET", sender, 0, &dummy_sig, &payload);
 
         // 4. Verify - Should return Ok(false)
         assert!(result.is_ok());

@@ -83,7 +83,11 @@ impl ChainSync {
             println!("🌐 [ChainSync] Connecting to {} ({}:{})...", peer_id, peer_ip, peer_port);
             
             // 1. Establish Secure Connection (With MitM Check)
-            match secure_connect(&peer_ip, *peer_port, &self.node_id, self.my_port, Some(peer_id)).await {
+            use rand::rngs::OsRng;
+            let mut csprng = OsRng;
+            let ephemeral_signing_key = crypto::SigningKey::generate(&mut csprng);
+
+            match secure_connect(&peer_ip, *peer_port, "__sync__", self.my_port, Some(peer_id), &ephemeral_signing_key).await {
                 Ok((mut stream, shared_key, _peer_node_id)) => {
                     println!("🔐 Secure Channel Established with {}", peer_id);
                     
@@ -131,6 +135,7 @@ impl ChainSync {
     
     fn process_blocks(&self, blocks: Vec<Block>, current_height: u64) {
         let mut last_processed = current_height;
+        let executor = executor::Executor::new(std::sync::Arc::clone(&self.storage));
         for block in blocks {
              // 5. SECURITY: Validate block before processing
              // In real impl, we fetch prev block hash from DB to validate chain link
@@ -148,6 +153,9 @@ impl ChainSync {
                  eprintln!("🚨 [SECURITY] Block #{} validation FAILED: {}", block.header.height, e);
                  break; // Stop processing batch on first failure
              }
+             
+             // 5.5. STATE COMPLIANCE: Execute through the VM/Executor to prevent blind DB writes
+             executor.execute_block_parallel(block.transactions.clone(), &block.header.proposer_id);
              
              if let Ok(json) = serde_json::to_string(&block) {
                  if let Err(e) = self.storage.save_block_json(block.header.height, &json) {

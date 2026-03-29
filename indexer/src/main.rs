@@ -153,7 +153,10 @@ async fn indexer_loop(db: Arc<Mutex<Connection>>) {
                                     // Calculate Hash (Naive)
                                     // use sha2::{Sha256, Digest}; // Unused for now
                                     
-                                    let hash = format!("{}_{}", height, sender); // Temporary ID
+                                    use sha2::{Sha256, Digest};
+                                    let mut hasher = Sha256::new();
+                                    hasher.update(tx_str.as_bytes());
+                                    let hash = hex::encode(hasher.finalize());
                                     
                                     let mut receiver = None;
                                     let mut amount = 0;

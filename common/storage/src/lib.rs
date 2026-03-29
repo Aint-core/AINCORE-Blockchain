@@ -88,17 +88,19 @@ impl StateDB {
 
     pub fn scan_peers(&self) -> Vec<(String, u16)> {
         let mut peers = Vec::new();
-        let iter = self.db.iterator(IteratorMode::Start);
+        let prefix = b"peer:";
+        let iter = self.db.prefix_iterator(prefix);
 
         for item in iter {
             if let Ok((key, value)) = item {
-                let k = String::from_utf8(key.to_vec()).unwrap_or_default();
+                if !key.starts_with(prefix) {
+                    break;
+                }
                 
-                if k.starts_with("peer:") {
-                    let val_str = String::from_utf8(value.to_vec()).unwrap_or_default();
-                    if let Ok(port) = val_str.parse::< u16>() {
-                        peers.push((k.replace("peer:", ""), port));
-                    }
+                let k = String::from_utf8(key.to_vec()).unwrap_or_default();
+                let val_str = String::from_utf8(value.to_vec()).unwrap_or_default();
+                if let Ok(port) = val_str.parse::<u16>() {
+                    peers.push((k.replace("peer:", ""), port));
                 }
             }
         }
@@ -125,20 +127,20 @@ impl StateDB {
     }
 
     pub fn scan_peer_addrs(&self) -> Vec<(String, String)> {
-        // Iterator is safe, but we should wrap it eventually. 
-        // For now, scan is infallible in rocksdb api wrapper usually, iterator just ends.
         let mut peers = Vec::new();
-        let prefix = "peer_addr:";
+        let prefix = b"peer_addr:";
         let iter = self.db.prefix_iterator(prefix);
         
         for item in iter {
             if let Ok((key, value)) = item {
-                let k = String::from_utf8_lossy(&key).to_string();
-                if k.starts_with(prefix) {
-                     let node_id = k.replace(prefix, "");
-                    let addr = String::from_utf8_lossy(&value).to_string();
-                    peers.push((node_id, addr));
+                if !key.starts_with(prefix) {
+                    break;
                 }
+                
+                let k = String::from_utf8_lossy(&key).into_owned();
+                let node_id = k.replace("peer_addr:", "");
+                let addr = String::from_utf8_lossy(&value).into_owned();
+                peers.push((node_id, addr));
             }
         }
         peers
@@ -146,15 +148,17 @@ impl StateDB {
 
     pub fn scan_vertices(&self) -> Vec<String> {
         let mut vertices = Vec::new();
-        let iter = self.db.iterator(IteratorMode::Start);
+        let prefix = b"vertex:";
+        let iter = self.db.prefix_iterator(prefix);
 
         for item in iter {
             if let Ok((key, value)) = item {
-                let k = String::from_utf8(key.to_vec()).unwrap_or_else(|_| "INVALID_UTF8".to_string());
-                if k.starts_with("vertex:") {
-                    let v_json = String::from_utf8(value.to_vec()).unwrap_or_else(|_| "{}".to_string());
-                    vertices.push(v_json);
+                if !key.starts_with(prefix) {
+                    break;
                 }
+                
+                let v_json = String::from_utf8(value.to_vec()).unwrap_or_else(|_| "{}".to_string());
+                vertices.push(v_json);
             }
         }
         vertices

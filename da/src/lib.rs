@@ -13,6 +13,8 @@ pub struct DABatchPayload {
     pub root_hash: String,
     pub tx_count: usize,
     pub proposer_id: String,
+    #[serde(default)]
+    pub proposer_pubkey: String,
     pub timestamp: i64,
 }
 
@@ -105,6 +107,7 @@ impl DASequencer {
             root_hash: root_hash.clone(),
             tx_count,
             proposer_id: self.node_id.clone(),
+            proposer_pubkey: hex::encode(self.signage_key.verifying_key().to_bytes()),
             timestamp: Utc::now().timestamp(),
         };
 
@@ -255,8 +258,12 @@ impl DASequencer {
             let peer_ip = self.storage.get_peer_ip(peer_id).unwrap_or("127.0.0.1".to_string());
             
             // Ephemeral encrypted connection for broadcast
+            use rand::rngs::OsRng;
+            let mut csprng = OsRng;
+            let ephemeral_signing_key = SigningKey::generate(&mut csprng);
+            
             // Optimization: Maintain persistent connections in a ConnectionPool
-            match secure_connect(&peer_ip, *port, &self.node_id, 0, Some(peer_id)).await {
+            match secure_connect(&peer_ip, *port, "__da__", 0, Some(peer_id), &ephemeral_signing_key).await {
                 Ok((mut stream, shared_key, _peer_node_id)) => {
                     if let Err(e) = send_encrypted_msg(&mut stream, &shared_key, &full_msg).await {
                         eprintln!("❌ [DA] Failed to send to {}: {}", peer_id, e);
@@ -269,18 +276,48 @@ impl DASequencer {
         }
     }
 
-    /// Sinkronisasi batch DA dari peer lain
     pub fn handle_incoming_batch(&self, raw_msg: &str) {
         if let Ok(batch) = serde_json::from_str::<DABatch>(raw_msg) {
              let payload = &batch.payload;
              
-             // 1. Verify Signature
-             // In a real system, we'd lookup the proposer's public key from a Registry.
-             // For now, we assume implicit trust or Self-Verification if we had the key.
-             // TODO: Add Registry Lookup.
+             // 1. Strict Signature Verification (Mitigate DA Poisoning)
+             if let Ok(pubkey_bytes) = hex::decode(&payload.proposer_pubkey) {
+                 use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+                 if let Ok(vk) = VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap_or(&[0;32])) {
+                     if let Ok(sig_bytes) = hex::decode(&batch.signature) {
+                         if let Ok(signature) = Signature::from_slice(&sig_bytes) {
+                             if let Ok(payload_json) = serde_json::to_string(payload) {
+                                 let payload_hash = crypto::hash(payload_json.as_bytes());
+                                 if vk.verify(&payload_hash, &signature).is_err() {
+                                     eprintln!("🚨 [DA] Invalid Signature for batch epoch {}", payload.epoch);
+                                     return;
+                                 }
+                                 
+                                 // Verify Identity matches
+                                 let expected_id = hex::encode(&pubkey_bytes)[0..32].to_string();
+                                 if expected_id != payload.proposer_id {
+                                     eprintln!("🚨 [DA] Identity mismatch for batch epoch {}", payload.epoch);
+                                     return;
+                                 }
+                             }
+                         } else {
+                             eprintln!("🚨 [DA] Invalid signature format");
+                             return;
+                         }
+                     } else { return; }
+                 } else { return; }
+             } else {
+                 if payload.proposer_pubkey.is_empty() {
+                     // For backwards compatibility: warning only if old block from DB
+                     println!("⚠️  [DA] Legacy batch detected without pubkey (epoch {})", payload.epoch);
+                 } else {
+                     eprintln!("🚨 [DA] Missing or invalid proposer_pubkey");
+                     return;
+                 }
+             }
              
             println!(
-                "📥 [DA Sequencer] Received DA_COMMIT epoch={} from {}",
+                "📥 [DA Sequencer] Verified DA_COMMIT epoch={} from {}",
                 payload.epoch, payload.proposer_id
             );
 

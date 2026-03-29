@@ -136,7 +136,14 @@ impl AINCOREVM {
     */
 
 
-    pub fn execute_transaction(&self, sender: AccountAddress, signature: &[u8], _payload: &[u8]) -> Result<bool> {
+    pub fn execute_transaction(
+        &self, 
+        chain_id: &str, 
+        sender: AccountAddress, 
+        sequence_number: u64, 
+        signature: &[u8], 
+        _payload: &[u8]
+    ) -> Result<bool> {
         // === NATIVE ACCOUNT ABSTRACTION (Crypto-Agility) ===
         // This demonstrates how AINCORE supports multiple cryptographic schemes.
         
@@ -211,7 +218,11 @@ impl AINCOREVM {
             
             let sig_obj = Signature::from_bytes(signature.try_into().unwrap());
             
-            if verifying_key.verify(_payload, &sig_obj).is_ok() {
+            // FULL PAYLOAD VERIFICATION (Phase 4):
+            // Match the executor's format: chain_id:sender:payload_hex:seq_num
+            let message = format!("{}:{}:{}:{}", chain_id, sender.to_string(), hex::encode(_payload), sequence_number);
+            
+            if verifying_key.verify(message.as_bytes(), &sig_obj).is_ok() {
                  return Ok(true);
             } else {
                  eprintln!("❌ [VM] Signature Verification FAILED for {}", sender);
@@ -268,7 +279,8 @@ impl AINCOREVM {
                  }
              };
              
-             match pqcrypto_dilithium::dilithium5::verify_detached_signature(&sig, _payload, &pk) {
+             let message = format!("{}:{}:{}:{}", chain_id, sender.to_string(), hex::encode(_payload), sequence_number);
+             match pqcrypto_dilithium::dilithium5::verify_detached_signature(&sig, message.as_bytes(), &pk) {
                  Ok(_) => {
                      // println!("✅ [Native AA] PQC Signature Verified!");
                      return Ok(true);

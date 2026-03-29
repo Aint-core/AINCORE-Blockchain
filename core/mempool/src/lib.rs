@@ -7,6 +7,7 @@ const MAX_SEEN_TXS: usize = 50000;
 pub struct Mempool {
     pending_txs: VecDeque<String>,
     seen_txs: HashSet<String>, // Deduplication
+    seen_order: VecDeque<String>, // Bounded cache tracking
 }
 
 impl Mempool {
@@ -14,6 +15,7 @@ impl Mempool {
         Self {
             pending_txs: VecDeque::new(),
             seen_txs: HashSet::new(),
+            seen_order: VecDeque::new(),
         }
     }
 }
@@ -34,6 +36,29 @@ impl Mempool {
         if let Ok(parsed_tx) = serde_json::from_str::<Transaction>(&tx) {
             if parsed_tx.chain_id != expected_chain {
                 println!("❌ [Mempool] Rejected tx: Invalid Chain ID (Expected {}, Got {})", expected_chain, parsed_tx.chain_id);
+                return;
+            }
+            
+            // === EARLY SIGNATURE VERIFICATION (DoS Protection) ===
+            if parsed_tx.signature.len() == 128 { // 64 bytes hex
+                use ed25519_dalek::{Verifier, VerifyingKey, Signature};
+                if let Ok(pk_bytes) = hex::decode(&parsed_tx.public_key) {
+                    if let Ok(vk) = VerifyingKey::from_bytes(pk_bytes.as_slice().try_into().unwrap_or(&[0;32])) {
+                        if let Ok(sig_bytes) = hex::decode(&parsed_tx.signature) {
+                            if let Ok(sig) = Signature::from_slice(&sig_bytes) {
+                                let message = format!("{}:{}:{}:{}", parsed_tx.chain_id, parsed_tx.sender, parsed_tx.payload, parsed_tx.sequence_number);
+                                if vk.verify(message.as_bytes(), &sig).is_err() {
+                                    println!("❌ [Mempool] Rejected tx: Invalid Signature Verification");
+                                    return;
+                                }
+                            } else { return; }
+                        } else { return; }
+                    } else { return; }
+                } else { return; }
+            } else if parsed_tx.signature.len() == 9254 {
+                // Pass PQC validation down to Executor for performance
+            } else {
+                println!("❌ [Mempool] Rejected tx: Unknown Signature Scheme size");
                 return;
             }
         } else {
@@ -62,13 +87,15 @@ impl Mempool {
              return;
         }
 
-        // Prevent memory leak in deduplication set
+        // Bounded LRU-style eviction
         if self.seen_txs.len() >= MAX_SEEN_TXS {
-            println!("🧹 Clearing seen_txs cache (size limit reached)");
-            self.seen_txs.clear();
+            if let Some(old_tx) = self.seen_order.pop_front() {
+                self.seen_txs.remove(&old_tx);
+            }
         }
 
-        self.seen_txs.insert(tx_hash);
+        self.seen_txs.insert(tx_hash.clone());
+        self.seen_order.push_back(tx_hash.clone());
         self.pending_txs.push_back(tx.clone());
         
         println!("📥 Added transaction to mempool: {}", self.pending_txs.len());

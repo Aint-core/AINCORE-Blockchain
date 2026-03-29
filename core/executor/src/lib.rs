@@ -66,8 +66,15 @@ impl Executor {
         let mut parsed_txs = Vec::new();
         for raw in &txs_json {
             match serde_json::from_str::<Transaction>(raw) {
-                Ok(tx) => parsed_txs.push((tx, raw.clone())),
-                Err(_e) => { /* Silently ignore parse errors in hot loop, or log trace */ },
+                Ok(tx) => {
+                    // CRITICAL FIX: Prevent Scheduler DoS and Lock Truncation here
+                    if tx.input_objects.len() > 128 {
+                        println!("⛔ Transaction REJECTED: Too many input objects (>128)");
+                        continue;
+                    }
+                    parsed_txs.push((tx, raw.clone()));
+                },
+                Err(_e) => { },
             }
         }
 
@@ -283,9 +290,6 @@ impl Executor {
         deps.push(tx.sender.clone());
         for obj in &tx.input_objects {
             deps.push(obj.clone());
-            if deps.len() > 128 { // QUANTUM AUDIT FIX: Limit deps to prevent Scheduler DoS
-                 break;
-            }
         }
         if tx.payload.starts_with("transfer:") {
             let parts: Vec<&str> = tx.payload.split(':').collect();
@@ -346,7 +350,7 @@ impl Executor {
             };
             
             let signature = Signature::from_bytes(&sig_bytes);
-            let message = format!("{}:{}:{}", tx.chain_id, tx.payload, tx.sequence_number);
+            let message = format!("{}:{}:{}:{}", tx.chain_id, tx.sender, tx.payload, tx.sequence_number);
             
             if verifying_key.verify(message.as_bytes(), &signature).is_err() {
                 println!("❌ Invalid Signature Verification");
@@ -419,19 +423,34 @@ impl Executor {
                  return None;
             }
 
-            // Special: If payer is sender, we MUST increment seq number here?
+            // CRITICAL FIX: ALWAYS increment the SENDER's sequence number, even if Paymaster pays gas
+            let mut sender_account_data: aa::AccountData = if payer_addr == tx.sender {
+                account_data.clone()
+            } else {
+                sender_data_check
+            };
+
+            if let Some(new_seq) = sender_account_data.sequence_number.checked_add(1) {
+                sender_account_data.sequence_number = new_seq;
+            } else {
+                println!("❌ Sender Sequence Number Overflow");
+                return None;
+            }
+
             if payer_addr == tx.sender {
-                 if let Some(new_seq) = account_data.sequence_number.checked_add(1) {
-                     account_data.sequence_number = new_seq;
-                 } else {
-                     return None; // Sequence overflow
-                 }
+                account_data.sequence_number = sender_account_data.sequence_number;
+            } else {
+                // Save the sender's updated sequence number independently
+                let mut updated_sender_obj = sender_obj.clone();
+                if let Ok(new_sender_data) = serde_json::to_vec(&sender_account_data) {
+                    updated_sender_obj.data = new_sender_data;
+                    updates.push((format!("obj:{}", updated_sender_obj.id.to_string()), Some(serde_json::to_string(&updated_sender_obj).unwrap_or_else(|_| "{}".to_string()))));
+                }
             }
             
-            // Save Payer Update
+            // Save Payer Update (deducted gas)
             if let Ok(new_data) = serde_json::to_vec(&account_data) {
                 payer_obj.data = new_data;
-                // Add to updates, NOT put
                 updates.push((format!("obj:{}", payer_obj.id.to_string()), Some(serde_json::to_string(&payer_obj).unwrap_or_else(|_| "{}".to_string()))));
             }
 

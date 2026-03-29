@@ -22,7 +22,7 @@ export class Transaction {
         this.sequenceNumber = 0;
         this.publicKey = '';
         this.signature = '';
-        this.chainId = 'AINCORE-MAINNET-1';
+        this.chainId = ''; // Must be explicitly set by developer
     }
 
     /**
@@ -376,8 +376,11 @@ export class Transaction {
         if (signer.address !== this.sender) {
             throw new Error('Signer does not match sender');
         }
-        // Include sequence number AND Chain ID in signature payload (REPLAY PROTECTION)
-        const message = `${this.chainId}:${this.payload}:${this.sequenceNumber}`;
+        if (!this.chainId) {
+            throw new Error('CRITICAL: Chain ID must be explicitly set to prevent replay attacks');
+        }
+        // Include sender, chain ID, and sequence number in signature payload (Phase 4 Node standard)
+        const message = `${this.chainId}:${this.sender}:${this.payload}:${this.sequenceNumber}`;
         this.signature = signer.sign(Buffer.from(message));
         this.publicKey = signer.publicKey;
     }

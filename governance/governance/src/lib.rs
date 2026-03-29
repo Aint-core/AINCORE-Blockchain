@@ -74,6 +74,25 @@ impl GovernanceManager {
     
     // Updated Signature: Added action parameter
     pub fn create_proposal(&self, id: String, title: String, description: String, proposer: String, duration_seconds: u64, action: Option<GovernanceAction>) -> Result<String, String> {
+        // PREVENT SPAM: Require 10,000 AIN to create a proposal
+        let required_stake: u128 = 10_000 * 1_000_000_000_000_000_000;
+        
+        let mut account_obj = self.db.get_object(&proposer).ok_or("Proposer account not found")?;
+        let mut account_data: AccountData = serde_json::from_slice(&account_obj.data).map_err(|_| "Failed to parse account data")?;
+        
+        if account_data.balance < required_stake {
+             return Err(format!("Insufficient balance to create proposal. Required: {} AIN", required_stake / 1_000_000_000_000_000_000));
+        }
+        
+        // Deduct/Burn Fee
+        account_data.balance -= required_stake;
+        if let Ok(new_data) = serde_json::to_vec(&account_data) {
+             account_obj.data = new_data;
+             if let Err(e) = self.db.put_object(&account_obj) {
+                 return Err(format!("Failed to deduct proposal fee: {}", e));
+             }
+        }
+
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         let proposal = Proposal {
             id: id.clone(),
@@ -146,7 +165,10 @@ impl GovernanceManager {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         
         if now >= proposal.end_time && proposal.status == ProposalStatus::Active {
-             if proposal.yes_votes > proposal.no_votes {
+             let total_votes = proposal.yes_votes + proposal.no_votes;
+             let minimum_quorum: u128 = 1_000_000 * 1_000_000_000_000_000_000; // 1M AIN Quorum
+             
+             if total_votes >= minimum_quorum && proposal.yes_votes > proposal.no_votes {
                  // TIMELOCK ENFORCEMENT
                  // 24 Hours Delay
                  const TIMELOCK_DELAY: u64 = 86400; 
