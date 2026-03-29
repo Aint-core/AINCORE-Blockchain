@@ -20,6 +20,11 @@
             "address": "bf960011662109496e7603e09a410e65",
             "public_key": "bf960011662109496e7603e09a410e65ee4639941798e944b63d3f1b94fb1ba6",
             "stake": "500000000000000000000000"
+        },
+        {
+            "address": "1caa60a9bb6f0f8b1dec5e4c200da8e5",
+            "public_key": "1caa60a9bb6f0f8b1dec5e4c200da8e5d31f6c74677e5dd342352fed529ce5ee",
+            "stake": "500000000000000000000000"
         }
     ],
     "treasury_reserve": "50000000000000000000000",
