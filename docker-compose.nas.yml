@@ -21,6 +21,7 @@ services:
     container_name: aincore-validator
     restart: unless-stopped
     ports:
+      - "9102:9102"   # P2P Gossipsub
       - "9002:9002"   # P2P Consensus
       - "8002:8002"   # REST API / RPC
     volumes:
