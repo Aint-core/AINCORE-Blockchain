@@ -42,12 +42,6 @@ services:
         reservations:
           cpus: "1.0"
           memory: 1024M
-    healthcheck:
-      test: ["CMD-SHELL", "cat < /dev/tcp/localhost/8002 || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 120s
     logging:
       driver: json-file
       options:
@@ -70,8 +64,7 @@ services:
     ports:
       - "3001:3001"   # Indexer API
     depends_on:
-      aincore-node:
-        condition: service_healthy
+      - aincore-node
     deploy:
       resources:
         limits:
