@@ -243,6 +243,12 @@ pub async fn start_p2p(port: u16, bootnodes: Vec<String>, storage: Arc<StateDB>,
                             swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                         }
                     }
+                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                        eprintln!("❌ P2P Outgoing Connection Error to {:?}: {:?}", peer_id, error);
+                    }
+                    SwarmEvent::Dialing { peer_id, .. } => {
+                        println!("📞 Dialing peer: {:?}", peer_id);
+                    }
                     _ => {}
                 }
             }
