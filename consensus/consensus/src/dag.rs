@@ -259,6 +259,11 @@ impl DagConsensus {
             dag.insert(vertex.hash.clone(), vertex.clone());
             round_idx.entry(vertex.round).or_default().push(vertex.hash.clone());
             println!("📥 Added Vertex to DAG: {} (Round {})", vertex.hash, vertex.round);
+            
+            // Fast-forward local round to match network if lagging behind (Amnesia Recovery)
+            if vertex.round >= self.current_round {
+                self.current_round = vertex.round + 1;
+            }
         } // Locks dropped here!
 
         // --- ORDERING LOGIC (Bullshark-lite) ---
