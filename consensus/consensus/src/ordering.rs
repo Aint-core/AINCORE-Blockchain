@@ -124,9 +124,9 @@ impl OrderingEngine {
             }
         }
 
-        // Threshold: For prototype with 1 node, need 1 vote.
-        // Real BFT: 2f + 1.
-        let threshold = if validators.is_empty() { 1 } else { (validators.len() * 2 / 3) + 1 };
+        // BFT Commit Threshold: ceil(2n/3) — tolerates up to floor((n-1)/3) Byzantine failures
+        // n=1 → 1, n=2 → 2, n=3 → 2, n=4 → 3, n=7 → 5
+        let threshold = if validators.is_empty() { 1 } else { (validators.len() * 2 + 2) / 3 };
         
         if vote_count < threshold {
             println!("⚠️ Anchor Round {} (Leader {}) not committed. Votes: {}/{}", 

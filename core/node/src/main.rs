@@ -519,12 +519,10 @@ async fn main() {
         };
         
         if !already_validator {
-            println!("🔑 [AutoReg] Node {} not in validator set — registering...", node_id_post_sync);
-            if let Err(e) = storage_post_sync.update_validator_weight(&node_id_post_sync, 100) {
-                eprintln!("❌ [AutoReg] Failed to register: {}", e);
-            } else {
-                println!("✅ [AutoReg] Node registered as Validator (Weight: 100)");
-            }
+            // DISABLED: AutoReg was creating phantom validators that broke BFT quorum.
+            // Validators must be defined in genesis.json or added via governance/staking.
+            println!("⚠️  [AutoReg] Node {} is NOT in validator set. Use genesis.json or staking to register.", node_id_post_sync);
+            println!("   Current node will run in Observer mode until registered.");
         } else {
             println!("✅ [AutoReg] Already a validator in the set");
         }
