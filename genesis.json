@@ -2,8 +2,8 @@
     "chain_id": "AINCORE-MAINNET-1",
     "validators": [
         {
-            "address": "e82b11cca9913c11e015e0e66a725ab2",
-            "public_key": "e82b11cca9913c11e015e0e66a725ab211e8295e994e7f4ae7bfe45e16f31131",
+            "address": "e22cfb41c2937bf864d3a1c2533b20ab",
+            "public_key": "e22cfb41c2937bf864d3a1c2533b20ab8101c8d972f7c475bf08965ae512f585",
             "stake": "1000000000000000000000000"
         },
         {
