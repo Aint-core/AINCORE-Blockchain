@@ -229,12 +229,9 @@ impl StateDB {
 
     // === PHASE 9: DECENTRALIZED CONFIG ===
     pub fn get_federation_key(&self) -> String {
-        // Default Genesis Key (Hardcoded Fallback)
-        const GENESIS_FED_ADDR: &str = "c9c32c8d0607850e6d89c8f048dd3a94";
-        
         match self.get("sys:config:federation_addr") {
             Ok(Some(k)) => k,
-            _ => GENESIS_FED_ADDR.to_string(),
+            _ => "".to_string(), // Empty means not initialized by Genesis yet
         }
     }
 
@@ -281,15 +278,15 @@ impl StateDB {
     // In full prod, we'd use a separate column family or index.
     pub fn get_active_validators(&self) -> Vec<(String, u64)> {
          // Logic: Check a "sys:validators" list.
-         // If empty/missing, fallback to Genesis Validator (Federation Key) with 100 weight.
+         // This is populated by genesis.json during node bootstrap.
          if let Ok(Some(json)) = self.get("sys:validators") {
              if let Ok(vals) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
                  return vals;
              }
          }
          
-         // Fallback: Genesis Validator
-         vec![("c9c32c8d0607850e6d89c8f048dd3a94".to_string(), 100)]
+         // Return empty if not initialized (genesis tool will populate this)
+         vec![]
     }
 
     pub fn update_validator_weight(&self, pubkey: &str, weight: u64) -> std::result::Result<(), rocksdb::Error> {

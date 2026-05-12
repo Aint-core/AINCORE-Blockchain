@@ -269,9 +269,29 @@ module 0x1::staking {
 
         if (found) {
             let config = vector::remove(&mut validator_set.validators, index);
-            let ValidatorConfig { validator_addr: _, stake, public_key: _ } = config;
-            // Burn the stake (Deflationary Event)
+            let ValidatorConfig { validator_addr, stake, public_key: _ } = config;
+            
+            // JAIL SYSTEM: Instead of 100% burn, we slash 5% and force-unbond the rest (21 days jail)
+            let total_val = coin::value(&stake);
+            let slash_amount = (total_val * 5) / 100; // 5% Slashing
+            let remaining_amount = total_val - slash_amount;
+            
+            // Extract and Burn 5% (Deflationary Penalty)
+            let slash_coins = coin::extract(&mut stake, slash_amount);
+            coin::burn(slash_coins);
+            
+            // Burn the rest to re-mint on withdrawal (same as leave_validator_set)
             coin::burn(stake);
+            
+            let current_time = validator_set.current_epoch * 60;
+            let unlock_time = current_time + UNBONDING_PERIOD;
+            
+            // Push to Jail / Unbonding Queue
+            vector::push_back(&mut validator_set.unbonding_queue, UnbondingRequest {
+                validator_addr,
+                stake: remaining_amount,
+                unlock_time,
+            });
         };
     }
 }

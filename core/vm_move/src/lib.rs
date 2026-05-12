@@ -201,13 +201,8 @@ impl AINCOREVM {
             };
 
             // 4. Verify Signature
-            // We need the message that was signed.
-            // Problem: VM doesn't have the original transaction payload (only _payload arg which is script bytecode).
-            // AINCORE VM design flaw: Signature usually covers (Sender + Payload + SequenceNumber).
-            // The `execute_transaction` signature is `(sender, signature, payload)`.
-            // We will verify signature against `payload` (the script bytecode) for now.
-            // In a full implementation, it should verify the full RawTransaction.
-            // For this phase, verification against Payload is infinitely better than "return true".
+            // The signature covers the full transaction message:
+            // "CHAIN_ID:SENDER:PAYLOAD_HEX:SEQUENCE_NUMBER"
             
             use ed25519_dalek::{VerifyingKey, Signature, Verifier};
             
