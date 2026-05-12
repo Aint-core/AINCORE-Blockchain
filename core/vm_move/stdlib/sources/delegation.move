@@ -54,6 +54,7 @@ module 0x1::delegation {
         unbonding_queue: vector<UnbondingDelegation>,
         accumulated_rewards_per_share: u128, // Scaled by 1e18 for precision
         pending_rewards: u128,        // Rewards waiting to be distributed
+        escrowed_coins: Coin<AincoreCoin>, // M2 FIX: Hold coins instead of burn/mint
     }
 
     /// Global delegation registry
@@ -89,6 +90,7 @@ module 0x1::delegation {
             unbonding_queue: vector::empty(),
             accumulated_rewards_per_share: 0,
             pending_rewards: 0,
+            escrowed_coins: coin::mint<AincoreCoin>(0), // M2 FIX: Empty escrow
         });
         
         // Register in global registry
@@ -155,8 +157,8 @@ module 0x1::delegation {
         // Update total delegated
         pool.total_delegated = pool.total_delegated + amount;
         
-        // Deposit coins to validator's pool (burn for now, tracked in pool)
-        coin::burn(coins);
+        // M2 FIX: Hold coins in escrow instead of burning (prevents supply bypass)
+        coin::merge(&mut pool.escrowed_coins, coins);
     }
 
     /// Undelegate tokens (starts 21-day unbonding)
@@ -258,8 +260,8 @@ module 0x1::delegation {
             vector::remove(&mut pool.unbonding_queue, idx);
         };
         
-        // Mint and return tokens
-        let coins = coin::mint<AincoreCoin>(total_withdraw);
+        // M2 FIX: Return tokens from escrow instead of minting new ones
+        let coins = coin::split(&mut pool.escrowed_coins, total_withdraw);
         coin::deposit<AincoreCoin>(delegator_addr, coins);
     }
 

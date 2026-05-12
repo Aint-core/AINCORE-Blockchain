@@ -91,6 +91,46 @@ module 0x1::dex {
         user_lp.balance = user_lp.balance + liquidity;
     }
 
+    /// Remove liquidity from the pool (H1 FIX — was completely missing)
+    /// Returns proportional share of both tokens based on LP token ownership
+    public entry fun remove_liquidity<X, Y>(
+        account: &signer,
+        lp_amount: u128
+    ) acquires LiquidityPool, LPToken {
+        let user_addr = signer::address_of(account);
+        
+        // Verify user has enough LP tokens
+        assert!(exists<LPToken<X, Y>>(user_addr), EINVALID_LIQUIDITY);
+        let user_lp = borrow_global_mut<LPToken<X, Y>>(user_addr);
+        assert!(user_lp.balance >= lp_amount, EINVALID_LIQUIDITY);
+        
+        let pool = borrow_global_mut<LiquidityPool<X, Y>>(@0x1);
+        assert!(pool.lp_supply > 0, EINVALID_LIQUIDITY);
+        
+        let reserve_x = coin::value(&pool.coin_x);
+        let reserve_y = coin::value(&pool.coin_y);
+        
+        // Calculate proportional share: (lp_amount / total_lp) * reserve
+        let amount_x = (lp_amount * reserve_x) / pool.lp_supply;
+        let amount_y = (lp_amount * reserve_y) / pool.lp_supply;
+        
+        assert!(amount_x > 0 || amount_y > 0, EINVALID_LIQUIDITY);
+        
+        // Burn LP tokens
+        user_lp.balance = user_lp.balance - lp_amount;
+        pool.lp_supply = pool.lp_supply - lp_amount;
+        
+        // Return tokens to user
+        if (amount_x > 0) {
+            let coin_x = coin::split(&mut pool.coin_x, amount_x);
+            coin::deposit<X>(user_addr, coin_x);
+        };
+        if (amount_y > 0) {
+            let coin_y = coin::split(&mut pool.coin_y, amount_y);
+            coin::deposit<Y>(user_addr, coin_y);
+        };
+    }
+
     /// Swap X to Y
     public entry fun swap_x_to_y<X, Y>(
         account: &signer,

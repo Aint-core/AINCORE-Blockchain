@@ -5,6 +5,17 @@ module 0x1::coin {
     /// Error codes
     const EINSUFFICIENT_BALANCE: u64 = 1;
     const EALREADY_INITIALIZED: u64 = 2;
+    const ENOT_SYSTEM_MODULE: u64 = 3;
+
+    /// === FRIEND MODULE DECLARATIONS (C1 SECURITY FIX) ===
+    /// Only these system modules can call mint() and burn().
+    /// User-deployed scripts CANNOT call coin::mint — preventing infinite coin exploit.
+    friend 0x1::staking;
+    friend 0x1::dex;
+    friend 0x1::delegation;
+    friend 0x1::token_factory;
+    friend 0x1::treasury;
+    friend 0x1::universal_mining;
 
     struct Coin<phantom CoinType> has store {
         value: u128,
@@ -14,13 +25,14 @@ module 0x1::coin {
         coin: Coin<CoinType>,
     }
 
-    /// Mint new coins (for genesis/testing)
-    public fun mint<CoinType>(amount: u128): Coin<CoinType> {
+    /// Mint new coins — RESTRICTED to friend modules only (C1 FIX)
+    /// User scripts CANNOT call this function.
+    public(friend) fun mint<CoinType>(amount: u128): Coin<CoinType> {
         Coin { value: amount }
     }
 
-    /// Burn coins
-    public fun burn<CoinType>(coin: Coin<CoinType>) {
+    /// Burn coins — RESTRICTED to friend modules only
+    public(friend) fun burn<CoinType>(coin: Coin<CoinType>) {
         let Coin { value: _ } = coin;
     }
 
@@ -84,5 +96,10 @@ module 0x1::coin {
         assert!(coin.value >= amount, error::invalid_argument(EINSUFFICIENT_BALANCE));
         coin.value = coin.value - amount;
         Coin { value: amount }
+    }
+
+    /// Extract a specific amount from a coin (like split but takes amount)
+    public fun extract<CoinType>(coin: &mut Coin<CoinType>, amount: u128): Coin<CoinType> {
+        split(coin, amount)
     }
 }

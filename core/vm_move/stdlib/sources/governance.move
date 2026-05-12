@@ -68,11 +68,17 @@ module 0x1::governance {
         state.next_proposal_id = state.next_proposal_id + 1;
     }
 
+    /// H7 FIX: Vote escrow to lock tokens during voting (prevents double-vote attack)
+    struct VoteEscrow has key {
+        locked_amount: u128,
+        proposal_id: u64,
+    }
+
     public entry fun vote(
         account: &signer,
         proposal_id: u64,
         agree: bool
-    ) acquires GovernanceState {
+    ) acquires GovernanceState, VoteEscrow {
         let addr = signer::address_of(account);
         
         // Fetch Voter's Balance (Voting Weight)
@@ -98,6 +104,23 @@ module 0x1::governance {
                     j = j + 1;
                 };
 
+                // H7 FIX: Lock voting tokens to prevent double-vote via transfer
+                // Withdraw tokens from voter's balance — they CANNOT transfer or vote again
+                let locked_coins = coin::withdraw<AincoreCoin>(account, weight);
+                coin::burn(locked_coins); // Temporarily burn (re-minted on claim)
+                
+                // Store escrow record so voter can reclaim after execution
+                if (exists<VoteEscrow>(addr)) {
+                    let escrow = borrow_global_mut<VoteEscrow>(addr);
+                    escrow.locked_amount = escrow.locked_amount + weight;
+                    escrow.proposal_id = proposal_id;
+                } else {
+                    move_to(account, VoteEscrow {
+                        locked_amount: weight,
+                        proposal_id,
+                    });
+                };
+
                 // Add vote weight (1 token = 1 vote representation)
                 if (agree) {
                     p.votes_for = p.votes_for + weight;
@@ -110,6 +133,35 @@ module 0x1::governance {
             i = i + 1;
         };
         abort error::not_found(EPROPOSAL_NOT_FOUND)
+    }
+
+    /// H7 FIX: Claim locked voting tokens after proposal is executed
+    public entry fun claim_vote_tokens(account: &signer) acquires VoteEscrow, GovernanceState {
+        let addr = signer::address_of(account);
+        assert!(exists<VoteEscrow>(addr), error::not_found(EPROPOSAL_NOT_FOUND));
+        
+        let escrow = borrow_global<VoteEscrow>(addr);
+        let proposal_id = escrow.proposal_id;
+        
+        // Verify the proposal has been executed
+        let state = borrow_global<GovernanceState>(@0x1);
+        let len = vector::length(&state.proposals);
+        let i = 0;
+        let is_executed = false;
+        while (i < len) {
+            let p = vector::borrow(&state.proposals, i);
+            if (p.id == proposal_id) {
+                is_executed = p.executed;
+                break
+            };
+            i = i + 1;
+        };
+        assert!(is_executed, error::invalid_state(EPROPOSAL_EXECUTED));
+        
+        // Return locked tokens to voter
+        let VoteEscrow { locked_amount, proposal_id: _ } = move_from<VoteEscrow>(addr);
+        let returned_coins = coin::mint<AincoreCoin>(locked_amount);
+        coin::deposit<AincoreCoin>(addr, returned_coins);
     }
 
     public entry fun execute_proposal(account: &signer, proposal_id: u64) acquires GovernanceState {

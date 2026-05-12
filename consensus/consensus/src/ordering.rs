@@ -202,16 +202,35 @@ impl OrderingEngine {
         Some(sequence)
     }
 
-    /// CRITICAL-1 FIX: Get leader with fallback support for view change
-
-    /// attempt: 0 = primary leader, 1+ = backup leaders
+    /// H5 + M6 FIX: Leader selection now uses VDF random beacon for unpredictability.
+    /// Previously this was pure deterministic round-robin (idx = round % n), 
+    /// making leader election fully predictable by any observer.
+    /// Now the VDF beacon output is mixed into the selection to add randomness.
+    /// Also removed the hardcoded "node_9009" dev fallback (M6 fix).
     fn get_leader_with_fallback(&self, round: u64, validators: &[String], attempt: u32) -> String {
         if validators.is_empty() {
-            return "node_9009".to_string(); // Fallback for dev
+            // M6 FIX: Instead of hardcoded "node_9009", return empty string
+            // The caller already handles the "no leader found" case properly
+            return String::new();
         }
-        // Primary leader: round % n
-        // Backup leaders: (round + attempt) % n
-        let idx = ((round + attempt as u64) % validators.len() as u64) as usize;
+        
+        // H5 FIX: Mix VDF beacon randomness into leader selection
+        // Convert VDF output bytes to a u64 seed for index calculation
+        let vdf_seed: u64 = if self.last_vdf_output.len() >= 8 {
+            let bytes: [u8; 8] = [
+                self.last_vdf_output[0], self.last_vdf_output[1],
+                self.last_vdf_output[2], self.last_vdf_output[3],
+                self.last_vdf_output[4], self.last_vdf_output[5],
+                self.last_vdf_output[6], self.last_vdf_output[7],
+            ];
+            u64::from_le_bytes(bytes)
+        } else {
+            0 // Fallback to deterministic if VDF not initialized yet (first few rounds)
+        };
+        
+        // Leader index = (round + vdf_randomness + attempt) mod n
+        // The VDF seed changes after every committed anchor, making future leaders unpredictable
+        let idx = ((round.wrapping_add(vdf_seed).wrapping_add(attempt as u64)) % validators.len() as u64) as usize;
         validators[idx].clone()
     }
 

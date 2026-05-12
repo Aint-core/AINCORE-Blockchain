@@ -209,14 +209,16 @@ module 0x1::staking {
         validator_set.current_epoch = validator_set.current_epoch + 1;
         let current_reward = calculate_reward(validator_set.current_epoch);
 
-        // Stop minting if Max Supply reached
-        if (validator_set.total_supply >= MAX_SUPPLY) {
-            return
-        };
-
         let len = vector::length(&validator_set.validators);
         let i = 0;
         while (i < len) {
+            // C2 FIX: Check supply cap INSIDE loop for EACH validator reward
+            // This prevents total minted from exceeding MAX_SUPPLY with many validators
+            if (validator_set.total_supply + current_reward > MAX_SUPPLY) {
+                // Cap reached mid-loop — stop minting for remaining validators
+                break
+            };
+
             let v = vector::borrow_mut(&mut validator_set.validators, i);
             
             // Mint calculated reward

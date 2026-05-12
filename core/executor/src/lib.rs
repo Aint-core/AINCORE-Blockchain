@@ -693,7 +693,12 @@ impl Executor {
                          let base_reward: u128 = 360_000_000_000_000_000; 
                          let reward: u128 = (base_reward * bqi as u128) / 100;
                          
-                         account_data.balance += reward;
+                         // H2 FIX: Use checked arithmetic to prevent overflow
+                         if let Some(new_balance) = account_data.balance.checked_add(reward) {
+                             account_data.balance = new_balance;
+                         } else {
+                             eprintln!("❌ OVERFLOW: DePIN reward overflow blocked for account");
+                         }
                          
                          // CRITICAL FIX: Track inflation into Global Supply to maintain Logarithmic Decay accuracy
                          let mut total_supply: u128 = match self.db.get("sys:total_supply") {
@@ -781,7 +786,10 @@ impl Executor {
                              if gas_used < tx.gas_limit {
                                  let refund_amount: u128 = (tx.gas_limit - gas_used) as u128 * tx.gas_price;
                                  if refund_amount > 0 {
-                                     account_data.balance += refund_amount; 
+                                     // H2 FIX: Use checked arithmetic to prevent overflow
+                                     if let Some(new_bal) = account_data.balance.checked_add(refund_amount) {
+                                         account_data.balance = new_bal;
+                                     }
                                      if let Ok(refunded_data) = serde_json::to_vec(&account_data) {
                                          payer_obj.data = refunded_data;
                                          updates.push((format!("obj:{}", payer_obj.id.to_string()), Some(serde_json::to_string(&payer_obj).unwrap_or_else(|_| "{}".to_string()))));
@@ -1218,7 +1226,10 @@ impl Executor {
                          if gas_used < tx.gas_limit {
                              let refund_amount: u128 = (tx.gas_limit - gas_used) as u128 * tx.gas_price;
                              if refund_amount > 0 {
-                                 account_data.balance += refund_amount; 
+                                 // H2 FIX: Use checked arithmetic to prevent overflow
+                                 if let Some(new_bal) = account_data.balance.checked_add(refund_amount) {
+                                     account_data.balance = new_bal;
+                                 }
                                  if let Ok(refunded_data) = serde_json::to_vec(&account_data) {
                                      payer_obj.data = refunded_data;
                                       updates.push((format!("obj:{}", payer_obj.id.to_string()), Some(serde_json::to_string(&payer_obj).unwrap_or_else(|_| "{}".to_string()))));

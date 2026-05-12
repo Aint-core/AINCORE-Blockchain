@@ -86,8 +86,13 @@ module 0x1::token_factory {
         let fee = coin::withdraw<AincoreCoin>(creator, TOKEN_CREATION_FEE);
         coin::burn(fee); // Burn the fee (deflationary)
         
-        // Generate token_id from symbol + creator address
-        let token_id = symbol; // Simplified: use symbol as token_id
+        // M1 FIX: Token ID = symbol + creator address bytes
+        // This prevents front-running attacks where an attacker deploys a token
+        // with the same symbol to block the legitimate creator.
+        // Each creator gets a unique namespace for their tokens.
+        let creator_bytes = std::bcs::to_bytes(&creator_addr);
+        let token_id = copy symbol;
+        vector::append(&mut token_id, creator_bytes);
         
         // Check token doesn't exist
         let registry = borrow_global_mut<TokenRegistry>(@0x1);
