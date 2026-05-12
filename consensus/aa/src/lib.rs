@@ -5,12 +5,18 @@ use ed25519_dalek::{Verifier, VerifyingKey, Signature};
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct AccountData {
     pub sequence_number: u64,
+    /// DEPRECATED: This field exists only for backward compatibility during migration.
+    /// ALL balance operations MUST go through Move VM CoinStore<AincoreCoin>.
+    /// Native balance is NOT authoritative — the Move VM state is the Single Source of Truth.
+    /// See: C-5, C-6, C-7 audit findings.
     #[serde(default)]
-    pub balance: u128, // Upgraded to u128 for 18 decimals support
+    pub balance: u128,
+    /// DEPRECATED: BTC balance also migrating to Move VM wrapped_btc module.
     #[serde(default)]
-    pub btc_balance: u64, // Wrapped Bitcoin Balance (Sats)
+    pub btc_balance: u64,
     pub public_key: String,
 }
+
 
 pub struct AccountManager;
 

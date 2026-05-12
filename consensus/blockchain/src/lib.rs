@@ -146,28 +146,12 @@ impl Vertex {
         verifying_key.verify(self.hash.as_bytes(), &signature).is_ok()
     }
 
-    /// (DEPRECATED) Sign the vertex hash with BLS and set the signature field
-    pub fn sign_with_bls(&mut self, secret_key: &[u8; 32]) {
-        use crypto::bls::BLSEngine;
-        let bls = BLSEngine::new(b"AINCORE_CONSENSUS_V1");
-        let sig = bls.sign(self.hash.as_bytes(), secret_key);
-        self.signature = hex::encode(&sig);
-    }
-    
-    /// (DEPRECATED) Verify the BLS signature
-    pub fn verify_bls_signature(&self, public_key: &[u8; 32]) -> bool {
-        use crypto::bls::BLSEngine;
-        if self.signature.is_empty() {
-            return false;
-        }
-        let sig_bytes = match hex::decode(&self.signature) {
-            Ok(b) => b,
-            Err(_) => return false,
-        };
-        let bls = BLSEngine::new(b"AINCORE_CONSENSUS_V1");
-        let expected = bls.sign(self.hash.as_bytes(), public_key);
-        sig_bytes == expected
-    }
+    /// (REMOVED) sign_with_bls and verify_bls_signature have been deleted.
+    /// These used symmetric MAC verification (re-sign and compare) which is 
+    /// fundamentally insecure. Per-vertex signing uses Ed25519.
+    /// BLS aggregate signatures for consensus quorum certificates will be
+    /// applied externally by DagConsensus using crypto::BLSEngine.
+
 
     pub fn calculate_hash(&self) -> String {
         let mut data = Vec::new();

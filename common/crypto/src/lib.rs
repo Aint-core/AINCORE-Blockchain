@@ -34,7 +34,7 @@ pub use zkp::{SNARKProver, SNARKError, STARKProver, STARKError, HashPreimageCirc
 pub use vdf::{VDFEngine, VDFError};
 
 pub use mpc::{MPCProtocol, MPCError};
-pub use threshold::threshold_bls::{FrostParticipant, BlsSigner, aggregate_frost, aggregate_bls};
+pub use threshold::threshold_bls::{ThresholdBLS, ThresholdKeyShare, PartialSignature, BlsSigner, aggregate_bls};
 pub use bls::{BLSEngine, BLSError};
 pub use accumulator::{Accumulator, AccumulatorError};
 

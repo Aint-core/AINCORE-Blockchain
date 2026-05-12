@@ -3,13 +3,10 @@ use std::sync::Arc;
 use storage::StateDB;
 
 // === Governance Structs ===
+// NOTE: Native AccountData is no longer used in this module.
+// All balance queries now go through query_move_vm_balance() which reads
+// the authoritative Move VM CoinStore<AincoreCoin> resource directly.
 
-#[derive(Debug, Serialize, Deserialize)]
-struct AccountData {
-    pub balance: u128, // L3 FIX: Match staking module's u128 coin representation
-    pub sequence_number: u64,
-    pub public_key: String,
-}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VoteRecord {
@@ -71,27 +68,90 @@ impl GovernanceManager {
     pub fn new(db: Arc<StateDB>) -> Self {
         Self { db }
     }
+
+    /// === C-12 FIX: Query Move VM CoinStore<AincoreCoin> for authoritative balance ===
+    /// Reads the BCS-encoded CoinStore resource directly from RocksDB storage.
+    /// This bypasses the native AccountData entirely, ensuring the governance module
+    /// uses the Single Source of Truth (SSoT) for all balance-dependent decisions.
+    ///
+    /// Resource key format: resource_{hex_address}_0x1::coin::CoinStore<0x1::staking::AincoreCoin>
+    /// BCS layout of CoinStore<T>: { coin: Coin<T> { value: u128 } }
+    /// Since Coin<T> is a single-field struct, the BCS encoding is just a u128 (16 bytes LE).
+    fn query_move_vm_balance(&self, address: &str) -> u128 {
+        // Pad address to 64 hex chars (32 bytes) for Move VM address format
+        let padded_addr = if address.len() < 64 {
+            format!("{:0>64}", address)
+        } else {
+            address.to_string()
+        };
+        
+        let resource_key = format!(
+            "resource_{}_0x1::coin::CoinStore<0x1::staking::AincoreCoin>",
+            padded_addr
+        );
+        
+        match self.db.get(&resource_key) {
+            Ok(Some(hex_data)) => {
+                // Decode hex -> bytes
+                match hex::decode(&hex_data) {
+                    Ok(bytes) => {
+                        // BCS layout: CoinStore { coin: Coin { value: u128 } }
+                        // Coin is a single-field struct, so BCS encodes it as just the u128.
+                        // CoinStore wraps Coin, so the total BCS is still just a u128 (16 bytes LE).
+                        if bytes.len() >= 16 {
+                            let mut arr = [0u8; 16];
+                            arr.copy_from_slice(&bytes[0..16]);
+                            u128::from_le_bytes(arr)
+                        } else {
+                            println!("⚠️ GOVERNANCE: CoinStore resource too short ({} bytes) for {}", bytes.len(), address);
+                            0
+                        }
+                    },
+                    Err(e) => {
+                        println!("⚠️ GOVERNANCE: Failed to decode CoinStore hex for {}: {}", address, e);
+                        0
+                    }
+                }
+            },
+            Ok(None) => {
+                // No CoinStore resource exists — account has no AIN balance in Move VM
+                println!("ℹ️ GOVERNANCE: No CoinStore resource found for {} — balance is 0", address);
+                0
+            },
+            Err(e) => {
+                println!("⚠️ GOVERNANCE: DB error querying CoinStore for {}: {}", address, e);
+                0
+            }
+        }
+    }
     
     // Updated Signature: Added action parameter
     pub fn create_proposal(&self, id: String, title: String, description: String, proposer: String, duration_seconds: u64, action: Option<GovernanceAction>) -> Result<String, String> {
         // PREVENT SPAM: Require 10,000 AIN to create a proposal
         let required_stake: u128 = 10_000 * 1_000_000_000_000_000_000;
         
-        let mut account_obj = self.db.get_object(&proposer).ok_or("Proposer account not found")?;
-        let mut account_data: AccountData = serde_json::from_slice(&account_obj.data).map_err(|_| "Failed to parse account data")?;
+        // === C-12 FIX: Query Move VM CoinStore for authoritative balance ===
+        // OLD: Read from native AccountData.balance — dual-accounting vulnerability.
+        // NEW: Read directly from Move VM CoinStore<AincoreCoin> resource in storage.
+        // This is a READ-ONLY check. The actual fee deduction is performed atomically
+        // by the Move VM governance::create_proposal entry function when the transaction
+        // is processed by the executor.
+        let proposer_balance = self.query_move_vm_balance(&proposer);
         
-        if account_data.balance < required_stake {
-             return Err(format!("Insufficient balance to create proposal. Required: {} AIN", required_stake / 1_000_000_000_000_000_000));
+        if proposer_balance < required_stake {
+            return Err(format!(
+                "Insufficient balance to create proposal. Required: {} AIN, Available: {} AIN (Move VM CoinStore)",
+                required_stake / 1_000_000_000_000_000_000,
+                proposer_balance / 1_000_000_000_000_000_000
+            ));
         }
         
-        // Deduct/Burn Fee
-        account_data.balance -= required_stake;
-        if let Ok(new_data) = serde_json::to_vec(&account_data) {
-             account_obj.data = new_data;
-             if let Err(e) = self.db.put_object(&account_obj) {
-                 return Err(format!("Failed to deduct proposal fee: {}", e));
-             }
-        }
+        // SECURITY NOTE: Fee deduction is NOT performed here.
+        // The Move VM governance::create_proposal entry function handles atomic
+        // withdrawal + burn of the 10,000 AIN fee via coin::withdraw + coin::burn.
+        // This Rust module only validates the pre-condition (sufficient balance).
+        println!("🏛️ GOVERNANCE: Proposal fee verified via Move VM CoinStore ({} AIN available)", 
+                 proposer_balance / 1_000_000_000_000_000_000);
 
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         let proposal = Proposal {
@@ -130,13 +190,15 @@ impl GovernanceManager {
             return Err("Double voting detected: User has already voted on this proposal".to_string());
         }
 
-        // 3. Fetch User Balance for Weight
-        let account_obj = self.db.get_object(&voter).ok_or("Voter account not found")?;
-        
-        let account_data: AccountData = serde_json::from_slice(&account_obj.data).map_err(|_| "Failed to parse account data")?;
-        
-        let weight = account_data.balance;
-        if weight == 0 { return Err("Voter has no stake".to_string()); }
+        // 3. === C-12 FIX: Fetch Voting Weight from Move VM CoinStore ===
+        // OLD: Read from native AccountData.balance — desynchronized from Move VM state.
+        // NEW: Query Move VM CoinStore<AincoreCoin> directly for authoritative balance.
+        // The Move VM governance::vote entry function also performs vote escrow (token locking)
+        // to prevent double-vote via transfer attacks.
+        let weight = self.query_move_vm_balance(&voter);
+        if weight == 0 { 
+            return Err("Voter has no stake in Move VM CoinStore — cannot vote with zero balance".to_string()); 
+        }
 
         if approve {
             proposal.yes_votes += weight;

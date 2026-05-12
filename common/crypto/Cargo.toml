@@ -15,10 +15,9 @@ blake3 = "1.5"
 pqcrypto-dilithium = "0.5"
 pqcrypto-traits = "0.3"
 
-# BLS12-381 for production-grade BLS signatures
-bls12_381 = "0.8"
-group = "0.13"
-ff = "0.13"
+# BLS12-381 via blst (Supranational) — Audited, used by Ethereum 2.0
+# Replaces bls12_381 crate which was used incorrectly as symmetric MAC
+blst = "0.3"
 
 # Zero-Knowledge Proofs (zk-SNARKs)
 ark-snark = "0.4"
