@@ -110,7 +110,11 @@ where
             // Loop for Encrypted Messages
             let mut len_buf = [0u8; 4]; 
             loop {
-                if tokio::time::timeout(std::time::Duration::from_secs(60), socket.read_exact(&mut len_buf)).await.is_err() { break; }
+                let read_len_res = tokio::time::timeout(std::time::Duration::from_secs(60), socket.read_exact(&mut len_buf)).await;
+                match read_len_res {
+                    Ok(Ok(_)) => {}, // successfully read 4 bytes
+                    _ => break, // Timeout or EOF/connection closed
+                }
                 let msg_len = u32::from_be_bytes(len_buf) as usize;
                 
                 if msg_len > 10 * 1024 * 1024 { 
@@ -119,8 +123,10 @@ where
                 }
                 
                 let mut encrypted_msg = vec![0u8; msg_len];
-                if tokio::time::timeout(std::time::Duration::from_secs(120), socket.read_exact(&mut encrypted_msg)).await.is_err() { 
-                     break; 
+                let read_msg_res = tokio::time::timeout(std::time::Duration::from_secs(120), socket.read_exact(&mut encrypted_msg)).await;
+                match read_msg_res {
+                    Ok(Ok(_)) => {},
+                    _ => break, // Timeout or EOF
                 }
                 
                 if msg_len < 12 { break; }

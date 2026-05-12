@@ -171,57 +171,27 @@ impl Executor {
             }
         }
 
-        // 5. Apply Block Rewards (V3 ECONOMICS)
-        // A. Basic Params
+        // 5. Apply Block Rewards
+        // BUG #2 FIX: Reward minting is EXCLUSIVELY handled by staking.move (Halving model).
+        // The Executor only distributes TRANSACTION FEES to the miner.
+        // DO NOT mint new coins here — that would cause double inflation!
+        
         let _current_height = self.db.get_chain_height();
         
-        // V3 LOGIC: Calculate Reward based on Circulating Supply
-        // We get total supply from a tracked key (or estimate via height * avg if missing, strict tracking is better)
-        // For now, we simulate "Total Mined" roughly or use storage key if available.
-        // Let's use a robust approximation: current_height * 50 (Historical avg) -> Better: Track in DB.
-        
-        let mut total_supply: u128 = match self.db.get("sys:total_supply") {
+        let total_supply: u128 = match self.db.get("sys:total_supply") {
             Ok(Some(s)) => s.parse().unwrap_or(0),
             _ => 0, 
         };
 
-        // If total_supply is 0 (genesis), set it to expected genesis supply (1M)
-        if total_supply == 0 {
-             total_supply = 1_000_000 * 1_000_000_000_000_000_000;
-        }
-
-        // B. Calculate V3 Reward (Logarithmic Decay)
-        // Formula: BaseReward = (MaxSupply - CurrentSupply) / DecayFactor
-        // Floor: TailEmission
-        
-        let remaining = if MAX_SUPPLY > total_supply { MAX_SUPPLY - total_supply } else { 0 };
-        let mut block_inflation = (remaining / DECAY_FACTOR).max(TAIL_EMISSION);
-        
-        // Cap at 100 AIN to prevent Genesis craziness
-        let max_cap = 100 * 1_000_000_000_000_000_000;
-        if block_inflation > max_cap { block_inflation = max_cap; }
-
-        // PHASE 15: ANTI-LAZY PENALTY
-        // If block is empty (Heartbeat), slash reward by 90%.
-        if txs_json.is_empty() {
-            println!("💤 Lazy Block (0 Txs) detected. Slashing reward by 90%.");
-            block_inflation = block_inflation / 10;
-        }
-
-        // C. Fee Logic & Burning
-        let burn_pct = self.db.get_burn_percentage() as u128; // Cast to u128
-        let total_fees_u128 = total_fees as u128; // Fees are currently unit 1, might need scaling if gas price is high.
-        // Assume pure units for now.
+        // Fee Logic & Burning (fees only, no inflation)
+        let burn_pct = self.db.get_burn_percentage() as u128;
+        let total_fees_u128 = total_fees as u128;
         
         let burnt_fees = (total_fees_u128 * burn_pct) / 100;
         let miner_fees = total_fees_u128 - burnt_fees;
         
-        // D. Total Miner Reward
-        let reward_amount = block_inflation + miner_fees;
-        
-        // Update Total Supply
-        total_supply += block_inflation;
-        let _ = self.db.put("sys:total_supply", &total_supply.to_string());
+        // Miner reward = fees ONLY (no block inflation from executor)
+        let reward_amount = miner_fees;
         
         if burnt_fees > 0 {
              println!("🔥 BURNING {} Fees ({}% of {})", burnt_fees, burn_pct, total_fees);
@@ -231,8 +201,8 @@ impl Executor {
         // Or if proposer_hex IS the address (which it is in our consensus), we use it directly.
         let miner_addr = if proposer_hex.len() > 32 { &proposer_hex[0..32] } else { proposer_hex };
 
-        println!("💰 Distributing Block Reward: {} AIN (Inf: {}, Fees: {}) to Miner {}", 
-            reward_amount, block_inflation, miner_fees, miner_addr);
+        println!("💰 Distributing Block Fees: {} AIN (Fees Only, Inflation via staking.move) to Miner {}", 
+            reward_amount, miner_addr);
 
         // Fetch Miner Object
         let mut miner_obj = match self.db.get_object(miner_addr) {
@@ -1156,6 +1126,10 @@ impl Executor {
                      }
                  }
             }
+            // BUG #3 FIX: Only attempt raw hex Move script execution if payload
+            // was NOT already handled by any of the branches above.
+            // Previously this ran unconditionally, causing double-execution.
+            else if tx.payload.len() > 2 && tx.payload.chars().all(|c| c.is_ascii_hexdigit()) {
             if let Ok(script_bytes) = hex::decode(&tx.payload) {
                  match self.vm.execute_script(script_bytes, vec![], tx.gas_limit) {
                      Ok((gas_used, vm_changes, _)) => {
@@ -1180,6 +1154,7 @@ impl Executor {
                      Err(e) => {
                          println!("❌ Move Execution Failed: {}", e);
                      }
+                 }
                  }
             }
             

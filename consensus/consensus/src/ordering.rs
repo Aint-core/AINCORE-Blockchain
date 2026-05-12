@@ -1,5 +1,7 @@
 use blockchain::Vertex;
 use crypto::vdf::VDFEngine;
+use storage::StateDB;
+use std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
 
@@ -15,6 +17,8 @@ pub struct OrderingEngine {
     vdf_engine: Option<VDFEngine>,
     /// Last VDF output for randomness
     last_vdf_output: Vec<u8>,
+    /// Storage reference for persisting committed state
+    storage: Option<Arc<StateDB>>,
 }
 
 impl OrderingEngine {
@@ -27,6 +31,38 @@ impl OrderingEngine {
             committed_sequence: Vec::new(),
             vdf_engine: vdf,
             last_vdf_output: vec![0u8; 32],
+            storage: None,
+        }
+    }
+
+    /// Create with storage for persistence (production mode)
+    pub fn new_with_storage(storage: Arc<StateDB>) -> Self {
+        let vdf = VDFEngine::new(50).ok();
+        
+        // Load committed_rounds from DB
+        let mut committed_rounds = HashSet::new();
+        if let Ok(Some(json)) = storage.get("consensus:committed_rounds") {
+            if let Ok(rounds) = serde_json::from_str::<Vec<u64>>(&json) {
+                println!("🔄 Restored {} committed rounds from DB", rounds.len());
+                committed_rounds = rounds.into_iter().collect();
+            }
+        }
+        
+        // Load committed_sequence from DB
+        let mut committed_sequence = Vec::new();
+        if let Ok(Some(json)) = storage.get("consensus:committed_sequence") {
+            if let Ok(seq) = serde_json::from_str::<Vec<String>>(&json) {
+                println!("🔄 Restored {} committed vertex hashes from DB", seq.len());
+                committed_sequence = seq;
+            }
+        }
+        
+        Self {
+            committed_rounds,
+            committed_sequence,
+            vdf_engine: vdf,
+            last_vdf_output: vec![0u8; 32],
+            storage: Some(storage),
         }
     }
     
@@ -146,6 +182,18 @@ impl OrderingEngine {
         // Update state
         self.committed_rounds.insert(anchor_round);
         self.committed_sequence.extend(sequence.clone());
+        
+        // PERSIST committed state to DB (BUG #1 FIX)
+        if let Some(ref storage) = self.storage {
+            if let Ok(json) = serde_json::to_string(&self.committed_rounds.iter().collect::<Vec<_>>()) {
+                let _ = storage.put("consensus:committed_rounds", &json);
+            }
+            // Only persist last 10000 committed hashes to prevent unbounded growth
+            let seq_to_save: Vec<&String> = self.committed_sequence.iter().rev().take(10000).collect();
+            if let Ok(json) = serde_json::to_string(&seq_to_save) {
+                let _ = storage.put("consensus:committed_sequence", &json);
+            }
+        }
         
         // 6. Update VDF random beacon with committed anchor hash
         // This ensures unpredictable randomness for future leader selection

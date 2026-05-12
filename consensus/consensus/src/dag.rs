@@ -86,16 +86,29 @@ impl DagConsensus {
             _ => "genesis".to_string(),
         };
 
+        let explicit_max_round = match storage.get("latest_proposed_round") {
+            Ok(Some(r)) => r.parse::<u64>().unwrap_or(0),
+            _ => 0,
+        };
+        
+        let mut final_start_round = std::cmp::max(1, max_round + 1);
+        if explicit_max_round >= final_start_round {
+            println!("🔄 Restoring from explicitly saved proposed round: {}", explicit_max_round);
+            final_start_round = explicit_max_round + 1;
+        }
+
+        let storage_for_ordering = Arc::clone(&storage);
+
         Self {
             node_id,
             peers,
-            current_round: std::cmp::max(1, max_round + 1),
+            current_round: final_start_round,
             dag: Arc::new(Mutex::new(dag_map)),
             round_index: Arc::new(Mutex::new(round_idx_map)),
             mempool,
             executor,
             storage,
-            ordering_engine: Arc::new(Mutex::new(OrderingEngine::new())),
+            ordering_engine: Arc::new(Mutex::new(OrderingEngine::new_with_storage(storage_for_ordering))),
             latest_block_height,
             latest_block_hash,
             accumulator: Accumulator::new(),
@@ -209,6 +222,9 @@ impl DagConsensus {
             self.add_vertex(vertex.clone());
             self.broadcast_vertex(&vertex);
             
+            // Explicitly save the round we just proposed to prevent Double-Sign on restart
+            let _ = self.storage.put("latest_proposed_round", &self.current_round.to_string());
+            
             // Advance round
             self.current_round += 1;
             println!("⚡ Created Vertex {} (Round {}) [BLS Signed]", vertex.hash, vertex.round);
@@ -261,8 +277,9 @@ impl DagConsensus {
             println!("📥 Added Vertex to DAG: {} (Round {})", vertex.hash, vertex.round);
             
             // Fast-forward local round to match network if lagging behind (Amnesia Recovery)
-            if vertex.round > self.current_round {
+            if vertex.round >= self.current_round {
                 self.current_round = vertex.round + 1;
+                let _ = self.storage.put("latest_proposed_round", &self.current_round.to_string());
             }
         } // Locks dropped here!
 
