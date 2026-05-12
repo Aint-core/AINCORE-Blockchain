@@ -1,34 +1,55 @@
-# Rust Build Artifacts
-# System Files
-.DS_Store
-Thumbs.db
+# ===========================
+# AINCORE BLOCKCHAIN .gitignore
+# ===========================
 
-# Build Artifacts
+# Rust Build Artifacts
 target/
 build/
+**/*.rs.bk
+
+# Node.js
 node_modules/
 dist/
 .next/
 
-# Logs & Data
+# System Files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Logs & Temp
 *.log
 logs/
+tmp/
 
-# Node Data (RocksDB)
+# ===========================
+# 🔒 SECRETS — NEVER COMMIT
+# ===========================
+.env
+.env.*
+.env.local
+.env.production
+*.key
+*.pem
+*.p12
+*.secret
+*.keystore
+wallet.key
+node.key
+node_identity.key
+user.key
+seed_phrase*
+private_key*
+vault_address.txt
+
+# Node Data (RocksDB / Database)
 data/
 data_*/
+.aincore/
 aincore_data/
 testnet_data/
 *.db
-
-# Secrets (Keys)
-*.key
-wallet.key
-node_identity.key
-
-# Local Configs
-vault_address.txt
-.env
-
-# MacOS
-.DS_Store
+*.sst
+*.ldb
