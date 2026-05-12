@@ -224,6 +224,62 @@ impl DagConsensus {
             
             // Explicitly save the round we just proposed to prevent Double-Sign on restart
             let _ = self.storage.put("latest_proposed_round", &self.current_round.to_string());
+
+            // === DOWNTIME DETECTION (Jail System Trigger) ===
+            // Track which validators participated in this round.
+            // If a validator misses 100+ consecutive rounds (~100 minutes), mark for slashing.
+            const DOWNTIME_THRESHOLD: u64 = 100; // 100 rounds of absence = jail
+            
+            // Record our participation
+            let _ = self.storage.put(
+                &format!("validator:last_seen:{}", self.node_id),
+                &self.current_round.to_string()
+            );
+            
+            // Check all validators for downtime (only every 10 rounds to save CPU)
+            if self.current_round % 10 == 0 {
+                for validator_id in &validators {
+                    if validator_id == &self.node_id { continue; } // Skip self
+                    
+                    let last_seen = match self.storage.get(&format!("validator:last_seen:{}", validator_id)) {
+                        Ok(Some(r)) => r.parse::<u64>().unwrap_or(0),
+                        _ => 0,
+                    };
+                    
+                    let rounds_missed = if self.current_round > last_seen {
+                        self.current_round - last_seen
+                    } else {
+                        0
+                    };
+                    
+                    if rounds_missed >= DOWNTIME_THRESHOLD && last_seen > 0 {
+                        // Check if already jailed (prevent double-slash)
+                        let jail_key = format!("validator:jailed:{}", validator_id);
+                        if let Ok(Some(_)) = self.storage.get(&jail_key) {
+                            continue; // Already jailed, skip
+                        }
+                        
+                        println!("🚨 DOWNTIME DETECTED: Validator {} missed {} rounds!", validator_id, rounds_missed);
+                        println!("⚖️  Triggering Jail System: 5% slash + 21-day unbonding");
+                        
+                        // Mark as jailed to prevent re-slashing
+                        let _ = self.storage.put(&jail_key, &self.current_round.to_string());
+                        
+                        // Log the slashing event (actual Move VM slash will be called by epoch.move)
+                        let slash_event = serde_json::json!({
+                            "event": "validator_jailed",
+                            "validator": validator_id,
+                            "round": self.current_round,
+                            "rounds_missed": rounds_missed,
+                            "penalty": "5% slash + 21-day unbonding"
+                        });
+                        let _ = self.storage.put(
+                            &format!("slash_event:{}", self.current_round),
+                            &slash_event.to_string()
+                        );
+                    }
+                }
+            }
             
             // Advance round
             self.current_round += 1;

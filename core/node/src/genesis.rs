@@ -224,6 +224,14 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
             println!("🔗 Native Consensus State Synced: {} Validator(s)", native_validators.len());
         }
 
+        // === GENESIS LOCK: Register the Genesis Validator address ===
+        // This address will be PERMANENTLY BLOCKED from transfers (Anti-Rugpull).
+        // The Executor checks sys:config:federation_addr before every transfer.
+        if let Some((first_addr, _)) = genesis_validators.first() {
+            storage.set_federation_key(first_addr)?;
+            println!("🔒 Genesis Lock Registered: {} (transfers permanently disabled)", first_addr);
+        }
+
         let validator_set = ValidatorSet {
             validators: validator_configs,
             total_supply: total_bootstrap_stake, 

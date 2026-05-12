@@ -495,6 +495,17 @@ impl Executor {
                 if parts.len() == 3 {
                     let recipient_addr = parts[1];
                     let amount: u128 = parts[2].parse().unwrap_or(0);
+
+                    // === GENESIS LOCK (Anti-Rugpull) ===
+                    // The Genesis Validator's pre-mined AIN is PERMANENTLY locked.
+                    // It can ONLY be used for staking, NEVER for transfers.
+                    // This ensures 100% Fairlaunch integrity.
+                    let genesis_addr = self.db.get_federation_key();
+                    if !genesis_addr.is_empty() && tx.sender == genesis_addr {
+                        println!("🔒 GENESIS LOCK: Transfer BLOCKED from Genesis address {}", &tx.sender[..8]);
+                        println!("   Genesis funds are permanently locked for staking only.");
+                        return None;
+                    }
                     
                     if amount > 0 {
                           // Check balance for transfer (after gas)
