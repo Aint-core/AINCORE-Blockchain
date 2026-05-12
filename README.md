@@ -24,7 +24,7 @@ AINCORE is a high-performance Layer-1 blockchain built entirely in Rust, featuri
 - **Token Factory:** Create custom tokens (ERC-20 equivalent) on-chain
 - **DEX:** Built-in AMM (Constant Product x*y=k) with 0.3% fee
 - **DePIN Integration:** Bio-Oracle for real-world data mining (Universal Mining)
-- **Security:** Ed25519 signatures, AES-256-GCM encrypted P2P, full-transaction replay protection
+- **Security:** Ed25519 + Dilithium5 (PQC) signatures, ChaCha20-Poly1305 encrypted P2P, full-transaction replay protection
 - **Downtime Detection:** Validators missing 100+ rounds are automatically jailed and slashed
 
 ---
@@ -270,17 +270,19 @@ If you wish to stop validating:
 | **Chain ID Isolation** | Transactions rejected if chain_id mismatches | `executor/src/lib.rs` |
 | **Sequence Numbers** | Per-account nonce prevents transaction replay | `executor/src/lib.rs` |
 | **Ed25519 Signatures** | All transactions cryptographically signed | `vm_move/src/lib.rs` |
-| **AES-256-GCM P2P** | Encrypted node-to-node communication | `network/src/lib.rs` |
+| **ChaCha20-Poly1305 P2P** | Authenticated encrypted node-to-node communication (X25519 key exchange) | `crypto/src/transport.rs` |
 | **BFT Threshold** | `ceil(2n/3)` quorum for consensus finality | `ordering.rs` |
 | **Input Object ACL** | Move VM scripts restricted to declared objects | `executor/src/lib.rs` |
 | **Supply Hard Cap** | `MAX_SUPPLY` enforced in smart contract with checked arithmetic | `staking.move` |
 
 ### Cryptographic Stack
 
-- **Signatures:** Ed25519 (ed25519-dalek)
+- **Signatures:** Ed25519 (ed25519-dalek) + CRYSTALS-Dilithium5 (Post-Quantum)
 - **Hashing:** SHA-256 (sha2), SHA3-256 (sha3)
 - **BLS:** BLS12-381 aggregate signatures for consensus
-- **Encryption:** AES-256-GCM with ECDH key exchange
+- **Key Exchange:** X25519 (Diffie-Hellman) for ephemeral session keys
+- **Encryption:** ChaCha20-Poly1305 authenticated encryption (timing-attack resistant)
+- **PQC:** CRYSTALS-Dilithium5 (NIST Standard) for quantum-resistant transaction signing
 - **Accumulator:** Cryptographic accumulator for state root proofs
 
 ---

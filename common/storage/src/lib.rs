@@ -71,6 +71,26 @@ impl StateDB {
         self.db.delete(key)
     }
 
+    /// Generic prefix scanner — returns all (key, value) pairs matching a prefix.
+    /// Used by the Executor to process pending slashes from the consensus engine.
+    pub fn scan_prefix(&self, prefix: &str) -> Vec<(String, String)> {
+        let mut results = Vec::new();
+        let prefix_bytes = prefix.as_bytes();
+        let iter = self.db.prefix_iterator(prefix_bytes);
+        
+        for item in iter {
+            if let Ok((key, value)) = item {
+                if !key.starts_with(prefix_bytes) {
+                    break;
+                }
+                let k = String::from_utf8_lossy(&key).into_owned();
+                let v = String::from_utf8_lossy(&value).into_owned();
+                results.push((k, v));
+            }
+        }
+        results
+    }
+
     // === HELPER FOR PEER MAN AGEMENT ===
     pub fn save_peer(&self, node_id: &str, port: u16) -> std::result::Result<(), rocksdb::Error> {
         let key = format!("peer:{}", node_id);

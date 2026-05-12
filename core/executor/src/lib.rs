@@ -244,7 +244,72 @@ impl Executor {
             }
         }
 
+        // 6. Process Pending Slashes from Consensus Engine
+        // The consensus layer writes sys:pending_slash:{address} entries when it detects
+        // downtime or equivocation. We process them here to execute on-chain balance deduction.
+        self.execute_pending_slashes();
+
         println!("✅ Parallel Execution Complete.");
+    }
+
+    /// Execute pending slash events written by the consensus engine.
+    /// This is the critical bridge between consensus-level detection and on-chain execution.
+    /// Reads sys:pending_slash:{addr}, deducts 5% of validator stake, removes from validator set.
+    fn execute_pending_slashes(&self) {
+        // Scan for pending slash entries
+        let slash_keys = self.db.scan_prefix("sys:pending_slash:");
+        
+        for (key, event_json) in &slash_keys {
+            // Extract validator address from key: "sys:pending_slash:{addr}"
+            let validator_addr = match key.strip_prefix("sys:pending_slash:") {
+                Some(addr) => addr.to_string(),
+                None => continue,
+            };
+            
+            println!("⚖️  EXECUTING ON-CHAIN SLASH for validator: {}", &validator_addr);
+            
+            // Parse the slash event for logging
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(event_json) {
+                let reason = event.get("reason").and_then(|r| r.as_str()).unwrap_or("unknown");
+                println!("   Reason: {}", reason);
+            }
+            
+            // Deduct 5% from validator's account balance (the on-chain penalty)
+            if let Some(mut validator_obj) = self.db.get_object(&validator_addr) {
+                if let Ok(mut data) = serde_json::from_slice::<aa::AccountData>(&validator_obj.data) {
+                    let slash_amount = data.balance / 20; // 5% = balance / 20
+                    if let Some(new_balance) = data.balance.checked_sub(slash_amount) {
+                        data.balance = new_balance;
+                        println!("   🔥 Slashed {} AIN (5% of {})", slash_amount, data.balance + slash_amount);
+                        println!("   💰 Remaining balance: {}", data.balance);
+                        
+                        if let Ok(new_data) = serde_json::to_vec(&data) {
+                            validator_obj.data = new_data;
+                            let _ = self.db.put_object(&validator_obj);
+                        }
+                    }
+                }
+            }
+            
+            // Remove validator from active set (sys:validators)
+            if let Ok(Some(json)) = self.db.get("sys:validators") {
+                if let Ok(mut vals) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
+                    let before_len = vals.len();
+                    vals.retain(|(addr, _)| addr != &validator_addr);
+                    if vals.len() < before_len {
+                        if let Ok(new_json) = serde_json::to_string(&vals) {
+                            let _ = self.db.put("sys:validators", &new_json);
+                            println!("   ⛓️  Validator {} removed from active set ({} -> {} validators)", 
+                                     &validator_addr, before_len, vals.len());
+                        }
+                    }
+                }
+            }
+            
+            // Delete the pending slash entry (processed)
+            let _ = self.db.delete(&key);
+            println!("   ✅ Slash executed and cleared from queue.");
+        }
     }
 
     pub fn analyze_dependencies(&self, tx_json: &str) -> Vec<String> {

@@ -265,14 +265,21 @@ impl DagConsensus {
                         // Mark as jailed to prevent re-slashing
                         let _ = self.storage.put(&jail_key, &self.current_round.to_string());
                         
-                        // Log the slashing event (actual Move VM slash will be called by epoch.move)
+                        // === SLASH EXECUTION QUEUE ===
+                        // Write pending slash to storage. The Executor will pick this up
+                        // during block processing and execute the on-chain balance deduction.
                         let slash_event = serde_json::json!({
                             "event": "validator_jailed",
                             "validator": validator_id,
                             "round": self.current_round,
                             "rounds_missed": rounds_missed,
+                            "reason": "downtime",
                             "penalty": "5% slash + 21-day unbonding"
                         });
+                        let _ = self.storage.put(
+                            &format!("sys:pending_slash:{}", validator_id),
+                            &slash_event.to_string()
+                        );
                         let _ = self.storage.put(
                             &format!("slash_event:{}", self.current_round),
                             &slash_event.to_string()
@@ -319,9 +326,26 @@ impl DagConsensus {
                              println!("   Round: {}", vertex.round);
                              println!("   Proof A: {}", existing_hash);
                              println!("   Proof B: {}", vertex.hash);
-                             println!("🔥 BURNING STAKE OF {}", vertex.author);
-                             // In a full contract system: self.executor.call_slash_contract(vertex.author)
-                             // For now, we block the vertex and logically slash.
+                             println!("🔥 SLASHING STAKE OF {}", vertex.author);
+                             
+                             // === SLASH EXECUTION QUEUE (Equivocation) ===
+                             let slash_event = serde_json::json!({
+                                 "event": "equivocation_detected",
+                                 "validator": vertex.author,
+                                 "round": vertex.round,
+                                 "proof_a": existing_hash,
+                                 "proof_b": vertex.hash,
+                                 "reason": "double_sign",
+                                 "penalty": "5% slash + 21-day unbonding"
+                             });
+                             let _ = self.storage.put(
+                                 &format!("sys:pending_slash:{}", vertex.author),
+                                 &slash_event.to_string()
+                             );
+                             let _ = self.storage.put(
+                                 &format!("validator:jailed:{}", vertex.author),
+                                 &vertex.round.to_string()
+                             );
                              return; 
                          }
                      }
