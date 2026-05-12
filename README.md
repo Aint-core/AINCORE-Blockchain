@@ -1,26 +1,31 @@
 # AINCORE Blockchain
 
-**Layer-1 Blockchain | DAG BFT Consensus | Move VM | Proof of Stake**
+**Sovereign Layer-1 | DAG-BFT Consensus | Move VM | No-VC Fairlaunch**
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)]()
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange)]()
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
+[![Security](https://img.shields.io/badge/audit-internal--passed-green)]()
 
 ---
 
 ## Overview
 
-AINCORE is a high-performance Layer-1 blockchain built entirely in Rust, featuring DAG-based BFT consensus (inspired by Bullshark), parallel transaction execution via Move VM, and a Delegated Proof of Stake (DPoS) economic model.
+AINCORE is a high-performance Layer-1 blockchain built entirely in Rust, featuring DAG-based BFT consensus (inspired by Bullshark/Narwhal), parallel transaction execution via Move VM, and a Delegated Proof of Stake (DPoS) economic model with **Zero VC allocation**.
 
 ### Key Features
 
-- **Consensus:** DAG BFT (Bullshark-inspired) with VDF random beacon for unpredictable leader election
+- **Consensus:** DAG-BFT (Bullshark-inspired) with VDF random beacon for unpredictable leader election
 - **Execution:** Parallel Move VM with conflict-aware batch scheduling (Rayon)
 - **Smart Contracts:** Move language (Aptos-compatible) for resource-safe programmability
 - **Staking:** DPoS with 1,000 AIN minimum stake, 21-day unbonding, halving rewards
-- **Token Factory:** Create custom tokens (ERC-20 equivalent) in seconds
+- **Jail System:** Misbehaving validators are slashed 5% and force-unbonded (not 100% burned)
+- **Genesis Lock:** Founder's pre-mine is **mathematically locked** in smart contract — cannot be transferred or sold
+- **Token Factory:** Create custom tokens (ERC-20 equivalent) on-chain
+- **DEX:** Built-in AMM (Constant Product x*y=k) with 0.3% fee
 - **DePIN Integration:** Bio-Oracle for real-world data mining (Universal Mining)
-- **Security:** Ed25519 signatures, AES-256-GCM encrypted P2P, chain-level replay protection
+- **Security:** Ed25519 signatures, AES-256-GCM encrypted P2P, full-transaction replay protection
+- **Downtime Detection:** Validators missing 100+ rounds are automatically jailed and slashed
 
 ---
 
@@ -28,45 +33,64 @@ AINCORE is a high-performance Layer-1 blockchain built entirely in Rust, featuri
 
 | Parameter | Value |
 |---|---|
-| **Native Coin** | $AIN |
-| **Max Supply** | 150,000,000 AIN (Hard Cap) |
+| **Native Coin** | **$AIN** |
+| **Max Supply** | 150,000,000 AIN (Hard Cap, enforced in smart contract) |
+| **Genesis Allocation** | ~1,050,000 AIN (0.7% — Validator Stake + Treasury) |
+| **Community Supply** | ~148,950,000 AIN (99.3% — Mined via DePIN & Staking) |
+| **VC Allocation** | **0% (Zero)** |
 | **Block Reward** | 36 AIN per epoch (Halving model) |
 | **Halving Interval** | ~4 years (2,102,400 epochs) |
 | **Min Validator Stake** | 1,000 AIN |
-| **Unbonding Period** | 21 days |
-| **Consensus** | Delegated Proof of Stake (DPoS) |
+| **Unbonding Period** | 21 days (1,814,400 seconds) |
+| **Slashing Penalty** | 5% stake burn + forced 21-day unbonding |
 | **Reward Formula** | `Reward = 36 AIN >> (epoch / 2,102,400)` |
 
-The halving schedule follows the same geometric decay as Bitcoin, ensuring deflationary pressure over time.
+### Fairlaunch Model (No-VC, Hyperliquid-Style)
+
+AINCORE follows a **No-VC Fairlaunch** model inspired by Hyperliquid:
+
+1. **Genesis Validator Lock:** The founder's initial stake (used to bootstrap the network) is **permanently locked** at the protocol level. The `Executor` rejects any `transfer` transaction from the Genesis address. This is enforced in code, not by promise.
+2. **Zero VC/Presale:** No tokens were sold to venture capitalists or institutional investors at a discount.
+3. **99.3% Community Owned:** Nearly all tokens are minted exclusively through DePIN Mining and Staking Rewards over time.
+4. **Buyback Ready:** Transaction fees flow to the Treasury, enabling protocol-level buyback mechanisms.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                   AINCORE Node                   │
-├──────────┬──────────┬──────────┬────────────────┤
-│ P2P Net  │ Mempool  │ DAG BFT  │ Ordering Engine│
-│ (AES-GCM)│ (Ed25519)│(Bullshark)│  (Commit/VDF) │
-├──────────┴──────────┴──────────┴────────────────┤
-│              Executor (Parallel Batches)          │
-├──────────────────────────────────────────────────┤
-│              Move VM (Smart Contracts)            │
-├──────────────────────────────────────────────────┤
-│              StateDB (RocksDB)                    │
-└──────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                    AINCORE Node                       │
+├───────────┬───────────┬───────────┬──────────────────┤
+│  P2P Net  │  Mempool  │  DAG-BFT  │ Ordering Engine  │
+│ (AES-GCM) │ (Ed25519) │(Bullshark)│ (Commit/VDF)     │
+├───────────┴───────────┴───────────┴──────────────────┤
+│          Executor (Parallel Batch Scheduling)         │
+│          ├── Genesis Lock (Anti-Rugpull)              │
+│          └── Gas Abstraction (Paymaster)              │
+├──────────────────────────────────────────────────────┤
+│          Move VM (Smart Contracts)                    │
+│          ├── staking.move (DPoS + Jail System)        │
+│          ├── dex.move (AMM x*y=k)                    │
+│          ├── universal_mining.move (DePIN Oracle)     │
+│          └── token_factory.move (Custom Tokens)       │
+├──────────────────────────────────────────────────────┤
+│          StateDB (RocksDB) + DAG Checkpoints          │
+└──────────────────────────────────────────────────────┘
 ```
+
+### Component Map
 
 | Component | Port | Path | Description |
 |---|---|---|---|
 | Core Node | 9000 (P2P) | `core/node` | Main validator process |
 | JSON-RPC API | 8002 (HTTP) | `core/node/src/api_local.rs` | Wallet/DApp interface |
-| CLI Wallet | - | `core/cli` | Command-line wallet |
-| JS/TS SDK | - | `aincore-js` | DApp development SDK |
+| CLI Wallet | — | `core/cli` | Command-line wallet & tools |
+| Bench-TPS | — | `core/cli/src/bin/bench_tps.rs` | Stress test tool |
+| JS/TS SDK | — | `aincore-js` | DApp development SDK |
 | Indexer | 3001 | `indexer` | Transaction history API |
-| Bridge | - | `depin/bridge-rust` | Cross-chain bridge |
-| Monitor | Terminal | `monitor` | Live dashboard |
+| Bridge | — | `depin/bridge-rust` | Cross-chain BTC bridge |
+| Monitor | Terminal | `monitor` | Live node dashboard |
 
 ---
 
@@ -93,6 +117,13 @@ cargo run --release -p node -- --port 9000 --datadir .aincore
 
 The node will start producing blocks and expose the JSON-RPC API at `http://localhost:8002/rpc`.
 
+### Run Stress Test (Bench-TPS)
+
+```bash
+# Fire 1000 transactions at your local node
+cargo run --release --bin bench_tps -- http://127.0.0.1:3030 1000
+```
+
 ---
 
 ## Become a Validator (Step-by-Step)
@@ -103,12 +134,14 @@ This guide walks you through becoming a validator on the AINCORE network.
 
 | Requirement | Minimum |
 |---|---|
-| **Server** | VPS or dedicated machine, 24/7 uptime |
+| **Server** | VPS or dedicated machine, **24/7 uptime required** |
 | **CPU** | 2+ cores |
 | **RAM** | 4 GB |
 | **Storage** | 50 GB SSD |
 | **Network** | Stable internet, open port 9000 (TCP) |
 | **Stake** | 1,000 AIN tokens |
+
+> ⚠️ **WARNING:** Running a validator on unreliable hardware (laptop, home WiFi) risks **automatic slashing**. If your node misses 100+ consecutive rounds, the Jail System will slash 5% of your stake and lock the remaining 95% for 21 days. Use a reliable VPS provider (AWS, Google Cloud, Hetzner, etc.).
 
 ### Step 1: Install and Build
 
@@ -223,6 +256,59 @@ If you wish to stop validating:
 
 ---
 
+## Security Model
+
+### Protocol-Level Protections
+
+| Protection | Implementation | File |
+|---|---|---|
+| **Genesis Lock** | Transfers from Genesis address permanently blocked | `executor/src/lib.rs` |
+| **Jail System** | 5% slash + 21-day forced unbonding for misbehavior | `staking.move` |
+| **Downtime Detection** | Auto-slash after 100+ missed rounds | `consensus/dag.rs` |
+| **Double-Sign Detection** | Equivocation proof triggers immediate slash | `consensus/dag.rs` |
+| **Replay Protection** | Full transaction signing: `chain_id:sender:payload:seq_num` | `executor/src/lib.rs` |
+| **Chain ID Isolation** | Transactions rejected if chain_id mismatches | `executor/src/lib.rs` |
+| **Sequence Numbers** | Per-account nonce prevents transaction replay | `executor/src/lib.rs` |
+| **Ed25519 Signatures** | All transactions cryptographically signed | `vm_move/src/lib.rs` |
+| **AES-256-GCM P2P** | Encrypted node-to-node communication | `network/src/lib.rs` |
+| **BFT Threshold** | `ceil(2n/3)` quorum for consensus finality | `ordering.rs` |
+| **Input Object ACL** | Move VM scripts restricted to declared objects | `executor/src/lib.rs` |
+| **Supply Hard Cap** | `MAX_SUPPLY` enforced in smart contract with checked arithmetic | `staking.move` |
+
+### Cryptographic Stack
+
+- **Signatures:** Ed25519 (ed25519-dalek)
+- **Hashing:** SHA-256 (sha2), SHA3-256 (sha3)
+- **BLS:** BLS12-381 aggregate signatures for consensus
+- **Encryption:** AES-256-GCM with ECDH key exchange
+- **Accumulator:** Cryptographic accumulator for state root proofs
+
+---
+
+## Smart Contract Modules (Move)
+
+AINCORE uses the Move programming language. All core modules live in `core/vm_move/stdlib/sources/`:
+
+| Module | File | Description |
+|---|---|---|
+| `staking` | `staking.move` | DPoS validator staking, halving rewards, **Jail System** |
+| `delegation` | `delegation.move` | Liquid staking delegation with commission |
+| `dex` | `dex.move` | AMM DEX (Constant Product x*y=k, 0.3% fee) |
+| `token_factory` | `token_factory.move` | Create/Mint/Burn/Transfer custom tokens |
+| `governance` | `governance.move` | On-chain proposal creation and voting |
+| `treasury` | `treasury.move` | System treasury and reserve management |
+| `universal_mining` | `universal_mining.move` | DePIN Bio-Oracle with quorum voting |
+| `epoch` | `epoch.move` | Epoch lifecycle management |
+| `coin` | `coin.move` | Base coin operations (mint/burn/transfer) |
+| `wbtc` | `wbtc.move` | Wrapped BTC bridge integration |
+
+Compile a Move module:
+```bash
+cargo run --release -p move_compiler_tool -- -s path/to/your_module.move -o ./build
+```
+
+---
+
 ## JSON-RPC API
 
 Default endpoint: `http://localhost:8002/rpc`
@@ -248,28 +334,6 @@ curl -X POST http://localhost:8002/rpc \
 
 ---
 
-## Smart Contract Development (Move)
-
-AINCORE uses the Move programming language. Built-in modules:
-
-| Module | File | Description |
-|---|---|---|
-| `staking` | `staking.move` | Validator staking with halving rewards |
-| `delegation` | `delegation.move` | DPoS delegation system |
-| `token_factory` | `token_factory.move` | Create/Mint/Burn/Transfer custom tokens |
-| `governance` | `governance.move` | On-chain proposal and voting |
-| `treasury` | `treasury.move` | System treasury management |
-| `dex` | `dex.move` | AMM DEX primitives |
-| `universal_mining` | `universal_mining.move` | DePIN Bio-Oracle mining |
-| `coin` | `coin.move` | Base coin operations |
-
-Compile a Move module:
-```bash
-cargo run --release -p move_compiler_tool -- compile path/to/your_module.move
-```
-
----
-
 ## Network Configuration
 
 ### Chain IDs
@@ -287,19 +351,49 @@ export AINCORE_CHAIN_ID=AINCORE-MAINNET-1  # Required for production
 
 ---
 
-## Recent Updates (May 2026)
+## Changelog
 
-### Critical Fixes
-- **Consensus State Persistence:** `committed_rounds` and `latest_proposed_round` now persist to RocksDB, preventing duplicate blocks after node restart
-- **Single Reward Source:** Block inflation is exclusively handled by `staking.move` (Halving model). Executor only distributes transaction fees
-- **Ghost Script Prevention:** Raw hex payload execution now properly guarded with `else if` branch and hex validation
-- **P2P Stability:** Network read errors properly distinguished from decryption failures, eliminating false "Decryption Failed" spam
+### v1.1.0 — May 12, 2026 (Security Hardening)
 
-### Architecture Validation
-- Consensus model validated against Bullshark paper (CCS 2022)
-- Halving formula mathematically proven to converge below 150M AIN hard cap
-- 21-day unbonding period follows Cosmos SDK security standard
-- BFT threshold `ceil(2n/3)` verified against Byzantine fault tolerance requirements
+**Genesis Lock (Anti-Rugpull)**
+- Executor permanently blocks transfer transactions from the Genesis Validator address
+- Genesis funds can only be used for staking, never sold or transferred
+- Automatically registered during genesis ceremony
+
+**Jail System (Validator Protection)**
+- `slash_validator` now slashes 5% stake and force-unbonds remaining 95% for 21 days
+- Replaces the previous 100% immediate burn policy (too destructive for honest mistakes)
+- Follows Cosmos SDK economic safety standards
+
+**Downtime Auto-Detection**
+- Consensus engine tracks validator participation per round via `validator:last_seen:{id}`
+- Validators missing 100+ consecutive rounds are automatically jailed
+- Double-slash prevention via jail key tracking
+- Efficient: runs every 10 rounds to minimize CPU overhead
+
+**Hardcoded Key Removal**
+- Removed all hardcoded genesis validator addresses from `storage/src/lib.rs`
+- Validator set now purely driven by `genesis.json` configuration
+- `get_active_validators()` returns empty if not initialized (no hidden fallbacks)
+
+**Stress Test Tool**
+- New binary: `bench_tps` for network throughput testing
+- Generates N unique Ed25519 keypairs and fires transactions at node API
+- Real-time TPS monitoring with success/failure counters
+
+### v1.0.0 — May 2026 (Initial Release)
+
+- DAG-BFT consensus with Bullshark-inspired ordering
+- Move VM integration with parallel execution (Rayon)
+- Full DPoS staking with halving economic model
+- 21-day unbonding period (Nothing-at-Stake protection)
+- Consensus state persistence (RocksDB) for crash recovery
+- DAG checkpoint system for O(1) node startup
+- Single reward source (staking.move only, no executor inflation)
+- Ghost script execution prevention
+- P2P network stability improvements
+- Cryptographic accumulator for state proofs
+- Data Availability sequencer with erasure coding
 
 ---
 
@@ -317,15 +411,13 @@ Detailed documentation is available in the [`/docs`](./docs) folder:
 
 ---
 
-## Security
+## Contributing
 
-- Ed25519 digital signatures on all transactions
-- AES-256-GCM encrypted P2P communication with ECDH key exchange
-- Chain ID replay protection across networks
-- Sequence number anti-replay per account
-- Input object access control for Move VM execution
-- Slashing for equivocation (double-sign detection)
-- 21-day unbonding to prevent Nothing-at-Stake attacks
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
 ---
 
@@ -335,4 +427,4 @@ MIT License. See [LICENSE](./LICENSE) for details.
 
 ---
 
-**Built with Rust. Secured by Math. Powered by Community.**
+**Built with Rust. Secured by Math. Powered by Community. Zero VC.**
