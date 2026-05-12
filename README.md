@@ -5,7 +5,7 @@
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)]()
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange)]()
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
-[![Security](https://img.shields.io/badge/audit-internal--passed-green)]()
+[![Security](https://img.shields.io/badge/audit-pending-yellow)]()
 
 ---
 

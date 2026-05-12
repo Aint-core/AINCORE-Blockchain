@@ -264,6 +264,7 @@ async fn main() {
         Arc::clone(&storage),
         Some(Arc::clone(&da_sequencer)), // Wired DA Sequencer!
         p2p_tx_clone, // Add Libp2p gossip channel
+        signing_key.to_bytes(), // H4 FIX: Pass the persistent Ed25519 key for BLS derivation
     )));
 
     let chain_sync = Arc::new(ChainSync::new(

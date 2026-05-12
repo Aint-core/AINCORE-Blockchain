@@ -348,7 +348,8 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
         if let Some((first_addr, _)) = genesis_validators.first() {
              let bytes = hex::decode(first_addr)
                  ?;
-             let mut arr = [0u8; 16];
+             // C3 FIX: Use proper address length instead of hardcoded 16
+             let mut arr = [0u8; move_core_types::account_address::AccountAddress::LENGTH];
              arr.copy_from_slice(&bytes);
              feeders.push(move_core_types::account_address::AccountAddress::new(arr));
         }

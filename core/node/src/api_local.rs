@@ -131,37 +131,52 @@ fn handle_rpc_method(
         "aincore_getTransaction" => {
             // params: [tx_hash]
             if let Some(target_hash) = params.get(0).and_then(|v| v.as_str()) {
-                let consensus = data.consensus.read().map_err(|e| JsonRpcError { code: -32000, message: format!("Consensus lock error: {}", e) })?;
-                let dag = consensus.dag.lock().map_err(|e| JsonRpcError { code: -32000, message: format!("DAG lock error: {}", e) })?;
-                
-                let mut found_tx = None;
-                
-                // Scan all vertices (inefficient but works for prototype)
-                'outer: for vertex in dag.values() {
-                    for tx_str in &vertex.payload {
-                        use sha2::{Sha256, Digest};
-                        let mut hasher = Sha256::new();
-                        hasher.update(tx_str.as_bytes());
-                        let result = hasher.finalize();
-                        let tx_hash = hex::encode(result);
-                        
-                        if tx_hash == target_hash {
-                            // Parse JSON to return structured data
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tx_str) {
-                                found_tx = Some(parsed);
-                            } else {
-                                found_tx = Some(serde_json::json!({ "raw": tx_str }));
+                // M4 FIX: Use O(1) indexed lookup instead of O(N) DAG scan
+                if let Some(block_height) = data.storage.get_tx_block_height(target_hash) {
+                    let block_key = format!("block_{}", block_height);
+                    if let Ok(Some(block_json)) = data.storage.get(&block_key) {
+                        if let Ok(block_obj) = serde_json::from_str::<serde_json::Value>(&block_json) {
+                            if let Some(txs) = block_obj.get("transactions").and_then(|t| t.as_array()) {
+                                for tx_val in txs {
+                                    if let Some(tx_str) = tx_val.as_str() {
+                                        use sha2::{Sha256, Digest};
+                                        let mut hasher = Sha256::new();
+                                        hasher.update(tx_str.as_bytes());
+                                        let tx_hash = hex::encode(hasher.finalize());
+                                        
+                                        if tx_hash == target_hash {
+                                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tx_str) {
+                                                return Ok(parsed);
+                                            } else {
+                                                return Ok(serde_json::json!({ "raw": tx_str }));
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                            break 'outer;
                         }
                     }
                 }
                 
-                if let Some(tx) = found_tx {
-                    Ok(tx)
-                } else {
-                    Ok(serde_json::json!(null))
+                // Fallback to mempool check if not in a block
+                let in_mempool = if let Ok(mp) = data.mempool.lock() {
+                    mp.get_all_pending().iter().find(|tx| {
+                         use sha2::{Sha256, Digest};
+                         let mut hasher = Sha256::new();
+                         hasher.update(tx.as_bytes());
+                         hex::encode(hasher.finalize()) == target_hash
+                    }).cloned()
+                } else { None };
+                
+                if let Some(tx_str) = in_mempool {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&tx_str) {
+                         return Ok(parsed);
+                    } else {
+                         return Ok(serde_json::json!({ "raw": tx_str }));
+                    }
                 }
+                
+                Ok(serde_json::json!(null))
             } else {
                 Err(JsonRpcError { code: -32602, message: "Invalid params".into() })
             }

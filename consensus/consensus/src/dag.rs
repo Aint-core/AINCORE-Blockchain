@@ -25,6 +25,7 @@ pub struct DagConsensus {
     pub accumulator: Accumulator,
     pub da_sequencer: Option<Arc<Mutex<DASequencer>>>, // Added DA Sequencer
     pub p2p_tx: Option<tokio::sync::mpsc::Sender<String>>, // Added P2P Libp2p Channel
+    pub node_key: [u8; 32], // H4 FIX: Store the persistent Ed25519 key for BLS derivation
 }
 
 impl DagConsensus {
@@ -36,6 +37,7 @@ impl DagConsensus {
         storage: Arc<StateDB>,
         da_sequencer: Option<Arc<Mutex<DASequencer>>>, 
         p2p_tx: Option<tokio::sync::mpsc::Sender<String>>, // Corrected to Sender
+        node_key: [u8; 32], // H4 FIX: Accept the persistent key
     ) -> Self {
         let mut dag_map = HashMap::new();
         let mut round_idx_map: HashMap<u64, Vec<String>> = HashMap::new();
@@ -114,6 +116,7 @@ impl DagConsensus {
             accumulator: Accumulator::new(),
             da_sequencer,
             p2p_tx,
+            node_key,
         }
     }
 
@@ -207,16 +210,10 @@ impl DagConsensus {
             
             vertex.hash = vertex.calculate_hash(); 
             
-            // 3b. Sign vertex with BLS (optional - requires node secret key)
-            // In production, this would use the node's BLS key from keystore
-            // For now, derive a simple key from node_id for deterministic signing
-            let node_key = {
-                let mut key = [0u8; 32];
-                let hash = crypto::hash(self.node_id.as_bytes());
-                key.copy_from_slice(&hash);
-                key
-            };
-            vertex.sign_with_bls(&node_key);
+            // H4 FIX: Use the actual node_key (Ed25519 private key) for BLS signing
+            // This prevents the cryptographic forgery vulnerability where anyone could
+            // derive the BLS key from the public node_id string.
+            vertex.sign_with_bls(&self.node_key);
             
             // 4. Add & Broadcast
             self.add_vertex(vertex.clone());

@@ -29,7 +29,8 @@ impl Default for Mempool {
 impl Mempool {
     pub fn add_transaction(&mut self, tx: String) {
         // === CHAIN ID VALIDATION ===
-        let expected_chain = std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-TESTNET-1".to_string());
+        // L5 FIX: Match mainnet genesis default to prevent unexpected rejections
+        let expected_chain = std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
         
         // Parse the transaction to enforce Chain ID early
         use executor::Transaction;
@@ -119,6 +120,10 @@ impl Mempool {
 
     pub fn len(&self) -> usize {
         self.pending_txs.len()
+    }
+
+    pub fn get_all_pending(&self) -> &VecDeque<String> {
+        &self.pending_txs
     }
 }
 
