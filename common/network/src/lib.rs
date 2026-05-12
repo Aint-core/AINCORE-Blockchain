@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::net::IpAddr;
-use std::time::Instant;
 
 // Reserved for future rate limiting implementation
 const MAX_CONNECTIONS: usize = 100;
@@ -150,8 +148,9 @@ where
                                  // Verify Client Signature
                                  if let (Ok(pubkey_bytes), Ok(sig_bytes)) = (hex::decode(&peer_pubkey_hex), hex::decode(&peer_sig_hex)) {
                                      if pubkey_bytes.len() == 32 && sig_bytes.len() == 64 {
-                                         if let Ok(verifying_key) = VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
-                                             let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+                                         if let (Ok(pk_arr), Ok(sig_arr)) = (pubkey_bytes.as_slice().try_into(), sig_bytes.as_slice().try_into()) {
+                                         if let Ok(verifying_key) = VerifyingKey::from_bytes(pk_arr) {
+                                             let signature = Signature::from_bytes(sig_arr);
                                              let mut verify_msg = Vec::new();
                                              verify_msg.extend_from_slice(&client_public);
                                              verify_msg.extend_from_slice(my_public.as_bytes());
@@ -161,7 +160,11 @@ where
                                                  let expected_node_id = hex::encode(&pubkey_bytes)[0..32].to_string();
                                                  if expected_node_id == peer_id && !peer_id.starts_with("__") && peer_port != 0 {
                                                      let remote_ip = addr.ip().to_string();
-                                                     peers_clone.lock().unwrap().insert(peer_id.clone(), peer_port);
+                                                      if let Ok(mut peers) = peers_clone.lock() {
+                                                          peers.insert(peer_id.clone(), peer_port);
+                                                      } else {
+                                                          eprintln!("⚠️ Peers lock poisoned, cannot register peer {}", peer_id);
+                                                      }
                                                      let _ = db_clone.save_peer(&peer_id, peer_port);
                                                      let _ = db_clone.save_peer_ip(&peer_id, &remote_ip);
                                                      println!("🤝 Authenticated Peer registered: {} ({}:{})", peer_id, remote_ip, peer_port);
@@ -170,6 +173,7 @@ where
                                                  eprintln!("🚨 Invalid Client Signature from {}", addr);
                                                  break;
                                              }
+                                         }
                                          }
                                      }
                                  }
@@ -420,10 +424,13 @@ pub fn send_message(addr: &str, msg: &str) -> std::io::Result<()> {
                  let mut csprng = OsRng;
                  let ephemeral_signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
                  
+                 // C-3 FIX: Use ephemeral key identity instead of __broadcast__ magic string
+                 let ephemeral_node_id = hex::encode(&ephemeral_signing_key.verifying_key().to_bytes())[0..32].to_string();
+                 
                  // Attempt secure connect with timeout
                  if let Ok(res) = tokio::time::timeout(
                      std::time::Duration::from_secs(3), 
-                     secure_connect(ip, port, "__broadcast__", 0, None, &ephemeral_signing_key)
+                     secure_connect(ip, port, &ephemeral_node_id, 0, None, &ephemeral_signing_key)
                  ).await {
                      if let Ok((mut stream, shared, _peer_id)) = res {
                          let _ = send_encrypted_msg(&mut stream, &shared, &msg).await;

@@ -210,10 +210,9 @@ impl DagConsensus {
             
             vertex.hash = vertex.calculate_hash(); 
             
-            // H4 FIX: Use the actual node_key (Ed25519 private key) for BLS signing
-            // This prevents the cryptographic forgery vulnerability where anyone could
-            // derive the BLS key from the public node_id string.
-            vertex.sign_with_bls(&self.node_key);
+            // C-2 FIX: Use Ed25519 signing (BLS was actually symmetric MAC)
+            let signing_key = crypto::SigningKey::from_bytes(&self.node_key);
+            vertex.sign_with_ed25519(&signing_key);
             
             // 4. Add & Broadcast
             self.add_vertex(vertex.clone());
@@ -292,6 +291,19 @@ impl DagConsensus {
     }
 
     pub fn add_vertex(&mut self, vertex: Vertex) {
+        // C-2 FIX: Authenticate vertex signature BEFORE processing
+        if !vertex.verify_ed25519_signature(&vertex.author) {
+            println!("🚨 REJECTED: Invalid Ed25519 signature from author {}", vertex.author);
+            return;
+        }
+
+        // C-2 FIX: Cross-check against the active ValidatorSet
+        let validators = self.get_validator_set();
+        if !validators.contains(&vertex.author) && self.current_round > 0 {
+             println!("🚨 REJECTED: Vertex author {} is not in the active validator set", vertex.author);
+             return;
+        }
+
         // 1. Scope for DAG and RoundIndex modification
         {
             let mut dag = self.dag.lock()
@@ -354,7 +366,8 @@ impl DagConsensus {
             println!("📥 Added Vertex to DAG: {} (Round {})", vertex.hash, vertex.round);
             
             // Fast-forward local round to match network if lagging behind (Amnesia Recovery)
-            if vertex.round >= self.current_round {
+            // ONLY for remote vertices — try_create_vertex already increments for local ones
+            if vertex.author != self.node_id && vertex.round >= self.current_round {
                 self.current_round = vertex.round + 1;
                 let _ = self.storage.put("latest_proposed_round", &self.current_round.to_string());
             }
@@ -366,7 +379,7 @@ impl DagConsensus {
         // We need read access to DAG and RoundIndex for ordering check, BUT we don't need write.
         // And we definitly don't want to hold them during execution.
         
-        let committed_hashes = {
+        let committed_result = {
             let mut engine = self.ordering_engine.lock()
                 .expect("🚨 FATAL: Ordering engine lock poisoned");
             let dag = self.dag.lock()
@@ -378,12 +391,12 @@ impl DagConsensus {
             engine.try_commit(vertex.round, &dag, &round_idx, &validators)
         }; // All locks dropped here!
 
-        if let Some(hashes) = committed_hashes {
+        if let Some((hashes, anchor_leader)) = committed_result {
              println!("⛓️  Consensus Reached! Executing {} vertices in order...", hashes.len());
              
              let executor = &self.executor;
              let mut block_txs = Vec::new();
-             let mut reward_recipient = self.node_id.clone(); // Default fallback
+             let reward_recipient = anchor_leader; // C-10 FIX: Reward the anchor leader deterministically
 
              // Re-acquire DAG read lock just to fetch payloads
              // We can optimize this by cloning necessary data in the previous block, 
@@ -391,14 +404,6 @@ impl DagConsensus {
              // So we just re-acquire efficiently.
              let dag = self.dag.lock()
                  .expect("🚨 FATAL: DAG lock poisoned");
-
-             // Identify Reward Recipient (Author of the last vertex in the batch)
-             // This ensures all nodes agree on who gets the reward.
-             if let Some(last_hash) = hashes.last() {
-                 if let Some(v) = dag.get(last_hash) {
-                     reward_recipient = v.author.clone();
-                 }
-             }
 
              for hash in &hashes {
                  if let Some(v) = dag.get(hash) {
@@ -469,9 +474,21 @@ impl DagConsensus {
              // Let's Skip intricate pruning update for this hotfix.
              // Or re-acquire lock.
              if hashes.len() > 0 {
-                  // Simplified trigger: just prune every 10 blocks
+                  // H-5 FIX: Prune only FINALIZED rounds (check ordering engine)
                   if self.latest_block_height % 10 == 0 && self.current_round > 50 {
-                       self.prune_dag(self.current_round - 50);
+                       // Only prune rounds confirmed as committed by the ordering engine
+                       let min_safe_round = {
+                           if let Ok(engine) = self.ordering_engine.lock() {
+                               // Find the minimum committed round to establish the finality boundary
+                               engine.committed_rounds.iter().copied().min().unwrap_or(self.current_round)
+                           } else {
+                               self.current_round // Don't prune if we can't verify finality
+                           }
+                       };
+                       // Keep a safety buffer of 10 rounds beyond the oldest committed round
+                       if min_safe_round > 10 {
+                           self.prune_dag(min_safe_round - 10);
+                       }
                   }
                   
                   // CHECKPOINT SAVE: Save checkpoint every 100 rounds for fast recovery

@@ -1,6 +1,8 @@
-use rocksdb::{DB, IteratorMode};
+use rocksdb::DB;
 pub use rocksdb; // Export for consumers
 pub mod object;
+#[cfg(test)]
+mod tests;
 use object::Object;
 use std::fmt;
 

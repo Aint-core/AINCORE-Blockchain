@@ -271,7 +271,13 @@ impl SimpleConsensus {
         }
 
         {
-            let mut proposals_lock = self.pending_proposals.lock().unwrap();
+            let mut proposals_lock = match self.pending_proposals.lock() {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("❌ Proposals lock poisoned in handle_proposal: {}", e);
+                    return;
+                }
+            };
             proposals_lock.insert(proposal.block.header.hash.clone(), proposal.clone());
         }
 

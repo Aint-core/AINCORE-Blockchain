@@ -8,4 +8,5 @@ storage = { path = "../../common/storage" }
 crypto = { path = "../../common/crypto" }
 serde = { version = "1.0", features = ["derive"] }
 hex = "0.4"
+ed25519-dalek = "2.0"
 # sha2 now provided by crypto module

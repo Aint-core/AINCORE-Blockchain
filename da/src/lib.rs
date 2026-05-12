@@ -75,12 +75,29 @@ impl DASequencer {
         // Initialize shard manager (32 total shards, 3x replication)
         let shard_manager = ShardManager::new(32, 3);
 
-        // Generate a random signing key for this sequencer instance
-        // In reality, this should be loaded from a secure keystore.
-        use rand::RngCore;
-        let mut rng = rand::thread_rng();
+        // H-9 FIX: Persistent DA signing key
         let mut key_bytes = [0u8; 32];
-        rng.fill_bytes(&mut key_bytes);
+        let mut key_loaded = false;
+        
+        if let Ok(Some(key_hex)) = storage.get("sys:da:signing_key") {
+            if let Ok(decoded) = hex::decode(&key_hex) {
+                if decoded.len() == 32 {
+                    key_bytes.copy_from_slice(&decoded);
+                    key_loaded = true;
+                }
+            }
+        }
+        
+        if !key_loaded {
+            use rand::RngCore;
+            let mut rng = rand::thread_rng();
+            rng.fill_bytes(&mut key_bytes);
+            let _ = storage.put("sys:da:signing_key", &hex::encode(&key_bytes));
+            println!("🔑 [DA Sequencer] Generated NEW persistent DA signing key.");
+        } else {
+            println!("🔑 [DA Sequencer] Loaded existing persistent DA signing key.");
+        }
+        
         let signage_key = SigningKey::from_bytes(&key_bytes);
         let pubkey_bytes = signage_key.verifying_key().to_bytes();
         println!("🔑 [DA Sequencer] ID: {} | PubKey: {}", node_id, hex::encode(pubkey_bytes));

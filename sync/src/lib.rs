@@ -56,6 +56,21 @@ impl ChainSync {
         if expected_height > 1 && block.header.prev_hash != prev_hash {
             return Err(format!("Parent hash mismatch at {}: exp {}, got {}", expected_height, prev_hash, block.header.prev_hash));
         }
+        
+        // S3-4a: Reject blocks with future timestamps (30s drift tolerance)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::from_secs(0))
+            .as_secs();
+        if block.header.timestamp > now + 30 {
+            return Err(format!("Future timestamp rejected: block={}, now={}", block.header.timestamp, now));
+        }
+        
+        // S3-4b: Reject blocks with excessive transaction count (DoS prevention)
+        if block.transactions.len() > 10_000 {
+            return Err(format!("Transaction count {} exceeds max 10,000", block.transactions.len()));
+        }
+        
         self.verify_block_hash(block)?;
         Ok(())
     }
@@ -247,3 +262,6 @@ impl ChainSync {
         // No-op in new pull model
     }
 }
+
+#[cfg(test)]
+mod tests;

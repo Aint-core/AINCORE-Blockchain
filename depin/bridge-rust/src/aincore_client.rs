@@ -28,6 +28,7 @@ pub struct Block {
 pub struct Transaction {
     pub sender: String,
     pub payload: String,
+    #[allow(dead_code)]
     pub signature: String,
 }
 

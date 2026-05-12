@@ -87,7 +87,7 @@ impl OrderingEngine {
         dag: &HashMap<String, Vertex>,
         round_index: &HashMap<u64, Vec<String>>,
         validators: &[String],
-    ) -> Option<Vec<String>> {
+    ) -> Option<(Vec<String>, String)> {
         if current_round < 4 {
             return None;
         }
@@ -199,7 +199,7 @@ impl OrderingEngine {
         // This ensures unpredictable randomness for future leader selection
         self.update_random_beacon(anchor_vertex_hash.as_bytes());
         
-        Some(sequence)
+        Some((sequence, successful_leader))
     }
 
     /// H5 + M6 FIX: Leader selection now uses VDF random beacon for unpredictability.

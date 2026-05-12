@@ -10,11 +10,10 @@ use rayon::prelude::*;
 fn get_chain_id() -> String {
     std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-TESTNET-1".to_string())
 }
-// REMOVED: const BLOCK_REWARD: u64 = 50; 
 // V3 CONSTANTS
 const MAX_SUPPLY: u128 = 150_000_000 * 1_000_000_000_000_000_000; // 150 Million AIN
-const TAIL_EMISSION: u128 = 10 * 1_000_000_000_000_000_000; // 10 AIN Min per block
-const DECAY_FACTOR: u128 = 5_000_000; // Decay speed factor
+// Note: Block rewards handled exclusively by staking.move (Halving model)
+// Executor only distributes transaction fees — no inflationary minting here
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Transaction {
@@ -125,7 +124,7 @@ impl Executor {
             // println!("   ⚡ Executing Batch {} ({} txs)", i + 1, batch.len());
             
             // Execute in parallel to get updates
-            let results: Vec<Option<Vec<(String, Option<String>)>>> = batch.par_iter().map(|(_tx, raw)| {
+            let results: Vec<Option<(Vec<(String, Option<String>)>, u128)>> = batch.par_iter().map(|(_tx, raw)| {
                 self.execute_transaction(raw)
             }).collect();
 
@@ -135,7 +134,7 @@ impl Executor {
             use sha2::Digest;
 
             for res in results {
-                if let Some(updates) = res {
+                if let Some((updates, gas_charged)) = res {
                     for (key, val_opt) in updates {
                          if let Some(val) = val_opt {
                              write_batch.put(key.as_bytes(), val.as_bytes());
@@ -147,7 +146,7 @@ impl Executor {
                              batch_hasher.update(b"DELETE");
                          }
                     }
-                    total_fees += 1; // Simplistic fee counting
+                    total_fees += gas_charged; // C-6 FIX: Accumulate actual gas cost
                 }
             }
             
@@ -178,7 +177,7 @@ impl Executor {
         
         let _current_height = self.db.get_chain_height();
         
-        let total_supply: u128 = match self.db.get("sys:total_supply") {
+        let _total_supply: u128 = match self.db.get("sys:total_supply") {
             Ok(Some(s)) => s.parse().unwrap_or(0),
             _ => 0, 
         };
@@ -256,8 +255,8 @@ impl Executor {
     /// This is the critical bridge between consensus-level detection and on-chain execution.
     /// Reads sys:pending_slash:{addr}, deducts 5% of validator stake, removes from validator set.
     fn execute_pending_slashes(&self) {
-        // Scan for pending slash entries
-        let slash_keys = self.db.scan_prefix("sys:pending_slash:");
+        // H-4 FIX: Cap processing to 5 slashes per block to prevent O(N) drain
+        let slash_keys: Vec<_> = self.db.scan_prefix("sys:pending_slash:").into_iter().take(5).collect();
         
         for (key, event_json) in &slash_keys {
             // Extract validator address from key: "sys:pending_slash:{addr}"
@@ -266,48 +265,69 @@ impl Executor {
                 None => continue,
             };
             
+            // Parse the slash event
+            let (reason, round) = if let Ok(event) = serde_json::from_str::<serde_json::Value>(event_json) {
+                let r = event.get("reason").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                let rd = event.get("round").and_then(|v| v.as_u64()).unwrap_or(0);
+                (r, rd)
+            } else {
+                ("unknown".to_string(), 0)
+            };
+
+            // H-4 FIX: Tombstone check for replay protection
+            let event_id = format!("{}:{}", validator_addr, round);
+            let tombstone_key = format!("sys:slashed:{}", event_id);
+            if let Ok(Some(_)) = self.db.get(&tombstone_key) {
+                 println!("   ⏭️  Skipping already processed slash event: {}", event_id);
+                 let _ = self.db.delete(key);
+                 continue;
+            }
+
             println!("⚖️  EXECUTING ON-CHAIN SLASH for validator: {}", &validator_addr);
+            println!("   Reason: {}, Round: {}", reason, round);
             
-            // Parse the slash event for logging
-            if let Ok(event) = serde_json::from_str::<serde_json::Value>(event_json) {
-                let reason = event.get("reason").and_then(|r| r.as_str()).unwrap_or("unknown");
-                println!("   Reason: {}", reason);
-            }
+            // C-5 FIX: Removed the erroneous native free-balance deduction. 
+            // Slashing must hit bonded stake via Move VM (TODO: Route via staking::slash).
+            // For now, we only remove them from the active consensus set.
             
-            // Deduct 5% from validator's account balance (the on-chain penalty)
-            if let Some(mut validator_obj) = self.db.get_object(&validator_addr) {
-                if let Ok(mut data) = serde_json::from_slice::<aa::AccountData>(&validator_obj.data) {
-                    let slash_amount = data.balance / 20; // 5% = balance / 20
-                    if let Some(new_balance) = data.balance.checked_sub(slash_amount) {
-                        data.balance = new_balance;
-                        println!("   🔥 Slashed {} AIN (5% of {})", slash_amount, data.balance + slash_amount);
-                        println!("   💰 Remaining balance: {}", data.balance);
-                        
-                        if let Ok(new_data) = serde_json::to_vec(&data) {
-                            validator_obj.data = new_data;
-                            let _ = self.db.put_object(&validator_obj);
-                        }
-                    }
-                }
-            }
-            
-            // Remove validator from active set (sys:validators)
+            // Remove or reduce validator from active set (sys:validators)
             if let Ok(Some(json)) = self.db.get("sys:validators") {
                 if let Ok(mut vals) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
                     let before_len = vals.len();
-                    vals.retain(|(addr, _)| addr != &validator_addr);
-                    if vals.len() < before_len {
+                    let mut slashed = false;
+                    
+                    for (addr, weight) in vals.iter_mut() {
+                        if addr == &validator_addr {
+                            if reason == "equivocation" {
+                                *weight = 0; // 100% slash
+                                println!("   💥 EQUIVOCATION: 100% Validator Stake Slashed!");
+                            } else {
+                                // downtime
+                                *weight = (*weight * 95) / 100; // 5% slash
+                                println!("   ⏳ DOWNTIME: 5% Validator Stake Slashed!");
+                            }
+                            slashed = true;
+                        }
+                    }
+                    
+                    if slashed {
+                        // Remove if stake hit 0 (e.g. equivocation)
+                        vals.retain(|(_, w)| *w > 0);
+                        
                         if let Ok(new_json) = serde_json::to_string(&vals) {
                             let _ = self.db.put("sys:validators", &new_json);
-                            println!("   ⛓️  Validator {} removed from active set ({} -> {} validators)", 
-                                     &validator_addr, before_len, vals.len());
+                            println!("   ⛓️  Validator set updated ({} -> {} validators)", 
+                                     before_len, vals.len());
                         }
                     }
                 }
             }
             
+            // H-4 FIX: Write tombstone
+            let _ = self.db.put(&tombstone_key, "1");
+            
             // Delete the pending slash entry (processed)
-            let _ = self.db.delete(&key);
+            let _ = self.db.delete(key);
             println!("   ✅ Slash executed and cleared from queue.");
         }
     }
@@ -337,7 +357,7 @@ impl Executor {
 
     // Now returns a list of DB updates instead of writing directly. 
     // Thread-safe because it only reads.
-    pub fn execute_transaction(&self, tx_json: &str) -> Option<Vec<(String, Option<String>)>> {
+    pub fn execute_transaction(&self, tx_json: &str) -> Option<(Vec<(String, Option<String>)>, u128)> {
         let mut updates = Vec::new();
         
         if let Ok(tx) = serde_json::from_str::<Transaction>(tx_json) {
@@ -424,6 +444,34 @@ impl Executor {
             
             // Paymaster Logic
             let payer_addr = if let Some(pm) = &tx.paymaster {
+                // M-3 FIX: Verify Paymaster Ed25519 Signature
+                // Paymaster must sign the tx hash to prove consent for gas sponsorship
+                if let Some(pm_sig_hex) = &tx.paymaster_signature {
+                    use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+                    let pm_valid = (|| -> Result<(), ()> {
+                        let pm_pubkey_bytes = hex::decode(pm).map_err(|_| ())?;
+                        if pm_pubkey_bytes.len() != 32 { return Err(()); }
+                        let vk = VerifyingKey::from_bytes(
+                            pm_pubkey_bytes.as_slice().try_into().map_err(|_| ())?
+                        ).map_err(|_| ())?;
+                        let sig_bytes = hex::decode(pm_sig_hex).map_err(|_| ())?;
+                        let sig = Signature::from_slice(&sig_bytes).map_err(|_| ())?;
+                        // Paymaster signs: sender || payload
+                        let mut msg = Vec::new();
+                        msg.extend_from_slice(tx.sender.as_bytes());
+                        msg.extend_from_slice(tx.payload.as_bytes());
+                        use sha2::{Sha256, Digest};
+                        let hash = Sha256::digest(&msg);
+                        vk.verify(&hash, &sig).map_err(|_| ())
+                    })();
+                    if pm_valid.is_err() {
+                        println!("❌ Invalid Paymaster Signature! Gas sponsorship rejected.");
+                        return None;
+                    }
+                } else {
+                    println!("❌ Paymaster specified without signature! Rejected.");
+                    return None;
+                }
                 pm.clone()
             } else {
                 tx.sender.clone()
@@ -488,6 +536,8 @@ impl Executor {
                 payer_obj.data = new_data;
                 updates.push((format!("obj:{}", payer_obj.id.to_string()), Some(serde_json::to_string(&payer_obj).unwrap_or_else(|_| "{}".to_string()))));
             }
+            
+            let mut actual_gas = gas_cost;
 
             // 4. Execution Payload
             if tx.payload.starts_with("0x") {
@@ -526,7 +576,7 @@ impl Executor {
                              }
 
                              for (key, _val) in &vm_changes {
-                                 let is_allowed = allowed_keys.iter().any(|allowed| key.contains(allowed));
+                                 let is_allowed = allowed_keys.iter().any(|allowed| key == &format!("obj:{}", allowed));
                                  if !is_allowed {
                                      println!("❌ CRITICAL SECURITY: Script attempted to modify unauthorized object: {}", key);
                                      unauthorized_access = true;
@@ -566,7 +616,11 @@ impl Executor {
                     // It can ONLY be used for staking, NEVER for transfers.
                     // This ensures 100% Fairlaunch integrity.
                     let genesis_addr = self.db.get_federation_key();
-                    if !genesis_addr.is_empty() && tx.sender == genesis_addr {
+                    if genesis_addr.is_empty() {
+                        println!("🔒 GENESIS LOCK FAIL-CLOSED: Federation address not initialized. Transfers blocked.");
+                        return None;
+                    }
+                    if tx.sender == genesis_addr {
                         println!("🔒 GENESIS LOCK: Transfer BLOCKED from Genesis address {}", &tx.sender[..8]);
                         println!("   Genesis funds are permanently locked for staking only.");
                         return None;
@@ -693,22 +747,34 @@ impl Executor {
                          let base_reward: u128 = 360_000_000_000_000_000; 
                          let reward: u128 = (base_reward * bqi as u128) / 100;
                          
-                         // H2 FIX: Use checked arithmetic to prevent overflow
-                         if let Some(new_balance) = account_data.balance.checked_add(reward) {
-                             account_data.balance = new_balance;
-                         } else {
-                             eprintln!("❌ OVERFLOW: DePIN reward overflow blocked for account");
-                         }
-                         
                          // CRITICAL FIX: Track inflation into Global Supply to maintain Logarithmic Decay accuracy
                          let mut total_supply: u128 = match self.db.get("sys:total_supply") {
                              Ok(Some(s)) => s.parse().unwrap_or(0),
                              _ => 0, 
                          };
-                         total_supply += reward;
-                         let _ = self.db.put("sys:total_supply", &total_supply.to_string());
                          
-                         println!("🫁 Breath Value DePIN Mining: BQI {} -> Reward {} Wei", bqi, reward);
+                         // C-9 & H-10 FIX: MAX_SUPPLY guard for native mint path
+                         let reward_to_mint = if total_supply + reward > MAX_SUPPLY {
+                             MAX_SUPPLY.saturating_sub(total_supply)
+                         } else {
+                             reward
+                         };
+                         
+                         if reward_to_mint == 0 {
+                             println!("❌ Supply Cap Reached! No DePIN reward.");
+                         } else {
+                             total_supply += reward_to_mint;
+                             let _ = self.db.put("sys:total_supply", &total_supply.to_string());
+                             
+                             // H2 FIX: Use checked arithmetic to prevent overflow
+                             if let Some(new_balance) = account_data.balance.checked_add(reward_to_mint) {
+                                 account_data.balance = new_balance;
+                             } else {
+                                 eprintln!("❌ OVERFLOW: DePIN reward overflow blocked for account");
+                             }
+                             
+                             println!("🫁 Breath Value DePIN Mining: BQI {} -> Reward {} Wei", bqi, reward_to_mint);
+                         }
                          
                          // Save updated balance (Payer/Sender)
                          if let Ok(new_data) = serde_json::to_vec(&account_data) {
@@ -750,7 +816,25 @@ impl Executor {
                          Identifier::new("staking").expect("staking identifier is valid")
                      );
                      
-                     let sender_addr = AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)).unwrap_or(AccountAddress::ZERO);
+                     let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
+
+                     
+                         Ok(addr) => addr,
+
+                     
+                         Err(_) => {
+
+                     
+                             println!("❌ Invalid address format: {}", tx.sender);
+
+                     
+                             return None;
+
+                     
+                         }
+
+                     
+                     };
                      
                      match self.vm.execute_public_entry_function(
                          module_id, 
@@ -789,6 +873,7 @@ impl Executor {
                                      // H2 FIX: Use checked arithmetic to prevent overflow
                                      if let Some(new_bal) = account_data.balance.checked_add(refund_amount) {
                                          account_data.balance = new_bal;
+                                         actual_gas = actual_gas.saturating_sub(refund_amount); // C-6 FIX: Adjust actual_gas
                                      }
                                      if let Ok(refunded_data) = serde_json::to_vec(&account_data) {
                                          payer_obj.data = refunded_data;
@@ -820,11 +905,47 @@ impl Executor {
                              Identifier::new("delegation").expect("delegation identifier is valid")
                          );
                          
-                         let validator_account = AccountAddress::from_hex_literal(&format!("0x{}", validator_addr)).unwrap_or(AccountAddress::ZERO);
+                         let validator_account = match AccountAddress::from_hex_literal(&format!("0x{}", validator_addr)) {
+
+                         
+                             Ok(addr) => addr,
+
+                         
+                             Err(_) => {
+
+                         
+                                 println!("❌ Invalid address format: {}", validator_addr);
+
+                         
+                                 return None;
+
+                         
+                             }
+
+                         
+                         };
                          let arg_validator = bcs::to_bytes(&validator_account).unwrap_or_default();
                          let arg_amount = bcs::to_bytes(&amount).unwrap_or_default();
                          
-                         let sender_addr = AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)).unwrap_or(AccountAddress::ZERO);
+                         let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
+
+                         
+                             Ok(addr) => addr,
+
+                         
+                             Err(_) => {
+
+                         
+                                 println!("❌ Invalid address format: {}", tx.sender);
+
+                         
+                                 return None;
+
+                         
+                             }
+
+                         
+                         };
                          
                          match self.vm.execute_public_entry_function(
                              module_id,
@@ -863,11 +984,47 @@ impl Executor {
                              Identifier::new("delegation").expect("delegation identifier is valid")
                          );
                          
-                         let validator_account = AccountAddress::from_hex_literal(&format!("0x{}", validator_addr)).unwrap_or(AccountAddress::ZERO);
+                         let validator_account = match AccountAddress::from_hex_literal(&format!("0x{}", validator_addr)) {
+
+                         
+                             Ok(addr) => addr,
+
+                         
+                             Err(_) => {
+
+                         
+                                 println!("❌ Invalid address format: {}", validator_addr);
+
+                         
+                                 return None;
+
+                         
+                             }
+
+                         
+                         };
                          let arg_validator = bcs::to_bytes(&validator_account).unwrap_or_default();
                          let arg_amount = bcs::to_bytes(&amount).unwrap_or_default();
                          
-                         let sender_addr = AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)).unwrap_or(AccountAddress::ZERO);
+                         let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
+
+                         
+                             Ok(addr) => addr,
+
+                         
+                             Err(_) => {
+
+                         
+                                 println!("❌ Invalid address format: {}", tx.sender);
+
+                         
+                                 return None;
+
+                         
+                             }
+
+                         
+                         };
                          
                          match self.vm.execute_public_entry_function(
                              module_id,
@@ -904,10 +1061,46 @@ impl Executor {
                          Identifier::new("delegation").expect("delegation identifier is valid")
                      );
                      
-                     let validator_account = AccountAddress::from_hex_literal(&format!("0x{}", validator_addr)).unwrap_or(AccountAddress::ZERO);
+                     let validator_account = match AccountAddress::from_hex_literal(&format!("0x{}", validator_addr)) {
+
+                     
+                         Ok(addr) => addr,
+
+                     
+                         Err(_) => {
+
+                     
+                             println!("❌ Invalid address format: {}", validator_addr);
+
+                     
+                             return None;
+
+                     
+                         }
+
+                     
+                     };
                      let arg_validator = bcs::to_bytes(&validator_account).unwrap_or_default();
                      
-                     let sender_addr = AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)).unwrap_or(AccountAddress::ZERO);
+                     let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
+
+                     
+                         Ok(addr) => addr,
+
+                     
+                         Err(_) => {
+
+                     
+                             println!("❌ Invalid address format: {}", tx.sender);
+
+                     
+                             return None;
+
+                     
+                         }
+
+                     
+                     };
                      
                      match self.vm.execute_public_entry_function(
                          module_id,
@@ -943,10 +1136,46 @@ impl Executor {
                          Identifier::new("delegation").expect("delegation identifier is valid")
                      );
                      
-                     let validator_account = AccountAddress::from_hex_literal(&format!("0x{}", validator_addr)).unwrap_or(AccountAddress::ZERO);
+                     let validator_account = match AccountAddress::from_hex_literal(&format!("0x{}", validator_addr)) {
+
+                     
+                         Ok(addr) => addr,
+
+                     
+                         Err(_) => {
+
+                     
+                             println!("❌ Invalid address format: {}", validator_addr);
+
+                     
+                             return None;
+
+                     
+                         }
+
+                     
+                     };
                      let arg_validator = bcs::to_bytes(&validator_account).unwrap_or_default();
                      
-                     let sender_addr = AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)).unwrap_or(AccountAddress::ZERO);
+                     let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
+
+                     
+                         Ok(addr) => addr,
+
+                     
+                         Err(_) => {
+
+                     
+                             println!("❌ Invalid address format: {}", tx.sender);
+
+                     
+                             return None;
+
+                     
+                         }
+
+                     
+                     };
                      
                      match self.vm.execute_public_entry_function(
                          module_id,
@@ -984,7 +1213,25 @@ impl Executor {
                      
                      let arg_commission = bcs::to_bytes(&commission_rate).unwrap_or_default();
                      
-                     let sender_addr = AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)).unwrap_or(AccountAddress::ZERO);
+                     let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
+
+                     
+                         Ok(addr) => addr,
+
+                     
+                         Err(_) => {
+
+                     
+                             println!("❌ Invalid address format: {}", tx.sender);
+
+                     
+                             return None;
+
+                     
+                         }
+
+                     
+                     };
                      
                      match self.vm.execute_public_entry_function(
                          module_id,
@@ -1031,7 +1278,25 @@ impl Executor {
                      let arg_max = bcs::to_bytes(&max_supply).unwrap_or_default();
                      let arg_initial = bcs::to_bytes(&initial_supply).unwrap_or_default();
                      
-                     let sender_addr = AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)).unwrap_or(AccountAddress::ZERO);
+                     let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
+
+                     
+                         Ok(addr) => addr,
+
+                     
+                         Err(_) => {
+
+                     
+                             println!("❌ Invalid address format: {}", tx.sender);
+
+                     
+                             return None;
+
+                     
+                         }
+
+                     
+                     };
                      
                      match self.vm.execute_public_entry_function(
                          module_id,
@@ -1070,11 +1335,41 @@ impl Executor {
                      );
                      
                      let arg_token = bcs::to_bytes(&token_id.as_bytes().to_vec()).unwrap_or_default();
-                     let to_addr = AccountAddress::from_hex_literal(&format!("0x{}", to)).unwrap_or(AccountAddress::ZERO);
+                     let to_addr = match AccountAddress::from_hex_literal(&format!("0x{}", to)) {
+
+                         Ok(addr) => addr,
+
+                         Err(_) => {
+
+                             println!("❌ Invalid address format: {}", to);
+
+                             return None;
+
+                         }
+
+                     };
                      let arg_to = bcs::to_bytes(&to_addr).unwrap_or_default();
                      let arg_amount = bcs::to_bytes(&amount).unwrap_or_default();
                      
-                     let sender_addr = AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)).unwrap_or(AccountAddress::ZERO);
+                     let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
+
+                     
+                         Ok(addr) => addr,
+
+                     
+                         Err(_) => {
+
+                     
+                             println!("❌ Invalid address format: {}", tx.sender);
+
+                     
+                             return None;
+
+                     
+                         }
+
+                     
+                     };
                      
                      match self.vm.execute_public_entry_function(
                          module_id,
@@ -1114,7 +1409,25 @@ impl Executor {
                      let arg_token = bcs::to_bytes(&token_id.as_bytes().to_vec()).unwrap_or_default();
                      let arg_amount = bcs::to_bytes(&amount).unwrap_or_default();
                      
-                     let sender_addr = AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)).unwrap_or(AccountAddress::ZERO);
+                     let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
+
+                     
+                         Ok(addr) => addr,
+
+                     
+                         Err(_) => {
+
+                     
+                             println!("❌ Invalid address format: {}", tx.sender);
+
+                     
+                             return None;
+
+                     
+                         }
+
+                     
+                     };
                      
                      match self.vm.execute_public_entry_function(
                          module_id,
@@ -1153,11 +1466,41 @@ impl Executor {
                      );
                      
                      let arg_token = bcs::to_bytes(&token_id.as_bytes().to_vec()).unwrap_or_default();
-                     let to_addr = AccountAddress::from_hex_literal(&format!("0x{}", to)).unwrap_or(AccountAddress::ZERO);
+                     let to_addr = match AccountAddress::from_hex_literal(&format!("0x{}", to)) {
+
+                         Ok(addr) => addr,
+
+                         Err(_) => {
+
+                             println!("❌ Invalid address format: {}", to);
+
+                             return None;
+
+                         }
+
+                     };
                      let arg_to = bcs::to_bytes(&to_addr).unwrap_or_default();
                      let arg_amount = bcs::to_bytes(&amount).unwrap_or_default();
                      
-                     let sender_addr = AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)).unwrap_or(AccountAddress::ZERO);
+                     let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
+
+                     
+                         Ok(addr) => addr,
+
+                     
+                         Err(_) => {
+
+                     
+                             println!("❌ Invalid address format: {}", tx.sender);
+
+                     
+                             return None;
+
+                     
+                         }
+
+                     
+                     };
                      
                      match self.vm.execute_public_entry_function(
                          module_id,
@@ -1189,7 +1532,25 @@ impl Executor {
                      Identifier::new("token_factory").expect("token_factory identifier is valid")
                  );
                  
-                 let sender_addr = AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)).unwrap_or(AccountAddress::ZERO);
+                 let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
+
+                 
+                     Ok(addr) => addr,
+
+                 
+                     Err(_) => {
+
+                 
+                         println!("❌ Invalid address format: {}", tx.sender);
+
+                 
+                         return None;
+
+                 
+                     }
+
+                 
+                 };
                  
                  match self.vm.execute_public_entry_function(
                      module_id,
@@ -1229,6 +1590,7 @@ impl Executor {
                                  // H2 FIX: Use checked arithmetic to prevent overflow
                                  if let Some(new_bal) = account_data.balance.checked_add(refund_amount) {
                                      account_data.balance = new_bal;
+                                     actual_gas = actual_gas.saturating_sub(refund_amount); // C-6 FIX: Adjust actual_gas
                                  }
                                  if let Ok(refunded_data) = serde_json::to_vec(&account_data) {
                                      payer_obj.data = refunded_data;
@@ -1245,7 +1607,7 @@ impl Executor {
                  }
             }
             
-            Some(updates)
+            Some((updates, actual_gas))
         } else {
             None
         }
@@ -1271,3 +1633,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod verify_transfer_test;

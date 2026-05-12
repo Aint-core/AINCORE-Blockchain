@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use network::PeerList;
 
 // Input validation constants
-// Input validation constants
 const MAX_BLOCK_HEIGHT: u64 = 1_000_000_000;
+const MAX_QUERY_LIMIT: u64 = 1000;
 
 // --- Shared State ---
 use consensus::DagConsensus;
@@ -184,6 +184,7 @@ fn handle_rpc_method(
         "aincore_getBlocks" => {
             // params: [limit] (optional, default 10)
             let limit = params.get(0).and_then(|v| v.as_u64()).unwrap_or(10);
+            let limit = std::cmp::min(limit, MAX_QUERY_LIMIT); // S3: DoS prevention
             
             // FIXED: Explicitly handle latest_height parsing with logging
             let latest_height: u64 = match data.storage.get("latest_height") {
@@ -234,20 +235,7 @@ fn handle_rpc_method(
             }).collect();
             Ok(serde_json::json!(peer_list))
         },
-        "aincore_debug" => {
-            // Scan all keys to see what's inside
-            let mut keys = Vec::new();
-            let iter = data.storage.db.iterator(rocksdb::IteratorMode::Start);
-            for (i, item) in iter.enumerate() {
-                if i > 100 { break; } // Limit to 100 keys
-                if let Ok((k, v)) = item {
-                    let key_str = String::from_utf8_lossy(&k).to_string();
-                    let val_str = String::from_utf8_lossy(&v).to_string();
-                    keys.push(format!("{} = {}", key_str, val_str));
-                }
-            }
-            Ok(serde_json::json!(keys))
-        },
+        // S3: aincore_debug REMOVED — raw DB key scanner is a data exfiltration vector on mainnet
         "aincore_getMiningStats" => {
             let peers = data.peers.lock()
                 .map_err(|e| JsonRpcError { code: -32000, message: format!("Peers lock error: {}", e) })?;
@@ -606,7 +594,6 @@ fn handle_rpc_method(
         "aincore_getSupply" => {
             // No params
             let max_supply: u128 = 150_000_000 * 1_000_000_000_000_000_000; // 150M AIN
-            let tail_emission: u128 = 10 * 1_000_000_000_000_000_000; // 10 AIN
             
             // Read total minted from storage
             let total_minted = match data.storage.get("total_supply") {
@@ -619,12 +606,20 @@ fn handle_rpc_method(
             };
             let circulating = total_minted.saturating_sub(total_burned);
             
+            // S3: Calculate current reward from halving model (36 AIN base, halves every 2.1M blocks)
+            let latest_height = data.storage.get_chain_height();
+            let halving_interval: u64 = 2_102_400;
+            let halvings = latest_height / halving_interval;
+            let base_reward: u128 = 36_000_000_000_000_000_000; // 36 AIN
+            let current_reward = if halvings >= 128 { 0 } else { base_reward >> halvings };
+            
             Ok(serde_json::json!({
                 "max_supply": max_supply.to_string(),
                 "total_minted": total_minted.to_string(),
                 "total_burned": total_burned.to_string(),
                 "circulating_supply": circulating.to_string(),
-                "tail_emission_per_block": tail_emission.to_string(),
+                "current_block_reward": current_reward.to_string(),
+                "halving_epoch": halvings,
                 "decimals": 18
             }))
         },
@@ -768,7 +763,7 @@ fn handle_rpc_method(
                 "current_epoch": epoch,
                 "max_supply": max_supply.to_string(),
                 "block_height": latest_height,
-                "decay_model": "Exponential Smooth (TAIL_EMISSION = 10 AIN)"
+                "decay_model": "Halving (36 AIN base, halves every 2,102,400 blocks)"
             }))
         },
         
@@ -856,7 +851,7 @@ fn handle_rpc_method(
         "aincore_getTransactionsByAddress" => {
             // params: [address, limit (optional)]
             if let Some(address) = params.get(0).and_then(|v| v.as_str()) {
-                let limit = params.get(1).and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                let limit = std::cmp::min(params.get(1).and_then(|v| v.as_u64()).unwrap_or(20), MAX_QUERY_LIMIT) as usize;
                 let latest_height = data.storage.get_chain_height();
                 let mut txs = Vec::new();
                 

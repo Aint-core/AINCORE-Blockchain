@@ -191,7 +191,7 @@ pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str, genesis_add
         } else {
             println!("⚠️ genesis.json not found! Falling back to single-node bootstrap using local key.");
             genesis_validators.push((genesis_addr_hex.to_string(), genesis_addr_hex.to_string()));
-            let stake = 1_000_000 * 1_000_000_000_000_000_000_000_000;
+            let stake: u128 = 1_000_000u128 * 1_000_000_000_000_000_000; // M-8 FIX: 1M AIN in 18-decimal Wei
             total_bootstrap_stake = stake;
             treasury_reserve_amount = 50_000 * 1_000_000_000_000_000_000;
             genesis_epoch_duration = 10;

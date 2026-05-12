@@ -107,7 +107,46 @@ impl Vertex {
         v
     }
     
-    /// Sign the vertex hash with BLS and set the signature field
+    /// Sign the vertex hash with Ed25519 and set the signature field
+    pub fn sign_with_ed25519(&mut self, secret_key: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        let sig = secret_key.sign(self.hash.as_bytes());
+        self.signature = hex::encode(sig.to_bytes());
+    }
+    
+    /// Verify the Ed25519 signature
+    pub fn verify_ed25519_signature(&self, public_key_hex: &str) -> bool {
+        use ed25519_dalek::{Verifier, VerifyingKey, Signature};
+        if self.signature.is_empty() {
+            return false;
+        }
+        let sig_bytes = match hex::decode(&self.signature) {
+            Ok(b) if b.len() == 64 => {
+                let mut arr = [0u8; 64];
+                arr.copy_from_slice(&b);
+                arr
+            },
+            _ => return false,
+        };
+        let pk_bytes = match hex::decode(public_key_hex) {
+            Ok(b) if b.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b);
+                arr
+            },
+            _ => return false,
+        };
+        
+        let verifying_key = match VerifyingKey::from_bytes(&pk_bytes) {
+            Ok(vk) => vk,
+            Err(_) => return false,
+        };
+        let signature = Signature::from_bytes(&sig_bytes);
+        
+        verifying_key.verify(self.hash.as_bytes(), &signature).is_ok()
+    }
+
+    /// (DEPRECATED) Sign the vertex hash with BLS and set the signature field
     pub fn sign_with_bls(&mut self, secret_key: &[u8; 32]) {
         use crypto::bls::BLSEngine;
         let bls = BLSEngine::new(b"AINCORE_CONSENSUS_V1");
@@ -115,7 +154,7 @@ impl Vertex {
         self.signature = hex::encode(&sig);
     }
     
-    /// Verify the BLS signature
+    /// (DEPRECATED) Verify the BLS signature
     pub fn verify_bls_signature(&self, public_key: &[u8; 32]) -> bool {
         use crypto::bls::BLSEngine;
         if self.signature.is_empty() {
