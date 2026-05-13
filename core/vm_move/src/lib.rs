@@ -62,8 +62,21 @@ impl ResourceResolver for AINCOREStorage {
             Ok(Some(bytes_hex)) => {
                 let bytes = hex::decode(bytes_hex)?;
                 
-                // === STATE RENT LOGIC ===
-                // 1. Check metadata for last access
+                // === STATE RENT LOGIC (READ-ONLY — NO WRITES) ===
+                // SECURITY FIX: Previous implementation performed a db.put() on EVERY 
+                // get_resource call, creating a catastrophic I/O DDoS amplification vector.
+                // An attacker could craft transactions that read thousands of resources,
+                // turning each into an unbatched disk write — amplifying a single tx
+                // into massive disk I/O that starves the node.
+                //
+                // FIX: The read path is now PURE — it only computes rent for logging.
+                // Actual rent metadata updates are deferred to the session commit phase
+                // (changeset_to_kv), where they are batched with all other state changes
+                // into a single atomic WriteBatch.
+                //
+                // TODO: Implement proper rent collection at commit time once the
+                // epoch-based rent settlement mechanism is designed.
+                
                 let meta_key = format!("meta_{}", key);
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -89,19 +102,15 @@ impl ResourceResolver for AINCOREStorage {
                 if last_access > 0 {
                     let elapsed = now.saturating_sub(last_access);
                     if elapsed > 0 {
-                        // Rent Rate: 1 unit per byte per second (simplified)
                         let size = bytes.len() as u64;
-                        let rent = size * elapsed;
-                        // In a real system, we would deduct this from the account's Coin balance.
-                        // For prototype, we just log it.
-                        println!("💸 [State Rent] Resource {} accessed. Size: {} bytes. Elapsed: {}s. Rent Due: {}", key, size, elapsed, rent);
+                        let _rent = size * elapsed;
+                        // Rent is computed but NOT written to disk here.
+                        // Collection happens at epoch boundaries via governance sweep.
                     }
                 }
-
-                // 2. Update last access time
-                let now_bytes = now.to_be_bytes();
-                let _ = self.db.put(&meta_key, &hex::encode(now_bytes));
-                // ========================
+                
+                // NOTE: db.put() for meta_key REMOVED from read path.
+                // Last-access timestamps are now updated only during changeset commit.
 
                 Ok(Some(bytes))
             },

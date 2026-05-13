@@ -82,10 +82,24 @@ module 0x1::coin {
     }
 
     /// === SYSTEM GAS & FEE FUNCTIONS (EXECUTOR ONLY) ===
-    /// Deduct gas from a user. Must be called by the system/executor.
-    public entry fun deduct_gas<CoinType>(account: &signer, amount: u128) acquires CoinStore {
-        let coin = withdraw<CoinType>(account, amount);
-        burn(coin); // For now, gas is burned. Can be modified to go to a fee pool.
+    /// Deduct gas from a user account. RESTRICTED to system caller only.
+    /// 
+    /// SECURITY FIX: Previous signature was `deduct_gas(account: &signer, amount)` which meant
+    /// the executor had to impersonate user signers to deduct gas — a capability leak where
+    /// ANY user-deployed script could also call this function with their own signer.
+    /// 
+    /// New signature requires @0x1 system authority to deduct from any target address,
+    /// making gas deduction an exclusive system privilege.
+    public entry fun deduct_gas<CoinType>(sys: &signer, user_addr: address, amount: u128) acquires CoinStore {
+        // CRITICAL: Only the system address can deduct gas
+        assert!(signer::address_of(sys) == @0x1, error::permission_denied(ENOT_SYSTEM_MODULE));
+        assert!(exists<CoinStore<CoinType>>(user_addr), error::not_found(EINSUFFICIENT_BALANCE));
+        
+        let store = borrow_global_mut<CoinStore<CoinType>>(user_addr);
+        assert!(store.coin.value >= amount, error::invalid_argument(EINSUFFICIENT_BALANCE));
+        
+        store.coin.value = store.coin.value - amount;
+        // Gas fees are burned (removed from circulation)
     }
 
     /// Deposit block fee reward to miner. Must be called by system.

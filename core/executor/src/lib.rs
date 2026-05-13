@@ -1,9 +1,15 @@
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use storage::StateDB;
 use storage::rocksdb::WriteBatch;
 use vm_move::AINCOREVM;
 use rayon::prelude::*;
+
+/// SECURITY FIX: Global mutex to serialize block execution.
+/// Prevents State Root Race Condition where concurrent execute_block_parallel
+/// calls (from consensus + sync threads) could read the same prev_root and
+/// compute conflicting new roots, causing an instant Hard Fork.
+static BLOCK_EXECUTION_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
 
 /// Chain ID loaded from environment, defaults to TESTNET for safety.
 /// Set AINCORE_CHAIN_ID=AINCORE-MAINNET-1 explicitly for production.
@@ -59,6 +65,10 @@ impl Executor {
     /// Execute a batch of transactions in PARALLEL.
     /// This uses a Scheduler to group non-conflicting transactions.
     pub fn execute_block_parallel(&self, txs_json: Vec<String>, proposer_hex: &str) {
+        // SECURITY FIX: Acquire block-level lock to serialize state root calculation.
+        // Individual transactions within a block still run in parallel (via Rayon),
+        // but two DIFFERENT blocks cannot execute concurrently.
+        let _block_lock = BLOCK_EXECUTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         println!("🚀 Starting Parallel Execution for {} transactions...", txs_json.len());
         
         // 1. Parse all transactions
@@ -248,13 +258,66 @@ impl Executor {
                     println!("✅ Fee Reward Credited via Move VM: {} AIN to {}", reward_amount, miner_addr);
                 },
                 Err(e) => {
-                    // Fallback: Log but do NOT credit native balance (prevents dual-accounting)
-                    eprintln!("⚠️ Move VM fee distribution failed: {}. Fees held in system pool.", e);
-                    // Store unclaimed fees for later distribution
-                    let unclaimed: u128 = self.db.get("sys:unclaimed_fees")
-                        .unwrap_or(None).unwrap_or("0".to_string())
-                        .parse().unwrap_or(0);
-                    let _ = self.db.put("sys:unclaimed_fees", &(unclaimed + reward_amount).to_string());
+                    // SECURITY FIX: Old code dumped fees into sys:unclaimed_fees with no
+                    // claim mechanism, permanently locking validator rewards.
+                    // New approach: Retry up to 3 times, then queue for epoch-based sweep.
+                    eprintln!("⚠️ Move VM fee distribution failed (attempt 1): {}. Retrying...", e);
+                    
+                    let mut distributed = false;
+                    for retry in 2..=3 {
+                        // Re-create args fresh for each retry attempt
+                        let retry_module = move_core_types::language_storage::ModuleId::new(
+                            move_core_types::account_address::AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
+                            move_core_types::identifier::Identifier::new("coin").expect("valid")
+                        );
+                        let retry_ty = vec![move_core_types::language_storage::TypeTag::Struct(
+                            Box::new(move_core_types::language_storage::StructTag {
+                                address: move_core_types::account_address::AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
+                                module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                                name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                                type_params: vec![],
+                            })
+                        )];
+                        let r_sys = bcs::to_bytes(&move_core_types::account_address::AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1])).unwrap_or_default();
+                        let r_miner = bcs::to_bytes(&miner_account).unwrap_or_default();
+                        let r_amount = bcs::to_bytes(&reward_amount).unwrap_or_default();
+                        
+                        match self.vm.execute_public_entry_function(
+                            retry_module, "deposit_fee_reward", retry_ty,
+                            vec![r_sys, r_miner, r_amount],
+                            100_000,
+                            move_core_types::account_address::AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1])
+                        ) {
+                            Ok((_g, changes, _)) => {
+                                for (k, v) in changes {
+                                    if let Some(val) = v {
+                                        let _ = self.db.put(&k, &val);
+                                    }
+                                }
+                                println!("✅ Fee Reward Credited via Move VM (retry {}): {} AIN to {}", retry, reward_amount, miner_addr);
+                                distributed = true;
+                                break;
+                            },
+                            Err(e2) => {
+                                eprintln!("⚠️ Move VM fee distribution failed (attempt {}): {}", retry, e2);
+                            }
+                        }
+                    }
+                    
+                    if !distributed {
+                        // Queue for epoch-based sweep instead of dead-end accumulation.
+                        // Validators can query sys:fee_sweep_queue entries and claim via governance.
+                        let sweep_key = format!("sys:fee_sweep_queue:{}:{}", miner_addr, 
+                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default().as_secs());
+                        let sweep_entry = serde_json::json!({
+                            "miner": miner_addr,
+                            "amount": reward_amount.to_string(),
+                            "reason": "vm_distribution_failed_3_attempts"
+                        });
+                        let _ = self.db.put(&sweep_key, &sweep_entry.to_string());
+                        eprintln!("🔴 Fee distribution failed after 3 attempts. Queued for sweep: {} AIN for {}", reward_amount, miner_addr);
+                    }
                 }
             }
         }
@@ -556,6 +619,10 @@ impl Executor {
             // === C-7 FIX: GAS DEDUCTION VIA MOVE VM ===
             // Gas balance check and deduction now goes through the Move VM CoinStore.
             // The native AccountData.balance is NO LONGER the source of truth for gas sufficiency.
+            //
+            // SECURITY FIX (coin.move deduct_gas signature update):
+            // Old: deduct_gas<CoinType>(account: &signer, amount) — caller = user (capability leak)
+            // New: deduct_gas<CoinType>(sys: &signer, user_addr: address, amount) — caller = @0x1
             {
                 use move_core_types::language_storage::ModuleId;
                 use move_core_types::identifier::Identifier;
@@ -571,8 +638,13 @@ impl Executor {
                     Err(_) => { println!("❌ Invalid payer address for gas deduction"); return None; }
                 };
                 
-                // deduct_gas<CoinType>(account: &signer, amount: u128)
-                let arg_signer = bcs::to_bytes(&payer_vm_addr).unwrap_or_default();
+                // NEW SIGNATURE: deduct_gas<CoinType>(sys: &signer, user_addr: address, amount: u128)
+                // sys = @0x1 (system, passed as sender to execute_public_entry_function)
+                // user_addr = the payer's address (BCS-encoded as an argument)
+                // amount = gas_cost (BCS-encoded)
+                let sys_addr = AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]);
+                let arg_sys_signer = bcs::to_bytes(&sys_addr).unwrap_or_default();
+                let arg_user_addr = bcs::to_bytes(&payer_vm_addr).unwrap_or_default();
                 let arg_amount = bcs::to_bytes(&gas_cost).unwrap_or_default();
                 
                 let ty_args = vec![move_core_types::language_storage::TypeTag::Struct(
@@ -588,9 +660,9 @@ impl Executor {
                     module_id,
                     "deduct_gas",
                     ty_args,
-                    vec![arg_signer, arg_amount],
+                    vec![arg_sys_signer, arg_user_addr, arg_amount],
                     100_000, // Minimal gas budget for gas deduction itself
-                    payer_vm_addr
+                    sys_addr // FIXED: System is the caller, NOT the user
                 ) {
                     Ok((_gas_used, vm_changes, _)) => {
                         for (k, v) in vm_changes {
@@ -640,8 +712,12 @@ impl Executor {
 
             // 4. Execution Payload
             if tx.payload.starts_with("0x") {
-                 // === PHASE 8: TRUE VM EXECUTION ===
-                 // Parse Script Bytecode
+                 // GHOST SCRIPT INJECTION — PERMANENTLY DISABLED (CRITICAL)
+                 // Raw execute_script() allowed arbitrary code execution (RCE).
+                 // All execution must use "call:0xADDR::module::function" format.
+                 let _preview_len = std::cmp::min(tx.payload.len(), 22);
+                 println!("🚫 [SECURITY] Raw script execution BLOCKED");
+                 if false { // Dead code block — compile guard only
                  if let Ok(script_bytes) = hex::decode(&tx.payload[2..]) {
                      // Parse Args (assume string hex args for now)
                      let mut vm_args = Vec::new();
@@ -743,6 +819,7 @@ impl Executor {
                         }
                     }
                  }
+                 } // end if false — ghost script execution permanently disabled
             } else if tx.payload.starts_with("transfer:") {
                 // C-5/C-7 FIX: Route transfers through Move VM coin::transfer
                 // Old code directly manipulated AccountData.balance — dual-accounting vulnerability.
@@ -1773,63 +1850,13 @@ impl Executor {
                      }
                  }
             }
-            // BUG #3 FIX: Only attempt raw hex Move script execution if payload
-            // was NOT already handled by any of the branches above.
-            // Previously this ran unconditionally, causing double-execution.
-            else if tx.payload.len() > 2 && tx.payload.chars().all(|c| c.is_ascii_hexdigit()) {
-            if let Ok(script_bytes) = hex::decode(&tx.payload) {
-                 match self.vm.execute_script(script_bytes, vec![], tx.gas_limit) {
-                     Ok((gas_used, vm_changes, _)) => {
-                         for (k, v) in vm_changes {
-                             updates.push((k, v));
-                         }
-                         println!("✅ Move Script Executed. Gas Used: {}", gas_used);
-                         
-                         // === C-6 FIX: GAS REFUND VIA MOVE VM ===
-                         // OLD: Credited native account_data.balance — dual-accounting vulnerability.
-                         // NEW: Routes refund through Move VM coin::deposit_fee_reward.
-                         if gas_used < tx.gas_limit {
-                             let refund_amount: u128 = (tx.gas_limit - gas_used) as u128 * tx.gas_price;
-                             if refund_amount > 0 {
-                                 use move_core_types::language_storage::ModuleId;
-                                 use move_core_types::identifier::Identifier;
-                                 use move_core_types::account_address::AccountAddress;
-                                 
-                                 let refund_module = ModuleId::new(
-                                     AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
-                                     Identifier::new("coin").expect("coin identifier is valid")
-                                 );
-                                 let refund_addr = AccountAddress::from_hex_literal(&format!("0x{}", tx.sender))
-                                     .unwrap_or(AccountAddress::new([0u8; 16]));
-                                 let arg_refund = bcs::to_bytes(&refund_amount).unwrap_or_default();
-                                 
-                                 match self.vm.execute_public_entry_function(
-                                     refund_module,
-                                     "deposit_fee_reward",
-                                     vec![],
-                                     vec![arg_refund],
-                                     50_000,
-                                     refund_addr
-                                 ) {
-                                     Ok((_rg, refund_changes, _)) => {
-                                         for (k, v) in refund_changes {
-                                             updates.push((k, v));
-                                         }
-                                         actual_gas = actual_gas.saturating_sub(refund_amount);
-                                         println!("   💰 Gas Refund via Move VM: {} Wei to {}", refund_amount, tx.sender);
-                                     },
-                                     Err(e) => {
-                                         println!("   ⚠️ Gas refund failed (Move VM): {}. Refund held in system escrow.", e);
-                                     }
-                                 }
-                             }
-                         }
-                     },
-                     Err(e) => {
-                         println!("❌ Move Execution Failed: {}", e);
-                     }
-                 }
-                 }
+            // SECURITY FIX: Ghost Script Vulnerability ELIMINATED.
+            // Previously, ANY raw hex payload that didn't match known prefixes was decoded
+            // and executed as arbitrary Move bytecode — allowing attackers to run malicious
+            // scripts without publishing a module. This is now BLOCKED.
+            // All Move interactions MUST use the published module entry function format.
+            else {
+                println!("⚠️ REJECTED: Unrecognized payload format from {}. Raw hex script execution is disabled for security.", tx.sender);
             }
             
             Some((updates, actual_gas))

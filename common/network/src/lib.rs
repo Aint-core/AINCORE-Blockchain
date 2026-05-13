@@ -220,12 +220,9 @@ where
 }
 
 async fn send_encrypted(socket: &mut tokio::net::TcpStream, key: &[u8; 32], msg: &str) -> std::io::Result<()> {
-    // Nonce: Random or Counter. For simplicity here: Random 12 bytes
-    let mut nonce = [0u8; 12];
-    use rand::RngCore;
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
-    
-    let ciphertext = TransportEngine::encrypt(key, &nonce, msg.as_bytes())
+    // SECURITY: Uses atomic-counter-based nonce generation (encrypt_safe)
+    // to guarantee nonce uniqueness per message under the same session key.
+    let (nonce, ciphertext) = TransportEngine::encrypt_safe(key, msg.as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     
     // Packet: [Length (4B)][Nonce (12B)][Ciphertext]
