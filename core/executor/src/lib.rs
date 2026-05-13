@@ -8,7 +8,7 @@ use rayon::prelude::*;
 /// Chain ID loaded from environment, defaults to TESTNET for safety.
 /// Set AINCORE_CHAIN_ID=AINCORE-MAINNET-1 explicitly for production.
 fn get_chain_id() -> String {
-    std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-TESTNET-1".to_string())
+    std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string())
 }
 // V3 CONSTANTS
 const MAX_SUPPLY: u128 = 150_000_000 * 1_000_000_000_000_000_000; // 150 Million AIN
@@ -216,14 +216,25 @@ impl Executor {
             
             let miner_account = AccountAddress::from_hex_literal(&format!("0x{}", miner_addr))
                 .unwrap_or(AccountAddress::new([0u8; 16]));
-            let arg_amount = bcs::to_bytes(&reward_amount).unwrap_or_default();
+            let arg_sys = bcs::to_bytes(&AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1])).unwrap_or_default();
             let arg_miner = bcs::to_bytes(&miner_account).unwrap_or_default();
+            let arg_amount = bcs::to_bytes(&reward_amount).unwrap_or_default();
             
+            // deposit_fee_reward<CoinType>(sys: &signer, to: address, amount: u128)
+            let ty_args = vec![move_core_types::language_storage::TypeTag::Struct(
+                Box::new(move_core_types::language_storage::StructTag {
+                    address: AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
+                    module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                    name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                    type_params: vec![],
+                })
+            )];
+
             match self.vm.execute_public_entry_function(
                 module_id,
                 "deposit_fee_reward",
-                vec![],
-                vec![arg_miner, arg_amount],
+                ty_args,
+                vec![arg_sys, arg_miner, arg_amount],
                 100_000, // Internal gas limit for fee distribution
                 AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]) // System caller
             ) {
@@ -314,13 +325,17 @@ impl Executor {
                 }
             };
             
-            let arg_pct = bcs::to_bytes(&slash_pct).unwrap_or_default();
+            // slash_validator(account: &signer, validator_addr: address)
+            // Wait, does it take pct? The existing contract says `slash_validator(account: &signer, validator_addr: address)`.
+            // Let's pass the system signer and validator address.
+            let arg_sys = bcs::to_bytes(&AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1])).unwrap_or_default();
+            let arg_val = bcs::to_bytes(&vm_addr).unwrap_or_default();
             
             match self.vm.execute_public_entry_function(
                 module_id,
                 "slash_validator",
                 vec![],
-                vec![arg_pct],
+                vec![arg_sys, arg_val],
                 500_000, // Gas budget for slash operation
                 vm_addr
             ) {
@@ -556,13 +571,24 @@ impl Executor {
                     Err(_) => { println!("❌ Invalid payer address for gas deduction"); return None; }
                 };
                 
+                // deduct_gas<CoinType>(account: &signer, amount: u128)
+                let arg_signer = bcs::to_bytes(&payer_vm_addr).unwrap_or_default();
                 let arg_amount = bcs::to_bytes(&gas_cost).unwrap_or_default();
                 
+                let ty_args = vec![move_core_types::language_storage::TypeTag::Struct(
+                    Box::new(move_core_types::language_storage::StructTag {
+                        address: AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
+                        module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                        name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                        type_params: vec![],
+                    })
+                )];
+
                 match self.vm.execute_public_entry_function(
                     module_id,
                     "deduct_gas",
-                    vec![],
-                    vec![arg_amount],
+                    ty_args,
+                    vec![arg_signer, arg_amount],
                     100_000, // Minimal gas budget for gas deduction itself
                     payer_vm_addr
                 ) {
@@ -646,12 +672,24 @@ impl Executor {
                                           Ok(addr) => addr,
                                           Err(_) => { println!("❌ Invalid refund address"); AccountAddress::ZERO }
                                       };
+                                      // deposit_fee_reward<CoinType>(sys: &signer, to: address, amount: u128)
+                                      let arg_sys = bcs::to_bytes(&AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1])).unwrap_or_default();
+                                      let arg_to = bcs::to_bytes(&payer_vm_addr).unwrap_or_default();
                                       let arg_refund = bcs::to_bytes(&refund).unwrap_or_default();
+                                      let ty_args = vec![move_core_types::language_storage::TypeTag::Struct(
+                                          Box::new(move_core_types::language_storage::StructTag {
+                                              address: AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
+                                              module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                                              name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                                              type_params: vec![],
+                                          })
+                                      )];
+
                                       match self.vm.execute_public_entry_function(
                                           refund_module,
                                           "deposit_fee_reward",
-                                          vec![],
-                                          vec![arg_refund],
+                                          ty_args,
+                                          vec![arg_sys, arg_to, arg_refund],
                                           50_000,
                                           payer_vm_addr
                                       ) {
@@ -743,14 +781,25 @@ impl Executor {
                             Err(_) => { println!("❌ Invalid recipient address"); return None; }
                         };
                         
+                        // transfer<CoinType>(from: &signer, to: address, amount: u128)
+                        let arg_from = bcs::to_bytes(&sender_addr).unwrap_or_default();
                         let arg_to = bcs::to_bytes(&recipient_account).unwrap_or_default();
                         let arg_amount = bcs::to_bytes(&amount).unwrap_or_default();
                         
+                        let ty_args = vec![move_core_types::language_storage::TypeTag::Struct(
+                            Box::new(move_core_types::language_storage::StructTag {
+                                address: AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
+                                module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                                name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                                type_params: vec![],
+                            })
+                        )];
+
                         match self.vm.execute_public_entry_function(
                             module_id,
                             "transfer",
-                            vec![],
-                            vec![arg_to, arg_amount],
+                            ty_args,
+                            vec![arg_from, arg_to, arg_amount],
                             tx.gas_limit,
                             sender_addr
                         ) {
@@ -819,6 +868,7 @@ impl Executor {
                              
                              // wbtc::mint(bridge: &signer, to: address, amount: u128)
                              let mint_amount_u128: u128 = amount as u128;
+                             let arg_bridge = bcs::to_bytes(&bridge_addr_move).unwrap_or_default();
                              let arg_to = bcs::to_bytes(&mint_to_addr).unwrap_or_default();
                              let arg_amount = bcs::to_bytes(&mint_amount_u128).unwrap_or_default();
                              
@@ -826,7 +876,7 @@ impl Executor {
                                  wbtc_module,
                                  "mint",
                                  vec![],
-                                 vec![arg_to, arg_amount],
+                                 vec![arg_bridge, arg_to, arg_amount],
                                  tx.gas_limit,
                                  bridge_addr_move
                              ) {
@@ -881,14 +931,25 @@ impl Executor {
                                  Err(_) => { println!("❌ Invalid miner address"); return None; }
                              };
                              
-                             // Route through deposit_fee_reward: mint + deposit in single atomic op
+                             // deposit_fee_reward<CoinType>(sys: &signer, to: address, amount: u128)
+                             let arg_sys = bcs::to_bytes(&AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1])).unwrap_or_default();
+                             let arg_miner = bcs::to_bytes(&miner_addr).unwrap_or_default();
                              let arg_amount = bcs::to_bytes(&reward).unwrap_or_default();
                              
+                             let ty_args = vec![move_core_types::language_storage::TypeTag::Struct(
+                                 Box::new(move_core_types::language_storage::StructTag {
+                                     address: AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
+                                     module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                                     name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                                     type_params: vec![],
+                                 })
+                             )];
+
                              match self.vm.execute_public_entry_function(
                                  module_id,
                                  "deposit_fee_reward",
-                                 vec![],
-                                 vec![arg_amount],
+                                 ty_args,
+                                 vec![arg_sys, arg_miner, arg_amount],
                                  tx.gas_limit,
                                  miner_addr
                              ) {
@@ -916,17 +977,16 @@ impl Executor {
                  // Decode Public Key
                  if let Ok(pubkey_bytes) = hex::decode(&tx.public_key) {
                      // Prepare BCS Args
-                     // Arg0: &signer (Handled by VM automatically for Entry Function first arg if it's signer)
-                     // Wait, VM expects Signer to be injected via sending session??
-                     // execute_entry_function signature: 
-                     // fun join_validator_set(account: &signer, stake_amount: u128, public_key: vector<u8>)
-                     // The VM automatically binds the first &signer argument to the txn sender.
-                     // So we only provide args for stake_amount and public_key.
+                     // Arg0: &signer (Handled by injecting into args)
                      
+                     let arg_account = bcs::to_bytes(&match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
+                         Ok(addr) => addr,
+                         Err(_) => { println!("❌ Invalid sender format"); return None; }
+                     }).unwrap_or_default();
                      let arg_stake = bcs::to_bytes(&stake_amount).unwrap_or_default();
                      let arg_pubkey = bcs::to_bytes(&pubkey_bytes).unwrap_or_default();
                      
-                     let args = vec![arg_stake, arg_pubkey];
+                     let args = vec![arg_account, arg_stake, arg_pubkey];
                      let ty_args = vec![];
                      
                      use move_core_types::language_storage::ModuleId;

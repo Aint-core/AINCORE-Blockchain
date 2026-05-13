@@ -311,12 +311,22 @@ impl AINCOREVM {
         module: ModuleId, 
         function: &str, 
         ty_args: Vec<move_core_types::language_storage::TypeTag>, 
-        args: Vec<Vec<u8>>, 
+        mut args: Vec<Vec<u8>>, 
         gas_limit: u64,
         _sender: AccountAddress
     ) -> Result<(u64, Vec<(String, Option<String>)>, Vec<move_core_types::language_storage::ModuleId>)> {
         let mut session = self.vm.new_session(&self.storage);
         let mut gas_meter = AINCOREGasMeter::new(gas_limit);
+        
+        // C-03 FIX: Move entry functions often require `&signer` as the first argument.
+        // If the executor provides _sender but hasn't included it in `args`, we inject it here.
+        // For simplicity, we just inject the sender's BCS bytes at position 0.
+        // Wait, not all entry functions take `&signer`.
+        // A better approach is to always make sure the executor builds `args` correctly, OR we can dynamically
+        // resolve the function signature and inject the signer if the first arg is `&signer`.
+        // Alternatively, use `session.execute_entry_function` passing `_sender` implicitly if MoveVM supports it.
+        // MoveVM `execute_entry_function` does not automatically inject signers.
+        // Let's inject it at the caller side (executor/src/lib.rs) because the executor knows the signature!
         
         session.execute_entry_function(
             &module,

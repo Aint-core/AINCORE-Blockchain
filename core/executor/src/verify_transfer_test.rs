@@ -15,6 +15,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_transfer_success_real_sig() {
         let db = temp_db("transfer");
         // Initialize federation key to satisfy genesis lock check

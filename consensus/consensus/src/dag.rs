@@ -402,6 +402,20 @@ impl DagConsensus {
             round_idx.entry(vertex.round).or_default().push(vertex.hash.clone());
             println!("📥 Added Vertex to DAG: {} (Round {})", vertex.hash, vertex.round);
             
+            // C-04 FIX: Record peer activity to prevent false-positive downtime slashes
+            if vertex.author != self.node_id {
+                let current_last_seen = match self.storage.get(&format!("validator:last_seen:{}", vertex.author)) {
+                    Ok(Some(r)) => r.parse::<u64>().unwrap_or(0),
+                    _ => 0,
+                };
+                if vertex.round > current_last_seen {
+                    let _ = self.storage.put(
+                        &format!("validator:last_seen:{}", vertex.author),
+                        &vertex.round.to_string()
+                    );
+                }
+            }
+            
             // Fast-forward local round to match network if lagging behind (Amnesia Recovery)
             // ONLY for remote vertices — try_create_vertex already increments for local ones
             if vertex.author != self.node_id && vertex.round >= self.current_round {
