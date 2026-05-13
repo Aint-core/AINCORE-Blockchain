@@ -21,6 +21,12 @@ const MAX_SUPPLY: u128 = 150_000_000 * 1_000_000_000_000_000_000; // 150 Million
 // Note: Block rewards handled exclusively by staking.move (Halving model)
 // Executor only distributes transaction fees — no inflationary minting here
 
+// N-2 FIX: Per-block cumulative object limit to prevent memory exhaustion DoS.
+// 10,000 TXs × 128 objects = 1.28M objects → 1.28GB RAM. Cap at 10K total.
+const MAX_OBJECTS_PER_BLOCK: usize = 10_000;
+// Gas cost per input object loaded (prevents zero-cost object flooding)
+const OBJECT_LOAD_GAS: u64 = 100;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Transaction {
     pub chain_id: String, // Replay Protection
@@ -71,21 +77,36 @@ impl Executor {
         let _block_lock = BLOCK_EXECUTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         println!("🚀 Starting Parallel Execution for {} transactions...", txs_json.len());
         
-        // 1. Parse all transactions
+        // 1. Parse all transactions with N-2 FIX: cumulative object limit
         let mut parsed_txs = Vec::new();
+        let mut total_block_objects: usize = 0;
+        
         for raw in &txs_json {
             match serde_json::from_str::<Transaction>(raw) {
                 Ok(tx) => {
-                    // CRITICAL FIX: Prevent Scheduler DoS and Lock Truncation here
+                    // Per-TX limit (existing)
                     if tx.input_objects.len() > 128 {
                         println!("⛔ Transaction REJECTED: Too many input objects (>128)");
                         continue;
                     }
+                    
+                    // N-2 FIX: Cumulative per-block object limit
+                    let new_total = total_block_objects + tx.input_objects.len();
+                    if new_total > MAX_OBJECTS_PER_BLOCK {
+                        println!("⛔ BLOCK OBJECT LIMIT: {} + {} = {} exceeds cap ({}). Dropping remaining TXs.",
+                            total_block_objects, tx.input_objects.len(), new_total, MAX_OBJECTS_PER_BLOCK);
+                        break; // Block is "full" — no more TXs accepted
+                    }
+                    
+                    total_block_objects = new_total;
                     parsed_txs.push((tx, raw.clone()));
                 },
                 Err(_e) => { },
             }
         }
+        
+        println!("📊 Block accepted {} TXs with {} total input objects (limit: {})",
+            parsed_txs.len(), total_block_objects, MAX_OBJECTS_PER_BLOCK);
 
         // 2. Build Dependency Graph & Schedule
         let mut batches: Vec<Vec<(Transaction, String)>> = Vec::new();
@@ -509,8 +530,20 @@ impl Executor {
                 _ => return None,
             };
 
-            // Derivation check
-            if tx.sender != tx.public_key[0..32] { return None; }
+            // N-3 FIX: Proper address derivation using SHA256 instead of string prefix comparison.
+            // Old (WRONG): if tx.sender != tx.public_key[0..32] { return None; }
+            // New (CORRECT): Derive address from public key bytes using crypto::derive_address()
+            let derived_address = match crypto::derive_address(&pk_bytes) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    println!("❌ Failed to derive address from public key: {}", e);
+                    return None;
+                }
+            };
+            if tx.sender != derived_address {
+                println!("❌ SENDER ADDRESS MISMATCH: tx.sender={} derived={}", tx.sender, derived_address);
+                return None;
+            }
 
             // Verify Sig
             let sig_bytes = match hex::decode(&tx.signature) {
@@ -563,12 +596,19 @@ impl Executor {
             }
 
             // 3. Check Balance & Deduct Gas
-            let gas_cost: u128 = (tx.gas_limit as u128) * tx.gas_price;
+            // N-2 FIX: Charge gas for object loading upfront
+            let object_load_gas = (tx.input_objects.len() as u64) * OBJECT_LOAD_GAS;
+            if object_load_gas > tx.gas_limit {
+                println!("❌ Insufficient gas for object loading: {} objects × {} gas = {} > gas_limit {}",
+                    tx.input_objects.len(), OBJECT_LOAD_GAS, object_load_gas, tx.gas_limit);
+                return None;
+            }
+            let effective_gas_limit = tx.gas_limit; // Full gas_limit charged; object gas is included
+            let gas_cost: u128 = (effective_gas_limit as u128) * tx.gas_price;
             
-            // Paymaster Logic
+            // N-1 FIX (HARDENED): Paymaster Signature Validation
+            // Message now includes chain_id, sequence_number, gas_limit for full replay protection.
             let payer_addr = if let Some(pm) = &tx.paymaster {
-                // M-3 FIX: Verify Paymaster Ed25519 Signature
-                // Paymaster must sign the tx hash to prove consent for gas sponsorship
                 if let Some(pm_sig_hex) = &tx.paymaster_signature {
                     use ed25519_dalek::{VerifyingKey, Signature, Verifier};
                     let pm_valid = (|| -> Result<(), ()> {
@@ -579,18 +619,22 @@ impl Executor {
                         ).map_err(|_| ())?;
                         let sig_bytes = hex::decode(pm_sig_hex).map_err(|_| ())?;
                         let sig = Signature::from_slice(&sig_bytes).map_err(|_| ())?;
-                        // Paymaster signs: sender || payload
-                        let mut msg = Vec::new();
-                        msg.extend_from_slice(tx.sender.as_bytes());
-                        msg.extend_from_slice(tx.payload.as_bytes());
+                        
+                        // N-1 FIX: Paymaster signs FULL context to prevent replay and cross-TX theft:
+                        // PAYMASTER_AUTH:{chain_id}:{sender}:{payload}:{gas_limit}:{sequence_number}
+                        let pm_message = format!(
+                            "PAYMASTER_AUTH:{}:{}:{}:{}:{}",
+                            tx.chain_id, tx.sender, tx.payload, tx.gas_limit, tx.sequence_number
+                        );
                         use sha2::{Sha256, Digest};
-                        let hash = Sha256::digest(&msg);
+                        let hash = Sha256::digest(pm_message.as_bytes());
                         vk.verify(&hash, &sig).map_err(|_| ())
                     })();
                     if pm_valid.is_err() {
                         println!("❌ Invalid Paymaster Signature! Gas sponsorship rejected.");
                         return None;
                     }
+                    println!("✅ Paymaster {} authorized gas payment for TX seq={}", pm, tx.sequence_number);
                 } else {
                     println!("❌ Paymaster specified without signature! Rejected.");
                     return None;

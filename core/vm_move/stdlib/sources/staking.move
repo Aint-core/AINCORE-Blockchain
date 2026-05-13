@@ -137,7 +137,46 @@ module 0x1::staking {
         
         vector::push_back(&mut validator_set.unbonding_queue, unbonding_req);
     }
-    
+    /// Clean up unbonding requests that are older than grace period
+    /// Called periodically by epoch::advance_epoch
+    public fun cleanup_old_unbonding(account: &signer) acquires ValidatorSet {
+        let addr = signer::address_of(account);
+        assert!(addr == @0x1, error::permission_denied(ENOT_VALIDATOR));
+        
+        let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
+        let current_time = validator_set.current_epoch * 60; // ~60s per epoch
+        
+        // Grace period: 21 days (unbonding) + 10 days (claim buffer) = 31 days
+        let grace_period: u64 = 2678400; // 31 days in seconds
+        
+        let queue_len = vector::length(&validator_set.unbonding_queue);
+        let i = 0;
+        
+        while (i < queue_len) {
+            let req = vector::borrow(&validator_set.unbonding_queue, i);
+            
+            // If request is older than grace period, auto-burn
+            if (current_time >= req.unlock_time + grace_period) {
+                let old_req = vector::remove(&mut validator_set.unbonding_queue, i);
+                let UnbondingRequest { validator_addr: _, stake: amount, unlock_time: _ } = old_req;
+                
+                // Auto-burn unclaimed stake (deflationary penalty for not withdrawing)
+                // Reduce total_supply accordingly
+                validator_set.total_supply = 
+                    if (validator_set.total_supply >= amount) {
+                        validator_set.total_supply - amount
+                    } else {
+                        0
+                    };
+                
+                queue_len = queue_len - 1;
+                // Don't increment i (next item shifts down)
+            } else {
+                i = i + 1;
+            };
+        };
+    }
+
     /// Withdraw unbonded stake (after 21 days)
     public entry fun withdraw_unbonded(account: &signer) acquires ValidatorSet {
         let addr = signer::address_of(account);
