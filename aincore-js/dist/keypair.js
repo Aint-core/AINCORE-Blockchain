@@ -36,6 +36,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.Keypair = void 0;
 const nacl = __importStar(require("tweetnacl"));
 const bip39 = __importStar(require("bip39"));
+const crypto = __importStar(require("crypto"));
 class Keypair {
     constructor(keypair) {
         this._keypair = keypair;
@@ -88,10 +89,11 @@ class Keypair {
         return Buffer.from(this._keypair.secretKey).toString('hex');
     }
     /**
-     * Get the AINCORE Address (First 16 bytes of Public Key)
+     * Get the AINCORE Address (First 16 bytes of SHA256(Public Key))
      */
     get address() {
-        return this.publicKey.slice(0, 32);
+        const hash = crypto.createHash('sha256').update(this._keypair.publicKey).digest();
+        return hash.subarray(0, 16).toString('hex');
     }
     /**
      * Sign a message (bytes)

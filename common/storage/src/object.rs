@@ -7,10 +7,6 @@ impl ObjectID {
     pub fn new(id: String) -> Self {
         Self(id)
     }
-    
-    pub fn to_string(&self) -> String {
-        self.0.clone()
-    }
 }
 
 impl std::fmt::Display for ObjectID {

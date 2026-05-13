@@ -28,7 +28,7 @@ export declare class Keypair {
      */
     get secretKey(): string;
     /**
-     * Get the AINCORE Address (First 16 bytes of Public Key)
+     * Get the AINCORE Address (First 16 bytes of SHA256(Public Key))
      */
     get address(): string;
     /**

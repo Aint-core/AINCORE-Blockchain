@@ -116,15 +116,13 @@ impl StateDB {
         let prefix_bytes = prefix.as_bytes();
         let iter = self.db.prefix_iterator(prefix_bytes);
         
-        for item in iter {
-            if let Ok((key, value)) = item {
-                if !key.starts_with(prefix_bytes) {
-                    break;
-                }
-                let k = String::from_utf8_lossy(&key).into_owned();
-                let v = String::from_utf8_lossy(&value).into_owned();
-                results.push((k, v));
+        for (key, value) in iter.flatten() {
+            if !key.starts_with(prefix_bytes) {
+                break;
             }
+            let k = String::from_utf8_lossy(&key).into_owned();
+            let v = String::from_utf8_lossy(&value).into_owned();
+            results.push((k, v));
         }
         results
     }
@@ -149,17 +147,15 @@ impl StateDB {
         let prefix = b"peer:";
         let iter = self.db.prefix_iterator(prefix);
 
-        for item in iter {
-            if let Ok((key, value)) = item {
-                if !key.starts_with(prefix) {
-                    break;
-                }
-                
-                let k = String::from_utf8(key.to_vec()).unwrap_or_default();
-                let val_str = String::from_utf8(value.to_vec()).unwrap_or_default();
-                if let Ok(port) = val_str.parse::<u16>() {
-                    peers.push((k.replace("peer:", ""), port));
-                }
+        for (key, value) in iter.flatten() {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            
+            let k = String::from_utf8(key.to_vec()).unwrap_or_default();
+            let val_str = String::from_utf8(value.to_vec()).unwrap_or_default();
+            if let Ok(port) = val_str.parse::<u16>() {
+                peers.push((k.replace("peer:", ""), port));
             }
         }
 
@@ -189,17 +185,15 @@ impl StateDB {
         let prefix = b"peer_addr:";
         let iter = self.db.prefix_iterator(prefix);
         
-        for item in iter {
-            if let Ok((key, value)) = item {
-                if !key.starts_with(prefix) {
-                    break;
-                }
-                
-                let k = String::from_utf8_lossy(&key).into_owned();
-                let node_id = k.replace("peer_addr:", "");
-                let addr = String::from_utf8_lossy(&value).into_owned();
-                peers.push((node_id, addr));
+        for (key, value) in iter.flatten() {
+            if !key.starts_with(prefix) {
+                break;
             }
+            
+            let k = String::from_utf8_lossy(&key).into_owned();
+            let node_id = k.replace("peer_addr:", "");
+            let addr = String::from_utf8_lossy(&value).into_owned();
+            peers.push((node_id, addr));
         }
         peers
     }
@@ -209,21 +203,19 @@ impl StateDB {
         let prefix = b"vertex:";
         let iter = self.db.prefix_iterator(prefix);
 
-        for item in iter {
-            if let Ok((key, value)) = item {
-                if !key.starts_with(prefix) {
-                    break;
-                }
-                
-                let v_json = String::from_utf8(value.to_vec()).unwrap_or_else(|_| "{}".to_string());
-                vertices.push(v_json);
+        for (key, value) in iter.flatten() {
+            if !key.starts_with(prefix) {
+                break;
             }
+            
+            let v_json = String::from_utf8(value.to_vec()).unwrap_or_else(|_| "{}".to_string());
+            vertices.push(v_json);
         }
         vertices
     }
 
     pub fn put_object(&self, object: &Object) -> std::result::Result<(), rocksdb::Error> {
-        let key = format!("obj:{}", object.id.to_string());
+        let key = format!("obj:{}", object.id);
         let value = serde_json::to_string(object).unwrap_or_default(); // Safe default or error? Default is ok for prototype.
         self.db.put(key, value)
     }

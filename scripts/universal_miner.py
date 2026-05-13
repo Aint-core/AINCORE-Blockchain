@@ -3,6 +3,7 @@ import time
 import json
 import requests
 import sys
+import hashlib
 
 # Requires: pip install requests pynacl
 try:
@@ -48,7 +49,7 @@ def main():
         signing_key = nacl.signing.SigningKey(seed_bytes)
         verify_key = signing_key.verify_key
         pub_hex = verify_key.encode(encoder=nacl.encoding.HexEncoder).decode('utf-8')
-        address = pub_hex[:32] 
+        address = hashlib.sha256(verify_key.encode()).digest()[:16].hex()
     except Exception as e:
         print(f"❌ Key error: {e}")
         sys.exit(1)
@@ -103,7 +104,7 @@ def main():
 
     # 2. Build Transaction
     payload = f"submit_proof:{args.device}:{args.quality}"
-    message = f"{payload}:{seq_num}"
+    message = f"AINCORE-MAINNET-1:{address}:{payload}:{seq_num}"
     
     signed = signing_key.sign(message.encode('utf-8'))
     signature_hex =signed.signature.hex()

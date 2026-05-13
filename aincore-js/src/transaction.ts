@@ -394,6 +394,19 @@ export class Transaction {
     }
 
     /**
+     * Sign the transaction as a Paymaster (Hardened payload)
+     * Payload: PAYMASTER_AUTH:{chain_id}:{sender}:{payload}:{gas_limit}:{sequence_number}
+     */
+    signAsPaymaster(paymasterKeypair: Keypair) {
+        if (!this.chainId) {
+            throw new Error('CRITICAL: Chain ID must be explicitly set to prevent replay attacks');
+        }
+        const message = `PAYMASTER_AUTH:${this.chainId}:${this.sender}:${this.payload}:${this.gasLimit}:${this.sequenceNumber}`;
+        const signature = paymasterKeypair.sign(Buffer.from(message));
+        this.setPaymaster(paymasterKeypair.address, signature);
+    }
+
+    /**
      * Convert to JSON string for API
      */
     toString(): string {

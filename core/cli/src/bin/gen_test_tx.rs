@@ -26,23 +26,24 @@ fn main() {
     
     // 2. Format Keys
     let public_key_hex = hex::encode(verifying_key.to_bytes());
-    // In AINCORE, address is first 16 bytes (32 hex chars) of public key
-    let sender_addr = public_key_hex[0..32].to_string();
+    // In AINCORE, address is first 16 bytes (32 hex chars) of SHA256 of public key
+    let sender_addr = crypto::derive_address(verifying_key.as_bytes()).unwrap();
 
     // 3. Create Payload
     let payload = format!("transfer:{}:1", sender_addr); // Self-transfer to ensure receiver exists (or creates a new one)
     let sequence_number = 0;
 
     // 4. Sign
-    // Message format from executor::execute_transaction: "{}:{}" (payload:seq_num)
-    let message = format!("{}:{}", payload, sequence_number);
+    // Message format from executor::execute_transaction: "{}:{}:{}:{}" (chain_id:sender:payload:seq_num)
+    let chain_id = "AINCORE-MAINNET-1";
+    let message = format!("{}:{}:{}:{}", chain_id, sender_addr, payload, sequence_number);
     let signature = signing_key.sign(message.as_bytes());
     let signature_hex = hex::encode(signature.to_bytes());
 
     // 5. Construct TX
     let tx = Transaction {
-        chain_id: "AINCORE-MAINNET-1".to_string(),
-        sender: sender_addr,
+        chain_id: chain_id.to_string(),
+        sender: sender_addr.clone(),
         input_objects: vec![], // No input objects for simple tests or ignored
         payload,
         args: vec![],

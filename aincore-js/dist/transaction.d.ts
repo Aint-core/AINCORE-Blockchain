@@ -84,7 +84,7 @@ export declare class Transaction {
      * @param initialSupply - Initial supply to mint to creator
      * @param sequenceNumber - Transaction sequence number
      */
-    static createToken(sender: Keypair, name: string, symbol: string, decimals: number, maxSupply: bigint, initialSupply: bigint, sequenceNumber?: number): Transaction;
+    static createToken(sender: Keypair, name: string, symbol: string, decimals: number, maxSupply: bigint, initialSupply: bigint, iconUrl: string, projectUrl: string, sequenceNumber?: number): Transaction;
     /**
      * Mint tokens (only token creator can mint)
      * @param sender - Token creator's keypair
@@ -154,6 +154,11 @@ export declare class Transaction {
      * Set Paymaster details
      */
     setPaymaster(paymasterAddress: string, signature: string): void;
+    /**
+     * Sign the transaction as a Paymaster (Hardened payload)
+     * Payload: PAYMASTER_AUTH:{chain_id}:{sender}:{payload}:{gas_limit}:{sequence_number}
+     */
+    signAsPaymaster(paymasterKeypair: Keypair): void;
     /**
      * Convert to JSON string for API
      */

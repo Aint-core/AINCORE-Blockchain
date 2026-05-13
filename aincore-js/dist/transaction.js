@@ -11,7 +11,7 @@ class Transaction {
         this.sequenceNumber = 0;
         this.publicKey = '';
         this.signature = '';
-        this.chainId = 'AINCORE-MAINNET-1';
+        this.chainId = ''; // Must be explicitly set by developer
     }
     /**
      * Create a transfer transaction
@@ -147,7 +147,7 @@ class Transaction {
      * @param initialSupply - Initial supply to mint to creator
      * @param sequenceNumber - Transaction sequence number
      */
-    static createToken(sender, name, symbol, decimals, maxSupply, initialSupply, sequenceNumber = 0) {
+    static createToken(sender, name, symbol, decimals, maxSupply, initialSupply, iconUrl, projectUrl, sequenceNumber = 0) {
         if (decimals < 0 || decimals > 18) {
             throw new Error('Decimals must be between 0 and 18');
         }
@@ -156,7 +156,7 @@ class Transaction {
         }
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = `create_token:${name}:${symbol}:${decimals}:${maxSupply.toString()}:${initialSupply.toString()}`;
+        tx.payload = `create_token:${name}:${symbol}:${decimals}:${maxSupply.toString()}:${initialSupply.toString()}:${iconUrl}:${projectUrl}`;
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
@@ -275,8 +275,11 @@ class Transaction {
         if (signer.address !== this.sender) {
             throw new Error('Signer does not match sender');
         }
-        // Include sequence number AND Chain ID in signature payload (REPLAY PROTECTION)
-        const message = `${this.chainId}:${this.payload}:${this.sequenceNumber}`;
+        if (!this.chainId) {
+            throw new Error('CRITICAL: Chain ID must be explicitly set to prevent replay attacks');
+        }
+        // Include sender, chain ID, and sequence number in signature payload (Phase 4 Node standard)
+        const message = `${this.chainId}:${this.sender}:${this.payload}:${this.sequenceNumber}`;
         this.signature = signer.sign(Buffer.from(message));
         this.publicKey = signer.publicKey;
     }
@@ -286,6 +289,18 @@ class Transaction {
     setPaymaster(paymasterAddress, signature) {
         this.paymaster = paymasterAddress;
         this.paymasterSignature = signature;
+    }
+    /**
+     * Sign the transaction as a Paymaster (Hardened payload)
+     * Payload: PAYMASTER_AUTH:{chain_id}:{sender}:{payload}:{gas_limit}:{sequence_number}
+     */
+    signAsPaymaster(paymasterKeypair) {
+        if (!this.chainId) {
+            throw new Error('CRITICAL: Chain ID must be explicitly set to prevent replay attacks');
+        }
+        const message = `PAYMASTER_AUTH:${this.chainId}:${this.sender}:${this.payload}:${this.gasLimit}:${this.sequenceNumber}`;
+        const signature = paymasterKeypair.sign(Buffer.from(message));
+        this.setPaymaster(paymasterKeypair.address, signature);
     }
     /**
      * Convert to JSON string for API

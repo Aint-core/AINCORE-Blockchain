@@ -13,7 +13,6 @@ mod gas;
 use gas::AINCOREGasMeter;
 use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
 use serde::Deserialize;
-use serde_json;
 
 mod tests;
 
@@ -120,6 +119,8 @@ impl ResourceResolver for AINCOREStorage {
     }
 }
 
+pub type ExecutionResult = Result<(u64, Vec<(String, Option<String>)>, Vec<move_core_types::language_storage::ModuleId>)>;
+
 pub struct AINCOREVM {
     vm: MoveVM,
     storage: AINCOREStorage,
@@ -224,7 +225,7 @@ impl AINCOREVM {
             
             // FULL PAYLOAD VERIFICATION (Phase 4):
             // Match the executor's format: chain_id:sender:payload_hex:seq_num
-            let message = format!("{}:{}:{}:{}", chain_id, sender.to_string(), hex::encode(_payload), sequence_number);
+            let message = format!("{}:{}:{}:{}", chain_id, sender, hex::encode(_payload), sequence_number);
             
             if verifying_key.verify(message.as_bytes(), &sig_obj).is_ok() {
                  return Ok(true);
@@ -283,7 +284,7 @@ impl AINCOREVM {
                  }
              };
              
-             let message = format!("{}:{}:{}:{}", chain_id, sender.to_string(), hex::encode(_payload), sequence_number);
+             let message = format!("{}:{}:{}:{}", chain_id, sender, hex::encode(_payload), sequence_number);
              match pqcrypto_dilithium::dilithium5::verify_detached_signature(&sig, message.as_bytes(), &pk) {
                  Ok(_) => {
                      // println!("✅ [Native AA] PQC Signature Verified!");
@@ -302,7 +303,7 @@ impl AINCOREVM {
         Ok(false)
     }
 
-    pub fn execute_script(&self, script: Vec<u8>, args: Vec<Vec<u8>>, gas_limit: u64) -> Result<(u64, Vec<(String, Option<String>)>, Vec<move_core_types::language_storage::ModuleId>)> {
+    pub fn execute_script(&self, script: Vec<u8>, args: Vec<Vec<u8>>, gas_limit: u64) -> ExecutionResult {
         let mut session = self.vm.new_session(&self.storage);
         let mut gas_meter = AINCOREGasMeter::new(gas_limit);
         
@@ -320,10 +321,10 @@ impl AINCOREVM {
         module: ModuleId, 
         function: &str, 
         ty_args: Vec<move_core_types::language_storage::TypeTag>, 
-        mut args: Vec<Vec<u8>>, 
+        args: Vec<Vec<u8>>, 
         gas_limit: u64,
         _sender: AccountAddress
-    ) -> Result<(u64, Vec<(String, Option<String>)>, Vec<move_core_types::language_storage::ModuleId>)> {
+    ) -> ExecutionResult {
         let mut session = self.vm.new_session(&self.storage);
         let mut gas_meter = AINCOREGasMeter::new(gas_limit);
         

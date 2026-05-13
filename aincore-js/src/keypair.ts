@@ -1,5 +1,6 @@
 import * as nacl from 'tweetnacl';
 import * as bip39 from 'bip39';
+import * as crypto from 'crypto';
 
 export class Keypair {
     private _keypair: nacl.SignKeyPair;
@@ -62,10 +63,11 @@ export class Keypair {
     }
 
     /**
-     * Get the AINCORE Address (First 16 bytes of Public Key)
+     * Get the AINCORE Address (First 16 bytes of SHA256(Public Key))
      */
     get address(): string {
-        return this.publicKey.slice(0, 32);
+        const hash = crypto.createHash('sha256').update(this._keypair.publicKey).digest();
+        return hash.subarray(0, 16).toString('hex');
     }
 
     /**

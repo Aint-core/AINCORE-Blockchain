@@ -1,3 +1,4 @@
+#![allow(clippy::module_inception)]
 #[cfg(test)]
 mod tests {
     use crate::AINCOREVM;
@@ -32,7 +33,7 @@ mod tests {
 
         // 4. Sign a message
         let payload = b"Hello Quantum World";
-        let full_message = format!("AINCORE-TESTNET-1:{}:{}:0", sender.to_string(), hex::encode(payload));
+        let full_message = format!("AINCORE-TESTNET-1:{}:{}:0", sender, hex::encode(payload));
         let sig = pqcrypto_dilithium::dilithium5::detached_sign(full_message.as_bytes(), &sk);
 
         // 5. Execute Transaction
@@ -93,11 +94,10 @@ mod tests {
         
         // 5. Sign a message
         let payload = b"test_payload";
-        let signature = signing_key.sign(payload);
         
         // 6. Execute (Note: using exactly what was signed to pass verification)
         // Re-sign with the full formatted message to avoid test failures:
-        let full_message = format!("AINCORE-TESTNET-1:{}:{}:0", sender.to_string(), hex::encode(payload));
+        let full_message = format!("AINCORE-TESTNET-1:{}:{}:0", sender, hex::encode(payload));
         let signature = signing_key.sign(full_message.as_bytes());
         
         let result = vm.execute_transaction("AINCORE-TESTNET-1", sender, 0, signature.to_bytes().as_slice(), payload);

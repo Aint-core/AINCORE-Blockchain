@@ -15,6 +15,7 @@ tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 config = { path = "../../common/config" }
 keystore = { path = "../../common/keystore" }
+crypto = { path = "../../common/crypto" }
 rpassword = "7.0"
 
 # Post-Quantum Cryptography

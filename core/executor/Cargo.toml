@@ -16,3 +16,4 @@ rayon = "1.8"
 ed25519-dalek = "2.0"
 bcs = "0.1"
 sha2 = "0.10"
+crypto = { path = "../../common/crypto" }

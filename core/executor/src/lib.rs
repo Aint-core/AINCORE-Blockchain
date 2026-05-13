@@ -17,6 +17,7 @@ fn get_chain_id() -> String {
     std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string())
 }
 // V3 CONSTANTS
+#[allow(dead_code)]
 const MAX_SUPPLY: u128 = 150_000_000 * 1_000_000_000_000_000_000; // 150 Million AIN
 // Note: Block rewards handled exclusively by staking.move (Halving model)
 // Executor only distributes transaction fees — no inflationary minting here
@@ -950,7 +951,7 @@ impl Executor {
                          println!("🌉 Minting {} AIN-BTC to {}", amount, recipient_addr);
 
                          // Fetch Recipient
-                         let mut recipient_obj = match self.db.get_object(recipient_addr) {
+                         let _recipient_obj = match self.db.get_object(recipient_addr) {
                              Some(obj) => obj,
                              None => {
                                   // Create New Account

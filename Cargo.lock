@@ -322,6 +322,7 @@ dependencies = [
  "anyhow",
  "clap 4.5.53",
  "config",
+ "crypto",
  "ed25519-dalek",
  "hex",
  "keystore",
@@ -2593,6 +2594,7 @@ version = "0.1.0"
 dependencies = [
  "aa",
  "bcs",
+ "crypto",
  "ed25519-dalek",
  "hex",
  "move-binary-format",
