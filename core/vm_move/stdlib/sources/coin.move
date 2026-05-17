@@ -9,14 +9,15 @@ module 0x1::coin {
 
     /// === FRIEND MODULE DECLARATIONS (C1 SECURITY FIX) ===
     /// Only these system modules can call mint() and burn().
-    /// User-deployed scripts CANNOT call coin::mint — preventing infinite coin exploit.
+    /// User-deployed scripts CANNOT call coin::mint -- preventing infinite coin exploit.
     friend 0x1::staking;
     friend 0x1::dex;
     friend 0x1::delegation;
     friend 0x1::token_factory;
     friend 0x1::treasury;
     friend 0x1::universal_mining;
-    friend 0x1::system; // For executor to call fee functions
+    friend 0x1::governance;
+    friend 0x1::wbtc;
 
     struct Coin<phantom CoinType> has store {
         value: u128,
@@ -26,13 +27,13 @@ module 0x1::coin {
         coin: Coin<CoinType>,
     }
 
-    /// Mint new coins — RESTRICTED to friend modules only (C1 FIX)
+    /// Mint new coins -- RESTRICTED to friend modules only (C1 FIX)
     /// User scripts CANNOT call this function.
     public(friend) fun mint<CoinType>(amount: u128): Coin<CoinType> {
         Coin { value: amount }
     }
 
-    /// Burn coins — RESTRICTED to friend modules only
+    /// Burn coins -- RESTRICTED to friend modules only
     public(friend) fun burn<CoinType>(coin: Coin<CoinType>) {
         let Coin { value: _ } = coin;
     }
@@ -85,7 +86,7 @@ module 0x1::coin {
     /// Deduct gas from a user account. RESTRICTED to system caller only.
     /// 
     /// SECURITY FIX: Previous signature was `deduct_gas(account: &signer, amount)` which meant
-    /// the executor had to impersonate user signers to deduct gas — a capability leak where
+    /// the executor had to impersonate user signers to deduct gas -- a capability leak where
     /// ANY user-deployed script could also call this function with their own signer.
     /// 
     /// New signature requires @0x1 system authority to deduct from any target address,

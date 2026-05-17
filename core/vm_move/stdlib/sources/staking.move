@@ -254,7 +254,7 @@ module 0x1::staking {
             // C2 FIX: Check supply cap INSIDE loop for EACH validator reward
             // This prevents total minted from exceeding MAX_SUPPLY with many validators
             if (validator_set.total_supply + current_reward > MAX_SUPPLY) {
-                // Cap reached mid-loop — stop minting for remaining validators
+                // Cap reached mid-loop -- stop minting for remaining validators
                 break
             };
 

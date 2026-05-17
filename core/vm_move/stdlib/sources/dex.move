@@ -91,7 +91,7 @@ module 0x1::dex {
         user_lp.balance = user_lp.balance + liquidity;
     }
 
-    /// Remove liquidity from the pool (H1 FIX — was completely missing)
+    /// Remove liquidity from the pool (H1 FIX -- was completely missing)
     /// Returns proportional share of both tokens based on LP token ownership
     public entry fun remove_liquidity<X, Y>(
         account: &signer,

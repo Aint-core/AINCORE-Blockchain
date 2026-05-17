@@ -105,7 +105,7 @@ module 0x1::governance {
                 };
 
                 // H7 FIX: Lock voting tokens to prevent double-vote via transfer
-                // Withdraw tokens from voter's balance — they CANNOT transfer or vote again
+                // Withdraw tokens from voter's balance -- they CANNOT transfer or vote again
                 let locked_coins = coin::withdraw<AincoreCoin>(account, weight);
                 coin::burn(locked_coins); // Temporarily burn (re-minted on claim)
                 
