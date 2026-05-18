@@ -520,8 +520,9 @@ async fn main() {
         };
         
         if !already_validator {
-            // DISABLED: AutoReg was creating phantom validators that broke BFT quorum.
-            // Validators must be defined in genesis.json or added via governance/staking.
+            // SECURITY: AutoReg disabled to prevent Sybil attacks.
+            // Testnet: Add node address to genesis.json validators array.
+            // Mainnet: Use staking transaction to register with locked stake.
             println!("⚠️  [AutoReg] Node {} is NOT in validator set. Use genesis.json or staking to register.", node_id_post_sync);
             println!("   Current node will run in Observer mode until registered.");
         } else {

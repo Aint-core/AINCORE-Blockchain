@@ -9,8 +9,9 @@ services:
     container_name: aincore-testnet-1
     restart: always
     ports:
-      - "9000:9000" # P2P
-      - "8000:8000" # API/RPC
+      - "9000:9000" # P2P Legacy
+      - "9100:9100" # P2P Libp2p Gossip & Kademlia DHT
+      - "8545:8000" # API/RPC
     volumes:
       - ./testnet_data:/root/.aincore/data
     environment:
@@ -32,6 +33,18 @@ services:
       - "19090:9090"
     networks:
       - aincore-testnet
+
+    networks:
+      - aincore-testnet
+
+  # Playit.gg P2P Tunnel Agent
+  playit:
+    image: ghcr.io/playit-cloud/playit-agent:0.17
+    container_name: aincore-playit-agent
+    restart: always
+    network_mode: host
+    environment:
+      - SECRET_KEY=b5f257564bb46ea7254ea563b93f6887eb720c5d3f61bced455f97824d85f186
 
 networks:
   aincore-testnet:

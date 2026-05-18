@@ -1,0 +1,36 @@
+services:
+  aincore-node:
+    image: aincore:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aincore-local-node
+    restart: always
+    ports:
+      - "9000:9000"   # P2P Legacy
+      - "9100:9100"   # P2P Libp2p Gossip & Kademlia DHT
+      - "8545:8000"   # API/RPC
+    volumes:
+      - ./local_data:/root/.aincore/data
+    environment:
+      - AINCORE_PORT=9000
+      - AINCORE_API_PORT=8000
+      - AINCORE_CHAIN_ID=AINCORE-TESTNET-1
+      - RUST_LOG=info
+    command:
+      - "node"
+      - "--port"
+      - "9000"
+      - "--rpc-port"
+      - "8000"
+      - "--datadir"
+      - "/root/.aincore/data"
+      - "--enable-mdns"
+      - "--bootnodes"
+      - "45.80.181.141:9000"
+    networks:
+      - aincore-local
+
+networks:
+  aincore-local:
+    driver: bridge
