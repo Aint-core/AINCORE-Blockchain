@@ -14,6 +14,7 @@ services:
       - "8545:8000" # API/RPC
     volumes:
       - ./testnet_data:/root/.aincore/data
+      - ./genesis.json:/root/.aincore/genesis.json:ro
     environment:
       - AINCORE_PORT=9000
       - AINCORE_API_PORT=8000
