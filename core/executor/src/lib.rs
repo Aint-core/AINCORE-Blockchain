@@ -1,15 +1,16 @@
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
-use storage::StateDB;
 use storage::rocksdb::WriteBatch;
-use vm_move::AINCOREVM;
-use rayon::prelude::*;
+use storage::StateDB;
+use vm_move::{EntryFunctionCall, MoveAction, AINCOREVM};
 
 /// SECURITY FIX: Global mutex to serialize block execution.
 /// Prevents State Root Race Condition where concurrent execute_block_parallel
 /// calls (from consensus + sync threads) could read the same prev_root and
 /// compute conflicting new roots, causing an instant Hard Fork.
-static BLOCK_EXECUTION_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
+static BLOCK_EXECUTION_LOCK: std::sync::LazyLock<Mutex<()>> =
+    std::sync::LazyLock::new(|| Mutex::new(()));
 
 /// Chain ID loaded from environment, defaults to TESTNET for safety.
 /// Set AINCORE_CHAIN_ID=AINCORE-MAINNET-1 explicitly for production.
@@ -19,21 +20,141 @@ fn get_chain_id() -> String {
 // V3 CONSTANTS
 #[allow(dead_code)]
 const MAX_SUPPLY: u128 = 150_000_000 * 1_000_000_000_000_000_000; // 150 Million AIN
-// Note: Block rewards handled exclusively by staking.move (Halving model)
-// Executor only distributes transaction fees — no inflationary minting here
+                                                                  // Note: Block rewards handled exclusively by staking.move (Halving model)
+                                                                  // Executor only distributes transaction fees — no inflationary minting here
 
 // N-2 FIX: Per-block cumulative object limit to prevent memory exhaustion DoS.
 // 10,000 TXs × 128 objects = 1.28M objects → 1.28GB RAM. Cap at 10K total.
 const MAX_OBJECTS_PER_BLOCK: usize = 10_000;
 // Gas cost per input object loaded (prevents zero-cost object flooding)
 const OBJECT_LOAD_GAS: u64 = 100;
+const MIN_GAS_PRICE: u128 = 1;
+
+fn system_address() -> move_core_types::account_address::AccountAddress {
+    move_core_types::account_address::AccountAddress::from_hex_literal("0x1")
+        .expect("0x1 must be a valid Move system address")
+}
+
+fn parse_move_address(addr: &str) -> Option<move_core_types::account_address::AccountAddress> {
+    move_core_types::account_address::AccountAddress::from_hex_literal(&format!("0x{}", addr)).ok()
+}
+
+fn aincore_coin_type() -> move_core_types::language_storage::TypeTag {
+    move_core_types::language_storage::TypeTag::Struct(Box::new(
+        move_core_types::language_storage::StructTag {
+            address: system_address(),
+            module: move_core_types::identifier::Identifier::new("staking").expect("valid module"),
+            name: move_core_types::identifier::Identifier::new("AincoreCoin")
+                .expect("valid struct"),
+            type_params: vec![],
+        },
+    ))
+}
+
+#[cfg(test)]
+fn coin_store_key(addr: move_core_types::account_address::AccountAddress) -> String {
+    let tag = move_core_types::language_storage::StructTag {
+        address: system_address(),
+        module: move_core_types::identifier::Identifier::new("coin").expect("valid module"),
+        name: move_core_types::identifier::Identifier::new("CoinStore").expect("valid struct"),
+        type_params: vec![aincore_coin_type()],
+    };
+    format!("resource_{}_{}", addr, tag)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MoveCoin {
+    value: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MoveValidatorConfig {
+    validator_addr: move_core_types::account_address::AccountAddress,
+    stake: MoveCoin,
+    public_key: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MoveUnbondingRequest {
+    validator_addr: move_core_types::account_address::AccountAddress,
+    stake: u128,
+    unlock_time: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MoveValidatorSet {
+    validators: Vec<MoveValidatorConfig>,
+    unbonding_queue: Vec<MoveUnbondingRequest>,
+    total_supply: u128,
+    current_epoch: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FeeSweepEntry {
+    miner: String,
+    amount: String,
+    reason: String,
+    attempts: u64,
+}
+
+fn validator_set_key() -> String {
+    format!(
+        "resource_{}_{}",
+        system_address(),
+        "0x1::staking::ValidatorSet"
+    )
+}
+
+fn decode_validator_set_hex(value: &str) -> Option<MoveValidatorSet> {
+    let bytes = hex::decode(value).ok()?;
+    bcs::from_bytes::<MoveValidatorSet>(&bytes).ok()
+}
+
+fn encode_validator_set_hex(value: &MoveValidatorSet) -> Option<String> {
+    bcs::to_bytes(value).ok().map(hex::encode)
+}
+
+fn tx_hash_hex(tx_json: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(tx_json.as_bytes()))
+}
+
+fn receipt_update(
+    tx_json: &str,
+    status: &str,
+    gas_charged: u128,
+    error: Option<String>,
+) -> (String, Option<String>) {
+    let value = serde_json::json!({
+        "status": status,
+        "gas_charged": gas_charged.to_string(),
+        "error": error,
+    });
+    (
+        format!("tx_receipt:{}", tx_hash_hex(tx_json)),
+        Some(value.to_string()),
+    )
+}
+
+fn known_payload_format(payload: &str) -> bool {
+    let hex_payload = payload.trim_start_matches("0x");
+    if let Ok(bytes) = hex::decode(hex_payload) {
+        matches!(
+            bcs::from_bytes::<vm_move::TransactionPayload>(&bytes),
+            Ok(vm_move::TransactionPayload::EntryFunction(_))
+                | Ok(vm_move::TransactionPayload::PublishModule(_))
+        )
+    } else {
+        false
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Transaction {
-    pub chain_id: String, // Replay Protection
-    pub sender: String, // Account Object ID
+    pub chain_id: String,           // Replay Protection
+    pub sender: String,             // Account Object ID
     pub input_objects: Vec<String>, // Object IDs
-    pub payload: String, // Scripts (0x..) or Native (transfer:)
+    pub payload: String,            // Hex-encoded BCS TransactionPayload
     #[serde(default)]
     pub args: Vec<String>, // Arguments for Script
     pub gas_limit: u64,
@@ -43,16 +164,24 @@ pub struct Transaction {
     #[serde(default)]
     pub public_key: String, // Hex Public Key (Required for verification)
     pub signature: String, // Hex signature
-    
+
     // === Native Paymaster Fields (Gas Abstraction) ===
     #[serde(default)]
     pub paymaster: Option<String>, // Optional: Address of gas payer
     #[serde(default)]
     pub paymaster_signature: Option<String>, // Optional: Signature from paymaster
-    
+
     // === ZKP Proof Field (Scalability) ===
     #[serde(default)]
     pub zkp_proof: Option<String>, // Optional: STARK proof for computation (hex encoded)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlockExecutionSummary {
+    pub state_root: String,
+    pub receipts_root: String,
+    pub gas_charged: u128,
+    pub tx_count: usize,
 }
 
 pub struct Executor {
@@ -60,28 +189,361 @@ pub struct Executor {
     vm: AINCOREVM,
 }
 
+fn default_state_root() -> String {
+    "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+}
+
+fn short_hash(hash: &str) -> String {
+    hash.chars().take(8).collect()
+}
+
 impl Executor {
     pub fn new(db: Arc<StateDB>) -> Self {
         let vm = AINCOREVM::new(Arc::clone(&db));
-        Self { 
-            db,
-            vm,
+        Self { db, vm }
+    }
+
+    pub fn current_state_root(&self) -> String {
+        self.db
+            .get("sys:state_root")
+            .ok()
+            .flatten()
+            .unwrap_or_else(default_state_root)
+    }
+
+    pub fn receipts_root_for_block(&self, txs_json: &[String]) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update((txs_json.len() as u64).to_be_bytes());
+        for tx_json in txs_json {
+            let tx_hash = tx_hash_hex(tx_json);
+            hasher.update(tx_hash.as_bytes());
+            match self.db.get(&format!("tx_receipt:{}", tx_hash)) {
+                Ok(Some(receipt)) => hasher.update(receipt.as_bytes()),
+                _ => hasher.update(b"NO_RECEIPT"),
+            }
+        }
+        hex::encode(hasher.finalize())
+    }
+
+    fn append_supply_tracker_updates(&self, updates: &mut Vec<(String, Option<String>)>) {
+        let key = validator_set_key();
+        let new_supply = updates
+            .iter()
+            .rev()
+            .find_map(|(k, v)| if k == &key { v.as_deref() } else { None })
+            .and_then(decode_validator_set_hex)
+            .map(|set| set.total_supply);
+
+        let Some(new_supply) = new_supply else {
+            return;
+        };
+
+        let old_supply = self
+            .db
+            .get("sys:total_supply")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u128>().ok());
+
+        if old_supply != Some(new_supply) {
+            updates.push(("sys:total_supply".to_string(), Some(new_supply.to_string())));
+        }
+
+        if let Some(old_supply) = old_supply {
+            if old_supply > new_supply {
+                let burned_delta = old_supply - new_supply;
+                let prev_burned = self
+                    .db
+                    .get("total_burned")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.parse::<u128>().ok())
+                    .unwrap_or(0);
+                let new_burned = prev_burned.saturating_add(burned_delta);
+                updates.push(("total_burned".to_string(), Some(new_burned.to_string())));
+            }
+        }
+    }
+
+    fn commit_kv_updates(
+        &self,
+        mut updates: Vec<(String, Option<String>)>,
+        context: &str,
+    ) -> Result<(), String> {
+        updates.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut write_batch = WriteBatch::default();
+        for (key, val_opt) in updates {
+            if let Some(value) = val_opt {
+                write_batch.put(key.as_bytes(), value.as_bytes());
+            } else {
+                write_batch.delete(key.as_bytes());
+            }
+        }
+        self.db
+            .write_batch(write_batch)
+            .map_err(|e| format!("{} write batch failed: {}", context, e))
+    }
+
+    fn sync_supply_trackers_from_validator_set(&self) {
+        let Some(new_supply) = self
+            .db
+            .get(&validator_set_key())
+            .ok()
+            .flatten()
+            .and_then(|value| decode_validator_set_hex(&value))
+            .map(|set| set.total_supply)
+        else {
+            return;
+        };
+
+        let old_supply = self
+            .db
+            .get("sys:total_supply")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u128>().ok());
+
+        if old_supply != Some(new_supply) {
+            let _ = self.db.put("sys:total_supply", &new_supply.to_string());
+        }
+
+        if let Some(old_supply) = old_supply {
+            if old_supply > new_supply {
+                let burned_delta = old_supply - new_supply;
+                let prev_burned = self
+                    .db
+                    .get("total_burned")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.parse::<u128>().ok())
+                    .unwrap_or(0);
+                let _ = self.db.put(
+                    "total_burned",
+                    &prev_burned.saturating_add(burned_delta).to_string(),
+                );
+            }
+        }
+    }
+
+    fn epoch_block_interval() -> u64 {
+        std::env::var("AINCORE_EPOCH_BLOCK_INTERVAL")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(20)
+    }
+
+    fn maybe_advance_epoch(&self) {
+        let interval = Self::epoch_block_interval();
+        let next_height = self.db.get_chain_height().saturating_add(1);
+        if next_height == 0 || next_height % interval != 0 {
+            return;
+        }
+
+        let module = move_core_types::language_storage::ModuleId::new(
+            system_address(),
+            move_core_types::identifier::Identifier::new("epoch").expect("epoch identifier"),
+        );
+        let action = MoveAction::CallEntryFunction(EntryFunctionCall {
+            module,
+            function: "advance_epoch".to_string(),
+            ty_args: vec![],
+            args: vec![bcs::to_bytes(&system_address()).unwrap_or_default()],
+        });
+
+        match self
+            .vm
+            .execute_transaction_actions(vec![(action, true)], system_address(), 1_000_000)
+        {
+            Ok((_gas_used, mut updates, status)) => {
+                if !status.success {
+                    eprintln!(
+                        "⚠️ Epoch advance aborted at block {}: {:?}",
+                        next_height, status.error
+                    );
+                    return;
+                }
+                self.append_supply_tracker_updates(&mut updates);
+                if let Err(err) = self.commit_kv_updates(updates, "epoch advance") {
+                    eprintln!("🚨 [EPOCH_ADVANCE_COMMIT_FAIL] {}", err);
+                    return;
+                }
+                self.sync_supply_trackers_from_validator_set();
+                println!("⏳ Epoch advanced at block {}", next_height);
+            }
+            Err(err) => {
+                eprintln!("⚠️ Epoch advance failed at block {}: {}", next_height, err);
+            }
+        }
+    }
+
+    fn burn_supply_trackers(&self, amount: u128) {
+        if amount == 0 {
+            return;
+        }
+
+        let prev_burned = self
+            .db
+            .get("total_burned")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(0);
+        let _ = self.db.put(
+            "total_burned",
+            &prev_burned.saturating_add(amount).to_string(),
+        );
+
+        if let Ok(Some(total_supply_str)) = self.db.get("sys:total_supply") {
+            if let Ok(total_supply) = total_supply_str.parse::<u128>() {
+                let adjusted_supply = total_supply.saturating_sub(amount);
+                let _ = self
+                    .db
+                    .put("sys:total_supply", &adjusted_supply.to_string());
+            }
+        }
+
+        let key = validator_set_key();
+        if let Ok(Some(value)) = self.db.get(&key) {
+            if let Some(mut set) = decode_validator_set_hex(&value) {
+                set.total_supply = set.total_supply.saturating_sub(amount);
+                if let Some(encoded) = encode_validator_set_hex(&set) {
+                    let _ = self.db.put(&key, &encoded);
+                }
+            }
+        }
+    }
+
+    fn deposit_fee_reward(&self, miner_addr: &str, amount: u128) -> Result<(), String> {
+        if amount == 0 {
+            return Ok(());
+        }
+
+        use move_core_types::account_address::AccountAddress;
+        use move_core_types::identifier::Identifier;
+        use move_core_types::language_storage::ModuleId;
+
+        let miner_account = AccountAddress::from_hex_literal(&format!("0x{}", miner_addr))
+            .map_err(|e| format!("invalid miner address {miner_addr}: {e}"))?;
+        let module_id = ModuleId::new(system_address(), Identifier::new("coin").unwrap());
+        let arg_sys = bcs::to_bytes(&system_address()).map_err(|e| e.to_string())?;
+        let arg_miner = bcs::to_bytes(&miner_account).map_err(|e| e.to_string())?;
+        let arg_amount = bcs::to_bytes(&amount).map_err(|e| e.to_string())?;
+
+        let (_gas_used, vm_changes, _) = self
+            .vm
+            .execute_public_entry_function(
+                vec![],
+                module_id,
+                "deposit_fee_reward",
+                vec![aincore_coin_type()],
+                vec![arg_sys, arg_miner, arg_amount],
+                100_000,
+                system_address(),
+            )
+            .map_err(|e| e.to_string())?;
+
+        for (k, v) in vm_changes {
+            match v {
+                Some(val) => self.db.put(&k, &val).map_err(|e| e.to_string())?,
+                None => self.db.delete(&k).map_err(|e| e.to_string())?,
+            }
+        }
+
+        Ok(())
+    }
+
+    fn queue_fee_sweep(&self, miner_addr: &str, amount: u128, height: u64) {
+        let sweep_key = format!("sys:fee_sweep_queue:{height}:{miner_addr}");
+        let existing_amount = self
+            .db
+            .get(&sweep_key)
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<FeeSweepEntry>(&raw).ok())
+            .and_then(|entry| entry.amount.parse::<u128>().ok())
+            .unwrap_or(0);
+        let entry = FeeSweepEntry {
+            miner: miner_addr.to_string(),
+            amount: existing_amount.saturating_add(amount).to_string(),
+            reason: "vm_distribution_failed_3_attempts".to_string(),
+            attempts: 0,
+        };
+        if let Ok(json) = serde_json::to_string(&entry) {
+            let _ = self.db.put(&sweep_key, &json);
+        }
+    }
+
+    fn process_fee_sweep_queue(&self) {
+        // M-06 FIX: bound the scan at the storage layer rather than relying on
+        // a downstream `.take(25)` that would otherwise materialise the entire
+        // queue into a Vec first. The cap of 25 matches the original drain rate.
+        let sweep_keys: Vec<_> = self
+            .db
+            .scan_prefix_limited("sys:fee_sweep_queue:", 25);
+
+        for (key, raw) in sweep_keys {
+            let mut entry = match serde_json::from_str::<FeeSweepEntry>(&raw) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    eprintln!("⚠️ Invalid fee sweep entry {key}: {e}. Leaving queued.");
+                    continue;
+                }
+            };
+            let amount = match entry.amount.parse::<u128>() {
+                Ok(amount) if amount > 0 => amount,
+                _ => {
+                    let _ = self.db.delete(&key);
+                    continue;
+                }
+            };
+
+            match self.deposit_fee_reward(&entry.miner, amount) {
+                Ok(()) => {
+                    let _ = self.db.delete(&key);
+                    println!(
+                        "✅ Fee sweep recovered {} AIN for miner {}",
+                        amount, entry.miner
+                    );
+                }
+                Err(e) => {
+                    entry.attempts = entry.attempts.saturating_add(1);
+                    if let Ok(json) = serde_json::to_string(&entry) {
+                        let _ = self.db.put(&key, &json);
+                    }
+                    eprintln!(
+                        "⚠️ Fee sweep retry failed for {} AIN to {}: {}",
+                        amount, entry.miner, e
+                    );
+                }
+            }
         }
     }
 
     /// Execute a batch of transactions in PARALLEL.
     /// This uses a Scheduler to group non-conflicting transactions.
-    pub fn execute_block_parallel(&self, txs_json: Vec<String>, proposer_hex: &str) {
+    pub fn execute_block_parallel(
+        &self,
+        txs_json: Vec<String>,
+        proposer_hex: &str,
+    ) -> BlockExecutionSummary {
         // SECURITY FIX: Acquire block-level lock to serialize state root calculation.
         // Individual transactions within a block still run in parallel (via Rayon),
         // but two DIFFERENT blocks cannot execute concurrently.
-        let _block_lock = BLOCK_EXECUTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        println!("🚀 Starting Parallel Execution for {} transactions...", txs_json.len());
-        
+        let _block_lock = BLOCK_EXECUTION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        println!(
+            "🚀 Starting Parallel Execution for {} transactions...",
+            txs_json.len()
+        );
+
         // 1. Parse all transactions with N-2 FIX: cumulative object limit
         let mut parsed_txs = Vec::new();
         let mut total_block_objects: usize = 0;
-        
+
         for raw in &txs_json {
             match serde_json::from_str::<Transaction>(raw) {
                 Ok(tx) => {
@@ -90,34 +552,44 @@ impl Executor {
                         println!("⛔ Transaction REJECTED: Too many input objects (>128)");
                         continue;
                     }
-                    
+
                     // N-2 FIX: Cumulative per-block object limit
                     let new_total = total_block_objects + tx.input_objects.len();
                     if new_total > MAX_OBJECTS_PER_BLOCK {
-                        println!("⛔ BLOCK OBJECT LIMIT: {} + {} = {} exceeds cap ({}). Dropping remaining TXs.",
-                            total_block_objects, tx.input_objects.len(), new_total, MAX_OBJECTS_PER_BLOCK);
+                        println!(
+                            "⛔ BLOCK OBJECT LIMIT: {} + {} = {} exceeds cap ({}). Dropping remaining TXs.",
+                            total_block_objects,
+                            tx.input_objects.len(),
+                            new_total,
+                            MAX_OBJECTS_PER_BLOCK
+                        );
                         break; // Block is "full" — no more TXs accepted
                     }
-                    
+
                     total_block_objects = new_total;
                     parsed_txs.push((tx, raw.clone()));
-                },
-                Err(_e) => { },
+                }
+                Err(_e) => {}
             }
         }
-        
-        println!("📊 Block accepted {} TXs with {} total input objects (limit: {})",
-            parsed_txs.len(), total_block_objects, MAX_OBJECTS_PER_BLOCK);
+
+        println!(
+            "📊 Block accepted {} TXs with {} total input objects (limit: {})",
+            parsed_txs.len(),
+            total_block_objects,
+            MAX_OBJECTS_PER_BLOCK
+        );
 
         // 2. Build Dependency Graph & Schedule
         let mut batches: Vec<Vec<(Transaction, String)>> = Vec::new();
         let mut current_batch: Vec<(Transaction, String)> = Vec::new();
-        let mut locked_objects: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut locked_objects: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for (tx, raw) in parsed_txs {
             let deps = self.get_tx_dependencies(&tx);
             let mut conflict = false;
-            
+
             for dep in &deps {
                 if locked_objects.contains(dep) {
                     conflict = true;
@@ -131,7 +603,7 @@ impl Executor {
                 }
                 current_batch = Vec::new();
                 locked_objects.clear();
-                
+
                 current_batch.push((tx.clone(), raw));
                 for dep in deps {
                     locked_objects.insert(dep);
@@ -154,51 +626,58 @@ impl Executor {
 
         for (_i, batch) in batches.iter().enumerate() {
             // println!("   ⚡ Executing Batch {} ({} txs)", i + 1, batch.len());
-            
+
             // Execute in parallel to get updates
-            let results: Vec<Option<(Vec<(String, Option<String>)>, u128)>> = batch.par_iter().map(|(_tx, raw)| {
-                self.execute_transaction(raw)
-            }).collect();
+            let mut results: Vec<(String, Option<(Vec<(String, Option<String>)>, u128)>)> = batch
+                .par_iter()
+                .map(|(_tx, raw)| (tx_hash_hex(raw), self.execute_transaction(raw)))
+                .collect();
+            results.sort_by(|left, right| left.0.cmp(&right.0));
 
             // 4. Commit Batch Atomically
             let mut write_batch = WriteBatch::default();
             let mut batch_hasher = sha2::Sha256::new();
             use sha2::Digest;
 
-            for res in results {
-                if let Some((updates, gas_charged)) = res {
+            for (_tx_hash, res) in results {
+                if let Some((mut updates, gas_charged)) = res {
+                    updates.sort_by(|left, right| left.0.cmp(&right.0));
                     for (key, val_opt) in updates {
-                         if let Some(val) = val_opt {
-                             write_batch.put(key.as_bytes(), val.as_bytes());
-                             batch_hasher.update(key.as_bytes());
-                             batch_hasher.update(val.as_bytes());
-                         } else {
-                             write_batch.delete(key.as_bytes());
-                             batch_hasher.update(key.as_bytes()); // Hash key for delete
-                             batch_hasher.update(b"DELETE");
-                         }
+                        if let Some(val) = val_opt {
+                            write_batch.put(key.as_bytes(), val.as_bytes());
+                            batch_hasher.update(key.as_bytes());
+                            batch_hasher.update(val.as_bytes());
+                        } else {
+                            write_batch.delete(key.as_bytes());
+                            batch_hasher.update(key.as_bytes()); // Hash key for delete
+                            batch_hasher.update(b"DELETE");
+                        }
                     }
                     total_fees += gas_charged; // C-6 FIX: Accumulate actual gas cost
                 }
             }
-            
+
             // Calc Batch Hash
             let batch_hash = batch_hasher.finalize();
-            
+
             // Update Global State Root
             // Get previous root
-            let prev_root = self.db.get("sys:state_root").unwrap_or(None).unwrap_or("0000000000000000000000000000000000000000000000000000000000000000".to_string());
+            let prev_root = self.db.get("sys:state_root").unwrap_or(None).unwrap_or(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            );
             let mut global_hasher = sha2::Sha256::new();
             global_hasher.update(hex::decode(&prev_root).unwrap_or(vec![0u8; 32]));
             global_hasher.update(batch_hash);
             let new_root = hex::encode(global_hasher.finalize());
-            
+
             // println!("🌳 State Root Updated: {} -> {}", &prev_root[0..8], &new_root[0..8]);
             write_batch.put("sys:state_root", new_root.as_bytes());
 
             if let Err(e) = self.db.write_batch(write_batch) {
-                 eprintln!("❌ FATAL: RocksDB Write Batch Failed: {}", e);
-                 panic!("CRITICAL: database write failure - stopping node to prevent state corruption.");
+                eprintln!("❌ FATAL: RocksDB Write Batch Failed: {}", e);
+                panic!(
+                    "CRITICAL: database write failure - stopping node to prevent state corruption."
+                );
             }
         }
 
@@ -206,223 +685,192 @@ impl Executor {
         // BUG #2 FIX: Reward minting is EXCLUSIVELY handled by staking.move (Halving model).
         // The Executor only distributes TRANSACTION FEES to the miner.
         // DO NOT mint new coins here — that would cause double inflation!
-        
+
         let _current_height = self.db.get_chain_height();
-        
+
         let _total_supply: u128 = match self.db.get("sys:total_supply") {
             Ok(Some(s)) => s.parse().unwrap_or(0),
-            _ => 0, 
+            _ => 0,
         };
 
         // Fee Logic & Burning (fees only, no inflation)
         let burn_pct = self.db.get_burn_percentage() as u128;
         let total_fees_u128 = total_fees as u128;
-        
+
         let burnt_fees = (total_fees_u128 * burn_pct) / 100;
         let miner_fees = total_fees_u128 - burnt_fees;
-        
+
         // Miner reward = fees ONLY (no block inflation from executor)
         let reward_amount = miner_fees;
-        
+
         if burnt_fees > 0 {
-             println!("🔥 BURNING {} Fees ({}% of {})", burnt_fees, burn_pct, total_fees);
+            println!(
+                "🔥 BURNING {} Fees ({}% of {})",
+                burnt_fees, burn_pct, total_fees
+            );
+            self.burn_supply_trackers(burnt_fees);
         }
-        
+
         // C-5/C-6 FIX: Route fee distribution through Move VM instead of native balance.
         // The old code directly credited AccountData.balance which created a dual-accounting
         // vulnerability where native and Move VM balances could desynchronize.
-        let miner_addr = if proposer_hex.len() > 32 { &proposer_hex[0..32] } else { proposer_hex };
+        let miner_addr = if proposer_hex.len() > 32 {
+            &proposer_hex[0..32]
+        } else {
+            proposer_hex
+        };
 
         if reward_amount > 0 {
-            println!("💰 Distributing Block Fees via Move VM: {} AIN to Miner {}", reward_amount, miner_addr);
-            
-            // Route through Move VM: 0x1::coin::deposit<AincoreCoin>(miner, amount)
-            use move_core_types::language_storage::ModuleId;
-            use move_core_types::identifier::Identifier;
-            use move_core_types::account_address::AccountAddress;
-            
-            let module_id = ModuleId::new(
-                AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
-                Identifier::new("coin").expect("coin identifier is valid")
+            println!(
+                "💰 Distributing Block Fees via Move VM: {} AIN to Miner {}",
+                reward_amount, miner_addr
             );
-            
-            let miner_account = AccountAddress::from_hex_literal(&format!("0x{}", miner_addr))
-                .unwrap_or(AccountAddress::new([0u8; 16]));
-            let arg_sys = bcs::to_bytes(&AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1])).unwrap_or_default();
-            let arg_miner = bcs::to_bytes(&miner_account).unwrap_or_default();
-            let arg_amount = bcs::to_bytes(&reward_amount).unwrap_or_default();
-            
-            // deposit_fee_reward<CoinType>(sys: &signer, to: address, amount: u128)
-            let ty_args = vec![move_core_types::language_storage::TypeTag::Struct(
-                Box::new(move_core_types::language_storage::StructTag {
-                    address: AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
-                    module: move_core_types::identifier::Identifier::new("staking").unwrap(),
-                    name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
-                    type_params: vec![],
-                })
-            )];
 
-            match self.vm.execute_public_entry_function(
-                module_id,
-                "deposit_fee_reward",
-                ty_args,
-                vec![arg_sys, arg_miner, arg_amount],
-                100_000, // Internal gas limit for fee distribution
-                AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]) // System caller
-            ) {
-                Ok((_gas_used, vm_changes, _)) => {
-                    // Commit VM changes to storage
-                    for (k, v) in vm_changes {
-                        if let Some(val) = v {
-                            let _ = self.db.put(&k, &val);
-                        }
-                    }
-                    println!("✅ Fee Reward Credited via Move VM: {} AIN to {}", reward_amount, miner_addr);
-                },
-                Err(e) => {
-                    // SECURITY FIX: Old code dumped fees into sys:unclaimed_fees with no
-                    // claim mechanism, permanently locking validator rewards.
-                    // New approach: Retry up to 3 times, then queue for epoch-based sweep.
-                    eprintln!("⚠️ Move VM fee distribution failed (attempt 1): {}. Retrying...", e);
-                    
-                    let mut distributed = false;
-                    for retry in 2..=3 {
-                        // Re-create args fresh for each retry attempt
-                        let retry_module = move_core_types::language_storage::ModuleId::new(
-                            move_core_types::account_address::AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
-                            move_core_types::identifier::Identifier::new("coin").expect("valid")
+            let mut distributed = false;
+            for attempt in 1..=3 {
+                match self.deposit_fee_reward(miner_addr, reward_amount) {
+                    Ok(()) => {
+                        distributed = true;
+                        println!(
+                            "✅ Fee Reward Credited via Move VM: {} AIN to {}",
+                            reward_amount, miner_addr
                         );
-                        let retry_ty = vec![move_core_types::language_storage::TypeTag::Struct(
-                            Box::new(move_core_types::language_storage::StructTag {
-                                address: move_core_types::account_address::AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
-                                module: move_core_types::identifier::Identifier::new("staking").unwrap(),
-                                name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
-                                type_params: vec![],
-                            })
-                        )];
-                        let r_sys = bcs::to_bytes(&move_core_types::account_address::AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1])).unwrap_or_default();
-                        let r_miner = bcs::to_bytes(&miner_account).unwrap_or_default();
-                        let r_amount = bcs::to_bytes(&reward_amount).unwrap_or_default();
-                        
-                        match self.vm.execute_public_entry_function(
-                            retry_module, "deposit_fee_reward", retry_ty,
-                            vec![r_sys, r_miner, r_amount],
-                            100_000,
-                            move_core_types::account_address::AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1])
-                        ) {
-                            Ok((_g, changes, _)) => {
-                                for (k, v) in changes {
-                                    if let Some(val) = v {
-                                        let _ = self.db.put(&k, &val);
-                                    }
-                                }
-                                println!("✅ Fee Reward Credited via Move VM (retry {}): {} AIN to {}", retry, reward_amount, miner_addr);
-                                distributed = true;
-                                break;
-                            },
-                            Err(e2) => {
-                                eprintln!("⚠️ Move VM fee distribution failed (attempt {}): {}", retry, e2);
-                            }
-                        }
+                        break;
                     }
-                    
-                    if !distributed {
-                        // Queue for epoch-based sweep instead of dead-end accumulation.
-                        // Validators can query sys:fee_sweep_queue entries and claim via governance.
-                        let sweep_key = format!("sys:fee_sweep_queue:{}:{}", miner_addr, 
-                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default().as_secs());
-                        let sweep_entry = serde_json::json!({
-                            "miner": miner_addr,
-                            "amount": reward_amount.to_string(),
-                            "reason": "vm_distribution_failed_3_attempts"
-                        });
-                        let _ = self.db.put(&sweep_key, &sweep_entry.to_string());
-                        eprintln!("🔴 Fee distribution failed after 3 attempts. Queued for sweep: {} AIN for {}", reward_amount, miner_addr);
-                    }
+                    Err(e) => eprintln!(
+                        "⚠️ Move VM fee distribution failed (attempt {}): {}",
+                        attempt, e
+                    ),
                 }
+            }
+
+            if !distributed {
+                self.queue_fee_sweep(miner_addr, reward_amount, self.db.get_chain_height());
+                eprintln!(
+                    "🔴 Fee distribution failed after 3 attempts. Queued for sweep: {} AIN for {}",
+                    reward_amount, miner_addr
+                );
             }
         }
 
-        // 6. Process Pending Slashes from Consensus Engine
+        // 6. Recover queued fee rewards whose recipient CoinStore is now valid.
+        self.process_fee_sweep_queue();
+
+        // 7. Process Pending Slashes from Consensus Engine
         // The consensus layer writes sys:pending_slash:{address} entries when it detects
         // downtime or equivocation. We process them here to execute on-chain balance deduction.
         self.execute_pending_slashes();
 
-        println!("✅ Parallel Execution Complete.");
+        // 8. Advance Move epoch on a deterministic block interval.
+        // This is the only path that triggers staking reward distribution.
+        self.maybe_advance_epoch();
+
+        let summary = BlockExecutionSummary {
+            state_root: self.current_state_root(),
+            receipts_root: self.receipts_root_for_block(&txs_json),
+            gas_charged: total_fees,
+            tx_count: txs_json.len(),
+        };
+
+        println!(
+            "✅ Parallel Execution Complete. state_root={} receipts_root={}",
+            short_hash(&summary.state_root),
+            short_hash(&summary.receipts_root)
+        );
+        summary
     }
 
     /// Execute pending slash events written by the consensus engine.
     /// This is the critical bridge between consensus-level detection and on-chain execution.
     /// Reads sys:pending_slash:{addr}, deducts 5% of validator stake, removes from validator set.
     fn execute_pending_slashes(&self) {
-        use move_core_types::language_storage::ModuleId;
-        use move_core_types::identifier::Identifier;
         use move_core_types::account_address::AccountAddress;
-        
-        // H-4 FIX: Cap processing to 5 slashes per block to prevent O(N) drain
-        let slash_keys: Vec<_> = self.db.scan_prefix("sys:pending_slash:").into_iter().take(5).collect();
-        
+        use move_core_types::identifier::Identifier;
+        use move_core_types::language_storage::ModuleId;
+
+        // H-4 FIX: Cap processing to 5 slashes per block to prevent O(N) drain.
+        // M-06 FIX: enforce the cap at the storage scan instead of after
+        // materialising the entire queue.
+        let slash_keys: Vec<_> = self
+            .db
+            .scan_prefix_limited("sys:pending_slash:", 5);
+
         for (key, event_json) in &slash_keys {
             // Extract validator address from key: "sys:pending_slash:{addr}"
             let validator_addr = match key.strip_prefix("sys:pending_slash:") {
                 Some(addr) => addr.to_string(),
                 None => continue,
             };
-            
+
             // Parse the slash event
-            let (reason, round) = if let Ok(event) = serde_json::from_str::<serde_json::Value>(event_json) {
-                let r = event.get("reason").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-                let rd = event.get("round").and_then(|v| v.as_u64()).unwrap_or(0);
-                (r, rd)
-            } else {
-                ("unknown".to_string(), 0)
-            };
+            let (reason, round) =
+                if let Ok(event) = serde_json::from_str::<serde_json::Value>(event_json) {
+                    let r = event
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let rd = event.get("round").and_then(|v| v.as_u64()).unwrap_or(0);
+                    (r, rd)
+                } else {
+                    ("unknown".to_string(), 0)
+                };
 
             // H-4 FIX: Tombstone check for replay protection
             let event_id = format!("{}:{}", validator_addr, round);
             let tombstone_key = format!("sys:slashed:{}", event_id);
             if let Ok(Some(_)) = self.db.get(&tombstone_key) {
-                 println!("   ⏭️  Skipping already processed slash event: {}", event_id);
-                 let _ = self.db.delete(key);
-                 continue;
+                println!(
+                    "   ⏭️  Skipping already processed slash event: {}",
+                    event_id
+                );
+                let _ = self.db.delete(key);
+                continue;
             }
 
-            println!("⚖️  EXECUTING ON-CHAIN SLASH for validator: {}", &validator_addr);
+            println!(
+                "⚖️  EXECUTING ON-CHAIN SLASH for validator: {}",
+                &validator_addr
+            );
             println!("   Reason: {}, Round: {}", reason, round);
-            
+
             // === C-5 FIX: ROUTE ECONOMIC SLASH THROUGH MOVE VM ===
             // The Move VM staking::slash_validator handles bonded stake deduction atomically.
             // This replaces the old native-only weight manipulation.
             let slash_pct: u64 = if reason == "equivocation" { 100 } else { 5 };
-            
+
             let module_id = ModuleId::new(
-                AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
-                Identifier::new("staking").expect("staking identifier is valid")
+                AccountAddress::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+                Identifier::new("staking").expect("staking identifier is valid"),
             );
-            
+
             let vm_addr = match AccountAddress::from_hex_literal(&format!("0x{}", validator_addr)) {
                 Ok(addr) => addr,
                 Err(_) => {
-                    println!("   ❌ Invalid validator address for slash: {}", validator_addr);
+                    println!(
+                        "   ❌ Invalid validator address for slash: {}",
+                        validator_addr
+                    );
                     let _ = self.db.delete(key);
                     continue;
                 }
             };
-            
-            // slash_validator(account: &signer, validator_addr: address)
-            // Wait, does it take pct? The existing contract says `slash_validator(account: &signer, validator_addr: address)`.
-            // Let's pass the system signer and validator address.
-            let arg_sys = bcs::to_bytes(&AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1])).unwrap_or_default();
+
+            let arg_sys = bcs::to_bytes(&AccountAddress::new([
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+            ]))
+            .unwrap_or_default();
             let arg_val = bcs::to_bytes(&vm_addr).unwrap_or_default();
-            
+            let arg_bps = bcs::to_bytes(&(slash_pct * 100)).unwrap_or_default();
+
             match self.vm.execute_public_entry_function(
-                module_id,
-                "slash_validator",
                 vec![],
-                vec![arg_sys, arg_val],
+                module_id,
+                "slash_validator_bps",
+                vec![],
+                vec![arg_sys, arg_val, arg_bps],
                 500_000, // Gas budget for slash operation
-                vm_addr
+                vm_addr,
             ) {
                 Ok((_gas_used, vm_changes, _)) => {
                     for (k, v) in vm_changes {
@@ -431,46 +879,62 @@ impl Executor {
                             None => self.db.delete(&k),
                         };
                     }
-                    println!("   ⚡ Move VM slash executed: {}% of bonded stake for {}", slash_pct, validator_addr);
-                },
+                    self.sync_supply_trackers_from_validator_set();
+                    println!(
+                        "   ⚡ Move VM slash executed: {}% of bonded stake for {}",
+                        slash_pct, validator_addr
+                    );
+                }
                 Err(e) => {
-                    println!("   ⚠️  Move VM slash failed ({}), falling back to consensus-only removal", e);
+                    println!(
+                        "   ⚠️  Move VM slash failed ({}), falling back to consensus-only removal",
+                        e
+                    );
                 }
             }
-            
-            // CONSENSUS SET UPDATE: Also remove/reduce in the native validator set for liveness
+
+            // CONSENSUS SET UPDATE: mirror Move staking's active-set semantics.
+            // staking::slash_validator_bps removes the validator from the Move active set
+            // and queues any remaining stake for unbonding/jail, so the native cache must
+            // not keep the validator active with reduced weight.
             if let Ok(Some(json)) = self.db.get("sys:validators") {
                 if let Ok(mut vals) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
                     let before_len = vals.len();
                     let mut slashed = false;
-                    
+
                     for (addr, weight) in vals.iter_mut() {
                         if addr == &validator_addr {
                             if reason == "equivocation" {
-                                *weight = 0; // 100% slash -> removal
-                                println!("   💥 EQUIVOCATION: Validator removed from consensus set!");
+                                println!(
+                                    "   💥 EQUIVOCATION: Validator permanently removed from consensus set!"
+                                );
                             } else {
-                                *weight = (*weight * 95) / 100; // 5% weight reduction
-                                println!("   ⏳ DOWNTIME: Validator weight reduced in consensus set.");
+                                println!(
+                                    "   ⏳ DOWNTIME: Validator jailed and removed from active consensus set."
+                                );
                             }
+                            *weight = 0;
                             slashed = true;
                         }
                     }
-                    
+
                     if slashed {
                         vals.retain(|(_, w)| *w > 0);
                         if let Ok(new_json) = serde_json::to_string(&vals) {
                             let _ = self.db.put("sys:validators", &new_json);
-                            println!("   ⛓️  Validator set updated ({} -> {} validators)", 
-                                     before_len, vals.len());
+                            println!(
+                                "   ⛓️  Validator set updated ({} -> {} validators)",
+                                before_len,
+                                vals.len()
+                            );
                         }
                     }
                 }
             }
-            
+
             // H-4 FIX: Write tombstone
             let _ = self.db.put(&tombstone_key, "1");
-            
+
             // Delete the pending slash entry (processed)
             let _ = self.db.delete(key);
             println!("   ✅ Slash executed and cleared from queue.");
@@ -491,25 +955,124 @@ impl Executor {
         for obj in &tx.input_objects {
             deps.push(obj.clone());
         }
-        if tx.payload.starts_with("transfer:") {
-            let parts: Vec<&str> = tx.payload.split(':').collect();
-            if parts.len() == 3 {
-                deps.push(parts[1].to_string());
+
+        let payload_bytes = match hex::decode(tx.payload.trim_start_matches("0x")) {
+            Ok(bytes) => bytes,
+            Err(_) => return deps,
+        };
+        let payload = match bcs::from_bytes::<vm_move::TransactionPayload>(&payload_bytes) {
+            Ok(payload) => payload,
+            Err(_) => return deps,
+        };
+
+        fn push_addr_arg(deps: &mut Vec<String>, args: &[Vec<u8>], index: usize) {
+            if let Some(bytes) = args.get(index) {
+                if let Ok(addr) =
+                    bcs::from_bytes::<move_core_types::account_address::AccountAddress>(bytes)
+                {
+                    deps.push(addr.to_string());
+                }
+            }
+        }
+
+        if let vm_move::TransactionPayload::EntryFunction(call) = payload {
+            let module_addr = call.module.address();
+            let module_name = call.module.name().as_str();
+            let function = call.function.as_str();
+
+            if *module_addr == system_address() && module_name == "coin" && function == "transfer" {
+                push_addr_arg(&mut deps, &call.args, 1);
+            } else if *module_addr == system_address() && module_name == "staking" {
+                deps.push(validator_set_key());
+            } else if *module_addr == system_address() && module_name == "delegation" {
+                match function {
+                    "enable_delegation" => {
+                        deps.push(format!(
+                            "resource_{}_{}",
+                            tx.sender, "0x1::delegation::ValidatorPool"
+                        ));
+                        deps.push(format!(
+                            "resource_{}_{}",
+                            system_address(),
+                            "0x1::delegation::DelegationRegistry"
+                        ));
+                    }
+                    "delegate" | "undelegate" | "claim_rewards" | "withdraw_unbonded" => {
+                        push_addr_arg(&mut deps, &call.args, 1);
+                        if let Some(bytes) = call.args.get(1) {
+                            if let Ok(addr) = bcs::from_bytes::<
+                                move_core_types::account_address::AccountAddress,
+                            >(bytes)
+                            {
+                                deps.push(format!(
+                                    "resource_{}_{}",
+                                    addr, "0x1::delegation::ValidatorPool"
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else if *module_addr == system_address() && module_name == "governance" {
+                deps.push(format!(
+                    "resource_{}_{}",
+                    system_address(),
+                    "0x1::governance::GovernanceState"
+                ));
+                deps.push(format!(
+                    "resource_{}_{}",
+                    tx.sender, "0x1::governance::VoteEscrow"
+                ));
+            } else if *module_addr == system_address()
+                && module_name == "token_factory"
+                && function == "transfer"
+            {
+                push_addr_arg(&mut deps, &call.args, 2);
+                deps.push(format!(
+                    "resource_{}_{}",
+                    tx.sender, "0x1::token_factory::TokenWallet"
+                ));
+                if let Some(bytes) = call.args.get(2) {
+                    if let Ok(addr) =
+                        bcs::from_bytes::<move_core_types::account_address::AccountAddress>(bytes)
+                    {
+                        deps.push(format!(
+                            "resource_{}_{}",
+                            addr, "0x1::token_factory::TokenWallet"
+                        ));
+                    }
+                }
+            } else if *module_addr == system_address() && module_name == "token_factory" {
+                deps.push(format!(
+                    "resource_{}_{}",
+                    system_address(),
+                    "0x1::token_factory::TokenRegistry"
+                ));
+                deps.push(format!(
+                    "resource_{}_{}",
+                    tx.sender, "0x1::token_factory::TokenWallet"
+                ));
             }
         }
         deps
     }
 
-    // Now returns a list of DB updates instead of writing directly. 
+    // Now returns a list of DB updates instead of writing directly.
     // Thread-safe because it only reads.
-    pub fn execute_transaction(&self, tx_json: &str) -> Option<(Vec<(String, Option<String>)>, u128)> {
+    pub fn execute_transaction(
+        &self,
+        tx_json: &str,
+    ) -> Option<(Vec<(String, Option<String>)>, u128)> {
         let mut updates = Vec::new();
-        
+
         if let Ok(tx) = serde_json::from_str::<Transaction>(tx_json) {
             // 0. Verify Chain ID
             let expected_chain = get_chain_id();
             if tx.chain_id != expected_chain {
-                println!("❌ Invalid Chain ID: Expected {}, Got {}", expected_chain, tx.chain_id);
+                println!(
+                    "❌ Invalid Chain ID: Expected {}, Got {}",
+                    expected_chain, tx.chain_id
+                );
                 return None;
             }
 
@@ -520,39 +1083,39 @@ impl Executor {
             };
 
             // 2. Verify Signature (Sender)
-            use ed25519_dalek::{Verifier, VerifyingKey, Signature};
+            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
             let pk_bytes = match hex::decode(&tx.public_key) {
                 Ok(bytes) if bytes.len() == 32 => {
                     let mut arr = [0u8; 32];
                     arr.copy_from_slice(&bytes);
                     arr
-                },
+                }
                 _ => return None,
             };
 
-            // N-3 FIX: Proper address derivation using SHA256 instead of string prefix comparison.
-            // Old (WRONG): if tx.sender != tx.public_key[0..32] { return None; }
-            // New (CORRECT): Derive address from public key bytes using crypto::derive_address()
-            let derived_address = match crypto::derive_address(&pk_bytes) {
+            let expected_sender = match crypto::derive_address(&pk_bytes) {
                 Ok(addr) => addr,
                 Err(e) => {
-                    println!("❌ Failed to derive address from public key: {}", e);
+                    println!("❌ Failed to derive sender address: {}", e);
                     return None;
                 }
             };
-            if tx.sender != derived_address {
-                println!("❌ SENDER ADDRESS MISMATCH: tx.sender={} derived={}", tx.sender, derived_address);
+            if tx.sender != expected_sender {
+                println!(
+                    "❌ SENDER ADDRESS MISMATCH: tx.sender={} expected={}",
+                    tx.sender, expected_sender
+                );
                 return None;
             }
 
             // Verify Sig
             let sig_bytes = match hex::decode(&tx.signature) {
                 Ok(bytes) if bytes.len() == 64 => {
-                     let mut arr = [0u8; 64];
-                     arr.copy_from_slice(&bytes);
-                     arr
-                },
+                    let mut arr = [0u8; 64];
+                    arr.copy_from_slice(&bytes);
+                    arr
+                }
                 _ => return None,
             };
 
@@ -560,11 +1123,17 @@ impl Executor {
                 Ok(vk) => vk,
                 Err(_) => return None,
             };
-            
+
             let signature = Signature::from_bytes(&sig_bytes);
-            let message = format!("{}:{}:{}:{}", tx.chain_id, tx.sender, tx.payload, tx.sequence_number);
-            
-            if verifying_key.verify(message.as_bytes(), &signature).is_err() {
+            let message = format!(
+                "{}:{}:{}:{}",
+                tx.chain_id, tx.sender, tx.payload, tx.sequence_number
+            );
+
+            if verifying_key
+                .verify(message.as_bytes(), &signature)
+                .is_err()
+            {
                 println!("❌ Invalid Signature Verification");
                 return None;
             }
@@ -573,61 +1142,102 @@ impl Executor {
             if let Some(ref proof_hex) = tx.zkp_proof {
                 if !proof_hex.is_empty() {
                     // Log that we have a ZKP proof attached
-                    println!("🔐 Transaction has ZKP proof ({} bytes)", proof_hex.len() / 2);
-                    
+                    println!(
+                        "🔐 Transaction has ZKP proof ({} bytes)",
+                        proof_hex.len() / 2
+                    );
+
                     // In production, this would verify the STARK proof:
                     // use crypto::zkp::{STARKVerifier, STARKProofData};
                     // let proof_bytes = hex::decode(proof_hex)?;
                     // let proof = STARKProofData::from_bytes(&proof_bytes)?;
                     // if !verifier.verify(&proof) { return None; }
-                    
+
                     // For now, presence of proof is logged for future integration
                 }
             }
 
             // 2.5 Replay Protection
-            let sender_data_check: aa::AccountData = match serde_json::from_slice(&sender_obj.data) {
+            let sender_data_check: aa::AccountData = match serde_json::from_slice(&sender_obj.data)
+            {
                 Ok(d) => d,
                 Err(_) => return None,
             };
-            
+
             if tx.sequence_number != sender_data_check.sequence_number {
-                 println!("❌ Invalid Sequence Number");
-                 return None;
+                println!("❌ Invalid Sequence Number");
+                return None;
+            }
+
+            if !known_payload_format(&tx.payload) {
+                println!(
+                    "⚠️ REJECTED: Unrecognized payload format from {}. Raw hex script execution is disabled for security.",
+                    tx.sender
+                );
+                return None;
+            }
+
+            if tx.gas_price < MIN_GAS_PRICE {
+                println!(
+                    "❌ Gas price too low: {} < minimum {}",
+                    tx.gas_price, MIN_GAS_PRICE
+                );
+                return None;
+            }
+
+            if tx.gas_limit == 0 {
+                println!("❌ Gas limit must be greater than 0");
+                return None;
             }
 
             // 3. Check Balance & Deduct Gas
             // N-2 FIX: Charge gas for object loading upfront
             let object_load_gas = (tx.input_objects.len() as u64) * OBJECT_LOAD_GAS;
             if object_load_gas > tx.gas_limit {
-                println!("❌ Insufficient gas for object loading: {} objects × {} gas = {} > gas_limit {}",
-                    tx.input_objects.len(), OBJECT_LOAD_GAS, object_load_gas, tx.gas_limit);
+                println!(
+                    "❌ Insufficient gas for object loading: {} objects × {} gas = {} > gas_limit {}",
+                    tx.input_objects.len(),
+                    OBJECT_LOAD_GAS,
+                    object_load_gas,
+                    tx.gas_limit
+                );
                 return None;
             }
-            let effective_gas_limit = tx.gas_limit; // Full gas_limit charged; object gas is included
-            let gas_cost: u128 = (effective_gas_limit as u128) * tx.gas_price;
-            
+            let gas_cost: u128 = match (tx.gas_limit as u128).checked_mul(tx.gas_price) {
+                Some(cost) => cost,
+                None => {
+                    println!(
+                        "❌ Gas cost overflow: gas_limit={} gas_price={}",
+                        tx.gas_limit, tx.gas_price
+                    );
+                    return None;
+                }
+            };
+
             // N-1 FIX (HARDENED): Paymaster Signature Validation
             // Message now includes chain_id, sequence_number, gas_limit for full replay protection.
             let payer_addr = if let Some(pm) = &tx.paymaster {
                 if let Some(pm_sig_hex) = &tx.paymaster_signature {
-                    use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+                    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
                     let pm_valid = (|| -> Result<(), ()> {
                         let pm_pubkey_bytes = hex::decode(pm).map_err(|_| ())?;
-                        if pm_pubkey_bytes.len() != 32 { return Err(()); }
+                        if pm_pubkey_bytes.len() != 32 {
+                            return Err(());
+                        }
                         let vk = VerifyingKey::from_bytes(
-                            pm_pubkey_bytes.as_slice().try_into().map_err(|_| ())?
-                        ).map_err(|_| ())?;
+                            pm_pubkey_bytes.as_slice().try_into().map_err(|_| ())?,
+                        )
+                        .map_err(|_| ())?;
                         let sig_bytes = hex::decode(pm_sig_hex).map_err(|_| ())?;
                         let sig = Signature::from_slice(&sig_bytes).map_err(|_| ())?;
-                        
+
                         // N-1 FIX: Paymaster signs FULL context to prevent replay and cross-TX theft:
                         // PAYMASTER_AUTH:{chain_id}:{sender}:{payload}:{gas_limit}:{sequence_number}
                         let pm_message = format!(
                             "PAYMASTER_AUTH:{}:{}:{}:{}:{}",
                             tx.chain_id, tx.sender, tx.payload, tx.gas_limit, tx.sequence_number
                         );
-                        use sha2::{Sha256, Digest};
+                        use sha2::{Digest, Sha256};
                         let hash = Sha256::digest(pm_message.as_bytes());
                         vk.verify(&hash, &sig).map_err(|_| ())
                     })();
@@ -635,7 +1245,10 @@ impl Executor {
                         println!("❌ Invalid Paymaster Signature! Gas sponsorship rejected.");
                         return None;
                     }
-                    println!("✅ Paymaster {} authorized gas payment for TX seq={}", pm, tx.sequence_number);
+                    println!(
+                        "✅ Paymaster {} authorized gas payment for TX seq={}",
+                        pm, tx.sequence_number
+                    );
                 } else {
                     println!("❌ Paymaster specified without signature! Rejected.");
                     return None;
@@ -650,7 +1263,7 @@ impl Executor {
             let mut payer_obj = if payer_addr == tx.sender {
                 sender_obj.clone()
             } else {
-                 match self.db.get_object(&payer_addr) {
+                match self.db.get_object(&payer_addr) {
                     Some(obj) => obj,
                     None => return None,
                 }
@@ -661,65 +1274,33 @@ impl Executor {
                 Err(_) => return None,
             };
 
-            // === C-7 FIX: GAS DEDUCTION VIA MOVE VM ===
-            // Gas balance check and deduction now goes through the Move VM CoinStore.
-            // The native AccountData.balance is NO LONGER the source of truth for gas sufficiency.
-            //
-            // SECURITY FIX (coin.move deduct_gas signature update):
-            // Old: deduct_gas<CoinType>(account: &signer, amount) — caller = user (capability leak)
-            // New: deduct_gas<CoinType>(sys: &signer, user_addr: address, amount) — caller = @0x1
-            {
-                use move_core_types::language_storage::ModuleId;
-                use move_core_types::identifier::Identifier;
-                use move_core_types::account_address::AccountAddress;
-                
-                let module_id = ModuleId::new(
-                    AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
-                    Identifier::new("coin").expect("coin identifier is valid")
-                );
-                
-                let payer_vm_addr = match AccountAddress::from_hex_literal(&format!("0x{}", payer_addr)) {
-                    Ok(addr) => addr,
-                    Err(_) => { println!("❌ Invalid payer address for gas deduction"); return None; }
-                };
-                
-                // NEW SIGNATURE: deduct_gas<CoinType>(sys: &signer, user_addr: address, amount: u128)
-                // sys = @0x1 (system, passed as sender to execute_public_entry_function)
-                // user_addr = the payer's address (BCS-encoded as an argument)
-                // amount = gas_cost (BCS-encoded)
-                let sys_addr = AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]);
-                let arg_sys_signer = bcs::to_bytes(&sys_addr).unwrap_or_default();
-                let arg_user_addr = bcs::to_bytes(&payer_vm_addr).unwrap_or_default();
-                let arg_amount = bcs::to_bytes(&gas_cost).unwrap_or_default();
-                
-                let ty_args = vec![move_core_types::language_storage::TypeTag::Struct(
-                    Box::new(move_core_types::language_storage::StructTag {
-                        address: AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
-                        module: move_core_types::identifier::Identifier::new("staking").unwrap(),
-                        name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
-                        type_params: vec![],
-                    })
-                )];
-
-                match self.vm.execute_public_entry_function(
-                    module_id,
-                    "deduct_gas",
-                    ty_args,
-                    vec![arg_sys_signer, arg_user_addr, arg_amount],
-                    100_000, // Minimal gas budget for gas deduction itself
-                    sys_addr // FIXED: System is the caller, NOT the user
-                ) {
-                    Ok((_gas_used, vm_changes, _)) => {
-                        for (k, v) in vm_changes {
-                            updates.push((k, v));
-                        }
-                        println!("⛽ Gas deducted via Move VM: {} from {}", gas_cost, payer_addr);
-                    },
-                    Err(e) => {
-                        println!("❌ Insufficient Balance for Gas (Move VM): {}", e);
+            // === MOVE GAS DEDUCTION ===
+            // AccountData is now identity/nonce metadata. AIN balance lives in
+            // 0x1::coin::CoinStore<0x1::staking::AincoreCoin>.
+            let mut pre_actions = vec![];
+            if gas_cost > 0 {
+                let payer_move_addr = match parse_move_address(&payer_addr) {
+                    Some(addr) => addr,
+                    None => {
+                        println!("❌ Invalid gas payer address");
                         return None;
                     }
-                }
+                };
+                let gas_module = move_core_types::language_storage::ModuleId::new(
+                    system_address(),
+                    move_core_types::identifier::Identifier::new("coin")
+                        .expect("coin identifier is valid"),
+                );
+                let arg_sys = bcs::to_bytes(&system_address()).unwrap_or_default();
+                let arg_user = bcs::to_bytes(&payer_move_addr).unwrap_or_default();
+                let arg_amount = bcs::to_bytes(&gas_cost).unwrap_or_default();
+                let gas_action = MoveAction::CallEntryFunction(EntryFunctionCall {
+                    module: gas_module,
+                    function: "deduct_gas".to_string(),
+                    ty_args: vec![aincore_coin_type()],
+                    args: vec![arg_sys, arg_user, arg_amount],
+                });
+                pre_actions.push((gas_action, true)); // true = must succeed
             }
 
             // CRITICAL FIX: ALWAYS increment the SENDER's sequence number, even if Paymaster pays gas
@@ -743,1167 +1324,152 @@ impl Executor {
                 let mut updated_sender_obj = sender_obj.clone();
                 if let Ok(new_sender_data) = serde_json::to_vec(&sender_account_data) {
                     updated_sender_obj.data = new_sender_data;
-                    updates.push((format!("obj:{}", updated_sender_obj.id.to_string()), Some(serde_json::to_string(&updated_sender_obj).unwrap_or_else(|_| "{}".to_string()))));
+                    updates.push((
+                        format!("obj:{}", updated_sender_obj.id.to_string()),
+                        Some(
+                            serde_json::to_string(&updated_sender_obj)
+                                .unwrap_or_else(|_| "{}".to_string()),
+                        ),
+                    ));
                 }
             }
-            
-            // Save Payer Update (sequence number only — gas deducted via Move VM above)
+
+            // Save Payer Update (sequence number only; gas is deducted via Move VM)
             if let Ok(new_data) = serde_json::to_vec(&account_data) {
                 payer_obj.data = new_data;
-                updates.push((format!("obj:{}", payer_obj.id.to_string()), Some(serde_json::to_string(&payer_obj).unwrap_or_else(|_| "{}".to_string()))));
+                updates.push((
+                    format!("obj:{}", payer_obj.id.to_string()),
+                    Some(serde_json::to_string(&payer_obj).unwrap_or_else(|_| "{}".to_string())),
+                ));
             }
-            
-            let mut actual_gas = gas_cost;
 
-            // 4. Execution Payload
-            if tx.payload.starts_with("0x") {
-                 // GHOST SCRIPT INJECTION — PERMANENTLY DISABLED (CRITICAL)
-                 // Raw execute_script() allowed arbitrary code execution (RCE).
-                 // All execution must use "call:0xADDR::module::function" format.
-                 let _preview_len = std::cmp::min(tx.payload.len(), 22);
-                 println!("🚫 [SECURITY] Raw script execution BLOCKED");
-                 if false { // Dead code block — compile guard only
-                 if let Ok(script_bytes) = hex::decode(&tx.payload[2..]) {
-                     // Parse Args (assume string hex args for now)
-                     let mut vm_args = Vec::new();
-                     for arg in &tx.args {
-                         if let Ok(b) = hex::decode(arg) {
-                             vm_args.push(b);
-                         }
-                     }
-                     
-                     println!("🔧 VM: Executing Move Script ({} bytes, {} args)", script_bytes.len(), vm_args.len());
-                     
-                     match self.vm.execute_script(script_bytes, vm_args, tx.gas_limit) {
-                         Ok((gas_used, vm_changes, _)) => {
-                              // Gas Refund via Move VM (Checked)
-                              if gas_used < tx.gas_limit {
-                                  let refund = (tx.gas_limit - gas_used) as u128 * tx.gas_price;
-                                  if refund > 0 {
-                                      // Route refund through Move VM to maintain SSoT
-                                      use move_core_types::language_storage::ModuleId;
-                                      use move_core_types::identifier::Identifier;
-                                      use move_core_types::account_address::AccountAddress;
-                                      
-                                      let refund_module = ModuleId::new(
-                                          AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
-                                          Identifier::new("coin").expect("coin identifier is valid")
-                                      );
-                                      let payer_vm_addr = match AccountAddress::from_hex_literal(&format!("0x{}", payer_addr)) {
-                                          Ok(addr) => addr,
-                                          Err(_) => { println!("❌ Invalid refund address"); AccountAddress::ZERO }
-                                      };
-                                      // deposit_fee_reward<CoinType>(sys: &signer, to: address, amount: u128)
-                                      let arg_sys = bcs::to_bytes(&AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1])).unwrap_or_default();
-                                      let arg_to = bcs::to_bytes(&payer_vm_addr).unwrap_or_default();
-                                      let arg_refund = bcs::to_bytes(&refund).unwrap_or_default();
-                                      let ty_args = vec![move_core_types::language_storage::TypeTag::Struct(
-                                          Box::new(move_core_types::language_storage::StructTag {
-                                              address: AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
-                                              module: move_core_types::identifier::Identifier::new("staking").unwrap(),
-                                              name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
-                                              type_params: vec![],
-                                          })
-                                      )];
-
-                                      match self.vm.execute_public_entry_function(
-                                          refund_module,
-                                          "deposit_fee_reward",
-                                          ty_args,
-                                          vec![arg_sys, arg_to, arg_refund],
-                                          50_000,
-                                          payer_vm_addr
-                                      ) {
-                                          Ok((_g, refund_changes, _)) => {
-                                              for (k, v) in refund_changes {
-                                                  updates.push((k, v));
-                                              }
-                                              println!("⛽ Gas refund via Move VM: {} to {}", refund, payer_addr);
-                                          },
-                                          Err(e) => {
-                                              println!("⚠️ Gas refund failed (Move VM): {}. Refund held in escrow.", e);
-                                          }
-                                      }
-                                  }
-                              }
-
-                             // Must verify that all written keys were declared in input_objects (or are the sender)
-                             let mut unauthorized_access = false;
-                             let mut allowed_keys = std::collections::HashSet::new();
-                             allowed_keys.insert(tx.sender.clone());
-                             for obj in &tx.input_objects {
-                                 allowed_keys.insert(obj.clone());
-                             }
-
-                             for (key, _val) in &vm_changes {
-                                 let is_allowed = allowed_keys.iter().any(|allowed| key == &format!("obj:{}", allowed));
-                                 if !is_allowed {
-                                     println!("❌ CRITICAL SECURITY: Script attempted to modify unauthorized object: {}", key);
-                                     unauthorized_access = true;
-                                     break;
-                                 }
-                             }
-
-                             if unauthorized_access {
-                                  println!("⛔ Transaction REJECTED due to Unauthorized Write Access");
-                             } else {
-                                  // Must save account data if refund happens
-                                  if let Ok(new_data) = serde_json::to_vec(&account_data) {
-                                       payer_obj.data = new_data;
-                                       updates.push((format!("obj:{}", payer_obj.id.to_string()), Some(serde_json::to_string(&payer_obj).unwrap_or_else(|_| "{}".to_string()))));
-                                  }
-                                  
-                                  // Push VM changes
-                                  for (k, v) in vm_changes {
-                                      updates.push((k, v));
-                                  }
-                             }
-                        },
-                        Err(e) => {
-                             println!("❌ VM Execution Failed: {}", e);
-                        }
+            let actual_gas = gas_cost;
+            let mut tx_status = "success".to_string();
+            let mut tx_error: Option<String> = None;
+            macro_rules! absorb_vm_result {
+                ($vm_changes:expr, $status:expr) => {{
+                    for (k, v) in $vm_changes {
+                        updates.push((k, v));
                     }
-                 }
-                 } // end if false — ghost script execution permanently disabled
-            } else if tx.payload.starts_with("transfer:") {
-                // C-5/C-7 FIX: Route transfers through Move VM coin::transfer
-                // Old code directly manipulated AccountData.balance — dual-accounting vulnerability.
-                let parts: Vec<&str> = tx.payload.split(':').collect();
-                if parts.len() == 3 {
-                    let recipient_addr = parts[1];
-                    let amount: u128 = parts[2].parse().unwrap_or(0);
-
-                    // === GENESIS LOCK (Anti-Rugpull) ===
-                    let genesis_addr = self.db.get_federation_key();
-                    if genesis_addr.is_empty() {
-                        println!("🔒 GENESIS LOCK FAIL-CLOSED: Federation address not initialized. Transfers blocked.");
-                        return None;
-                    }
-                    if tx.sender == genesis_addr {
-                        println!("🔒 GENESIS LOCK: Transfer BLOCKED from Genesis address {}", &tx.sender[..8]);
-                        return None;
-                    }
-                    
-                    if amount > 0 {
-                        use move_core_types::language_storage::ModuleId;
-                        use move_core_types::identifier::Identifier;
-                        use move_core_types::account_address::AccountAddress;
-                        
-                        let module_id = ModuleId::new(
-                            AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
-                            Identifier::new("coin").expect("coin identifier is valid")
+                    self.append_supply_tracker_updates(&mut updates);
+                    if !$status.success {
+                        tx_status = "aborted".to_string();
+                        tx_error = Some(
+                            $status
+                                .error
+                                .unwrap_or_else(|| "Move execution aborted".to_string()),
                         );
-                        
-                        let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
-                            Ok(addr) => addr,
-                            Err(_) => { println!("❌ Invalid sender address"); return None; }
-                        };
-                        let recipient_account = match AccountAddress::from_hex_literal(&format!("0x{}", recipient_addr)) {
-                            Ok(addr) => addr,
-                            Err(_) => { println!("❌ Invalid recipient address"); return None; }
-                        };
-                        
-                        // transfer<CoinType>(from: &signer, to: address, amount: u128)
-                        let arg_from = bcs::to_bytes(&sender_addr).unwrap_or_default();
-                        let arg_to = bcs::to_bytes(&recipient_account).unwrap_or_default();
-                        let arg_amount = bcs::to_bytes(&amount).unwrap_or_default();
-                        
-                        let ty_args = vec![move_core_types::language_storage::TypeTag::Struct(
-                            Box::new(move_core_types::language_storage::StructTag {
-                                address: AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
-                                module: move_core_types::identifier::Identifier::new("staking").unwrap(),
-                                name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
-                                type_params: vec![],
-                            })
-                        )];
+                        false
+                    } else {
+                        true
+                    }
+                }};
+            }
 
-                        match self.vm.execute_public_entry_function(
-                            module_id,
-                            "transfer",
-                            ty_args,
-                            vec![arg_from, arg_to, arg_amount],
-                            tx.gas_limit,
-                            sender_addr
-                        ) {
-                            Ok((_gas_used, vm_changes, _)) => {
-                                for (k, v) in vm_changes {
-                                    updates.push((k, v));
-                                }
-                                println!("✅ Transfer via Move VM: {} AIN from {} to {}", amount, tx.sender, recipient_addr);
-                            },
-                            Err(e) => {
-                                println!("❌ Transfer Failed (Move VM): {}", e);
+            // 4. Execution Payload (Structured BCS)
+            let sender_addr = match parse_move_address(&tx.sender) {
+                Some(addr) => addr,
+                None => {
+                    println!("❌ Invalid sender address format");
+                    return None;
+                }
+            };
+
+            let payload_bytes = match hex::decode(&tx.payload.trim_start_matches("0x")) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    // C-11 FIX: Backwards compatibility for genesis and old tools (TEMPORARY)
+                    // If it's not valid hex, maybe it's a legacy string payload.
+                    // For now, if we are in Phase 0 / 1 transition, we can optionally parse legacy here,
+                    // but the objective says: "Hapus semua if tx.payload.starts_with...".
+                    // However, we MUST NOT break the entire chain right now before we fix the CLI.
+                    // Actually, the instruction was clear: Replace it entirely to enforce structured ABI.
+                    println!(
+                        "⚠️ REJECTED: Unrecognized payload format from {}. Must be hex-encoded BCS TransactionPayload. Err: {}",
+                        tx.sender, e
+                    );
+                    return None;
+                }
+            };
+
+            let parsed_payload: Result<vm_move::TransactionPayload, _> =
+                bcs::from_bytes(&payload_bytes);
+
+            match parsed_payload {
+                Ok(vm_move::TransactionPayload::EntryFunction(call)) => {
+                    let mut actions = pre_actions.clone();
+                    actions.push((vm_move::MoveAction::CallEntryFunction(call), false));
+                    match self
+                        .vm
+                        .execute_transaction_actions(actions, sender_addr, tx.gas_limit)
+                    {
+                        Ok((_gas_used, vm_changes, status)) => {
+                            if absorb_vm_result!(vm_changes, status) {
+                                println!("✅ Move EntryFunction executed by {}", tx.sender);
+                            } else {
+                                println!(
+                                    "❌ EntryFunction aborted after gas charge: {}",
+                                    tx_error
+                                        .clone()
+                                        .unwrap_or_else(|| "unknown Move error".to_string())
+                                );
                             }
+                        }
+                        Err(e) => {
+                            println!("❌ EntryFunction Failed (Move VM fatal): {}", e);
+                            return None;
                         }
                     }
                 }
-            } else if tx.payload.starts_with("mint_btc:") {
-                 // === MINT BTC LOGIC ===
-                 // Payload: "mint_btc:AMOUNT:RECIPIENT"
-                 // PHASE 9: DECENTRALIZED FEDERATION KEY LOOKUP
-                 let federation_addr = self.db.get_federation_key();
-
-                 if tx.sender == federation_addr {
-                     let parts: Vec<&str> = tx.payload.split(':').collect();
-                     if parts.len() == 3 {
-                         let amount: u64 = parts[1].parse().unwrap_or(0);
-                         let recipient_addr = parts[2];
-                         println!("🌉 Minting {} AIN-BTC to {}", amount, recipient_addr);
-
-                         // Fetch Recipient
-                         let _recipient_obj = match self.db.get_object(recipient_addr) {
-                             Some(obj) => obj,
-                             None => {
-                                  // Create New Account
-                                  use storage::object::{Object, ObjectID, Owner};
-                                  Object {
-                                      id: ObjectID::new(recipient_addr.to_string()),
-                                      data: serde_json::to_vec(&aa::AccountData {
-                                          balance: 0,
-                                          sequence_number: 0,
-                                          btc_balance: 0,
-                                          public_key: "".to_string(),
-                                      }).unwrap_or_else(|_| vec![]),
-                                      owner: Owner::Address(recipient_addr.to_string()),
-                                      type_struct: "0x1::account::Account".to_string(),
-                                      version: 0,
-                                  }
-                             }
-                         };
-
-                         // === C-7 FIX: MINT WBTC VIA MOVE VM ===
-                         // OLD: Credited native rec_data.btc_balance — dual-accounting vulnerability.
-                         // NEW: Routes through Move VM 0x1::wbtc::mint entry function.
-                         {
-                             use move_core_types::language_storage::ModuleId;
-                             use move_core_types::identifier::Identifier;
-                             use move_core_types::account_address::AccountAddress;
-                             
-                             let wbtc_module = ModuleId::new(
-                                 AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
-                                 Identifier::new("wbtc").expect("wbtc identifier is valid")
-                             );
-                             let mint_to_addr = AccountAddress::from_hex_literal(&format!("0x{}", recipient_addr))
-                                 .unwrap_or(AccountAddress::new([0u8; 16]));
-                             let bridge_addr_move = AccountAddress::from_hex_literal(&format!("0x{}", federation_addr))
-                                 .unwrap_or(AccountAddress::new([0u8; 16]));
-                             
-                             // wbtc::mint(bridge: &signer, to: address, amount: u128)
-                             let mint_amount_u128: u128 = amount as u128;
-                             let arg_bridge = bcs::to_bytes(&bridge_addr_move).unwrap_or_default();
-                             let arg_to = bcs::to_bytes(&mint_to_addr).unwrap_or_default();
-                             let arg_amount = bcs::to_bytes(&mint_amount_u128).unwrap_or_default();
-                             
-                             match self.vm.execute_public_entry_function(
-                                 wbtc_module,
-                                 "mint",
-                                 vec![],
-                                 vec![arg_bridge, arg_to, arg_amount],
-                                 tx.gas_limit,
-                                 bridge_addr_move
-                             ) {
-                                 Ok((_gas, vm_changes, _)) => {
-                                     for (k, v) in vm_changes {
-                                         updates.push((k, v));
-                                     }
-                                     println!("✅ wBTC Mint via Move VM: {} to {}", amount, recipient_addr);
-                                 },
-                                 Err(e) => {
-                                     println!("❌ wBTC Mint Failed (Move VM): {}. No native fallback.", e);
-                                 }
-                             }
-                         }
-                     }
-                 } else {
-                     println!("❌ Authorization Failed: Only Federation can mint BTC. Sender: {}", tx.sender);
-                 }
-            } else if tx.payload.starts_with("submit_proof:") {
-                 // === DePIN MINING LOGIC (C-9 FIX: MOVE VM ROUTED) ===
-                 // Payload: "submit_proof:DEVICE_ID:BQI"
-                 // OLD: Directly credited AccountData.balance — critical inflation bypass.
-                 // NEW: Routes reward through Move VM coin::deposit_fee_reward.
-                 let parts: Vec<&str> = tx.payload.split(':').collect();
-                 if parts.len() >= 3 {
-                     let device_id = parts[1];
-                     let bqi: u64 = parts[2].parse().unwrap_or(0);
-                     
-                     // SYNERGY CHECK: The Sender MUST be the Device (or owner)
-                     if device_id != tx.sender {
-                         println!("❌ DePIN spoofing attempt! Sender {} tried to submit for Device {}", tx.sender, device_id);
-                     } else if bqi > 100 {
-                         println!("❌ Invalid BQI Score: {}", bqi);
-                     } else {
-                         // Reward Logic: Max 0.36 AIN * BQI%
-                         // Using true 18-decimal scaling (V3 Standard)
-                         let base_reward: u128 = 360_000_000_000_000_000; 
-                         let reward: u128 = (base_reward * bqi as u128) / 100;
-                         
-                         if reward > 0 {
-                             use move_core_types::language_storage::ModuleId;
-                             use move_core_types::identifier::Identifier;
-                             use move_core_types::account_address::AccountAddress;
-                             
-                             let module_id = ModuleId::new(
-                                 AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
-                                 Identifier::new("coin").expect("coin identifier is valid")
-                             );
-                             
-                             let miner_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
-                                 Ok(addr) => addr,
-                                 Err(_) => { println!("❌ Invalid miner address"); return None; }
-                             };
-                             
-                             // deposit_fee_reward<CoinType>(sys: &signer, to: address, amount: u128)
-                             let arg_sys = bcs::to_bytes(&AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1])).unwrap_or_default();
-                             let arg_miner = bcs::to_bytes(&miner_addr).unwrap_or_default();
-                             let arg_amount = bcs::to_bytes(&reward).unwrap_or_default();
-                             
-                             let ty_args = vec![move_core_types::language_storage::TypeTag::Struct(
-                                 Box::new(move_core_types::language_storage::StructTag {
-                                     address: AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
-                                     module: move_core_types::identifier::Identifier::new("staking").unwrap(),
-                                     name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
-                                     type_params: vec![],
-                                 })
-                             )];
-
-                             match self.vm.execute_public_entry_function(
-                                 module_id,
-                                 "deposit_fee_reward",
-                                 ty_args,
-                                 vec![arg_sys, arg_miner, arg_amount],
-                                 tx.gas_limit,
-                                 miner_addr
-                             ) {
-                                 Ok((_gas_used, vm_changes, _)) => {
-                                     for (k, v) in vm_changes {
-                                         updates.push((k, v));
-                                     }
-                                     println!("🫁 DePIN Mining via Move VM: BQI {} -> Reward {} Wei to {}", bqi, reward, tx.sender);
-                                 },
-                                 Err(e) => {
-                                     println!("❌ DePIN Reward Failed (Move VM): {}. Reward held in escrow.", e);
-                                 }
-                             }
-                         }
-                     }
-                 }
-            } else if tx.payload == "register_validator" {
-                 // === STAKING LOGIC ===
-                 // Payload: "register_validator"
-                 // Invokes 0x1::staking::join_validator_set(account, stake_amount, pubkey)
-                 
-                 // 1. Prepare Arguments
-                 let stake_amount: u128 = 1000u128 * 1_000_000_000_000_000_000; // 1000 AIN
-                 
-                 // Decode Public Key
-                 if let Ok(pubkey_bytes) = hex::decode(&tx.public_key) {
-                     // Prepare BCS Args
-                     // Arg0: &signer (Handled by injecting into args)
-                     
-                     let arg_account = bcs::to_bytes(&match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
-                         Ok(addr) => addr,
-                         Err(_) => { println!("❌ Invalid sender format"); return None; }
-                     }).unwrap_or_default();
-                     let arg_stake = bcs::to_bytes(&stake_amount).unwrap_or_default();
-                     let arg_pubkey = bcs::to_bytes(&pubkey_bytes).unwrap_or_default();
-                     
-                     let args = vec![arg_account, arg_stake, arg_pubkey];
-                     let ty_args = vec![];
-                     
-                     use move_core_types::language_storage::ModuleId;
-                     use move_core_types::identifier::Identifier;
-                     use move_core_types::account_address::AccountAddress;
-                     
-                     let module_id = ModuleId::new(
-                         AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]), 
-                         Identifier::new("staking").expect("staking identifier is valid")
-                     );
-                     
-                     let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
-
-                     
-                         Ok(addr) => addr,
-
-                     
-                         Err(_) => {
-
-                     
-                             println!("❌ Invalid address format: {}", tx.sender);
-
-                     
-                             return None;
-
-                     
-                         }
-
-                     
-                     };
-                     
-                     match self.vm.execute_public_entry_function(
-                         module_id, 
-                         "join_validator_set", 
-                         ty_args, 
-                         args, 
-                         tx.gas_limit,
-                         sender_addr 
-                     ) {
-                         Ok((gas_used, vm_changes, _)) => {
-                             for (k, v) in vm_changes {
-                                 updates.push((k, v));
-                             }
-                             println!("✅ Staking Successful! Validator Joined: {}", tx.sender);
-                             
-                             // === PREMATURE SYSTEM FIX: SYNC NATIVE CONSENSUS ===
-                             // Problem: Move VM updates state, but Consensus uses 'sys:validators'
-                             // Fix: Native Hook to update 'sys:validators'
-                             if let Ok(mut vals) = serde_json::from_str::<Vec<(String, u64)>>(
-                                 &self.db.get("sys:validators").unwrap_or(None).unwrap_or("[]".to_string())
-                             ) {
-                                 if !vals.iter().any(|(k, _)| k == &tx.sender) {
-                                     // Add with default weight (stake amount related, but simplified to 100)
-                                     vals.push((tx.sender.clone(), 100));
-                                     if let Ok(json) = serde_json::to_string(&vals) {
-                                         println!("🔗 Native Hook: Syncing Validator Set -> Consensus Engine");
-                                         updates.push(("sys:validators".to_string(), Some(json)));
-                                     }
-                                 }
-                             }
-                             
-                             // === C-6 FIX: GAS REFUND VIA MOVE VM ===
-                             // OLD: Credited native account_data.balance — dual-accounting vulnerability.
-                             // NEW: Routes refund through Move VM coin::deposit_fee_reward.
-                             if gas_used < tx.gas_limit {
-                                 let refund_amount: u128 = (tx.gas_limit - gas_used) as u128 * tx.gas_price;
-                                 if refund_amount > 0 {
-                                     let refund_module = ModuleId::new(
-                                         AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]),
-                                         Identifier::new("coin").expect("coin identifier is valid")
-                                     );
-                                     let refund_addr = AccountAddress::from_hex_literal(&format!("0x{}", tx.sender))
-                                         .unwrap_or(AccountAddress::new([0u8; 16]));
-                                     let arg_refund = bcs::to_bytes(&refund_amount).unwrap_or_default();
-                                     
-                                     match self.vm.execute_public_entry_function(
-                                         refund_module,
-                                         "deposit_fee_reward",
-                                         vec![],
-                                         vec![arg_refund],
-                                         50_000, // Minimal gas budget for refund op
-                                         refund_addr
-                                     ) {
-                                         Ok((_rg, refund_changes, _)) => {
-                                             for (k, v) in refund_changes {
-                                                 updates.push((k, v));
-                                             }
-                                             actual_gas = actual_gas.saturating_sub(refund_amount);
-                                             println!("   💰 Gas Refund via Move VM: {} Wei to {}", refund_amount, tx.sender);
-                                         },
-                                         Err(e) => {
-                                             println!("   ⚠️ Gas refund failed (Move VM): {}. Refund held in system escrow.", e);
-                                         }
-                                     }
-                                 }
-                             }
-                         },
-                         Err(e) => {
-                             println!("❌ Staking Failed: {}", e);
-                         }
-                     }
-                 }
-            // ============ DELEGATION SYSTEM ============
-            } else if tx.payload.starts_with("delegate:") {
-                 // Payload: "delegate:VALIDATOR_ADDR:AMOUNT"
-                 let parts: Vec<&str> = tx.payload.split(':').collect();
-                 if parts.len() == 3 {
-                     let validator_addr = parts[1];
-                     let amount: u128 = parts[2].parse().unwrap_or(0);
-                     
-                     if amount > 0 {
-                         use move_core_types::language_storage::ModuleId;
-                         use move_core_types::identifier::Identifier;
-                         use move_core_types::account_address::AccountAddress;
-                         
-                         let module_id = ModuleId::new(
-                             AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]), 
-                             Identifier::new("delegation").expect("delegation identifier is valid")
-                         );
-                         
-                         let validator_account = match AccountAddress::from_hex_literal(&format!("0x{}", validator_addr)) {
-
-                         
-                             Ok(addr) => addr,
-
-                         
-                             Err(_) => {
-
-                         
-                                 println!("❌ Invalid address format: {}", validator_addr);
-
-                         
-                                 return None;
-
-                         
-                             }
-
-                         
-                         };
-                         let arg_validator = bcs::to_bytes(&validator_account).unwrap_or_default();
-                         let arg_amount = bcs::to_bytes(&amount).unwrap_or_default();
-                         
-                         let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
-
-                         
-                             Ok(addr) => addr,
-
-                         
-                             Err(_) => {
-
-                         
-                                 println!("❌ Invalid address format: {}", tx.sender);
-
-                         
-                                 return None;
-
-                         
-                             }
-
-                         
-                         };
-                         
-                         match self.vm.execute_public_entry_function(
-                             module_id,
-                             "delegate",
-                             vec![],
-                             vec![arg_validator, arg_amount],
-                             tx.gas_limit,
-                             sender_addr
-                         ) {
-                             Ok((_gas_used, vm_changes, _)) => {
-                                 for (k, v) in vm_changes {
-                                     updates.push((k, v));
-                                 }
-                                 println!("✅ Delegation Successful: {} delegated {} to {}", tx.sender, amount, validator_addr);
-                             },
-                             Err(e) => {
-                                 println!("❌ Delegation Failed: {}", e);
-                             }
-                         }
-                     }
-                 }
-            } else if tx.payload.starts_with("undelegate:") {
-                 // Payload: "undelegate:VALIDATOR_ADDR:AMOUNT"
-                 let parts: Vec<&str> = tx.payload.split(':').collect();
-                 if parts.len() == 3 {
-                     let validator_addr = parts[1];
-                     let amount: u128 = parts[2].parse().unwrap_or(0);
-                     
-                     if amount > 0 {
-                         use move_core_types::language_storage::ModuleId;
-                         use move_core_types::identifier::Identifier;
-                         use move_core_types::account_address::AccountAddress;
-                         
-                         let module_id = ModuleId::new(
-                             AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]), 
-                             Identifier::new("delegation").expect("delegation identifier is valid")
-                         );
-                         
-                         let validator_account = match AccountAddress::from_hex_literal(&format!("0x{}", validator_addr)) {
-
-                         
-                             Ok(addr) => addr,
-
-                         
-                             Err(_) => {
-
-                         
-                                 println!("❌ Invalid address format: {}", validator_addr);
-
-                         
-                                 return None;
-
-                         
-                             }
-
-                         
-                         };
-                         let arg_validator = bcs::to_bytes(&validator_account).unwrap_or_default();
-                         let arg_amount = bcs::to_bytes(&amount).unwrap_or_default();
-                         
-                         let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
-
-                         
-                             Ok(addr) => addr,
-
-                         
-                             Err(_) => {
-
-                         
-                                 println!("❌ Invalid address format: {}", tx.sender);
-
-                         
-                                 return None;
-
-                         
-                             }
-
-                         
-                         };
-                         
-                         match self.vm.execute_public_entry_function(
-                             module_id,
-                             "undelegate",
-                             vec![],
-                             vec![arg_validator, arg_amount],
-                             tx.gas_limit,
-                             sender_addr
-                         ) {
-                             Ok((_gas_used, vm_changes, _)) => {
-                                 for (k, v) in vm_changes {
-                                     updates.push((k, v));
-                                 }
-                                 println!("✅ Undelegation Started: {} undelegating {} from {} (21-day unbonding)", tx.sender, amount, validator_addr);
-                             },
-                             Err(e) => {
-                                 println!("❌ Undelegation Failed: {}", e);
-                             }
-                         }
-                     }
-                 }
-            } else if tx.payload.starts_with("claim_rewards:") {
-                 // Payload: "claim_rewards:VALIDATOR_ADDR"
-                 let parts: Vec<&str> = tx.payload.split(':').collect();
-                 if parts.len() >= 2 {
-                     let validator_addr = parts[1];
-                     
-                     use move_core_types::language_storage::ModuleId;
-                     use move_core_types::identifier::Identifier;
-                     use move_core_types::account_address::AccountAddress;
-                     
-                     let module_id = ModuleId::new(
-                         AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]), 
-                         Identifier::new("delegation").expect("delegation identifier is valid")
-                     );
-                     
-                     let validator_account = match AccountAddress::from_hex_literal(&format!("0x{}", validator_addr)) {
-
-                     
-                         Ok(addr) => addr,
-
-                     
-                         Err(_) => {
-
-                     
-                             println!("❌ Invalid address format: {}", validator_addr);
-
-                     
-                             return None;
-
-                     
-                         }
-
-                     
-                     };
-                     let arg_validator = bcs::to_bytes(&validator_account).unwrap_or_default();
-                     
-                     let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
-
-                     
-                         Ok(addr) => addr,
-
-                     
-                         Err(_) => {
-
-                     
-                             println!("❌ Invalid address format: {}", tx.sender);
-
-                     
-                             return None;
-
-                     
-                         }
-
-                     
-                     };
-                     
-                     match self.vm.execute_public_entry_function(
-                         module_id,
-                         "claim_rewards",
-                         vec![],
-                         vec![arg_validator],
-                         tx.gas_limit,
-                         sender_addr
-                     ) {
-                         Ok((_gas_used, vm_changes, _)) => {
-                             for (k, v) in vm_changes {
-                                 updates.push((k, v));
-                             }
-                             println!("✅ Rewards Claimed: {} claimed from {}", tx.sender, validator_addr);
-                         },
-                         Err(e) => {
-                             println!("❌ Claim Rewards Failed: {}", e);
-                         }
-                     }
-                 }
-            } else if tx.payload.starts_with("withdraw_unbonded:") {
-                 // Payload: "withdraw_unbonded:VALIDATOR_ADDR"
-                 let parts: Vec<&str> = tx.payload.split(':').collect();
-                 if parts.len() >= 2 {
-                     let validator_addr = parts[1];
-                     
-                     use move_core_types::language_storage::ModuleId;
-                     use move_core_types::identifier::Identifier;
-                     use move_core_types::account_address::AccountAddress;
-                     
-                     let module_id = ModuleId::new(
-                         AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]), 
-                         Identifier::new("delegation").expect("delegation identifier is valid")
-                     );
-                     
-                     let validator_account = match AccountAddress::from_hex_literal(&format!("0x{}", validator_addr)) {
-
-                     
-                         Ok(addr) => addr,
-
-                     
-                         Err(_) => {
-
-                     
-                             println!("❌ Invalid address format: {}", validator_addr);
-
-                     
-                             return None;
-
-                     
-                         }
-
-                     
-                     };
-                     let arg_validator = bcs::to_bytes(&validator_account).unwrap_or_default();
-                     
-                     let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
-
-                     
-                         Ok(addr) => addr,
-
-                     
-                         Err(_) => {
-
-                     
-                             println!("❌ Invalid address format: {}", tx.sender);
-
-                     
-                             return None;
-
-                     
-                         }
-
-                     
-                     };
-                     
-                     match self.vm.execute_public_entry_function(
-                         module_id,
-                         "withdraw_unbonded",
-                         vec![],
-                         vec![arg_validator],
-                         tx.gas_limit,
-                         sender_addr
-                     ) {
-                         Ok((_gas_used, vm_changes, _)) => {
-                             for (k, v) in vm_changes {
-                                 updates.push((k, v));
-                             }
-                             println!("✅ Unbonded Tokens Withdrawn: {} from {}", tx.sender, validator_addr);
-                         },
-                         Err(e) => {
-                             println!("❌ Withdraw Unbonded Failed: {}", e);
-                         }
-                     }
-                 }
-            } else if tx.payload.starts_with("enable_delegation:") {
-                 // Payload: "enable_delegation:COMMISSION_RATE"
-                 let parts: Vec<&str> = tx.payload.split(':').collect();
-                 if parts.len() >= 2 {
-                     let commission_rate: u64 = parts[1].parse().unwrap_or(0);
-                     
-                     use move_core_types::language_storage::ModuleId;
-                     use move_core_types::identifier::Identifier;
-                     use move_core_types::account_address::AccountAddress;
-                     
-                     let module_id = ModuleId::new(
-                         AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]), 
-                         Identifier::new("delegation").expect("delegation identifier is valid")
-                     );
-                     
-                     let arg_commission = bcs::to_bytes(&commission_rate).unwrap_or_default();
-                     
-                     let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
-
-                     
-                         Ok(addr) => addr,
-
-                     
-                         Err(_) => {
-
-                     
-                             println!("❌ Invalid address format: {}", tx.sender);
-
-                     
-                             return None;
-
-                     
-                         }
-
-                     
-                     };
-                     
-                     match self.vm.execute_public_entry_function(
-                         module_id,
-                         "enable_delegation",
-                         vec![],
-                         vec![arg_commission],
-                         tx.gas_limit,
-                         sender_addr
-                     ) {
-                         Ok((_gas_used, vm_changes, _)) => {
-                             for (k, v) in vm_changes {
-                                 updates.push((k, v));
-                             }
-                             println!("✅ Delegation Enabled: Validator {} now accepts delegations (Commission: {} bps)", tx.sender, commission_rate);
-                         },
-                          Err(e) => {
-                             println!("❌ Enable Delegation Failed: {}", e);
-                         }
-                     }
-                 }
-            // ============ TOKEN FACTORY ============
-            } else if tx.payload.starts_with("create_token:") {
-                 // Payload: "create_token:NAME:SYMBOL:DECIMALS:MAX_SUPPLY:INITIAL_SUPPLY"
-                 let parts: Vec<&str> = tx.payload.split(':').collect();
-                 if parts.len() == 6 {
-                     let name = parts[1];
-                     let symbol = parts[2];
-                     let decimals: u8 = parts[3].parse().unwrap_or(18);
-                     let max_supply: u128 = parts[4].parse().unwrap_or(0);
-                     let initial_supply: u128 = parts[5].parse().unwrap_or(0);
-                     
-                     use move_core_types::language_storage::ModuleId;
-                     use move_core_types::identifier::Identifier;
-                     use move_core_types::account_address::AccountAddress;
-                     
-                     let module_id = ModuleId::new(
-                         AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]), 
-                         Identifier::new("token_factory").expect("token_factory identifier is valid")
-                     );
-                     
-                     let arg_name = bcs::to_bytes(&name.as_bytes().to_vec()).unwrap_or_default();
-                     let arg_symbol = bcs::to_bytes(&symbol.as_bytes().to_vec()).unwrap_or_default();
-                     let arg_decimals = bcs::to_bytes(&decimals).unwrap_or_default();
-                     let arg_max = bcs::to_bytes(&max_supply).unwrap_or_default();
-                     let arg_initial = bcs::to_bytes(&initial_supply).unwrap_or_default();
-                     
-                     let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
-
-                     
-                         Ok(addr) => addr,
-
-                     
-                         Err(_) => {
-
-                     
-                             println!("❌ Invalid address format: {}", tx.sender);
-
-                     
-                             return None;
-
-                     
-                         }
-
-                     
-                     };
-                     
-                     match self.vm.execute_public_entry_function(
-                         module_id,
-                         "create_token",
-                         vec![],
-                         vec![arg_name, arg_symbol, arg_decimals, arg_max, arg_initial],
-                         tx.gas_limit,
-                         sender_addr
-                     ) {
-                         Ok((_gas_used, vm_changes, _)) => {
-                             for (k, v) in vm_changes {
-                                 updates.push((k, v));
-                             }
-                             println!("✅ Token Created: {} ({}) by {}", name, symbol, tx.sender);
-                         },
-                         Err(e) => {
-                             println!("❌ Token Creation Failed: {}", e);
-                         }
-                     }
-                 }
-            } else if tx.payload.starts_with("mint_token:") {
-                 // Payload: "mint_token:TOKEN_ID:TO:AMOUNT"
-                 let parts: Vec<&str> = tx.payload.split(':').collect();
-                 if parts.len() == 4 {
-                     let token_id = parts[1];
-                     let to = parts[2];
-                     let amount: u128 = parts[3].parse().unwrap_or(0);
-                     
-                     use move_core_types::language_storage::ModuleId;
-                     use move_core_types::identifier::Identifier;
-                     use move_core_types::account_address::AccountAddress;
-                     
-                     let module_id = ModuleId::new(
-                         AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]), 
-                         Identifier::new("token_factory").expect("token_factory identifier is valid")
-                     );
-                     
-                     let arg_token = bcs::to_bytes(&token_id.as_bytes().to_vec()).unwrap_or_default();
-                     let to_addr = match AccountAddress::from_hex_literal(&format!("0x{}", to)) {
-
-                         Ok(addr) => addr,
-
-                         Err(_) => {
-
-                             println!("❌ Invalid address format: {}", to);
-
-                             return None;
-
-                         }
-
-                     };
-                     let arg_to = bcs::to_bytes(&to_addr).unwrap_or_default();
-                     let arg_amount = bcs::to_bytes(&amount).unwrap_or_default();
-                     
-                     let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
-
-                     
-                         Ok(addr) => addr,
-
-                     
-                         Err(_) => {
-
-                     
-                             println!("❌ Invalid address format: {}", tx.sender);
-
-                     
-                             return None;
-
-                     
-                         }
-
-                     
-                     };
-                     
-                     match self.vm.execute_public_entry_function(
-                         module_id,
-                         "mint",
-                         vec![],
-                         vec![arg_token, arg_to, arg_amount],
-                         tx.gas_limit,
-                         sender_addr
-                     ) {
-                         Ok((_gas_used, vm_changes, _)) => {
-                             for (k, v) in vm_changes {
-                                 updates.push((k, v));
-                             }
-                             println!("✅ Tokens Minted: {} {} to {}", amount, token_id, to);
-                         },
-                         Err(e) => {
-                             println!("❌ Token Mint Failed: {}", e);
-                         }
-                     }
-                 }
-            } else if tx.payload.starts_with("burn_token:") {
-                 // Payload: "burn_token:TOKEN_ID:AMOUNT"
-                 let parts: Vec<&str> = tx.payload.split(':').collect();
-                 if parts.len() == 3 {
-                     let token_id = parts[1];
-                     let amount: u128 = parts[2].parse().unwrap_or(0);
-                     
-                     use move_core_types::language_storage::ModuleId;
-                     use move_core_types::identifier::Identifier;
-                     use move_core_types::account_address::AccountAddress;
-                     
-                     let module_id = ModuleId::new(
-                         AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]), 
-                         Identifier::new("token_factory").expect("token_factory identifier is valid")
-                     );
-                     
-                     let arg_token = bcs::to_bytes(&token_id.as_bytes().to_vec()).unwrap_or_default();
-                     let arg_amount = bcs::to_bytes(&amount).unwrap_or_default();
-                     
-                     let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
-
-                     
-                         Ok(addr) => addr,
-
-                     
-                         Err(_) => {
-
-                     
-                             println!("❌ Invalid address format: {}", tx.sender);
-
-                     
-                             return None;
-
-                     
-                         }
-
-                     
-                     };
-                     
-                     match self.vm.execute_public_entry_function(
-                         module_id,
-                         "burn",
-                         vec![],
-                         vec![arg_token, arg_amount],
-                         tx.gas_limit,
-                         sender_addr
-                     ) {
-                         Ok((_gas_used, vm_changes, _)) => {
-                             for (k, v) in vm_changes {
-                                 updates.push((k, v));
-                             }
-                             println!("✅ Tokens Burned: {} {}", amount, token_id);
-                         },
-                         Err(e) => {
-                             println!("❌ Token Burn Failed: {}", e);
-                         }
-                     }
-                 }
-            } else if tx.payload.starts_with("transfer_token:") {
-                 // Payload: "transfer_token:TOKEN_ID:TO:AMOUNT"
-                 let parts: Vec<&str> = tx.payload.split(':').collect();
-                 if parts.len() == 4 {
-                     let token_id = parts[1];
-                     let to = parts[2];
-                     let amount: u128 = parts[3].parse().unwrap_or(0);
-                     
-                     use move_core_types::language_storage::ModuleId;
-                     use move_core_types::identifier::Identifier;
-                     use move_core_types::account_address::AccountAddress;
-                     
-                     let module_id = ModuleId::new(
-                         AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]), 
-                         Identifier::new("token_factory").expect("token_factory identifier is valid")
-                     );
-                     
-                     let arg_token = bcs::to_bytes(&token_id.as_bytes().to_vec()).unwrap_or_default();
-                     let to_addr = match AccountAddress::from_hex_literal(&format!("0x{}", to)) {
-
-                         Ok(addr) => addr,
-
-                         Err(_) => {
-
-                             println!("❌ Invalid address format: {}", to);
-
-                             return None;
-
-                         }
-
-                     };
-                     let arg_to = bcs::to_bytes(&to_addr).unwrap_or_default();
-                     let arg_amount = bcs::to_bytes(&amount).unwrap_or_default();
-                     
-                     let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
-
-                     
-                         Ok(addr) => addr,
-
-                     
-                         Err(_) => {
-
-                     
-                             println!("❌ Invalid address format: {}", tx.sender);
-
-                     
-                             return None;
-
-                     
-                         }
-
-                     
-                     };
-                     
-                     match self.vm.execute_public_entry_function(
-                         module_id,
-                         "transfer",
-                         vec![],
-                         vec![arg_token, arg_to, arg_amount],
-                         tx.gas_limit,
-                         sender_addr
-                     ) {
-                         Ok((_gas_used, vm_changes, _)) => {
-                             for (k, v) in vm_changes {
-                                 updates.push((k, v));
-                             }
-                             println!("✅ Tokens Transferred: {} {} to {}", amount, token_id, to);
-                         },
-                         Err(e) => {
-                             println!("❌ Token Transfer Failed: {}", e);
-                         }
-                     }
-                 }
-            } else if tx.payload == "init_token_wallet" {
-                 // Payload: "init_token_wallet"
-                 use move_core_types::language_storage::ModuleId;
-                 use move_core_types::identifier::Identifier;
-                 use move_core_types::account_address::AccountAddress;
-                 
-                 let module_id = ModuleId::new(
-                     AccountAddress::new([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]), 
-                     Identifier::new("token_factory").expect("token_factory identifier is valid")
-                 );
-                 
-                 let sender_addr = match AccountAddress::from_hex_literal(&format!("0x{}", tx.sender)) {
-
-                 
-                     Ok(addr) => addr,
-
-                 
-                     Err(_) => {
-
-                 
-                         println!("❌ Invalid address format: {}", tx.sender);
-
-                 
-                         return None;
-
-                 
-                     }
-
-                 
-                 };
-                 
-                 match self.vm.execute_public_entry_function(
-                     module_id,
-                     "init_wallet",
-                     vec![],
-                     vec![],
-                     tx.gas_limit,
-                     sender_addr
-                 ) {
-                     Ok((_gas_used, vm_changes, _)) => {
-                         for (k, v) in vm_changes {
-                             updates.push((k, v));
-                         }
-                         println!("✅ Token Wallet Initialized for {}", tx.sender);
-                     },
-                     Err(e) => {
-                         println!("❌ Token Wallet Init Failed: {}", e);
-                     }
-                 }
+                Ok(vm_move::TransactionPayload::PublishModule(modules)) => {
+                    if sender_addr == system_address() {
+                        println!("❌ Publish rejected: user transactions cannot publish to 0x1");
+                        return None;
+                    }
+                    let mut actions = pre_actions.clone();
+                    actions.push((vm_move::MoveAction::PublishModule(modules), false));
+                    match self
+                        .vm
+                        .execute_transaction_actions(actions, sender_addr, tx.gas_limit)
+                    {
+                        Ok((_gas_used, vm_changes, status)) => {
+                            if absorb_vm_result!(vm_changes, status) {
+                                println!("✅ Move module published by {}", tx.sender);
+                            } else {
+                                println!(
+                                    "❌ Publish aborted after gas charge: {}",
+                                    tx_error
+                                        .clone()
+                                        .unwrap_or_else(|| "unknown Move error".to_string())
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            println!("❌ Publish Failed (Move VM fatal): {}", e);
+                            return None;
+                        }
+                    }
+                }
+                Ok(vm_move::TransactionPayload::Script(_)) => {
+                    println!("🚫 [SECURITY] Raw script execution BLOCKED");
+                    return None;
+                }
+                Err(e) => {
+                    println!(
+                        "⚠️ REJECTED: Failed to deserialize BCS TransactionPayload from {}: {}",
+                        tx.sender, e
+                    );
+                    // Invalid format -> no gas charged
+                    return None;
+                }
             }
-            // SECURITY FIX: Ghost Script Vulnerability ELIMINATED.
-            // Previously, ANY raw hex payload that didn't match known prefixes was decoded
-            // and executed as arbitrary Move bytecode — allowing attackers to run malicious
-            // scripts without publishing a module. This is now BLOCKED.
-            // All Move interactions MUST use the published module entry function format.
-            else {
-                println!("⚠️ REJECTED: Unrecognized payload format from {}. Raw hex script execution is disabled for security.", tx.sender);
-            }
-            
+
+            updates.push(receipt_update(
+                tx_json,
+                &tx_status,
+                actual_gas,
+                tx_error.clone(),
+            ));
             Some((updates, actual_gas))
         } else {
             None
@@ -1914,12 +1480,17 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use move_binary_format::CompiledModule;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
     #[test]
     fn test_transaction_deserialization() {
         // Updated JSON with chain_id
-        let json = r#"{"chain_id":"AINCORE-MAINNET-1","sender":"c4b14ae227ec4e1f661dbb0d15039f1c","input_objects":[],"payload":"transfer:9e1289745b7ebd72cb17064a2c44458f:11","args":[],"gas_limit":10000,"gas_price":1,"signature":"bf3714c3b74c954cd88d5e076cc2335ab389cd3e0bc9cec55fbc9d3c62edcc3ad5720868385f45e87bf257c3dcd0083c0737c60f4839ccc949e8e68e214e5c02"}"#;
-        
+        let json = r#"{"chain_id":"AINCORE-MAINNET-1","sender":"c4b14ae227ec4e1f661dbb0d15039f1c","input_objects":[],"payload":"0200","args":[],"gas_limit":10000,"gas_price":1,"signature":"bf3714c3b74c954cd88d5e076cc2335ab389cd3e0bc9cec55fbc9d3c62edcc3ad5720868385f45e87bf257c3dcd0083c0737c60f4839ccc949e8e68e214e5c02"}"#;
+
         let tx: Result<Transaction, _> = serde_json::from_str(json);
         match tx {
             Ok(_) => println!("✅ Deserialization Successful"),
@@ -1929,7 +1500,1273 @@ mod tests {
             }
         }
     }
-}
 
-#[cfg(test)]
-mod verify_transfer_test;
+    #[test]
+    fn test_receipt_update_records_status_and_gas() {
+        let (key, value) = receipt_update("{}", "aborted", 42, Some("Move abort".to_string()));
+        assert!(key.starts_with("tx_receipt:"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&value.expect("receipt value")).unwrap();
+        assert_eq!(parsed["status"], "aborted");
+        assert_eq!(parsed["gas_charged"], "42");
+        assert_eq!(parsed["error"], "Move abort");
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct TestCoin {
+        value: u128,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct TestValidatorConfig {
+        validator_addr: move_core_types::account_address::AccountAddress,
+        stake: TestCoin,
+        public_key: Vec<u8>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct TestUnbondingRequest {
+        validator_addr: move_core_types::account_address::AccountAddress,
+        stake: u128,
+        unlock_time: u64,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct TestValidatorSet {
+        validators: Vec<TestValidatorConfig>,
+        unbonding_queue: Vec<TestUnbondingRequest>,
+        total_supply: u128,
+        current_epoch: u64,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct TestProposal {
+        id: u64,
+        proposer: move_core_types::account_address::AccountAddress,
+        description: Vec<u8>,
+        votes_for: u128,
+        votes_against: u128,
+        executed: bool,
+        action_type: u8,
+        action_value: u64,
+        voters: Vec<move_core_types::account_address::AccountAddress>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct TestGovernanceState {
+        proposals: Vec<TestProposal>,
+        next_proposal_id: u64,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct TestVoteEscrow {
+        locked_coins: TestCoin,
+        proposal_id: u64,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct TestLiquidityPool {
+        coin_x: TestCoin,
+        coin_y: TestCoin,
+        lp_supply: u128,
+        fee_bp: u64,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct TestLPToken {
+        balance: u128,
+    }
+
+    fn temp_db(name: &str) -> Arc<StateDB> {
+        let path = format!(
+            "/tmp/aincore_phase0_executor_{}_{}",
+            name,
+            std::process::id()
+        );
+        let _ = fs::remove_dir_all(&path);
+        Arc::new(StateDB::open(&path).expect("test DB opens"))
+    }
+
+    fn load_stdlib(db: &StateDB) {
+        let bytecode_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vm_move/stdlib/bytecode");
+        let mut paths: Vec<_> = fs::read_dir(&bytecode_dir)
+            .expect("stdlib bytecode dir exists")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("mv"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let bytes = fs::read(&path).expect("stdlib module readable");
+            let module = CompiledModule::deserialize(&bytes).expect("stdlib module deserializes");
+            let id = module.self_id();
+            let key = format!("module_{}_{}", id.address(), id.name());
+            db.put(&key, &hex::encode(bytes)).expect("module stored");
+        }
+    }
+
+    fn create_account(db: &StateDB, signing_key: &SigningKey) -> String {
+        let public_key = signing_key.verifying_key();
+        let public_key_hex = hex::encode(public_key.as_bytes());
+        let address = crypto::derive_address(public_key.as_bytes()).expect("canonical address");
+        let object = aa::AccountManager::create_account(address.clone(), public_key_hex);
+        db.put_object(&object).expect("account object stored");
+        address
+    }
+
+    fn set_coin_store(db: &StateDB, address: &str, value: u128) {
+        let move_addr = parse_move_address(address).expect("valid move address");
+        let bytes = bcs::to_bytes(&TestCoin { value }).expect("coin store BCS");
+        db.put(&coin_store_key(move_addr), &hex::encode(bytes))
+            .expect("coin store stored");
+    }
+
+    fn coin_balance(db: &StateDB, address: &str) -> u128 {
+        let move_addr = parse_move_address(address).expect("valid move address");
+        let value = db
+            .get(&coin_store_key(move_addr))
+            .expect("coin store read")
+            .expect("coin store exists");
+        let bytes = hex::decode(value).expect("coin store hex");
+        bcs::from_bytes::<TestCoin>(&bytes)
+            .expect("coin store BCS")
+            .value
+    }
+
+    fn wbtc_coin_type() -> move_core_types::language_storage::TypeTag {
+        move_core_types::language_storage::TypeTag::Struct(Box::new(
+            move_core_types::language_storage::StructTag {
+                address: system_address(),
+                module: move_core_types::identifier::Identifier::new("wbtc").unwrap(),
+                name: move_core_types::identifier::Identifier::new("WBTC").unwrap(),
+                type_params: vec![],
+            },
+        ))
+    }
+
+    fn coin_store_key_for(
+        addr: move_core_types::account_address::AccountAddress,
+        coin_type: move_core_types::language_storage::TypeTag,
+    ) -> String {
+        let tag = move_core_types::language_storage::StructTag {
+            address: system_address(),
+            module: move_core_types::identifier::Identifier::new("coin").unwrap(),
+            name: move_core_types::identifier::Identifier::new("CoinStore").unwrap(),
+            type_params: vec![coin_type],
+        };
+        format!("resource_{}_{}", addr, tag)
+    }
+
+    fn set_coin_store_for(
+        db: &StateDB,
+        address: &str,
+        coin_type: move_core_types::language_storage::TypeTag,
+        value: u128,
+    ) {
+        let move_addr = parse_move_address(address).expect("valid move address");
+        let bytes = bcs::to_bytes(&TestCoin { value }).expect("coin store BCS");
+        db.put(
+            &coin_store_key_for(move_addr, coin_type),
+            &hex::encode(bytes),
+        )
+        .expect("coin store stored");
+    }
+
+    fn coin_balance_for(
+        db: &StateDB,
+        address: &str,
+        coin_type: move_core_types::language_storage::TypeTag,
+    ) -> u128 {
+        let move_addr = parse_move_address(address).expect("valid move address");
+        let value = db
+            .get(&coin_store_key_for(move_addr, coin_type))
+            .expect("coin store read")
+            .expect("coin store exists");
+        let bytes = hex::decode(value).expect("coin store hex");
+        bcs::from_bytes::<TestCoin>(&bytes)
+            .expect("coin store BCS")
+            .value
+    }
+
+    fn dex_pool_key(
+        x: move_core_types::language_storage::TypeTag,
+        y: move_core_types::language_storage::TypeTag,
+    ) -> String {
+        let tag = move_core_types::language_storage::StructTag {
+            address: system_address(),
+            module: move_core_types::identifier::Identifier::new("dex").unwrap(),
+            name: move_core_types::identifier::Identifier::new("LiquidityPool").unwrap(),
+            type_params: vec![x, y],
+        };
+        format!("resource_{}_{}", system_address(), tag)
+    }
+
+    fn dex_lp_key(
+        owner: &str,
+        x: move_core_types::language_storage::TypeTag,
+        y: move_core_types::language_storage::TypeTag,
+    ) -> String {
+        let tag = move_core_types::language_storage::StructTag {
+            address: system_address(),
+            module: move_core_types::identifier::Identifier::new("dex").unwrap(),
+            name: move_core_types::identifier::Identifier::new("LPToken").unwrap(),
+            type_params: vec![x, y],
+        };
+        format!("resource_{}_{}", owner, tag)
+    }
+
+    fn set_dex_pool(
+        db: &StateDB,
+        x: move_core_types::language_storage::TypeTag,
+        y: move_core_types::language_storage::TypeTag,
+        reserve_x: u128,
+        reserve_y: u128,
+        lp_supply: u128,
+    ) {
+        let pool = TestLiquidityPool {
+            coin_x: TestCoin { value: reserve_x },
+            coin_y: TestCoin { value: reserve_y },
+            lp_supply,
+            fee_bp: 30,
+        };
+        db.put(
+            &dex_pool_key(x, y),
+            &hex::encode(bcs::to_bytes(&pool).expect("dex pool BCS")),
+        )
+        .expect("dex pool stored");
+    }
+
+    fn dex_pool(
+        db: &StateDB,
+        x: move_core_types::language_storage::TypeTag,
+        y: move_core_types::language_storage::TypeTag,
+    ) -> TestLiquidityPool {
+        let value = db
+            .get(&dex_pool_key(x, y))
+            .expect("dex pool read")
+            .expect("dex pool exists");
+        bcs::from_bytes(&hex::decode(value).expect("dex pool hex")).expect("dex pool BCS")
+    }
+
+    fn dex_lp_balance(
+        db: &StateDB,
+        owner: &str,
+        x: move_core_types::language_storage::TypeTag,
+        y: move_core_types::language_storage::TypeTag,
+    ) -> u128 {
+        let value = db
+            .get(&dex_lp_key(owner, x, y))
+            .expect("lp token read")
+            .expect("lp token exists");
+        bcs::from_bytes::<TestLPToken>(&hex::decode(value).expect("lp token hex"))
+            .expect("lp token BCS")
+            .balance
+    }
+
+    fn entry_payload(
+        module_name: &str,
+        function: &str,
+        ty_args: Vec<move_core_types::language_storage::TypeTag>,
+        args: Vec<Vec<u8>>,
+    ) -> String {
+        let call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                system_address(),
+                move_core_types::identifier::Identifier::new(module_name).unwrap(),
+            ),
+            function: function.to_string(),
+            ty_args,
+            args,
+        };
+        hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap())
+    }
+
+    fn validator_set_key() -> String {
+        super::validator_set_key()
+    }
+
+    fn token_registry_key() -> String {
+        format!(
+            "resource_{}_{}",
+            system_address(),
+            "0x1::token_factory::TokenRegistry"
+        )
+    }
+
+    fn token_wallet_key(addr: &str) -> String {
+        format!("resource_{}_{}", addr, "0x1::token_factory::TokenWallet")
+    }
+
+    fn governance_state_key() -> String {
+        format!(
+            "resource_{}_{}",
+            system_address(),
+            "0x1::governance::GovernanceState"
+        )
+    }
+
+    fn vote_escrow_key(addr: &str) -> String {
+        format!("resource_{}_{}", addr, "0x1::governance::VoteEscrow")
+    }
+
+    fn set_governance_state(db: &StateDB, state: &TestGovernanceState) {
+        let bytes = bcs::to_bytes(state).expect("governance state BCS");
+        db.put(&governance_state_key(), &hex::encode(bytes))
+            .expect("governance state stored");
+    }
+
+    fn governance_state(db: &StateDB) -> TestGovernanceState {
+        let value = db
+            .get(&governance_state_key())
+            .expect("governance state read")
+            .expect("governance state exists");
+        let bytes = hex::decode(value).expect("governance state hex");
+        bcs::from_bytes::<TestGovernanceState>(&bytes).expect("governance state BCS")
+    }
+
+    fn vote_escrow(db: &StateDB, addr: &str) -> TestVoteEscrow {
+        let value = db
+            .get(&vote_escrow_key(addr))
+            .expect("vote escrow read")
+            .expect("vote escrow exists");
+        let bytes = hex::decode(value).expect("vote escrow hex");
+        bcs::from_bytes::<TestVoteEscrow>(&bytes).expect("vote escrow BCS")
+    }
+
+    fn set_validator_set(db: &StateDB, validator: &str, stake: u128, total_supply: u128) {
+        let validator_addr = parse_move_address(validator).expect("validator move address");
+        let set = TestValidatorSet {
+            validators: vec![TestValidatorConfig {
+                validator_addr,
+                stake: TestCoin { value: stake },
+                public_key: vec![1, 2, 3],
+            }],
+            unbonding_queue: vec![],
+            total_supply,
+            current_epoch: 0,
+        };
+        let bytes = bcs::to_bytes(&set).expect("validator set BCS");
+        db.put(&validator_set_key(), &hex::encode(bytes))
+            .expect("validator set stored");
+    }
+
+    fn validator_set(db: &StateDB) -> TestValidatorSet {
+        let value = db
+            .get(&validator_set_key())
+            .expect("validator set read")
+            .expect("validator set exists");
+        let bytes = hex::decode(value).expect("validator set hex");
+        bcs::from_bytes::<TestValidatorSet>(&bytes).expect("validator set BCS")
+    }
+
+    fn apply_updates(db: &StateDB, updates: Vec<(String, Option<String>)>) {
+        for (key, value) in updates {
+            if let Some(value) = value {
+                db.put(&key, &value).expect("update put");
+            } else {
+                db.delete(&key).expect("update delete");
+            }
+        }
+    }
+
+    fn signed_tx(
+        signing_key: &SigningKey,
+        sender: &str,
+        payload: &str,
+        sequence_number: u64,
+        gas_limit: u64,
+        gas_price: u128,
+    ) -> String {
+        let public_key = signing_key.verifying_key();
+        let message = format!(
+            "{}:{}:{}:{}",
+            "AINCORE-MAINNET-1", sender, payload, sequence_number
+        );
+        let signature = signing_key.sign(message.as_bytes());
+        serde_json::to_string(&Transaction {
+            chain_id: "AINCORE-MAINNET-1".to_string(),
+            sender: sender.to_string(),
+            input_objects: vec![],
+            payload: payload.to_string(),
+            args: vec![],
+            gas_limit,
+            gas_price,
+            sequence_number,
+            public_key: hex::encode(public_key.as_bytes()),
+            signature: hex::encode(signature.to_bytes()),
+            paymaster: None,
+            paymaster_signature: None,
+            zkp_proof: None,
+        })
+        .expect("tx json")
+    }
+
+    #[test]
+    fn test_move_transfer_charges_gas_and_updates_coinstores() {
+        let db = temp_db("transfer_success");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[7u8; 32]);
+        let recipient_key = SigningKey::from_bytes(&[8u8; 32]);
+        let sender = create_account(&db, &sender_key);
+        let recipient = create_account(&db, &recipient_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        set_coin_store(&db, &sender, 1_000_000);
+        set_coin_store(&db, &recipient, 0);
+
+        let executor = Executor::new(db.clone());
+        let call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                move_core_types::account_address::AccountAddress::new([
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+                move_core_types::identifier::Identifier::new("coin").unwrap(),
+            ),
+            function: "transfer".to_string(),
+            ty_args: vec![move_core_types::language_storage::TypeTag::Struct(
+                Box::new(move_core_types::language_storage::StructTag {
+                    address: move_core_types::account_address::AccountAddress::new([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                    name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                    type_params: vec![],
+                }),
+            )],
+            args: vec![
+                bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_address(&recipient).unwrap()).unwrap(),
+                bcs::to_bytes(&100u128).unwrap(),
+            ],
+        };
+        let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
+        let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
+        let (updates, gas) = executor
+            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1))
+            .expect("transaction accepted");
+        assert_eq!(gas, 100_000);
+        apply_updates(&db, updates);
+
+        assert_eq!(coin_balance(&db, &sender), 899_900);
+        assert_eq!(coin_balance(&db, &recipient), 100);
+        let sender_obj = db.get_object(&sender).expect("sender object");
+        let sender_data: aa::AccountData = serde_json::from_slice(&sender_obj.data).unwrap();
+        assert_eq!(sender_data.sequence_number, 1);
+    }
+
+    #[test]
+    fn test_move_transfer_abort_still_charges_gas_and_records_receipt() {
+        let db = temp_db("transfer_abort");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[9u8; 32]);
+        let recipient_key = SigningKey::from_bytes(&[10u8; 32]);
+        let sender = create_account(&db, &sender_key);
+        let recipient = create_account(&db, &recipient_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        set_coin_store(&db, &sender, 100_050);
+        set_coin_store(&db, &recipient, 0);
+
+        let executor = Executor::new(db.clone());
+        let call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                move_core_types::account_address::AccountAddress::new([
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+                move_core_types::identifier::Identifier::new("coin").unwrap(),
+            ),
+            function: "transfer".to_string(),
+            ty_args: vec![move_core_types::language_storage::TypeTag::Struct(
+                Box::new(move_core_types::language_storage::StructTag {
+                    address: move_core_types::account_address::AccountAddress::new([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                    name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                    type_params: vec![],
+                }),
+            )],
+            args: vec![
+                bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_address(&recipient).unwrap()).unwrap(),
+                bcs::to_bytes(&100u128).unwrap(),
+            ],
+        };
+        let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
+        let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
+        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
+        let (updates, gas) = executor
+            .execute_transaction(&tx_json)
+            .expect("transaction accepted");
+        assert_eq!(gas, 100_000);
+        apply_updates(&db, updates);
+
+        assert_eq!(coin_balance(&db, &sender), 50);
+        assert_eq!(coin_balance(&db, &recipient), 0);
+        let receipt = db
+            .get(&format!("tx_receipt:{}", tx_hash_hex(&tx_json)))
+            .unwrap()
+            .expect("receipt stored");
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["status"], "aborted");
+        assert_eq!(receipt["gas_charged"], "100000");
+    }
+
+    #[test]
+    fn test_bad_signature_rejects_before_gas_or_nonce() {
+        let db = temp_db("bad_signature");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[11u8; 32]);
+        let other_key = SigningKey::from_bytes(&[12u8; 32]);
+        let recipient_key = SigningKey::from_bytes(&[13u8; 32]);
+        let sender = create_account(&db, &sender_key);
+        let recipient = create_account(&db, &recipient_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        set_coin_store(&db, &sender, 1_000);
+        set_coin_store(&db, &recipient, 0);
+
+        let executor = Executor::new(db.clone());
+        let call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                move_core_types::account_address::AccountAddress::new([
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+                move_core_types::identifier::Identifier::new("coin").unwrap(),
+            ),
+            function: "transfer".to_string(),
+            ty_args: vec![move_core_types::language_storage::TypeTag::Struct(
+                Box::new(move_core_types::language_storage::StructTag {
+                    address: move_core_types::account_address::AccountAddress::new([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                    name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                    type_params: vec![],
+                }),
+            )],
+            args: vec![
+                bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_address(&recipient).unwrap()).unwrap(),
+                bcs::to_bytes(&100u128).unwrap(),
+            ],
+        };
+        let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
+        let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
+        assert!(executor
+            .execute_transaction(&signed_tx(&other_key, &sender, &payload, 0, 10, 1))
+            .is_none());
+
+        assert_eq!(coin_balance(&db, &sender), 1_000);
+        let sender_obj = db.get_object(&sender).expect("sender object");
+        let sender_data: aa::AccountData = serde_json::from_slice(&sender_obj.data).unwrap();
+        assert_eq!(sender_data.sequence_number, 0);
+    }
+
+    #[test]
+    fn test_zero_gas_price_rejects_before_gas_or_nonce() {
+        let db = temp_db("zero_gas_price");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[31u8; 32]);
+        let sender = create_account(&db, &sender_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        set_coin_store(&db, &sender, 1_000_000);
+
+        let executor = Executor::new(db.clone());
+        let payload_struct = vm_move::TransactionPayload::PublishModule(vec![vec![0xCA, 0xFE]]);
+        let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
+        assert!(executor
+            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 100_000, 0))
+            .is_none());
+
+        assert_eq!(coin_balance(&db, &sender), 1_000_000);
+        let sender_obj = db.get_object(&sender).expect("sender object");
+        let sender_data: aa::AccountData = serde_json::from_slice(&sender_obj.data).unwrap();
+        assert_eq!(sender_data.sequence_number, 0);
+    }
+
+    #[test]
+    fn test_publish_invalid_hex_rejects_before_gas_or_nonce() {
+        let db = temp_db("publish_bad_hex");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[14u8; 32]);
+        let sender = create_account(&db, &sender_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        set_coin_store(&db, &sender, 1_000_000);
+
+        let executor = Executor::new(db.clone());
+        assert!(executor
+            .execute_transaction(&signed_tx(
+                &sender_key,
+                &sender,
+                "publish:not-hex",
+                0,
+                100_000,
+                1
+            ))
+            .is_none());
+
+        assert_eq!(coin_balance(&db, &sender), 1_000_000);
+        let sender_obj = db.get_object(&sender).expect("sender object");
+        let sender_data: aa::AccountData = serde_json::from_slice(&sender_obj.data).unwrap();
+        assert_eq!(sender_data.sequence_number, 0);
+    }
+
+    #[test]
+    fn test_publish_invalid_bytecode_charges_gas_and_records_abort() {
+        let db = temp_db("publish_bad_bytecode");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[15u8; 32]);
+        let sender = create_account(&db, &sender_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        set_coin_store(&db, &sender, 1_000_000);
+
+        let executor = Executor::new(db.clone());
+        let payload_struct = vm_move::TransactionPayload::PublishModule(vec![vec![0xCA, 0xFE]]);
+        let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
+        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
+        let (updates, gas) = executor
+            .execute_transaction(&tx_json)
+            .expect("transaction accepted");
+        assert_eq!(gas, 100_000);
+        apply_updates(&db, updates);
+
+        assert_eq!(coin_balance(&db, &sender), 900_000);
+        let sender_obj = db.get_object(&sender).expect("sender object");
+        let sender_data: aa::AccountData = serde_json::from_slice(&sender_obj.data).unwrap();
+        assert_eq!(sender_data.sequence_number, 1);
+
+        let receipt = db
+            .get(&format!("tx_receipt:{}", tx_hash_hex(&tx_json)))
+            .unwrap()
+            .expect("receipt stored");
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["status"], "aborted");
+        assert_eq!(receipt["gas_charged"], "100000");
+    }
+
+    #[test]
+    fn test_script_payload_rejects_before_gas_or_nonce() {
+        let db = temp_db("script_reject");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[16u8; 32]);
+        let sender = create_account(&db, &sender_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        set_coin_store(&db, &sender, 1_000_000);
+
+        let executor = Executor::new(db.clone());
+        let payload_struct = vm_move::TransactionPayload::Script(vec![0xca, 0xfe]);
+        let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
+        assert!(executor
+            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1))
+            .is_none());
+
+        assert_eq!(coin_balance(&db, &sender), 1_000_000);
+        let sender_obj = db.get_object(&sender).expect("sender object");
+        let sender_data: aa::AccountData = serde_json::from_slice(&sender_obj.data).unwrap();
+        assert_eq!(sender_data.sequence_number, 0);
+    }
+
+    #[test]
+    fn test_bcs_transfer_dependency_includes_recipient() {
+        let db = temp_db("bcs_transfer_deps");
+        let sender_key = SigningKey::from_bytes(&[17u8; 32]);
+        let recipient_key = SigningKey::from_bytes(&[18u8; 32]);
+        let sender = crypto::derive_address(sender_key.verifying_key().as_bytes()).unwrap();
+        let recipient = crypto::derive_address(recipient_key.verifying_key().as_bytes()).unwrap();
+        let executor = Executor::new(db);
+
+        let call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                system_address(),
+                move_core_types::identifier::Identifier::new("coin").unwrap(),
+            ),
+            function: "transfer".to_string(),
+            ty_args: vec![aincore_coin_type()],
+            args: vec![
+                bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_address(&recipient).unwrap()).unwrap(),
+                bcs::to_bytes(&100u128).unwrap(),
+            ],
+        };
+        let payload =
+            hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
+        let tx_json = serde_json::to_string(&Transaction {
+            chain_id: "AINCORE-MAINNET-1".to_string(),
+            sender,
+            input_objects: vec![],
+            payload,
+            args: vec![],
+            gas_limit: 100_000,
+            gas_price: 1,
+            sequence_number: 0,
+            public_key: hex::encode(sender_key.verifying_key().as_bytes()),
+            signature: String::new(),
+            paymaster: None,
+            paymaster_signature: None,
+            zkp_proof: None,
+        })
+        .unwrap();
+
+        let deps = executor.analyze_dependencies(&tx_json);
+        assert!(deps.contains(&recipient));
+    }
+
+    #[test]
+    fn test_block_fee_burn_updates_supply_trackers() {
+        let db = temp_db("block_burn_supply");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[19u8; 32]);
+        let recipient_key = SigningKey::from_bytes(&[20u8; 32]);
+        let sender = create_account(&db, &sender_key);
+        let recipient = create_account(&db, &recipient_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        set_coin_store(&db, &sender, 1_000_000);
+        set_coin_store(&db, &recipient, 0);
+        set_validator_set(&db, &sender, 0, 1_000_000_000);
+        db.put("sys:total_supply", "1000000000").unwrap();
+        db.put("total_burned", "0").unwrap();
+        db.put("sys:config:burn_percentage", "10").unwrap();
+
+        let call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                move_core_types::account_address::AccountAddress::new([
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+                move_core_types::identifier::Identifier::new("coin").unwrap(),
+            ),
+            function: "transfer".to_string(),
+            ty_args: vec![move_core_types::language_storage::TypeTag::Struct(
+                Box::new(move_core_types::language_storage::StructTag {
+                    address: move_core_types::account_address::AccountAddress::new([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                    name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                    type_params: vec![],
+                }),
+            )],
+            args: vec![
+                bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_address(&recipient).unwrap()).unwrap(),
+                bcs::to_bytes(&100u128).unwrap(),
+            ],
+        };
+        let payload =
+            hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
+        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
+
+        let executor = Executor::new(db.clone());
+        executor.execute_block_parallel(vec![tx_json], &sender);
+
+        let total_burned = db
+            .get("total_burned")
+            .unwrap()
+            .unwrap()
+            .parse::<u128>()
+            .unwrap();
+        let total_supply = db
+            .get("sys:total_supply")
+            .unwrap()
+            .unwrap()
+            .parse::<u128>()
+            .unwrap();
+        assert_eq!(total_burned, 10_000);
+        assert_eq!(total_supply, 999_990_000);
+        assert_eq!(validator_set(&db).total_supply, 999_990_000);
+    }
+
+    #[test]
+    fn test_dex_add_liquidity_and_swap_updates_pool_and_user_balances() {
+        let db = temp_db("dex_liquidity_swap");
+        load_stdlib(&db);
+        let trader_key = SigningKey::from_bytes(&[32u8; 32]);
+        let trader = create_account(&db, &trader_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+
+        let ain = aincore_coin_type();
+        let wbtc = wbtc_coin_type();
+        set_coin_store_for(&db, &trader, ain.clone(), 1_000_000);
+        set_coin_store_for(&db, &trader, wbtc.clone(), 1_000_000);
+        set_dex_pool(&db, ain.clone(), wbtc.clone(), 0, 0, 0);
+
+        let executor = Executor::new(db.clone());
+        let add_payload = entry_payload(
+            "dex",
+            "add_liquidity",
+            vec![ain.clone(), wbtc.clone()],
+            vec![
+                bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+                bcs::to_bytes(&10_000u128).unwrap(),
+                bcs::to_bytes(&10_000u128).unwrap(),
+            ],
+        );
+        let (updates, gas) = executor
+            .execute_transaction(&signed_tx(&trader_key, &trader, &add_payload, 0, 10_000, 1))
+            .expect("add liquidity accepted");
+        assert_eq!(gas, 10_000);
+        apply_updates(&db, updates);
+
+        let pool = dex_pool(&db, ain.clone(), wbtc.clone());
+        assert_eq!(pool.coin_x.value, 10_000);
+        assert_eq!(pool.coin_y.value, 10_000);
+        assert_eq!(pool.lp_supply, 10_000);
+        assert_eq!(
+            dex_lp_balance(&db, &trader, ain.clone(), wbtc.clone()),
+            9_000
+        );
+        assert_eq!(
+            coin_balance_for(&db, &trader, ain.clone()),
+            1_000_000 - 10_000 - 10_000
+        );
+        assert_eq!(coin_balance_for(&db, &trader, wbtc.clone()), 990_000);
+
+        let swap_payload = entry_payload(
+            "dex",
+            "swap_x_to_y",
+            vec![ain.clone(), wbtc.clone()],
+            vec![
+                bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+                bcs::to_bytes(&1_000u128).unwrap(),
+                bcs::to_bytes(&900u128).unwrap(),
+            ],
+        );
+        let (updates, gas) = executor
+            .execute_transaction(&signed_tx(
+                &trader_key,
+                &trader,
+                &swap_payload,
+                1,
+                10_000,
+                1,
+            ))
+            .expect("swap accepted");
+        assert_eq!(gas, 10_000);
+        apply_updates(&db, updates);
+
+        let pool = dex_pool(&db, ain.clone(), wbtc.clone());
+        assert_eq!(pool.coin_x.value, 11_000);
+        assert_eq!(pool.coin_y.value, 9_094);
+        assert_eq!(coin_balance_for(&db, &trader, ain), 969_000);
+        assert_eq!(coin_balance_for(&db, &trader, wbtc), 990_906);
+    }
+
+    #[test]
+    fn test_dex_initial_liquidity_below_minimum_aborts_after_gas_only() {
+        let db = temp_db("dex_minimum_liquidity");
+        load_stdlib(&db);
+        let trader_key = SigningKey::from_bytes(&[33u8; 32]);
+        let trader = create_account(&db, &trader_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+
+        let ain = aincore_coin_type();
+        let wbtc = wbtc_coin_type();
+        set_coin_store_for(&db, &trader, ain.clone(), 100_000);
+        set_coin_store_for(&db, &trader, wbtc.clone(), 100_000);
+        set_dex_pool(&db, ain.clone(), wbtc.clone(), 0, 0, 0);
+
+        let payload = entry_payload(
+            "dex",
+            "add_liquidity",
+            vec![ain.clone(), wbtc.clone()],
+            vec![
+                bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+                bcs::to_bytes(&1_000u128).unwrap(),
+                bcs::to_bytes(&1_000u128).unwrap(),
+            ],
+        );
+        let executor = Executor::new(db.clone());
+        let tx_json = signed_tx(&trader_key, &trader, &payload, 0, 10_000, 1);
+        let (updates, gas) = executor
+            .execute_transaction(&tx_json)
+            .expect("minimum-liquidity abort is accepted and gas-charged");
+        assert_eq!(gas, 10_000);
+        apply_updates(&db, updates);
+
+        let pool = dex_pool(&db, ain.clone(), wbtc.clone());
+        assert_eq!(pool.lp_supply, 0);
+        assert_eq!(pool.coin_x.value, 0);
+        assert_eq!(pool.coin_y.value, 0);
+        assert_eq!(coin_balance_for(&db, &trader, ain), 90_000);
+        assert_eq!(coin_balance_for(&db, &trader, wbtc), 100_000);
+        let receipt = db
+            .get(&format!("tx_receipt:{}", tx_hash_hex(&tx_json)))
+            .unwrap()
+            .expect("receipt stored");
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["status"], "aborted");
+    }
+
+    #[test]
+    fn test_dex_swap_overflow_guard_aborts_before_withdrawal() {
+        let db = temp_db("dex_swap_overflow");
+        load_stdlib(&db);
+        let trader_key = SigningKey::from_bytes(&[34u8; 32]);
+        let trader = create_account(&db, &trader_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+
+        let wbtc = wbtc_coin_type();
+        let ain = aincore_coin_type();
+        let overflow_input = (u128::MAX / 9_970) + 1;
+        set_coin_store_for(&db, &trader, ain.clone(), 100_000);
+        set_coin_store_for(&db, &trader, wbtc.clone(), overflow_input);
+        set_dex_pool(&db, wbtc.clone(), ain.clone(), 10_000, 10_000, 10_000);
+
+        let payload = entry_payload(
+            "dex",
+            "swap_x_to_y",
+            vec![wbtc.clone(), ain.clone()],
+            vec![
+                bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+                bcs::to_bytes(&overflow_input).unwrap(),
+                bcs::to_bytes(&0u128).unwrap(),
+            ],
+        );
+        let executor = Executor::new(db.clone());
+        let tx_json = signed_tx(&trader_key, &trader, &payload, 0, 10_000, 1);
+        let (updates, gas) = executor
+            .execute_transaction(&tx_json)
+            .expect("overflow abort is accepted and gas-charged");
+        assert_eq!(gas, 10_000);
+        apply_updates(&db, updates);
+
+        let pool = dex_pool(&db, wbtc.clone(), ain.clone());
+        assert_eq!(pool.coin_x.value, 10_000);
+        assert_eq!(pool.coin_y.value, 10_000);
+        assert_eq!(coin_balance_for(&db, &trader, wbtc), overflow_input);
+        assert_eq!(coin_balance_for(&db, &trader, ain), 90_000);
+        let receipt = db
+            .get(&format!("tx_receipt:{}", tx_hash_hex(&tx_json)))
+            .unwrap()
+            .expect("receipt stored");
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["status"], "aborted");
+    }
+
+    #[test]
+    fn test_token_creation_fee_burn_syncs_move_and_native_supply_trackers() {
+        let db = temp_db("token_fee_supply");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[23u8; 32]);
+        let sender = create_account(&db, &sender_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        set_coin_store(&db, &sender, 200_000_000_000_000_000_000);
+        set_validator_set(&db, &sender, 0, 200_000_000_000_000_000_000);
+        db.put("sys:total_supply", "200000000000000000000").unwrap();
+        db.put("total_burned", "0").unwrap();
+        db.put(&token_registry_key(), "00").unwrap();
+        db.put(&token_wallet_key(&sender), "00").unwrap();
+
+        let call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                system_address(),
+                move_core_types::identifier::Identifier::new("token_factory").unwrap(),
+            ),
+            function: "create_token".to_string(),
+            ty_args: vec![],
+            args: vec![
+                bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
+                bcs::to_bytes(&b"Ain Pepe".to_vec()).unwrap(),
+                bcs::to_bytes(&b"APEPE".to_vec()).unwrap(),
+                bcs::to_bytes(&18u8).unwrap(),
+                bcs::to_bytes(&1_000_000u128).unwrap(),
+                bcs::to_bytes(&0u128).unwrap(),
+                bcs::to_bytes(&Vec::<u8>::new()).unwrap(),
+                bcs::to_bytes(&Vec::<u8>::new()).unwrap(),
+            ],
+        };
+        let payload =
+            hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
+        let executor = Executor::new(db.clone());
+        let (updates, _) = executor
+            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 10_000, 1))
+            .expect("token creation accepted");
+        apply_updates(&db, updates);
+
+        assert_eq!(
+            db.get("sys:total_supply").unwrap().unwrap(),
+            "100000000000000000000"
+        );
+        assert_eq!(
+            db.get("total_burned").unwrap().unwrap(),
+            "100000000000000000000"
+        );
+        assert_eq!(validator_set(&db).total_supply, 100_000_000_000_000_000_000);
+    }
+
+    #[test]
+    fn test_governance_proposal_fee_burn_syncs_move_and_native_supply_trackers() {
+        let db = temp_db("governance_fee_supply");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[24u8; 32]);
+        let sender = create_account(&db, &sender_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        let starting_supply = 20_000_000_000_000_000_000_000u128;
+        set_coin_store(&db, &sender, starting_supply);
+        set_validator_set(&db, &sender, 0, starting_supply);
+        db.put("sys:total_supply", &starting_supply.to_string())
+            .unwrap();
+        db.put("total_burned", "0").unwrap();
+        db.put(&governance_state_key(), "000000000000000000")
+            .unwrap();
+
+        let call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                system_address(),
+                move_core_types::identifier::Identifier::new("governance").unwrap(),
+            ),
+            function: "create_proposal".to_string(),
+            ty_args: vec![],
+            args: vec![
+                bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
+                bcs::to_bytes(&b"reduce spam".to_vec()).unwrap(),
+                bcs::to_bytes(&1u8).unwrap(),
+                bcs::to_bytes(&60u64).unwrap(),
+            ],
+        };
+        let payload =
+            hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
+        let executor = Executor::new(db.clone());
+        let (updates, _) = executor
+            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 10_000, 1))
+            .expect("proposal accepted");
+        apply_updates(&db, updates);
+
+        let fee = 10_000_000_000_000_000_000_000u128;
+        assert_eq!(
+            db.get("sys:total_supply").unwrap().unwrap(),
+            (starting_supply - fee).to_string()
+        );
+        assert_eq!(db.get("total_burned").unwrap().unwrap(), fee.to_string());
+        assert_eq!(validator_set(&db).total_supply, starting_supply - fee);
+    }
+
+    #[test]
+    fn test_governance_vote_escrow_locks_real_coin_without_supply_drift() {
+        let db = temp_db("governance_vote_escrow");
+        load_stdlib(&db);
+        let voter_key = SigningKey::from_bytes(&[25u8; 32]);
+        let voter = create_account(&db, &voter_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        let balance = 1_000_000_000_000_000_000_000u128;
+        set_coin_store(&db, &voter, balance);
+        set_validator_set(&db, &voter, 0, balance);
+        db.put("sys:total_supply", &balance.to_string()).unwrap();
+        db.put("total_burned", "0").unwrap();
+        set_governance_state(
+            &db,
+            &TestGovernanceState {
+                proposals: vec![TestProposal {
+                    id: 0,
+                    proposer: parse_move_address(&voter).unwrap(),
+                    description: b"escrow check".to_vec(),
+                    votes_for: 0,
+                    votes_against: 0,
+                    executed: false,
+                    action_type: 1,
+                    action_value: 60,
+                    voters: vec![],
+                }],
+                next_proposal_id: 1,
+            },
+        );
+
+        let vote_call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                system_address(),
+                move_core_types::identifier::Identifier::new("governance").unwrap(),
+            ),
+            function: "vote".to_string(),
+            ty_args: vec![],
+            args: vec![
+                bcs::to_bytes(&parse_move_address(&voter).unwrap()).unwrap(),
+                bcs::to_bytes(&0u64).unwrap(),
+                bcs::to_bytes(&true).unwrap(),
+            ],
+        };
+        let payload = hex::encode(
+            bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(vote_call)).unwrap(),
+        );
+        let executor = Executor::new(db.clone());
+        let (updates, _) = executor
+            .execute_transaction(&signed_tx(&voter_key, &voter, &payload, 0, 10_000, 1))
+            .expect("vote accepted");
+        apply_updates(&db, updates);
+
+        let gas_per_tx = 10_000u128;
+        let vote_gas_reserve = 1_000_000_000_000_000_000u128;
+        let locked = balance - gas_per_tx - vote_gas_reserve;
+
+        assert_eq!(coin_balance(&db, &voter), vote_gas_reserve);
+        assert_eq!(vote_escrow(&db, &voter).locked_coins.value, locked);
+        assert_eq!(
+            db.get("sys:total_supply").unwrap().unwrap(),
+            balance.to_string()
+        );
+        assert_eq!(db.get("total_burned").unwrap().unwrap(), "0");
+        assert_eq!(validator_set(&db).total_supply, balance);
+
+        let mut state = governance_state(&db);
+        state.proposals[0].executed = true;
+        set_governance_state(&db, &state);
+
+        let claim_call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                system_address(),
+                move_core_types::identifier::Identifier::new("governance").unwrap(),
+            ),
+            function: "claim_vote_tokens".to_string(),
+            ty_args: vec![],
+            args: vec![bcs::to_bytes(&parse_move_address(&voter).unwrap()).unwrap()],
+        };
+        let payload = hex::encode(
+            bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(claim_call)).unwrap(),
+        );
+        let (updates, _) = executor
+            .execute_transaction(&signed_tx(&voter_key, &voter, &payload, 1, 10_000, 1))
+            .expect("claim accepted");
+        apply_updates(&db, updates);
+
+        assert_eq!(coin_balance(&db, &voter), balance - (gas_per_tx * 2));
+        assert!(db.get(&vote_escrow_key(&voter)).unwrap().is_none());
+        assert_eq!(
+            db.get("sys:total_supply").unwrap().unwrap(),
+            balance.to_string()
+        );
+        assert_eq!(db.get("total_burned").unwrap().unwrap(), "0");
+        assert_eq!(validator_set(&db).total_supply, balance);
+    }
+
+    #[test]
+    fn test_fee_sweep_queue_recovers_after_miner_registers_coinstore() {
+        let db = temp_db("fee_sweep_recovery");
+        load_stdlib(&db);
+        let miner_key = SigningKey::from_bytes(&[26u8; 32]);
+        let miner = create_account(&db, &miner_key);
+        let executor = Executor::new(db.clone());
+        let amount = 777_000u128;
+
+        executor.queue_fee_sweep("not_a_hex_address", amount, 42);
+        executor.process_fee_sweep_queue();
+        let queued = db
+            .scan_prefix("sys:fee_sweep_queue:")
+            .into_iter()
+            .next()
+            .expect("fee remains queued");
+        let entry: FeeSweepEntry = serde_json::from_str(&queued.1).unwrap();
+        assert_eq!(entry.attempts, 1);
+
+        let recovered_entry = FeeSweepEntry {
+            miner: miner.clone(),
+            amount: amount.to_string(),
+            reason: entry.reason,
+            attempts: entry.attempts,
+        };
+        db.put(&queued.0, &serde_json::to_string(&recovered_entry).unwrap())
+            .unwrap();
+        set_coin_store(&db, &miner, 0);
+        executor.process_fee_sweep_queue();
+
+        assert!(db.scan_prefix("sys:fee_sweep_queue:").is_empty());
+        assert_eq!(coin_balance(&db, &miner), amount);
+    }
+
+    #[test]
+    fn test_pending_equivocation_slash_burns_all_stake_and_removes_validator() {
+        let db = temp_db("slash_equivocation");
+        load_stdlib(&db);
+        let validator_key = SigningKey::from_bytes(&[21u8; 32]);
+        let validator = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
+        db.put(
+            "sys:validators",
+            &serde_json::to_string(&vec![
+                (validator.clone(), 100u64),
+                ("33333333333333333333333333333333".to_string(), 100u64),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        set_validator_set(&db, &validator, 1_000_000, 1_000_000);
+        db.put(
+            &format!("sys:pending_slash:{}", validator),
+            &serde_json::json!({"reason":"equivocation","round":77}).to_string(),
+        )
+        .unwrap();
+
+        let executor = Executor::new(db.clone());
+        executor.execute_pending_slashes();
+
+        assert!(db
+            .get(&format!("sys:pending_slash:{}", validator))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.get(&format!("sys:slashed:{}:77", validator))
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+        let native_validators: Vec<(String, u64)> =
+            serde_json::from_str(&db.get("sys:validators").unwrap().unwrap()).unwrap();
+        assert!(!native_validators.iter().any(|(addr, _)| addr == &validator));
+
+        let move_validators = validator_set(&db);
+        assert!(move_validators.validators.is_empty());
+        assert!(move_validators.unbonding_queue.is_empty());
+        assert_eq!(move_validators.total_supply, 0);
+    }
+
+    #[test]
+    fn test_pending_downtime_slash_jails_validator_and_unbonds_remaining_stake() {
+        let db = temp_db("slash_downtime");
+        load_stdlib(&db);
+        let validator_key = SigningKey::from_bytes(&[22u8; 32]);
+        let validator = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
+        db.put(
+            "sys:validators",
+            &serde_json::to_string(&vec![(validator.clone(), 100u64)]).unwrap(),
+        )
+        .unwrap();
+        set_validator_set(&db, &validator, 1_000_000, 1_000_000);
+        db.put(
+            &format!("sys:pending_slash:{}", validator),
+            &serde_json::json!({"reason":"downtime","round":78}).to_string(),
+        )
+        .unwrap();
+
+        let executor = Executor::new(db.clone());
+        executor.execute_pending_slashes();
+
+        assert!(db
+            .get(&format!("sys:pending_slash:{}", validator))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.get(&format!("sys:slashed:{}:78", validator))
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+        let native_validators: Vec<(String, u64)> =
+            serde_json::from_str(&db.get("sys:validators").unwrap().unwrap()).unwrap();
+        assert!(native_validators.is_empty());
+
+        let move_validators = validator_set(&db);
+        assert!(move_validators.validators.is_empty());
+        assert_eq!(move_validators.unbonding_queue.len(), 1);
+        assert_eq!(move_validators.unbonding_queue[0].stake, 950_000);
+        assert_eq!(move_validators.total_supply, 950_000);
+    }
+}

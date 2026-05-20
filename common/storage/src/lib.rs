@@ -1,5 +1,5 @@
-use rocksdb::DB;
-pub use rocksdb; // Export for consumers
+pub use rocksdb;
+use rocksdb::DB; // Export for consumers
 pub mod object;
 #[cfg(test)]
 mod tests;
@@ -31,14 +31,13 @@ impl From<rocksdb::Error> for StorageError {
     }
 }
 
-
 pub struct StateDB {
     pub db: DB,
 }
 
 impl StateDB {
     /// Open database with production-grade durability settings
-    /// 
+    ///
     /// Returns Err if:
     /// - Database is locked by another process
     /// - Insufficient permissions
@@ -46,40 +45,40 @@ impl StateDB {
     ///
     /// # Security Hardening (Audit Remediation)
     /// - WAL (Write-Ahead Log) is enabled with manual flush for crash recovery
-    /// - `sync` = true forces fsync on every write, ensuring durability even on 
+    /// - `sync` = true forces fsync on every write, ensuring durability even on
     ///   power failure (prevents data loss that could cause state root divergence)
     /// - Checksums are enabled to detect silent data corruption
     /// - `create_if_missing` = true for first-run genesis bootstrap
     pub fn open(path: &str) -> Result<Self, StorageError> {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
-        
+
         // === DURABILITY HARDENING (Audit Finding: RocksDB WAL Configuration) ===
         // Without these settings, a crash during block commit can leave the
         // database in an inconsistent state, causing irrecoverable state root
         // divergence between validators (instant hard fork).
-        
+
         // Force fsync after each write to ensure WAL entries hit disk.
         // Performance cost: ~10-20% write throughput reduction, but this is
         // non-negotiable for a blockchain — data integrity > speed.
         opts.set_use_fsync(true);
-        
+
         // Manual WAL flush gives us control over when WAL is synced,
         // allowing batch writes (WriteBatch) to be atomic + durable.
         opts.set_manual_wal_flush(true);
-        
+
         // Enable paranoid checks for detecting silent data corruption.
         // This adds CPU overhead but catches bit-rot before it propagates.
         opts.set_paranoid_checks(true);
-        
+
         // Set WAL size limit to prevent unbounded WAL growth.
         // 256MB is generous for typical blockchain workloads.
         opts.set_max_total_wal_size(256 * 1024 * 1024);
-        
+
         // Optimize for blockchain read patterns (point lookups by key)
         opts.set_allow_concurrent_memtable_write(true);
         opts.set_enable_write_thread_adaptive_yield(true);
-        
+
         let db = DB::open(&opts, path)
             .map_err(|e| StorageError::DatabaseOpen(format!(
                 "Path: {}, Error: {}. Ensure no other process is using this directory and you have write permissions.",
@@ -95,11 +94,11 @@ impl StateDB {
     pub fn get(&self, key: &str) -> std::result::Result<Option<String>, rocksdb::Error> {
         match self.db.get(key) {
             Ok(Some(v)) => {
-                 match String::from_utf8(v) {
-                     Ok(s) => Ok(Some(s)),
-                     Err(_) => Ok(None), // Fail safe for invalid utf8
-                 }
-            },
+                match String::from_utf8(v) {
+                    Ok(s) => Ok(Some(s)),
+                    Err(_) => Ok(None), // Fail safe for invalid utf8
+                }
+            }
             Ok(None) => Ok(None),
             Err(e) => Err(e),
         }
@@ -109,13 +108,44 @@ impl StateDB {
         self.db.delete(key)
     }
 
-    /// Generic prefix scanner — returns all (key, value) pairs matching a prefix.
-    /// Used by the Executor to process pending slashes from the consensus engine.
+    /// Hard ceiling on `scan_prefix` results so an unbounded namespace
+    /// (e.g. a runaway pending-slash queue or an attacker-controlled key
+    /// space) cannot exhaust process memory or stall a hot path.
+    /// Callers that know a tighter bound should use
+    /// [`scan_prefix_limited`] with an explicit cap.
+    pub const SCAN_PREFIX_HARD_CAP: usize = 100_000;
+
+    /// Generic prefix scanner — returns up to [`SCAN_PREFIX_HARD_CAP`]
+    /// `(key, value)` pairs matching a prefix. Used by the Executor to
+    /// process pending slashes from the consensus engine.
+    ///
+    /// M-06 FIX: previously this scanned with no upper bound. Any code
+    /// path that wrote into a key space without retention (or that an
+    /// attacker could write into) could blow up the process by forcing
+    /// `scan_prefix` to materialise the entire range into a `Vec`. The
+    /// hard cap protects every existing caller without changing the
+    /// public signature. For namespaces with a known tighter bound,
+    /// prefer [`scan_prefix_limited`].
     pub fn scan_prefix(&self, prefix: &str) -> Vec<(String, String)> {
-        let mut results = Vec::new();
+        self.scan_prefix_limited(prefix, Self::SCAN_PREFIX_HARD_CAP)
+    }
+
+    /// Bounded prefix scanner. Stops iterating after `limit` matches.
+    /// Use this from hot paths where the caller can reason about the
+    /// expected upper bound (e.g. validator count, miner count).
+    pub fn scan_prefix_limited(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Vec<(String, String)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut results = Vec::with_capacity(limit.min(1024));
         let prefix_bytes = prefix.as_bytes();
         let iter = self.db.prefix_iterator(prefix_bytes);
-        
+
         for (key, value) in iter.flatten() {
             if !key.starts_with(prefix_bytes) {
                 break;
@@ -123,6 +153,9 @@ impl StateDB {
             let k = String::from_utf8_lossy(&key).into_owned();
             let v = String::from_utf8_lossy(&value).into_owned();
             results.push((k, v));
+            if results.len() >= limit {
+                break;
+            }
         }
         results
     }
@@ -151,7 +184,7 @@ impl StateDB {
             if !key.starts_with(prefix) {
                 break;
             }
-            
+
             let k = String::from_utf8(key.to_vec()).unwrap_or_default();
             let val_str = String::from_utf8(value.to_vec()).unwrap_or_default();
             if let Ok(port) = val_str.parse::<u16>() {
@@ -176,7 +209,11 @@ impl StateDB {
         }
     }
 
-    pub fn save_peer_addr(&self, peer_id: &str, multiaddr: &str) -> std::result::Result<(), rocksdb::Error> {
+    pub fn save_peer_addr(
+        &self,
+        peer_id: &str,
+        multiaddr: &str,
+    ) -> std::result::Result<(), rocksdb::Error> {
         self.put(&format!("peer_addr:{}", peer_id), multiaddr)
     }
 
@@ -184,12 +221,12 @@ impl StateDB {
         let mut peers = Vec::new();
         let prefix = b"peer_addr:";
         let iter = self.db.prefix_iterator(prefix);
-        
+
         for (key, value) in iter.flatten() {
             if !key.starts_with(prefix) {
                 break;
             }
-            
+
             let k = String::from_utf8_lossy(&key).into_owned();
             let node_id = k.replace("peer_addr:", "");
             let addr = String::from_utf8_lossy(&value).into_owned();
@@ -207,7 +244,7 @@ impl StateDB {
             if !key.starts_with(prefix) {
                 break;
             }
-            
+
             let v_json = String::from_utf8(value.to_vec()).unwrap_or_else(|_| "{}".to_string());
             vertices.push(v_json);
         }
@@ -220,8 +257,12 @@ impl StateDB {
         self.db.put(key, value)
     }
 
-    pub fn write_batch(&self, batch: rocksdb::WriteBatch) -> std::result::Result<(), rocksdb::Error> {
-        self.db.write(batch)
+    pub fn write_batch(
+        &self,
+        batch: rocksdb::WriteBatch,
+    ) -> std::result::Result<(), rocksdb::Error> {
+        self.db.write(batch)?;
+        self.db.flush_wal(true)
     }
 
     /// Get current blockchain height
@@ -231,19 +272,20 @@ impl StateDB {
             _ => 0,
         }
     }
-    
+
     /// Save block as JSON string — atomically updates height AND hash
     pub fn save_block_json(&self, height: u64, block_json: &str) -> Result<(), rocksdb::Error> {
         let key = format!("block_{}", height);
-        self.put(&key, block_json)?;
-        self.put("latest_height", &height.to_string())?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(key.as_bytes(), block_json.as_bytes());
+        batch.put(b"latest_height", height.to_string().as_bytes());
         // Extract hash from block JSON and persist it for consensus continuity
         if let Ok(block) = serde_json::from_str::<serde_json::Value>(block_json) {
             if let Some(hash) = block["header"]["hash"].as_str() {
-                self.put("latest_block_hash", hash)?;
+                batch.put(b"latest_block_hash", hash.as_bytes());
             }
         }
-        Ok(())
+        self.write_batch(batch)
     }
 
     pub fn get_object(&self, object_id: &str) -> Option<Object> {
@@ -259,18 +301,22 @@ impl StateDB {
             _ => None,
         }
     }
-    
+
     /// Index transaction for fast lookup: tx_hash → block_height
-    /// 
+    ///
     /// This enables O(1) transaction lookups instead of O(n) DAG scan.
     /// Call this after successfully executing a block.
-    pub fn index_transaction(&self, tx_hash: &str, block_height: u64) -> Result<(), rocksdb::Error> {
+    pub fn index_transaction(
+        &self,
+        tx_hash: &str,
+        block_height: u64,
+    ) -> Result<(), rocksdb::Error> {
         let key = format!("tx_index:{}", tx_hash);
         self.put(&key, &block_height.to_string())
     }
-    
+
     /// Get block height for a transaction hash (O(1) lookup)
-    /// 
+    ///
     /// Returns None if transaction not found in index.
     pub fn get_tx_block_height(&self, tx_hash: &str) -> Option<u64> {
         let key = format!("tx_index:{}", tx_hash);
@@ -290,7 +336,7 @@ impl StateDB {
     }
 
     // === PHASE 10: ECONOMIC MODEL ===
-    
+
     pub fn get_base_reward(&self) -> u64 {
         const DEFAULT_REWARD: u64 = 50;
         match self.get("sys:config:base_reward") {
@@ -298,7 +344,7 @@ impl StateDB {
             _ => DEFAULT_REWARD,
         }
     }
-    
+
     pub fn get_halving_interval(&self) -> u64 {
         const DEFAULT_INTERVAL: u64 = 2_100_000;
         match self.get("sys:config:halving_interval") {
@@ -306,7 +352,7 @@ impl StateDB {
             _ => DEFAULT_INTERVAL,
         }
     }
-    
+
     pub fn get_burn_percentage(&self) -> u8 {
         const DEFAULT_BURN: u8 = 10; // 10%
         match self.get("sys:config:burn_percentage") {
@@ -315,53 +361,72 @@ impl StateDB {
         }
     }
 
-    pub fn update_economic_config(&self, reward: Option<u64>, interval: Option<u64>, burn: Option<u8>) -> std::result::Result<(), rocksdb::Error> {
-        if let Some(r) = reward { self.put("sys:config:base_reward", &r.to_string())?; }
-        if let Some(i) = interval { self.put("sys:config:halving_interval", &i.to_string())?; }
-        if let Some(b) = burn { self.put("sys:config:burn_percentage", &b.to_string())?; }
+    pub fn update_economic_config(
+        &self,
+        reward: Option<u64>,
+        interval: Option<u64>,
+        burn: Option<u8>,
+    ) -> std::result::Result<(), rocksdb::Error> {
+        if let Some(r) = reward {
+            self.put("sys:config:base_reward", &r.to_string())?;
+        }
+        if let Some(i) = interval {
+            self.put("sys:config:halving_interval", &i.to_string())?;
+        }
+        if let Some(b) = burn {
+            self.put("sys:config:burn_percentage", &b.to_string())?;
+        }
         Ok(())
     }
 
     // === PHASE 12: VALIDATOR SET (SYBIL PROTECTION) ===
-    
+
     // Scan method clearly not optimal for Mainnet, but "Real" enough for < 1000 validators.
     // In full prod, we'd use a separate column family or index.
     pub fn get_active_validators(&self) -> Vec<(String, u64)> {
-         // Logic: Check a "sys:validators" list.
-         // This is populated by genesis.json during node bootstrap.
-         if let Ok(Some(json)) = self.get("sys:validators") {
-             if let Ok(vals) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
-                 return vals;
-             }
-         }
-         
-         // Return empty if not initialized (genesis tool will populate this)
-         vec![]
+        // Logic: Check a "sys:validators" list.
+        // This is populated by genesis.json during node bootstrap.
+        if let Ok(Some(json)) = self.get("sys:validators") {
+            if let Ok(vals) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
+                return vals;
+            }
+        }
+
+        // Return empty if not initialized (genesis tool will populate this)
+        vec![]
     }
 
-    pub fn update_validator_weight(&self, pubkey: &str, weight: u64) -> std::result::Result<(), rocksdb::Error> {
-         let mut vals = self.get_active_validators();
-         if let Some(v) = vals.iter_mut().find(|v| v.0 == pubkey) {
-             v.1 = weight;
-         } else {
-             vals.push((pubkey.to_string(), weight));
-         }
-         let json = serde_json::to_string(&vals).unwrap_or_default();
-         self.put("sys:validators", &json)
+    pub fn update_validator_weight(
+        &self,
+        pubkey: &str,
+        weight: u64,
+    ) -> std::result::Result<(), rocksdb::Error> {
+        let mut vals = self.get_active_validators();
+        if let Some(v) = vals.iter_mut().find(|v| v.0 == pubkey) {
+            v.1 = weight;
+        } else {
+            vals.push((pubkey.to_string(), weight));
+        }
+        let json = serde_json::to_string(&vals).unwrap_or_default();
+        self.put("sys:validators", &json)
     }
 
     // === DAG CHECKPOINT SYSTEM (Aptos/Sui Style) ===
-    
+
     /// Save DAG checkpoint for fast recovery
     /// Called every N rounds (e.g., 100) to enable O(1) startup
-    pub fn save_dag_checkpoint(&self, round: u64, vertices_json: &str) -> std::result::Result<(), rocksdb::Error> {
+    pub fn save_dag_checkpoint(
+        &self,
+        round: u64,
+        vertices_json: &str,
+    ) -> std::result::Result<(), rocksdb::Error> {
         // Save checkpoint data
         self.put(&format!("dag:checkpoint:{}", round), vertices_json)?;
         // Update latest checkpoint pointer
         self.put("dag:checkpoint:latest", &round.to_string())?;
         Ok(())
     }
-    
+
     /// Get latest checkpoint round
     pub fn get_latest_checkpoint_round(&self) -> u64 {
         match self.get("dag:checkpoint:latest") {
@@ -369,7 +434,7 @@ impl StateDB {
             _ => 0,
         }
     }
-    
+
     /// Load DAG checkpoint data
     pub fn get_dag_checkpoint(&self, round: u64) -> Option<String> {
         match self.get(&format!("dag:checkpoint:{}", round)) {
@@ -377,9 +442,13 @@ impl StateDB {
             _ => None,
         }
     }
-    
+
     /// Prune old checkpoints (keep last N)
-    pub fn prune_old_checkpoints(&self, current_round: u64, keep_count: u64) -> std::result::Result<(), rocksdb::Error> {
+    pub fn prune_old_checkpoints(
+        &self,
+        current_round: u64,
+        keep_count: u64,
+    ) -> std::result::Result<(), rocksdb::Error> {
         if current_round <= keep_count {
             return Ok(());
         }

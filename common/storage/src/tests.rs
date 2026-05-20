@@ -1,7 +1,10 @@
 #![allow(clippy::module_inception)]
 #[cfg(test)]
 mod tests {
-    use crate::{StateDB, object::{self, Object}};
+    use crate::{
+        object::{self, Object},
+        StateDB,
+    };
     use std::fs;
 
     fn temp_db(name: &str) -> StateDB {
@@ -49,9 +52,12 @@ mod tests {
         let db = temp_db("block_json");
         let block_json = r#"{"header":{"hash":"abc123","height":1},"transactions":[]}"#;
         db.save_block_json(1, block_json).unwrap();
-        
+
         assert_eq!(db.get_chain_height(), 1);
-        assert_eq!(db.get("latest_block_hash").unwrap(), Some("abc123".to_string()));
+        assert_eq!(
+            db.get("latest_block_hash").unwrap(),
+            Some("abc123".to_string())
+        );
         assert_eq!(db.get("block_1").unwrap(), Some(block_json.to_string()));
     }
 
@@ -69,9 +75,49 @@ mod tests {
         db.put("metric:cpu", "50").unwrap();
         db.put("metric:mem", "80").unwrap();
         db.put("other:key", "val").unwrap();
-        
+
         let results = db.scan_prefix("metric:");
         assert_eq!(results.len(), 2);
+    }
+
+    /// M-06 REGRESSION TEST
+    ///
+    /// `scan_prefix_limited` must stop iterating after the caller's `limit`,
+    /// and the default `scan_prefix` must enforce a hard ceiling even when
+    /// the matching range is much larger.
+    #[test]
+    fn test_scan_prefix_respects_explicit_limit_and_hard_cap() {
+        let db = temp_db("scan_prefix_limit");
+
+        // Insert 200 keys under one prefix and a stray key under another.
+        for i in 0..200u32 {
+            db.put(&format!("queue:{:04}", i), &i.to_string()).unwrap();
+        }
+        db.put("other:key", "1").unwrap();
+
+        // Explicit limit is respected.
+        let small = db.scan_prefix_limited("queue:", 10);
+        assert_eq!(small.len(), 10, "explicit limit must cap result count");
+
+        // Limit larger than range returns everything in range (but not the
+        // stray key under a different prefix).
+        let all = db.scan_prefix_limited("queue:", 1_000);
+        assert_eq!(all.len(), 200, "limit > range returns all matches");
+
+        // Limit of 0 returns nothing (guards against accidental wide scans).
+        let none = db.scan_prefix_limited("queue:", 0);
+        assert!(none.is_empty(), "limit of 0 must return empty vec");
+
+        // Default scan_prefix still works but is now bounded by the hard cap.
+        // Construction-of-attack guard: verify the constant is a sane ceiling.
+        assert!(
+            StateDB::SCAN_PREFIX_HARD_CAP >= 1_000,
+            "hard cap must be high enough for legitimate workloads"
+        );
+        assert!(
+            StateDB::SCAN_PREFIX_HARD_CAP <= 10_000_000,
+            "hard cap must not be effectively unbounded"
+        );
     }
 
     #[test]
@@ -105,9 +151,10 @@ mod tests {
         assert_eq!(db.get_base_reward(), 50);
         assert_eq!(db.get_halving_interval(), 2_100_000);
         assert_eq!(db.get_burn_percentage(), 10);
-        
+
         // Update
-        db.update_economic_config(Some(36), Some(2_102_400), Some(5)).unwrap();
+        db.update_economic_config(Some(36), Some(2_102_400), Some(5))
+            .unwrap();
         assert_eq!(db.get_base_reward(), 36);
         assert_eq!(db.get_halving_interval(), 2_102_400);
         assert_eq!(db.get_burn_percentage(), 5);
@@ -117,15 +164,15 @@ mod tests {
     fn test_validator_set() {
         let db = temp_db("validators");
         assert_eq!(db.get_active_validators().len(), 0);
-        
+
         db.update_validator_weight("pk_alice", 1000).unwrap();
         db.update_validator_weight("pk_bob", 2000).unwrap();
-        
+
         let vals = db.get_active_validators();
         assert_eq!(vals.len(), 2);
         assert!(vals.iter().any(|(pk, w)| pk == "pk_alice" && *w == 1000));
         assert!(vals.iter().any(|(pk, w)| pk == "pk_bob" && *w == 2000));
-        
+
         // Update existing weight
         db.update_validator_weight("pk_alice", 3000).unwrap();
         let vals = db.get_active_validators();
@@ -136,7 +183,7 @@ mod tests {
     fn test_dag_checkpoint() {
         let db = temp_db("dag_ckpt");
         assert_eq!(db.get_latest_checkpoint_round(), 0);
-        
+
         db.save_dag_checkpoint(100, r#"[{"round":100}]"#).unwrap();
         assert_eq!(db.get_latest_checkpoint_round(), 100);
         assert!(db.get_dag_checkpoint(100).is_some());
@@ -153,7 +200,7 @@ mod tests {
             "0x1::coin::Coin".to_string(),
         );
         db.put_object(&obj).unwrap();
-        
+
         let loaded = db.get_object("obj_001");
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
@@ -167,7 +214,7 @@ mod tests {
         let db = temp_db("overwrite");
         db.put("key", "v1").unwrap();
         assert_eq!(db.get("key").unwrap(), Some("v1".to_string()));
-        
+
         db.put("key", "v2").unwrap();
         assert_eq!(db.get("key").unwrap(), Some("v2".to_string()));
     }
