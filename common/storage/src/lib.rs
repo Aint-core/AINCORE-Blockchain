@@ -273,18 +273,62 @@ impl StateDB {
         }
     }
 
-    /// Save block as JSON string — atomically updates height AND hash
+    /// Save block as JSON string — atomically updates height, hash, AND
+    /// per-transaction index entries in a single RocksDB write batch.
+    ///
+    /// H-07 FIX: previously this saved the block + height + hash but did
+    /// not populate `tx_index:{tx_hash}` entries. As a result,
+    /// `aincore_getTransaction` fell back to scanning every vertex in the
+    /// DAG while holding the consensus read lock, which is O(N·M) over
+    /// the whole chain and stalls block production. By writing the
+    /// per-tx index in the same atomic batch we never observe a state
+    /// where a block exists but its transactions are not yet indexable,
+    /// and the lookup becomes O(1) → O(M) for the single block.
     pub fn save_block_json(&self, height: u64, block_json: &str) -> Result<(), rocksdb::Error> {
+        use sha2::{Digest, Sha256};
+
         let key = format!("block_{}", height);
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(key.as_bytes(), block_json.as_bytes());
         batch.put(b"latest_height", height.to_string().as_bytes());
-        // Extract hash from block JSON and persist it for consensus continuity
+
+        // Extract hash from block JSON and persist it for consensus continuity.
+        // While we're parsing, also index every transaction in the payload so
+        // getTransaction / getTransactionReceipt can do O(1) lookups.
         if let Ok(block) = serde_json::from_str::<serde_json::Value>(block_json) {
             if let Some(hash) = block["header"]["hash"].as_str() {
                 batch.put(b"latest_block_hash", hash.as_bytes());
             }
+
+            // Index transactions. Block JSON shape from blockchain::Block is
+            // `{ "header": {...}, "transactions": [<tx_string>, ...] }`. Each
+            // transaction is stored as the raw JSON string it was submitted
+            // as, and tx_hash is SHA-256 over those bytes — the same
+            // construction the mempool uses for dedupe and the API uses for
+            // its current O(N) scan, so the index is wire-compatible.
+            if let Some(txs) = block.get("transactions").and_then(|v| v.as_array()) {
+                let height_bytes = height.to_string().into_bytes();
+                for tx in txs {
+                    let tx_str_owned: String;
+                    let tx_bytes: &[u8] = if let Some(s) = tx.as_str() {
+                        s.as_bytes()
+                    } else {
+                        // Defensive: a future schema change might inline
+                        // structured tx objects. Re-serialise so we still
+                        // produce a stable hash instead of silently
+                        // skipping the entry.
+                        tx_str_owned = tx.to_string();
+                        tx_str_owned.as_bytes()
+                    };
+                    let mut hasher = Sha256::new();
+                    hasher.update(tx_bytes);
+                    let tx_hash = hex::encode(hasher.finalize());
+                    let idx_key = format!("tx_index:{}", tx_hash);
+                    batch.put(idx_key.as_bytes(), &height_bytes);
+                }
+            }
         }
+
         self.write_batch(batch)
     }
 

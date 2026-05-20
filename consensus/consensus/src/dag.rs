@@ -651,15 +651,24 @@ impl DagConsensus {
                 }
 
                 if let Ok(block_json) = serde_json::to_string(&new_block) {
-                    let _ = self
+                    // H-07 FIX: route through save_block_json so block,
+                    // latest_height, latest_block_hash, and the per-tx
+                    // index are all written in a single atomic batch.
+                    // Previously these were three separate put() calls,
+                    // which (a) was not crash-safe — a sync between
+                    // height and hash updates could leave the chain
+                    // pointing at the wrong block — and (b) skipped the
+                    // tx index entirely, forcing aincore_getTransaction
+                    // to scan the whole DAG under lock.
+                    if let Err(e) = self
                         .storage
-                        .put(&format!("block_{}", self.latest_block_height), &block_json);
-                    let _ = self
-                        .storage
-                        .put("latest_height", &self.latest_block_height.to_string());
-                    let _ = self
-                        .storage
-                        .put("latest_block_hash", &self.latest_block_hash);
+                        .save_block_json(self.latest_block_height, &block_json)
+                    {
+                        eprintln!(
+                            "❌ Failed to persist block #{}: {}",
+                            self.latest_block_height, e
+                        );
+                    }
                     println!(
                         "📦 Created Block #{} (Hash: {:.8})",
                         self.latest_block_height, self.latest_block_hash

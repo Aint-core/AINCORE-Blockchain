@@ -69,6 +69,57 @@ mod tests {
         assert_eq!(db.get_tx_block_height("0xnonexistent"), None);
     }
 
+    /// H-07 REGRESSION TEST
+    ///
+    /// save_block_json must populate `tx_index:{tx_hash} -> height` for
+    /// every transaction in the block's payload, in the same atomic
+    /// batch as the block / latest_height / latest_block_hash writes.
+    /// This is what lets aincore_getTransaction do an O(1) lookup
+    /// instead of scanning the entire DAG under the consensus lock.
+    #[test]
+    fn test_save_block_json_indexes_transactions_atomically() {
+        use sha2::{Digest, Sha256};
+
+        let db = temp_db("block_json_tx_index");
+
+        // Two synthetic transaction strings — content doesn't matter for the
+        // hashing/indexing contract, only that we get stable SHA-256s.
+        let tx_a = r#"{"sender":"aaa","sequence_number":0}"#;
+        let tx_b = r#"{"sender":"bbb","sequence_number":0}"#;
+
+        let block_json = format!(
+            r#"{{"header":{{"hash":"feedface","height":7}},"transactions":[{},{}]}}"#,
+            serde_json::to_string(tx_a).unwrap(),
+            serde_json::to_string(tx_b).unwrap(),
+        );
+
+        db.save_block_json(7, &block_json).unwrap();
+
+        // Existing invariants still hold.
+        assert_eq!(db.get_chain_height(), 7);
+        assert_eq!(
+            db.get("latest_block_hash").unwrap(),
+            Some("feedface".to_string())
+        );
+
+        // New invariant: each transaction is indexed to its block height.
+        let hash_a = hex::encode(Sha256::digest(tx_a.as_bytes()));
+        let hash_b = hex::encode(Sha256::digest(tx_b.as_bytes()));
+        assert_eq!(
+            db.get_tx_block_height(&hash_a),
+            Some(7),
+            "tx A must be indexed to block 7 by save_block_json"
+        );
+        assert_eq!(
+            db.get_tx_block_height(&hash_b),
+            Some(7),
+            "tx B must be indexed to block 7 by save_block_json"
+        );
+
+        // Unknown hash returns None — index is authoritative, no full scan.
+        assert_eq!(db.get_tx_block_height("ffffffff"), None);
+    }
+
     #[test]
     fn test_scan_prefix() {
         let db = temp_db("scan_prefix");

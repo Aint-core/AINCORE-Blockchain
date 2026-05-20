@@ -1,7 +1,13 @@
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use network::PeerList;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, RwLock};
-use network::PeerList;
+
+fn permissive_cors_enabled() -> bool {
+    std::env::var("AINCORE_PERMISSIVE_CORS")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
 use actix_governor::{Governor, GovernorConfigBuilder};
 use actix_web::middleware::Logger;
 
@@ -11,6 +17,59 @@ const MAX_LIMIT: u64 = 1000;
 // --- Shared State ---
 use consensus::DagConsensus;
 use storage::StateDB;
+
+#[derive(Deserialize)]
+struct MoveCoin {
+    value: u128,
+}
+
+fn move_coin_store_key(addr: move_core_types::account_address::AccountAddress) -> String {
+    use move_core_types::{
+        account_address::AccountAddress,
+        identifier::Identifier,
+        language_storage::{StructTag, TypeTag},
+    };
+    let system = AccountAddress::from_hex_literal("0x1").expect("valid system address");
+    let coin_type = TypeTag::Struct(Box::new(StructTag {
+        address: system,
+        module: Identifier::new("staking").expect("valid module"),
+        name: Identifier::new("AincoreCoin").expect("valid coin"),
+        type_params: vec![],
+    }));
+    let store = StructTag {
+        address: system,
+        module: Identifier::new("coin").expect("valid module"),
+        name: Identifier::new("CoinStore").expect("valid store"),
+        type_params: vec![coin_type],
+    };
+    format!("resource_{}_{}", addr, store)
+}
+
+fn move_balance(storage: &Arc<StateDB>, addr: &str) -> String {
+    let move_addr = match move_core_types::account_address::AccountAddress::from_hex_literal(
+        &format!("0x{}", addr),
+    ) {
+        Ok(addr) => addr,
+        Err(_) => return "0".to_string(),
+    };
+    let key = move_coin_store_key(move_addr);
+    storage
+        .get(&key)
+        .ok()
+        .flatten()
+        .and_then(|hex_value| hex::decode(hex_value).ok())
+        .and_then(|bytes| bcs::from_bytes::<MoveCoin>(&bytes).ok())
+        .map(|coin| coin.value.to_string())
+        .unwrap_or_else(|| "0".to_string())
+}
+
+fn stored_tx_receipt(storage: &Arc<StateDB>, tx_hash: &str) -> Option<serde_json::Value> {
+    storage
+        .get(&format!("tx_receipt:{}", tx_hash))
+        .ok()
+        .flatten()
+        .and_then(|receipt| serde_json::from_str(&receipt).ok())
+}
 
 // --- Shared State ---
 pub struct AppState {
@@ -58,9 +117,18 @@ async fn json_rpc_handler(
             // params: [address]
             if let Some(addr) = params.get(0).and_then(|v| v.as_str()) {
                 if let Some(obj) = data.storage.get_object(addr) {
-                     Ok(serde_json::json!(obj))
+                     let mut value = serde_json::json!(obj);
+                     if let Some(map) = value.as_object_mut() {
+                         map.insert("move_balance".to_string(), serde_json::json!(move_balance(&data.storage, addr)));
+                         map.insert("balance_source".to_string(), serde_json::json!("move_coin_store"));
+                     }
+                     Ok(value)
                 } else {
-                     Ok(serde_json::json!(null))
+                     Ok(serde_json::json!({
+                         "id": addr,
+                         "move_balance": move_balance(&data.storage, addr),
+                         "balance_source": "move_coin_store"
+                     }))
                 }
             } else {
                 Err(JsonRpcError { code: -32602, message: "Invalid params".into() })
@@ -94,20 +162,22 @@ async fn json_rpc_handler(
 
             if let Some(tx_str) = tx_str_opt {
                 let mut mempool = data.mempool.lock().unwrap_or_else(|e| e.into_inner());
-                mempool.add_transaction(tx_str.clone());
-                // std::fs::write("debug_api.log", format!("Received TX: {}\n", tx_str)).ok();
-                
-                // Calculate Hash
-                use sha2::{Sha256, Digest};
-                let mut hasher = Sha256::new();
-                hasher.update(tx_str.as_bytes());
-                let result = hasher.finalize();
-                let tx_hash = hex::encode(result);
-                
-                Ok(serde_json::json!({ "status": "sent", "tx_hash": tx_hash }))
+                match mempool.add_transaction(tx_str) {
+                    Ok(tx_hash) => Ok(serde_json::json!({ "status": "sent", "tx_hash": tx_hash })),
+                    Err(reason) => Err(JsonRpcError {
+                        code: -32010,
+                        message: format!("Transaction rejected by mempool: {}", reason),
+                    }),
+                }
             } else {
                 Err(JsonRpcError { code: -32602, message: "Invalid params: Expected JSON string or object".into() })
             }
+        },
+        "submit_transaction_with_key" => {
+            Err(JsonRpcError {
+                code: -32040,
+                message: "submit_transaction_with_key disabled in secure mode; submit signed transaction via aincore_sendTransaction".into(),
+            })
         },
         "aincore_nodeStatus" => {
              let consensus = data.consensus.read().unwrap_or_else(|e| e.into_inner());
@@ -120,7 +190,39 @@ async fn json_rpc_handler(
                      Ok(Some(h)) => h,
                      _ => "0".to_string(),
                  },
+                 "finalized_round": match data.storage.get("consensus:finalized_round") {
+                     Ok(Some(v)) => v,
+                     _ => "0".to_string(),
+                 },
+                 "last_anchor_round": match data.storage.get("consensus:last_anchor_round") {
+                     Ok(Some(v)) => v,
+                     _ => "0".to_string(),
+                 },
+                 "finality_digest": match data.storage.get("consensus:finality_digest") {
+                     Ok(Some(v)) => v,
+                     _ => String::new(),
+                 },
              }))
+        },
+        "aincore_getFinalityStatus" => {
+            Ok(serde_json::json!({
+                "finalized_round": match data.storage.get("consensus:finalized_round") {
+                    Ok(Some(v)) => v,
+                    _ => "0".to_string(),
+                },
+                "last_anchor_round": match data.storage.get("consensus:last_anchor_round") {
+                    Ok(Some(v)) => v,
+                    _ => "0".to_string(),
+                },
+                "last_anchor_hash": match data.storage.get("consensus:last_anchor_hash") {
+                    Ok(Some(v)) => v,
+                    _ => String::new(),
+                },
+                "finality_digest": match data.storage.get("consensus:finality_digest") {
+                    Ok(Some(v)) => v,
+                    _ => String::new(),
+                }
+            }))
         },
         "aincore_getDag" => {
             let consensus = data.consensus.read().unwrap_or_else(|e| e.into_inner());
@@ -128,48 +230,126 @@ async fn json_rpc_handler(
             let vertices: Vec<_> = dag.values().cloned().collect();
             Ok(serde_json::json!(vertices))
         },
-        "aincore_getTransaction" => {
-            // params: [tx_hash]
-            if let Some(target_hash) = params.get(0).and_then(|v| v.as_str()) {
-                let consensus = data.consensus.read().unwrap_or_else(|e| e.into_inner());
-                let dag = consensus.dag.lock().unwrap_or_else(|e| e.into_inner());
-                
-                let mut found_tx = None;
-                
-                // Scan all vertices (inefficient but works for prototype)
-                'outer: for vertex in dag.values() {
-                    for tx_str in &vertex.payload {
-                        use sha2::{Sha256, Digest};
-                        let mut hasher = Sha256::new();
-                        hasher.update(tx_str.as_bytes());
-                        let result = hasher.finalize();
-                        let tx_hash = hex::encode(result);
-                        
-                        if tx_hash == target_hash {
-                            // Parse JSON to return structured data
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tx_str) {
-                                found_tx = Some(parsed);
-                            } else {
-                                found_tx = Some(serde_json::json!({ "raw": tx_str }));
-                            }
-                            break 'outer;
-                        }
-                    }
-                }
-                
-                if let Some(tx) = found_tx {
-                    Ok(tx)
+        "aincore_getTransactionReceipt" => {
+            if let Some(tx_hash) = params.get(0).and_then(|v| v.as_str()) {
+                let execution_receipt = stored_tx_receipt(&data.storage, tx_hash);
+                if let Some(block_height) = data.storage.get_tx_block_height(tx_hash) {
+                    let block_key = format!("block_{}", block_height);
+                    let block_data = match data.storage.get(&block_key) {
+                        Ok(Some(b)) => serde_json::from_str::<serde_json::Value>(&b).ok(),
+                        _ => None,
+                    };
+                    let latest_height = data.storage.get_chain_height();
+                    let confirmations = latest_height.saturating_sub(block_height);
+                    let status = execution_receipt
+                        .as_ref()
+                        .and_then(|receipt| receipt.get("status"))
+                        .and_then(|status| status.as_str())
+                        .unwrap_or("confirmed");
+                    Ok(serde_json::json!({
+                        "tx_hash": tx_hash,
+                        "block_height": block_height,
+                        "confirmations": confirmations,
+                        "status": status,
+                        "execution_receipt": execution_receipt,
+                        "block_hash": block_data.as_ref()
+                            .and_then(|b| b.get("header"))
+                            .and_then(|h| h.get("hash"))
+                            .and_then(|h| h.as_str())
+                            .unwrap_or("")
+                    }))
+                } else if let Some(receipt) = execution_receipt {
+                    let status = receipt
+                        .get("status")
+                        .and_then(|status| status.as_str())
+                        .unwrap_or("executed");
+                    Ok(serde_json::json!({
+                        "tx_hash": tx_hash,
+                        "status": status,
+                        "confirmations": 0,
+                        "execution_receipt": receipt
+                    }))
                 } else {
-                    Ok(serde_json::json!(null))
+                    let in_mempool = data
+                        .mempool
+                        .lock()
+                        .map(|mempool| mempool.len() > 0)
+                        .unwrap_or(false);
+                    Ok(serde_json::json!({
+                        "tx_hash": tx_hash,
+                        "status": if in_mempool { "pending" } else { "not_found" },
+                        "confirmations": 0
+                    }))
                 }
             } else {
+                Err(JsonRpcError { code: -32602, message: "Invalid params: [tx_hash]".into() })
+            }
+        },
+        "aincore_getTransaction" => {
+            // params: [tx_hash]
+            //
+            // H-07 FIX: previously this acquired the consensus read lock,
+            // then the DAG lock, then scanned every vertex hashing every
+            // payload tx — O(N·M) under lock, which stalled block
+            // production whenever a wallet polled for tx status.
+            //
+            // Block commit now writes `tx_index:{tx_hash} -> block_height`
+            // atomically with the block (see StateDB::save_block_json),
+            // so we can do O(1) → O(M_block) lookup with no consensus
+            // locks held. We deliberately do NOT fall back to a full DAG
+            // scan if the index miss: the index is authoritative once
+            // a block is committed, so a miss means the tx is either
+            // still pending (mempool path elsewhere) or genuinely
+            // unknown. Forcing a scan-on-miss would let attackers
+            // restore the original DoS by spamming unknown-hash queries.
+            //
+            // Wrapped in a closure so `?`-style early exits do not escape
+            // the outer json_rpc_handler function signature.
+            let lookup = || -> Option<serde_json::Value> {
+                let target_hash = params.get(0).and_then(|v| v.as_str())?;
+                let block_height = data.storage.get_tx_block_height(target_hash)?;
+                let block_json = data
+                    .storage
+                    .get(&format!("block_{}", block_height))
+                    .ok()
+                    .flatten()?;
+                let block: serde_json::Value = serde_json::from_str(&block_json).ok()?;
+                let txs = block.get("transactions").and_then(|v| v.as_array())?;
+
+                use sha2::{Digest, Sha256};
+                for tx in txs {
+                    let tx_str_owned: String;
+                    let tx_bytes: &[u8] = if let Some(s) = tx.as_str() {
+                        s.as_bytes()
+                    } else {
+                        tx_str_owned = tx.to_string();
+                        tx_str_owned.as_bytes()
+                    };
+                    let mut hasher = Sha256::new();
+                    hasher.update(tx_bytes);
+                    let tx_hash = hex::encode(hasher.finalize());
+                    if tx_hash == target_hash {
+                        if let Some(s) = tx.as_str() {
+                            return serde_json::from_str::<serde_json::Value>(s)
+                                .ok()
+                                .or_else(|| Some(serde_json::json!({ "raw": s })));
+                        }
+                        return Some(tx.clone());
+                    }
+                }
+                None
+            };
+
+            if params.get(0).and_then(|v| v.as_str()).is_none() {
                 Err(JsonRpcError { code: -32602, message: "Invalid params".into() })
+            } else {
+                Ok(lookup().unwrap_or(serde_json::Value::Null))
             }
         },
         "aincore_getBlocks" => {
             // params: [limit] (optional, default 10)
             let limit = params.get(0).and_then(|v| v.as_u64()).unwrap_or(10);
-            
+
             // INPUT VALIDATION: Limit max blocks to prevent DoS
             if limit > MAX_LIMIT {
                 return HttpResponse::BadRequest().json(JsonRpcResponse {
@@ -182,18 +362,18 @@ async fn json_rpc_handler(
                     id: req.id.clone(),
                 });
             }
-            
+
             let latest_height: u64 = match data.storage.get("latest_height") {
                 Ok(Some(h)) => h.parse::<u64>().unwrap_or(0),
                 _ => 0,
             };
-            
+
             println!("🔍 [API] aincore_getBlocks: latest_height = {}", latest_height);
-            
+
             let mut blocks = Vec::new();
             let start = latest_height;
             let start_index = latest_height.saturating_sub(limit);
-            
+
             for i in (start_index..=start).rev() {
                 let key = format!("block_{}", i);
                 if let Ok(Some(block_json)) = data.storage.get(&key) {
@@ -202,7 +382,7 @@ async fn json_rpc_handler(
                     }
                 }
             }
-            
+
             Ok(serde_json::json!(blocks))
         },
         "aincore_getPeers" => {
@@ -264,7 +444,6 @@ async fn metrics_handler() -> impl Responder {
 // --- Server setup ---
 // use consensus::SimpleConsensus; // Removed
 
-
 // ...
 
 pub async fn start_api_server(
@@ -282,7 +461,7 @@ pub async fn start_api_server(
         mempool,
         storage,
     });
-    
+
     // Rate limiter: 100 requests per second per IP
     let governor_conf = GovernorConfigBuilder::default()
         .per_second(100)
@@ -296,8 +475,18 @@ pub async fn start_api_server(
         .run_until(
             HttpServer::new(move || {
                 use actix_cors::Cors;
-                let cors = Cors::permissive();
-                
+                let cors = if permissive_cors_enabled() {
+                    Cors::permissive()
+                } else {
+                    Cors::default()
+                        .allowed_origin("http://localhost:3000")
+                        .allowed_origin("http://127.0.0.1:3000")
+                        .allowed_origin("http://localhost:5173")
+                        .allowed_origin("http://127.0.0.1:5173")
+                        .allow_any_header()
+                        .allowed_methods(vec!["POST", "GET"])
+                };
+
                 App::new()
                     .wrap(cors)
                     .wrap(Governor::new(&governor_conf))
