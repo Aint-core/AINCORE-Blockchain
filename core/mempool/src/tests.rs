@@ -249,3 +249,111 @@ fn test_oversized_tx_rejected_before_signature_verification() {
         err
     );
 }
+
+/// H-01 REGRESSION TEST
+///
+/// Mempool must fail-closed for PQC (9254-char Dilithium5 hex) signatures
+/// until full Dilithium5 verification is wired at the mempool layer.
+/// Previously this path silently accepted any string of the right length
+/// without checking sender↔pubkey binding or running signature verify,
+/// turning the mempool into a free DoS surface that only got cleaned up
+/// inside block execution.
+#[test]
+fn test_pqc_signature_rejected_at_mempool_until_wired() {
+    let mut mempool = Mempool::new();
+
+    let chain_id = std::env::var("AINCORE_CHAIN_ID")
+        .unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+    // 9254 hex chars = 4627 bytes raw = Dilithium5 detached signature length.
+    let fake_pqc_sig = "ab".repeat(9254 / 2);
+    assert_eq!(fake_pqc_sig.len(), 9254);
+
+    let payload = hex::encode(
+        bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![1u8]]))
+            .unwrap(),
+    );
+
+    let tx = serde_json::json!({
+        "chain_id": chain_id,
+        "sender": "deadbeefdeadbeefdeadbeefdeadbeef",
+        "input_objects": [],
+        "payload": payload,
+        "args": [],
+        "gas_limit": 1000,
+        "gas_price": 1,
+        "sequence_number": 0,
+        // Public key length is irrelevant — H-01 gate triggers off the
+        // signature length first, before any Ed25519 / PQC processing.
+        "public_key": "00".repeat(32),
+        "signature": fake_pqc_sig,
+    })
+    .to_string();
+
+    let err = mempool
+        .add_transaction(tx)
+        .expect_err("PQC submissions must be rejected at the mempool layer");
+
+    assert!(
+        err.contains("PQC") || err.contains("Dilithium"),
+        "PQC reject must clearly tell submitters the gate is closed. \
+         Got error: {:?}",
+        err
+    );
+}
+
+/// H-04 REGRESSION TEST
+///
+/// Mempool must fail-closed for any transaction that carries a non-empty
+/// `zkp_proof` field until the STARK verifier is wired into block
+/// execution. Previously the executor logged the presence of the proof
+/// and continued — pure security theater that gave users a false sense
+/// of assurance.
+#[test]
+fn test_zkp_tagged_transaction_rejected_at_mempool_until_wired() {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let mut mempool = Mempool::new();
+
+    let seed = [44u8; 32];
+    let signing_key = SigningKey::from_bytes(&seed);
+    let public_key = hex::encode(signing_key.verifying_key().to_bytes());
+    let sender = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
+    let chain_id = std::env::var("AINCORE_CHAIN_ID")
+        .unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+    let payload = hex::encode(
+        bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![7u8]]))
+            .unwrap(),
+    );
+    let sequence_number = 0u64;
+    let message = format!("{}:{}:{}:{}", chain_id, sender, payload, sequence_number);
+    let signature = signing_key.sign(message.as_bytes());
+    let sig_hex = hex::encode(signature.to_bytes());
+
+    // Attach a non-empty zkp_proof — value doesn't matter, the gate trips
+    // on presence + non-emptiness alone.
+    let tx = serde_json::json!({
+        "chain_id": chain_id,
+        "sender": sender,
+        "input_objects": [],
+        "payload": payload,
+        "args": [],
+        "gas_limit": 1000,
+        "gas_price": 1,
+        "sequence_number": sequence_number,
+        "public_key": public_key,
+        "signature": sig_hex,
+        "zkp_proof": "deadbeef",
+    })
+    .to_string();
+
+    let err = mempool
+        .add_transaction(tx)
+        .expect_err("ZKP-tagged tx must be rejected at mempool until verifier is wired");
+
+    assert!(
+        err.contains("ZKP") || err.contains("STARK") || err.contains("fail-closed"),
+        "ZKP reject must clearly tell submitters the verifier is not yet wired. \
+         Got error: {:?}",
+        err
+    );
+}

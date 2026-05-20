@@ -75,6 +75,32 @@ impl Mempool {
             return Err("Gas limit must be greater than 0".to_string());
         }
 
+        // === H-04 FIX: ZKP PROOF FAIL-CLOSED ===
+        //
+        // The Transaction struct carries an optional `zkp_proof` field that
+        // the executor used to log-but-not-verify. Accepting transactions
+        // tagged with a "ZKP proof" while doing nothing with it is worse
+        // than rejecting them: it gives users a false sense of additional
+        // assurance and makes future enablement risky (any naïve client
+        // pinning to "ZKP enabled" semantics would have to be re-signed
+        // once the verifier finally runs).
+        //
+        // Until the STARK verifier is wired end-to-end (proof decoding,
+        // public-input binding to the tx hash, and verification result
+        // gating execution), refuse any submission that carries a non-empty
+        // zkp_proof. This is the fail-closed-sementara pattern: keep the
+        // infra and tests around, just close the door at the entry point.
+        if let Some(ref proof_hex) = parsed_tx.zkp_proof {
+            if !proof_hex.is_empty() {
+                return Err(
+                    "ZKP proofs are not yet verified by the executor and are \
+                     intentionally fail-closed at the mempool until the STARK \
+                     verifier is wired. Resubmit with zkp_proof = null."
+                        .to_string(),
+                );
+            }
+        }
+
         let payload_bytes = hex::decode(parsed_tx.payload.trim_start_matches("0x"))
             .map_err(|_| "Invalid payload hex: expected BCS TransactionPayload".to_string())?;
         match bcs::from_bytes::<vm_move::TransactionPayload>(&payload_bytes) {
@@ -86,6 +112,41 @@ impl Mempool {
             Err(e) => {
                 return Err(format!("Invalid BCS TransactionPayload: {}", e));
             }
+        }
+
+        // === H-01 FIX: PQC FAIL-CLOSED AT MEMPOOL ===
+        //
+        // The Dilithium5 path is verified at the VM layer (vm_move). That
+        // verification is correct on its own, but the mempool used to
+        // silently accept any 9254-char hex string as "PQC signature" and
+        // forward it down without:
+        //   - checking sender == derive_address(pubkey)
+        //   - actually verifying the signature
+        //
+        // That turned the mempool into a free DoS surface: an attacker
+        // could flood the queue with 9254-char garbage that only gets
+        // rejected during block execution, after consuming mempool slots
+        // and pulling executor cycles.
+        //
+        // Until the full Dilithium5 verification is wired at the mempool
+        // entry (matching the VM-layer logic and storing the canonical
+        // sender↔pqc_pubkey binding), refuse PQC submissions at this
+        // gate. Existing PQC infra (CLI keygen, VM-level verification,
+        // vm_move test_pqc_dilithium_detection) is intentionally NOT
+        // disabled — they exercise the VM path directly without going
+        // through the mempool.
+        //
+        // When PQC is ready for mempool acceptance, replace this branch
+        // with a real Dilithium5 verification mirroring vm_move's logic.
+        const PQC_DILITHIUM5_HEX_LEN: usize = 9254;
+        if parsed_tx.signature.len() == PQC_DILITHIUM5_HEX_LEN {
+            return Err(
+                "PQC (Dilithium5) signatures are not yet accepted at the \
+                 mempool layer. This path is intentionally fail-closed until \
+                 full Dilithium5 verification is wired at submission time. \
+                 Use Ed25519 (signature.len() == 128 hex chars) for now."
+                    .to_string(),
+            );
         }
 
         // === EARLY SIGNATURE VERIFICATION (DoS Protection) ===
@@ -132,9 +193,9 @@ impl Mempool {
             } else {
                 return Err("Invalid public key hex".to_string());
             }
-        } else if parsed_tx.signature.len() == 9254 {
-            // Pass PQC validation down to Executor for performance
         } else {
+            // PQC (9254-char Dilithium5) is rejected earlier by the H-01
+            // fail-closed gate. Any other length is unsupported.
             return Err("Unknown Signature Scheme size".to_string());
         }
 

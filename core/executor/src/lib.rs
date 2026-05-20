@@ -1138,22 +1138,28 @@ impl Executor {
                 return None;
             }
 
-            // 2b. Verify ZKP proof if present (optional STARK proof verification)
+            // 2b. H-04 FIX: ZKP proof fail-closed (defense in depth).
+            //
+            // Previously this block logged the presence of a zkp_proof and
+            // then continued execution as if everything was fine — pure
+            // security theater. The mempool is now also fail-closed on this
+            // field, but block execution may still see ZKP-tagged
+            // transactions from peers running an older mempool, from
+            // gossip, or from any future path that bypasses the mempool
+            // (e.g. block sync). Reject them here to make the policy
+            // uniform: no execution path silently accepts an unverified
+            // ZKP claim. When the STARK verifier is wired, replace this
+            // reject with the actual verification call (decode → bind
+            // public inputs → verify → gate execution on the result).
             if let Some(ref proof_hex) = tx.zkp_proof {
                 if !proof_hex.is_empty() {
-                    // Log that we have a ZKP proof attached
                     println!(
-                        "🔐 Transaction has ZKP proof ({} bytes)",
+                        "❌ Transaction carries zkp_proof ({} bytes) but the \
+                         STARK verifier is not yet wired. Rejecting (H-04 \
+                         fail-closed).",
                         proof_hex.len() / 2
                     );
-
-                    // In production, this would verify the STARK proof:
-                    // use crypto::zkp::{STARKVerifier, STARKProofData};
-                    // let proof_bytes = hex::decode(proof_hex)?;
-                    // let proof = STARKProofData::from_bytes(&proof_bytes)?;
-                    // if !verifier.verify(&proof) { return None; }
-
-                    // For now, presence of proof is logged for future integration
+                    return None;
                 }
             }
 
