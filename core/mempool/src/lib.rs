@@ -1,13 +1,15 @@
-use std::collections::{VecDeque, HashSet};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
+use std::collections::{HashSet, VecDeque};
 
 const MAX_PENDING_TXS: usize = 5000;
 const MAX_SEEN_TXS: usize = 50000;
+const MIN_GAS_PRICE: u128 = 1;
 
 pub struct Mempool {
     pending_txs: VecDeque<String>,
-    seen_txs: HashSet<String>, // Deduplication
-    seen_order: VecDeque<String>, // Bounded cache tracking
+    seen_txs: HashSet<String>,       // Deduplication
+    seen_order: VecDeque<String>,    // Bounded cache tracking
+    pending_nonces: HashSet<String>, // sender:sequence_number in the pending queue
 }
 
 impl Mempool {
@@ -16,6 +18,7 @@ impl Mempool {
             pending_txs: VecDeque::new(),
             seen_txs: HashSet::new(),
             seen_order: VecDeque::new(),
+            pending_nonces: HashSet::new(),
         }
     }
 }
@@ -27,44 +30,112 @@ impl Default for Mempool {
 }
 
 impl Mempool {
-    pub fn add_transaction(&mut self, tx: String) {
+    pub fn add_transaction(&mut self, tx: String) -> Result<String, String> {
+        // === M-04 FIX: SIZE GUARD FIRST (cheapest reject path) ===
+        //
+        // Hard size cap BEFORE we touch serde_json, hex decode, BCS, or any
+        // signature/PQC verification. Previously the 100KB check sat after
+        // Ed25519 verify (and after BCS parse), meaning an attacker could
+        // burn server CPU on serde + crypto for arbitrarily large payloads
+        // before being rejected. Moving it to the very first line bounds
+        // the worst-case wasted work to one `.len()` call.
+        const TX_BYTE_LIMIT: usize = 100 * 1024; // 100KB
+        if tx.len() > TX_BYTE_LIMIT {
+            return Err(format!(
+                "Transaction too large ({} bytes). limit {}KB.",
+                tx.len(),
+                TX_BYTE_LIMIT / 1024
+            ));
+        }
+
         // === CHAIN ID VALIDATION ===
         // L5 FIX: Match mainnet genesis default to prevent unexpected rejections
-        let expected_chain = std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
-        
+        let expected_chain =
+            std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+
         // Parse the transaction to enforce Chain ID early
         use executor::Transaction;
-        if let Ok(parsed_tx) = serde_json::from_str::<Transaction>(&tx) {
-            if parsed_tx.chain_id != expected_chain {
-                println!("❌ [Mempool] Rejected tx: Invalid Chain ID (Expected {}, Got {})", expected_chain, parsed_tx.chain_id);
-                return;
+        let parsed_tx = serde_json::from_str::<Transaction>(&tx)
+            .map_err(|_| "Invalid JSON format".to_string())?;
+        if parsed_tx.chain_id != expected_chain {
+            return Err(format!(
+                "Invalid Chain ID (Expected {}, Got {})",
+                expected_chain, parsed_tx.chain_id
+            ));
+        }
+
+        if parsed_tx.gas_price < MIN_GAS_PRICE {
+            return Err(format!(
+                "Gas price too low: {} < minimum {}",
+                parsed_tx.gas_price, MIN_GAS_PRICE
+            ));
+        }
+
+        if parsed_tx.gas_limit == 0 {
+            return Err("Gas limit must be greater than 0".to_string());
+        }
+
+        let payload_bytes = hex::decode(parsed_tx.payload.trim_start_matches("0x"))
+            .map_err(|_| "Invalid payload hex: expected BCS TransactionPayload".to_string())?;
+        match bcs::from_bytes::<vm_move::TransactionPayload>(&payload_bytes) {
+            Ok(vm_move::TransactionPayload::EntryFunction(_))
+            | Ok(vm_move::TransactionPayload::PublishModule(_)) => {}
+            Ok(vm_move::TransactionPayload::Script(_)) => {
+                return Err("Raw script payloads are disabled".to_string());
             }
-            
-            // === EARLY SIGNATURE VERIFICATION (DoS Protection) ===
-            if parsed_tx.signature.len() == 128 { // 64 bytes hex
-                use ed25519_dalek::{Verifier, VerifyingKey, Signature};
-                if let Ok(pk_bytes) = hex::decode(&parsed_tx.public_key) {
-                    if let Ok(vk) = VerifyingKey::from_bytes(pk_bytes.as_slice().try_into().unwrap_or(&[0;32])) {
-                        if let Ok(sig_bytes) = hex::decode(&parsed_tx.signature) {
-                            if let Ok(sig) = Signature::from_slice(&sig_bytes) {
-                                let message = format!("{}:{}:{}:{}", parsed_tx.chain_id, parsed_tx.sender, parsed_tx.payload, parsed_tx.sequence_number);
-                                if vk.verify(message.as_bytes(), &sig).is_err() {
-                                    println!("❌ [Mempool] Rejected tx: Invalid Signature Verification");
-                                    return;
-                                }
-                            } else { return; }
-                        } else { return; }
-                    } else { return; }
-                } else { return; }
-            } else if parsed_tx.signature.len() == 9254 {
-                // Pass PQC validation down to Executor for performance
+            Err(e) => {
+                return Err(format!("Invalid BCS TransactionPayload: {}", e));
+            }
+        }
+
+        // === EARLY SIGNATURE VERIFICATION (DoS Protection) ===
+        if parsed_tx.signature.len() == 128 {
+            // 64 bytes hex
+            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+            if let Ok(pk_bytes) = hex::decode(&parsed_tx.public_key) {
+                match crypto::derive_address(&pk_bytes) {
+                    Ok(expected_sender) if expected_sender == parsed_tx.sender => {}
+                    Ok(expected_sender) => {
+                        return Err(format!(
+                            "Sender mismatch (expected {}, got {})",
+                            expected_sender, parsed_tx.sender
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(format!("Address derivation failed: {}", e));
+                    }
+                }
+                if let Ok(vk) =
+                    VerifyingKey::from_bytes(pk_bytes.as_slice().try_into().unwrap_or(&[0; 32]))
+                {
+                    if let Ok(sig_bytes) = hex::decode(&parsed_tx.signature) {
+                        if let Ok(sig) = Signature::from_slice(&sig_bytes) {
+                            let message = format!(
+                                "{}:{}:{}:{}",
+                                parsed_tx.chain_id,
+                                parsed_tx.sender,
+                                parsed_tx.payload,
+                                parsed_tx.sequence_number
+                            );
+                            if vk.verify(message.as_bytes(), &sig).is_err() {
+                                return Err("Invalid Signature Verification".to_string());
+                            }
+                        } else {
+                            return Err("Invalid signature bytes".to_string());
+                        }
+                    } else {
+                        return Err("Invalid signature hex".to_string());
+                    }
+                } else {
+                    return Err("Invalid public key".to_string());
+                }
             } else {
-                println!("❌ [Mempool] Rejected tx: Unknown Signature Scheme size");
-                return;
+                return Err("Invalid public key hex".to_string());
             }
+        } else if parsed_tx.signature.len() == 9254 {
+            // Pass PQC validation down to Executor for performance
         } else {
-             println!("❌ [Mempool] Rejected tx: Invalid JSON format");
-             return;
+            return Err("Unknown Signature Scheme size".to_string());
         }
 
         // Calculate Hash for Deduplication
@@ -73,19 +144,26 @@ impl Mempool {
         let tx_hash = hex::encode(hasher.finalize());
 
         if self.seen_txs.contains(&tx_hash) {
-            println!("⚠️ Ignored duplicate transaction: {}", tx_hash);
-            return;
+            return Err(format!("Duplicate transaction: {}", tx_hash));
         }
 
-        // 1. Check Transaction Size to prevent RAM DoS
-        if tx.len() > 100 * 1024 { // 100KB Limit
-             println!("⚠️ Transaction too large ({} bytes). limit 100KB.", tx.len());
-             return;
-        }
+        // (M-04: size guard was moved to the top of add_transaction so it
+        // runs before any expensive parsing or signature verification.)
 
         if self.pending_txs.len() >= MAX_PENDING_TXS {
-             println!("⚠️ Mempool Full ({}/{}) - Rejecting transaction {}", self.pending_txs.len(), MAX_PENDING_TXS, tx_hash);
-             return;
+            return Err(format!(
+                "Mempool full ({}/{})",
+                self.pending_txs.len(),
+                MAX_PENDING_TXS
+            ));
+        }
+
+        let nonce_key = format!("{}:{}", parsed_tx.sender, parsed_tx.sequence_number);
+        if self.pending_nonces.contains(&nonce_key) {
+            return Err(format!(
+                "Duplicate pending nonce for sender {} sequence {}",
+                parsed_tx.sender, parsed_tx.sequence_number
+            ));
         }
 
         // Bounded LRU-style eviction
@@ -97,9 +175,14 @@ impl Mempool {
 
         self.seen_txs.insert(tx_hash.clone());
         self.seen_order.push_back(tx_hash.clone());
+        self.pending_nonces.insert(nonce_key);
         self.pending_txs.push_back(tx.clone());
-        
-        println!("📥 Added transaction to mempool: {}", self.pending_txs.len());
+
+        println!(
+            "📥 Added transaction to mempool: {}",
+            self.pending_txs.len()
+        );
+        Ok(tx_hash)
     }
 
     pub fn get_pending_transactions(&mut self, limit: usize) -> Vec<String> {
@@ -107,6 +190,7 @@ impl Mempool {
         let mut count = 0;
         while count < limit && !self.pending_txs.is_empty() {
             if let Some(tx) = self.pending_txs.pop_front() {
+                self.remove_pending_nonce(&tx);
                 transactions.push(tx);
                 count += 1;
             }
@@ -124,6 +208,15 @@ impl Mempool {
 
     pub fn get_all_pending(&self) -> &VecDeque<String> {
         &self.pending_txs
+    }
+
+    fn remove_pending_nonce(&mut self, tx: &str) {
+        if let Ok(parsed_tx) = serde_json::from_str::<executor::Transaction>(tx) {
+            self.pending_nonces.remove(&format!(
+                "{}:{}",
+                parsed_tx.sender, parsed_tx.sequence_number
+            ));
+        }
     }
 }
 
