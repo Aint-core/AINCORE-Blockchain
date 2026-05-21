@@ -1,0 +1,59 @@
+error: could not compile `crypto` (lib test) due to 4 previous errors; 27 warnings emitted
+error: self-assignment of `state[0]` to `state[0]`
+error: self-assignment of `state[1]` to `state[1]`
+error: self-assignment of `state[2]` to `state[2]`
+error: self-assignment of `state[3]` to `state[3]`
+warning: `aincore-cli` (bin "aincore-cli" test) generated 1 warning (1 duplicate)
+warning: `aincore-cli` (bin "aincore-cli") generated 1 warning (run `cargo clippy --fix --bin "aincore-cli"` to apply 1 suggestion)
+warning: `blockchain` (lib test) generated 6 warnings (run `cargo clippy --fix --lib -p blockchain --tests` to apply 5 suggestions)
+warning: `blockchain` (lib) generated 6 warnings (6 duplicates)
+warning: `bridge-rust` (bin "bridge-rust" test) generated 3 warnings (3 duplicates)
+warning: `bridge-rust` (bin "bridge-rust") generated 3 warnings (run `cargo clippy --fix --bin "bridge-rust"` to apply 3 suggestions)
+warning: `crypto` (lib test) generated 27 warnings (15 duplicates)
+warning: `crypto` (lib) generated 15 warnings (run `cargo clippy --fix --lib -p crypto` to apply 5 suggestions)
+warning: `da_sequencer` (lib test) generated 19 warnings (13 duplicates) (run `cargo clippy --fix --lib -p da_sequencer --tests` to apply 5 suggestions)
+warning: `da_sequencer` (lib) generated 13 warnings (run `cargo clippy --fix --lib -p da_sequencer` to apply 7 suggestions)
+warning: `executor` (lib) generated 10 warnings (run `cargo clippy --fix --lib -p executor` to apply 7 suggestions)
+warning: `indexer` (bin "indexer" test) generated 4 warnings (run `cargo clippy --fix --bin "indexer" --tests` to apply 4 suggestions)
+warning: `indexer` (bin "indexer") generated 4 warnings (4 duplicates)
+warning: `network` (lib) generated 3 warnings (run `cargo clippy --fix --lib -p network` to apply 2 suggestions)
+warning: `to_string` applied to a type that implements `Display` in `format!` args
+warning: build failed, waiting for other jobs to finish...
+warning: casting to the same type is unnecessary (`u128` -> `u128`)
+warning: duplicated attribute
+warning: empty lines after doc comment
+warning: empty string literal in `println!`
+warning: it looks like you're manually copying between slices
+warning: length comparison to one
+warning: length comparison to zero
+warning: manual `RangeInclusive::contains` implementation
+warning: manual arithmetic check found
+warning: manual implementation of `.is_multiple_of()`
+warning: manual implementation of an assign operation
+warning: manually reimplementing `div_ceil`
+warning: method `default` can be confused for the standard trait method `std::default::Default::default`
+warning: stripping a prefix manually
+warning: the borrowed expression implements the required traits
+warning: the loop variable `i` is only used to index `partial_shards`
+warning: the loop variable `i` is only used to index `shards`
+warning: the loop variable `i` is only used to index `state`
+warning: the loop variable `i` is used to index `new_state`
+warning: this `else { if .. }` block can be collapsed
+warning: this `if let` can be collapsed into the outer `if let`
+warning: this `if` statement can be collapsed
+warning: this `match` expression can be replaced with `?`
+warning: this can be `std::io::Error::other(_)`
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+warning: this operation has no effect
+warning: unnecessary `if let` since only the `Ok` variant of the iterator element is used
+warning: unnecessary `if let` since only the `Some` variant of the iterator element is used
+warning: unused import: `crate::zkp::merkle_trace::MerkleTrace`
+warning: unused import: `winterfell::math::StarkField`
+warning: unused variable: `group_pk`
+warning: use of deprecated associated function `sha2::digest::generic_array::GenericArray::<T, N>::from_slice`: please upgrade to generic-array 1.x
+warning: useless use of `vec!`
+warning: very complex type used. Consider factoring parts into `type` definitions
+warning: you seem to use `.enumerate()` and immediately discard the index
+warning: you should consider adding a `Default` implementation for `DAMetrics`
+warning: you should consider adding a `Default` implementation for `LightClient`
+warning: you should consider adding a `Default` implementation for `RecursiveProver`

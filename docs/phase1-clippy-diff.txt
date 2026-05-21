@@ -1,0 +1,36 @@
+6,11c6,7
+< warning: `aincore-cli` (bin "aincore-cli" test) generated 1 warning (1 duplicate)
+< warning: `aincore-cli` (bin "aincore-cli") generated 1 warning (run `cargo clippy --fix --bin "aincore-cli"` to apply 1 suggestion)
+< warning: `blockchain` (lib test) generated 6 warnings (run `cargo clippy --fix --lib -p blockchain --tests` to apply 5 suggestions)
+< warning: `blockchain` (lib) generated 6 warnings (6 duplicates)
+< warning: `bridge-rust` (bin "bridge-rust" test) generated 3 warnings (3 duplicates)
+< warning: `bridge-rust` (bin "bridge-rust") generated 3 warnings (run `cargo clippy --fix --bin "bridge-rust"` to apply 3 suggestions)
+---
+> warning: `blockchain` (lib test) generated 6 warnings (2 duplicates) (run `cargo clippy --fix --lib -p blockchain --tests` to apply 3 suggestions)
+> warning: `blockchain` (lib) generated 6 warnings (4 duplicates) (run `cargo clippy --fix --lib -p blockchain` to apply 2 suggestions)
+16,18c12
+< warning: `executor` (lib) generated 10 warnings (run `cargo clippy --fix --lib -p executor` to apply 7 suggestions)
+< warning: `indexer` (bin "indexer" test) generated 4 warnings (run `cargo clippy --fix --bin "indexer" --tests` to apply 4 suggestions)
+< warning: `indexer` (bin "indexer") generated 4 warnings (4 duplicates)
+---
+> warning: `network` (lib test) generated 3 warnings (3 duplicates)
+20d13
+< warning: `to_string` applied to a type that implements `Display` in `format!` args
+22d14
+< warning: casting to the same type is unnecessary (`u128` -> `u128`)
+24,25c16
+< warning: empty lines after doc comment
+< warning: empty string literal in `println!`
+---
+> warning: empty line after doc comment
+30d20
+< warning: manual arithmetic check found
+43,44d32
+< warning: this `if` statement can be collapsed
+< warning: this `match` expression can be replaced with `?`
+48,49d35
+< warning: unnecessary `if let` since only the `Ok` variant of the iterator element is used
+< warning: unnecessary `if let` since only the `Some` variant of the iterator element is used
+55,56d40
+< warning: very complex type used. Consider factoring parts into `type` definitions
+< warning: you seem to use `.enumerate()` and immediately discard the index
