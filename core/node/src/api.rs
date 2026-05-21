@@ -273,7 +273,7 @@ async fn json_rpc_handler(
                     let in_mempool = data
                         .mempool
                         .lock()
-                        .map(|mempool| mempool.len() > 0)
+                        .map(|mempool| !mempool.is_empty())
                         .unwrap_or(false);
                     Ok(serde_json::json!({
                         "tx_hash": tx_hash,

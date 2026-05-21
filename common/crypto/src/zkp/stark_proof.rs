@@ -455,7 +455,7 @@ mod tests {
         assert!(result.is_ok());
 
         let proof_bytes = result.unwrap();
-        assert!(proof_bytes.len() > 0);
+        assert!(!proof_bytes.is_empty());
 
         // Verify batch
         let verify_result = verify_batch_proof(&proof_bytes);
@@ -465,8 +465,6 @@ mod tests {
 
     #[test]
     fn test_merkle_batch_proof_integration() {
-        use crate::zkp::merkle_trace::MerkleTrace;
-
         // Create test data
         let merkle_data = vec![
             (42u64, vec![10, 20, 30, 40, 50, 60, 70, 80], vec![false; 8]),
@@ -474,7 +472,6 @@ mod tests {
         ];
 
         // Calculate expected roots dynamically
-        use winterfell::math::StarkField;
         let mut merkle_proofs = Vec::new();
         for (leaf, path, path_bits) in merkle_data {
             merkle_proofs.push((leaf, path, path_bits));

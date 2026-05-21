@@ -50,6 +50,7 @@ impl DagConsensus {
         (validator_count * 2 / 3) + 1
     }
 
+    #[allow(clippy::too_many_arguments)] // intrinsic to DagConsensus dependencies
     pub fn new(
         node_id: String,
         peers: PeerList,
@@ -78,18 +79,21 @@ impl DagConsensus {
             // Phase 2.5 → Phase 4.A2: production checkpoints are signed with
             // the node's Ed25519 key. On load we re-verify the signature:
             //   - signature present + valid  → fast recovery from checkpoint
-            //   - signature present + invalid → REJECT checkpoint, fall back
-            //     to full scan_vertices replay (safety over speed)
-            //   - signature absent           → REJECT (Phase 4.A2)
+            //   - signature present + invalid → REJECT fast recovery, fall
+            //     back to full scan_vertices replay (safety over speed)
+            //   - signature absent           → REJECT fast recovery, fall
+            //     back to full scan_vertices replay (Phase 4.A2)
             //
-            // The previous "legacy unsigned → accept with warning" branch
-            // was an attack vector: an operator-level adversary with storage
-            // write access could DELETE the signature blob to forge a
-            // checkpoint. Phase 4.A2 closes that loophole: a node booting
-            // against unsigned checkpoint data now ALWAYS falls back to
-            // the safe scan_vertices replay path. Operators upgrading from
-            // pre-Phase-2 take a one-time longer boot until their node
-            // produces a fresh signed checkpoint.
+            // ⚠️  PRECISE SCOPE OF A2 FIX:
+            //   "Reject unsigned checkpoint" here means "do not use it for
+            //   fast recovery"; it does NOT mean the node fails-fast on boot.
+            //   The node still boots successfully via the slower
+            //   scan_vertices replay path. This closes the legacy-bypass
+            //   attack vector (operator-level adversary deleting the
+            //   signature blob to forge a checkpoint) while preserving
+            //   one-time recovery for operators upgrading from pre-Phase-2
+            //   installs — they incur a single longer boot until their
+            //   node produces a fresh signed checkpoint.
             let checkpoint_accepted: bool;
             if let Some(checkpoint_data) = storage.get_dag_checkpoint(checkpoint_round) {
                 checkpoint_accepted = match storage
@@ -129,13 +133,13 @@ impl DagConsensus {
                         }
                     }
                     None => {
-                        // Phase 4.A2: REJECT unsigned checkpoints. Falling
-                        // back to safe scan replay closes the
-                        // "delete-signature → forge-checkpoint" attack.
+                        // Phase 4.A2: REJECT FAST RECOVERY from unsigned
+                        // checkpoint (not a hard boot reject — node falls
+                        // back to scan replay below).
                         eprintln!(
                             "🚨 [H-06/A2] Checkpoint at round {} has NO signature — \
-                             REJECTING fast recovery (legacy-bypass attack vector closed). \
-                             Falling back to scan_vertices replay.",
+                             REJECTING fast recovery path; falling back to \
+                             scan_vertices replay (legacy-bypass attack vector closed).",
                             checkpoint_round
                         );
                         false
@@ -152,7 +156,7 @@ impl DagConsensus {
                             }
                             round_idx_map
                                 .entry(vertex.round)
-                                .or_insert_with(Vec::new)
+                                .or_default()
                                 .push(vertex.hash.clone());
                             dag_map.insert(vertex.hash.clone(), vertex);
                         }
@@ -185,7 +189,7 @@ impl DagConsensus {
                     }
                     round_idx_map
                         .entry(vertex.round)
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(vertex.hash.clone());
                     dag_map.insert(vertex.hash.clone(), vertex);
                     replayed_tail += 1;
@@ -207,7 +211,7 @@ impl DagConsensus {
                     }
                     round_idx_map
                         .entry(vertex.round)
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(vertex.hash.clone());
                     dag_map.insert(vertex.hash.clone(), vertex);
                 }
@@ -348,7 +352,7 @@ impl DagConsensus {
 
         // RULE 1: If I am NOT a validator, I am an Observer. Observers CANNOT mine.
         if !is_active_validator {
-            if self.current_round % 10 == 0 || self.current_round < 5 {
+            if self.current_round.is_multiple_of(10) || self.current_round < 5 {
                 println!("⚠️  [Consensus] Observer Mode: I am not in Validator Set. Waiting to sync/register... (Round {})", self.current_round);
             }
             return;
@@ -412,7 +416,7 @@ impl DagConsensus {
             );
 
             // Check all validators for downtime (only every 10 rounds to save CPU)
-            if self.current_round % 10 == 0 {
+            if self.current_round.is_multiple_of(10) {
                 for validator_id in &validators {
                     if validator_id == &self.node_id {
                         continue;
@@ -426,11 +430,7 @@ impl DagConsensus {
                         _ => 0,
                     };
 
-                    let rounds_missed = if self.current_round > last_seen {
-                        self.current_round - last_seen
-                    } else {
-                        0
-                    };
+                    let rounds_missed = self.current_round.saturating_sub(last_seen);
 
                     if rounds_missed >= DOWNTIME_THRESHOLD && last_seen > 0 {
                         // Check if already jailed (prevent double-slash)
@@ -854,9 +854,9 @@ impl DagConsensus {
             // We can't look up round without DAG lock.
             // Let's Skip intricate pruning update for this hotfix.
             // Or re-acquire lock.
-            if hashes.len() > 0 {
+            if !hashes.is_empty() {
                 // H-5 FIX: Prune only FINALIZED rounds (check ordering engine)
-                if self.latest_block_height % 10 == 0 && self.current_round > 50 {
+                if self.latest_block_height.is_multiple_of(10) && self.current_round > 50 {
                     // Only prune rounds confirmed as committed by the ordering engine
                     let min_safe_round = {
                         if let Ok(engine) = self.ordering_engine.lock() {
@@ -884,7 +884,7 @@ impl DagConsensus {
                 // detect tampering. A node booting against a checkpoint that
                 // doesn't verify against its OWN key will refuse to fast-
                 // recover from it and fall back to a full scan replay.
-                if self.current_round % 100 == 0 {
+                if self.current_round.is_multiple_of(100) {
                     if let Ok(dag) = self.dag.lock() {
                         let vertices: Vec<&Vertex> = dag.values().collect();
                         if let Ok(json) = serde_json::to_string(&vertices) {

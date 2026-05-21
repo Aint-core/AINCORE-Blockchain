@@ -204,6 +204,38 @@ fn dex_quote(amount_in: u128, reserve_in: u128, reserve_out: u128, fee_bp: u64) 
     Some(numerator / denominator)
 }
 
+fn dex_spot_price_json(
+    token_in: &str,
+    token_out: &str,
+    unit_amount_in: u128,
+    quote: serde_json::Value,
+) -> serde_json::Value {
+    let amount_out = quote
+        .get("amount_out")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let approx_price = amount_out
+        .as_ref()
+        .and_then(|value| value.parse::<f64>().ok())
+        .and_then(|amount_out| {
+            if unit_amount_in == 0 {
+                None
+            } else {
+                Some(amount_out / unit_amount_in as f64)
+            }
+        });
+
+    serde_json::json!({
+        "status": quote.get("status").cloned().unwrap_or_else(|| serde_json::json!("unavailable")),
+        "token_in": token_in,
+        "token_out": token_out,
+        "unit_amount_in": unit_amount_in.to_string(),
+        "amount_out": amount_out,
+        "approx_price": approx_price,
+        "quote": quote,
+    })
+}
+
 fn move_balance(storage: &Arc<StateDB>, addr: &str) -> String {
     let move_addr = match move_core_types::account_address::AccountAddress::from_hex_literal(
         &format!("0x{}", addr),
@@ -1073,6 +1105,28 @@ fn handle_rpc_method(
             }))
         },
 
+        "aincore_getDexSpotPrice" => {
+            let token_in = params.get(0).and_then(|v| v.as_str());
+            let token_out = params.get(1).and_then(|v| v.as_str());
+            let unit_amount_in = params.get(2).and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<u128>().ok())
+                    .or_else(|| v.as_u64().map(|n| n as u128))
+            })
+            .unwrap_or(1_000_000_000_000_000_000u128);
+
+            let (Some(token_in), Some(token_out)) = (token_in, token_out) else {
+                return Err(JsonRpcError { code: -32602, message: "Invalid params: [token_in, token_out, unit_amount_in?]".into() });
+            };
+
+            let quote = handle_rpc_method(
+                "aincore_getDexQuote",
+                serde_json::json!([token_in, token_out, unit_amount_in.to_string()]),
+                data,
+            )?;
+            Ok(dex_spot_price_json(token_in, token_out, unit_amount_in, quote))
+        },
+
         "aincore_getTokenBalance" => {
             // params: [address, token_id]
             if let (Some(address), Some(token_id)) = (
@@ -1191,7 +1245,7 @@ fn handle_rpc_method(
                 } else {
                     // Check if it's in mempool
                     let in_mempool = if let Ok(mp) = data.mempool.lock() {
-                        mp.len() > 0 // Simplified check
+                        !mp.is_empty() // Simplified check
                     } else { false };
 
                     Ok(serde_json::json!({
@@ -2162,6 +2216,17 @@ mod tests {
         assert_eq!(quote["status"], "ok");
         assert_eq!(quote["amount_out"], "906");
         assert_eq!(quote["direction"], "x_to_y");
+
+        let spot = handle_rpc_method(
+            "aincore_getDexSpotPrice",
+            serde_json::json!([token_x, token_y, "1000"]),
+            &state,
+        )
+        .expect("dex spot response");
+        assert_eq!(spot["status"], "ok");
+        assert_eq!(spot["amount_out"], "906");
+        assert_eq!(spot["approx_price"], 0.906);
+        assert_eq!(spot["quote"]["pool_key"], pool_key);
     }
 
     #[test]

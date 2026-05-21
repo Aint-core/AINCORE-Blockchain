@@ -13,15 +13,18 @@ pub struct PruningConfig {
     pub archive_path: Option<String>,
 }
 
-impl PruningConfig {
+impl Default for PruningConfig {
     /// Default: 30 days retention, enabled
-    pub fn default() -> Self {
+    fn default() -> Self {
         Self {
             retention_days: 30,
             enabled: true,
             archive_path: None,
         }
     }
+}
+
+impl PruningConfig {
 
     /// Calculate cutoff epoch based on retention period
     pub fn cutoff_timestamp(&self) -> i64 {
@@ -85,6 +88,12 @@ pub struct DAMetrics {
 
     /// Storage efficiency (%)
     pub storage_efficiency: f64,
+}
+
+impl Default for DAMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DAMetrics {
@@ -168,7 +177,7 @@ mod tests {
         assert!(pruner.should_prune(old_ts));
 
         // Recent timestamp (1 day ago)
-        let recent_ts = Utc::now().timestamp() - (1 * 24 * 3600);
+        let recent_ts = Utc::now().timestamp() - (24 * 3600);
         assert!(!pruner.should_prune(recent_ts));
     }
 

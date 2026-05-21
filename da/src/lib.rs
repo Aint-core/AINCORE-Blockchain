@@ -138,9 +138,9 @@ impl DASequencer {
     /// can practically achieve without HSM/TPM hardware.
     ///
     /// On boot the routine prefers the encrypted blob; if only the
-    /// legacy plaintext key is present it migrates atomically (decrypt
-    /// + re-encrypt + delete legacy) so a one-shot upgrade does not
-    /// regenerate the DA identity.
+    /// legacy plaintext key is present it migrates atomically — decrypt
+    /// then re-encrypt then delete legacy — so a one-shot upgrade does
+    /// not regenerate the DA identity.
     pub fn new_encrypted(
         node_id: String,
         storage: Arc<StateDB>,
@@ -303,11 +303,11 @@ impl DASequencer {
                          to plaintext storage. Investigate transport layer.",
                         e
                     );
-                    let _ = storage.put(DA_KEY_LEGACY_PLAINTEXT, &hex::encode(&key_bytes));
+                    let _ = storage.put(DA_KEY_LEGACY_PLAINTEXT, &hex::encode(key_bytes));
                 }
             }
         } else {
-            let _ = storage.put(DA_KEY_LEGACY_PLAINTEXT, &hex::encode(&key_bytes));
+            let _ = storage.put(DA_KEY_LEGACY_PLAINTEXT, &hex::encode(key_bytes));
             eprintln!(
                 "⚠️  [DA Sequencer M-09] Generated NEW DA signing key without node identity \
                  — stored as plaintext. Migrate caller to new_encrypted()."
@@ -591,17 +591,15 @@ impl DASequencer {
                 } else {
                     return;
                 }
+            } else if payload.proposer_pubkey.is_empty() {
+                // For backwards compatibility: warning only if old block from DB
+                println!(
+                    "⚠️  [DA] Legacy batch detected without pubkey (epoch {})",
+                    payload.epoch
+                );
             } else {
-                if payload.proposer_pubkey.is_empty() {
-                    // For backwards compatibility: warning only if old block from DB
-                    println!(
-                        "⚠️  [DA] Legacy batch detected without pubkey (epoch {})",
-                        payload.epoch
-                    );
-                } else {
-                    eprintln!("🚨 [DA] Missing or invalid proposer_pubkey");
-                    return;
-                }
+                eprintln!("🚨 [DA] Missing or invalid proposer_pubkey");
+                return;
             }
 
             println!(
@@ -719,10 +717,10 @@ impl DASequencer {
     /// - BATCH_ANNOUNCEMENT: Trigger shard fetching from peers
     pub fn handle_p2p_message(&self, raw_msg: &str) -> Option<String> {
         // Strip prefix if present
-        let json = if raw_msg.starts_with("DA_SHARD:") {
-            &raw_msg[9..]
-        } else if raw_msg.starts_with("DA_COMMIT:") {
-            self.handle_incoming_batch(&raw_msg[10..]);
+        let json = if let Some(rest) = raw_msg.strip_prefix("DA_SHARD:") {
+            rest
+        } else if let Some(rest) = raw_msg.strip_prefix("DA_COMMIT:") {
+            self.handle_incoming_batch(rest);
             return None;
         } else {
             raw_msg
@@ -858,7 +856,7 @@ mod m09_tests {
     fn m09_legacy_plaintext_migrates_to_encrypted() {
         let db = temp_db("migrate");
         let legacy_key = [77u8; 32];
-        db.put(DA_KEY_LEGACY_PLAINTEXT, &hex::encode(&legacy_key))
+        db.put(DA_KEY_LEGACY_PLAINTEXT, &hex::encode(legacy_key))
             .unwrap();
 
         let node_identity = [22u8; 32];

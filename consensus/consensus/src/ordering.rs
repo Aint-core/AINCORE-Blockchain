@@ -22,6 +22,12 @@ pub struct OrderingEngine {
     storage: Option<Arc<StateDB>>,
 }
 
+impl Default for OrderingEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OrderingEngine {
     pub fn new() -> Self {
         // Initialize VDF with moderate difficulty (adjustable for faster/slower)

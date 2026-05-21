@@ -154,8 +154,7 @@ impl SimpleConsensus {
                     return;
                 }
             };
-            let txs = mempool_lock.get_pending_transactions(50);
-            txs // return txs, lock drops
+            mempool_lock.get_pending_transactions(50)
         };
 
         // ALLOW EMPTY BLOCKS (Heartbeat / Reward Mining)
@@ -254,15 +253,13 @@ impl SimpleConsensus {
     }
 
     pub fn handle_message(&mut self, message: String) {
-        if message.starts_with("PROPOSAL:") {
-            let content = &message[9..];
+        if let Some(content) = message.strip_prefix("PROPOSAL:") {
             if let Ok(proposal) = serde_json::from_str::<Proposal>(content) {
                 self.handle_proposal(proposal);
             } else {
                 eprintln!("❌ Failed to parse PROPOSAL");
             }
-        } else if message.starts_with("VOTE:") {
-            let content = &message[5..];
+        } else if let Some(content) = message.strip_prefix("VOTE:") {
             if let Ok(vote) = serde_json::from_str::<Vote>(content) {
                 self.handle_vote(vote);
             } else {

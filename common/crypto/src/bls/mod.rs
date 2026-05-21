@@ -476,7 +476,7 @@ mod tests {
         let sk = bls.keygen(&ikm);
         let pk = bls.pubkey_from_secret(&sk);
         let valid = bls
-            .verify(b"test_message", &sig, &pk.compress().as_ref())
+            .verify(b"test_message", &sig, pk.compress().as_ref())
             .unwrap();
         assert!(valid);
     }

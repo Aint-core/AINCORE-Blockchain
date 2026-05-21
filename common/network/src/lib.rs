@@ -264,7 +264,7 @@ async fn send_encrypted(
     // SECURITY: Uses atomic-counter-based nonce generation (encrypt_safe)
     // to guarantee nonce uniqueness per message under the same session key.
     let (nonce, ciphertext) = TransportEngine::encrypt_safe(key, msg.as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     // Packet: [Length (4B)][Nonce (12B)][Ciphertext]
     let total_len = 12 + ciphertext.len();
@@ -529,11 +529,11 @@ pub fn send_message(addr: &str, msg: &str) -> std::io::Result<()> {
 
                 // C-3 FIX: Use ephemeral key identity instead of __broadcast__ magic string
                 let ephemeral_node_id =
-                    hex::encode(&ephemeral_signing_key.verifying_key().to_bytes())[0..32]
+                    hex::encode(ephemeral_signing_key.verifying_key().to_bytes())[0..32]
                         .to_string();
 
                 // Attempt secure connect with timeout
-                if let Ok(res) = tokio::time::timeout(
+                if let Ok(Ok((mut stream, shared, _peer_id))) = tokio::time::timeout(
                     std::time::Duration::from_secs(3),
                     secure_connect(
                         ip,
@@ -546,9 +546,7 @@ pub fn send_message(addr: &str, msg: &str) -> std::io::Result<()> {
                 )
                 .await
                 {
-                    if let Ok((mut stream, shared, _peer_id)) = res {
-                        let _ = send_encrypted_msg(&mut stream, &shared, &msg).await;
-                    }
+                    let _ = send_encrypted_msg(&mut stream, &shared, &msg).await;
                 }
             }
         }

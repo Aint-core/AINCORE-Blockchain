@@ -92,7 +92,7 @@ pub fn calculate_tx_hash(transactions: &[String]) -> String {
 // Fungsi bantu untuk menghitung hash dari header blok
 pub fn calculate_header_hash(header: &BlockHeader) -> String {
     let mut data = Vec::new();
-    data.extend_from_slice(&header.height.to_string().as_bytes());
+    data.extend_from_slice(header.height.to_string().as_bytes());
     data.extend_from_slice(header.prev_hash.as_bytes());
     data.extend_from_slice(header.tx_hash.as_bytes());
     if !header.state_root.is_empty() || !header.receipts_root.is_empty() {
@@ -100,8 +100,8 @@ pub fn calculate_header_hash(header: &BlockHeader) -> String {
         data.extend_from_slice(header.receipts_root.as_bytes());
     }
     data.extend_from_slice(header.proposer_id.as_bytes());
-    data.extend_from_slice(&header.round.to_string().as_bytes());
-    data.extend_from_slice(&header.timestamp.to_string().as_bytes());
+    data.extend_from_slice(header.round.to_string().as_bytes());
+    data.extend_from_slice(header.timestamp.to_string().as_bytes());
     hex::encode(hash(&data))
 }
 
@@ -183,15 +183,14 @@ impl Vertex {
             .is_ok()
     }
 
-    /// (REMOVED) sign_with_bls and verify_bls_signature have been deleted.
-    /// These used symmetric MAC verification (re-sign and compare) which is
-    /// fundamentally insecure. Per-vertex signing uses Ed25519.
-    /// BLS aggregate signatures for consensus quorum certificates will be
-    /// applied externally by DagConsensus using crypto::BLSEngine.
-
+    // (REMOVED) sign_with_bls and verify_bls_signature have been deleted.
+    // These used symmetric MAC verification (re-sign and compare) which is
+    // fundamentally insecure. Per-vertex signing uses Ed25519.
+    // BLS aggregate signatures for consensus quorum certificates will be
+    // applied externally by DagConsensus using crypto::BLSEngine.
     pub fn calculate_hash(&self) -> String {
         let mut data = Vec::new();
-        data.extend_from_slice(&self.round.to_string().as_bytes());
+        data.extend_from_slice(self.round.to_string().as_bytes());
         data.extend_from_slice(self.author.as_bytes());
         for p in &self.parents {
             data.extend_from_slice(p.as_bytes());
@@ -199,7 +198,7 @@ impl Vertex {
         for tx in &self.payload {
             data.extend_from_slice(tx.as_bytes());
         }
-        data.extend_from_slice(&self.timestamp.to_string().as_bytes());
+        data.extend_from_slice(self.timestamp.to_string().as_bytes());
         hex::encode(hash(&data))
     }
 }

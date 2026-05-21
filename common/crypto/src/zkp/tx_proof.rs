@@ -106,7 +106,7 @@ pub fn verify_tx_attached_proof(
     //    digest of this transaction's canonical message. This makes
     //    a valid proof non-transferable across transactions.
     let expected = Sha256::digest(canonical_msg);
-    if proof.public_inputs() != expected.as_slice() {
+    if proof.public_inputs() != &expected[..] {
         return Err(AttachedProofError::PublicInputMismatch);
     }
 
@@ -116,7 +116,7 @@ pub fn verify_tx_attached_proof(
     //    pass). When the verifier is wired to a real AIR, accepted
     //    proofs flow through here unchanged.
     let verifier = STARKVerifier::new();
-    match verifier.verify(&proof, expected.as_slice()) {
+    match verifier.verify(&proof, &expected[..]) {
         Ok(true) => Ok(()),
         Ok(false) => Err(AttachedProofError::VerificationFailed(
             "verifier returned Ok(false)".to_string(),

@@ -85,7 +85,7 @@ impl Accumulator {
                     // If we are in the chunk containing our path, add the sibling
                     if current_index / 2 == i {
                         // If we are left, push right sibling. If we are right, push left sibling.
-                        if current_index % 2 == 0 {
+                        if current_index.is_multiple_of(2) {
                             proof.push(vec_to_array(right));
                         } else {
                             proof.push(vec_to_array(left));
@@ -124,7 +124,7 @@ impl Accumulator {
 
         for sibling in proof {
             let sibling_vec = sibling.to_vec();
-            if current_index % 2 == 0 {
+            if current_index.is_multiple_of(2) {
                 current_hash = hash_node(&current_hash, &sibling_vec);
             } else {
                 current_hash = hash_node(&sibling_vec, &current_hash);

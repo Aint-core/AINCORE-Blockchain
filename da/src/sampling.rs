@@ -25,10 +25,16 @@ impl DASampler {
         }
     }
 
+}
+
+impl Default for DASampler {
     /// Default sampler (30 samples, 99.9% confidence)
-    pub fn default() -> Self {
+    fn default() -> Self {
         Self::new(30, 0.999)
     }
+}
+
+impl DASampler {
 
     /// Sample random shards to verify DA
     ///
@@ -125,6 +131,12 @@ pub struct LightClient {
     sampler: DASampler,
 }
 
+impl Default for LightClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LightClient {
     pub fn new() -> Self {
         Self {
@@ -164,7 +176,7 @@ mod tests {
 
         // Mock fetcher that fails 50% of the time
         let fetcher = |shard_id: u32| -> Result<Vec<u8>, String> {
-            if shard_id % 2 == 0 {
+            if shard_id.is_multiple_of(2) {
                 Ok(vec![1, 2, 3, 4])
             } else {
                 Err("Not available".to_string())
@@ -182,7 +194,7 @@ mod tests {
 
         // Mock fetcher with 80% availability
         let fetcher = |shard_id: u32| -> Result<Vec<u8>, String> {
-            if shard_id % 5 == 0 {
+            if shard_id.is_multiple_of(5) {
                 Err("Not available".to_string())
             } else {
                 Ok(vec![1, 2, 3, 4])
@@ -201,7 +213,7 @@ mod tests {
         println!("Required samples: {}", n);
         // Formula gives ~5 samples, but we use 30 in practice for safety
         assert!(
-            n >= 3 && n <= 10,
+            (3..=10).contains(&n),
             "Sample size should match formula: got {}",
             n
         );

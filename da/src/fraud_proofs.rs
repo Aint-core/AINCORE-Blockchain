@@ -176,15 +176,18 @@ pub struct SlashingParams {
     pub burn_percentage: u8,
 }
 
-impl SlashingParams {
+impl Default for SlashingParams {
     /// Default slashing params (50% slash, 10% reward, 40% burn)
-    pub fn default() -> Self {
+    fn default() -> Self {
         Self {
             slash_percentage: 50,
             reward_percentage: 10,
             burn_percentage: 40,
         }
     }
+}
+
+impl SlashingParams {
 
     /// Validate parameters sum to slash_percentage
     pub fn validate(&self) -> bool {

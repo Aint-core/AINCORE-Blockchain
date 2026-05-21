@@ -337,7 +337,7 @@ mod tests {
         let tbls = ThresholdBLS::new(2, 3);
         let master_ikm = [99u8; 32];
 
-        let (group_pk, shares) = tbls.generate_shares(&master_ikm);
+        let (_group_pk, shares) = tbls.generate_shares(&master_ikm);
         let message = b"block_hash_round_42";
 
         // Create partial signatures from 2 of 3 participants

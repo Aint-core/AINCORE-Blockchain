@@ -17,6 +17,12 @@ pub struct RecursiveProver {
     hasher: PoseidonHash,
 }
 
+impl Default for RecursiveProver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RecursiveProver {
     pub fn new() -> Self {
         Self {
@@ -49,9 +55,7 @@ impl RecursiveProver {
         // Simplified: [1, 1, 1, ... commitment bytes]
         let mut new_proof = vec![1u8; 32];
         let bytes = commitment.to_le_bytes();
-        for i in 0..8 {
-            new_proof[i] = bytes[i];
-        }
+        new_proof[..8].copy_from_slice(&bytes[..8]);
 
         Ok(new_proof)
     }
@@ -75,9 +79,7 @@ impl RecursiveProver {
         // Output aggregated proof
         let mut new_proof = vec![2u8; 32]; // Type 2 for aggregate
         let bytes = agg_commitment.to_le_bytes();
-        for i in 0..8 {
-            new_proof[i] = bytes[i];
-        }
+        new_proof[..8].copy_from_slice(&bytes[..8]);
 
         Ok(new_proof)
     }

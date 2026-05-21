@@ -205,7 +205,7 @@ mod tests {
 
         // This is probabilistic, but should usually keep at least 1 node
         assert!(
-            common.len() >= 1,
+            !common.is_empty(),
             "Consistent hashing should minimize changes"
         );
     }

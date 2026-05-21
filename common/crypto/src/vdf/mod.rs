@@ -173,7 +173,7 @@ impl VDFEngine {
             h.finalize().into()
         };
 
-        let n_checkpoints = ((self.difficulty + self.stride - 1) / self.stride) as usize;
+        let n_checkpoints = self.difficulty.div_ceil(self.stride) as usize;
         let mut checkpoints: Vec<[u8; 32]> = Vec::with_capacity(n_checkpoints);
 
         for i in 0..self.difficulty {

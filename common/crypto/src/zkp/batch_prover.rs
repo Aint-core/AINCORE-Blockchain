@@ -283,9 +283,6 @@ mod tests {
 
     #[test]
     fn test_merkle_batch_single() {
-        use crate::zkp::merkle_trace::MerkleTrace;
-        use winterfell::math::StarkField;
-
         let prover = BatchProver::new();
 
         let leaf = 42;
@@ -300,9 +297,6 @@ mod tests {
 
     #[test]
     fn test_merkle_batch_multiple() {
-        use crate::zkp::merkle_trace::MerkleTrace;
-        use winterfell::math::StarkField;
-
         let prover = BatchProver::new();
 
         let proofs_data = vec![

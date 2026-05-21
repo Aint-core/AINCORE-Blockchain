@@ -36,8 +36,8 @@ impl PoseidonHashField {
 
     fn full_round<E: FieldElement>(state: &mut [E; 3]) {
         // S-box (x^5)
-        for i in 0..3 {
-            state[i] = Self::sbox(state[i]);
+        for slot in state.iter_mut() {
+            *slot = Self::sbox(*slot);
         }
 
         // MDS matrix (simplified)
@@ -45,12 +45,12 @@ impl PoseidonHashField {
         let t1 = state[0] + state[1];
         let t2 = state[1] + state[2];
 
-        state[0] = t0 + state[0];
+        state[0] += t0;
         state[1] = t0 + t1;
         state[2] = t0 + t2;
 
         // Add round constants (simplified - use field element arithmetic)
-        state[0] = state[0] + E::ONE;
+        state[0] += E::ONE;
         state[1] = state[1] + E::ONE + E::ONE;
         state[2] = state[2] + E::ONE + E::ONE + E::ONE;
     }
@@ -63,12 +63,12 @@ impl PoseidonHashField {
         let t0 = state[0] + state[1] + state[2];
         let t1 = state[0] + state[1];
 
-        state[0] = t0 + state[0];
+        state[0] += t0;
         state[1] = t0 + t1;
-        state[2] = t0 + state[2];
+        state[2] += t0;
 
         // Add round constant
-        state[0] = state[0] + E::ONE;
+        state[0] += E::ONE;
     }
 
     fn sbox<E: FieldElement>(x: E) -> E {

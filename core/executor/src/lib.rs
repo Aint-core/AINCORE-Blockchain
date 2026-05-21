@@ -463,7 +463,7 @@ impl Executor {
     fn maybe_advance_epoch(&self) {
         let interval = Self::epoch_block_interval();
         let next_height = self.db.get_chain_height().saturating_add(1);
-        if next_height == 0 || next_height % interval != 0 {
+        if next_height == 0 || !next_height.is_multiple_of(interval) {
             return;
         }
 
@@ -561,13 +561,13 @@ impl Executor {
         total_reward: u128,
     ) -> Vec<(String, u128)> {
         // Step 1: read validator set with stakes.
-        let validators: Vec<(String, u64)> = match self.db.get("sys:validators") {
-            Ok(Some(json)) => match serde_json::from_str::<Vec<(String, u64)>>(&json) {
-                Ok(vs) => vs,
-                Err(_) => Vec::new(),
-            },
-            _ => Vec::new(),
-        };
+        let validators: Vec<(String, u64)> = self
+            .db
+            .get("sys:validators")
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str::<Vec<(String, u64)>>(&json).ok())
+            .unwrap_or_default();
 
         // Fallback: no validator set → legacy single-miner path.
         if validators.is_empty() {
@@ -810,12 +810,11 @@ impl Executor {
         println!("📊 Scheduled {} execution batches.", batches.len());
 
         // 3. Execute Batches ATOMICALLY
-        let mut total_fees = 0;
+        let mut total_fees: u128 = 0;
 
-        for (_i, batch) in batches.iter().enumerate() {
-            // println!("   ⚡ Executing Batch {} ({} txs)", i + 1, batch.len());
-
+        for batch in batches.iter() {
             // Execute in parallel to get updates
+            #[allow(clippy::type_complexity)] // intrinsic to parallel TX result shape
             let mut results: Vec<(String, Option<(Vec<(String, Option<String>)>, u128)>)> = batch
                 .par_iter()
                 .map(|(_tx, raw)| (tx_hash_hex(raw), self.execute_transaction(raw)))
@@ -883,7 +882,7 @@ impl Executor {
 
         // Fee Logic & Burning (fees only, no inflation)
         let burn_pct = self.db.get_burn_percentage() as u128;
-        let total_fees_u128 = total_fees as u128;
+        let total_fees_u128 = total_fees;
 
         let burnt_fees = (total_fees_u128 * burn_pct) / 100;
         let miner_fees = total_fees_u128 - burnt_fees;
@@ -1016,10 +1015,10 @@ impl Executor {
     /// Honest limitation: until cross-validator gossip of attestations
     /// is wired (Phase 3 work), only this node's attestations exist
     /// locally, so BFT quorum is unreachable on real networks with
-    /// > 1 validator. The path is therefore *safe* (no false positives)
-    /// but not yet *live* (real offenders are not punished). Equivocation
-    /// slashing is unaffected — it's provable from local DAG data and
-    /// continues to apply through the equivocation detector.
+    /// more than 1 validator. The path is therefore *safe* (no false
+    /// positives) but not yet *live* (real offenders are not punished).
+    /// Equivocation slashing is unaffected — it's provable from local
+    /// DAG data and continues to apply through the equivocation detector.
     pub fn promote_downtime_attestations_to_slash(&self) {
         // 1. Snapshot the active validator set so quorum is computed
         //    against a stable set within this routine.
@@ -1459,6 +1458,7 @@ impl Executor {
     /// function is read-only against shared state. Phase 2.4 documents
     /// the contract explicitly so any future caller that needs to call
     /// this outside the canonical flow has clear instructions.
+    #[allow(clippy::type_complexity)]
     pub fn execute_transaction(
         &self,
         tx_json: &str,
@@ -1477,10 +1477,7 @@ impl Executor {
             }
 
             // 1. Fetch Sender Account Object
-            let sender_obj = match self.db.get_object(&tx.sender) {
-                Some(obj) => obj,
-                None => return None,
-            };
+            let sender_obj = self.db.get_object(&tx.sender)?;
 
             // 2. Verify Signature (Sender)
             use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -1678,10 +1675,7 @@ impl Executor {
             let mut payer_obj = if payer_addr == tx.sender {
                 sender_obj.clone()
             } else {
-                match self.db.get_object(&payer_addr) {
-                    Some(obj) => obj,
-                    None => return None,
-                }
+                self.db.get_object(&payer_addr)?
             };
 
             let mut account_data: aa::AccountData = match serde_json::from_slice(&payer_obj.data) {
@@ -1740,7 +1734,7 @@ impl Executor {
                 if let Ok(new_sender_data) = serde_json::to_vec(&sender_account_data) {
                     updated_sender_obj.data = new_sender_data;
                     updates.push((
-                        format!("obj:{}", updated_sender_obj.id.to_string()),
+                        format!("obj:{}", updated_sender_obj.id),
                         Some(
                             serde_json::to_string(&updated_sender_obj)
                                 .unwrap_or_else(|_| "{}".to_string()),
@@ -1753,7 +1747,7 @@ impl Executor {
             if let Ok(new_data) = serde_json::to_vec(&account_data) {
                 payer_obj.data = new_data;
                 updates.push((
-                    format!("obj:{}", payer_obj.id.to_string()),
+                    format!("obj:{}", payer_obj.id),
                     Some(serde_json::to_string(&payer_obj).unwrap_or_else(|_| "{}".to_string())),
                 ));
             }
@@ -1790,7 +1784,7 @@ impl Executor {
                 }
             };
 
-            let payload_bytes = match hex::decode(&tx.payload.trim_start_matches("0x")) {
+            let payload_bytes = match hex::decode(tx.payload.trim_start_matches("0x")) {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     // C-11 FIX: Backwards compatibility for genesis and old tools (TEMPORARY)
@@ -3051,6 +3045,92 @@ mod tests {
             .expect("receipt stored");
         let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
         assert_eq!(receipt["status"], "aborted");
+    }
+
+    #[test]
+    fn test_dex_add_liquidity_uses_only_ratio_matched_amounts() {
+        let db = temp_db("dex_liquidity_ratio_guard");
+        load_stdlib(&db);
+        let maker_key = SigningKey::from_bytes(&[37u8; 32]);
+        let maker = create_account(&db, &maker_key);
+        let lp2_key = SigningKey::from_bytes(&[38u8; 32]);
+        let lp2 = create_account(&db, &lp2_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+
+        let ain = aincore_coin_type();
+        let wbtc = wbtc_coin_type();
+        set_coin_store_for(&db, &maker, ain.clone(), 100_000);
+        set_coin_store_for(&db, &maker, wbtc.clone(), 100_000);
+        set_coin_store_for(&db, &lp2, ain.clone(), 100_000);
+        set_coin_store_for(&db, &lp2, wbtc.clone(), 100_000);
+        set_dex_registry(&db, vec![]);
+
+        let executor = Executor::new(db.clone());
+        let create_payload = entry_payload(
+            "dex",
+            "create_pool",
+            vec![ain.clone(), wbtc.clone()],
+            vec![bcs::to_bytes(&parse_move_address(&maker).unwrap()).unwrap()],
+        );
+        let (updates, _) = executor
+            .execute_transaction(&signed_tx(&maker_key, &maker, &create_payload, 0, 10_000, 1))
+            .expect("create pool accepted");
+        apply_updates(&db, updates);
+
+        let seed_payload = entry_payload(
+            "dex",
+            "add_liquidity",
+            vec![ain.clone(), wbtc.clone()],
+            vec![
+                bcs::to_bytes(&parse_move_address(&maker).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_address(&maker).unwrap()).unwrap(),
+                bcs::to_bytes(&10_000u128).unwrap(),
+                bcs::to_bytes(&10_000u128).unwrap(),
+                bcs::to_bytes(&9_000u128).unwrap(),
+            ],
+        );
+        let (updates, _) = executor
+            .execute_transaction(&signed_tx(&maker_key, &maker, &seed_payload, 1, 10_000, 1))
+            .expect("seed liquidity accepted");
+        apply_updates(&db, updates);
+
+        let imbalanced_payload = entry_payload(
+            "dex",
+            "add_liquidity",
+            vec![ain.clone(), wbtc.clone()],
+            vec![
+                bcs::to_bytes(&parse_move_address(&lp2).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_address(&maker).unwrap()).unwrap(),
+                bcs::to_bytes(&10_000u128).unwrap(),
+                bcs::to_bytes(&5_000u128).unwrap(),
+                bcs::to_bytes(&4_000u128).unwrap(),
+            ],
+        );
+        let (updates, _) = executor
+            .execute_transaction(&signed_tx(&lp2_key, &lp2, &imbalanced_payload, 0, 10_000, 1))
+            .expect("imbalanced add liquidity accepted");
+        apply_updates(&db, updates);
+
+        let pool = dex_pool(&db, &maker, ain.clone(), wbtc.clone());
+        assert_eq!(pool.coin_x.value, 15_000, "pool should only take matched X");
+        assert_eq!(pool.coin_y.value, 15_000, "pool should only take matched Y");
+        assert_eq!(pool.lp_supply, 15_000);
+        assert_eq!(
+            dex_lp_balance(&db, &lp2, ain.clone(), wbtc.clone()),
+            5_000,
+            "second LP shares should come from the limiting side",
+        );
+        assert_eq!(
+            coin_balance_for(&db, &lp2, ain),
+            85_000,
+            "only matched X plus gas should be deducted",
+        );
+        assert_eq!(
+            coin_balance_for(&db, &lp2, wbtc),
+            95_000,
+            "matched Y should be fully deposited",
+        );
     }
 
     #[test]

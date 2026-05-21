@@ -246,7 +246,7 @@ mod tests {
             };
 
             let proof = prover.prove(circuit, &mut rng).unwrap();
-            let is_valid = prover.verify(&vec![hash_output], &proof).unwrap();
+            let is_valid = prover.verify(&[hash_output], &proof).unwrap();
             assert!(is_valid, "Proof {} should be valid", i);
         }
     }

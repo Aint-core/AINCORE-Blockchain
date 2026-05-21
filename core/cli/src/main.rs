@@ -146,7 +146,7 @@ fn main() -> anyhow::Result<()> {
             println!("Public Key:  {} ({} bytes)", pk_path, pk_bytes.len());
             println!("Private Key: {} ({} bytes)", sk_path, sk_bytes.len());
             println!("Address:     {}", address);
-            println!("");
+            println!();
             println!("SECURITY: Keep pqc_privkey.bin secure!");
         }
         Commands::Info => {
@@ -190,7 +190,7 @@ fn main() -> anyhow::Result<()> {
                 args: vec![
                     bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
                     bcs::to_bytes(&device_bytes).unwrap(),
-                    bcs::to_bytes(&(quality as u64)).unwrap(),
+                    bcs::to_bytes(&{ quality }).unwrap(),
                 ],
             };
             let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
@@ -479,7 +479,7 @@ fn main() -> anyhow::Result<()> {
             // Skipping client-side balance check due to u64 parsing limitations in CLI for u128 balances
 
             let pk_bytes = hex::decode(wallet.public_key()).unwrap_or_default();
-            let min_stake: u128 = 1000_000_000_000_000_000_000; // 1000 AIN in wei
+            let min_stake: u128 = 1_000_000_000_000_000_000_000; // 1000 AIN in wei
             let call = vm_move::EntryFunctionCall {
                 module: move_core_types::language_storage::ModuleId::new(
                     move_core_types::account_address::AccountAddress::new([

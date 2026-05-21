@@ -121,7 +121,6 @@ impl Air for PoseidonMerkleAir {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
     use winterfell::{math::fields::f128::BaseElement, FieldExtension, ProofOptions, Trace};

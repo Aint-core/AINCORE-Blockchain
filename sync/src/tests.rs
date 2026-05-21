@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::{ChainSync, SyncRequest, SyncResponse};
     use blockchain::Block;
@@ -135,12 +136,12 @@ mod tests {
 
         // Recompute hash after manipulation to ensure it only fails due to timestamp
         let mut data = Vec::new();
-        data.extend_from_slice(&block.header.height.to_string().as_bytes());
+        data.extend_from_slice(block.header.height.to_string().as_bytes());
         data.extend_from_slice(block.header.prev_hash.as_bytes());
         data.extend_from_slice(block.header.tx_hash.as_bytes());
         data.extend_from_slice(block.header.proposer_id.as_bytes());
-        data.extend_from_slice(&block.header.round.to_string().as_bytes());
-        data.extend_from_slice(&block.header.timestamp.to_string().as_bytes());
+        data.extend_from_slice(block.header.round.to_string().as_bytes());
+        data.extend_from_slice(block.header.timestamp.to_string().as_bytes());
         block.header.hash = hex::encode(crypto::hash(&data));
 
         let result = sync.validate_block(&block, 2, "prev_hash_1");

@@ -142,7 +142,6 @@ impl Trace for MerkleTrace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use winterfell::math::StarkField;
 
     #[test]
     fn test_merkle_trace_creation() {

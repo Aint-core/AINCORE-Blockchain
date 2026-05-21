@@ -418,6 +418,7 @@ impl AINCOREVM {
         Ok((gas_meter.gas_used(), vm_changes, ExecutionStatus::success()))
     }
 
+    #[allow(clippy::too_many_arguments)] // Move VM entry interface — args are intrinsic to function call
     pub fn execute_public_entry_function(
         &self,
         pre_actions: Vec<(MoveAction, bool)>, // Optional pre-actions like gas deduction

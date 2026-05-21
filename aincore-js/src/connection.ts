@@ -1,5 +1,40 @@
 import axios, { AxiosInstance } from 'axios';
 
+export interface DexPool {
+    pool_key: string;
+    pool_addr: string;
+    token_x: string;
+    token_y: string;
+    fee_bp: number;
+    creator: string;
+    active: boolean;
+    reserve_x: string;
+    reserve_y: string;
+    lp_supply: string;
+}
+
+export interface DexQuote {
+    status: string;
+    pool_key?: string;
+    pool_addr?: string;
+    direction?: string;
+    amount_in?: string;
+    amount_out?: string | null;
+    fee_bp?: number;
+    reserve_in?: string;
+    reserve_out?: string;
+}
+
+export interface DexSpotPrice {
+    status: string;
+    token_in: string;
+    token_out: string;
+    unit_amount_in: string;
+    amount_out: string | null;
+    approx_price: number | null;
+    quote: DexQuote;
+}
+
 export class Connection {
     private rpcUrl: string;
     private client: AxiosInstance;
@@ -119,6 +154,13 @@ export class Connection {
     }
 
     /**
+     * Get a forward block range in ascending order.
+     */
+    async getBlocksRange(startHeight: number, limit: number = 100): Promise<any[]> {
+        return await this.request('aincore_getBlocks', [limit, startHeight]);
+    }
+
+    /**
      * Get transaction details
      */
     async getTransaction(hash: string): Promise<any> {
@@ -196,11 +238,54 @@ export class Connection {
      * Get a single block by height
      */
     async getBlock(height: number): Promise<any> {
-        const blocks = await this.request('aincore_getBlocks', [1]);
-        // Backend returns latest blocks, so we need to fetch specific height
-        // For now, use the block storage key pattern
-        const allBlocks = await this.getBlocks(Math.max(height + 10, 100));
-        return allBlocks.find((b: any) => b?.header?.height === height) || null;
+        const blocks = await this.getBlocksRange(height, 1);
+        return blocks.find((b: any) => b?.header?.height === height) || null;
+    }
+
+    // =====================
+    // DEX METHODS
+    // =====================
+
+    /**
+     * Get all canonical DEX pools from the on-chain Move registry.
+     */
+    async getDexPools(): Promise<DexPool[]> {
+        const result = await this.request('aincore_getDexPools', []);
+        return result || [];
+    }
+
+    /**
+     * Get a single DEX pool by canonical pool key or token pair.
+     */
+    async getDexPool(poolKeyOrTokenX: string, tokenY?: string): Promise<DexPool | null> {
+        const params = tokenY === undefined
+            ? [poolKeyOrTokenX]
+            : [poolKeyOrTokenX, tokenY];
+        const result = await this.request('aincore_getDexPool', params);
+        return result || null;
+    }
+
+    /**
+     * Quote a CPMM swap using the canonical on-chain pool state.
+     */
+    async getDexQuote(tokenIn: string, tokenOut: string, amountIn: string | number): Promise<DexQuote> {
+        return await this.request('aincore_getDexQuote', [tokenIn, tokenOut, String(amountIn)]);
+    }
+
+    /**
+     * Compute spot price from current reserves for a canonical pool.
+     * Returns how many `tokenOut` units back one whole `tokenIn` unit.
+     */
+    async getDexSpotPrice(
+        tokenIn: string,
+        tokenOut: string,
+        unitAmountIn: string | number = '1000000000000000000',
+    ): Promise<DexSpotPrice> {
+        return await this.request('aincore_getDexSpotPrice', [
+            tokenIn,
+            tokenOut,
+            String(unitAmountIn),
+        ]);
     }
 
     /**

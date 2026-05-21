@@ -32,6 +32,11 @@ static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// - Atomic nonce counter for guaranteed nonce uniqueness
 pub struct TransportEngine;
 
+// Phase 4.B3.real: chacha20poly1305 0.10 wraps generic-array 0.x whose
+// `from_slice` is deprecated in favour of the 1.x API. We pin chacha for
+// AEAD compatibility; migration to a chacha20poly1305 version using
+// generic-array 1.x is tracked as a dependency-bump task.
+#[allow(deprecated)]
 impl TransportEngine {
     /// Generate an ephemeral keypair for a session
     pub fn generate_ephemeral() -> (EphemeralSecret, PublicKey) {

@@ -77,7 +77,7 @@ impl MerkleTree {
 
         // Traverse up the tree
         for level in &self.levels[..self.levels.len() - 1] {
-            let sibling_index = if index % 2 == 0 { index + 1 } else { index - 1 };
+            let sibling_index = if index.is_multiple_of(2) { index + 1 } else { index - 1 };
 
             if sibling_index < level.len() {
                 proof.push(level[sibling_index]);
@@ -108,7 +108,7 @@ impl MerkleTree {
 
         // Traverse up using proof
         for sibling in proof {
-            current_hash = if index % 2 == 0 {
+            current_hash = if index.is_multiple_of(2) {
                 Self::hash_pair(&current_hash, sibling)
             } else {
                 Self::hash_pair(sibling, &current_hash)

@@ -435,13 +435,10 @@ pub fn initialize_genesis(
     genesis_pubkey_hex: &str,
 ) -> Result<(), GenesisError> {
     // Check if genesis is already initialized
-    match storage.get("genesis_initialized") {
-        Ok(Some(_)) => {
-            verify_genesis_integrity(storage)?;
-            println!("✨ Genesis already initialized.");
-            return Ok(());
-        }
-        _ => {}
+    if let Ok(Some(_)) = storage.get("genesis_initialized") {
+        verify_genesis_integrity(storage)?;
+        println!("✨ Genesis already initialized.");
+        return Ok(());
     }
 
     println!("🌋 Initializing Genesis...");

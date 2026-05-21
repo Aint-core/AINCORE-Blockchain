@@ -88,7 +88,7 @@ impl EvmClient {
 
         let mut sig_bytes = Vec::new();
         for signer in self.signers.iter().take(self.threshold) {
-            let sig = signer.sign_message(&message_hash).await?;
+            let sig = signer.sign_message(message_hash).await?;
             sig_bytes.push(Bytes::from(sig.to_vec()));
         }
 

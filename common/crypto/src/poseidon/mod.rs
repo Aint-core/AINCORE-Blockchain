@@ -93,10 +93,10 @@ impl PoseidonHash {
 
             // 3. MixLayer (MDS)
             let mut new_state = vec![0u64; self.params.t];
-            for i in 0..self.params.t {
+            for (i, slot) in new_state.iter_mut().enumerate() {
                 for j in 0..self.params.t {
                     let mul = self.state[j].wrapping_mul(self.params.mds[i][j]);
-                    new_state[i] = new_state[i].wrapping_add(mul);
+                    *slot = slot.wrapping_add(mul);
                 }
             }
             self.state = new_state;

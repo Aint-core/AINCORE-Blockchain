@@ -219,7 +219,7 @@ pub async fn start_p2p(
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Mdns(MdnsEvent::Discovered(list))) => {
                         for (peer_id, multiaddr) in list {
                             println!("👀 mDNS discovered a new peer: {:?}", peer_id);
-                            let _ = swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                             swarm.behaviour_mut().kademlia.add_address(&peer_id, multiaddr.clone());
 
                             // Persist peer
@@ -229,7 +229,7 @@ pub async fn start_p2p(
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Mdns(MdnsEvent::Expired(list))) => {
                         for (peer_id, _multiaddr) in list {
                             println!("👋 mDNS peer expired: {:?}", peer_id);
-                            let _ = swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                            swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                         }
                     }
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Kademlia(KademliaEvent::RoutingUpdated { peer, addresses, .. })) => {

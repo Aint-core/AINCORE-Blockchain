@@ -56,6 +56,10 @@ impl AincoreClient {
         self.last_processed_height
     }
 
+    /// Legacy "latest N blocks" fetch. After Phase 3.5 the bridge uses
+    /// `get_blocks_range()` exclusively (range-based to avoid backlog skip),
+    /// but this remains for ad-hoc operator queries and explorer integrations.
+    #[allow(dead_code)]
     pub async fn get_latest_blocks(&self, limit: u64) -> Result<Vec<Block>, Box<dyn Error>> {
         let payload = serde_json::json!({
             "jsonrpc": "2.0",
@@ -131,10 +135,10 @@ impl AincoreClient {
 
         let rpc_resp: RpcResponse<serde_json::Value> = resp.json().await?;
 
-        if let Some(result) = rpc_resp.result {
-            if let Some(height) = result.get("block_height").and_then(|h| h.as_u64()) {
-                return Ok(height);
-            }
+        if let Some(result) = rpc_resp.result
+            && let Some(height) = result.get("block_height").and_then(|h| h.as_u64())
+        {
+            return Ok(height);
         }
 
         Ok(0)
@@ -145,11 +149,7 @@ impl AincoreClient {
     pub async fn get_finalized_height(&self) -> Result<u64, Box<dyn Error>> {
         let latest = self.get_latest_height().await?;
 
-        let finalized = if latest > FINALITY_DEPTH {
-            latest - FINALITY_DEPTH
-        } else {
-            0 // Genesis case
-        };
+        let finalized = latest.saturating_sub(FINALITY_DEPTH);
 
         info!(
             "📊 Latest: {}, Finalized: {} (depth: {})",

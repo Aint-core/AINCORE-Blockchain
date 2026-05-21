@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BridgeState {
     /// Last AINCORE block height fully processed.
     pub last_processed_height: u64,
@@ -25,16 +25,6 @@ pub struct BridgeState {
     /// Tombstone set — canonical event keys that have already been minted.
     /// Key format: `{tx_sender}:{block_height}:{amount}:{eth_addr}`
     pub processed_events: HashSet<String>,
-}
-
-impl Default for BridgeState {
-    fn default() -> Self {
-        Self {
-            last_processed_height: 0,
-            nonce_counter: 0,
-            processed_events: HashSet::new(),
-        }
-    }
 }
 
 impl BridgeState {

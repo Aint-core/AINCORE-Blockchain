@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     // use super::*; // Unused
     use crate::dag::DagConsensus;
@@ -498,7 +499,7 @@ mod tests {
     /// reflects any updated validator set.
     #[test]
     fn m08_validator_cache_serves_repeated_reads_and_refreshes_on_commit() {
-        let (mut consensus, path) = setup_dag("m08_validator_cache");
+        let (consensus, path) = setup_dag("m08_validator_cache");
 
         // First read primes the cache.
         let first = consensus.get_validator_set();
@@ -684,21 +685,33 @@ mod tests {
 
     // ── Phase 4.B2: H-02 multi-node integration ──────────────────────────
 
-    /// Phase 4.B2 — Multi-node downtime attestation flow reaches BFT quorum.
+    /// Phase 4.B2 — Logic-level simulation of cross-node attestation flow.
+    ///
+    /// **HONEST SCOPE OF THIS TEST:**
+    ///   This is a LOGIC-LEVEL integration test, NOT a real network
+    ///   integration test. It proves:
+    ///     ✅ Message format, signing, signature verification, storage,
+    ///        validator-set check, BFT quorum math, executor promotion
+    ///        all work correctly across 3 in-process DagConsensus instances.
+    ///
+    ///   It does NOT prove:
+    ///     ❌ libp2p Gossipsub serialization/transport
+    ///     ❌ TCP fallback path
+    ///     ❌ Network partition / heal scenarios
+    ///     ❌ Real broadcasting via `p2p_tx` channel
+    ///
+    ///   For full network integration, a separate `tests/h02_libp2p_*`
+    ///   harness spinning up real libp2p nodes is required (tracked as
+    ///   Phase 4+ work).
     ///
     /// Scenario:
     ///   3 validators A, B, C. Offender X is offline. Each validator
-    ///   independently observes downtime and signs an attestation.
-    ///   Attestations are gossiped (simulated via direct `handle_message`
-    ///   calls on the OTHER nodes). After all gossip messages settle,
-    ///   the executor on any node should see 3 distinct reporter
-    ///   attestations against X for the same epoch → BFT quorum
-    ///   ((3*2/3)+1 = 3) met → pending slash queued.
-    ///
-    /// This proves cross-validator gossip + executor promotion works
-    /// end-to-end, not just the parser-level unit tests in 3.1.
+    ///   independently signs an attestation. Attestations are passed
+    ///   via DIRECT `handle_message()` calls (simulating successful
+    ///   gossip). After exchange, every node has 3 distinct reporter
+    ///   attestations → executor promotes to pending slash on quorum.
     #[test]
-    fn test_h02_b2_multi_node_attestation_reaches_quorum() {
+    fn test_h02_b2_simulated_cross_node_attestation_reaches_quorum() {
         use crypto::{Signer, SigningKey, derive_address};
 
         // Helper: spin up an isolated DagConsensus node with a given key seed.

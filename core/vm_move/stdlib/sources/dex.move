@@ -105,12 +105,16 @@ module 0x1::dex {
         let reserve_y = coin::value(&pool.coin_y);
 
         let liquidity: u128;
+        let used_x: u128;
+        let used_y: u128;
         if (pool.lp_supply == 0) {
             assert_mul_safe(amount_x, amount_y);
             let raw_liquidity = sqrt(amount_x * amount_y);
             assert!(raw_liquidity > MINIMUM_LIQUIDITY, error::invalid_argument(EINVALID_LIQUIDITY));
             liquidity = raw_liquidity - MINIMUM_LIQUIDITY;
             pool.lp_supply = pool.lp_supply + MINIMUM_LIQUIDITY;
+            used_x = amount_x;
+            used_y = amount_y;
         } else {
             assert!(reserve_x > 0 && reserve_y > 0, error::invalid_state(EINVALID_LIQUIDITY));
             assert_mul_safe(amount_x, pool.lp_supply);
@@ -121,14 +125,19 @@ module 0x1::dex {
                 liquidity = share_x;
             } else {
                 liquidity = share_y;
-            }
+            };
+            assert_mul_safe(liquidity, reserve_x);
+            assert_mul_safe(liquidity, reserve_y);
+            used_x = (liquidity * reserve_x) / pool.lp_supply;
+            used_y = (liquidity * reserve_y) / pool.lp_supply;
         };
 
         assert!(liquidity > 0, error::invalid_argument(EINVALID_LIQUIDITY));
         assert!(liquidity >= min_lp, error::invalid_argument(EINVALID_LIQUIDITY));
+        assert!(used_x > 0 && used_y > 0, error::invalid_argument(EINVALID_LIQUIDITY));
 
-        let input_x = coin::withdraw<X>(account, amount_x);
-        let input_y = coin::withdraw<Y>(account, amount_y);
+        let input_x = coin::withdraw<X>(account, used_x);
+        let input_y = coin::withdraw<Y>(account, used_y);
         coin::merge(&mut pool.coin_x, input_x);
         coin::merge(&mut pool.coin_y, input_y);
         pool.lp_supply = pool.lp_supply + liquidity;

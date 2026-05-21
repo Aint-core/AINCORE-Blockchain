@@ -88,11 +88,11 @@ fn get_last_indexed_height(conn: &Connection) -> u64 {
         .ok();
     if let Some(mut s) = stmt {
         let mut rows = s.query([]).ok();
-        if let Some(rows) = rows.as_mut() {
-            if let Ok(Some(row)) = rows.next() {
-                let s: String = row.get(0).unwrap_or("0".to_string());
-                return s.parse::<u64>().unwrap_or(0);
-            }
+        if let Some(rows) = rows.as_mut()
+            && let Ok(Some(row)) = rows.next()
+        {
+            let s: String = row.get(0).unwrap_or("0".to_string());
+            return s.parse::<u64>().unwrap_or(0);
         }
     }
     0
@@ -145,7 +145,7 @@ async fn fetch_blocks(_start: u64, limit: u64) -> Option<Vec<serde_json::Value>>
         id: 1,
     };
 
-    let res = client.post(&get_rpc_url()).json(&req).send().await.ok()?;
+    let res = client.post(get_rpc_url()).json(&req).send().await.ok()?;
     let json: RpcResponse<Vec<serde_json::Value>> = res.json().await.ok()?;
     json.result
 }
@@ -188,29 +188,25 @@ async fn indexer_loop(db: Arc<Mutex<Connection>>) {
                             // In `main.rs`, `Block` struct has `transactions: Vec<String>`.
                             // So it's a list of JSON strings.
 
-                            if let Some(tx_str) = tx.as_str() {
-                                if let Ok(parsed) =
+                            if let Some(tx_str) = tx.as_str()
+                                && let Ok(parsed) =
                                     serde_json::from_str::<serde_json::Value>(tx_str)
-                                {
-                                    let sender = parsed["sender"].as_str().unwrap_or("");
-                                    let payload = parsed["payload"].as_str().unwrap_or("");
+                            {
+                                let sender = parsed["sender"].as_str().unwrap_or("");
+                                let payload = parsed["payload"].as_str().unwrap_or("");
 
-                                    // Calculate Hash (Naive)
-                                    // use sha2::{Sha256, Digest}; // Unused for now
+                                use sha2::{Digest, Sha256};
+                                let mut hasher = Sha256::new();
+                                hasher.update(tx_str.as_bytes());
+                                let hash = hex::encode(hasher.finalize());
 
-                                    use sha2::{Digest, Sha256};
-                                    let mut hasher = Sha256::new();
-                                    hasher.update(tx_str.as_bytes());
-                                    let hash = hex::encode(hasher.finalize());
+                                let (receiver, amount) = decode_transfer(payload);
 
-                                    let (receiver, amount) = decode_transfer(payload);
-
-                                    conn.execute(
-                                        "INSERT OR IGNORE INTO transactions (hash, sender, receiver, amount, payload, block_height, timestamp)
-                                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                                        params![hash, sender, receiver, amount, payload, height, 0],
-                                    ).ok();
-                                }
+                                conn.execute(
+                                    "INSERT OR IGNORE INTO transactions (hash, sender, receiver, amount, payload, block_height, timestamp)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                    params![hash, sender, receiver, amount, payload, height, 0],
+                                ).ok();
                             }
                         }
                         set_last_indexed_height(&conn, height);
@@ -269,10 +265,8 @@ async fn get_history(data: web::Data<AppState>, path: web::Path<String>) -> impl
     };
 
     let mut txs = Vec::new();
-    for tx in rows {
-        if let Ok(t) = tx {
-            txs.push(t);
-        }
+    for t in rows.flatten() {
+        txs.push(t);
     }
 
     HttpResponse::Ok().json(txs)

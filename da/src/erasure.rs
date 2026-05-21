@@ -46,7 +46,7 @@ impl ErasureEncoder {
         let total_shards = self.data_shards + self.parity_shards;
 
         // Calculate shard size (round up)
-        let shard_size = (data.len() + self.data_shards - 1) / self.data_shards;
+        let shard_size = data.len().div_ceil(self.data_shards);
 
         // Create data shards
         let mut shards: Vec<Vec<u8>> = Vec::with_capacity(total_shards);
@@ -105,12 +105,10 @@ impl ErasureEncoder {
         // Extract data from data shards
         let mut result = Vec::with_capacity(original_size);
 
-        for i in 0..self.data_shards {
-            if let Some(shard) = &shards[i] {
-                result.extend_from_slice(shard);
-                if result.len() >= original_size {
-                    break;
-                }
+        for shard in shards.iter().take(self.data_shards).flatten() {
+            result.extend_from_slice(shard);
+            if result.len() >= original_size {
+                break;
             }
         }
 
@@ -166,8 +164,8 @@ mod tests {
 
         // Lose too many shards (6 out of 15, need at least 10)
         let mut partial_shards: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
-        for i in 0..6 {
-            partial_shards[i] = None;
+        for slot in partial_shards.iter_mut().take(6) {
+            *slot = None;
         }
 
         let result = encoder.decode(partial_shards, data.len());
