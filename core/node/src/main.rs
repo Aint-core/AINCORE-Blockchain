@@ -371,10 +371,17 @@ async fn main() {
     // (pre-Phase-1) or fail-closed (Phase 1 mitigation).
     let mempool = Arc::new(Mutex::new(Mempool::with_storage(Arc::clone(&storage))));
 
-    let da_sequencer = Arc::new(Mutex::new(DASequencer::new(
+    // Phase 2.9 (M-09): pass the node's persistent Ed25519 key bytes
+    // so the DA signing key is encrypted at rest with a key derived
+    // from the node identity. Reading the RocksDB directory is no
+    // longer sufficient to extract the DA signing key — an attacker
+    // also needs `node.key`.
+    let node_identity_bytes = signing_key.to_bytes();
+    let da_sequencer = Arc::new(Mutex::new(DASequencer::new_encrypted(
         node_id.clone(),
         Arc::clone(&storage),
         Arc::clone(&peers),
+        &node_identity_bytes,
     )));
 
     // CRITICAL: Use RwLock for DAG Consensus
