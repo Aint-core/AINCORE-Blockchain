@@ -105,6 +105,59 @@ fn validator_set_key() -> String {
     )
 }
 
+fn dex_registry_key() -> String {
+    format!(
+        "resource_{}_{}",
+        system_address(),
+        "0x1::dex::PoolRegistry"
+    )
+}
+
+fn coin_store_key_for_type(
+    addr: move_core_types::account_address::AccountAddress,
+    coin_type: move_core_types::language_storage::TypeTag,
+) -> String {
+    let tag = move_core_types::language_storage::StructTag {
+        address: system_address(),
+        module: move_core_types::identifier::Identifier::new("coin").expect("valid module"),
+        name: move_core_types::identifier::Identifier::new("CoinStore").expect("valid struct"),
+        type_params: vec![coin_type],
+    };
+    format!("resource_{}_{}", addr, tag)
+}
+
+fn dex_pool_key_for_type_args(
+    pool_addr: move_core_types::account_address::AccountAddress,
+    ty_args: &[move_core_types::language_storage::TypeTag],
+) -> Option<String> {
+    if ty_args.len() != 2 {
+        return None;
+    }
+    let tag = move_core_types::language_storage::StructTag {
+        address: system_address(),
+        module: move_core_types::identifier::Identifier::new("dex").ok()?,
+        name: move_core_types::identifier::Identifier::new("LiquidityPool").ok()?,
+        type_params: vec![ty_args[0].clone(), ty_args[1].clone()],
+    };
+    Some(format!("resource_{}_{}", pool_addr, tag))
+}
+
+fn dex_lp_key_for_type_args(
+    owner: move_core_types::account_address::AccountAddress,
+    ty_args: &[move_core_types::language_storage::TypeTag],
+) -> Option<String> {
+    if ty_args.len() != 2 {
+        return None;
+    }
+    let tag = move_core_types::language_storage::StructTag {
+        address: system_address(),
+        module: move_core_types::identifier::Identifier::new("dex").ok()?,
+        name: move_core_types::identifier::Identifier::new("LPToken").ok()?,
+        type_params: vec![ty_args[0].clone(), ty_args[1].clone()],
+    };
+    Some(format!("resource_{}_{}", owner, tag))
+}
+
 fn decode_validator_set_hex(value: &str) -> Option<MoveValidatorSet> {
     let bytes = hex::decode(value).ok()?;
     bcs::from_bytes::<MoveValidatorSet>(&bytes).ok()
@@ -125,15 +178,87 @@ fn receipt_update(
     gas_charged: u128,
     error: Option<String>,
 ) -> (String, Option<String>) {
+    let metadata = receipt_metadata(tx_json);
     let value = serde_json::json!({
         "status": status,
         "gas_charged": gas_charged.to_string(),
         "error": error,
+        "metadata": metadata,
     });
     (
         format!("tx_receipt:{}", tx_hash_hex(tx_json)),
         Some(value.to_string()),
     )
+}
+
+fn bcs_arg<T: serde::de::DeserializeOwned>(args: &[Vec<u8>], index: usize) -> Option<T> {
+    args.get(index).and_then(|bytes| bcs::from_bytes(bytes).ok())
+}
+
+fn receipt_metadata(tx_json: &str) -> Option<serde_json::Value> {
+    let tx = serde_json::from_str::<Transaction>(tx_json).ok()?;
+    let payload_bytes = hex::decode(tx.payload.trim_start_matches("0x")).ok()?;
+    let payload = bcs::from_bytes::<vm_move::TransactionPayload>(&payload_bytes).ok()?;
+    let vm_move::TransactionPayload::EntryFunction(call) = payload else {
+        return None;
+    };
+    if *call.module.address() != system_address() || call.module.name().as_str() != "dex" {
+        return None;
+    }
+
+    let type_args: Vec<String> = call.ty_args.iter().map(|arg| arg.to_string()).collect();
+    let sender_addr = parse_move_address(&tx.sender)?;
+    let pool_addr = if call.function == "create_pool" {
+        Some(sender_addr)
+    } else {
+        bcs_arg::<move_core_types::account_address::AccountAddress>(&call.args, 1)
+    };
+
+    let mut metadata = serde_json::json!({
+        "kind": "dex",
+        "module": "dex",
+        "function": call.function,
+        "type_args": type_args,
+        "pool_addr": pool_addr.map(|addr| addr.to_string()),
+    });
+
+    if let Some(obj) = metadata.as_object_mut() {
+        match call.function.as_str() {
+            "add_liquidity" => {
+                if let Some(amount_x) = bcs_arg::<u128>(&call.args, 2) {
+                    obj.insert("amount_x".to_string(), serde_json::json!(amount_x.to_string()));
+                }
+                if let Some(amount_y) = bcs_arg::<u128>(&call.args, 3) {
+                    obj.insert("amount_y".to_string(), serde_json::json!(amount_y.to_string()));
+                }
+                if let Some(min_lp) = bcs_arg::<u128>(&call.args, 4) {
+                    obj.insert("min_lp".to_string(), serde_json::json!(min_lp.to_string()));
+                }
+            }
+            "remove_liquidity" => {
+                if let Some(lp_amount) = bcs_arg::<u128>(&call.args, 2) {
+                    obj.insert("lp_amount".to_string(), serde_json::json!(lp_amount.to_string()));
+                }
+                if let Some(min_x) = bcs_arg::<u128>(&call.args, 3) {
+                    obj.insert("min_x".to_string(), serde_json::json!(min_x.to_string()));
+                }
+                if let Some(min_y) = bcs_arg::<u128>(&call.args, 4) {
+                    obj.insert("min_y".to_string(), serde_json::json!(min_y.to_string()));
+                }
+            }
+            "swap_x_to_y" | "swap_y_to_x" => {
+                if let Some(amount_in) = bcs_arg::<u128>(&call.args, 2) {
+                    obj.insert("amount_in".to_string(), serde_json::json!(amount_in.to_string()));
+                }
+                if let Some(min_out) = bcs_arg::<u128>(&call.args, 3) {
+                    obj.insert("min_out".to_string(), serde_json::json!(min_out.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(metadata)
 }
 
 fn known_payload_format(payload: &str) -> bool {
@@ -1186,13 +1311,71 @@ impl Executor {
                     "resource_{}_{}",
                     tx.sender, "0x1::token_factory::TokenWallet"
                 ));
+            } else if *module_addr == system_address() && module_name == "dex" {
+                deps.push(dex_registry_key());
+
+                let sender_addr = parse_move_address(&tx.sender);
+                let pool_addr = if function == "create_pool" {
+                    sender_addr
+                } else {
+                    bcs_arg::<move_core_types::account_address::AccountAddress>(&call.args, 1)
+                };
+
+                if let Some(pool_addr) = pool_addr {
+                    if let Some(pool_key) = dex_pool_key_for_type_args(pool_addr, &call.ty_args) {
+                        deps.push(pool_key);
+                    }
+                }
+
+                if let Some(sender_addr) = sender_addr {
+                    if let Some(lp_key) = dex_lp_key_for_type_args(sender_addr, &call.ty_args) {
+                        if matches!(function, "add_liquidity" | "remove_liquidity") {
+                            deps.push(lp_key);
+                        }
+                    }
+                    for coin_type in &call.ty_args {
+                        deps.push(coin_store_key_for_type(sender_addr, coin_type.clone()));
+                    }
+                }
             }
         }
         deps
     }
 
-    // Now returns a list of DB updates instead of writing directly.
-    // Thread-safe because it only reads.
+    /// Build the database update set for a single transaction.
+    ///
+    /// # Lock Contract (Phase 2.4 / H-05 hardening)
+    ///
+    /// This function performs only **reads** against `self.db` and Move
+    /// VM caches — it does NOT write to RocksDB. The caller is
+    /// responsible for applying the returned update list, and that
+    /// application MUST happen while the global
+    /// [`BLOCK_EXECUTION_LOCK`] is held. Otherwise concurrent block
+    /// executions could observe each other's intermediate state and
+    /// produce divergent state roots, instantly forking the chain.
+    ///
+    /// In the production code path this contract is satisfied because
+    /// `execute_block_parallel` acquires `BLOCK_EXECUTION_LOCK` at the
+    /// top of its body and only releases it after every parallel
+    /// worker has finished and updates have been committed to
+    /// RocksDB. The rayon worker pool inside that critical section
+    /// invokes this function read-only and ships the resulting
+    /// `Vec<(key, value)>` back to the main thread for batched commit.
+    ///
+    /// External / test callers that invoke `execute_transaction`
+    /// directly (without going through `execute_block_parallel`) must
+    /// either:
+    ///   1. ensure no other thread is running `execute_block_parallel`
+    ///      against the same `Executor`, or
+    ///   2. wrap their own use in `BLOCK_EXECUTION_LOCK.lock()` to
+    ///      preserve the global-serialization invariant.
+    ///
+    /// The audit (DEEP-AUDIT-REPORT-2026-05-21 H-05) initially flagged
+    /// this as a critical lock-bypass risk. Code review downgraded the
+    /// severity because the production commit path is locked and this
+    /// function is read-only against shared state. Phase 2.4 documents
+    /// the contract explicitly so any future caller that needs to call
+    /// this outside the canonical flow has clear instructions.
     pub fn execute_transaction(
         &self,
         tx_json: &str,
@@ -1726,6 +1909,22 @@ mod tests {
         balance: u128,
     }
 
+    #[derive(Serialize, Deserialize, Clone)]
+    struct TestPoolInfo {
+        pool_key: Vec<u8>,
+        pool_addr: move_core_types::account_address::AccountAddress,
+        token_x_name: Vec<u8>,
+        token_y_name: Vec<u8>,
+        fee_bp: u64,
+        creator: move_core_types::account_address::AccountAddress,
+        active: bool,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct TestPoolRegistry {
+        pools: Vec<TestPoolInfo>,
+    }
+
     fn temp_db(name: &str) -> Arc<StateDB> {
         let path = format!(
             "/tmp/aincore_phase0_executor_{}_{}",
@@ -1838,7 +2037,12 @@ mod tests {
             .value
     }
 
+    fn dex_registry_key() -> String {
+        super::dex_registry_key()
+    }
+
     fn dex_pool_key(
+        pool_addr: move_core_types::account_address::AccountAddress,
         x: move_core_types::language_storage::TypeTag,
         y: move_core_types::language_storage::TypeTag,
     ) -> String {
@@ -1848,7 +2052,7 @@ mod tests {
             name: move_core_types::identifier::Identifier::new("LiquidityPool").unwrap(),
             type_params: vec![x, y],
         };
-        format!("resource_{}_{}", system_address(), tag)
+        format!("resource_{}_{}", pool_addr, tag)
     }
 
     fn dex_lp_key(
@@ -1865,8 +2069,28 @@ mod tests {
         format!("resource_{}_{}", owner, tag)
     }
 
+    fn set_dex_registry(db: &StateDB, pools: Vec<TestPoolInfo>) {
+        db.put(
+            &dex_registry_key(),
+            &hex::encode(
+                bcs::to_bytes(&TestPoolRegistry { pools }).expect("dex registry BCS"),
+            ),
+        )
+        .expect("dex registry stored");
+    }
+
+    fn dex_registry(db: &StateDB) -> TestPoolRegistry {
+        let value = db
+            .get(&dex_registry_key())
+            .expect("dex registry read")
+            .expect("dex registry exists");
+        bcs::from_bytes(&hex::decode(value).expect("dex registry hex"))
+            .expect("dex registry BCS")
+    }
+
     fn set_dex_pool(
         db: &StateDB,
+        pool_owner: &str,
         x: move_core_types::language_storage::TypeTag,
         y: move_core_types::language_storage::TypeTag,
         reserve_x: u128,
@@ -1879,8 +2103,9 @@ mod tests {
             lp_supply,
             fee_bp: 30,
         };
+        let pool_addr = parse_move_address(pool_owner).expect("pool owner address");
         db.put(
-            &dex_pool_key(x, y),
+            &dex_pool_key(pool_addr, x, y),
             &hex::encode(bcs::to_bytes(&pool).expect("dex pool BCS")),
         )
         .expect("dex pool stored");
@@ -1888,11 +2113,13 @@ mod tests {
 
     fn dex_pool(
         db: &StateDB,
+        pool_owner: &str,
         x: move_core_types::language_storage::TypeTag,
         y: move_core_types::language_storage::TypeTag,
     ) -> TestLiquidityPool {
+        let pool_addr = parse_move_address(pool_owner).expect("pool owner address");
         let value = db
-            .get(&dex_pool_key(x, y))
+            .get(&dex_pool_key(pool_addr, x, y))
             .expect("dex pool read")
             .expect("dex pool exists");
         bcs::from_bytes(&hex::decode(value).expect("dex pool hex")).expect("dex pool BCS")
@@ -2432,7 +2659,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dex_add_liquidity_and_swap_updates_pool_and_user_balances() {
+    fn test_dex_create_pool_liquidity_swap_and_remove_end_to_end() {
         let db = temp_db("dex_liquidity_swap");
         load_stdlib(&db);
         let trader_key = SigningKey::from_bytes(&[32u8; 32]);
@@ -2444,26 +2671,39 @@ mod tests {
         let wbtc = wbtc_coin_type();
         set_coin_store_for(&db, &trader, ain.clone(), 1_000_000);
         set_coin_store_for(&db, &trader, wbtc.clone(), 1_000_000);
-        set_dex_pool(&db, ain.clone(), wbtc.clone(), 0, 0, 0);
+        set_dex_registry(&db, vec![]);
 
         let executor = Executor::new(db.clone());
+        let create_payload = entry_payload("dex", "create_pool", vec![ain.clone(), wbtc.clone()], vec![
+            bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+        ]);
+        let create_tx = signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1);
+        let (updates, gas) = executor
+            .execute_transaction(&create_tx)
+            .expect("create pool accepted");
+        assert_eq!(gas, 10_000);
+        apply_updates(&db, updates);
+        assert_eq!(dex_registry(&db).pools.len(), 1);
+
         let add_payload = entry_payload(
             "dex",
             "add_liquidity",
             vec![ain.clone(), wbtc.clone()],
             vec![
                 bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
                 bcs::to_bytes(&10_000u128).unwrap(),
                 bcs::to_bytes(&10_000u128).unwrap(),
+                bcs::to_bytes(&9_000u128).unwrap(),
             ],
         );
         let (updates, gas) = executor
-            .execute_transaction(&signed_tx(&trader_key, &trader, &add_payload, 0, 10_000, 1))
+            .execute_transaction(&signed_tx(&trader_key, &trader, &add_payload, 1, 10_000, 1))
             .expect("add liquidity accepted");
         assert_eq!(gas, 10_000);
         apply_updates(&db, updates);
 
-        let pool = dex_pool(&db, ain.clone(), wbtc.clone());
+        let pool = dex_pool(&db, &trader, ain.clone(), wbtc.clone());
         assert_eq!(pool.coin_x.value, 10_000);
         assert_eq!(pool.coin_y.value, 10_000);
         assert_eq!(pool.lp_supply, 10_000);
@@ -2473,7 +2713,7 @@ mod tests {
         );
         assert_eq!(
             coin_balance_for(&db, &trader, ain.clone()),
-            1_000_000 - 10_000 - 10_000
+            1_000_000 - 10_000 - 10_000 - 10_000
         );
         assert_eq!(coin_balance_for(&db, &trader, wbtc.clone()), 990_000);
 
@@ -2483,28 +2723,135 @@ mod tests {
             vec![ain.clone(), wbtc.clone()],
             vec![
                 bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+                bcs::to_bytes(&1_000u128).unwrap(),
+                bcs::to_bytes(&900u128).unwrap(),
+            ],
+        );
+        let swap_tx = signed_tx(&trader_key, &trader, &swap_payload, 2, 10_000, 1);
+        let (updates, gas) = executor
+            .execute_transaction(&swap_tx)
+            .expect("swap accepted");
+        assert_eq!(gas, 10_000);
+        apply_updates(&db, updates);
+
+        let pool = dex_pool(&db, &trader, ain.clone(), wbtc.clone());
+        assert_eq!(pool.coin_x.value, 11_000);
+        assert_eq!(pool.coin_y.value, 9_094);
+        assert_eq!(coin_balance_for(&db, &trader, ain.clone()), 959_000);
+        assert_eq!(coin_balance_for(&db, &trader, wbtc.clone()), 990_906);
+        let receipt = db
+            .get(&format!("tx_receipt:{}", tx_hash_hex(&swap_tx)))
+            .unwrap()
+            .expect("receipt stored");
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["status"], "success");
+        assert_eq!(receipt["metadata"]["kind"], "dex");
+        assert_eq!(receipt["metadata"]["function"], "swap_x_to_y");
+
+        let remove_payload = entry_payload(
+            "dex",
+            "remove_liquidity",
+            vec![ain.clone(), wbtc.clone()],
+            vec![
+                bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+                bcs::to_bytes(&1_000u128).unwrap(),
                 bcs::to_bytes(&1_000u128).unwrap(),
                 bcs::to_bytes(&900u128).unwrap(),
             ],
         );
         let (updates, gas) = executor
-            .execute_transaction(&signed_tx(
-                &trader_key,
-                &trader,
-                &swap_payload,
-                1,
-                10_000,
-                1,
-            ))
-            .expect("swap accepted");
+            .execute_transaction(&signed_tx(&trader_key, &trader, &remove_payload, 3, 10_000, 1))
+            .expect("remove liquidity accepted");
         assert_eq!(gas, 10_000);
         apply_updates(&db, updates);
 
-        let pool = dex_pool(&db, ain.clone(), wbtc.clone());
-        assert_eq!(pool.coin_x.value, 11_000);
-        assert_eq!(pool.coin_y.value, 9_094);
-        assert_eq!(coin_balance_for(&db, &trader, ain), 969_000);
-        assert_eq!(coin_balance_for(&db, &trader, wbtc), 990_906);
+        let pool = dex_pool(&db, &trader, ain.clone(), wbtc.clone());
+        assert_eq!(pool.coin_x.value, 9_900);
+        assert_eq!(pool.coin_y.value, 8_185);
+        assert_eq!(pool.lp_supply, 9_000);
+        assert_eq!(dex_lp_balance(&db, &trader, ain.clone(), wbtc.clone()), 8_000);
+        assert_eq!(coin_balance_for(&db, &trader, ain), 950_100);
+        assert_eq!(coin_balance_for(&db, &trader, wbtc), 991_815);
+    }
+
+    #[test]
+    fn test_dex_duplicate_and_reverse_pool_creation_abort_after_gas() {
+        let db = temp_db("dex_duplicate_reverse");
+        load_stdlib(&db);
+        let trader_key = SigningKey::from_bytes(&[35u8; 32]);
+        let trader = create_account(&db, &trader_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+
+        let ain = aincore_coin_type();
+        let wbtc = wbtc_coin_type();
+        set_coin_store_for(&db, &trader, ain.clone(), 100_000);
+        set_coin_store_for(&db, &trader, wbtc.clone(), 100_000);
+        set_dex_registry(&db, vec![]);
+
+        let executor = Executor::new(db.clone());
+        let create_payload = entry_payload("dex", "create_pool", vec![ain.clone(), wbtc.clone()], vec![
+            bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+        ]);
+        let (updates, _) = executor
+            .execute_transaction(&signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1))
+            .expect("first create accepted");
+        apply_updates(&db, updates);
+        assert_eq!(dex_registry(&db).pools.len(), 1);
+
+        let reverse_payload = entry_payload("dex", "create_pool", vec![wbtc.clone(), ain.clone()], vec![
+            bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+        ]);
+        let reverse_tx = signed_tx(&trader_key, &trader, &reverse_payload, 1, 10_000, 1);
+        let (updates, _) = executor
+            .execute_transaction(&reverse_tx)
+            .expect("reverse create abort is accepted and gas-charged");
+        apply_updates(&db, updates);
+        assert_eq!(dex_registry(&db).pools.len(), 1);
+        let receipt = db
+            .get(&format!("tx_receipt:{}", tx_hash_hex(&reverse_tx)))
+            .unwrap()
+            .expect("reverse receipt stored");
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["status"], "aborted");
+
+        let duplicate_tx = signed_tx(&trader_key, &trader, &create_payload, 2, 10_000, 1);
+        let (updates, _) = executor
+            .execute_transaction(&duplicate_tx)
+            .expect("duplicate create abort is accepted and gas-charged");
+        apply_updates(&db, updates);
+        assert_eq!(dex_registry(&db).pools.len(), 1);
+        assert_eq!(coin_balance_for(&db, &trader, ain), 70_000);
+    }
+
+    #[test]
+    fn test_dex_dependency_tracking_includes_shared_pool_resource() {
+        let db = temp_db("dex_dependencies");
+        let trader_key = SigningKey::from_bytes(&[36u8; 32]);
+        let trader = create_account(&db, &trader_key);
+        let ain = aincore_coin_type();
+        let wbtc = wbtc_coin_type();
+        let pool_addr = parse_move_address(&trader).unwrap();
+        let payload = entry_payload(
+            "dex",
+            "swap_x_to_y",
+            vec![ain.clone(), wbtc.clone()],
+            vec![
+                bcs::to_bytes(&pool_addr).unwrap(),
+                bcs::to_bytes(&pool_addr).unwrap(),
+                bcs::to_bytes(&1_000u128).unwrap(),
+                bcs::to_bytes(&1u128).unwrap(),
+            ],
+        );
+        let tx_json = signed_tx(&trader_key, &trader, &payload, 0, 10_000, 1);
+        let executor = Executor::new(db.clone());
+        let deps = executor.analyze_dependencies(&tx_json);
+        let expected_pool = dex_pool_key(pool_addr, ain, wbtc);
+
+        assert!(deps.contains(&dex_registry_key()));
+        assert!(deps.contains(&expected_pool));
     }
 
     #[test]
@@ -2520,7 +2867,17 @@ mod tests {
         let wbtc = wbtc_coin_type();
         set_coin_store_for(&db, &trader, ain.clone(), 100_000);
         set_coin_store_for(&db, &trader, wbtc.clone(), 100_000);
-        set_dex_pool(&db, ain.clone(), wbtc.clone(), 0, 0, 0);
+        set_dex_registry(&db, vec![]);
+
+        let executor = Executor::new(db.clone());
+        let create_payload = entry_payload("dex", "create_pool", vec![ain.clone(), wbtc.clone()], vec![
+            bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+        ]);
+        let (updates, gas) = executor
+            .execute_transaction(&signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1))
+            .expect("create pool accepted");
+        assert_eq!(gas, 10_000);
+        apply_updates(&db, updates);
 
         let payload = entry_payload(
             "dex",
@@ -2528,23 +2885,24 @@ mod tests {
             vec![ain.clone(), wbtc.clone()],
             vec![
                 bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
                 bcs::to_bytes(&1_000u128).unwrap(),
                 bcs::to_bytes(&1_000u128).unwrap(),
+                bcs::to_bytes(&0u128).unwrap(),
             ],
         );
-        let executor = Executor::new(db.clone());
-        let tx_json = signed_tx(&trader_key, &trader, &payload, 0, 10_000, 1);
+        let tx_json = signed_tx(&trader_key, &trader, &payload, 1, 10_000, 1);
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("minimum-liquidity abort is accepted and gas-charged");
         assert_eq!(gas, 10_000);
         apply_updates(&db, updates);
 
-        let pool = dex_pool(&db, ain.clone(), wbtc.clone());
+        let pool = dex_pool(&db, &trader, ain.clone(), wbtc.clone());
         assert_eq!(pool.lp_supply, 0);
         assert_eq!(pool.coin_x.value, 0);
         assert_eq!(pool.coin_y.value, 0);
-        assert_eq!(coin_balance_for(&db, &trader, ain), 90_000);
+        assert_eq!(coin_balance_for(&db, &trader, ain), 80_000);
         assert_eq!(coin_balance_for(&db, &trader, wbtc), 100_000);
         let receipt = db
             .get(&format!("tx_receipt:{}", tx_hash_hex(&tx_json)))
@@ -2563,36 +2921,47 @@ mod tests {
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
 
-        let wbtc = wbtc_coin_type();
         let ain = aincore_coin_type();
+        let wbtc = wbtc_coin_type();
         let overflow_input = (u128::MAX / 9_970) + 1;
-        set_coin_store_for(&db, &trader, ain.clone(), 100_000);
-        set_coin_store_for(&db, &trader, wbtc.clone(), overflow_input);
-        set_dex_pool(&db, wbtc.clone(), ain.clone(), 10_000, 10_000, 10_000);
+        set_coin_store_for(&db, &trader, ain.clone(), overflow_input + 10_000);
+        set_coin_store_for(&db, &trader, wbtc.clone(), 100_000);
+        set_dex_registry(&db, vec![]);
+
+        let executor = Executor::new(db.clone());
+        let create_payload = entry_payload("dex", "create_pool", vec![ain.clone(), wbtc.clone()], vec![
+            bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+        ]);
+        let (updates, gas) = executor
+            .execute_transaction(&signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1))
+            .expect("create pool accepted");
+        assert_eq!(gas, 10_000);
+        apply_updates(&db, updates);
+        set_dex_pool(&db, &trader, ain.clone(), wbtc.clone(), 10_000, 10_000, 10_000);
 
         let payload = entry_payload(
             "dex",
             "swap_x_to_y",
-            vec![wbtc.clone(), ain.clone()],
+            vec![ain.clone(), wbtc.clone()],
             vec![
+                bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
                 bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
                 bcs::to_bytes(&overflow_input).unwrap(),
                 bcs::to_bytes(&0u128).unwrap(),
             ],
         );
-        let executor = Executor::new(db.clone());
-        let tx_json = signed_tx(&trader_key, &trader, &payload, 0, 10_000, 1);
+        let tx_json = signed_tx(&trader_key, &trader, &payload, 1, 10_000, 1);
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("overflow abort is accepted and gas-charged");
         assert_eq!(gas, 10_000);
         apply_updates(&db, updates);
 
-        let pool = dex_pool(&db, wbtc.clone(), ain.clone());
+        let pool = dex_pool(&db, &trader, ain.clone(), wbtc.clone());
         assert_eq!(pool.coin_x.value, 10_000);
         assert_eq!(pool.coin_y.value, 10_000);
-        assert_eq!(coin_balance_for(&db, &trader, wbtc), overflow_input);
-        assert_eq!(coin_balance_for(&db, &trader, ain), 90_000);
+        assert_eq!(coin_balance_for(&db, &trader, ain), overflow_input - 10_000);
+        assert_eq!(coin_balance_for(&db, &trader, wbtc), 100_000);
         let receipt = db
             .get(&format!("tx_receipt:{}", tx_hash_hex(&tx_json)))
             .unwrap()
