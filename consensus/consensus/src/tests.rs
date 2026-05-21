@@ -484,6 +484,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    /// Phase 2.8 (M-08): validator cache is populated on first read and
+    /// returned for subsequent reads without re-parsing storage. After
+    /// a block commit, the cache is invalidated and the next read
+    /// reflects any updated validator set.
+    #[test]
+    fn m08_validator_cache_serves_repeated_reads_and_refreshes_on_commit() {
+        let (mut consensus, path) = setup_dag("m08_validator_cache");
+
+        // First read primes the cache.
+        let first = consensus.get_validator_set();
+        assert!(!first.is_empty(), "test setup seeded a validator");
+        let seeded_node = first[0].clone();
+
+        // Mutate storage behind the cache's back. With a naïve
+        // implementation this would IMMEDIATELY change the result —
+        // but the M-08 cache must keep returning the pre-mutation
+        // value until the next legitimate invalidation point.
+        let phantom_validator = format!(
+            "{}deadbeefdeadbeefdeadbeefdeadbeef",
+            &seeded_node[..0] // empty prefix; just construct a distinct 32-char hex
+        );
+        let mutated_json = format!(
+            r#"[["{}",1000],["{}",1000]]"#,
+            seeded_node, "deadbeefdeadbeefdeadbeefdeadbeef"
+        );
+        consensus
+            .storage
+            .put("sys:validators", &mutated_json)
+            .unwrap();
+
+        // Cache hit: still the original set.
+        let cached_second_read = consensus.get_validator_set();
+        assert_eq!(
+            cached_second_read.len(),
+            first.len(),
+            "cache must not reflect the storage mutation until invalidation"
+        );
+
+        // Drive a commit to trigger invalidation. We can't easily
+        // synthesise a block commit in this unit test, so call the
+        // public invalidator directly — same code path the commit
+        // takes.
+        consensus.invalidate_validators_cache();
+
+        let post_invalidation = consensus.get_validator_set();
+        assert!(
+            post_invalidation.len() > first.len()
+                || post_invalidation.contains(&"deadbeefdeadbeefdeadbeefdeadbeef".to_string()),
+            "after invalidation, cache must re-read storage and reflect the new set"
+        );
+
+        let _ = phantom_validator;
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     /// A checkpoint whose signature does NOT verify against this node's
     /// key (tampered or signed with a different key) must be rejected
     /// — the boot path falls back to scan-based recovery instead of

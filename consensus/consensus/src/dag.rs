@@ -26,6 +26,17 @@ pub struct DagConsensus {
     pub da_sequencer: Option<Arc<Mutex<DASequencer>>>, // Added DA Sequencer
     pub p2p_tx: Option<tokio::sync::mpsc::Sender<String>>, // Added P2P Libp2p Channel
     pub node_key: [u8; 32], // H4 FIX: Store the persistent Ed25519 key for BLS derivation
+    /// Phase 2.8 (M-08): cache of the active validator set.
+    ///
+    /// `get_validator_set` used to hit RocksDB on every call — twice per
+    /// vertex (proposal + verification) plus once per ordering attempt.
+    /// On a healthy network that's hundreds of disk reads + JSON parses
+    /// per second of identical data. The cache is populated on first
+    /// access, returned for all reads in the same block window, and
+    /// invalidated when a block commits (cheapest moment to refresh —
+    /// the only time validator set may legitimately change during normal
+    /// operation is via a slash, which happens during block execution).
+    validators_cache: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 impl DagConsensus {
@@ -252,6 +263,22 @@ impl DagConsensus {
             da_sequencer,
             p2p_tx,
             node_key,
+            // Phase 2.8 (M-08): empty cache; first get_validator_set call
+            // populates it from storage. Subsequent reads are cache hits
+            // until the next block commit invalidates.
+            validators_cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Phase 2.8 (M-08): force the next `get_validator_set` to re-read
+    /// from storage. Called on block commit because that's the only
+    /// moment validator set may legitimately change during normal
+    /// operation (slash execution updates `sys:validators`). Public so
+    /// out-of-band code paths (genesis init, integration tests,
+    /// admin tooling that mutates storage directly) can force a refresh.
+    pub fn invalidate_validators_cache(&self) {
+        if let Ok(mut guard) = self.validators_cache.lock() {
+            *guard = None;
         }
     }
 
@@ -779,6 +806,10 @@ impl DagConsensus {
                             self.latest_block_height, e
                         );
                     }
+                    // Phase 2.8 (M-08): block commit is the only moment
+                    // where a slash could have changed the validator set
+                    // during normal operation, so refresh the cache here.
+                    self.invalidate_validators_cache();
                     println!(
                         "📦 Created Block #{} (Hash: {:.8})",
                         self.latest_block_height, self.latest_block_hash
@@ -980,6 +1011,43 @@ impl DagConsensus {
     }
 
     pub fn get_validator_set(&self) -> Vec<String> {
+        // Phase 2.8 (M-08): cache fast path.
+        //
+        // The previous implementation re-read `sys:validators` from RocksDB
+        // and re-parsed the JSON on every call. `try_create_vertex` and
+        // `add_vertex` both call this once or more per vertex, so on a
+        // healthy network this was hundreds of identical disk reads per
+        // block period for data that only changes when a slash executes.
+        //
+        // Cache invariants:
+        //   * `validators_cache` is populated on first cache miss.
+        //   * `invalidate_validators_cache()` is called from `add_vertex`
+        //     immediately after a block is persisted via save_block_json
+        //     — that is the only moment a slash could have changed the
+        //     active set during normal operation.
+        //   * If anything bypasses that flow (tests writing
+        //     `sys:validators` directly, manual ops surgery), they must
+        //     also call `invalidate_validators_cache()`; otherwise the
+        //     cache will stay stale until the next legitimate commit.
+        if let Ok(guard) = self.validators_cache.lock() {
+            if let Some(cached) = guard.as_ref() {
+                return cached.clone();
+            }
+        }
+
+        // Cache miss — read fresh from storage and populate.
+        let fresh = self.read_validators_from_storage();
+        if let Ok(mut guard) = self.validators_cache.lock() {
+            *guard = Some(fresh.clone());
+        }
+        fresh
+    }
+
+    /// Storage-backed read path. Direct callers should prefer
+    /// `get_validator_set` so the cache is exercised; this helper is
+    /// extracted so cache misses and explicit refreshes share one
+    /// implementation.
+    fn read_validators_from_storage(&self) -> Vec<String> {
         // 1. FAST PATH: Native Consensus State sync'd from Move VM (sys:validators)
         if let Ok(Some(json)) = self.storage.get("sys:validators") {
             if let Ok(vals) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
