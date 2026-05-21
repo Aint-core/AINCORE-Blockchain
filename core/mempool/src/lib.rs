@@ -1,24 +1,61 @@
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
+use storage::StateDB;
 
 const MAX_PENDING_TXS: usize = 5000;
 const MAX_SEEN_TXS: usize = 50000;
 const MIN_GAS_PRICE: u128 = 1;
+
+/// Dilithium5 signature length as raw bytes (NIST round-3 spec).
+const PQC_DILITHIUM5_SIG_BYTES: usize = 4627;
+/// Dilithium5 signature length as hex characters.
+const PQC_DILITHIUM5_HEX_LEN: usize = PQC_DILITHIUM5_SIG_BYTES * 2;
+/// Dilithium5 public key length as raw bytes (NIST round-3 spec).
+const PQC_DILITHIUM5_PUBKEY_BYTES: usize = 2592;
 
 pub struct Mempool {
     pending_txs: VecDeque<String>,
     seen_txs: HashSet<String>,       // Deduplication
     seen_order: VecDeque<String>,    // Bounded cache tracking
     pending_nonces: HashSet<String>, // sender:sequence_number in the pending queue
+    /// Optional storage handle. When `Some`, `add_transaction` performs
+    /// full Dilithium5 (PQC) verification by looking up the canonical
+    /// `pqc_pubkey_{sender}` binding. When `None`, PQC submissions are
+    /// fail-closed at the mempool gate (Phase 1 H-01 behaviour).
+    /// Production callers should always pass storage via
+    /// [`Mempool::with_storage`].
+    storage: Option<Arc<StateDB>>,
 }
 
 impl Mempool {
+    /// Construct a mempool without storage. PQC submissions will be
+    /// fail-closed at the gate. Useful for unit tests that exercise
+    /// Ed25519 paths only.
     pub fn new() -> Self {
         Self {
             pending_txs: VecDeque::new(),
             seen_txs: HashSet::new(),
             seen_order: VecDeque::new(),
             pending_nonces: HashSet::new(),
+            storage: None,
+        }
+    }
+
+    /// Construct a mempool with storage access. PQC submissions go
+    /// through full Dilithium5 verification against the canonical
+    /// `pqc_pubkey_{sender}` binding before being queued.
+    ///
+    /// Phase 2.1 (H-01): this is the constructor production node code
+    /// should use — wiring real PQC verification at the mempool entry
+    /// instead of leaving it as a fail-closed gate.
+    pub fn with_storage(storage: Arc<StateDB>) -> Self {
+        Self {
+            pending_txs: VecDeque::new(),
+            seen_txs: HashSet::new(),
+            seen_order: VecDeque::new(),
+            pending_nonces: HashSet::new(),
+            storage: Some(storage),
         }
     }
 }
@@ -114,43 +151,126 @@ impl Mempool {
             }
         }
 
-        // === H-01 FIX: PQC FAIL-CLOSED AT MEMPOOL ===
+        // === H-01 PROMOTED (Phase 2.1): REAL DILITHIUM5 VERIFICATION ===
         //
-        // The Dilithium5 path is verified at the VM layer (vm_move). That
-        // verification is correct on its own, but the mempool used to
-        // silently accept any 9254-char hex string as "PQC signature" and
-        // forward it down without:
-        //   - checking sender == derive_address(pubkey)
-        //   - actually verifying the signature
+        // PQC submissions used to be silently accepted (DoS surface) or
+        // fail-closed (Phase 1). Phase 2.1 wires full Dilithium5
+        // verification at the mempool gate by mirroring the VM-layer
+        // verify_native_aa_signature path:
         //
-        // That turned the mempool into a free DoS surface: an attacker
-        // could flood the queue with 9254-char garbage that only gets
-        // rejected during block execution, after consuming mempool slots
-        // and pulling executor cycles.
+        //   1. Look up the canonical pqc_pubkey_{sender} binding in
+        //      storage (registered out-of-band during onboarding).
+        //   2. Assert sender == derive_address(pqc_pubkey) — catches
+        //      pubkey-spoofing-as-sender, an authentication tightening
+        //      the VM-layer code does not currently perform.
+        //   3. Decode the 9254-hex (4627-byte) detached signature.
+        //   4. Verify the Dilithium5 signature against the canonical
+        //      submission message format.
         //
-        // Until the full Dilithium5 verification is wired at the mempool
-        // entry (matching the VM-layer logic and storing the canonical
-        // sender↔pqc_pubkey binding), refuse PQC submissions at this
-        // gate. Existing PQC infra (CLI keygen, VM-level verification,
-        // vm_move test_pqc_dilithium_detection) is intentionally NOT
-        // disabled — they exercise the VM path directly without going
-        // through the mempool.
-        //
-        // When PQC is ready for mempool acceptance, replace this branch
-        // with a real Dilithium5 verification mirroring vm_move's logic.
-        const PQC_DILITHIUM5_HEX_LEN: usize = 9254;
+        // If storage is not available to this mempool instance (Mempool
+        // constructed via ::new() instead of ::with_storage(...) — only
+        // used in unit tests that don't exercise PQC), fall back to the
+        // Phase 1 fail-closed behaviour so an unconfigured mempool
+        // doesn't accidentally accept unverified PQC.
         if parsed_tx.signature.len() == PQC_DILITHIUM5_HEX_LEN {
-            return Err(
-                "PQC (Dilithium5) signatures are not yet accepted at the \
-                 mempool layer. This path is intentionally fail-closed until \
-                 full Dilithium5 verification is wired at submission time. \
-                 Use Ed25519 (signature.len() == 128 hex chars) for now."
-                    .to_string(),
-            );
-        }
+            let storage = match &self.storage {
+                Some(s) => s,
+                None => {
+                    return Err(
+                        "PQC (Dilithium5) signatures require a storage-backed \
+                         mempool. This instance was constructed without \
+                         storage; submit via the node API instead."
+                            .to_string(),
+                    );
+                }
+            };
 
-        // === EARLY SIGNATURE VERIFICATION (DoS Protection) ===
-        if parsed_tx.signature.len() == 128 {
+            // 1. Look up canonical PQC public key.
+            let pk_key = format!("pqc_pubkey_{}", parsed_tx.sender);
+            let pk_hex = match storage.get(&pk_key) {
+                Ok(Some(s)) => s,
+                _ => {
+                    return Err(format!(
+                        "PQC public key not registered for sender {}. \
+                         Register pqc_pubkey_{{sender}} before submitting \
+                         Dilithium5-signed transactions.",
+                        parsed_tx.sender
+                    ));
+                }
+            };
+            let pk_bytes = match hex::decode(&pk_hex) {
+                Ok(b) => b,
+                Err(e) => {
+                    return Err(format!(
+                        "Registered PQC pubkey is not valid hex: {}",
+                        e
+                    ));
+                }
+            };
+            if pk_bytes.len() != PQC_DILITHIUM5_PUBKEY_BYTES {
+                return Err(format!(
+                    "Registered PQC pubkey has wrong size: {} (expected {})",
+                    pk_bytes.len(),
+                    PQC_DILITHIUM5_PUBKEY_BYTES
+                ));
+            }
+
+            // 2. Sender↔pubkey binding via canonical address derivation
+            // (matches `aincore-cli pqc-keygen` and the Ed25519 path:
+            // hex(SHA-256(pubkey)[..16])).
+            let derived = crypto::derive_address(&pk_bytes)
+                .map_err(|e| format!("PQC address derivation failed: {}", e))?;
+            if derived != parsed_tx.sender {
+                return Err(format!(
+                    "PQC sender mismatch: registered pubkey derives address \
+                     {}, but transaction claims sender {}. Pubkey↔sender \
+                     binding has been tampered with.",
+                    derived, parsed_tx.sender
+                ));
+            }
+
+            // 3. Decode detached signature.
+            let sig_bytes = match hex::decode(&parsed_tx.signature) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err(format!("PQC signature is not valid hex: {}", e));
+                }
+            };
+            if sig_bytes.len() != PQC_DILITHIUM5_SIG_BYTES {
+                return Err(format!(
+                    "PQC signature has wrong size: {} (expected {})",
+                    sig_bytes.len(),
+                    PQC_DILITHIUM5_SIG_BYTES
+                ));
+            }
+
+            // 4. Verify Dilithium5.
+            use pqcrypto_dilithium::dilithium5;
+            use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
+
+            let pk = dilithium5::PublicKey::from_bytes(&pk_bytes)
+                .map_err(|_| "Invalid Dilithium5 public key format".to_string())?;
+            let sig = dilithium5::DetachedSignature::from_bytes(&sig_bytes)
+                .map_err(|_| "Invalid Dilithium5 signature format".to_string())?;
+
+            // Canonical submission message — must match what wallets sign.
+            // We use the same shape as the Ed25519 path so wallet code can
+            // share message construction between schemes.
+            let message = format!(
+                "{}:{}:{}:{}",
+                parsed_tx.chain_id,
+                parsed_tx.sender,
+                parsed_tx.payload,
+                parsed_tx.sequence_number
+            );
+            if dilithium5::verify_detached_signature(&sig, message.as_bytes(), &pk).is_err() {
+                return Err("Invalid Dilithium5 signature verification".to_string());
+            }
+
+            // Verification passed — fall through to the rest of the
+            // pipeline (hash dedupe, size, mempool limits, nonce dedupe)
+            // by jumping past the Ed25519 branch below.
+        } else if parsed_tx.signature.len() == 128 {
             // 64 bytes hex
             use ed25519_dalek::{Signature, Verifier, VerifyingKey};
             if let Ok(pk_bytes) = hex::decode(&parsed_tx.public_key) {

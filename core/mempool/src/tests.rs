@@ -259,7 +259,10 @@ fn test_oversized_tx_rejected_before_signature_verification() {
 /// turning the mempool into a free DoS surface that only got cleaned up
 /// inside block execution.
 #[test]
-fn test_pqc_signature_rejected_at_mempool_until_wired() {
+fn test_pqc_signature_rejected_at_mempool_when_storage_absent() {
+    // Phase 2.1 (H-01): a storage-less Mempool (Mempool::new) keeps the
+    // Phase 1 fail-closed behaviour because real Dilithium5 verification
+    // requires the storage handle to look up pqc_pubkey_{sender}.
     let mut mempool = Mempool::new();
 
     let chain_id = std::env::var("AINCORE_CHAIN_ID")
@@ -282,8 +285,8 @@ fn test_pqc_signature_rejected_at_mempool_until_wired() {
         "gas_limit": 1000,
         "gas_price": 1,
         "sequence_number": 0,
-        // Public key length is irrelevant — H-01 gate triggers off the
-        // signature length first, before any Ed25519 / PQC processing.
+        // Public key length is irrelevant — gate triggers off the
+        // signature length first.
         "public_key": "00".repeat(32),
         "signature": fake_pqc_sig,
     })
@@ -291,14 +294,192 @@ fn test_pqc_signature_rejected_at_mempool_until_wired() {
 
     let err = mempool
         .add_transaction(tx)
-        .expect_err("PQC submissions must be rejected at the mempool layer");
+        .expect_err("PQC submissions must be rejected when mempool has no storage");
 
     assert!(
-        err.contains("PQC") || err.contains("Dilithium"),
-        "PQC reject must clearly tell submitters the gate is closed. \
-         Got error: {:?}",
+        err.contains("storage-backed") || err.contains("PQC") || err.contains("Dilithium"),
+        "PQC reject must clearly explain why. Got: {:?}",
         err
     );
+}
+
+/// Phase 2.1 (H-01) — REAL VERIFICATION TESTS
+///
+/// These tests exercise the full Dilithium5 verification path that
+/// replaces the Phase 1 fail-closed gate when the mempool has a
+/// storage handle. They cover:
+///   - happy path (legitimate PQC TX accepted)
+///   - missing pubkey registration (rejected)
+///   - wrong sender↔pubkey binding (rejected, prevents pubkey spoofing)
+///   - invalid signature bytes (rejected)
+///   - tampered message (rejected)
+mod pqc_phase21 {
+    use super::*;
+    use std::sync::Arc;
+    use storage::StateDB;
+
+    fn temp_db(name: &str) -> Arc<StateDB> {
+        let path = format!("/tmp/aincore_pqc_mempool_{}_{}", std::process::id(), name);
+        let _ = std::fs::remove_dir_all(&path);
+        Arc::new(StateDB::open(&path).expect("open temp db"))
+    }
+
+    fn build_pqc_tx(
+        sender: &str,
+        signature_hex: &str,
+        sequence_number: u64,
+        chain_id: &str,
+        payload: &str,
+    ) -> String {
+        serde_json::json!({
+            "chain_id": chain_id,
+            "sender": sender,
+            "input_objects": [],
+            "payload": payload,
+            "args": [],
+            "gas_limit": 1000,
+            "gas_price": 1,
+            "sequence_number": sequence_number,
+            "public_key": "",
+            "signature": signature_hex,
+        })
+        .to_string()
+    }
+
+    /// Generates (sender, pubkey_bytes, signing function, chain_id, payload) for tests.
+    fn fresh_pqc_identity() -> (
+        String,
+        Vec<u8>,
+        pqcrypto_dilithium::dilithium5::SecretKey,
+        String,
+        String,
+    ) {
+        use pqcrypto_traits::sign::PublicKey;
+        let (pk, sk) = pqcrypto_dilithium::dilithium5::keypair();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let sender = crypto::derive_address(&pk_bytes).unwrap();
+        let chain_id = std::env::var("AINCORE_CHAIN_ID")
+            .unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+        let payload = hex::encode(
+            bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![9u8]]))
+                .unwrap(),
+        );
+        (sender, pk_bytes, sk, chain_id, payload)
+    }
+
+    fn sign_pqc_message(
+        sk: &pqcrypto_dilithium::dilithium5::SecretKey,
+        chain_id: &str,
+        sender: &str,
+        payload: &str,
+        seq: u64,
+    ) -> String {
+        use pqcrypto_traits::sign::DetachedSignature;
+        let msg = format!("{}:{}:{}:{}", chain_id, sender, payload, seq);
+        let sig = pqcrypto_dilithium::dilithium5::detached_sign(msg.as_bytes(), sk);
+        hex::encode(sig.as_bytes())
+    }
+
+    #[test]
+    fn happy_path_real_dilithium5_signature_accepted() {
+        let db = temp_db("happy");
+        let (sender, pk_bytes, sk, chain_id, payload) = fresh_pqc_identity();
+        db.put(&format!("pqc_pubkey_{}", sender), &hex::encode(&pk_bytes))
+            .unwrap();
+        let sig_hex = sign_pqc_message(&sk, &chain_id, &sender, &payload, 0);
+
+        let mut mempool = Mempool::with_storage(db);
+        let tx = build_pqc_tx(&sender, &sig_hex, 0, &chain_id, &payload);
+
+        let hash = mempool
+            .add_transaction(tx)
+            .expect("legitimate PQC TX must be accepted");
+        assert_eq!(hash.len(), 64, "tx hash must be sha256 hex");
+        assert_eq!(mempool.len(), 1);
+    }
+
+    #[test]
+    fn pubkey_not_registered_rejected() {
+        let db = temp_db("not_registered");
+        let (sender, _pk_bytes, sk, chain_id, payload) = fresh_pqc_identity();
+        // Deliberately DON'T put pqc_pubkey_{sender} into storage.
+        let sig_hex = sign_pqc_message(&sk, &chain_id, &sender, &payload, 0);
+
+        let mut mempool = Mempool::with_storage(db);
+        let tx = build_pqc_tx(&sender, &sig_hex, 0, &chain_id, &payload);
+        let err = mempool.add_transaction(tx).expect_err("unregistered must fail");
+        assert!(
+            err.contains("not registered"),
+            "error must explain pubkey is not registered. Got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn sender_pubkey_binding_mismatch_rejected() {
+        let db = temp_db("binding");
+        let (sender_a, pk_a, sk_a, chain_id, payload) = fresh_pqc_identity();
+        // Register A's pubkey, but the tx claims sender B (different address).
+        db.put(
+            &format!("pqc_pubkey_{}", "11111111111111111111111111111111"),
+            &hex::encode(&pk_a),
+        )
+        .unwrap();
+        let _ = sender_a;
+        // Sign with A's secret key but bind to the spoofed sender so the
+        // mempool's storage lookup actually finds the pubkey.
+        let spoofed = "11111111111111111111111111111111";
+        let sig_hex = sign_pqc_message(&sk_a, &chain_id, spoofed, &payload, 0);
+
+        let mut mempool = Mempool::with_storage(db);
+        let tx = build_pqc_tx(spoofed, &sig_hex, 0, &chain_id, &payload);
+        let err = mempool.add_transaction(tx).expect_err("binding mismatch must fail");
+        assert!(
+            err.contains("sender mismatch") || err.contains("tampered"),
+            "error must surface the pubkey↔sender binding violation. Got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn tampered_message_rejected() {
+        let db = temp_db("tampered_msg");
+        let (sender, pk_bytes, sk, chain_id, payload) = fresh_pqc_identity();
+        db.put(&format!("pqc_pubkey_{}", sender), &hex::encode(&pk_bytes))
+            .unwrap();
+        // Sign sequence_number=0 but submit sequence_number=1 → signature
+        // does not match the message the mempool will reconstruct.
+        let sig_hex = sign_pqc_message(&sk, &chain_id, &sender, &payload, 0);
+
+        let mut mempool = Mempool::with_storage(db);
+        let tx = build_pqc_tx(&sender, &sig_hex, 1, &chain_id, &payload);
+        let err = mempool.add_transaction(tx).expect_err("tampered msg must fail");
+        assert!(
+            err.contains("verification"),
+            "error must call out failed signature verification. Got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn corrupt_signature_bytes_rejected() {
+        let db = temp_db("corrupt_sig");
+        let (sender, pk_bytes, _sk, chain_id, payload) = fresh_pqc_identity();
+        db.put(&format!("pqc_pubkey_{}", sender), &hex::encode(&pk_bytes))
+            .unwrap();
+        // Construct a syntactically-correct-length signature filled with
+        // zeros. Cryptographically invalid; verification must reject.
+        let bad_sig = hex::encode(vec![0u8; 4627]);
+
+        let mut mempool = Mempool::with_storage(db);
+        let tx = build_pqc_tx(&sender, &bad_sig, 0, &chain_id, &payload);
+        let err = mempool.add_transaction(tx).expect_err("corrupt sig must fail");
+        assert!(
+            err.contains("verification") || err.contains("format"),
+            "error must call out verification or format failure. Got: {:?}",
+            err
+        );
+    }
 }
 
 /// H-04 REGRESSION TEST

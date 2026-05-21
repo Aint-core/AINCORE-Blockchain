@@ -365,7 +365,11 @@ async fn main() {
     }
 
     let executor = Arc::new(Executor::new(Arc::clone(&storage)));
-    let mempool = Arc::new(Mutex::new(Mempool::new()));
+    // Phase 2.1 (H-01): use with_storage so PQC (Dilithium5) submissions
+    // are verified at the mempool gate against the canonical
+    // pqc_pubkey_{sender} binding, instead of being silently accepted
+    // (pre-Phase-1) or fail-closed (Phase 1 mitigation).
+    let mempool = Arc::new(Mutex::new(Mempool::with_storage(Arc::clone(&storage))));
 
     let da_sequencer = Arc::new(Mutex::new(DASequencer::new(
         node_id.clone(),
