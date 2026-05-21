@@ -46,7 +46,7 @@ impl UserOperation {
             signature: vec![],
         }
     }
-    
+
     pub fn hash(&self) -> u64 {
         // Simple hash of fields for signing
         let mut hasher = PoseidonHash::new();
@@ -71,7 +71,7 @@ impl Paymaster {
         // 2. Check sufficient capability/balance (simplified)
         let required_gas = user_op.call_gas_limit + user_op.verification_gas_limit;
         let required_fund = required_gas * user_op.max_fee_per_gas;
-        
+
         self.balance >= required_fund
     }
 
@@ -82,7 +82,7 @@ impl Paymaster {
 
         let required_gas = user_op.call_gas_limit + user_op.verification_gas_limit;
         let cost = required_gas * user_op.max_fee_per_gas;
-        
+
         self.balance -= cost;
         Ok(cost)
     }
@@ -91,27 +91,27 @@ impl Paymaster {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_paymaster_flow() {
         let mut paymaster = Paymaster::new(1_000_000);
         let mut user_op = UserOperation::new(1, 0, vec![1, 2, 3]);
-        
+
         // Set realistic gas limits that paymaster can afford
         user_op.call_gas_limit = 50000;
         user_op.verification_gas_limit = 30000;
         user_op.max_fee_per_gas = 10;
-        
+
         // Add paymaster data to indicate paymaster should sponsor
         user_op.paymaster_and_data = vec![1]; // Mark as present
-        
+
         // Execute sponsorship
         let result = paymaster.execute_sponsorship(&user_op);
         assert!(result.is_ok());
-        
+
         // Verify balance decreased
         assert!(paymaster.balance < 1_000_000);
-        
+
         // Verify exact cost calculation
         let expected_cost = (50000 + 30000) * 10; // 800,000
         assert_eq!(paymaster.balance, 1_000_000 - expected_cost);

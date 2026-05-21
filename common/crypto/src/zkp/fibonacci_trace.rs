@@ -43,44 +43,44 @@ impl FibonacciTrace {
         // Column 1: F(n+1)
         let mut col0 = Vec::with_capacity(steps);
         let mut col1 = Vec::with_capacity(steps);
-        
+
         // Initialize: F(0) = 0, F(1) = 1
         let mut a = 0u64;
         let mut b = 1u64;
-        
+
         for _ in 0..steps {
             // Add to columns
             col0.push(BaseElement::new(a as u128));
             col1.push(BaseElement::new(b as u128));
-            
+
             // Compute next Fibonacci number
             let next = a + b;
             a = b;
             b = next;
         }
-        
+
         // Create trace table: vec of column vectors
         let trace = TraceTable::init(vec![col0, col1]);
-        
+
         Self { trace }
     }
-    
+
     /// Returns the final Fibonacci number (F(n))
     pub fn get_result(&self) -> BaseElement {
         let last_step = self.trace.length() - 1;
         self.trace.get(1, last_step)
     }
-    
+
     /// Returns the trace length
     pub fn length(&self) -> usize {
         self.trace.length()
     }
-    
+
     /// Returns the trace width (always 2 for Fibonacci)
     pub fn width(&self) -> usize {
         self.trace.width()
     }
-    
+
     /// Gets a value from the trace at the specified column and step
     pub fn get(&self, col: usize, step: usize) -> BaseElement {
         self.trace.get(col, step)
@@ -98,9 +98,13 @@ impl Trace for FibonacciTrace {
         self.trace.info()
     }
 
-    fn read_main_frame(&self, row_idx: usize, frame: &mut winterfell::EvaluationFrame<Self::BaseField>) {
+    fn read_main_frame(
+        &self,
+        row_idx: usize,
+        frame: &mut winterfell::EvaluationFrame<Self::BaseField>,
+    ) {
         let next_idx = (row_idx + 1) % self.length();
-        
+
         frame.current_mut()[0] = self.trace.get(0, row_idx);
         frame.current_mut()[1] = self.trace.get(1, row_idx);
         frame.next_mut()[0] = self.trace.get(0, next_idx);
@@ -129,23 +133,23 @@ mod tests {
     #[test]
     fn test_fibonacci_trace_values() {
         let trace = FibonacciTrace::new(8);
-        
+
         // Step 0: [0, 1]
         assert_eq!(trace.get(0, 0), BaseElement::new(0));
         assert_eq!(trace.get(1, 0), BaseElement::new(1));
-        
+
         // Step 1: [1, 1]
         assert_eq!(trace.get(0, 1), BaseElement::new(1));
         assert_eq!(trace.get(1, 1), BaseElement::new(1));
-        
+
         // Step 2: [1, 2]
         assert_eq!(trace.get(0, 2), BaseElement::new(1));
         assert_eq!(trace.get(1, 2), BaseElement::new(2));
-        
+
         // Step 3: [2, 3]
         assert_eq!(trace.get(0, 3), BaseElement::new(2));
         assert_eq!(trace.get(1, 3), BaseElement::new(3));
-        
+
         // Step 7: [13, 21]
         assert_eq!(trace.get(0, 7), BaseElement::new(13));
         assert_eq!(trace.get(1, 7), BaseElement::new(21));
@@ -175,7 +179,7 @@ mod tests {
         let trace = FibonacciTrace::new(16);
         assert_eq!(trace.length(), 16);
         assert_eq!(trace.width(), 2);
-        
+
         // F(16) should be in column 1, step 15
         // Fibonacci: 0,1,1,2,3,5,8,13,21,34,55,89,144,233,377,610,987
         // At step 15: col0=610, col1=987

@@ -66,9 +66,7 @@ pub struct BLSEngine {
 impl BLSEngine {
     /// Create new BLS engine with custom domain separation tag
     pub fn new(dst: &[u8]) -> Self {
-        Self {
-            dst: dst.to_vec(),
-        }
+        Self { dst: dst.to_vec() }
     }
 
     /// Create engine with AINCORE consensus domain separation
@@ -123,7 +121,7 @@ impl BLSEngine {
         // Decompress public key (48 bytes -> G1 point)
         let pk = blst::min_pk::PublicKey::uncompress(public_key)
             .map_err(|e| BLSError::InvalidPublicKey(format!("{:?}", e)))?;
-        
+
         // Validate public key is in the correct subgroup
         pk.validate()
             .map_err(|e| BLSError::InvalidPublicKey(format!("Subgroup check failed: {:?}", e)))?;
@@ -131,14 +129,14 @@ impl BLSEngine {
         // Decompress signature (96 bytes -> G2 point)
         let sig = blst::min_pk::Signature::uncompress(signature)
             .map_err(|e| BLSError::InvalidSignature(format!("{:?}", e)))?;
-        
+
         // Validate signature is in the correct subgroup
         sig.validate(false)
             .map_err(|e| BLSError::InvalidSignature(format!("Subgroup check failed: {:?}", e)))?;
 
         // Perform pairing verification: e(pk, H(m)) == e(G1, sig)
         let result = sig.verify(false, message, &self.dst, &[], &pk, false);
-        
+
         match result {
             blst::BLST_ERROR::BLST_SUCCESS => Ok(true),
             _ => Ok(false),
@@ -151,20 +149,23 @@ impl BLSEngine {
     /// The result is a single 96-byte compressed signature.
     pub fn aggregate_signatures(&self, signatures: &[Vec<u8>]) -> Result<Vec<u8>, BLSError> {
         if signatures.is_empty() {
-            return Err(BLSError::AggregationFailed("No signatures to aggregate".to_string()));
+            return Err(BLSError::AggregationFailed(
+                "No signatures to aggregate".to_string(),
+            ));
         }
 
         // Decompress all signatures
         let mut sigs = Vec::with_capacity(signatures.len());
         for (i, sig_bytes) in signatures.iter().enumerate() {
-            let sig = blst::min_pk::Signature::uncompress(sig_bytes)
-                .map_err(|e| BLSError::InvalidSignature(
-                    format!("Signature {} decompression failed: {:?}", i, e)
-                ))?;
-            sig.validate(false)
-                .map_err(|e| BLSError::InvalidSignature(
-                    format!("Signature {} subgroup check failed: {:?}", i, e)
-                ))?;
+            let sig = blst::min_pk::Signature::uncompress(sig_bytes).map_err(|e| {
+                BLSError::InvalidSignature(format!("Signature {} decompression failed: {:?}", i, e))
+            })?;
+            sig.validate(false).map_err(|e| {
+                BLSError::InvalidSignature(format!(
+                    "Signature {} subgroup check failed: {:?}",
+                    i, e
+                ))
+            })?;
             sigs.push(sig);
         }
 
@@ -193,44 +194,45 @@ impl BLSEngine {
     ) -> Result<bool, BLSError> {
         if messages.len() != public_keys.len() {
             return Err(BLSError::VerificationFailed(
-                "Messages and public keys count mismatch".to_string()
+                "Messages and public keys count mismatch".to_string(),
             ));
         }
 
         if messages.is_empty() {
-            return Err(BLSError::VerificationFailed("No messages to verify".to_string()));
+            return Err(BLSError::VerificationFailed(
+                "No messages to verify".to_string(),
+            ));
         }
 
         // Decompress aggregated signature
         let agg_sig = blst::min_pk::Signature::uncompress(aggregated_sig)
             .map_err(|e| BLSError::InvalidSignature(format!("{:?}", e)))?;
-        agg_sig.validate(false)
+        agg_sig
+            .validate(false)
             .map_err(|e| BLSError::InvalidSignature(format!("Subgroup check failed: {:?}", e)))?;
 
         // Decompress and validate all public keys
         let mut pks = Vec::with_capacity(public_keys.len());
         for (i, pk_bytes) in public_keys.iter().enumerate() {
-            let pk = blst::min_pk::PublicKey::uncompress(pk_bytes)
-                .map_err(|e| BLSError::InvalidPublicKey(
-                    format!("Public key {} decompression failed: {:?}", i, e)
-                ))?;
-            pk.validate()
-                .map_err(|e| BLSError::InvalidPublicKey(
-                    format!("Public key {} subgroup check failed: {:?}", i, e)
-                ))?;
+            let pk = blst::min_pk::PublicKey::uncompress(pk_bytes).map_err(|e| {
+                BLSError::InvalidPublicKey(format!(
+                    "Public key {} decompression failed: {:?}",
+                    i, e
+                ))
+            })?;
+            pk.validate().map_err(|e| {
+                BLSError::InvalidPublicKey(format!(
+                    "Public key {} subgroup check failed: {:?}",
+                    i, e
+                ))
+            })?;
             pks.push(pk);
         }
 
         // Use blst's fast aggregate verify for distinct messages
         let pk_refs: Vec<&blst::min_pk::PublicKey> = pks.iter().collect();
-        
-        let result = agg_sig.aggregate_verify(
-            false,
-            messages,
-            &self.dst,
-            &pk_refs,
-            false,
-        );
+
+        let result = agg_sig.aggregate_verify(false, messages, &self.dst, &pk_refs, false);
 
         match result {
             blst::BLST_ERROR::BLST_SUCCESS => Ok(true),
@@ -256,31 +258,31 @@ impl BLSEngine {
         // Decompress aggregated signature
         let agg_sig = blst::min_pk::Signature::uncompress(aggregated_sig)
             .map_err(|e| BLSError::InvalidSignature(format!("{:?}", e)))?;
-        agg_sig.validate(false)
+        agg_sig
+            .validate(false)
             .map_err(|e| BLSError::InvalidSignature(format!("Subgroup check failed: {:?}", e)))?;
 
         // Decompress and validate all public keys
         let mut pks = Vec::with_capacity(public_keys.len());
         for (i, pk_bytes) in public_keys.iter().enumerate() {
-            let pk = blst::min_pk::PublicKey::uncompress(pk_bytes)
-                .map_err(|e| BLSError::InvalidPublicKey(
-                    format!("Public key {} decompression failed: {:?}", i, e)
-                ))?;
-            pk.validate()
-                .map_err(|e| BLSError::InvalidPublicKey(
-                    format!("Public key {} subgroup check failed: {:?}", i, e)
-                ))?;
+            let pk = blst::min_pk::PublicKey::uncompress(pk_bytes).map_err(|e| {
+                BLSError::InvalidPublicKey(format!(
+                    "Public key {} decompression failed: {:?}",
+                    i, e
+                ))
+            })?;
+            pk.validate().map_err(|e| {
+                BLSError::InvalidPublicKey(format!(
+                    "Public key {} subgroup check failed: {:?}",
+                    i, e
+                ))
+            })?;
             pks.push(pk);
         }
 
         let pk_refs: Vec<&blst::min_pk::PublicKey> = pks.iter().collect();
 
-        let result = agg_sig.fast_aggregate_verify(
-            false,
-            message,
-            &self.dst,
-            &pk_refs,
-        );
+        let result = agg_sig.fast_aggregate_verify(false, message, &self.dst, &pk_refs);
 
         match result {
             blst::BLST_ERROR::BLST_SUCCESS => Ok(true),
@@ -291,19 +293,25 @@ impl BLSEngine {
     /// Aggregate multiple public keys into one (for same-message optimization)
     pub fn aggregate_public_keys(&self, public_keys: &[Vec<u8>]) -> Result<Vec<u8>, BLSError> {
         if public_keys.is_empty() {
-            return Err(BLSError::AggregationFailed("No public keys to aggregate".to_string()));
+            return Err(BLSError::AggregationFailed(
+                "No public keys to aggregate".to_string(),
+            ));
         }
 
         let mut pks = Vec::with_capacity(public_keys.len());
         for (i, pk_bytes) in public_keys.iter().enumerate() {
-            let pk = blst::min_pk::PublicKey::uncompress(pk_bytes)
-                .map_err(|e| BLSError::InvalidPublicKey(
-                    format!("Public key {} decompression failed: {:?}", i, e)
-                ))?;
-            pk.validate()
-                .map_err(|e| BLSError::InvalidPublicKey(
-                    format!("Public key {} subgroup check failed: {:?}", i, e)
-                ))?;
+            let pk = blst::min_pk::PublicKey::uncompress(pk_bytes).map_err(|e| {
+                BLSError::InvalidPublicKey(format!(
+                    "Public key {} decompression failed: {:?}",
+                    i, e
+                ))
+            })?;
+            pk.validate().map_err(|e| {
+                BLSError::InvalidPublicKey(format!(
+                    "Public key {} subgroup check failed: {:?}",
+                    i, e
+                ))
+            })?;
             pks.push(pk);
         }
 
@@ -345,7 +353,11 @@ mod tests {
 
         let sig = bls.sign(message, &sk);
         // MinPk: signatures are 96 bytes (G2 compressed)
-        assert_eq!(sig.len(), 96, "BLS signature must be 96 bytes (G2 compressed)");
+        assert_eq!(
+            sig.len(),
+            96,
+            "BLS signature must be 96 bytes (G2 compressed)"
+        );
 
         let valid = bls.verify(message, &sig, &pk_bytes).unwrap();
         assert!(valid, "Valid signature must verify");
@@ -379,19 +391,15 @@ mod tests {
         assert_eq!(agg_sig.len(), 96);
 
         // Fast aggregate verify (same message)
-        let valid = bls.fast_aggregate_verify(
-            message,
-            &[pk1.clone(), pk2.clone(), pk3.clone()],
-            &agg_sig,
-        ).unwrap();
+        let valid = bls
+            .fast_aggregate_verify(message, &[pk1.clone(), pk2.clone(), pk3.clone()], &agg_sig)
+            .unwrap();
         assert!(valid, "Aggregated signature must verify for same message");
 
         // Missing one key must fail
-        let invalid = bls.fast_aggregate_verify(
-            message,
-            &[pk1.clone(), pk2.clone()],
-            &agg_sig,
-        ).unwrap();
+        let invalid = bls
+            .fast_aggregate_verify(message, &[pk1.clone(), pk2.clone()], &agg_sig)
+            .unwrap();
         assert!(!invalid, "Aggregated sig must fail with missing public key");
     }
 
@@ -411,11 +419,9 @@ mod tests {
         let agg_sig = bls.aggregate_signatures(&[sig1, sig2]).unwrap();
 
         // Distinct-message aggregate verify
-        let valid = bls.verify_aggregated(
-            &[msg1.as_ref(), msg2.as_ref()],
-            &[pk1, pk2],
-            &agg_sig,
-        ).unwrap();
+        let valid = bls
+            .verify_aggregated(&[msg1.as_ref(), msg2.as_ref()], &[pk1, pk2], &agg_sig)
+            .unwrap();
         assert!(valid, "Distinct-message aggregate must verify");
     }
 
@@ -427,7 +433,11 @@ mod tests {
         let (_, pk2) = make_keypair(70);
 
         let agg_pk = bls.aggregate_public_keys(&[pk1, pk2]).unwrap();
-        assert_eq!(agg_pk.len(), 48, "Aggregated public key must be 48 bytes (G1 compressed)");
+        assert_eq!(
+            agg_pk.len(),
+            48,
+            "Aggregated public key must be 48 bytes (G1 compressed)"
+        );
     }
 
     #[test]
@@ -465,7 +475,9 @@ mod tests {
         // Verify using keygen + pubkey
         let sk = bls.keygen(&ikm);
         let pk = bls.pubkey_from_secret(&sk);
-        let valid = bls.verify(b"test_message", &sig, &pk.compress().as_ref()).unwrap();
+        let valid = bls
+            .verify(b"test_message", &sig, &pk.compress().as_ref())
+            .unwrap();
         assert!(valid);
     }
 }

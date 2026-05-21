@@ -1,7 +1,7 @@
 use clap::Parser;
+use node::genesis;
 use std::sync::Arc;
 use storage::StateDB;
-use node::genesis;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -17,9 +17,13 @@ struct Args {
     /// Genesis Validator Address (Hex)
     #[arg(short, long, default_value = "00000000000000000000000000000001")]
     genesis_addr: String,
+
+    /// Genesis Validator Public Key (Hex). Defaults to genesis_addr for legacy tooling.
+    #[arg(long)]
+    genesis_pubkey: Option<String>,
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     println!("🛠️  AINCORE Genesis Tool");
@@ -31,7 +35,14 @@ fn main() {
     let storage = Arc::new(StateDB::open(&args.db_path).expect("Failed to open DB"));
 
     // Initialize Genesis
-    let _ = genesis::initialize_genesis(&storage, &args.stdlib_path, &args.genesis_addr);
+    let genesis_pubkey = args.genesis_pubkey.as_deref().unwrap_or(&args.genesis_addr);
+    genesis::initialize_genesis(
+        &storage,
+        &args.stdlib_path,
+        &args.genesis_addr,
+        genesis_pubkey,
+    )?;
 
     println!("✅ Genesis initialization complete!");
+    Ok(())
 }

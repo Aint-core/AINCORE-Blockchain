@@ -25,15 +25,16 @@ services:
       - "9002:9002"   # P2P Consensus
       - "8002:8002"   # REST API / RPC
     volumes:
-      - aincore-data:/root/.aincore/data
+      - ./nas_data:/root/.aincore/data
       - ./genesis.json:/root/.aincore/genesis.json:ro
     environment:
       - AINCORE_PORT=9002
       - AINCORE_API_PORT=8002
+      - AINCORE_GENESIS_PATH=/root/.aincore/genesis.json
       - AINCORE_PEERS=
       - RUST_LOG=info
       - RUST_BACKTRACE=1
-    command: ["node", "--port", "9002"]
+    command: ["node", "--port", "9002", "--rpc-port", "8002", "--datadir", "/root/.aincore/data"]
     # NAS Resource Limits (F2-423: 2 cores, 4GB RAM)
     deploy:
       resources:

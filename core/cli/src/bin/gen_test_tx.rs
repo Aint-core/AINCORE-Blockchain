@@ -2,6 +2,43 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use serde::Serialize;
 
+fn aincore_coin_type() -> move_core_types::language_storage::TypeTag {
+    move_core_types::language_storage::TypeTag::Struct(Box::new(
+        move_core_types::language_storage::StructTag {
+            address: move_core_types::account_address::AccountAddress::new([
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+            ]),
+            module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+            name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+            type_params: vec![],
+        },
+    ))
+}
+
+fn parse_move_address(addr: &str) -> move_core_types::account_address::AccountAddress {
+    move_core_types::account_address::AccountAddress::from_hex_literal(&format!("0x{}", addr))
+        .unwrap()
+}
+
+fn transfer_payload(sender: &str, recipient: &str, amount: u128) -> String {
+    let call = vm_move::EntryFunctionCall {
+        module: move_core_types::language_storage::ModuleId::new(
+            move_core_types::account_address::AccountAddress::new([
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+            ]),
+            move_core_types::identifier::Identifier::new("coin").unwrap(),
+        ),
+        function: "transfer".to_string(),
+        ty_args: vec![aincore_coin_type()],
+        args: vec![
+            bcs::to_bytes(&parse_move_address(sender)).unwrap(),
+            bcs::to_bytes(&parse_move_address(recipient)).unwrap(),
+            bcs::to_bytes(&amount).unwrap(),
+        ],
+    };
+    hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap())
+}
+
 #[derive(Serialize)]
 struct Transaction {
     chain_id: String,
@@ -20,23 +57,26 @@ fn main() {
     // 1. Generate Keypair
     let signing_key = SigningKey::generate(&mut OsRng);
     let verifying_key = signing_key.verifying_key();
-    
+
     // Print Private Key for extraction
     println!("PRIVATE_KEY: {}", hex::encode(signing_key.to_bytes()));
-    
+
     // 2. Format Keys
     let public_key_hex = hex::encode(verifying_key.to_bytes());
     // In AINCORE, address is first 16 bytes (32 hex chars) of SHA256 of public key
     let sender_addr = crypto::derive_address(verifying_key.as_bytes()).unwrap();
 
     // 3. Create Payload
-    let payload = format!("transfer:{}:1", sender_addr); // Self-transfer to ensure receiver exists (or creates a new one)
+    let payload = transfer_payload(&sender_addr, &sender_addr, 1);
     let sequence_number = 0;
 
     // 4. Sign
     // Message format from executor::execute_transaction: "{}:{}:{}:{}" (chain_id:sender:payload:seq_num)
     let chain_id = "AINCORE-MAINNET-1";
-    let message = format!("{}:{}:{}:{}", chain_id, sender_addr, payload, sequence_number);
+    let message = format!(
+        "{}:{}:{}:{}",
+        chain_id, sender_addr, payload, sequence_number
+    );
     let signature = signing_key.sign(message.as_bytes());
     let signature_hex = hex::encode(signature.to_bytes());
 

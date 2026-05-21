@@ -14,11 +14,17 @@ const BATCH_SIZE: usize = 50; // Parallel requests per batch
 #[tokio::main]
 async fn main() {
     println!("{}", "🚀 AINCORE TPS Benchmark Tool".bold().cyan());
-    println!("{}", "─────────────────────────────────────────────".dimmed());
+    println!(
+        "{}",
+        "─────────────────────────────────────────────".dimmed()
+    );
     println!("Target: {}", RPC_URL);
     println!("Total Transactions: {}", TOTAL_TXS);
     println!("Batch Size: {}", BATCH_SIZE);
-    println!("{}", "─────────────────────────────────────────────".dimmed());
+    println!(
+        "{}",
+        "─────────────────────────────────────────────".dimmed()
+    );
 
     let client = Client::new();
 
@@ -35,29 +41,33 @@ async fn main() {
     println!("{} Starting Benchmark...", "🔥".red());
     let start_time = Instant::now();
     let pb = ProgressBar::new(TOTAL_TXS as u64);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-        .unwrap()
-        .progress_chars("#>-"));
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+    );
 
     let mut handles = Vec::new();
-    
+
     for (i, kp) in keypairs.iter().enumerate() {
         let client = client.clone();
         // Mock Transaction: Transfer 1 unit to self (or random)
         // In a real scenario, we need a valid signature and nonce.
         // For this benchmark, we assume the node accepts signed payloads.
-        
+
         let pubkey = hex::encode(kp.verifying_key().as_bytes());
         // Simple payload: "transfer:TO_ADDRESS:AMOUNT:NONCE"
-        let payload = format!("transfer:{}:1:{}", pubkey, i); 
-        
+        let payload = format!("transfer:{}:1:{}", pubkey, i);
+
         // PROTOCOL UPDATE: Chain Binding Signature
         // Format: CHAIN_ID:PAYLOAD:SEQ
         let chain_id = "AINCORE-MAINNET-1";
         let seq = i as u64;
         let message = format!("{}:{}:{}", chain_id, payload, seq);
-        
+
         let signature = kp.sign(message.as_bytes());
         let sig_hex = hex::encode(signature.to_bytes());
 
@@ -96,12 +106,18 @@ async fn main() {
     let duration = start_time.elapsed();
     let tps = TOTAL_TXS as f64 / duration.as_secs_f64();
 
-    println!("{}", "─────────────────────────────────────────────".dimmed());
+    println!(
+        "{}",
+        "─────────────────────────────────────────────".dimmed()
+    );
     println!("{} Benchmark Complete!", "✅".green());
     println!("Time Elapsed: {:.2?}", duration);
     println!("Throughput: {} TPS", format!("{:.2}", tps).bold().green());
-    println!("{}", "─────────────────────────────────────────────".dimmed());
-    
+    println!(
+        "{}",
+        "─────────────────────────────────────────────".dimmed()
+    );
+
     // Note: This measures SUBMISSION TPS. Confirmation TPS requires polling.
     // For "Parallel Execution" verification, high submission acceptance is the first step.
 }

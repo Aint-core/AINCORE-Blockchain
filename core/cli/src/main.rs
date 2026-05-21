@@ -1,15 +1,27 @@
-mod wallet;
+fn parse_move_address(hex_str: &str) -> Option<move_core_types::account_address::AccountAddress> {
+    let hex_str = hex_str.trim_start_matches("0x");
+    let mut bytes = [0u8; 16];
+    if hex_str.len() != 32 {
+        return None;
+    }
+    match hex::decode_to_slice(hex_str, &mut bytes) {
+        Ok(_) => Some(move_core_types::account_address::AccountAddress::new(bytes)),
+        Err(_) => None,
+    }
+}
+
 mod client;
 mod keys;
+mod wallet;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
-use std::path::Path;
-use wallet::Wallet;
 use client::RpcClient;
 use keys::KeysCmd;
 use serde_json::json;
-use anyhow::Context;
 use sha2::Digest;
+use std::path::Path;
+use wallet::Wallet;
 
 #[derive(Parser)]
 #[command(name = "aincore-cli")]
@@ -49,9 +61,7 @@ enum Commands {
         quality: u64,
     },
     /// Get account balance/object
-    Balance {
-        address: Option<String>,
-    },
+    Balance { address: Option<String> },
     /// Transfer funds (Real Transaction)
     Transfer {
         to: String,
@@ -60,9 +70,7 @@ enum Commands {
         gas_limit: u64,
     },
     /// Publish a Move module
-    Publish {
-        path: String,
-    },
+    Publish { path: String },
     /// Manage keys (Encrypted Keystores)
     Keys {
         #[command(subcommand)]
@@ -70,6 +78,13 @@ enum Commands {
     },
     /// Register as a Validator (Stakes 1000 AIN)
     RegisterValidator,
+    /// Distribute AIN from Genesis (Testnet Faucet)
+    Faucet {
+        /// Recipient address
+        to: String,
+        /// Amount in AIN (whole units)
+        amount: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -98,34 +113,35 @@ fn main() -> anyhow::Result<()> {
             let wallet = Wallet::load_or_create(path)?;
             println!("Wallet loaded/created at {:?}", path);
             println!("Address: {}", wallet.address());
+            println!("Public Key: {}", wallet.public_key());
         }
         Commands::PqcKeygen { out } => {
             use pqcrypto_dilithium::dilithium5;
             use pqcrypto_traits::sign::{PublicKey, SecretKey};
-            
+
             // Create output directory
             std::fs::create_dir_all(&out)?;
-            
+
             // Generate Dilithium5 keypair
             let (pk, sk) = dilithium5::keypair();
-            
+
             // Get bytes
             let pk_bytes = pk.as_bytes();
             let sk_bytes = sk.as_bytes();
-            
+
             // Derive address (first 16 bytes of SHA256 hash of public key)
             let pk_hash = sha2::Sha256::digest(pk_bytes);
             let address = hex::encode(&pk_hash[..16]);
-            
+
             // Save files
             let pk_path = format!("{}/pqc_pubkey.bin", out);
             let sk_path = format!("{}/pqc_privkey.bin", out);
             let addr_path = format!("{}/pqc_address.txt", out);
-            
+
             std::fs::write(&pk_path, pk_bytes)?;
             std::fs::write(&sk_path, sk_bytes)?;
             std::fs::write(&addr_path, &address)?;
-            
+
             println!("Post-Quantum Keypair Generated (Dilithium5)");
             println!("Public Key:  {} ({} bytes)", pk_path, pk_bytes.len());
             println!("Private Key: {} ({} bytes)", sk_path, sk_bytes.len());
@@ -140,39 +156,62 @@ fn main() -> anyhow::Result<()> {
         Commands::SubmitProof { device, quality } => {
             let wallet = Wallet::load_or_create(Path::new(&cli.keyfile))?;
             let sender = wallet.address();
-            
+
             // Get Seq Number
             let balance_res = client.call("aincore_getBalance", json!([sender]))?;
             let mut sequence_number = 0;
             if let Some(obj) = balance_res.as_object() {
                 if let Some(data_bytes) = obj.get("data").and_then(|v| v.as_array()) {
-                    let bytes: Vec<u8> = data_bytes.iter().map(|b| b.as_u64().unwrap_or(0) as u8).collect();
+                    let bytes: Vec<u8> = data_bytes
+                        .iter()
+                        .map(|b| b.as_u64().unwrap_or(0) as u8)
+                        .collect();
                     if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                         sequence_number = account_data["sequence_number"].as_u64().unwrap_or(0);
                     }
                 }
             }
-            
-            println!("📡 Submitting Proof for Device: {} (BQI: {})", device, quality);
-            
-            let payload = format!("submit_proof:{}:{}", device, quality);
+
+            println!(
+                "📡 Submitting Proof for Device: {} (BQI: {})",
+                device, quality
+            );
+
+            let device_bytes = hex::decode(&device).unwrap_or_else(|_| device.as_bytes().to_vec());
+            let call = vm_move::EntryFunctionCall {
+                module: move_core_types::language_storage::ModuleId::new(
+                    move_core_types::account_address::AccountAddress::new([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    move_core_types::identifier::Identifier::new("universal_mining").unwrap(),
+                ),
+                function: "submit_mining_proof".to_string(),
+                ty_args: vec![],
+                args: vec![
+                    bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
+                    bcs::to_bytes(&device_bytes).unwrap(),
+                    bcs::to_bytes(&(quality as u64)).unwrap(),
+                ],
+            };
+            let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
+            let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
             let seq_num = sequence_number;
             // PROTOCOL UPDATE: Chain Binding
-            let message = format!("{}:{}:{}", "AINCORE-MAINNET-1", payload, seq_num);
+            let message = format!("{}:{}:{}:{}", "AINCORE-MAINNET-1", sender, payload, seq_num);
             let signature = wallet.sign(message.as_bytes());
-            
+
             let tx_json = json!({
                 "chain_id": "AINCORE-MAINNET-1",
                 "sender": sender,
                 "public_key": wallet.public_key(),
-                "input_objects": [], 
+                "input_objects": [],
                 "payload": payload,
                 "gas_limit": 5000,
                 "gas_price": 1,
-                "sequence_number": seq_num, 
+                "sequence_number": seq_num,
                 "signature": signature
             });
-            
+
             let res = client.call("aincore_sendTransaction", json!([tx_json.to_string()]))?;
             println!("✅ Proof Submitted: {}", res);
         }
@@ -183,69 +222,102 @@ fn main() -> anyhow::Result<()> {
                 let wallet = Wallet::load_or_create(Path::new(&cli.keyfile))?;
                 wallet.address()
             };
-            
+
             println!("🔍 Checking balance for: {}", addr);
             let res = client.call("aincore_getBalance", json!([addr]))?;
             // println!("{}", serde_json::to_string_pretty(&res)?); // Raw output bad
 
-            let mut balance = 0;
+            let mut balance = "0".to_string();
             let mut btc_balance = 0;
             if let Some(obj) = res.as_object() {
+                if let Some(move_balance) = obj.get("move_balance").and_then(|v| v.as_str()) {
+                    balance = move_balance.to_string();
+                }
                 if let Some(data_bytes) = obj.get("data").and_then(|v| v.as_array()) {
-                    let bytes: Vec<u8> = data_bytes.iter().map(|b| b.as_u64().unwrap_or(0) as u8).collect();
-                    // Attempt to decode as generic Value first to find "balance" fields
+                    let bytes: Vec<u8> = data_bytes
+                        .iter()
+                        .map(|b| b.as_u64().unwrap_or(0) as u8)
+                        .collect();
+                    // AccountData now stores metadata; keep btc_balance read for bridge tooling.
                     if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        if let Some(b) = account_data.get("balance").and_then(|v| v.as_u64()) {
-                            balance = b;
-                        }
-                        if let Some(btc) = account_data.get("btc_balance").and_then(|v| v.as_u64()) {
+                        if let Some(btc) = account_data.get("btc_balance").and_then(|v| v.as_u64())
+                        {
                             btc_balance = btc;
                         }
                     }
                 }
             }
-            
+
             // Print in a grep-friendly format for the script
-            println!("{{ \"balance\": {}, \"btc_balance\": {} }}", balance, btc_balance);
+            println!(
+                "{{ \"balance\": \"{}\", \"btc_balance\": {} }}",
+                balance, btc_balance
+            );
         }
-        Commands::Transfer { to, amount, gas_limit } => {
+        Commands::Transfer {
+            to,
+            amount,
+            gas_limit,
+        } => {
             let wallet = Wallet::load_or_create(Path::new(&cli.keyfile))?;
             let sender = wallet.address();
-            
-            println!("🔍 Checking balance for sender: {}", sender);
+
+            println!("🔍 Loading sender metadata: {}", sender);
             let balance_res = client.call("aincore_getBalance", json!([sender]))?;
-            
-            let mut current_balance = 0;
+
             let mut sequence_number = 0;
 
             if let Some(obj) = balance_res.as_object() {
                 if let Some(data_bytes) = obj.get("data").and_then(|v| v.as_array()) {
-                    let bytes: Vec<u8> = data_bytes.iter().map(|b| b.as_u64().unwrap_or(0) as u8).collect();
+                    let bytes: Vec<u8> = data_bytes
+                        .iter()
+                        .map(|b| b.as_u64().unwrap_or(0) as u8)
+                        .collect();
                     if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        current_balance = account_data["balance"].as_u64().unwrap_or(0);
                         sequence_number = account_data["sequence_number"].as_u64().unwrap_or(0);
                     }
                 }
             }
 
-            let gas_price = 1;
-            let total_cost = amount + (gas_limit * gas_price);
+            println!("✅ Sender metadata loaded (Seq: {})", sequence_number);
+            println!(
+                "💸 Sending {} from {} to {} (Gas Limit: {})",
+                amount, sender, to, gas_limit
+            );
 
-            if current_balance < total_cost {
-                anyhow::bail!("❌ Insufficient balance! Have: {}, Need: {} (Amount: {} + Gas: {})", 
-                    current_balance, total_cost, amount, gas_limit * gas_price);
-            }
-
-            println!("✅ Balance verified: {} (Seq: {})", current_balance, sequence_number);
-            println!("💸 Sending {} from {} to {} (Gas Limit: {})", amount, sender, to, gas_limit);
-            
             // Construct payload
-            let payload = format!("transfer:{}:{}", to, amount);
+            let call = vm_move::EntryFunctionCall {
+                module: move_core_types::language_storage::ModuleId::new(
+                    move_core_types::account_address::AccountAddress::new([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    move_core_types::identifier::Identifier::new("coin").unwrap(),
+                ),
+                function: "transfer".to_string(),
+                ty_args: vec![move_core_types::language_storage::TypeTag::Struct(
+                    Box::new(move_core_types::language_storage::StructTag {
+                        address: move_core_types::account_address::AccountAddress::new([
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                        ]),
+                        module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                        name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                        type_params: vec![],
+                    }),
+                )],
+                args: vec![
+                    bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
+                    bcs::to_bytes(&parse_move_address(&to).unwrap()).unwrap(),
+                    bcs::to_bytes(&(amount as u128)).unwrap(),
+                ],
+            };
+            let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
+            let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
             let seq_num = sequence_number; // Use current seq number (Executor expects match)
+            let gas_price = 1;
             // PROTOCOL UPDATE: Chain Binding
-            let message = format!("{}:{}:{}", "AINCORE-MAINNET-1", payload, seq_num);
+            let message = format!("{}:{}:{}:{}", "AINCORE-MAINNET-1", sender, payload, seq_num);
             let signature = wallet.sign(message.as_bytes());
-            
+
             // Construct Transaction JSON
             // Note: In Account-Based model, input_objects is empty for native coin transfers.
             // The dependency is implied by the sender address.
@@ -253,14 +325,14 @@ fn main() -> anyhow::Result<()> {
                 "chain_id": "AINCORE-MAINNET-1",
                 "sender": sender,
                 "public_key": wallet.public_key(),
-                "input_objects": [], 
+                "input_objects": [],
                 "payload": payload,
                 "gas_limit": gas_limit,
                 "gas_price": gas_price,
-                "sequence_number": seq_num, 
+                "sequence_number": seq_num,
                 "signature": signature
             });
-            
+
             let tx_str = tx_json.to_string();
             let res = client.call("aincore_sendTransaction", json!([tx_str]))?;
             println!("✅ Transaction submitted: {}", res);
@@ -269,7 +341,7 @@ fn main() -> anyhow::Result<()> {
             let wallet = Wallet::load_or_create(Path::new(&cli.keyfile))?;
             let sender = wallet.address();
             let source_path = Path::new(&path);
-            
+
             println!("📦 Publishing module from: {:?}", source_path);
 
             // 1. Compile using move_compiler_tool
@@ -277,10 +349,10 @@ fn main() -> anyhow::Result<()> {
             // For dev environment, we look in ../../target/debug/
             let compiler_tool = "../../target/debug/move_compiler_tool";
             let output_dir = "temp_build";
-            
+
             // Path to Stdlib sources (Hardcoded for dev environment)
             let stdlib_path = "../vm_move/stdlib/sources";
-            
+
             // Clean/Create temp dir
             if Path::new(output_dir).exists() {
                 std::fs::remove_dir_all(output_dir)?;
@@ -288,11 +360,11 @@ fn main() -> anyhow::Result<()> {
             std::fs::create_dir(output_dir)?;
 
             println!("   Compiling...");
-            
+
             // Collect all .move files from stdlib
             let mut cmd = std::process::Command::new(compiler_tool);
             cmd.arg("--sources").arg(path);
-            
+
             // Add stdlib files
             if let Ok(entries) = std::fs::read_dir(stdlib_path) {
                 for entry in entries.flatten() {
@@ -332,22 +404,27 @@ fn main() -> anyhow::Result<()> {
 
             // 3. Construct Payload
             let bytecode_hex = hex::encode(bytecode);
-            let payload = format!("publish:{}", bytecode_hex);
-             // PROTOCOL UPDATE: Chain Binding (Publish uses seq 0 implicit or handled? Wait. Publish needs sequence number logic too!)
-            // Currently Publish command does NOT check sequence number. This is a BUG in CLI.
-            // But for now, let's just fix the signature format.
-            // Wait, payload for publish is just "publish:hex". 
-            // Executor verifies signature against "chain_id:payload:seq".
-            // We need to fetch sequence number for Publish too?
-            // The prompt didn't ask to fix logic bugs, just signature.
-            // But if I don't use the right seq number, it will fail.
-            // Existing code seems to rely on ... wait, Publish didn't fetch seq number!
-            // It just signs payload! 
-            // If Executor checks seq number, Publish command is BROKEN.
-            // I will inject a dummy seq 0 for now as previously implied, OR assume the user has 0 seq if creating fresh.
-            // But let's stick to the signature format update.
-            // "chain_id:payload:0" (Assuming 0 for now to match previous behavior implication)
-             let message = format!("{}:{}:{}", "AINCORE-MAINNET-1", payload, 0); // Assuming 0 for Publish
+
+            let bytes = hex::decode(&bytecode_hex).expect("invalid hex in publish command");
+            let payload_struct = vm_move::TransactionPayload::PublishModule(vec![bytes]);
+            let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
+            let balance_res = client.call("aincore_getBalance", json!([sender]))?;
+            let mut sequence_number = 0;
+            if let Some(obj) = balance_res.as_object() {
+                if let Some(data_bytes) = obj.get("data").and_then(|v| v.as_array()) {
+                    let bytes: Vec<u8> = data_bytes
+                        .iter()
+                        .map(|b| b.as_u64().unwrap_or(0) as u8)
+                        .collect();
+                    if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        sequence_number = account_data["sequence_number"].as_u64().unwrap_or(0);
+                    }
+                }
+            }
+            let message = format!(
+                "{}:{}:{}:{}",
+                "AINCORE-MAINNET-1", sender, payload, sequence_number
+            );
             let signature = wallet.sign(message.as_bytes());
 
             // 4. Send Transaction
@@ -359,13 +436,14 @@ fn main() -> anyhow::Result<()> {
                 "payload": payload,
                 "gas_limit": 50000, // Higher limit for publish
                 "gas_price": 1,
+                "sequence_number": sequence_number,
                 "signature": signature
             });
-            
+
             let tx_str = tx_json.to_string();
             let res = client.call("aincore_sendTransaction", json!([tx_str]))?;
             println!("✅ Publish Transaction submitted: {}", res);
-            
+
             // Cleanup
             std::fs::remove_dir_all(output_dir)?;
         }
@@ -376,37 +454,56 @@ fn main() -> anyhow::Result<()> {
             KeysSubcommand::Import { priv_key, out } => {
                 KeysCmd::import(&priv_key, &out)?;
             }
-        }
+        },
         Commands::RegisterValidator => {
             let wallet = Wallet::load_or_create(Path::new(&cli.keyfile))?;
             let sender = wallet.address();
-            
+
             println!("🔒 Registering Validator for address: {}", sender);
-            
+
             // Check Balance
             let res = client.call("aincore_getBalance", json!([sender]))?;
-            let mut current_balance = 0;
             let mut sequence_number = 0;
             if let Some(obj) = res.as_object() {
                 if let Some(data_bytes) = obj.get("data").and_then(|v| v.as_array()) {
-                    let bytes: Vec<u8> = data_bytes.iter().map(|b| b.as_u64().unwrap_or(0) as u8).collect();
+                    let bytes: Vec<u8> = data_bytes
+                        .iter()
+                        .map(|b| b.as_u64().unwrap_or(0) as u8)
+                        .collect();
                     if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        current_balance = account_data["balance"].as_u64().unwrap_or(0);
                         sequence_number = account_data["sequence_number"].as_u64().unwrap_or(0);
                     }
                 }
             }
-            
-            let required_stake: u128 = 1000 * 1_000_000_000_000_000_000;
-            if u128::from(current_balance) < required_stake {
-                anyhow::bail!("❌ Insufficient Balance! Need 1000 AIN. You have: {}", current_balance);
-            }
-            
-            let payload = "register_validator".to_string();
+
+            // Skipping client-side balance check due to u64 parsing limitations in CLI for u128 balances
+
+            let pk_bytes = hex::decode(wallet.public_key()).unwrap_or_default();
+            let min_stake: u128 = 1000_000_000_000_000_000_000; // 1000 AIN in wei
+            let call = vm_move::EntryFunctionCall {
+                module: move_core_types::language_storage::ModuleId::new(
+                    move_core_types::account_address::AccountAddress::new([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    move_core_types::identifier::Identifier::new("staking").unwrap(),
+                ),
+                function: "join_validator_set".to_string(),
+                ty_args: vec![],
+                args: vec![
+                    bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
+                    bcs::to_bytes(&min_stake).unwrap(),
+                    bcs::to_bytes(&pk_bytes).unwrap(),
+                ],
+            };
+            let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
+            let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
             // PROTOCOL UPDATE: Chain Binding
-            let message = format!("{}:{}:{}", "AINCORE-MAINNET-1", payload, sequence_number);
+            let message = format!(
+                "{}:{}:{}:{}",
+                "AINCORE-MAINNET-1", sender, payload, sequence_number
+            );
             let signature = wallet.sign(message.as_bytes());
-            
+
             let tx_json = json!({
                 "chain_id": "AINCORE-MAINNET-1",
                 "sender": sender,
@@ -418,9 +515,79 @@ fn main() -> anyhow::Result<()> {
                 "sequence_number": sequence_number,
                 "signature": signature
             });
-            
+
             let res = client.call("aincore_sendTransaction", json!([tx_json.to_string()]))?;
             println!("✅ Validator Registration Submitted: {}", res);
+        }
+        Commands::Faucet { to, amount } => {
+            let wallet = Wallet::load_or_create(Path::new(&cli.keyfile))?;
+            let sender = wallet.address();
+
+            println!("🚰 Faucet: Sending {} AIN to {}", amount, to);
+
+            // Get sequence number
+            let res = client.call("aincore_getBalance", json!([sender]))?;
+            let mut sequence_number = 0;
+            if let Some(obj) = res.as_object() {
+                if let Some(data_bytes) = obj.get("data").and_then(|v| v.as_array()) {
+                    let bytes: Vec<u8> = data_bytes
+                        .iter()
+                        .map(|b| b.as_u64().unwrap_or(0) as u8)
+                        .collect();
+                    if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        sequence_number = account_data["sequence_number"].as_u64().unwrap_or(0);
+                    }
+                }
+            }
+
+            // Convert AIN to Wei (18 decimals)
+            let amount_wei: u128 = amount as u128 * 1_000_000_000_000_000_000;
+            let call = vm_move::EntryFunctionCall {
+                module: move_core_types::language_storage::ModuleId::new(
+                    move_core_types::account_address::AccountAddress::new([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    move_core_types::identifier::Identifier::new("coin").unwrap(),
+                ),
+                function: "transfer".to_string(),
+                ty_args: vec![move_core_types::language_storage::TypeTag::Struct(
+                    Box::new(move_core_types::language_storage::StructTag {
+                        address: move_core_types::account_address::AccountAddress::new([
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                        ]),
+                        module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                        name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                        type_params: vec![],
+                    }),
+                )],
+                args: vec![
+                    bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
+                    bcs::to_bytes(&parse_move_address(&to).unwrap()).unwrap(),
+                    bcs::to_bytes(&amount_wei).unwrap(),
+                ],
+            };
+            let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
+            let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
+            let message = format!(
+                "{}:{}:{}:{}",
+                "AINCORE-MAINNET-1", sender, payload, sequence_number
+            );
+            let signature = wallet.sign(message.as_bytes());
+
+            let tx_json = json!({
+                "chain_id": "AINCORE-MAINNET-1",
+                "sender": sender,
+                "public_key": wallet.public_key(),
+                "input_objects": [],
+                "payload": payload,
+                "gas_limit": 50000,
+                "gas_price": 1,
+                "sequence_number": sequence_number,
+                "signature": signature
+            });
+
+            let res = client.call("aincore_sendTransaction", json!([tx_json.to_string()]))?;
+            println!("✅ Faucet Transaction Submitted: {}", res);
         }
     }
 

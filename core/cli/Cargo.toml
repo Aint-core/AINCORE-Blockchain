@@ -23,3 +23,7 @@ pqcrypto-dilithium = "0.5"
 pqcrypto-traits = "0.3"
 sha2 = "0.10"
 
+
+vm_move = { path = "../vm_move" }
+move-core-types = { git = "https://github.com/move-language/move", branch = "aptos-v1.3.0" }
+bcs = "0.1.3"

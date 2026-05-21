@@ -46,33 +46,69 @@ export class Connection {
     /**
      * Get account data (balance, sequence number)
      */
-    async getAccount(address: string): Promise<{ balance: number, sequence_number: number }> {
+    async getAccount(address: string): Promise<{ balance: number, sequence_number: number, move_balance: string, balance_source: string }> {
         const account = await this.request('aincore_getBalance', [address]);
-        if (!account) return { balance: 0, sequence_number: 0 };
+        if (!account) {
+            return { balance: 0, sequence_number: 0, move_balance: '0', balance_source: 'move_coin_store' };
+        }
+
+        const moveBalance = String(account.move_balance ?? '0');
+        const balanceSource = String(account.balance_source ?? 'move_coin_store');
+        let sequenceNumber = 0;
 
         if (account && account.data) {
             try {
-                // Convert byte array to string
-                const jsonString = Buffer.from(account.data).toString('utf-8');
+                const data = typeof account.data === 'string'
+                    ? Buffer.from(account.data, /^[0-9a-fA-F]+$/.test(account.data) ? 'hex' : 'utf-8')
+                    : Buffer.from(account.data);
+                const jsonString = data.toString('utf-8');
                 const accountData = JSON.parse(jsonString);
-                return {
-                    balance: accountData.balance || 0,
-                    sequence_number: accountData.sequence_number || 0
-                };
+                sequenceNumber = accountData.sequence_number || 0;
             } catch (e) {
                 console.warn('Failed to parse account data', e);
-                return { balance: 0, sequence_number: 0 };
             }
         }
-        return { balance: 0, sequence_number: 0 };
+
+        return {
+            balance: Number(moveBalance),
+            sequence_number: sequenceNumber,
+            move_balance: moveBalance,
+            balance_source: balanceSource,
+        };
     }
 
     /**
-     * Get balance of an address
+     * Get native AIN balance from Move CoinStore.
      */
     async getBalance(address: string): Promise<number> {
         const account = await this.getAccount(address);
         return account.balance;
+    }
+
+    /**
+     * Get exact native AIN balance from Move CoinStore as a decimal string.
+     */
+    async getMoveBalance(address: string): Promise<string> {
+        const account = await this.getAccount(address);
+        return account.move_balance;
+    }
+
+    /**
+     * Request local/testnet faucet funds. Node must run with AINCORE_ENABLE_FAUCET=1.
+     */
+    async requestFaucet(address: string, amount?: string | number, publicKey?: string): Promise<{
+        address: string;
+        amount: string;
+        move_balance: string;
+        balance_source: string;
+    }> {
+        const params: any[] = [address];
+        if (amount !== undefined) params.push(String(amount));
+        if (publicKey !== undefined) {
+            if (amount === undefined) params.push('1000000000000000000');
+            params.push(publicKey);
+        }
+        return await this.request('aincore_faucet', params);
     }
 
     /**
@@ -502,4 +538,3 @@ export class Connection {
         return result?.balance || '0';
     }
 }
-

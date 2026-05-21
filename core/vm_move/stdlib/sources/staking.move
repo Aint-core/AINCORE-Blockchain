@@ -10,6 +10,7 @@ module 0x1::staking {
     const EINSUFFICIENT_STAKE: u64 = 3;
     const EUNBONDING_NOT_READY: u64 = 4;
     const ENO_UNBONDING_REQUEST: u64 = 5;
+    const EINVALID_SLASH_BPS: u64 = 6;
 
     /// Minimum stake required to join validator set (1000 AIN)
     const MIN_STAKE: u128 = 1000000000000000000000; 
@@ -23,10 +24,13 @@ module 0x1::staking {
     
     /// Halving Interval: 4 Years (2,102,400 blocks @ 60s)
     const HALVING_INTERVAL: u64 = 2102400;
+    const COIN_SCALE: u128 = 1000000000000000000;
+    const EPOCH_SECONDS: u64 = 60;
     
     /// Unbonding Period: 21 days (1,814,400 seconds)
     /// This prevents Nothing-at-Stake attacks by locking stake after leaving
     const UNBONDING_PERIOD: u64 = 1814400; 
+    const MAX_BPS: u64 = 10000;
     
     /// Marker struct for AINCORE Coin
     struct AincoreCoin has drop {}
@@ -122,8 +126,7 @@ module 0x1::staking {
         
         // CRITICAL: Do NOT return stake immediately!
         // Lock it for 21 days to prevent Nothing-at-Stake attacks
-        // Use current_epoch * 60 as proxy timestamp (each epoch ~60s)
-        let current_time = validator_set.current_epoch * 60;
+        let current_time = validator_set.current_epoch * EPOCH_SECONDS;
         let unlock_time = current_time + UNBONDING_PERIOD;
         
         let stake_amount = coin::value(&stake);
@@ -144,7 +147,7 @@ module 0x1::staking {
         assert!(addr == @0x1, error::permission_denied(ENOT_VALIDATOR));
         
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
-        let current_time = validator_set.current_epoch * 60; // ~60s per epoch
+        let current_time = validator_set.current_epoch * EPOCH_SECONDS;
         
         // Grace period: 21 days (unbonding) + 10 days (claim buffer) = 31 days
         let grace_period: u64 = 2678400; // 31 days in seconds
@@ -181,7 +184,7 @@ module 0x1::staking {
     public entry fun withdraw_unbonded(account: &signer) acquires ValidatorSet {
         let addr = signer::address_of(account);
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
-        let current_time = validator_set.current_epoch * 60;
+        let current_time = validator_set.current_epoch * EPOCH_SECONDS;
         
         let len = vector::length(&validator_set.unbonding_queue);
         let i = 0;
@@ -249,24 +252,44 @@ module 0x1::staking {
         let current_reward = calculate_reward(validator_set.current_epoch);
 
         let len = vector::length(&validator_set.validators);
+        if (len == 0 || current_reward == 0) {
+            return
+        };
+        if (validator_set.total_supply >= MAX_SUPPLY) {
+            return
+        };
+
+        let epoch_budget = current_reward * (len as u128);
+        if (validator_set.total_supply + epoch_budget > MAX_SUPPLY) {
+            epoch_budget = MAX_SUPPLY - validator_set.total_supply;
+        };
+        if (epoch_budget == 0) {
+            return
+        };
+
+        let total_weight = 0u128;
+        let j = 0;
+        while (j < len) {
+            let validator = vector::borrow(&validator_set.validators, j);
+            total_weight = total_weight + (coin::value(&validator.stake) / COIN_SCALE);
+            j = j + 1;
+        };
+
+        if (total_weight == 0) {
+            return
+        };
+
         let i = 0;
         while (i < len) {
-            // C2 FIX: Check supply cap INSIDE loop for EACH validator reward
-            // This prevents total minted from exceeding MAX_SUPPLY with many validators
-            if (validator_set.total_supply + current_reward > MAX_SUPPLY) {
-                // Cap reached mid-loop -- stop minting for remaining validators
-                break
-            };
-
             let v = vector::borrow_mut(&mut validator_set.validators, i);
+            let weight = coin::value(&v.stake) / COIN_SCALE;
+            let reward_amount = (epoch_budget * weight) / total_weight;
             
-            // Mint calculated reward
-            let reward_coins = coin::mint<AincoreCoin>(current_reward);
-            
-            // Update total supply tracker
-            validator_set.total_supply = validator_set.total_supply + current_reward;
-            
-            coin::merge(&mut v.stake, reward_coins);
+            if (reward_amount > 0) {
+                let reward_coins = coin::mint<AincoreCoin>(reward_amount);
+                validator_set.total_supply = validator_set.total_supply + reward_amount;
+                coin::merge(&mut v.stake, reward_coins);
+            };
             i = i + 1;
         };
     }
@@ -286,11 +309,31 @@ module 0x1::staking {
         coin::mint<AincoreCoin>(amount)
     }
 
+    /// Permanently burn AIN and update the canonical supply tracker.
+    public fun burn_ain(coin_to_burn: Coin<AincoreCoin>) acquires ValidatorSet {
+        let amount = coin::value(&coin_to_burn);
+        let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
+        validator_set.total_supply =
+            if (validator_set.total_supply >= amount) {
+                validator_set.total_supply - amount
+            } else {
+                0
+            };
+        coin::burn(coin_to_burn);
+    }
+
     /// Slash a validator (burn stake and remove)
     public fun slash_validator(account: &signer, validator_addr: address) acquires ValidatorSet {
+        slash_validator_bps(account, validator_addr, 500)
+    }
+
+    /// Slash a validator by basis points. Only system may call this.
+    /// Downtime uses 500 bps (5%). Equivocation can use 10000 bps (100%).
+    public entry fun slash_validator_bps(account: &signer, validator_addr: address, slash_bps: u64) acquires ValidatorSet {
         let addr = signer::address_of(account);
         // Only 0x1 can call this (system)
         assert!(addr == @0x1, error::permission_denied(ENOT_VALIDATOR));
+        assert!(slash_bps <= MAX_BPS, error::invalid_argument(EINVALID_SLASH_BPS));
 
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
         let len = vector::length(&validator_set.validators);
@@ -312,27 +355,32 @@ module 0x1::staking {
             let config = vector::remove(&mut validator_set.validators, index);
             let ValidatorConfig { validator_addr, stake, public_key: _ } = config;
             
-            // JAIL SYSTEM: Instead of 100% burn, we slash 5% and force-unbond the rest (21 days jail)
             let total_val = coin::value(&stake);
-            let slash_amount = (total_val * 5) / 100; // 5% Slashing
+            let slash_amount = (total_val * (slash_bps as u128)) / (MAX_BPS as u128);
             let remaining_amount = total_val - slash_amount;
             
-            // Extract and Burn 5% (Deflationary Penalty)
+            // Extract and burn the slash amount as a deflationary penalty.
             let slash_coins = coin::extract(&mut stake, slash_amount);
             coin::burn(slash_coins);
+            validator_set.total_supply =
+                if (validator_set.total_supply >= slash_amount) {
+                    validator_set.total_supply - slash_amount
+                } else {
+                    0
+                };
             
-            // Burn the rest to re-mint on withdrawal (same as leave_validator_set)
+            // Burn the rest to re-mint on withdrawal (same as leave_validator_set).
             coin::burn(stake);
-            
-            let current_time = validator_set.current_epoch * 60;
-            let unlock_time = current_time + UNBONDING_PERIOD;
-            
-            // Push to Jail / Unbonding Queue
-            vector::push_back(&mut validator_set.unbonding_queue, UnbondingRequest {
-                validator_addr,
-                stake: remaining_amount,
-                unlock_time,
-            });
+
+            if (remaining_amount > 0) {
+                let current_time = validator_set.current_epoch * EPOCH_SECONDS;
+                let unlock_time = current_time + UNBONDING_PERIOD;
+                vector::push_back(&mut validator_set.unbonding_queue, UnbondingRequest {
+                    validator_addr,
+                    stake: remaining_amount,
+                    unlock_time,
+                });
+            };
         };
     }
 }

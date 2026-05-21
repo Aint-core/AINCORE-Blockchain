@@ -101,9 +101,20 @@ impl BridgeState {
     }
 
     /// Build the canonical event key for deduplication.
-    /// Includes sender + amount + eth_addr + block_height for uniqueness.
-    pub fn event_key(sender: &str, amount: u64, eth_addr: &str, block_height: u64) -> String {
-        format!("{}:{}:{}:{}", sender, amount, eth_addr, block_height)
+    ///
+    /// Phase 3.5 / H-03 fix: also includes `tx_index` (position within block)
+    /// so two identical (sender, amount, eth_addr) transactions inside the
+    /// SAME finalized block no longer collide. Before this fix, such a pair
+    /// would have produced identical keys → the second event would be
+    /// dropped as "replay" even though it is a legitimate distinct lock.
+    pub fn event_key(
+        sender: &str,
+        amount: u64,
+        eth_addr: &str,
+        block_height: u64,
+        tx_index: usize,
+    ) -> String {
+        format!("{}:{}:{}:{}:{}", sender, amount, eth_addr, block_height, tx_index)
     }
 
     /// Returns `true` if this event has already been processed (replay).
@@ -137,7 +148,7 @@ mod tests {
 
         let mut state = BridgeState::load_from(&path);
         assert_eq!(state.nonce_counter, 0);
-        let n1 = state.mark_processed(BridgeState::event_key("alice", 100, "0xABCD", 5));
+        let n1 = state.mark_processed(BridgeState::event_key("alice", 100, "0xABCD", 5, 0));
         assert_eq!(n1, 1);
         state.last_processed_height = 5;
         state.save_to(&path);
@@ -155,7 +166,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let mut state = BridgeState::load_from(&path);
-        let key = BridgeState::event_key("bob", 200, "0x1234", 10);
+        let key = BridgeState::event_key("bob", 200, "0x1234", 10, 0);
 
         assert!(!state.is_seen(&key));
         state.mark_processed(key.clone());
@@ -174,13 +185,44 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let mut state = BridgeState::load_from(&path);
-        let k1 = BridgeState::event_key("alice", 100, "0xAA", 1);
-        let k2 = BridgeState::event_key("alice", 100, "0xAA", 2);
-        let k3 = BridgeState::event_key("bob", 100, "0xAA", 1);
+        let k1 = BridgeState::event_key("alice", 100, "0xAA", 1, 0);
+        let k2 = BridgeState::event_key("alice", 100, "0xAA", 2, 0); // different block
+        let k3 = BridgeState::event_key("bob", 100, "0xAA", 1, 0);   // different sender
 
         state.mark_processed(k1);
         assert!(!state.is_seen(&k2), "different block height = different event");
         assert!(!state.is_seen(&k3), "different sender = different event");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Phase 3.5 / H-03 fix: two identical (sender, amount, eth_addr)
+    /// transactions in the SAME finalized block must NOT collide on the
+    /// dedup key. Distinguished by `tx_index`.
+    #[test]
+    fn test_h03_same_block_identical_payload_distinct() {
+        let path = tmp_path("same_block_distinct");
+        let _ = std::fs::remove_file(&path);
+
+        let mut state = BridgeState::load_from(&path);
+        // Two truly identical bridge_lock txs from the same sender,
+        // same amount, same destination, same block — but at different
+        // tx positions in that block.
+        let k_a = BridgeState::event_key("alice", 500, "0xDEAD", 42, 0);
+        let k_b = BridgeState::event_key("alice", 500, "0xDEAD", 42, 1);
+
+        assert_ne!(k_a, k_b, "tx_index must differentiate identical payloads");
+
+        state.mark_processed(k_a.clone());
+        assert!(state.is_seen(&k_a));
+        assert!(
+            !state.is_seen(&k_b),
+            "second identical-payload tx must NOT be falsely flagged as replay"
+        );
+
+        // And processing it must yield a fresh nonce, not collide.
+        let nonce_b = state.mark_processed(k_b);
+        assert_eq!(nonce_b, 2, "second event must get its own nonce");
 
         let _ = std::fs::remove_file(&path);
     }

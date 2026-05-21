@@ -13,26 +13,47 @@ fn main() {
         .split(',')
         .filter_map(|s| s.trim().parse().ok())
         .collect();
-    
+    let rpc_ports_override: Option<Vec<u16>> = std::env::var("AINCORE_RPC_PORTS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect::<Vec<u16>>()
+        })
+        .filter(|ports| !ports.is_empty());
+
     if nodes.is_empty() {
         eprintln!("❌ No valid node ports specified. Set AINCORE_NODES=9000,9001,...");
         return;
     }
-    
+
     let client = Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
         .unwrap_or_else(|_| Client::new());
 
-    println!("{}", "🚀 AINCORE Cluster Monitor (RPC Mode)".bold().purple());
-    println!("{}", "─────────────────────────────────────────────".dimmed());
+    println!(
+        "{}",
+        "🚀 AINCORE Cluster Monitor (RPC Mode)".bold().purple()
+    );
+    println!(
+        "{}",
+        "─────────────────────────────────────────────".dimmed()
+    );
 
     loop {
         // Clear screen
         print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
 
-        println!("{}", "🚀 AINCORE Cluster Monitor (RPC Mode)".bold().purple());
-        println!("{}", "─────────────────────────────────────────────".dimmed());
+        println!(
+            "{}",
+            "🚀 AINCORE Cluster Monitor (RPC Mode)".bold().purple()
+        );
+        println!(
+            "{}",
+            "─────────────────────────────────────────────".dimmed()
+        );
 
         let mut max_height = 0;
         let mut node_data = Vec::new();
@@ -44,7 +65,10 @@ fn main() {
             // Let's try to guess RPC port from Node port.
             // Node 9001 -> RPC 8001
             // Node 9002 -> RPC 8002
-            let rpc_port = port - 1000; 
+            let rpc_port = rpc_ports_override
+                .as_ref()
+                .and_then(|ports| ports.get(node_data.len()).copied())
+                .unwrap_or_else(|| port.saturating_sub(999));
             let url = format!("http://localhost:{}/rpc", rpc_port);
 
             let mut status = "Offline".to_string();
@@ -68,7 +92,7 @@ fn main() {
                             height = result["block_height"].as_u64().unwrap_or(0);
                             peers = result["peer_count"].as_u64().unwrap_or(0);
                             version = result["version"].as_str().unwrap_or("0.1.0").to_string();
-                            
+
                             if height > max_height {
                                 max_height = height;
                             }
@@ -84,13 +108,15 @@ fn main() {
                         "id": 1
                     });
                     if let Ok(resp) = client.post(&url).json(&body_h).send() {
-                         if let Ok(json) = resp.json::<Value>() {
+                        if let Ok(json) = resp.json::<Value>() {
                             if let Some(res) = json.get("result") {
                                 status = "Active".to_string();
                                 height = res.as_u64().unwrap_or(0);
-                                if height > max_height { max_height = height; }
+                                if height > max_height {
+                                    max_height = height;
+                                }
                             }
-                         }
+                        }
                     }
                 }
             }
@@ -145,7 +171,10 @@ fn main() {
             } else {
                 println!("   {} {}", "N/A".dimmed(), "(0/0)".dimmed());
             }
-            println!("{}", "─────────────────────────────────────────────".dimmed());
+            println!(
+                "{}",
+                "─────────────────────────────────────────────".dimmed()
+            );
         }
 
         println!(

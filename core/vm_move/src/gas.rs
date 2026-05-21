@@ -1,9 +1,9 @@
+use move_binary_format::errors::PartialVMError;
+use move_core_types::gas_algebra::{Arg, InternalGas, NumBytes};
 use move_core_types::vm_status::StatusCode;
 use move_vm_types::gas::GasMeter;
-use move_binary_format::errors::PartialVMError;
-use move_core_types::gas_algebra::{InternalGas, NumBytes, Arg};
-use std::iter::ExactSizeIterator;
 use move_vm_types::views::{TypeView, ValueView};
+use std::iter::ExactSizeIterator;
 
 // Simple constants for now
 #[allow(dead_code)]
@@ -60,13 +60,15 @@ impl AINCOREGasMeter {
     }
 }
 
-
 impl GasMeter for AINCOREGasMeter {
     fn balance_internal(&self) -> InternalGas {
         InternalGas::new(self.gas_limit.saturating_sub(self.gas_consumed))
     }
 
-    fn charge_simple_instr(&mut self, _instr: move_vm_types::gas::SimpleInstruction) -> Result<(), PartialVMError> {
+    fn charge_simple_instr(
+        &mut self,
+        _instr: move_vm_types::gas::SimpleInstruction,
+    ) -> Result<(), PartialVMError> {
         self.charge(self.schedule.instruction_cost)
     }
 
@@ -75,8 +77,8 @@ impl GasMeter for AINCOREGasMeter {
         _amount: InternalGas,
         _ret_vals: Option<impl ExactSizeIterator<Item = impl Sized>>,
     ) -> Result<(), PartialVMError> {
-         let val: u64 = _amount.into(); 
-         self.charge(val)
+        let val: u64 = _amount.into();
+        self.charge(val)
     }
 
     fn charge_load_resource(
@@ -84,10 +86,10 @@ impl GasMeter for AINCOREGasMeter {
         _loaded: Option<(NumBytes, impl ValueView)>,
     ) -> Result<(), PartialVMError> {
         if let Some((k, _)) = _loaded {
-             let k_val: u64 = k.into();
-             self.charge(self.schedule.load_base + k_val * self.schedule.storage_per_byte)
+            let k_val: u64 = k.into();
+            self.charge(self.schedule.load_base + k_val * self.schedule.storage_per_byte)
         } else {
-             self.charge(self.schedule.load_base)
+            self.charge(self.schedule.load_base)
         }
     }
 
@@ -98,7 +100,7 @@ impl GasMeter for AINCOREGasMeter {
         _args: impl ExactSizeIterator<Item = impl Sized>,
         _num_locals: move_core_types::gas_algebra::NumArgs,
     ) -> Result<(), PartialVMError> {
-         self.charge(10)
+        self.charge(10)
     }
 
     fn charge_call_generic(
@@ -109,15 +111,18 @@ impl GasMeter for AINCOREGasMeter {
         _args: impl ExactSizeIterator<Item = impl Sized>,
         _num_locals: move_core_types::gas_algebra::NumArgs,
     ) -> Result<(), PartialVMError> {
-         self.charge(15)
+        self.charge(15)
     }
 
     fn charge_ld_const(&mut self, _size: NumBytes) -> Result<(), PartialVMError> {
         let val: u64 = _size.into();
         self.charge(val)
     }
-    
-    fn charge_ld_const_after_deserialization(&mut self, _val: impl ValueView) -> Result<(), PartialVMError> {
+
+    fn charge_ld_const_after_deserialization(
+        &mut self,
+        _val: impl ValueView,
+    ) -> Result<(), PartialVMError> {
         self.charge(1)
     }
 
@@ -149,10 +154,7 @@ impl GasMeter for AINCOREGasMeter {
         self.charge(5)
     }
 
-    fn charge_read_ref(
-        &mut self,
-        _val: impl ValueView,
-    ) -> Result<(), PartialVMError> {
+    fn charge_read_ref(&mut self, _val: impl ValueView) -> Result<(), PartialVMError> {
         self.charge(1)
     }
 
@@ -163,12 +165,20 @@ impl GasMeter for AINCOREGasMeter {
     ) -> Result<(), PartialVMError> {
         self.charge(1)
     }
-    
-    fn charge_eq(&mut self, _lhs: impl ValueView, _rhs: impl ValueView) -> Result<(), PartialVMError> {
+
+    fn charge_eq(
+        &mut self,
+        _lhs: impl ValueView,
+        _rhs: impl ValueView,
+    ) -> Result<(), PartialVMError> {
         self.charge(1)
     }
 
-    fn charge_neq(&mut self, _lhs: impl ValueView, _rhs: impl ValueView) -> Result<(), PartialVMError> {
+    fn charge_neq(
+        &mut self,
+        _lhs: impl ValueView,
+        _rhs: impl ValueView,
+    ) -> Result<(), PartialVMError> {
         self.charge(1)
     }
 
@@ -213,10 +223,7 @@ impl GasMeter for AINCOREGasMeter {
         self.charge(3)
     }
 
-    fn charge_vec_swap(
-        &mut self,
-        _ty: impl TypeView,
-    ) -> Result<(), PartialVMError> {
+    fn charge_vec_swap(&mut self, _ty: impl TypeView) -> Result<(), PartialVMError> {
         self.charge(3)
     }
 
@@ -227,45 +234,68 @@ impl GasMeter for AINCOREGasMeter {
         self.charge(2)
     }
 
-    fn charge_borrow_global(&mut self, _is_mut: bool, _is_generic: bool, _ty: impl TypeView, _is_alignment: bool) -> Result<(), PartialVMError> {
+    fn charge_borrow_global(
+        &mut self,
+        _is_mut: bool,
+        _is_generic: bool,
+        _ty: impl TypeView,
+        _is_alignment: bool,
+    ) -> Result<(), PartialVMError> {
         self.charge(10)
     }
-    
-    fn charge_exists(&mut self, _is_generic: bool, _ty: impl TypeView, _exists: bool) -> Result<(), PartialVMError> {
+
+    fn charge_exists(
+        &mut self,
+        _is_generic: bool,
+        _ty: impl TypeView,
+        _exists: bool,
+    ) -> Result<(), PartialVMError> {
         self.charge(5)
     }
-    
-    fn charge_move_from(&mut self, _is_generic: bool, _ty: impl TypeView, _val: Option<impl ValueView>) -> Result<(), PartialVMError> {
+
+    fn charge_move_from(
+        &mut self,
+        _is_generic: bool,
+        _ty: impl TypeView,
+        _val: Option<impl ValueView>,
+    ) -> Result<(), PartialVMError> {
         // Charge base + size if value exists
         if let Some(_val) = _val {
-             // Approximation of size cost
-             self.charge(self.schedule.load_base + self.schedule.storage_per_byte * 100) // Simplified size
+            // Approximation of size cost
+            self.charge(self.schedule.load_base + self.schedule.storage_per_byte * 100)
+        // Simplified size
         } else {
-             self.charge(self.schedule.load_base)
+            self.charge(self.schedule.load_base)
         }
     }
-    
-    fn charge_move_to(&mut self, _is_generic: bool, _ty: impl TypeView, _val: impl ValueView, _already_exists: bool) -> Result<(), PartialVMError> {
+
+    fn charge_move_to(
+        &mut self,
+        _is_generic: bool,
+        _ty: impl TypeView,
+        _val: impl ValueView,
+        _already_exists: bool,
+    ) -> Result<(), PartialVMError> {
         // Charge stricter storage fee for writing logic
         // We can't easily get exact byte size from ValueView without serialization cost,
         // so we charge a higher base cost + heuristic.
         // For prototype, we charge 500 gas units per write to discourage spam.
         self.charge(500)
     }
-    
+
     fn charge_vec_unpack(
-        &mut self, 
-        _ty: impl TypeView, 
-        _expect_num_elements: move_core_types::gas_algebra::GasQuantity<Arg>, 
-        _elems: impl ExactSizeIterator<Item = impl ValueView>
+        &mut self,
+        _ty: impl TypeView,
+        _expect_num_elements: move_core_types::gas_algebra::GasQuantity<Arg>,
+        _elems: impl ExactSizeIterator<Item = impl ValueView>,
     ) -> Result<(), PartialVMError> {
         self.charge(5)
     }
-    
+
     fn charge_native_function_before_execution(
-        &mut self, 
-        _ty_args: impl ExactSizeIterator<Item = impl TypeView>, 
-        _args: impl ExactSizeIterator<Item = impl ValueView>
+        &mut self,
+        _ty_args: impl ExactSizeIterator<Item = impl TypeView>,
+        _args: impl ExactSizeIterator<Item = impl ValueView>,
     ) -> Result<(), PartialVMError> {
         self.charge(2)
     }

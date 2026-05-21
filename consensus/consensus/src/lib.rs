@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 // std::thread no longer needed - broadcast uses network::send_message (bounded GOSSIP_RUNTIME)
+use executor::Executor;
+use mempool::Mempool;
 use serde::{Deserialize, Serialize};
 use storage::StateDB;
-use mempool::Mempool;
-use executor::{Executor};
 // Use crypto crate for everything
-use crypto::{hash_hex, Signer, Verifier, SigningKey, VerifyingKey, Signature}; 
+use crypto::{hash_hex, Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
 
@@ -37,7 +37,13 @@ pub struct Block {
 }
 
 impl Block {
-    pub fn new(height: u64, round: u64, parent_hash: String, transactions: Vec<String>, proposer: String) -> Self {
+    pub fn new(
+        height: u64,
+        round: u64,
+        parent_hash: String,
+        transactions: Vec<String>,
+        proposer: String,
+    ) -> Self {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or(std::time::Duration::from_secs(0))
@@ -82,13 +88,13 @@ pub struct Proposal {
 // === Consensus Engine ===
 
 pub struct SimpleConsensus {
-    node_id: String, // Friendly ID
-    keypair: SigningKey, // The Node's Private Key
+    node_id: String,                         // Friendly ID
+    keypair: SigningKey,                     // The Node's Private Key
     peers: Arc<Mutex<HashMap<String, u16>>>, // PeerID -> Port
     mempool: Arc<Mutex<Mempool>>,
     db: Arc<StateDB>, // Active DB access for PoS
     executor: Arc<Executor>,
-    
+
     // State
     current_round: u64,
     votes: Arc<Mutex<HashMap<String, Vec<Vote>>>>, // BlockHash -> Votes
@@ -108,11 +114,15 @@ impl SimpleConsensus {
         let mut key_bytes = [0u8; 32];
         csprng.fill_bytes(&mut key_bytes);
         let keypair = SigningKey::from_bytes(&key_bytes);
-        
+
         let public_key_bytes = VerifyingKey::from(&keypair).to_bytes();
         let public_key_hex = hex::encode(public_key_bytes);
 
-        println!("🔑 [Node {}] Generated Session Keypair. Public Key: {}...", node_id, &public_key_hex[0..8]);
+        println!(
+            "🔑 [Node {}] Generated Session Keypair. Public Key: {}...",
+            node_id,
+            &public_key_hex[0..8]
+        );
 
         Self {
             node_id,
@@ -165,7 +175,8 @@ impl SimpleConsensus {
                 }
             };
             let h = blocks.len() as u64;
-            let ph = blocks.last()
+            let ph = blocks
+                .last()
                 .map(|b| b.header.hash.clone())
                 .unwrap_or_else(|| "0".to_string());
             (h, ph)
@@ -174,7 +185,13 @@ impl SimpleConsensus {
         let pk_bytes = VerifyingKey::from(&self.keypair).to_bytes();
         let my_public_key = hex::encode(pk_bytes);
 
-        let block = Block::new(height, self.current_round, prev_hash, transactions.clone(), my_public_key.clone());
+        let block = Block::new(
+            height,
+            self.current_round,
+            prev_hash,
+            transactions.clone(),
+            my_public_key.clone(),
+        );
         let block_hash = block.header.hash.clone();
 
         let message = format!("{}{}", block_hash, self.current_round);
@@ -200,34 +217,40 @@ impl SimpleConsensus {
             proposals_lock.insert(block_hash.clone(), proposal.clone());
         }
 
-        println!("✅ [Node {}] Proposed Block #{} ({}) [Txs: {}]", self.node_id, height, block_hash, transactions.len());
+        println!(
+            "✅ [Node {}] Proposed Block #{} ({}) [Txs: {}]",
+            self.node_id,
+            height,
+            block_hash,
+            transactions.len()
+        );
 
         if let Ok(msg) = serde_json::to_string(&proposal) {
             self.broadcast_message(&format!("PROPOSAL:{}", msg));
         }
-        
+
         self.vote_on_proposal(&block_hash);
     }
-    
+
     pub fn vote_on_proposal(&mut self, block_hash: &str) {
-         let pk_bytes = VerifyingKey::from(&self.keypair).to_bytes();
-         let my_public_key = hex::encode(pk_bytes);
-         
-         let message = format!("{}{}{}", block_hash, self.current_round, "VOTE");
-         let signature = self.keypair.sign(message.as_bytes());
-         
-         let vote = Vote {
-             block_hash: block_hash.to_string(),
-             voter_id: my_public_key,
-             round: self.current_round,
-             signature: hex::encode(signature.to_bytes()), 
-         };
-         
-         self.handle_vote(vote.clone());
-         
-         if let Ok(msg) = serde_json::to_string(&vote) {
-             self.broadcast_message(&format!("VOTE:{}", msg));
-         }
+        let pk_bytes = VerifyingKey::from(&self.keypair).to_bytes();
+        let my_public_key = hex::encode(pk_bytes);
+
+        let message = format!("{}{}{}", block_hash, self.current_round, "VOTE");
+        let signature = self.keypair.sign(message.as_bytes());
+
+        let vote = Vote {
+            block_hash: block_hash.to_string(),
+            voter_id: my_public_key,
+            round: self.current_round,
+            signature: hex::encode(signature.to_bytes()),
+        };
+
+        self.handle_vote(vote.clone());
+
+        if let Ok(msg) = serde_json::to_string(&vote) {
+            self.broadcast_message(&format!("VOTE:{}", msg));
+        }
     }
 
     pub fn handle_message(&mut self, message: String) {
@@ -236,38 +259,57 @@ impl SimpleConsensus {
             if let Ok(proposal) = serde_json::from_str::<Proposal>(content) {
                 self.handle_proposal(proposal);
             } else {
-                 eprintln!("❌ Failed to parse PROPOSAL");
+                eprintln!("❌ Failed to parse PROPOSAL");
             }
         } else if message.starts_with("VOTE:") {
             let content = &message[5..];
-             if let Ok(vote) = serde_json::from_str::<Vote>(content) {
+            if let Ok(vote) = serde_json::from_str::<Vote>(content) {
                 self.handle_vote(vote);
             } else {
-                 eprintln!("❌ Failed to parse VOTE");
+                eprintln!("❌ Failed to parse VOTE");
             }
         }
     }
 
     fn handle_proposal(&mut self, proposal: Proposal) {
-        println!("📨 [Node {}] Received PROPOSAL for {} from {}", self.node_id, proposal.block.header.hash, proposal.proposer_id);
-        
-        if !self.verify_signature(&proposal.proposer_id, &proposal.signature, &format!("{}{}", proposal.block.header.hash, proposal.round)) {
-             println!("⛔ [Node {}] INVALID SIGNATURE on Proposal from {}", self.node_id, proposal.proposer_id);
-             return;
+        println!(
+            "📨 [Node {}] Received PROPOSAL for {} from {}",
+            self.node_id, proposal.block.header.hash, proposal.proposer_id
+        );
+
+        if !self.verify_signature(
+            &proposal.proposer_id,
+            &proposal.signature,
+            &format!("{}{}", proposal.block.header.hash, proposal.round),
+        ) {
+            println!(
+                "⛔ [Node {}] INVALID SIGNATURE on Proposal from {}",
+                self.node_id, proposal.proposer_id
+            );
+            return;
         }
 
         // === TIMESTAMP VERIFICATION (Future Block Protection) ===
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or(std::time::Duration::from_secs(0)).as_secs();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::from_secs(0))
+            .as_secs();
         if proposal.block.header.timestamp > now + 5 {
-             println!("⚠️ [Node {}] REJECTED Future Block (Ts: {}, Now: {})", self.node_id, proposal.block.header.timestamp, now);
-             return;
+            println!(
+                "⚠️ [Node {}] REJECTED Future Block (Ts: {}, Now: {})",
+                self.node_id, proposal.block.header.timestamp, now
+            );
+            return;
         }
 
         // === REAL MODE: VALIDATOR CHECK ===
         let validators = self.db.get_active_validators();
         if !validators.iter().any(|(pk, _)| pk == &proposal.proposer_id) {
-             println!("⚠️ [Node {}] Ignored PROPOSAL from non-validator: {}", self.node_id, proposal.proposer_id);
-             return;
+            println!(
+                "⚠️ [Node {}] Ignored PROPOSAL from non-validator: {}",
+                self.node_id, proposal.proposer_id
+            );
+            return;
         }
 
         {
@@ -285,20 +327,30 @@ impl SimpleConsensus {
     }
 
     fn handle_vote(&mut self, vote: Vote) {
-        if !self.verify_signature(&vote.voter_id, &vote.signature, &format!("{}{}{}", vote.block_hash, vote.round, "VOTE")) {
-             println!("⛔ [Node {}] INVALID SIGNATURE on Vote from {}", self.node_id, vote.voter_id);
-             return; 
+        if !self.verify_signature(
+            &vote.voter_id,
+            &vote.signature,
+            &format!("{}{}{}", vote.block_hash, vote.round, "VOTE"),
+        ) {
+            println!(
+                "⛔ [Node {}] INVALID SIGNATURE on Vote from {}",
+                self.node_id, vote.voter_id
+            );
+            return;
         }
 
         // === REAL MODE: VALIDATOR SET CHECK ===
         // Fetch active validators from StateDB
         let validators = self.db.get_active_validators();
-        
+
         // 1. Check if voter is a validator
         let _voter_weight = match validators.iter().find(|(pk, _)| pk == &vote.voter_id) {
             Some((_, weight)) => *weight,
             None => {
-                println!("⚠️ [Node {}] Ignored vote from non-validator: {}", self.node_id, vote.voter_id);
+                println!(
+                    "⚠️ [Node {}] Ignored vote from non-validator: {}",
+                    self.node_id, vote.voter_id
+                );
                 return;
             }
         };
@@ -315,44 +367,53 @@ impl SimpleConsensus {
                 }
             };
             let current_votes = votes_lock.entry(block_hash.clone()).or_insert(Vec::new());
-            
+
             if !current_votes.iter().any(|v| v.voter_id == vote.voter_id) {
-                 current_votes.push(vote);
-                 
-                 // 2. Calculate Stake-Based Quorum
-                 let total_stake: u64 = validators.iter().map(|(_, w)| w).sum();
-                 let current_stake_weight: u64 = current_votes.iter()
-                    .filter_map(|v| validators.iter().find(|(pk, _)| pk == &v.voter_id).map(|(_, w)| *w))
+                current_votes.push(vote);
+
+                // 2. Calculate Stake-Based Quorum
+                let total_stake: u64 = validators.iter().map(|(_, w)| w).sum();
+                let current_stake_weight: u64 = current_votes
+                    .iter()
+                    .filter_map(|v| {
+                        validators
+                            .iter()
+                            .find(|(pk, _)| pk == &v.voter_id)
+                            .map(|(_, w)| *w)
+                    })
                     .sum();
 
-                 // BFT Quorum: 2/3 + 1
-                 let quorum_threshold = (total_stake * 2) / 3 + 1;
+                // BFT Quorum: 2/3 + 1
+                let quorum_threshold = (total_stake * 2) / 3 + 1;
 
-                 if current_stake_weight >= quorum_threshold {
-                      println!("🎉 [Node {}] BFT Quorum Reached ({}/{} Stake) for Block {}", self.node_id, current_stake_weight, total_stake, block_hash);
-                      should_commit = true;
-                 }
+                if current_stake_weight >= quorum_threshold {
+                    println!(
+                        "🎉 [Node {}] BFT Quorum Reached ({}/{} Stake) for Block {}",
+                        self.node_id, current_stake_weight, total_stake, block_hash
+                    );
+                    should_commit = true;
+                }
             }
         } // votes_lock dropped here
 
         if should_commit {
-             // Check if already committed to avoid double commit
-             let is_committed = {
-                 let blocks = match self.committed_blocks.lock() {
-                     Ok(g) => g,
-                     Err(_) => return, // Fail silently if poisoned
-                 };
-                 blocks.iter().any(|b| b.header.hash == block_hash)
-             }; // lock drops
+            // Check if already committed to avoid double commit
+            let is_committed = {
+                let blocks = match self.committed_blocks.lock() {
+                    Ok(g) => g,
+                    Err(_) => return, // Fail silently if poisoned
+                };
+                blocks.iter().any(|b| b.header.hash == block_hash)
+            }; // lock drops
 
-             if !is_committed {
-                  self.commit_block(block_hash);
-             }
+            if !is_committed {
+                self.commit_block(block_hash);
+            }
         }
     }
 
     fn commit_block(&mut self, block_hash: String) {
-         let proposal_opt = {
+        let proposal_opt = {
             let proposals = match self.pending_proposals.lock() {
                 Ok(g) => g,
                 Err(_) => return,
@@ -361,17 +422,26 @@ impl SimpleConsensus {
         }; // lock drops
 
         if let Some(proposal) = proposal_opt {
-             println!("💾 [Node {}] Committing Block {} (Height {})", self.node_id, block_hash, proposal.block.header.height);
-             
-             if let Ok(mut blocks) = self.committed_blocks.lock() {
-                 blocks.push(proposal.block.clone());
-             }
-             
-             println!("⚙️ [Node {}] Executing Transactions...", self.node_id);
-             // PASS PROPOSER TO EXECUTOR FOR REWARDS
-             self.executor.execute_block_parallel(proposal.block.transactions.clone(), &proposal.block.header.proposer);
+            println!(
+                "💾 [Node {}] Committing Block {} (Height {})",
+                self.node_id, block_hash, proposal.block.header.height
+            );
+
+            if let Ok(mut blocks) = self.committed_blocks.lock() {
+                blocks.push(proposal.block.clone());
+            }
+
+            println!("⚙️ [Node {}] Executing Transactions...", self.node_id);
+            // PASS PROPOSER TO EXECUTOR FOR REWARDS
+            self.executor.execute_block_parallel(
+                proposal.block.transactions.clone(),
+                &proposal.block.header.proposer,
+            );
         } else {
-             eprintln!("❌ [Node {}] Cannot commit block {}: Proposal data missing!", self.node_id, block_hash);
+            eprintln!(
+                "❌ [Node {}] Cannot commit block {}: Proposal data missing!",
+                self.node_id, block_hash
+            );
         }
     }
 
@@ -384,42 +454,45 @@ impl SimpleConsensus {
             }
         };
         for (peer_id, port) in peers.iter() {
-             // Look up peer IP from storage, fallback to 127.0.0.1 for local
-             let peer_ip = self.db.get_peer_ip(peer_id).unwrap_or_else(|| "127.0.0.1".to_string());
-             let addr = format!("{}:{}", peer_ip, port);
-             // Use network::send_message which routes through the bounded GOSSIP_RUNTIME
-             // and performs proper encrypted DH handshake (fixes both thread exhaustion
-             // and Decryption Failed errors from sending raw unencrypted TCP)
-             let _ = network::send_message(&addr, message);
+            // Look up peer IP from storage, fallback to 127.0.0.1 for local
+            let peer_ip = self
+                .db
+                .get_peer_ip(peer_id)
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            let addr = format!("{}:{}", peer_ip, port);
+            // Use network::send_message which routes through the bounded GOSSIP_RUNTIME
+            // and performs proper encrypted DH handshake (fixes both thread exhaustion
+            // and Decryption Failed errors from sending raw unencrypted TCP)
+            let _ = network::send_message(&addr, message);
         }
     }
-    
+
     fn verify_signature(&self, public_key_hex: &str, signature_hex: &str, message: &str) -> bool {
         let pk_bytes = match hex::decode(public_key_hex) {
             Ok(b) if b.len() == 32 => {
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&b);
                 arr
-            },
+            }
             _ => return false,
         };
-        
+
         let sig_bytes = match hex::decode(signature_hex) {
             Ok(b) if b.len() == 64 => {
-                 let mut arr = [0u8; 64];
-                 arr.copy_from_slice(&b);
-                 arr
-            },
+                let mut arr = [0u8; 64];
+                arr.copy_from_slice(&b);
+                arr
+            }
             _ => return false,
         };
-        
+
         let verifying_key = match VerifyingKey::from_bytes(&pk_bytes) {
             Ok(vk) => vk,
             Err(_) => return false,
         };
-        
+
         let signature = Signature::from_bytes(&sig_bytes);
-        
+
         verifying_key.verify(message.as_bytes(), &signature).is_ok()
     }
 }

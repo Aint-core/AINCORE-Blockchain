@@ -13,11 +13,26 @@ export declare class Connection {
     getAccount(address: string): Promise<{
         balance: number;
         sequence_number: number;
+        move_balance: string;
+        balance_source: string;
     }>;
     /**
-     * Get balance of an address
+     * Get native AIN balance from Move CoinStore.
      */
     getBalance(address: string): Promise<number>;
+    /**
+     * Get exact native AIN balance from Move CoinStore as a decimal string.
+     */
+    getMoveBalance(address: string): Promise<string>;
+    /**
+     * Request local/testnet faucet funds. Node must run with AINCORE_ENABLE_FAUCET=1.
+     */
+    requestFaucet(address: string, amount?: string | number, publicKey?: string): Promise<{
+        address: string;
+        amount: string;
+        move_balance: string;
+        balance_source: string;
+    }>;
     /**
      * Get latest blocks
      */

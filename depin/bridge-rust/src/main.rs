@@ -103,13 +103,18 @@ async fn main() {
     loop {
         match aincore.fetch_bridge_events().await {
             Ok(events) => {
-                let current_height = aincore.get_last_processed_height();
+                let cursor_after_fetch = aincore.get_last_processed_height();
                 let mut batch_processed = 0u64;
 
-                for (sender, amount, eth_addr) in events {
-                    // H-03: Build dedup key and check tombstone before processing.
-                    let event_key =
-                        BridgeState::event_key(&sender, amount, &eth_addr, current_height);
+                // Phase 3.5 fix: events now carry block_height + tx_index so
+                // the dedup key is GLOBALLY unique. Two identical (sender,
+                // amount, eth_addr) transactions in the same finalized batch
+                // no longer collide because their (block_height, tx_index)
+                // differ.
+                for (sender, amount, eth_addr, block_height, tx_index) in events {
+                    let event_key = BridgeState::event_key(
+                        &sender, amount, &eth_addr, block_height, tx_index,
+                    );
 
                     if bridge_state.is_seen(&event_key) {
                         warn!(
@@ -119,7 +124,10 @@ async fn main() {
                         continue;
                     }
 
-                    info!("🔒 Processing Lock: {} AIN from {}", amount, sender);
+                    info!(
+                        "🔒 Lock @ block {} tx#{}: {} AIN from {}",
+                        block_height, tx_index, amount, sender
+                    );
 
                     if let Some(evm_client) = &evm {
                         // H-03: Get next nonce from persisted state (never resets).
@@ -135,21 +143,17 @@ async fn main() {
                             }
                             Err(e) => {
                                 error!("❌ Failed to mint on EVM: {}", e);
-                                // On failure: nonce was already incremented in state.
-                                // The EVM tx was attempted; operator must resolve manually.
-                                // We still persist to avoid re-sending (which would use
-                                // a different nonce and create a stuck tx).
+                                // Nonce already incremented; operator resolves manually.
                             }
                         }
                     } else {
                         info!("⚠️ EVM Client not ready. Skipping mint for {}", eth_addr);
-                        // Don't mark as processed — retry next loop.
                     }
                 }
 
-                // Persist state after every polling cycle (height + any new tombstones).
-                bridge_state.last_processed_height = current_height;
-                if batch_processed > 0 || current_height > 0 {
+                // Persist cursor + any new tombstones.
+                bridge_state.last_processed_height = cursor_after_fetch;
+                if batch_processed > 0 || cursor_after_fetch > 0 {
                     bridge_state.save();
                 }
             }

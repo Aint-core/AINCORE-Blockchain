@@ -1,3 +1,4 @@
-export * from './keypair';
-export * from './connection';
-export * from './transaction';
+export { Keypair } from './keypair';
+export { Transaction } from './transaction';
+export { Connection } from './connection';
+export * from './bcs';

@@ -7,18 +7,13 @@ lazy_static! {
         "Current block height of the blockchain"
     ))
     .unwrap();
-
     pub static ref TRANSACTION_COUNT: Counter = register_counter!(opts!(
         "aincore_transaction_count",
         "Total number of transactions processed"
     ))
     .unwrap();
-
-    pub static ref PEER_COUNT: IntGauge = register_int_gauge!(opts!(
-        "aincore_peer_count",
-        "Number of connected peers"
-    ))
-    .unwrap();
+    pub static ref PEER_COUNT: IntGauge =
+        register_int_gauge!(opts!("aincore_peer_count", "Number of connected peers")).unwrap();
 }
 
 pub fn gather_metrics() -> String {

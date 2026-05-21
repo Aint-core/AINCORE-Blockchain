@@ -1,6 +1,6 @@
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use storage::object::{Object, Owner};
-use ed25519_dalek::{Verifier, VerifyingKey, Signature};
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct AccountData {
@@ -17,7 +17,6 @@ pub struct AccountData {
     pub public_key: String,
 }
 
-
 pub struct AccountManager;
 
 impl AccountManager {
@@ -29,9 +28,8 @@ impl AccountManager {
             balance: 0,
             btc_balance: 0,
         };
-        let data_bytes = serde_json::to_vec(&data)
-            .expect("AA: Failed to serialize AccountData");
-        
+        let data_bytes = serde_json::to_vec(&data).expect("AA: Failed to serialize AccountData");
+
         Object::new(
             address.clone(),
             Owner::Address(address),
@@ -42,7 +40,11 @@ impl AccountManager {
 
     /// Verify a transaction signature against the Account Object
     /// This simulates the "validate" phase of AA
-    pub fn validate_transaction(account_obj: &Object, tx_payload: &[u8], signature_hex: &str) -> bool {
+    pub fn validate_transaction(
+        account_obj: &Object,
+        tx_payload: &[u8],
+        signature_hex: &str,
+    ) -> bool {
         // 1. Parse Account Data
         let account_data: AccountData = match serde_json::from_slice(&account_obj.data) {
             Ok(d) => d,
@@ -63,7 +65,7 @@ impl AccountManager {
                 return false;
             }
         };
-        
+
         let verifying_key = match VerifyingKey::from_bytes(&pub_key_array) {
             Ok(k) => k,
             Err(_) => {
@@ -77,7 +79,7 @@ impl AccountManager {
             Ok(b) => b,
             Err(_) => return false,
         };
-        
+
         let sig_array: [u8; 64] = match sig_bytes_vec.as_slice().try_into() {
             Ok(bytes) => bytes,
             Err(_) => {
@@ -85,9 +87,8 @@ impl AccountManager {
                 return false;
             }
         };
-        
-        let signature = Signature::from_bytes(&sig_array);
 
+        let signature = Signature::from_bytes(&sig_array);
 
         // 4. Verify
         verifying_key.verify(tx_payload, &signature).is_ok()

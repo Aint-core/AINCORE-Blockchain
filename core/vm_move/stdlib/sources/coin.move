@@ -39,7 +39,7 @@ module 0x1::coin {
     }
 
     /// Register an account to receive coins
-    public fun register<CoinType>(account: &signer) {
+    public entry fun register<CoinType>(account: &signer) {
         let addr = signer::address_of(account);
         assert!(!exists<CoinStore<CoinType>>(addr), error::already_exists(EALREADY_INITIALIZED));
         

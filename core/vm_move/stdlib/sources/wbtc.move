@@ -8,6 +8,7 @@
 module 0x1::wbtc {
     use std::signer;
     use std::error;
+    use std::vector;
     use 0x1::coin;
 
     /// Error codes
@@ -15,6 +16,9 @@ module 0x1::wbtc {
     const EINSUFFICIENT_BALANCE: u64 = 2;
     const EALREADY_INITIALIZED: u64 = 3;
     const ENOT_INITIALIZED: u64 = 4;
+    const EINVALID_BTC_ADDRESS: u64 = 5;
+    const MIN_BTC_ADDRESS_LEN: u64 = 14;
+    const MAX_BTC_ADDRESS_LEN: u64 = 90;
 
     /// The wBTC coin type marker
     struct WBTC has drop {}
@@ -70,6 +74,11 @@ module 0x1::wbtc {
         btc_address: vector<u8>  // Bitcoin address to receive BTC
     ) acquires BridgeConfig {
         let addr = signer::address_of(account);
+        let btc_len = vector::length(&btc_address);
+        assert!(
+            btc_len >= MIN_BTC_ADDRESS_LEN && btc_len <= MAX_BTC_ADDRESS_LEN,
+            error::invalid_argument(EINVALID_BTC_ADDRESS)
+        );
         
         // Check balance
         assert!(coin::balance<WBTC>(addr) >= amount, error::invalid_argument(EINSUFFICIENT_BALANCE));

@@ -11,7 +11,7 @@ pub struct Storage {
 impl Storage {
     pub fn new(path: &str) -> Self {
         let mut processed_txs = HashSet::new();
-        
+
         if Path::new(path).exists() {
             if let Ok(content) = fs::read_to_string(path) {
                 if let Ok(txs) = serde_json::from_str::<HashSet<String>>(&content) {

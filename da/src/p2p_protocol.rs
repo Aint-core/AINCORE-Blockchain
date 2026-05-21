@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// P2P messages for shard distribution
 /// Note: Kept for future P2P shard distribution implementation (Phase 6)
@@ -11,7 +11,7 @@ pub enum ShardMessage {
         shard_id: u32,
         requester_id: String,
     },
-    
+
     /// Response with shard data
     ShardResponse {
         epoch: u64,
@@ -19,7 +19,7 @@ pub enum ShardMessage {
         data: Vec<u8>,
         merkle_proof: Vec<[u8; 32]>,
     },
-    
+
     /// Announce new DA batch
     BatchAnnouncement {
         epoch: u64,
@@ -32,16 +32,14 @@ pub enum ShardMessage {
 impl ShardMessage {
     /// Serialize to JSON
     pub fn to_json(&self) -> Result<String, String> {
-        serde_json::to_string(self)
-            .map_err(|e| format!("Serialization failed: {}", e))
+        serde_json::to_string(self).map_err(|e| format!("Serialization failed: {}", e))
     }
-    
+
     /// Deserialize from JSON
     pub fn from_json(json: &str) -> Result<Self, String> {
-        serde_json::from_str(json)
-            .map_err(|e| format!("Deserialization failed: {}", e))
+        serde_json::from_str(json).map_err(|e| format!("Deserialization failed: {}", e))
     }
-    
+
     /// Get message type as string
     pub fn message_type(&self) -> &str {
         match self {
@@ -55,7 +53,7 @@ impl ShardMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_shard_request_serialization() {
         let msg = ShardMessage::ShardRequest {
@@ -63,12 +61,16 @@ mod tests {
             shard_id: 5,
             requester_id: "node1".to_string(),
         };
-        
+
         let json = msg.to_json().unwrap();
         let decoded = ShardMessage::from_json(&json).unwrap();
-        
+
         match decoded {
-            ShardMessage::ShardRequest { epoch, shard_id, requester_id } => {
+            ShardMessage::ShardRequest {
+                epoch,
+                shard_id,
+                requester_id,
+            } => {
                 assert_eq!(epoch, 100);
                 assert_eq!(shard_id, 5);
                 assert_eq!(requester_id, "node1");
@@ -76,7 +78,7 @@ mod tests {
             _ => panic!("Wrong message type"),
         }
     }
-    
+
     #[test]
     fn test_batch_announcement() {
         let msg = ShardMessage::BatchAnnouncement {
@@ -85,9 +87,9 @@ mod tests {
             shard_count: 32,
             proposer_id: "validator1".to_string(),
         };
-        
+
         assert_eq!(msg.message_type(), "BATCH_ANNOUNCEMENT");
-        
+
         let json = msg.to_json().unwrap();
         assert!(json.contains("\"epoch\":42"));
     }

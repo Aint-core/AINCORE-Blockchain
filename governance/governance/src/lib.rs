@@ -9,6 +9,23 @@ where
     serializer.serialize_str(&value.to_string())
 }
 
+fn deserialize_u128_string<'de, D>(deserializer: D) -> Result<u128, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum U128StringOrNumber {
+        String(String),
+        Number(u128),
+    }
+
+    match U128StringOrNumber::deserialize(deserializer)? {
+        U128StringOrNumber::String(value) => value.parse().map_err(serde::de::Error::custom),
+        U128StringOrNumber::Number(value) => Ok(value),
+    }
+}
+
 // === Governance Structs ===
 // NOTE: Native AccountData is no longer used in this module.
 // All balance queries now go through query_move_vm_balance() which reads
@@ -26,6 +43,7 @@ pub struct VoteRecord {
     /// stake each address committed to a given proposal.
     #[serde(default)]
     #[serde(serialize_with = "serialize_u128_string")]
+    #[serde(deserialize_with = "deserialize_u128_string")]
     pub weight: u128,
     /// Phase 2.6 (M-03): chain height at the moment the vote was cast.
     /// Used together with `Proposal::snapshot_block_height` so future

@@ -7,6 +7,7 @@ edition = "2021"
 # --- Core modules ---
 executor = { path = "../executor" }
 mempool = { path = "../mempool" }
+vm_move = { path = "../vm_move" }
 storage = { path = "../../common/storage" }
 network = { path = "../../common/network" }
 config = { path = "../../common/config" }

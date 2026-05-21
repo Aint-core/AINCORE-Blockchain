@@ -24,7 +24,11 @@ impl BridgeValidator {
         }
     }
 
-    pub fn process_message(&mut self, msg: &CrossChainMessage, proof: &[u64]) -> Result<bool, String> {
+    pub fn process_message(
+        &mut self,
+        msg: &CrossChainMessage,
+        proof: &[u64],
+    ) -> Result<bool, String> {
         // 1. Hash the message
         let mut msg_hash = self.hasher.hash_two(msg.source_chain_id, msg.dest_chain_id);
         msg_hash = self.hasher.hash_two(msg_hash, msg.nonce);
@@ -35,10 +39,10 @@ impl BridgeValidator {
         // 2. Verify Proof (Simplified: Proof sum + Validator Hash should match something)
         // In real logic: Merkle inclusion proof or Multi-sig verification
         let proof_sum: u64 = proof.iter().sum();
-        
+
         if proof_sum.wrapping_add(self.validator_set_hash) == 0 {
-             // Failure condition check
-             return Err("Invalid proof".to_string());
+            // Failure condition check
+            return Err("Invalid proof".to_string());
         }
 
         Ok(true)
@@ -48,7 +52,7 @@ impl BridgeValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_bridge_logic() {
         let mut bridge = BridgeValidator::new(100);
@@ -58,11 +62,11 @@ mod tests {
             nonce: 1,
             payload: vec![1, 2, 3],
         };
-        
+
         // Use dummy proof
         let proof = vec![1, 1, 1];
         let result = bridge.process_message(&msg, &proof);
-        
+
         assert!(result.is_ok());
     }
 }

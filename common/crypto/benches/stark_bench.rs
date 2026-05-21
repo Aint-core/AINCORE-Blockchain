@@ -3,19 +3,15 @@
 // Comprehensive benchmarking suite for STARK proofs
 // Measures: proving time, verification time, proof size
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use crypto::zkp::{
-    fibonacci_prover::FibonacciProver,
-    merkle_prover::MerkleProver,
-    stark_proof::*,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use crypto::zkp::{fibonacci_prover::FibonacciProver, merkle_prover::MerkleProver, stark_proof::*};
 use winterfell::Prover;
 
 // ========== Fibonacci Benchmarks ==========
 
 fn bench_fibonacci_proving(c: &mut Criterion) {
     let mut group = c.benchmark_group("fibonacci_proving");
-    
+
     for steps in [8, 16, 32, 64].iter() {
         group.bench_with_input(BenchmarkId::new("default", steps), steps, |b, &steps| {
             b.iter(|| {
@@ -24,7 +20,7 @@ fn bench_fibonacci_proving(c: &mut Criterion) {
                 black_box(prover.prove(trace).unwrap())
             });
         });
-        
+
         group.bench_with_input(BenchmarkId::new("optimized", steps), steps, |b, &steps| {
             b.iter(|| {
                 let prover = FibonacciProver::new_optimized();
@@ -33,13 +29,13 @@ fn bench_fibonacci_proving(c: &mut Criterion) {
             });
         });
     }
-    
+
     group.finish();
 }
 
 fn bench_fibonacci_verification(c: &mut Criterion) {
     let mut group = c.benchmark_group("fibonacci_verification");
-    
+
     for steps in [8, 16, 32].iter() {
         // Pre-generate proof
         let proof_bytes = generate_fibonacci_proof(*steps).unwrap();
@@ -49,20 +45,18 @@ fn bench_fibonacci_verification(c: &mut Criterion) {
             32 => 2178309,
             _ => 0,
         };
-        
+
         group.bench_with_input(BenchmarkId::from_parameter(steps), steps, |b, _| {
-            b.iter(|| {
-                black_box(verify_fibonacci_proof(&proof_bytes, expected).unwrap())
-            });
+            b.iter(|| black_box(verify_fibonacci_proof(&proof_bytes, expected).unwrap()));
         });
     }
-    
+
     group.finish();
 }
 
 fn bench_fibonacci_proof_size(c: &mut Criterion) {
     let mut group = c.benchmark_group("fibonacci_proof_size");
-    
+
     for steps in [8, 16, 32].iter() {
         group.bench_with_input(BenchmarkId::new("default", steps), steps, |b, &steps| {
             b.iter(|| {
@@ -71,7 +65,7 @@ fn bench_fibonacci_proof_size(c: &mut Criterion) {
             });
         });
     }
-    
+
     group.finish();
 }
 
@@ -79,11 +73,11 @@ fn bench_fibonacci_proof_size(c: &mut Criterion) {
 
 fn bench_merkle_proving(c: &mut Criterion) {
     let mut group = c.benchmark_group("merkle_proving");
-    
+
     let leaf = 100;
     let path = vec![1, 2, 3, 4, 5, 6, 7, 8];
     let path_bits = vec![false; 8];
-    
+
     group.bench_function("default", |b| {
         b.iter(|| {
             let prover = MerkleProver::new();
@@ -91,7 +85,7 @@ fn bench_merkle_proving(c: &mut Criterion) {
             black_box(prover.prove(trace).unwrap())
         });
     });
-    
+
     group.bench_function("optimized", |b| {
         b.iter(|| {
             let prover = MerkleProver::new_optimized();
@@ -99,27 +93,25 @@ fn bench_merkle_proving(c: &mut Criterion) {
             black_box(prover.prove(trace).unwrap())
         });
     });
-    
+
     group.finish();
 }
 
 fn bench_merkle_verification(c: &mut Criterion) {
     let mut group = c.benchmark_group("merkle_verification");
-    
+
     let leaf = 100;
     let path = vec![1, 2, 3, 4, 5, 6, 7, 8];
     let path_bits = vec![false; 8];
-    
+
     // Pre-generate proof
     let proof_bytes = generate_merkle_proof(leaf, path, path_bits).unwrap();
     let expected_root = 136; // Pre-calculated
-    
+
     group.bench_function("verify", |b| {
-        b.iter(|| {
-            black_box(verify_merkle_proof(&proof_bytes, expected_root).unwrap())
-        });
+        b.iter(|| black_box(verify_merkle_proof(&proof_bytes, expected_root).unwrap()));
     });
-    
+
     group.finish();
 }
 
@@ -127,13 +119,11 @@ fn bench_merkle_verification(c: &mut Criterion) {
 
 fn bench_batch_proving(c: &mut Criterion) {
     let mut group = c.benchmark_group("batch_proving");
-    
+
     group.bench_function("fibonacci_batch_3", |b| {
-        b.iter(|| {
-            black_box(generate_fibonacci_batch_proof(vec![8, 16, 32]).unwrap())
-        });
+        b.iter(|| black_box(generate_fibonacci_batch_proof(vec![8, 16, 32]).unwrap()));
     });
-    
+
     group.bench_function("merkle_batch_2", |b| {
         b.iter(|| {
             let proofs = vec![
@@ -143,7 +133,7 @@ fn bench_batch_proving(c: &mut Criterion) {
             black_box(generate_merkle_batch_proof(proofs).unwrap())
         });
     });
-    
+
     group.finish();
 }
 

@@ -1,11 +1,12 @@
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use actix_cors::Cors;
-use rusqlite::{params, Connection, Result};
+use actix_web::{App, HttpResponse, HttpServer, Responder, web};
+use rusqlite::{Connection, Result, params};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
-use log::{info, error};
+use log::{error, info};
+use move_core_types::account_address::AccountAddress;
 use std::env;
 
 fn get_rpc_url() -> String {
@@ -13,10 +14,50 @@ fn get_rpc_url() -> String {
 }
 const DB_PATH: &str = "indexer.db";
 
+fn permissive_cors_enabled() -> bool {
+    env::var("AINCORE_PERMISSIVE_CORS")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn decode_transfer(payload: &str) -> (Option<String>, u64) {
+    let hex_payload = payload.trim_start_matches("0x");
+    let bytes = match hex::decode(hex_payload) {
+        Ok(bytes) => bytes,
+        Err(_) => return (None, 0),
+    };
+
+    let tx_payload = match bcs::from_bytes::<vm_move::TransactionPayload>(&bytes) {
+        Ok(payload) => payload,
+        Err(_) => return (None, 0),
+    };
+
+    let vm_move::TransactionPayload::EntryFunction(call) = tx_payload else {
+        return (None, 0);
+    };
+
+    let system_address = AccountAddress::from_hex_literal("0x1").expect("valid system address");
+    if call.module.address() != &system_address
+        || call.module.name().as_str() != "coin"
+        || call.function != "transfer"
+        || call.args.len() < 3
+    {
+        return (None, 0);
+    }
+
+    let receiver =
+        bcs::from_bytes::<move_core_types::account_address::AccountAddress>(&call.args[1])
+            .ok()
+            .map(|addr| addr.to_string());
+    let amount_u128 = bcs::from_bytes::<u128>(&call.args[2]).unwrap_or(0);
+    let amount = u64::try_from(amount_u128).unwrap_or(u64::MAX);
+    (receiver, amount)
+}
+
 // --- Database Setup ---
 fn init_db() -> Result<Connection, Box<dyn std::error::Error>> {
     let conn = Connection::open(DB_PATH)?;
-    
+
     conn.execute(
         "CREATE TABLE IF NOT EXISTS transactions (
             hash TEXT PRIMARY KEY,
@@ -42,7 +83,9 @@ fn init_db() -> Result<Connection, Box<dyn std::error::Error>> {
 }
 
 fn get_last_indexed_height(conn: &Connection) -> u64 {
-    let stmt = conn.prepare("SELECT value FROM state WHERE key = 'last_height'").ok();
+    let stmt = conn
+        .prepare("SELECT value FROM state WHERE key = 'last_height'")
+        .ok();
     if let Some(mut s) = stmt {
         let mut rows = s.query([]).ok();
         if let Some(rows) = rows.as_mut() {
@@ -84,9 +127,9 @@ async fn fetch_blocks(_start: u64, limit: u64) -> Option<Vec<serde_json::Value>>
     // We might need to fetch one by one or handle the range logic carefully.
     // For simplicity, let's just fetch latest blocks and filter.
     // Ideally, we add `aincore_getBlockByHeight` to the node.
-    // But for now, let's use `aincore_getBlocks` with a large limit and filter locally, 
+    // But for now, let's use `aincore_getBlocks` with a large limit and filter locally,
     // or just rely on the fact that we are catching up.
-    
+
     // Actually, let's just implement a loop that tries to get block N.
     // But we don't have getBlockByHeight exposed nicely yet (only getBlocks range).
     // Let's assume we fetch latest 10 and see if we missed any.
@@ -94,7 +137,7 @@ async fn fetch_blocks(_start: u64, limit: u64) -> Option<Vec<serde_json::Value>>
     // Just fetch `aincore_getBlocks` with limit 50.
     // Process them. If we see a block height > last_indexed, we process it.
     // Since blocks are immutable, we can just process any block we haven't seen.
-    
+
     let req = RpcRequest {
         jsonrpc: "2.0".to_string(),
         method: "aincore_getBlocks".to_string(),
@@ -116,7 +159,7 @@ async fn indexer_loop(db: Arc<Mutex<Connection>>) {
                 Ok(conn) => get_last_indexed_height(&conn),
                 Err(_) => {
                     eprintln!("❌ DB Lock Poisoned");
-                    0 
+                    0
                 }
             }
         };
@@ -131,7 +174,7 @@ async fn indexer_loop(db: Arc<Mutex<Connection>>) {
                 let height = block["header"]["height"].as_u64().unwrap_or(0);
                 if height > last_height {
                     println!("📥 Indexing Block #{}", height);
-                    
+
                     // Process Transactions
                     if let Some(txs) = block["transactions"].as_array() {
                         let conn = match db.lock() {
@@ -144,31 +187,24 @@ async fn indexer_loop(db: Arc<Mutex<Connection>>) {
                             // aincore_getBlocks returns block object with transactions list.
                             // In `main.rs`, `Block` struct has `transactions: Vec<String>`.
                             // So it's a list of JSON strings.
-                            
+
                             if let Some(tx_str) = tx.as_str() {
-                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tx_str) {
+                                if let Ok(parsed) =
+                                    serde_json::from_str::<serde_json::Value>(tx_str)
+                                {
                                     let sender = parsed["sender"].as_str().unwrap_or("");
                                     let payload = parsed["payload"].as_str().unwrap_or("");
-                                    
+
                                     // Calculate Hash (Naive)
                                     // use sha2::{Sha256, Digest}; // Unused for now
-                                    
-                                    use sha2::{Sha256, Digest};
+
+                                    use sha2::{Digest, Sha256};
                                     let mut hasher = Sha256::new();
                                     hasher.update(tx_str.as_bytes());
                                     let hash = hex::encode(hasher.finalize());
-                                    
-                                    let mut receiver = None;
-                                    let mut amount = 0;
-                                    
-                                    if payload.starts_with("transfer:") {
-                                        let parts: Vec<&str> = payload.split(':').collect();
-                                        if parts.len() == 3 {
-                                            receiver = Some(parts[1].to_string());
-                                            amount = parts[2].parse().unwrap_or(0);
-                                        }
-                                    }
-                                    
+
+                                    let (receiver, amount) = decode_transfer(payload);
+
                                     conn.execute(
                                         "INSERT OR IGNORE INTO transactions (hash, sender, receiver, amount, payload, block_height, timestamp)
                                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -208,16 +244,16 @@ async fn get_history(data: web::Data<AppState>, path: web::Path<String>) -> impl
         Ok(c) => c,
         Err(_) => return HttpResponse::InternalServerError().body("DB Lock Error"),
     };
-    
+
     let mut stmt = match conn.prepare(
         "SELECT hash, sender, receiver, amount, payload, block_height FROM transactions 
          WHERE sender = ?1 OR receiver = ?1 
-         ORDER BY block_height DESC LIMIT 50"
+         ORDER BY block_height DESC LIMIT 50",
     ) {
         Ok(s) => s,
         Err(_) => return HttpResponse::InternalServerError().body("DB Query Error"),
     };
-    
+
     let rows = match stmt.query_map(params![address], |row| {
         Ok(TxRecord {
             hash: row.get(0)?,
@@ -254,7 +290,7 @@ async fn main() -> std::io::Result<()> {
             return Ok(());
         }
     };
-    
+
     // Spawn Indexer
     let db_clone = db.clone();
     tokio::spawn(async move {
@@ -262,11 +298,21 @@ async fn main() -> std::io::Result<()> {
     });
 
     println!("🚀 Indexer API running on port 3001");
-    
+
     let app_state = web::Data::new(AppState { db });
 
     HttpServer::new(move || {
-        let cors = Cors::permissive();
+        let cors = if permissive_cors_enabled() {
+            Cors::permissive()
+        } else {
+            Cors::default()
+                .allowed_origin("http://localhost:3000")
+                .allowed_origin("http://127.0.0.1:3000")
+                .allowed_origin("http://localhost:5173")
+                .allowed_origin("http://127.0.0.1:5173")
+                .allow_any_header()
+                .allowed_methods(vec!["GET"])
+        };
         App::new()
             .wrap(cors)
             .app_data(app_state.clone())
@@ -275,4 +321,65 @@ async fn main() -> std::io::Result<()> {
     .bind(("0.0.0.0", 3001))?
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_transfer;
+    use move_core_types::{
+        account_address::AccountAddress,
+        identifier::Identifier,
+        language_storage::{ModuleId, StructTag, TypeTag},
+    };
+
+    fn system_address() -> AccountAddress {
+        AccountAddress::from_hex_literal("0x1").expect("valid system address")
+    }
+
+    fn aincore_coin_type() -> TypeTag {
+        TypeTag::Struct(Box::new(StructTag {
+            address: system_address(),
+            module: Identifier::new("staking").expect("valid module"),
+            name: Identifier::new("AincoreCoin").expect("valid coin"),
+            type_params: vec![],
+        }))
+    }
+
+    #[test]
+    fn decode_transfer_reads_bcs_entry_function_payload() {
+        let sender =
+            AccountAddress::from_hex_literal("0x11111111111111111111111111111111").unwrap();
+        let receiver =
+            AccountAddress::from_hex_literal("0x22222222222222222222222222222222").unwrap();
+        let payload = vm_move::TransactionPayload::EntryFunction(vm_move::EntryFunctionCall {
+            module: ModuleId::new(system_address(), Identifier::new("coin").unwrap()),
+            function: "transfer".to_string(),
+            ty_args: vec![aincore_coin_type()],
+            args: vec![
+                bcs::to_bytes(&sender).unwrap(),
+                bcs::to_bytes(&receiver).unwrap(),
+                bcs::to_bytes(&1234u128).unwrap(),
+            ],
+        });
+
+        let encoded = hex::encode(bcs::to_bytes(&payload).unwrap());
+        let (decoded_receiver, decoded_amount) = decode_transfer(&encoded);
+
+        assert_eq!(
+            decoded_receiver.as_deref(),
+            Some("22222222222222222222222222222222")
+        );
+        assert_eq!(decoded_amount, 1234);
+    }
+
+    #[test]
+    fn decode_transfer_rejects_non_transfer_payloads() {
+        let payload = vm_move::TransactionPayload::PublishModule(vec![vec![0xCA, 0xFE]]);
+        let encoded = hex::encode(bcs::to_bytes(&payload).unwrap());
+
+        let (decoded_receiver, decoded_amount) = decode_transfer(&encoded);
+
+        assert!(decoded_receiver.is_none());
+        assert_eq!(decoded_amount, 0);
+    }
 }

@@ -1,4 +1,46 @@
 import { Keypair } from './keypair';
+import {
+    serializeTransactionPayload,
+    TransactionPayload,
+    EntryFunctionCall,
+    TypeTag,
+    SYSTEM_ADDRESS,
+    AINCORE_COIN_TYPE,
+    bcsAddress,
+    bcsU64,
+    bcsU128,
+    bcsU8,
+    bcsBool,
+    bcsString,
+    bcsVectorU8,
+    hexToBytes,
+    bytesToHex,
+} from './bcs';
+
+// ============================================================
+// Helper: Build a standard 0x1 entry function call
+// ============================================================
+
+function systemCall(
+    moduleName: string,
+    functionName: string,
+    tyArgs: TypeTag[],
+    args: Uint8Array[]
+): string {
+    const call: EntryFunctionCall = {
+        module: { address: SYSTEM_ADDRESS, name: moduleName },
+        function: functionName,
+        tyArgs,
+        args,
+    };
+    const payload: TransactionPayload = { kind: 'EntryFunction', call };
+    const bytes = serializeTransactionPayload(payload);
+    return bytesToHex(bytes);
+}
+
+// ============================================================
+// Transaction Class
+// ============================================================
 
 export class Transaction {
     sender: string;
@@ -6,10 +48,10 @@ export class Transaction {
     payload: string;
     gasLimit: number;
     gasPrice: number;
-    sequenceNumber: number; // Replay Protection
+    sequenceNumber: number;
     publicKey: string;
     signature: string;
-    chainId: string; // Replay Protection
+    chainId: string;
     paymaster?: string;
     paymasterSignature?: string;
 
@@ -22,40 +64,65 @@ export class Transaction {
         this.sequenceNumber = 0;
         this.publicKey = '';
         this.signature = '';
-        this.chainId = ''; // Must be explicitly set by developer
+        this.chainId = '';
     }
 
+    // ============ CORE METHODS ============
+
     /**
-     * Create a transfer transaction
+     * Create a transfer transaction (AIN native coin)
+     * Calls: 0x1::coin::transfer<0x1::staking::AincoreCoin>
      */
-    static createTransfer(sender: Keypair, to: string, amount: number, sequenceNumber: number = 0): Transaction {
+    static createTransfer(sender: Keypair, to: string, amount: bigint, sequenceNumber: number = 0): Transaction {
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = `transfer:${to}:${amount}`;
+        tx.payload = systemCall('coin', 'transfer', [AINCORE_COIN_TYPE], [
+            bcsAddress(sender.address),
+            bcsAddress(to),
+            bcsU128(amount),
+        ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
 
     /**
-     * Create a Move smart contract call
-     * @param sender - Sender keypair
-     * @param bytecodeHex - Move bytecode as hex string (starting with 0x)
-     * @param sequenceNumber - Transaction sequence number
+     * Create a Move smart contract publication
+     * Uses: TransactionPayload::PublishModule
      */
-    static createMoveCall(sender: Keypair, bytecodeHex: string, sequenceNumber: number = 0): Transaction {
+    static createPublish(sender: Keypair, bytecodeHex: string, sequenceNumber: number = 0): Transaction {
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = bytecodeHex.startsWith('0x') ? bytecodeHex : `0x${bytecodeHex}`;
+        const bytes = hexToBytes(bytecodeHex);
+        const payload: TransactionPayload = { kind: 'PublishModule', modules: [bytes] };
+        tx.payload = bytesToHex(serializeTransactionPayload(payload));
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
+
+    /**
+     * Create a generic Move entry function call
+     * This is the universal builder — all specialized methods use this internally
+     */
+    static createMoveCall(
+        sender: Keypair,
+        moduleName: string,
+        functionName: string,
+        tyArgs: TypeTag[],
+        args: Uint8Array[],
+        sequenceNumber: number = 0
+    ): Transaction {
+        const tx = new Transaction();
+        tx.sender = sender.address;
+        tx.payload = systemCall(moduleName, functionName, tyArgs, args);
+        tx.sequenceNumber = sequenceNumber;
+        return tx;
+    }
+
+    // ============ DePIN METHODS ============
 
     /**
      * Create a DePIN proof submission transaction
-     * @param sender - Device keypair (device address must match sender)
-     * @param deviceId - Device ID (should match sender address)
-     * @param bqi - Bandwidth Quality Index (0-100)
-     * @param sequenceNumber - Transaction sequence number
+     * Calls: 0x1::universal_mining::submit_mining_proof(oracle, device_pubkey, bqi_score)
      */
     static createDePINProof(sender: Keypair, deviceId: string, bqi: number, sequenceNumber: number = 0): Transaction {
         if (bqi < 0 || bqi > 100) {
@@ -63,20 +130,31 @@ export class Transaction {
         }
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = `submit_proof:${deviceId}:${bqi}`;
+        const deviceBytes = hexToBytes(deviceId);
+        tx.payload = systemCall('universal_mining', 'submit_mining_proof', [], [
+            bcsAddress(sender.address),
+            bcsVectorU8(deviceBytes),
+            bcsU64(BigInt(bqi)),
+        ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
 
+    // ============ STAKING METHODS ============
+
     /**
-     * Create a validator registration transaction
-     * @param sender - Validator keypair (must have staking balance)
-     * @param sequenceNumber - Transaction sequence number
+     * Register as a validator
+     * Calls: 0x1::staking::join_validator_set(account, stake_amount, public_key)
      */
-    static createRegisterValidator(sender: Keypair, sequenceNumber: number = 0): Transaction {
+    static createRegisterValidator(sender: Keypair, stakeAmount: bigint, sequenceNumber: number = 0): Transaction {
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = 'register_validator';
+        const pkBytes = hexToBytes(sender.publicKey);
+        tx.payload = systemCall('staking', 'join_validator_set', [], [
+            bcsAddress(sender.address),
+            bcsU128(stakeAmount),
+            bcsVectorU8(pkBytes),
+        ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
@@ -85,10 +163,7 @@ export class Transaction {
 
     /**
      * Delegate tokens to a validator
-     * @param sender - Delegator keypair
-     * @param validatorAddress - Address of the validator to delegate to
-     * @param amount - Amount to delegate (in smallest unit, 1 AIN = 1e18)
-     * @param sequenceNumber - Transaction sequence number
+     * Calls: 0x1::delegation::delegate(delegator, validator_addr, amount)
      */
     static createDelegate(
         sender: Keypair,
@@ -98,17 +173,18 @@ export class Transaction {
     ): Transaction {
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = `delegate:${validatorAddress}:${amount.toString()}`;
+        tx.payload = systemCall('delegation', 'delegate', [], [
+            bcsAddress(sender.address),
+            bcsAddress(validatorAddress),
+            bcsU128(amount),
+        ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
 
     /**
      * Undelegate tokens from a validator (starts 21-day unbonding)
-     * @param sender - Delegator keypair
-     * @param validatorAddress - Address of the validator to undelegate from
-     * @param amount - Amount to undelegate
-     * @param sequenceNumber - Transaction sequence number
+     * Calls: 0x1::delegation::undelegate(delegator, validator_addr, amount)
      */
     static createUndelegate(
         sender: Keypair,
@@ -118,16 +194,18 @@ export class Transaction {
     ): Transaction {
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = `undelegate:${validatorAddress}:${amount.toString()}`;
+        tx.payload = systemCall('delegation', 'undelegate', [], [
+            bcsAddress(sender.address),
+            bcsAddress(validatorAddress),
+            bcsU128(amount),
+        ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
 
     /**
      * Claim delegation rewards from a validator
-     * @param sender - Delegator keypair
-     * @param validatorAddress - Address of the validator
-     * @param sequenceNumber - Transaction sequence number
+     * Calls: 0x1::delegation::claim_rewards(delegator, validator_addr)
      */
     static createClaimRewards(
         sender: Keypair,
@@ -136,16 +214,17 @@ export class Transaction {
     ): Transaction {
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = `claim_rewards:${validatorAddress}`;
+        tx.payload = systemCall('delegation', 'claim_rewards', [], [
+            bcsAddress(sender.address),
+            bcsAddress(validatorAddress),
+        ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
 
     /**
      * Withdraw unbonded tokens (after 21-day unbonding period)
-     * @param sender - Delegator keypair
-     * @param validatorAddress - Address of the validator
-     * @param sequenceNumber - Transaction sequence number
+     * Calls: 0x1::delegation::withdraw_unbonded(delegator, validator_addr)
      */
     static createWithdrawUnbonded(
         sender: Keypair,
@@ -154,16 +233,17 @@ export class Transaction {
     ): Transaction {
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = `withdraw_unbonded:${validatorAddress}`;
+        tx.payload = systemCall('delegation', 'withdraw_unbonded', [], [
+            bcsAddress(sender.address),
+            bcsAddress(validatorAddress),
+        ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
 
     /**
      * Enable delegation for a validator (validator only)
-     * @param sender - Validator keypair
-     * @param commissionRate - Commission rate in basis points (100 = 1%, max 3000 = 30%)
-     * @param sequenceNumber - Transaction sequence number
+     * Calls: 0x1::delegation::enable_delegation(validator, commission_rate)
      */
     static createEnableDelegation(
         sender: Keypair,
@@ -175,7 +255,10 @@ export class Transaction {
         }
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = `enable_delegation:${commissionRate}`;
+        tx.payload = systemCall('delegation', 'enable_delegation', [], [
+            bcsAddress(sender.address),
+            bcsU64(BigInt(commissionRate)),
+        ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
@@ -184,13 +267,7 @@ export class Transaction {
 
     /**
      * Create a new token
-     * @param sender - Creator keypair (must have 100 AIN for creation fee)
-     * @param name - Token name (e.g., "My Token")
-     * @param symbol - Token symbol (e.g., "MTK")
-     * @param decimals - Number of decimals (max 18)
-     * @param maxSupply - Maximum supply (in smallest unit)
-     * @param initialSupply - Initial supply to mint to creator
-     * @param sequenceNumber - Transaction sequence number
+     * Calls: 0x1::token_factory::create_token(creator, name, symbol, decimals, max_supply, initial_supply, icon_url, project_url)
      */
     static createToken(
         sender: Keypair,
@@ -211,18 +288,23 @@ export class Transaction {
         }
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = `create_token:${name}:${symbol}:${decimals}:${maxSupply.toString()}:${initialSupply.toString()}:${iconUrl}:${projectUrl}`;
+        tx.payload = systemCall('token_factory', 'create_token', [], [
+            bcsAddress(sender.address),
+            bcsString(name),
+            bcsString(symbol),
+            bcsU8(decimals),
+            bcsU128(maxSupply),
+            bcsU128(initialSupply),
+            bcsString(iconUrl),
+            bcsString(projectUrl),
+        ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
 
     /**
      * Mint tokens (only token creator can mint)
-     * @param sender - Token creator's keypair
-     * @param tokenId - Token ID (symbol)
-     * @param to - Recipient address
-     * @param amount - Amount to mint
-     * @param sequenceNumber - Transaction sequence number
+     * Calls: 0x1::token_factory::mint(admin, token_id, to, amount)
      */
     static mintToken(
         sender: Keypair,
@@ -233,17 +315,19 @@ export class Transaction {
     ): Transaction {
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = `mint_token:${tokenId}:${to}:${amount.toString()}`;
+        tx.payload = systemCall('token_factory', 'mint', [], [
+            bcsAddress(sender.address),
+            bcsVectorU8(new TextEncoder().encode(tokenId)),
+            bcsAddress(to),
+            bcsU128(amount),
+        ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
 
     /**
      * Burn tokens
-     * @param sender - Token holder's keypair
-     * @param tokenId - Token ID (symbol)
-     * @param amount - Amount to burn
-     * @param sequenceNumber - Transaction sequence number
+     * Calls: 0x1::token_factory::burn(holder, token_id, amount)
      */
     static burnToken(
         sender: Keypair,
@@ -253,18 +337,18 @@ export class Transaction {
     ): Transaction {
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = `burn_token:${tokenId}:${amount.toString()}`;
+        tx.payload = systemCall('token_factory', 'burn', [], [
+            bcsAddress(sender.address),
+            bcsVectorU8(new TextEncoder().encode(tokenId)),
+            bcsU128(amount),
+        ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
 
     /**
      * Transfer tokens to another address
-     * @param sender - Token holder's keypair
-     * @param tokenId - Token ID (symbol)
-     * @param to - Recipient address
-     * @param amount - Amount to transfer
-     * @param sequenceNumber - Transaction sequence number
+     * Calls: 0x1::token_factory::transfer(from, token_id, to, amount)
      */
     static transferToken(
         sender: Keypair,
@@ -275,15 +359,19 @@ export class Transaction {
     ): Transaction {
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = `transfer_token:${tokenId}:${to}:${amount.toString()}`;
+        tx.payload = systemCall('token_factory', 'transfer', [], [
+            bcsAddress(sender.address),
+            bcsVectorU8(new TextEncoder().encode(tokenId)),
+            bcsAddress(to),
+            bcsU128(amount),
+        ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
 
     /**
      * Initialize token wallet (required before receiving custom tokens)
-     * @param sender - User's keypair
-     * @param sequenceNumber - Transaction sequence number
+     * Calls: 0x1::token_factory::init_wallet(account)
      */
     static initTokenWallet(
         sender: Keypair,
@@ -291,7 +379,134 @@ export class Transaction {
     ): Transaction {
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = 'init_token_wallet';
+        tx.payload = systemCall('token_factory', 'init_wallet', [], [
+            bcsAddress(sender.address),
+        ]);
+        tx.sequenceNumber = sequenceNumber;
+        return tx;
+    }
+
+    // ============ NATIVE DEX METHODS ============
+
+    /**
+     * Create a canonical AINCORE CPMM pool.
+     * Calls: 0x1::dex::create_pool<X, Y>(creator)
+     */
+    static createDexPool(
+        sender: Keypair,
+        tokenX: TypeTag,
+        tokenY: TypeTag,
+        sequenceNumber: number = 0
+    ): Transaction {
+        const tx = new Transaction();
+        tx.sender = sender.address;
+        tx.payload = systemCall('dex', 'create_pool', [tokenX, tokenY], [
+            bcsAddress(sender.address),
+        ]);
+        tx.sequenceNumber = sequenceNumber;
+        return tx;
+    }
+
+    /**
+     * Add liquidity to an existing AINCORE CPMM pool.
+     * Calls: 0x1::dex::add_liquidity<X, Y>(provider, pool_addr, amount_x, amount_y, min_lp)
+     */
+    static addDexLiquidity(
+        sender: Keypair,
+        poolAddress: string,
+        tokenX: TypeTag,
+        tokenY: TypeTag,
+        amountX: bigint,
+        amountY: bigint,
+        minLp: bigint,
+        sequenceNumber: number = 0
+    ): Transaction {
+        const tx = new Transaction();
+        tx.sender = sender.address;
+        tx.payload = systemCall('dex', 'add_liquidity', [tokenX, tokenY], [
+            bcsAddress(sender.address),
+            bcsAddress(poolAddress),
+            bcsU128(amountX),
+            bcsU128(amountY),
+            bcsU128(minLp),
+        ]);
+        tx.sequenceNumber = sequenceNumber;
+        return tx;
+    }
+
+    /**
+     * Remove liquidity from an existing AINCORE CPMM pool.
+     * Calls: 0x1::dex::remove_liquidity<X, Y>(provider, pool_addr, lp_amount, min_x, min_y)
+     */
+    static removeDexLiquidity(
+        sender: Keypair,
+        poolAddress: string,
+        tokenX: TypeTag,
+        tokenY: TypeTag,
+        lpAmount: bigint,
+        minX: bigint,
+        minY: bigint,
+        sequenceNumber: number = 0
+    ): Transaction {
+        const tx = new Transaction();
+        tx.sender = sender.address;
+        tx.payload = systemCall('dex', 'remove_liquidity', [tokenX, tokenY], [
+            bcsAddress(sender.address),
+            bcsAddress(poolAddress),
+            bcsU128(lpAmount),
+            bcsU128(minX),
+            bcsU128(minY),
+        ]);
+        tx.sequenceNumber = sequenceNumber;
+        return tx;
+    }
+
+    /**
+     * Swap token X to token Y through a canonical AINCORE CPMM pool.
+     * Calls: 0x1::dex::swap_x_to_y<X, Y>(trader, pool_addr, amount_x_in, min_y_out)
+     */
+    static createDexSwapXToY(
+        sender: Keypair,
+        poolAddress: string,
+        tokenX: TypeTag,
+        tokenY: TypeTag,
+        amountXIn: bigint,
+        minYOut: bigint,
+        sequenceNumber: number = 0
+    ): Transaction {
+        const tx = new Transaction();
+        tx.sender = sender.address;
+        tx.payload = systemCall('dex', 'swap_x_to_y', [tokenX, tokenY], [
+            bcsAddress(sender.address),
+            bcsAddress(poolAddress),
+            bcsU128(amountXIn),
+            bcsU128(minYOut),
+        ]);
+        tx.sequenceNumber = sequenceNumber;
+        return tx;
+    }
+
+    /**
+     * Swap token Y to token X through a canonical AINCORE CPMM pool.
+     * Calls: 0x1::dex::swap_y_to_x<X, Y>(trader, pool_addr, amount_y_in, min_x_out)
+     */
+    static createDexSwapYToX(
+        sender: Keypair,
+        poolAddress: string,
+        tokenX: TypeTag,
+        tokenY: TypeTag,
+        amountYIn: bigint,
+        minXOut: bigint,
+        sequenceNumber: number = 0
+    ): Transaction {
+        const tx = new Transaction();
+        tx.sender = sender.address;
+        tx.payload = systemCall('dex', 'swap_y_to_x', [tokenX, tokenY], [
+            bcsAddress(sender.address),
+            bcsAddress(poolAddress),
+            bcsU128(amountYIn),
+            bcsU128(minXOut),
+        ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
@@ -300,67 +515,68 @@ export class Transaction {
 
     /**
      * Create a governance proposal
-     * @param sender - Proposer's keypair
-     * @param proposalId - Unique proposal ID
-     * @param title - Proposal title
-     * @param description - Proposal description
-     * @param durationSeconds - Voting duration in seconds
-     * @param sequenceNumber - Transaction sequence number
+     * Calls: 0x1::governance::create_proposal(proposer, description, action_type, action_value)
      */
     static createProposal(
         sender: Keypair,
-        proposalId: string,
-        title: string,
         description: string,
-        durationSeconds: number,
+        actionType: number,
+        actionValue: number,
         sequenceNumber: number = 0
     ): Transaction {
         const tx = new Transaction();
         tx.sender = sender.address;
-        // For governance, we need to use RPC directly (via aincore_createProposal)
-        // This is a helper that creates a proposal via transaction
-        tx.payload = `create_proposal:${proposalId}:${title}:${description}:${durationSeconds}`;
+        tx.payload = systemCall('governance', 'create_proposal', [], [
+            bcsAddress(sender.address),
+            bcsString(description),
+            bcsU8(actionType),
+            bcsU64(BigInt(actionValue)),
+        ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
 
     /**
      * Vote on a governance proposal
-     * @param sender - Voter's keypair
-     * @param proposalId - Proposal ID to vote on
-     * @param approve - true for yes, false for no
-     * @param sequenceNumber - Transaction sequence number
+     * Calls: 0x1::governance::vote(voter, proposal_id, approve)
      */
     static vote(
         sender: Keypair,
-        proposalId: string,
+        proposalId: number,
         approve: boolean,
         sequenceNumber: number = 0
     ): Transaction {
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = `vote:${proposalId}:${approve ? 'yes' : 'no'}`;
+        tx.payload = systemCall('governance', 'vote', [], [
+            bcsAddress(sender.address),
+            bcsU64(BigInt(proposalId)),
+            bcsBool(approve),
+        ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
 
     /**
      * Execute a passed governance proposal (after timelock)
-     * @param sender - Executor's keypair
-     * @param proposalId - Proposal ID to execute
-     * @param sequenceNumber - Transaction sequence number
+     * Calls: 0x1::governance::execute_proposal(executor, proposal_id)
      */
     static executeProposal(
         sender: Keypair,
-        proposalId: string,
+        proposalId: number,
         sequenceNumber: number = 0
     ): Transaction {
         const tx = new Transaction();
         tx.sender = sender.address;
-        tx.payload = `execute_proposal:${proposalId}`;
+        tx.payload = systemCall('governance', 'execute_proposal', [], [
+            bcsAddress(sender.address),
+            bcsU64(BigInt(proposalId)),
+        ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
+
+    // ============ TRANSACTION LIFECYCLE ============
 
     /**
      * Set Chain ID (e.g. for Testnet)
@@ -379,7 +595,7 @@ export class Transaction {
         if (!this.chainId) {
             throw new Error('CRITICAL: Chain ID must be explicitly set to prevent replay attacks');
         }
-        // Include sender, chain ID, and sequence number in signature payload (Phase 4 Node standard)
+        // Include sender, chain ID, and sequence number in signature payload
         const message = `${this.chainId}:${this.sender}:${this.payload}:${this.sequenceNumber}`;
         this.signature = signer.sign(Buffer.from(message));
         this.publicKey = signer.publicKey;

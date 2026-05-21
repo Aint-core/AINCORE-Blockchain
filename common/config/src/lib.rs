@@ -30,7 +30,7 @@ impl NodeConfig {
     pub fn parse() -> Self {
         let args: Vec<String> = env::args().collect();
         let mut config = Self::default();
-        
+
         // Flags to track if user explicitly set ports
         let mut port_set = false;
         let mut api_port_set = false;
@@ -97,7 +97,7 @@ impl NodeConfig {
                 _ => i += 1,
             }
         }
-        
+
         // Auto-configure API port if not set but Node port is set
         // Convention: API = Node - 1000 (e.g., 9000 -> 8000)
         // Original logic: api_port = port - 1000;
@@ -105,8 +105,8 @@ impl NodeConfig {
             if config.port > 1000 {
                 config.api_port = config.port - 1000;
             } else {
-                 // Fallback if port is too low
-                 config.api_port = 8002;
+                // Fallback if port is too low
+                config.api_port = 8002;
             }
         }
 

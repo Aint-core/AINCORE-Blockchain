@@ -5,17 +5,15 @@
 // This implements the Prover trait for Fibonacci AIR
 // Connects FibonacciTrace to winterfell STARK prover mechanics
 
-use winterfell::{
-    math::{fields::f128::BaseElement, FieldElement},
-    matrix::ColMatrix,
-    ProofOptions, Prover,
-    crypto::{hashers::Blake3_256, DefaultRandomCoin},
-    DefaultTraceLde, DefaultConstraintEvaluator,
-    TraceInfo, TracePolyTable, StarkDomain, AuxRandElements,
-    ConstraintCompositionCoefficients,
-};
 use crate::zkp::fibonacci_air::FibonacciAir;
 use crate::zkp::fibonacci_trace::FibonacciTrace;
+use winterfell::{
+    crypto::{hashers::Blake3_256, DefaultRandomCoin},
+    math::{fields::f128::BaseElement, FieldElement},
+    matrix::ColMatrix,
+    AuxRandElements, ConstraintCompositionCoefficients, DefaultConstraintEvaluator,
+    DefaultTraceLde, ProofOptions, Prover, StarkDomain, TraceInfo, TracePolyTable,
+};
 
 /// Fibonacci STARK Prover
 ///
@@ -26,51 +24,51 @@ pub struct FibonacciProver {
 
 impl FibonacciProver {
     /// Creates a new Fibonacci prover with default options
-    /// 
+    ///
     /// Security: 95-bit conjectured security level (verified by Winterfell)
     pub fn new() -> Self {
         let options = ProofOptions::new(
-            32,  // num_queries
-            8,   // blowup_factor
-            0,   // grinding_factor
+            32, // num_queries
+            8,  // blowup_factor
+            0,  // grinding_factor
             winterfell::FieldExtension::None,
-            8,   // fri_folding_factor
-            31,  // fri_max_remainder_degree
+            8,  // fri_folding_factor
+            31, // fri_max_remainder_degree
         );
-        
+
         // NOTE: These parameters provide 95-bit security
         // Winterfell validates security internally
-        
+
         Self { options }
     }
-    
+
     /// Creates a new Fibonacci prover with custom options
     pub fn with_options(options: ProofOptions) -> Self {
         Self { options }
     }
-    
+
     /// Creates a new Fibonacci prover with optimized options for smaller proofs
-    /// 
+    ///
     /// Optimizations:
     /// - Reduced blowup_factor: 8 → 4 (smaller proof size)
     /// - Reduced num_queries: 32 → 24 (fewer queries)
     /// - Increased grinding_factor: 0 → 16 (better security/size tradeoff)
-    /// 
+    ///
     /// Security: Still maintains 95-bit security level
     /// Target: <2KB proof size
     pub fn new_optimized() -> Self {
         let options = ProofOptions::new(
-            24,  // num_queries (reduced from 32)
-            4,   // blowup_factor (reduced from 8)
-            16,  // grinding_factor (increased from 0)
+            24, // num_queries (reduced from 32)
+            4,  // blowup_factor (reduced from 8)
+            16, // grinding_factor (increased from 0)
             winterfell::FieldExtension::None,
-            8,   // fri_folding_factor
-            31,  // fri_max_remainder_degree
+            8,  // fri_folding_factor
+            31, // fri_max_remainder_degree
         );
-        
+
         // NOTE: Optimized parameters still provide 95-bit security
         // Grinding factor compensates for reduced queries/blowup
-        
+
         Self { options }
     }
 
@@ -84,13 +82,13 @@ impl FibonacciProver {
     pub fn prepare(&self, steps: usize) -> (FibonacciTrace, FibonacciAir) {
         // Generate trace
         let trace = FibonacciTrace::new(steps);
-        
+
         // Get final result
         let result = trace.get_result();
-        
+
         // Create AIR
         let air = FibonacciAir::with_params(result, steps, 32, 8);
-        
+
         (trace, air)
     }
 }
@@ -101,9 +99,10 @@ impl Prover for FibonacciProver {
     type Trace = FibonacciTrace;
     type HashFn = Blake3_256<BaseElement>;
     type RandomCoin = DefaultRandomCoin<Self::HashFn>;
-    
+
     type TraceLde<E: FieldElement<BaseField = Self::BaseField>> = DefaultTraceLde<E, Self::HashFn>;
-    type ConstraintEvaluator<'a, E: FieldElement<BaseField = Self::BaseField>> = DefaultConstraintEvaluator<'a, Self::Air, E>;
+    type ConstraintEvaluator<'a, E: FieldElement<BaseField = Self::BaseField>> =
+        DefaultConstraintEvaluator<'a, Self::Air, E>;
 
     fn options(&self) -> &ProofOptions {
         &self.options
@@ -148,6 +147,6 @@ mod tests {
         let prover = FibonacciProver::new();
         assert!(prover.options().num_queries() > 0);
     }
-    
+
     // Additional tests for trait implementation will be added
 }

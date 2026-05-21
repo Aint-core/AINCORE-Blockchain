@@ -27,7 +27,7 @@ pub struct Object {
     pub id: ObjectID,
     pub version: u64,
     pub owner: Owner,
-    pub data: Vec<u8>, // Raw data, can be JSON or BCS/Borsh later
+    pub data: Vec<u8>,       // Raw data, can be JSON or BCS/Borsh later
     pub type_struct: String, // e.g., "0x2::coin::Coin<0x2::sui::SUI>"
 }
 

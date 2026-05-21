@@ -6,12 +6,11 @@
 // Trace: Two columns [F(n), F(n+1)]
 // Constraint: next[0] = current[1], next[1] = current[0] + current[1]
 
+use winterfell::math::FieldElement;
 use winterfell::{
-    Air, AirContext, Assertion, EvaluationFrame,
-    FieldExtension, ProofOptions, TraceInfo,
+    Air, AirContext, Assertion, EvaluationFrame, FieldExtension, ProofOptions, TraceInfo,
     TransitionConstraintDegree,
 };
-use winterfell::math::FieldElement;
 
 /// Fibonacci AIR: Proves Fibonacci sequence computation
 ///
@@ -23,7 +22,7 @@ use winterfell::math::FieldElement;
 /// 2. next[1] = current[0] + current[1]  (Fibonacci relation)
 pub struct FibonacciAir {
     context: AirContext<winterfell::math::fields::f128::BaseElement>,
-    result: winterfell::math::fields::f128::BaseElement,  // The final Fibonacci number we're proving
+    result: winterfell::math::fields::f128::BaseElement, // The final Fibonacci number we're proving
 }
 
 impl FibonacciAir {
@@ -50,7 +49,10 @@ impl FibonacciAir {
         blowup_factor: usize,
     ) -> Self {
         assert!(trace_length >= 8, "trace length must be at least 8");
-        assert!(trace_length.is_power_of_two(), "trace length must be power of 2");
+        assert!(
+            trace_length.is_power_of_two(),
+            "trace length must be power of 2"
+        );
 
         // Fibonacci trace has 2 columns: [F(n), F(n+1)]
         let trace_info = TraceInfo::new(2, trace_length);
@@ -67,10 +69,10 @@ impl FibonacciAir {
         let options = ProofOptions::new(
             num_queries,
             blowup_factor,
-            0,   // grinding_factor
+            0, // grinding_factor
             FieldExtension::None,
-            8,   // fri_folding_factor
-            31,  // fri_max_remainder_degree
+            8,  // fri_folding_factor
+            31, // fri_max_remainder_degree
         );
 
         let context = AirContext::new(
@@ -98,11 +100,7 @@ impl Air for FibonacciAir {
     type GkrProof = ();
     type GkrVerifier = ();
 
-    fn new(
-        trace_info: TraceInfo,
-        pub_inputs: Self::PublicInputs,
-        options: ProofOptions,
-    ) -> Self {
+    fn new(trace_info: TraceInfo, pub_inputs: Self::PublicInputs, options: ProofOptions) -> Self {
         let transition_constraint_degrees = vec![
             TransitionConstraintDegree::new(1),
             TransitionConstraintDegree::new(1),

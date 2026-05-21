@@ -1,7 +1,7 @@
+use anyhow::{anyhow, Result};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use anyhow::{Result, anyhow};
 
 pub struct RpcClient {
     url: String,
@@ -44,9 +44,7 @@ impl RpcClient {
             id: 1,
         };
 
-        let res = self.client.post(&self.url)
-            .json(&request)
-            .send()?;
+        let res = self.client.post(&self.url).json(&request).send()?;
 
         if !res.status().is_success() {
             return Err(anyhow!("HTTP Error: {}", res.status()));

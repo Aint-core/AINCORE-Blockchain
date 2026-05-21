@@ -1,16 +1,19 @@
-use serde::{Deserialize, Serialize};
 use crypto::hash; // Use crypto module's hash function
+use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
-
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BlockHeader {
     pub height: u64,
     pub prev_hash: String, // Hash dari blok sebelumnya
     pub tx_hash: String,   // Hash dari daftar transaksi dalam blok ini
+    #[serde(default)]
+    pub state_root: String, // Post-execution state root. Empty only for legacy blocks.
+    #[serde(default)]
+    pub receipts_root: String, // Root of per-transaction receipts. Empty only for legacy blocks.
     pub proposer_id: String, // ID node yang mengusulkan blok ini
     #[serde(default)]
-    pub round: u64,          // Consensus Round (DAG)
+    pub round: u64, // Consensus Round (DAG)
     pub timestamp: u64,    // Waktu pembuatan blok
     pub hash: String,      // Hash dari header ini sendiri
 }
@@ -22,7 +25,33 @@ pub struct Block {
 }
 
 impl Block {
-    pub fn new(height: u64, round: u64, prev_hash: String, transactions: Vec<String>, proposer_id: String) -> Self {
+    pub fn new(
+        height: u64,
+        round: u64,
+        prev_hash: String,
+        transactions: Vec<String>,
+        proposer_id: String,
+    ) -> Self {
+        Self::new_with_roots(
+            height,
+            round,
+            prev_hash,
+            transactions,
+            proposer_id,
+            String::new(),
+            String::new(),
+        )
+    }
+
+    pub fn new_with_roots(
+        height: u64,
+        round: u64,
+        prev_hash: String,
+        transactions: Vec<String>,
+        proposer_id: String,
+        state_root: String,
+        receipts_root: String,
+    ) -> Self {
         let tx_hash = calculate_tx_hash(&transactions);
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -33,6 +62,8 @@ impl Block {
             height,
             prev_hash,
             tx_hash,
+            state_root,
+            receipts_root,
             proposer_id,
             round,
             timestamp,
@@ -50,7 +81,7 @@ impl Block {
 }
 
 // Fungsi bantu untuk menghitung hash dari daftar transaksi
-fn calculate_tx_hash(transactions: &[String]) -> String {
+pub fn calculate_tx_hash(transactions: &[String]) -> String {
     let mut data = Vec::new();
     for tx in transactions {
         data.extend_from_slice(tx.as_bytes());
@@ -59,11 +90,15 @@ fn calculate_tx_hash(transactions: &[String]) -> String {
 }
 
 // Fungsi bantu untuk menghitung hash dari header blok
-fn calculate_header_hash(header: &BlockHeader) -> String {
+pub fn calculate_header_hash(header: &BlockHeader) -> String {
     let mut data = Vec::new();
     data.extend_from_slice(&header.height.to_string().as_bytes());
     data.extend_from_slice(header.prev_hash.as_bytes());
     data.extend_from_slice(header.tx_hash.as_bytes());
+    if !header.state_root.is_empty() || !header.receipts_root.is_empty() {
+        data.extend_from_slice(header.state_root.as_bytes());
+        data.extend_from_slice(header.receipts_root.as_bytes());
+    }
     data.extend_from_slice(header.proposer_id.as_bytes());
     data.extend_from_slice(&header.round.to_string().as_bytes());
     data.extend_from_slice(&header.timestamp.to_string().as_bytes());
@@ -92,7 +127,7 @@ impl Vertex {
             .duration_since(UNIX_EPOCH)
             .unwrap_or(std::time::Duration::from_secs(0))
             .as_secs();
-            
+
         let mut v = Vertex {
             round,
             author,
@@ -106,17 +141,17 @@ impl Vertex {
         v.hash = v.calculate_hash();
         v
     }
-    
+
     /// Sign the vertex hash with Ed25519 and set the signature field
     pub fn sign_with_ed25519(&mut self, secret_key: &ed25519_dalek::SigningKey) {
         use ed25519_dalek::Signer;
         let sig = secret_key.sign(self.hash.as_bytes());
         self.signature = hex::encode(sig.to_bytes());
     }
-    
+
     /// Verify the Ed25519 signature
     pub fn verify_ed25519_signature(&self, public_key_hex: &str) -> bool {
-        use ed25519_dalek::{Verifier, VerifyingKey, Signature};
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
         if self.signature.is_empty() {
             return false;
         }
@@ -125,7 +160,7 @@ impl Vertex {
                 let mut arr = [0u8; 64];
                 arr.copy_from_slice(&b);
                 arr
-            },
+            }
             _ => return false,
         };
         let pk_bytes = match hex::decode(public_key_hex) {
@@ -133,25 +168,26 @@ impl Vertex {
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&b);
                 arr
-            },
+            }
             _ => return false,
         };
-        
+
         let verifying_key = match VerifyingKey::from_bytes(&pk_bytes) {
             Ok(vk) => vk,
             Err(_) => return false,
         };
         let signature = Signature::from_bytes(&sig_bytes);
-        
-        verifying_key.verify(self.hash.as_bytes(), &signature).is_ok()
+
+        verifying_key
+            .verify(self.hash.as_bytes(), &signature)
+            .is_ok()
     }
 
     /// (REMOVED) sign_with_bls and verify_bls_signature have been deleted.
-    /// These used symmetric MAC verification (re-sign and compare) which is 
+    /// These used symmetric MAC verification (re-sign and compare) which is
     /// fundamentally insecure. Per-vertex signing uses Ed25519.
     /// BLS aggregate signatures for consensus quorum certificates will be
     /// applied externally by DagConsensus using crypto::BLSEngine.
-
 
     pub fn calculate_hash(&self) -> String {
         let mut data = Vec::new();

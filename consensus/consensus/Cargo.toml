@@ -19,6 +19,7 @@ rand = "0.8"
 bcs = "0.1"
 hex = "0.4"
 rayon = "1.7"
+sha2 = "0.10"
 # Note: Cryptography now consolidated in common/crypto
 # ed25519-dalek removed - use crypto crate
 # sha256 removed - use crypto crate

@@ -32,6 +32,10 @@ pub struct Transaction {
     pub signature: String,
 }
 
+/// Phase 3.5 fix: Bridge event with full context for dedup uniqueness.
+/// `(sender, amount, eth_addr, block_height, tx_index_in_block)`
+pub type BridgeEvent = (String, u64, String, u64, usize);
+
 impl AincoreClient {
     pub fn new(rpc_url: String) -> Self {
         Self {
@@ -71,6 +75,38 @@ impl AincoreClient {
 
         if let Some(err) = rpc_resp.error {
             error!("RPC Error: {:?}", err);
+            return Ok(vec![]);
+        }
+
+        Ok(rpc_resp.result.unwrap_or_default())
+    }
+
+    /// Phase 3.5 / H-03 fix: fetch a specific range of blocks (ascending order).
+    /// This is the correct primitive for catching up on bridge backlog without
+    /// losing blocks. `start_height` is inclusive; up to `limit` blocks returned.
+    pub async fn get_blocks_range(
+        &self,
+        start_height: u64,
+        limit: u64,
+    ) -> Result<Vec<Block>, Box<dyn Error>> {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "aincore_getBlocks",
+            "params": [limit, start_height],
+            "id": 1
+        });
+
+        let resp = self
+            .client
+            .post(&self.rpc_url)
+            .json(&payload)
+            .send()
+            .await?;
+
+        let rpc_resp: RpcResponse<Vec<Block>> = resp.json().await?;
+
+        if let Some(err) = rpc_resp.error {
+            error!("RPC Error (range): {:?}", err);
             return Ok(vec![]);
         }
 
@@ -122,17 +158,21 @@ impl AincoreClient {
         Ok(finalized)
     }
 
-    /// Fetch bridge events from FINALIZED blocks only
-    /// CRITICAL-5 FIX: Prevents processing events from blocks that could be reorganized
+    /// Fetch bridge events from FINALIZED blocks only.
+    ///
+    /// Phase 3.5 / H-03 critical fix:
+    ///   1. Use range-based `get_blocks_range(start, limit)` so old blocks
+    ///      are NEVER skipped on backlog. Cursor only advances by the number
+    ///      of blocks actually fetched in this batch.
+    ///   2. Return tuple includes `block_height` + `tx_index` so the bridge
+    ///      can build a globally-unique event key (no in-batch collisions).
+    ///
+    /// CRITICAL-5: only processes FINALIZED blocks (no reorg risk).
     pub async fn fetch_bridge_events(
         &mut self,
-    ) -> Result<Vec<(String, u64, String)>, Box<dyn Error>> {
-        // Returns (Sender, Amount, EthAddress)
-
-        // Get finalized height
+    ) -> Result<Vec<BridgeEvent>, Box<dyn Error>> {
         let finalized_height = self.get_finalized_height().await?;
 
-        // Check if we have new finalized blocks to process
         if finalized_height <= self.last_processed_height {
             info!(
                 "⏸️  No new finalized blocks (last: {}, finalized: {})",
@@ -141,54 +181,73 @@ impl AincoreClient {
             return Ok(vec![]);
         }
 
-        // Calculate range to fetch
-        let start = self.last_processed_height + 1;
-        let end = finalized_height;
-        let count = end - start + 1;
+        // Calculate scan window. Process in chunks of up to 100 blocks per
+        // RPC call; the rest will be picked up in the next polling cycle.
+        let scan_start = self.last_processed_height + 1;
+        let backlog = finalized_height - self.last_processed_height;
+        let chunk_size = std::cmp::min(backlog, 100);
+        let scan_end = scan_start + chunk_size - 1;
 
         info!(
-            "🔍 Scanning finalized blocks {} to {} ({} blocks)",
-            start, end, count
+            "🔍 Scanning finalized blocks {}..={} (backlog={}, chunk={})",
+            scan_start, scan_end, backlog, chunk_size
         );
 
-        // Fetch blocks (limited to avoid overwhelming RPC)
-        let fetch_limit = std::cmp::min(count, 100); // Max 100 blocks per call
-        let blocks = self.get_latest_blocks(fetch_limit).await?;
+        // FIX: range-based fetch — no more "latest N" silent skip.
+        let blocks = self.get_blocks_range(scan_start, chunk_size).await?;
 
         let mut events = Vec::new();
+        let mut blocks_actually_returned: u64 = 0;
 
-        for block in blocks {
-            for tx_str in block.transactions {
-                // Parse TX JSON
-                if let Ok(tx) = serde_json::from_str::<Transaction>(&tx_str) {
-                    // Check payload for "bridge_lock"
-                    // Payload format: "bridge_lock:AMOUNT:ETH_ADDR"
-                    if tx.payload.starts_with("bridge_lock:") {
-                        let parts: Vec<&str> = tx.payload.split(':').collect();
-                        if parts.len() == 3 {
-                            // CRITICAL-4 PARTIAL: Validate Ethereum address format
-                            let eth_addr = parts[2].to_string();
-                            if !eth_addr.starts_with("0x") || eth_addr.len() != 42 {
-                                warn!("⚠️  Invalid Ethereum address format: {}", eth_addr);
-                                continue;
-                            }
+        // RPC returns blocks in ASCENDING order when start_height is given.
+        // Map them back to absolute heights: scan_start, scan_start+1, ...
+        for (block_offset, block) in blocks.iter().enumerate() {
+            let block_height = scan_start + block_offset as u64;
+            blocks_actually_returned += 1;
 
-                            if let Ok(amount) = parts[1].parse::<u64>() {
-                                info!(
-                                    "🌉 Found FINALIZED Bridge Lock: {} AIN from {} -> {}",
-                                    amount, tx.sender, eth_addr
-                                );
-                                events.push((tx.sender, amount, eth_addr));
-                            }
-                        }
-                    }
+            for (tx_index, tx_str) in block.transactions.iter().enumerate() {
+                let tx: Transaction = match serde_json::from_str(tx_str) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+
+                if !tx.payload.starts_with("bridge_lock:") {
+                    continue;
                 }
+                let parts: Vec<&str> = tx.payload.split(':').collect();
+                if parts.len() != 3 {
+                    continue;
+                }
+
+                let eth_addr = parts[2].to_string();
+                if !eth_addr.starts_with("0x") || eth_addr.len() != 42 {
+                    warn!("⚠️  Invalid Ethereum address format: {}", eth_addr);
+                    continue;
+                }
+
+                let amount = match parts[1].parse::<u64>() {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
+
+                info!(
+                    "🌉 Bridge Lock @ block {}, tx#{}: {} AIN from {} -> {}",
+                    block_height, tx_index, amount, tx.sender, eth_addr
+                );
+                events.push((tx.sender, amount, eth_addr, block_height, tx_index));
             }
         }
 
-        // Update last processed height
-        self.last_processed_height = finalized_height;
-        info!("✅ Processed up to finalized block {}", finalized_height);
+        // FIX: advance cursor by what we actually consumed, NOT to
+        // finalized_height. If RPC returned fewer blocks than requested
+        // we still want correct progress next call.
+        if blocks_actually_returned > 0 {
+            self.last_processed_height = scan_start + blocks_actually_returned - 1;
+        }
+        info!(
+            "✅ Processed up to finalized block {} ({} events found)",
+            self.last_processed_height, events.len()
+        );
 
         Ok(events)
     }

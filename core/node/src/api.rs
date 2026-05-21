@@ -347,10 +347,13 @@ async fn json_rpc_handler(
             }
         },
         "aincore_getBlocks" => {
-            // params: [limit] (optional, default 10)
+            // params: [limit]  OR  [limit, start_height]
+            //
+            // Phase 3.5 / H-03 fix: bridge backlog could silently skip older
+            // finalized blocks. Optional `start_height` lets callers request
+            // a specific range. Backward compatible.
             let limit = params.get(0).and_then(|v| v.as_u64()).unwrap_or(10);
 
-            // INPUT VALIDATION: Limit max blocks to prevent DoS
             if limit > MAX_LIMIT {
                 return HttpResponse::BadRequest().json(JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
@@ -363,22 +366,47 @@ async fn json_rpc_handler(
                 });
             }
 
+            let start_height_param = params.get(1).and_then(|v| v.as_u64());
+
             let latest_height: u64 = match data.storage.get("latest_height") {
                 Ok(Some(h)) => h.parse::<u64>().unwrap_or(0),
                 _ => 0,
             };
 
-            println!("🔍 [API] aincore_getBlocks: latest_height = {}", latest_height);
-
             let mut blocks = Vec::new();
-            let start = latest_height;
-            let start_index = latest_height.saturating_sub(limit);
-
-            for i in (start_index..=start).rev() {
-                let key = format!("block_{}", i);
-                if let Ok(Some(block_json)) = data.storage.get(&key) {
-                    if let Ok(block_obj) = serde_json::from_str::<serde_json::Value>(&block_json) {
-                        blocks.push(block_obj);
+            match start_height_param {
+                Some(start_height) if start_height > 0 && start_height <= latest_height => {
+                    let end_height = std::cmp::min(
+                        start_height.saturating_add(limit).saturating_sub(1),
+                        latest_height,
+                    );
+                    println!(
+                        "🔍 [API] getBlocks range: {}..={} (latest={})",
+                        start_height, end_height, latest_height
+                    );
+                    for i in start_height..=end_height {
+                        let key = format!("block_{}", i);
+                        if let Ok(Some(block_json)) = data.storage.get(&key) {
+                            if let Ok(block_obj) =
+                                serde_json::from_str::<serde_json::Value>(&block_json)
+                            {
+                                blocks.push(block_obj);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    println!("🔍 [API] getBlocks latest: head={} limit={}", latest_height, limit);
+                    let start_index = latest_height.saturating_sub(limit);
+                    for i in (start_index..=latest_height).rev() {
+                        let key = format!("block_{}", i);
+                        if let Ok(Some(block_json)) = data.storage.get(&key) {
+                            if let Ok(block_obj) =
+                                serde_json::from_str::<serde_json::Value>(&block_json)
+                            {
+                                blocks.push(block_obj);
+                            }
+                        }
                     }
                 }
             }

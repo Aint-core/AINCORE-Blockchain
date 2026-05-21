@@ -6,7 +6,9 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test:bcs": "ts-node test_bcs_parity.ts",
+    "test:phase05": "ts-node phase05_live_smoke.ts",
+    "test": "npm run test:bcs"
   },
   "keywords": [],
   "author": "",

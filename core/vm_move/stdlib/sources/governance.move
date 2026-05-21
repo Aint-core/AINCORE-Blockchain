@@ -4,13 +4,14 @@ module 0x1::governance {
     use std::error;
     use 0x1::epoch;
     use 0x1::coin;
-    use 0x1::staking::AincoreCoin;
+    use 0x1::staking::{Self, AincoreCoin};
 
     /// Error codes
     const EPROPOSAL_NOT_FOUND: u64 = 1;
     const EALREADY_VOTED: u64 = 2;
     const EPROPOSAL_EXECUTED: u64 = 3;
     const EINSUFFICIENT_VOTES: u64 = 4;
+    const VOTE_GAS_RESERVE: u128 = 1000000000000000000; // 1 AIN stays liquid for claim/ops gas
 
     struct Proposal has store, drop {
         id: u64,
@@ -48,7 +49,7 @@ module 0x1::governance {
         // 10,000 AIN represented in 18 decimals
         let fee_amount: u128 = 10000000000000000000000; 
         let fee_coins = coin::withdraw<AincoreCoin>(account, fee_amount);
-        coin::burn(fee_coins); // Permanently destroy the fee to prevent spam
+        staking::burn_ain(fee_coins); // Permanently destroy fee and update canonical supply
 
         let state = borrow_global_mut<GovernanceState>(@0x1);
         
@@ -70,7 +71,7 @@ module 0x1::governance {
 
     /// H7 FIX: Vote escrow to lock tokens during voting (prevents double-vote attack)
     struct VoteEscrow has key {
-        locked_amount: u128,
+        locked_coins: coin::Coin<AincoreCoin>,
         proposal_id: u64,
     }
 
@@ -82,8 +83,9 @@ module 0x1::governance {
         let addr = signer::address_of(account);
         
         // Fetch Voter's Balance (Voting Weight)
-        let weight = (coin::balance<AincoreCoin>(addr) as u128); 
-        assert!(weight > 0, error::invalid_argument(EINSUFFICIENT_VOTES));
+        let available = (coin::balance<AincoreCoin>(addr) as u128);
+        assert!(available > VOTE_GAS_RESERVE, error::invalid_argument(EINSUFFICIENT_VOTES));
+        let weight = available - VOTE_GAS_RESERVE;
 
         let state = borrow_global_mut<GovernanceState>(@0x1);
         
@@ -107,16 +109,15 @@ module 0x1::governance {
                 // H7 FIX: Lock voting tokens to prevent double-vote via transfer
                 // Withdraw tokens from voter's balance -- they CANNOT transfer or vote again
                 let locked_coins = coin::withdraw<AincoreCoin>(account, weight);
-                coin::burn(locked_coins); // Temporarily burn (re-minted on claim)
                 
                 // Store escrow record so voter can reclaim after execution
                 if (exists<VoteEscrow>(addr)) {
                     let escrow = borrow_global_mut<VoteEscrow>(addr);
-                    escrow.locked_amount = escrow.locked_amount + weight;
+                    coin::merge(&mut escrow.locked_coins, locked_coins);
                     escrow.proposal_id = proposal_id;
                 } else {
                     move_to(account, VoteEscrow {
-                        locked_amount: weight,
+                        locked_coins,
                         proposal_id,
                     });
                 };
@@ -159,9 +160,8 @@ module 0x1::governance {
         assert!(is_executed, error::invalid_state(EPROPOSAL_EXECUTED));
         
         // Return locked tokens to voter
-        let VoteEscrow { locked_amount, proposal_id: _ } = move_from<VoteEscrow>(addr);
-        let returned_coins = coin::mint<AincoreCoin>(locked_amount);
-        coin::deposit<AincoreCoin>(addr, returned_coins);
+        let VoteEscrow { locked_coins, proposal_id: _ } = move_from<VoteEscrow>(addr);
+        coin::deposit<AincoreCoin>(addr, locked_coins);
     }
 
     public entry fun execute_proposal(account: &signer, proposal_id: u64) acquires GovernanceState {

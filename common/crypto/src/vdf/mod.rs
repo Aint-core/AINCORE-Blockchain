@@ -1,30 +1,53 @@
-/// Phase 3 / C-03 — Real VDF Implementation
+/// Phase 3 / C-03 — Checkpointed Sequential-Hash VDF
 ///
-/// Replaces the "compute = verify" stub with a proper hash-chain VDF that
-/// has distinct computation cost (O(t)) vs verification cost (O(√t)):
+/// Replaces the "compute == verify" stub with a sequential hash-chain VDF
+/// that has DISTINCT computation cost (O(t)) vs verification cost (O(√t)).
 ///
-/// ## Construction
-/// Sequential SHA3-256 chain: `h_0 = challenge`, `h_{i+1} = SHA3(h_i || i)`
+/// ## What this IS
+/// - A **sequential SHA3-256 hash chain**: `h_0 = SHA3(challenge)`,
+///   `h_{i+1} = SHA3(h_i || i)`, output = `h_difficulty`.
+/// - **Proof** = an array of `⌈√difficulty⌉` evenly-spaced intermediate
+///   hashes (checkpoints). Verifier re-runs only the last stride
+///   (`√t` hashes) from the final checkpoint, plus one spot-check at the
+///   midpoint, achieving O(√t) verification.
 ///
-/// **Proof** = sqrt(t) evenly-spaced checkpoint values embedded in the VDF proof.
-/// A verifier only needs to re-run from the nearest checkpoint — O(√t) work,
-/// not O(t). The checkpoint set itself is a Merkle-committed sequence so a
-/// single-bit tamper in any checkpoint is caught.
+/// ## What this IS NOT (honest disclosures)
+/// - **NOT a Merkle commitment.** Checkpoints are stored as a raw
+///   `Vec<[u8; 32]>` array in the proof; there is no Merkle tree and
+///   no membership proof structure. Tamper detection comes from
+///   re-running the hash chain across stride boundaries, not from
+///   a binding commitment.
+/// - **NOT an RSA-group VDF** (Wesolowski / Pietrzak). Soundness here
+///   rests purely on the sequentiality of SHA3-256 and hash collision
+///   resistance, NOT on the algebraic delay property of squaring in a
+///   group of unknown order.
+/// - **NOT proven sound against an adaptive prover** in the same sense
+///   as a published VDF construction. The spot-check bounds forgery
+///   surface to a single stride window (≈√t steps), but does not give
+///   the tight verifier-time guarantees of an academic VDF.
 ///
-/// ## Security
-/// - **Sequential**: each step depends on the previous; no parallelism possible.
-/// - **Deterministic**: same challenge + difficulty → same output.
-/// - **Quantum-safe**: SHA3-256 has 128-bit post-quantum security.
-/// - **Non-skippable**: skipping any step changes every subsequent hash.
+/// ## Soundness sketch (for the construction used here)
+/// To forge a final output `y' ≠ y` for the same challenge, an attacker
+/// must either:
+///   1. Find a SHA3-256 collision somewhere in the chain — infeasible
+///      under standard hash assumptions (128-bit post-quantum security).
+///   2. Submit a checkpoint array that is internally consistent across
+///      the verifier's spot-checks but inconsistent with the genuine
+///      sequential chain — requires forging hash continuity in BOTH the
+///      midpoint stride AND the final stride, each ≈√t sequential
+///      operations.
 ///
-/// ## Limitations vs RSA-VDF (Wesolowski/Pietrzak)
-/// - Verification is O(√t), not O(log t). For AINCORE's difficulty=50_000 that
-///   is ~224 hashes — negligible.
-/// - Does not rely on a group of unknown order; security assumption is purely
-///   hash collision resistance, which is well-understood.
+/// ## Properties used by AINCORE
+/// - **Sequential**: each step depends on the previous; no parallelism.
+/// - **Deterministic**: same challenge → same output (leader election).
+/// - **Quantum-safe**: SHA3-256.
+/// - **Cheap to verify** at AINCORE's parameters (difficulty=50_000 →
+///   ~224 hashes for verification, ≈microseconds).
 ///
-/// For mainnet with external auditors, migrating to an RSA-VDF crate
-/// (e.g. `vdf` by Chia Network) is recommended but not required for testnet.
+/// ## Roadmap
+/// For mainnet auditors, migration to a real RSA-VDF crate (e.g. Chia
+/// Network's `vdf`) gives O(log t) verification and a published
+/// soundness proof. Tracked as a Phase 4 / pre-mainnet upgrade.
 use sha3::{Digest, Sha3_256};
 use std::fmt;
 
@@ -51,15 +74,21 @@ impl std::error::Error for VDFError {}
 
 // ─── Proof ────────────────────────────────────────────────────────────────────
 
-/// VDF proof containing checkpointed intermediate states for fast verification.
+/// VDF proof: raw array of checkpoint hashes plus the final output.
+///
+/// This is NOT a Merkle proof. It is the verifier's working memory:
+/// a list of intermediate states the prover claims to have visited.
+/// The verifier re-runs short stride re-computations to cross-check
+/// claimed checkpoints against the genuine hash chain.
 ///
 /// Layout (binary):
 ///   [ 8 bytes: difficulty as little-endian u64 ]
-///   [ 32 * n bytes: n checkpoint hashes ]
+///   [ 8 bytes: checkpoint count n as little-endian u64 ]
+///   [ 32 * n bytes: n checkpoint hashes (sequential, no tree structure) ]
 ///   [ 32 bytes: final output ]
 ///
 /// where n = ceil(sqrt(difficulty)) checkpoints at positions
-///   0, step, 2*step, ..., (n-1)*step,  with step = ceil(sqrt(difficulty)).
+///   0, stride, 2*stride, ..., (n-1)*stride,  with stride = ceil(sqrt(difficulty)).
 #[derive(Debug, Clone)]
 pub struct VDFProof {
     pub difficulty: u64,

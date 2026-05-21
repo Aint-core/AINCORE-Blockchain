@@ -6,7 +6,7 @@ module 0x1::token_factory {
     use std::vector;
     use std::error;
     use 0x1::coin::{Self, Coin};
-    use 0x1::staking::{AincoreCoin};
+    use 0x1::staking::{Self, AincoreCoin};
 
     /// Error codes
     const ETOKEN_EXISTS: u64 = 1;
@@ -84,7 +84,7 @@ module 0x1::token_factory {
         
         // Charge creation fee (100 AIN)
         let fee = coin::withdraw<AincoreCoin>(creator, TOKEN_CREATION_FEE);
-        coin::burn(fee); // Burn the fee (deflationary)
+        staking::burn_ain(fee); // Burn the fee and update canonical supply
         
         // M1 FIX: Token ID = symbol + creator address bytes
         // This prevents front-running attacks where an attacker deploys a token

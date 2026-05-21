@@ -8,15 +8,15 @@ pub mod stark_poseidon;
 
 // Re-export for convenience
 pub use field_hash::PoseidonHashField;
-pub use stark_poseidon::{PoseidonConfig, poseidon_hash, poseidon_hash_multi_step};
+pub use stark_poseidon::{poseidon_hash, poseidon_hash_multi_step, PoseidonConfig};
 
 /// Poseidon hash parameters
 #[derive(Clone, Debug)]
 pub struct PoseidonParams {
-    pub t: usize,         // State size
-    pub rounds_f: usize,  // Full rounds (beginning + end)
-    pub rounds_p: usize,  // Partial rounds (middle)
-    pub alpha: u64,       // S-box exponent
+    pub t: usize,           // State size
+    pub rounds_f: usize,    // Full rounds (beginning + end)
+    pub rounds_p: usize,    // Partial rounds (middle)
+    pub alpha: u64,         // S-box exponent
     pub mds: Vec<Vec<u64>>, // MDS Matrix
     pub ark: Vec<Vec<u64>>, // Add Round Constants
 }
@@ -37,7 +37,7 @@ impl PoseidonHash {
         let rounds_f = 8;
         let rounds_p = 55;
         let total_rounds = rounds_f + rounds_p;
-        
+
         // Simple distinct constants generation for functionality
         let mut ark = Vec::with_capacity(total_rounds);
         for i in 0..total_rounds {
@@ -52,11 +52,7 @@ impl PoseidonHash {
         // [2, 1, 1]
         // [1, 2, 1]
         // [1, 1, 2]
-        let mds = vec![
-            vec![2, 1, 1],
-            vec![1, 2, 1],
-            vec![1, 1, 2],
-        ];
+        let mds = vec![vec![2, 1, 1], vec![1, 2, 1], vec![1, 1, 2]];
 
         let params = PoseidonParams {
             t,
@@ -72,7 +68,7 @@ impl PoseidonHash {
             state: vec![0; t],
         }
     }
-    
+
     /// Permutation function
     fn permute(&mut self) {
         let pf = self.params.rounds_f / 2;
@@ -119,7 +115,7 @@ impl PoseidonHash {
     pub fn hash_two(&mut self, left: u64, right: u64) -> u64 {
         // Initialize state
         self.state = vec![0; self.params.t];
-        
+
         // Inject inputs (Capacity=1, Rate=2)
         // state[0] = capacity (initial 0 or domain separator)
         // state[1] = left
@@ -145,19 +141,19 @@ impl Default for PoseidonHash {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_poseidon_functional() {
         let mut hasher = PoseidonHash::new();
         let result1 = hasher.hash_two(1, 2);
         let result2 = hasher.hash_two(1, 2);
-        
+
         // Assert determinism
         assert_eq!(result1, result2);
-        
+
         // Assert non-linearity (hash(a,b) != a+b)
         assert_ne!(result1, 3);
-        
+
         // Assert avalanche (small change = huge diff)
         let result3 = hasher.hash_two(1, 3);
         assert_ne!(result1, result3);
