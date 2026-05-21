@@ -228,6 +228,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    /// Phase 1.5.2 INVARIANT TEST
+    ///
+    /// After H-07 refactored block commit to route through
+    /// `StateDB::save_block_json` (atomic block + height + hash + tx_index
+    /// write), assert the post-commit invariant:
+    ///
+    ///   consensus.latest_block_hash == storage.get("latest_block_hash")
+    ///   consensus.latest_block_height == storage.get_chain_height()
+    ///   storage.get("block_{height}") is a parseable Block with that hash
+    ///
+    /// This catches any drift between the in-memory consensus state and
+    /// the persisted state — historically a class of bug that lets a
+    /// crashed node restart on a stale chain tip.
+    #[test]
+    fn test_block_commit_keeps_consensus_and_storage_in_sync() {
+        let (mut consensus, path) = setup_dag("commit_sync_invariant");
+
+        // Drive enough rounds for the singleton validator's ordering
+        // engine to actually commit a block. Bullshark needs leader
+        // support across consecutive rounds; 6 rounds gives the engine
+        // at least one full anchor commit.
+        for _ in 0..6 {
+            consensus.try_create_vertex();
+        }
+
+        // If no block was committed, the test is inconclusive — but with
+        // a singleton validator and 6 rounds that means the ordering
+        // engine itself is broken, which is also a regression worth
+        // failing on.
+        let height_in_memory = consensus.latest_block_height;
+        assert!(
+            height_in_memory >= 1,
+            "ordering engine must commit at least one block over 6 rounds \
+             with a singleton validator; got height {}",
+            height_in_memory
+        );
+
+        let height_in_storage = consensus.storage.get_chain_height();
+        assert_eq!(
+            height_in_memory, height_in_storage,
+            "in-memory latest_block_height must equal storage latest_height \
+             after commit (save_block_json atomicity invariant)"
+        );
+
+        let hash_in_storage = consensus
+            .storage
+            .get("latest_block_hash")
+            .unwrap()
+            .expect("latest_block_hash must be present after a block is committed");
+        assert_eq!(
+            consensus.latest_block_hash, hash_in_storage,
+            "in-memory latest_block_hash must equal storage latest_block_hash \
+             — drift here means consensus and storage disagree on the chain tip"
+        );
+
+        // The block itself must be retrievable and round-trip cleanly.
+        let block_json = consensus
+            .storage
+            .get(&format!("block_{}", height_in_memory))
+            .unwrap()
+            .expect("block at the committed height must be persisted");
+        let block: serde_json::Value =
+            serde_json::from_str(&block_json).expect("persisted block must be valid JSON");
+        let header_hash = block["header"]["hash"]
+            .as_str()
+            .expect("block header.hash field must be a string");
+        assert_eq!(
+            header_hash, consensus.latest_block_hash,
+            "block header.hash at committed height must equal the chain-tip \
+             hash (no stale block or hash mismatch from refactor)"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     /// C-01 REGRESSION TEST
     ///
     /// Ensures the equivocation slash event written to `sys:pending_slash:` uses
