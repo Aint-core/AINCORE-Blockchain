@@ -329,8 +329,26 @@ impl DASequencer {
             timestamp: Utc::now().timestamp(),
         };
 
-        // Sign the payload
-        let payload_json = serde_json::to_string(&payload).expect("Serialization failed");
+        // Sign the payload.
+        //
+        // Phase 2.12 (panic audit): replaced unconditional .expect() with a
+        // logged early-return. DABatchPayload is composed of primitive
+        // fields so serde_json::to_string is not expected to fail in
+        // practice, but a future schema change could introduce a
+        // non-serialisable type and we don't want that to take the DA
+        // sequencer down with a panic — better to skip this batch and
+        // surface the error in logs for triage.
+        let payload_json = match serde_json::to_string(&payload) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "❌ [DA Sequencer] Failed to serialise batch payload (epoch {}): {} — \
+                     skipping this batch instead of panicking.",
+                    self.epoch, e
+                );
+                return;
+            }
+        };
         let payload_hash = crypto::hash(payload_json.as_bytes());
         let signature = self.signage_key.sign(&payload_hash);
 
