@@ -367,6 +367,125 @@ impl StateDB {
         self.get(&key).ok()?.and_then(|h| h.parse().ok())
     }
 
+    /// Sentinel key marking that the v1 backfill of `tx_index` has run on
+    /// this DB. Bump the version suffix if the indexing rules ever change
+    /// so existing installs re-run the migration.
+    pub const TX_INDEX_BACKFILL_SENTINEL: &'static str = "sys:tx_index_backfill_v1_complete";
+
+    /// One-shot migration: walk every `block_*` already persisted in this
+    /// DB and populate `tx_index:{tx_hash} -> height` entries for any
+    /// transaction whose hash is not already indexed.
+    ///
+    /// Why this exists
+    /// ---------------
+    /// Before H-07, block commits did not write `tx_index:` entries. After
+    /// H-07, `save_block_json` writes them atomically for **new** blocks,
+    /// but everything already on disk was invisible to
+    /// `aincore_getTransaction`. External audit caught this as a real
+    /// regression: a wallet that submitted a transaction last week and
+    /// then queries today would get `null` instead of the historical
+    /// receipt.
+    ///
+    /// This routine fixes that by walking the existing `block_*` range
+    /// once at startup. It is:
+    ///   * **Idempotent**: guarded by `TX_INDEX_BACKFILL_SENTINEL` so
+    ///     restarts don't replay it.
+    ///   * **Non-destructive**: we only `put` index entries that are not
+    ///     already present, and we never touch the block payloads.
+    ///   * **Batched**: every block is flushed in one RocksDB
+    ///     `WriteBatch` so the indexer cannot crash with a partial state.
+    ///
+    /// Returns the number of `tx_index` entries inserted. A return of `0`
+    /// with `already_done == true` (visible via the sentinel) means the
+    /// migration was a no-op on this DB.
+    pub fn backfill_tx_index(&self) -> Result<usize, rocksdb::Error> {
+        use sha2::{Digest, Sha256};
+
+        // Idempotency gate.
+        if let Ok(Some(_)) = self.get(Self::TX_INDEX_BACKFILL_SENTINEL) {
+            return Ok(0);
+        }
+
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut inserted: usize = 0;
+        let mut blocks_scanned: usize = 0;
+
+        // Scan all block_* keys. We don't use scan_prefix because that
+        // returns Vec<(String,String)> — we want to stream into a single
+        // WriteBatch without intermediate Vec materialisation.
+        let iter = self.db.prefix_iterator(b"block_");
+        for (key_bytes, value_bytes) in iter.flatten() {
+            if !key_bytes.starts_with(b"block_") {
+                break;
+            }
+            blocks_scanned += 1;
+
+            // Parse height from key.
+            let key_str = match std::str::from_utf8(&key_bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let height: u64 = match key_str.trim_start_matches("block_").parse() {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            // Parse block JSON.
+            let block: serde_json::Value =
+                match serde_json::from_slice(&value_bytes) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+            let txs = match block.get("transactions").and_then(|v| v.as_array()) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            let height_bytes = height.to_string().into_bytes();
+            for tx in txs {
+                let tx_str_owned: String;
+                let tx_bytes: &[u8] = if let Some(s) = tx.as_str() {
+                    s.as_bytes()
+                } else {
+                    tx_str_owned = tx.to_string();
+                    tx_str_owned.as_bytes()
+                };
+                let mut hasher = Sha256::new();
+                hasher.update(tx_bytes);
+                let tx_hash = hex::encode(hasher.finalize());
+                let idx_key = format!("tx_index:{}", tx_hash);
+
+                // Skip if already indexed — preserves existing entries and
+                // means a partial run from a crashed prior invocation
+                // doesn't double-write.
+                if matches!(self.db.get(idx_key.as_bytes()), Ok(Some(_))) {
+                    continue;
+                }
+
+                batch.put(idx_key.as_bytes(), &height_bytes);
+                inserted += 1;
+            }
+        }
+
+        // Mark migration complete in the same batch so the sentinel write
+        // is atomic with the last index inserts.
+        batch.put(
+            Self::TX_INDEX_BACKFILL_SENTINEL.as_bytes(),
+            blocks_scanned.to_string().as_bytes(),
+        );
+
+        self.write_batch(batch)?;
+
+        if inserted > 0 {
+            eprintln!(
+                "🛠️  tx_index backfill: scanned {} blocks, inserted {} new index entries",
+                blocks_scanned, inserted
+            );
+        }
+        Ok(inserted)
+    }
+
     // === PHASE 9: DECENTRALIZED CONFIG ===
     pub fn get_federation_key(&self) -> String {
         match self.get("sys:config:federation_addr") {

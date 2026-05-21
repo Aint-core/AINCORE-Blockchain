@@ -69,6 +69,119 @@ mod tests {
         assert_eq!(db.get_tx_block_height("0xnonexistent"), None);
     }
 
+    /// Phase 1.5.1: H-07 MIGRATION REGRESSION TEST
+    ///
+    /// External audit catch: `save_block_json` indexes new blocks, but every
+    /// block that landed on disk **before** the H-07 fix has zero
+    /// `tx_index:` entries. `aincore_getTransaction` would return `null`
+    /// for those historical transactions — a silent regression vs the
+    /// pre-H-07 full DAG scan.
+    ///
+    /// `backfill_tx_index` is the migration: walks existing `block_*`
+    /// rows, populates missing `tx_index:` entries, and writes a sentinel
+    /// so restarts don't replay. This test reproduces the pre-fix state
+    /// (block written via raw `put`, no index) and asserts the migration
+    /// makes those transactions queryable.
+    #[test]
+    fn test_backfill_tx_index_recovers_pre_fix_blocks() {
+        use sha2::{Digest, Sha256};
+
+        let db = temp_db("backfill_tx_index");
+
+        // Simulate "old" blocks: written via raw put(), bypassing the
+        // save_block_json indexing path. This is what the DB looks like
+        // before the H-07 fix.
+        let tx_a = r#"{"sender":"aaa","sequence_number":0}"#;
+        let tx_b = r#"{"sender":"bbb","sequence_number":0}"#;
+        let tx_c = r#"{"sender":"ccc","sequence_number":1}"#;
+
+        let block1_json = format!(
+            r#"{{"header":{{"hash":"h1","height":1}},"transactions":[{},{}]}}"#,
+            serde_json::to_string(tx_a).unwrap(),
+            serde_json::to_string(tx_b).unwrap(),
+        );
+        let block2_json = format!(
+            r#"{{"header":{{"hash":"h2","height":2}},"transactions":[{}]}}"#,
+            serde_json::to_string(tx_c).unwrap(),
+        );
+
+        db.put("block_1", &block1_json).unwrap();
+        db.put("block_2", &block2_json).unwrap();
+
+        // Pre-condition: no index entries exist for these transactions.
+        let hash_a = hex::encode(Sha256::digest(tx_a.as_bytes()));
+        let hash_b = hex::encode(Sha256::digest(tx_b.as_bytes()));
+        let hash_c = hex::encode(Sha256::digest(tx_c.as_bytes()));
+        assert_eq!(db.get_tx_block_height(&hash_a), None);
+        assert_eq!(db.get_tx_block_height(&hash_b), None);
+        assert_eq!(db.get_tx_block_height(&hash_c), None);
+
+        // Run migration.
+        let inserted = db.backfill_tx_index().unwrap();
+        assert_eq!(inserted, 3, "migration must index all 3 historical txs");
+
+        // Post-condition: every historical tx is now queryable.
+        assert_eq!(db.get_tx_block_height(&hash_a), Some(1));
+        assert_eq!(db.get_tx_block_height(&hash_b), Some(1));
+        assert_eq!(db.get_tx_block_height(&hash_c), Some(2));
+
+        // Sentinel is set.
+        assert!(
+            db.get(StateDB::TX_INDEX_BACKFILL_SENTINEL)
+                .unwrap()
+                .is_some(),
+            "sentinel must be set after successful migration"
+        );
+
+        // Idempotency: running again must be a no-op (returns 0).
+        let inserted_again = db.backfill_tx_index().unwrap();
+        assert_eq!(inserted_again, 0, "migration must be idempotent on restart");
+    }
+
+    /// Phase 1.5.1: backfill must not clobber existing `tx_index` entries
+    /// that were correctly written by `save_block_json` for new blocks.
+    /// This mixed-state is what a node looks like after a Phase 1 upgrade:
+    /// some old blocks (no index) + some new blocks (indexed).
+    #[test]
+    fn test_backfill_tx_index_preserves_existing_entries() {
+        use sha2::{Digest, Sha256};
+
+        let db = temp_db("backfill_tx_index_mixed");
+
+        // "New" block goes through save_block_json (already indexed).
+        let tx_new = r#"{"sender":"new","sequence_number":0}"#;
+        let new_block_json = format!(
+            r#"{{"header":{{"hash":"hnew","height":5}},"transactions":[{}]}}"#,
+            serde_json::to_string(tx_new).unwrap(),
+        );
+        db.save_block_json(5, &new_block_json).unwrap();
+
+        // "Old" block written via raw put (not indexed yet).
+        let tx_old = r#"{"sender":"old","sequence_number":0}"#;
+        let old_block_json = format!(
+            r#"{{"header":{{"hash":"hold","height":3}},"transactions":[{}]}}"#,
+            serde_json::to_string(tx_old).unwrap(),
+        );
+        db.put("block_3", &old_block_json).unwrap();
+
+        let hash_new = hex::encode(Sha256::digest(tx_new.as_bytes()));
+        let hash_old = hex::encode(Sha256::digest(tx_old.as_bytes()));
+
+        // Pre: new is indexed, old is not.
+        assert_eq!(db.get_tx_block_height(&hash_new), Some(5));
+        assert_eq!(db.get_tx_block_height(&hash_old), None);
+
+        let inserted = db.backfill_tx_index().unwrap();
+        assert_eq!(
+            inserted, 1,
+            "only the previously-unindexed tx should be added"
+        );
+
+        // Post: both are correctly mapped to their original heights.
+        assert_eq!(db.get_tx_block_height(&hash_new), Some(5));
+        assert_eq!(db.get_tx_block_height(&hash_old), Some(3));
+    }
+
     /// H-07 REGRESSION TEST
     ///
     /// save_block_json must populate `tx_index:{tx_hash} -> height` for

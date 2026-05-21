@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::{thread, time::Duration};
 
 // === --- IMPORT FASE 2 --- ===
+use consensus::DagConsensus;
 use executor::Executor;
 use mempool::Mempool;
-use consensus::DagConsensus;
 
 // === --- IMPORT FASE 3 (Chain Sync) --- ===
 use chain_sync::{ChainSync, SyncRequest, SyncResponse};
@@ -19,8 +19,8 @@ use da_sequencer::DASequencer;
 
 // === --- IMPORT FASE 5 (P2P Network) --- ===
 // === --- IMPORT FASE 5 (P2P Network) --- ===
-use node::p2p::start_p2p;
 use node::genesis;
+use node::p2p::start_p2p;
 // use node::api; // Bypass library issue
 mod api_local;
 use api_local as api;
@@ -29,7 +29,7 @@ use api_local as api;
 async fn main() {
     // === ARGUMENT PARSER ===
     let config = config::NodeConfig::parse();
-    
+
     // Unpack config for backward compatibility
     let port = config.port;
     let api_port = config.api_port;
@@ -39,10 +39,9 @@ async fn main() {
     let enable_mdns = config.enable_mdns;
     let enable_nat = config.enable_nat;
 
-
     // === INISIALISASI NODE IDENTITY ===
-    use ed25519_dalek::{SigningKey};
-    
+    use ed25519_dalek::SigningKey;
+
     // Load or Generate Keypair
     let _ = std::fs::create_dir_all(&datadir);
     let datadir_path = std::path::PathBuf::from(&datadir);
@@ -55,15 +54,38 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    
+
     let signing_key = if std::path::Path::new(key_path).exists() {
         match std::fs::read(key_path) {
             Ok(bytes) => {
-                match bytes.as_slice().try_into() {
+                let key_bytes = if bytes.len() == 32 {
+                    bytes
+                } else if let Ok(text) = std::str::from_utf8(&bytes) {
+                    let trimmed = text.trim();
+                    if trimmed.len() == 64 {
+                        match hex::decode(trimmed) {
+                            Ok(decoded) => decoded,
+                            Err(e) => {
+                                eprintln!("❌ FATAL: Invalid hex node key in {}", key_path);
+                                eprintln!("   Error: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        bytes
+                    }
+                } else {
+                    bytes
+                };
+
+                match key_bytes.as_slice().try_into() {
                     Ok(key_bytes) => SigningKey::from_bytes(key_bytes),
                     Err(_) => {
                         eprintln!("❌ FATAL: Invalid key length in {}", key_path);
-                        eprintln!("   Expected 32 bytes, got {}", bytes.len());
+                        eprintln!(
+                            "   Expected raw 32 bytes or 64 hex chars, got {} bytes",
+                            key_bytes.len()
+                        );
                         eprintln!("   Try deleting the key file to regenerate.");
                         std::process::exit(1);
                     }
@@ -76,13 +98,19 @@ async fn main() {
         }
     } else {
         // Auto-generate key for testnet (key persists via Docker volume)
-        println!("⚠️  node.key not found in {} — generating new keypair...", datadir);
+        println!(
+            "⚠️  node.key not found in {} — generating new keypair...",
+            datadir
+        );
         let mut csprng = rand::rngs::OsRng;
         let new_key = SigningKey::generate(&mut csprng);
         match std::fs::write(key_path, new_key.to_bytes()) {
             Ok(_) => {
                 println!("✅ Generated new node key: {}", key_path);
-                println!("🔑 Public Key: {}", hex::encode(new_key.verifying_key().to_bytes()));
+                println!(
+                    "🔑 Public Key: {}",
+                    hex::encode(new_key.verifying_key().to_bytes())
+                );
             }
             Err(e) => {
                 eprintln!("❌ FATAL: Failed to save generated key: {}", e);
@@ -94,8 +122,13 @@ async fn main() {
 
     let verifying_key = signing_key.verifying_key();
     let pub_key_hex = hex::encode(verifying_key.to_bytes());
-    // Use first 16 bytes (32 hex chars) as address for Move compatibility
-    let node_addr_hex = pub_key_hex[0..32].to_string();
+    let node_addr_hex = match crypto::derive_address(verifying_key.as_bytes()) {
+        Ok(addr) => addr,
+        Err(e) => {
+            eprintln!("❌ FATAL: Failed to derive node address: {}", e);
+            std::process::exit(1);
+        }
+    };
     let node_id = node_addr_hex.clone(); // Use address as node_id for consensus matching
 
     let db_path = format!("{}/validator_{}.db", datadir, port);
@@ -113,6 +146,38 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // === H-07 MIGRATION: one-shot tx_index backfill ===
+    //
+    // Before the H-07 fix, `save_block_json` did not write `tx_index:`
+    // entries. Any block that landed before this build is invisible to
+    // `aincore_getTransaction`, which would silently return `null` for
+    // historical receipts. The backfill walks existing `block_*` rows
+    // and populates the index for them. It is idempotent (sentinel-
+    // gated) so subsequent restarts are no-ops.
+    //
+    // Failure here is non-fatal: we log and continue, because the
+    // index is a query convenience, not a consensus invariant. New
+    // blocks are still indexed correctly by `save_block_json`.
+    match storage.backfill_tx_index() {
+        Ok(0) => {
+            // Either already done in a previous boot, or no blocks yet.
+        }
+        Ok(n) => {
+            println!(
+                "🛠️  tx_index migration: backfilled {} historical transactions",
+                n
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "⚠️  tx_index backfill failed (non-fatal, getTransaction may \
+                 return null for old txs until rerun): {}",
+                e
+            );
+        }
+    }
+
     let peers = Arc::new(Mutex::new(std::collections::HashMap::<String, u16>::new()));
 
     println!("🚀 AINCORE node {} running on port {}", node_id, port);
@@ -121,7 +186,10 @@ async fn main() {
     // === LOAD PERSISTED PEERS ===
     let saved_peer_addrs = storage.scan_peer_addrs();
     if !saved_peer_addrs.is_empty() {
-        println!("📚 Found {} saved peer addresses in database", saved_peer_addrs.len());
+        println!(
+            "📚 Found {} saved peer addresses in database",
+            saved_peer_addrs.len()
+        );
         for (_, addr) in saved_peer_addrs {
             if !bootnodes.contains(&addr) {
                 bootnodes.push(addr);
@@ -130,59 +198,85 @@ async fn main() {
     }
 
     if bootnodes.is_empty() {
-        println!("🌐 No bootnodes provided. Using default AINCORE public seed node...");
-        bootnodes.push("/dns4/seed.aincore.network/tcp/9000".to_string());
+        match std::env::var("AINCORE_PUBLIC_SEED_BOOTNODE") {
+            Ok(seed) if !seed.trim().is_empty() => {
+                println!(
+                    "🌐 Using explicit public seed bootnode from AINCORE_PUBLIC_SEED_BOOTNODE"
+                );
+                bootnodes.push(seed);
+            }
+            _ => {
+                println!("🌐 No bootnodes provided. Starting isolated/sovereign node with no public seed.");
+            }
+        }
     }
 
     // === NORMALIZE BOOTNODES ===
-    let normalized_bootnodes: Vec<String> = bootnodes.iter().map(|s| {
-        if s.starts_with("/") {
-            s.clone()
-        } else {
-            // Try IP:PORT
-            if let Ok(addr) = s.parse::<std::net::SocketAddr>() {
-                 format!("/ip4/{}/tcp/{}", addr.ip(), addr.port())
+    let normalized_bootnodes: Vec<String> = bootnodes
+        .iter()
+        .map(|s| {
+            if s.starts_with("/") {
+                s.clone()
             } else {
-                // Try DOMAIN:PORT (e.g. ngrok)
-                let parts: Vec<&str> = s.split(':').collect();
-                if parts.len() == 2 {
-                    if let Ok(p) = parts[1].parse::<u16>() {
-                        format!("/dns4/{}/tcp/{}", parts[0], p)
+                // Try IP:PORT
+                if let Ok(addr) = s.parse::<std::net::SocketAddr>() {
+                    format!("/ip4/{}/tcp/{}", addr.ip(), addr.port())
+                } else {
+                    // Try DOMAIN:PORT (e.g. ngrok)
+                    let parts: Vec<&str> = s.split(':').collect();
+                    if parts.len() == 2 {
+                        if let Ok(p) = parts[1].parse::<u16>() {
+                            format!("/dns4/{}/tcp/{}", parts[0], p)
+                        } else {
+                            s.clone()
+                        }
                     } else {
                         s.clone()
                     }
-                } else {
-                    s.clone()
                 }
             }
-        }
-    }).collect();
-    
-    // === LIBP2P BOOTNODES (Port + 100) ===
-    let libp2p_bootnodes: Vec<String> = normalized_bootnodes.iter().map(|s| {
-        let parts: Vec<&str> = s.split('/').collect();
-        if parts.len() >= 5 && parts[3] == "tcp" {
-            if let Ok(p) = parts[4].parse::<u16>() {
-                let new_port = p + 100;
-                let mut new_parts = parts.clone();
-                let port_str = new_port.to_string();
-                new_parts[4] = &port_str;
-                return new_parts.join("/");
-            }
-        }
-        s.clone()
-    }).collect();
+        })
+        .collect();
 
-    println!("🕸️  Kademlia DHT: Feeding {} bootnodes to Routing Table", libp2p_bootnodes.len());
+    // === LIBP2P BOOTNODES (Port + 100) ===
+    let libp2p_bootnodes: Vec<String> = normalized_bootnodes
+        .iter()
+        .map(|s| {
+            let parts: Vec<&str> = s.split('/').collect();
+            if parts.len() >= 5 && parts[3] == "tcp" {
+                if let Ok(p) = parts[4].parse::<u16>() {
+                    let new_port = p + 100;
+                    let mut new_parts = parts.clone();
+                    let port_str = new_port.to_string();
+                    new_parts[4] = &port_str;
+                    return new_parts.join("/");
+                }
+            }
+            s.clone()
+        })
+        .collect();
+
+    println!(
+        "🕸️  Kademlia DHT: Feeding {} bootnodes to Routing Table",
+        libp2p_bootnodes.len()
+    );
     if !libp2p_bootnodes.is_empty() {
-         println!("   - Example Libp2p: {}", libp2p_bootnodes[0]);
-         if let Some(first_legacy) = normalized_bootnodes.first() {
-             println!("   - Example Legacy: {}", first_legacy);
-         }
+        println!("   - Example Libp2p: {}", libp2p_bootnodes[0]);
+        if let Some(first_legacy) = normalized_bootnodes.first() {
+            println!("   - Example Legacy: {}", first_legacy);
+        }
     }
-    
+
     // === INISIALISASI P2P NETWORK (Start early to bind port) ===
-    let (_p2p_tx, mut p2p_rx) = match start_p2p(port, libp2p_bootnodes, Arc::clone(&storage), enable_mdns, enable_nat).await {
+    let (_p2p_tx, mut p2p_rx) = match start_p2p(
+        port,
+        libp2p_bootnodes,
+        Arc::clone(&storage),
+        enable_mdns,
+        enable_nat,
+    )
+    .await
+    {
         Ok((tx, rx)) => {
             println!("🌐 P2P gossip network started (libp2p running in background)");
             (tx, rx)
@@ -195,10 +289,13 @@ async fn main() {
 
     // === HANDSHAKE KE PEERS (legacy - optional now) ===
     let node_signing_key = Arc::new(signing_key.clone());
-    
+
     // CRITICAL FIX: Parse bootnodes to extract IP and port for legacy TCP handshake
     if !normalized_bootnodes.is_empty() {
-        println!("🔗 Attempting legacy TCP handshake with {} bootnodes", normalized_bootnodes.len());
+        println!(
+            "🔗 Attempting legacy TCP handshake with {} bootnodes",
+            normalized_bootnodes.len()
+        );
         for bootnode in &normalized_bootnodes {
             // Parse bootnode address: /ip4/192.168.18.90/tcp/9000 or /dns4/example.com/tcp/9000
             let parts: Vec<&str> = bootnode.split('/').collect();
@@ -206,18 +303,38 @@ async fn main() {
                 let ip_or_dns = parts[2]; // "192.168.18.90" or "example.com"
                 if let Ok(port) = parts[4].parse::<u16>() {
                     println!("🔗 Trying legacy TCP handshake to {}:{}", ip_or_dns, port);
-                    handshake(&node_id, ip_or_dns, port, port, Arc::clone(&peers), Arc::clone(&storage), Arc::clone(&node_signing_key));
+                    handshake(
+                        &node_id,
+                        ip_or_dns,
+                        port,
+                        port,
+                        Arc::clone(&peers),
+                        Arc::clone(&storage),
+                        Arc::clone(&node_signing_key),
+                    );
                     thread::sleep(Duration::from_millis(500));
                 }
             }
         }
     }
-    
+
     if !initial_peers.is_empty() {
-        println!("🔗 Connecting to {} initial peers (legacy TCP): {:?}", initial_peers.len(), initial_peers);
+        println!(
+            "🔗 Connecting to {} initial peers (legacy TCP): {:?}",
+            initial_peers.len(),
+            initial_peers
+        );
         for peer_port in &initial_peers {
             // FIXED: Now accepts peer_ip parameter (localhost for legacy peers)
-            handshake(&node_id, "127.0.0.1", *peer_port, port, Arc::clone(&peers), Arc::clone(&storage), Arc::clone(&node_signing_key));
+            handshake(
+                &node_id,
+                "127.0.0.1",
+                *peer_port,
+                port,
+                Arc::clone(&peers),
+                Arc::clone(&storage),
+                Arc::clone(&node_signing_key),
+            );
             thread::sleep(Duration::from_millis(100));
         }
     } else if normalized_bootnodes.is_empty() {
@@ -237,7 +354,8 @@ async fn main() {
         "core/vm_move/stdlib/bytecode" // Default, will error with clear message if missing
     };
     // Initialize Genesis with error handling
-    if let Err(e) = genesis::initialize_genesis(&storage, stdlib_path, &node_addr_hex) {
+    if let Err(e) = genesis::initialize_genesis(&storage, stdlib_path, &node_addr_hex, &pub_key_hex)
+    {
         eprintln!("❌ FATAL: Genesis initialization failed: {}", e);
         eprintln!("   This usually means:");
         eprintln!("   1. Stdlib bytecode is missing or corrupted");
@@ -248,14 +366,16 @@ async fn main() {
 
     let executor = Arc::new(Executor::new(Arc::clone(&storage)));
     let mempool = Arc::new(Mutex::new(Mempool::new()));
-    
-    let da_sequencer = Arc::new(Mutex::new(
-        DASequencer::new(node_id.clone(), Arc::clone(&storage), Arc::clone(&peers)),
-    ));
+
+    let da_sequencer = Arc::new(Mutex::new(DASequencer::new(
+        node_id.clone(),
+        Arc::clone(&storage),
+        Arc::clone(&peers),
+    )));
 
     // CRITICAL: Use RwLock for DAG Consensus
     let p2p_tx_clone = Some(_p2p_tx.clone()); // Pass the libp2p transmitter
-    
+
     let consensus = Arc::new(RwLock::new(DagConsensus::new(
         node_id.clone(),
         Arc::clone(&peers),
@@ -263,7 +383,7 @@ async fn main() {
         Arc::clone(&executor),
         Arc::clone(&storage),
         Some(Arc::clone(&da_sequencer)), // Wired DA Sequencer!
-        p2p_tx_clone, // Add Libp2p gossip channel
+        p2p_tx_clone,                    // Add Libp2p gossip channel
         signing_key.to_bytes(), // H4 FIX: Pass the persistent Ed25519 key for BLS derivation
     )));
 
@@ -286,7 +406,7 @@ async fn main() {
     // We use a channel to signal when consensus creates a new vertex/block
     // Ideally, consensus should push to a 'committed_blocks' channel.
     // For this prototype, we'll keep the lock-based access but run the ticker in a separate task.
-    
+
     let consensus_clone = Arc::clone(&consensus);
     tokio::spawn(async move {
         loop {
@@ -305,18 +425,21 @@ async fn main() {
     {
         let node_consensus = Arc::clone(&consensus);
         let da_seq_clone = Arc::clone(&da_sequencer);
-        
+
         tokio::spawn(async move {
             while let Some(msg) = p2p_rx.recv().await {
                 // println!("📨 Main loop received P2P msg: {}", msg);
                 if msg.starts_with("TX:") || msg.starts_with('{') {
-                    // READ LOCK usually sufficient if mempool is internally mutexed, 
+                    // READ LOCK usually sufficient if mempool is internally mutexed,
                     // BUT Mempool is stored as Arc<Mutex> inside DagConsensus struct in Main?
                     // Actually DagConsensus struct definition: pub mempool: Arc<Mutex<Mempool>>
                     // So we only need READ access to DagConsensus to get the Mempool Arc.
                     if let Ok(guard) = node_consensus.read() {
                         if let Ok(mut mp) = guard.mempool.lock() {
-                            mp.add_transaction(msg);
+                            let tx_msg = msg.strip_prefix("TX:").unwrap_or(&msg).to_string();
+                            if let Err(reason) = mp.add_transaction(tx_msg) {
+                                println!("❌ [P2P] Rejected transaction: {}", reason);
+                            }
                         }
                     }
                 } else if msg.starts_with("DAG_VERTEX:") {
@@ -357,7 +480,10 @@ async fn main() {
                     if msg.starts_with("TX:") {
                         if let Ok(guard) = node_consensus.read() {
                             if let Ok(mut mp) = guard.mempool.lock() {
-                                mp.add_transaction(msg);
+                                let tx_msg = msg.strip_prefix("TX:").unwrap_or(&msg).to_string();
+                                if let Err(reason) = mp.add_transaction(tx_msg) {
+                                    println!("❌ [P2P] Rejected transaction: {}", reason);
+                                }
                             }
                         }
                     } else if msg.starts_with("DAG_VERTEX:") {
@@ -374,13 +500,15 @@ async fn main() {
                             // println!("🔍 [DEBUG] Parsed SYNC_REQUEST from {}", req.sender_id);
                             let resp = node_chain_sync.handle_sync_request(req.clone());
                             // println!("🔍 [DEBUG] Got {} blocks from handle_sync_request", resp.blocks.len());
-                            
+
                             let resp_json = serde_json::to_string(&resp).unwrap_or_default();
                             let response_msg = format!("SYNC_RESPONSE:{}", resp_json);
-                            
-                            let requester_ip = storage_clone.get_peer_ip(&req.sender_id).unwrap_or_else(|| "127.0.0.1".to_string());
+
+                            let requester_ip = storage_clone
+                                .get_peer_ip(&req.sender_id)
+                                .unwrap_or_else(|| "127.0.0.1".to_string());
                             let requester_addr = format!("{}:{}", requester_ip, req.sender_port);
-                            
+
                             if let Err(e) = network::send_message(&requester_addr, &response_msg) {
                                 eprintln!("❌ Failed to send sync response error: {}", e);
                             }
@@ -392,7 +520,8 @@ async fn main() {
                         }
                     }
                 },
-            ).await;
+            )
+            .await;
         });
     }
 
@@ -409,46 +538,47 @@ async fn main() {
             println!("🛡️ P2P Maintenance Service started (Auto-Reconnect every 15s)");
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-                
+
                 // 1. Reconnect to Bootnodes
                 for bootnode_str in &bootnodes_clone {
-                     let parts: Vec<&str> = bootnode_str.split('/').collect();
-                     if parts.len() >= 5 {
-                         let ip = parts[2];
-                         let port_str = parts[4];
-                         if let Ok(p) = port_str.parse::<u16>() {
-                             if p != my_port {
-                                 network::handshake(
-                                     &node_id_reconnect,
-                                     ip,
-                                     p,
-                                     my_port,
-                                     Arc::clone(&peers_clone_reconnect),
-                                     Arc::clone(&storage_clone_reconnect),
-                                     Arc::clone(&signing_key_reconnect)
-                                 );
-                             }
-                         }
-                     }
+                    let parts: Vec<&str> = bootnode_str.split('/').collect();
+                    if parts.len() >= 5 {
+                        let ip = parts[2];
+                        let port_str = parts[4];
+                        if let Ok(p) = port_str.parse::<u16>() {
+                            if p != my_port {
+                                network::handshake(
+                                    &node_id_reconnect,
+                                    ip,
+                                    p,
+                                    my_port,
+                                    Arc::clone(&peers_clone_reconnect),
+                                    Arc::clone(&storage_clone_reconnect),
+                                    Arc::clone(&signing_key_reconnect),
+                                );
+                            }
+                        }
+                    }
                 }
-                
+
                 // 2. Reconnect to Saved Peers (from Storage)
                 // FIXED: Use scan_peers() which stores valid (peer_id, port) pairs,
                 // NOT scan_peer_addrs() which stores libp2p multiaddrs with ephemeral ports
                 let saved_peers = storage_clone_reconnect.scan_peers();
                 for (peer_id, peer_port) in saved_peers {
                     if peer_port != 0 && peer_port != my_port {
-                        let ip = storage_clone_reconnect.get_peer_ip(&peer_id)
+                        let ip = storage_clone_reconnect
+                            .get_peer_ip(&peer_id)
                             .unwrap_or_else(|| "127.0.0.1".to_string());
                         network::handshake(
-                             &node_id_reconnect,
-                             &ip,
-                             peer_port,
-                             my_port,
-                             Arc::clone(&peers_clone_reconnect),
-                             Arc::clone(&storage_clone_reconnect),
-                             Arc::clone(&signing_key_reconnect)
-                         );
+                            &node_id_reconnect,
+                            &ip,
+                            peer_port,
+                            my_port,
+                            Arc::clone(&peers_clone_reconnect),
+                            Arc::clone(&storage_clone_reconnect),
+                            Arc::clone(&signing_key_reconnect),
+                        );
                     }
                 }
             }
@@ -456,33 +586,47 @@ async fn main() {
     }
 
     // === INITIALIZE GOVERNANCE ===
-    let governance = Arc::new(Mutex::new(governance::GovernanceManager::new(Arc::clone(&storage))));
-    
-     // === START REST API SERVER ===
+    let governance = Arc::new(Mutex::new(governance::GovernanceManager::new(Arc::clone(
+        &storage,
+    ))));
+
+    // === START REST API SERVER ===
     {
         let api_consensus = Arc::clone(&consensus);
         let api_peers = Arc::clone(&peers);
         let api_mempool = Arc::clone(&mempool);
         let api_storage = Arc::clone(&storage);
         let api_governance = Arc::clone(&governance);
-        
+
         std::thread::spawn(move || {
-            println!("🌍 [Reference] Initializing API Thread for port {}...", api_port);
+            println!(
+                "🌍 [Reference] Initializing API Thread for port {}...",
+                api_port
+            );
             match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
-                .build() 
+                .build()
             {
                 Ok(rt) => {
                     println!("🌍 [Reference] Runtime built. Blocking on API...");
                     rt.block_on(async {
                         println!("🌍 [Reference] Calling start_api_server...");
-                        if let Err(e) = api::start_api_server(api_port, api_consensus, api_peers, api_mempool, api_storage, api_governance).await {
+                        if let Err(e) = api::start_api_server(
+                            api_port,
+                            api_consensus,
+                            api_peers,
+                            api_mempool,
+                            api_storage,
+                            api_governance,
+                        )
+                        .await
+                        {
                             eprintln!("❌ API Server CRASHED: {}", e);
                         } else {
                             println!("🌍 API Server exited normally (Unexpected).");
                         }
                     });
-                },
+                }
                 Err(e) => eprintln!("❌ Failed to build endpoint runtime: {}", e),
             }
         });
@@ -490,11 +634,11 @@ async fn main() {
 
     // === MAIN LOOP (EXECUTION & DA ONLY) ===
     // Consensus is now running in background!
-    
+
     // === INITIAL SYNC + AUTO-REGISTRATION ===
     println!("🔄 Starting initial chain sync...");
     tokio::time::sleep(Duration::from_secs(3)).await;
-    
+
     // Spawn initial sync as task — then register as validator if needed
     let chain_sync_initial = Arc::clone(&chain_sync);
     let consensus_post_sync = Arc::clone(&consensus);
@@ -502,23 +646,27 @@ async fn main() {
     let node_id_post_sync = node_id.clone();
     tokio::spawn(async move {
         let synced_height = chain_sync_initial.sync_from_peers().await;
-        
+
         // Reload consensus chain tip to prevent fork
         if synced_height > 0 {
             if let Ok(mut c) = consensus_post_sync.write() {
                 c.reload_chain_tip();
             }
         }
-        
+
         // Auto-register as validator if not already in the set
         let already_validator = {
             if let Ok(Some(json)) = storage_post_sync.get("sys:validators") {
                 if let Ok(vals) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
                     vals.iter().any(|(addr, _)| addr == &node_id_post_sync)
-                } else { false }
-            } else { false }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
         };
-        
+
         if !already_validator {
             // SECURITY: AutoReg disabled to prevent Sybil attacks.
             // Testnet: Add node address to genesis.json validators array.
@@ -529,7 +677,7 @@ async fn main() {
             println!("✅ [AutoReg] Already a validator in the set");
         }
     });
-    
+
     // === PERIODIC BACKGROUND SYNC ===
     let chain_sync_periodic = Arc::clone(&chain_sync);
     let consensus_periodic = Arc::clone(&consensus);
@@ -557,13 +705,13 @@ async fn main() {
         // Update Metrics
         let peer_count = if let Ok(p) = peers.lock() { p.len() } else { 0 };
         node::metrics::PEER_COUNT.set(peer_count as i64);
-        
+
         if let Ok(Some(height_str)) = storage.get("latest_height") {
             if let Ok(h) = height_str.parse::<i64>() {
                 node::metrics::BLOCK_HEIGHT.set(h);
             }
         }
-        
+
         thread::sleep(Duration::from_millis(1000)); // Lower tick rate for efficiency
     }
 }
