@@ -541,6 +541,69 @@ impl Executor {
         }
     }
 
+    /// Phase 4.A1: Compute stake-proportional block reward payouts.
+    ///
+    /// Splits `total_reward` between:
+    ///   - 20% anchor-leader bonus → `anchor_leader`
+    ///   - 80% stake-weighted pool → every validator in sys:validators
+    ///
+    /// The leader still receives any pool share they're entitled to from
+    /// their own stake (so a high-stake leader gets bonus + pool share).
+    ///
+    /// Rounding remainder (from integer division) is given to anchor_leader
+    /// so the reward is fully consumed and never lost.
+    ///
+    /// Fallback: if validator set is empty/unreadable, ALL goes to leader
+    /// (legacy behaviour preserved for genesis bootstrap and edge cases).
+    fn compute_block_payouts(
+        &self,
+        anchor_leader: &str,
+        total_reward: u128,
+    ) -> Vec<(String, u128)> {
+        // Step 1: read validator set with stakes.
+        let validators: Vec<(String, u64)> = match self.db.get("sys:validators") {
+            Ok(Some(json)) => match serde_json::from_str::<Vec<(String, u64)>>(&json) {
+                Ok(vs) => vs,
+                Err(_) => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+
+        // Fallback: no validator set → legacy single-miner path.
+        if validators.is_empty() {
+            return vec![(anchor_leader.to_string(), total_reward)];
+        }
+
+        let total_stake: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
+        if total_stake == 0 {
+            return vec![(anchor_leader.to_string(), total_reward)];
+        }
+
+        // Step 2: split into bonus + pool buckets.
+        // 20% leader bonus, 80% stake-weighted pool.
+        const LEADER_BONUS_PCT: u128 = 20;
+        let leader_bonus = (total_reward * LEADER_BONUS_PCT) / 100;
+        let pool = total_reward - leader_bonus;
+
+        // Step 3: stake-weighted distribution of the pool.
+        use std::collections::BTreeMap;
+        let mut payouts: BTreeMap<String, u128> = BTreeMap::new();
+        let mut distributed_pool: u128 = 0;
+
+        for (addr, stake) in &validators {
+            let share = (pool * (*stake as u128)) / total_stake;
+            distributed_pool += share;
+            *payouts.entry(addr.clone()).or_insert(0) += share;
+        }
+
+        // Step 4: leader bonus + rounding remainder to leader.
+        let remainder = pool.saturating_sub(distributed_pool);
+        *payouts.entry(anchor_leader.to_string()).or_insert(0) +=
+            leader_bonus.saturating_add(remainder);
+
+        payouts.into_iter().collect()
+    }
+
     fn deposit_fee_reward(&self, miner_addr: &str, amount: u128) -> Result<(), String> {
         if amount == 0 {
             return Ok(());
@@ -837,8 +900,22 @@ impl Executor {
         }
 
         // C-5/C-6 FIX: Route fee distribution through Move VM instead of native balance.
-        // The old code directly credited AccountData.balance which created a dual-accounting
-        // vulnerability where native and Move VM balances could desynchronize.
+        // Phase 4.A1: Stake-proportional reward distribution.
+        //
+        // OLD BEHAVIOUR (broken economics):
+        //   100% of miner_fees went to the anchor_leader. Every other
+        //   validator stake-locked tokens, ran consensus, but earned
+        //   zero from each block they helped finalise. With many
+        //   validators this means most stakers earn nothing — the
+        //   protocol is effectively winner-take-all per block, which
+        //   destroys the incentive to run a non-leader validator.
+        //
+        // NEW BEHAVIOUR (Phase 4.A1):
+        //   - 20% bonus → anchor_leader (block proposer)
+        //   - 80% pool  → distributed across the active validator set
+        //                 weighted by stake.
+        //   If the validator set is empty or unreadable, fall back to
+        //   the legacy single-miner path so we never burn the reward.
         let miner_addr = if proposer_hex.len() > 32 {
             &proposer_hex[0..32]
         } else {
@@ -846,35 +923,41 @@ impl Executor {
         };
 
         if reward_amount > 0 {
+            let payouts = self.compute_block_payouts(miner_addr, reward_amount);
+
             println!(
-                "💰 Distributing Block Fees via Move VM: {} AIN to Miner {}",
-                reward_amount, miner_addr
+                "💰 Distributing Block Fees ({} AIN total) across {} recipient(s)",
+                reward_amount, payouts.len()
             );
 
-            let mut distributed = false;
-            for attempt in 1..=3 {
-                match self.deposit_fee_reward(miner_addr, reward_amount) {
-                    Ok(()) => {
-                        distributed = true;
-                        println!(
-                            "✅ Fee Reward Credited via Move VM: {} AIN to {}",
-                            reward_amount, miner_addr
-                        );
-                        break;
-                    }
-                    Err(e) => eprintln!(
-                        "⚠️ Move VM fee distribution failed (attempt {}): {}",
-                        attempt, e
-                    ),
+            for (recipient, share) in &payouts {
+                if *share == 0 {
+                    continue;
                 }
-            }
-
-            if !distributed {
-                self.queue_fee_sweep(miner_addr, reward_amount, self.db.get_chain_height());
-                eprintln!(
-                    "🔴 Fee distribution failed after 3 attempts. Queued for sweep: {} AIN for {}",
-                    reward_amount, miner_addr
-                );
+                let mut distributed = false;
+                for attempt in 1..=3 {
+                    match self.deposit_fee_reward(recipient, *share) {
+                        Ok(()) => {
+                            distributed = true;
+                            println!(
+                                "✅ Paid {} AIN → {} (attempt {})",
+                                share, recipient, attempt
+                            );
+                            break;
+                        }
+                        Err(e) => eprintln!(
+                            "⚠️ Reward payout failed for {} (attempt {}): {}",
+                            recipient, attempt, e
+                        ),
+                    }
+                }
+                if !distributed {
+                    self.queue_fee_sweep(recipient, *share, self.db.get_chain_height());
+                    eprintln!(
+                        "🔴 Reward queued for sweep: {} AIN → {}",
+                        share, recipient
+                    );
+                }
             }
         }
 
@@ -937,7 +1020,7 @@ impl Executor {
     /// but not yet *live* (real offenders are not punished). Equivocation
     /// slashing is unaffected — it's provable from local DAG data and
     /// continues to apply through the equivocation detector.
-    fn promote_downtime_attestations_to_slash(&self) {
+    pub fn promote_downtime_attestations_to_slash(&self) {
         // 1. Snapshot the active validator set so quorum is computed
         //    against a stable set within this routine.
         let validators: Vec<String> = match self.db.get("sys:validators") {
@@ -3445,5 +3528,116 @@ mod tests {
             .unwrap()
             .is_none(),
             "stale reporter must not push the group over quorum");
+    }
+
+    // ── Phase 4.A1: stake-proportional reward distribution ────────────────
+
+    fn temp_db_a1(suffix: &str) -> Arc<StateDB> {
+        let mut p = std::env::temp_dir();
+        p.push(format!("aincore_a1_{}_{}", std::process::id(), suffix));
+        let _ = std::fs::remove_dir_all(&p);
+        Arc::new(StateDB::open(p.to_str().unwrap()).unwrap())
+    }
+
+    fn set_validator_set_a1(db: &StateDB, vs: &[(&str, u64)]) {
+        let owned: Vec<(String, u64)> =
+            vs.iter().map(|(a, s)| (a.to_string(), *s)).collect();
+        db.put("sys:validators", &serde_json::to_string(&owned).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn a1_empty_validator_set_falls_back_to_leader() {
+        let db = temp_db_a1("empty_vset");
+        let executor = Executor::new(Arc::clone(&db));
+        let payouts = executor.compute_block_payouts("leader", 1_000);
+
+        assert_eq!(payouts.len(), 1);
+        assert_eq!(payouts[0], ("leader".to_string(), 1_000));
+    }
+
+    #[test]
+    fn a1_single_validator_gets_everything() {
+        let db = temp_db_a1("single");
+        set_validator_set_a1(&db, &[("alice", 100)]);
+        let executor = Executor::new(Arc::clone(&db));
+        let payouts = executor.compute_block_payouts("alice", 1_000);
+
+        // alice = anchor leader, also sole pool member
+        // total must == 1_000, no funds lost
+        let total: u128 = payouts.iter().map(|(_, s)| s).sum();
+        assert_eq!(total, 1_000);
+        // Should be a single entry for alice with 1_000
+        assert_eq!(payouts.iter().find(|(a, _)| a == "alice").unwrap().1, 1_000);
+    }
+
+    #[test]
+    fn a1_stake_proportional_distribution() {
+        let db = temp_db_a1("proportional");
+        // 3 validators with stakes 100, 200, 700 (total 1000)
+        // Leader bonus: 20% of 1000 = 200 → leader (alice)
+        // Pool: 80% of 1000 = 800
+        //   alice (100/1000): 80
+        //   bob   (200/1000): 160
+        //   carol (700/1000): 560
+        //   sum: 800 (no remainder)
+        // Final: alice = 200 + 80 = 280, bob = 160, carol = 560
+        set_validator_set_a1(&db, &[("alice", 100), ("bob", 200), ("carol", 700)]);
+        let executor = Executor::new(Arc::clone(&db));
+        let payouts = executor.compute_block_payouts("alice", 1_000);
+
+        let map: std::collections::HashMap<String, u128> = payouts.into_iter().collect();
+        assert_eq!(map.get("alice").copied().unwrap_or(0), 280);
+        assert_eq!(map.get("bob").copied().unwrap_or(0), 160);
+        assert_eq!(map.get("carol").copied().unwrap_or(0), 560);
+
+        // Conservation: total payouts == total_reward
+        let total: u128 = map.values().sum();
+        assert_eq!(total, 1_000, "no AIN may be lost in distribution");
+    }
+
+    #[test]
+    fn a1_rounding_remainder_goes_to_leader() {
+        let db = temp_db_a1("rounding");
+        // 3 validators, equal stake 1 each (total 3).
+        // total_reward = 100
+        // leader_bonus = 20% = 20
+        // pool = 80
+        // each share = 80 / 3 = 26 (truncated)
+        // distributed_pool = 78
+        // remainder = 2 → goes to leader (alice)
+        // alice = 20 + 26 + 2 = 48
+        // bob   = 26
+        // carol = 26
+        // total: 100 ✓
+        set_validator_set_a1(&db, &[("alice", 1), ("bob", 1), ("carol", 1)]);
+        let executor = Executor::new(Arc::clone(&db));
+        let payouts = executor.compute_block_payouts("alice", 100);
+
+        let map: std::collections::HashMap<String, u128> = payouts.into_iter().collect();
+        let total: u128 = map.values().sum();
+        assert_eq!(total, 100, "rounding remainder must not be lost");
+        // Leader gets at least bonus + own share
+        assert!(*map.get("alice").unwrap_or(&0) >= 20 + 26);
+    }
+
+    #[test]
+    fn a1_non_validator_leader_still_gets_bonus() {
+        // Edge case: anchor_leader is NOT in validator set (e.g. transient state).
+        // Leader bonus still flows to leader; pool split among validators.
+        let db = temp_db_a1("non_validator_leader");
+        set_validator_set_a1(&db, &[("bob", 100), ("carol", 100)]);
+        let executor = Executor::new(Arc::clone(&db));
+        let payouts = executor.compute_block_payouts("ghost_leader", 1_000);
+
+        let map: std::collections::HashMap<String, u128> = payouts.into_iter().collect();
+        // ghost_leader gets 20% bonus = 200
+        assert_eq!(*map.get("ghost_leader").unwrap_or(&0), 200);
+        // bob + carol split 800 equally = 400 each
+        assert_eq!(*map.get("bob").unwrap_or(&0), 400);
+        assert_eq!(*map.get("carol").unwrap_or(&0), 400);
+
+        let total: u128 = map.values().sum();
+        assert_eq!(total, 1_000);
     }
 }

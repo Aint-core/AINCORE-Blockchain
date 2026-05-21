@@ -400,12 +400,17 @@ mod tests {
     // Phase 2.5 (H-06): DAG checkpoint integrity tests
     // ========================================================================
 
-    /// A checkpoint with no signature (legacy / unsigned) MUST still be
-    /// loaded — otherwise nodes upgrading from a pre-Phase-2 build would
-    /// be forced into a full state resync. We log a warning but accept.
+    /// Phase 4.A2 — Unsigned checkpoint MUST be rejected.
+    ///
+    /// The previous policy ("legacy unsigned → accept with warning") was an
+    /// attack vector: an operator-level adversary with storage write access
+    /// could DELETE the signature blob to forge a checkpoint. Phase 4.A2
+    /// closes that loophole — a node booting against unsigned checkpoint
+    /// data now falls back to scan_vertices (in-memory DAG stays empty
+    /// because we never wrote individual vertex_:* rows in this test).
     #[test]
-    fn h06_legacy_unsigned_checkpoint_still_loads_with_warning() {
-        let (mut consensus, path) = setup_dag("h06_legacy_unsigned");
+    fn h06_a2_unsigned_checkpoint_rejected() {
+        let (mut consensus, path) = setup_dag("h06_a2_unsigned_rejected");
 
         consensus.try_create_vertex();
         consensus.try_create_vertex();
@@ -414,6 +419,8 @@ mod tests {
             let vs: Vec<_> = dag.values().cloned().collect();
             serde_json::to_string(&vs).unwrap()
         };
+        // Save the checkpoint but NOT the signature — simulates an attacker
+        // (or a stale pre-Phase-2 install) deleting the signature blob.
         consensus
             .storage
             .save_dag_checkpoint(2, &checkpoint_json)
@@ -435,8 +442,9 @@ mod tests {
         );
         let recovered_dag = recovered.dag.lock().unwrap();
         assert!(
-            !recovered_dag.is_empty(),
-            "legacy unsigned checkpoint must still load (warning, not reject)"
+            recovered_dag.is_empty(),
+            "Phase 4.A2: unsigned checkpoint MUST be rejected — \
+             in-memory DAG must NOT be populated from unsigned data"
         );
 
         let _ = std::fs::remove_dir_all(&path);
@@ -672,6 +680,181 @@ mod tests {
         assert!(dag.storage.get(&key).unwrap().is_none(), "bad sig must be rejected");
 
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    // ── Phase 4.B2: H-02 multi-node integration ──────────────────────────
+
+    /// Phase 4.B2 — Multi-node downtime attestation flow reaches BFT quorum.
+    ///
+    /// Scenario:
+    ///   3 validators A, B, C. Offender X is offline. Each validator
+    ///   independently observes downtime and signs an attestation.
+    ///   Attestations are gossiped (simulated via direct `handle_message`
+    ///   calls on the OTHER nodes). After all gossip messages settle,
+    ///   the executor on any node should see 3 distinct reporter
+    ///   attestations against X for the same epoch → BFT quorum
+    ///   ((3*2/3)+1 = 3) met → pending slash queued.
+    ///
+    /// This proves cross-validator gossip + executor promotion works
+    /// end-to-end, not just the parser-level unit tests in 3.1.
+    #[test]
+    fn test_h02_b2_multi_node_attestation_reaches_quorum() {
+        use crypto::{Signer, SigningKey, derive_address};
+
+        // Helper: spin up an isolated DagConsensus node with a given key seed.
+        fn spawn_node(seed_byte: u8, suffix: &str) -> (DagConsensus, String, String) {
+            let path = get_test_db_path(suffix);
+            let db = Arc::new(StateDB::open(&path).unwrap());
+            let mempool = Arc::new(Mutex::new(Mempool::new()));
+            let executor = Arc::new(Executor::new(Arc::clone(&db)));
+            let peers = Arc::new(Mutex::new(HashMap::new()));
+
+            let node_key = [seed_byte; 32];
+            let sk = SigningKey::from_bytes(&node_key);
+            let vk = sk.verifying_key();
+            let node_id = derive_address(vk.as_bytes()).unwrap();
+
+            let consensus = DagConsensus::new(
+                node_id.clone(),
+                peers,
+                mempool,
+                executor,
+                db,
+                None,
+                None,
+                node_key,
+            );
+            (consensus, path, node_id)
+        }
+
+        // Build a signed DOWNTIME_ATTEST: message as if produced by
+        // `broadcast_attestation` — without needing the p2p_tx channel.
+        fn build_signed_attestation(
+            seed_byte: u8,
+            reporter_addr: &str,
+            offender: &str,
+            epoch: u64,
+            round: u64,
+        ) -> String {
+            let sk = SigningKey::from_bytes(&[seed_byte; 32]);
+            let vk = sk.verifying_key();
+            let pubkey_hex = hex::encode(vk.to_bytes());
+
+            let canonical = format!("{}:{}:{}:{}", offender, epoch, reporter_addr, round);
+            let sig = sk.sign(canonical.as_bytes());
+            let sig_hex = hex::encode(sig.to_bytes());
+
+            let payload = serde_json::json!({
+                "offender": offender,
+                "epoch": epoch,
+                "reporter": reporter_addr,
+                "reporter_pubkey": pubkey_hex,
+                "round": round,
+                "rounds_missed": 120u64,
+                "signature": sig_hex,
+            });
+            format!("DOWNTIME_ATTEST:{}", payload)
+        }
+
+        // 1. Spawn 3 validators with deterministic keys.
+        let (mut node_a, path_a, addr_a) = spawn_node(0xA1, "b2_node_a");
+        let (mut node_b, path_b, addr_b) = spawn_node(0xB2, "b2_node_b");
+        let (mut node_c, path_c, addr_c) = spawn_node(0xC3, "b2_node_c");
+
+        // Offender = address derived from yet another key (not a validator
+        // we'll need to test it).
+        let offender_sk = SigningKey::from_bytes(&[0xFF; 32]);
+        let offender = derive_address(offender_sk.verifying_key().as_bytes()).unwrap();
+
+        // 2. Register A, B, C as the validator set on EVERY node's storage.
+        //    (Offender is NOT in the set — they were already removed; this
+        //    is OK for the test, what matters is the 3 REPORTER addresses
+        //    are validators.)
+        let vset: Vec<(String, u64)> = vec![
+            (addr_a.clone(), 100),
+            (addr_b.clone(), 100),
+            (addr_c.clone(), 100),
+        ];
+        let vset_json = serde_json::to_string(&vset).unwrap();
+        for node in [&node_a, &node_b, &node_c] {
+            node.storage.put("sys:validators", &vset_json).unwrap();
+            node.invalidate_validators_cache();
+        }
+
+        // 3. Each validator builds + "broadcasts" their attestation.
+        //    Each receiving node gets the OTHER TWO attestations + already
+        //    has its own (saved locally before broadcast in real code).
+        let epoch = 1u64;
+        let round = 100u64;
+
+        let attest_from_a = build_signed_attestation(0xA1, &addr_a, &offender, epoch, round);
+        let attest_from_b = build_signed_attestation(0xB2, &addr_b, &offender, epoch, round);
+        let attest_from_c = build_signed_attestation(0xC3, &addr_c, &offender, epoch, round);
+
+        // Each node stores its own attestation locally (simulates the
+        // local write in the downtime detection path).
+        for (node, reporter) in [
+            (&node_a, &addr_a),
+            (&node_b, &addr_b),
+            (&node_c, &addr_c),
+        ] {
+            let key = format!(
+                "sys:downtime_attestation:{}:{}:{}",
+                offender, epoch, reporter
+            );
+            let payload = serde_json::json!({
+                "offender": &offender,
+                "epoch": epoch,
+                "reporter": reporter,
+                "round": round,
+                "rounds_missed": 120u64,
+            });
+            node.storage.put(&key, &payload.to_string()).unwrap();
+        }
+
+        // 4. Gossip: each node receives the other two attestations.
+        node_a.handle_message(&attest_from_b);
+        node_a.handle_message(&attest_from_c);
+
+        node_b.handle_message(&attest_from_a);
+        node_b.handle_message(&attest_from_c);
+
+        node_c.handle_message(&attest_from_a);
+        node_c.handle_message(&attest_from_b);
+
+        // 5. Verify EACH node now has 3 distinct attestations stored for X.
+        for (node, label) in [(&node_a, "A"), (&node_b, "B"), (&node_c, "C")] {
+            let mut count = 0;
+            for reporter in [&addr_a, &addr_b, &addr_c] {
+                let key = format!(
+                    "sys:downtime_attestation:{}:{}:{}",
+                    offender, epoch, reporter
+                );
+                if node.storage.get(&key).unwrap().is_some() {
+                    count += 1;
+                }
+            }
+            assert_eq!(
+                count, 3,
+                "Node {} must have 3 distinct attestations after gossip",
+                label
+            );
+        }
+
+        // 6. Executor on node A promotes attestations → pending slash.
+        //    BFT quorum = (3*2/3)+1 = 3, exactly met.
+        let executor_a = Executor::new(Arc::clone(&node_a.storage));
+        executor_a.promote_downtime_attestations_to_slash();
+
+        let slash_key = format!("sys:pending_slash:{}", offender);
+        assert!(
+            node_a.storage.get(&slash_key).unwrap().is_some(),
+            "Phase 4.B2: BFT quorum reached → executor must queue pending slash"
+        );
+
+        let _ = std::fs::remove_dir_all(&path_a);
+        let _ = std::fs::remove_dir_all(&path_b);
+        let _ = std::fs::remove_dir_all(&path_c);
     }
 
     /// Attestation from unknown validator is rejected.

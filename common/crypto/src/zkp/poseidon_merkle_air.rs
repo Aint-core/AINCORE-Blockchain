@@ -144,12 +144,10 @@ mod tests {
             // update closure: filling row i+1 based on row i?
             // Actually winterfell 0.9 signature usually implies:
             // fn update(step, &mut state)
-            |_, state| {
-                // simple identity or increment to keep it valid-ish
-                state[0] = state[0];
-                state[1] = state[1];
-                state[2] = state[2];
-                state[3] = state[3];
+            |_, _state| {
+                // Identity transition — `state` is intentionally unchanged.
+                // Phase 4.B3: removed redundant `state[i] = state[i]`
+                // self-assignments that broke clippy (no semantic change).
             },
         );
 

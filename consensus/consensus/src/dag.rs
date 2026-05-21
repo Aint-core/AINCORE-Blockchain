@@ -75,18 +75,21 @@ impl DagConsensus {
             // checkpoint and the node would happily restore from it on
             // boot — silent rollback / arbitrary-state attack.
             //
-            // Phase 2.5: production checkpoints are now signed with the
-            // node's Ed25519 key (see save path below). On load we
-            // re-verify the signature against the local node key:
+            // Phase 2.5 → Phase 4.A2: production checkpoints are signed with
+            // the node's Ed25519 key. On load we re-verify the signature:
             //   - signature present + valid  → fast recovery from checkpoint
             //   - signature present + invalid → REJECT checkpoint, fall back
             //     to full scan_vertices replay (safety over speed)
-            //   - signature absent (legacy)  → accept with warning
+            //   - signature absent           → REJECT (Phase 4.A2)
             //
-            // The "legacy unsigned" branch is required for one-shot
-            // upgrade from a pre-Phase-2 node that already has unsigned
-            // checkpoints on disk. After one signed save cycle the
-            // unsigned checkpoints age out via prune_old_checkpoints.
+            // The previous "legacy unsigned → accept with warning" branch
+            // was an attack vector: an operator-level adversary with storage
+            // write access could DELETE the signature blob to forge a
+            // checkpoint. Phase 4.A2 closes that loophole: a node booting
+            // against unsigned checkpoint data now ALWAYS falls back to
+            // the safe scan_vertices replay path. Operators upgrading from
+            // pre-Phase-2 take a one-time longer boot until their node
+            // produces a fresh signed checkpoint.
             let checkpoint_accepted: bool;
             if let Some(checkpoint_data) = storage.get_dag_checkpoint(checkpoint_round) {
                 checkpoint_accepted = match storage
@@ -126,12 +129,16 @@ impl DagConsensus {
                         }
                     }
                     None => {
+                        // Phase 4.A2: REJECT unsigned checkpoints. Falling
+                        // back to safe scan replay closes the
+                        // "delete-signature → forge-checkpoint" attack.
                         eprintln!(
-                            "⚠️  [H-06] Checkpoint at round {} has no signature (legacy data). \
-                             Accepting with warning; new checkpoints will be signed.",
+                            "🚨 [H-06/A2] Checkpoint at round {} has NO signature — \
+                             REJECTING fast recovery (legacy-bypass attack vector closed). \
+                             Falling back to scan_vertices replay.",
                             checkpoint_round
                         );
-                        true
+                        false
                     }
                 };
 
