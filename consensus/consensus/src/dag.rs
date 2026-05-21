@@ -331,33 +331,69 @@ impl DagConsensus {
                             continue; // Already jailed, skip
                         }
 
+                        // === H-02 PROMOTED (Phase 2.3): BFT ATTESTATION, NOT UNILATERAL SLASH ===
+                        //
+                        // The pre-Phase-2 path wrote `sys:pending_slash:{addr}`
+                        // directly from this single node's local observation.
+                        // That meant any single validator could trigger a 5%
+                        // slash + 21-day unbonding against any other validator,
+                        // which is unsafe during network partitions (an
+                        // isolated node sees everyone else as "down") and
+                        // open to griefing (a Byzantine validator slashing
+                        // honest peers).
+                        //
+                        // Phase 2.3 replaces the direct slash queue with an
+                        // attestation: this node records *its own* downtime
+                        // observation for (offender, epoch). The executor
+                        // promotes the attestation set to a real pending
+                        // slash only when distinct reporters reach BFT
+                        // quorum.
+                        //
+                        // Without cross-validator gossip of attestations
+                        // (Phase 3 work) only THIS node's attestations exist
+                        // locally; BFT quorum cannot be reached and no
+                        // downtime slash will fire. That is the intended
+                        // safety stance until the gossip protocol lands —
+                        // false positives stop NOW; real offenders are
+                        // punished AFTER gossip is wired. Equivocation
+                        // slashing (provable from local data) is unaffected
+                        // and continues to apply.
+                        const DOWNTIME_EPOCH_ROUNDS: u64 = 50;
+                        let epoch = self.current_round / DOWNTIME_EPOCH_ROUNDS;
+
                         println!(
-                            "🚨 DOWNTIME DETECTED: Validator {} missed {} rounds!",
+                            "🚨 DOWNTIME OBSERVED: Validator {} missed {} rounds (this node only)",
                             validator_id, rounds_missed
                         );
-                        println!("⚖️  Triggering Jail System: 5% slash + 21-day unbonding");
+                        println!(
+                            "⚖️  Recording BFT attestation for offender={}, epoch={}, reporter={}",
+                            validator_id, epoch, self.node_id
+                        );
 
-                        // Mark as jailed to prevent re-slashing
-                        let _ = self.storage.put(&jail_key, &self.current_round.to_string());
-
-                        // === SLASH EXECUTION QUEUE ===
-                        // Write pending slash to storage. The Executor will pick this up
-                        // during block processing and execute the on-chain balance deduction.
-                        let slash_event = serde_json::json!({
-                            "event": "validator_jailed",
-                            "validator": validator_id,
+                        // Attestation key: distinct per (offender, epoch, reporter)
+                        // so the same node cannot inflate the count by
+                        // re-attesting within the same epoch.
+                        let attestation_key = format!(
+                            "sys:downtime_attestation:{}:{}:{}",
+                            validator_id, epoch, self.node_id
+                        );
+                        let attestation = serde_json::json!({
+                            "offender": validator_id,
+                            "epoch": epoch,
+                            "reporter": self.node_id,
                             "round": self.current_round,
                             "rounds_missed": rounds_missed,
-                            "reason": "downtime",
-                            "penalty": "5% slash + 21-day unbonding"
                         });
-                        let _ = self.storage.put(
-                            &format!("sys:pending_slash:{}", validator_id),
-                            &slash_event.to_string(),
-                        );
+                        let _ = self
+                            .storage
+                            .put(&attestation_key, &attestation.to_string());
+
+                        // Log the local observation in the audit trail. The
+                        // executor will scan attestations and queue a real
+                        // slash once BFT quorum is reached.
                         let _ = self.storage.put(
                             &format!("slash_event:{}", self.current_round),
-                            &slash_event.to_string(),
+                            &attestation.to_string(),
                         );
                     }
                 }

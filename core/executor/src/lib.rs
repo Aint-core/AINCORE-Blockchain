@@ -756,7 +756,13 @@ impl Executor {
         // 6. Recover queued fee rewards whose recipient CoinStore is now valid.
         self.process_fee_sweep_queue();
 
-        // 7. Process Pending Slashes from Consensus Engine
+        // 7. Promote downtime attestations to pending slashes when distinct
+        //    reporters reach BFT quorum (Phase 2.3 / H-02). Equivocation
+        //    slashes are written directly by the consensus equivocation
+        //    detector and bypass this step.
+        self.promote_downtime_attestations_to_slash();
+
+        // 8. Process Pending Slashes from Consensus Engine
         // The consensus layer writes sys:pending_slash:{address} entries when it detects
         // downtime or equivocation. We process them here to execute on-chain balance deduction.
         self.execute_pending_slashes();
@@ -778,6 +784,134 @@ impl Executor {
             short_hash(&summary.receipts_root)
         );
         summary
+    }
+
+    /// Phase 2.3 (H-02): promote downtime attestations to pending slashes
+    /// only when distinct reporters reach BFT quorum.
+    ///
+    /// Pre-Phase-2 the consensus layer wrote `sys:pending_slash:{addr}`
+    /// directly from a single node's local observation, which let any
+    /// validator unilaterally slash any other (false positives on
+    /// network partition, griefing surface for Byzantine validators).
+    ///
+    /// New protocol:
+    ///   1. Each validator writes its own attestation under
+    ///      `sys:downtime_attestation:{offender}:{epoch}:{reporter}`.
+    ///   2. This routine groups attestations by `(offender, epoch)`,
+    ///      counts *distinct* reporters that are still in the active
+    ///      validator set, and only when the count meets BFT quorum
+    ///      `(n*2/3) + 1` does it write `sys:pending_slash:{offender}`.
+    ///   3. Once promoted, the attestations for that (offender, epoch)
+    ///      are deleted so the slash isn't re-queued. The jail marker
+    ///      also prevents double-processing inside `execute_pending_slashes`.
+    ///
+    /// Honest limitation: until cross-validator gossip of attestations
+    /// is wired (Phase 3 work), only this node's attestations exist
+    /// locally, so BFT quorum is unreachable on real networks with
+    /// > 1 validator. The path is therefore *safe* (no false positives)
+    /// but not yet *live* (real offenders are not punished). Equivocation
+    /// slashing is unaffected — it's provable from local DAG data and
+    /// continues to apply through the equivocation detector.
+    fn promote_downtime_attestations_to_slash(&self) {
+        // 1. Snapshot the active validator set so quorum is computed
+        //    against a stable set within this routine.
+        let validators: Vec<String> = match self.db.get("sys:validators") {
+            Ok(Some(json)) => match serde_json::from_str::<Vec<(String, u64)>>(&json) {
+                Ok(vs) => vs.into_iter().map(|(addr, _)| addr).collect(),
+                Err(_) => return,
+            },
+            _ => return,
+        };
+        if validators.is_empty() {
+            return;
+        }
+        let n = validators.len();
+        let bft_quorum = ((n * 2) / 3) + 1;
+
+        // 2. Scan attestations. Bounded by SCAN_PREFIX_HARD_CAP via
+        //    `scan_prefix` so a Byzantine flood cannot blow up memory.
+        let entries = self.db.scan_prefix("sys:downtime_attestation:");
+        if entries.is_empty() {
+            return;
+        }
+
+        // 3. Group by (offender, epoch) -> set of distinct reporters.
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut groups: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+        for (key, _value) in &entries {
+            // key format: sys:downtime_attestation:{offender}:{epoch}:{reporter}
+            let parts: Vec<&str> = key.splitn(5, ':').collect();
+            if parts.len() != 5 {
+                continue;
+            }
+            let offender = parts[2].to_string();
+            let epoch = parts[3].to_string();
+            let reporter = parts[4].to_string();
+
+            // Only count reporters that are currently active validators.
+            // Stale reporters from a removed/slashed validator do not
+            // count toward quorum (anti-grief).
+            if !validators.contains(&reporter) {
+                continue;
+            }
+
+            groups
+                .entry((offender, epoch))
+                .or_default()
+                .insert(reporter);
+        }
+
+        // 4. Promote groups that hit BFT quorum.
+        for ((offender, epoch), reporters) in groups {
+            if reporters.len() < bft_quorum {
+                continue;
+            }
+
+            // Skip if already jailed (prevents double-slash if the
+            // executor runs this twice for the same offender).
+            let jail_key = format!("validator:jailed:{}", offender);
+            if matches!(self.db.get(&jail_key), Ok(Some(_))) {
+                continue;
+            }
+
+            let slash_event = serde_json::json!({
+                "event": "validator_jailed",
+                "validator": offender,
+                "epoch": epoch,
+                "reporters": reporters.iter().collect::<Vec<_>>(),
+                "reporter_count": reporters.len(),
+                "bft_quorum": bft_quorum,
+                "validator_set_size": n,
+                "reason": "downtime",
+                "penalty": "5% slash + 21-day unbonding"
+            });
+
+            // Queue the real slash and the jail marker.
+            let _ = self.db.put(
+                &format!("sys:pending_slash:{}", offender),
+                &slash_event.to_string(),
+            );
+            let _ = self
+                .db
+                .put(&jail_key, &serde_json::to_string(&reporters).unwrap_or_default());
+
+            // Drop the attestations for this (offender, epoch) to free
+            // storage and prevent re-promotion. We only drop the
+            // promoted group; attestations for OTHER offenders or
+            // future epochs are untouched.
+            let prefix = format!("sys:downtime_attestation:{}:{}:", offender, epoch);
+            for (key, _) in self.db.scan_prefix(&prefix) {
+                let _ = self.db.delete(&key);
+            }
+
+            println!(
+                "⛓️  BFT-quorum downtime slash queued for {} (reporters={}, quorum={}, n={})",
+                offender,
+                reporters.len(),
+                bft_quorum,
+                n
+            );
+        }
     }
 
     /// Execute pending slash events written by the consensus engine.
@@ -2783,5 +2917,164 @@ mod tests {
         assert_eq!(move_validators.unbonding_queue.len(), 1);
         assert_eq!(move_validators.unbonding_queue[0].stake, 950_000);
         assert_eq!(move_validators.total_supply, 950_000);
+    }
+
+    // ========================================================================
+    // Phase 2.3 (H-02): BFT-quorum downtime attestation tests
+    // ========================================================================
+
+    /// Unilateral observation is no longer enough to trigger a slash.
+    /// With 4 validators and BFT quorum = 3, a single reporter must NOT
+    /// promote the attestation to a pending_slash.
+    #[test]
+    fn downtime_attestation_below_bft_quorum_does_not_slash() {
+        let db = temp_db("downtime_below_quorum");
+        // 4-validator set, quorum = 3.
+        let validators: Vec<(String, u64)> = vec![
+            ("aaaa".repeat(8), 100),
+            ("bbbb".repeat(8), 100),
+            ("cccc".repeat(8), 100),
+            ("dddd".repeat(8), 100),
+        ];
+        db.put("sys:validators", &serde_json::to_string(&validators).unwrap())
+            .unwrap();
+
+        // Only ONE reporter attests against the offender.
+        let offender = &validators[0].0;
+        let reporter = &validators[1].0;
+        db.put(
+            &format!(
+                "sys:downtime_attestation:{}:{}:{}",
+                offender, 7, reporter
+            ),
+            &serde_json::json!({"reason": "downtime"}).to_string(),
+        )
+        .unwrap();
+
+        let executor = Executor::new(db.clone());
+        executor.promote_downtime_attestations_to_slash();
+
+        // No pending_slash queued — single reporter is below quorum.
+        assert!(db
+            .get(&format!("sys:pending_slash:{}", offender))
+            .unwrap()
+            .is_none(),
+            "single-reporter attestation must NOT promote to a slash");
+        // Attestation is retained for future reporters to potentially
+        // bring the count to quorum.
+        assert!(db
+            .get(&format!(
+                "sys:downtime_attestation:{}:{}:{}",
+                offender, 7, reporter
+            ))
+            .unwrap()
+            .is_some());
+    }
+
+    /// Once enough distinct reporters attest, the offender's slash is queued.
+    #[test]
+    fn downtime_attestation_at_bft_quorum_promotes_to_slash() {
+        let db = temp_db("downtime_at_quorum");
+        let validators: Vec<(String, u64)> = vec![
+            ("aaaa".repeat(8), 100),
+            ("bbbb".repeat(8), 100),
+            ("cccc".repeat(8), 100),
+            ("dddd".repeat(8), 100),
+        ];
+        db.put("sys:validators", &serde_json::to_string(&validators).unwrap())
+            .unwrap();
+
+        let offender = &validators[0].0;
+        // 3 distinct reporters (out of 4) — exactly BFT quorum.
+        for reporter in &validators[1..] {
+            db.put(
+                &format!(
+                    "sys:downtime_attestation:{}:{}:{}",
+                    offender, 9, reporter.0
+                ),
+                &serde_json::json!({"reason": "downtime", "round": 500}).to_string(),
+            )
+            .unwrap();
+        }
+
+        let executor = Executor::new(db.clone());
+        executor.promote_downtime_attestations_to_slash();
+
+        // pending_slash queued with quorum metadata.
+        let slash = db
+            .get(&format!("sys:pending_slash:{}", offender))
+            .unwrap()
+            .expect("BFT-quorum attestations must promote to a pending slash");
+        let parsed: serde_json::Value = serde_json::from_str(&slash).unwrap();
+        assert_eq!(parsed["reason"].as_str(), Some("downtime"));
+        assert_eq!(parsed["reporter_count"].as_u64(), Some(3));
+        assert_eq!(parsed["bft_quorum"].as_u64(), Some(3));
+
+        // Attestations for the promoted (offender, epoch) are cleaned up.
+        for reporter in &validators[1..] {
+            assert!(db
+                .get(&format!(
+                    "sys:downtime_attestation:{}:{}:{}",
+                    offender, 9, reporter.0
+                ))
+                .unwrap()
+                .is_none());
+        }
+
+        // Jail marker is set so re-running doesn't double-promote.
+        assert!(db
+            .get(&format!("validator:jailed:{}", offender))
+            .unwrap()
+            .is_some());
+    }
+
+    /// Attestations from a non-validator reporter must not count toward
+    /// quorum (anti-grief: a slashed/removed validator cannot keep
+    /// influencing slashing decisions).
+    #[test]
+    fn downtime_attestation_from_non_validator_reporter_does_not_count() {
+        let db = temp_db("downtime_stale_reporter");
+        let validators: Vec<(String, u64)> = vec![
+            ("aaaa".repeat(8), 100),
+            ("bbbb".repeat(8), 100),
+            ("cccc".repeat(8), 100),
+            ("dddd".repeat(8), 100),
+        ];
+        db.put("sys:validators", &serde_json::to_string(&validators).unwrap())
+            .unwrap();
+
+        let offender = &validators[0].0;
+        // 2 valid reporters + 1 stale (not in validator set) = only 2 count.
+        // 2 < BFT quorum of 3 → no slash should be queued.
+        let valid_reporters = [&validators[1].0, &validators[2].0];
+        let stale_reporter = "ffff".repeat(8);
+
+        for reporter in valid_reporters.iter() {
+            db.put(
+                &format!(
+                    "sys:downtime_attestation:{}:{}:{}",
+                    offender, 11, reporter
+                ),
+                &serde_json::json!({}).to_string(),
+            )
+            .unwrap();
+        }
+        db.put(
+            &format!(
+                "sys:downtime_attestation:{}:{}:{}",
+                offender, 11, stale_reporter
+            ),
+            &serde_json::json!({}).to_string(),
+        )
+        .unwrap();
+
+        let executor = Executor::new(db.clone());
+        executor.promote_downtime_attestations_to_slash();
+
+        assert!(db
+            .get(&format!("sys:pending_slash:{}", offender))
+            .unwrap()
+            .is_none(),
+            "stale reporter must not push the group over quorum");
     }
 }
