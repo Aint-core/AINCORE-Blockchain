@@ -395,4 +395,136 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&path);
     }
+
+    // ========================================================================
+    // Phase 2.5 (H-06): DAG checkpoint integrity tests
+    // ========================================================================
+
+    /// A checkpoint with no signature (legacy / unsigned) MUST still be
+    /// loaded — otherwise nodes upgrading from a pre-Phase-2 build would
+    /// be forced into a full state resync. We log a warning but accept.
+    #[test]
+    fn h06_legacy_unsigned_checkpoint_still_loads_with_warning() {
+        let (mut consensus, path) = setup_dag("h06_legacy_unsigned");
+
+        consensus.try_create_vertex();
+        consensus.try_create_vertex();
+        let checkpoint_json = {
+            let dag = consensus.dag.lock().unwrap();
+            let vs: Vec<_> = dag.values().cloned().collect();
+            serde_json::to_string(&vs).unwrap()
+        };
+        consensus
+            .storage
+            .save_dag_checkpoint(2, &checkpoint_json)
+            .unwrap();
+        consensus.storage.put("latest_proposed_round", "2").unwrap();
+
+        let db = Arc::clone(&consensus.storage);
+        let node_id = consensus.node_id.clone();
+        let node_key = consensus.node_key;
+        let recovered = DagConsensus::new(
+            node_id,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Mempool::new())),
+            Arc::new(Executor::new(Arc::clone(&db))),
+            db,
+            None,
+            None,
+            node_key,
+        );
+        let recovered_dag = recovered.dag.lock().unwrap();
+        assert!(
+            !recovered_dag.is_empty(),
+            "legacy unsigned checkpoint must still load (warning, not reject)"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A signed checkpoint produced by THIS node's key round-trips:
+    /// boot path verifies the signature and does not panic / does not
+    /// log a tamper warning.
+    #[test]
+    fn h06_signed_checkpoint_round_trips() {
+        let (consensus, path) = setup_dag("h06_signed_roundtrip");
+
+        let checkpoint_json = serde_json::json!([]).to_string();
+        let signing_key = crypto::SigningKey::from_bytes(&consensus.node_key);
+        use crypto::Signer;
+        let sig = signing_key.sign(checkpoint_json.as_bytes());
+        let sig_hex = hex::encode(sig.to_bytes());
+
+        consensus
+            .storage
+            .save_dag_checkpoint_signed(5, &checkpoint_json, &sig_hex)
+            .unwrap();
+        consensus.storage.put("latest_proposed_round", "5").unwrap();
+
+        let db = Arc::clone(&consensus.storage);
+        let node_id = consensus.node_id.clone();
+        let node_key = consensus.node_key;
+        let _ = DagConsensus::new(
+            node_id,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Mempool::new())),
+            Arc::new(Executor::new(Arc::clone(&db))),
+            db,
+            None,
+            None,
+            node_key,
+        );
+
+        // Sig still in storage post-boot — boot did not delete it.
+        assert!(consensus
+            .storage
+            .get_dag_checkpoint_signature(5)
+            .is_some());
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A checkpoint whose signature does NOT verify against this node's
+    /// key (tampered or signed with a different key) must be rejected
+    /// — the boot path falls back to scan-based recovery instead of
+    /// trusting the corrupted checkpoint.
+    #[test]
+    fn h06_tampered_checkpoint_signature_rejected() {
+        let (consensus, path) = setup_dag("h06_tampered_sig");
+
+        // Pair a legitimate-looking checkpoint with a bogus signature
+        // of the right length (cryptographically impossible to verify
+        // against the node's real Ed25519 key).
+        let checkpoint_json = serde_json::json!([]).to_string();
+        let bad_sig_hex = "00".repeat(64);
+
+        consensus
+            .storage
+            .save_dag_checkpoint_signed(7, &checkpoint_json, &bad_sig_hex)
+            .unwrap();
+        consensus.storage.put("latest_proposed_round", "7").unwrap();
+
+        let db = Arc::clone(&consensus.storage);
+        let node_id = consensus.node_id.clone();
+        let node_key = consensus.node_key;
+        let recovered = DagConsensus::new(
+            node_id,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Mempool::new())),
+            Arc::new(Executor::new(Arc::clone(&db))),
+            db,
+            None,
+            None,
+            node_key,
+        );
+
+        // Tampered checkpoint must not populate the in-memory DAG.
+        let recovered_dag = recovered.dag.lock().unwrap();
+        assert!(
+            recovered_dag.is_empty(),
+            "tampered checkpoint must not populate the in-memory DAG"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }

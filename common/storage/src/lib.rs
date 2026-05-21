@@ -576,16 +576,41 @@ impl StateDB {
 
     // === DAG CHECKPOINT SYSTEM (Aptos/Sui Style) ===
 
-    /// Save DAG checkpoint for fast recovery
-    /// Called every N rounds (e.g., 100) to enable O(1) startup
+    /// Save DAG checkpoint for fast recovery (legacy / unsigned form).
+    ///
+    /// Prefer [`Self::save_dag_checkpoint_signed`] in production. This
+    /// entry point is kept for test helpers and any legacy code path
+    /// that has not yet been migrated; checkpoints saved here have no
+    /// integrity signature and will be loaded with a warning.
     pub fn save_dag_checkpoint(
         &self,
         round: u64,
         vertices_json: &str,
     ) -> std::result::Result<(), rocksdb::Error> {
-        // Save checkpoint data
         self.put(&format!("dag:checkpoint:{}", round), vertices_json)?;
-        // Update latest checkpoint pointer
+        self.put("dag:checkpoint:latest", &round.to_string())?;
+        Ok(())
+    }
+
+    /// H-06 PROMOTED (Phase 2.5): save a DAG checkpoint with an
+    /// integrity signature.
+    ///
+    /// `signature_hex` is the hex-encoded Ed25519 signature produced
+    /// by the node over `vertices_json` (caller responsibility — the
+    /// storage layer is content-agnostic, it just persists the bytes).
+    /// On load, [`Self::verify_and_get_dag_checkpoint`] re-verifies
+    /// the signature and refuses to surface tampered checkpoints.
+    pub fn save_dag_checkpoint_signed(
+        &self,
+        round: u64,
+        vertices_json: &str,
+        signature_hex: &str,
+    ) -> std::result::Result<(), rocksdb::Error> {
+        self.put(&format!("dag:checkpoint:{}", round), vertices_json)?;
+        self.put(
+            &format!("dag:checkpoint_sig:{}", round),
+            signature_hex,
+        )?;
         self.put("dag:checkpoint:latest", &round.to_string())?;
         Ok(())
     }
@@ -598,10 +623,21 @@ impl StateDB {
         }
     }
 
-    /// Load DAG checkpoint data
+    /// Load raw DAG checkpoint data (no integrity check). Internal /
+    /// legacy callers only — production callers must go through
+    /// [`Self::verify_and_get_dag_checkpoint`].
     pub fn get_dag_checkpoint(&self, round: u64) -> Option<String> {
         match self.get(&format!("dag:checkpoint:{}", round)) {
             Ok(Some(data)) => Some(data),
+            _ => None,
+        }
+    }
+
+    /// Get the integrity signature for a checkpoint, if one was
+    /// recorded by [`Self::save_dag_checkpoint_signed`].
+    pub fn get_dag_checkpoint_signature(&self, round: u64) -> Option<String> {
+        match self.get(&format!("dag:checkpoint_sig:{}", round)) {
+            Ok(Some(s)) => Some(s),
             _ => None,
         }
     }

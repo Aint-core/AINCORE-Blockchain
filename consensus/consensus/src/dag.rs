@@ -57,25 +57,99 @@ impl DagConsensus {
         let checkpoint_round = storage.get_latest_checkpoint_round();
 
         if checkpoint_round > 0 {
-            // Fast path: Load from checkpoint
+            // Fast path: Load from checkpoint with H-06 integrity verification.
+            //
+            // Pre-Phase-2 code loaded checkpoints blindly. An attacker with
+            // write access to the storage layer could inject a fake
+            // checkpoint and the node would happily restore from it on
+            // boot — silent rollback / arbitrary-state attack.
+            //
+            // Phase 2.5: production checkpoints are now signed with the
+            // node's Ed25519 key (see save path below). On load we
+            // re-verify the signature against the local node key:
+            //   - signature present + valid  → fast recovery from checkpoint
+            //   - signature present + invalid → REJECT checkpoint, fall back
+            //     to full scan_vertices replay (safety over speed)
+            //   - signature absent (legacy)  → accept with warning
+            //
+            // The "legacy unsigned" branch is required for one-shot
+            // upgrade from a pre-Phase-2 node that already has unsigned
+            // checkpoints on disk. After one signed save cycle the
+            // unsigned checkpoints age out via prune_old_checkpoints.
+            let checkpoint_accepted: bool;
             if let Some(checkpoint_data) = storage.get_dag_checkpoint(checkpoint_round) {
-                if let Ok(vertices) = serde_json::from_str::<Vec<Vertex>>(&checkpoint_data) {
-                    for vertex in vertices {
-                        if vertex.round > max_round {
-                            max_round = vertex.round;
+                checkpoint_accepted = match storage
+                    .get_dag_checkpoint_signature(checkpoint_round)
+                {
+                    Some(sig_hex) => {
+                        let signing_key = crypto::SigningKey::from_bytes(&node_key);
+                        let verifying_key = signing_key.verifying_key();
+                        let pubkey_bytes = verifying_key.to_bytes();
+                        match hex::decode(&sig_hex) {
+                            Ok(sig_bytes) if sig_bytes.len() == 64 => {
+                                match crypto::verify_signature(
+                                    &pubkey_bytes,
+                                    checkpoint_data.as_bytes(),
+                                    &sig_bytes,
+                                ) {
+                                    Ok(true) => true,
+                                    _ => {
+                                        eprintln!(
+                                            "🚨 [H-06] Checkpoint signature INVALID for round {} — \
+                                             refusing fast recovery; falling back to scan. \
+                                             Possible storage tampering.",
+                                            checkpoint_round
+                                        );
+                                        false
+                                    }
+                                }
+                            }
+                            _ => {
+                                eprintln!(
+                                    "🚨 [H-06] Checkpoint signature malformed for round {} — \
+                                     refusing fast recovery; falling back to scan.",
+                                    checkpoint_round
+                                );
+                                false
+                            }
                         }
-                        round_idx_map
-                            .entry(vertex.round)
-                            .or_insert_with(Vec::new)
-                            .push(vertex.hash.clone());
-                        dag_map.insert(vertex.hash.clone(), vertex);
                     }
-                    println!(
-                        "⚡ Fast recovery from checkpoint: {} vertices, Round {}",
-                        dag_map.len(),
-                        checkpoint_round
-                    );
+                    None => {
+                        eprintln!(
+                            "⚠️  [H-06] Checkpoint at round {} has no signature (legacy data). \
+                             Accepting with warning; new checkpoints will be signed.",
+                            checkpoint_round
+                        );
+                        true
+                    }
+                };
+
+                if checkpoint_accepted {
+                    if let Ok(vertices) =
+                        serde_json::from_str::<Vec<Vertex>>(&checkpoint_data)
+                    {
+                        for vertex in vertices {
+                            if vertex.round > max_round {
+                                max_round = vertex.round;
+                            }
+                            round_idx_map
+                                .entry(vertex.round)
+                                .or_insert_with(Vec::new)
+                                .push(vertex.hash.clone());
+                            dag_map.insert(vertex.hash.clone(), vertex);
+                        }
+                        println!(
+                            "⚡ Fast recovery from checkpoint: {} vertices, Round {}",
+                            dag_map.len(),
+                            checkpoint_round
+                        );
+                    }
                 }
+                // Whether or not checkpoint was accepted, the tail-replay
+                // loop below still runs to fill in vertices written after
+                // the checkpoint. If the checkpoint was rejected, the
+                // tail replay alone reconstructs as much of the DAG as
+                // honest on-disk data permits.
             }
 
             // Checkpoints are saved periodically, while every proposed vertex is persisted
@@ -760,17 +834,34 @@ impl DagConsensus {
                     }
                 }
 
-                // CHECKPOINT SAVE: Save checkpoint every 100 rounds for fast recovery
+                // CHECKPOINT SAVE: Save checkpoint every 100 rounds for fast
+                // recovery. Phase 2.5 (H-06): we now sign the checkpoint JSON
+                // with the node's Ed25519 key and route through
+                // `save_dag_checkpoint_signed` so the boot-time loader can
+                // detect tampering. A node booting against a checkpoint that
+                // doesn't verify against its OWN key will refuse to fast-
+                // recover from it and fall back to a full scan replay.
                 if self.current_round % 100 == 0 {
                     if let Ok(dag) = self.dag.lock() {
                         let vertices: Vec<&Vertex> = dag.values().collect();
                         if let Ok(json) = serde_json::to_string(&vertices) {
-                            if let Err(e) =
-                                self.storage.save_dag_checkpoint(self.current_round, &json)
-                            {
-                                eprintln!("⚠️ Failed to save checkpoint: {}", e);
+                            let signing_key = crypto::SigningKey::from_bytes(&self.node_key);
+                            use crypto::Signer;
+                            let sig = signing_key.sign(json.as_bytes());
+                            let sig_hex = hex::encode(sig.to_bytes());
+
+                            if let Err(e) = self.storage.save_dag_checkpoint_signed(
+                                self.current_round,
+                                &json,
+                                &sig_hex,
+                            ) {
+                                eprintln!("⚠️ Failed to save signed checkpoint: {}", e);
                             } else {
-                                println!("💾 Checkpoint saved at Round {}", self.current_round);
+                                println!(
+                                    "💾 Signed checkpoint saved at Round {} ({}B sig)",
+                                    self.current_round,
+                                    sig_hex.len() / 2
+                                );
                                 // Prune old checkpoints (keep last 5)
                                 let _ = self.storage.prune_old_checkpoints(self.current_round, 500);
                             }
