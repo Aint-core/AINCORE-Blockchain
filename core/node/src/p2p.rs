@@ -1,35 +1,42 @@
-use libp2p::{
-    core::upgrade,
-    identity,
-    noise,
-    yamux,
-    gossipsub::{Behaviour as GossipsubBehaviour, Config as GossipsubConfig, IdentTopic, MessageAuthenticity, Event as GossipsubEvent},
-    mdns::{tokio::Behaviour as Mdns, Event as MdnsEvent, Config as MdnsConfig},
-    kad::{store::MemoryStore, Behaviour as Kademlia, Config as KademliaConfig, Event as KademliaEvent},
-    swarm::{Swarm, SwarmEvent},
-    Multiaddr, PeerId, Transport,
-    multiaddr::Protocol,
-    tcp,
-    autonat,
-    identify,
-    dcutr,
-    relay,
-};
 use libp2p::futures::StreamExt;
-use tokio::sync::mpsc;
+use libp2p::{
+    autonat,
+    core::upgrade,
+    dcutr,
+    gossipsub::{
+        Behaviour as GossipsubBehaviour, ConfigBuilder as GossipsubConfigBuilder,
+        Event as GossipsubEvent, IdentTopic, MessageAuthenticity, ValidationMode,
+    },
+    identify, identity,
+    kad::{
+        store::MemoryStore, Behaviour as Kademlia, Config as KademliaConfig, Event as KademliaEvent,
+    },
+    mdns::{tokio::Behaviour as Mdns, Config as MdnsConfig, Event as MdnsEvent},
+    multiaddr::Protocol,
+    noise, relay,
+    swarm::{Swarm, SwarmEvent},
+    tcp, yamux, Multiaddr, PeerId, Transport,
+};
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 use storage::StateDB;
+use tokio::sync::mpsc;
 
 // === START P2P ===
 use libp2p::swarm::behaviour::toggle::Toggle;
 
 // === START P2P ===
 // Returns: (Sender to broadcast, Receiver for incoming messages)
-pub async fn start_p2p(port: u16, bootnodes: Vec<String>, storage: Arc<StateDB>, enable_mdns: bool, enable_nat: bool) -> Result<(mpsc::Sender<String>, mpsc::Receiver<String>), Box<dyn Error>> {
+pub async fn start_p2p(
+    port: u16,
+    bootnodes: Vec<String>,
+    storage: Arc<StateDB>,
+    enable_mdns: bool,
+    enable_nat: bool,
+) -> Result<(mpsc::Sender<String>, mpsc::Receiver<String>), Box<dyn Error>> {
     let (tx_out, mut rx_in) = mpsc::channel::<String>(64); // Main -> P2P
-    let (tx_in, rx_out) = mpsc::channel::<String>(64);     // P2P -> Main
+    let (tx_in, rx_out) = mpsc::channel::<String>(64); // P2P -> Main
 
     // === Generate keypair ===
     let local_key = identity::Keypair::generate_ed25519();
@@ -54,8 +61,48 @@ pub async fn start_p2p(port: u16, bootnodes: Vec<String>, storage: Arc<StateDB>,
         .multiplex(yamux::Config::default())
         .boxed();
 
-    // === Gossipsub behaviour ===
-    let gossipsub_config = GossipsubConfig::default();
+    // === Gossipsub behaviour (Phase 2.7 / M-05 hardened config) ===
+    //
+    // Default libp2p Gossipsub config is tuned for general use, not for a
+    // BFT L1 with adversarial validators. M-05 tightens the params:
+    //
+    //   * validation_mode = Strict
+    //       Reject malformed messages immediately instead of forwarding,
+    //       so a Byzantine peer cannot waste mesh bandwidth flooding
+    //       garbage to its neighbours.
+    //   * max_transmit_size = 1 MiB
+    //       Bounds per-message work and aligns with the mempool's 100KB
+    //       tx limit + headroom for batched DAG vertices. Default is
+    //       much larger and lets a single peer push memory pressure.
+    //   * mesh params (D, D_lo, D_hi)
+    //       Default D=6 is fine for typical p2p; we keep it but pin the
+    //       low/high watermarks so adversarial churn cannot drift the
+    //       mesh into degenerate fan-out.
+    //   * heartbeat_interval = 1 s (default), but documented here so the
+    //       cadence is explicit when reading the config.
+    //   * duplicate_cache_time = 60 s
+    //       Suppresses replayed messages for a full minute. The default
+    //       (30 s) is on the low side for a chain with 5 s round times
+    //       under load.
+    //   * message_id_fn = sha256 of payload
+    //       Deduplication keys are cryptographic, not pointer-based, so
+    //       semantically-equal messages from different peers collapse.
+    let gossipsub_config = GossipsubConfigBuilder::default()
+        .validation_mode(ValidationMode::Strict)
+        .max_transmit_size(1 << 20) // 1 MiB
+        .mesh_n(6)
+        .mesh_n_low(4)
+        .mesh_n_high(12)
+        .heartbeat_interval(Duration::from_secs(1))
+        .duplicate_cache_time(Duration::from_secs(60))
+        .message_id_fn(|msg| {
+            use sha2::{Digest, Sha256};
+            libp2p::gossipsub::MessageId::from(
+                Sha256::digest(&msg.data).to_vec(),
+            )
+        })
+        .build()
+        .map_err(|e| -> Box<dyn Error> { format!("gossipsub config: {}", e).into() })?;
     let mut gossipsub = GossipsubBehaviour::new(
         MessageAuthenticity::Signed(local_key.clone()),
         gossipsub_config,
@@ -80,10 +127,7 @@ pub async fn start_p2p(port: u16, bootnodes: Vec<String>, storage: Arc<StateDB>,
     let kademlia = Kademlia::with_config(local_peer_id, store, kad_config);
 
     // === AutoNAT ===
-    let autonat = autonat::Behaviour::new(
-        local_peer_id,
-        autonat::Config::default(),
-    );
+    let autonat = autonat::Behaviour::new(local_peer_id, autonat::Config::default());
 
     // === Identify ===
     let identify = identify::Behaviour::new(identify::Config::new(
@@ -105,8 +149,6 @@ pub async fn start_p2p(port: u16, bootnodes: Vec<String>, storage: Arc<StateDB>,
         None
     };
 
-
-
     // === Combine behaviours ===
     #[derive(libp2p::swarm::NetworkBehaviour)]
     struct P2PBehaviour {
@@ -119,9 +161,9 @@ pub async fn start_p2p(port: u16, bootnodes: Vec<String>, storage: Arc<StateDB>,
         pub relay: Toggle<relay::client::Behaviour>,
     }
 
-    let behaviour = P2PBehaviour { 
-        gossipsub, 
-        mdns: Toggle::from(mdns), 
+    let behaviour = P2PBehaviour {
+        gossipsub,
+        mdns: Toggle::from(mdns),
         kademlia,
         autonat,
         identify,
@@ -141,10 +183,13 @@ pub async fn start_p2p(port: u16, bootnodes: Vec<String>, storage: Arc<StateDB>,
     for peer_addr in bootnodes {
         if let Ok(multiaddr) = peer_addr.parse::<Multiaddr>() {
             println!("🔗 Adding bootnode: {:?}", multiaddr);
-    if let Some(Protocol::P2p(peer_id)) = multiaddr.iter().last() {
-        swarm.behaviour_mut().kademlia.add_address(&peer_id, multiaddr.clone());
-        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-    }
+            if let Some(Protocol::P2p(peer_id)) = multiaddr.iter().last() {
+                swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, multiaddr.clone());
+                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+            }
             // Force dial
             if let Err(e) = swarm.dial(multiaddr) {
                 eprintln!("❌ Failed to dial bootnode: {:?}", e);
@@ -158,7 +203,8 @@ pub async fn start_p2p(port: u16, bootnodes: Vec<String>, storage: Arc<StateDB>,
     Swarm::listen_on(&mut swarm, addr)?;
 
     // === LiDAR DDoS Protection ===
-    let mut lidar_tracker: std::collections::HashMap<PeerId, (std::time::Instant, u32)> = std::collections::HashMap::new();
+    let mut lidar_tracker: std::collections::HashMap<PeerId, (std::time::Instant, u32)> =
+        std::collections::HashMap::new();
     const MAX_MSG_PER_SEC: u32 = 100; // Production Grade Limit
 
     // === Event Loop ===
@@ -175,7 +221,7 @@ pub async fn start_p2p(port: u16, bootnodes: Vec<String>, storage: Arc<StateDB>,
                             println!("👀 mDNS discovered a new peer: {:?}", peer_id);
                             let _ = swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                             swarm.behaviour_mut().kademlia.add_address(&peer_id, multiaddr.clone());
-                            
+
                             // Persist peer
                             let _ = storage.save_peer_addr(&peer_id.to_string(), &multiaddr.to_string());
                         }
@@ -189,7 +235,7 @@ pub async fn start_p2p(port: u16, bootnodes: Vec<String>, storage: Arc<StateDB>,
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Kademlia(KademliaEvent::RoutingUpdated { peer, addresses, .. })) => {
                         println!("🕸️  Kademlia Routing Updated: peer={:?} addrs={:?}", peer, addresses);
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
-                        
+
                         // Persist peer (save first known address)
                         if let Some(addr) = addresses.iter().next() {
                              let _ = storage.save_peer_addr(&peer.to_string(), &addr.to_string());
@@ -199,7 +245,7 @@ pub async fn start_p2p(port: u16, bootnodes: Vec<String>, storage: Arc<StateDB>,
                         // 🛡️ LiDAR PROTECTION LOGIC
                         let now = std::time::Instant::now();
                         let (last_time, count) = lidar_tracker.entry(peer_id).or_insert((now, 0));
-                        
+
                         if now.duration_since(*last_time) > std::time::Duration::from_secs(1) {
                             // Reset window
                             *last_time = now;
