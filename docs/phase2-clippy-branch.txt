@@ -1,0 +1,29 @@
+error: could not compile `crypto` (lib test) due to 4 previous errors; 29 warnings emitted
+error: self-assignment of `state[0]` to `state[0]`
+error: self-assignment of `state[1]` to `state[1]`
+error: self-assignment of `state[2]` to `state[2]`
+error: self-assignment of `state[3]` to `state[3]`
+warning: `blockchain` (lib) generated 6 warnings (run `cargo clippy --fix --lib -p blockchain` to apply 5 suggestions)
+warning: `crypto` (lib test) generated 29 warnings (17 duplicates)
+warning: `crypto` (lib) generated 17 warnings (run `cargo clippy --fix --lib -p crypto` to apply 5 suggestions)
+warning: `network` (lib) generated 3 warnings (run `cargo clippy --fix --lib -p network` to apply 2 suggestions)
+warning: build failed, waiting for other jobs to finish...
+warning: duplicated attribute
+warning: empty line after doc comment
+warning: it looks like you're manually copying between slices
+warning: length comparison to zero
+warning: manual implementation of `.is_multiple_of()`
+warning: manual implementation of an assign operation
+warning: the borrowed expression implements the required traits
+warning: the loop variable `i` is only used to index `state`
+warning: the loop variable `i` is used to index `new_state`
+warning: this `if let` can be collapsed into the outer `if let`
+warning: this can be `std::io::Error::other(_)`
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+warning: unused import: `crate::zkp::merkle_trace::MerkleTrace`
+warning: unused import: `winterfell::math::StarkField`
+warning: unused variable: `group_pk`
+warning: use of deprecated associated function `sha2::digest::generic_array::GenericArray::<T, N>::from_slice`: please upgrade to generic-array 1.x
+warning: use of deprecated method `sha2::digest::generic_array::GenericArray::<T, N>::as_slice`: please upgrade to generic-array 1.x
+warning: useless use of `vec!`
+warning: you should consider adding a `Default` implementation for `RecursiveProver`

@@ -1,0 +1,59 @@
+1c1
+< error: could not compile `crypto` (lib test) due to 4 previous errors; 27 warnings emitted
+---
+> error: could not compile `crypto` (lib test) due to 4 previous errors; 29 warnings emitted
+6,18c6,8
+< warning: `aincore-cli` (bin "aincore-cli" test) generated 1 warning (1 duplicate)
+< warning: `aincore-cli` (bin "aincore-cli") generated 1 warning (run `cargo clippy --fix --bin "aincore-cli"` to apply 1 suggestion)
+< warning: `blockchain` (lib test) generated 6 warnings (run `cargo clippy --fix --lib -p blockchain --tests` to apply 5 suggestions)
+< warning: `blockchain` (lib) generated 6 warnings (6 duplicates)
+< warning: `bridge-rust` (bin "bridge-rust" test) generated 3 warnings (3 duplicates)
+< warning: `bridge-rust` (bin "bridge-rust") generated 3 warnings (run `cargo clippy --fix --bin "bridge-rust"` to apply 3 suggestions)
+< warning: `crypto` (lib test) generated 27 warnings (15 duplicates)
+< warning: `crypto` (lib) generated 15 warnings (run `cargo clippy --fix --lib -p crypto` to apply 5 suggestions)
+< warning: `da_sequencer` (lib test) generated 19 warnings (13 duplicates) (run `cargo clippy --fix --lib -p da_sequencer --tests` to apply 5 suggestions)
+< warning: `da_sequencer` (lib) generated 13 warnings (run `cargo clippy --fix --lib -p da_sequencer` to apply 7 suggestions)
+< warning: `executor` (lib) generated 10 warnings (run `cargo clippy --fix --lib -p executor` to apply 7 suggestions)
+< warning: `indexer` (bin "indexer" test) generated 4 warnings (run `cargo clippy --fix --bin "indexer" --tests` to apply 4 suggestions)
+< warning: `indexer` (bin "indexer") generated 4 warnings (4 duplicates)
+---
+> warning: `blockchain` (lib) generated 6 warnings (run `cargo clippy --fix --lib -p blockchain` to apply 5 suggestions)
+> warning: `crypto` (lib test) generated 29 warnings (17 duplicates)
+> warning: `crypto` (lib) generated 17 warnings (run `cargo clippy --fix --lib -p crypto` to apply 5 suggestions)
+20d9
+< warning: `to_string` applied to a type that implements `Display` in `format!` args
+22d10
+< warning: casting to the same type is unnecessary (`u128` -> `u128`)
+24,25c12
+< warning: empty lines after doc comment
+< warning: empty string literal in `println!`
+---
+> warning: empty line after doc comment
+27d13
+< warning: length comparison to one
+29,30d14
+< warning: manual `RangeInclusive::contains` implementation
+< warning: manual arithmetic check found
+33,35d16
+< warning: manually reimplementing `div_ceil`
+< warning: method `default` can be confused for the standard trait method `std::default::Default::default`
+< warning: stripping a prefix manually
+37,38d17
+< warning: the loop variable `i` is only used to index `partial_shards`
+< warning: the loop variable `i` is only used to index `shards`
+41d19
+< warning: this `else { if .. }` block can be collapsed
+43,44d20
+< warning: this `if` statement can be collapsed
+< warning: this `match` expression can be replaced with `?`
+47,49d22
+< warning: this operation has no effect
+< warning: unnecessary `if let` since only the `Ok` variant of the iterator element is used
+< warning: unnecessary `if let` since only the `Some` variant of the iterator element is used
+53a27
+> warning: use of deprecated method `sha2::digest::generic_array::GenericArray::<T, N>::as_slice`: please upgrade to generic-array 1.x
+55,58d28
+< warning: very complex type used. Consider factoring parts into `type` definitions
+< warning: you seem to use `.enumerate()` and immediately discard the index
+< warning: you should consider adding a `Default` implementation for `DAMetrics`
+< warning: you should consider adding a `Default` implementation for `LightClient`
