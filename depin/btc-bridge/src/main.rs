@@ -32,22 +32,50 @@ async fn main() {
         match btc.get_deposits(CONFIRMATIONS).await {
             Ok(deposits) => {
                 for (tx_hash, amount, user) in deposits {
-                    if !db.is_processed(&tx_hash) {
-                        println!(
-                            "💰 New Deposit Detected: {} sats from tx {}",
-                            amount, tx_hash
-                        );
+                    // H-03 (BTC port): is_seen() now also covers in-progress
+                    // tombstones from a crashed prior run — those entries
+                    // must NOT be retried automatically.
+                    if db.is_seen(&tx_hash) {
+                        continue;
+                    }
 
-                        // Mint wBTC
-                        match aincore.mint_wbtc(&user, amount).await {
-                            Ok(_) => {
-                                println!("✅ Minted successfully!");
-                                if let Err(e) = db.mark_processed(tx_hash.clone()) {
-                                    eprintln!("❌ Failed to save state: {}", e);
-                                }
+                    println!(
+                        "💰 New Deposit Detected: {} sats from tx {}",
+                        amount, tx_hash
+                    );
+
+                    // H-03 fix: tombstone BEFORE mint. If save() fails we
+                    // abort the mint attempt entirely — better to be late
+                    // than to double-mint after a crash between mint and
+                    // mark_completed.
+                    if let Err(e) = db.mark_in_progress(tx_hash.clone()) {
+                        eprintln!(
+                            "❌ [H-03] Failed to tombstone tx {} before mint; \
+                             ABORTING mint to prevent double-mint risk: {}",
+                            tx_hash, e
+                        );
+                        continue;
+                    }
+
+                    // Attempt the mint. On success: promote tombstone to
+                    // Completed. On failure: leave as InProgress so the
+                    // operator can investigate; automatic retry is blocked.
+                    match aincore.mint_wbtc(&user, amount).await {
+                        Ok(_) => {
+                            println!("✅ Minted successfully!");
+                            if let Err(e) = db.mark_completed(&tx_hash) {
+                                eprintln!(
+                                    "⚠️  Mint succeeded but mark_completed failed: {} \
+                                     (tx remains in InProgress; operator must verify)",
+                                    e
+                                );
                             }
-                            Err(e) => eprintln!("❌ Minting failed: {}", e),
                         }
+                        Err(e) => eprintln!(
+                            "❌ Minting failed for tx {}: {} \
+                             (left as InProgress; operator-manual resolution)",
+                            tx_hash, e
+                        ),
                     }
                 }
             }

@@ -105,56 +105,44 @@ pub struct DASequencer {
 }
 
 impl DASequencer {
-    /// Legacy constructor — keeps the DA signing key in RocksDB as
-    /// plaintext hex (pre-Phase-2.9 behaviour). Retained so callers
-    /// that haven't been wired to pass a node identity continue to
-    /// work, but emits a loud warning. Production callers should use
-    /// [`Self::new_encrypted`].
-    pub fn new(
-        node_id: String,
-        storage: Arc<StateDB>,
-        peers: Arc<Mutex<HashMap<String, u16>>>,
-    ) -> Self {
-        eprintln!(
-            "⚠️  [DA Sequencer M-09] new() stores the DA signing key as plaintext \
-             in RocksDB. Migrate the caller to new_encrypted(node_identity, ...) \
-             for at-rest encryption."
-        );
-        Self::initialize(node_id, storage, peers, None)
-    }
-
-    /// Phase 2.9 (M-09): construct a DA sequencer that encrypts its
-    /// signing key at rest using a key derived from the supplied node
-    /// identity (typically the node's persistent Ed25519 key bytes
-    /// loaded from `node.key`).
+    /// Phase 2.9 (M-09) + Phase 5.3 (C1): the ONLY way to construct a DA
+    /// sequencer. The signing key is encrypted at rest with a key derived
+    /// from `node_identity` (typically the node's persistent Ed25519 key
+    /// bytes loaded from `node.key`).
     ///
-    /// Threat model upgrade: pre-Phase-2.9 anyone who could read the
-    /// RocksDB directory could trivially extract the DA signing key.
-    /// With encryption the attacker also needs the node identity,
-    /// which lives in a separately-permissioned file outside the
-    /// database. This raises the bar from "any RocksDB-read attacker"
-    /// to "filesystem-read attacker with node.key access" — the same
-    /// blast radius as full node compromise, which is the floor we
-    /// can practically achieve without HSM/TPM hardware.
+    /// Threat model: pre-Phase-2.9 anyone who could read the RocksDB
+    /// directory could trivially extract the DA signing key. With
+    /// encryption the attacker also needs the node identity, which lives
+    /// in a separately-permissioned file outside the database. This
+    /// raises the bar from "any RocksDB-read attacker" to "filesystem-
+    /// read attacker with node.key access" — the same blast radius as
+    /// full node compromise, which is the floor we can practically
+    /// achieve without HSM/TPM hardware.
     ///
     /// On boot the routine prefers the encrypted blob; if only the
     /// legacy plaintext key is present it migrates atomically — decrypt
     /// then re-encrypt then delete legacy — so a one-shot upgrade does
     /// not regenerate the DA identity.
+    ///
+    /// Phase 5.3 cleanup: the legacy `new()` constructor (which stored
+    /// the signing key as plaintext when no identity was supplied) has
+    /// been removed. There is no longer a path that writes a plaintext
+    /// DA key to disk — the only remaining plaintext read path is the
+    /// one-shot legacy migration into the encrypted form.
     pub fn new_encrypted(
         node_id: String,
         storage: Arc<StateDB>,
         peers: Arc<Mutex<HashMap<String, u16>>>,
         node_identity: &[u8; 32],
     ) -> Self {
-        Self::initialize(node_id, storage, peers, Some(*node_identity))
+        Self::initialize(node_id, storage, peers, *node_identity)
     }
 
     fn initialize(
         node_id: String,
         storage: Arc<StateDB>,
         peers: Arc<Mutex<HashMap<String, u16>>>,
-        node_identity: Option<[u8; 32]>,
+        node_identity: [u8; 32],
     ) -> Self {
         println!("⚙️ Initializing Sovereign Data Availability Sequencer (Production Grade)...");
         println!("🏰 [DA Sequencer] 100% Sovereign Mode - No external dependencies!");
@@ -193,34 +181,24 @@ impl DASequencer {
     }
 
     /// Returns the 32-byte DA signing key, decrypting / migrating as
-    /// needed. Logic:
-    ///   1. If encrypted blob exists AND we have a node identity → decrypt.
-    ///      If decrypt fails, abort (do NOT silently regenerate, which
-    ///      would orphan past signed batches).
-    ///   2. Else if legacy plaintext exists:
-    ///        - encryption available → migrate (encrypt + delete plaintext),
-    ///        - encryption unavailable → keep as legacy plaintext.
-    ///   3. Else generate fresh:
-    ///        - encryption available → encrypt and store,
-    ///        - encryption unavailable → store plaintext (warning).
+    /// needed. Phase 5.3 cleanup: node_identity is now mandatory and
+    /// there is no plaintext-write fallback. Logic:
+    ///   1. If encrypted blob exists → decrypt (panic on failure rather
+    ///      than silently regenerate, which would orphan signed batches).
+    ///   2. Else if legacy plaintext exists → migrate atomically
+    ///      (decrypt-read + encrypt-write + delete-legacy). If the
+    ///      encrypt step fails the boot is aborted via panic — we never
+    ///      keep a key in plaintext on a fresh write.
+    ///   3. Else generate fresh and store encrypted.
     fn load_or_generate_signing_key(
         storage: &Arc<StateDB>,
-        node_identity: Option<[u8; 32]>,
+        node_identity: [u8; 32],
     ) -> [u8; 32] {
         use crypto::transport::TransportEngine;
+        let enc_key = derive_da_enc_key(&node_identity);
 
         // Path 1: encrypted blob present.
         if let Ok(Some(blob_hex)) = storage.get(DA_KEY_ENCRYPTED_V1) {
-            let enc_key = match node_identity {
-                Some(id) => derive_da_enc_key(&id),
-                None => {
-                    panic!(
-                        "[DA Sequencer M-09] encrypted DA signing key is present \
-                         but no node identity was supplied to decrypt it. \
-                         Refusing to regenerate; this would orphan signed batches."
-                    );
-                }
-            };
             let (nonce, ciphertext) = decode_encrypted_key(&blob_hex)
                 .expect("[DA Sequencer M-09] encrypted DA key blob is malformed");
             let plaintext = TransportEngine::decrypt(&enc_key, &nonce, &ciphertext)
@@ -228,91 +206,62 @@ impl DASequencer {
                     "[DA Sequencer M-09] failed to decrypt DA signing key — \
                      node identity may have changed. Refusing to regenerate.",
                 );
-            if plaintext.len() != 32 {
-                panic!(
-                    "[DA Sequencer M-09] decrypted DA key has wrong length: {}",
-                    plaintext.len()
-                );
-            }
+            assert_eq!(
+                plaintext.len(),
+                32,
+                "[DA Sequencer M-09] decrypted DA key has wrong length"
+            );
             let mut key_bytes = [0u8; 32];
             key_bytes.copy_from_slice(&plaintext);
             println!("🔑 [DA Sequencer] Loaded encrypted DA signing key (decrypted at boot).");
             return key_bytes;
         }
 
-        // Path 2: legacy plaintext present.
+        // Path 2: legacy plaintext present — one-shot migration to encrypted.
         if let Ok(Some(legacy_hex)) = storage.get(DA_KEY_LEGACY_PLAINTEXT) {
+            let decoded = hex::decode(&legacy_hex)
+                .expect("[DA Sequencer M-09] legacy plaintext DA key is not valid hex");
+            assert_eq!(
+                decoded.len(),
+                32,
+                "[DA Sequencer M-09] legacy plaintext DA key has wrong length"
+            );
             let mut key_bytes = [0u8; 32];
-            if let Ok(decoded) = hex::decode(&legacy_hex) {
-                if decoded.len() == 32 {
-                    key_bytes.copy_from_slice(&decoded);
-                    if let Some(id) = node_identity {
-                        // Migrate to encrypted form.
-                        let enc_key = derive_da_enc_key(&id);
-                        match TransportEngine::encrypt_safe(&enc_key, &key_bytes) {
-                            Ok((nonce, ciphertext)) => {
-                                let _ = storage.put(
-                                    DA_KEY_ENCRYPTED_V1,
-                                    &encode_encrypted_key(nonce, &ciphertext),
-                                );
-                                let _ = storage.delete(DA_KEY_LEGACY_PLAINTEXT);
-                                println!(
-                                    "🔑 [DA Sequencer M-09] Migrated legacy plaintext DA \
-                                     signing key to encrypted-at-rest form."
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "⚠️  [DA Sequencer M-09] Migration to encrypted form \
-                                     failed: {} — keeping legacy plaintext.",
-                                    e
-                                );
-                            }
-                        }
-                    } else {
-                        eprintln!(
-                            "⚠️  [DA Sequencer M-09] Legacy plaintext DA key in use. \
-                             Migrate caller to new_encrypted() to enable at-rest encryption."
-                        );
-                    }
-                    return key_bytes;
-                }
-            }
+            key_bytes.copy_from_slice(&decoded);
+            let (nonce, ciphertext) = TransportEngine::encrypt_safe(&enc_key, &key_bytes)
+                .expect(
+                    "[DA Sequencer M-09 / C1] legacy → encrypted migration failed; \
+                     refusing to keep the key as plaintext. Investigate transport layer.",
+                );
+            let _ = storage.put(
+                DA_KEY_ENCRYPTED_V1,
+                &encode_encrypted_key(nonce, &ciphertext),
+            );
+            let _ = storage.delete(DA_KEY_LEGACY_PLAINTEXT);
+            println!(
+                "🔑 [DA Sequencer M-09] Migrated legacy plaintext DA signing key \
+                 to encrypted-at-rest form."
+            );
+            return key_bytes;
         }
 
-        // Path 3: nothing present — generate fresh.
+        // Path 3: nothing present — generate fresh and store encrypted.
         use rand::RngCore;
         let mut key_bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut key_bytes);
 
-        if let Some(id) = node_identity {
-            let enc_key = derive_da_enc_key(&id);
-            match TransportEngine::encrypt_safe(&enc_key, &key_bytes) {
-                Ok((nonce, ciphertext)) => {
-                    let _ = storage.put(
-                        DA_KEY_ENCRYPTED_V1,
-                        &encode_encrypted_key(nonce, &ciphertext),
-                    );
-                    println!(
-                        "🔑 [DA Sequencer M-09] Generated NEW DA signing key (stored encrypted-at-rest)."
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "⚠️  [DA Sequencer M-09] encrypt_safe failed ({}). Falling back \
-                         to plaintext storage. Investigate transport layer.",
-                        e
-                    );
-                    let _ = storage.put(DA_KEY_LEGACY_PLAINTEXT, &hex::encode(key_bytes));
-                }
-            }
-        } else {
-            let _ = storage.put(DA_KEY_LEGACY_PLAINTEXT, &hex::encode(key_bytes));
-            eprintln!(
-                "⚠️  [DA Sequencer M-09] Generated NEW DA signing key without node identity \
-                 — stored as plaintext. Migrate caller to new_encrypted()."
+        let (nonce, ciphertext) = TransportEngine::encrypt_safe(&enc_key, &key_bytes)
+            .expect(
+                "[DA Sequencer M-09 / C1] failed to encrypt fresh DA key; \
+                 refusing to write plaintext fallback. Investigate transport layer.",
             );
-        }
+        let _ = storage.put(
+            DA_KEY_ENCRYPTED_V1,
+            &encode_encrypted_key(nonce, &ciphertext),
+        );
+        println!(
+            "🔑 [DA Sequencer M-09] Generated NEW DA signing key (stored encrypted-at-rest)."
+        );
         key_bytes
     }
 

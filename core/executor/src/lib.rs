@@ -173,12 +173,14 @@ fn tx_hash_hex(tx_json: &str) -> String {
 }
 
 fn receipt_update(
+    db: &StateDB,
     tx_json: &str,
+    updates: &[(String, Option<String>)],
     status: &str,
     gas_charged: u128,
     error: Option<String>,
 ) -> (String, Option<String>) {
-    let metadata = receipt_metadata(tx_json);
+    let metadata = receipt_metadata(db, tx_json, updates, status);
     let value = serde_json::json!({
         "status": status,
         "gas_charged": gas_charged.to_string(),
@@ -195,7 +197,25 @@ fn bcs_arg<T: serde::de::DeserializeOwned>(args: &[Vec<u8>], index: usize) -> Op
     args.get(index).and_then(|bytes| bcs::from_bytes(bytes).ok())
 }
 
-fn receipt_metadata(tx_json: &str) -> Option<serde_json::Value> {
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DexReceiptCoin {
+    value: u128,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DexReceiptPool {
+    coin_x: DexReceiptCoin,
+    coin_y: DexReceiptCoin,
+    lp_supply: u128,
+    fee_bp: u64,
+}
+
+struct DexReceiptContext {
+    tx: Transaction,
+    call: vm_move::EntryFunctionCall,
+}
+
+fn decode_dex_receipt_context(tx_json: &str) -> Option<DexReceiptContext> {
     let tx = serde_json::from_str::<Transaction>(tx_json).ok()?;
     let payload_bytes = hex::decode(tx.payload.trim_start_matches("0x")).ok()?;
     let payload = bcs::from_bytes::<vm_move::TransactionPayload>(&payload_bytes).ok()?;
@@ -205,6 +225,135 @@ fn receipt_metadata(tx_json: &str) -> Option<serde_json::Value> {
     if *call.module.address() != system_address() || call.module.name().as_str() != "dex" {
         return None;
     }
+
+    Some(DexReceiptContext { tx, call })
+}
+
+fn read_updated_value<'a>(
+    db: &'a StateDB,
+    updates: &'a [(String, Option<String>)],
+    key: &str,
+) -> Option<String> {
+    for (candidate, value) in updates.iter().rev() {
+        if candidate == key {
+            return value.clone();
+        }
+    }
+    db.get(key).ok().flatten()
+}
+
+fn decode_dex_pool_from_state(
+    db: &StateDB,
+    updates: &[(String, Option<String>)],
+    pool_addr: move_core_types::account_address::AccountAddress,
+    ty_args: &[move_core_types::language_storage::TypeTag],
+) -> Option<DexReceiptPool> {
+    let key = dex_pool_key_for_type_args(pool_addr, ty_args)?;
+    read_updated_value(db, updates, &key)
+        .and_then(|hex_value| hex::decode(hex_value).ok())
+        .and_then(|bytes| bcs::from_bytes::<DexReceiptPool>(&bytes).ok())
+}
+
+fn add_pool_delta_metadata(
+    metadata: &mut serde_json::Map<String, serde_json::Value>,
+    pre_pool: &DexReceiptPool,
+    post_pool: &DexReceiptPool,
+    function: &str,
+    type_args: &[String],
+) {
+    metadata.insert(
+        "reserve_x_before".to_string(),
+        serde_json::json!(pre_pool.coin_x.value.to_string()),
+    );
+    metadata.insert(
+        "reserve_y_before".to_string(),
+        serde_json::json!(pre_pool.coin_y.value.to_string()),
+    );
+    metadata.insert(
+        "reserve_x_after".to_string(),
+        serde_json::json!(post_pool.coin_x.value.to_string()),
+    );
+    metadata.insert(
+        "reserve_y_after".to_string(),
+        serde_json::json!(post_pool.coin_y.value.to_string()),
+    );
+    metadata.insert(
+        "lp_supply_before".to_string(),
+        serde_json::json!(pre_pool.lp_supply.to_string()),
+    );
+    metadata.insert(
+        "lp_supply_after".to_string(),
+        serde_json::json!(post_pool.lp_supply.to_string()),
+    );
+
+    match function {
+        "add_liquidity" => {
+            metadata.insert(
+                "actual_amount_x".to_string(),
+                serde_json::json!(
+                    post_pool.coin_x.value.saturating_sub(pre_pool.coin_x.value).to_string()
+                ),
+            );
+            metadata.insert(
+                "actual_amount_y".to_string(),
+                serde_json::json!(
+                    post_pool.coin_y.value.saturating_sub(pre_pool.coin_y.value).to_string()
+                ),
+            );
+            metadata.insert(
+                "actual_lp_minted".to_string(),
+                serde_json::json!(post_pool.lp_supply.saturating_sub(pre_pool.lp_supply).to_string()),
+            );
+        }
+        "remove_liquidity" => {
+            metadata.insert(
+                "actual_amount_x".to_string(),
+                serde_json::json!(
+                    pre_pool.coin_x.value.saturating_sub(post_pool.coin_x.value).to_string()
+                ),
+            );
+            metadata.insert(
+                "actual_amount_y".to_string(),
+                serde_json::json!(
+                    pre_pool.coin_y.value.saturating_sub(post_pool.coin_y.value).to_string()
+                ),
+            );
+            metadata.insert(
+                "actual_lp_burned".to_string(),
+                serde_json::json!(pre_pool.lp_supply.saturating_sub(post_pool.lp_supply).to_string()),
+            );
+        }
+        "swap_x_to_y" => {
+            metadata.insert("token_in".to_string(), serde_json::json!(type_args.first().cloned()));
+            metadata.insert("token_out".to_string(), serde_json::json!(type_args.get(1).cloned()));
+            metadata.insert(
+                "actual_amount_out".to_string(),
+                serde_json::json!(
+                    pre_pool.coin_y.value.saturating_sub(post_pool.coin_y.value).to_string()
+                ),
+            );
+        }
+        "swap_y_to_x" => {
+            metadata.insert("token_in".to_string(), serde_json::json!(type_args.get(1).cloned()));
+            metadata.insert("token_out".to_string(), serde_json::json!(type_args.first().cloned()));
+            metadata.insert(
+                "actual_amount_out".to_string(),
+                serde_json::json!(
+                    pre_pool.coin_x.value.saturating_sub(post_pool.coin_x.value).to_string()
+                ),
+            );
+        }
+        _ => {}
+    }
+}
+
+fn receipt_metadata(
+    db: &StateDB,
+    tx_json: &str,
+    updates: &[(String, Option<String>)],
+    status: &str,
+) -> Option<serde_json::Value> {
+    let DexReceiptContext { tx, call } = decode_dex_receipt_context(tx_json)?;
 
     let type_args: Vec<String> = call.ty_args.iter().map(|arg| arg.to_string()).collect();
     let sender_addr = parse_move_address(&tx.sender)?;
@@ -255,6 +404,26 @@ fn receipt_metadata(tx_json: &str) -> Option<serde_json::Value> {
                 }
             }
             _ => {}
+        }
+
+        if status == "success" {
+            if let Some(pool_addr) = pool_addr {
+                if let Some(pre_pool) =
+                    decode_dex_pool_from_state(db, &[], pool_addr, &call.ty_args)
+                {
+                    if let Some(post_pool) =
+                        decode_dex_pool_from_state(db, updates, pool_addr, &call.ty_args)
+                    {
+                        add_pool_delta_metadata(
+                            obj,
+                            &pre_pool,
+                            &post_pool,
+                            &call.function,
+                            &type_args,
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1874,7 +2043,9 @@ impl Executor {
             }
 
             updates.push(receipt_update(
+                &self.db,
                 tx_json,
+                &updates,
                 &tx_status,
                 actual_gas,
                 tx_error.clone(),
@@ -1912,7 +2083,15 @@ mod tests {
 
     #[test]
     fn test_receipt_update_records_status_and_gas() {
-        let (key, value) = receipt_update("{}", "aborted", 42, Some("Move abort".to_string()));
+        let db = temp_db("receipt_update");
+        let (key, value) = receipt_update(
+            &db,
+            "{}",
+            &[],
+            "aborted",
+            42,
+            Some("Move abort".to_string()),
+        );
         assert!(key.starts_with("tx_receipt:"));
         let parsed: serde_json::Value =
             serde_json::from_str(&value.expect("receipt value")).unwrap();
@@ -2825,6 +3004,26 @@ mod tests {
         assert_eq!(receipt["status"], "success");
         assert_eq!(receipt["metadata"]["kind"], "dex");
         assert_eq!(receipt["metadata"]["function"], "swap_x_to_y");
+        assert_eq!(
+            receipt["metadata"]["actual_amount_out"],
+            serde_json::json!("906")
+        );
+        assert_eq!(
+            receipt["metadata"]["reserve_x_before"],
+            serde_json::json!("10000")
+        );
+        assert_eq!(
+            receipt["metadata"]["reserve_y_after"],
+            serde_json::json!("9094")
+        );
+        assert_eq!(
+            receipt["metadata"]["token_in"],
+            serde_json::json!("0x1::staking::AincoreCoin")
+        );
+        assert_eq!(
+            receipt["metadata"]["token_out"],
+            serde_json::json!("0x1::wbtc::WBTC")
+        );
 
         let remove_payload = entry_payload(
             "dex",
