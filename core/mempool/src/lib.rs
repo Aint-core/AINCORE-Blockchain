@@ -112,29 +112,40 @@ impl Mempool {
             return Err("Gas limit must be greater than 0".to_string());
         }
 
-        // === H-04 FIX: ZKP PROOF FAIL-CLOSED ===
+        // === H-04 PROMOTED (Phase 2.2): WIRE THE STARK VERIFIER ===
         //
-        // The Transaction struct carries an optional `zkp_proof` field that
-        // the executor used to log-but-not-verify. Accepting transactions
-        // tagged with a "ZKP proof" while doing nothing with it is worse
-        // than rejecting them: it gives users a false sense of additional
-        // assurance and makes future enablement risky (any naïve client
-        // pinning to "ZKP enabled" semantics would have to be re-signed
-        // once the verifier finally runs).
+        // Phase 1 fail-closed the zkp_proof field. Phase 2.2 routes any
+        // attached proof through crypto::zkp::verify_tx_attached_proof,
+        // which:
+        //   1. hex-decodes the envelope,
+        //   2. parses it as STARKProofData (rejects structural garbage),
+        //   3. asserts the proof's public inputs commit to
+        //      SHA-256("{chain_id}:{sender}:{payload}:{seq}") so a
+        //      detached-and-replayed proof cannot be reused on a
+        //      different transaction,
+        //   4. invokes STARKVerifier::verify on the dispatched proof.
         //
-        // Until the STARK verifier is wired end-to-end (proof decoding,
-        // public-input binding to the tx hash, and verification result
-        // gating execution), refuse any submission that carries a non-empty
-        // zkp_proof. This is the fail-closed-sementara pattern: keep the
-        // infra and tests around, just close the door at the entry point.
+        // The underlying STARKVerifier is a Phase-2 placeholder today,
+        // so in practice no valid proof can be constructed yet. But the
+        // wiring is real: the moment a real AIR is plumbed in, valid
+        // proofs flow through unchanged and invalid ones are rejected
+        // with specific diagnostic categories instead of the blanket
+        // "fail-closed gate" message.
         if let Some(ref proof_hex) = parsed_tx.zkp_proof {
             if !proof_hex.is_empty() {
-                return Err(
-                    "ZKP proofs are not yet verified by the executor and are \
-                     intentionally fail-closed at the mempool until the STARK \
-                     verifier is wired. Resubmit with zkp_proof = null."
-                        .to_string(),
+                let canonical_msg = format!(
+                    "{}:{}:{}:{}",
+                    parsed_tx.chain_id,
+                    parsed_tx.sender,
+                    parsed_tx.payload,
+                    parsed_tx.sequence_number
                 );
+                if let Err(e) = crypto::zkp::verify_tx_attached_proof(
+                    proof_hex,
+                    canonical_msg.as_bytes(),
+                ) {
+                    return Err(format!("ZKP proof rejected: {}", e));
+                }
             }
         }
 

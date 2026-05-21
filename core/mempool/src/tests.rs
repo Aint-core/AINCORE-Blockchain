@@ -482,15 +482,14 @@ mod pqc_phase21 {
     }
 }
 
-/// H-04 REGRESSION TEST
+/// H-04 REGRESSION TEST (updated Phase 2.2)
 ///
-/// Mempool must fail-closed for any transaction that carries a non-empty
-/// `zkp_proof` field until the STARK verifier is wired into block
-/// execution. Previously the executor logged the presence of the proof
-/// and continued — pure security theater that gave users a false sense
-/// of assurance.
+/// Mempool now dispatches any non-empty `zkp_proof` through
+/// `crypto::zkp::verify_tx_attached_proof`. We verify the gate still
+/// rejects the obvious failure modes — garbage hex, wrong binding —
+/// with diagnostic error messages that distinguish them.
 #[test]
-fn test_zkp_tagged_transaction_rejected_at_mempool_until_wired() {
+fn test_zkp_garbage_hex_rejected_with_specific_diagnostic() {
     use ed25519_dalek::{Signer, SigningKey};
 
     let mut mempool = Mempool::new();
@@ -510,8 +509,9 @@ fn test_zkp_tagged_transaction_rejected_at_mempool_until_wired() {
     let signature = signing_key.sign(message.as_bytes());
     let sig_hex = hex::encode(signature.to_bytes());
 
-    // Attach a non-empty zkp_proof — value doesn't matter, the gate trips
-    // on presence + non-emptiness alone.
+    // "deadbeef" is valid hex but the bytes do not parse as a
+    // STARKProofData envelope — the dispatcher's structural check
+    // should catch this with a specific diagnostic.
     let tx = serde_json::json!({
         "chain_id": chain_id,
         "sender": sender,
@@ -529,12 +529,77 @@ fn test_zkp_tagged_transaction_rejected_at_mempool_until_wired() {
 
     let err = mempool
         .add_transaction(tx)
-        .expect_err("ZKP-tagged tx must be rejected at mempool until verifier is wired");
+        .expect_err("ZKP-tagged tx with garbage envelope must be rejected");
 
     assert!(
-        err.contains("ZKP") || err.contains("STARK") || err.contains("fail-closed"),
-        "ZKP reject must clearly tell submitters the verifier is not yet wired. \
-         Got error: {:?}",
+        err.contains("ZKP proof rejected"),
+        "error must come from the dispatcher, not a generic fail-closed gate. Got: {:?}",
+        err
+    );
+    assert!(
+        err.contains("STARKProofData") || err.contains("envelope") || err.contains("structure"),
+        "error must specifically call out the structural failure. Got: {:?}",
+        err
+    );
+}
+
+/// Phase 2.2 — REPLAY PROTECTION
+///
+/// A structurally valid proof whose `public_inputs` commit to a
+/// different transaction's canonical message must be rejected. This
+/// blocks proof-detach-and-replay across transactions.
+#[test]
+fn test_zkp_replayed_proof_with_wrong_binding_rejected() {
+    use crypto::zkp::STARKProofData;
+    use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha256};
+
+    let mut mempool = Mempool::new();
+
+    let seed = [55u8; 32];
+    let signing_key = SigningKey::from_bytes(&seed);
+    let public_key = hex::encode(signing_key.verifying_key().to_bytes());
+    let sender = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
+    let chain_id = std::env::var("AINCORE_CHAIN_ID")
+        .unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+    let payload = hex::encode(
+        bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![7u8]]))
+            .unwrap(),
+    );
+    let sequence_number = 0u64;
+    let canonical = format!("{}:{}:{}:{}", chain_id, sender, payload, sequence_number);
+    let signature = signing_key.sign(canonical.as_bytes());
+    let sig_hex = hex::encode(signature.to_bytes());
+
+    // Construct a structurally-valid STARKProofData but bind it to a
+    // DIFFERENT canonical message ("some-other-tx") — replayed proof
+    // scenario.
+    let wrong_binding = Sha256::digest(b"some-other-tx").to_vec();
+    let proof_envelope = STARKProofData::new(vec![0xFF, 0xEE, 0xDD, 0xCC], wrong_binding);
+    let proof_hex = hex::encode(proof_envelope.to_bytes());
+
+    let tx = serde_json::json!({
+        "chain_id": chain_id,
+        "sender": sender,
+        "input_objects": [],
+        "payload": payload,
+        "args": [],
+        "gas_limit": 1000,
+        "gas_price": 1,
+        "sequence_number": sequence_number,
+        "public_key": public_key,
+        "signature": sig_hex,
+        "zkp_proof": proof_hex,
+    })
+    .to_string();
+
+    let err = mempool
+        .add_transaction(tx)
+        .expect_err("ZKP proof bound to a different tx must be rejected (replay block)");
+
+    assert!(
+        err.contains("public inputs") || err.contains("bind") || err.contains("replay"),
+        "error must explicitly call out the binding/replay violation. Got: {:?}",
         err
     );
 }

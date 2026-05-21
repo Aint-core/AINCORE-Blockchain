@@ -1138,28 +1138,37 @@ impl Executor {
                 return None;
             }
 
-            // 2b. H-04 FIX: ZKP proof fail-closed (defense in depth).
+            // 2b. H-04 PROMOTED (Phase 2.2): defense-in-depth STARK verify.
             //
-            // Previously this block logged the presence of a zkp_proof and
-            // then continued execution as if everything was fine — pure
-            // security theater. The mempool is now also fail-closed on this
-            // field, but block execution may still see ZKP-tagged
-            // transactions from peers running an older mempool, from
-            // gossip, or from any future path that bypasses the mempool
-            // (e.g. block sync). Reject them here to make the policy
-            // uniform: no execution path silently accepts an unverified
-            // ZKP claim. When the STARK verifier is wired, replace this
-            // reject with the actual verification call (decode → bind
-            // public inputs → verify → gate execution on the result).
+            // The mempool's H-04 gate also calls the same dispatcher,
+            // so most ZKP-tagged transactions are rejected before they
+            // reach here. We re-run the check at the executor because
+            // block execution can also see transactions via sync /
+            // gossip / older peers that bypassed our mempool. Policy
+            // must be uniform: no execution path silently accepts an
+            // unverified ZKP claim.
+            //
+            // The check performs hex decode → STARKProofData parse →
+            // public-input binding to "{chain_id}:{sender}:{payload}:{seq}"
+            // → STARKVerifier::verify dispatch. The verifier itself is
+            // currently a Phase-2 placeholder; when it's wired to a
+            // real AIR, valid proofs flow through unchanged.
             if let Some(ref proof_hex) = tx.zkp_proof {
                 if !proof_hex.is_empty() {
-                    println!(
-                        "❌ Transaction carries zkp_proof ({} bytes) but the \
-                         STARK verifier is not yet wired. Rejecting (H-04 \
-                         fail-closed).",
-                        proof_hex.len() / 2
+                    let canonical_msg = format!(
+                        "{}:{}:{}:{}",
+                        tx.chain_id, tx.sender, tx.payload, tx.sequence_number
                     );
-                    return None;
+                    if let Err(e) = crypto::zkp::verify_tx_attached_proof(
+                        proof_hex,
+                        canonical_msg.as_bytes(),
+                    ) {
+                        println!(
+                            "❌ Transaction zkp_proof rejected at executor (H-04): {}",
+                            e
+                        );
+                        return None;
+                    }
                 }
             }
 
