@@ -453,8 +453,8 @@ async fn main() {
                             }
                         }
                     }
-                } else if msg.starts_with("DAG_VERTEX:") {
-                    // WRITE LOCK required to update DAG
+                } else if msg.starts_with("DAG_VERTEX:") || msg.starts_with("DOWNTIME_ATTEST:") {
+                    // WRITE LOCK required to update DAG / store remote attestation
                     if let Ok(mut guard) = node_consensus.write() {
                         guard.handle_message(&msg);
                     }
@@ -497,7 +497,7 @@ async fn main() {
                                 }
                             }
                         }
-                    } else if msg.starts_with("DAG_VERTEX:") {
+                    } else if msg.starts_with("DAG_VERTEX:") || msg.starts_with("DOWNTIME_ATTEST:") {
                         if let Ok(mut guard) = node_consensus.write() {
                             guard.handle_message(&msg);
                         }

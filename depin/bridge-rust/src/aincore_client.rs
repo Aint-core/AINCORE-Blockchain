@@ -1,7 +1,7 @@
-use serde::Deserialize;
+use log::{error, info, warn};
 use reqwest::Client;
+use serde::Deserialize;
 use std::error::Error;
-use log::{info, error, warn};
 
 // CRITICAL-5 FIX: Finality depth to prevent reorg attacks
 const FINALITY_DEPTH: u64 = 100; // Wait for 100 block confirmations (~20 minutes)
@@ -41,6 +41,17 @@ impl AincoreClient {
         }
     }
 
+    /// Phase 3 / H-03: Restore height cursor from persisted BridgeState so
+    /// the client does not re-scan blocks already processed before a restart.
+    pub fn set_last_processed_height(&mut self, height: u64) {
+        self.last_processed_height = height;
+    }
+
+    /// Return the cursor after the latest fetch_bridge_events call.
+    pub fn get_last_processed_height(&self) -> u64 {
+        self.last_processed_height
+    }
+
     pub async fn get_latest_blocks(&self, limit: u64) -> Result<Vec<Block>, Box<dyn Error>> {
         let payload = serde_json::json!({
             "jsonrpc": "2.0",
@@ -49,13 +60,15 @@ impl AincoreClient {
             "id": 1
         });
 
-        let resp = self.client.post(&self.rpc_url)
+        let resp = self
+            .client
+            .post(&self.rpc_url)
             .json(&payload)
             .send()
             .await?;
 
         let rpc_resp: RpcResponse<Vec<Block>> = resp.json().await?;
-        
+
         if let Some(err) = rpc_resp.error {
             error!("RPC Error: {:?}", err);
             return Ok(vec![]);
@@ -73,19 +86,21 @@ impl AincoreClient {
             "id": 1
         });
 
-        let resp = self.client.post(&self.rpc_url)
+        let resp = self
+            .client
+            .post(&self.rpc_url)
             .json(&payload)
             .send()
             .await?;
 
         let rpc_resp: RpcResponse<serde_json::Value> = resp.json().await?;
-        
+
         if let Some(result) = rpc_resp.result {
             if let Some(height) = result.get("block_height").and_then(|h| h.as_u64()) {
                 return Ok(height);
             }
         }
-        
+
         Ok(0)
     }
 
@@ -93,43 +108,53 @@ impl AincoreClient {
     /// CRITICAL-5 FIX: Only process events from finalized blocks to prevent reorg attacks
     pub async fn get_finalized_height(&self) -> Result<u64, Box<dyn Error>> {
         let latest = self.get_latest_height().await?;
-        
+
         let finalized = if latest > FINALITY_DEPTH {
             latest - FINALITY_DEPTH
         } else {
             0 // Genesis case
         };
-        
-        info!("📊 Latest: {}, Finalized: {} (depth: {})", latest, finalized, FINALITY_DEPTH);
+
+        info!(
+            "📊 Latest: {}, Finalized: {} (depth: {})",
+            latest, finalized, FINALITY_DEPTH
+        );
         Ok(finalized)
     }
 
     /// Fetch bridge events from FINALIZED blocks only
     /// CRITICAL-5 FIX: Prevents processing events from blocks that could be reorganized
-    pub async fn fetch_bridge_events(&mut self) -> Result<Vec<(String, u64, String)>, Box<dyn Error>> {
+    pub async fn fetch_bridge_events(
+        &mut self,
+    ) -> Result<Vec<(String, u64, String)>, Box<dyn Error>> {
         // Returns (Sender, Amount, EthAddress)
-        
+
         // Get finalized height
         let finalized_height = self.get_finalized_height().await?;
-        
+
         // Check if we have new finalized blocks to process
         if finalized_height <= self.last_processed_height {
-            info!("⏸️  No new finalized blocks (last: {}, finalized: {})", 
-                self.last_processed_height, finalized_height);
+            info!(
+                "⏸️  No new finalized blocks (last: {}, finalized: {})",
+                self.last_processed_height, finalized_height
+            );
             return Ok(vec![]);
         }
-        
+
         // Calculate range to fetch
         let start = self.last_processed_height + 1;
         let end = finalized_height;
         let count = end - start + 1;
-        
-        info!("🔍 Scanning finalized blocks {} to {} ({} blocks)", start, end, count);
-        
+
+        info!(
+            "🔍 Scanning finalized blocks {} to {} ({} blocks)",
+            start, end, count
+        );
+
         // Fetch blocks (limited to avoid overwhelming RPC)
         let fetch_limit = std::cmp::min(count, 100); // Max 100 blocks per call
         let blocks = self.get_latest_blocks(fetch_limit).await?;
-        
+
         let mut events = Vec::new();
 
         for block in blocks {
@@ -147,10 +172,12 @@ impl AincoreClient {
                                 warn!("⚠️  Invalid Ethereum address format: {}", eth_addr);
                                 continue;
                             }
-                            
+
                             if let Ok(amount) = parts[1].parse::<u64>() {
-                                info!("🌉 Found FINALIZED Bridge Lock: {} AIN from {} -> {}", 
-                                    amount, tx.sender, eth_addr);
+                                info!(
+                                    "🌉 Found FINALIZED Bridge Lock: {} AIN from {} -> {}",
+                                    amount, tx.sender, eth_addr
+                                );
                                 events.push((tx.sender, amount, eth_addr));
                             }
                         }
@@ -158,11 +185,11 @@ impl AincoreClient {
                 }
             }
         }
-        
+
         // Update last processed height
         self.last_processed_height = finalized_height;
         info!("✅ Processed up to finalized block {}", finalized_height);
-        
+
         Ok(events)
     }
 }

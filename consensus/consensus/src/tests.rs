@@ -582,4 +582,131 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&path);
     }
+
+    // ── Phase 3 / H-02: Downtime attestation gossip ──────────────────────
+
+    /// Valid remote attestation (correct sig + known validator) is stored.
+    #[test]
+    fn test_h02_valid_remote_attestation_stored() {
+        use crypto::{Signer, SigningKey, derive_address};
+
+        let (mut dag, path) = setup_dag("h02_valid_attest");
+
+        // Create a fake "remote" validator key pair.
+        let remote_key_bytes: [u8; 32] = [0xBB; 32];
+        let remote_sk = SigningKey::from_bytes(&remote_key_bytes);
+        let remote_vk = remote_sk.verifying_key();
+        let remote_pubkey_hex = hex::encode(remote_vk.to_bytes());
+        let remote_addr = derive_address(remote_vk.as_bytes()).expect("derive_address");
+
+        // Register the remote validator in storage so the validator-set check passes.
+        // Format: Vec<(String, u64)> serialised by serde_json → [["addr", stake], ...]
+        let vset: Vec<(String, u64)> = vec![(remote_addr.clone(), 1000u64)];
+        dag.storage.put("sys:validators", &serde_json::to_string(&vset).unwrap()).unwrap();
+        // Invalidate cache so the new entry is visible.
+        dag.invalidate_validators_cache();
+
+        // Build and sign an attestation as the remote validator would.
+        let offender = "deadbeefdeadbeef".to_string();
+        let epoch: u64 = 1;
+        let round: u64 = 100;
+        let canonical = format!("{}:{}:{}:{}", offender, epoch, remote_addr, round);
+        let sig = remote_sk.sign(canonical.as_bytes());
+        let sig_hex = hex::encode(sig.to_bytes());
+
+        let payload = serde_json::json!({
+            "offender": offender,
+            "epoch": epoch,
+            "reporter": remote_addr,
+            "reporter_pubkey": remote_pubkey_hex,
+            "round": round,
+            "rounds_missed": 120u64,
+            "signature": sig_hex,
+        });
+
+        let content = payload.to_string();
+        dag.handle_message(&format!("DOWNTIME_ATTEST:{}", content));
+
+        // Attestation must now be in storage.
+        let key = format!("sys:downtime_attestation:{}:{}:{}", offender, epoch, remote_addr);
+        let stored = dag.storage.get(&key).expect("db ok").expect("must be stored");
+        assert!(stored.contains(&offender));
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Attestation with wrong signature is rejected.
+    #[test]
+    fn test_h02_invalid_signature_rejected() {
+        use crypto::{SigningKey, derive_address};
+
+        let (mut dag, path) = setup_dag("h02_bad_sig");
+
+        let remote_key_bytes: [u8; 32] = [0xCC; 32];
+        let remote_sk = SigningKey::from_bytes(&remote_key_bytes);
+        let remote_vk = remote_sk.verifying_key();
+        let remote_pubkey_hex = hex::encode(remote_vk.to_bytes());
+        let remote_addr = derive_address(remote_vk.as_bytes()).expect("derive");
+
+        let vset: Vec<(String, u64)> = vec![(remote_addr.clone(), 1000u64)];
+        dag.storage.put("sys:validators", &serde_json::to_string(&vset).unwrap()).unwrap();
+        dag.invalidate_validators_cache();
+
+        // Wrong signature — 64 zeros.
+        let bad_sig_hex = hex::encode([0u8; 64]);
+
+        let payload = serde_json::json!({
+            "offender": "aabbccdd",
+            "epoch": 1u64,
+            "reporter": remote_addr,
+            "reporter_pubkey": remote_pubkey_hex,
+            "round": 50u64,
+            "rounds_missed": 101u64,
+            "signature": bad_sig_hex,
+        });
+
+        dag.handle_message(&format!("DOWNTIME_ATTEST:{}", payload));
+
+        // Must NOT be stored.
+        let key = format!("sys:downtime_attestation:aabbccdd:1:{}", remote_addr);
+        assert!(dag.storage.get(&key).unwrap().is_none(), "bad sig must be rejected");
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Attestation from unknown validator is rejected.
+    #[test]
+    fn test_h02_unknown_reporter_rejected() {
+        use crypto::{Signer, SigningKey};
+
+        let (mut dag, path) = setup_dag("h02_unknown_reporter");
+
+        // Empty validator set — no one is registered.
+        let vset: Vec<(String, u64)> = vec![];
+        dag.storage.put("sys:validators", &serde_json::to_string(&vset).unwrap()).unwrap();
+        dag.invalidate_validators_cache();
+
+        let key_bytes: [u8; 32] = [0xDD; 32];
+        let sk = SigningKey::from_bytes(&key_bytes);
+        let vk = sk.verifying_key();
+        let canonical = "offender:1:fakereporter:10";
+        let sig = sk.sign(canonical.as_bytes());
+
+        let payload = serde_json::json!({
+            "offender": "offender",
+            "epoch": 1u64,
+            "reporter": "fakereporter",
+            "reporter_pubkey": hex::encode(vk.to_bytes()),
+            "round": 10u64,
+            "rounds_missed": 110u64,
+            "signature": hex::encode(sig.to_bytes()),
+        });
+
+        dag.handle_message(&format!("DOWNTIME_ATTEST:{}", payload));
+
+        let key = "sys:downtime_attestation:offender:1:fakereporter";
+        assert!(dag.storage.get(key).unwrap().is_none(), "unknown reporter must be rejected");
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }

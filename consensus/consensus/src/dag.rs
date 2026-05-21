@@ -485,6 +485,11 @@ impl DagConsensus {
                             "round": self.current_round,
                             "rounds_missed": rounds_missed,
                         });
+
+                        // Phase 3 / H-02: Broadcast to peers so they can add
+                        // their own view and collectively reach BFT quorum.
+                        self.broadcast_attestation(&attestation);
+
                         let _ = self
                             .storage
                             .put(&attestation_key, &attestation.to_string());
@@ -942,11 +947,193 @@ impl DagConsensus {
         }
     }
 
+    /// Phase 3 / H-02: Broadcast a downtime attestation to all peers via
+    /// Gossipsub + TCP so that BFT quorum can be reached across the validator
+    /// set.  The attestation JSON is signed with this node's Ed25519 key;
+    /// the reporter's raw public-key bytes are embedded so receivers can
+    /// independently verify authenticity without a PKI lookup.
+    fn broadcast_attestation(&self, attestation: &serde_json::Value) {
+        use crypto::Signer;
+        // Build the canonical payload that will be signed:
+        // strip "signature" + "reporter_pubkey" fields first, then sign.
+        let signing_key = crypto::SigningKey::from_bytes(&self.node_key);
+        let verifying_key = signing_key.verifying_key();
+        let pubkey_hex = hex::encode(verifying_key.to_bytes());
+
+        // Canonical message = deterministic JSON with known fields only.
+        let canonical = format!(
+            "{}:{}:{}:{}",
+            attestation["offender"].as_str().unwrap_or(""),
+            attestation["epoch"],
+            attestation["reporter"].as_str().unwrap_or(""),
+            attestation["round"],
+        );
+        let sig_bytes = signing_key.sign(canonical.as_bytes());
+        let sig_hex = hex::encode(sig_bytes.to_bytes());
+
+        let mut full = attestation.clone();
+        full["reporter_pubkey"] = serde_json::Value::String(pubkey_hex);
+        full["signature"] = serde_json::Value::String(sig_hex);
+
+        let serialized = match serde_json::to_string(&full) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("❌ [H-02] Failed to serialise attestation: {}", e);
+                return;
+            }
+        };
+        let msg = format!("DOWNTIME_ATTEST:{}", serialized);
+
+        // 1. Gossipsub
+        if let Some(tx) = &self.p2p_tx {
+            let tx_clone = tx.clone();
+            let msg_clone = msg.clone();
+            tokio::spawn(async move {
+                let _ = tx_clone.send(msg_clone).await;
+            });
+        }
+
+        // 2. TCP fallback
+        use network::send_message;
+        if let Ok(peers) = self.peers.lock() {
+            for (peer_id, port) in peers.iter() {
+                if *peer_id != self.node_id {
+                    let ip = self
+                        .storage
+                        .get_peer_ip(peer_id)
+                        .unwrap_or_else(|| "127.0.0.1".to_string());
+                    let addr = format!("{}:{}", ip, port);
+                    let _ = send_message(&addr, &msg);
+                }
+            }
+        }
+    }
+
     pub fn handle_message(&mut self, msg: &str) {
         if let Some(content) = msg.strip_prefix("DAG_VERTEX:") {
             if let Ok(vertex) = serde_json::from_str::<Vertex>(content) {
                 self.add_vertex(vertex);
             }
+        } else if let Some(content) = msg.strip_prefix("DOWNTIME_ATTEST:") {
+            // Phase 3 / H-02: Remote downtime attestation received from a peer.
+            // Validate → store so executor can count towards BFT quorum.
+            self.handle_remote_attestation(content);
+        }
+    }
+
+    /// Validate and store a remote downtime attestation.
+    ///
+    /// Checks:
+    ///  1. JSON parses correctly and has all required fields.
+    ///  2. `reporter` is a known validator (in current validator set).
+    ///  3. `reporter_pubkey` derives to the claimed `reporter` address.
+    ///  4. Ed25519 signature over canonical payload is valid.
+    ///  5. Not a duplicate (storage key already guards this).
+    fn handle_remote_attestation(&mut self, content: &str) {
+        let attest: serde_json::Value = match serde_json::from_str(content) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("❌ [H-02] Malformed attestation JSON: {}", e);
+                return;
+            }
+        };
+
+        let offender = match attest["offender"].as_str() {
+            Some(s) => s.to_string(),
+            None => { eprintln!("❌ [H-02] Missing offender field"); return; }
+        };
+        let epoch = match attest["epoch"].as_u64() {
+            Some(e) => e,
+            None => { eprintln!("❌ [H-02] Missing epoch field"); return; }
+        };
+        let reporter = match attest["reporter"].as_str() {
+            Some(s) => s.to_string(),
+            None => { eprintln!("❌ [H-02] Missing reporter field"); return; }
+        };
+        let round = attest["round"].as_u64().unwrap_or(0);
+        let reporter_pubkey_hex = match attest["reporter_pubkey"].as_str() {
+            Some(s) => s.to_string(),
+            None => { eprintln!("❌ [H-02] Missing reporter_pubkey"); return; }
+        };
+        let sig_hex = match attest["signature"].as_str() {
+            Some(s) => s.to_string(),
+            None => { eprintln!("❌ [H-02] Missing signature"); return; }
+        };
+
+        // Don't re-process our own attestation broadcast back to us.
+        if reporter == self.node_id {
+            return;
+        }
+
+        // 1. Reporter must be a known validator.
+        let validators = self.get_validator_set();
+        if !validators.contains(&reporter) {
+            eprintln!(
+                "❌ [H-02] Attestation from unknown validator {}, dropping",
+                reporter
+            );
+            return;
+        }
+
+        // 2. Verify pubkey → address derivation matches claimed reporter.
+        let pubkey_bytes = match hex::decode(&reporter_pubkey_hex) {
+            Ok(b) => b,
+            Err(_) => { eprintln!("❌ [H-02] reporter_pubkey not valid hex"); return; }
+        };
+        let derived_addr = match crypto::derive_address(&pubkey_bytes) {
+            Ok(a) => a,
+            Err(e) => { eprintln!("❌ [H-02] derive_address failed: {}", e); return; }
+        };
+        if derived_addr != reporter {
+            eprintln!(
+                "❌ [H-02] reporter_pubkey derives to {} but reporter claims {}",
+                derived_addr, reporter
+            );
+            return;
+        }
+
+        // 3. Verify Ed25519 signature over canonical payload.
+        let canonical = format!("{}:{}:{}:{}", offender, epoch, reporter, round);
+        let sig_bytes = match hex::decode(&sig_hex) {
+            Ok(b) => b,
+            Err(_) => { eprintln!("❌ [H-02] signature not valid hex"); return; }
+        };
+        match crypto::verify_signature(&pubkey_bytes, canonical.as_bytes(), &sig_bytes) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("❌ [H-02] Attestation signature INVALID from {}", reporter);
+                return;
+            }
+            Err(e) => {
+                eprintln!("❌ [H-02] Attestation signature verify error: {}", e);
+                return;
+            }
+        }
+
+        // 4. Store — key is unique per (offender, epoch, reporter) so this is
+        //    idempotent; the executor counts distinct reporters for BFT quorum.
+        let key = format!(
+            "sys:downtime_attestation:{}:{}:{}",
+            offender, epoch, reporter
+        );
+        // Only store if not already present (idempotency).
+        if let Ok(Some(_)) = self.storage.get(&key) {
+            return; // Already have this attestation, skip.
+        }
+
+        let payload = serde_json::json!({
+            "offender": offender,
+            "epoch": epoch,
+            "reporter": reporter,
+            "round": round,
+            "rounds_missed": attest["rounds_missed"].as_u64().unwrap_or(0),
+        });
+        match self.storage.put(&key, &payload.to_string()) {
+            Ok(_) => println!(
+                "✅ [H-02] Stored remote attestation: offender={} epoch={} reporter={}",
+                offender, epoch, reporter
+            ),
+            Err(e) => eprintln!("❌ [H-02] Failed to store remote attestation: {}", e),
         }
     }
 
