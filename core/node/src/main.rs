@@ -497,7 +497,8 @@ async fn main() {
                                 }
                             }
                         }
-                    } else if msg.starts_with("DAG_VERTEX:") || msg.starts_with("DOWNTIME_ATTEST:") {
+                    } else if msg.starts_with("DAG_VERTEX:") || msg.starts_with("DOWNTIME_ATTEST:")
+                    {
                         if let Ok(mut guard) = node_consensus.write() {
                             guard.handle_message(&msg);
                         }

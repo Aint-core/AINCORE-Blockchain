@@ -150,7 +150,25 @@ impl DagConsensus {
                     if let Ok(vertices) =
                         serde_json::from_str::<Vec<Vertex>>(&checkpoint_data)
                     {
+                        // Phase 5C.1 / NEW-001: enforce PWN-001 also at boot.
+                        // The checkpoint signature covers the JSON blob as a
+                        // whole, but each Vertex.hash inside MUST still match
+                        // a freshly computed hash of its body. Otherwise a
+                        // disk-write attacker could mutate vertices inside an
+                        // otherwise-valid checkpoint and bypass PWN-001 on
+                        // the recovery path.
+                        let mut accepted = 0usize;
+                        let mut rejected = 0usize;
                         for vertex in vertices {
+                            if vertex.calculate_hash() != vertex.hash {
+                                eprintln!(
+                                    "🚨 [NEW-001/boot] checkpoint vertex hash tampered, \
+                                     dropping (hash={})",
+                                    vertex.hash
+                                );
+                                rejected += 1;
+                                continue;
+                            }
                             if vertex.round > max_round {
                                 max_round = vertex.round;
                             }
@@ -159,11 +177,11 @@ impl DagConsensus {
                                 .or_default()
                                 .push(vertex.hash.clone());
                             dag_map.insert(vertex.hash.clone(), vertex);
+                            accepted += 1;
                         }
                         println!(
-                            "⚡ Fast recovery from checkpoint: {} vertices, Round {}",
-                            dag_map.len(),
-                            checkpoint_round
+                            "⚡ Fast recovery from checkpoint: {} accepted / {} tampered-dropped, Round {}",
+                            accepted, rejected, checkpoint_round
                         );
                     }
                 }
@@ -179,9 +197,19 @@ impl DagConsensus {
             // otherwise latest_proposed_round can advance past the in-memory round index and
             // the node gets stuck with zero parents.
             let mut replayed_tail = 0usize;
+            let mut tail_rejected = 0usize;
             for v_json in storage.scan_vertices() {
                 if let Ok(vertex) = serde_json::from_str::<Vertex>(&v_json) {
                     if vertex.round <= checkpoint_round || dag_map.contains_key(&vertex.hash) {
+                        continue;
+                    }
+                    // Phase 5C.1 / NEW-001: hash-integrity check on tail replay.
+                    if vertex.calculate_hash() != vertex.hash {
+                        eprintln!(
+                            "🚨 [NEW-001/tail] tail vertex hash tampered, dropping (hash={})",
+                            vertex.hash
+                        );
+                        tail_rejected += 1;
                         continue;
                     }
                     if vertex.round > max_round {
@@ -195,17 +223,27 @@ impl DagConsensus {
                     replayed_tail += 1;
                 }
             }
-            if replayed_tail > 0 {
+            if replayed_tail > 0 || tail_rejected > 0 {
                 println!(
-                    "🔄 Replayed {} DAG vertices after checkpoint round {}",
-                    replayed_tail, checkpoint_round
+                    "🔄 Replayed {} DAG vertices after checkpoint round {} ({} tampered-dropped)",
+                    replayed_tail, checkpoint_round, tail_rejected
                 );
             }
         } else {
             // Fallback: Scan for legacy data (only on first run or migration)
             let vertices_json = storage.scan_vertices();
+            let mut legacy_rejected = 0usize;
             for v_json in vertices_json {
                 if let Ok(vertex) = serde_json::from_str::<Vertex>(&v_json) {
+                    // Phase 5C.1 / NEW-001: hash-integrity check on legacy scan.
+                    if vertex.calculate_hash() != vertex.hash {
+                        eprintln!(
+                            "🚨 [NEW-001/legacy] legacy vertex hash tampered, dropping (hash={})",
+                            vertex.hash
+                        );
+                        legacy_rejected += 1;
+                        continue;
+                    }
                     if vertex.round > max_round {
                         max_round = vertex.round;
                     }
@@ -218,8 +256,9 @@ impl DagConsensus {
             }
             if !dag_map.is_empty() {
                 println!(
-                    "♻️  Legacy recovery (scan): {} vertices, Max Round {}",
+                    "♻️  Legacy recovery (scan): {} vertices ({} tampered-dropped), Max Round {}",
                     dag_map.len(),
+                    legacy_rejected,
                     max_round
                 );
             }
@@ -521,24 +560,43 @@ impl DagConsensus {
         }
     }
 
-    /// Phase 5B.2 / PWN-002: a single Byzantine validator must not be able
-    /// to fast-forward the local `current_round` to `u64::MAX` by signing a
-    /// vertex with a wildly-future round. The bound below caps any single
-    /// jump to `current_round + MAX_ROUND_JUMP`, after which the chain
-    /// would converge naturally through honest leaders. Saturating on the
-    /// upper end is fine — a real network never exceeds ~2^40 rounds.
-    const MAX_ROUND_JUMP: u64 = 50;
+    /// Phase 5B.2 + 5C.2 — round-bound limits:
+    ///
+    /// * `ABSOLUTE_ROUND_CEILING` is the hard upper bound on any vertex
+    ///   round. Set well below `u64::MAX` so `current_round += 1` and
+    ///   `vertex.round + 1` never wrap. Practically unreachable: at one
+    ///   block per second a chain would need ~300 quadrillion years to
+    ///   approach this. Defends PWN-002 anti-overflow attack.
+    ///
+    /// * `MAX_ROUND_JUMP` is the soft cap on a single-vertex round jump
+    ///   from the node's CURRENT view. Phase 5B.2 set this to 50, which
+    ///   the Phase 5C.2 re-audit revealed wedges legitimate long-partition
+    ///   recovery: a node offline for >50 rounds rejects every catch-up
+    ///   vertex and never re-syncs via P2P. Raised to 10_000 (~hours of
+    ///   downtime on a 1-block-per-second chain). Still rejects the
+    ///   "jump to u64::MAX" griefing attack because that lands above
+    ///   ABSOLUTE_ROUND_CEILING anyway.
+    const ABSOLUTE_ROUND_CEILING: u64 = u64::MAX / 2;
+    const MAX_ROUND_JUMP: u64 = 10_000;
 
     pub fn add_vertex(&mut self, vertex: Vertex) {
-        // Phase 5B.2 / PWN-002: reject any vertex whose round is more than
-        // MAX_ROUND_JUMP ahead of our current view. Without this guard, an
-        // attacker validator can submit `vertex.round = u64::MAX - 1`, the
-        // honest peers fast-forward at line "self.current_round = vertex.round + 1",
-        // and the next `try_create_vertex` either wraps to 0 (release) or
-        // panics (debug). Either way: chain halt + mass-jail.
+        // Anti-overflow: any vertex above ABSOLUTE_ROUND_CEILING is malicious
+        // — the chain cannot legitimately reach this magnitude.
+        if vertex.round > Self::ABSOLUTE_ROUND_CEILING {
+            println!(
+                "🚨 REJECTED [PWN-002/abs]: vertex round {} exceeds absolute ceiling {}",
+                vertex.round,
+                Self::ABSOLUTE_ROUND_CEILING
+            );
+            return;
+        }
+
+        // Anti-grief: reject "one giant jump" that an attacker could use to
+        // fast-forward `current_round` past honest progress. Legitimate
+        // catch-up is a STREAM of vertices, not one big-round vertex.
         if vertex.round > self.current_round.saturating_add(Self::MAX_ROUND_JUMP) {
             println!(
-                "🚨 REJECTED [PWN-002]: vertex round {} exceeds local round {} + {} cap",
+                "🚨 REJECTED [PWN-002/jump]: vertex round {} exceeds local round {} + {} cap",
                 vertex.round, self.current_round, Self::MAX_ROUND_JUMP
             );
             return;

@@ -97,9 +97,7 @@ pub async fn start_p2p(
         .duplicate_cache_time(Duration::from_secs(60))
         .message_id_fn(|msg| {
             use sha2::{Digest, Sha256};
-            libp2p::gossipsub::MessageId::from(
-                Sha256::digest(&msg.data).to_vec(),
-            )
+            libp2p::gossipsub::MessageId::from(Sha256::digest(&msg.data).to_vec())
         })
         .build()
         .map_err(|e| -> Box<dyn Error> { format!("gossipsub config: {}", e).into() })?;

@@ -756,8 +756,12 @@ impl Executor {
         // any future governance bug that engineers an oversized reward
         // would panic in debug or wrap in release. saturating_* gives
         // defense-in-depth without changing correct-case behaviour.
+        // Phase 5C.4 / NEW-003: saturating_sub here too — if total_reward
+        // is so large that LEADER_BONUS_PCT/100 actually saturated (only
+        // possible via a future governance bug), `leader_bonus` could
+        // exceed `total_reward` and an unchecked `-` would wrap.
         let leader_bonus = total_reward.saturating_mul(LEADER_BONUS_PCT) / 100;
-        let pool = total_reward - leader_bonus;
+        let pool = total_reward.saturating_sub(leader_bonus);
 
         // Step 3: stake-weighted distribution of the pool.
         use std::collections::BTreeMap;
@@ -772,9 +776,13 @@ impl Executor {
         }
 
         // Step 4: leader bonus + rounding remainder to leader.
+        // Phase 5C.4 / NEW-003: saturating_add on the `+=` too — the
+        // unchecked `+=` would wrap if leader_bonus + remainder + their
+        // own pool share crossed u128::MAX.
         let remainder = pool.saturating_sub(distributed_pool);
-        *payouts.entry(anchor_leader.to_string()).or_insert(0) +=
-            leader_bonus.saturating_add(remainder);
+        let leader_credit = leader_bonus.saturating_add(remainder);
+        let entry = payouts.entry(anchor_leader.to_string()).or_insert(0);
+        *entry = entry.saturating_add(leader_credit);
 
         payouts.into_iter().collect()
     }
@@ -1246,6 +1254,22 @@ impl Executor {
         // 4. Promote groups that hit BFT quorum.
         for ((offender, epoch), reporters) in groups {
             if reporters.len() < bft_quorum {
+                continue;
+            }
+
+            // Phase 5C.3 / NEW-002 (SEC-N03 reverse hole): the
+            // attest-time check on dag.rs only validates `offender`
+            // against the validator set AT THE TIME OF ATTESTATION
+            // RECEIVE. If the offender voluntarily unbonds or is
+            // governance-removed between attest and promote, they
+            // could be slashed despite no longer being a validator.
+            // Re-check offender ∈ current validator_set here.
+            if !validators.contains(&offender) {
+                eprintln!(
+                    "⚠️  [NEW-002] skipping promote: offender {} left validator set \
+                     between attestation and quorum promotion",
+                    offender
+                );
                 continue;
             }
 
@@ -3813,6 +3837,62 @@ mod tests {
             .unwrap()
             .is_none(),
             "stale reporter must not push the group over quorum");
+    }
+
+    /// Phase 5C.3 / NEW-002: an offender who LEFT the validator set
+    /// between attestation collection and quorum promotion must NOT be
+    /// slashed. Closes the reverse hole in SEC-N03 (attest-time check
+    /// catches non-validator offenders, but a graceful exit between
+    /// attest and promote slipped through before this fix).
+    #[test]
+    fn new002_offender_left_set_between_attest_and_promote_not_slashed() {
+        let db = temp_db("new002_offender_unbonded");
+
+        // Validator set at ATTEST time: a, b, c, d, and the offender (e).
+        let attest_time_validators: Vec<(String, u64)> = vec![
+            ("aaaa".repeat(8), 100),
+            ("bbbb".repeat(8), 100),
+            ("cccc".repeat(8), 100),
+            ("dddd".repeat(8), 100),
+            ("eeee".repeat(8), 100),
+        ];
+        let offender = attest_time_validators[4].0.clone();
+
+        // Persist 3 valid reporter attestations against offender.
+        for reporter in attest_time_validators[..3].iter() {
+            db.put(
+                &format!(
+                    "sys:downtime_attestation:{}:{}:{}",
+                    offender, 7, reporter.0
+                ),
+                &serde_json::json!({}).to_string(),
+            )
+            .unwrap();
+        }
+
+        // Validator set at PROMOTE time: offender removed (e.g. governance
+        // unbonded them between attestation and quorum check).
+        let promote_time_validators: Vec<(String, u64)> = vec![
+            ("aaaa".repeat(8), 100),
+            ("bbbb".repeat(8), 100),
+            ("cccc".repeat(8), 100),
+            ("dddd".repeat(8), 100),
+        ];
+        db.put(
+            "sys:validators",
+            &serde_json::to_string(&promote_time_validators).unwrap(),
+        )
+        .unwrap();
+
+        let executor = Executor::new(db.clone());
+        executor.promote_downtime_attestations_to_slash();
+
+        assert!(
+            db.get(&format!("sys:pending_slash:{}", offender))
+                .unwrap()
+                .is_none(),
+            "NEW-002: offender removed from validator set must NOT be slashed at promote time"
+        );
     }
 
     // ── Phase 4.A1: stake-proportional reward distribution ────────────────

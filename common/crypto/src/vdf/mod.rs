@@ -105,12 +105,24 @@ impl VDFProof {
     }
 
     /// Deserialise from bytes.
+    ///
+    /// Phase 5C.4 / NEW-004: cap `n_cp` BEFORE `Vec::with_capacity` to
+    /// prevent an attacker-crafted blob with `n_cp = u64::MAX` from
+    /// triggering an allocator panic / OOM. The VDF is internal today
+    /// (no external proof ingest), but this bound future-proofs any
+    /// path that ever forwards untrusted bytes here.
+    const MAX_CHECKPOINTS: usize = 1 << 20; // 1M checkpoints = ~32MB max alloc
+
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 16 {
             return None;
         }
         let difficulty = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
-        let n_cp = u64::from_le_bytes(bytes[8..16].try_into().ok()?) as usize;
+        let n_cp_u64 = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+        if n_cp_u64 > Self::MAX_CHECKPOINTS as u64 {
+            return None;
+        }
+        let n_cp = n_cp_u64 as usize;
         let expected_len = 16 + 32 * (n_cp + 1);
         if bytes.len() < expected_len {
             return None;

@@ -48,6 +48,14 @@ struct DexLiquidityPool {
 }
 
 fn move_coin_store_key(addr: move_core_types::account_address::AccountAddress) -> String {
+    move_coin_store_key_for(addr, "staking", "AincoreCoin")
+}
+
+fn move_coin_store_key_for(
+    addr: move_core_types::account_address::AccountAddress,
+    module: &str,
+    name: &str,
+) -> String {
     use move_core_types::{
         account_address::AccountAddress,
         identifier::Identifier,
@@ -56,8 +64,8 @@ fn move_coin_store_key(addr: move_core_types::account_address::AccountAddress) -
     let system = AccountAddress::from_hex_literal("0x1").expect("valid system address");
     let coin_type = TypeTag::Struct(Box::new(StructTag {
         address: system,
-        module: Identifier::new("staking").expect("valid module"),
-        name: Identifier::new("AincoreCoin").expect("valid coin"),
+        module: Identifier::new(module).expect("valid module"),
+        name: Identifier::new(name).expect("valid coin"),
         type_params: vec![],
     }));
     let store = StructTag {
@@ -69,10 +77,13 @@ fn move_coin_store_key(addr: move_core_types::account_address::AccountAddress) -
     format!("resource_{}_{}", addr, store)
 }
 
+fn wbtc_coin_store_key(addr: move_core_types::account_address::AccountAddress) -> String {
+    move_coin_store_key_for(addr, "wbtc", "WBTC")
+}
+
 fn dex_registry_key() -> String {
-    let system =
-        move_core_types::account_address::AccountAddress::from_hex_literal("0x1")
-            .expect("valid system address");
+    let system = move_core_types::account_address::AccountAddress::from_hex_literal("0x1")
+        .expect("valid system address");
     format!("resource_{}_{}", system, "0x1::dex::PoolRegistry")
 }
 
@@ -112,9 +123,7 @@ fn normalize_pool_key(value: &str) -> String {
     }
 }
 
-fn type_tag_from_name(
-    value: &str,
-) -> Option<move_core_types::language_storage::TypeTag> {
+fn type_tag_from_name(value: &str) -> Option<move_core_types::language_storage::TypeTag> {
     use move_core_types::{
         account_address::AccountAddress,
         identifier::Identifier,
@@ -142,9 +151,7 @@ fn dex_pool_key(
     token_y_name: &str,
 ) -> Option<String> {
     use move_core_types::{
-        account_address::AccountAddress,
-        identifier::Identifier,
-        language_storage::StructTag,
+        account_address::AccountAddress, identifier::Identifier, language_storage::StructTag,
     };
     let system = AccountAddress::from_hex_literal("0x1").ok()?;
     let x = type_tag_from_name(token_x_name)?;
@@ -342,6 +349,88 @@ fn credit_testnet_faucet(
     }))
 }
 
+fn credit_testnet_wbtc(
+    storage: &Arc<StateDB>,
+    addr: &str,
+    amount: u128,
+    public_key_hex: Option<&str>,
+) -> Result<serde_json::Value, JsonRpcError> {
+    if !faucet_enabled() {
+        return Err(JsonRpcError {
+            code: -32030,
+            message: "Test WBTC mint disabled. Set AINCORE_ENABLE_FAUCET=1 for local/testnet smoke tests."
+                .into(),
+        });
+    }
+
+    let move_addr =
+        move_core_types::account_address::AccountAddress::from_hex_literal(&format!("0x{}", addr))
+            .map_err(|_| JsonRpcError {
+                code: -32602,
+                message: "Invalid address".into(),
+            })?;
+
+    if let Some(public_key) = public_key_hex {
+        let public_key_bytes = hex::decode(public_key).map_err(|_| JsonRpcError {
+            code: -32602,
+            message: "Invalid public key hex".into(),
+        })?;
+        let expected_addr =
+            crypto::derive_address(&public_key_bytes).map_err(|e| JsonRpcError {
+                code: -32602,
+                message: format!("Address derivation failed: {}", e),
+            })?;
+        if expected_addr != addr {
+            return Err(JsonRpcError {
+                code: -32602,
+                message: format!("Public key/address mismatch: expected {}", expected_addr),
+            });
+        }
+        if storage.get_object(addr).is_none() {
+            let account =
+                aa::AccountManager::create_account(addr.to_string(), public_key.to_string());
+            storage.put_object(&account).map_err(|e| JsonRpcError {
+                code: -32000,
+                message: format!("Failed to create faucet account: {}", e),
+            })?;
+        }
+    }
+
+    let key = wbtc_coin_store_key(move_addr);
+    let current = storage
+        .get(&key)
+        .map_err(|e| JsonRpcError {
+            code: -32000,
+            message: format!("Failed to read WBTC CoinStore: {}", e),
+        })?
+        .and_then(|hex_value| hex::decode(hex_value).ok())
+        .and_then(|bytes| bcs::from_bytes::<MoveCoin>(&bytes).ok())
+        .map(|coin| coin.value)
+        .unwrap_or(0);
+    let new_balance = current.checked_add(amount).ok_or_else(|| JsonRpcError {
+        code: -32602,
+        message: "Test WBTC amount overflows balance".into(),
+    })?;
+    let bytes = bcs::to_bytes(&MoveCoin { value: new_balance }).map_err(|e| JsonRpcError {
+        code: -32000,
+        message: format!("Failed to encode WBTC CoinStore: {}", e),
+    })?;
+    storage
+        .put(&key, &hex::encode(bytes))
+        .map_err(|e| JsonRpcError {
+            code: -32000,
+            message: format!("Failed to write WBTC CoinStore: {}", e),
+        })?;
+
+    Ok(serde_json::json!({
+        "address": addr,
+        "amount": amount.to_string(),
+        "wbtc_balance": new_balance.to_string(),
+        "balance_source": "move_coin_store",
+        "faucet_mode": "local_testnet_only"
+    }))
+}
+
 fn estimate_payload_gas(payload: &str) -> u64 {
     let bytes = match hex::decode(payload.trim_start_matches("0x")) {
         Ok(bytes) => bytes,
@@ -512,6 +601,25 @@ fn handle_rpc_method(
                 credit_testnet_faucet(&data.storage, addr, amount, public_key)
             } else {
                 Err(JsonRpcError { code: -32602, message: "Invalid params: [address, amount?, public_key?]".into() })
+            }
+        },
+        "aincore_testMintWbtc" => {
+            // params: [address, amount, public_key?]
+            //
+            // Local/testnet-only helper for DEX market seeding. This never
+            // represents real BTC custody; production WBTC minting must go
+            // through the bridge authority path.
+            if let Some(addr) = params.get(0).and_then(|v| v.as_str()) {
+                let amount = params.get(1)
+                    .and_then(|v| v.as_str().and_then(|s| s.parse::<u128>().ok()).or_else(|| v.as_u64().map(|n| n as u128)))
+                    .ok_or_else(|| JsonRpcError {
+                        code: -32602,
+                        message: "Invalid params: [address, amount, public_key?]".into(),
+                    })?;
+                let public_key = params.get(2).and_then(|v| v.as_str());
+                credit_testnet_wbtc(&data.storage, addr, amount, public_key)
+            } else {
+                Err(JsonRpcError { code: -32602, message: "Invalid params: [address, amount, public_key?]".into() })
             }
         },
         "aincore_getStatus" => {
@@ -2169,11 +2277,10 @@ mod tests {
     #[test]
     fn test_dex_pool_and_quote_endpoints_read_move_registry() {
         let db = temp_db("dex_rpc");
-        let pool_addr =
-            move_core_types::account_address::AccountAddress::from_hex_literal(
-                "0x11111111111111111111111111111111",
-            )
-            .unwrap();
+        let pool_addr = move_core_types::account_address::AccountAddress::from_hex_literal(
+            "0x11111111111111111111111111111111",
+        )
+        .unwrap();
         let token_x = "00000000000000000000000000000001::staking::AincoreCoin";
         let token_y = "00000000000000000000000000000001::wbtc::WBTC";
         let pool_key = format!("{}::{}", token_x, token_y);

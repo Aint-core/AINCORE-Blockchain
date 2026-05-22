@@ -77,14 +77,12 @@ async fn h02_libp2p_stack_starts_and_accepts_broadcast() {
 
     // Start two stacks. Either MUST be successful — if libp2p fails to
     // bring up Gossipsub/Kademlia/etc. that is a regression.
-    let (tx_a, mut rx_a) =
-        node::p2p::start_p2p(port_a, vec![], storage_a, true, false)
-            .await
-            .expect("node A libp2p stack must start");
-    let (_tx_b, _rx_b) =
-        node::p2p::start_p2p(port_b, vec![], storage_b, true, false)
-            .await
-            .expect("node B libp2p stack must start");
+    let (tx_a, mut rx_a) = node::p2p::start_p2p(port_a, vec![], storage_a, true, false)
+        .await
+        .expect("node A libp2p stack must start");
+    let (_tx_b, _rx_b) = node::p2p::start_p2p(port_b, vec![], storage_b, true, false)
+        .await
+        .expect("node B libp2p stack must start");
 
     // Settle: let the swarms boot, subscribe to the topic, and surface
     // any startup-time panic on the event loops.
