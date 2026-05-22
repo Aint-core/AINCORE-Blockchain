@@ -67,31 +67,31 @@ impl Default for Mempool {
 }
 
 impl Mempool {
+    /// Phase 5B.11 / PWN-007 PROPER fix: canonical TX identity.
+    ///
+    /// The dedup key MUST be derived from the same canonical form the
+    /// signature is bound to (`chain_id:sender:payload:seq`), NOT from
+    /// raw JSON bytes. Otherwise an attacker can replay a signed TX by
+    /// reordering JSON keys or tweaking whitespace — different raw bytes,
+    /// same signature, same semantic intent — and bypass `seen_txs`.
+    ///
+    /// Hashing canonical fields at this layer also closes ALL upstream
+    /// entry points in one place: api_local.rs, api.rs, P2P TX inbound,
+    /// and any future RPC method. None of them can submit a "different"
+    /// version of a TX that has already been seen.
+    fn canonical_tx_hash(tx: &executor::Transaction) -> String {
+        let canonical = format!(
+            "{}:{}:{}:{}",
+            tx.chain_id, tx.sender, tx.payload, tx.sequence_number
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
     pub fn add_transaction(&mut self, tx: String) -> Result<String, String> {
         // === M-04 FIX: SIZE GUARD FIRST (cheapest reject path) ===
-        //
-        // Hard size cap BEFORE we touch serde_json, hex decode, BCS, or any
-        // signature/PQC verification. Previously the 100KB check sat after
-        // Ed25519 verify (and after BCS parse), meaning an attacker could
-        // burn server CPU on serde + crypto for arbitrarily large payloads
-        // before being rejected. Moving it to the very first line bounds
-        // the worst-case wasted work to one `.len()` call.
         const TX_BYTE_LIMIT: usize = 100 * 1024; // 100KB
-
-        // Phase 5B.7 / PWN-004: hash-based dedup runs RIGHT AFTER the size
-        // guard, BEFORE any signature/PQC verification. The original flow
-        // ran SHA-256 dedup last (line 338), letting an attacker spam
-        // N unique payloads and burn Dilithium-5 verify CPU on every one
-        // before being rejected. Now any duplicate byte-for-byte payload
-        // hits a HashSet lookup and exits at near-zero cost.
-        if tx.len() <= TX_BYTE_LIMIT {
-            let mut early_hasher = Sha256::new();
-            early_hasher.update(tx.as_bytes());
-            let early_tx_hash = hex::encode(early_hasher.finalize());
-            if self.seen_txs.contains(&early_tx_hash) {
-                return Err(format!("Duplicate transaction: {}", early_tx_hash));
-            }
-        }
 
         if tx.len() > TX_BYTE_LIMIT {
             return Err(format!(
@@ -126,6 +126,23 @@ impl Mempool {
 
         if parsed_tx.gas_limit == 0 {
             return Err("Gas limit must be greater than 0".to_string());
+        }
+
+        // Phase 5B.11 / PWN-004 + PWN-007 COMBINED: compute the canonical
+        // dedup hash and check `seen_txs` IMMEDIATELY after parse + cheap
+        // header checks. This:
+        //   - PWN-004: rejects byte-identical AND re-encoded replays
+        //     BEFORE Dilithium-5 / Ed25519 signature verify (cheapest
+        //     possible reject path for any replay attack)
+        //   - PWN-007: catches all attacker JSON re-encodings because
+        //     the canonical form is the same the signature is bound to
+        //     ({chain_id}:{sender}:{payload}:{seq})
+        //   - covers ALL upstream entry points (api_local, api.rs, P2P
+        //     TX inbound, future RPC methods) in one place — no API-
+        //     layer canonicalization needed.
+        let tx_hash = Self::canonical_tx_hash(&parsed_tx);
+        if self.seen_txs.contains(&tx_hash) {
+            return Err(format!("Duplicate transaction: {}", tx_hash));
         }
 
         // === H-04 PROMOTED (Phase 2.2): WIRE THE STARK VERIFIER ===
@@ -346,14 +363,7 @@ impl Mempool {
             return Err("Unknown Signature Scheme size".to_string());
         }
 
-        // Calculate Hash for Deduplication
-        let mut hasher = Sha256::new();
-        hasher.update(tx.as_bytes());
-        let tx_hash = hex::encode(hasher.finalize());
-
-        if self.seen_txs.contains(&tx_hash) {
-            return Err(format!("Duplicate transaction: {}", tx_hash));
-        }
+        // (tx_hash already computed early — see PWN-004 + PWN-007 block above.)
 
         // (M-04: size guard was moved to the top of add_transaction so it
         // runs before any expensive parsing or signature verification.)

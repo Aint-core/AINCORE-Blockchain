@@ -603,3 +603,73 @@ fn test_zkp_replayed_proof_with_wrong_binding_rejected() {
         err
     );
 }
+
+/// Phase 5B.11 / PWN-007 PROPER: dedup at the mempool layer must be
+/// CANONICAL, not raw-bytes. The same signed TX submitted with reordered
+/// JSON keys or extra whitespace must be detected as a duplicate — across
+/// EVERY entry point (api_local.rs, api.rs, P2P). This test exercises the
+/// mempool directly and proves cross-encoding replay is caught with NO
+/// API-layer cooperation.
+#[test]
+fn pwn007_proper_replay_with_reordered_keys_rejected() {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let mut mempool = Mempool::new();
+
+    // Build a real signed TX (canonical form A).
+    let seed = [99u8; 32];
+    let sk = SigningKey::from_bytes(&seed);
+    let pk = hex::encode(sk.verifying_key().to_bytes());
+    let sender = crypto::derive_address(sk.verifying_key().as_bytes()).unwrap();
+    let chain_id = std::env::var("AINCORE_CHAIN_ID")
+        .unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+    let payload = hex::encode(bcs::to_bytes(
+        &vm_move::TransactionPayload::PublishModule(vec![b"pwn007".to_vec()]),
+    ).unwrap());
+    let seq = 42u64;
+    let canonical_msg = format!("{}:{}:{}:{}", chain_id, sender, payload, seq);
+    let sig_hex = hex::encode(sk.sign(canonical_msg.as_bytes()).to_bytes());
+
+    // Form A: keys in one order.
+    let tx_a = serde_json::json!({
+        "chain_id": chain_id,
+        "sender": sender,
+        "input_objects": [],
+        "payload": payload,
+        "args": [],
+        "gas_limit": 1000,
+        "gas_price": 1u128,
+        "sequence_number": seq,
+        "public_key": pk,
+        "signature": sig_hex,
+    }).to_string();
+
+    // Form B: same fields, REORDERED + extra whitespace. Different raw
+    // bytes, IDENTICAL canonical signed form, identical signature.
+    let tx_b = format!(
+        r#"{{ "signature": "{}", "public_key": "{}", "sequence_number": {}, "gas_price": 1, "gas_limit": 1000, "args": [], "payload": "{}", "input_objects": [], "sender": "{}", "chain_id": "{}" }}"#,
+        sig_hex, pk, seq, payload, sender, chain_id
+    );
+
+    assert_ne!(tx_a, tx_b, "test setup: raw bytes must differ for the test to be meaningful");
+
+    // First submit succeeds.
+    let h1 = mempool.add_transaction(tx_a).expect("form A must enter mempool");
+
+    // Second submit (reordered) must be rejected as duplicate.
+    let err = mempool.add_transaction(tx_b).expect_err(
+        "PWN-007: re-encoded duplicate must be rejected at mempool layer",
+    );
+    assert!(
+        err.contains("Duplicate"),
+        "rejection must call out duplicate. Got: {:?}",
+        err
+    );
+
+    // Canonical hash must be identical for both forms.
+    assert!(
+        err.contains(&h1),
+        "duplicate error should reference the original canonical hash {}, got: {:?}",
+        h1, err
+    );
+}
