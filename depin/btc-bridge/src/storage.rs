@@ -1,14 +1,28 @@
-/// Phase 5.1 / H-03 port — BTC Bridge Replay Protection
+/// Phase 5.1 / H-03 BTC port — Bridge Replay Protection (SCOPE: replay only).
 ///
-/// Parity with the EVM bridge `BridgeState`:
-///   1. Atomic save: write to `*.tmp` then rename — crash-safe (no partial JSON).
-///   2. Tombstone-before-mint flow: caller marks a deposit `in_progress`
-///      BEFORE attempting the wBTC mint. On crash between mint and "completed"
-///      mark the operator sees an in-progress entry and can investigate, but
-///      automatic retry will NOT re-mint (the tombstone already exists).
-///   3. Optional `last_seen_height` cursor for future block-range scans —
-///      the blockchain.info API does not yet support range queries, so this
-///      is informational for now.
+/// ⚠️  HONEST SCOPE — what this port DOES and DOES NOT achieve vs the
+/// EVM bridge:
+///
+/// ## DOES (replay-protection parity):
+///   1. Atomic save: write to `*.tmp` then rename — crash-safe (no
+///      partial JSON file on disk).
+///   2. Tombstone-before-mint flow: caller marks a deposit `InProgress`
+///      BEFORE attempting the wBTC mint. On crash between mint and
+///      "completed" mark, the operator sees an InProgress entry and
+///      can investigate; automatic retry will NOT re-mint (tombstone
+///      already exists).
+///   3. Legacy `HashSet<String>` state file migrates one-shot to the
+///      new schema on boot.
+///
+/// ## DOES NOT (NOT full EVM-bridge feature parity):
+///   - No range-based block scanning. `last_seen_height` is stored
+///     but currently INFORMATIONAL ONLY — the upstream blockchain.info
+///     API does not expose `getBlocksInRange(start, end)`, so the
+///     scanner still re-reads the full address history each cycle and
+///     relies on tx-hash dedup for correctness. The EVM bridge has
+///     this through `aincore_getBlocks(limit, start_height)`; BTC
+///     does not, yet.
+///   - No multisig (C-02 scope, deferred).
 ///
 /// State file: `./processed_txs.json` (path configurable in `Storage::new`).
 use anyhow::Result;

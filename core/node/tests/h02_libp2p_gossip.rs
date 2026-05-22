@@ -21,16 +21,19 @@
 //!   ❌ Byzantine peer behaviour (covered by the Phase 2.7 gossipsub
 //!      hardening config — separate concern)
 //!
-//! ## What closes the H-02 loop end-to-end
+//! ## What closes the H-02 loop end-to-end (HONEST DECOMPOSITION)
 //!   1. The logic-level simulation in
 //!      `consensus::tests::test_h02_b2_simulated_cross_node_attestation_reaches_quorum`
 //!      proves the message format, signing, verification, storage,
 //!      validator-set lookup, BFT quorum, and executor promotion.
 //!   2. THIS test proves the libp2p stack starts and accepts
 //!      DOWNTIME_ATTEST: payloads onto the broadcast channel.
-//!   3. The `docker-compose.local.yml` runbook spins up real separate
-//!      processes — that is where true cross-process integration is
-//!      validated for releases.
+//!   3. STILL OPEN: full cross-process Gossipsub delivery.
+//!      `docker-compose.local.yml` exists in the repo as a deployment
+//!      runbook but is NOT executed by any automated test in this
+//!      branch. Cross-process delivery is therefore an OPERATOR /
+//!      manual integration gate, not a CI-proven closure. Tracked as
+//!      task "Phase 5.B2.cross-process" in the audit task list.
 //!
 //! Marked `#[ignore]` so the default `cargo test` run is fast. To run:
 //!   cargo test -p node --test h02_libp2p_gossip -- --ignored --nocapture
