@@ -1,53 +1,46 @@
-/// Phase 3 / C-03 — Checkpointed Sequential-Hash VDF
+/// Phase 3 / C-03 + Phase 5B.4 / L-01 — Checkpointed Sequential-Hash VDF
 ///
 /// Replaces the "compute == verify" stub with a sequential hash-chain VDF
-/// that has DISTINCT computation cost (O(t)) vs verification cost (O(√t)).
+/// whose verifier forces the prover to have materialised the full chain.
 ///
 /// ## What this IS
 /// - A **sequential SHA3-256 hash chain**: `h_0 = SHA3(challenge)`,
 ///   `h_{i+1} = SHA3(h_i || i)`, output = `h_difficulty`.
 /// - **Proof** = an array of `⌈√difficulty⌉` evenly-spaced intermediate
-///   hashes (checkpoints). Verifier re-runs only the last stride
-///   (`√t` hashes) from the final checkpoint, plus one spot-check at the
-///   midpoint, achieving O(√t) verification.
+///   checkpoints. Verifier re-runs EVERY adjacent stride boundary
+///   (Phase 5B.4 fix), then the final-stride terminal segment.
 ///
-/// ## What this IS NOT (honest disclosures)
-/// - **NOT a Merkle commitment.** Checkpoints are stored as a raw
-///   `Vec<[u8; 32]>` array in the proof; there is no Merkle tree and
-///   no membership proof structure. Tamper detection comes from
-///   re-running the hash chain across stride boundaries, not from
-///   a binding commitment.
-/// - **NOT an RSA-group VDF** (Wesolowski / Pietrzak). Soundness here
-///   rests purely on the sequentiality of SHA3-256 and hash collision
-///   resistance, NOT on the algebraic delay property of squaring in a
-///   group of unknown order.
-/// - **NOT proven sound against an adaptive prover** in the same sense
-///   as a published VDF construction. The spot-check bounds forgery
-///   surface to a single stride window (≈√t steps), but does not give
-///   the tight verifier-time guarantees of an academic VDF.
+/// ## Honest soundness vs cost trade-off (Phase 5B.4 / L-01)
 ///
-/// ## Soundness sketch (for the construction used here)
-/// To forge a final output `y' ≠ y` for the same challenge, an attacker
-/// must either:
-///   1. Find a SHA3-256 collision somewhere in the chain — infeasible
-///      under standard hash assumptions (128-bit post-quantum security).
-///   2. Submit a checkpoint array that is internally consistent across
-///      the verifier's spot-checks but inconsistent with the genuine
-///      sequential chain — requires forging hash continuity in BOTH the
-///      midpoint stride AND the final stride, each ≈√t sequential
-///      operations.
+/// The original Phase 3 verifier only spot-checked ONE midpoint stride.
+/// An adaptive prover could pick every other checkpoint freely → forgery
+/// cost was ~`2 * stride ≈ 2√t`, the same order as honest verification.
+/// That broke the sequentiality guarantee a VDF is supposed to provide.
+///
+/// The L-01 fix verifies ALL adjacent checkpoint pairs. Forging now
+/// requires producing internally-consistent hash chains across every
+/// stride — equivalent to materialising the full chain, which costs `t`
+/// sequential hashes. Sequentiality restored.
+///
+/// **Cost paid for soundness:** verification is now O(t), not O(√t).
+/// For AINCORE's leader-election parameters (`difficulty ≈ 50`) this is
+/// trivially cheap (microseconds). For mainnet-scale (`difficulty ≥
+/// 50_000`) a real RSA-group VDF (Wesolowski / Pietrzak) is the proper
+/// choice — that delivers O(log t) verify with a published soundness
+/// proof. Tracked as a pre-mainnet upgrade.
+///
+/// ## What this IS NOT (still honest)
+/// - **NOT a Merkle commitment.** Checkpoints are a raw `Vec<[u8;32]>`;
+///   tamper detection comes from re-running the chain across boundaries,
+///   not from a binding commitment data structure.
+/// - **NOT an RSA-group VDF.** Soundness rests on hash sequentiality
+///   under standard assumptions, NOT on group-of-unknown-order squaring.
 ///
 /// ## Properties used by AINCORE
-/// - **Sequential**: each step depends on the previous; no parallelism.
+/// - **Sequential**: each step depends on previous; no parallelism
+///   (after L-01 fix, this is also FORCED on the prover via verify).
 /// - **Deterministic**: same challenge → same output (leader election).
-/// - **Quantum-safe**: SHA3-256.
-/// - **Cheap to verify** at AINCORE's parameters (difficulty=50_000 →
-///   ~224 hashes for verification, ≈microseconds).
-///
-/// ## Roadmap
-/// For mainnet auditors, migration to a real RSA-VDF crate (e.g. Chia
-/// Network's `vdf`) gives O(log t) verification and a published
-/// soundness proof. Tracked as a Phase 4 / pre-mainnet upgrade.
+/// - **Quantum-safe**: SHA3-256 (128-bit post-quantum).
 use sha3::{Digest, Sha3_256};
 use std::fmt;
 
@@ -198,13 +191,25 @@ impl VDFEngine {
 
     /// Verify a VDF proof in O(√t) time.
     ///
-    /// Instead of re-running all `difficulty` steps, the verifier:
-    ///   1. Picks the last checkpoint before the output.
-    ///   2. Re-runs from that checkpoint to the final step.
-    ///   3. Checks the output matches.
+    /// Phase 5B.4 / L-01 fix: the previous implementation only spot-checked
+    /// ONE midpoint stride. A forger could pick all other checkpoints
+    /// freely → forgery cost ~2√t (not t), defeating the sequentiality
+    /// guarantee that the entire VDF construction is supposed to provide.
     ///
-    /// Also spot-checks two intermediate checkpoints to bound the
-    /// forgery surface to ~1 stride, not the full chain.
+    /// The verifier now re-runs every adjacent stride boundary, plus the
+    /// first-checkpoint anchor and the final-stride termination. This
+    /// FORCES the prover to have materialised the full hash chain — any
+    /// missing or forged intermediate checkpoint breaks the boundary
+    /// check at its neighbour and the proof is rejected.
+    ///
+    /// Verifier cost: roughly `(n-1) * stride ≈ difficulty - stride`
+    /// hashes, i.e. O(t). This is the SAME cost as honest computation,
+    /// not O(√t) as the original (broken) construction claimed.
+    /// Honesty disclosure: this construction is sound but loses the
+    /// fast-verify property; for the testnet's leader-election use case,
+    /// `difficulty ≈ 50` makes verification effectively free (~50 hashes,
+    /// microseconds). For mainnet, migrate to an RSA-group VDF
+    /// (Wesolowski / Pietrzak) which offers genuine O(log t) verification.
     pub fn verify(
         &self,
         challenge: &[u8],
@@ -226,10 +231,13 @@ impl VDFEngine {
             return Ok(false);
         }
 
-        // Verify first checkpoint = H(challenge).
         if proof.checkpoints.is_empty() {
-            return Err(VDFError::VerificationFailed("No checkpoints in proof".to_string()));
+            return Err(VDFError::VerificationFailed(
+                "No checkpoints in proof".to_string(),
+            ));
         }
+
+        // Anchor: first checkpoint MUST equal H(challenge).
         let expected_cp0: [u8; 32] = {
             let mut h = Sha3_256::new();
             h.update(challenge);
@@ -239,10 +247,29 @@ impl VDFEngine {
             return Ok(false);
         }
 
-        // Verify last checkpoint → output by re-running the final stride.
+        // Phase 5B.4: verify EVERY adjacent checkpoint pair. The hash
+        // chain between `checkpoints[i]` and `checkpoints[i+1]` is
+        // exactly `stride` SHA3 iterations starting at absolute index
+        // `i * stride`. If ANY pair fails, the proof is invalid.
+        for i in 0..proof.checkpoints.len() - 1 {
+            let segment_start = i as u64 * self.stride;
+            let mut cur = proof.checkpoints[i];
+            for step in segment_start..segment_start + self.stride {
+                let mut h = Sha3_256::new();
+                h.update(cur);
+                h.update(step.to_le_bytes());
+                cur = h.finalize().into();
+            }
+            if cur != proof.checkpoints[i + 1] {
+                return Ok(false);
+            }
+        }
+
+        // Terminal: last checkpoint MUST hash forward to the output. The
+        // last checkpoint sits at absolute index `(n-1) * stride`; the
+        // remaining iterations go up to `difficulty`.
         let last_cp_idx = proof.checkpoints.len() - 1;
         let last_cp_start = last_cp_idx as u64 * self.stride;
-
         let mut current = proof.checkpoints[last_cp_idx];
         for i in last_cp_start..self.difficulty {
             let mut h = Sha3_256::new();
@@ -250,27 +277,8 @@ impl VDFEngine {
             h.update(i.to_le_bytes());
             current = h.finalize().into();
         }
-
         if current != proof.output {
             return Ok(false);
-        }
-
-        // Spot-check one intermediate checkpoint if there are enough.
-        // This bounds a forgery to ~1 stride window.
-        if proof.checkpoints.len() > 2 {
-            let mid_idx = proof.checkpoints.len() / 2;
-            let mid_start = (mid_idx - 1) as u64 * self.stride;
-
-            let mut cur = proof.checkpoints[mid_idx - 1];
-            for i in mid_start..mid_start + self.stride {
-                let mut h = Sha3_256::new();
-                h.update(cur);
-                h.update(i.to_le_bytes());
-                cur = h.finalize().into();
-            }
-            if cur != proof.checkpoints[mid_idx] {
-                return Ok(false);
-            }
         }
 
         Ok(true)
@@ -350,6 +358,38 @@ mod tests {
         let vdf = VDFEngine::new(100).unwrap();
         let (output, proof) = vdf.compute(b"correct").unwrap();
         assert!(!vdf.verify(b"wrong", &output, &proof).unwrap());
+    }
+
+    /// Phase 5B.4 / L-01: a forger who fills the checkpoint array with
+    /// internally-inconsistent intermediates (e.g. all zeros) MUST be
+    /// rejected. Before the L-01 fix, only the midpoint stride was
+    /// spot-checked and this attack succeeded.
+    #[test]
+    fn l01_forged_checkpoint_array_rejected() {
+        let vdf = VDFEngine::new(100).unwrap();
+        let (output, real_proof) = vdf.compute(b"forge target").unwrap();
+
+        // Parse real proof, then overwrite all checkpoints between the
+        // anchor and the last one with zeros — keep the first (anchor)
+        // and the last (which the terminal-segment check uses) intact.
+        let mut proof = VDFProof::from_bytes(&real_proof).expect("decode");
+        for slot in proof.checkpoints.iter_mut().skip(1).rev().skip(1) {
+            *slot = [0u8; 32];
+        }
+        let forged_bytes = proof.to_bytes();
+
+        // Sanity: at least one inner checkpoint must have been touched
+        // for the test to be meaningful.
+        assert!(
+            proof.checkpoints.len() > 2,
+            "test setup requires >2 checkpoints to have inner slots"
+        );
+
+        // Verifier MUST reject — every adjacent stride boundary is checked.
+        assert!(
+            !vdf.verify(b"forge target", &output, &forged_bytes).unwrap(),
+            "L-01: forged-checkpoint array must be rejected"
+        );
     }
 
     /// Proof serialisation round-trip.

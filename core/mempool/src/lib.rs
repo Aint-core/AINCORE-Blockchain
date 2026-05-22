@@ -77,6 +77,22 @@ impl Mempool {
         // before being rejected. Moving it to the very first line bounds
         // the worst-case wasted work to one `.len()` call.
         const TX_BYTE_LIMIT: usize = 100 * 1024; // 100KB
+
+        // Phase 5B.7 / PWN-004: hash-based dedup runs RIGHT AFTER the size
+        // guard, BEFORE any signature/PQC verification. The original flow
+        // ran SHA-256 dedup last (line 338), letting an attacker spam
+        // N unique payloads and burn Dilithium-5 verify CPU on every one
+        // before being rejected. Now any duplicate byte-for-byte payload
+        // hits a HashSet lookup and exits at near-zero cost.
+        if tx.len() <= TX_BYTE_LIMIT {
+            let mut early_hasher = Sha256::new();
+            early_hasher.update(tx.as_bytes());
+            let early_tx_hash = hex::encode(early_hasher.finalize());
+            if self.seen_txs.contains(&early_tx_hash) {
+                return Err(format!("Duplicate transaction: {}", early_tx_hash));
+            }
+        }
+
         if tx.len() > TX_BYTE_LIMIT {
             return Err(format!(
                 "Transaction too large ({} bytes). limit {}KB.",

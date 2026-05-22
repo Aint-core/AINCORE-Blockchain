@@ -464,11 +464,43 @@ fn handle_rpc_method(
         },
         "aincore_sendTransaction" => {
             // params: [signed_tx_json_string OR signed_tx_object]
+            //
+            // Phase 5B.8 / PWN-007: when an object is supplied, canonicalise
+            // the JSON before forwarding to the mempool. Without this, a
+            // replay attacker could resubmit the same signed transaction
+            // with reordered keys or different whitespace and bypass
+            // hash-based dedup (`seen_txs`) while the signature still
+            // verifies because it was computed over a separate
+            // chain_id:sender:payload:seq canonical string. By forcing the
+            // mempool to dedupe over a sorted-key serialisation we ensure
+            // semantically-identical TXs hash identically.
+            fn canonicalise(value: &serde_json::Value) -> String {
+                use serde_json::Value;
+                match value {
+                    Value::Object(map) => {
+                        let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+                        entries.sort_by(|a, b| a.0.cmp(b.0));
+                        let inner: Vec<String> = entries
+                            .into_iter()
+                            .map(|(k, v)| {
+                                format!("{}:{}", serde_json::to_string(k).unwrap_or_default(), canonicalise(v))
+                            })
+                            .collect();
+                        format!("{{{}}}", inner.join(","))
+                    }
+                    Value::Array(arr) => {
+                        let inner: Vec<String> = arr.iter().map(canonicalise).collect();
+                        format!("[{}]", inner.join(","))
+                    }
+                    _ => serde_json::to_string(value).unwrap_or_default(),
+                }
+            }
+
             let tx_str_opt = if let Some(val) = params.get(0) {
                 if val.is_string() {
                     val.as_str().map(|s| s.to_string())
                 } else if val.is_object() {
-                    serde_json::to_string(val).ok()
+                    Some(canonicalise(val))
                 } else {
                     None
                 }

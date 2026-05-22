@@ -592,6 +592,85 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    // ── Phase 5B.1 / PWN-001: Vertex hash integrity ──────────────────────
+
+    /// Vertex whose self-declared `hash` does NOT match a freshly recomputed
+    /// `calculate_hash()` must be rejected, even when the Ed25519 signature
+    /// over that declared hash is valid. Without this guard a malicious
+    /// validator could emit two vertices with the same `hash` + `signature`
+    /// but different `payload` / `parents` / `timestamp`, splitting state
+    /// across honest peers.
+    #[test]
+    fn pwn001_vertex_with_tampered_hash_field_is_rejected() {
+        use blockchain::Vertex;
+        use crypto::SigningKey;
+
+        let (mut dag, path) = setup_dag("pwn001_tampered_hash");
+
+        // Build a real vertex authored by THIS node so the validator-set
+        // check passes (this node is registered in setup_dag).
+        let signing_key = SigningKey::from_bytes(&dag.node_key);
+        let mut vertex = Vertex {
+            round: 1,
+            author: dag.node_id.clone(),
+            parents: vec![],
+            payload: vec!["tx_a".to_string()],
+            timestamp: 1,
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+        };
+        // Tamper: set hash to garbage, then sign over the garbage hash.
+        vertex.hash = "deadbeef".repeat(8);
+        vertex.sign_with_ed25519(&signing_key);
+
+        let dag_len_before = dag.dag.lock().unwrap().len();
+        dag.add_vertex(vertex);
+        let dag_len_after = dag.dag.lock().unwrap().len();
+
+        assert_eq!(
+            dag_len_before, dag_len_after,
+            "PWN-001: vertex with tampered hash must NOT enter the DAG"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// PWN-002: a vertex with round vastly larger than current_round must
+    /// be rejected, preventing u64 fast-forward + overflow halt.
+    #[test]
+    fn pwn002_round_overflow_attack_rejected() {
+        use blockchain::Vertex;
+        use crypto::SigningKey;
+
+        let (mut dag, path) = setup_dag("pwn002_round_overflow");
+
+        // Build a vertex with round = u64::MAX - 1 authored by this node.
+        let signing_key = SigningKey::from_bytes(&dag.node_key);
+        let mut vertex = Vertex {
+            round: u64::MAX - 1,
+            author: dag.node_id.clone(),
+            parents: vec![],
+            payload: vec!["malicious".to_string()],
+            timestamp: 1,
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+        };
+        vertex.hash = vertex.calculate_hash();
+        vertex.sign_with_ed25519(&signing_key);
+
+        let round_before = dag.current_round;
+        dag.add_vertex(vertex);
+
+        assert_eq!(
+            dag.current_round, round_before,
+            "PWN-002: vertex with far-future round must NOT advance current_round"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     // ── Phase 3 / H-02: Downtime attestation gossip ──────────────────────
 
     /// Valid remote attestation (correct sig + known validator) is stored.
@@ -608,15 +687,18 @@ mod tests {
         let remote_pubkey_hex = hex::encode(remote_vk.to_bytes());
         let remote_addr = derive_address(remote_vk.as_bytes()).expect("derive_address");
 
-        // Register the remote validator in storage so the validator-set check passes.
-        // Format: Vec<(String, u64)> serialised by serde_json → [["addr", stake], ...]
-        let vset: Vec<(String, u64)> = vec![(remote_addr.clone(), 1000u64)];
+        // Register both the remote reporter AND the offender as validators
+        // so the post-Phase-5B.6 checks pass (offender must be a validator
+        // to be eligible for downtime slashing).
+        let offender = "deadbeefdeadbeef".to_string();
+        let vset: Vec<(String, u64)> = vec![
+            (remote_addr.clone(), 1000u64),
+            (offender.clone(), 1000u64),
+        ];
         dag.storage.put("sys:validators", &serde_json::to_string(&vset).unwrap()).unwrap();
-        // Invalidate cache so the new entry is visible.
         dag.invalidate_validators_cache();
 
         // Build and sign an attestation as the remote validator would.
-        let offender = "deadbeefdeadbeef".to_string();
         let epoch: u64 = 1;
         let round: u64 = 100;
         let canonical = format!("{}:{}:{}:{}", offender, epoch, remote_addr, round);
@@ -640,6 +722,98 @@ mod tests {
         let key = format!("sys:downtime_attestation:{}:{}:{}", offender, epoch, remote_addr);
         let stored = dag.storage.get(&key).expect("db ok").expect("must be stored");
         assert!(stored.contains(&offender));
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Phase 5B.6 / SEC-N03: an attestation whose `offender` is NOT in
+    /// the validator set must be rejected — otherwise a single Byzantine
+    /// reporter can spam attestations against arbitrary addresses and
+    /// blow up `sys:downtime_attestation:` storage.
+    #[test]
+    fn sec_n03_offender_not_in_validator_set_rejected() {
+        use crypto::{Signer, SigningKey, derive_address};
+
+        let (mut dag, path) = setup_dag("sec_n03_unknown_offender");
+
+        let remote_key_bytes: [u8; 32] = [0xEE; 32];
+        let remote_sk = SigningKey::from_bytes(&remote_key_bytes);
+        let remote_vk = remote_sk.verifying_key();
+        let remote_pubkey_hex = hex::encode(remote_vk.to_bytes());
+        let remote_addr = derive_address(remote_vk.as_bytes()).expect("derive");
+
+        // Reporter IS in validator set, but offender is NOT.
+        let vset: Vec<(String, u64)> = vec![(remote_addr.clone(), 1000u64)];
+        dag.storage.put("sys:validators", &serde_json::to_string(&vset).unwrap()).unwrap();
+        dag.invalidate_validators_cache();
+
+        let offender = "ghost_offender_not_a_validator".to_string();
+        let epoch = 1u64;
+        let round = 50u64;
+        let canonical = format!("{}:{}:{}:{}", offender, epoch, remote_addr, round);
+        let sig = remote_sk.sign(canonical.as_bytes());
+
+        let payload = serde_json::json!({
+            "offender": offender,
+            "epoch": epoch,
+            "reporter": remote_addr,
+            "reporter_pubkey": remote_pubkey_hex,
+            "round": round,
+            "rounds_missed": 130u64,
+            "signature": hex::encode(sig.to_bytes()),
+        });
+        dag.handle_message(&format!("DOWNTIME_ATTEST:{}", payload));
+
+        let key = format!("sys:downtime_attestation:{}:{}:{}", offender, epoch, remote_addr);
+        assert!(
+            dag.storage.get(&key).unwrap().is_none(),
+            "SEC-N03: attestation against non-validator offender must NOT be stored"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Phase 5B.6 / L-05: a reporter cannot attest its own downtime
+    /// (reporter == offender). Otherwise a Byzantine validator gets a
+    /// "free" attestation slot toward quorum.
+    #[test]
+    fn l05_self_attestation_rejected() {
+        use crypto::{Signer, SigningKey, derive_address};
+
+        let (mut dag, path) = setup_dag("l05_self_attest");
+
+        let key_bytes: [u8; 32] = [0xAB; 32];
+        let sk = SigningKey::from_bytes(&key_bytes);
+        let vk = sk.verifying_key();
+        let pubkey_hex = hex::encode(vk.to_bytes());
+        let addr = derive_address(vk.as_bytes()).expect("derive");
+
+        let vset: Vec<(String, u64)> = vec![(addr.clone(), 1000u64)];
+        dag.storage.put("sys:validators", &serde_json::to_string(&vset).unwrap()).unwrap();
+        dag.invalidate_validators_cache();
+
+        // reporter == offender
+        let epoch = 1u64;
+        let round = 50u64;
+        let canonical = format!("{}:{}:{}:{}", addr, epoch, addr, round);
+        let sig = sk.sign(canonical.as_bytes());
+
+        let payload = serde_json::json!({
+            "offender": addr,
+            "epoch": epoch,
+            "reporter": addr,
+            "reporter_pubkey": pubkey_hex,
+            "round": round,
+            "rounds_missed": 130u64,
+            "signature": hex::encode(sig.to_bytes()),
+        });
+        dag.handle_message(&format!("DOWNTIME_ATTEST:{}", payload));
+
+        let key = format!("sys:downtime_attestation:{}:{}:{}", addr, epoch, addr);
+        assert!(
+            dag.storage.get(&key).unwrap().is_none(),
+            "L-05: self-attestation must NOT be stored"
+        );
 
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -779,14 +953,16 @@ mod tests {
         let offender_sk = SigningKey::from_bytes(&[0xFF; 32]);
         let offender = derive_address(offender_sk.verifying_key().as_bytes()).unwrap();
 
-        // 2. Register A, B, C as the validator set on EVERY node's storage.
-        //    (Offender is NOT in the set — they were already removed; this
-        //    is OK for the test, what matters is the 3 REPORTER addresses
-        //    are validators.)
+        // 2. Register A, B, C AND the offender as the validator set on
+        //    EVERY node's storage. Post-Phase-5B.6 (SEC-N03), an offender
+        //    must be in the validator set to be eligible for downtime
+        //    attestation — otherwise spam against random addresses would
+        //    cause unbounded storage growth.
         let vset: Vec<(String, u64)> = vec![
             (addr_a.clone(), 100),
             (addr_b.clone(), 100),
             (addr_c.clone(), 100),
+            (offender.clone(), 100),
         ];
         let vset_json = serde_json::to_string(&vset).unwrap();
         for node in [&node_a, &node_b, &node_c] {

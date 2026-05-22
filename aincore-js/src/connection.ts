@@ -35,6 +35,55 @@ export interface DexSpotPrice {
     quote: DexQuote;
 }
 
+export interface DexTrade {
+    tx_hash: string;
+    pool_addr: string;
+    function: string;
+    token_x: string;
+    token_y: string;
+    token_in: string;
+    token_out: string;
+    amount_in: string;
+    amount_out: string;
+    block_height: number;
+    timestamp: number;
+}
+
+export interface DexOhlcCandle {
+    time: number;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+}
+
+export interface DexPairSummary {
+    base_token: string;
+    quote_token: string;
+    last_price: number;
+    price_change_24h_pct: number;
+    volume_base_24h: number;
+    volume_quote_24h: number;
+    trades_24h: number;
+    high_24h: number;
+    low_24h: number;
+    first_trade_at: number;
+    last_trade_at: number;
+}
+
+export interface DexMarketSummary {
+    token_x: string;
+    token_y: string;
+    pool_addr: string;
+    last_price: number;
+    price_change_24h_pct: number;
+    volume_x_24h: number;
+    volume_y_24h: number;
+    trades_24h: number;
+    last_trade_at: number;
+}
+
 export class Connection {
     private rpcUrl: string;
     private client: AxiosInstance;
@@ -286,6 +335,87 @@ export class Connection {
             tokenOut,
             String(unitAmountIn),
         ]);
+    }
+
+    /**
+     * Read recent native DEX trades from the indexer.
+     */
+    async getDexTrades(tokenIn: string, tokenOut: string, limit: number = 100): Promise<DexTrade[]> {
+        if (!this.indexerUrl) {
+            console.warn("Indexer URL not configured. Returning empty DEX trades.");
+            return [];
+        }
+        try {
+            const response = await axios.get(`${this.indexerUrl}/api/v1/trades`, {
+                params: { base: tokenIn, quote: tokenOut, limit },
+            });
+            return response.data || [];
+        } catch (e) {
+            console.error("Failed to fetch DEX trades from indexer", e);
+            return [];
+        }
+    }
+
+    /**
+     * Read native OHLC candles aggregated from DEX swap history.
+     */
+    async getDexOhlc(
+        tokenIn: string,
+        tokenOut: string,
+        resolution: number = 15,
+        limit: number = 5000,
+    ): Promise<DexOhlcCandle[]> {
+        if (!this.indexerUrl) {
+            console.warn("Indexer URL not configured. Returning empty OHLC.");
+            return [];
+        }
+        try {
+            const response = await axios.get(`${this.indexerUrl}/api/v1/ohlc`, {
+                params: { base: tokenIn, quote: tokenOut, resolution, limit },
+            });
+            return response.data || [];
+        } catch (e) {
+            console.error("Failed to fetch DEX OHLC from indexer", e);
+            return [];
+        }
+    }
+
+    /**
+     * Read a market summary for one canonical pair from the indexer.
+     */
+    async getDexPairSummary(tokenIn: string, tokenOut: string): Promise<DexPairSummary | null> {
+        if (!this.indexerUrl) {
+            console.warn("Indexer URL not configured. Returning null DEX pair summary.");
+            return null;
+        }
+        try {
+            const response = await axios.get(`${this.indexerUrl}/api/v1/pair_summary`, {
+                params: { base: tokenIn, quote: tokenOut },
+            });
+            return response.data || null;
+        } catch (e) {
+            console.error("Failed to fetch DEX pair summary from indexer", e);
+            return null;
+        }
+    }
+
+    /**
+     * Read market summaries across all indexed canonical pools.
+     */
+    async getDexMarkets(limit: number = 50): Promise<DexMarketSummary[]> {
+        if (!this.indexerUrl) {
+            console.warn("Indexer URL not configured. Returning empty DEX market list.");
+            return [];
+        }
+        try {
+            const response = await axios.get(`${this.indexerUrl}/api/v1/markets`, {
+                params: { limit },
+            });
+            return response.data || [];
+        } catch (e) {
+            console.error("Failed to fetch DEX markets from indexer", e);
+            return [];
+        }
     }
 
     /**

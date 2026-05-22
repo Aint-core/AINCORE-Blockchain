@@ -751,7 +751,12 @@ impl Executor {
         // Step 2: split into bonus + pool buckets.
         // 20% leader bonus, 80% stake-weighted pool.
         const LEADER_BONUS_PCT: u128 = 20;
-        let leader_bonus = (total_reward * LEADER_BONUS_PCT) / 100;
+        // Phase 5B.9 / L-02 + L-03: saturating arithmetic in reward math.
+        // At AINCORE supply scale the unchecked `*` does not overflow, but
+        // any future governance bug that engineers an oversized reward
+        // would panic in debug or wrap in release. saturating_* gives
+        // defense-in-depth without changing correct-case behaviour.
+        let leader_bonus = total_reward.saturating_mul(LEADER_BONUS_PCT) / 100;
         let pool = total_reward - leader_bonus;
 
         // Step 3: stake-weighted distribution of the pool.
@@ -760,9 +765,10 @@ impl Executor {
         let mut distributed_pool: u128 = 0;
 
         for (addr, stake) in &validators {
-            let share = (pool * (*stake as u128)) / total_stake;
-            distributed_pool += share;
-            *payouts.entry(addr.clone()).or_insert(0) += share;
+            let share = pool.saturating_mul(*stake as u128) / total_stake;
+            distributed_pool = distributed_pool.saturating_add(share);
+            *payouts.entry(addr.clone()).or_insert(0) =
+                payouts.get(addr).copied().unwrap_or(0).saturating_add(share);
         }
 
         // Step 4: leader bonus + rounding remainder to leader.

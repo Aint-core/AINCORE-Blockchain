@@ -25,59 +25,83 @@ async fn main() {
     let contract_addr = env::var("CONTRACT_ADDRESS")
         .unwrap_or_else(|_| "0x0000000000000000000000000000000000000000".to_string());
 
-    // Argument Parsing for Keystore
+    // Phase 5B.3 / SEC-N01: parse ONE OR MORE `--keystore <path>` flags.
+    // EvmClient requires 3 distinct signers (MULTISIG_THRESHOLD = 3). The
+    // previous code accepted exactly one keystore and silently padded the
+    // signer set with two `LocalWallet::new(&mut rand::thread_rng())`
+    // ephemeral keys — fake multisig that collapsed to single-key trust
+    // and broke on every restart (regenerated keys would not match any
+    // on-chain registration). Bridge now hard-fails boot unless at least
+    // MULTISIG_THRESHOLD real keystores are supplied.
     let args: Vec<String> = env::args().collect();
-    let mut keystore_path = None;
-    for i in 0..args.len() {
+    let mut keystore_paths: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
         if args[i] == "--keystore" && i + 1 < args.len() {
-            keystore_path = Some(args[i + 1].clone());
+            keystore_paths.push(args[i + 1].clone());
+            i += 2;
+        } else {
+            i += 1;
         }
     }
 
-    let evm_private_key = if let Some(keystore_path) = keystore_path {
-        info!(
-            "🔐 Loading EVM private key from secure keystore: {}",
-            keystore_path
+    const REQUIRED_KEYSTORES: usize = 3;
+    if keystore_paths.len() < REQUIRED_KEYSTORES {
+        error!(
+            "🚨 CRITICAL [SEC-N01]: bridge requires {} real keystores; got {}.",
+            REQUIRED_KEYSTORES,
+            keystore_paths.len()
         );
-
-        // Prompt for password
-        let password = rpassword::prompt_password("Enter keystore password: ")
-            .expect("Failed to read password");
-
-        // Decrypt keystore
-        keystore::KeyManager::decrypt(&keystore_path, &password)
-            .expect("Failed to decrypt keystore")
-    } else {
-        // PRODUCTION SECURITY: Keystore is MANDATORY
-        error!("🚨 CRITICAL: --keystore flag is REQUIRED for production deployment");
-        error!("🚨 Environment variables (EVM_PRIVATE_KEY) are NOT SECURE:");
-        error!("   - Visible in process listings (ps aux)");
-        error!("   - Leaked in core dumps");
-        error!("   - Exposed to child processes");
-        error!("   - Logged in system logs");
+        error!("🚨 The previous build silently padded with ephemeral random wallets —");
+        error!("🚨 that collapsed the security to single-key trust and is now BLOCKED.");
         error!("");
-        error!("Usage: cargo run -- --keystore /path/to/keystore.json");
-
+        error!("Usage:");
+        error!("  bridge-rust --keystore /path/to/key1.json \\");
+        error!("              --keystore /path/to/key2.json \\");
+        error!("              --keystore /path/to/key3.json");
         std::process::exit(1);
-    };
+    }
 
-    // FIX: mut aincore
+    // Decrypt each keystore (separate password prompt per file). All
+    // keystores must succeed before the bridge starts.
+    let mut wallets: Vec<LocalWallet> = Vec::with_capacity(keystore_paths.len());
+    for (idx, path) in keystore_paths.iter().enumerate() {
+        info!(
+            "🔐 Loading keystore {}/{}: {}",
+            idx + 1,
+            keystore_paths.len(),
+            path
+        );
+        let password = rpassword::prompt_password(format!(
+            "Enter password for keystore {} ({}): ",
+            idx + 1,
+            path
+        ))
+        .expect("Failed to read password");
+        let pk = keystore::KeyManager::decrypt(path, &password)
+            .expect("Failed to decrypt keystore");
+        let w: LocalWallet = pk.parse().expect("Failed to parse private key from keystore");
+        wallets.push(w);
+    }
+
+    // Refuse to start if any two keystores resolved to the same address —
+    // that defeats the multisig requirement just as effectively as
+    // ephemeral random wallets did.
+    let mut addrs: Vec<_> = wallets.iter().map(|w| {
+        use ethers::signers::Signer;
+        w.address()
+    }).collect();
+    addrs.sort();
+    let unique_before = addrs.len();
+    addrs.dedup();
+    if addrs.len() != unique_before {
+        error!("🚨 CRITICAL [SEC-N01]: keystores resolve to duplicate addresses; refusing to start.");
+        std::process::exit(1);
+    }
+
     let mut aincore = AincoreClient::new(aincore_rpc.clone());
 
-    // Initialize EVM Client
-    // FIX: Parse String pkey to LocalWallet
-    let wallet: LocalWallet = evm_private_key
-        .parse()
-        .expect("Failed to parse private key");
-    // Ensure 3-of-5 threshold is met by generating additional temporary signers for prototype
-    let wallet2 = LocalWallet::new(&mut rand::thread_rng());
-    let wallet3 = LocalWallet::new(&mut rand::thread_rng());
-
-    let evm = match EvmClient::new(
-        evm_rpc.clone(),
-        contract_addr.clone(),
-        vec![wallet, wallet2, wallet3],
-    ) {
+    let evm = match EvmClient::new(evm_rpc.clone(), contract_addr.clone(), wallets) {
         Ok(c) => Some(c),
         Err(e) => {
             error!("⚠️ Failed to initialize EVM Client: {}", e);

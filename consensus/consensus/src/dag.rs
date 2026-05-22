@@ -521,7 +521,29 @@ impl DagConsensus {
         }
     }
 
+    /// Phase 5B.2 / PWN-002: a single Byzantine validator must not be able
+    /// to fast-forward the local `current_round` to `u64::MAX` by signing a
+    /// vertex with a wildly-future round. The bound below caps any single
+    /// jump to `current_round + MAX_ROUND_JUMP`, after which the chain
+    /// would converge naturally through honest leaders. Saturating on the
+    /// upper end is fine — a real network never exceeds ~2^40 rounds.
+    const MAX_ROUND_JUMP: u64 = 50;
+
     pub fn add_vertex(&mut self, vertex: Vertex) {
+        // Phase 5B.2 / PWN-002: reject any vertex whose round is more than
+        // MAX_ROUND_JUMP ahead of our current view. Without this guard, an
+        // attacker validator can submit `vertex.round = u64::MAX - 1`, the
+        // honest peers fast-forward at line "self.current_round = vertex.round + 1",
+        // and the next `try_create_vertex` either wraps to 0 (release) or
+        // panics (debug). Either way: chain halt + mass-jail.
+        if vertex.round > self.current_round.saturating_add(Self::MAX_ROUND_JUMP) {
+            println!(
+                "🚨 REJECTED [PWN-002]: vertex round {} exceeds local round {} + {} cap",
+                vertex.round, self.current_round, Self::MAX_ROUND_JUMP
+            );
+            return;
+        }
+
         // C-10 FIX: Resolve the FULL Ed25519 public key from the account object in storage.
         // vertex.author is a truncated 16-byte address (32 hex chars), but Ed25519 verification
         // requires the full 32-byte public key (64 hex chars). Without this fix, signature
@@ -595,6 +617,22 @@ impl DagConsensus {
             println!(
                 "🚨 REJECTED: Invalid Ed25519 signature from author {}",
                 vertex.author
+            );
+            return;
+        }
+
+        // Phase 5B.1 / PWN-001 CRITICAL: vertex.hash MUST equal a fresh
+        // calculate_hash(). Without this check, the signature only binds
+        // the attacker-controlled `hash` field to the author, NOT to the
+        // vertex body — letting one malicious validator emit two vertices
+        // with the same hash + signature but different `payload` / `parents`
+        // / `timestamp`, splitting state across honest peers.
+        let recomputed = vertex.calculate_hash();
+        if recomputed != vertex.hash {
+            println!(
+                "🚨 REJECTED [PWN-001]: vertex.hash {} does not match \
+                 recomputed hash {} — body tampered after signing",
+                vertex.hash, recomputed
             );
             return;
         }
@@ -886,7 +924,15 @@ impl DagConsensus {
                 // recover from it and fall back to a full scan replay.
                 if self.current_round.is_multiple_of(100) {
                     if let Ok(dag) = self.dag.lock() {
-                        let vertices: Vec<&Vertex> = dag.values().collect();
+                        // Phase 5B.10 / L-04: HashMap::values() yields
+                        // vertices in non-deterministic order, so two nodes
+                        // with identical state produced byte-different
+                        // checkpoint blobs (signature still verifies, but
+                        // checkpoints were not byte-reproducible across
+                        // peers / restarts). Sort by vertex hash to make
+                        // the on-disk representation canonical.
+                        let mut vertices: Vec<&Vertex> = dag.values().collect();
+                        vertices.sort_by(|a, b| a.hash.cmp(&b.hash));
                         if let Ok(json) = serde_json::to_string(&vertices) {
                             let signing_key = crypto::SigningKey::from_bytes(&self.node_key);
                             use crypto::Signer;
@@ -1072,12 +1118,39 @@ impl DagConsensus {
             return;
         }
 
+        // Phase 5B.6 / L-05: a reporter must not be able to attest its
+        // own downtime. Self-attestations cannot reach quorum alone but
+        // they inflate the attestation-set surface and complicate
+        // forensic review.
+        if reporter == offender {
+            eprintln!(
+                "❌ [L-05] Attestation rejected: reporter == offender ({})",
+                reporter
+            );
+            return;
+        }
+
         // 1. Reporter must be a known validator.
         let validators = self.get_validator_set();
         if !validators.contains(&reporter) {
             eprintln!(
                 "❌ [H-02] Attestation from unknown validator {}, dropping",
                 reporter
+            );
+            return;
+        }
+
+        // Phase 5B.6 / SEC-N03: offender must ALSO be a known validator.
+        // Without this check a single Byzantine reporter could write
+        // attestations against arbitrary addresses, producing unbounded
+        // `sys:downtime_attestation:` storage growth (bounded only by
+        // the scan-prefix cap). Even though such attestations cannot
+        // reach BFT quorum (no other reporter would echo a non-validator
+        // offender), the disk write itself is a DoS amplifier.
+        if !validators.contains(&offender) {
+            eprintln!(
+                "❌ [SEC-N03] Attestation rejected: offender {} is not in validator set",
+                offender
             );
             return;
         }

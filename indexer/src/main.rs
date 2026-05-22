@@ -113,6 +113,7 @@ struct TradePoint {
     timestamp: u64,
     price: f64,
     volume_base: f64,
+    volume_quote: f64,
 }
 
 #[derive(Serialize)]
@@ -123,6 +124,34 @@ struct OhlcCandle {
     low: f64,
     close: f64,
     volume: f64,
+}
+
+#[derive(Serialize)]
+struct DexPairSummary {
+    base_token: String,
+    quote_token: String,
+    last_price: f64,
+    price_change_24h_pct: f64,
+    volume_base_24h: f64,
+    volume_quote_24h: f64,
+    trades_24h: u64,
+    high_24h: f64,
+    low_24h: f64,
+    first_trade_at: u64,
+    last_trade_at: u64,
+}
+
+#[derive(Serialize)]
+struct DexMarketSummary {
+    token_x: String,
+    token_y: String,
+    pool_addr: String,
+    last_price: f64,
+    price_change_24h_pct: f64,
+    volume_x_24h: f64,
+    volume_y_24h: f64,
+    trades_24h: u64,
+    last_trade_at: u64,
 }
 
 fn dex_trade_from_receipt(
@@ -185,12 +214,14 @@ fn trade_point_for_pair(
             timestamp: trade.timestamp,
             price: amount_out / amount_in,
             volume_base: amount_in,
+            volume_quote: amount_out,
         })
     } else if trade.token_in == quote_token && trade.token_out == base_token {
         Some(TradePoint {
             timestamp: trade.timestamp,
             price: amount_in / amount_out,
             volume_base: amount_out,
+            volume_quote: amount_in,
         })
     } else {
         None
@@ -249,6 +280,78 @@ fn build_ohlc(points: &[TradePoint], resolution_minutes: u64) -> Vec<OhlcCandle>
     }
 
     candles
+}
+
+fn build_pair_summary(
+    base_token: &str,
+    quote_token: &str,
+    points: &[TradePoint],
+    now_ts: u64,
+) -> Option<DexPairSummary> {
+    let first = points.first()?;
+    let last = points.last()?;
+    let cutoff = now_ts.saturating_sub(24 * 60 * 60);
+    let recent: Vec<&TradePoint> = points.iter().filter(|point| point.timestamp >= cutoff).collect();
+    let recent_first = recent.first().copied().unwrap_or(last);
+    let recent_last = recent.last().copied().unwrap_or(last);
+    let volume_base_24h = recent.iter().map(|point| point.volume_base).sum::<f64>();
+    let volume_quote_24h = recent.iter().map(|point| point.volume_quote).sum::<f64>();
+    let trades_24h = recent.len() as u64;
+    let high_24h = recent
+        .iter()
+        .map(|point| point.price)
+        .reduce(f64::max)
+        .unwrap_or(last.price);
+    let low_24h = recent
+        .iter()
+        .map(|point| point.price)
+        .reduce(f64::min)
+        .unwrap_or(last.price);
+    let price_change_24h_pct = if recent_first.price > 0.0 {
+        ((recent_last.price - recent_first.price) / recent_first.price) * 100.0
+    } else {
+        0.0
+    };
+
+    Some(DexPairSummary {
+        base_token: base_token.to_string(),
+        quote_token: quote_token.to_string(),
+        last_price: last.price,
+        price_change_24h_pct,
+        volume_base_24h,
+        volume_quote_24h,
+        trades_24h,
+        high_24h,
+        low_24h,
+        first_trade_at: first.timestamp,
+        last_trade_at: last.timestamp,
+    })
+}
+
+fn market_summary_for_trades(
+    token_x: &str,
+    token_y: &str,
+    pool_addr: &str,
+    trades: &[DexTradeRecord],
+    now_ts: u64,
+) -> Option<DexMarketSummary> {
+    let points: Vec<TradePoint> = trades
+        .iter()
+        .filter_map(|trade| trade_point_for_pair(trade, token_x, token_y))
+        .collect();
+    let summary = build_pair_summary(token_x, token_y, &points, now_ts)?;
+
+    Some(DexMarketSummary {
+        token_x: token_x.to_string(),
+        token_y: token_y.to_string(),
+        pool_addr: pool_addr.to_string(),
+        last_price: summary.last_price,
+        price_change_24h_pct: summary.price_change_24h_pct,
+        volume_x_24h: summary.volume_base_24h,
+        volume_y_24h: summary.volume_quote_24h,
+        trades_24h: summary.trades_24h,
+        last_trade_at: summary.last_trade_at,
+    })
 }
 
 // --- Database Setup ---
@@ -508,6 +611,17 @@ struct TradesQuery {
     limit: Option<u64>,
 }
 
+#[derive(Deserialize)]
+struct PairSummaryQuery {
+    base: String,
+    quote: String,
+}
+
+#[derive(Deserialize)]
+struct MarketsQuery {
+    limit: Option<u64>,
+}
+
 async fn get_history(data: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
     let address = path.into_inner();
     let conn = match data.db.lock() {
@@ -648,6 +762,129 @@ async fn get_ohlc(
     HttpResponse::Ok().json(build_ohlc(&points, resolution))
 }
 
+async fn get_pair_summary(
+    data: web::Data<AppState>,
+    query: web::Query<PairSummaryQuery>,
+) -> impl Responder {
+    let base = canonical_asset_id(&query.base);
+    let quote = canonical_asset_id(&query.quote);
+    let conn = match data.db.lock() {
+        Ok(c) => c,
+        Err(_) => return HttpResponse::InternalServerError().body("DB Lock Error"),
+    };
+
+    let mut stmt = match conn.prepare(
+        "SELECT tx_hash, pool_addr, function, token_x, token_y, token_in, token_out, amount_in, amount_out, block_height, timestamp
+         FROM dex_trades
+         WHERE (token_in = ?1 AND token_out = ?2) OR (token_in = ?2 AND token_out = ?1)
+         ORDER BY timestamp ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return HttpResponse::InternalServerError().body("DB Query Error"),
+    };
+
+    let rows = match stmt.query_map(params![base, quote], |row| {
+        Ok(DexTradeRecord {
+            tx_hash: row.get(0)?,
+            pool_addr: row.get(1)?,
+            function: row.get(2)?,
+            token_x: row.get(3)?,
+            token_y: row.get(4)?,
+            token_in: row.get(5)?,
+            token_out: row.get(6)?,
+            amount_in: row.get(7)?,
+            amount_out: row.get(8)?,
+            block_height: row.get(9)?,
+            timestamp: row.get(10)?,
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return HttpResponse::InternalServerError().body("DB Fetch Error"),
+    };
+
+    let points: Vec<TradePoint> = rows
+        .flatten()
+        .filter_map(|row| trade_point_for_pair(&row, &base, &quote))
+        .collect();
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+
+    match build_pair_summary(&base, &quote, &points, now_ts) {
+        Some(summary) => HttpResponse::Ok().json(summary),
+        None => HttpResponse::NotFound().json(serde_json::json!({
+            "error": "pair_not_found",
+            "base_token": base,
+            "quote_token": quote,
+        })),
+    }
+}
+
+async fn get_markets(
+    data: web::Data<AppState>,
+    query: web::Query<MarketsQuery>,
+) -> impl Responder {
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let conn = match data.db.lock() {
+        Ok(c) => c,
+        Err(_) => return HttpResponse::InternalServerError().body("DB Lock Error"),
+    };
+
+    let mut stmt = match conn.prepare(
+        "SELECT tx_hash, pool_addr, function, token_x, token_y, token_in, token_out, amount_in, amount_out, block_height, timestamp
+         FROM dex_trades
+         ORDER BY timestamp ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return HttpResponse::InternalServerError().body("DB Query Error"),
+    };
+
+    let rows = match stmt.query_map([], |row| {
+        Ok(DexTradeRecord {
+            tx_hash: row.get(0)?,
+            pool_addr: row.get(1)?,
+            function: row.get(2)?,
+            token_x: row.get(3)?,
+            token_y: row.get(4)?,
+            token_in: row.get(5)?,
+            token_out: row.get(6)?,
+            amount_in: row.get(7)?,
+            amount_out: row.get(8)?,
+            block_height: row.get(9)?,
+            timestamp: row.get(10)?,
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return HttpResponse::InternalServerError().body("DB Fetch Error"),
+    };
+
+    let mut grouped: std::collections::BTreeMap<(String, String, String), Vec<DexTradeRecord>> =
+        std::collections::BTreeMap::new();
+    for row in rows.flatten() {
+        grouped
+            .entry((row.token_x.clone(), row.token_y.clone(), row.pool_addr.clone()))
+            .or_default()
+            .push(row);
+    }
+
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let mut markets: Vec<DexMarketSummary> = grouped
+        .into_iter()
+        .filter_map(|((token_x, token_y, pool_addr), trades)| {
+            market_summary_for_trades(&token_x, &token_y, &pool_addr, &trades, now_ts)
+        })
+        .collect();
+
+    markets.sort_by(|a, b| b.last_trade_at.cmp(&a.last_trade_at));
+    markets.truncate(limit as usize);
+
+    HttpResponse::Ok().json(markets)
+}
+
 async fn health() -> impl Responder {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -701,6 +938,8 @@ async fn main() -> std::io::Result<()> {
             .route("/history/{address}", web::get().to(get_history))
             .route("/api/v1/trades", web::get().to(get_dex_trades))
             .route("/api/v1/ohlc", web::get().to(get_ohlc))
+            .route("/api/v1/pair_summary", web::get().to(get_pair_summary))
+            .route("/api/v1/markets", web::get().to(get_markets))
     })
     .bind(("0.0.0.0", 3001))?
     .run()
@@ -710,7 +949,8 @@ async fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TradePoint, build_ohlc, decode_transfer, dex_trade_from_receipt,
+        DexTradeRecord, TradePoint, build_ohlc, build_pair_summary, decode_transfer,
+        dex_trade_from_receipt, market_summary_for_trades,
     };
     use move_core_types::{
         account_address::AccountAddress,
@@ -804,16 +1044,19 @@ mod tests {
                 timestamp: 1_715_000_000,
                 price: 0.90,
                 volume_base: 10.0,
+                volume_quote: 9.0,
             },
             TradePoint {
                 timestamp: 1_715_000_100,
                 price: 0.95,
                 volume_base: 5.0,
+                volume_quote: 4.75,
             },
             TradePoint {
                 timestamp: 1_715_000_950,
                 price: 0.85,
                 volume_base: 8.0,
+                volume_quote: 6.8,
             },
         ];
 
@@ -826,5 +1069,84 @@ mod tests {
         assert!((candles[0].volume - 15.0).abs() < f64::EPSILON);
         assert_eq!(candles[1].open, 0.85);
         assert_eq!(candles[1].close, 0.85);
+    }
+
+    #[test]
+    fn build_pair_summary_tracks_last_price_and_24h_change() {
+        let now_ts = 1_715_086_400;
+        let points = vec![
+            TradePoint {
+                timestamp: now_ts - 23 * 60 * 60,
+                price: 0.90,
+                volume_base: 10.0,
+                volume_quote: 9.0,
+            },
+            TradePoint {
+                timestamp: now_ts - 60,
+                price: 1.05,
+                volume_base: 5.0,
+                volume_quote: 5.25,
+            },
+        ];
+
+        let summary = build_pair_summary(
+            "0x1::staking::AincoreCoin",
+            "0x1::wbtc::WBTC",
+            &points,
+            now_ts,
+        )
+        .expect("summary exists");
+        assert_eq!(summary.last_price, 1.05);
+        assert_eq!(summary.trades_24h, 2);
+        assert!((summary.volume_base_24h - 15.0).abs() < f64::EPSILON);
+        assert!((summary.volume_quote_24h - 14.25).abs() < f64::EPSILON);
+        assert!(summary.price_change_24h_pct > 16.0 && summary.price_change_24h_pct < 17.0);
+    }
+
+    #[test]
+    fn market_summary_uses_canonical_trade_direction() {
+        let now_ts = 1_715_086_400;
+        let trades = vec![
+            DexTradeRecord {
+                tx_hash: "tx1".into(),
+                pool_addr: "pool1".into(),
+                function: "swap_x_to_y".into(),
+                token_x: "0x1::staking::AincoreCoin".into(),
+                token_y: "0x1::wbtc::WBTC".into(),
+                token_in: "0x1::staking::AincoreCoin".into(),
+                token_out: "0x1::wbtc::WBTC".into(),
+                amount_in: "10".into(),
+                amount_out: "9".into(),
+                block_height: 1,
+                timestamp: now_ts - 3600,
+            },
+            DexTradeRecord {
+                tx_hash: "tx2".into(),
+                pool_addr: "pool1".into(),
+                function: "swap_y_to_x".into(),
+                token_x: "0x1::staking::AincoreCoin".into(),
+                token_y: "0x1::wbtc::WBTC".into(),
+                token_in: "0x1::wbtc::WBTC".into(),
+                token_out: "0x1::staking::AincoreCoin".into(),
+                amount_in: "4".into(),
+                amount_out: "5".into(),
+                block_height: 2,
+                timestamp: now_ts - 60,
+            },
+        ];
+
+        let market = market_summary_for_trades(
+            "0x1::staking::AincoreCoin",
+            "0x1::wbtc::WBTC",
+            "pool1",
+            &trades,
+            now_ts,
+        )
+        .expect("market summary");
+        assert_eq!(market.pool_addr, "pool1");
+        assert_eq!(market.trades_24h, 2);
+        assert!((market.last_price - 0.8).abs() < f64::EPSILON);
+        assert!((market.volume_x_24h - 15.0).abs() < f64::EPSILON);
+        assert!((market.volume_y_24h - 13.0).abs() < f64::EPSILON);
     }
 }
