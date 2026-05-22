@@ -75,6 +75,23 @@ fn canonical_asset_id(asset: &str) -> String {
     }
 }
 
+fn token_decimals(token: &str) -> i32 {
+    let canonical = canonical_asset_id(token);
+    match canonical.as_str() {
+        "0x1::staking::AincoreCoin" => 18,
+        "0x1::wbtc::WBTC" => 8,
+        _ => 0,
+    }
+}
+
+fn amount_to_display_units(raw_amount: &str, token: &str) -> Option<f64> {
+    let amount = raw_amount.parse::<f64>().ok()?;
+    if amount < 0.0 {
+        return None;
+    }
+    Some(amount / 10_f64.powi(token_decimals(token)))
+}
+
 fn normalize_timestamp_secs(timestamp: u64) -> u64 {
     if timestamp >= 1_000_000_000_000 {
         timestamp / 1000
@@ -203,8 +220,8 @@ fn trade_point_for_pair(
     base_token: &str,
     quote_token: &str,
 ) -> Option<TradePoint> {
-    let amount_in = trade.amount_in.parse::<f64>().ok()?;
-    let amount_out = trade.amount_out.parse::<f64>().ok()?;
+    let amount_in = amount_to_display_units(&trade.amount_in, &trade.token_in)?;
+    let amount_out = amount_to_display_units(&trade.amount_out, &trade.token_out)?;
     if amount_in <= 0.0 || amount_out <= 0.0 {
         return None;
     }
@@ -291,7 +308,10 @@ fn build_pair_summary(
     let first = points.first()?;
     let last = points.last()?;
     let cutoff = now_ts.saturating_sub(24 * 60 * 60);
-    let recent: Vec<&TradePoint> = points.iter().filter(|point| point.timestamp >= cutoff).collect();
+    let recent: Vec<&TradePoint> = points
+        .iter()
+        .filter(|point| point.timestamp >= cutoff)
+        .collect();
     let recent_first = recent.first().copied().unwrap_or(last);
     let recent_last = recent.last().copied().unwrap_or(last);
     let volume_base_24h = recent.iter().map(|point| point.volume_base).sum::<f64>();
@@ -466,12 +486,7 @@ async fn fetch_transaction_receipt(tx_hash: &str) -> Option<serde_json::Value> {
     json.result
 }
 
-fn index_transaction_row(
-    conn: &Connection,
-    tx_str: &str,
-    height: u64,
-    timestamp: u64,
-) {
+fn index_transaction_row(conn: &Connection, tx_str: &str, height: u64, timestamp: u64) {
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tx_str) {
         let sender = parsed["sender"].as_str().unwrap_or("");
         let payload = parsed["payload"].as_str().unwrap_or("");
@@ -709,10 +724,7 @@ async fn get_dex_trades(
     HttpResponse::Ok().json(trades)
 }
 
-async fn get_ohlc(
-    data: web::Data<AppState>,
-    query: web::Query<OhlcQuery>,
-) -> impl Responder {
+async fn get_ohlc(data: web::Data<AppState>, query: web::Query<OhlcQuery>) -> impl Responder {
     let base = canonical_asset_id(&query.base);
     let quote = canonical_asset_id(&query.quote);
     let resolution = query.resolution.unwrap_or(15).clamp(1, 1440);
@@ -821,10 +833,7 @@ async fn get_pair_summary(
     }
 }
 
-async fn get_markets(
-    data: web::Data<AppState>,
-    query: web::Query<MarketsQuery>,
-) -> impl Responder {
+async fn get_markets(data: web::Data<AppState>, query: web::Query<MarketsQuery>) -> impl Responder {
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
     let conn = match data.db.lock() {
         Ok(c) => c,
@@ -863,7 +872,11 @@ async fn get_markets(
         std::collections::BTreeMap::new();
     for row in rows.flatten() {
         grouped
-            .entry((row.token_x.clone(), row.token_y.clone(), row.pool_addr.clone()))
+            .entry((
+                row.token_x.clone(),
+                row.token_y.clone(),
+                row.pool_addr.clone(),
+            ))
             .or_default()
             .push(row);
     }
@@ -950,7 +963,7 @@ async fn main() -> std::io::Result<()> {
 mod tests {
     use super::{
         DexTradeRecord, TradePoint, build_ohlc, build_pair_summary, decode_transfer,
-        dex_trade_from_receipt, market_summary_for_trades,
+        dex_trade_from_receipt, market_summary_for_trades, trade_point_for_pair,
     };
     use move_core_types::{
         account_address::AccountAddress,
@@ -1027,8 +1040,8 @@ mod tests {
             }
         });
 
-        let trade = dex_trade_from_receipt("tx1", 12, 1_715_000_000, &receipt)
-            .expect("dex trade parsed");
+        let trade =
+            dex_trade_from_receipt("tx1", 12, 1_715_000_000, &receipt).expect("dex trade parsed");
         assert_eq!(trade.tx_hash, "tx1");
         assert_eq!(trade.function, "swap_x_to_y");
         assert_eq!(trade.token_in, "0x1::staking::AincoreCoin");
@@ -1115,8 +1128,8 @@ mod tests {
                 token_y: "0x1::wbtc::WBTC".into(),
                 token_in: "0x1::staking::AincoreCoin".into(),
                 token_out: "0x1::wbtc::WBTC".into(),
-                amount_in: "10".into(),
-                amount_out: "9".into(),
+                amount_in: "10000000000000000000".into(),
+                amount_out: "900000000".into(),
                 block_height: 1,
                 timestamp: now_ts - 3600,
             },
@@ -1128,8 +1141,8 @@ mod tests {
                 token_y: "0x1::wbtc::WBTC".into(),
                 token_in: "0x1::wbtc::WBTC".into(),
                 token_out: "0x1::staking::AincoreCoin".into(),
-                amount_in: "4".into(),
-                amount_out: "5".into(),
+                amount_in: "400000000".into(),
+                amount_out: "5000000000000000000".into(),
                 block_height: 2,
                 timestamp: now_ts - 60,
             },
@@ -1148,5 +1161,40 @@ mod tests {
         assert!((market.last_price - 0.8).abs() < f64::EPSILON);
         assert!((market.volume_x_24h - 15.0).abs() < f64::EPSILON);
         assert!((market.volume_y_24h - 13.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn dex_market_math_scales_native_token_decimals() {
+        let now_ts = 1_715_086_400;
+        let trade = DexTradeRecord {
+            tx_hash: "tx-scaled".into(),
+            pool_addr: "pool1".into(),
+            function: "swap_x_to_y".into(),
+            token_x: "0x1::staking::AincoreCoin".into(),
+            token_y: "0x1::wbtc::WBTC".into(),
+            token_in: "0x1::staking::AincoreCoin".into(),
+            token_out: "0x1::wbtc::WBTC".into(),
+            amount_in: "100000000000000000000".into(),
+            amount_out: "9871580".into(),
+            block_height: 1,
+            timestamp: now_ts,
+        };
+
+        let point = trade_point_for_pair(&trade, "0x1::staking::AincoreCoin", "0x1::wbtc::WBTC")
+            .expect("scaled trade point");
+        assert!((point.volume_base - 100.0).abs() < 0.000001);
+        assert!((point.volume_quote - 0.0987158).abs() < 0.00000001);
+        assert!((point.price - 0.000987158).abs() < 0.000000001);
+
+        let summary = build_pair_summary(
+            "0x1::staking::AincoreCoin",
+            "0x1::wbtc::WBTC",
+            &[point],
+            now_ts,
+        )
+        .expect("summary exists");
+        assert!((summary.volume_base_24h - 100.0).abs() < 0.000001);
+        assert!((summary.volume_quote_24h - 0.0987158).abs() < 0.00000001);
+        assert!((summary.last_price - 0.000987158).abs() < 0.000000001);
     }
 }
