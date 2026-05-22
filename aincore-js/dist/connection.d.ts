@@ -1,3 +1,80 @@
+export interface DexPool {
+    pool_key: string;
+    pool_addr: string;
+    token_x: string;
+    token_y: string;
+    fee_bp: number;
+    creator: string;
+    active: boolean;
+    reserve_x: string;
+    reserve_y: string;
+    lp_supply: string;
+}
+export interface DexQuote {
+    status: string;
+    pool_key?: string;
+    pool_addr?: string;
+    direction?: string;
+    amount_in?: string;
+    amount_out?: string | null;
+    fee_bp?: number;
+    reserve_in?: string;
+    reserve_out?: string;
+}
+export interface DexSpotPrice {
+    status: string;
+    token_in: string;
+    token_out: string;
+    unit_amount_in: string;
+    amount_out: string | null;
+    approx_price: number | null;
+    quote: DexQuote;
+}
+export interface DexTrade {
+    tx_hash: string;
+    pool_addr: string;
+    function: string;
+    token_x: string;
+    token_y: string;
+    token_in: string;
+    token_out: string;
+    amount_in: string;
+    amount_out: string;
+    block_height: number;
+    timestamp: number;
+}
+export interface DexOhlcCandle {
+    time: number;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+}
+export interface DexPairSummary {
+    base_token: string;
+    quote_token: string;
+    last_price: number;
+    price_change_24h_pct: number;
+    volume_base_24h: number;
+    volume_quote_24h: number;
+    trades_24h: number;
+    high_24h: number;
+    low_24h: number;
+    first_trade_at: number;
+    last_trade_at: number;
+}
+export interface DexMarketSummary {
+    token_x: string;
+    token_y: string;
+    pool_addr: string;
+    last_price: number;
+    price_change_24h_pct: number;
+    volume_x_24h: number;
+    volume_y_24h: number;
+    trades_24h: number;
+    last_trade_at: number;
+}
 export declare class Connection {
     private rpcUrl;
     private client;
@@ -37,6 +114,10 @@ export declare class Connection {
      * Get latest blocks
      */
     getBlocks(limit?: number): Promise<any[]>;
+    /**
+     * Get a forward block range in ascending order.
+     */
+    getBlocksRange(startHeight: number, limit?: number): Promise<any[]>;
     /**
      * Get transaction details
      */
@@ -82,6 +163,39 @@ export declare class Connection {
      * Get a single block by height
      */
     getBlock(height: number): Promise<any>;
+    /**
+     * Get all canonical DEX pools from the on-chain Move registry.
+     */
+    getDexPools(): Promise<DexPool[]>;
+    /**
+     * Get a single DEX pool by canonical pool key or token pair.
+     */
+    getDexPool(poolKeyOrTokenX: string, tokenY?: string): Promise<DexPool | null>;
+    /**
+     * Quote a CPMM swap using the canonical on-chain pool state.
+     */
+    getDexQuote(tokenIn: string, tokenOut: string, amountIn: string | number): Promise<DexQuote>;
+    /**
+     * Compute spot price from current reserves for a canonical pool.
+     * Returns how many `tokenOut` units back one whole `tokenIn` unit.
+     */
+    getDexSpotPrice(tokenIn: string, tokenOut: string, unitAmountIn?: string | number): Promise<DexSpotPrice>;
+    /**
+     * Read recent native DEX trades from the indexer.
+     */
+    getDexTrades(tokenIn: string, tokenOut: string, limit?: number): Promise<DexTrade[]>;
+    /**
+     * Read native OHLC candles aggregated from DEX swap history.
+     */
+    getDexOhlc(tokenIn: string, tokenOut: string, resolution?: number, limit?: number): Promise<DexOhlcCandle[]>;
+    /**
+     * Read a market summary for one canonical pair from the indexer.
+     */
+    getDexPairSummary(tokenIn: string, tokenOut: string): Promise<DexPairSummary | null>;
+    /**
+     * Read market summaries across all indexed canonical pools.
+     */
+    getDexMarkets(limit?: number): Promise<DexMarketSummary[]>;
     /**
      * Wait for transaction confirmation
      * @param txHash - Transaction hash to wait for

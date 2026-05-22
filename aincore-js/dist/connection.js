@@ -108,6 +108,12 @@ class Connection {
         return await this.request('aincore_getBlocks', [limit]);
     }
     /**
+     * Get a forward block range in ascending order.
+     */
+    async getBlocksRange(startHeight, limit = 100) {
+        return await this.request('aincore_getBlocks', [limit, startHeight]);
+    }
+    /**
      * Get transaction details
      */
     async getTransaction(hash) {
@@ -173,11 +179,121 @@ class Connection {
      * Get a single block by height
      */
     async getBlock(height) {
-        const blocks = await this.request('aincore_getBlocks', [1]);
-        // Backend returns latest blocks, so we need to fetch specific height
-        // For now, use the block storage key pattern
-        const allBlocks = await this.getBlocks(Math.max(height + 10, 100));
-        return allBlocks.find((b) => b?.header?.height === height) || null;
+        const blocks = await this.getBlocksRange(height, 1);
+        return blocks.find((b) => b?.header?.height === height) || null;
+    }
+    // =====================
+    // DEX METHODS
+    // =====================
+    /**
+     * Get all canonical DEX pools from the on-chain Move registry.
+     */
+    async getDexPools() {
+        const result = await this.request('aincore_getDexPools', []);
+        return result || [];
+    }
+    /**
+     * Get a single DEX pool by canonical pool key or token pair.
+     */
+    async getDexPool(poolKeyOrTokenX, tokenY) {
+        const params = tokenY === undefined
+            ? [poolKeyOrTokenX]
+            : [poolKeyOrTokenX, tokenY];
+        const result = await this.request('aincore_getDexPool', params);
+        return result || null;
+    }
+    /**
+     * Quote a CPMM swap using the canonical on-chain pool state.
+     */
+    async getDexQuote(tokenIn, tokenOut, amountIn) {
+        return await this.request('aincore_getDexQuote', [tokenIn, tokenOut, String(amountIn)]);
+    }
+    /**
+     * Compute spot price from current reserves for a canonical pool.
+     * Returns how many `tokenOut` units back one whole `tokenIn` unit.
+     */
+    async getDexSpotPrice(tokenIn, tokenOut, unitAmountIn = '1000000000000000000') {
+        return await this.request('aincore_getDexSpotPrice', [
+            tokenIn,
+            tokenOut,
+            String(unitAmountIn),
+        ]);
+    }
+    /**
+     * Read recent native DEX trades from the indexer.
+     */
+    async getDexTrades(tokenIn, tokenOut, limit = 100) {
+        if (!this.indexerUrl) {
+            console.warn("Indexer URL not configured. Returning empty DEX trades.");
+            return [];
+        }
+        try {
+            const response = await axios_1.default.get(`${this.indexerUrl}/api/v1/trades`, {
+                params: { base: tokenIn, quote: tokenOut, limit },
+            });
+            return response.data || [];
+        }
+        catch (e) {
+            console.error("Failed to fetch DEX trades from indexer", e);
+            return [];
+        }
+    }
+    /**
+     * Read native OHLC candles aggregated from DEX swap history.
+     */
+    async getDexOhlc(tokenIn, tokenOut, resolution = 15, limit = 5000) {
+        if (!this.indexerUrl) {
+            console.warn("Indexer URL not configured. Returning empty OHLC.");
+            return [];
+        }
+        try {
+            const response = await axios_1.default.get(`${this.indexerUrl}/api/v1/ohlc`, {
+                params: { base: tokenIn, quote: tokenOut, resolution, limit },
+            });
+            return response.data || [];
+        }
+        catch (e) {
+            console.error("Failed to fetch DEX OHLC from indexer", e);
+            return [];
+        }
+    }
+    /**
+     * Read a market summary for one canonical pair from the indexer.
+     */
+    async getDexPairSummary(tokenIn, tokenOut) {
+        if (!this.indexerUrl) {
+            console.warn("Indexer URL not configured. Returning null DEX pair summary.");
+            return null;
+        }
+        try {
+            const response = await axios_1.default.get(`${this.indexerUrl}/api/v1/pair_summary`, {
+                params: { base: tokenIn, quote: tokenOut },
+            });
+            return response.data || null;
+        }
+        catch (e) {
+            console.error("Failed to fetch DEX pair summary from indexer", e);
+            return null;
+        }
+    }
+    /**
+     * Read market summaries across all indexed canonical pools.
+     */
+    async getDexMarkets(limit = 50) {
+        if (!this.indexerUrl) {
+            console.warn("Indexer URL not configured. Returning empty DEX market list.");
+            return [];
+        }
+        try {
+            const response = await axios_1.default.get(`${this.indexerUrl}/api/v1/markets`, {
+                params: { limit },
+            });
+            return response.data || [];
+        }
+        catch (e) {
+            console.error("Failed to fetch DEX markets from indexer", e);
+            return [];
+        }
     }
     /**
      * Wait for transaction confirmation
