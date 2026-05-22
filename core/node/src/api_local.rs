@@ -88,7 +88,14 @@ fn dex_registry_key() -> String {
 }
 
 fn normalize_type_name(value: &str) -> String {
-    let trimmed = value.trim().trim_start_matches("0x");
+    let value = value.trim();
+    match value.to_ascii_uppercase().as_str() {
+        "AIN" => return "00000000000000000000000000000001::staking::AincoreCoin".to_string(),
+        "WBTC" => return "00000000000000000000000000000001::wbtc::WBTC".to_string(),
+        _ => {}
+    }
+
+    let trimmed = value.trim_start_matches("0x");
     let mut parts: Vec<String> = trimmed.split("::").map(|part| part.to_string()).collect();
     if let Some(addr) = parts.get_mut(0) {
         *addr = addr.to_ascii_lowercase();
@@ -2329,6 +2336,16 @@ mod tests {
         assert_eq!(quote["status"], "ok");
         assert_eq!(quote["amount_out"], "906");
         assert_eq!(quote["direction"], "x_to_y");
+
+        let alias_quote = handle_rpc_method(
+            "aincore_getDexQuote",
+            serde_json::json!(["AIN", "WBTC", "1000"]),
+            &state,
+        )
+        .expect("dex alias quote response");
+        assert_eq!(alias_quote["status"], "ok");
+        assert_eq!(alias_quote["amount_out"], "906");
+        assert_eq!(alias_quote["direction"], "x_to_y");
 
         let spot = handle_rpc_method(
             "aincore_getDexSpotPrice",
