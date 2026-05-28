@@ -177,7 +177,7 @@ module 0x1::dex {
         let amount_y = (lp_amount * reserve_y) / pool.lp_supply;
 
         assert!(amount_x >= min_x && amount_y >= min_y, error::invalid_argument(EINVALID_LIQUIDITY));
-        assert!(amount_x > 0 || amount_y > 0, error::invalid_argument(EINVALID_LIQUIDITY));
+        assert!(amount_x > 0 && amount_y > 0, error::invalid_argument(EINVALID_LIQUIDITY));
 
         user_lp.balance = user_lp.balance - lp_amount;
         pool.lp_supply = pool.lp_supply - lp_amount;
@@ -208,6 +208,7 @@ module 0x1::dex {
         assert!(reserve_x > 0 && reserve_y > 0, error::invalid_state(EPOOL_NOT_FOUND));
 
         let amount_y_out = quote_out(amount_x_in, reserve_x, reserve_y, pool.fee_bp);
+        assert!(amount_y_out > 0, error::invalid_argument(EINSUFFICIENT_OUTPUT));
         assert!(amount_y_out >= min_y_out, error::invalid_argument(EINSUFFICIENT_OUTPUT));
         assert!(amount_y_out < reserve_y, error::invalid_argument(EINSUFFICIENT_OUTPUT));
 
@@ -234,6 +235,7 @@ module 0x1::dex {
         assert!(reserve_x > 0 && reserve_y > 0, error::invalid_state(EPOOL_NOT_FOUND));
 
         let amount_x_out = quote_out(amount_y_in, reserve_y, reserve_x, pool.fee_bp);
+        assert!(amount_x_out > 0, error::invalid_argument(EINSUFFICIENT_OUTPUT));
         assert!(amount_x_out >= min_x_out, error::invalid_argument(EINSUFFICIENT_OUTPUT));
         assert!(amount_x_out < reserve_x, error::invalid_argument(EINSUFFICIENT_OUTPUT));
 

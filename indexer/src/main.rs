@@ -13,6 +13,24 @@ fn get_rpc_url() -> String {
     env::var("NODE_RPC_URL").unwrap_or_else(|_| "http://localhost:8002/rpc".to_string())
 }
 const DB_PATH: &str = "indexer.db";
+const DEFAULT_INDEXER_BATCH_SIZE: u64 = 500;
+const MAX_INDEXER_BATCH_SIZE: u64 = 2_000;
+const DEFAULT_INDEXER_BOOTSTRAP_BACKFILL: u64 = 5_000;
+
+fn indexer_batch_size() -> u64 {
+    env::var("AINCORE_INDEXER_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(1, MAX_INDEXER_BATCH_SIZE))
+        .unwrap_or(DEFAULT_INDEXER_BATCH_SIZE)
+}
+
+fn indexer_bootstrap_backfill() -> Option<u64> {
+    env::var("AINCORE_INDEXER_BOOTSTRAP_BACKFILL")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.min(1_000_000))
+}
 
 fn permissive_cors_enabled() -> bool {
     env::var("AINCORE_PERMISSIVE_CORS")
@@ -92,6 +110,14 @@ fn amount_to_display_units(raw_amount: &str, token: &str) -> Option<f64> {
     Some(amount / 10_f64.powi(token_decimals(token)))
 }
 
+fn clean_market_float(value: f64) -> f64 {
+    if !value.is_finite() || value.abs() < f64::EPSILON {
+        0.0
+    } else {
+        value
+    }
+}
+
 fn normalize_timestamp_secs(timestamp: u64) -> u64 {
     if timestamp >= 1_000_000_000_000 {
         timestamp / 1000
@@ -123,6 +149,7 @@ struct DexTradeRecord {
     amount_out: String,
     block_height: u64,
     timestamp: u64,
+    sender: String,
 }
 
 #[derive(Clone, Debug)]
@@ -175,6 +202,7 @@ fn dex_trade_from_receipt(
     tx_hash: &str,
     block_height: u64,
     timestamp: u64,
+    sender: &str,
     receipt: &serde_json::Value,
 ) -> Option<DexTradeRecord> {
     let execution_receipt = receipt.get("execution_receipt")?;
@@ -212,6 +240,7 @@ fn dex_trade_from_receipt(
         amount_out,
         block_height,
         timestamp: normalize_timestamp_secs(timestamp),
+        sender: sender.to_string(),
     })
 }
 
@@ -271,22 +300,22 @@ fn build_ohlc(points: &[TradePoint], resolution_minutes: u64) -> Vec<OhlcCandle>
                 current_bucket = bucket;
                 current = Some(OhlcCandle {
                     time: bucket,
-                    open: point.price,
-                    high: point.price,
-                    low: point.price,
-                    close: point.price,
-                    volume: point.volume_base,
+                    open: clean_market_float(point.price),
+                    high: clean_market_float(point.price),
+                    low: clean_market_float(point.price),
+                    close: clean_market_float(point.price),
+                    volume: clean_market_float(point.volume_base),
                 });
             }
             None => {
                 current_bucket = bucket;
                 current = Some(OhlcCandle {
                     time: bucket,
-                    open: point.price,
-                    high: point.price,
-                    low: point.price,
-                    close: point.price,
-                    volume: point.volume_base,
+                    open: clean_market_float(point.price),
+                    high: clean_market_float(point.price),
+                    low: clean_market_float(point.price),
+                    close: clean_market_float(point.price),
+                    volume: clean_market_float(point.volume_base),
                 });
             }
         }
@@ -336,13 +365,13 @@ fn build_pair_summary(
     Some(DexPairSummary {
         base_token: base_token.to_string(),
         quote_token: quote_token.to_string(),
-        last_price: last.price,
-        price_change_24h_pct,
-        volume_base_24h,
-        volume_quote_24h,
+        last_price: clean_market_float(last.price),
+        price_change_24h_pct: clean_market_float(price_change_24h_pct),
+        volume_base_24h: clean_market_float(volume_base_24h),
+        volume_quote_24h: clean_market_float(volume_quote_24h),
         trades_24h,
-        high_24h,
-        low_24h,
+        high_24h: clean_market_float(high_24h),
+        low_24h: clean_market_float(low_24h),
         first_trade_at: first.timestamp,
         last_trade_at: last.timestamp,
     })
@@ -365,10 +394,10 @@ fn market_summary_for_trades(
         token_x: token_x.to_string(),
         token_y: token_y.to_string(),
         pool_addr: pool_addr.to_string(),
-        last_price: summary.last_price,
-        price_change_24h_pct: summary.price_change_24h_pct,
-        volume_x_24h: summary.volume_base_24h,
-        volume_y_24h: summary.volume_quote_24h,
+        last_price: clean_market_float(summary.last_price),
+        price_change_24h_pct: clean_market_float(summary.price_change_24h_pct),
+        volume_x_24h: clean_market_float(summary.volume_base_24h),
+        volume_y_24h: clean_market_float(summary.volume_quote_24h),
         trades_24h: summary.trades_24h,
         last_trade_at: summary.last_trade_at,
     })
@@ -411,10 +440,34 @@ fn init_db() -> Result<Connection, Box<dyn std::error::Error>> {
             amount_in TEXT NOT NULL,
             amount_out TEXT NOT NULL,
             block_height INTEGER NOT NULL,
-            timestamp INTEGER NOT NULL
+            timestamp INTEGER NOT NULL,
+            sender TEXT NOT NULL DEFAULT ''
         )",
         [],
     )?;
+
+    // Migration: add sender column to existing dex_trades tables that pre-date
+    // this column. SQLite ALTER TABLE ADD COLUMN is idempotent-via-error: we
+    // ignore the "duplicate column" error path.
+    let _ = conn.execute(
+        "ALTER TABLE dex_trades ADD COLUMN sender TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+
+    // Backfill sender from transactions.sender for any historical dex_trades
+    // rows that landed before the column existed. Cheap one-pass join.
+    let _ = conn.execute(
+        "UPDATE dex_trades \
+         SET sender = (SELECT sender FROM transactions WHERE transactions.hash = dex_trades.tx_hash) \
+         WHERE sender = '' AND EXISTS (SELECT 1 FROM transactions WHERE transactions.hash = dex_trades.tx_hash)",
+        [],
+    );
+
+    // Index for fast sender filtering
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dex_trades_sender ON dex_trades(sender)",
+        [],
+    );
 
     Ok(conn)
 }
@@ -486,6 +539,25 @@ async fn fetch_transaction_receipt(tx_hash: &str) -> Option<serde_json::Value> {
     json.result
 }
 
+async fn fetch_latest_height() -> Option<u64> {
+    let client = reqwest::Client::new();
+    let req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        method: "aincore_getStatus".to_string(),
+        params: vec![],
+        id: 1,
+    };
+
+    let res = client.post(get_rpc_url()).json(&req).send().await.ok()?;
+    let json: RpcResponse<serde_json::Value> = res.json().await.ok()?;
+    let status = json.result?;
+    value_to_u64(
+        status
+            .get("latest_height")
+            .unwrap_or(&serde_json::Value::Null),
+    )
+}
+
 fn index_transaction_row(conn: &Connection, tx_str: &str, height: u64, timestamp: u64) {
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tx_str) {
         let sender = parsed["sender"].as_str().unwrap_or("");
@@ -504,8 +576,8 @@ fn index_transaction_row(conn: &Connection, tx_str: &str, height: u64, timestamp
 fn index_dex_trade_row(conn: &Connection, trade: &DexTradeRecord) {
     let _ = conn.execute(
         "INSERT OR REPLACE INTO dex_trades
-         (tx_hash, pool_addr, function, token_x, token_y, token_in, token_out, amount_in, amount_out, block_height, timestamp)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         (tx_hash, pool_addr, function, token_x, token_y, token_in, token_out, amount_in, amount_out, block_height, timestamp, sender)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             trade.tx_hash,
             trade.pool_addr,
@@ -518,6 +590,7 @@ fn index_dex_trade_row(conn: &Connection, trade: &DexTradeRecord) {
             trade.amount_out,
             trade.block_height,
             trade.timestamp,
+            trade.sender,
         ],
     );
 }
@@ -525,6 +598,34 @@ fn index_dex_trade_row(conn: &Connection, trade: &DexTradeRecord) {
 // --- Indexing Logic ---
 async fn indexer_loop(db: Arc<Mutex<Connection>>) {
     println!("🕵️ Indexer started...");
+    let batch_size = indexer_batch_size();
+    let bootstrap_backfill =
+        indexer_bootstrap_backfill().unwrap_or(DEFAULT_INDEXER_BOOTSTRAP_BACKFILL);
+    if bootstrap_backfill > 0
+        && let Some(latest_height) = fetch_latest_height().await
+    {
+        let last_height = db
+            .lock()
+            .map(|conn| get_last_indexed_height(&conn))
+            .unwrap_or(0);
+        if last_height == 0 && latest_height > bootstrap_backfill {
+            let bootstrap_height = latest_height.saturating_sub(bootstrap_backfill);
+            if let Ok(conn) = db.lock() {
+                set_last_indexed_height(&conn, bootstrap_height);
+                println!(
+                    "⚡ Indexer bootstrap tail mode: latest={} backfill={} start={}",
+                    latest_height,
+                    bootstrap_backfill,
+                    bootstrap_height.saturating_add(1)
+                );
+            }
+        }
+    }
+
+    // Concurrency for receipt fetches inside a batch. RPC node tolerates 32 in-flight
+    // without backpressure; raise if your node has more headroom.
+    const RECEIPT_CONCURRENCY: usize = 32;
+
     loop {
         let last_height = {
             match db.lock() {
@@ -537,47 +638,108 @@ async fn indexer_loop(db: Arc<Mutex<Connection>>) {
         };
 
         let start_height = last_height.saturating_add(1);
-        if let Some(blocks) = fetch_blocks(start_height, 20).await {
-            for block in blocks {
+        let mut indexed_any = false;
+
+        // Pull lag metric for observability
+        let latest_height_for_log = fetch_latest_height().await;
+
+        if let Some(blocks) = fetch_blocks(start_height, batch_size).await {
+            // Phase 1 — collect ALL (height, timestamp, hash, tx_str) tuples across the batch.
+            //          This lets us fan-out receipt fetches in parallel below.
+            #[derive(Clone)]
+            struct PendingTx {
+                height: u64,
+                timestamp: u64,
+                hash: String,
+                tx_str: String,
+            }
+            let mut pending: Vec<PendingTx> = Vec::new();
+            let mut max_height_in_batch = last_height;
+
+            for block in &blocks {
                 let height = block["header"]["height"].as_u64().unwrap_or(0);
                 if height == 0 || height < start_height {
                     continue;
                 }
-
-                println!("📥 Indexing Block #{}", height);
+                indexed_any = true;
+                if height > max_height_in_batch {
+                    max_height_in_batch = height;
+                }
                 let timestamp = value_to_u64(&block["header"]["timestamp"]).unwrap_or(0);
-
                 if let Some(txs) = block["transactions"].as_array() {
-                    let mut parsed_txs = Vec::new();
                     for tx in txs {
                         if let Some(tx_str) = tx.as_str() {
-                            parsed_txs.push((tx_hash_hex(tx_str), tx_str.to_string()));
-                        }
-                    }
-
-                    for (hash, tx_str) in &parsed_txs {
-                        let receipt = fetch_transaction_receipt(hash).await;
-                        let conn = match db.lock() {
-                            Ok(c) => c,
-                            Err(_) => continue,
-                        };
-                        index_transaction_row(&conn, tx_str, height, timestamp);
-                        if let Some(receipt) = receipt
-                            && let Some(trade) =
-                                dex_trade_from_receipt(hash, height, timestamp, &receipt)
-                        {
-                            index_dex_trade_row(&conn, &trade);
+                            pending.push(PendingTx {
+                                height,
+                                timestamp,
+                                hash: tx_hash_hex(tx_str),
+                                tx_str: tx_str.to_string(),
+                            });
                         }
                     }
                 }
+            }
 
-                if let Ok(conn) = db.lock() {
-                    set_last_indexed_height(&conn, height);
+            if let Some(latest) = latest_height_for_log {
+                let lag = latest.saturating_sub(last_height);
+                if lag > 100 || pending.len() > 50 {
+                    println!(
+                        "📥 Indexing batch: start={} end={} txs={} lag={}",
+                        start_height,
+                        max_height_in_batch,
+                        pending.len(),
+                        lag
+                    );
+                }
+            }
+
+            // Phase 2 — fan-out receipt fetches with bounded concurrency.
+            use futures::stream::{self, StreamExt};
+            let receipts: Vec<(PendingTx, Option<serde_json::Value>)> =
+                stream::iter(pending.into_iter().map(|tx| {
+                    let hash = tx.hash.clone();
+                    async move {
+                        let receipt = fetch_transaction_receipt(&hash).await;
+                        (tx, receipt)
+                    }
+                }))
+                .buffer_unordered(RECEIPT_CONCURRENCY)
+                .collect()
+                .await;
+
+            // Phase 3 — single DB lock per batch, drain all writes serially.
+            if let Ok(conn) = db.lock() {
+                for (tx, receipt) in &receipts {
+                    let sender = serde_json::from_str::<serde_json::Value>(&tx.tx_str)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("sender")
+                                .and_then(|s| s.as_str())
+                                .map(String::from)
+                        })
+                        .unwrap_or_default();
+                    index_transaction_row(&conn, &tx.tx_str, tx.height, tx.timestamp);
+                    if let Some(receipt) = receipt
+                        && let Some(trade) = dex_trade_from_receipt(
+                            &tx.hash,
+                            tx.height,
+                            tx.timestamp,
+                            &sender,
+                            receipt,
+                        )
+                    {
+                        index_dex_trade_row(&conn, &trade);
+                    }
+                }
+                if max_height_in_batch > last_height {
+                    set_last_indexed_height(&conn, max_height_in_batch);
                 }
             }
         }
 
-        sleep(Duration::from_secs(2)).await;
+        if !indexed_any {
+            sleep(Duration::from_secs(2)).await;
+        }
     }
 }
 
@@ -609,6 +771,7 @@ struct DexTradeResponse {
     amount_out: String,
     block_height: u64,
     timestamp: u64,
+    sender: String,
 }
 
 #[derive(Deserialize)]
@@ -624,6 +787,7 @@ struct TradesQuery {
     base: String,
     quote: String,
     limit: Option<u64>,
+    sender: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -682,23 +846,13 @@ async fn get_dex_trades(
     let base = canonical_asset_id(&query.base);
     let quote = canonical_asset_id(&query.quote);
     let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    let sender_filter = query.sender.as_ref().map(|s| s.trim().to_string());
     let conn = match data.db.lock() {
         Ok(c) => c,
         Err(_) => return HttpResponse::InternalServerError().body("DB Lock Error"),
     };
 
-    let mut stmt = match conn.prepare(
-        "SELECT tx_hash, pool_addr, function, token_x, token_y, token_in, token_out, amount_in, amount_out, block_height, timestamp
-         FROM dex_trades
-         WHERE (token_in = ?1 AND token_out = ?2) OR (token_in = ?2 AND token_out = ?1)
-         ORDER BY timestamp DESC
-         LIMIT ?3",
-    ) {
-        Ok(s) => s,
-        Err(_) => return HttpResponse::InternalServerError().body("DB Query Error"),
-    };
-
-    let rows = match stmt.query_map(params![base, quote, limit], |row| {
+    let row_mapper = |row: &rusqlite::Row<'_>| -> rusqlite::Result<DexTradeResponse> {
         Ok(DexTradeResponse {
             tx_hash: row.get(0)?,
             pool_addr: row.get(1)?,
@@ -711,17 +865,43 @@ async fn get_dex_trades(
             amount_out: row.get(8)?,
             block_height: row.get(9)?,
             timestamp: row.get(10)?,
+            sender: row.get::<_, String>(11).unwrap_or_default(),
         })
-    }) {
-        Ok(rows) => rows,
-        Err(_) => return HttpResponse::InternalServerError().body("DB Fetch Error"),
     };
 
-    let mut trades = Vec::new();
-    for row in rows.flatten() {
-        trades.push(row);
+    let trades_result: rusqlite::Result<Vec<DexTradeResponse>> = if let Some(sender) = sender_filter {
+        let mut stmt = match conn.prepare(
+            "SELECT tx_hash, pool_addr, function, token_x, token_y, token_in, token_out, amount_in, amount_out, block_height, timestamp, sender
+             FROM dex_trades
+             WHERE ((token_in = ?1 AND token_out = ?2) OR (token_in = ?2 AND token_out = ?1))
+               AND sender = ?3
+             ORDER BY timestamp DESC
+             LIMIT ?4",
+        ) {
+            Ok(s) => s,
+            Err(_) => return HttpResponse::InternalServerError().body("DB Query Error"),
+        };
+        let rows = stmt.query_map(params![base, quote, sender, limit], row_mapper);
+        rows.map(|iter| iter.flatten().collect())
+    } else {
+        let mut stmt = match conn.prepare(
+            "SELECT tx_hash, pool_addr, function, token_x, token_y, token_in, token_out, amount_in, amount_out, block_height, timestamp, sender
+             FROM dex_trades
+             WHERE (token_in = ?1 AND token_out = ?2) OR (token_in = ?2 AND token_out = ?1)
+             ORDER BY timestamp DESC
+             LIMIT ?3",
+        ) {
+            Ok(s) => s,
+            Err(_) => return HttpResponse::InternalServerError().body("DB Query Error"),
+        };
+        let rows = stmt.query_map(params![base, quote, limit], row_mapper);
+        rows.map(|iter| iter.flatten().collect())
+    };
+
+    match trades_result {
+        Ok(trades) => HttpResponse::Ok().json(trades),
+        Err(_) => HttpResponse::InternalServerError().body("DB Fetch Error"),
     }
-    HttpResponse::Ok().json(trades)
 }
 
 async fn get_ohlc(data: web::Data<AppState>, query: web::Query<OhlcQuery>) -> impl Responder {
@@ -758,6 +938,7 @@ async fn get_ohlc(data: web::Data<AppState>, query: web::Query<OhlcQuery>) -> im
             amount_out: row.get(8)?,
             block_height: row.get(9)?,
             timestamp: row.get(10)?,
+            sender: String::new(),
         })
     }) {
         Ok(rows) => rows,
@@ -808,6 +989,7 @@ async fn get_pair_summary(
             amount_out: row.get(8)?,
             block_height: row.get(9)?,
             timestamp: row.get(10)?,
+            sender: String::new(),
         })
     }) {
         Ok(rows) => rows,
@@ -862,6 +1044,7 @@ async fn get_markets(data: web::Data<AppState>, query: web::Query<MarketsQuery>)
             amount_out: row.get(8)?,
             block_height: row.get(9)?,
             timestamp: row.get(10)?,
+            sender: String::new(),
         })
     }) {
         Ok(rows) => rows,
@@ -962,8 +1145,8 @@ async fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DexTradeRecord, TradePoint, build_ohlc, build_pair_summary, decode_transfer,
-        dex_trade_from_receipt, market_summary_for_trades, trade_point_for_pair,
+        DexMarketSummary, DexTradeRecord, TradePoint, build_ohlc, build_pair_summary,
+        decode_transfer, dex_trade_from_receipt, market_summary_for_trades, trade_point_for_pair,
     };
     use move_core_types::{
         account_address::AccountAddress,
@@ -1040,8 +1223,8 @@ mod tests {
             }
         });
 
-        let trade =
-            dex_trade_from_receipt("tx1", 12, 1_715_000_000, &receipt).expect("dex trade parsed");
+        let trade = dex_trade_from_receipt("tx1", 12, 1_715_000_000, "test-sender", &receipt)
+            .expect("dex trade parsed");
         assert_eq!(trade.tx_hash, "tx1");
         assert_eq!(trade.function, "swap_x_to_y");
         assert_eq!(trade.token_in, "0x1::staking::AincoreCoin");
@@ -1132,6 +1315,7 @@ mod tests {
                 amount_out: "900000000".into(),
                 block_height: 1,
                 timestamp: now_ts - 3600,
+                sender: "test-sender".into(),
             },
             DexTradeRecord {
                 tx_hash: "tx2".into(),
@@ -1145,6 +1329,7 @@ mod tests {
                 amount_out: "5000000000000000000".into(),
                 block_height: 2,
                 timestamp: now_ts - 60,
+                sender: "test-sender".into(),
             },
         ];
 
@@ -1178,6 +1363,7 @@ mod tests {
             amount_out: "9871580".into(),
             block_height: 1,
             timestamp: now_ts,
+                sender: "test-sender".into(),
         };
 
         let point = trade_point_for_pair(&trade, "0x1::staking::AincoreCoin", "0x1::wbtc::WBTC")
@@ -1196,5 +1382,42 @@ mod tests {
         assert!((summary.volume_base_24h - 100.0).abs() < 0.000001);
         assert!((summary.volume_quote_24h - 0.0987158).abs() < 0.00000001);
         assert!((summary.last_price - 0.000987158).abs() < 0.000000001);
+    }
+
+    #[test]
+    fn dex_market_summary_never_emits_negative_zero() {
+        let now_ts = 1_715_086_400;
+        let points = vec![TradePoint {
+            timestamp: now_ts - 25 * 60 * 60,
+            price: 0.00098412,
+            volume_base: 100.0,
+            volume_quote: 0.098412,
+        }];
+
+        let summary = build_pair_summary(
+            "0x1::staking::AincoreCoin",
+            "0x1::wbtc::WBTC",
+            &points,
+            now_ts,
+        )
+        .expect("summary exists");
+        assert_eq!(summary.trades_24h, 0);
+        assert_eq!(summary.volume_base_24h.to_bits(), 0.0f64.to_bits());
+        assert_eq!(summary.volume_quote_24h.to_bits(), 0.0f64.to_bits());
+        assert_eq!(summary.price_change_24h_pct.to_bits(), 0.0f64.to_bits());
+
+        let market = DexMarketSummary {
+            token_x: "0x1::staking::AincoreCoin".into(),
+            token_y: "0x1::wbtc::WBTC".into(),
+            pool_addr: "pool1".into(),
+            last_price: summary.last_price,
+            price_change_24h_pct: summary.price_change_24h_pct,
+            volume_x_24h: summary.volume_base_24h,
+            volume_y_24h: summary.volume_quote_24h,
+            trades_24h: summary.trades_24h,
+            last_trade_at: summary.last_trade_at,
+        };
+        let json = serde_json::to_string(&market).expect("serializes");
+        assert!(!json.contains("-0.0"));
     }
 }
