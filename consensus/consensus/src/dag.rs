@@ -96,9 +96,7 @@ impl DagConsensus {
             //   node produces a fresh signed checkpoint.
             let checkpoint_accepted: bool;
             if let Some(checkpoint_data) = storage.get_dag_checkpoint(checkpoint_round) {
-                checkpoint_accepted = match storage
-                    .get_dag_checkpoint_signature(checkpoint_round)
-                {
+                checkpoint_accepted = match storage.get_dag_checkpoint_signature(checkpoint_round) {
                     Some(sig_hex) => {
                         let signing_key = crypto::SigningKey::from_bytes(&node_key);
                         let verifying_key = signing_key.verifying_key();
@@ -147,9 +145,7 @@ impl DagConsensus {
                 };
 
                 if checkpoint_accepted {
-                    if let Ok(vertices) =
-                        serde_json::from_str::<Vec<Vertex>>(&checkpoint_data)
-                    {
+                    if let Ok(vertices) = serde_json::from_str::<Vec<Vertex>>(&checkpoint_data) {
                         // Phase 5C.1 / NEW-001: enforce PWN-001 also at boot.
                         // The checkpoint signature covers the JSON blob as a
                         // whole, but each Vertex.hash inside MUST still match
@@ -536,9 +532,7 @@ impl DagConsensus {
                         // their own view and collectively reach BFT quorum.
                         self.broadcast_attestation(&attestation);
 
-                        let _ = self
-                            .storage
-                            .put(&attestation_key, &attestation.to_string());
+                        let _ = self.storage.put(&attestation_key, &attestation.to_string());
 
                         // Log the local observation in the audit trail. The
                         // executor will scan attestations and queue a real
@@ -597,7 +591,9 @@ impl DagConsensus {
         if vertex.round > self.current_round.saturating_add(Self::MAX_ROUND_JUMP) {
             println!(
                 "🚨 REJECTED [PWN-002/jump]: vertex round {} exceeds local round {} + {} cap",
-                vertex.round, self.current_round, Self::MAX_ROUND_JUMP
+                vertex.round,
+                self.current_round,
+                Self::MAX_ROUND_JUMP
             );
             return;
         }
@@ -813,6 +809,22 @@ impl DagConsensus {
                     .put("latest_proposed_round", &self.current_round.to_string());
             }
         } // Locks dropped here!
+
+        // Observer nodes may ingest and persist validator vertices so chain
+        // sync has visibility into the live network, but only active
+        // validators are allowed to run local ordering and commit blocks.
+        // Without this guard a non-validator observer can manufacture a
+        // private fork from incoming DAG traffic, then later fail sequential
+        // sync with parent-hash mismatches.
+        if !validators.contains(&self.node_id) {
+            if self.current_round.is_multiple_of(10) {
+                println!(
+                    "⚠️  [Consensus] Observer Mode: skipping local ordering/commit at round {}",
+                    self.current_round
+                );
+            }
+            return;
+        }
 
         // --- ORDERING LOGIC (Bullshark-lite) ---
         // Now we can take new locks without holding the previous ones.
@@ -1151,24 +1163,39 @@ impl DagConsensus {
 
         let offender = match attest["offender"].as_str() {
             Some(s) => s.to_string(),
-            None => { eprintln!("❌ [H-02] Missing offender field"); return; }
+            None => {
+                eprintln!("❌ [H-02] Missing offender field");
+                return;
+            }
         };
         let epoch = match attest["epoch"].as_u64() {
             Some(e) => e,
-            None => { eprintln!("❌ [H-02] Missing epoch field"); return; }
+            None => {
+                eprintln!("❌ [H-02] Missing epoch field");
+                return;
+            }
         };
         let reporter = match attest["reporter"].as_str() {
             Some(s) => s.to_string(),
-            None => { eprintln!("❌ [H-02] Missing reporter field"); return; }
+            None => {
+                eprintln!("❌ [H-02] Missing reporter field");
+                return;
+            }
         };
         let round = attest["round"].as_u64().unwrap_or(0);
         let reporter_pubkey_hex = match attest["reporter_pubkey"].as_str() {
             Some(s) => s.to_string(),
-            None => { eprintln!("❌ [H-02] Missing reporter_pubkey"); return; }
+            None => {
+                eprintln!("❌ [H-02] Missing reporter_pubkey");
+                return;
+            }
         };
         let sig_hex = match attest["signature"].as_str() {
             Some(s) => s.to_string(),
-            None => { eprintln!("❌ [H-02] Missing signature"); return; }
+            None => {
+                eprintln!("❌ [H-02] Missing signature");
+                return;
+            }
         };
 
         // Don't re-process our own attestation broadcast back to us.
@@ -1216,11 +1243,17 @@ impl DagConsensus {
         // 2. Verify pubkey → address derivation matches claimed reporter.
         let pubkey_bytes = match hex::decode(&reporter_pubkey_hex) {
             Ok(b) => b,
-            Err(_) => { eprintln!("❌ [H-02] reporter_pubkey not valid hex"); return; }
+            Err(_) => {
+                eprintln!("❌ [H-02] reporter_pubkey not valid hex");
+                return;
+            }
         };
         let derived_addr = match crypto::derive_address(&pubkey_bytes) {
             Ok(a) => a,
-            Err(e) => { eprintln!("❌ [H-02] derive_address failed: {}", e); return; }
+            Err(e) => {
+                eprintln!("❌ [H-02] derive_address failed: {}", e);
+                return;
+            }
         };
         if derived_addr != reporter {
             eprintln!(
@@ -1234,7 +1267,10 @@ impl DagConsensus {
         let canonical = format!("{}:{}:{}:{}", offender, epoch, reporter, round);
         let sig_bytes = match hex::decode(&sig_hex) {
             Ok(b) => b,
-            Err(_) => { eprintln!("❌ [H-02] signature not valid hex"); return; }
+            Err(_) => {
+                eprintln!("❌ [H-02] signature not valid hex");
+                return;
+            }
         };
         match crypto::verify_signature(&pubkey_bytes, canonical.as_bytes(), &sig_bytes) {
             Ok(true) => {}
@@ -1332,6 +1368,33 @@ impl DagConsensus {
             );
             self.latest_block_height = new_height;
             self.latest_block_hash = new_hash;
+
+            let synced_round = self
+                .storage
+                .get(&format!("block_{}", new_height))
+                .ok()
+                .flatten()
+                .and_then(|block_json| serde_json::from_str::<serde_json::Value>(&block_json).ok())
+                .and_then(|block| {
+                    block
+                        .get("header")
+                        .and_then(|header| header.get("round"))
+                        .and_then(|round| round.as_u64())
+                });
+
+            if let Some(round) = synced_round {
+                let next_round = round.saturating_add(1);
+                if next_round > self.current_round {
+                    println!(
+                        "🔄 [Consensus] Round reloaded from synced tip: {} -> {}",
+                        self.current_round, next_round
+                    );
+                    self.current_round = next_round;
+                    let _ = self
+                        .storage
+                        .put("latest_proposed_round", &round.to_string());
+                }
+            }
         }
     }
 

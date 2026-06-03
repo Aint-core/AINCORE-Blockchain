@@ -127,7 +127,6 @@ mod tests {
 
         // Sentinel is set.
         assert!(
-
             db.get(StateDB::TX_INDEX_BACKFILL_SENTINEL)
                 .unwrap()
                 .is_some(),
@@ -271,8 +270,7 @@ mod tests {
 
         // Limit of 0 returns nothing (guards against accidental wide scans).
         let none = db.scan_prefix_limited("queue:", 0);
-        assert!(
-none.is_empty(), "limit of 0 must return empty vec");
+        assert!(none.is_empty(), "limit of 0 must return empty vec");
 
         // Default scan_prefix still works but is now bounded by the hard cap.
         // Construction-of-attack guard: verify the constant is a sane ceiling.
@@ -341,16 +339,13 @@ none.is_empty(), "limit of 0 must return empty vec");
 
         let vals = db.get_active_validators();
         assert_eq!(vals.len(), 2);
-        assert!(
-vals.iter().any(|(pk, w)| pk == "pk_alice" && *w == 1000));
-        assert!(
-vals.iter().any(|(pk, w)| pk == "pk_bob" && *w == 2000));
+        assert!(vals.iter().any(|(pk, w)| pk == "pk_alice" && *w == 1000));
+        assert!(vals.iter().any(|(pk, w)| pk == "pk_bob" && *w == 2000));
 
         // Update existing weight
         db.update_validator_weight("pk_alice", 3000).unwrap();
         let vals = db.get_active_validators();
-        assert!(
-vals.iter().any(|(pk, w)| pk == "pk_alice" && *w == 3000));
+        assert!(vals.iter().any(|(pk, w)| pk == "pk_alice" && *w == 3000));
     }
 
     #[test]
@@ -360,10 +355,8 @@ vals.iter().any(|(pk, w)| pk == "pk_alice" && *w == 3000));
 
         db.save_dag_checkpoint(100, r#"[{"round":100}]"#).unwrap();
         assert_eq!(db.get_latest_checkpoint_round(), 100);
-        assert!(
-db.get_dag_checkpoint(100).is_some());
-        assert!(
-db.get_dag_checkpoint(50).is_none());
+        assert!(db.get_dag_checkpoint(100).is_some());
+        assert!(db.get_dag_checkpoint(50).is_none());
     }
 
     #[test]
@@ -378,8 +371,7 @@ db.get_dag_checkpoint(50).is_none());
         db.put_object(&obj).unwrap();
 
         let loaded = db.get_object("obj_001");
-        assert!(
-loaded.is_some());
+        assert!(loaded.is_some());
         let loaded = loaded.unwrap();
         assert_eq!(loaded.owner, object::Owner::Address("alice".to_string()));
         assert_eq!(loaded.version, 0);

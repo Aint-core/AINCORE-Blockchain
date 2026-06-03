@@ -39,6 +39,8 @@ services:
     image: aincore:latest
     container_name: aincore-indexer
     command: [ "indexer" ]
+    volumes:
+      - ./aincore_data/indexer:/root/.aincore
     environment:
       - NODE_RPC_URL=http://aincore-node:8002/rpc
       - RUST_LOG=info

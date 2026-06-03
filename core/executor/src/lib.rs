@@ -106,11 +106,7 @@ fn validator_set_key() -> String {
 }
 
 fn dex_registry_key() -> String {
-    format!(
-        "resource_{}_{}",
-        system_address(),
-        "0x1::dex::PoolRegistry"
-    )
+    format!("resource_{}_{}", system_address(), "0x1::dex::PoolRegistry")
 }
 
 fn coin_store_key_for_type(
@@ -194,7 +190,8 @@ fn receipt_update(
 }
 
 fn bcs_arg<T: serde::de::DeserializeOwned>(args: &[Vec<u8>], index: usize) -> Option<T> {
-    args.get(index).and_then(|bytes| bcs::from_bytes(bytes).ok())
+    args.get(index)
+        .and_then(|bytes| bcs::from_bytes(bytes).ok())
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -290,57 +287,87 @@ fn add_pool_delta_metadata(
         "add_liquidity" => {
             metadata.insert(
                 "actual_amount_x".to_string(),
-                serde_json::json!(
-                    post_pool.coin_x.value.saturating_sub(pre_pool.coin_x.value).to_string()
-                ),
+                serde_json::json!(post_pool
+                    .coin_x
+                    .value
+                    .saturating_sub(pre_pool.coin_x.value)
+                    .to_string()),
             );
             metadata.insert(
                 "actual_amount_y".to_string(),
-                serde_json::json!(
-                    post_pool.coin_y.value.saturating_sub(pre_pool.coin_y.value).to_string()
-                ),
+                serde_json::json!(post_pool
+                    .coin_y
+                    .value
+                    .saturating_sub(pre_pool.coin_y.value)
+                    .to_string()),
             );
             metadata.insert(
                 "actual_lp_minted".to_string(),
-                serde_json::json!(post_pool.lp_supply.saturating_sub(pre_pool.lp_supply).to_string()),
+                serde_json::json!(post_pool
+                    .lp_supply
+                    .saturating_sub(pre_pool.lp_supply)
+                    .to_string()),
             );
         }
         "remove_liquidity" => {
             metadata.insert(
                 "actual_amount_x".to_string(),
-                serde_json::json!(
-                    pre_pool.coin_x.value.saturating_sub(post_pool.coin_x.value).to_string()
-                ),
+                serde_json::json!(pre_pool
+                    .coin_x
+                    .value
+                    .saturating_sub(post_pool.coin_x.value)
+                    .to_string()),
             );
             metadata.insert(
                 "actual_amount_y".to_string(),
-                serde_json::json!(
-                    pre_pool.coin_y.value.saturating_sub(post_pool.coin_y.value).to_string()
-                ),
+                serde_json::json!(pre_pool
+                    .coin_y
+                    .value
+                    .saturating_sub(post_pool.coin_y.value)
+                    .to_string()),
             );
             metadata.insert(
                 "actual_lp_burned".to_string(),
-                serde_json::json!(pre_pool.lp_supply.saturating_sub(post_pool.lp_supply).to_string()),
+                serde_json::json!(pre_pool
+                    .lp_supply
+                    .saturating_sub(post_pool.lp_supply)
+                    .to_string()),
             );
         }
         "swap_x_to_y" => {
-            metadata.insert("token_in".to_string(), serde_json::json!(type_args.first().cloned()));
-            metadata.insert("token_out".to_string(), serde_json::json!(type_args.get(1).cloned()));
+            metadata.insert(
+                "token_in".to_string(),
+                serde_json::json!(type_args.first().cloned()),
+            );
+            metadata.insert(
+                "token_out".to_string(),
+                serde_json::json!(type_args.get(1).cloned()),
+            );
             metadata.insert(
                 "actual_amount_out".to_string(),
-                serde_json::json!(
-                    pre_pool.coin_y.value.saturating_sub(post_pool.coin_y.value).to_string()
-                ),
+                serde_json::json!(pre_pool
+                    .coin_y
+                    .value
+                    .saturating_sub(post_pool.coin_y.value)
+                    .to_string()),
             );
         }
         "swap_y_to_x" => {
-            metadata.insert("token_in".to_string(), serde_json::json!(type_args.get(1).cloned()));
-            metadata.insert("token_out".to_string(), serde_json::json!(type_args.first().cloned()));
+            metadata.insert(
+                "token_in".to_string(),
+                serde_json::json!(type_args.get(1).cloned()),
+            );
+            metadata.insert(
+                "token_out".to_string(),
+                serde_json::json!(type_args.first().cloned()),
+            );
             metadata.insert(
                 "actual_amount_out".to_string(),
-                serde_json::json!(
-                    pre_pool.coin_x.value.saturating_sub(post_pool.coin_x.value).to_string()
-                ),
+                serde_json::json!(pre_pool
+                    .coin_x
+                    .value
+                    .saturating_sub(post_pool.coin_x.value)
+                    .to_string()),
             );
         }
         _ => {}
@@ -375,10 +402,16 @@ fn receipt_metadata(
         match call.function.as_str() {
             "add_liquidity" => {
                 if let Some(amount_x) = bcs_arg::<u128>(&call.args, 2) {
-                    obj.insert("amount_x".to_string(), serde_json::json!(amount_x.to_string()));
+                    obj.insert(
+                        "amount_x".to_string(),
+                        serde_json::json!(amount_x.to_string()),
+                    );
                 }
                 if let Some(amount_y) = bcs_arg::<u128>(&call.args, 3) {
-                    obj.insert("amount_y".to_string(), serde_json::json!(amount_y.to_string()));
+                    obj.insert(
+                        "amount_y".to_string(),
+                        serde_json::json!(amount_y.to_string()),
+                    );
                 }
                 if let Some(min_lp) = bcs_arg::<u128>(&call.args, 4) {
                     obj.insert("min_lp".to_string(), serde_json::json!(min_lp.to_string()));
@@ -386,7 +419,10 @@ fn receipt_metadata(
             }
             "remove_liquidity" => {
                 if let Some(lp_amount) = bcs_arg::<u128>(&call.args, 2) {
-                    obj.insert("lp_amount".to_string(), serde_json::json!(lp_amount.to_string()));
+                    obj.insert(
+                        "lp_amount".to_string(),
+                        serde_json::json!(lp_amount.to_string()),
+                    );
                 }
                 if let Some(min_x) = bcs_arg::<u128>(&call.args, 3) {
                     obj.insert("min_x".to_string(), serde_json::json!(min_x.to_string()));
@@ -397,10 +433,16 @@ fn receipt_metadata(
             }
             "swap_x_to_y" | "swap_y_to_x" => {
                 if let Some(amount_in) = bcs_arg::<u128>(&call.args, 2) {
-                    obj.insert("amount_in".to_string(), serde_json::json!(amount_in.to_string()));
+                    obj.insert(
+                        "amount_in".to_string(),
+                        serde_json::json!(amount_in.to_string()),
+                    );
                 }
                 if let Some(min_out) = bcs_arg::<u128>(&call.args, 3) {
-                    obj.insert("min_out".to_string(), serde_json::json!(min_out.to_string()));
+                    obj.insert(
+                        "min_out".to_string(),
+                        serde_json::json!(min_out.to_string()),
+                    );
                 }
             }
             _ => {}
@@ -771,8 +813,11 @@ impl Executor {
         for (addr, stake) in &validators {
             let share = pool.saturating_mul(*stake as u128) / total_stake;
             distributed_pool = distributed_pool.saturating_add(share);
-            *payouts.entry(addr.clone()).or_insert(0) =
-                payouts.get(addr).copied().unwrap_or(0).saturating_add(share);
+            *payouts.entry(addr.clone()).or_insert(0) = payouts
+                .get(addr)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(share);
         }
 
         // Step 4: leader bonus + rounding remainder to leader.
@@ -851,9 +896,7 @@ impl Executor {
         // M-06 FIX: bound the scan at the storage layer rather than relying on
         // a downstream `.take(25)` that would otherwise materialise the entire
         // queue into a Vec first. The cap of 25 matches the original drain rate.
-        let sweep_keys: Vec<_> = self
-            .db
-            .scan_prefix_limited("sys:fee_sweep_queue:", 25);
+        let sweep_keys: Vec<_> = self.db.scan_prefix_limited("sys:fee_sweep_queue:", 25);
 
         for (key, raw) in sweep_keys {
             let mut entry = match serde_json::from_str::<FeeSweepEntry>(&raw) {
@@ -998,7 +1041,10 @@ impl Executor {
         for batch in batches.iter() {
             // Execute in parallel to get updates
             #[allow(clippy::type_complexity)] // intrinsic to parallel TX result shape
-            let mut results: Vec<(String, Option<(Vec<(String, Option<String>)>, u128)>)> = batch
+            let mut results: Vec<(
+                String,
+                Option<(Vec<(String, Option<String>)>, u128)>,
+            )> = batch
                 .par_iter()
                 .map(|(_tx, raw)| (tx_hash_hex(raw), self.execute_transaction(raw)))
                 .collect();
@@ -1109,7 +1155,8 @@ impl Executor {
 
             println!(
                 "💰 Distributing Block Fees ({} AIN total) across {} recipient(s)",
-                reward_amount, payouts.len()
+                reward_amount,
+                payouts.len()
             );
 
             for (recipient, share) in &payouts {
@@ -1135,10 +1182,7 @@ impl Executor {
                 }
                 if !distributed {
                     self.queue_fee_sweep(recipient, *share, self.db.get_chain_height());
-                    eprintln!(
-                        "🔴 Reward queued for sweep: {} AIN → {}",
-                        share, recipient
-                    );
+                    eprintln!("🔴 Reward queued for sweep: {} AIN → {}", share, recipient);
                 }
             }
         }
@@ -1297,9 +1341,10 @@ impl Executor {
                 &format!("sys:pending_slash:{}", offender),
                 &slash_event.to_string(),
             );
-            let _ = self
-                .db
-                .put(&jail_key, &serde_json::to_string(&reporters).unwrap_or_default());
+            let _ = self.db.put(
+                &jail_key,
+                &serde_json::to_string(&reporters).unwrap_or_default(),
+            );
 
             // Drop the attestations for this (offender, epoch) to free
             // storage and prevent re-promotion. We only drop the
@@ -1331,9 +1376,7 @@ impl Executor {
         // H-4 FIX: Cap processing to 5 slashes per block to prevent O(N) drain.
         // M-06 FIX: enforce the cap at the storage scan instead of after
         // materialising the entire queue.
-        let slash_keys: Vec<_> = self
-            .db
-            .scan_prefix_limited("sys:pending_slash:", 5);
+        let slash_keys: Vec<_> = self.db.scan_prefix_limited("sys:pending_slash:", 5);
 
         for (key, event_json) in &slash_keys {
             // Extract validator address from key: "sys:pending_slash:{addr}"
@@ -1755,10 +1798,9 @@ impl Executor {
                         "{}:{}:{}:{}",
                         tx.chain_id, tx.sender, tx.payload, tx.sequence_number
                     );
-                    if let Err(e) = crypto::zkp::verify_tx_attached_proof(
-                        proof_hex,
-                        canonical_msg.as_bytes(),
-                    ) {
+                    if let Err(e) =
+                        crypto::zkp::verify_tx_attached_proof(proof_hex, canonical_msg.as_bytes())
+                    {
                         println!(
                             "❌ Transaction zkp_proof rejected at executor (H-04): {}",
                             e
@@ -2358,9 +2400,7 @@ mod tests {
     fn set_dex_registry(db: &StateDB, pools: Vec<TestPoolInfo>) {
         db.put(
             &dex_registry_key(),
-            &hex::encode(
-                bcs::to_bytes(&TestPoolRegistry { pools }).expect("dex registry BCS"),
-            ),
+            &hex::encode(bcs::to_bytes(&TestPoolRegistry { pools }).expect("dex registry BCS")),
         )
         .expect("dex registry stored");
     }
@@ -2370,8 +2410,7 @@ mod tests {
             .get(&dex_registry_key())
             .expect("dex registry read")
             .expect("dex registry exists");
-        bcs::from_bytes(&hex::decode(value).expect("dex registry hex"))
-            .expect("dex registry BCS")
+        bcs::from_bytes(&hex::decode(value).expect("dex registry hex")).expect("dex registry BCS")
     }
 
     fn set_dex_pool(
@@ -2395,6 +2434,20 @@ mod tests {
             &hex::encode(bcs::to_bytes(&pool).expect("dex pool BCS")),
         )
         .expect("dex pool stored");
+    }
+
+    fn set_dex_lp_balance(
+        db: &StateDB,
+        owner: &str,
+        x: move_core_types::language_storage::TypeTag,
+        y: move_core_types::language_storage::TypeTag,
+        balance: u128,
+    ) {
+        db.put(
+            &dex_lp_key(owner, x, y),
+            &hex::encode(bcs::to_bytes(&TestLPToken { balance }).expect("lp token BCS")),
+        )
+        .expect("lp token stored");
     }
 
     fn dex_pool(
@@ -2960,9 +3013,12 @@ mod tests {
         set_dex_registry(&db, vec![]);
 
         let executor = Executor::new(db.clone());
-        let create_payload = entry_payload("dex", "create_pool", vec![ain.clone(), wbtc.clone()], vec![
-            bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
-        ]);
+        let create_payload = entry_payload(
+            "dex",
+            "create_pool",
+            vec![ain.clone(), wbtc.clone()],
+            vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
+        );
         let create_tx = signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1);
         let (updates, gas) = executor
             .execute_transaction(&create_tx)
@@ -3068,7 +3124,14 @@ mod tests {
             ],
         );
         let (updates, gas) = executor
-            .execute_transaction(&signed_tx(&trader_key, &trader, &remove_payload, 3, 10_000, 1))
+            .execute_transaction(&signed_tx(
+                &trader_key,
+                &trader,
+                &remove_payload,
+                3,
+                10_000,
+                1,
+            ))
             .expect("remove liquidity accepted");
         assert_eq!(gas, 10_000);
         apply_updates(&db, updates);
@@ -3077,7 +3140,10 @@ mod tests {
         assert_eq!(pool.coin_x.value, 9_900);
         assert_eq!(pool.coin_y.value, 8_185);
         assert_eq!(pool.lp_supply, 9_000);
-        assert_eq!(dex_lp_balance(&db, &trader, ain.clone(), wbtc.clone()), 8_000);
+        assert_eq!(
+            dex_lp_balance(&db, &trader, ain.clone(), wbtc.clone()),
+            8_000
+        );
         assert_eq!(coin_balance_for(&db, &trader, ain), 950_100);
         assert_eq!(coin_balance_for(&db, &trader, wbtc), 991_815);
     }
@@ -3098,18 +3164,31 @@ mod tests {
         set_dex_registry(&db, vec![]);
 
         let executor = Executor::new(db.clone());
-        let create_payload = entry_payload("dex", "create_pool", vec![ain.clone(), wbtc.clone()], vec![
-            bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
-        ]);
+        let create_payload = entry_payload(
+            "dex",
+            "create_pool",
+            vec![ain.clone(), wbtc.clone()],
+            vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
+        );
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1))
+            .execute_transaction(&signed_tx(
+                &trader_key,
+                &trader,
+                &create_payload,
+                0,
+                10_000,
+                1,
+            ))
             .expect("first create accepted");
         apply_updates(&db, updates);
         assert_eq!(dex_registry(&db).pools.len(), 1);
 
-        let reverse_payload = entry_payload("dex", "create_pool", vec![wbtc.clone(), ain.clone()], vec![
-            bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
-        ]);
+        let reverse_payload = entry_payload(
+            "dex",
+            "create_pool",
+            vec![wbtc.clone(), ain.clone()],
+            vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
+        );
         let reverse_tx = signed_tx(&trader_key, &trader, &reverse_payload, 1, 10_000, 1);
         let (updates, _) = executor
             .execute_transaction(&reverse_tx)
@@ -3176,11 +3255,21 @@ mod tests {
         set_dex_registry(&db, vec![]);
 
         let executor = Executor::new(db.clone());
-        let create_payload = entry_payload("dex", "create_pool", vec![ain.clone(), wbtc.clone()], vec![
-            bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
-        ]);
+        let create_payload = entry_payload(
+            "dex",
+            "create_pool",
+            vec![ain.clone(), wbtc.clone()],
+            vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
+        );
         let (updates, gas) = executor
-            .execute_transaction(&signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1))
+            .execute_transaction(&signed_tx(
+                &trader_key,
+                &trader,
+                &create_payload,
+                0,
+                10_000,
+                1,
+            ))
             .expect("create pool accepted");
         assert_eq!(gas, 10_000);
         apply_updates(&db, updates);
@@ -3235,15 +3324,33 @@ mod tests {
         set_dex_registry(&db, vec![]);
 
         let executor = Executor::new(db.clone());
-        let create_payload = entry_payload("dex", "create_pool", vec![ain.clone(), wbtc.clone()], vec![
-            bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
-        ]);
+        let create_payload = entry_payload(
+            "dex",
+            "create_pool",
+            vec![ain.clone(), wbtc.clone()],
+            vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
+        );
         let (updates, gas) = executor
-            .execute_transaction(&signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1))
+            .execute_transaction(&signed_tx(
+                &trader_key,
+                &trader,
+                &create_payload,
+                0,
+                10_000,
+                1,
+            ))
             .expect("create pool accepted");
         assert_eq!(gas, 10_000);
         apply_updates(&db, updates);
-        set_dex_pool(&db, &trader, ain.clone(), wbtc.clone(), 10_000, 10_000, 10_000);
+        set_dex_pool(
+            &db,
+            &trader,
+            ain.clone(),
+            wbtc.clone(),
+            10_000,
+            10_000,
+            10_000,
+        );
 
         let payload = entry_payload(
             "dex",
@@ -3267,6 +3374,166 @@ mod tests {
         assert_eq!(pool.coin_x.value, 10_000);
         assert_eq!(pool.coin_y.value, 10_000);
         assert_eq!(coin_balance_for(&db, &trader, ain), overflow_input - 10_000);
+        assert_eq!(coin_balance_for(&db, &trader, wbtc), 100_000);
+        let receipt = db
+            .get(&format!("tx_receipt:{}", tx_hash_hex(&tx_json)))
+            .unwrap()
+            .expect("receipt stored");
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["status"], "aborted");
+    }
+
+    #[test]
+    fn test_dex_swap_zero_output_aborts_before_withdrawal() {
+        let db = temp_db("dex_zero_output_swap");
+        load_stdlib(&db);
+        let trader_key = SigningKey::from_bytes(&[38u8; 32]);
+        let trader = create_account(&db, &trader_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+
+        let ain = aincore_coin_type();
+        let wbtc = wbtc_coin_type();
+        set_coin_store_for(&db, &trader, ain.clone(), 100_000);
+        set_coin_store_for(&db, &trader, wbtc.clone(), 100_000);
+        set_dex_registry(&db, vec![]);
+
+        let executor = Executor::new(db.clone());
+        let create_payload = entry_payload(
+            "dex",
+            "create_pool",
+            vec![ain.clone(), wbtc.clone()],
+            vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
+        );
+        let (updates, _) = executor
+            .execute_transaction(&signed_tx(
+                &trader_key,
+                &trader,
+                &create_payload,
+                0,
+                10_000,
+                1,
+            ))
+            .expect("create pool accepted");
+        apply_updates(&db, updates);
+        set_dex_pool(
+            &db,
+            &trader,
+            ain.clone(),
+            wbtc.clone(),
+            1_000_000_000_000,
+            1,
+            1_000_000_000_000,
+        );
+
+        let payload = entry_payload(
+            "dex",
+            "swap_x_to_y",
+            vec![ain.clone(), wbtc.clone()],
+            vec![
+                bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+                bcs::to_bytes(&1u128).unwrap(),
+                bcs::to_bytes(&0u128).unwrap(),
+            ],
+        );
+        let tx_json = signed_tx(&trader_key, &trader, &payload, 1, 10_000, 1);
+        let (updates, gas) = executor
+            .execute_transaction(&tx_json)
+            .expect("zero-output swap abort is accepted and gas-charged");
+        assert_eq!(gas, 10_000);
+        apply_updates(&db, updates);
+
+        let pool = dex_pool(&db, &trader, ain.clone(), wbtc.clone());
+        assert_eq!(pool.coin_x.value, 1_000_000_000_000);
+        assert_eq!(pool.coin_y.value, 1);
+        assert_eq!(
+            coin_balance_for(&db, &trader, ain),
+            80_000,
+            "only create-pool gas and aborted-swap gas should be charged",
+        );
+        assert_eq!(coin_balance_for(&db, &trader, wbtc), 100_000);
+        let receipt = db
+            .get(&format!("tx_receipt:{}", tx_hash_hex(&tx_json)))
+            .unwrap()
+            .expect("receipt stored");
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["status"], "aborted");
+    }
+
+    #[test]
+    fn test_dex_remove_liquidity_rejects_zero_side_output() {
+        let db = temp_db("dex_remove_zero_side");
+        load_stdlib(&db);
+        let trader_key = SigningKey::from_bytes(&[39u8; 32]);
+        let trader = create_account(&db, &trader_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+
+        let ain = aincore_coin_type();
+        let wbtc = wbtc_coin_type();
+        set_coin_store_for(&db, &trader, ain.clone(), 100_000);
+        set_coin_store_for(&db, &trader, wbtc.clone(), 100_000);
+        set_dex_registry(&db, vec![]);
+
+        let executor = Executor::new(db.clone());
+        let create_payload = entry_payload(
+            "dex",
+            "create_pool",
+            vec![ain.clone(), wbtc.clone()],
+            vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
+        );
+        let (updates, _) = executor
+            .execute_transaction(&signed_tx(
+                &trader_key,
+                &trader,
+                &create_payload,
+                0,
+                10_000,
+                1,
+            ))
+            .expect("create pool accepted");
+        apply_updates(&db, updates);
+        set_dex_pool(
+            &db,
+            &trader,
+            ain.clone(),
+            wbtc.clone(),
+            1_000_000,
+            1,
+            1_000_000,
+        );
+        set_dex_lp_balance(&db, &trader, ain.clone(), wbtc.clone(), 1);
+
+        let payload = entry_payload(
+            "dex",
+            "remove_liquidity",
+            vec![ain.clone(), wbtc.clone()],
+            vec![
+                bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap(),
+                bcs::to_bytes(&1u128).unwrap(),
+                bcs::to_bytes(&0u128).unwrap(),
+                bcs::to_bytes(&0u128).unwrap(),
+            ],
+        );
+        let tx_json = signed_tx(&trader_key, &trader, &payload, 1, 10_000, 1);
+        let (updates, gas) = executor
+            .execute_transaction(&tx_json)
+            .expect("zero-side remove abort is accepted and gas-charged");
+        assert_eq!(gas, 10_000);
+        apply_updates(&db, updates);
+
+        let pool = dex_pool(&db, &trader, ain.clone(), wbtc.clone());
+        assert_eq!(pool.coin_x.value, 1_000_000);
+        assert_eq!(pool.coin_y.value, 1);
+        assert_eq!(pool.lp_supply, 1_000_000);
+        assert_eq!(
+            dex_lp_balance(&db, &trader, ain.clone(), wbtc.clone()),
+            1,
+            "LP token must not burn when one side rounds to zero",
+        );
+        assert_eq!(coin_balance_for(&db, &trader, ain), 80_000);
         assert_eq!(coin_balance_for(&db, &trader, wbtc), 100_000);
         let receipt = db
             .get(&format!("tx_receipt:{}", tx_hash_hex(&tx_json)))
@@ -3303,7 +3570,14 @@ mod tests {
             vec![bcs::to_bytes(&parse_move_address(&maker).unwrap()).unwrap()],
         );
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(&maker_key, &maker, &create_payload, 0, 10_000, 1))
+            .execute_transaction(&signed_tx(
+                &maker_key,
+                &maker,
+                &create_payload,
+                0,
+                10_000,
+                1,
+            ))
             .expect("create pool accepted");
         apply_updates(&db, updates);
 
@@ -3337,7 +3611,14 @@ mod tests {
             ],
         );
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(&lp2_key, &lp2, &imbalanced_payload, 0, 10_000, 1))
+            .execute_transaction(&signed_tx(
+                &lp2_key,
+                &lp2,
+                &imbalanced_payload,
+                0,
+                10_000,
+                1,
+            ))
             .expect("imbalanced add liquidity accepted");
         apply_updates(&db, updates);
 
@@ -3697,17 +3978,17 @@ mod tests {
             ("cccc".repeat(8), 100),
             ("dddd".repeat(8), 100),
         ];
-        db.put("sys:validators", &serde_json::to_string(&validators).unwrap())
-            .unwrap();
+        db.put(
+            "sys:validators",
+            &serde_json::to_string(&validators).unwrap(),
+        )
+        .unwrap();
 
         // Only ONE reporter attests against the offender.
         let offender = &validators[0].0;
         let reporter = &validators[1].0;
         db.put(
-            &format!(
-                "sys:downtime_attestation:{}:{}:{}",
-                offender, 7, reporter
-            ),
+            &format!("sys:downtime_attestation:{}:{}:{}", offender, 7, reporter),
             &serde_json::json!({"reason": "downtime"}).to_string(),
         )
         .unwrap();
@@ -3716,11 +3997,12 @@ mod tests {
         executor.promote_downtime_attestations_to_slash();
 
         // No pending_slash queued — single reporter is below quorum.
-        assert!(db
-            .get(&format!("sys:pending_slash:{}", offender))
-            .unwrap()
-            .is_none(),
-            "single-reporter attestation must NOT promote to a slash");
+        assert!(
+            db.get(&format!("sys:pending_slash:{}", offender))
+                .unwrap()
+                .is_none(),
+            "single-reporter attestation must NOT promote to a slash"
+        );
         // Attestation is retained for future reporters to potentially
         // bring the count to quorum.
         assert!(db
@@ -3742,17 +4024,17 @@ mod tests {
             ("cccc".repeat(8), 100),
             ("dddd".repeat(8), 100),
         ];
-        db.put("sys:validators", &serde_json::to_string(&validators).unwrap())
-            .unwrap();
+        db.put(
+            "sys:validators",
+            &serde_json::to_string(&validators).unwrap(),
+        )
+        .unwrap();
 
         let offender = &validators[0].0;
         // 3 distinct reporters (out of 4) — exactly BFT quorum.
         for reporter in &validators[1..] {
             db.put(
-                &format!(
-                    "sys:downtime_attestation:{}:{}:{}",
-                    offender, 9, reporter.0
-                ),
+                &format!("sys:downtime_attestation:{}:{}:{}", offender, 9, reporter.0),
                 &serde_json::json!({"reason": "downtime", "round": 500}).to_string(),
             )
             .unwrap();
@@ -3801,8 +4083,11 @@ mod tests {
             ("cccc".repeat(8), 100),
             ("dddd".repeat(8), 100),
         ];
-        db.put("sys:validators", &serde_json::to_string(&validators).unwrap())
-            .unwrap();
+        db.put(
+            "sys:validators",
+            &serde_json::to_string(&validators).unwrap(),
+        )
+        .unwrap();
 
         let offender = &validators[0].0;
         // 2 valid reporters + 1 stale (not in validator set) = only 2 count.
@@ -3812,10 +4097,7 @@ mod tests {
 
         for reporter in valid_reporters.iter() {
             db.put(
-                &format!(
-                    "sys:downtime_attestation:{}:{}:{}",
-                    offender, 11, reporter
-                ),
+                &format!("sys:downtime_attestation:{}:{}:{}", offender, 11, reporter),
                 &serde_json::json!({}).to_string(),
             )
             .unwrap();
@@ -3832,11 +4114,12 @@ mod tests {
         let executor = Executor::new(db.clone());
         executor.promote_downtime_attestations_to_slash();
 
-        assert!(db
-            .get(&format!("sys:pending_slash:{}", offender))
-            .unwrap()
-            .is_none(),
-            "stale reporter must not push the group over quorum");
+        assert!(
+            db.get(&format!("sys:pending_slash:{}", offender))
+                .unwrap()
+                .is_none(),
+            "stale reporter must not push the group over quorum"
+        );
     }
 
     /// Phase 5C.3 / NEW-002: an offender who LEFT the validator set
@@ -3861,10 +4144,7 @@ mod tests {
         // Persist 3 valid reporter attestations against offender.
         for reporter in attest_time_validators[..3].iter() {
             db.put(
-                &format!(
-                    "sys:downtime_attestation:{}:{}:{}",
-                    offender, 7, reporter.0
-                ),
+                &format!("sys:downtime_attestation:{}:{}:{}", offender, 7, reporter.0),
                 &serde_json::json!({}).to_string(),
             )
             .unwrap();
@@ -3905,8 +4185,7 @@ mod tests {
     }
 
     fn set_validator_set_a1(db: &StateDB, vs: &[(&str, u64)]) {
-        let owned: Vec<(String, u64)> =
-            vs.iter().map(|(a, s)| (a.to_string(), *s)).collect();
+        let owned: Vec<(String, u64)> = vs.iter().map(|(a, s)| (a.to_string(), *s)).collect();
         db.put("sys:validators", &serde_json::to_string(&owned).unwrap())
             .unwrap();
     }

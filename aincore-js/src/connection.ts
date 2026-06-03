@@ -84,6 +84,33 @@ export interface DexMarketSummary {
     last_trade_at: number;
 }
 
+export interface DexLpBalance {
+    address: string;
+    status: string;
+    pool_key?: string;
+    pool_addr?: string;
+    token_x?: string;
+    token_y?: string;
+    balance: string;
+    lp_supply: string;
+    share_bps: number;
+    balance_source?: string;
+}
+
+export interface TransactionReceipt {
+    tx_hash: string;
+    status: string;
+    confirmations: number;
+    block_height?: number;
+    block_hash?: string;
+    execution_receipt?: {
+        status?: string;
+        gas_charged?: string;
+        error?: string;
+        metadata?: Record<string, unknown>;
+    } | null;
+}
+
 export class Connection {
     private rpcUrl: string;
     private client: AxiosInstance;
@@ -178,6 +205,28 @@ export class Connection {
     }
 
     /**
+     * Get account nonce/sequence number directly from the node wallet RPC.
+     */
+    async getAccountNonce(address: string): Promise<number> {
+        const result = await this.request('aincore_getAccountNonce', [address]);
+        return Number(result?.sequence_number ?? result?.nonce ?? 0);
+    }
+
+    /**
+     * Get an exact Move CoinStore balance for native AIN or synthetic test WBTC.
+     */
+    async getCoinBalance(address: string, token: 'AIN' | 'WBTC' | string): Promise<{
+        address: string;
+        token: string;
+        balance: string;
+        decimals: number;
+        balance_source: string;
+        market_mode?: string;
+    }> {
+        return await this.request('aincore_getCoinBalance', [address, token]);
+    }
+
+    /**
      * Request local/testnet faucet funds. Node must run with AINCORE_ENABLE_FAUCET=1.
      */
     async requestFaucet(address: string, amount?: string | number, publicKey?: string): Promise<{
@@ -193,6 +242,22 @@ export class Connection {
             params.push(publicKey);
         }
         return await this.request('aincore_faucet', params);
+    }
+
+    /**
+     * Mint synthetic WBTC for local/testnet DEX smoke tests.
+     * This does not represent real BTC backing.
+     */
+    async requestTestMintWbtc(address: string, amount: string | number, publicKey?: string): Promise<{
+        address: string;
+        amount: string;
+        wbtc_balance: string;
+        balance_source: string;
+        faucet_mode: string;
+    }> {
+        const params: any[] = [address, String(amount)];
+        if (publicKey !== undefined) params.push(publicKey);
+        return await this.request('aincore_testMintWbtc', params);
     }
 
     /**
@@ -217,9 +282,24 @@ export class Connection {
     }
 
     /**
+     * Get transaction receipt/status from the node.
+     */
+    async getTransactionReceipt(hash: string): Promise<TransactionReceipt> {
+        return await this.request('aincore_getTransactionReceipt', [hash]);
+    }
+
+    /**
      * Send a signed transaction
      */
     async sendTransaction(signedTxJson: string): Promise<string> {
+        const res = await this.request('aincore_sendTransaction', [signedTxJson]);
+        return res.tx_hash;
+    }
+
+    /**
+     * Alias for browser/native wallet integrations that already produce tx JSON.
+     */
+    async submitSignedTransaction(signedTxJson: string | Record<string, unknown>): Promise<string> {
         const res = await this.request('aincore_sendTransaction', [signedTxJson]);
         return res.tx_hash;
     }
@@ -319,6 +399,26 @@ export class Connection {
      */
     async getDexQuote(tokenIn: string, tokenOut: string, amountIn: string | number): Promise<DexQuote> {
         return await this.request('aincore_getDexQuote', [tokenIn, tokenOut, String(amountIn)]);
+    }
+
+    /**
+     * Read a provider's native Move LPToken balance for a DEX pool.
+     *
+     * When `poolAddrOrTokenX` is omitted, the node defaults to the Phase DEX
+     * AIN/WBTC market. Passing a pool address reads that pool directly; passing
+     * `poolAddrOrTokenX` + `tokenY` resolves a canonical token pair.
+     */
+    async getDexLpBalance(
+        address: string,
+        poolAddrOrTokenX?: string,
+        tokenY?: string,
+    ): Promise<DexLpBalance> {
+        const params = tokenY === undefined
+            ? poolAddrOrTokenX === undefined
+                ? [address]
+                : [address, poolAddrOrTokenX]
+            : [address, poolAddrOrTokenX, tokenY];
+        return await this.request('aincore_getDexLpBalance', params);
     }
 
     /**

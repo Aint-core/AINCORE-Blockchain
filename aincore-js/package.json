@@ -8,6 +8,7 @@
     "build": "tsc",
     "test:bcs": "ts-node test_bcs_parity.ts",
     "test:phase05": "ts-node phase05_live_smoke.ts",
+    "dex:seed": "ts-node dex_native_seed_e2e.ts",
     "test": "npm run test:bcs"
   },
   "keywords": [],

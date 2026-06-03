@@ -25,7 +25,6 @@ impl Default for PruningConfig {
 }
 
 impl PruningConfig {
-
     /// Calculate cutoff epoch based on retention period
     pub fn cutoff_timestamp(&self) -> i64 {
         let now = Utc::now();

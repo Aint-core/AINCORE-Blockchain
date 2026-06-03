@@ -95,8 +95,8 @@ pub fn verify_tx_attached_proof(
     canonical_msg: &[u8],
 ) -> Result<(), AttachedProofError> {
     // 1. Hex decode.
-    let proof_bytes = hex::decode(proof_hex)
-        .map_err(|e| AttachedProofError::InvalidHex(e.to_string()))?;
+    let proof_bytes =
+        hex::decode(proof_hex).map_err(|e| AttachedProofError::InvalidHex(e.to_string()))?;
 
     // 2. Structural parse.
     let proof = STARKProofData::from_bytes(&proof_bytes)

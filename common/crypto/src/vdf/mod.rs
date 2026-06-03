@@ -135,7 +135,11 @@ impl VDFProof {
         }
         let out_start = 16 + n_cp * 32;
         let output: [u8; 32] = bytes[out_start..out_start + 32].try_into().ok()?;
-        Some(Self { difficulty, checkpoints, output })
+        Some(Self {
+            difficulty,
+            checkpoints,
+            output,
+        })
     }
 }
 
@@ -340,7 +344,9 @@ mod tests {
         let vdf = VDFEngine::new(500).unwrap();
         let (output, proof) = vdf.compute(b"leader election seed").unwrap();
         // Fast verify — must return true.
-        assert!(vdf.verify(b"leader election seed", &output, &proof).unwrap());
+        assert!(vdf
+            .verify(b"leader election seed", &output, &proof)
+            .unwrap());
     }
 
     /// Tampered output must be rejected.

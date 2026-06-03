@@ -1,0 +1,26 @@
+.git
+.github
+.DS_Store
+
+# Rust build output is recreated inside Docker. Sending it as context makes
+# NAS builds painfully slow and can copy stale host artifacts into the image.
+target
+**/target
+
+# Runtime data must never be baked into the image.
+nas_data*
+*.db
+*.sqlite
+*.log
+
+# Frontend/package-manager caches are not needed for the Rust node image.
+node_modules
+**/node_modules
+build
+dist
+coverage
+
+# Local/editor scratch.
+*.tmp
+*.bak
+*.swp

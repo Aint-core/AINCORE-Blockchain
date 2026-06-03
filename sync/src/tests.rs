@@ -1,7 +1,7 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod tests {
-    use crate::{ChainSync, SyncRequest, SyncResponse};
+    use crate::{ChainSync, FinalityArtifact, SyncRequest, SyncResponse};
     use blockchain::Block;
     use std::collections::HashMap;
     use std::fs;
@@ -50,6 +50,16 @@ mod tests {
     #[test]
     fn test_handle_sync_request() {
         let sync = setup_sync("sync_req");
+        sync.storage.put("consensus:finalized_round", "4").unwrap();
+        sync.storage
+            .put("consensus:last_anchor_round", "4")
+            .unwrap();
+        sync.storage
+            .put("consensus:last_anchor_hash", "anchor-hash")
+            .unwrap();
+        sync.storage
+            .put("consensus:finality_digest", "digest")
+            .unwrap();
 
         // Create dummy blocks in DB
         for height in 1..=5 {
@@ -77,6 +87,9 @@ mod tests {
         assert_eq!(resp.blocks.len(), 3);
         assert_eq!(resp.blocks[0].header.height, 3);
         assert_eq!(resp.blocks[2].header.height, 5);
+        let finality = resp.finality.expect("sync response includes finality");
+        assert_eq!(finality.finalized_round, "4");
+        assert_eq!(finality.last_anchor_hash, "anchor-hash");
     }
 
     #[test]
@@ -99,6 +112,69 @@ mod tests {
         let resp_json = resp_msg.strip_prefix("SYNC_RESP:").unwrap();
         let resp: SyncResponse = serde_json::from_str(resp_json).unwrap();
         assert_eq!(resp.blocks.len(), 1);
+        assert!(resp.finality.is_some());
+    }
+
+    #[test]
+    fn test_get_finality_message() {
+        let sync = setup_sync("get_finality");
+        sync.storage.put("consensus:finalized_round", "9").unwrap();
+        sync.storage
+            .put("consensus:last_anchor_round", "8")
+            .unwrap();
+        sync.storage
+            .put("consensus:last_anchor_hash", "abc")
+            .unwrap();
+        sync.storage
+            .put("consensus:finality_digest", "def")
+            .unwrap();
+
+        let resp = sync.handle_message("GET_FINALITY").unwrap();
+        let json = resp.strip_prefix("FINALITY:").unwrap();
+        let artifact: FinalityArtifact = serde_json::from_str(json).unwrap();
+        assert_eq!(artifact.finalized_round, "9");
+        assert_eq!(artifact.last_anchor_round, "8");
+        assert_eq!(artifact.finality_digest, "def");
+    }
+
+    #[test]
+    fn test_apply_finality_artifact_updates_observer_storage() {
+        let sync = setup_sync("apply_finality");
+        sync.storage.put("latest_height", "100").unwrap();
+
+        let artifact = FinalityArtifact {
+            finalized_round: "95".to_string(),
+            last_anchor_round: "95".to_string(),
+            last_anchor_hash: "anchor".to_string(),
+            finality_digest: "digest".to_string(),
+        };
+
+        sync.apply_finality_artifact(&artifact).unwrap();
+        assert_eq!(
+            sync.storage.get("consensus:finalized_round").unwrap(),
+            Some("95".to_string())
+        );
+        assert_eq!(
+            sync.storage.get("consensus:finality_digest").unwrap(),
+            Some("digest".to_string())
+        );
+    }
+
+    #[test]
+    fn test_apply_finality_artifact_rejects_absurd_future_round() {
+        let sync = setup_sync("apply_finality_future");
+        sync.storage.put("latest_height", "10").unwrap();
+
+        let artifact = FinalityArtifact {
+            finalized_round: "5000".to_string(),
+            last_anchor_round: "5000".to_string(),
+            last_anchor_hash: "anchor".to_string(),
+            finality_digest: "digest".to_string(),
+        };
+
+        let err = sync.apply_finality_artifact(&artifact).unwrap_err();
+        assert!(err.contains("too far beyond local height"));
+        assert_eq!(sync.storage.get("consensus:finalized_round").unwrap(), None);
     }
 
     #[test]

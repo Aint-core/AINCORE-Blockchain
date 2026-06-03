@@ -304,6 +304,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    /// ChainSync reload regression.
+    ///
+    /// A synced observer can advance `latest_height` by thousands of blocks
+    /// without adding the corresponding live DAG vertices. If
+    /// `reload_chain_tip()` only refreshes height/hash, `current_round` stays
+    /// near genesis and the PWN-002 jump guard rejects every live peer vertex
+    /// as "far future". The reload must therefore also adopt the synced block
+    /// round from the persisted tip.
+    #[test]
+    fn test_reload_chain_tip_updates_current_round_from_synced_block() {
+        let (mut consensus, path) = setup_dag("reload_round_from_synced_tip");
+
+        let synced_block =
+            blockchain::Block::new(42, 12_345, "genesis".to_string(), vec![], "validator".into());
+        let block_json = serde_json::to_string(&synced_block).unwrap();
+        consensus.storage.save_block_json(42, &block_json).unwrap();
+
+        assert_eq!(consensus.latest_block_height, 0);
+        assert_eq!(consensus.current_round, 1);
+
+        consensus.reload_chain_tip();
+
+        assert_eq!(consensus.latest_block_height, 42);
+        assert_eq!(consensus.current_round, 12_346);
+        assert_eq!(
+            consensus
+                .storage
+                .get("latest_proposed_round")
+                .unwrap()
+                .as_deref(),
+            Some("12345")
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     /// C-01 REGRESSION TEST
     ///
     /// Ensures the equivocation slash event written to `sys:pending_slash:` uses
@@ -377,8 +413,8 @@ mod tests {
             .expect("storage read must not error")
             .expect("equivocation must queue a pending slash event");
 
-        let event: serde_json::Value = serde_json::from_str(&raw)
-            .expect("slash event must be valid JSON");
+        let event: serde_json::Value =
+            serde_json::from_str(&raw).expect("slash event must be valid JSON");
 
         assert_eq!(
             event.get("reason").and_then(|v| v.as_str()),
@@ -485,10 +521,7 @@ mod tests {
         );
 
         // Sig still in storage post-boot — boot did not delete it.
-        assert!(consensus
-            .storage
-            .get_dag_checkpoint_signature(5)
-            .is_some());
+        assert!(consensus.storage.get_dag_checkpoint_signature(5).is_some());
 
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -671,12 +704,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    /// Observer nodes must not locally order and commit blocks from incoming
+    /// validator DAG vertices. They are allowed to store vertices and follow
+    /// rounds, but block production belongs to active validators only. This
+    /// protects observer peers from creating a private fork and later failing
+    /// sync with parent-hash mismatches.
+    #[test]
+    fn observer_add_vertex_does_not_commit_local_blocks() {
+        use blockchain::Vertex;
+        use crypto::{derive_address, SigningKey};
+
+        let (mut dag, path) = setup_dag("observer_no_local_commit");
+
+        let remote_key_bytes: [u8; 32] = [0x33; 32];
+        let remote_sk = SigningKey::from_bytes(&remote_key_bytes);
+        let remote_vk = remote_sk.verifying_key();
+        let remote_pubkey_hex = hex::encode(remote_vk.to_bytes());
+        let remote_addr = derive_address(remote_vk.as_bytes()).expect("derive remote addr");
+
+        let remote_account = Object::new(
+            remote_addr.clone(),
+            Owner::Address(remote_addr.clone()),
+            serde_json::json!({
+                "public_key": remote_pubkey_hex,
+                "sequence_number": 0
+            })
+            .to_string()
+            .into_bytes(),
+            "0x1::account::AccountData".to_string(),
+        );
+        dag.storage.put_object(&remote_account).unwrap();
+
+        // Make the local node an observer by removing it from the active
+        // validator set. The remote author remains a valid validator.
+        let validator_json = serde_json::to_string(&vec![(remote_addr.clone(), 1000u64)]).unwrap();
+        dag.storage.put("sys:validators", &validator_json).unwrap();
+        dag.invalidate_validators_cache();
+
+        let mut parents = vec!["genesis".to_string()];
+        for round in 1..=4 {
+            let mut vertex = Vertex::new(round, remote_addr.clone(), parents.clone(), vec![]);
+            vertex.sign_with_ed25519(&remote_sk);
+            parents = vec![vertex.hash.clone()];
+            dag.add_vertex(vertex);
+        }
+
+        assert_eq!(
+            dag.latest_block_height, 0,
+            "observer must not commit local blocks from remote validator vertices"
+        );
+        assert!(
+            dag.storage.get("latest_height").unwrap().is_none(),
+            "observer must not write latest_height from local ordering"
+        );
+        assert_eq!(
+            dag.dag.lock().unwrap().len(),
+            4,
+            "observer should still retain incoming vertices for visibility"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     // ── Phase 3 / H-02: Downtime attestation gossip ──────────────────────
 
     /// Valid remote attestation (correct sig + known validator) is stored.
     #[test]
     fn test_h02_valid_remote_attestation_stored() {
-        use crypto::{Signer, SigningKey, derive_address};
+        use crypto::{derive_address, Signer, SigningKey};
 
         let (mut dag, path) = setup_dag("h02_valid_attest");
 
@@ -691,11 +786,11 @@ mod tests {
         // so the post-Phase-5B.6 checks pass (offender must be a validator
         // to be eligible for downtime slashing).
         let offender = "deadbeefdeadbeef".to_string();
-        let vset: Vec<(String, u64)> = vec![
-            (remote_addr.clone(), 1000u64),
-            (offender.clone(), 1000u64),
-        ];
-        dag.storage.put("sys:validators", &serde_json::to_string(&vset).unwrap()).unwrap();
+        let vset: Vec<(String, u64)> =
+            vec![(remote_addr.clone(), 1000u64), (offender.clone(), 1000u64)];
+        dag.storage
+            .put("sys:validators", &serde_json::to_string(&vset).unwrap())
+            .unwrap();
         dag.invalidate_validators_cache();
 
         // Build and sign an attestation as the remote validator would.
@@ -719,8 +814,15 @@ mod tests {
         dag.handle_message(&format!("DOWNTIME_ATTEST:{}", content));
 
         // Attestation must now be in storage.
-        let key = format!("sys:downtime_attestation:{}:{}:{}", offender, epoch, remote_addr);
-        let stored = dag.storage.get(&key).expect("db ok").expect("must be stored");
+        let key = format!(
+            "sys:downtime_attestation:{}:{}:{}",
+            offender, epoch, remote_addr
+        );
+        let stored = dag
+            .storage
+            .get(&key)
+            .expect("db ok")
+            .expect("must be stored");
         assert!(stored.contains(&offender));
 
         let _ = std::fs::remove_dir_all(&path);
@@ -732,7 +834,7 @@ mod tests {
     /// blow up `sys:downtime_attestation:` storage.
     #[test]
     fn sec_n03_offender_not_in_validator_set_rejected() {
-        use crypto::{Signer, SigningKey, derive_address};
+        use crypto::{derive_address, Signer, SigningKey};
 
         let (mut dag, path) = setup_dag("sec_n03_unknown_offender");
 
@@ -744,7 +846,9 @@ mod tests {
 
         // Reporter IS in validator set, but offender is NOT.
         let vset: Vec<(String, u64)> = vec![(remote_addr.clone(), 1000u64)];
-        dag.storage.put("sys:validators", &serde_json::to_string(&vset).unwrap()).unwrap();
+        dag.storage
+            .put("sys:validators", &serde_json::to_string(&vset).unwrap())
+            .unwrap();
         dag.invalidate_validators_cache();
 
         let offender = "ghost_offender_not_a_validator".to_string();
@@ -764,7 +868,10 @@ mod tests {
         });
         dag.handle_message(&format!("DOWNTIME_ATTEST:{}", payload));
 
-        let key = format!("sys:downtime_attestation:{}:{}:{}", offender, epoch, remote_addr);
+        let key = format!(
+            "sys:downtime_attestation:{}:{}:{}",
+            offender, epoch, remote_addr
+        );
         assert!(
             dag.storage.get(&key).unwrap().is_none(),
             "SEC-N03: attestation against non-validator offender must NOT be stored"
@@ -778,7 +885,7 @@ mod tests {
     /// "free" attestation slot toward quorum.
     #[test]
     fn l05_self_attestation_rejected() {
-        use crypto::{Signer, SigningKey, derive_address};
+        use crypto::{derive_address, Signer, SigningKey};
 
         let (mut dag, path) = setup_dag("l05_self_attest");
 
@@ -789,7 +896,9 @@ mod tests {
         let addr = derive_address(vk.as_bytes()).expect("derive");
 
         let vset: Vec<(String, u64)> = vec![(addr.clone(), 1000u64)];
-        dag.storage.put("sys:validators", &serde_json::to_string(&vset).unwrap()).unwrap();
+        dag.storage
+            .put("sys:validators", &serde_json::to_string(&vset).unwrap())
+            .unwrap();
         dag.invalidate_validators_cache();
 
         // reporter == offender
@@ -821,7 +930,7 @@ mod tests {
     /// Attestation with wrong signature is rejected.
     #[test]
     fn test_h02_invalid_signature_rejected() {
-        use crypto::{SigningKey, derive_address};
+        use crypto::{derive_address, SigningKey};
 
         let (mut dag, path) = setup_dag("h02_bad_sig");
 
@@ -832,7 +941,9 @@ mod tests {
         let remote_addr = derive_address(remote_vk.as_bytes()).expect("derive");
 
         let vset: Vec<(String, u64)> = vec![(remote_addr.clone(), 1000u64)];
-        dag.storage.put("sys:validators", &serde_json::to_string(&vset).unwrap()).unwrap();
+        dag.storage
+            .put("sys:validators", &serde_json::to_string(&vset).unwrap())
+            .unwrap();
         dag.invalidate_validators_cache();
 
         // Wrong signature — 64 zeros.
@@ -852,7 +963,10 @@ mod tests {
 
         // Must NOT be stored.
         let key = format!("sys:downtime_attestation:aabbccdd:1:{}", remote_addr);
-        assert!(dag.storage.get(&key).unwrap().is_none(), "bad sig must be rejected");
+        assert!(
+            dag.storage.get(&key).unwrap().is_none(),
+            "bad sig must be rejected"
+        );
 
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -886,7 +1000,7 @@ mod tests {
     ///   attestations → executor promotes to pending slash on quorum.
     #[test]
     fn test_h02_b2_simulated_cross_node_attestation_reaches_quorum() {
-        use crypto::{Signer, SigningKey, derive_address};
+        use crypto::{derive_address, Signer, SigningKey};
 
         // Helper: spin up an isolated DagConsensus node with a given key seed.
         fn spawn_node(seed_byte: u8, suffix: &str) -> (DagConsensus, String, String) {
@@ -982,11 +1096,7 @@ mod tests {
 
         // Each node stores its own attestation locally (simulates the
         // local write in the downtime detection path).
-        for (node, reporter) in [
-            (&node_a, &addr_a),
-            (&node_b, &addr_b),
-            (&node_c, &addr_c),
-        ] {
+        for (node, reporter) in [(&node_a, &addr_a), (&node_b, &addr_b), (&node_c, &addr_c)] {
             let key = format!(
                 "sys:downtime_attestation:{}:{}:{}",
                 offender, epoch, reporter
@@ -1055,7 +1165,9 @@ mod tests {
 
         // Empty validator set — no one is registered.
         let vset: Vec<(String, u64)> = vec![];
-        dag.storage.put("sys:validators", &serde_json::to_string(&vset).unwrap()).unwrap();
+        dag.storage
+            .put("sys:validators", &serde_json::to_string(&vset).unwrap())
+            .unwrap();
         dag.invalidate_validators_cache();
 
         let key_bytes: [u8; 32] = [0xDD; 32];
@@ -1077,7 +1189,10 @@ mod tests {
         dag.handle_message(&format!("DOWNTIME_ATTEST:{}", payload));
 
         let key = "sys:downtime_attestation:offender:1:fakereporter";
-        assert!(dag.storage.get(key).unwrap().is_none(), "unknown reporter must be rejected");
+        assert!(
+            dag.storage.get(key).unwrap().is_none(),
+            "unknown reporter must be rejected"
+        );
 
         let _ = std::fs::remove_dir_all(&path);
     }

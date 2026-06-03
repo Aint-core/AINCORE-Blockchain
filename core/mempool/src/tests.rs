@@ -265,15 +265,14 @@ fn test_pqc_signature_rejected_at_mempool_when_storage_absent() {
     // requires the storage handle to look up pqc_pubkey_{sender}.
     let mut mempool = Mempool::new();
 
-    let chain_id = std::env::var("AINCORE_CHAIN_ID")
-        .unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+    let chain_id =
+        std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
     // 9254 hex chars = 4627 bytes raw = Dilithium5 detached signature length.
     let fake_pqc_sig = "ab".repeat(9254 / 2);
     assert_eq!(fake_pqc_sig.len(), 9254);
 
     let payload = hex::encode(
-        bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![1u8]]))
-            .unwrap(),
+        bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![1u8]])).unwrap(),
     );
 
     let tx = serde_json::json!({
@@ -358,11 +357,10 @@ mod pqc_phase21 {
         let (pk, sk) = pqcrypto_dilithium::dilithium5::keypair();
         let pk_bytes = pk.as_bytes().to_vec();
         let sender = crypto::derive_address(&pk_bytes).unwrap();
-        let chain_id = std::env::var("AINCORE_CHAIN_ID")
-            .unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+        let chain_id =
+            std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
         let payload = hex::encode(
-            bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![9u8]]))
-                .unwrap(),
+            bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![9u8]])).unwrap(),
         );
         (sender, pk_bytes, sk, chain_id, payload)
     }
@@ -407,7 +405,9 @@ mod pqc_phase21 {
 
         let mut mempool = Mempool::with_storage(db);
         let tx = build_pqc_tx(&sender, &sig_hex, 0, &chain_id, &payload);
-        let err = mempool.add_transaction(tx).expect_err("unregistered must fail");
+        let err = mempool
+            .add_transaction(tx)
+            .expect_err("unregistered must fail");
         assert!(
             err.contains("not registered"),
             "error must explain pubkey is not registered. Got: {:?}",
@@ -433,7 +433,9 @@ mod pqc_phase21 {
 
         let mut mempool = Mempool::with_storage(db);
         let tx = build_pqc_tx(spoofed, &sig_hex, 0, &chain_id, &payload);
-        let err = mempool.add_transaction(tx).expect_err("binding mismatch must fail");
+        let err = mempool
+            .add_transaction(tx)
+            .expect_err("binding mismatch must fail");
         assert!(
             err.contains("sender mismatch") || err.contains("tampered"),
             "error must surface the pubkey↔sender binding violation. Got: {:?}",
@@ -453,7 +455,9 @@ mod pqc_phase21 {
 
         let mut mempool = Mempool::with_storage(db);
         let tx = build_pqc_tx(&sender, &sig_hex, 1, &chain_id, &payload);
-        let err = mempool.add_transaction(tx).expect_err("tampered msg must fail");
+        let err = mempool
+            .add_transaction(tx)
+            .expect_err("tampered msg must fail");
         assert!(
             err.contains("verification"),
             "error must call out failed signature verification. Got: {:?}",
@@ -473,7 +477,9 @@ mod pqc_phase21 {
 
         let mut mempool = Mempool::with_storage(db);
         let tx = build_pqc_tx(&sender, &bad_sig, 0, &chain_id, &payload);
-        let err = mempool.add_transaction(tx).expect_err("corrupt sig must fail");
+        let err = mempool
+            .add_transaction(tx)
+            .expect_err("corrupt sig must fail");
         assert!(
             err.contains("verification") || err.contains("format"),
             "error must call out verification or format failure. Got: {:?}",
@@ -498,11 +504,10 @@ fn test_zkp_garbage_hex_rejected_with_specific_diagnostic() {
     let signing_key = SigningKey::from_bytes(&seed);
     let public_key = hex::encode(signing_key.verifying_key().to_bytes());
     let sender = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
-    let chain_id = std::env::var("AINCORE_CHAIN_ID")
-        .unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+    let chain_id =
+        std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
     let payload = hex::encode(
-        bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![7u8]]))
-            .unwrap(),
+        bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![7u8]])).unwrap(),
     );
     let sequence_number = 0u64;
     let message = format!("{}:{}:{}:{}", chain_id, sender, payload, sequence_number);
@@ -560,11 +565,10 @@ fn test_zkp_replayed_proof_with_wrong_binding_rejected() {
     let signing_key = SigningKey::from_bytes(&seed);
     let public_key = hex::encode(signing_key.verifying_key().to_bytes());
     let sender = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
-    let chain_id = std::env::var("AINCORE_CHAIN_ID")
-        .unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+    let chain_id =
+        std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
     let payload = hex::encode(
-        bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![7u8]]))
-            .unwrap(),
+        bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![7u8]])).unwrap(),
     );
     let sequence_number = 0u64;
     let canonical = format!("{}:{}:{}:{}", chain_id, sender, payload, sequence_number);
@@ -621,11 +625,14 @@ fn pwn007_proper_replay_with_reordered_keys_rejected() {
     let sk = SigningKey::from_bytes(&seed);
     let pk = hex::encode(sk.verifying_key().to_bytes());
     let sender = crypto::derive_address(sk.verifying_key().as_bytes()).unwrap();
-    let chain_id = std::env::var("AINCORE_CHAIN_ID")
-        .unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
-    let payload = hex::encode(bcs::to_bytes(
-        &vm_move::TransactionPayload::PublishModule(vec![b"pwn007".to_vec()]),
-    ).unwrap());
+    let chain_id =
+        std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+    let payload = hex::encode(
+        bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![
+            b"pwn007".to_vec()
+        ]))
+        .unwrap(),
+    );
     let seq = 42u64;
     let canonical_msg = format!("{}:{}:{}:{}", chain_id, sender, payload, seq);
     let sig_hex = hex::encode(sk.sign(canonical_msg.as_bytes()).to_bytes());
@@ -642,7 +649,8 @@ fn pwn007_proper_replay_with_reordered_keys_rejected() {
         "sequence_number": seq,
         "public_key": pk,
         "signature": sig_hex,
-    }).to_string();
+    })
+    .to_string();
 
     // Form B: same fields, REORDERED + extra whitespace. Different raw
     // bytes, IDENTICAL canonical signed form, identical signature.
@@ -651,15 +659,20 @@ fn pwn007_proper_replay_with_reordered_keys_rejected() {
         sig_hex, pk, seq, payload, sender, chain_id
     );
 
-    assert_ne!(tx_a, tx_b, "test setup: raw bytes must differ for the test to be meaningful");
+    assert_ne!(
+        tx_a, tx_b,
+        "test setup: raw bytes must differ for the test to be meaningful"
+    );
 
     // First submit succeeds.
-    let h1 = mempool.add_transaction(tx_a).expect("form A must enter mempool");
+    let h1 = mempool
+        .add_transaction(tx_a)
+        .expect("form A must enter mempool");
 
     // Second submit (reordered) must be rejected as duplicate.
-    let err = mempool.add_transaction(tx_b).expect_err(
-        "PWN-007: re-encoded duplicate must be rejected at mempool layer",
-    );
+    let err = mempool
+        .add_transaction(tx_b)
+        .expect_err("PWN-007: re-encoded duplicate must be rejected at mempool layer");
     assert!(
         err.contains("Duplicate"),
         "rejection must call out duplicate. Got: {:?}",
@@ -670,6 +683,7 @@ fn pwn007_proper_replay_with_reordered_keys_rejected() {
     assert!(
         err.contains(&h1),
         "duplicate error should reference the original canonical hash {}, got: {:?}",
-        h1, err
+        h1,
+        err
     );
 }

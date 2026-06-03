@@ -1,0 +1,30 @@
+# Build only the AINCORE indexer binary.
+#
+# This is intentionally separate from Dockerfile because the full node image
+# compiles the validator node first. NAS DEX deployments often only need an
+# indexer refresh, and rebuilding the node binary there is slow and needless.
+FROM rust:latest AS builder
+
+WORKDIR /usr/src/aincore
+
+RUN apt-get update \
+    && apt-get install -y pkg-config libssl-dev protobuf-compiler clang \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . .
+
+RUN cargo build --release --bin indexer
+
+FROM debian:trixie-slim
+
+WORKDIR /root/.aincore
+
+RUN apt-get update \
+    && apt-get install -y ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/src/aincore/target/release/indexer /usr/local/bin/indexer
+
+EXPOSE 3001
+
+CMD ["indexer"]

@@ -79,7 +79,10 @@ impl Storage {
                 );
             }
         }
-        Self { path: path_buf, state }
+        Self {
+            path: path_buf,
+            state,
+        }
     }
 
     fn load(path: &Path) -> Option<PersistedState> {

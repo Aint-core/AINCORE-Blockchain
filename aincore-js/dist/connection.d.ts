@@ -75,6 +75,31 @@ export interface DexMarketSummary {
     trades_24h: number;
     last_trade_at: number;
 }
+export interface DexLpBalance {
+    address: string;
+    status: string;
+    pool_key?: string;
+    pool_addr?: string;
+    token_x?: string;
+    token_y?: string;
+    balance: string;
+    lp_supply: string;
+    share_bps: number;
+    balance_source?: string;
+}
+export interface TransactionReceipt {
+    tx_hash: string;
+    status: string;
+    confirmations: number;
+    block_height?: number;
+    block_hash?: string;
+    execution_receipt?: {
+        status?: string;
+        gas_charged?: string;
+        error?: string;
+        metadata?: Record<string, unknown>;
+    } | null;
+}
 export declare class Connection {
     private rpcUrl;
     private client;
@@ -102,6 +127,21 @@ export declare class Connection {
      */
     getMoveBalance(address: string): Promise<string>;
     /**
+     * Get account nonce/sequence number directly from the node wallet RPC.
+     */
+    getAccountNonce(address: string): Promise<number>;
+    /**
+     * Get an exact Move CoinStore balance for native AIN or synthetic test WBTC.
+     */
+    getCoinBalance(address: string, token: 'AIN' | 'WBTC' | string): Promise<{
+        address: string;
+        token: string;
+        balance: string;
+        decimals: number;
+        balance_source: string;
+        market_mode?: string;
+    }>;
+    /**
      * Request local/testnet faucet funds. Node must run with AINCORE_ENABLE_FAUCET=1.
      */
     requestFaucet(address: string, amount?: string | number, publicKey?: string): Promise<{
@@ -109,6 +149,17 @@ export declare class Connection {
         amount: string;
         move_balance: string;
         balance_source: string;
+    }>;
+    /**
+     * Mint synthetic WBTC for local/testnet DEX smoke tests.
+     * This does not represent real BTC backing.
+     */
+    requestTestMintWbtc(address: string, amount: string | number, publicKey?: string): Promise<{
+        address: string;
+        amount: string;
+        wbtc_balance: string;
+        balance_source: string;
+        faucet_mode: string;
     }>;
     /**
      * Get latest blocks
@@ -123,9 +174,17 @@ export declare class Connection {
      */
     getTransaction(hash: string): Promise<any>;
     /**
+     * Get transaction receipt/status from the node.
+     */
+    getTransactionReceipt(hash: string): Promise<TransactionReceipt>;
+    /**
      * Send a signed transaction
      */
     sendTransaction(signedTxJson: string): Promise<string>;
+    /**
+     * Alias for browser/native wallet integrations that already produce tx JSON.
+     */
+    submitSignedTransaction(signedTxJson: string | Record<string, unknown>): Promise<string>;
     /**
      * Get transaction history from Indexer
      */
@@ -175,6 +234,14 @@ export declare class Connection {
      * Quote a CPMM swap using the canonical on-chain pool state.
      */
     getDexQuote(tokenIn: string, tokenOut: string, amountIn: string | number): Promise<DexQuote>;
+    /**
+     * Read a provider's native Move LPToken balance for a DEX pool.
+     *
+     * When `poolAddrOrTokenX` is omitted, the node defaults to the Phase DEX
+     * AIN/WBTC market. Passing a pool address reads that pool directly; passing
+     * `poolAddrOrTokenX` + `tokenY` resolves a canonical token pair.
+     */
+    getDexLpBalance(address: string, poolAddrOrTokenX?: string, tokenY?: string): Promise<DexLpBalance>;
     /**
      * Compute spot price from current reserves for a canonical pool.
      * Returns how many `tokenOut` units back one whole `tokenIn` unit.

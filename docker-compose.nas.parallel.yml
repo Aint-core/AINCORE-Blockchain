@@ -17,19 +17,21 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: aincore:latest
-    container_name: aincore-validator
+    image: aincore:dex-next
+    container_name: aincore-dexnode-parallel
     restart: unless-stopped
     ports:
-      - "9102:9102"   # P2P Gossipsub
-      - "9002:9002"   # P2P Consensus
-      - "8002:8002"   # REST API / RPC
+      - "9112:9102"   # P2P Gossipsub
+      - "9012:9002"   # P2P Consensus
+      - "8012:8002"   # REST API / RPC
     volumes:
-      - ./nas_data:/root/.aincore/data
+      - ./nas_data_parallel:/root/.aincore/data
       - ./genesis.json:/root/.aincore/genesis.json:ro
     environment:
       - AINCORE_PORT=9002
       - AINCORE_API_PORT=8002
+      - AINCORE_ENABLE_FAUCET=1
+      - AINCORE_PERMISSIVE_CORS=1
       - AINCORE_GENESIS_PATH=/root/.aincore/genesis.json
       - AINCORE_PEERS=
       - RUST_LOG=info
@@ -50,23 +52,29 @@ services:
         max-size: "50m"
         max-file: "5"
     networks:
-      - aincore-net
+      - aincore-parallel-net
 
   # ──────────────────────────────────────────────
   # Indexer (Block Explorer Backend)
   # ──────────────────────────────────────────────
   aincore-indexer:
-    image: aincore:latest
-    container_name: aincore-indexer
+    build:
+      context: .
+      dockerfile: Dockerfile.indexer
+    image: aincore-indexer:dex-next
+    container_name: aincore-indexer-parallel
     restart: unless-stopped
     command: ["indexer"]
     volumes:
-      - ./nas_data/indexer:/root/.aincore
+      - ./nas_data_parallel/indexer:/root/.aincore
     environment:
       - NODE_RPC_URL=http://aincore-node:8002/rpc
+      - AINCORE_PERMISSIVE_CORS=1
+      - AINCORE_INDEXER_BOOTSTRAP_BACKFILL=5000
+      - AINCORE_INDEXER_BATCH_SIZE=2000
       - RUST_LOG=info
     ports:
-      - "3001:3001"   # Indexer API
+      - "3012:3001"   # Indexer API
     depends_on:
       - aincore-node
     deploy:
@@ -80,14 +88,16 @@ services:
         max-size: "20m"
         max-file: "3"
     networks:
-      - aincore-net
+      - aincore-parallel-net
 
   # ──────────────────────────────────────────────
   # Watchtower (Auto-update containers)
   # ──────────────────────────────────────────────
+  # disabled for soak safety
   watchtower:
+    profiles: ["manual-watchtower"]
     image: containrrr/watchtower
-    container_name: aincore-watchtower
+    container_name: aincore-dex-watchtower-disabled
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -106,5 +116,5 @@ volumes:
     driver: local
 
 networks:
-  aincore-net:
+  aincore-parallel-net:
     driver: bridge

@@ -597,7 +597,7 @@ pub fn initialize_genesis(
             "⚠️ genesis.json not found! Falling back to single-node bootstrap using local key."
         );
         genesis_validators.push((genesis_addr_hex.to_string(), genesis_pubkey_hex.to_string()));
-        let stake: u128 = 1_000_000u128 * 1_000_000_000_000_000_000; // M-8 FIX: 1M AIN in 18-decimal Wei
+        let stake: u128 = 1_000_000u128 * 1_000_000_000_000_000_000; // M-8 FIX: 1M AIN in quanta (10^18 smallest unit)
         total_bootstrap_stake = stake;
         treasury_reserve_amount = 50_000 * 1_000_000_000_000_000_000;
         genesis_epoch_duration = 10;

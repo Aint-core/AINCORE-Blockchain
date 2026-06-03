@@ -479,7 +479,7 @@ fn main() -> anyhow::Result<()> {
             // Skipping client-side balance check due to u64 parsing limitations in CLI for u128 balances
 
             let pk_bytes = hex::decode(wallet.public_key()).unwrap_or_default();
-            let min_stake: u128 = 1_000_000_000_000_000_000_000; // 1000 AIN in wei
+            let min_stake: u128 = 1_000_000_000_000_000_000_000; // 1000 AIN in quanta (smallest unit, 10^18)
             let call = vm_move::EntryFunctionCall {
                 module: move_core_types::language_storage::ModuleId::new(
                     move_core_types::account_address::AccountAddress::new([
@@ -540,8 +540,9 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Convert AIN to Wei (18 decimals)
-            let amount_wei: u128 = amount as u128 * 1_000_000_000_000_000_000;
+            // Convert AIN to quanta (AINCORE smallest unit, 18 decimals).
+            // 1 AIN = 10^18 quanta.
+            let amount_quanta: u128 = amount as u128 * 1_000_000_000_000_000_000;
             let call = vm_move::EntryFunctionCall {
                 module: move_core_types::language_storage::ModuleId::new(
                     move_core_types::account_address::AccountAddress::new([
@@ -563,7 +564,7 @@ fn main() -> anyhow::Result<()> {
                 args: vec![
                     bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
                     bcs::to_bytes(&parse_move_address(&to).unwrap()).unwrap(),
-                    bcs::to_bytes(&amount_wei).unwrap(),
+                    bcs::to_bytes(&amount_quanta).unwrap(),
                 ],
             };
             let payload_struct = vm_move::TransactionPayload::EntryFunction(call);

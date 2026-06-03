@@ -24,7 +24,6 @@ impl DASampler {
             confidence,
         }
     }
-
 }
 
 impl Default for DASampler {
@@ -35,7 +34,6 @@ impl Default for DASampler {
 }
 
 impl DASampler {
-
     /// Sample random shards to verify DA
     ///
     /// Returns true if data is available with high confidence

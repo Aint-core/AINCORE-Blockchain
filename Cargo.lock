@@ -3762,6 +3762,7 @@ dependencies = [
  "actix-web",
  "bcs",
  "env_logger",
+ "futures",
  "hex",
  "log",
  "move-core-types",

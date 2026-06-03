@@ -77,7 +77,11 @@ impl MerkleTree {
 
         // Traverse up the tree
         for level in &self.levels[..self.levels.len() - 1] {
-            let sibling_index = if index.is_multiple_of(2) { index + 1 } else { index - 1 };
+            let sibling_index = if index.is_multiple_of(2) {
+                index + 1
+            } else {
+                index - 1
+            };
 
             if sibling_index < level.len() {
                 proof.push(level[sibling_index]);

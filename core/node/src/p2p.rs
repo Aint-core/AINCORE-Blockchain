@@ -26,6 +26,18 @@ use tokio::sync::mpsc;
 // === START P2P ===
 use libp2p::swarm::behaviour::toggle::Toggle;
 
+const MAX_LIBP2P_CONNECTIONS_PER_PEER: u32 = 2;
+const MAX_INBOUND_LIBP2P_CONNECTIONS_PER_HOST: u32 = 2;
+
+fn multiaddr_host(addr: &Multiaddr) -> Option<String> {
+    addr.iter().find_map(|protocol| match protocol {
+        Protocol::Ip4(ip) => Some(ip.to_string()),
+        Protocol::Ip6(ip) => Some(ip.to_string()),
+        Protocol::Dns(host) | Protocol::Dns4(host) | Protocol::Dns6(host) => Some(host.to_string()),
+        _ => None,
+    })
+}
+
 // === START P2P ===
 // Returns: (Sender to broadcast, Receiver for incoming messages)
 pub async fn start_p2p(
@@ -174,7 +186,8 @@ pub async fn start_p2p(
         transport,
         behaviour,
         local_peer_id,
-        libp2p::swarm::Config::with_tokio_executor(),
+        libp2p::swarm::Config::with_tokio_executor()
+            .with_idle_connection_timeout(Duration::from_secs(20)),
     );
 
     // Add bootnodes
@@ -196,9 +209,23 @@ pub async fn start_p2p(
     }
 
     // === Listen on configured libp2p port (port + 100 to avoid conflict with legacy TCP) ===
-    let libp2p_port = port + 100;
-    let addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", libp2p_port).parse()?;
-    Swarm::listen_on(&mut swarm, addr)?;
+    //
+    // Lightweight observer nodes (e.g. Raspberry Pi) can run outbound-only by
+    // setting AINCORE_P2P_LISTEN=0. They still dial bootnodes and receive
+    // gossip/sync over outbound connections, but they do not accept inbound
+    // libp2p sessions. This prevents a non-validator observer from becoming a
+    // socket sink if a bootnode repeatedly redials it over multiple observed
+    // addresses.
+    let p2p_listen = std::env::var("AINCORE_P2P_LISTEN")
+        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    if p2p_listen {
+        let libp2p_port = port + 100;
+        let addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", libp2p_port).parse()?;
+        Swarm::listen_on(&mut swarm, addr)?;
+    } else {
+        println!("🚫 P2P listening disabled (AINCORE_P2P_LISTEN=0); outbound-only observer mode");
+    }
 
     // === LiDAR DDoS Protection ===
     let mut lidar_tracker: std::collections::HashMap<PeerId, (std::time::Instant, u32)> =
@@ -207,6 +234,9 @@ pub async fn start_p2p(
 
     // === Event Loop ===
     tokio::spawn(async move {
+        let mut inbound_connections_by_host: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+
         loop {
             tokio::select! {
                 Some(msg) = rx_in.recv() => {
@@ -270,13 +300,57 @@ pub async fn start_p2p(
                     SwarmEvent::NewListenAddr { address, .. } => {
                         println!("🌐 P2P Listening on {:?}", address);
                     }
-                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                    SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, num_established, .. } => {
+                        if num_established.get() > MAX_LIBP2P_CONNECTIONS_PER_PEER {
+                            eprintln!(
+                                "⚠️ Closing duplicate libp2p connection to {:?}: established={} limit={}",
+                                peer_id,
+                                num_established,
+                                MAX_LIBP2P_CONNECTIONS_PER_PEER
+                            );
+                            let _ = swarm.close_connection(connection_id);
+                            continue;
+                        }
+
                         println!("🤝 Connection established with {:?}", peer_id);
-                        let addr = match endpoint {
-                            libp2p::core::ConnectedPoint::Dialer { address, .. } => address,
-                            libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
-                        };
-                        let _ = storage.save_peer_addr(&peer_id.to_string(), &addr.to_string());
+                        match endpoint {
+                            libp2p::core::ConnectedPoint::Dialer { address, .. } => {
+                                let _ = storage.save_peer_addr(&peer_id.to_string(), &address.to_string());
+                            }
+                            libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => {
+                                if let Some(host) = multiaddr_host(&send_back_addr) {
+                                    let count = inbound_connections_by_host.entry(host.clone()).or_insert(0);
+                                    *count = count.saturating_add(1);
+                                    if *count > MAX_INBOUND_LIBP2P_CONNECTIONS_PER_HOST {
+                                        eprintln!(
+                                            "⚠️ Closing excess inbound libp2p connection from {}: established={} limit={}",
+                                            host,
+                                            count,
+                                            MAX_INBOUND_LIBP2P_CONNECTIONS_PER_HOST
+                                        );
+                                        let _ = swarm.close_connection(connection_id);
+                                        continue;
+                                    }
+                                }
+                                // Do not persist inbound send-back addresses: they are usually
+                                // ephemeral source ports, not stable listen addresses. Persisting
+                                // them poisons the next boot's bootnode list and can trigger a
+                                // connection storm against stale ports.
+                                println!("🤝 Inbound libp2p connection from {:?} via {}", peer_id, send_back_addr);
+                            }
+                        }
+                    }
+                    SwarmEvent::ConnectionClosed { endpoint, .. } => {
+                        if let libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } = endpoint {
+                            if let Some(host) = multiaddr_host(&send_back_addr) {
+                                if let Some(count) = inbound_connections_by_host.get_mut(&host) {
+                                    *count = count.saturating_sub(1);
+                                    if *count == 0 {
+                                        inbound_connections_by_host.remove(&host);
+                                    }
+                                }
+                            }
+                        }
                     }
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Autonat(autonat::Event::StatusChanged { old, new })) => {
                         println!("🔄 AutoNAT Status Changed: {:?} -> {:?}", old, new);

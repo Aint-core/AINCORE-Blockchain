@@ -15,6 +15,16 @@ pub struct SyncRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncResponse {
     pub blocks: Vec<Block>,
+    #[serde(default)]
+    pub finality: Option<FinalityArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FinalityArtifact {
+    pub finalized_round: String,
+    pub last_anchor_round: String,
+    pub last_anchor_hash: String,
+    pub finality_digest: String,
 }
 
 pub struct ChainSync {
@@ -25,6 +35,8 @@ pub struct ChainSync {
 }
 
 impl ChainSync {
+    const FINALITY_ROUND_DRIFT_LIMIT: u64 = 1_000;
+
     pub fn new(
         node_id: String,
         my_port: u16,
@@ -168,6 +180,91 @@ impl ChainSync {
             .unwrap_or(0)
     }
 
+    fn collect_finality_artifact(&self) -> FinalityArtifact {
+        FinalityArtifact {
+            finalized_round: self
+                .storage
+                .get("consensus:finalized_round")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "0".to_string()),
+            last_anchor_round: self
+                .storage
+                .get("consensus:last_anchor_round")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "0".to_string()),
+            last_anchor_hash: self
+                .storage
+                .get("consensus:last_anchor_hash")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            finality_digest: self
+                .storage
+                .get("consensus:finality_digest")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        }
+    }
+
+    fn apply_finality_artifact(&self, artifact: &FinalityArtifact) -> Result<(), String> {
+        let remote_finalized = artifact
+            .finalized_round
+            .parse::<u64>()
+            .map_err(|_| "remote finalized_round is not numeric".to_string())?;
+        let remote_anchor = artifact
+            .last_anchor_round
+            .parse::<u64>()
+            .map_err(|_| "remote last_anchor_round is not numeric".to_string())?;
+
+        if remote_finalized == 0 {
+            return Ok(());
+        }
+        if remote_anchor > remote_finalized {
+            return Err(format!(
+                "remote finality anchor {} exceeds finalized round {}",
+                remote_anchor, remote_finalized
+            ));
+        }
+        if artifact.finality_digest.is_empty() {
+            return Err("remote finality digest is empty".to_string());
+        }
+
+        let local_finalized = self.finalized_round_boundary();
+        if remote_finalized <= local_finalized {
+            return Ok(());
+        }
+
+        let local_height = self.get_local_height();
+        if remote_finalized > local_height + Self::FINALITY_ROUND_DRIFT_LIMIT {
+            return Err(format!(
+                "remote finality round {} is too far beyond local height {}",
+                remote_finalized, local_height
+            ));
+        }
+
+        self.storage
+            .put("consensus:finalized_round", &artifact.finalized_round)
+            .map_err(|e| format!("persist finalized_round failed: {}", e))?;
+        self.storage
+            .put("consensus:last_anchor_round", &artifact.last_anchor_round)
+            .map_err(|e| format!("persist last_anchor_round failed: {}", e))?;
+        self.storage
+            .put("consensus:last_anchor_hash", &artifact.last_anchor_hash)
+            .map_err(|e| format!("persist last_anchor_hash failed: {}", e))?;
+        self.storage
+            .put("consensus:finality_digest", &artifact.finality_digest)
+            .map_err(|e| format!("persist finality_digest failed: {}", e))?;
+
+        println!(
+            "✅ [ChainSync] Applied finality artifact: finalized_round={} anchor_round={}",
+            artifact.finalized_round, artifact.last_anchor_round
+        );
+        Ok(())
+    }
+
     fn rollback_to_height(&self, target_height: u64) -> Result<(), String> {
         let current_height = self.storage.get_chain_height();
         if target_height >= current_height {
@@ -225,6 +322,15 @@ impl ChainSync {
                 .storage
                 .get_peer_ip(peer_id)
                 .unwrap_or_else(|| "127.0.0.1".to_string());
+
+            // Skip self-dials and bogus loopback entries. A stale peer record
+            // pointing at our own port (e.g. 127.0.0.1:<my_port>) just wastes a
+            // connect + handshake cycle and spams the log; it can never sync us.
+            let is_loopback = peer_ip == "127.0.0.1" || peer_ip == "localhost" || peer_ip == "::1";
+            if is_loopback && *peer_port == self.my_port {
+                continue;
+            }
+
             println!(
                 "🌐 [ChainSync] Connecting to {} ({}:{})...",
                 peer_id, peer_ip, peer_port
@@ -298,7 +404,18 @@ impl ChainSync {
                                                 if let Ok(sync_resp) =
                                                     serde_json::from_str::<SyncResponse>(json_data)
                                                 {
+                                                    let finality = sync_resp.finality.clone();
                                                     if sync_resp.blocks.is_empty() {
+                                                        if let Some(finality) = finality {
+                                                            if let Err(e) = self
+                                                                .apply_finality_artifact(&finality)
+                                                            {
+                                                                eprintln!(
+                                                                    "🚨 [SECURITY][SYNC_FINALITY_REJECT] {}",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
                                                         break; // No more blocks
                                                     }
                                                     let synced = self
@@ -308,6 +425,16 @@ impl ChainSync {
                                                     }
                                                     current = synced;
                                                     final_height = synced;
+                                                    if let Some(finality) = finality {
+                                                        if let Err(e) =
+                                                            self.apply_finality_artifact(&finality)
+                                                        {
+                                                            eprintln!(
+                                                                "🚨 [SECURITY][SYNC_FINALITY_REJECT] {}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
                                                 } else {
                                                     break;
                                                 }
@@ -323,6 +450,35 @@ impl ChainSync {
                                         "✅ [ChainSync] Already caught up with peer {}",
                                         peer_id
                                     );
+                                }
+
+                                if send_encrypted_msg(
+                                    &mut stream,
+                                    &shared_key,
+                                    &"GET_FINALITY".to_string(),
+                                )
+                                .await
+                                .is_ok()
+                                {
+                                    if let Ok(finality_resp) =
+                                        read_encrypted_msg(&mut stream, &shared_key).await
+                                    {
+                                        if let Some(json) = finality_resp.strip_prefix("FINALITY:")
+                                        {
+                                            if let Ok(artifact) =
+                                                serde_json::from_str::<FinalityArtifact>(json)
+                                            {
+                                                if let Err(e) =
+                                                    self.apply_finality_artifact(&artifact)
+                                                {
+                                                    eprintln!(
+                                                        "🚨 [SECURITY][SYNC_FINALITY_REJECT] {}",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -449,6 +605,13 @@ impl ChainSync {
             return Some(format!("HEIGHT:{}", h));
         }
 
+        if msg == "GET_FINALITY" {
+            if let Ok(json) = serde_json::to_string(&self.collect_finality_artifact()) {
+                return Some(format!("FINALITY:{}", json));
+            }
+            return None;
+        }
+
         if let Some(req_json) = msg.strip_prefix("SYNC_REQ:") {
             if let Ok(req) = serde_json::from_str::<SyncRequest>(req_json) {
                 let resp = self.handle_sync_request(req);
@@ -477,6 +640,7 @@ impl ChainSync {
         }
         SyncResponse {
             blocks: blocks_to_send,
+            finality: Some(self.collect_finality_artifact()),
         }
     }
 

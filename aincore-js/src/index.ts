@@ -9,5 +9,7 @@ export type {
   DexOhlcCandle,
   DexPairSummary,
   DexMarketSummary,
+  DexLpBalance,
+  TransactionReceipt,
 } from './connection';
 export * from './bcs';

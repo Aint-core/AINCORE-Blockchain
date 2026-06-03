@@ -190,10 +190,7 @@ impl DASequencer {
     ///      encrypt step fails the boot is aborted via panic — we never
     ///      keep a key in plaintext on a fresh write.
     ///   3. Else generate fresh and store encrypted.
-    fn load_or_generate_signing_key(
-        storage: &Arc<StateDB>,
-        node_identity: [u8; 32],
-    ) -> [u8; 32] {
+    fn load_or_generate_signing_key(storage: &Arc<StateDB>, node_identity: [u8; 32]) -> [u8; 32] {
         use crypto::transport::TransportEngine;
         let enc_key = derive_da_enc_key(&node_identity);
 
@@ -201,11 +198,10 @@ impl DASequencer {
         if let Ok(Some(blob_hex)) = storage.get(DA_KEY_ENCRYPTED_V1) {
             let (nonce, ciphertext) = decode_encrypted_key(&blob_hex)
                 .expect("[DA Sequencer M-09] encrypted DA key blob is malformed");
-            let plaintext = TransportEngine::decrypt(&enc_key, &nonce, &ciphertext)
-                .expect(
-                    "[DA Sequencer M-09] failed to decrypt DA signing key — \
+            let plaintext = TransportEngine::decrypt(&enc_key, &nonce, &ciphertext).expect(
+                "[DA Sequencer M-09] failed to decrypt DA signing key — \
                      node identity may have changed. Refusing to regenerate.",
-                );
+            );
             assert_eq!(
                 plaintext.len(),
                 32,
@@ -228,11 +224,10 @@ impl DASequencer {
             );
             let mut key_bytes = [0u8; 32];
             key_bytes.copy_from_slice(&decoded);
-            let (nonce, ciphertext) = TransportEngine::encrypt_safe(&enc_key, &key_bytes)
-                .expect(
-                    "[DA Sequencer M-09 / C1] legacy → encrypted migration failed; \
+            let (nonce, ciphertext) = TransportEngine::encrypt_safe(&enc_key, &key_bytes).expect(
+                "[DA Sequencer M-09 / C1] legacy → encrypted migration failed; \
                      refusing to keep the key as plaintext. Investigate transport layer.",
-                );
+            );
             let _ = storage.put(
                 DA_KEY_ENCRYPTED_V1,
                 &encode_encrypted_key(nonce, &ciphertext),
@@ -250,18 +245,15 @@ impl DASequencer {
         let mut key_bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut key_bytes);
 
-        let (nonce, ciphertext) = TransportEngine::encrypt_safe(&enc_key, &key_bytes)
-            .expect(
-                "[DA Sequencer M-09 / C1] failed to encrypt fresh DA key; \
+        let (nonce, ciphertext) = TransportEngine::encrypt_safe(&enc_key, &key_bytes).expect(
+            "[DA Sequencer M-09 / C1] failed to encrypt fresh DA key; \
                  refusing to write plaintext fallback. Investigate transport layer.",
-            );
+        );
         let _ = storage.put(
             DA_KEY_ENCRYPTED_V1,
             &encode_encrypted_key(nonce, &ciphertext),
         );
-        println!(
-            "🔑 [DA Sequencer M-09] Generated NEW DA signing key (stored encrypted-at-rest)."
-        );
+        println!("🔑 [DA Sequencer M-09] Generated NEW DA signing key (stored encrypted-at-rest).");
         key_bytes
     }
 
@@ -769,11 +761,7 @@ mod m09_tests {
     use std::sync::Arc;
 
     fn temp_db(suffix: &str) -> Arc<StateDB> {
-        let path = format!(
-            "/tmp/aincore_da_m09_test_{}_{}",
-            std::process::id(),
-            suffix
-        );
+        let path = format!("/tmp/aincore_da_m09_test_{}_{}", std::process::id(), suffix);
         let _ = std::fs::remove_dir_all(&path);
         Arc::new(StateDB::open(&path).expect("open temp db"))
     }
@@ -786,7 +774,8 @@ mod m09_tests {
         let node_identity = [11u8; 32];
         let peers = Arc::new(Mutex::new(HashMap::new()));
 
-        let _seq = DASequencer::new_encrypted("test".into(), Arc::clone(&db), peers, &node_identity);
+        let _seq =
+            DASequencer::new_encrypted("test".into(), Arc::clone(&db), peers, &node_identity);
 
         assert!(
             db.get(DA_KEY_ENCRYPTED_V1).unwrap().is_some(),
@@ -811,12 +800,7 @@ mod m09_tests {
         let node_identity = [22u8; 32];
         let peers = Arc::new(Mutex::new(HashMap::new()));
 
-        let seq = DASequencer::new_encrypted(
-            "test".into(),
-            Arc::clone(&db),
-            peers,
-            &node_identity,
-        );
+        let seq = DASequencer::new_encrypted("test".into(), Arc::clone(&db), peers, &node_identity);
 
         // Plaintext key must have been deleted.
         assert!(

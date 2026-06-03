@@ -7,6 +7,12 @@ const MAX_CONNECTIONS: usize = 100;
 #[allow(dead_code)]
 const MAX_CONN_PER_IP_MIN: usize = 60;
 
+/// Max time allowed for the pre-message-loop handshake (each direction) and for
+/// an outbound connect + handshake. Prevents half-open / unresponsive peers from
+/// pinning a file descriptor indefinitely (root cause of FD exhaustion).
+const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+const CONNECT_TIMEOUT_SECS: u64 = 5;
+
 struct ConnectionGuard {
     counter: Arc<AtomicUsize>,
 }
@@ -82,9 +88,20 @@ pub async fn start_server<F>(
             let (my_secret, my_public) = TransportEngine::generate_ephemeral();
 
             // 1. HANDSHAKE INITIATION (Receiver Side)
+            // Bounded by a timeout: a peer that completes the TCP handshake (consuming
+            // an FD + a ConnectionGuard slot) but never sends its 32-byte ephemeral key
+            // would otherwise park this task forever, leaking the FD and the connection
+            // slot. Repeated half-open connections were the source of FD exhaustion
+            // ("Too many open files", os error 24) on long-lived nodes.
             let mut buf = [0u8; 32];
-            if socket.read_exact(&mut buf).await.is_err() {
-                return;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+                socket.read_exact(&mut buf),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                _ => return, // timeout or read error → drop guard, close FD
             }
             let client_public = buf;
 
@@ -102,8 +119,14 @@ pub async fn start_server<F>(
             server_hello.extend_from_slice(&my_identity_bytes);
             server_hello.extend_from_slice(&my_signature.to_bytes());
 
-            if socket.write_all(&server_hello).await.is_err() {
-                return;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+                socket.write_all(&server_hello),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                _ => return,
             }
 
             // 4. Compute Shared Secret
@@ -182,8 +205,17 @@ pub async fn start_server<F>(
                                                 {
                                                     // Signature Valid! Register Peer.
                                                     let expected_node_id =
-                                                        hex::encode(&pubkey_bytes)[0..32]
-                                                            .to_string();
+                                                        match crypto::derive_address(&pubkey_bytes)
+                                                        {
+                                                            Ok(addr) => addr,
+                                                            Err(e) => {
+                                                                eprintln!(
+                                                                    "🚨 Invalid peer public key address derivation from {}: {}",
+                                                                    addr, e
+                                                                );
+                                                                break;
+                                                            }
+                                                        };
                                                     if expected_node_id == peer_id
                                                         && !peer_id.starts_with("__")
                                                         && peer_port != 0
@@ -221,6 +253,35 @@ pub async fn start_server<F>(
                             let height = db_clone.get_chain_height();
                             let resp = format!("HEIGHT:{}", height);
                             let _ = send_encrypted(&mut socket, &shared_key, &resp).await;
+                        } else if msg == "GET_FINALITY" {
+                            // ChainSync also has a higher-level finality response path, but this
+                            // legacy transport handles GET_HEIGHT/SYNC_REQ inline. Keep finality
+                            // available here too so observer nodes that sync over this fast path
+                            // can mirror the finalized boundary, not just the block height.
+                            let artifact = serde_json::json!({
+                                "finalized_round": db_clone
+                                    .get("consensus:finalized_round")
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_else(|| "0".to_string()),
+                                "last_anchor_round": db_clone
+                                    .get("consensus:last_anchor_round")
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_else(|| "0".to_string()),
+                                "last_anchor_hash": db_clone
+                                    .get("consensus:last_anchor_hash")
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_default(),
+                                "finality_digest": db_clone
+                                    .get("consensus:finality_digest")
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_default(),
+                            });
+                            let msg = format!("FINALITY:{}", artifact);
+                            let _ = send_encrypted(&mut socket, &shared_key, &msg).await;
                         } else if let Some(req_json) = msg.strip_prefix("SYNC_REQ:") {
                             // Handle sync request inline (avoid circular dep with chain_sync)
                             if let Ok(req) = serde_json::from_str::<serde_json::Value>(req_json) {
@@ -238,7 +299,32 @@ pub async fn start_server<F>(
                                         }
                                     }
                                 }
-                                let resp = serde_json::json!({"blocks": blocks_json});
+                                let finality = serde_json::json!({
+                                    "finalized_round": db_clone
+                                        .get("consensus:finalized_round")
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or_else(|| "0".to_string()),
+                                    "last_anchor_round": db_clone
+                                        .get("consensus:last_anchor_round")
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or_else(|| "0".to_string()),
+                                    "last_anchor_hash": db_clone
+                                        .get("consensus:last_anchor_hash")
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or_default(),
+                                    "finality_digest": db_clone
+                                        .get("consensus:finality_digest")
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or_default(),
+                                });
+                                let resp = serde_json::json!({
+                                    "blocks": blocks_json,
+                                    "finality": finality,
+                                });
                                 let msg = format!("SYNC_RESP:{}", resp);
                                 let _ = send_encrypted(&mut socket, &shared_key, &msg).await;
                             }
@@ -263,8 +349,8 @@ async fn send_encrypted(
 ) -> std::io::Result<()> {
     // SECURITY: Uses atomic-counter-based nonce generation (encrypt_safe)
     // to guarantee nonce uniqueness per message under the same session key.
-    let (nonce, ciphertext) = TransportEngine::encrypt_safe(key, msg.as_bytes())
-        .map_err(std::io::Error::other)?;
+    let (nonce, ciphertext) =
+        TransportEngine::encrypt_safe(key, msg.as_bytes()).map_err(std::io::Error::other)?;
 
     // Packet: [Length (4B)][Nonce (12B)][Ciphertext]
     let total_len = 12 + ciphertext.len();
@@ -289,15 +375,38 @@ pub async fn secure_connect(
     use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 
     let peer_addr = format!("{}:{}", peer_ip, peer_port);
-    let mut stream = tokio::net::TcpStream::connect(&peer_addr).await?;
+    // Bounded connect: a dead/unroutable peer (e.g. a stale 127.0.0.1:NNNN entry)
+    // must not park this task. Refused connects already return immediately; this
+    // guards the SYN-dropped / silent-host case.
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        tokio::net::TcpStream::connect(&peer_addr),
+    )
+    .await
+    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> { "TCP connect timeout".into() })??;
 
     // 1. Client Hello (Send Ephemeral Public Key)
     let (my_secret, my_public) = TransportEngine::generate_ephemeral();
-    stream.write_all(my_public.as_bytes()).await?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+        stream.write_all(my_public.as_bytes()),
+    )
+    .await
+    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+        "Handshake write timeout".into()
+    })??;
 
     // 2. Server Hello (Read Ephemeral Pub, Server Pub Identity, Signature)
+    // Timeout so a peer that accepts the TCP connection but never replies cannot
+    // pin this FD forever (this is the sync-path leak, since the sync caller does
+    // not wrap secure_connect in its own timeout).
     let mut server_hello = [0u8; 32 + 32 + 64];
-    stream.read_exact(&mut server_hello).await?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+        stream.read_exact(&mut server_hello),
+    )
+    .await
+    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> { "Server hello timeout".into() })??;
 
     let mut server_pub = [0u8; 32];
     server_pub.copy_from_slice(&server_hello[0..32]);
@@ -339,13 +448,30 @@ pub async fn secure_connect(
     );
     send_encrypted(&mut stream, &shared, &hello_msg).await?;
 
-    // 5. Read Encrypted Welcome
+    // 5. Read Encrypted Welcome (bounded)
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+        stream.read_exact(&mut len_buf),
+    )
+    .await
+    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+        "Welcome length timeout".into()
+    })??;
     let msg_len = u32::from_be_bytes(len_buf) as usize;
 
+    // Guard against a malicious/garbage length pinning a huge allocation.
+    if msg_len > 10 * 1024 * 1024 {
+        return Err("Welcome message too large".into());
+    }
+
     let mut enc_msg = vec![0u8; msg_len];
-    stream.read_exact(&mut enc_msg).await?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+        stream.read_exact(&mut enc_msg),
+    )
+    .await
+    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> { "Welcome body timeout".into() })??;
 
     let nonce = &enc_msg[0..12];
     let cipher = &enc_msg[12..];
@@ -367,7 +493,8 @@ pub async fn secure_connect(
         "unknown".to_string()
     };
 
-    let server_addr_expected = hex::encode(server_identity_bytes)[0..32].to_string();
+    let server_addr_expected = crypto::derive_address(&server_identity_bytes)
+        .map_err(|e| format!("Server identity address derivation failed: {}", e))?;
     if peer_node_id != server_addr_expected {
         eprintln!(
             "🚨 MitM DETECTED! Expected Node Id {}, Got {}",
@@ -456,39 +583,45 @@ pub async fn read_encrypted_msg(
 ) -> std::io::Result<String> {
     let mut len_buf = [0u8; 4];
     // Add Timeout for Length Read
-    if tokio::time::timeout(
+    match tokio::time::timeout(
         std::time::Duration::from_secs(10),
         socket.read_exact(&mut len_buf),
     )
     .await
-    .is_err()
     {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "Read Length Timeout",
-        ));
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Read Length Timeout",
+            ))
+        }
     }
     let msg_len = u32::from_be_bytes(len_buf) as usize;
 
-    if msg_len > 10 * 1024 * 1024 {
+    if !(12..=10 * 1024 * 1024).contains(&msg_len) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "Message too large",
+            "Invalid encrypted message length",
         ));
     }
 
     let mut enc_msg = vec![0u8; msg_len];
-    if tokio::time::timeout(
+    match tokio::time::timeout(
         std::time::Duration::from_secs(30),
         socket.read_exact(&mut enc_msg),
     )
     .await
-    .is_err()
     {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "Read Body Timeout",
-        ));
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Read Body Timeout",
+            ))
+        }
     }
 
     let nonce = &enc_msg[0..12];
@@ -529,8 +662,14 @@ pub fn send_message(addr: &str, msg: &str) -> std::io::Result<()> {
 
                 // C-3 FIX: Use ephemeral key identity instead of __broadcast__ magic string
                 let ephemeral_node_id =
-                    hex::encode(ephemeral_signing_key.verifying_key().to_bytes())[0..32]
-                        .to_string();
+                    match crypto::derive_address(&ephemeral_signing_key.verifying_key().to_bytes())
+                    {
+                        Ok(addr) => addr,
+                        Err(e) => {
+                            eprintln!("❌ Failed to derive ephemeral gossip address: {}", e);
+                            return;
+                        }
+                    };
 
                 // Attempt secure connect with timeout
                 if let Ok(Ok((mut stream, shared, _peer_id))) = tokio::time::timeout(
@@ -553,4 +692,62 @@ pub fn send_message(addr: &str, msg: &str) -> std::io::Result<()> {
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: a peer that accepts the TCP connection but never completes the
+    /// handshake must NOT pin secure_connect forever. Before the timeout fix this
+    /// hung indefinitely, leaking the FD — the root cause of "Too many open files".
+    #[tokio::test]
+    async fn secure_connect_times_out_on_stalled_peer() {
+        // Listener that accepts then goes silent (never sends server hello).
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept and hold the socket open without writing anything.
+            if let Ok((sock, _)) = listener.accept().await {
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                drop(sock);
+            }
+        });
+
+        let mut csprng = rand::rngs::OsRng;
+        let key = ed25519_dalek::SigningKey::generate(&mut csprng);
+
+        let started = std::time::Instant::now();
+        let result = secure_connect("127.0.0.1", addr.port(), "__test__", 0, None, &key).await;
+
+        // Must error out (not succeed) and return well before the stalled peer's
+        // 120s hold — i.e. bounded by HANDSHAKE_TIMEOUT_SECS (+ small slack).
+        assert!(
+            result.is_err(),
+            "stalled peer must not produce a live channel"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS + 5),
+            "secure_connect did not respect handshake timeout (elapsed {:?})",
+            started.elapsed()
+        );
+    }
+
+    /// A connect to a port with no listener must fail fast (bounded by connect
+    /// timeout), never hang.
+    #[tokio::test]
+    async fn secure_connect_fails_fast_on_dead_port() {
+        let mut csprng = rand::rngs::OsRng;
+        let key = ed25519_dalek::SigningKey::generate(&mut csprng);
+
+        let started = std::time::Instant::now();
+        // Port 1 on loopback: nothing listens; connect refuses or times out.
+        let result = secure_connect("127.0.0.1", 1, "__test__", 0, None, &key).await;
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS + 3),
+            "connect to dead port did not respect timeout (elapsed {:?})",
+            started.elapsed()
+        );
+    }
 }

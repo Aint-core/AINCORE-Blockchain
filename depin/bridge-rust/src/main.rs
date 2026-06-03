@@ -78,24 +78,31 @@ async fn main() {
             path
         ))
         .expect("Failed to read password");
-        let pk = keystore::KeyManager::decrypt(path, &password)
-            .expect("Failed to decrypt keystore");
-        let w: LocalWallet = pk.parse().expect("Failed to parse private key from keystore");
+        let pk =
+            keystore::KeyManager::decrypt(path, &password).expect("Failed to decrypt keystore");
+        let w: LocalWallet = pk
+            .parse()
+            .expect("Failed to parse private key from keystore");
         wallets.push(w);
     }
 
     // Refuse to start if any two keystores resolved to the same address —
     // that defeats the multisig requirement just as effectively as
     // ephemeral random wallets did.
-    let mut addrs: Vec<_> = wallets.iter().map(|w| {
-        use ethers::signers::Signer;
-        w.address()
-    }).collect();
+    let mut addrs: Vec<_> = wallets
+        .iter()
+        .map(|w| {
+            use ethers::signers::Signer;
+            w.address()
+        })
+        .collect();
     addrs.sort();
     let unique_before = addrs.len();
     addrs.dedup();
     if addrs.len() != unique_before {
-        error!("🚨 CRITICAL [SEC-N01]: keystores resolve to duplicate addresses; refusing to start.");
+        error!(
+            "🚨 CRITICAL [SEC-N01]: keystores resolve to duplicate addresses; refusing to start."
+        );
         std::process::exit(1);
     }
 
@@ -136,9 +143,8 @@ async fn main() {
                 // no longer collide because their (block_height, tx_index)
                 // differ.
                 for (sender, amount, eth_addr, block_height, tx_index) in events {
-                    let event_key = BridgeState::event_key(
-                        &sender, amount, &eth_addr, block_height, tx_index,
-                    );
+                    let event_key =
+                        BridgeState::event_key(&sender, amount, &eth_addr, block_height, tx_index);
 
                     if bridge_state.is_seen(&event_key) {
                         warn!(

@@ -168,9 +168,7 @@ impl AincoreClient {
     ///      can build a globally-unique event key (no in-batch collisions).
     ///
     /// CRITICAL-5: only processes FINALIZED blocks (no reorg risk).
-    pub async fn fetch_bridge_events(
-        &mut self,
-    ) -> Result<Vec<BridgeEvent>, Box<dyn Error>> {
+    pub async fn fetch_bridge_events(&mut self) -> Result<Vec<BridgeEvent>, Box<dyn Error>> {
         let finalized_height = self.get_finalized_height().await?;
 
         if finalized_height <= self.last_processed_height {
@@ -246,7 +244,8 @@ impl AincoreClient {
         }
         info!(
             "✅ Processed up to finalized block {} ({} events found)",
-            self.last_processed_height, events.len()
+            self.last_processed_height,
+            events.len()
         );
 
         Ok(events)

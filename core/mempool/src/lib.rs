@@ -173,10 +173,9 @@ impl Mempool {
                     parsed_tx.payload,
                     parsed_tx.sequence_number
                 );
-                if let Err(e) = crypto::zkp::verify_tx_attached_proof(
-                    proof_hex,
-                    canonical_msg.as_bytes(),
-                ) {
+                if let Err(e) =
+                    crypto::zkp::verify_tx_attached_proof(proof_hex, canonical_msg.as_bytes())
+                {
                     return Err(format!("ZKP proof rejected: {}", e));
                 }
             }
@@ -220,12 +219,10 @@ impl Mempool {
             let storage = match &self.storage {
                 Some(s) => s,
                 None => {
-                    return Err(
-                        "PQC (Dilithium5) signatures require a storage-backed \
+                    return Err("PQC (Dilithium5) signatures require a storage-backed \
                          mempool. This instance was constructed without \
                          storage; submit via the node API instead."
-                            .to_string(),
-                    );
+                        .to_string());
                 }
             };
 
@@ -245,10 +242,7 @@ impl Mempool {
             let pk_bytes = match hex::decode(&pk_hex) {
                 Ok(b) => b,
                 Err(e) => {
-                    return Err(format!(
-                        "Registered PQC pubkey is not valid hex: {}",
-                        e
-                    ));
+                    return Err(format!("Registered PQC pubkey is not valid hex: {}", e));
                 }
             };
             if pk_bytes.len() != PQC_DILITHIUM5_PUBKEY_BYTES {
@@ -302,10 +296,7 @@ impl Mempool {
             // share message construction between schemes.
             let message = format!(
                 "{}:{}:{}:{}",
-                parsed_tx.chain_id,
-                parsed_tx.sender,
-                parsed_tx.payload,
-                parsed_tx.sequence_number
+                parsed_tx.chain_id, parsed_tx.sender, parsed_tx.payload, parsed_tx.sequence_number
             );
             if dilithium5::verify_detached_signature(&sig, message.as_bytes(), &pk).is_err() {
                 return Err("Invalid Dilithium5 signature verification".to_string());

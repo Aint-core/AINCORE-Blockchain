@@ -88,6 +88,19 @@ class Connection {
         return account.move_balance;
     }
     /**
+     * Get account nonce/sequence number directly from the node wallet RPC.
+     */
+    async getAccountNonce(address) {
+        const result = await this.request('aincore_getAccountNonce', [address]);
+        return Number(result?.sequence_number ?? result?.nonce ?? 0);
+    }
+    /**
+     * Get an exact Move CoinStore balance for native AIN or synthetic test WBTC.
+     */
+    async getCoinBalance(address, token) {
+        return await this.request('aincore_getCoinBalance', [address, token]);
+    }
+    /**
      * Request local/testnet faucet funds. Node must run with AINCORE_ENABLE_FAUCET=1.
      */
     async requestFaucet(address, amount, publicKey) {
@@ -100,6 +113,16 @@ class Connection {
             params.push(publicKey);
         }
         return await this.request('aincore_faucet', params);
+    }
+    /**
+     * Mint synthetic WBTC for local/testnet DEX smoke tests.
+     * This does not represent real BTC backing.
+     */
+    async requestTestMintWbtc(address, amount, publicKey) {
+        const params = [address, String(amount)];
+        if (publicKey !== undefined)
+            params.push(publicKey);
+        return await this.request('aincore_testMintWbtc', params);
     }
     /**
      * Get latest blocks
@@ -120,9 +143,22 @@ class Connection {
         return await this.request('aincore_getTransaction', [hash]);
     }
     /**
+     * Get transaction receipt/status from the node.
+     */
+    async getTransactionReceipt(hash) {
+        return await this.request('aincore_getTransactionReceipt', [hash]);
+    }
+    /**
      * Send a signed transaction
      */
     async sendTransaction(signedTxJson) {
+        const res = await this.request('aincore_sendTransaction', [signedTxJson]);
+        return res.tx_hash;
+    }
+    /**
+     * Alias for browser/native wallet integrations that already produce tx JSON.
+     */
+    async submitSignedTransaction(signedTxJson) {
         const res = await this.request('aincore_sendTransaction', [signedTxJson]);
         return res.tx_hash;
     }
@@ -207,6 +243,21 @@ class Connection {
      */
     async getDexQuote(tokenIn, tokenOut, amountIn) {
         return await this.request('aincore_getDexQuote', [tokenIn, tokenOut, String(amountIn)]);
+    }
+    /**
+     * Read a provider's native Move LPToken balance for a DEX pool.
+     *
+     * When `poolAddrOrTokenX` is omitted, the node defaults to the Phase DEX
+     * AIN/WBTC market. Passing a pool address reads that pool directly; passing
+     * `poolAddrOrTokenX` + `tokenY` resolves a canonical token pair.
+     */
+    async getDexLpBalance(address, poolAddrOrTokenX, tokenY) {
+        const params = tokenY === undefined
+            ? poolAddrOrTokenX === undefined
+                ? [address]
+                : [address, poolAddrOrTokenX]
+            : [address, poolAddrOrTokenX, tokenY];
+        return await this.request('aincore_getDexLpBalance', params);
     }
     /**
      * Compute spot price from current reserves for a canonical pool.

@@ -29,8 +29,8 @@ pub struct BridgeState {
 
 impl BridgeState {
     fn state_path() -> PathBuf {
-        let path = env::var("BRIDGE_STATE_PATH")
-            .unwrap_or_else(|_| "./bridge_state.json".to_string());
+        let path =
+            env::var("BRIDGE_STATE_PATH").unwrap_or_else(|_| "./bridge_state.json".to_string());
         PathBuf::from(path)
     }
 
@@ -61,7 +61,10 @@ impl BridgeState {
                 }
             },
             Err(_) => {
-                info!("📂 [H-03] No bridge state at {:?}, starting from genesis", path);
+                info!(
+                    "📂 [H-03] No bridge state at {:?}, starting from genesis",
+                    path
+                );
                 BridgeState::default()
             }
         }
@@ -104,7 +107,10 @@ impl BridgeState {
         block_height: u64,
         tx_index: usize,
     ) -> String {
-        format!("{}:{}:{}:{}:{}", sender, amount, eth_addr, block_height, tx_index)
+        format!(
+            "{}:{}:{}:{}:{}",
+            sender, amount, eth_addr, block_height, tx_index
+        )
     }
 
     /// Returns `true` if this event has already been processed (replay).
@@ -127,7 +133,11 @@ mod tests {
 
     fn tmp_path(suffix: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("bridge_state_test_{}_{}.json", std::process::id(), suffix));
+        p.push(format!(
+            "bridge_state_test_{}_{}.json",
+            std::process::id(),
+            suffix
+        ));
         p
     }
 
@@ -145,7 +155,10 @@ mod tests {
 
         let state2 = BridgeState::load_from(&path);
         assert_eq!(state2.nonce_counter, 1, "nonce must survive restart");
-        assert_eq!(state2.last_processed_height, 5, "height must survive restart");
+        assert_eq!(
+            state2.last_processed_height, 5,
+            "height must survive restart"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -164,7 +177,10 @@ mod tests {
 
         state.save_to(&path);
         let state2 = BridgeState::load_from(&path);
-        assert!(state2.is_seen(&key), "replay detection must survive restart");
+        assert!(
+            state2.is_seen(&key),
+            "replay detection must survive restart"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -177,10 +193,13 @@ mod tests {
         let mut state = BridgeState::load_from(&path);
         let k1 = BridgeState::event_key("alice", 100, "0xAA", 1, 0);
         let k2 = BridgeState::event_key("alice", 100, "0xAA", 2, 0); // different block
-        let k3 = BridgeState::event_key("bob", 100, "0xAA", 1, 0);   // different sender
+        let k3 = BridgeState::event_key("bob", 100, "0xAA", 1, 0); // different sender
 
         state.mark_processed(k1);
-        assert!(!state.is_seen(&k2), "different block height = different event");
+        assert!(
+            !state.is_seen(&k2),
+            "different block height = different event"
+        );
         assert!(!state.is_seen(&k3), "different sender = different event");
 
         let _ = std::fs::remove_file(&path);

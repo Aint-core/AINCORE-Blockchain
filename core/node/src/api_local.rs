@@ -1,4 +1,4 @@
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{App, HttpResponse, HttpServer, Responder, web};
 use network::PeerList;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, RwLock};
@@ -45,6 +45,11 @@ struct DexLiquidityPool {
     coin_y: MoveCoin,
     lp_supply: u128,
     fee_bp: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct DexLPToken {
+    balance: u128,
 }
 
 fn move_coin_store_key(addr: move_core_types::account_address::AccountAddress) -> String {
@@ -172,6 +177,26 @@ fn dex_pool_key(
     Some(format!("resource_{}_{}", pool_addr, tag))
 }
 
+fn dex_lp_key(
+    owner: move_core_types::account_address::AccountAddress,
+    token_x_name: &str,
+    token_y_name: &str,
+) -> Option<String> {
+    use move_core_types::{
+        account_address::AccountAddress, identifier::Identifier, language_storage::StructTag,
+    };
+    let system = AccountAddress::from_hex_literal("0x1").ok()?;
+    let x = type_tag_from_name(token_x_name)?;
+    let y = type_tag_from_name(token_y_name)?;
+    let tag = StructTag {
+        address: system,
+        module: Identifier::new("dex").ok()?,
+        name: Identifier::new("LPToken").ok()?,
+        type_params: vec![x, y],
+    };
+    Some(format!("resource_{}_{}", owner, tag))
+}
+
 fn decode_dex_registry(storage: &Arc<StateDB>) -> DexPoolRegistry {
     storage
         .get(&dex_registry_key())
@@ -203,6 +228,109 @@ fn dex_pool_json(storage: &Arc<StateDB>, info: &DexPoolInfo) -> serde_json::Valu
         "reserve_y": pool.as_ref().map(|p| p.coin_y.value.to_string()).unwrap_or_else(|| "0".to_string()),
         "lp_supply": pool.as_ref().map(|p| p.lp_supply.to_string()).unwrap_or_else(|| "0".to_string()),
     })
+}
+
+fn find_dex_pool_info<'a>(
+    registry: &'a DexPoolRegistry,
+    selector: Option<&str>,
+    token_y: Option<&str>,
+) -> Option<&'a DexPoolInfo> {
+    match (selector, token_y) {
+        (Some(left), Some(right)) => {
+            let target_key = canonical_pool_key(left, right)?;
+            registry
+                .pools
+                .iter()
+                .find(|info| String::from_utf8_lossy(&info.pool_key) == target_key)
+        }
+        (Some(value), None) => {
+            let normalized_value = value.trim_start_matches("0x").to_ascii_lowercase();
+            if normalized_value.len() == 32
+                && normalized_value.chars().all(|ch| ch.is_ascii_hexdigit())
+            {
+                registry.pools.iter().find(|info| {
+                    info.pool_addr
+                        .to_string()
+                        .trim_start_matches("0x")
+                        .eq_ignore_ascii_case(&normalized_value)
+                })
+            } else {
+                let target_key = normalize_pool_key(value);
+                registry
+                    .pools
+                    .iter()
+                    .find(|info| String::from_utf8_lossy(&info.pool_key) == target_key)
+            }
+        }
+        (None, None) => {
+            let target_key = canonical_pool_key("AIN", "WBTC")?;
+            registry
+                .pools
+                .iter()
+                .find(|info| String::from_utf8_lossy(&info.pool_key) == target_key)
+        }
+        (None, Some(_)) => None,
+    }
+}
+
+fn dex_lp_balance_json(
+    storage: &Arc<StateDB>,
+    owner: &str,
+    selector: Option<&str>,
+    token_y: Option<&str>,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let owner_addr = move_core_types::account_address::AccountAddress::from_hex_literal(&format!(
+        "0x{}",
+        owner.trim_start_matches("0x")
+    ))
+    .map_err(|_| JsonRpcError {
+        code: -32602,
+        message: "Invalid address".into(),
+    })?;
+
+    let registry = decode_dex_registry(storage);
+    let Some(info) = find_dex_pool_info(&registry, selector, token_y) else {
+        return Ok(serde_json::json!({
+            "address": owner.trim_start_matches("0x"),
+            "status": "pool_not_found",
+            "balance": "0",
+            "lp_supply": "0",
+            "share_bps": 0.0,
+        }));
+    };
+
+    let token_x_name = String::from_utf8_lossy(&info.token_x_name).to_string();
+    let token_y_name = String::from_utf8_lossy(&info.token_y_name).to_string();
+    let pool = dex_pool_key(info.pool_addr, &token_x_name, &token_y_name)
+        .and_then(|key| storage.get(&key).ok().flatten())
+        .and_then(|hex_value| hex::decode(hex_value).ok())
+        .and_then(|bytes| bcs::from_bytes::<DexLiquidityPool>(&bytes).ok());
+
+    let lp_balance = dex_lp_key(owner_addr, &token_x_name, &token_y_name)
+        .and_then(|key| storage.get(&key).ok().flatten())
+        .and_then(|hex_value| hex::decode(hex_value).ok())
+        .and_then(|bytes| bcs::from_bytes::<DexLPToken>(&bytes).ok())
+        .map(|lp| lp.balance)
+        .unwrap_or(0);
+    let lp_supply = pool.as_ref().map(|pool| pool.lp_supply).unwrap_or(0);
+    let share_bps = if lp_supply == 0 {
+        0.0
+    } else {
+        (lp_balance as f64 / lp_supply as f64) * 10_000.0
+    };
+
+    Ok(serde_json::json!({
+        "address": owner.trim_start_matches("0x"),
+        "status": "ok",
+        "pool_key": String::from_utf8_lossy(&info.pool_key).to_string(),
+        "pool_addr": info.pool_addr.to_string(),
+        "token_x": token_x_name,
+        "token_y": token_y_name,
+        "balance": lp_balance.to_string(),
+        "lp_supply": lp_supply.to_string(),
+        "share_bps": share_bps,
+        "balance_source": "move_dex_lp_token",
+    }))
 }
 
 fn dex_quote(amount_in: u128, reserve_in: u128, reserve_out: u128, fee_bp: u64) -> Option<u128> {
@@ -252,12 +380,15 @@ fn dex_spot_price_json(
 
 fn move_balance(storage: &Arc<StateDB>, addr: &str) -> String {
     let move_addr = match move_core_types::account_address::AccountAddress::from_hex_literal(
-        &format!("0x{}", addr),
+        &format!("0x{}", addr.trim_start_matches("0x")),
     ) {
         Ok(addr) => addr,
         Err(_) => return "0".to_string(),
     };
-    let key = move_coin_store_key(move_addr);
+    coin_store_balance(storage, move_coin_store_key(move_addr))
+}
+
+fn coin_store_balance(storage: &Arc<StateDB>, key: String) -> String {
     storage
         .get(&key)
         .ok()
@@ -266,6 +397,42 @@ fn move_balance(storage: &Arc<StateDB>, addr: &str) -> String {
         .and_then(|bytes| bcs::from_bytes::<MoveCoin>(&bytes).ok())
         .map(|coin| coin.value.to_string())
         .unwrap_or_else(|| "0".to_string())
+}
+
+fn coin_balance(
+    storage: &Arc<StateDB>,
+    addr: &str,
+    token: &str,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let move_addr = move_core_types::account_address::AccountAddress::from_hex_literal(&format!(
+        "0x{}",
+        addr.trim_start_matches("0x")
+    ))
+    .map_err(|_| JsonRpcError {
+        code: -32602,
+        message: "Invalid address".into(),
+    })?;
+
+    let token = token.trim().to_ascii_uppercase();
+    let (canonical_token, key) = match token.as_str() {
+        "AIN" | "AINCORE" => ("AIN", move_coin_store_key(move_addr)),
+        "WBTC" | "SYNTHETIC_WBTC" | "SYNTHETIC WBTC" => ("WBTC", wbtc_coin_store_key(move_addr)),
+        _ => {
+            return Err(JsonRpcError {
+                code: -32602,
+                message: "Unsupported token alias. Supported tokens: AIN, WBTC".into(),
+            });
+        }
+    };
+
+    Ok(serde_json::json!({
+        "address": addr.trim_start_matches("0x"),
+        "token": canonical_token,
+        "balance": coin_store_balance(storage, key),
+        "decimals": if canonical_token == "AIN" { 18 } else { 8 },
+        "balance_source": "move_coin_store",
+        "market_mode": if canonical_token == "WBTC" { "synthetic_test_asset_not_btc_backed" } else { "native_ain" }
+    }))
 }
 
 fn faucet_enabled() -> bool {
@@ -627,6 +794,24 @@ fn handle_rpc_method(
                 credit_testnet_wbtc(&data.storage, addr, amount, public_key)
             } else {
                 Err(JsonRpcError { code: -32602, message: "Invalid params: [address, amount, public_key?]".into() })
+            }
+        },
+        "aincore_getCoinBalance" => {
+            // params: [address, token]
+            //
+            // Reads the exact Move CoinStore balance for native AIN or the
+            // Phase DEX synthetic WBTC test asset. This is intentionally
+            // separate from legacy AccountData.balance.
+            if let (Some(addr), Some(token)) = (
+                params.get(0).and_then(|v| v.as_str()),
+                params.get(1).and_then(|v| v.as_str()),
+            ) {
+                coin_balance(&data.storage, addr, token)
+            } else {
+                Err(JsonRpcError {
+                    code: -32602,
+                    message: "Invalid params: [address, token]".into(),
+                })
             }
         },
         "aincore_getStatus" => {
@@ -1149,28 +1334,29 @@ fn handle_rpc_method(
 
         "aincore_getDexPool" => {
             let registry = decode_dex_registry(&data.storage);
-            let target_key = if let Some(pool_key) = params.get(0).and_then(|v| v.as_str()) {
-                if params.as_array().map(|items| items.len()).unwrap_or(0) == 1 {
-                    Some(normalize_pool_key(pool_key))
-                } else if let Some(token_y) = params.get(1).and_then(|v| v.as_str()) {
-                    canonical_pool_key(pool_key, token_y)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            let Some(target_key) = target_key else {
-                return Err(JsonRpcError { code: -32602, message: "Invalid params: [pool_key] or [token_x, token_y]".into() });
-            };
-
-            let pool = registry.pools.iter().find(|info| {
-                String::from_utf8_lossy(&info.pool_key) == target_key
-            });
+            let pool = find_dex_pool_info(
+                &registry,
+                params.get(0).and_then(|v| v.as_str()),
+                params.get(1).and_then(|v| v.as_str()),
+            );
             Ok(pool
                 .map(|info| dex_pool_json(&data.storage, info))
                 .unwrap_or_else(|| serde_json::json!(null)))
+        },
+
+        "aincore_getDexLpBalance" => {
+            // params: [address, pool_addr?] or [address, token_x, token_y].
+            // With only address, defaults to the canonical Phase DEX AIN/WBTC
+            // test market. Balance source is the Move LPToken<X,Y> resource.
+            let Some(address) = params.get(0).and_then(|v| v.as_str()) else {
+                return Err(JsonRpcError { code: -32602, message: "Invalid params: [address, pool_addr?] or [address, token_x, token_y]".into() });
+            };
+            dex_lp_balance_json(
+                &data.storage,
+                address,
+                params.get(1).and_then(|v| v.as_str()),
+                params.get(2).and_then(|v| v.as_str()),
+            )
         },
 
         "aincore_getDexQuote" => {
@@ -1859,7 +2045,9 @@ async fn get_latest_blocks_handler(
     let latest_height: u64 = match data.storage.get("latest_height") {
         Ok(Some(h)) => h.parse::<u64>().unwrap_or(0),
         _ => {
-            println!("⚠️ [API] get_latest_blocks: 'latest_height' key not found or error. Returning empty.");
+            println!(
+                "⚠️ [API] get_latest_blocks: 'latest_height' key not found or error. Returning empty."
+            );
             return HttpResponse::Ok().json(serde_json::json!([]));
         }
     };
@@ -2201,6 +2389,58 @@ mod tests {
     }
 
     #[test]
+    fn test_coin_balance_endpoint_reads_ain_and_synthetic_wbtc_coinstores() {
+        let _guard = faucet_env_lock().lock().unwrap();
+        std::env::set_var("AINCORE_ENABLE_FAUCET", "1");
+        let db = temp_db("coin_balance");
+        let signing_key = SigningKey::from_bytes(&[33u8; 32]);
+        let public_key = hex::encode(signing_key.verifying_key().as_bytes());
+        let address = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
+
+        credit_testnet_faucet(
+            &db,
+            &address,
+            123_000_000_000_000_000_000,
+            Some(&public_key),
+        )
+        .expect("AIN faucet credits CoinStore");
+        credit_testnet_wbtc(&db, &address, 42_000_000, Some(&public_key))
+            .expect("synthetic WBTC mint credits CoinStore");
+        let state = test_state(Arc::clone(&db));
+
+        let ain = handle_rpc_method(
+            "aincore_getCoinBalance",
+            serde_json::json!([address, "AIN"]),
+            &state,
+        )
+        .expect("AIN balance response");
+        assert_eq!(ain["token"], "AIN");
+        assert_eq!(ain["balance"], "123000000000000000000");
+        assert_eq!(ain["decimals"], 18);
+        assert_eq!(ain["balance_source"], "move_coin_store");
+
+        let wbtc = handle_rpc_method(
+            "aincore_getCoinBalance",
+            serde_json::json!([address, "synthetic_wbtc"]),
+            &state,
+        )
+        .expect("WBTC balance response");
+        assert_eq!(wbtc["token"], "WBTC");
+        assert_eq!(wbtc["balance"], "42000000");
+        assert_eq!(wbtc["decimals"], 8);
+        assert_eq!(wbtc["market_mode"], "synthetic_test_asset_not_btc_backed");
+
+        let err = handle_rpc_method(
+            "aincore_getCoinBalance",
+            serde_json::json!([address, "USDT"]),
+            &state,
+        )
+        .expect_err("unsupported token rejected");
+        assert!(err.message.contains("Supported tokens"));
+        std::env::remove_var("AINCORE_ENABLE_FAUCET");
+    }
+
+    #[test]
     fn test_supply_reads_genesis_total_supply_key() {
         let db = temp_db("supply");
         db.put("sys:total_supply", "42").expect("write sys supply");
@@ -2319,6 +2559,16 @@ mod tests {
             &hex::encode(bcs::to_bytes(&pool).unwrap()),
         )
         .unwrap();
+        let owner = move_core_types::account_address::AccountAddress::from_hex_literal(
+            "0x22222222222222222222222222222222",
+        )
+        .unwrap();
+        let lp_key = dex_lp_key(owner, token_x, token_y).unwrap();
+        db.put(
+            &lp_key,
+            &hex::encode(bcs::to_bytes(&DexLPToken { balance: 2_500 }).unwrap()),
+        )
+        .unwrap();
         let state = test_state(Arc::clone(&db));
 
         let pools = handle_rpc_method("aincore_getDexPools", serde_json::json!([]), &state)
@@ -2357,6 +2607,26 @@ mod tests {
         assert_eq!(spot["amount_out"], "906");
         assert_eq!(spot["approx_price"], 0.906);
         assert_eq!(spot["quote"]["pool_key"], pool_key);
+
+        let lp_balance = handle_rpc_method(
+            "aincore_getDexLpBalance",
+            serde_json::json!([owner.to_string(), pool_addr.to_string()]),
+            &state,
+        )
+        .expect("dex LP balance response");
+        assert_eq!(lp_balance["status"], "ok");
+        assert_eq!(lp_balance["balance"], "2500");
+        assert_eq!(lp_balance["lp_supply"], "10000");
+        assert_eq!(lp_balance["pool_addr"], pool_addr.to_string());
+        assert_eq!(lp_balance["share_bps"], 2500.0);
+
+        let default_lp_balance = handle_rpc_method(
+            "aincore_getDexLpBalance",
+            serde_json::json!([owner.to_string()]),
+            &state,
+        )
+        .expect("default dex LP balance response");
+        assert_eq!(default_lp_balance["balance"], "2500");
     }
 
     #[test]

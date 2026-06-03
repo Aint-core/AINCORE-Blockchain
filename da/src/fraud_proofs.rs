@@ -188,7 +188,6 @@ impl Default for SlashingParams {
 }
 
 impl SlashingParams {
-
     /// Validate parameters sum to slash_percentage
     pub fn validate(&self) -> bool {
         self.reward_percentage + self.burn_percentage == self.slash_percentage

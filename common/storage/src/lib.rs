@@ -133,11 +133,7 @@ impl StateDB {
     /// Bounded prefix scanner. Stops iterating after `limit` matches.
     /// Use this from hot paths where the caller can reason about the
     /// expected upper bound (e.g. validator count, miner count).
-    pub fn scan_prefix_limited(
-        &self,
-        prefix: &str,
-        limit: usize,
-    ) -> Vec<(String, String)> {
+    pub fn scan_prefix_limited(&self, prefix: &str, limit: usize) -> Vec<(String, String)> {
         if limit == 0 {
             return Vec::new();
         }
@@ -431,11 +427,10 @@ impl StateDB {
             };
 
             // Parse block JSON.
-            let block: serde_json::Value =
-                match serde_json::from_slice(&value_bytes) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
+            let block: serde_json::Value = match serde_json::from_slice(&value_bytes) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
 
             let txs = match block.get("transactions").and_then(|v| v.as_array()) {
                 Some(t) => t,
@@ -607,10 +602,7 @@ impl StateDB {
         signature_hex: &str,
     ) -> std::result::Result<(), rocksdb::Error> {
         self.put(&format!("dag:checkpoint:{}", round), vertices_json)?;
-        self.put(
-            &format!("dag:checkpoint_sig:{}", round),
-            signature_hex,
-        )?;
+        self.put(&format!("dag:checkpoint_sig:{}", round), signature_hex)?;
         self.put("dag:checkpoint:latest", &round.to_string())?;
         Ok(())
     }
