@@ -126,6 +126,146 @@ cargo run --release --bin bench_tps -- http://127.0.0.1:3030 1000
 
 ---
 
+## Join as an Observer Peer over Tailscale
+
+Use this path for a non-validator peer that syncs from an existing AINCORE node without exposing public P2P ports. This is the recommended setup for Raspberry Pi, spare laptops, NAS boxes, and private testnet devices.
+
+Runtime networking uses **Tailscale**. GitHub is only used to distribute source code.
+
+### Current Hardening Branch
+
+The latest hardening + native DEX integration branch is:
+
+```bash
+audit/phase-1-safe-wins
+```
+
+GitHub URL:
+
+```text
+https://github.com/Aint-core/AINCORE-Blockchain/tree/audit/phase-1-safe-wins
+```
+
+### Step 1: Install and Join Tailscale
+
+Install Tailscale on the observer device and log in to the same tailnet as the bootnode:
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+tailscale status
+```
+
+Confirm you can reach the bootnode's Tailscale IP before building:
+
+```bash
+nc -vz 100.111.32.83 9022
+```
+
+If the port check fails, fix Tailscale connectivity first. Do not fall back to public internet ports unless you intentionally want a public peer.
+
+### Step 2: Clone the Source
+
+```bash
+git clone https://github.com/Aint-core/AINCORE-Blockchain.git
+cd AINCORE-Blockchain
+git checkout audit/phase-1-safe-wins
+```
+
+If the repository already exists:
+
+```bash
+cd AINCORE-Blockchain
+git fetch origin
+git checkout audit/phase-1-safe-wins
+git pull --ff-only origin audit/phase-1-safe-wins
+```
+
+### Step 3: Build the Node
+
+```bash
+cargo build --release --bin node
+```
+
+On small ARM devices such as Raspberry Pi, limit parallel jobs if the build runs out of memory:
+
+```bash
+CARGO_BUILD_JOBS=2 cargo build --release --bin node
+```
+
+### Step 4: Run the Observer Peer
+
+Pick ports that do not conflict with any local service. This example uses `9032` for P2P and `8032` for RPC:
+
+```bash
+mkdir -p ./aincore-peer-data
+
+./target/release/node \
+  --port 9032 \
+  --rpc-port 8032 \
+  --datadir ./aincore-peer-data \
+  --bootnodes /ip4/100.111.32.83/tcp/9022
+```
+
+The bootnode address above is the NAS fresh-node Tailscale endpoint:
+
+```text
+/ip4/100.111.32.83/tcp/9022
+```
+
+### Step 5: Verify Health and Sync
+
+Health check:
+
+```bash
+curl -fsS http://127.0.0.1:8032/health
+```
+
+Status check:
+
+```bash
+curl -fsS -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"aincore_getStatus","params":[]}' \
+  http://127.0.0.1:8032/rpc
+```
+
+Healthy observer output should show:
+
+- `latest_height` increasing over time
+- `finalized_round` increasing over time
+- `finality_digest` not empty
+- `peers_count` at least `1`
+- `/health` returning `OK`
+
+### Step 6: Watch File Descriptors on Small Devices
+
+AINCORE's encrypted P2P transport includes handshake timeouts to prevent stale sockets from pinning file descriptors. On small devices, still monitor the process during long runs:
+
+```bash
+pid=$(pgrep -f "target/release/node" | head -n1)
+echo "pid=$pid"
+ls /proc/$pid/fd | wc -l
+ss -tanp | grep "$pid" | wc -l
+```
+
+As a rough sanity check, an idle observer should stay in the tens or low hundreds of file descriptors, not thousands.
+
+For a persistent Linux service, use `systemd` and set a higher file descriptor limit:
+
+```ini
+[Service]
+LimitNOFILE=65535
+```
+
+### Notes
+
+- Observer peers do **not** validate or earn rewards.
+- Validator registration still requires staking and the validator flow below.
+- Keep node-to-node traffic on Tailscale while this network is still in private testnet mode.
+- Do not compare an observer connected to the fresh Tailscale bootnode with an older soak chain if they use different data directories or genesis state.
+
+---
+
 ## Become a Validator (Step-by-Step)
 
 This guide walks you through becoming a validator on the AINCORE network.
