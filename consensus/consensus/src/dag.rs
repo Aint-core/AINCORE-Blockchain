@@ -964,24 +964,25 @@ impl DagConsensus {
             // Or re-acquire lock.
             if !hashes.is_empty() {
                 // H-5 FIX: Prune only FINALIZED rounds (check ordering engine)
+                // M3 FIX: Derive the prune watermark from the MONOTONIC finality
+                // high-water mark, not committed_rounds.iter().min(). The old
+                // min() was permanently pinned to the earliest committed round,
+                // so the watermark never advanced and pruning was a no-op
+                // (unbounded DAG growth). The high-water mark advances every
+                // commit, so the watermark now tracks finality forward.
                 if self.latest_block_height.is_multiple_of(10) && self.current_round > 50 {
-                    // Only prune rounds confirmed as committed by the ordering engine
-                    let min_safe_round = {
+                    let finalized_round = {
                         if let Ok(engine) = self.ordering_engine.lock() {
-                            // Find the minimum committed round to establish the finality boundary
-                            engine
-                                .committed_rounds
-                                .iter()
-                                .copied()
-                                .min()
-                                .unwrap_or(self.current_round)
+                            engine.finalized_round
                         } else {
-                            self.current_round // Don't prune if we can't verify finality
+                            0 // Don't prune if we can't verify finality
                         }
                     };
-                    // Keep a safety buffer of 10 rounds beyond the oldest committed round
-                    if min_safe_round > 10 {
-                        self.prune_dag(min_safe_round - 10);
+                    // Keep a safety buffer of 10 rounds below the latest finalized
+                    // round. Anything older than this is causally settled and safe
+                    // to reclaim.
+                    if finalized_round > 10 {
+                        self.prune_dag(finalized_round - 10);
                     }
                 }
 

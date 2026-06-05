@@ -12,7 +12,16 @@ use std::collections::{HashMap, HashSet};
 /// 2. Jika Leader punya cukup dukungan (votes) dari ronde sebelumnya, dia jadi "Anchor".
 /// 3. Semua vertex yang terhubung ke Anchor tersebut akan diurutkan (Committed).
 pub struct OrderingEngine {
+    /// Bounded recent de-dup window of committed anchor rounds. This is NO LONGER
+    /// an unbounded finality log: it is trimmed to the most recent
+    /// `COMMITTED_ROUNDS_WINDOW` rounds and is used purely to reject
+    /// double-committing a just-seen anchor. Authoritative finality progress is
+    /// tracked by `finalized_round` (monotonic high-water mark).
     pub committed_rounds: HashSet<u64>,
+    /// Monotonic high-water mark of the highest committed anchor round. Never
+    /// decreases. Used to (a) gate re-committing old anchors that have already
+    /// fallen out of `committed_rounds`, and (b) derive the DAG prune watermark.
+    pub finalized_round: u64,
     pub committed_sequence: Vec<String>, // List of Vertex Hashes in order
     /// VDF engine for random beacon (unpredictable leader election)
     vdf_engine: Option<VDFEngine>,
@@ -21,6 +30,11 @@ pub struct OrderingEngine {
     /// Storage reference for persisting committed state
     storage: Option<Arc<StateDB>>,
 }
+
+/// Number of most-recent committed anchor rounds retained in `committed_rounds`
+/// for de-dup. Anchors older than `finalized_round - COMMITTED_ROUNDS_WINDOW`
+/// are rejected via the high-water comparison instead of set membership.
+const COMMITTED_ROUNDS_WINDOW: u64 = 256;
 
 impl Default for OrderingEngine {
     fn default() -> Self {
@@ -35,6 +49,7 @@ impl OrderingEngine {
 
         Self {
             committed_rounds: HashSet::new(),
+            finalized_round: 0,
             committed_sequence: Vec::new(),
             vdf_engine: vdf,
             last_vdf_output: vec![0u8; 32],
@@ -46,12 +61,24 @@ impl OrderingEngine {
     pub fn new_with_storage(storage: Arc<StateDB>) -> Self {
         let vdf = VDFEngine::new(50).ok();
 
-        // Load committed_rounds from DB
-        let mut committed_rounds = HashSet::new();
+        // Load committed_rounds from DB (backward-compatible: old data may be a
+        // huge unbounded Vec<u64>; we derive the high-water mark from it and
+        // then keep only the most recent window in memory).
+        let mut committed_rounds: HashSet<u64> = HashSet::new();
+        let mut finalized_round: u64 = 0;
         if let Ok(Some(json)) = storage.get("consensus:committed_rounds") {
             if let Ok(rounds) = serde_json::from_str::<Vec<u64>>(&json) {
                 println!("🔄 Restored {} committed rounds from DB", rounds.len());
-                committed_rounds = rounds.into_iter().collect();
+                finalized_round = rounds.iter().copied().max().unwrap_or(0);
+                let cutoff = finalized_round.saturating_sub(COMMITTED_ROUNDS_WINDOW);
+                committed_rounds = rounds.into_iter().filter(|r| *r >= cutoff).collect();
+            }
+        }
+        // Prefer the explicit persisted high-water mark when present (newer nodes
+        // persist it); fall back to the value derived from the set above.
+        if let Ok(Some(s)) = storage.get("consensus:finalized_round") {
+            if let Ok(persisted) = s.parse::<u64>() {
+                finalized_round = finalized_round.max(persisted);
             }
         }
 
@@ -66,6 +93,7 @@ impl OrderingEngine {
 
         Self {
             committed_rounds,
+            finalized_round,
             committed_sequence,
             vdf_engine: vdf,
             last_vdf_output: vec![0u8; 32],
@@ -125,7 +153,16 @@ impl OrderingEngine {
         // So if we are at R+2 (current_round), we can check if R+1 voted for R.
 
         let anchor_round = current_round - 2;
-        if self.committed_rounds.contains(&anchor_round) {
+        // Anti-double-commit invariant: reject if this anchor round was already
+        // committed. `committed_rounds` only retains a recent window, so we also
+        // reject anything at or below the monotonic high-water mark that is no
+        // longer in the set (those are definitively already finalized).
+        // `finalized_round` starts at 0 and round 0 is never a valid anchor here
+        // (current_round >= 4 implies anchor_round >= 2), so the `> 0` guard only
+        // skips the genesis no-op case.
+        if self.committed_rounds.contains(&anchor_round)
+            || (self.finalized_round > 0 && anchor_round <= self.finalized_round)
+        {
             return None;
         }
 
@@ -221,10 +258,21 @@ impl OrderingEngine {
 
         // Update state
         self.committed_rounds.insert(anchor_round);
+        // Advance the monotonic finality high-water mark.
+        self.finalized_round = self.finalized_round.max(anchor_round);
+        // Trim the de-dup window so `committed_rounds` stays bounded regardless of
+        // how many rounds are committed (this is the leak fix). Rounds below the
+        // cutoff are still rejected by the high-water comparison in the guard.
+        let cutoff = self.finalized_round.saturating_sub(COMMITTED_ROUNDS_WINDOW);
+        if cutoff > 0 {
+            self.committed_rounds.retain(|r| *r >= cutoff);
+        }
         self.committed_sequence.extend(sequence.clone());
 
         // PERSIST committed state to DB (BUG #1 FIX)
         if let Some(ref storage) = self.storage {
+            // committed_rounds is now bounded (<= COMMITTED_ROUNDS_WINDOW + 1
+            // entries), so this write is O(window), not O(history).
             if let Ok(json) =
                 serde_json::to_string(&self.committed_rounds.iter().collect::<Vec<_>>())
             {
@@ -236,8 +284,9 @@ impl OrderingEngine {
             if let Ok(json) = serde_json::to_string(&seq_to_save) {
                 let _ = storage.put("consensus:committed_sequence", &json);
             }
-            let finalized_round = self.committed_rounds.iter().copied().max().unwrap_or(0);
-            let _ = storage.put("consensus:finalized_round", &finalized_round.to_string());
+            // Persist the monotonic high-water mark directly (no longer derived
+            // from the now-trimmed set).
+            let _ = storage.put("consensus:finalized_round", &self.finalized_round.to_string());
             let _ = storage.put("consensus:last_anchor_round", &anchor_round.to_string());
             let _ = storage.put("consensus:last_anchor_hash", anchor_vertex_hash);
             let digest = Self::finality_digest(&self.committed_sequence);
@@ -338,7 +387,19 @@ impl OrderingEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::OrderingEngine;
+    use super::{OrderingEngine, COMMITTED_ROUNDS_WINDOW};
+    use std::sync::Arc;
+    use storage::StateDB;
+
+    fn temp_db(suffix: &str) -> Arc<StateDB> {
+        let path = format!(
+            "/tmp/aincore_ordering_test_{}_{}",
+            std::process::id(),
+            suffix
+        );
+        let _ = std::fs::remove_dir_all(&path);
+        Arc::new(StateDB::open(&path).unwrap())
+    }
 
     #[test]
     fn bft_threshold_requires_strict_supermajority() {
@@ -348,5 +409,55 @@ mod tests {
         assert_eq!(OrderingEngine::bft_commit_threshold(3), 3);
         assert_eq!(OrderingEngine::bft_commit_threshold(4), 3);
         assert_eq!(OrderingEngine::bft_commit_threshold(7), 5);
+    }
+
+    /// M3: a legacy node persisted committed_rounds as a huge unbounded Vec.
+    /// On boot the engine must (a) bound the in-memory de-dup set to the recent
+    /// window (the leak fix), and (b) recover the finality high-water mark from
+    /// the max of the old data so DAG pruning has a correct watermark.
+    #[test]
+    fn m3_legacy_unbounded_committed_rounds_loads_bounded_with_watermark() {
+        let db = temp_db("legacy_unbounded");
+        // Simulate the old format: every round 0..5000 ever committed.
+        let legacy: Vec<u64> = (0..5000).collect();
+        db.put(
+            "consensus:committed_rounds",
+            &serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let engine = OrderingEngine::new_with_storage(db);
+        // Leak fixed: the in-memory set is bounded by the window, NOT 5000.
+        assert!(
+            engine.committed_rounds.len() as u64 <= COMMITTED_ROUNDS_WINDOW + 1,
+            "committed_rounds must be trimmed to the recent window, got {}",
+            engine.committed_rounds.len()
+        );
+        // Watermark recovered from the max of the legacy data.
+        assert_eq!(engine.finalized_round, 4999, "high-water mark = max(rounds)");
+        // The oldest rounds were dropped from the set but remain rejected via the
+        // high-water comparison (they are <= finalized_round).
+        assert!(!engine.committed_rounds.contains(&0));
+        assert!(engine.committed_rounds.contains(&4999));
+    }
+
+    /// M3: when an explicit persisted high-water mark exists it is preferred /
+    /// max-merged, so the prune watermark never regresses even if the set was
+    /// trimmed below it.
+    #[test]
+    fn m3_prefers_persisted_finalized_round_high_water() {
+        let db = temp_db("persisted_hw");
+        db.put(
+            "consensus:committed_rounds",
+            &serde_json::to_string(&vec![10u64, 11, 12]).unwrap(),
+        )
+        .unwrap();
+        db.put("consensus:finalized_round", "9000").unwrap();
+
+        let engine = OrderingEngine::new_with_storage(db);
+        assert_eq!(
+            engine.finalized_round, 9000,
+            "explicit persisted high-water mark must win over the set max"
+        );
     }
 }

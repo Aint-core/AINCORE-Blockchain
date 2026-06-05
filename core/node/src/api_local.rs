@@ -1,3 +1,4 @@
+use actix_governor::{Governor, GovernorConfigBuilder};
 use actix_web::{App, HttpResponse, HttpServer, Responder, web};
 use network::PeerList;
 use serde::{Deserialize, Serialize};
@@ -435,6 +436,41 @@ fn coin_balance(
     }))
 }
 
+/// Canonical mainnet chain id. Mirrors the default used by the mempool
+/// (`core/mempool/src/lib.rs`) and genesis (`core/node/src/genesis.rs`).
+const MAINNET_CHAIN_ID: &str = "AINCORE-MAINNET-1";
+
+/// Resolve the node's chain id using the same env contract as the mempool:
+/// `AINCORE_CHAIN_ID`, defaulting to the mainnet id when unset.
+fn resolve_chain_id() -> String {
+    std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| MAINNET_CHAIN_ID.to_string())
+}
+
+/// M2: Hard safety gate for ALL direct-write faucet/test-mint paths.
+///
+/// The faucet writes balances straight into RocksDB CoinStore keys, bypassing
+/// the executor, supply accounting and `BLOCK_EXECUTION_LOCK`. On mainnet that
+/// would be an unlimited-mint + state-root-race + supply-desync hole, so we
+/// refuse unconditionally when the resolved chain id is the mainnet id --
+/// EVEN IF `AINCORE_ENABLE_FAUCET` is set. Dev/testnet nodes (any other
+/// `AINCORE_CHAIN_ID`) are unaffected.
+fn faucet_chain_guard() -> Result<(), JsonRpcError> {
+    let chain_id = resolve_chain_id();
+    if chain_id == MAINNET_CHAIN_ID {
+        eprintln!(
+            "[SECURITY] Faucet/test-mint RPC refused: chain_id={} is mainnet. \
+             Direct-write faucet is permanently disabled on mainnet regardless of \
+             AINCORE_ENABLE_FAUCET. Set AINCORE_CHAIN_ID to a testnet id to use it.",
+            chain_id
+        );
+        return Err(JsonRpcError {
+            code: -32041,
+            message: "Faucet permanently disabled on mainnet (AINCORE-MAINNET-1).".into(),
+        });
+    }
+    Ok(())
+}
+
 fn faucet_enabled() -> bool {
     std::env::var("AINCORE_ENABLE_FAUCET")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
@@ -447,6 +483,9 @@ fn credit_testnet_faucet(
     amount: u128,
     public_key_hex: Option<&str>,
 ) -> Result<serde_json::Value, JsonRpcError> {
+    // M2: Mainnet refusal FIRST — never mints on AINCORE-MAINNET-1 even if the
+    // enable flag is set. Dev/testnet continues past this.
+    faucet_chain_guard()?;
     if !faucet_enabled() {
         return Err(JsonRpcError {
             code: -32030,
@@ -529,6 +568,9 @@ fn credit_testnet_wbtc(
     amount: u128,
     public_key_hex: Option<&str>,
 ) -> Result<serde_json::Value, JsonRpcError> {
+    // M2: Mainnet refusal FIRST — never mints on AINCORE-MAINNET-1 even if the
+    // enable flag is set. Dev/testnet continues past this.
+    faucet_chain_guard()?;
     if !faucet_enabled() {
         return Err(JsonRpcError {
             code: -32030,
@@ -2223,6 +2265,22 @@ pub async fn start_api_server(
         storage,
     });
 
+    // M1: Rate limiter — 100 requests/second per IP, burst up to 200.
+    // Mirrors the (previously dead) config in api.rs so the LIVE server is throttled.
+    let governor_conf = GovernorConfigBuilder::default()
+        .per_second(100)
+        .burst_size(200)
+        .finish()
+        .expect("governor config is valid");
+
+    // M1: Bind address — default to loopback only; operators must opt into a
+    // wider interface (e.g. 0.0.0.0) explicitly via AINCORE_RPC_BIND.
+    let bind_host = std::env::var("AINCORE_RPC_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    println!(
+        "🔒 RPC bind host: {} (override with AINCORE_RPC_BIND), rate limit: 100 req/s burst 200",
+        bind_host
+    );
+
     // gunakan tokio::task::LocalSet agar runtime single-thread tidak butuh Send
     let local = tokio::task::LocalSet::new();
     local
@@ -2243,6 +2301,7 @@ pub async fn start_api_server(
 
                 App::new()
                     .wrap(cors)
+                    .wrap(Governor::new(&governor_conf))
                     .app_data(app_state.clone())
                     .route("/health", web::get().to(health))
                     .route("/metrics", web::get().to(metrics_handler))
@@ -2261,7 +2320,7 @@ pub async fn start_api_server(
                     .route("/get_network_info", web::get().to(get_network_info_handler))
                     .route("/get_transaction", web::get().to(get_transaction_handler))
             })
-            .bind(("0.0.0.0", api_port))?
+            .bind((bind_host.as_str(), api_port))?
             .run(),
         )
         .await
@@ -2316,16 +2375,21 @@ mod tests {
     fn test_faucet_disabled_by_default() {
         let _guard = faucet_env_lock().lock().unwrap();
         std::env::remove_var("AINCORE_ENABLE_FAUCET");
+        // Testnet chain id so the M2 mainnet guard passes and we reach the
+        // "disabled" (-32030) path this test asserts.
+        std::env::set_var("AINCORE_CHAIN_ID", "AINCORE-TESTNET-1");
         let db = temp_db("disabled");
         let err = credit_testnet_faucet(&db, "00000000000000000000000000000001", 1, None)
             .expect_err("faucet must be disabled by default");
         assert_eq!(err.code, -32030);
+        std::env::remove_var("AINCORE_CHAIN_ID");
     }
 
     #[test]
     fn test_faucet_creates_account_and_credits_move_coinstore() {
         let _guard = faucet_env_lock().lock().unwrap();
         std::env::set_var("AINCORE_ENABLE_FAUCET", "1");
+        std::env::set_var("AINCORE_CHAIN_ID", "AINCORE-TESTNET-1");
         let db = temp_db("credit");
         let signing_key = SigningKey::from_bytes(&[31u8; 32]);
         let public_key = hex::encode(signing_key.verifying_key().as_bytes());
@@ -2342,12 +2406,38 @@ mod tests {
         assert_eq!(result["move_balance"], "130");
         assert_eq!(move_balance(&db, &address), "130");
         std::env::remove_var("AINCORE_ENABLE_FAUCET");
+        std::env::remove_var("AINCORE_CHAIN_ID");
+    }
+
+    #[test]
+    fn test_faucet_refused_on_mainnet_even_when_enabled() {
+        let _guard = faucet_env_lock().lock().unwrap();
+        std::env::set_var("AINCORE_ENABLE_FAUCET", "1");
+        std::env::set_var("AINCORE_CHAIN_ID", "AINCORE-MAINNET-1");
+        let db = temp_db("mainnet_refused");
+        let signing_key = SigningKey::from_bytes(&[34u8; 32]);
+        let public_key = hex::encode(signing_key.verifying_key().as_bytes());
+        let address = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
+
+        let err = credit_testnet_faucet(&db, &address, 1, Some(&public_key))
+            .expect_err("faucet must refuse on mainnet even when enabled");
+        assert_eq!(err.code, -32041);
+        // No CoinStore must have been written.
+        assert_eq!(move_balance(&db, &address), "0");
+
+        let err = credit_testnet_wbtc(&db, &address, 1, Some(&public_key))
+            .expect_err("wbtc mint must refuse on mainnet even when enabled");
+        assert_eq!(err.code, -32041);
+
+        std::env::remove_var("AINCORE_ENABLE_FAUCET");
+        std::env::remove_var("AINCORE_CHAIN_ID");
     }
 
     #[test]
     fn test_faucet_rejects_public_key_address_mismatch() {
         let _guard = faucet_env_lock().lock().unwrap();
         std::env::set_var("AINCORE_ENABLE_FAUCET", "1");
+        std::env::set_var("AINCORE_CHAIN_ID", "AINCORE-TESTNET-1");
         let db = temp_db("mismatch");
         let signing_key = SigningKey::from_bytes(&[32u8; 32]);
         let public_key = hex::encode(signing_key.verifying_key().as_bytes());
@@ -2362,12 +2452,14 @@ mod tests {
         assert_eq!(err.code, -32602);
         assert!(err.message.contains("Public key/address mismatch"));
         std::env::remove_var("AINCORE_ENABLE_FAUCET");
+        std::env::remove_var("AINCORE_CHAIN_ID");
     }
 
     #[test]
     fn test_coin_balance_endpoint_reads_ain_and_synthetic_wbtc_coinstores() {
         let _guard = faucet_env_lock().lock().unwrap();
         std::env::set_var("AINCORE_ENABLE_FAUCET", "1");
+        std::env::set_var("AINCORE_CHAIN_ID", "AINCORE-TESTNET-1");
         let db = temp_db("coin_balance");
         let signing_key = SigningKey::from_bytes(&[33u8; 32]);
         let public_key = hex::encode(signing_key.verifying_key().as_bytes());
