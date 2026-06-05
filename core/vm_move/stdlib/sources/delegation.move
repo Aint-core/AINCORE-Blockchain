@@ -16,6 +16,8 @@ module 0x1::delegation {
     const EUNBONDING_NOT_READY: u64 = 4;
     const EINVALID_COMMISSION: u64 = 5;
     const ECOMMISSION_CHANGE_TOO_SOON: u64 = 6;
+    /// FIX #2: caller is not the system address (@0x1)
+    const EUNAUTHORIZED: u64 = 7;
 
     /// Minimum delegation amount: 1 AIN
     const MIN_DELEGATION: u128 = 1000000000000000000;
@@ -335,10 +337,16 @@ module 0x1::delegation {
 
     /// Distribute rewards to delegators (called by system after block production)
     /// This updates the accumulated_rewards_per_share for the pool
-    public fun distribute_delegation_rewards(
+    /// FIX #2: system-only. A leading `sys: &signer` must equal @0x1, mirroring
+    /// coin::deduct_gas / staking::distribute_rewards. SAFETY DEPENDS ON FIX #1:
+    /// this guard is only sound because the executor binds the genuine 0x1 signer
+    /// to system-originated calls and never lets a user forge a 0x1 signer.
+    public entry fun distribute_delegation_rewards(
+        sys: &signer,
         validator_addr: address,
         total_reward: u128
     ) acquires ValidatorPool {
+        assert!(signer::address_of(sys) == @0x1, error::permission_denied(EUNAUTHORIZED));
         if (!exists<ValidatorPool>(validator_addr)) {
             return
         };

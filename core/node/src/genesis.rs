@@ -964,8 +964,8 @@ mod tests {
     ) -> String {
         let public_key = signing_key.verifying_key();
         let message = format!(
-            "{}:{}:{}:{}",
-            "AINCORE-MAINNET-1", sender, payload, sequence_number
+            "{}:{}:{}:{}:{}:{}:{}",
+            "AINCORE-MAINNET-1", sender, payload, sequence_number, gas_limit, gas_price, ""
         );
         let signature = signing_key.sign(message.as_bytes());
         serde_json::to_string(&Transaction {

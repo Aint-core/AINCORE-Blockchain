@@ -1025,53 +1025,29 @@ fn handle_rpc_method(
             }))
         },
         "aincore_createProposal" => {
-            // params: [id, title, description, proposer, duration_seconds]
-            if let (Some(id), Some(title), Some(desc), Some(proposer), Some(duration)) = (
-                params.get(0).and_then(|v| v.as_str()),
-                params.get(1).and_then(|v| v.as_str()),
-                params.get(2).and_then(|v| v.as_str()),
-                params.get(3).and_then(|v| v.as_str()),
-                params.get(4).and_then(|v| v.as_u64())
-            ) {
-                 let governance = data.governance.lock()
-                     .map_err(|e| JsonRpcError { code: -32000, message: format!("Governance lock error: {}", e) })?;
-                 match governance.create_proposal(id.to_string(), title.to_string(), desc.to_string(), proposer.to_string(), duration, None) {
-                     Ok(pid) => Ok(serde_json::json!({ "status": "created", "proposal_id": pid })),
-                     Err(e) => Err(JsonRpcError { code: -32000, message: e }),
-                 }
-            } else {
-                 Err(JsonRpcError { code: -32602, message: "Invalid params".into() })
-            }
+            // SECURITY (FIX-3): This handler previously mutated governance state
+            // directly from an UNAUTHENTICATED `proposer` string param, bypassing
+            // the Move VM, escrow and fee-burn in 0x1::governance. Disabled.
+            // Governance must be driven by a signed transaction submitted via
+            // aincore_sendTransaction, calling 0x1::governance::create_proposal,
+            // so the mempool enforces Ed25519 signature + sender==derive_address(pubkey).
+            Err(JsonRpcError {
+                code: -32040,
+                message: "aincore_createProposal disabled: submit a signed transaction calling 0x1::governance::create_proposal via aincore_sendTransaction".into(),
+            })
         },
         "aincore_vote" => {
-            // params: [proposal_id, voter_addr, approve_bool]
-            if let (Some(pid), Some(voter), Some(approve)) = (
-                params.get(0).and_then(|v| v.as_str()),
-                params.get(1).and_then(|v| v.as_str()),
-                params.get(2).and_then(|v| v.as_bool())
-            ) {
-                 let governance = data.governance.lock()
-                     .map_err(|e| JsonRpcError { code: -32000, message: format!("Governance lock error: {}", e) })?;
-                 // weight is calculated internally now, passing 0 as placeholder
-                 match governance.vote(pid, voter.to_string(), approve, 0) {
-                     Ok(_) => Ok(serde_json::json!({ "status": "voted" })),
-                     Err(e) => Err(JsonRpcError { code: -32000, message: e }),
-                 }
-            } else {
-             // params: [proposal_id, voter, choice(bool)]
-             // Fix: Use as_array to safely check length
-             let len = params.as_array().map(|a| a.len()).unwrap_or(0);
-             if len < 3 { return Err(JsonRpcError { code: -32602, message: "Invalid params".into() }); }
-
-             let pid = params[0].as_str().unwrap_or("").to_string();
-             let voter = params[1].as_str().unwrap_or("").to_string();
-             let choice = params[2].as_bool().unwrap_or(false);
-
-             let governance = data.governance.lock().map_err(|e| JsonRpcError { code: -32000, message: format!("Governance lock error: {}", e) })?;
-             // Fix: Pass 4 args
-             let res = governance.vote(&pid, voter, choice, 0);
-             Ok(serde_json::json!(res))
-             }
+            // SECURITY (FIX-3): This handler previously cast a vote using an
+            // UNAUTHENTICATED `voter` string param and derived the vote weight
+            // from that CLAIMED address's on-chain balance, with no proof of key
+            // ownership. An attacker could vote with any whale's full stake weight.
+            // Disabled. Votes must be cast via a signed transaction submitted
+            // through aincore_sendTransaction, calling 0x1::governance::vote, so
+            // the mempool enforces Ed25519 signature + sender==derive_address(pubkey).
+            Err(JsonRpcError {
+                code: -32040,
+                message: "aincore_vote disabled: submit a signed transaction calling 0x1::governance::vote via aincore_sendTransaction".into(),
+            })
         },
         "aincore_getProposal" => {
             if let Some(pid) = params.get(0).and_then(|v| v.as_str()) {

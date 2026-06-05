@@ -135,12 +135,16 @@ mod tests {
 
         // 4. Sign a message
         let payload = b"Hello Quantum World";
-        let full_message = format!("AINCORE-TESTNET-1:{}:{}:0", sender, hex::encode(payload));
+        // F4: sign and call with the new gas/input_objects-bound form.
+        let full_message = format!(
+            "AINCORE-TESTNET-1:{}:{}:0:{}:{}:{}",
+            sender, hex::encode(payload), 0u64, 1u128, ""
+        );
         let sig = pqcrypto_dilithium::dilithium5::detached_sign(full_message.as_bytes(), &sk);
 
         // 5. Execute Transaction
         let result =
-            vm.execute_transaction("AINCORE-TESTNET-1", sender, 0, sig.as_bytes(), payload);
+            vm.execute_transaction("AINCORE-TESTNET-1", sender, 0, 0u64, 1u128, &[], sig.as_bytes(), payload);
 
         // 6. Verify Success
         assert!(result.is_ok());
@@ -152,6 +156,9 @@ mod tests {
             "AINCORE-TESTNET-1",
             sender,
             0,
+            0u64,
+            1u128,
+            &[],
             sig.as_bytes(),
             wrong_payload,
         );
@@ -212,13 +219,20 @@ mod tests {
 
         // 6. Execute (Note: using exactly what was signed to pass verification)
         // Re-sign with the full formatted message to avoid test failures:
-        let full_message = format!("AINCORE-TESTNET-1:{}:{}:0", sender, hex::encode(payload));
+        // F4: sign and call with the new gas/input_objects-bound form.
+        let full_message = format!(
+            "AINCORE-TESTNET-1:{}:{}:0:{}:{}:{}",
+            sender, hex::encode(payload), 0u64, 1u128, ""
+        );
         let signature = signing_key.sign(full_message.as_bytes());
 
         let result = vm.execute_transaction(
             "AINCORE-TESTNET-1",
             sender,
             0,
+            0u64,
+            1u128,
+            &[],
             signature.to_bytes().as_slice(),
             payload,
         );
@@ -246,7 +260,8 @@ mod tests {
         let payload = vec![];
 
         // 3. Execute
-        let result = vm.execute_transaction("TESTNET", sender, 0, &dummy_sig, &payload);
+        let result =
+            vm.execute_transaction("TESTNET", sender, 0, 0u64, 1u128, &[], &dummy_sig, &payload);
 
         // 4. Verify - Should return Ok(false)
         assert!(result.is_ok());

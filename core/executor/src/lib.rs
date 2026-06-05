@@ -689,10 +689,11 @@ impl Executor {
             args: vec![bcs::to_bytes(&system_address()).unwrap_or_default()],
         });
 
-        match self
-            .vm
-            .execute_transaction_actions(vec![(action, true)], system_address(), 1_000_000)
-        {
+        match self.vm.execute_transaction_actions(
+            vec![(action, true, system_address())],
+            system_address(),
+            1_000_000,
+        ) {
             Ok((_gas_used, mut updates, status)) => {
                 if !status.success {
                     eprintln!(
@@ -857,7 +858,7 @@ impl Executor {
                 vec![aincore_coin_type()],
                 vec![arg_sys, arg_miner, arg_amount],
                 100_000,
-                system_address(),
+                system_address(), // auth_signer: deposit_fee_reward asserts @0x1
             )
             .map_err(|e| e.to_string())?;
 
@@ -1453,7 +1454,10 @@ impl Executor {
                 vec![],
                 vec![arg_sys, arg_val, arg_bps],
                 500_000, // Gas budget for slash operation
-                vm_addr,
+                // auth_signer: slash_validator_bps asserts signer==@0x1. With FIX #1
+                // binding the signer slot to auth_signer, this MUST be system_address()
+                // (the validator target is carried separately in arg_val, not the signer).
+                system_address(),
             ) {
                 Ok((_gas_used, vm_changes, _)) => {
                     for (k, v) in vm_changes {
@@ -1764,9 +1768,18 @@ impl Executor {
             };
 
             let signature = Signature::from_bytes(&sig_bytes);
+            // F4: signature binds gas_limit, gas_price, input_objects so a
+            // network-mutated gas field or rewritten input_objects fails verify
+            // here too (defense-in-depth; sync/gossip txs bypass the mempool).
             let message = format!(
-                "{}:{}:{}:{}",
-                tx.chain_id, tx.sender, tx.payload, tx.sequence_number
+                "{}:{}:{}:{}:{}:{}:{}",
+                tx.chain_id,
+                tx.sender,
+                tx.payload,
+                tx.sequence_number,
+                tx.gas_limit,
+                tx.gas_price,
+                tx.input_objects.join(",")
             );
 
             if verifying_key
@@ -1950,7 +1963,10 @@ impl Executor {
                     ty_args: vec![aincore_coin_type()],
                     args: vec![arg_sys, arg_user, arg_amount],
                 });
-                pre_actions.push((gas_action, true)); // true = must succeed
+                // deduct_gas asserts signer::address_of(sys)==@0x1, so the
+                // authenticated signer for this system pre-action is @0x1, NOT the
+                // tx sender. This is why auth_signer must be per-action (FIX #1).
+                pre_actions.push((gas_action, true, system_address())); // must succeed
             }
 
             // CRITICAL FIX: ALWAYS increment the SENDER's sequence number, even if Paymaster pays gas
@@ -2048,7 +2064,15 @@ impl Executor {
             match parsed_payload {
                 Ok(vm_move::TransactionPayload::EntryFunction(call)) => {
                     let mut actions = pre_actions.clone();
-                    actions.push((vm_move::MoveAction::CallEntryFunction(call), false));
+                    // SECURITY (FIX #1): the user's entry call may only act as the
+                    // authenticated tx sender. bind_signer_args overwrites the
+                    // leading &signer slots with sender_addr, so a forged @0x1 (or
+                    // any other principal) embedded in the payload is discarded.
+                    actions.push((
+                        vm_move::MoveAction::CallEntryFunction(call),
+                        false,
+                        sender_addr,
+                    ));
                     match self
                         .vm
                         .execute_transaction_actions(actions, sender_addr, tx.gas_limit)
@@ -2077,7 +2101,14 @@ impl Executor {
                         return None;
                     }
                     let mut actions = pre_actions.clone();
-                    actions.push((vm_move::MoveAction::PublishModule(modules), false));
+                    // 3-tuple arity (FIX #1). PublishModule ignores auth_signer
+                    // (it uses the fn `sender` param for the 0x1 reservation check),
+                    // but the tuple must carry an address; pass sender_addr.
+                    actions.push((
+                        vm_move::MoveAction::PublishModule(modules),
+                        false,
+                        sender_addr,
+                    ));
                     match self
                         .vm
                         .execute_transaction_actions(actions, sender_addr, tx.gas_limit)
@@ -2595,8 +2626,8 @@ mod tests {
     ) -> String {
         let public_key = signing_key.verifying_key();
         let message = format!(
-            "{}:{}:{}:{}",
-            "AINCORE-MAINNET-1", sender, payload, sequence_number
+            "{}:{}:{}:{}:{}:{}:{}",
+            "AINCORE-MAINNET-1", sender, payload, sequence_number, gas_limit, gas_price, ""
         );
         let signature = signing_key.sign(message.as_bytes());
         serde_json::to_string(&Transaction {
@@ -2668,6 +2699,81 @@ mod tests {
         let sender_obj = db.get_object(&sender).expect("sender object");
         let sender_data: aa::AccountData = serde_json::from_slice(&sender_obj.data).unwrap();
         assert_eq!(sender_data.sequence_number, 1);
+    }
+
+    /// SECURITY (FIX #1 — VM signer binding). An attacker crafts a
+    /// `coin::transfer` whose FIRST argument (the `&signer` slot) is a forged
+    /// VICTIM address, signs the transaction with the ATTACKER's own key, and
+    /// submits it. Before FIX #1 the move-vm deserialized the signer straight
+    /// from the user-supplied arg bytes, so the transfer would withdraw from the
+    /// VICTIM — fund theft. After FIX #1 `bind_signer_args` overwrites the leading
+    /// signer slot with the authenticated sender (the attacker), so the victim's
+    /// balance is untouched. This test would FAIL (victim drained) on the pre-fix
+    /// code and PASSES now.
+    #[test]
+    fn test_fix1_forged_signer_cannot_spend_victim_funds() {
+        let db = temp_db("fix1_forged_signer");
+        load_stdlib(&db);
+        let attacker_key = SigningKey::from_bytes(&[21u8; 32]);
+        let victim_key = SigningKey::from_bytes(&[22u8; 32]);
+        let sink_key = SigningKey::from_bytes(&[23u8; 32]);
+        let attacker = create_account(&db, &attacker_key);
+        let victim = create_account(&db, &victim_key);
+        let sink = create_account(&db, &sink_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        // Attacker can pay gas; victim holds the funds the attacker wants to steal.
+        set_coin_store(&db, &attacker, 1_000_000);
+        set_coin_store(&db, &victim, 5_000_000);
+        set_coin_store(&db, &sink, 0);
+
+        let executor = Executor::new(db.clone());
+        // coin::transfer(from: &signer, to: address, amount). args[0] is the
+        // signer slot — the attacker forges it to the VICTIM's address.
+        let call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                move_core_types::account_address::AccountAddress::new([
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]),
+                move_core_types::identifier::Identifier::new("coin").unwrap(),
+            ),
+            function: "transfer".to_string(),
+            ty_args: vec![move_core_types::language_storage::TypeTag::Struct(Box::new(
+                move_core_types::language_storage::StructTag {
+                    address: move_core_types::account_address::AccountAddress::new([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]),
+                    module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                    name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                    type_params: vec![],
+                },
+            ))],
+            args: vec![
+                // FORGED signer slot = victim.
+                bcs::to_bytes(&parse_move_address(&victim).unwrap()).unwrap(),
+                // Recipient = attacker-controlled sink.
+                bcs::to_bytes(&parse_move_address(&sink).unwrap()).unwrap(),
+                bcs::to_bytes(&4_000_000u128).unwrap(),
+            ],
+        };
+        let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
+        let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
+
+        // Signed by the ATTACKER, sender = attacker.
+        let _ = executor
+            .execute_transaction(&signed_tx(&attacker_key, &attacker, &payload, 0, 100_000, 1));
+        // Whatever the VM did, it must NOT have spent the victim's coins, and the
+        // attacker-controlled sink must NOT have received the victim's funds.
+        assert_eq!(
+            coin_balance(&db, &victim),
+            5_000_000,
+            "FIX #1 FAILED: forged signer let the attacker spend the victim's balance"
+        );
+        assert_eq!(
+            coin_balance(&db, &sink),
+            0,
+            "FIX #1 FAILED: victim funds were redirected to the attacker sink"
+        );
     }
 
     #[test]

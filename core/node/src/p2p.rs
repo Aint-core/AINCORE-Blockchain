@@ -341,6 +341,8 @@ pub async fn start_p2p(
                         }
                     }
                     SwarmEvent::ConnectionClosed { endpoint, .. } => {
+                        // pre-existing nesting; kept explicit for clarity over collapsing
+                        #[allow(clippy::collapsible_match)]
                         if let libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } = endpoint {
                             if let Some(host) = multiaddr_host(&send_back_addr) {
                                 if let Some(count) = inbound_connections_by_host.get_mut(&host) {

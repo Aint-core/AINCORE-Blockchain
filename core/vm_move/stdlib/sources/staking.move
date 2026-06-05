@@ -4,6 +4,13 @@ module 0x1::staking {
     use std::error;
     use 0x1::coin::{Self, Coin};
 
+    // FIX #2: mint_reward inflates AIN supply and must only be reachable from
+    // other system (0x1) modules. Declare the legitimate in-0x1 callers as
+    // friends so `public(friend) fun mint_reward` is link-time restricted to
+    // them (enforced by the Move bytecode verifier; does NOT depend on F1).
+    friend 0x1::delegation;
+    friend 0x1::universal_mining;
+
     /// Error codes
     const ENOT_VALIDATOR: u64 = 1;
     const EALREADY_VALIDATOR: u64 = 2;
@@ -296,7 +303,9 @@ module 0x1::staking {
 
     /// Safe Minting for Ecosystem Rewards (DePIN/Mining)
     /// Enforces MAX_SUPPLY hard cap.
-    public fun mint_reward(amount: u128): Coin<AincoreCoin> acquires ValidatorSet {
+    /// FIX #2: restricted to friend modules (0x1::delegation, 0x1::universal_mining)
+    /// so it can never be invoked directly by a user-published module.
+    public(friend) fun mint_reward(amount: u128): Coin<AincoreCoin> acquires ValidatorSet {
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
         
         // Hard Cap Check

@@ -80,9 +80,17 @@ impl Mempool {
     /// and any future RPC method. None of them can submit a "different"
     /// version of a TX that has already been seen.
     fn canonical_tx_hash(tx: &executor::Transaction) -> String {
+        // F4: dedup identity must match the signed canonical form, which now
+        // also binds gas_limit, gas_price, and input_objects.
         let canonical = format!(
-            "{}:{}:{}:{}",
-            tx.chain_id, tx.sender, tx.payload, tx.sequence_number
+            "{}:{}:{}:{}:{}:{}:{}",
+            tx.chain_id,
+            tx.sender,
+            tx.payload,
+            tx.sequence_number,
+            tx.gas_limit,
+            tx.gas_price,
+            tx.input_objects.join(",")
         );
         let mut hasher = Sha256::new();
         hasher.update(canonical.as_bytes());
@@ -294,9 +302,16 @@ impl Mempool {
             // Canonical submission message — must match what wallets sign.
             // We use the same shape as the Ed25519 path so wallet code can
             // share message construction between schemes.
+            // F4: bind gas_limit, gas_price, input_objects in the signed message.
             let message = format!(
-                "{}:{}:{}:{}",
-                parsed_tx.chain_id, parsed_tx.sender, parsed_tx.payload, parsed_tx.sequence_number
+                "{}:{}:{}:{}:{}:{}:{}",
+                parsed_tx.chain_id,
+                parsed_tx.sender,
+                parsed_tx.payload,
+                parsed_tx.sequence_number,
+                parsed_tx.gas_limit,
+                parsed_tx.gas_price,
+                parsed_tx.input_objects.join(",")
             );
             if dilithium5::verify_detached_signature(&sig, message.as_bytes(), &pk).is_err() {
                 return Err("Invalid Dilithium5 signature verification".to_string());
@@ -326,12 +341,16 @@ impl Mempool {
                 {
                     if let Ok(sig_bytes) = hex::decode(&parsed_tx.signature) {
                         if let Ok(sig) = Signature::from_slice(&sig_bytes) {
+                            // F4: bind gas_limit, gas_price, input_objects.
                             let message = format!(
-                                "{}:{}:{}:{}",
+                                "{}:{}:{}:{}:{}:{}:{}",
                                 parsed_tx.chain_id,
                                 parsed_tx.sender,
                                 parsed_tx.payload,
-                                parsed_tx.sequence_number
+                                parsed_tx.sequence_number,
+                                parsed_tx.gas_limit,
+                                parsed_tx.gas_price,
+                                parsed_tx.input_objects.join(",")
                             );
                             if vk.verify(message.as_bytes(), &sig).is_err() {
                                 return Err("Invalid Signature Verification".to_string());

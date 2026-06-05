@@ -464,6 +464,13 @@ pub async fn secure_connect(
     if msg_len > 10 * 1024 * 1024 {
         return Err("Welcome message too large".into());
     }
+    // SECURITY (FIX-5): a valid encrypted frame is at least a 12-byte nonce.
+    // A shorter frame (truncated or hostile peer reply) would otherwise panic
+    // on the enc_msg[0..12] slice below and kill the caller's task (permanently
+    // disabling periodic sync). Mirror the server accept loop (msg_len < 12).
+    if msg_len < 12 {
+        return Err("Welcome message too short".into());
+    }
 
     let mut enc_msg = vec![0u8; msg_len];
     tokio::time::timeout(

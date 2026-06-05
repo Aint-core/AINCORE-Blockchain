@@ -197,7 +197,12 @@ fn main() -> anyhow::Result<()> {
             let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
             let seq_num = sequence_number;
             // PROTOCOL UPDATE: Chain Binding
-            let message = format!("{}:{}:{}:{}", "AINCORE-MAINNET-1", sender, payload, seq_num);
+            // F4: signature must cover gas_limit, gas_price, input_objects.
+            // input_objects=[] here, gas_limit=5000, gas_price=1 (must match tx_json below).
+            let message = format!(
+                "{}:{}:{}:{}:{}:{}:{}",
+                "AINCORE-MAINNET-1", sender, payload, seq_num, 5000u64, 1u128, ""
+            );
             let signature = wallet.sign(message.as_bytes());
 
             let tx_json = json!({
@@ -315,7 +320,11 @@ fn main() -> anyhow::Result<()> {
             let seq_num = sequence_number; // Use current seq number (Executor expects match)
             let gas_price = 1;
             // PROTOCOL UPDATE: Chain Binding
-            let message = format!("{}:{}:{}:{}", "AINCORE-MAINNET-1", sender, payload, seq_num);
+            // F4: bind gas_limit/gas_price/input_objects. input_objects=[] for native transfer.
+            let message = format!(
+                "{}:{}:{}:{}:{}:{}:{}",
+                "AINCORE-MAINNET-1", sender, payload, seq_num, gas_limit, gas_price, ""
+            );
             let signature = wallet.sign(message.as_bytes());
 
             // Construct Transaction JSON
@@ -421,9 +430,10 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            // F4: bind gas_limit/gas_price/input_objects (publish uses gas_limit 50000).
             let message = format!(
-                "{}:{}:{}:{}",
-                "AINCORE-MAINNET-1", sender, payload, sequence_number
+                "{}:{}:{}:{}:{}:{}:{}",
+                "AINCORE-MAINNET-1", sender, payload, sequence_number, 50000u64, 1u128, ""
             );
             let signature = wallet.sign(message.as_bytes());
 
@@ -498,9 +508,10 @@ fn main() -> anyhow::Result<()> {
             let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
             let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
             // PROTOCOL UPDATE: Chain Binding
+            // F4: bind gas_limit/gas_price/input_objects (register uses gas_limit 50000).
             let message = format!(
-                "{}:{}:{}:{}",
-                "AINCORE-MAINNET-1", sender, payload, sequence_number
+                "{}:{}:{}:{}:{}:{}:{}",
+                "AINCORE-MAINNET-1", sender, payload, sequence_number, 50000u64, 1u128, ""
             );
             let signature = wallet.sign(message.as_bytes());
 
@@ -569,9 +580,10 @@ fn main() -> anyhow::Result<()> {
             };
             let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
             let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
+            // F4: bind gas_limit/gas_price/input_objects (faucet uses gas_limit 50000).
             let message = format!(
-                "{}:{}:{}:{}",
-                "AINCORE-MAINNET-1", sender, payload, sequence_number
+                "{}:{}:{}:{}:{}:{}:{}",
+                "AINCORE-MAINNET-1", sender, payload, sequence_number, 50000u64, 1u128, ""
             );
             let signature = wallet.sign(message.as_bytes());
 

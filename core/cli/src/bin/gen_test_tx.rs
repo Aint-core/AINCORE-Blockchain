@@ -71,11 +71,12 @@ fn main() {
     let sequence_number = 0;
 
     // 4. Sign
-    // Message format from executor::execute_transaction: "{}:{}:{}:{}" (chain_id:sender:payload:seq_num)
+    // F4: Message format now chain_id:sender:payload:seq:gas_limit:gas_price:input_objects
+    // gas_limit=10000, gas_price=1, input_objects=[] (must match tx below).
     let chain_id = "AINCORE-MAINNET-1";
     let message = format!(
-        "{}:{}:{}:{}",
-        chain_id, sender_addr, payload, sequence_number
+        "{}:{}:{}:{}:{}:{}:{}",
+        chain_id, sender_addr, payload, sequence_number, 10000u64, 1u128, ""
     );
     let signature = signing_key.sign(message.as_bytes());
     let signature_hex = hex::encode(signature.to_bytes());

@@ -194,11 +194,15 @@ impl AINCOREVM {
     }
     */
 
+    #[allow(clippy::too_many_arguments)] // tx fields (incl. F4 gas_limit/gas_price/input_objects) are intrinsic to verification
     pub fn execute_transaction(
         &self,
         chain_id: &str,
         sender: AccountAddress,
         sequence_number: u64,
+        gas_limit: u64,
+        gas_price: u128,
+        input_objects: &[String],
         signature: &[u8],
         _payload: &[u8],
     ) -> Result<bool> {
@@ -280,12 +284,16 @@ impl AINCOREVM {
 
             // FULL PAYLOAD VERIFICATION (Phase 4):
             // Match the executor's format: chain_id:sender:payload_hex:seq_num
+            // F4: bind gas_limit, gas_price, input_objects to match wallet/mempool/executor.
             let message = format!(
-                "{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}:{}",
                 chain_id,
                 sender,
                 hex::encode(_payload),
-                sequence_number
+                sequence_number,
+                gas_limit,
+                gas_price,
+                input_objects.join(",")
             );
 
             if verifying_key.verify(message.as_bytes(), &sig_obj).is_ok() {
@@ -349,12 +357,16 @@ impl AINCOREVM {
                 }
             };
 
+            // F4: bind gas_limit, gas_price, input_objects.
             let message = format!(
-                "{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}:{}",
                 chain_id,
                 sender,
                 hex::encode(_payload),
-                sequence_number
+                sequence_number,
+                gas_limit,
+                gas_price,
+                input_objects.join(",")
             );
             match pqcrypto_dilithium::dilithium5::verify_detached_signature(
                 &sig,
@@ -421,13 +433,14 @@ impl AINCOREVM {
     #[allow(clippy::too_many_arguments)] // Move VM entry interface — args are intrinsic to function call
     pub fn execute_public_entry_function(
         &self,
-        pre_actions: Vec<(MoveAction, bool)>, // Optional pre-actions like gas deduction
+        // 3-tuple (action, must_succeed, auth_signer) — see execute_transaction_actions.
+        pre_actions: Vec<(MoveAction, bool, AccountAddress)>,
         module: ModuleId,
         function: &str,
         ty_args: Vec<move_core_types::language_storage::TypeTag>,
         args: Vec<Vec<u8>>,
         gas_limit: u64,
-        _sender: AccountAddress,
+        sender: AccountAddress,
     ) -> ExecutionResult {
         let mut actions = pre_actions;
         actions.push((
@@ -438,13 +451,21 @@ impl AINCOREVM {
                 args,
             }),
             false,
+            // The caller-supplied `sender` is the authenticated principal whose
+            // &signer slots are bound for this call (system_address() for
+            // system-gated functions like deposit_fee_reward / slash).
+            sender,
         ));
-        self.execute_transaction_actions(actions, _sender, gas_limit)
+        self.execute_transaction_actions(actions, sender, gas_limit)
     }
 
     pub fn execute_transaction_actions(
         &self,
-        actions: Vec<(MoveAction, bool)>, // bool = true if must succeed (propagate error)
+        // (action, must_succeed, auth_signer): auth_signer is the AUTHENTICATED
+        // address this action may act as. Every leading &signer slot of an entry
+        // function is overwritten with this address, so user-supplied bytes in a
+        // signer slot are always discarded and cannot forge another principal.
+        actions: Vec<(MoveAction, bool, AccountAddress)>,
         sender: AccountAddress,
         gas_limit: u64,
     ) -> ExecutionResult {
@@ -452,7 +473,7 @@ impl AINCOREVM {
         let mut gas_meter = AINCOREGasMeter::new(gas_limit);
         let mut status = ExecutionStatus::success();
 
-        for (action, must_succeed) in actions {
+        for (action, must_succeed, auth_signer) in actions {
             let result: Result<(), anyhow::Error> = match action {
                 MoveAction::PublishModule(modules) => {
                     if sender == system_address() {
@@ -465,16 +486,57 @@ impl AINCOREVM {
                             .map_err(|e| anyhow::anyhow!("{}", e))
                     }
                 }
-                MoveAction::CallEntryFunction(call) => session
-                    .execute_entry_function(
+                MoveAction::CallEntryFunction(call) => {
+                    let ident = match move_core_types::identifier::Identifier::new(
+                        call.function.clone(),
+                    ) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            let err = anyhow::anyhow!("invalid function identifier: {}", e);
+                            if must_succeed {
+                                return Err(err);
+                            }
+                            if status.success {
+                                status = ExecutionStatus::aborted(err.to_string());
+                            }
+                            continue;
+                        }
+                    };
+                    // SECURITY (FIX #1): bind &signer slots to the authenticated
+                    // principal. move-vm does NOT inject signers; it deserializes a
+                    // signer from raw arg bytes. Load the function signature, count
+                    // leading signer params, and overwrite those slots with the BCS
+                    // of auth_signer so a forged @0x1 (or any) signer is discarded.
+                    let bound_args = match Self::bind_signer_args(
+                        &session,
                         &call.module,
-                        &move_core_types::identifier::Identifier::new(call.function).unwrap(),
-                        call.ty_args,
+                        &ident,
+                        &call.ty_args,
                         call.args,
-                        &mut gas_meter,
-                    )
-                    .map(|_| ())
-                    .map_err(|e| anyhow::anyhow!("{}", e)),
+                        auth_signer,
+                    ) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            if must_succeed {
+                                return Err(e);
+                            }
+                            if status.success {
+                                status = ExecutionStatus::aborted(e.to_string());
+                            }
+                            continue;
+                        }
+                    };
+                    session
+                        .execute_entry_function(
+                            &call.module,
+                            &ident,
+                            call.ty_args,
+                            bound_args,
+                            &mut gas_meter,
+                        )
+                        .map(|_| ())
+                        .map_err(|e| anyhow::anyhow!("{}", e))
+                }
             };
 
             if let Err(e) = result {
@@ -493,6 +555,61 @@ impl AINCOREVM {
         let vm_changes = self.changeset_to_kv(changeset)?;
 
         Ok((gas_meter.gas_used(), vm_changes, status))
+    }
+
+    /// Overwrite the leading signer parameters of an entry function with the
+    /// BCS-serialized authenticated address, so a caller can never forge another
+    /// principal's &signer by supplying crafted argument bytes. In move-vm
+    /// aptos-v1.3.0 a signer argument is deserialized from raw bytes via the
+    /// Signer layout (== AccountAddress), so bcs::to_bytes(&address) is exactly
+    /// the bytes the VM expects for a signer slot.
+    fn bind_signer_args(
+        session: &move_vm_runtime::session::Session<'_, '_, AINCOREStorage>,
+        module: &ModuleId,
+        function: &move_core_types::identifier::IdentStr,
+        ty_args: &[move_core_types::language_storage::TypeTag],
+        mut args: Vec<Vec<u8>>,
+        auth_signer: AccountAddress,
+    ) -> Result<Vec<Vec<u8>>> {
+        use move_vm_types::loaded_data::runtime_types::Type;
+
+        let instantiation = session
+            .load_function(module, function, ty_args)
+            .map_err(|e| anyhow::anyhow!("failed to load function signature: {:?}", e))?;
+
+        let mut signer_count = 0usize;
+        for ty in &instantiation.parameters {
+            let is_signer = match ty {
+                Type::Signer => true,
+                Type::Reference(inner) | Type::MutableReference(inner) => {
+                    matches!(**inner, Type::Signer)
+                }
+                _ => false,
+            };
+            if is_signer {
+                signer_count += 1;
+            } else {
+                break;
+            }
+        }
+
+        if args.len() < signer_count {
+            anyhow::bail!(
+                "argument count {} is fewer than the {} required signer slots for {}::{}",
+                args.len(),
+                signer_count,
+                module,
+                function
+            );
+        }
+
+        let signer_bytes = bcs::to_bytes(&auth_signer)
+            .map_err(|e| anyhow::anyhow!("failed to serialize authenticated signer: {}", e))?;
+        for slot in args.iter_mut().take(signer_count) {
+            *slot = signer_bytes.clone();
+        }
+
+        Ok(args)
     }
 
     fn changeset_to_kv(

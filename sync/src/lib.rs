@@ -452,13 +452,9 @@ impl ChainSync {
                                     );
                                 }
 
-                                if send_encrypted_msg(
-                                    &mut stream,
-                                    &shared_key,
-                                    &"GET_FINALITY".to_string(),
-                                )
-                                .await
-                                .is_ok()
+                                if send_encrypted_msg(&mut stream, &shared_key, "GET_FINALITY")
+                                    .await
+                                    .is_ok()
                                 {
                                     if let Ok(finality_resp) =
                                         read_encrypted_msg(&mut stream, &shared_key).await

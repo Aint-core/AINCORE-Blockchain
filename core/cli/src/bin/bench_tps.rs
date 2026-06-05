@@ -85,11 +85,13 @@ fn main() {
         let payload = transfer_payload(&sender_addr, &sender_addr, 1);
         let sequence_number: u64 = 0;
 
-        // Sign with full message format (chain_id:sender:payload:seq_num)
+        // Sign with full message format
+        // F4: chain_id:sender:payload:seq:gas_limit:gas_price:input_objects
+        // gas_limit=10000, gas_price=1, input_objects=[] (must match tx below).
         let chain_id = "AINCORE-MAINNET-1";
         let message = format!(
-            "{}:{}:{}:{}",
-            chain_id, sender_addr, payload, sequence_number
+            "{}:{}:{}:{}:{}:{}:{}",
+            chain_id, sender_addr, payload, sequence_number, 10000u64, 1u128, ""
         );
         let signature = signing_key.sign(message.as_bytes());
 

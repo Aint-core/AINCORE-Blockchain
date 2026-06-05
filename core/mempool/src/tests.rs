@@ -16,8 +16,12 @@ fn make_test_tx(index: usize) -> String {
     let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
     let sequence_number = index as u64;
 
-    // Sign: "chain_id:sender:payload:sequence_number"
-    let message = format!("{}:{}:{}:{}", chain_id, sender, payload, sequence_number);
+    // Sign canonical form (F4: + gas_limit:gas_price:input_objects).
+    // This helper emits gas_limit=1000, gas_price=1, input_objects=[].
+    let message = format!(
+        "{}:{}:{}:{}:{}:{}:{}",
+        chain_id, sender, payload, sequence_number, 1000u64, 1u128, ""
+    );
     let signature = signing_key.sign(message.as_bytes());
     let sig_hex = hex::encode(signature.to_bytes());
 
@@ -55,7 +59,11 @@ fn make_test_tx_with_payload_and_gas(
     let chain_id =
         std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
     let sequence_number = index as u64;
-    let message = format!("{}:{}:{}:{}", chain_id, sender, payload, sequence_number);
+    // F4: bind gas_limit/gas_price/input_objects (input_objects=[] here).
+    let message = format!(
+        "{}:{}:{}:{}:{}:{}:{}",
+        chain_id, sender, payload, sequence_number, gas_limit, gas_price, ""
+    );
     let signature = signing_key.sign(message.as_bytes());
 
     serde_json::json!({
@@ -373,7 +381,8 @@ mod pqc_phase21 {
         seq: u64,
     ) -> String {
         use pqcrypto_traits::sign::DetachedSignature;
-        let msg = format!("{}:{}:{}:{}", chain_id, sender, payload, seq);
+        // F4: build_pqc_tx emits gas_limit=1000, gas_price=1, input_objects=[].
+        let msg = format!("{}:{}:{}:{}:{}:{}:{}", chain_id, sender, payload, seq, 1000u64, 1u128, "");
         let sig = pqcrypto_dilithium::dilithium5::detached_sign(msg.as_bytes(), sk);
         hex::encode(sig.as_bytes())
     }
@@ -510,7 +519,11 @@ fn test_zkp_garbage_hex_rejected_with_specific_diagnostic() {
         bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![7u8]])).unwrap(),
     );
     let sequence_number = 0u64;
-    let message = format!("{}:{}:{}:{}", chain_id, sender, payload, sequence_number);
+    // F4: tx below uses gas_limit=1000, gas_price=1, input_objects=[].
+    let message = format!(
+        "{}:{}:{}:{}:{}:{}:{}",
+        chain_id, sender, payload, sequence_number, 1000u64, 1u128, ""
+    );
     let signature = signing_key.sign(message.as_bytes());
     let sig_hex = hex::encode(signature.to_bytes());
 
@@ -571,7 +584,11 @@ fn test_zkp_replayed_proof_with_wrong_binding_rejected() {
         bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![7u8]])).unwrap(),
     );
     let sequence_number = 0u64;
-    let canonical = format!("{}:{}:{}:{}", chain_id, sender, payload, sequence_number);
+    // F4: tx below uses gas_limit=1000, gas_price=1, input_objects=[].
+    let canonical = format!(
+        "{}:{}:{}:{}:{}:{}:{}",
+        chain_id, sender, payload, sequence_number, 1000u64, 1u128, ""
+    );
     let signature = signing_key.sign(canonical.as_bytes());
     let sig_hex = hex::encode(signature.to_bytes());
 
@@ -634,7 +651,11 @@ fn pwn007_proper_replay_with_reordered_keys_rejected() {
         .unwrap(),
     );
     let seq = 42u64;
-    let canonical_msg = format!("{}:{}:{}:{}", chain_id, sender, payload, seq);
+    // F4: both tx_a and tx_b use gas_limit=1000, gas_price=1, input_objects=[].
+    let canonical_msg = format!(
+        "{}:{}:{}:{}:{}:{}:{}",
+        chain_id, sender, payload, seq, 1000u64, 1u128, ""
+    );
     let sig_hex = hex::encode(sk.sign(canonical_msg.as_bytes()).to_bytes());
 
     // Form A: keys in one order.
