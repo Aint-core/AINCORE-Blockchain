@@ -725,6 +725,9 @@ pub fn initialize_genesis(
     struct DeviceInfo {
         device_pubkey: Vec<u8>,
         owner_addr: move_core_types::account_address::AccountAddress,
+        // H3: must mirror 0x1::universal_mining::DeviceInfo BCS field order
+        // (verified before device_type).
+        verified: bool,
         device_type: u8,
     }
     #[derive(serde::Serialize)]

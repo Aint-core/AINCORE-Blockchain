@@ -1452,7 +1452,7 @@ impl Executor {
                 module_id,
                 "slash_validator_bps",
                 vec![],
-                vec![arg_sys, arg_val, arg_bps],
+                vec![arg_sys.clone(), arg_val.clone(), arg_bps.clone()],
                 500_000, // Gas budget for slash operation
                 // auth_signer: slash_validator_bps asserts signer==@0x1. With FIX #1
                 // binding the signer slot to auth_signer, this MUST be system_address()
@@ -1471,6 +1471,50 @@ impl Executor {
                         "   ⚡ Move VM slash executed: {}% of bonded stake for {}",
                         slash_pct, validator_addr
                     );
+
+                    // === FIX H1: ALSO SLASH DELEGATED STAKE ===
+                    // staking::slash_validator_bps only burns the validator's
+                    // self-stake. Delegated funds live in
+                    // delegation::ValidatorPool.escrowed_coins, which Move's
+                    // acyclic-module rule forbids staking from touching. Invoke
+                    // delegation::slash_pool with the same @0x1 system signer so
+                    // delegators share the penalty by the same bps. No-op if the
+                    // validator never enabled delegation.
+                    let deleg_module_id = ModuleId::new(
+                        AccountAddress::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+                        Identifier::new("delegation").expect("delegation identifier is valid"),
+                    );
+                    match self.vm.execute_public_entry_function(
+                        vec![],
+                        deleg_module_id,
+                        "slash_pool",
+                        vec![],
+                        vec![arg_sys.clone(), arg_val.clone(), arg_bps.clone()],
+                        500_000,
+                        // slash_pool asserts signer==@0x1; FIX #1 binds the
+                        // signer slot to this auth_signer.
+                        system_address(),
+                    ) {
+                        Ok((_g, deleg_changes, _)) => {
+                            for (k, v) in deleg_changes {
+                                let _ = match v {
+                                    Some(val) => self.db.put(&k, &val),
+                                    None => self.db.delete(&k),
+                                };
+                            }
+                            self.sync_supply_trackers_from_validator_set();
+                            println!(
+                                "   ⚡ Move VM delegation slash executed: {}% of delegated stake for {}",
+                                slash_pct, validator_addr
+                            );
+                        }
+                        Err(e) => {
+                            println!(
+                                "   ⚠️  Move VM delegation slash failed ({}); self-stake slash already applied",
+                                e
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     println!(
@@ -1538,7 +1582,21 @@ impl Executor {
 
     fn get_tx_dependencies(&self, tx: &Transaction) -> Vec<String> {
         let mut deps = Vec::new();
-        deps.push(tx.sender.clone());
+        // H2 FIX: Canonicalize the sender into the SAME representation used for
+        // recipients (Move `AccountAddress` Display, i.e. fully zero-padded
+        // lowercase hex). `tx.sender` is the raw client-supplied string, which
+        // may differ in case / padding / `0x` prefix from the canonical form
+        // that `push_addr_arg` and every `resource_{addr}_...` state key uses.
+        // If we left it raw, a transfer FROM A and a transfer TO A could yield
+        // two DIFFERENT conflict tokens for the same account, so the scheduler
+        // would place both in the same parallel batch, both would read A's
+        // pre-batch balance, and the atomic last-write-wins commit on
+        // `resource_{A}_CoinStore` would silently corrupt the balance and make
+        // the state root non-deterministic (consensus-split risk).
+        let sender_token = parse_move_address(&tx.sender)
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| tx.sender.clone());
+        deps.push(sender_token.clone());
         for obj in &tx.input_objects {
             deps.push(obj.clone());
         }
@@ -1576,7 +1634,7 @@ impl Executor {
                     "enable_delegation" => {
                         deps.push(format!(
                             "resource_{}_{}",
-                            tx.sender, "0x1::delegation::ValidatorPool"
+                            sender_token, "0x1::delegation::ValidatorPool"
                         ));
                         deps.push(format!(
                             "resource_{}_{}",
@@ -1608,7 +1666,7 @@ impl Executor {
                 ));
                 deps.push(format!(
                     "resource_{}_{}",
-                    tx.sender, "0x1::governance::VoteEscrow"
+                    sender_token, "0x1::governance::VoteEscrow"
                 ));
             } else if *module_addr == system_address()
                 && module_name == "token_factory"
@@ -1617,7 +1675,7 @@ impl Executor {
                 push_addr_arg(&mut deps, &call.args, 2);
                 deps.push(format!(
                     "resource_{}_{}",
-                    tx.sender, "0x1::token_factory::TokenWallet"
+                    sender_token, "0x1::token_factory::TokenWallet"
                 ));
                 if let Some(bytes) = call.args.get(2) {
                     if let Ok(addr) =
@@ -1637,7 +1695,7 @@ impl Executor {
                 ));
                 deps.push(format!(
                     "resource_{}_{}",
-                    tx.sender, "0x1::token_factory::TokenWallet"
+                    sender_token, "0x1::token_factory::TokenWallet"
                 ));
             } else if *module_addr == system_address() && module_name == "dex" {
                 deps.push(dex_registry_key());
@@ -2230,6 +2288,81 @@ mod tests {
         current_epoch: u64,
     }
 
+    // FIX H1: mirror 0x1::delegation::Delegation / ValidatorPool BCS layout so
+    // tests can seed a delegation pool with escrow and read it back after a slash.
+    #[derive(Serialize, Deserialize, Clone)]
+    struct TestDelegation {
+        delegator: move_core_types::account_address::AccountAddress,
+        amount: u128,
+        reward_debt: u128,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct TestUnbondingDelegation {
+        delegator: move_core_types::account_address::AccountAddress,
+        amount: u128,
+        unlock_time: u64,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct TestValidatorPool {
+        validator_addr: move_core_types::account_address::AccountAddress,
+        commission_rate: u64,
+        pending_commission: u64,
+        commission_change_time: u64,
+        total_delegated: u128,
+        delegations: Vec<TestDelegation>,
+        unbonding_queue: Vec<TestUnbondingDelegation>,
+        accumulated_rewards_per_share: u128,
+        pending_rewards: u128,
+        escrowed_coins: TestCoin,
+    }
+
+    fn delegation_pool_key(validator: &str) -> String {
+        format!("resource_{}_{}", validator, "0x1::delegation::ValidatorPool")
+    }
+
+    fn set_delegation_pool(db: &StateDB, validator: &str, delegators: &[(&str, u128)]) {
+        let validator_addr = parse_move_address(validator).expect("validator move address");
+        let mut total: u128 = 0;
+        let delegations: Vec<TestDelegation> = delegators
+            .iter()
+            .map(|(addr, amt)| {
+                total += *amt;
+                TestDelegation {
+                    delegator: parse_move_address(addr).expect("delegator move address"),
+                    amount: *amt,
+                    reward_debt: 0,
+                }
+            })
+            .collect();
+        let pool = TestValidatorPool {
+            validator_addr,
+            commission_rate: 0,
+            pending_commission: 0,
+            commission_change_time: 0,
+            total_delegated: total,
+            delegations,
+            unbonding_queue: vec![],
+            accumulated_rewards_per_share: 0,
+            pending_rewards: 0,
+            // Escrow invariant: escrowed_coins.value == total_delegated.
+            escrowed_coins: TestCoin { value: total },
+        };
+        let bytes = bcs::to_bytes(&pool).expect("validator pool BCS");
+        db.put(&delegation_pool_key(validator), &hex::encode(bytes))
+            .expect("validator pool stored");
+    }
+
+    fn delegation_pool(db: &StateDB, validator: &str) -> TestValidatorPool {
+        let value = db
+            .get(&delegation_pool_key(validator))
+            .expect("validator pool read")
+            .expect("validator pool exists");
+        let bytes = hex::decode(value).expect("validator pool hex");
+        bcs::from_bytes::<TestValidatorPool>(&bytes).expect("validator pool BCS")
+    }
+
     #[derive(Serialize, Deserialize)]
     struct TestProposal {
         id: u64,
@@ -2699,6 +2832,103 @@ mod tests {
         let sender_obj = db.get_object(&sender).expect("sender object");
         let sender_data: aa::AccountData = serde_json::from_slice(&sender_obj.data).unwrap();
         assert_eq!(sender_data.sequence_number, 1);
+    }
+
+    /// Build a hex-encoded BCS `coin::transfer` payload from `from` to `to`.
+    fn coin_transfer_payload(from: &str, to: &str, amount: u128) -> String {
+        let call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                system_address(),
+                move_core_types::identifier::Identifier::new("coin").unwrap(),
+            ),
+            function: "transfer".to_string(),
+            ty_args: vec![aincore_coin_type()],
+            args: vec![
+                bcs::to_bytes(&parse_move_address(from).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_address(to).unwrap()).unwrap(),
+                bcs::to_bytes(&amount).unwrap(),
+            ],
+        };
+        let payload = vm_move::TransactionPayload::EntryFunction(call);
+        hex::encode(bcs::to_bytes(&payload).unwrap())
+    }
+
+    fn dep_tx(sender: &str, payload: String) -> Transaction {
+        Transaction {
+            chain_id: "AINCORE-MAINNET-1".to_string(),
+            sender: sender.to_string(),
+            input_objects: vec![],
+            payload,
+            args: vec![],
+            gas_limit: 100_000,
+            gas_price: 1,
+            sequence_number: 0,
+            public_key: String::new(),
+            signature: String::new(),
+            paymaster: None,
+            paymaster_signature: None,
+            zkp_proof: None,
+        }
+    }
+
+    /// H2 REGRESSION. A transfer FROM account A and a transfer TO account A must
+    /// produce the SAME canonical conflict token for A, so the parallel
+    /// scheduler detects the read/write conflict and refuses to co-schedule
+    /// them into one batch. We deliberately give the "FROM A" transaction a
+    /// NON-canonical (uppercase) sender string to prove the fix normalizes it;
+    /// recipients are always emitted in canonical (lowercase, zero-padded)
+    /// Move-address form. Before the fix, `tx.sender` was pushed raw, so the two
+    /// roles produced different tokens, no conflict was detected, both txs read
+    /// A's pre-batch balance, and the atomic last-write-wins commit silently
+    /// corrupted A's CoinStore.
+    #[test]
+    fn test_h2_transfer_from_and_to_same_account_share_canonical_token() {
+        let db = temp_db("h2_canonical_token");
+        let executor = Executor::new(db.clone());
+
+        let account_a = "0000000000000000000000000000000a".to_string();
+        let account_b = "0000000000000000000000000000000b".to_string();
+        let other = "00000000000000000000000000000022".to_string();
+
+        // tx1: A -> other, with A supplied in NON-canonical (uppercase) form.
+        let a_uppercase = "0000000000000000000000000000000A".to_string();
+        let tx_from_a = dep_tx(&a_uppercase, coin_transfer_payload(&account_a, &other, 10));
+        // tx2: B -> A (A appears as the canonical recipient token).
+        let tx_to_a = dep_tx(&account_b, coin_transfer_payload(&account_b, &account_a, 10));
+
+        let deps_from_a = executor.get_tx_dependencies(&tx_from_a);
+        let deps_to_a = executor.get_tx_dependencies(&tx_to_a);
+
+        let canonical_a = parse_move_address(&account_a).unwrap().to_string();
+
+        // FROM-A must contribute the canonical A token, NOT the raw uppercase.
+        assert!(
+            deps_from_a.contains(&canonical_a),
+            "sender token not canonicalized: {:?}",
+            deps_from_a
+        );
+        assert!(
+            !deps_from_a.contains(&a_uppercase),
+            "raw uppercase sender token leaked into deps: {:?}",
+            deps_from_a
+        );
+        // TO-A must contribute the SAME canonical A token (recipient side).
+        assert!(
+            deps_to_a.contains(&canonical_a),
+            "recipient token missing canonical A: {:?}",
+            deps_to_a
+        );
+
+        // Scheduler-level assertion mirroring execute_block_parallel's lock
+        // check: after locking tx1's deps, tx2 MUST register a conflict so the
+        // batch builder flushes the current batch and isolates tx2.
+        let locked: std::collections::HashSet<String> = deps_from_a.iter().cloned().collect();
+        let conflict = deps_to_a.iter().any(|d| locked.contains(d));
+        assert!(
+            conflict,
+            "scheduler would NOT detect conflict between FROM-A and TO-A: from={:?} to={:?}",
+            deps_from_a, deps_to_a
+        );
     }
 
     /// SECURITY (FIX #1 — VM signer binding). An attacker crafts a
@@ -4065,6 +4295,342 @@ mod tests {
         assert_eq!(move_validators.unbonding_queue.len(), 1);
         assert_eq!(move_validators.unbonding_queue[0].stake, 950_000);
         assert_eq!(move_validators.total_supply, 950_000);
+    }
+
+    /// FIX H1: a downtime slash (500 bps = 5%) must shrink BOTH the validator's
+    /// self-stake AND the delegated stake. Previously delegation::ValidatorPool
+    /// (total_delegated + escrowed_coins) was untouched, letting delegators
+    /// recover 100% and collapsing PoS security. Assert total_delegated and
+    /// escrowed_coins each shrink by exactly slash_bps, and the escrow invariant
+    /// (escrowed_coins.value == total_delegated) is preserved.
+    #[test]
+    fn test_pending_downtime_slash_also_slashes_delegated_stake() {
+        let db = temp_db("slash_delegated");
+        load_stdlib(&db);
+        let validator_key = SigningKey::from_bytes(&[23u8; 32]);
+        let validator = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
+        db.put(
+            "sys:validators",
+            &serde_json::to_string(&vec![(validator.clone(), 100u64)]).unwrap(),
+        )
+        .unwrap();
+        // Self-stake = 1,000,000. Delegated = 800,000 from two delegators.
+        set_validator_set(&db, &validator, 1_000_000, 1_800_000);
+        let delegator_a = "44444444444444444444444444444444";
+        let delegator_b = "55555555555555555555555555555555";
+        set_delegation_pool(
+            &db,
+            &validator,
+            &[(delegator_a, 500_000u128), (delegator_b, 300_000u128)],
+        );
+
+        db.put(
+            &format!("sys:pending_slash:{}", validator),
+            &serde_json::json!({"reason":"downtime","round":79}).to_string(),
+        )
+        .unwrap();
+
+        let executor = Executor::new(db.clone());
+        executor.execute_pending_slashes();
+
+        // Self-stake slashed 5% => 50,000 burned, 950,000 unbonded.
+        let move_validators = validator_set(&db);
+        assert!(move_validators.validators.is_empty());
+        assert_eq!(move_validators.unbonding_queue.len(), 1);
+        assert_eq!(move_validators.unbonding_queue[0].stake, 950_000);
+
+        // Delegated stake slashed 5% proportionally:
+        //   A: 500_000 -> 475_000 (cut 25_000)
+        //   B: 300_000 -> 285_000 (cut 15_000)
+        // total_delegated: 800_000 -> 760_000; escrow burns 40_000.
+        let pool = delegation_pool(&db, &validator);
+        assert_eq!(pool.total_delegated, 760_000, "delegated total must shrink 5%");
+        assert_eq!(
+            pool.escrowed_coins.value, 760_000,
+            "escrow must shrink 5% and stay == total_delegated"
+        );
+        let a = pool
+            .delegations
+            .iter()
+            .find(|d| d.delegator == parse_move_address(delegator_a).unwrap())
+            .expect("delegator A present");
+        let b = pool
+            .delegations
+            .iter()
+            .find(|d| d.delegator == parse_move_address(delegator_b).unwrap())
+            .expect("delegator B present");
+        assert_eq!(a.amount, 475_000);
+        assert_eq!(b.amount, 285_000);
+
+        // Supply must reflect the 50_000 self-stake burn + 40_000 escrow burn.
+        // Starting total_supply 1_800_000 - 50_000 (self) - 40_000 (delegated)
+        // = 1_710_000.
+        assert_eq!(move_validators.total_supply, 1_710_000);
+    }
+
+    /// FIX H1-followup: stake already in the unbonding queue MUST also be slashed
+    /// (standard PoS keeps it slashable for the unbonding window). Otherwise an
+    /// attacker undelegates just before double-signing and recovers 100%. This
+    /// test seeds a pool with one BONDED delegation and one UNBONDING entry, then
+    /// asserts BOTH are cut, that `total_delegated` shrinks by ONLY the bonded
+    /// cut, and that escrow burns the bonded + unbonding cuts.
+    #[test]
+    fn test_h1_slash_also_slashes_unbonding_queue() {
+        let db = temp_db("slash_unbonding");
+        load_stdlib(&db);
+        let validator_key = SigningKey::from_bytes(&[31u8; 32]);
+        let validator = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
+        db.put(
+            "sys:validators",
+            &serde_json::to_string(&vec![(validator.clone(), 100u64)]).unwrap(),
+        )
+        .unwrap();
+        // Self-stake 1,000,000. Supply = self + active(400k) + unbonding(200k).
+        set_validator_set(&db, &validator, 1_000_000, 1_600_000);
+
+        let active = "66666666666666666666666666666666";
+        let unbonding = "77777777777777777777777777777777";
+        // total_delegated counts ONLY the bonded (active) delegation (400k).
+        // escrowed_coins backs active + unbonding (600k).
+        let pool = TestValidatorPool {
+            validator_addr: parse_move_address(&validator).unwrap(),
+            commission_rate: 0,
+            pending_commission: 0,
+            commission_change_time: 0,
+            total_delegated: 400_000,
+            delegations: vec![TestDelegation {
+                delegator: parse_move_address(active).unwrap(),
+                amount: 400_000,
+                reward_debt: 0,
+            }],
+            unbonding_queue: vec![TestUnbondingDelegation {
+                delegator: parse_move_address(unbonding).unwrap(),
+                amount: 200_000,
+                unlock_time: 999_999_999,
+            }],
+            accumulated_rewards_per_share: 0,
+            pending_rewards: 0,
+            escrowed_coins: TestCoin { value: 600_000 },
+        };
+        db.put(
+            &delegation_pool_key(&validator),
+            &hex::encode(bcs::to_bytes(&pool).unwrap()),
+        )
+        .unwrap();
+
+        db.put(
+            &format!("sys:pending_slash:{}", validator),
+            &serde_json::json!({"reason":"downtime","round":79}).to_string(),
+        )
+        .unwrap();
+
+        Executor::new(db.clone()).execute_pending_slashes();
+
+        let pool = delegation_pool(&db, &validator);
+        // Active 400k -> 380k (cut 20k); unbonding 200k -> 190k (cut 10k).
+        assert_eq!(pool.delegations[0].amount, 380_000, "active delegation slashed 5%");
+        assert_eq!(
+            pool.unbonding_queue[0].amount, 190_000,
+            "unbonding entry MUST be slashed 5% (the bypass this fix closes)"
+        );
+        // total_delegated shrinks by ONLY the bonded cut (20k), not the unbonding cut.
+        assert_eq!(
+            pool.total_delegated, 380_000,
+            "total_delegated must drop by the bonded cut only"
+        );
+        // Escrow burns bonded(20k) + unbonding(10k) = 30k.
+        assert_eq!(
+            pool.escrowed_coins.value, 570_000,
+            "escrow must burn both the bonded and unbonding cuts"
+        );
+        // Supply: 1_600_000 - 50_000 (self) - 30_000 (delegated+unbonding) = 1_520_000.
+        assert_eq!(validator_set(&db).total_supply, 1_520_000);
+    }
+
+    /// FIX H4: governance changing epoch_duration must NOT retroactively rescale
+    /// already-elapsed virtual time. We seed an Epoch as if 100 epochs elapsed at
+    /// the small duration and governance then jacked the duration to 1e9, advance
+    /// ONE epoch through the VM, and assert the monotonic clock moved forward by
+    /// exactly ONE new duration (1000 + 1e9) -- NOT by epoch_number * duration.
+    /// The pre-fix now_seconds() would have read 1000 + 100*1e9, instantly
+    /// maturing every unbonding lock; this test pins the fix.
+    #[test]
+    fn test_h4_duration_change_does_not_rescale_elapsed_time() {
+        let db = temp_db("h4_epoch_clock");
+        load_stdlib(&db);
+        let validator_key = SigningKey::from_bytes(&[41u8; 32]);
+        let validator = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
+        // distribute_rewards / cleanup_old_unbonding inside advance_epoch need a
+        // ValidatorSet to exist.
+        set_validator_set(&db, &validator, 1_000_000, 1_000_000);
+
+        // Seed Epoch @0x1 in its post-duration-change state:
+        //   epoch_number = 100, epoch_start_time = 1000 (accumulated), duration = 1e9.
+        let epoch_key = format!(
+            "resource_{}_0x1::epoch::Epoch",
+            "00000000000000000000000000000001"
+        );
+        let seeded = bcs::to_bytes(&(100u64, 1000u64, 1_000_000_000u64)).unwrap();
+        db.put(&epoch_key, &hex::encode(seeded)).unwrap();
+
+        // Advance one epoch through the real VM path (system signer).
+        let executor = Executor::new(db.clone());
+        let module = move_core_types::language_storage::ModuleId::new(
+            system_address(),
+            move_core_types::identifier::Identifier::new("epoch").unwrap(),
+        );
+        let (_g, updates, status) = executor
+            .vm
+            .execute_public_entry_function(
+                vec![],
+                module,
+                "advance_epoch",
+                vec![],
+                vec![bcs::to_bytes(&system_address()).unwrap()],
+                1_000_000,
+                system_address(),
+            )
+            .expect("advance_epoch executes");
+        assert!(status.success, "advance_epoch must not abort: {:?}", status);
+        apply_updates(&db, updates);
+
+        // Read back the Epoch resource.
+        let raw = db.get(&epoch_key).expect("epoch read").expect("epoch exists");
+        let bytes = hex::decode(raw).unwrap();
+        let (num, start, dur): (u64, u64, u64) = bcs::from_bytes(&bytes).unwrap();
+        assert_eq!(num, 101, "epoch_number increments by one");
+        assert_eq!(dur, 1_000_000_000, "duration unchanged by advance");
+        // The clock advanced by exactly ONE current duration, not 100 * duration.
+        assert_eq!(
+            start, 1_000_001_000,
+            "monotonic clock must add one duration (1000 + 1e9), NOT rescale elapsed epochs"
+        );
+    }
+
+    /// FIX H3: device registration front-run lockout + reward theft.
+    /// (1) Owner A registers pubkey P; attacker B registers the SAME pubkey P
+    ///     under B -- this must NOT abort (scoped duplicate guard closes the
+    ///     lockout). (2) A feeder verifies only (A, P). (3) Only the verified
+    ///     binding is eligible for rewards (B stays unverified, earns nothing).
+    #[test]
+    fn test_h3_no_lockout_and_only_verified_owner_is_bound() {
+        use serde::{Deserialize, Serialize};
+        #[derive(Serialize, Deserialize)]
+        struct TDevice {
+            device_pubkey: Vec<u8>,
+            owner_addr: move_core_types::account_address::AccountAddress,
+            verified: bool,
+            device_type: u8,
+        }
+        #[derive(Serialize, Deserialize)]
+        struct TRegistry {
+            devices: Vec<TDevice>,
+        }
+        #[derive(Serialize)]
+        struct TOracle {
+            feeders: Vec<move_core_types::account_address::AccountAddress>,
+            threshold: u64,
+            active_proofs: Vec<u8>, // empty -> BCS [0], same as empty Vec<PendingProof>
+        }
+
+        let db = temp_db("h3_device");
+        load_stdlib(&db);
+
+        let um = |s: &str| {
+            format!(
+                "resource_00000000000000000000000000000001_0x1::universal_mining::{}",
+                s
+            )
+        };
+        // Seed empty DeviceRegistry + OracleConfig with @0x1 as the trusted feeder.
+        db.put(&um("DeviceRegistry"), &hex::encode(bcs::to_bytes(&TRegistry { devices: vec![] }).unwrap())).unwrap();
+        db.put(
+            &um("OracleConfig"),
+            &hex::encode(
+                bcs::to_bytes(&TOracle {
+                    feeders: vec![system_address()],
+                    threshold: 1,
+                    active_proofs: vec![],
+                })
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let owner_a = "12121212121212121212121212121212";
+        let owner_b = "34343434343434343434343434343434";
+        let pubkey: Vec<u8> = vec![9u8; 32];
+        let module = move_core_types::language_storage::ModuleId::new(
+            system_address(),
+            move_core_types::identifier::Identifier::new("universal_mining").unwrap(),
+        );
+        let executor = Executor::new(db.clone());
+
+        let register = |auth: &str| {
+            let (_g, updates, status) = executor
+                .vm
+                .execute_public_entry_function(
+                    vec![],
+                    module.clone(),
+                    "register_device",
+                    vec![],
+                    vec![
+                        bcs::to_bytes(&parse_move_address(auth).unwrap()).unwrap(), // signer slot (rebound)
+                        bcs::to_bytes(&pubkey).unwrap(),
+                        bcs::to_bytes(&1u8).unwrap(),
+                    ],
+                    1_000_000,
+                    parse_move_address(auth).unwrap(),
+                )
+                .expect("register_device executes");
+            assert!(status.success, "register_device must not abort: {:?}", status);
+            apply_updates(&db, updates);
+        };
+
+        // A registers P, then B registers the SAME P -- the second MUST succeed.
+        register(owner_a);
+        register(owner_b);
+
+        let reg: TRegistry = bcs::from_bytes(
+            &hex::decode(db.get(&um("DeviceRegistry")).unwrap().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reg.devices.len(), 2, "no lockout: both owners registered the same pubkey");
+        assert!(reg.devices.iter().all(|d| !d.verified), "fresh registrations are unverified");
+
+        // Feeder @0x1 verifies ONLY (A, P).
+        let (_g, updates, status) = executor
+            .vm
+            .execute_public_entry_function(
+                vec![],
+                module.clone(),
+                "add_verified_device",
+                vec![],
+                vec![
+                    bcs::to_bytes(&system_address()).unwrap(), // feeder signer slot (rebound to @0x1)
+                    bcs::to_bytes(&parse_move_address(owner_a).unwrap()).unwrap(),
+                    bcs::to_bytes(&pubkey).unwrap(),
+                ],
+                1_000_000,
+                system_address(),
+            )
+            .expect("add_verified_device executes");
+        assert!(status.success, "feeder verify must succeed: {:?}", status);
+        apply_updates(&db, updates);
+
+        let reg: TRegistry = bcs::from_bytes(
+            &hex::decode(db.get(&um("DeviceRegistry")).unwrap().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let a_addr = parse_move_address(owner_a).unwrap();
+        let b_addr = parse_move_address(owner_b).unwrap();
+        let a = reg.devices.iter().find(|d| d.owner_addr == a_addr).unwrap();
+        let b = reg.devices.iter().find(|d| d.owner_addr == b_addr).unwrap();
+        assert!(a.verified, "owner A's binding must be feeder-verified");
+        assert!(
+            !b.verified,
+            "attacker B's front-run binding must remain unverified (earns no reward)"
+        );
     }
 
     // ========================================================================

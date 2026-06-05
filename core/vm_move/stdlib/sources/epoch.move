@@ -2,10 +2,17 @@ module 0x1::epoch {
     use std::signer;
     use 0x1::staking;
 
+    /// H4 FIX: `epoch_start_time` is a MONOTONIC ACCUMULATOR of elapsed virtual
+    /// seconds, advanced by the *current* `epoch_duration` on each advance_epoch.
+    /// `epoch_duration` stays governance-mutable but only affects FUTURE
+    /// increments, so changing it can never retroactively rescale time that has
+    /// already accumulated. This keeps the absolute unlock_time /
+    /// commission_change_time values stored in delegation.move valid across a
+    /// duration change.
     struct Epoch has key {
         epoch_number: u64,
-        epoch_start_time: u64,
-        epoch_duration: u64,
+        epoch_start_time: u64, // accumulator: total elapsed virtual seconds
+        epoch_duration: u64,   // seconds added per epoch advance (future-only)
     }
 
     public fun initialize(account: &signer) {
@@ -19,7 +26,11 @@ module 0x1::epoch {
     public entry fun advance_epoch(account: &signer) acquires Epoch {
         let epoch = borrow_global_mut<Epoch>(@0x1);
         epoch.epoch_number = epoch.epoch_number + 1;
-        
+        // H4 FIX: advance the monotonic clock by the CURRENT duration. Because we
+        // add (not multiply) and only ever move forward, a later duration change
+        // cannot rescale seconds already accumulated here.
+        epoch.epoch_start_time = epoch.epoch_start_time + epoch.epoch_duration;
+
         // Clean up old unbonding requests
         staking::cleanup_old_unbonding(account);
         
@@ -36,9 +47,12 @@ module 0x1::epoch {
         epoch.epoch_duration = new_duration;
     }
 
-    /// Get current timestamp (epoch_start_time + epoch_number * duration as proxy)
+    /// Get current virtual timestamp. H4 FIX: returns the monotonic accumulator
+    /// directly. It is NO LONGER a function of the live `epoch_duration`, so a
+    /// governance UpdateEconomicParams that changes the duration cannot move this
+    /// clock past (or behind) any previously stored absolute deadline.
     public fun now_seconds(): u64 acquires Epoch {
         let epoch = borrow_global<Epoch>(@0x1);
-        epoch.epoch_start_time + (epoch.epoch_number * epoch.epoch_duration)
+        epoch.epoch_start_time
     }
 }

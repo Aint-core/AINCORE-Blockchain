@@ -17,7 +17,10 @@ module 0x1::universal_mining {
     struct DeviceInfo has store, drop {
         device_pubkey: vector<u8>,
         owner_addr: address,
-        device_type: u8, 
+        // SECURITY (H3): only a feeder-verified (owner_addr, device_pubkey)
+        // binding may receive rewards. Defaults to false at registration.
+        verified: bool,
+        device_type: u8,
         // 0=Unknown
         // 1=Wearable (Watch/Band)
         // 2=Stationary (Air Monitor)
@@ -45,7 +48,19 @@ module 0x1::universal_mining {
         });
     }
 
-    /// Register a new device
+    /// Register a new device.
+    ///
+    /// SECURITY (H3): `owner_addr` is ALWAYS the authenticated transaction signer
+    /// (the VM rebinds the leading `&signer` slot to the real sender via FIX #1
+    /// bind_signer_args). There is NO ed25519 native available to Move here, so we
+    /// cannot prove on-chain that the registrant controls device_pubkey's private
+    /// key. To stop the front-running lock-out + reward-theft we therefore:
+    ///   1. Scope the duplicate guard to (owner_addr, device_pubkey) so a
+    ///      front-runner registering someone else's pubkey can no longer lock the
+    ///      real owner out of registering it under their own address.
+    ///   2. Trust the FEEDER SET to bind a physical device to an owner: only a
+    ///      feeder-verified binding earns rewards (see add_verified_device +
+    ///      distribute_reward).
     public entry fun register_device(
         account: &signer,
         device_pubkey: vector<u8>,
@@ -54,20 +69,68 @@ module 0x1::universal_mining {
         let owner_addr = signer::address_of(account);
         let registry = borrow_global_mut<DeviceRegistry>(@0x1);
 
-        // Check if device already registered (simple linear scan for prototype)
+        // Duplicate guard scoped to (owner_addr, device_pubkey): an attacker
+        // registering a victim's pubkey under the attacker address can NOT prevent
+        // the victim from registering the same pubkey under the victim address.
         let len = vector::length(&registry.devices);
         let i = 0;
         while (i < len) {
             let dev = vector::borrow(&registry.devices, i);
-            assert!(dev.device_pubkey != device_pubkey, error::already_exists(EDEVICE_ALREADY_REGISTERED));
+            assert!(
+                !(dev.device_pubkey == device_pubkey && dev.owner_addr == owner_addr),
+                error::already_exists(EDEVICE_ALREADY_REGISTERED)
+            );
             i = i + 1;
         };
 
         vector::push_back(&mut registry.devices, DeviceInfo {
             device_pubkey,
             owner_addr,
+            verified: false,
             device_type,
         });
+    }
+
+    /// FEEDER-GATED key-ownership binding.
+    ///
+    /// Because Move has no ed25519 native here, the feeder set (the same trust
+    /// anchor that finalizes rewards in submit_vote) is the authority that
+    /// confirms which registered owner truly controls a device. A feeder verifies
+    /// the device's key-ownership proof OFF-CHAIN (device signs a challenge over
+    /// its claimed owner address with its ed25519 key; the feeder verifies it with
+    /// the real ed25519 verifier in Rust) and then marks exactly one
+    /// (owner_addr, device_pubkey) registration verified. Only verified devices
+    /// receive rewards.
+    public entry fun add_verified_device(
+        feeder: &signer,
+        owner_addr: address,
+        device_pubkey: vector<u8>
+    ) acquires OracleConfig, DeviceRegistry {
+        let feeder_addr = signer::address_of(feeder);
+        let config = borrow_global<OracleConfig>(@0x1);
+        assert!(
+            vector::contains(&config.feeders, &feeder_addr),
+            error::permission_denied(ENOT_AUTHORIZED)
+        );
+
+        let registry = borrow_global_mut<DeviceRegistry>(@0x1);
+        let len = vector::length(&registry.devices);
+        let i = 0;
+        while (i < len) {
+            let dev = vector::borrow_mut(&mut registry.devices, i);
+            if (dev.device_pubkey == device_pubkey) {
+                // Single verified owner per pubkey: a pubkey already verified for
+                // a different owner cannot be re-bound here.
+                assert!(
+                    !(dev.verified && dev.owner_addr != owner_addr),
+                    error::permission_denied(ENOT_AUTHORIZED)
+                );
+                if (dev.owner_addr == owner_addr) {
+                    dev.verified = true;
+                };
+            };
+            i = i + 1;
+        };
     }
 
     /// Decentralization: Voting Logic
@@ -188,7 +251,10 @@ module 0x1::universal_mining {
 
     /// Internal function to distribute reward (Extracted from old submit_mining_proof)
     fun distribute_reward(device_pubkey: vector<u8>, bqi_score: u64) acquires DeviceRegistry {
-        // Find device owner
+        // Find device owner. SECURITY (H3): only a feeder-VERIFIED binding may be
+        // paid. An unverified (e.g. front-run) registration is skipped, so a
+        // pubkey squatted by an attacker who never passed feeder key-ownership
+        // verification receives nothing.
         let registry = borrow_global_mut<DeviceRegistry>(@0x1);
         let len = vector::length(&registry.devices);
         let i = 0;
@@ -197,7 +263,7 @@ module 0x1::universal_mining {
 
         while (i < len) {
             let dev = vector::borrow(&registry.devices, i);
-            if (dev.device_pubkey == device_pubkey) {
+            if (dev.device_pubkey == device_pubkey && dev.verified) {
                 owner = dev.owner_addr;
                 found = true;
                 break

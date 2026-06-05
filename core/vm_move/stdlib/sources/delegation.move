@@ -18,6 +18,11 @@ module 0x1::delegation {
     const ECOMMISSION_CHANGE_TOO_SOON: u64 = 6;
     /// FIX #2: caller is not the system address (@0x1)
     const EUNAUTHORIZED: u64 = 7;
+    /// FIX H1: slash basis points out of range (> 10000)
+    const EINVALID_SLASH_BPS: u64 = 8;
+
+    /// Max basis points (100%)
+    const MAX_BPS: u64 = 10000;
 
     /// Minimum delegation amount: 1 AIN
     const MIN_DELEGATION: u128 = 1000000000000000000;
@@ -374,6 +379,111 @@ module 0x1::delegation {
         // Update accumulated rewards per share (scaled by 1e18)
         let reward_per_share = (delegator_reward * 1000000000000000000) / pool.total_delegated;
         pool.accumulated_rewards_per_share = pool.accumulated_rewards_per_share + reward_per_share;
+    }
+
+    /// FIX H1: Slash the delegated stake of a misbehaving validator.
+    ///
+    /// Previously `staking::slash_validator_bps` only burned the validator's
+    /// self-stake; delegated funds held in `escrowed_coins` were untouched, so
+    /// delegators recovered 100% via `undelegate` -> `withdraw_unbonded`. That
+    /// let an attacker control a large stake while risking only the (tiny)
+    /// self-stake, collapsing PoS security. This function reduces every active
+    /// delegation AND every unbonding-queue entry by `slash_bps`, decrements
+    /// `total_delegated`, and permanently burns the matching amount from
+    /// `escrowed_coins` via `staking::burn_ain`. Note `escrowed_coins.value >=
+    /// total_delegated` (escrow also backs the unbonding queue), so the
+    /// extract is always covered.
+    ///
+    /// Direction note: `delegation` already depends on `staking` (AincoreCoin,
+    /// mint_reward, burn_ain), so Move forbids `staking` from calling back into
+    /// `delegation` (acyclic module deps). Therefore this is a system-gated
+    /// `entry` that the executor invokes directly with the genuine @0x1 signer,
+    /// immediately after `staking::slash_validator_bps`. SAFETY DEPENDS ON
+    /// FIX #1: the executor binds the real 0x1 signer for system-originated
+    /// calls and never lets a user forge a 0x1 signer.
+    public entry fun slash_pool(
+        sys: &signer,
+        validator_addr: address,
+        slash_bps: u64
+    ) acquires ValidatorPool {
+        assert!(signer::address_of(sys) == @0x1, error::permission_denied(EUNAUTHORIZED));
+        assert!(slash_bps <= MAX_BPS, error::invalid_argument(EINVALID_SLASH_BPS));
+
+        // Nothing to slash if the validator never enabled delegation.
+        if (!exists<ValidatorPool>(validator_addr)) {
+            return
+        };
+        if (slash_bps == 0) {
+            return
+        };
+
+        let pool = borrow_global_mut<ValidatorPool>(validator_addr);
+        if (pool.total_delegated == 0) {
+            return
+        };
+
+        // Two separate accumulators with DIFFERENT meanings:
+        //   active_slashed   = cut taken from BONDED delegations. `total_delegated`
+        //                      only counts bonded stake, so it shrinks by exactly
+        //                      this (NOT by the unbonding cut).
+        //   total_slashed    = active_slashed + unbonding cut. This is the amount
+        //                      burned from `escrowed_coins`, which backs BOTH the
+        //                      bonded delegations AND the unbonding queue.
+        // Per-entry flooring rounds each cut DOWN, so we never over-extract escrow.
+        let active_slashed = 0u128;
+        let len = vector::length(&pool.delegations);
+        let i = 0;
+        while (i < len) {
+            let d = vector::borrow_mut(&mut pool.delegations, i);
+            let cut = (d.amount * (slash_bps as u128)) / (MAX_BPS as u128);
+            if (cut > 0) {
+                d.amount = d.amount - cut;
+                // Keep reward accounting consistent with the reduced principal.
+                d.reward_debt = (d.amount * pool.accumulated_rewards_per_share) / 1000000000000000000;
+                active_slashed = active_slashed + cut;
+            };
+            i = i + 1;
+        };
+
+        // FIX H1-followup: also slash entries already in the unbonding queue.
+        // `undelegate` moves a delegation into `unbonding_queue` but leaves its
+        // coins in `escrowed_coins` until `withdraw_unbonded` (after 21 days).
+        // Standard PoS keeps unbonding stake slashable for the unbonding window,
+        // because the offense occurred while those coins were still at stake.
+        // Without this an attacker would simply undelegate just before
+        // double-signing and recover 100% -- the exact bypass this fix closes.
+        // Note: unbonding cuts do NOT reduce `total_delegated` (those amounts
+        // already left it on undelegate); they only add to the escrow burn.
+        let total_slashed = active_slashed;
+        let ulen = vector::length(&pool.unbonding_queue);
+        let j = 0;
+        while (j < ulen) {
+            let u = vector::borrow_mut(&mut pool.unbonding_queue, j);
+            let ucut = (u.amount * (slash_bps as u128)) / (MAX_BPS as u128);
+            if (ucut > 0) {
+                u.amount = u.amount - ucut;
+                total_slashed = total_slashed + ucut;
+            };
+            j = j + 1;
+        };
+
+        if (total_slashed == 0) {
+            return
+        };
+
+        // Defensive clamp: never extract more than the escrow holds.
+        let escrow_value = coin::value(&pool.escrowed_coins);
+        if (total_slashed > escrow_value) {
+            total_slashed = escrow_value;
+        };
+
+        // Shrink the pool's BONDED total by only the active (bonded) cut.
+        pool.total_delegated = pool.total_delegated - active_slashed;
+
+        // Extract the slashed coins from escrow and permanently burn them,
+        // decrementing the canonical AIN supply via staking::burn_ain.
+        let slashed_coins = coin::extract(&mut pool.escrowed_coins, total_slashed);
+        0x1::staking::burn_ain(slashed_coins);
     }
 
     /// Helper: Calculate pending reward for a delegation
