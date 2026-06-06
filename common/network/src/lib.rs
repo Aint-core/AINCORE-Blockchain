@@ -12,6 +12,8 @@ const MAX_CONN_PER_IP_MIN: usize = 60;
 /// pinning a file descriptor indefinitely (root cause of FD exhaustion).
 const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
+const FRAME_LENGTH_TIMEOUT_SECS: u64 = 10;
+const FRAME_BODY_TIMEOUT_SECS: u64 = 120;
 
 struct ConnectionGuard {
     counter: Arc<AtomicUsize>,
@@ -225,13 +227,19 @@ pub async fn start_server<F>(
                                                             peers
                                                                 .insert(peer_id.clone(), peer_port);
                                                         } else {
-                                                            eprintln!("⚠️ Peers lock poisoned, cannot register peer {}", peer_id);
+                                                            eprintln!(
+                                                                "⚠️ Peers lock poisoned, cannot register peer {}",
+                                                                peer_id
+                                                            );
                                                         }
                                                         let _ =
                                                             db_clone.save_peer(&peer_id, peer_port);
                                                         let _ = db_clone
                                                             .save_peer_ip(&peer_id, &remote_ip);
-                                                        println!("🤝 Authenticated Peer registered: {} ({}:{})", peer_id, remote_ip, peer_port);
+                                                        println!(
+                                                            "🤝 Authenticated Peer registered: {} ({}:{})",
+                                                            peer_id, remote_ip, peer_port
+                                                        );
                                                     }
                                                 } else {
                                                     eprintln!(
@@ -591,7 +599,7 @@ pub async fn read_encrypted_msg(
     let mut len_buf = [0u8; 4];
     // Add Timeout for Length Read
     match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(FRAME_LENGTH_TIMEOUT_SECS),
         socket.read_exact(&mut len_buf),
     )
     .await
@@ -602,7 +610,7 @@ pub async fn read_encrypted_msg(
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "Read Length Timeout",
-            ))
+            ));
         }
     }
     let msg_len = u32::from_be_bytes(len_buf) as usize;
@@ -616,7 +624,7 @@ pub async fn read_encrypted_msg(
 
     let mut enc_msg = vec![0u8; msg_len];
     match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(FRAME_BODY_TIMEOUT_SECS),
         socket.read_exact(&mut enc_msg),
     )
     .await
@@ -627,7 +635,7 @@ pub async fn read_encrypted_msg(
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "Read Body Timeout",
-            ))
+            ));
         }
     }
 

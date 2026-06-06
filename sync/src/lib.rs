@@ -381,7 +381,10 @@ impl ChainSync {
                                         let req_json = match serde_json::to_string(&sync_req) {
                                             Ok(j) => j,
                                             Err(e) => {
-                                                eprintln!("❌ [ChainSync] Failed to serialize sync request: {}", e);
+                                                eprintln!(
+                                                    "❌ [ChainSync] Failed to serialize sync request: {}",
+                                                    e
+                                                );
                                                 break;
                                             }
                                         };
@@ -395,17 +398,45 @@ impl ChainSync {
                                         }
 
                                         // 4. Receive Blocks Batch
-                                        if let Ok(data_resp) =
-                                            read_encrypted_msg(&mut stream, &shared_key).await
-                                        {
-                                            if let Some(json_data) =
-                                                data_resp.strip_prefix("SYNC_RESP:")
-                                            {
-                                                if let Ok(sync_resp) =
-                                                    serde_json::from_str::<SyncResponse>(json_data)
+                                        match read_encrypted_msg(&mut stream, &shared_key).await {
+                                            Ok(data_resp) => {
+                                                if let Some(json_data) =
+                                                    data_resp.strip_prefix("SYNC_RESP:")
                                                 {
-                                                    let finality = sync_resp.finality.clone();
-                                                    if sync_resp.blocks.is_empty() {
+                                                    if let Ok(sync_resp) =
+                                                        serde_json::from_str::<SyncResponse>(
+                                                            json_data,
+                                                        )
+                                                    {
+                                                        let finality = sync_resp.finality.clone();
+                                                        if sync_resp.blocks.is_empty() {
+                                                            if let Some(finality) = finality {
+                                                                if let Err(e) = self
+                                                                    .apply_finality_artifact(
+                                                                        &finality,
+                                                                    )
+                                                                {
+                                                                    eprintln!(
+                                                                        "🚨 [SECURITY][SYNC_FINALITY_REJECT] {}",
+                                                                        e
+                                                                    );
+                                                                }
+                                                            }
+                                                            break; // No more blocks
+                                                        }
+                                                        let synced = self.process_blocks(
+                                                            sync_resp.blocks,
+                                                            current,
+                                                        );
+                                                        if synced <= current {
+                                                            eprintln!(
+                                                                "⚠️ [ChainSync] Batch made no progress from height {}",
+                                                                current
+                                                            );
+                                                            break; // No progress made
+                                                        }
+                                                        current = synced;
+                                                        final_height = synced;
                                                         if let Some(finality) = finality {
                                                             if let Err(e) = self
                                                                 .apply_finality_artifact(&finality)
@@ -416,33 +447,31 @@ impl ChainSync {
                                                                 );
                                                             }
                                                         }
-                                                        break; // No more blocks
-                                                    }
-                                                    let synced = self
-                                                        .process_blocks(sync_resp.blocks, current);
-                                                    if synced <= current {
-                                                        break; // No progress made
-                                                    }
-                                                    current = synced;
-                                                    final_height = synced;
-                                                    if let Some(finality) = finality {
-                                                        if let Err(e) =
-                                                            self.apply_finality_artifact(&finality)
-                                                        {
-                                                            eprintln!(
-                                                                "🚨 [SECURITY][SYNC_FINALITY_REJECT] {}",
-                                                                e
-                                                            );
-                                                        }
+                                                    } else {
+                                                        eprintln!(
+                                                            "❌ [ChainSync] Failed to parse SYNC_RESP JSON ({} bytes)",
+                                                            json_data.len()
+                                                        );
+                                                        break;
                                                     }
                                                 } else {
+                                                    eprintln!(
+                                                        "❌ [ChainSync] Unexpected sync response prefix: {}",
+                                                        data_resp
+                                                            .chars()
+                                                            .take(80)
+                                                            .collect::<String>()
+                                                    );
                                                     break;
                                                 }
-                                            } else {
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "❌ [ChainSync] Failed to read SYNC_RESP from {}: {}",
+                                                    peer_id, e
+                                                );
                                                 break;
                                             }
-                                        } else {
-                                            break;
                                         }
                                     }
                                 } else {
@@ -507,9 +536,12 @@ impl ChainSync {
                             || block.header.round <= finalized_round
                         {
                             eprintln!(
-                                 "🚨 [SECURITY][SYNC_REORG_REJECT] conflict at finalized boundary height={} local_round={} remote_round={} finalized_round={}",
-                                 block.header.height, existing.header.round, block.header.round, finalized_round
-                             );
+                                "🚨 [SECURITY][SYNC_REORG_REJECT] conflict at finalized boundary height={} local_round={} remote_round={} finalized_round={}",
+                                block.header.height,
+                                existing.header.round,
+                                block.header.round,
+                                finalized_round
+                            );
                             break;
                         }
                         let rollback_target = block.header.height.saturating_sub(1);
@@ -519,7 +551,10 @@ impl ChainSync {
                         }
                         last_processed = rollback_target;
                     } else {
-                        eprintln!("🚨 [SECURITY][SYNC_REORG_REJECT] corrupt local block json at height {}", block.header.height);
+                        eprintln!(
+                            "🚨 [SECURITY][SYNC_REORG_REJECT] corrupt local block json at height {}",
+                            block.header.height
+                        );
                         break;
                     }
                 } else {
@@ -540,7 +575,10 @@ impl ChainSync {
                 {
                     Some(hash) => hash,
                     None => {
-                        eprintln!("🚨 [SECURITY] Cannot verify parent for block #{}: missing local block #{}", expected_height, last_processed);
+                        eprintln!(
+                            "🚨 [SECURITY] Cannot verify parent for block #{}: missing local block #{}",
+                            expected_height, last_processed
+                        );
                         break;
                     }
                 }
