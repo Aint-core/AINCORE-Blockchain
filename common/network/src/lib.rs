@@ -12,7 +12,7 @@ const MAX_CONN_PER_IP_MIN: usize = 60;
 /// pinning a file descriptor indefinitely (root cause of FD exhaustion).
 const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
-const FRAME_LENGTH_TIMEOUT_SECS: u64 = 10;
+const FRAME_LENGTH_TIMEOUT_SECS: u64 = 120;
 const FRAME_BODY_TIMEOUT_SECS: u64 = 120;
 
 struct ConnectionGuard {
