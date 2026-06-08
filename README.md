@@ -126,6 +126,76 @@ cargo run --release --bin bench_tps -- http://127.0.0.1:3030 1000
 
 ---
 
+## Public Testnet Burst (Temporary VPS Seed)
+
+This is the fastest public-connectivity test path. It uses the current VPS as a
+temporary public seed while the NAS/Pi/private observers keep running on
+Tailscale. It is meant to prove that outside nodes can reach AINCORE P2P without
+turning the home NAS into the public entrypoint.
+
+Current temporary public seed:
+
+```text
+/ip4/45.80.181.141/tcp/9042
+```
+
+Additional libp2p listener exposed for peer discovery experiments:
+
+```text
+/ip4/45.80.181.141/tcp/9142
+```
+
+Sanity check from a new machine:
+
+```bash
+nc -vz 45.80.181.141 9042
+nc -vz 45.80.181.141 9142
+```
+
+Run an observer against the public seed:
+
+```bash
+git clone https://github.com/Aint-core/AINCORE-Blockchain.git
+cd AINCORE-Blockchain
+git checkout audit/p0-security-fixes
+
+cargo build --release --bin node
+
+mkdir -p ./aincore-public-testnet-data
+
+./target/release/node \
+  --port 9032 \
+  --rpc-port 8032 \
+  --datadir ./aincore-public-testnet-data \
+  --bootnodes /ip4/45.80.181.141/tcp/9042
+```
+
+Verify local observer health:
+
+```bash
+curl -fsS http://127.0.0.1:8032/health
+
+curl -fsS -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"aincore_getStatus","params":[]}' \
+  http://127.0.0.1:8032/rpc
+```
+
+Expected status:
+
+- `/health` returns `OK`
+- `latest_height` increases
+- `finalized_round` increases
+- `peers_count` becomes at least `1`
+
+Important notes:
+
+- This VPS seed is temporary while the current VPS lease is still active.
+- Public RPC is intentionally not exposed here; only P2P seed ports are public.
+- This is still a testnet/fresh-chain surface, not a mainnet value network.
+- Do not use this path for real BTC/WBTC custody or production funds.
+
+---
+
 ## Join as an Observer Peer over Tailscale
 
 Use this path for a non-validator peer that syncs from an existing AINCORE node without exposing public P2P ports. This is the recommended setup for Raspberry Pi, spare laptops, NAS boxes, and private testnet devices.
@@ -134,16 +204,16 @@ Runtime networking uses **Tailscale**. GitHub is only used to distribute source 
 
 ### Current Hardening Branch
 
-The latest hardening + native DEX integration branch is:
+The latest security-hardening branch for the current testnet/fresh observer flow is:
 
 ```bash
-audit/phase-1-safe-wins
+audit/p0-security-fixes
 ```
 
 GitHub URL:
 
 ```text
-https://github.com/Aint-core/AINCORE-Blockchain/tree/audit/phase-1-safe-wins
+https://github.com/Aint-core/AINCORE-Blockchain/tree/audit/p0-security-fixes
 ```
 
 ### Step 1: Install and Join Tailscale
@@ -169,7 +239,7 @@ If the port check fails, fix Tailscale connectivity first. Do not fall back to p
 ```bash
 git clone https://github.com/Aint-core/AINCORE-Blockchain.git
 cd AINCORE-Blockchain
-git checkout audit/phase-1-safe-wins
+git checkout audit/p0-security-fixes
 ```
 
 If the repository already exists:
@@ -177,8 +247,8 @@ If the repository already exists:
 ```bash
 cd AINCORE-Blockchain
 git fetch origin
-git checkout audit/phase-1-safe-wins
-git pull --ff-only origin audit/phase-1-safe-wins
+git checkout audit/p0-security-fixes
+git pull --ff-only origin audit/p0-security-fixes
 ```
 
 ### Step 3: Build the Node
