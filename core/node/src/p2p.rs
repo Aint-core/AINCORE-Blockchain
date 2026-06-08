@@ -38,6 +38,16 @@ fn multiaddr_host(addr: &Multiaddr) -> Option<String> {
     })
 }
 
+fn is_docker_bridge_addr(addr: &Multiaddr) -> bool {
+    addr.iter().any(|protocol| match protocol {
+        Protocol::Ip4(ip) => {
+            let octets = ip.octets();
+            octets[0] == 172 && (16..=31).contains(&octets[1])
+        }
+        _ => false,
+    })
+}
+
 // === START P2P ===
 // Returns: (Sender to broadcast, Receiver for incoming messages)
 pub async fn start_p2p(
@@ -264,8 +274,12 @@ pub async fn start_p2p(
                         println!("🕸️  Kademlia Routing Updated: peer={:?} addrs={:?}", peer, addresses);
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
 
-                        // Persist peer (save first known address)
-                        if let Some(addr) = addresses.iter().next() {
+                        // Persist the first routable address. Docker bridge addresses
+                        // (172.16.0.0/12) leak through Identify/Kademlia when nodes run
+                        // in containers, but remote peers cannot dial them. Persisting
+                        // those addresses poisons the next boot's bootnode list and
+                        // causes repeated TCP connect timeouts.
+                        if let Some(addr) = addresses.iter().find(|addr| !is_docker_bridge_addr(addr)) {
                              let _ = storage.save_peer_addr(&peer.to_string(), &addr.to_string());
                         }
                     }
@@ -360,6 +374,10 @@ pub async fn start_p2p(
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                         println!("🆔 Identify Received from {:?}: Agent={:?}, Addrs={:?}", peer_id, info.agent_version, info.listen_addrs);
                         for addr in info.listen_addrs {
+                            if is_docker_bridge_addr(&addr) {
+                                println!("🧹 Ignoring Docker bridge peer address from Identify: {}", addr);
+                                continue;
+                            }
                             swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                         }
                     }

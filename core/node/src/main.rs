@@ -25,6 +25,24 @@ use node::p2p::start_p2p;
 mod api_local;
 use api_local as api;
 
+fn is_docker_bridge_host(host: &str) -> bool {
+    host.parse::<std::net::Ipv4Addr>()
+        .map(|ip| {
+            let octets = ip.octets();
+            octets[0] == 172 && (16..=31).contains(&octets[1])
+        })
+        .unwrap_or(false)
+}
+
+fn bootnode_host(addr: &str) -> Option<&str> {
+    let parts: Vec<&str> = addr.split('/').collect();
+    if parts.len() >= 5 && (parts[1] == "ip4" || parts[1] == "dns4") {
+        Some(parts[2])
+    } else {
+        None
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // === ARGUMENT PARSER ===
@@ -191,6 +209,10 @@ async fn main() {
             saved_peer_addrs.len()
         );
         for (_, addr) in saved_peer_addrs {
+            if bootnode_host(&addr).is_some_and(is_docker_bridge_host) {
+                println!("🧹 Skipping stale Docker bridge peer address: {}", addr);
+                continue;
+            }
             if !bootnodes.contains(&addr) {
                 bootnodes.push(addr);
             }
