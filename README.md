@@ -136,20 +136,21 @@ turning the home NAS into the public entrypoint.
 Current temporary public seed:
 
 ```text
-/ip4/45.80.181.141/tcp/9042
+/dns4/p2p.aincore.network/tcp/9042
 ```
 
 Additional libp2p listener exposed for peer discovery experiments:
 
 ```text
-/ip4/45.80.181.141/tcp/9142
+/dns4/p2p.aincore.network/tcp/9142
 ```
 
 Sanity check from a new machine:
 
 ```bash
-nc -vz 45.80.181.141 9042
-nc -vz 45.80.181.141 9142
+dig +short p2p.aincore.network A
+nc -vz p2p.aincore.network 9042
+nc -vz p2p.aincore.network 9142
 ```
 
 Run an observer against the public seed:
@@ -167,7 +168,14 @@ mkdir -p ./aincore-public-testnet-data
   --port 9032 \
   --rpc-port 8032 \
   --datadir ./aincore-public-testnet-data \
-  --bootnodes /ip4/45.80.181.141/tcp/9042
+  --bootnodes /dns4/p2p.aincore.network/tcp/9042
+```
+
+If DNS resolution is unavailable on your machine, use the temporary raw-IP
+fallback:
+
+```text
+/ip4/45.80.181.141/tcp/9042
 ```
 
 Verify local observer health:
