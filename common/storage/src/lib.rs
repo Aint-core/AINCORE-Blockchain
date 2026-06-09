@@ -634,21 +634,41 @@ impl StateDB {
         }
     }
 
-    /// Prune old checkpoints (keep last N)
+    /// Prune old checkpoints (keep checkpoints whose round is within `keep_rounds`).
+    ///
+    /// Checkpoints are created every 100 consensus rounds by `DagConsensus`.
+    /// The old cleanup attempted to delete ten adjacent round numbers below the
+    /// retention boundary. Since checkpoint keys exist only at 100-round
+    /// intervals, that usually deleted keys that never existed and left old
+    /// checkpoint blobs behind. This cleanup deletes the actual checkpoint
+    /// rounds and their signatures without scanning values, avoiding accidental
+    /// reads of large historical checkpoint JSON.
     pub fn prune_old_checkpoints(
         &self,
         current_round: u64,
-        keep_count: u64,
+        keep_rounds: u64,
     ) -> std::result::Result<(), rocksdb::Error> {
-        if current_round <= keep_count {
+        const DAG_CHECKPOINT_INTERVAL: u64 = 100;
+
+        if current_round <= keep_rounds {
             return Ok(());
         }
-        let oldest_to_keep = current_round - keep_count;
-        // Simple cleanup: delete checkpoints older than threshold
-        // Note: This is a best-effort cleanup, not a full scan
-        for old_round in (0..oldest_to_keep).rev().take(10) {
-            let _ = self.delete(&format!("dag:checkpoint:{}", old_round));
+
+        let oldest_to_keep = current_round - keep_rounds;
+        if oldest_to_keep == 0 {
+            return Ok(());
         }
-        Ok(())
+
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut old_round =
+            ((oldest_to_keep - 1) / DAG_CHECKPOINT_INTERVAL) * DAG_CHECKPOINT_INTERVAL;
+
+        while old_round > 0 {
+            batch.delete(format!("dag:checkpoint:{}", old_round).as_bytes());
+            batch.delete(format!("dag:checkpoint_sig:{}", old_round).as_bytes());
+            old_round = old_round.saturating_sub(DAG_CHECKPOINT_INTERVAL);
+        }
+
+        self.db.write(batch)
     }
 }

@@ -2,8 +2,8 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        object::{self, Object},
         StateDB,
+        object::{self, Object},
     };
     use std::fs;
 
@@ -357,6 +357,51 @@ mod tests {
         assert_eq!(db.get_latest_checkpoint_round(), 100);
         assert!(db.get_dag_checkpoint(100).is_some());
         assert!(db.get_dag_checkpoint(50).is_none());
+    }
+
+    #[test]
+    fn test_prune_old_checkpoints_deletes_checkpoint_intervals_and_signatures() {
+        let db = temp_db("dag_ckpt_prune_intervals");
+
+        for round in [100_u64, 200, 300, 400, 500, 600] {
+            db.save_dag_checkpoint_signed(
+                round,
+                &format!(r#"[{{"round":{}}}]"#, round),
+                &format!("sig_{round}"),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(db.get_latest_checkpoint_round(), 600);
+        db.prune_old_checkpoints(700, 250).unwrap();
+
+        for round in [100_u64, 200, 300, 400] {
+            assert!(
+                db.get_dag_checkpoint(round).is_none(),
+                "checkpoint {round} should be pruned"
+            );
+            assert!(
+                db.get_dag_checkpoint_signature(round).is_none(),
+                "checkpoint signature {round} should be pruned"
+            );
+        }
+
+        for round in [500_u64, 600] {
+            assert!(
+                db.get_dag_checkpoint(round).is_some(),
+                "checkpoint {round} should be retained"
+            );
+            assert!(
+                db.get_dag_checkpoint_signature(round).is_some(),
+                "checkpoint signature {round} should be retained"
+            );
+        }
+
+        assert_eq!(
+            db.get_latest_checkpoint_round(),
+            600,
+            "latest checkpoint pointer must not be pruned"
+        );
     }
 
     #[test]
