@@ -926,6 +926,24 @@ impl DagConsensus {
                             self.latest_block_height, e
                         );
                     }
+                    if let Some((keep_blocks, max_delete)) =
+                        storage::StateDB::block_pruning_policy_from_env()
+                    {
+                        match self.storage.prune_old_blocks(
+                            self.latest_block_height,
+                            keep_blocks,
+                            max_delete,
+                        ) {
+                            Ok(deleted) if deleted > 0 => {
+                                println!(
+                                    "🧹 Block history pruning: removed {} old blocks (retain={}, batch={})",
+                                    deleted, keep_blocks, max_delete
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => eprintln!("⚠️ Block history pruning failed: {}", e),
+                        }
+                    }
                     // Phase 2.8 (M-08): block commit is the only moment
                     // where a slash could have changed the validator set
                     // during normal operation, so refresh the cache here.

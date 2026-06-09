@@ -202,6 +202,35 @@ Important notes:
 - This is still a testnet/fresh-chain surface, not a mainnet value network.
 - Do not use this path for real BTC/WBTC custody or production funds.
 
+### Storage Mode
+
+AINCORE stores live world-state separately from historical block bodies. Validator
+and observer nodes do not need to keep every historical `block_{height}` row
+forever.
+
+Set `AINCORE_STORAGE_MODE` before running a node:
+
+```bash
+# Default validator mode: keep live state and the last 100k block bodies.
+export AINCORE_STORAGE_MODE=full
+
+# Observer mode: keep live state and a short local block-history window.
+export AINCORE_STORAGE_MODE=observer
+
+# Archive/indexer mode: keep all historical block bodies and tx indexes.
+export AINCORE_STORAGE_MODE=archive
+```
+
+Optional retention knobs:
+
+```bash
+export AINCORE_BLOCK_RETENTION=100000   # full default: 100k, observer default: 1k
+export AINCORE_BLOCK_PRUNE_BATCH=250    # max old block rows deleted per commit
+```
+
+Pruning only removes historical `block_*`, `block_txs:*`, and matching
+`tx_index:*` rows. It does **not** prune live account/object resources.
+
 ---
 
 ## Join as an Observer Peer over Tailscale

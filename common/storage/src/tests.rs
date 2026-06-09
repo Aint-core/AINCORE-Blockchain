@@ -2,8 +2,8 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        StateDB,
         object::{self, Object},
+        StateDB,
     };
     use std::fs;
 
@@ -228,9 +228,66 @@ mod tests {
             Some(7),
             "tx B must be indexed to block 7 by save_block_json"
         );
+        assert_eq!(
+            db.get("block_txs:7").unwrap(),
+            Some(serde_json::to_string(&vec![hash_a, hash_b]).unwrap()),
+            "block_txs metadata must be persisted so pruning can remove tx_index keys"
+        );
 
         // Unknown hash returns None — index is authoritative, no full scan.
         assert_eq!(db.get_tx_block_height("ffffffff"), None);
+    }
+
+    #[test]
+    fn test_prune_old_blocks_deletes_block_bodies_and_tx_indexes() {
+        use sha2::{Digest, Sha256};
+
+        let db = temp_db("block_prune");
+
+        let tx1 = r#"{"sender":"old","sequence_number":0}"#;
+        let tx2 = r#"{"sender":"old","sequence_number":1}"#;
+        let tx3 = r#"{"sender":"new","sequence_number":0}"#;
+
+        let block1_json = format!(
+            r#"{{"header":{{"hash":"h1","height":1}},"transactions":[{}]}}"#,
+            serde_json::to_string(tx1).unwrap(),
+        );
+        let block2_json = format!(
+            r#"{{"header":{{"hash":"h2","height":2}},"transactions":[{}]}}"#,
+            serde_json::to_string(tx2).unwrap(),
+        );
+        let block3_json = format!(
+            r#"{{"header":{{"hash":"h3","height":3}},"transactions":[{}]}}"#,
+            serde_json::to_string(tx3).unwrap(),
+        );
+
+        db.save_block_json(1, &block1_json).unwrap();
+        db.save_block_json(2, &block2_json).unwrap();
+        db.save_block_json(3, &block3_json).unwrap();
+
+        let hash1 = hex::encode(Sha256::digest(tx1.as_bytes()));
+        let hash2 = hex::encode(Sha256::digest(tx2.as_bytes()));
+        let hash3 = hex::encode(Sha256::digest(tx3.as_bytes()));
+
+        assert_eq!(db.get_tx_block_height(&hash1), Some(1));
+        assert_eq!(db.get_tx_block_height(&hash2), Some(2));
+        assert_eq!(db.get_tx_block_height(&hash3), Some(3));
+
+        let deleted = db.prune_old_blocks(4, 2, 10).unwrap();
+        assert_eq!(
+            deleted, 1,
+            "only block 1 is older than the retention window"
+        );
+
+        assert_eq!(db.get("block_1").unwrap(), None);
+        assert_eq!(db.get("block_txs:1").unwrap(), None);
+        assert_eq!(db.get_tx_block_height(&hash1), None);
+
+        assert!(db.get("block_2").unwrap().is_some());
+        assert!(db.get("block_3").unwrap().is_some());
+        assert_eq!(db.get_tx_block_height(&hash2), Some(2));
+        assert_eq!(db.get_tx_block_height(&hash3), Some(3));
+        assert_eq!(db.get_chain_height(), 3, "latest_height must not be pruned");
     }
 
     #[test]

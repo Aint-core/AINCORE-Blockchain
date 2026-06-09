@@ -36,6 +36,8 @@ pub struct StateDB {
 }
 
 impl StateDB {
+    pub const BLOCK_PRUNE_CURSOR_KEY: &'static str = "sys:block_prune_cursor_v1";
+
     /// Open database with production-grade durability settings
     ///
     /// Returns Err if:
@@ -281,8 +283,6 @@ impl StateDB {
     /// where a block exists but its transactions are not yet indexable,
     /// and the lookup becomes O(1) → O(M) for the single block.
     pub fn save_block_json(&self, height: u64, block_json: &str) -> Result<(), rocksdb::Error> {
-        use sha2::{Digest, Sha256};
-
         let key = format!("block_{}", height);
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(key.as_bytes(), block_json.as_bytes());
@@ -302,30 +302,148 @@ impl StateDB {
             // as, and tx_hash is SHA-256 over those bytes — the same
             // construction the mempool uses for dedupe and the API uses for
             // its current O(N) scan, so the index is wire-compatible.
-            if let Some(txs) = block.get("transactions").and_then(|v| v.as_array()) {
+            let tx_hashes = Self::tx_hashes_from_block_value(&block);
+            if !tx_hashes.is_empty() {
                 let height_bytes = height.to_string().into_bytes();
-                for tx in txs {
-                    let tx_str_owned: String;
-                    let tx_bytes: &[u8] = if let Some(s) = tx.as_str() {
-                        s.as_bytes()
-                    } else {
-                        // Defensive: a future schema change might inline
-                        // structured tx objects. Re-serialise so we still
-                        // produce a stable hash instead of silently
-                        // skipping the entry.
-                        tx_str_owned = tx.to_string();
-                        tx_str_owned.as_bytes()
-                    };
-                    let mut hasher = Sha256::new();
-                    hasher.update(tx_bytes);
-                    let tx_hash = hex::encode(hasher.finalize());
+                for tx_hash in &tx_hashes {
                     let idx_key = format!("tx_index:{}", tx_hash);
                     batch.put(idx_key.as_bytes(), &height_bytes);
+                }
+                if let Ok(json) = serde_json::to_string(&tx_hashes) {
+                    batch.put(format!("block_txs:{}", height).as_bytes(), json.as_bytes());
                 }
             }
         }
 
         self.write_batch(batch)
+    }
+
+    fn tx_hashes_from_block_json(block_json: &str) -> Vec<String> {
+        match serde_json::from_str::<serde_json::Value>(block_json) {
+            Ok(block) => Self::tx_hashes_from_block_value(&block),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn tx_hashes_from_block_value(block: &serde_json::Value) -> Vec<String> {
+        use sha2::{Digest, Sha256};
+
+        block
+            .get("transactions")
+            .and_then(|v| v.as_array())
+            .map(|txs| {
+                txs.iter()
+                    .map(|tx| {
+                        let tx_str_owned: String;
+                        let tx_bytes: &[u8] = if let Some(s) = tx.as_str() {
+                            s.as_bytes()
+                        } else {
+                            tx_str_owned = tx.to_string();
+                            tx_str_owned.as_bytes()
+                        };
+                        hex::encode(Sha256::digest(tx_bytes))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn block_tx_hashes(&self, height: u64) -> Vec<String> {
+        let block_txs_key = format!("block_txs:{}", height);
+        if let Ok(Some(json)) = self.get(&block_txs_key) {
+            if let Ok(hashes) = serde_json::from_str::<Vec<String>>(&json) {
+                return hashes;
+            }
+        }
+
+        match self.get(&format!("block_{}", height)) {
+            Ok(Some(block_json)) => Self::tx_hashes_from_block_json(&block_json),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Prune historical block bodies and their tx indexes while preserving
+    /// live world-state resources. This is for validator/observer storage
+    /// modes; archive nodes should not call it.
+    ///
+    /// The operation is cursor-based and bounded so a node that is already far
+    /// past the retention window does not try to delete hundreds of thousands
+    /// of keys in one block commit.
+    pub fn prune_old_blocks(
+        &self,
+        current_height: u64,
+        keep_blocks: u64,
+        max_delete_per_call: u64,
+    ) -> Result<usize, rocksdb::Error> {
+        if keep_blocks == 0 || max_delete_per_call == 0 || current_height <= keep_blocks {
+            return Ok(0);
+        }
+
+        let oldest_to_keep = current_height.saturating_sub(keep_blocks);
+        let mut cursor = self
+            .get(Self::BLOCK_PRUNE_CURSOR_KEY)?
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1);
+
+        if cursor >= oldest_to_keep {
+            return Ok(0);
+        }
+
+        let end_exclusive = oldest_to_keep.min(cursor.saturating_add(max_delete_per_call));
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut deleted = 0usize;
+
+        while cursor < end_exclusive {
+            for tx_hash in self.block_tx_hashes(cursor) {
+                batch.delete(format!("tx_index:{}", tx_hash).as_bytes());
+            }
+            batch.delete(format!("block_{}", cursor).as_bytes());
+            batch.delete(format!("block_txs:{}", cursor).as_bytes());
+            cursor = cursor.saturating_add(1);
+            deleted += 1;
+        }
+
+        batch.put(
+            Self::BLOCK_PRUNE_CURSOR_KEY.as_bytes(),
+            cursor.to_string().as_bytes(),
+        );
+        self.write_batch(batch)?;
+        Ok(deleted)
+    }
+
+    /// Return block retention policy from environment.
+    ///
+    /// - `archive`: never prune block history.
+    /// - `full` (default): retain validator history window.
+    /// - `observer`: retain a short local history window.
+    pub fn block_pruning_policy_from_env() -> Option<(u64, u64)> {
+        let mode = std::env::var("AINCORE_STORAGE_MODE")
+            .unwrap_or_else(|_| "full".to_string())
+            .to_ascii_lowercase();
+
+        match mode.as_str() {
+            "archive" => None,
+            "observer" => Some((
+                std::env::var("AINCORE_BLOCK_RETENTION")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1_000),
+                std::env::var("AINCORE_BLOCK_PRUNE_BATCH")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(100),
+            )),
+            _ => Some((
+                std::env::var("AINCORE_BLOCK_RETENTION")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(100_000),
+                std::env::var("AINCORE_BLOCK_PRUNE_BATCH")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(250),
+            )),
+        }
     }
 
     pub fn get_object(&self, object_id: &str) -> Option<Object> {
