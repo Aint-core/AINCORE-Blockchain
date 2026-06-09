@@ -231,6 +231,17 @@ export AINCORE_BLOCK_PRUNE_BATCH=250    # max old block rows deleted per commit
 Pruning only removes historical `block_*`, `block_txs:*`, and matching
 `tx_index:*` rows. It does **not** prune live account/object resources.
 
+### Consensus Tick
+
+Public testnet nodes should use the default 3-second consensus ticker. Faster
+ticks are useful for private soak/stress runs, but they increase DB, indexer,
+and observer load.
+
+```bash
+# Default public-testnet cadence: roughly one block every 3 seconds.
+export AINCORE_CONSENSUS_TICK_MS=3000
+```
+
 ---
 
 ## Join as an Observer Peer over Tailscale

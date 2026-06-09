@@ -440,17 +440,27 @@ async fn main() {
     // Ideally, consensus should push to a 'committed_blocks' channel.
     // For this prototype, we'll keep the lock-based access but run the ticker in a separate task.
 
+    let consensus_tick_ms = std::env::var("AINCORE_CONSENSUS_TICK_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= 100)
+        .unwrap_or(3_000);
+    println!(
+        "⏱️ Consensus ticker interval: {}ms",
+        consensus_tick_ms
+    );
+
     let consensus_clone = Arc::clone(&consensus);
     tokio::spawn(async move {
         loop {
-            // Run consensus round every 100ms (faster than 5s)
+            // Run one consensus attempt per configured ticker interval.
             {
                 // WRITE LOCK FOR MINING
                 if let Ok(mut c) = consensus_clone.write() {
                     c.try_create_vertex();
                 }
             }
-            tokio::time::sleep(Duration::from_millis(3000)).await;
+            tokio::time::sleep(Duration::from_millis(consensus_tick_ms)).await;
         }
     });
 
