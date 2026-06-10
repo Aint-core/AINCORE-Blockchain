@@ -23,6 +23,16 @@ use std::fmt;
 /// Following IETF draft-irtf-cfrg-bls-signature-05 § 4.1
 const DST_CONSENSUS: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_AINCORE_CONSENSUS_V1";
 
+/// SEPARATE Domain Separation Tag for proof-of-possession.
+///
+/// `fast_aggregate_verify` over a common message is only secure under the
+/// proof-of-possession scheme (IETF draft-irtf-cfrg-bls-signature). A validator
+/// proves it controls the secret key for its public key by signing the public
+/// key's OWN bytes under this distinct POP DST. Using a DST different from
+/// `DST_CONSENSUS` makes it impossible to replay a PoP as a finality vote (or
+/// vice-versa) and is what closes the rogue-public-key attack at registration.
+const DST_POP: &[u8] = b"BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_AINCORE_V1";
+
 /// BLS errors
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BLSError {
@@ -103,6 +113,41 @@ impl BLSEngine {
     pub fn sign_raw(&self, message: &[u8], sk_bytes: &[u8; 32]) -> Vec<u8> {
         let sk = self.keygen(sk_bytes);
         self.sign(message, &sk)
+    }
+
+    /// Produce a proof-of-possession for a BLS key.
+    ///
+    /// The PoP is a signature over the public key's OWN compressed bytes, under
+    /// the dedicated `DST_POP` (NOT the consensus DST). A verifier accepting this
+    /// PoP at registration is guaranteed the registrant holds the secret key for
+    /// the claimed public key — which is exactly what prevents the rogue-key
+    /// attack on `fast_aggregate_verify`. Independent of `self.dst`, so it behaves
+    /// identically regardless of which engine instance produced it.
+    pub fn prove_possession(&self, sk: &blst::min_pk::SecretKey) -> Vec<u8> {
+        let pk_bytes = sk.sk_to_pk().compress();
+        let sig = sk.sign(&pk_bytes, DST_POP, &[]);
+        sig.compress().to_vec()
+    }
+
+    /// Verify a proof-of-possession for a claimed BLS public key.
+    ///
+    /// Returns Ok(true) only if `pop` is a valid signature over `public_key`'s
+    /// own bytes under `DST_POP`. Registration MUST call this and reject any
+    /// validator BLS key whose PoP does not verify.
+    pub fn verify_possession(&self, public_key: &[u8], pop: &[u8]) -> Result<bool, BLSError> {
+        let pk = blst::min_pk::PublicKey::uncompress(public_key)
+            .map_err(|e| BLSError::InvalidPublicKey(format!("{:?}", e)))?;
+        pk.validate()
+            .map_err(|e| BLSError::InvalidPublicKey(format!("Subgroup check failed: {:?}", e)))?;
+
+        let sig = blst::min_pk::Signature::uncompress(pop)
+            .map_err(|e| BLSError::InvalidSignature(format!("{:?}", e)))?;
+        sig.validate(false)
+            .map_err(|e| BLSError::InvalidSignature(format!("Subgroup check failed: {:?}", e)))?;
+
+        // The PoP message is the public key's own compressed bytes, under DST_POP.
+        let result = sig.verify(false, public_key, DST_POP, &[], &pk, false);
+        Ok(matches!(result, blst::BLST_ERROR::BLST_SUCCESS))
     }
 
     /// Verify a single BLS signature using pairing check
@@ -370,6 +415,57 @@ mod tests {
         let (_, pk2_bytes) = make_keypair(2);
         let invalid2 = bls.verify(message, &sig, &pk2_bytes).unwrap();
         assert!(!invalid2, "Wrong public key must not verify");
+    }
+
+    #[test]
+    fn test_proof_of_possession_roundtrip() {
+        let bls = BLSEngine::consensus();
+        let (sk_a, pk_a) = make_keypair(11);
+        let (_sk_b, pk_b) = make_keypair(22);
+
+        // Honest PoP for key A verifies against key A.
+        let pop_a = bls.prove_possession(&sk_a);
+        assert!(
+            bls.verify_possession(&pk_a, &pop_a).unwrap(),
+            "honest proof-of-possession must verify"
+        );
+
+        // A's PoP must NOT verify for a different key B (can't claim another's key).
+        assert!(
+            !bls.verify_possession(&pk_b, &pop_a).unwrap(),
+            "PoP for key A must not verify against key B"
+        );
+
+        // A tampered PoP must fail (flip a byte in the body, keep it decodable).
+        let mut bad = pop_a.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 0x01;
+        // Either decode/subgroup error (Err) or a clean false — both are rejection.
+        let tampered_ok = bls.verify_possession(&pk_a, &bad).unwrap_or(false);
+        assert!(!tampered_ok, "tampered PoP must not verify");
+    }
+
+    #[test]
+    fn test_pop_domain_separation_blocks_cross_protocol_replay() {
+        // The PoP DST must be distinct from the consensus DST, so a consensus
+        // signature can never be replayed as a PoP (the cross-protocol leg of
+        // rogue-key defense), and a PoP can never be replayed as a finality vote.
+        let bls = BLSEngine::consensus();
+        let (sk_a, pk_a) = make_keypair(33);
+
+        // A consensus-DST signature over the pubkey bytes is NOT a valid PoP.
+        let consensus_sig_over_pk = bls.sign(&pk_a, &sk_a);
+        assert!(
+            !bls.verify_possession(&pk_a, &consensus_sig_over_pk).unwrap_or(false),
+            "a consensus-DST signature must NOT be accepted as a proof-of-possession"
+        );
+
+        // Conversely, a PoP is NOT a valid consensus signature over the pubkey.
+        let pop_a = bls.prove_possession(&sk_a);
+        assert!(
+            !bls.verify(&pk_a, &pop_a, &pk_a).unwrap_or(false),
+            "a PoP must NOT be accepted as a consensus signature"
+        );
     }
 
     #[test]
