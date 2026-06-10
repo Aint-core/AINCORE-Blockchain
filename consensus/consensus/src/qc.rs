@@ -150,6 +150,20 @@ fn decode_bitmap(bitmap: &[u8], n: usize) -> Vec<usize> {
     idx
 }
 
+/// THE single stake-weighted BFT quorum predicate: strict greater-than 2/3 of
+/// total stake. Used by QC verification, the DAG parent quorum, and the
+/// commit-side anchor quorum so all three agree byte-for-byte on what "quorum"
+/// means. u128 + saturating so `total_stake * 2` cannot overflow on any
+/// realistic supply.
+///
+/// Safety: two quorums each holding more than 2/3 of total stake must intersect
+/// in more than 1/3 of total stake; under the less-than-1/3-Byzantine-stake
+/// assumption that intersection contains at least one honest validator, which is
+/// what gives BFT agreement (no two conflicting commits).
+pub fn stake_quorum_met(signed_stake: u128, total_stake: u128) -> bool {
+    signed_stake.saturating_mul(3) > total_stake.saturating_mul(2)
+}
+
 /// Encode signer indices into a positional bitmap.
 pub fn encode_bitmap(indices: &[usize], n: usize) -> Vec<u8> {
     let mut bitmap = vec![0u8; n.div_ceil(8)];
@@ -200,8 +214,9 @@ pub fn verify_qc(qc: &QuorumCertificate, validators: &[ValidatorInfo]) -> Result
             recomputed: total_stake,
         });
     }
-    // Strict > 2/3, u128 (total_stake*2 cannot overflow realistic supplies).
-    if signed_stake.saturating_mul(3) <= total_stake.saturating_mul(2) {
+    // Strict > 2/3 of total stake — the single shared quorum predicate used by
+    // QC verification, the DAG parent quorum, and the commit-side quorum.
+    if !stake_quorum_met(signed_stake, total_stake) {
         return Err(QcError::BelowThreshold {
             signed: signed_stake,
             total: total_stake,

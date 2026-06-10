@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 // use serde::{Serialize, Deserialize}; // Unused
 use crate::ordering::OrderingEngine;
@@ -9,6 +9,9 @@ use executor::Executor;
 use mempool::Mempool;
 use network::PeerList;
 use storage::StateDB;
+
+/// Cached active validator set as `(address, stake)` pairs, canonically sorted.
+type ValidatorStakeCache = Arc<Mutex<Option<Vec<(String, u64)>>>>;
 
 pub struct DagConsensus {
     pub node_id: String,
@@ -36,20 +39,10 @@ pub struct DagConsensus {
     /// invalidated when a block commits (cheapest moment to refresh —
     /// the only time validator set may legitimately change during normal
     /// operation is via a slash, which happens during block execution).
-    validators_cache: Arc<Mutex<Option<Vec<String>>>>,
+    validators_cache: ValidatorStakeCache,
 }
 
 impl DagConsensus {
-    pub(crate) fn bft_quorum_threshold(validator_count: usize) -> usize {
-        if validator_count == 0 {
-            return 0;
-        }
-        if validator_count == 1 {
-            return 1;
-        }
-        (validator_count * 2 / 3) + 1
-    }
-
     #[allow(clippy::too_many_arguments)] // intrinsic to DagConsensus dependencies
     pub fn new(
         node_id: String,
@@ -344,33 +337,47 @@ impl DagConsensus {
             parents.push("genesis".to_string());
         }
 
-        // DYNAMIC CHECK: Get active validator set FIRST (needed for quorum calculation)
-        let validators = self.get_validator_set();
-        let is_active_validator = validators.contains(&self.node_id);
-
-        // BFT quorum is a strict >2/3 threshold; two validators need both parents.
+        // DYNAMIC CHECK: stake-aware validator set FIRST (B4).
+        let validators = self.get_validator_set_with_stake();
+        let is_active_validator = validators.iter().any(|(a, _)| a == &self.node_id);
         let n = validators.len();
         if n == 0 {
             println!("⚠️ [Consensus] No validators found! Defaulting to Singleton Quorum.");
-            // Return early or set n=1 to avoid division by zero
         }
-        let n = n.max(1); // Prevent division by zero safely
-        let bft_quorum = Self::bft_quorum_threshold(n);
+        let total_stake: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
 
-        // For genesis round (round 0), we need 0 parents (bootstrap)
-        // For subsequent rounds, we need BFT quorum of parents
-        let quorum = if prev_round == 0 {
-            0
+        // B4: parent quorum is STAKE-weighted. A new vertex must reference parents
+        // whose DISTINCT authors represent strict > 2/3 of total stake (genesis
+        // round bootstraps with no parents). This is the liveness/connectivity
+        // gate; the BFT SAFETY gate is the stake-weighted COMMIT quorum in
+        // try_commit. Same `qc::stake_quorum_met` predicate as QC verification.
+        let parent_quorum_met = if prev_round == 0 {
+            true
         } else {
-            bft_quorum.max(1) // At minimum 1 parent required
+            let stake_by_addr: HashMap<&str, u64> =
+                validators.iter().map(|(a, s)| (a.as_str(), *s)).collect();
+            let parent_stake: u128 = {
+                let dag = self.dag.lock().expect("🚨 FATAL: DAG lock poisoned");
+                let mut authors: HashSet<&str> = HashSet::new();
+                for ph in &parents {
+                    if let Some(v) = dag.get(ph) {
+                        authors.insert(v.author.as_str());
+                    }
+                }
+                authors
+                    .iter()
+                    .filter_map(|a| stake_by_addr.get(a).map(|s| *s as u128))
+                    .sum()
+            };
+            crate::qc::stake_quorum_met(parent_stake, total_stake)
         };
 
         println!(
-            "🔒 [Consensus] Round {}: Validators={}, BFT_Quorum={}, Parents={}",
+            "🔒 [Consensus] Round {}: Validators={}, Parents={}, StakeQuorum={}",
             self.current_round,
             n,
-            quorum,
-            parents.len()
+            parents.len(),
+            parent_quorum_met
         );
 
         // SPLIT-BRAIN PREVENTION & OBSERVER MODE:
@@ -399,7 +406,7 @@ impl DagConsensus {
         }
 
         // Standard logic for Genesis or Connected Nodes
-        if parents.len() >= quorum {
+        if parent_quorum_met {
             // 2. Create Payload (Fetch from Mempool)
             let mut payload = Vec::new();
             if let Ok(mut mp) = self.mempool.lock() {
@@ -452,7 +459,7 @@ impl DagConsensus {
 
             // Check all validators for downtime (only every 10 rounds to save CPU)
             if self.current_round.is_multiple_of(10) {
-                for validator_id in &validators {
+                for (validator_id, _stake) in &validators {
                     if validator_id == &self.node_id {
                         continue;
                     } // Skip self
@@ -842,7 +849,8 @@ impl DagConsensus {
                 .round_index
                 .lock()
                 .expect("🚨 FATAL: Round index lock poisoned");
-            let validators = self.get_validator_set(); // This acquires peers lock, safe now.
+            // B4: stake-aware set so the commit-side quorum is stake-weighted.
+            let validators = self.get_validator_set_with_stake();
 
             engine.try_commit(vertex.round, &dag, &round_idx, &validators)
         }; // All locks dropped here!
@@ -1417,32 +1425,20 @@ impl DagConsensus {
         }
     }
 
-    pub fn get_validator_set(&self) -> Vec<String> {
-        // Phase 2.8 (M-08): cache fast path.
-        //
-        // The previous implementation re-read `sys:validators` from RocksDB
-        // and re-parsed the JSON on every call. `try_create_vertex` and
-        // `add_vertex` both call this once or more per vertex, so on a
-        // healthy network this was hundreds of identical disk reads per
-        // block period for data that only changes when a slash executes.
-        //
-        // Cache invariants:
-        //   * `validators_cache` is populated on first cache miss.
-        //   * `invalidate_validators_cache()` is called from `add_vertex`
-        //     immediately after a block is persisted via save_block_json
-        //     — that is the only moment a slash could have changed the
-        //     active set during normal operation.
-        //   * If anything bypasses that flow (tests writing
-        //     `sys:validators` directly, manual ops surgery), they must
-        //     also call `invalidate_validators_cache()`; otherwise the
-        //     cache will stay stale until the next legitimate commit.
+    /// Authoritative validator-set read: `(address, stake)` pairs, sorted by
+    /// address and deduped. This is the single source of truth for both
+    /// membership AND stake-weighted quorum / leader election (B4). Cache fast
+    /// path (Phase 2.8 / M-08): `sys:validators` only changes when a slash
+    /// executes, and `invalidate_validators_cache()` is called from `add_vertex`
+    /// right after a block is persisted — the only moment the active set can
+    /// change in normal operation. Tests/ops that write `sys:validators`
+    /// directly MUST also invalidate, or the cache stays stale.
+    pub fn get_validator_set_with_stake(&self) -> Vec<(String, u64)> {
         if let Ok(guard) = self.validators_cache.lock() {
             if let Some(cached) = guard.as_ref() {
                 return cached.clone();
             }
         }
-
-        // Cache miss — read fresh from storage and populate.
         let fresh = self.read_validators_from_storage();
         if let Ok(mut guard) = self.validators_cache.lock() {
             *guard = Some(fresh.clone());
@@ -1450,17 +1446,27 @@ impl DagConsensus {
         fresh
     }
 
-    /// Storage-backed read path. Direct callers should prefer
-    /// `get_validator_set` so the cache is exercised; this helper is
-    /// extracted so cache misses and explicit refreshes share one
+    /// Membership-only view (addresses), derived from the authoritative
+    /// stake-aware set. Existing callers that only need membership/count stay
+    /// unchanged.
+    pub fn get_validator_set(&self) -> Vec<String> {
+        self.get_validator_set_with_stake()
+            .into_iter()
+            .map(|(addr, _)| addr)
+            .collect()
+    }
+
+    /// Storage-backed read path returning `(address, stake)`. Callers should
+    /// prefer `get_validator_set_with_stake` so the cache is exercised; this
+    /// helper is extracted so cache misses and explicit refreshes share one
     /// implementation.
-    fn read_validators_from_storage(&self) -> Vec<String> {
+    fn read_validators_from_storage(&self) -> Vec<(String, u64)> {
         // 1. FAST PATH: Native Consensus State sync'd from Move VM (sys:validators)
         if let Ok(Some(json)) = self.storage.get("sys:validators") {
             if let Ok(vals) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
-                let mut validators: Vec<String> = vals.into_iter().map(|(addr, _)| addr).collect();
-                validators.sort();
-                validators.dedup();
+                let mut validators: Vec<(String, u64)> = vals;
+                validators.sort_by(|a, b| a.0.cmp(&b.0));
+                validators.dedup_by(|a, b| a.0 == b.0);
                 return validators;
             }
         }
@@ -1470,13 +1476,22 @@ impl DagConsensus {
         if let Ok(Some(bytes_hex)) = self.storage.get(key) {
             if let Ok(bytes) = hex::decode(bytes_hex) {
                 if let Ok(val_set) = bcs::from_bytes::<ValidatorSet>(&bytes) {
-                    let mut validators: Vec<String> = val_set
+                    let mut validators: Vec<(String, u64)> = val_set
                         .validators
                         .iter()
-                        .map(|v| v.validator_addr.to_string())
+                        // Coin.value is u128 quanta (10^18 per AIN); scale to
+                        // whole-AIN u64 to match the fast-path / qc::ValidatorInfo
+                        // stake unit, saturating instead of truncating.
+                        .map(|v| {
+                            let whole_ain = v.stake.value / 1_000_000_000_000_000_000u128;
+                            (
+                                v.validator_addr.to_string(),
+                                u64::try_from(whole_ain).unwrap_or(u64::MAX),
+                            )
+                        })
                         .collect();
-                    validators.sort();
-                    validators.dedup();
+                    validators.sort_by(|a, b| a.0.cmp(&b.0));
+                    validators.dedup_by(|a, b| a.0 == b.0);
                     return validators;
                 }
             }

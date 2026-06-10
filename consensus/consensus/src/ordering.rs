@@ -123,23 +123,16 @@ impl OrderingEngine {
         hex::encode(hasher.finalize())
     }
 
-    fn bft_commit_threshold(validator_count: usize) -> usize {
-        if validator_count == 0 {
-            return 0;
-        }
-        if validator_count == 1 {
-            return 1;
-        }
-        (validator_count * 2 / 3) + 1
-    }
-
     /// Mencoba melakukan commit pada ronde tertentu
     pub fn try_commit(
         &mut self,
         current_round: u64,
         dag: &HashMap<String, Vertex>,
         round_index: &HashMap<u64, Vec<String>>,
-        validators: &[String],
+        // B4: (address, stake) pairs, canonically sorted by address (the order
+        // get_validator_set_with_stake guarantees) so leader election is
+        // deterministic across honest nodes.
+        validators: &[(String, u64)],
     ) -> Option<(Vec<String>, String)> {
         if current_round < 4 {
             return None;
@@ -224,30 +217,39 @@ impl OrderingEngine {
         let vote_round = current_round - 1;
         let votes = round_index.get(&vote_round)?;
 
-        let mut vote_count = 0;
+        // B4: stake-weighted commit quorum. Sum the stake of DISTINCT voter
+        // AUTHORS (one validator counts once even if it produced multiple
+        // vertices) that are in the active validator set, then require strict
+        // > 2/3 of TOTAL stake — the same predicate as qc::verify_qc and the DAG
+        // parent quorum.
+        let validator_stakes: HashMap<&str, u64> =
+            validators.iter().map(|(a, s)| (a.as_str(), *s)).collect();
+        let total_stake: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
+
+        let mut voted_authors: HashSet<&str> = HashSet::new();
         for voter_hash in votes {
             if let Some(voter) = dag.get(voter_hash) {
                 if voter.parents.contains(anchor_vertex_hash) {
-                    vote_count += 1;
+                    voted_authors.insert(voter.author.as_str());
                 }
             }
         }
+        let signed_stake: u128 = voted_authors
+            .iter()
+            .filter_map(|a| validator_stakes.get(a).map(|s| *s as u128))
+            .sum();
 
-        // Commit only with a strict >2/3 quorum. A two-validator network therefore
-        // needs both votes; one validator must not be able to finalize alone.
-        let threshold = Self::bft_commit_threshold(validators.len());
-
-        if vote_count < threshold {
+        if !crate::qc::stake_quorum_met(signed_stake, total_stake) {
             println!(
-                "⚠️ Anchor Round {} (Leader {}) not committed. Votes: {}/{}",
-                anchor_round, successful_leader, vote_count, threshold
+                "⚠️ Anchor Round {} (Leader {}) not committed. Stake {}/{} (need >2/3)",
+                anchor_round, successful_leader, signed_stake, total_stake
             );
             return None;
         }
 
         println!(
-            "⚓ Committing Anchor Round {} (Leader {}) with {} votes",
-            anchor_round, successful_leader, vote_count
+            "⚓ Committing Anchor Round {} (Leader {}) with stake {}/{} (>2/3)",
+            anchor_round, successful_leader, signed_stake, total_stake
         );
 
         // 5. Commit Causal History
@@ -308,7 +310,12 @@ impl OrderingEngine {
     /// making leader election fully predictable by any observer.
     /// Now the VDF beacon output is mixed into the selection to add randomness.
     /// Also removed the hardcoded "node_9009" dev fallback (M6 fix).
-    fn get_leader_with_fallback(&self, round: u64, validators: &[String], attempt: u32) -> String {
+    fn get_leader_with_fallback(
+        &self,
+        round: u64,
+        validators: &[(String, u64)],
+        attempt: u32,
+    ) -> String {
         if validators.is_empty() {
             // M6 FIX: Instead of hardcoded "node_9009", return empty string
             // The caller already handles the "no leader found" case properly
@@ -333,11 +340,32 @@ impl OrderingEngine {
             0 // Fallback to deterministic if VDF not initialized yet (first few rounds)
         };
 
-        // Leader index = (round + vdf_randomness + attempt) mod n
-        // The VDF seed changes after every committed anchor, making future leaders unpredictable
-        let idx = ((round.wrapping_add(vdf_seed).wrapping_add(attempt as u64))
-            % validators.len() as u64) as usize;
-        validators[idx].clone()
+        // B4: STAKE-WEIGHTED leader election. The seed mixes round + VDF beacon +
+        // fallback attempt (VDF changes every committed anchor -> unpredictable).
+        // A validator's chance of being leader is proportional to its stake.
+        // Deterministic across honest nodes: `validators` is canonically sorted
+        // by address, so the cumulative-stake walk picks the same leader for the
+        // same seed everywhere.
+        let seed = round.wrapping_add(vdf_seed).wrapping_add(attempt as u64);
+        let total_stake: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
+
+        if total_stake == 0 {
+            // Degenerate (no stake info): fall back to uniform round-robin so the
+            // chain never stalls on a divide-by-zero.
+            let idx = (seed % validators.len() as u64) as usize;
+            return validators[idx].0.clone();
+        }
+
+        let draw = (seed as u128) % total_stake;
+        let mut cumulative: u128 = 0;
+        for (addr, stake) in validators {
+            cumulative += *stake as u128;
+            if draw < cumulative {
+                return addr.clone();
+            }
+        }
+        // Unreachable: draw < total_stake guarantees a hit above. Safe fallback.
+        validators[validators.len() - 1].0.clone()
     }
 
     fn find_causal_history(&self, anchor_hash: &str, dag: &HashMap<String, Vertex>) -> Vec<String> {
@@ -405,13 +433,57 @@ mod tests {
     }
 
     #[test]
-    fn bft_threshold_requires_strict_supermajority() {
-        assert_eq!(OrderingEngine::bft_commit_threshold(0), 0);
-        assert_eq!(OrderingEngine::bft_commit_threshold(1), 1);
-        assert_eq!(OrderingEngine::bft_commit_threshold(2), 2);
-        assert_eq!(OrderingEngine::bft_commit_threshold(3), 3);
-        assert_eq!(OrderingEngine::bft_commit_threshold(4), 3);
-        assert_eq!(OrderingEngine::bft_commit_threshold(7), 5);
+    fn stake_quorum_requires_strict_supermajority() {
+        use crate::qc::stake_quorum_met;
+        // Exactly 2/3 must FAIL (strict greater-than).
+        assert!(!stake_quorum_met(2, 3));
+        assert!(!stake_quorum_met(20, 30));
+        // Just over 2/3 passes.
+        assert!(stake_quorum_met(21, 30));
+        // Full stake passes; zero stake never does.
+        assert!(stake_quorum_met(100, 100));
+        assert!(!stake_quorum_met(0, 100));
+        // Stake-weighting (not count): a 60/100-stake holder alone is NOT a
+        // quorum; 67/100 is. This is the property count-based thresholds missed.
+        assert!(!stake_quorum_met(60, 100));
+        assert!(stake_quorum_met(67, 100));
+    }
+
+    /// B4: leader election must be STAKE-WEIGHTED (a high-stake validator leads
+    /// far more often) AND deterministic (same inputs -> same leader on every
+    /// honest node, or the DAG forks).
+    #[test]
+    fn leader_election_is_stake_weighted_and_deterministic() {
+        let db = temp_db("leader_stake");
+        let engine = OrderingEngine::new_with_storage(db);
+        // B holds 99% of stake; canonically sorted by address.
+        let validators = vec![("aaaa".to_string(), 1u64), ("bbbb".to_string(), 99u64)];
+
+        let (mut a, mut b) = (0u32, 0u32);
+        for round in 0..1000u64 {
+            match engine
+                .get_leader_with_fallback(round, &validators, 0)
+                .as_str()
+            {
+                "aaaa" => a += 1,
+                "bbbb" => b += 1,
+                _ => {}
+            }
+        }
+        assert!(
+            b > a * 5,
+            "99%-stake validator must lead far more often: a={a} b={b}"
+        );
+        assert!(a > 0, "low-stake validator should still occasionally lead");
+
+        // Determinism: identical (round, attempt, set) -> identical leader.
+        assert_eq!(
+            engine.get_leader_with_fallback(42, &validators, 0),
+            engine.get_leader_with_fallback(42, &validators, 0),
+        );
+        // total_stake==0 must not panic (uniform fallback).
+        let zero = vec![("aaaa".to_string(), 0u64), ("bbbb".to_string(), 0u64)];
+        let _ = engine.get_leader_with_fallback(1, &zero, 0);
     }
 
     /// M3: a legacy node persisted committed_rounds as a huge unbounded Vec.

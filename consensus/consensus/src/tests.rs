@@ -162,12 +162,15 @@ mod tests {
 
     #[test]
     fn test_dag_parent_quorum_requires_strict_supermajority() {
-        assert_eq!(DagConsensus::bft_quorum_threshold(0), 0);
-        assert_eq!(DagConsensus::bft_quorum_threshold(1), 1);
-        assert_eq!(DagConsensus::bft_quorum_threshold(2), 2);
-        assert_eq!(DagConsensus::bft_quorum_threshold(3), 3);
-        assert_eq!(DagConsensus::bft_quorum_threshold(4), 3);
-        assert_eq!(DagConsensus::bft_quorum_threshold(7), 5);
+        // B4: the DAG parent quorum is now stake-weighted via qc::stake_quorum_met
+        // (strict > 2/3 of TOTAL stake), the same predicate as commit + QC verify.
+        use crate::qc::stake_quorum_met;
+        assert!(!stake_quorum_met(2, 3)); // exactly 2/3 fails (strict)
+        assert!(stake_quorum_met(3, 4)); // 3/4 passes
+        assert!(!stake_quorum_met(1, 3)); // 1/3 fails
+                                          // Stake, not count: a 60/100 holder is not a quorum; 67/100 is.
+        assert!(!stake_quorum_met(60, 100));
+        assert!(stake_quorum_met(67, 100));
     }
 
     #[test]

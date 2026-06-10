@@ -759,10 +759,16 @@ pub fn initialize_genesis(
 
     // === SYNC NATIVE CONSENSUS STATE (CRITICAL FIX) ===
     // Write 'sys:validators' so the Rust Consensus Engine knows who is allowed to mine.
-    // Format: Vec<(String, u64)> -> (PubKey, Weight)
-    let native_validators: Vec<(String, u64)> = genesis_validators
+    // Format: Vec<(String, u64)> -> (address, STAKE in whole-AIN).
+    // B4: this must carry REAL per-validator stake (not a uniform weight) so the
+    // stake-weighted DAG quorum + leader election are meaningful and consistent
+    // with qc::ValidatorInfo.stake. Source from v1_validators (already scaled
+    // whole-AIN by crypto_qc_validator_info). A floor of 1 guarantees no active
+    // validator has zero voting power (total_stake==0 would dead-chain), which
+    // holds anyway since MIN_STAKE is 1000 AIN.
+    let native_validators: Vec<(String, u64)> = v1_validators
         .iter()
-        .map(|(addr, _)| (addr.clone(), 100)) // Weight 100
+        .map(|v| (v.address.clone(), v.stake.max(1)))
         .collect();
 
     if let Ok(json) = serde_json::to_string(&native_validators) {
