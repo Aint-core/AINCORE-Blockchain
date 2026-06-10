@@ -73,11 +73,13 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap(),
+                bcs::to_bytes(&vec![0x11u8; 48]).unwrap(),
+                bcs::to_bytes(&vec![0x22u8; 96]).unwrap(),
             ],
         });
         assert_eq!(
             hex::encode(bcs::to_bytes(&register_validator).unwrap()),
-            "0100000000000000000000000000000001077374616b696e67126a6f696e5f76616c696461746f725f736574000310fe812c12f3ab4ce6ac5db69ac352f9061015cd5b070000000000000000000000002120ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
+            "0100000000000000000000000000000001077374616b696e67126a6f696e5f76616c696461746f725f736574000510fe812c12f3ab4ce6ac5db69ac352f9061015cd5b070000000000000000000000002120ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c31301111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111116160222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222"
         );
 
         let create_token = TransactionPayload::EntryFunction(EntryFunctionCall {
@@ -138,13 +140,25 @@ mod tests {
         // F4: sign and call with the new gas/input_objects-bound form.
         let full_message = format!(
             "AINCORE-TESTNET-1:{}:{}:0:{}:{}:{}",
-            sender, hex::encode(payload), 0u64, 1u128, ""
+            sender,
+            hex::encode(payload),
+            0u64,
+            1u128,
+            ""
         );
         let sig = pqcrypto_dilithium::dilithium5::detached_sign(full_message.as_bytes(), &sk);
 
         // 5. Execute Transaction
-        let result =
-            vm.execute_transaction("AINCORE-TESTNET-1", sender, 0, 0u64, 1u128, &[], sig.as_bytes(), payload);
+        let result = vm.execute_transaction(
+            "AINCORE-TESTNET-1",
+            sender,
+            0,
+            0u64,
+            1u128,
+            &[],
+            sig.as_bytes(),
+            payload,
+        );
 
         // 6. Verify Success
         assert!(result.is_ok());
@@ -222,7 +236,11 @@ mod tests {
         // F4: sign and call with the new gas/input_objects-bound form.
         let full_message = format!(
             "AINCORE-TESTNET-1:{}:{}:0:{}:{}:{}",
-            sender, hex::encode(payload), 0u64, 1u128, ""
+            sender,
+            hex::encode(payload),
+            0u64,
+            1u128,
+            ""
         );
         let signature = signing_key.sign(full_message.as_bytes());
 

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc; // Force rebuild
 use storage::StateDB;
 
-const GENESIS_VERSION: &str = "phase1-dex-registry-v1";
+const GENESIS_VERSION: &str = "phase1-bls-stake-v1";
 const GENESIS_STDLIB_MODULES_KEY: &str = "genesis_stdlib_modules";
 const GENESIS_STDLIB_COUNT_KEY: &str = "genesis_stdlib_module_count";
 const REQUIRED_STDLIB_MODULES: &[&str] = &[
@@ -126,6 +126,108 @@ fn parse_validator_public_key(
         )));
     }
     Ok(public_key)
+}
+
+/// Domain-separation prefix for deriving a validator's BLS key from the node
+/// identity. Mirrors `da/src/lib.rs` `derive_da_enc_key` so node.key remains the
+/// single secret; the Ed25519 secret is never used directly as a BLS secret.
+const VALIDATOR_BLS_DOMAIN: &[u8] = b"AINCORE_VALIDATOR_BLS_V1";
+
+/// Deterministically derive the 32-byte BLS seed from the 32-byte node identity:
+/// `bls_seed = SHA256(VALIDATOR_BLS_DOMAIN || node_identity)`.
+fn derive_validator_bls_seed(node_identity: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(VALIDATOR_BLS_DOMAIN);
+    hasher.update(node_identity);
+    let digest = hasher.finalize();
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&digest);
+    seed
+}
+
+/// Derive `(bls_public_key, bls_pop)` (compressed bytes) from the node identity.
+fn derive_validator_bls_identity(node_identity: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
+    let seed = derive_validator_bls_seed(node_identity);
+    let bls = crypto::bls::BLSEngine::consensus();
+    (bls.pubkey_raw(&seed), bls.prove_possession_raw(&seed))
+}
+
+/// Resolve the BLS identity for a genesis validator entry.
+///
+/// If `bls_public_key`/`bls_pop` are supplied (hex), they are decoded,
+/// length-checked (pk=48, pop=96), and PoP-verified — rejecting on any failure.
+/// If absent, the identity is derived deterministically from the local node
+/// identity (single-node / local fallback). Returns `(bls_public_key, bls_pop)`
+/// as raw bytes.
+fn resolve_genesis_bls_identity(
+    bls_public_key_hex: Option<&str>,
+    bls_pop_hex: Option<&str>,
+    node_identity: &[u8; 32],
+) -> Result<(Vec<u8>, Vec<u8>), GenesisError> {
+    let bls = crypto::bls::BLSEngine::consensus();
+    match (bls_public_key_hex, bls_pop_hex) {
+        (Some(pk_hex), Some(pop_hex)) => {
+            let pk = hex::decode(pk_hex.trim())?;
+            let pop = hex::decode(pop_hex.trim())?;
+            if pk.len() != 48 {
+                return Err(GenesisError::InvalidData(format!(
+                    "Genesis bls_public_key must be 48 bytes (MinPk), got {}",
+                    pk.len()
+                )));
+            }
+            if pop.len() != 96 {
+                return Err(GenesisError::InvalidData(format!(
+                    "Genesis bls_pop must be 96 bytes, got {}",
+                    pop.len()
+                )));
+            }
+            match bls.verify_possession(&pk, &pop) {
+                Ok(true) => Ok((pk, pop)),
+                Ok(false) => Err(GenesisError::InvalidData(
+                    "Genesis validator bls_pop failed proof-of-possession verification".to_string(),
+                )),
+                Err(e) => Err(GenesisError::InvalidData(format!(
+                    "Genesis validator BLS key/PoP invalid: {:?}",
+                    e
+                ))),
+            }
+        }
+        (None, None) => Ok(derive_validator_bls_identity(node_identity)),
+        _ => Err(GenesisError::InvalidData(
+            "Genesis validator must supply BOTH bls_public_key and bls_pop, or neither".to_string(),
+        )),
+    }
+}
+
+/// Convert a u128 genesis stake (in 10^18 quanta) to whole-AIN `u64` units for
+/// `qc::ValidatorInfo.stake`. Overflow-checked: an absurd stake that does not fit
+/// in u64 after scaling is rejected rather than silently truncated.
+fn scale_stake_to_whole_ain(stake_quanta: u128) -> Result<u64, GenesisError> {
+    const COIN_SCALE: u128 = 1_000_000_000_000_000_000; // 10^18
+    let whole = stake_quanta / COIN_SCALE;
+    u64::try_from(whole).map_err(|_| {
+        GenesisError::InvalidData(format!(
+            "Genesis stake {} AIN exceeds u64 range for validator-set stake",
+            whole
+        ))
+    })
+}
+
+/// Build a `consensus::qc::ValidatorInfo` for the versioned validator set.
+fn crypto_qc_validator_info(
+    address: &str,
+    stake_quanta: u128,
+    ed25519_public_key_hex: &str,
+    bls_public_key: &[u8],
+    bls_pop: &[u8],
+) -> Result<consensus::qc::ValidatorInfo, GenesisError> {
+    Ok(consensus::qc::ValidatorInfo {
+        address: address.to_string(),
+        stake: scale_stake_to_whole_ain(stake_quanta)?,
+        ed25519_public_key: ed25519_public_key_hex.to_string(),
+        bls_public_key: hex::encode(bls_public_key),
+        bls_pop: hex::encode(bls_pop),
+    })
 }
 
 fn aincore_coin_tag() -> StructTag {
@@ -289,6 +391,8 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
         validator_addr: AccountAddress,
         stake: Coin,
         public_key: Vec<u8>,
+        bls_public_key: Vec<u8>,
+        bls_pop: Vec<u8>,
     }
     #[derive(serde::Deserialize)]
     struct UnbondingRequest {
@@ -433,6 +537,7 @@ pub fn initialize_genesis(
     stdlib_path: &str,
     genesis_addr_hex: &str,
     genesis_pubkey_hex: &str,
+    node_identity: &[u8; 32],
 ) -> Result<(), GenesisError> {
     // Check if genesis is already initialized
     if let Ok(Some(_)) = storage.get("genesis_initialized") {
@@ -490,6 +595,8 @@ pub fn initialize_genesis(
         validator_addr: move_core_types::account_address::AccountAddress,
         stake: Coin,
         public_key: Vec<u8>,
+        bls_public_key: Vec<u8>,
+        bls_pop: Vec<u8>,
     }
     #[derive(serde::Serialize)]
     struct ValidatorSet {
@@ -512,6 +619,10 @@ pub fn initialize_genesis(
         address: String,
         public_key: String,
         stake: String,
+        #[serde(default)]
+        bls_public_key: Option<String>,
+        #[serde(default)]
+        bls_pop: Option<String>,
     }
 
     #[derive(serde::Deserialize)]
@@ -547,6 +658,7 @@ pub fn initialize_genesis(
 
     let mut genesis_validators = Vec::new();
     let mut validator_configs = Vec::new();
+    let mut v1_validators: Vec<consensus::qc::ValidatorInfo> = Vec::new();
     let mut total_bootstrap_stake: u128 = 0;
     let treasury_reserve_amount: u128;
     let genesis_epoch_duration: u64;
@@ -578,12 +690,27 @@ pub fn initialize_genesis(
 
             let account_addr = parse_move_addr(&val.address)?;
             let public_key = parse_validator_public_key(&val.public_key, &val.address)?;
+            // BLS identity: PoP-verify operator-supplied keys, or derive for the local node.
+            let (bls_public_key, bls_pop) = resolve_genesis_bls_identity(
+                val.bls_public_key.as_deref(),
+                val.bls_pop.as_deref(),
+                node_identity,
+            )?;
 
             validator_configs.push(ValidatorConfig {
                 validator_addr: account_addr,
                 stake: Coin { value: stake },
                 public_key,
+                bls_public_key: bls_public_key.clone(),
+                bls_pop: bls_pop.clone(),
             });
+            v1_validators.push(crypto_qc_validator_info(
+                &val.address,
+                stake,
+                &val.public_key,
+                &bls_public_key,
+                &bls_pop,
+            )?);
 
             let acc = AccountManager::create_account(val.address.clone(), val.public_key.clone());
             storage.put_object(&acc)?;
@@ -604,12 +731,23 @@ pub fn initialize_genesis(
 
         let account_addr = parse_move_addr(genesis_addr_hex)?;
         let public_key = parse_validator_public_key(genesis_pubkey_hex, genesis_addr_hex)?;
+        // Single-node fallback: derive BLS identity from the local node identity.
+        let (bls_public_key, bls_pop) = resolve_genesis_bls_identity(None, None, node_identity)?;
 
         validator_configs.push(ValidatorConfig {
             validator_addr: account_addr,
             stake: Coin { value: stake },
             public_key,
+            bls_public_key: bls_public_key.clone(),
+            bls_pop: bls_pop.clone(),
         });
+        v1_validators.push(crypto_qc_validator_info(
+            genesis_addr_hex,
+            stake,
+            genesis_pubkey_hex,
+            &bls_public_key,
+            &bls_pop,
+        )?);
 
         let acc = AccountManager::create_account(
             genesis_addr_hex.to_string(),
@@ -632,6 +770,16 @@ pub fn initialize_genesis(
         println!(
             "🔗 Native Consensus State Synced: {} Validator(s)",
             native_validators.len()
+        );
+    }
+
+    // Versioned validator set carrying full finality identity for QC verification.
+    // Shape == Vec<consensus::qc::ValidatorInfo> { address, stake, ed25519_public_key, bls_public_key, bls_pop }.
+    if let Ok(json) = serde_json::to_string(&v1_validators) {
+        storage.put("sys:validator_set:v1", &json)?;
+        println!(
+            "🔐 sys:validator_set:v1 written: {} validator(s)",
+            v1_validators.len()
         );
     }
 
@@ -893,6 +1041,9 @@ mod tests {
             .to_string()
     }
 
+    /// Deterministic node identity for tests (drives the single-node BLS fallback).
+    const TEST_NODE_IDENTITY: [u8; 32] = [7u8; 32];
+
     fn create_account(db: &StateDB, signing_key: &SigningKey) -> String {
         let public_key = signing_key.verifying_key();
         let public_key_hex = hex::encode(public_key.as_bytes());
@@ -1029,6 +1180,7 @@ mod tests {
 
     #[test]
     fn test_fresh_genesis_rejects_empty_stdlib_dir() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
         let db = temp_db("empty_stdlib");
         let empty_stdlib = temp_dir("empty_stdlib");
         let genesis_key = SigningKey::from_bytes(&[20u8; 32]);
@@ -1040,6 +1192,7 @@ mod tests {
             empty_stdlib.to_str().expect("utf8 temp path"),
             &genesis_addr,
             &genesis_pubkey,
+            &TEST_NODE_IDENTITY,
         )
         .expect_err("empty stdlib bytecode dir must fail");
         assert!(
@@ -1051,20 +1204,39 @@ mod tests {
 
     #[test]
     fn test_fresh_genesis_reopen_and_corrupt_marker_fail_fast() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
         let db = temp_db("integrity");
         let genesis_key = SigningKey::from_bytes(&[21u8; 32]);
         let genesis_addr = crypto::derive_address(genesis_key.verifying_key().as_bytes()).unwrap();
         let genesis_pubkey = hex::encode(genesis_key.verifying_key().as_bytes());
 
-        initialize_genesis(&db, &stdlib_path(), &genesis_addr, &genesis_pubkey)
-            .expect("fresh genesis initializes");
-        initialize_genesis(&db, &stdlib_path(), &genesis_addr, &genesis_pubkey)
-            .expect("valid genesis reopens");
+        initialize_genesis(
+            &db,
+            &stdlib_path(),
+            &genesis_addr,
+            &genesis_pubkey,
+            &TEST_NODE_IDENTITY,
+        )
+        .expect("fresh genesis initializes");
+        initialize_genesis(
+            &db,
+            &stdlib_path(),
+            &genesis_addr,
+            &genesis_pubkey,
+            &TEST_NODE_IDENTITY,
+        )
+        .expect("valid genesis reopens");
 
         db.delete("module_00000000000000000000000000000001_signer")
             .expect("corrupt stdlib delete");
-        let err = initialize_genesis(&db, &stdlib_path(), &genesis_addr, &genesis_pubkey)
-            .expect_err("corrupt stdlib marker must fail fast");
+        let err = initialize_genesis(
+            &db,
+            &stdlib_path(),
+            &genesis_addr,
+            &genesis_pubkey,
+            &TEST_NODE_IDENTITY,
+        )
+        .expect_err("corrupt stdlib marker must fail fast");
         assert!(
             err.to_string().contains("required Move module is missing"),
             "unexpected error: {}",
@@ -1074,18 +1246,31 @@ mod tests {
 
     #[test]
     fn test_genesis_reopen_rejects_corrupt_module_bytes() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
         let db = temp_db("corrupt_module_bytes");
         let genesis_key = SigningKey::from_bytes(&[25u8; 32]);
         let genesis_addr = crypto::derive_address(genesis_key.verifying_key().as_bytes()).unwrap();
         let genesis_pubkey = hex::encode(genesis_key.verifying_key().as_bytes());
 
-        initialize_genesis(&db, &stdlib_path(), &genesis_addr, &genesis_pubkey)
-            .expect("fresh genesis initializes");
+        initialize_genesis(
+            &db,
+            &stdlib_path(),
+            &genesis_addr,
+            &genesis_pubkey,
+            &TEST_NODE_IDENTITY,
+        )
+        .expect("fresh genesis initializes");
 
         db.put("module_00000000000000000000000000000001_signer", "00")
             .expect("corrupt module bytes");
-        let err = initialize_genesis(&db, &stdlib_path(), &genesis_addr, &genesis_pubkey)
-            .expect_err("corrupt module bytes must fail fast");
+        let err = initialize_genesis(
+            &db,
+            &stdlib_path(),
+            &genesis_addr,
+            &genesis_pubkey,
+            &TEST_NODE_IDENTITY,
+        )
+        .expect_err("corrupt module bytes must fail fast");
         assert!(
             err.to_string().contains("failed bytecode decode"),
             "unexpected error: {}",
@@ -1095,18 +1280,31 @@ mod tests {
 
     #[test]
     fn test_genesis_reopen_rejects_stdlib_hash_mismatch() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
         let db = temp_db("stdlib_hash_mismatch");
         let genesis_key = SigningKey::from_bytes(&[26u8; 32]);
         let genesis_addr = crypto::derive_address(genesis_key.verifying_key().as_bytes()).unwrap();
         let genesis_pubkey = hex::encode(genesis_key.verifying_key().as_bytes());
 
-        initialize_genesis(&db, &stdlib_path(), &genesis_addr, &genesis_pubkey)
-            .expect("fresh genesis initializes");
+        initialize_genesis(
+            &db,
+            &stdlib_path(),
+            &genesis_addr,
+            &genesis_pubkey,
+            &TEST_NODE_IDENTITY,
+        )
+        .expect("fresh genesis initializes");
 
         db.put("genesis_stdlib_hash", "deadbeef")
             .expect("corrupt stdlib hash marker");
-        let err = initialize_genesis(&db, &stdlib_path(), &genesis_addr, &genesis_pubkey)
-            .expect_err("hash mismatch must fail fast");
+        let err = initialize_genesis(
+            &db,
+            &stdlib_path(),
+            &genesis_addr,
+            &genesis_pubkey,
+            &TEST_NODE_IDENTITY,
+        )
+        .expect_err("hash mismatch must fail fast");
         assert!(
             err.to_string().contains("Genesis stdlib hash mismatch"),
             "unexpected error: {}",
@@ -1116,13 +1314,20 @@ mod tests {
 
     #[test]
     fn test_genesis_reopen_rejects_module_key_id_mismatch() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
         let db = temp_db("module_key_id_mismatch");
         let genesis_key = SigningKey::from_bytes(&[27u8; 32]);
         let genesis_addr = crypto::derive_address(genesis_key.verifying_key().as_bytes()).unwrap();
         let genesis_pubkey = hex::encode(genesis_key.verifying_key().as_bytes());
 
-        initialize_genesis(&db, &stdlib_path(), &genesis_addr, &genesis_pubkey)
-            .expect("fresh genesis initializes");
+        initialize_genesis(
+            &db,
+            &stdlib_path(),
+            &genesis_addr,
+            &genesis_pubkey,
+            &TEST_NODE_IDENTITY,
+        )
+        .expect("fresh genesis initializes");
 
         let coin_bytes = db
             .get("module_00000000000000000000000000000001_coin")
@@ -1133,8 +1338,14 @@ mod tests {
             &coin_bytes,
         )
         .expect("swap module bytes under signer key");
-        let err = initialize_genesis(&db, &stdlib_path(), &genesis_addr, &genesis_pubkey)
-            .expect_err("module key/id mismatch must fail fast");
+        let err = initialize_genesis(
+            &db,
+            &stdlib_path(),
+            &genesis_addr,
+            &genesis_pubkey,
+            &TEST_NODE_IDENTITY,
+        )
+        .expect_err("module key/id mismatch must fail fast");
         assert!(
             err.to_string().contains("key/id mismatch"),
             "unexpected error: {}",
@@ -1142,15 +1353,276 @@ mod tests {
         );
     }
 
+    // === B1 tests ===
+
+    use std::sync::Mutex as StdMutex;
+    /// Serializes tests that mutate the process-global AINCORE_GENESIS_PATH env.
+    static GENESIS_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// BCS mirror of the staking ValidatorSet WITH the new BLS fields, for tests
+    /// that decode the freshly-written genesis resource (proves field-order lockstep).
+    #[derive(serde::Deserialize)]
+    struct TestCoinU128 {
+        #[allow(dead_code)]
+        value: u128,
+    }
+    #[derive(serde::Deserialize)]
+    struct TestValidatorConfig {
+        #[allow(dead_code)]
+        validator_addr: AccountAddress,
+        #[allow(dead_code)]
+        stake: TestCoinU128,
+        #[allow(dead_code)]
+        public_key: Vec<u8>,
+        bls_public_key: Vec<u8>,
+        bls_pop: Vec<u8>,
+    }
+    #[derive(serde::Deserialize)]
+    struct TestUnbondingRequest {
+        #[allow(dead_code)]
+        validator_addr: AccountAddress,
+        #[allow(dead_code)]
+        stake: u128,
+        #[allow(dead_code)]
+        unlock_time: u64,
+    }
+    #[derive(serde::Deserialize)]
+    struct TestValidatorSet {
+        validators: Vec<TestValidatorConfig>,
+        #[allow(dead_code)]
+        unbonding_queue: Vec<TestUnbondingRequest>,
+        #[allow(dead_code)]
+        total_supply: u128,
+        #[allow(dead_code)]
+        current_epoch: u64,
+    }
+
+    fn decode_staking_validator_set(db: &StateDB) -> TestValidatorSet {
+        let key = system_resource_key("0x1::staking::ValidatorSet");
+        let hex_val = db
+            .get(&key)
+            .expect("read staking resource")
+            .expect("staking resource exists");
+        let bytes = hex::decode(hex_val).expect("staking resource hex");
+        bcs::from_bytes::<TestValidatorSet>(&bytes)
+            .expect("slow-path ValidatorSet BCS decode must succeed on fresh genesis")
+    }
+
+    /// Write a genesis.json with a single validator (optionally carrying BLS keys)
+    /// and return its path. Caller holds GENESIS_ENV_LOCK.
+    fn write_genesis_json(
+        name: &str,
+        addr: &str,
+        pubkey: &str,
+        bls_pk_hex: Option<&str>,
+        bls_pop_hex: Option<&str>,
+    ) -> PathBuf {
+        let dir = temp_dir(&format!("gjson_{}", name));
+        let path = dir.join("genesis.json");
+        let bls_fields = match (bls_pk_hex, bls_pop_hex) {
+            (Some(pk), Some(pop)) => {
+                format!(",\"bls_public_key\":\"{}\",\"bls_pop\":\"{}\"", pk, pop)
+            }
+            _ => String::new(),
+        };
+        let json = format!(
+            "{{\"chain_id\":\"AINCORE-MAINNET-1\",\"validators\":[{{\"address\":\"{}\",\"public_key\":\"{}\",\"stake\":\"1000000000000000000000\"{}}}],\"treasury_reserve\":\"0\",\"epoch_duration\":10}}",
+            addr, pubkey, bls_fields
+        );
+        fs::write(&path, json).expect("write genesis.json");
+        path
+    }
+
+    #[test]
+    fn test_single_node_fallback_derives_bls() {
+        // The single-node fallback path derives the BLS identity deterministically
+        // from the node identity. Unit-test the helper directly (the full
+        // initialize_genesis fallback cannot be exercised reliably here because a
+        // real genesis.json exists at ../../genesis.json in the search path).
+        let bls = crypto::bls::BLSEngine::consensus();
+        let (pk, pop) = resolve_genesis_bls_identity(None, None, &TEST_NODE_IDENTITY)
+            .expect("fallback derivation succeeds");
+        assert_eq!(pk.len(), 48, "derived bls_public_key must be 48 bytes");
+        assert_eq!(pop.len(), 96, "derived bls_pop must be 96 bytes");
+        assert!(
+            bls.verify_possession(&pk, &pop).unwrap(),
+            "derived PoP must verify"
+        );
+        // Deterministic: equals derive_validator_bls_identity for the same identity.
+        let (expect_pk, expect_pop) = derive_validator_bls_identity(&TEST_NODE_IDENTITY);
+        assert_eq!(pk, expect_pk);
+        assert_eq!(pop, expect_pop);
+        // A different node identity yields a different key.
+        let other = [9u8; 32];
+        let (other_pk, _) = derive_validator_bls_identity(&other);
+        assert_ne!(pk, other_pk);
+    }
+
+    #[test]
+    fn test_genesis_loads_bls_keys() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let validator_key = SigningKey::from_bytes(&[41u8; 32]);
+        let addr = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
+        let pubkey = hex::encode(validator_key.verifying_key().as_bytes());
+
+        // Generate a real BLS identity for the operator-supplied path.
+        let bls = crypto::bls::BLSEngine::consensus();
+        let bls_seed = [42u8; 32];
+        let bls_pk = bls.pubkey_raw(&bls_seed);
+        let bls_pop = bls.prove_possession_raw(&bls_seed);
+
+        let path = write_genesis_json(
+            "loads_bls",
+            &addr,
+            &pubkey,
+            Some(&hex::encode(&bls_pk)),
+            Some(&hex::encode(&bls_pop)),
+        );
+        std::env::set_var("AINCORE_GENESIS_PATH", &path);
+        let db = temp_db("loads_bls");
+        let res = initialize_genesis(&db, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY);
+        std::env::remove_var("AINCORE_GENESIS_PATH");
+        res.expect("genesis with valid BLS keys initializes");
+
+        let set = decode_staking_validator_set(&db);
+        assert_eq!(set.validators.len(), 1);
+        let v = &set.validators[0];
+        assert_eq!(
+            v.bls_public_key, bls_pk,
+            "operator BLS pubkey must be stored verbatim"
+        );
+        assert_eq!(v.bls_pop, bls_pop);
+        assert_eq!(v.bls_public_key.len(), 48);
+        assert_eq!(v.bls_pop.len(), 96);
+        assert!(bls
+            .verify_possession(&v.bls_public_key, &v.bls_pop)
+            .unwrap());
+    }
+
+    #[test]
+    fn test_genesis_rejects_bad_pop() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let validator_key = SigningKey::from_bytes(&[43u8; 32]);
+        let addr = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
+        let pubkey = hex::encode(validator_key.verifying_key().as_bytes());
+
+        let bls = crypto::bls::BLSEngine::consensus();
+        let pk = bls.pubkey_raw(&[44u8; 32]);
+        let bad_pop = bls.prove_possession_raw(&[200u8; 32]); // PoP from a DIFFERENT seed
+
+        let path = write_genesis_json(
+            "bad_pop",
+            &addr,
+            &pubkey,
+            Some(&hex::encode(&pk)),
+            Some(&hex::encode(&bad_pop)),
+        );
+        std::env::set_var("AINCORE_GENESIS_PATH", &path);
+        let db = temp_db("bad_pop");
+        let res = initialize_genesis(&db, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY);
+        std::env::remove_var("AINCORE_GENESIS_PATH");
+        let err = res.expect_err("genesis with mismatched bls_pop must be rejected");
+        assert!(
+            err.to_string().contains("proof-of-possession"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validator_set_v1_roundtrip() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let validator_key = SigningKey::from_bytes(&[45u8; 32]);
+        let addr = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
+        let pubkey = hex::encode(validator_key.verifying_key().as_bytes());
+
+        // Known BLS seed so we can sign a vote for the QC round-trip.
+        let bls = crypto::bls::BLSEngine::consensus();
+        let bls_seed = [70u8; 32];
+        let bls_pk = bls.pubkey_raw(&bls_seed);
+        let bls_pop = bls.prove_possession_raw(&bls_seed);
+
+        let path = write_genesis_json(
+            "v1_roundtrip",
+            &addr,
+            &pubkey,
+            Some(&hex::encode(&bls_pk)),
+            Some(&hex::encode(&bls_pop)),
+        );
+        std::env::set_var("AINCORE_GENESIS_PATH", &path);
+        let db = temp_db("v1_roundtrip");
+        let res = initialize_genesis(&db, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY);
+        std::env::remove_var("AINCORE_GENESIS_PATH");
+        res.expect("genesis initializes");
+
+        let json = db
+            .get("sys:validator_set:v1")
+            .expect("read v1")
+            .expect("v1 exists");
+        let set: Vec<consensus::qc::ValidatorInfo> =
+            serde_json::from_str(&json).expect("v1 decodes into qc::ValidatorInfo");
+        assert_eq!(set.len(), 1);
+        let v = &set[0];
+        assert_eq!(v.address, addr);
+        assert_eq!(v.ed25519_public_key, pubkey);
+        // genesis.json stake = 1000 AIN (10^21 quanta) -> 1000 whole-AIN u64.
+        assert_eq!(v.stake, 1000);
+        let pk = hex::decode(&v.bls_public_key).unwrap();
+        let pop = hex::decode(&v.bls_pop).unwrap();
+        assert_eq!(pk, bls_pk);
+        assert_eq!(pop, bls_pop);
+        assert!(bls.verify_possession(&pk, &pop).unwrap());
+
+        // Feed the v1 set into a real build_qc/verify_qc to prove the shape works.
+        let vote = consensus::qc::FinalityVote {
+            chain_id: "AINCORE-MAINNET-1".into(),
+            epoch: 0,
+            finalized_round: 1,
+            anchor_round: 0,
+            anchor_hash: "aa".repeat(32),
+            block_height: 1,
+            block_hash: "bb".repeat(32),
+            state_root: "cc".repeat(32),
+            receipts_root: "dd".repeat(32),
+            finality_digest: "ee".repeat(32),
+            validator_set_hash: "ff".repeat(32),
+        };
+        let sig = bls.sign_raw(&vote.to_signing_bytes(), &bls_seed);
+        let qc = consensus::qc::build_qc(&vote, &set, &[0], &[sig]).expect("build qc");
+        assert!(
+            consensus::qc::verify_qc(&qc, &set).is_ok(),
+            "1-of-1 QC over the genesis v1 set must verify"
+        );
+    }
+
+    #[test]
+    fn test_stake_scaling_no_truncation() {
+        // Whole-AIN scaling must not lose value vs the u128 genesis stake.
+        let one_million_ain: u128 = 1_000_000u128 * 1_000_000_000_000_000_000;
+        let scaled = scale_stake_to_whole_ain(one_million_ain).expect("scale ok");
+        assert_eq!(scaled, 1_000_000);
+        assert_eq!(scaled as u128 * 1_000_000_000_000_000_000, one_million_ain);
+        // An overflowing stake (> u64 whole-AIN) must be rejected, not truncated.
+        let absurd = u128::MAX;
+        assert!(scale_stake_to_whole_ain(absurd).is_err());
+    }
+
     #[test]
     fn test_fresh_genesis_then_executor_accepts_bcs_transfer_path() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
         let db = temp_db("transfer");
         let genesis_key = SigningKey::from_bytes(&[22u8; 32]);
         let genesis_addr = crypto::derive_address(genesis_key.verifying_key().as_bytes()).unwrap();
         let genesis_pubkey = hex::encode(genesis_key.verifying_key().as_bytes());
 
-        initialize_genesis(&db, &stdlib_path(), &genesis_addr, &genesis_pubkey)
-            .expect("fresh genesis initializes");
+        initialize_genesis(
+            &db,
+            &stdlib_path(),
+            &genesis_addr,
+            &genesis_pubkey,
+            &TEST_NODE_IDENTITY,
+        )
+        .expect("fresh genesis initializes");
 
         let sender_key = SigningKey::from_bytes(&[23u8; 32]);
         let recipient_key = SigningKey::from_bytes(&[24u8; 32]);

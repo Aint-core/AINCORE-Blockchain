@@ -1491,7 +1491,7 @@ impl DagConsensus {
 #[derive(serde::Deserialize)]
 struct Coin {
     #[allow(dead_code)]
-    value: u64,
+    value: u128,
 }
 
 #[derive(serde::Deserialize)]
@@ -1502,6 +1502,10 @@ struct ValidatorConfig {
     stake: Coin,
     #[allow(dead_code)]
     public_key: Vec<u8>,
+    #[allow(dead_code)]
+    bls_public_key: Vec<u8>,
+    #[allow(dead_code)]
+    bls_pop: Vec<u8>,
 }
 
 #[derive(serde::Deserialize)]

@@ -382,7 +382,10 @@ mod pqc_phase21 {
     ) -> String {
         use pqcrypto_traits::sign::DetachedSignature;
         // F4: build_pqc_tx emits gas_limit=1000, gas_price=1, input_objects=[].
-        let msg = format!("{}:{}:{}:{}:{}:{}:{}", chain_id, sender, payload, seq, 1000u64, 1u128, "");
+        let msg = format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            chain_id, sender, payload, seq, 1000u64, 1u128, ""
+        );
         let sig = pqcrypto_dilithium::dilithium5::detached_sign(msg.as_bytes(), sk);
         hex::encode(sig.as_bytes())
     }

@@ -18,6 +18,8 @@ module 0x1::staking {
     const EUNBONDING_NOT_READY: u64 = 4;
     const ENO_UNBONDING_REQUEST: u64 = 5;
     const EINVALID_SLASH_BPS: u64 = 6;
+    const EINVALID_BLS_KEY: u64 = 7;
+    const EINVALID_BLS_POP: u64 = 8;
 
     /// Minimum stake required to join validator set (1000 AIN)
     const MIN_STAKE: u128 = 1000000000000000000000; 
@@ -43,10 +45,16 @@ module 0x1::staking {
     struct AincoreCoin has drop {}
 
     /// Validator configuration
+    /// bls_public_key: 48-byte compressed BLS12-381 G1 pubkey (MinPk).
+    /// bls_pop: 96-byte proof-of-possession over bls_public_key (DST_POP).
+    /// PoP is verified off-chain (Rust) at genesis and join; recorded here
+    /// so any node can rebuild the QC verifier set from the resource.
     struct ValidatorConfig has key, store {
         validator_addr: address,
         stake: Coin<AincoreCoin>,
         public_key: vector<u8>,
+        bls_public_key: vector<u8>,
+        bls_pop: vector<u8>,
     }
     
     /// Unbonding request (stake locked for 21 days)
@@ -78,13 +86,21 @@ module 0x1::staking {
     public entry fun join_validator_set(
         account: &signer,
         stake_amount: u128,
-        public_key: vector<u8>
+        public_key: vector<u8>,
+        bls_public_key: vector<u8>,
+        bls_pop: vector<u8>
     ) acquires ValidatorSet {
         let addr = signer::address_of(account);
         assert!(stake_amount >= MIN_STAKE, error::invalid_argument(EINSUFFICIENT_STAKE));
+        // BLS sizes are MinPk: pk=48 bytes (G1), pop=96 bytes (G2). The
+        // pairing-based PoP check itself is done in the Rust executor BEFORE
+        // dispatching this entry (Move has no BLS verifier); here we enforce
+        // the structural invariant so a malformed entry can never be stored.
+        assert!(vector::length(&bls_public_key) == 48, error::invalid_argument(EINVALID_BLS_KEY));
+        assert!(vector::length(&bls_pop) == 96, error::invalid_argument(EINVALID_BLS_POP));
 
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
-        
+
         // Check if already a validator
         let len = vector::length(&validator_set.validators);
         let i = 0;
@@ -102,6 +118,8 @@ module 0x1::staking {
             validator_addr: addr,
             stake,
             public_key,
+            bls_public_key,
+            bls_pop,
         });
     }
 
@@ -129,7 +147,7 @@ module 0x1::staking {
 
         // Remove from active set
         let config = vector::remove(&mut validator_set.validators, index);
-        let ValidatorConfig { validator_addr: _, stake, public_key: _ } = config;
+        let ValidatorConfig { validator_addr: _, stake, public_key: _, bls_public_key: _, bls_pop: _ } = config;
         
         // CRITICAL: Do NOT return stake immediately!
         // Lock it for 21 days to prevent Nothing-at-Stake attacks
@@ -362,7 +380,7 @@ module 0x1::staking {
 
         if (found) {
             let config = vector::remove(&mut validator_set.validators, index);
-            let ValidatorConfig { validator_addr, stake, public_key: _ } = config;
+            let ValidatorConfig { validator_addr, stake, public_key: _, bls_public_key: _, bls_pop: _ } = config;
             
             let total_val = coin::value(&stake);
             let slash_amount = (total_val * (slash_bps as u128)) / (MAX_BPS as u128);

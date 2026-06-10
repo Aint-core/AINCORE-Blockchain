@@ -470,7 +470,8 @@ mod tests {
         // A consensus-DST signature over the pubkey bytes is NOT a valid PoP.
         let consensus_sig_over_pk = bls.sign(&pk_a, &sk_a);
         assert!(
-            !bls.verify_possession(&pk_a, &consensus_sig_over_pk).unwrap_or(false),
+            !bls.verify_possession(&pk_a, &consensus_sig_over_pk)
+                .unwrap_or(false),
             "a consensus-DST signature must NOT be accepted as a proof-of-possession"
         );
 

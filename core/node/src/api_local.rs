@@ -1,5 +1,5 @@
 use actix_governor::{Governor, GovernorConfigBuilder};
-use actix_web::{App, HttpResponse, HttpServer, Responder, web};
+use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use network::PeerList;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, RwLock};

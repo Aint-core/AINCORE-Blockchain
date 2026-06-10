@@ -235,6 +235,22 @@ pub fn build_qc(
 ) -> Result<QuorumCertificate, QcError> {
     let validators = canonical_order(validators);
     let n = validators.len();
+    if signer_indices.len() != signatures.len() {
+        return Err(QcError::VerifyFailed(
+            "signer/signature count mismatch".into(),
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for &idx in signer_indices {
+        if idx >= n {
+            return Err(QcError::SignerOutOfRange(idx));
+        }
+        if !seen.insert(idx) {
+            return Err(QcError::VerifyFailed(format!(
+                "duplicate signer index {idx}"
+            )));
+        }
+    }
     let bls = BLSEngine::consensus();
     let agg = bls
         .aggregate_signatures(signatures)
@@ -308,6 +324,32 @@ mod tests {
     }
 
     #[test]
+    fn test_join_rejects_bad_pop() {
+        // B1: a validator whose bls_pop was produced from a DIFFERENT seed than
+        // its bls_public_key must fail proof-of-possession. This is the exact
+        // check the executor/mempool pre-dispatch gate runs at registration.
+        let bls = BLSEngine::consensus();
+        let mut ikm_a = [0u8; 32];
+        ikm_a[0] = 11;
+        let mut ikm_b = [0u8; 32];
+        ikm_b[0] = 99;
+        let pk_a = bls.pubkey_raw(&ikm_a);
+        let pop_b = bls.prove_possession_raw(&ikm_b); // mismatched PoP
+
+        // Mismatched PoP must NOT verify.
+        assert!(
+            !bls.verify_possession(&pk_a, &pop_b).unwrap(),
+            "PoP from a different secret must be rejected"
+        );
+        // Matching PoP DOES verify (sanity).
+        let pop_a = bls.prove_possession_raw(&ikm_a);
+        assert!(
+            bls.verify_possession(&pk_a, &pop_a).unwrap(),
+            "matching PoP must verify"
+        );
+    }
+
+    #[test]
     fn pop_holds_for_generated_validators() {
         let bls = BLSEngine::consensus();
         let (v, _sk) = make_validator(1, 100);
@@ -378,7 +420,10 @@ mod tests {
             .collect();
         let lone_qc = build_qc(&vote, &set, &lone_idx, &lone_sigs).unwrap();
         assert!(
-            matches!(verify_qc(&lone_qc, &set), Err(QcError::BelowThreshold { .. })),
+            matches!(
+                verify_qc(&lone_qc, &set),
+                Err(QcError::BelowThreshold { .. })
+            ),
             "40/100 stake must be rejected below threshold"
         );
     }
@@ -409,7 +454,10 @@ mod tests {
         // Inflate claimed signed_stake; verifier recomputes and must reject.
         qc.signed_stake = 999;
         assert!(
-            matches!(verify_qc(&qc, &validators), Err(QcError::StakeMismatch { .. })),
+            matches!(
+                verify_qc(&qc, &validators),
+                Err(QcError::StakeMismatch { .. })
+            ),
             "forged signed_stake must be rejected"
         );
     }
@@ -424,8 +472,41 @@ mod tests {
         // Set a bit far beyond the single validator.
         qc.signer_bitmap = vec![0b0000_0101]; // bits 0 and 2; only index 0 exists
         assert!(
-            matches!(verify_qc(&qc, &validators), Err(QcError::SignerOutOfRange(_))),
+            matches!(
+                verify_qc(&qc, &validators),
+                Err(QcError::SignerOutOfRange(_))
+            ),
             "bitmap referencing a non-existent validator must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_qc_rejects_bad_signer_indices_before_aggregation() {
+        let vote = sample_vote();
+        let (v, sk) = make_validator(1, 100);
+        let validators = vec![v];
+        let sig = sign_vote(&sk, &vote);
+
+        assert!(
+            matches!(
+                build_qc(&vote, &validators, &[1], std::slice::from_ref(&sig)),
+                Err(QcError::SignerOutOfRange(1))
+            ),
+            "builder must reject signer index beyond validator set before indexing"
+        );
+        assert!(
+            matches!(
+                build_qc(&vote, &validators, &[0, 0], &[sig.clone(), sig.clone()]),
+                Err(QcError::VerifyFailed(_))
+            ),
+            "builder must reject duplicate signer indices before double-counting stake"
+        );
+        assert!(
+            matches!(
+                build_qc(&vote, &validators, &[0], &[sig.clone(), sig]),
+                Err(QcError::VerifyFailed(_))
+            ),
+            "builder must reject signer/signature count mismatch"
         );
     }
 

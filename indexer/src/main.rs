@@ -712,11 +712,7 @@ async fn indexer_loop(db: Arc<Mutex<Connection>>) {
                 for (tx, receipt) in &receipts {
                     let sender = serde_json::from_str::<serde_json::Value>(&tx.tx_str)
                         .ok()
-                        .and_then(|v| {
-                            v.get("sender")
-                                .and_then(|s| s.as_str())
-                                .map(String::from)
-                        })
+                        .and_then(|v| v.get("sender").and_then(|s| s.as_str()).map(String::from))
                         .unwrap_or_default();
                     index_transaction_row(&conn, &tx.tx_str, tx.height, tx.timestamp);
                     if let Some(receipt) = receipt
@@ -869,7 +865,8 @@ async fn get_dex_trades(
         })
     };
 
-    let trades_result: rusqlite::Result<Vec<DexTradeResponse>> = if let Some(sender) = sender_filter {
+    let trades_result: rusqlite::Result<Vec<DexTradeResponse>> = if let Some(sender) = sender_filter
+    {
         let mut stmt = match conn.prepare(
             "SELECT tx_hash, pool_addr, function, token_x, token_y, token_in, token_out, amount_in, amount_out, block_height, timestamp, sender
              FROM dex_trades
@@ -1363,7 +1360,7 @@ mod tests {
             amount_out: "9871580".into(),
             block_height: 1,
             timestamp: now_ts,
-                sender: "test-sender".into(),
+            sender: "test-sender".into(),
         };
 
         let point = trade_point_for_pair(&trade, "0x1::staking::AincoreCoin", "0x1::wbtc::WBTC")

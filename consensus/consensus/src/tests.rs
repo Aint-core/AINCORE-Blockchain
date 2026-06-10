@@ -316,8 +316,13 @@ mod tests {
     fn test_reload_chain_tip_updates_current_round_from_synced_block() {
         let (mut consensus, path) = setup_dag("reload_round_from_synced_tip");
 
-        let synced_block =
-            blockchain::Block::new(42, 12_345, "genesis".to_string(), vec![], "validator".into());
+        let synced_block = blockchain::Block::new(
+            42,
+            12_345,
+            "genesis".to_string(),
+            vec![],
+            "validator".into(),
+        );
         let block_json = serde_json::to_string(&synced_block).unwrap();
         consensus.storage.save_block_json(42, &block_json).unwrap();
 

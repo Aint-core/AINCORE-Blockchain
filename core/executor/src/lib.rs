@@ -67,11 +67,130 @@ struct MoveCoin {
     value: u128,
 }
 
+/// Local mirror of `consensus::qc::ValidatorInfo` for `sys:validator_set:v1`.
+///
+/// The executor cannot depend on the `consensus` crate (consensus depends on
+/// executor — a dep here would be circular), so this struct reproduces the
+/// exact serde JSON field layout of `consensus::qc::ValidatorInfo`. Field names
+/// MUST match byte-for-byte so the JSON written here round-trips through
+/// `consensus::qc::ValidatorInfo`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ValidatorSetV1Entry {
+    address: String,
+    stake: u64,
+    ed25519_public_key: String,
+    bls_public_key: String,
+    bls_pop: String,
+}
+
+/// Extract the `sys:validator_set:v1` entry for a `join_validator_set` call, or
+/// `None` if this is not such a call. Mirrors the genesis `crypto_qc_validator_info`
+/// scaling (stake in 10^18 quanta -> whole-AIN u64). The PoP has already been
+/// verified by `verify_join_validator_pop` before dispatch.
+fn extract_join_validator_v1(
+    call: &vm_move::EntryFunctionCall,
+    sender: &str,
+) -> Option<ValidatorSetV1Entry> {
+    if *call.module.address() != system_address()
+        || call.module.name().as_str() != "staking"
+        || call.function != "join_validator_set"
+        || call.args.len() < 5
+    {
+        return None;
+    }
+    let stake_quanta: u128 = bcs::from_bytes(&call.args[1]).ok()?;
+    let public_key: Vec<u8> = bcs::from_bytes(&call.args[2]).ok()?;
+    let bls_public_key: Vec<u8> = bcs::from_bytes(&call.args[3]).ok()?;
+    let bls_pop: Vec<u8> = bcs::from_bytes(&call.args[4]).ok()?;
+    const COIN_SCALE: u128 = 1_000_000_000_000_000_000;
+    let stake = u64::try_from(stake_quanta / COIN_SCALE).ok()?;
+    Some(ValidatorSetV1Entry {
+        address: sender.to_string(),
+        stake,
+        ed25519_public_key: hex::encode(&public_key),
+        bls_public_key: hex::encode(&bls_public_key),
+        bls_pop: hex::encode(&bls_pop),
+    })
+}
+
+/// Authoritative pre-dispatch gate for `0x1::staking::join_validator_set`.
+///
+/// Move cannot run the BLS pairing check, so the proof-of-possession binding
+/// (the rogue-key defense for QC aggregation) MUST be enforced in Rust BEFORE
+/// the entry function is dispatched. The Move entry only enforces structural
+/// length invariants (pk=48, pop=96). Returns Ok(()) when this is NOT a
+/// join_validator_set call (nothing to check) or when the supplied PoP verifies.
+///
+/// `join_validator_set(account: &signer, stake_amount: u128, public_key,
+/// bls_public_key, bls_pop)` — so `call.args` layout is:
+///   [0]=signer placeholder, [1]=stake_amount, [2]=public_key,
+///   [3]=bls_public_key, [4]=bls_pop  (each vector<u8> is BCS-encoded).
+fn verify_join_validator_pop(
+    call: &vm_move::EntryFunctionCall,
+    tx_public_key_hex: &str,
+) -> Result<(), String> {
+    if *call.module.address() != system_address()
+        || call.module.name().as_str() != "staking"
+        || call.function != "join_validator_set"
+    {
+        return Ok(());
+    }
+
+    if call.args.len() < 5 {
+        return Err(format!(
+            "join_validator_set: expected 5 args, got {}",
+            call.args.len()
+        ));
+    }
+
+    let public_key: Vec<u8> = bcs::from_bytes(&call.args[2])
+        .map_err(|e| format!("join_validator_set: malformed public_key arg: {}", e))?;
+    let bls_public_key: Vec<u8> = bcs::from_bytes(&call.args[3])
+        .map_err(|e| format!("join_validator_set: malformed bls_public_key arg: {}", e))?;
+    let bls_pop: Vec<u8> = bcs::from_bytes(&call.args[4])
+        .map_err(|e| format!("join_validator_set: malformed bls_pop arg: {}", e))?;
+
+    let tx_public_key = hex::decode(tx_public_key_hex.trim_start_matches("0x"))
+        .map_err(|e| format!("join_validator_set: malformed tx public_key hex: {}", e))?;
+    if public_key.len() != 32 {
+        return Err(format!(
+            "join_validator_set: public_key must be 32 bytes, got {}",
+            public_key.len()
+        ));
+    }
+    if public_key != tx_public_key {
+        return Err("join_validator_set: public_key arg must equal tx.public_key".into());
+    }
+    if bls_public_key.len() != 48 {
+        return Err(format!(
+            "join_validator_set: bls_public_key must be 48 bytes, got {}",
+            bls_public_key.len()
+        ));
+    }
+    if bls_pop.len() != 96 {
+        return Err(format!(
+            "join_validator_set: bls_pop must be 96 bytes, got {}",
+            bls_pop.len()
+        ));
+    }
+
+    match crypto::bls::BLSEngine::consensus().verify_possession(&bls_public_key, &bls_pop) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("join_validator_set: BLS proof-of-possession failed verification".into()),
+        Err(e) => Err(format!(
+            "join_validator_set: BLS PoP verification error: {:?}",
+            e
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MoveValidatorConfig {
     validator_addr: move_core_types::account_address::AccountAddress,
     stake: MoveCoin,
     public_key: Vec<u8>,
+    bls_public_key: Vec<u8>,
+    bls_pop: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +222,10 @@ fn validator_set_key() -> String {
         system_address(),
         "0x1::staking::ValidatorSet"
     )
+}
+
+fn validator_set_v1_key() -> &'static str {
+    "sys:validator_set:v1"
 }
 
 fn dex_registry_key() -> String {
@@ -537,6 +660,37 @@ impl Executor {
     pub fn new(db: Arc<StateDB>) -> Self {
         let vm = AINCOREVM::new(Arc::clone(&db));
         Self { db, vm }
+    }
+
+    /// B1: keep `sys:validator_set:v1` live when a validator joins at runtime.
+    /// Appends (or replaces by address) the new validator's finality identity and
+    /// stages it in the transaction update set. This MUST NOT write directly to
+    /// RocksDB: the production path commits updates atomically inside
+    /// `execute_block_parallel`, and the state-root hash is derived from that same
+    /// update list.
+    fn append_validator_set_v1_update(
+        &self,
+        updates: &mut Vec<(String, Option<String>)>,
+        entry: ValidatorSetV1Entry,
+    ) -> Result<(), String> {
+        let key = validator_set_v1_key();
+        let existing_json = updates
+            .iter()
+            .rev()
+            .find_map(|(k, v)| if k == key { v.as_deref() } else { None })
+            .map(str::to_string)
+            .or_else(|| self.db.get(key).ok().flatten());
+
+        let mut set: Vec<ValidatorSetV1Entry> = existing_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default();
+        set.retain(|v| v.address != entry.address);
+        set.push(entry);
+        let json = serde_json::to_string(&set)
+            .map_err(|e| format!("serialize sys:validator_set:v1 failed: {e}"))?;
+        updates.push((key.to_string(), Some(json)));
+        Ok(())
     }
 
     pub fn current_state_root(&self) -> String {
@@ -1629,6 +1783,7 @@ impl Executor {
                 push_addr_arg(&mut deps, &call.args, 1);
             } else if *module_addr == system_address() && module_name == "staking" {
                 deps.push(validator_set_key());
+                deps.push(validator_set_v1_key().to_string());
             } else if *module_addr == system_address() && module_name == "delegation" {
                 match function {
                     "enable_delegation" => {
@@ -2121,6 +2276,20 @@ impl Executor {
 
             match parsed_payload {
                 Ok(vm_move::TransactionPayload::EntryFunction(call)) => {
+                    // SECURITY (B1): authoritative PoP gate. Move cannot run the
+                    // BLS pairing check, so reject a join_validator_set whose
+                    // proof-of-possession does not verify BEFORE dispatch.
+                    if let Err(reason) = verify_join_validator_pop(&call, &tx.public_key) {
+                        println!(
+                            "❌ REJECTED join_validator_set from {}: {}",
+                            tx.sender, reason
+                        );
+                        return None;
+                    }
+                    // B1: capture join_validator_set identity BEFORE the call is
+                    // moved into the action, so we can append it to the live
+                    // sys:validator_set:v1 after a successful execution.
+                    let join_v1_entry = extract_join_validator_v1(&call, &tx.sender);
                     let mut actions = pre_actions.clone();
                     // SECURITY (FIX #1): the user's entry call may only act as the
                     // authenticated tx sender. bind_signer_args overwrites the
@@ -2138,6 +2307,18 @@ impl Executor {
                         Ok((_gas_used, vm_changes, status)) => {
                             if absorb_vm_result!(vm_changes, status) {
                                 println!("✅ Move EntryFunction executed by {}", tx.sender);
+                                // B1: keep sys:validator_set:v1 live on runtime join.
+                                if let Some(info) = join_v1_entry {
+                                    if let Err(e) =
+                                        self.append_validator_set_v1_update(&mut updates, info)
+                                    {
+                                        println!(
+                                            "❌ Failed to stage sys:validator_set:v1 update: {}",
+                                            e
+                                        );
+                                        return None;
+                                    }
+                                }
                             } else {
                                 println!(
                                     "❌ EntryFunction aborted after gas charge: {}",
@@ -2228,6 +2409,122 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn test_validator_set_bcs_roundtrip_preserves_bls() {
+        // B1 lockstep guard: the live commit path decodes the FULL MoveValidatorSet,
+        // mutates total_supply, and re-encodes it (encode_validator_set_hex). If
+        // MoveValidatorConfig were missing the two trailing BLS fields, BCS would
+        // either fail or silently drop bytes and corrupt the on-disk resource.
+        let bls = crypto::bls::BLSEngine::consensus();
+        let mut seed = [0u8; 32];
+        seed[0] = 7;
+        let bls_pk = bls.pubkey_raw(&seed);
+        let bls_pop = bls.prove_possession_raw(&seed);
+        assert_eq!(bls_pk.len(), 48);
+        assert_eq!(bls_pop.len(), 96);
+
+        let set = MoveValidatorSet {
+            validators: vec![MoveValidatorConfig {
+                validator_addr: system_address(),
+                stake: MoveCoin {
+                    value: 1_000_000_000_000_000_000_000,
+                },
+                public_key: vec![1u8; 32],
+                bls_public_key: bls_pk.clone(),
+                bls_pop: bls_pop.clone(),
+            }],
+            unbonding_queue: vec![],
+            total_supply: 1_000_000_000_000_000_000_000,
+            current_epoch: 0,
+        };
+
+        let hex1 = encode_validator_set_hex(&set).expect("encode");
+        let mut decoded = decode_validator_set_hex(&hex1).expect("decode");
+        // Mutate total_supply exactly like the commit path does.
+        decoded.total_supply += 42;
+        let hex2 = encode_validator_set_hex(&decoded).expect("re-encode");
+        let decoded2 = decode_validator_set_hex(&hex2).expect("re-decode");
+
+        assert_eq!(
+            decoded2.validators[0].bls_public_key, bls_pk,
+            "bls_public_key must survive the decode->mutate->encode round-trip"
+        );
+        assert_eq!(
+            decoded2.validators[0].bls_pop, bls_pop,
+            "bls_pop must survive the round-trip"
+        );
+        assert_eq!(decoded2.total_supply, 1_000_000_000_000_000_000_042);
+        // And the PoP still verifies on the survived bytes.
+        assert!(bls
+            .verify_possession(
+                &decoded2.validators[0].bls_public_key,
+                &decoded2.validators[0].bls_pop
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn test_validator_set_v1_update_is_staged_not_direct_written() {
+        let db = temp_db("validator_set_v1_staged");
+        let executor = Executor::new(db.clone());
+        let mut updates = Vec::new();
+        let entry = ValidatorSetV1Entry {
+            address: "11111111111111111111111111111111".to_string(),
+            stake: 1000,
+            ed25519_public_key: "ed25519".to_string(),
+            bls_public_key: "bls_pk".to_string(),
+            bls_pop: "bls_pop".to_string(),
+        };
+
+        executor
+            .append_validator_set_v1_update(&mut updates, entry.clone())
+            .expect("stage validator-set v1 update");
+
+        assert!(
+            db.get(validator_set_v1_key()).unwrap().is_none(),
+            "execute_transaction helpers must not write sys:validator_set:v1 directly"
+        );
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, validator_set_v1_key());
+        let staged: Vec<ValidatorSetV1Entry> =
+            serde_json::from_str(updates[0].1.as_deref().unwrap()).unwrap();
+        assert_eq!(staged, vec![entry]);
+    }
+
+    #[test]
+    fn test_join_validator_requires_payload_public_key_to_match_tx_public_key() {
+        let tx_public_key = vec![7u8; 32];
+        let forged_public_key = vec![8u8; 32];
+        let (bls_public_key, bls_pop) = test_bls_identity(9);
+        let call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                system_address(),
+                move_core_types::identifier::Identifier::new("staking").unwrap(),
+            ),
+            function: "join_validator_set".to_string(),
+            ty_args: vec![],
+            args: vec![
+                bcs::to_bytes(&system_address()).unwrap(),
+                bcs::to_bytes(&1_000_000_000_000_000_000_000u128).unwrap(),
+                bcs::to_bytes(&forged_public_key).unwrap(),
+                bcs::to_bytes(&bls_public_key).unwrap(),
+                bcs::to_bytes(&bls_pop).unwrap(),
+            ],
+        };
+
+        let err = verify_join_validator_pop(&call, &hex::encode(tx_public_key))
+            .expect_err("payload public_key must be bound to tx.public_key");
+        assert!(err.contains("public_key arg must equal tx.public_key"));
+
+        let mut good_call = call;
+        good_call.args[2] = bcs::to_bytes(&vec![7u8; 32]).unwrap();
+        verify_join_validator_pop(&good_call, &hex::encode(vec![7u8; 32]))
+            .expect("matching public key and PoP should pass");
+        let entry = extract_join_validator_v1(&good_call, "11111111111111111111111111111111")
+            .expect("extract validator v1");
+        assert_eq!(entry.ed25519_public_key, hex::encode(vec![7u8; 32]));
+    }
+
+    #[test]
     fn test_transaction_deserialization() {
         // Updated JSON with chain_id
         let json = r#"{"chain_id":"AINCORE-MAINNET-1","sender":"c4b14ae227ec4e1f661dbb0d15039f1c","input_objects":[],"payload":"0200","args":[],"gas_limit":10000,"gas_price":1,"signature":"bf3714c3b74c954cd88d5e076cc2335ab389cd3e0bc9cec55fbc9d3c62edcc3ad5720868385f45e87bf257c3dcd0083c0737c60f4839ccc949e8e68e214e5c02"}"#;
@@ -2271,6 +2568,17 @@ mod tests {
         validator_addr: move_core_types::account_address::AccountAddress,
         stake: TestCoin,
         public_key: Vec<u8>,
+        bls_public_key: Vec<u8>,
+        bls_pop: Vec<u8>,
+    }
+
+    /// Deterministic valid (bls_public_key, bls_pop) for test validator fixtures.
+    fn test_bls_identity(seed: u8) -> (Vec<u8>, Vec<u8>) {
+        let bls = crypto::bls::BLSEngine::consensus();
+        let mut ikm = [0u8; 32];
+        ikm[0] = seed;
+        ikm[31] = seed.wrapping_add(3);
+        (bls.pubkey_raw(&ikm), bls.prove_possession_raw(&ikm))
     }
 
     #[derive(Serialize, Deserialize)]
@@ -2319,7 +2627,10 @@ mod tests {
     }
 
     fn delegation_pool_key(validator: &str) -> String {
-        format!("resource_{}_{}", validator, "0x1::delegation::ValidatorPool")
+        format!(
+            "resource_{}_{}",
+            validator, "0x1::delegation::ValidatorPool"
+        )
     }
 
     fn set_delegation_pool(db: &StateDB, validator: &str, delegators: &[(&str, u128)]) {
@@ -2715,11 +3026,14 @@ mod tests {
 
     fn set_validator_set(db: &StateDB, validator: &str, stake: u128, total_supply: u128) {
         let validator_addr = parse_move_address(validator).expect("validator move address");
+        let (bls_public_key, bls_pop) = test_bls_identity(1);
         let set = TestValidatorSet {
             validators: vec![TestValidatorConfig {
                 validator_addr,
                 stake: TestCoin { value: stake },
                 public_key: vec![1, 2, 3],
+                bls_public_key,
+                bls_pop,
             }],
             unbonding_queue: vec![],
             total_supply,
@@ -2894,7 +3208,10 @@ mod tests {
         let a_uppercase = "0000000000000000000000000000000A".to_string();
         let tx_from_a = dep_tx(&a_uppercase, coin_transfer_payload(&account_a, &other, 10));
         // tx2: B -> A (A appears as the canonical recipient token).
-        let tx_to_a = dep_tx(&account_b, coin_transfer_payload(&account_b, &account_a, 10));
+        let tx_to_a = dep_tx(
+            &account_b,
+            coin_transfer_payload(&account_b, &account_a, 10),
+        );
 
         let deps_from_a = executor.get_tx_dependencies(&tx_from_a);
         let deps_to_a = executor.get_tx_dependencies(&tx_to_a);
@@ -2968,16 +3285,16 @@ mod tests {
                 move_core_types::identifier::Identifier::new("coin").unwrap(),
             ),
             function: "transfer".to_string(),
-            ty_args: vec![move_core_types::language_storage::TypeTag::Struct(Box::new(
-                move_core_types::language_storage::StructTag {
+            ty_args: vec![move_core_types::language_storage::TypeTag::Struct(
+                Box::new(move_core_types::language_storage::StructTag {
                     address: move_core_types::account_address::AccountAddress::new([
                         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
                     ]),
                     module: move_core_types::identifier::Identifier::new("staking").unwrap(),
                     name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
                     type_params: vec![],
-                },
-            ))],
+                }),
+            )],
             args: vec![
                 // FORGED signer slot = victim.
                 bcs::to_bytes(&parse_move_address(&victim).unwrap()).unwrap(),
@@ -2990,8 +3307,14 @@ mod tests {
         let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
 
         // Signed by the ATTACKER, sender = attacker.
-        let _ = executor
-            .execute_transaction(&signed_tx(&attacker_key, &attacker, &payload, 0, 100_000, 1));
+        let _ = executor.execute_transaction(&signed_tx(
+            &attacker_key,
+            &attacker,
+            &payload,
+            0,
+            100_000,
+            1,
+        ));
         // Whatever the VM did, it must NOT have spent the victim's coins, and the
         // attacker-controlled sink must NOT have received the victim's funds.
         assert_eq!(
@@ -4344,7 +4667,10 @@ mod tests {
         //   B: 300_000 -> 285_000 (cut 15_000)
         // total_delegated: 800_000 -> 760_000; escrow burns 40_000.
         let pool = delegation_pool(&db, &validator);
-        assert_eq!(pool.total_delegated, 760_000, "delegated total must shrink 5%");
+        assert_eq!(
+            pool.total_delegated, 760_000,
+            "delegated total must shrink 5%"
+        );
         assert_eq!(
             pool.escrowed_coins.value, 760_000,
             "escrow must shrink 5% and stay == total_delegated"
@@ -4428,7 +4754,10 @@ mod tests {
 
         let pool = delegation_pool(&db, &validator);
         // Active 400k -> 380k (cut 20k); unbonding 200k -> 190k (cut 10k).
-        assert_eq!(pool.delegations[0].amount, 380_000, "active delegation slashed 5%");
+        assert_eq!(
+            pool.delegations[0].amount, 380_000,
+            "active delegation slashed 5%"
+        );
         assert_eq!(
             pool.unbonding_queue[0].amount, 190_000,
             "unbonding entry MUST be slashed 5% (the bypass this fix closes)"
@@ -4495,7 +4824,10 @@ mod tests {
         apply_updates(&db, updates);
 
         // Read back the Epoch resource.
-        let raw = db.get(&epoch_key).expect("epoch read").expect("epoch exists");
+        let raw = db
+            .get(&epoch_key)
+            .expect("epoch read")
+            .expect("epoch exists");
         let bytes = hex::decode(raw).unwrap();
         let (num, start, dur): (u64, u64, u64) = bcs::from_bytes(&bytes).unwrap();
         assert_eq!(num, 101, "epoch_number increments by one");
@@ -4543,7 +4875,11 @@ mod tests {
             )
         };
         // Seed empty DeviceRegistry + OracleConfig with @0x1 as the trusted feeder.
-        db.put(&um("DeviceRegistry"), &hex::encode(bcs::to_bytes(&TRegistry { devices: vec![] }).unwrap())).unwrap();
+        db.put(
+            &um("DeviceRegistry"),
+            &hex::encode(bcs::to_bytes(&TRegistry { devices: vec![] }).unwrap()),
+        )
+        .unwrap();
         db.put(
             &um("OracleConfig"),
             &hex::encode(
@@ -4583,7 +4919,11 @@ mod tests {
                     parse_move_address(auth).unwrap(),
                 )
                 .expect("register_device executes");
-            assert!(status.success, "register_device must not abort: {:?}", status);
+            assert!(
+                status.success,
+                "register_device must not abort: {:?}",
+                status
+            );
             apply_updates(&db, updates);
         };
 
@@ -4591,12 +4931,18 @@ mod tests {
         register(owner_a);
         register(owner_b);
 
-        let reg: TRegistry = bcs::from_bytes(
-            &hex::decode(db.get(&um("DeviceRegistry")).unwrap().unwrap()).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(reg.devices.len(), 2, "no lockout: both owners registered the same pubkey");
-        assert!(reg.devices.iter().all(|d| !d.verified), "fresh registrations are unverified");
+        let reg: TRegistry =
+            bcs::from_bytes(&hex::decode(db.get(&um("DeviceRegistry")).unwrap().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(
+            reg.devices.len(),
+            2,
+            "no lockout: both owners registered the same pubkey"
+        );
+        assert!(
+            reg.devices.iter().all(|d| !d.verified),
+            "fresh registrations are unverified"
+        );
 
         // Feeder @0x1 verifies ONLY (A, P).
         let (_g, updates, status) = executor
@@ -4618,10 +4964,9 @@ mod tests {
         assert!(status.success, "feeder verify must succeed: {:?}", status);
         apply_updates(&db, updates);
 
-        let reg: TRegistry = bcs::from_bytes(
-            &hex::decode(db.get(&um("DeviceRegistry")).unwrap().unwrap()).unwrap(),
-        )
-        .unwrap();
+        let reg: TRegistry =
+            bcs::from_bytes(&hex::decode(db.get(&um("DeviceRegistry")).unwrap().unwrap()).unwrap())
+                .unwrap();
         let a_addr = parse_move_address(owner_a).unwrap();
         let b_addr = parse_move_address(owner_b).unwrap();
         let a = reg.devices.iter().find(|d| d.owner_addr == a_addr).unwrap();

@@ -10,6 +10,17 @@ fn parse_move_address(hex_str: &str) -> Option<move_core_types::account_address:
     }
 }
 
+fn derive_validator_bls_identity(wallet: &Wallet) -> (Vec<u8>, Vec<u8>) {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"AINCORE_VALIDATOR_BLS_V1");
+    hasher.update(wallet.key_pair.to_bytes());
+    let digest = hasher.finalize();
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&digest);
+    let bls = crypto::bls::BLSEngine::consensus();
+    (bls.pubkey_raw(&seed), bls.prove_possession_raw(&seed))
+}
+
 mod client;
 mod keys;
 mod wallet;
@@ -489,6 +500,7 @@ fn main() -> anyhow::Result<()> {
             // Skipping client-side balance check due to u64 parsing limitations in CLI for u128 balances
 
             let pk_bytes = hex::decode(wallet.public_key()).unwrap_or_default();
+            let (bls_public_key, bls_pop) = derive_validator_bls_identity(&wallet);
             let min_stake: u128 = 1_000_000_000_000_000_000_000; // 1000 AIN in quanta (smallest unit, 10^18)
             let call = vm_move::EntryFunctionCall {
                 module: move_core_types::language_storage::ModuleId::new(
@@ -503,6 +515,8 @@ fn main() -> anyhow::Result<()> {
                     bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
                     bcs::to_bytes(&min_stake).unwrap(),
                     bcs::to_bytes(&pk_bytes).unwrap(),
+                    bcs::to_bytes(&bls_public_key).unwrap(),
+                    bcs::to_bytes(&bls_pop).unwrap(),
                 ],
             };
             let payload_struct = vm_move::TransactionPayload::EntryFunction(call);

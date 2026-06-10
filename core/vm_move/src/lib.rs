@@ -487,21 +487,20 @@ impl AINCOREVM {
                     }
                 }
                 MoveAction::CallEntryFunction(call) => {
-                    let ident = match move_core_types::identifier::Identifier::new(
-                        call.function.clone(),
-                    ) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            let err = anyhow::anyhow!("invalid function identifier: {}", e);
-                            if must_succeed {
-                                return Err(err);
+                    let ident =
+                        match move_core_types::identifier::Identifier::new(call.function.clone()) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                let err = anyhow::anyhow!("invalid function identifier: {}", e);
+                                if must_succeed {
+                                    return Err(err);
+                                }
+                                if status.success {
+                                    status = ExecutionStatus::aborted(err.to_string());
+                                }
+                                continue;
                             }
-                            if status.success {
-                                status = ExecutionStatus::aborted(err.to_string());
-                            }
-                            continue;
-                        }
-                    };
+                        };
                     // SECURITY (FIX #1): bind &signer slots to the authenticated
                     // principal. move-vm does NOT inject signers; it deserializes a
                     // signer from raw arg bytes. Load the function signature, count

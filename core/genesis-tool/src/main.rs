@@ -21,6 +21,12 @@ struct Args {
     /// Genesis Validator Public Key (Hex). Defaults to genesis_addr for legacy tooling.
     #[arg(long)]
     genesis_pubkey: Option<String>,
+
+    /// Node identity seed (32-byte hex) used to derive the validator BLS key for
+    /// the single-node fallback path. Ignored when genesis.json supplies explicit
+    /// per-validator BLS keys. Defaults to a deterministic all-zero seed.
+    #[arg(long)]
+    node_identity: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

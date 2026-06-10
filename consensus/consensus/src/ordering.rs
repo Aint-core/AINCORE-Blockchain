@@ -286,7 +286,10 @@ impl OrderingEngine {
             }
             // Persist the monotonic high-water mark directly (no longer derived
             // from the now-trimmed set).
-            let _ = storage.put("consensus:finalized_round", &self.finalized_round.to_string());
+            let _ = storage.put(
+                "consensus:finalized_round",
+                &self.finalized_round.to_string(),
+            );
             let _ = storage.put("consensus:last_anchor_round", &anchor_round.to_string());
             let _ = storage.put("consensus:last_anchor_hash", anchor_vertex_hash);
             let digest = Self::finality_digest(&self.committed_sequence);
@@ -434,7 +437,10 @@ mod tests {
             engine.committed_rounds.len()
         );
         // Watermark recovered from the max of the legacy data.
-        assert_eq!(engine.finalized_round, 4999, "high-water mark = max(rounds)");
+        assert_eq!(
+            engine.finalized_round, 4999,
+            "high-water mark = max(rounds)"
+        );
         // The oldest rounds were dropped from the set but remain rejected via the
         // high-water comparison (they are <= finalized_round).
         assert!(!engine.committed_rounds.contains(&0));

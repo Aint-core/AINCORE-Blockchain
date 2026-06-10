@@ -376,8 +376,16 @@ async fn main() {
         "core/vm_move/stdlib/bytecode" // Default, will error with clear message if missing
     };
     // Initialize Genesis with error handling
-    if let Err(e) = genesis::initialize_genesis(&storage, stdlib_path, &node_addr_hex, &pub_key_hex)
-    {
+    // Pass the node identity (Ed25519 seed bytes) so the validator BLS key +
+    // PoP can be derived deterministically for the local/single-node fallback.
+    let genesis_node_identity = signing_key.to_bytes();
+    if let Err(e) = genesis::initialize_genesis(
+        &storage,
+        stdlib_path,
+        &node_addr_hex,
+        &pub_key_hex,
+        &genesis_node_identity,
+    ) {
         eprintln!("❌ FATAL: Genesis initialization failed: {}", e);
         eprintln!("   This usually means:");
         eprintln!("   1. Stdlib bytecode is missing or corrupted");
@@ -445,10 +453,7 @@ async fn main() {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value >= 100)
         .unwrap_or(3_000);
-    println!(
-        "⏱️ Consensus ticker interval: {}ms",
-        consensus_tick_ms
-    );
+    println!("⏱️ Consensus ticker interval: {}ms", consensus_tick_ms);
 
     let consensus_clone = Arc::clone(&consensus);
     tokio::spawn(async move {

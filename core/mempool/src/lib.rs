@@ -3,6 +3,73 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use storage::StateDB;
 
+/// B1 (best-effort): early-reject a `0x1::staking::join_validator_set` whose BLS
+/// proof-of-possession does not verify, before it enters the mempool. The
+/// executor pre-dispatch gate is authoritative; this mirrors it for early reject.
+/// `join_validator_set(account: &signer, stake_amount: u128, public_key,
+/// bls_public_key, bls_pop)` -> args[2]=public_key, args[3]=bls_public_key,
+/// args[4]=bls_pop.
+fn verify_join_validator_pop_mempool(
+    call: &vm_move::EntryFunctionCall,
+    tx_public_key_hex: &str,
+) -> Result<(), String> {
+    // 0x1 system address renders as 31 zero bytes + 01 in hex (no direct
+    // move_core_types dep in mempool, so compare via the canonical Display form).
+    let is_system = format!("{}", call.module.address())
+        .trim_start_matches("0x")
+        .trim_start_matches('0')
+        == "1";
+    if !is_system
+        || call.module.name().as_str() != "staking"
+        || call.function != "join_validator_set"
+    {
+        return Ok(());
+    }
+    if call.args.len() < 5 {
+        return Err(format!(
+            "join_validator_set: expected 5 args, got {}",
+            call.args.len()
+        ));
+    }
+    let public_key: Vec<u8> = bcs::from_bytes(&call.args[2])
+        .map_err(|e| format!("join_validator_set: malformed public_key arg: {}", e))?;
+    let bls_public_key: Vec<u8> = bcs::from_bytes(&call.args[3])
+        .map_err(|e| format!("join_validator_set: malformed bls_public_key arg: {}", e))?;
+    let bls_pop: Vec<u8> = bcs::from_bytes(&call.args[4])
+        .map_err(|e| format!("join_validator_set: malformed bls_pop arg: {}", e))?;
+    let tx_public_key = hex::decode(tx_public_key_hex.trim_start_matches("0x"))
+        .map_err(|e| format!("join_validator_set: malformed tx public_key hex: {}", e))?;
+    if public_key.len() != 32 {
+        return Err(format!(
+            "join_validator_set: public_key must be 32 bytes, got {}",
+            public_key.len()
+        ));
+    }
+    if public_key != tx_public_key {
+        return Err("join_validator_set: public_key arg must equal tx.public_key".into());
+    }
+    if bls_public_key.len() != 48 {
+        return Err(format!(
+            "join_validator_set: bls_public_key must be 48 bytes, got {}",
+            bls_public_key.len()
+        ));
+    }
+    if bls_pop.len() != 96 {
+        return Err(format!(
+            "join_validator_set: bls_pop must be 96 bytes, got {}",
+            bls_pop.len()
+        ));
+    }
+    match crypto::bls::BLSEngine::consensus().verify_possession(&bls_public_key, &bls_pop) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("join_validator_set: BLS proof-of-possession failed verification".into()),
+        Err(e) => Err(format!(
+            "join_validator_set: BLS PoP verification error: {:?}",
+            e
+        )),
+    }
+}
+
 const MAX_PENDING_TXS: usize = 5000;
 const MAX_SEEN_TXS: usize = 50000;
 const MIN_GAS_PRICE: u128 = 1;
@@ -192,8 +259,15 @@ impl Mempool {
         let payload_bytes = hex::decode(parsed_tx.payload.trim_start_matches("0x"))
             .map_err(|_| "Invalid payload hex: expected BCS TransactionPayload".to_string())?;
         match bcs::from_bytes::<vm_move::TransactionPayload>(&payload_bytes) {
-            Ok(vm_move::TransactionPayload::EntryFunction(_))
-            | Ok(vm_move::TransactionPayload::PublishModule(_)) => {}
+            Ok(vm_move::TransactionPayload::EntryFunction(call)) => {
+                // B1 (best-effort early reject): if this is a join_validator_set
+                // call, verify the BLS proof-of-possession here so a malformed /
+                // rogue-key join never enters the mempool. The executor
+                // pre-dispatch gate is the AUTHORITATIVE check; this only saves
+                // mempool/consensus work. Non-join calls pass through untouched.
+                verify_join_validator_pop_mempool(&call, &parsed_tx.public_key)?;
+            }
+            Ok(vm_move::TransactionPayload::PublishModule(_)) => {}
             Ok(vm_move::TransactionPayload::Script(_)) => {
                 return Err("Raw script payloads are disabled".to_string());
             }
