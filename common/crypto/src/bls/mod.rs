@@ -115,6 +115,20 @@ impl BLSEngine {
         self.sign(message, &sk)
     }
 
+    /// Derive the compressed BLS public key from raw 32-byte secret material.
+    /// Lets callers that store raw key material (validators, tests) avoid
+    /// depending on `blst` types directly.
+    pub fn pubkey_raw(&self, sk_bytes: &[u8; 32]) -> Vec<u8> {
+        let sk = self.keygen(sk_bytes);
+        sk.sk_to_pk().compress().to_vec()
+    }
+
+    /// Produce a proof-of-possession from raw 32-byte secret material.
+    pub fn prove_possession_raw(&self, sk_bytes: &[u8; 32]) -> Vec<u8> {
+        let sk = self.keygen(sk_bytes);
+        self.prove_possession(&sk)
+    }
+
     /// Produce a proof-of-possession for a BLS key.
     ///
     /// The PoP is a signature over the public key's OWN compressed bytes, under

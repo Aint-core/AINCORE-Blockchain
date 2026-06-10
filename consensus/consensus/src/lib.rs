@@ -12,6 +12,7 @@ use rand::RngCore;
 
 pub mod dag;
 pub mod ordering;
+pub mod qc;
 
 #[cfg(test)]
 mod tests;
