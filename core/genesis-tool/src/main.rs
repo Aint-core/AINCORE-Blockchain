@@ -42,11 +42,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize Genesis
     let genesis_pubkey = args.genesis_pubkey.as_deref().unwrap_or(&args.genesis_addr);
+
+    // B1: node identity (32-byte hex) drives the deterministic single-node BLS
+    // key + PoP fallback when genesis.json does not supply explicit per-validator
+    // BLS keys. Defaults to an all-zero seed if not provided.
+    let mut node_identity = [0u8; 32];
+    if let Some(ni_hex) = args.node_identity.as_deref() {
+        let bytes = hex::decode(ni_hex.trim()).expect("--node-identity must be valid hex");
+        assert_eq!(
+            bytes.len(),
+            32,
+            "--node-identity must be exactly 32 bytes (64 hex chars)"
+        );
+        node_identity.copy_from_slice(&bytes);
+    }
+
     genesis::initialize_genesis(
         &storage,
         &args.stdlib_path,
         &args.genesis_addr,
         genesis_pubkey,
+        &node_identity,
     )?;
 
     println!("✅ Genesis initialization complete!");
