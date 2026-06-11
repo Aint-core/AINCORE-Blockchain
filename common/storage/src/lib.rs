@@ -263,6 +263,16 @@ impl StateDB {
         self.db.flush_wal(true)
     }
 
+    /// Durably flush everything to disk: sync the WAL, then flush memtables to
+    /// SST files. Called on graceful shutdown (#10) so a clean SIGTERM (e.g.
+    /// `docker stop` during a rolling deploy) leaves the DB fully persisted with
+    /// no reliance on crash recovery. Writes are already fsync'd per-op, so this
+    /// is belt-and-suspenders, not a correctness requirement.
+    pub fn flush(&self) -> std::result::Result<(), rocksdb::Error> {
+        self.db.flush_wal(true)?;
+        self.db.flush()
+    }
+
     /// Get current blockchain height
     pub fn get_chain_height(&self) -> u64 {
         match self.get("latest_height") {

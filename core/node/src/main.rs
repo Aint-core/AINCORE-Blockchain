@@ -3,6 +3,7 @@ use storage::StateDB;
 // use network::{start_server, handshake}; // start_server unused
 use network::handshake;
 // use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::{thread, time::Duration};
 
@@ -455,9 +456,45 @@ async fn main() {
         .unwrap_or(3_000);
     println!("⏱️ Consensus ticker interval: {}ms", consensus_tick_ms);
 
+    // #10 Graceful shutdown: a shared flag flipped on SIGTERM/SIGINT. Background
+    // loops check it and stop creating new work so the final flush is not racing
+    // an in-flight commit.
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Signal listener: docker stop sends SIGTERM (then SIGKILL after the grace
+    // period); Ctrl-C sends SIGINT. Either flips the shutdown flag.
+    {
+        let shutdown_signal = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            let mut sigterm =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("⚠️ Failed to install SIGTERM handler: {e}");
+                        return;
+                    }
+                };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    println!("\n🛑 SIGINT received — initiating graceful shutdown...");
+                }
+                _ = sigterm.recv() => {
+                    println!("\n🛑 SIGTERM received — initiating graceful shutdown...");
+                }
+            }
+            shutdown_signal.store(true, Ordering::SeqCst);
+        });
+    }
+
     let consensus_clone = Arc::clone(&consensus);
+    let shutdown_consensus = Arc::clone(&shutdown);
     tokio::spawn(async move {
         loop {
+            // Stop mining the moment shutdown is requested so we never start a
+            // new vertex/commit while the main loop is draining + flushing.
+            if shutdown_consensus.load(Ordering::SeqCst) {
+                break;
+            }
             // Run one consensus attempt per configured ticker interval.
             {
                 // WRITE LOCK FOR MINING
@@ -747,6 +784,25 @@ async fn main() {
     println!("👤 Node Identity: {}", node_addr_hex);
 
     loop {
+        // #10 Graceful shutdown: on SIGTERM/SIGINT, drain any in-flight commit
+        // and flush the DB before exiting, so a rolling deploy never relies on
+        // crash recovery.
+        if shutdown.load(Ordering::SeqCst) {
+            println!("🧹 Graceful shutdown: draining in-flight consensus work...");
+            // Acquiring the consensus write lock blocks until the current
+            // try_create_vertex/commit (if any) has finished — the ticker has
+            // already stopped starting new ones via the same flag.
+            {
+                let _drain = consensus.write();
+            }
+            match storage.flush() {
+                Ok(()) => println!("💾 Graceful shutdown: storage flushed to disk."),
+                Err(e) => eprintln!("⚠️ Graceful shutdown: storage flush failed: {e}"),
+            }
+            println!("👋 Node exited cleanly.");
+            break;
+        }
+
         // === PARALLEL EXECUTION & DA INTEGRATION ===
         // Execution is now handled by DagConsensus::add_vertex upon commit.
         // DA Batch creation is triggered automatically by Consensus.
@@ -761,6 +817,6 @@ async fn main() {
             }
         }
 
-        thread::sleep(Duration::from_millis(1000)); // Lower tick rate for efficiency
+        thread::sleep(Duration::from_millis(250)); // Poll shutdown ~4x/sec; metrics tick
     }
 }

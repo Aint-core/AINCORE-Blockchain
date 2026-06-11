@@ -27,6 +27,24 @@ mod tests {
     }
 
     #[test]
+    fn test_flush_persists_then_survives_reopen() {
+        // #10 graceful-shutdown primitive: after flush(), data must be durable
+        // across a fresh open of the same path (simulates clean stop + restart).
+        let path = "/tmp/aincore_test_db_flush_reopen";
+        let _ = fs::remove_dir_all(path);
+        {
+            let db = StateDB::open(path).expect("open");
+            db.put("k1", "v1").unwrap();
+            db.put("k2", "v2").unwrap();
+            db.flush().expect("flush must succeed");
+        } // drop closes the DB
+        let reopened = StateDB::open(path).expect("reopen");
+        assert_eq!(reopened.get("k1").unwrap(), Some("v1".to_string()));
+        assert_eq!(reopened.get("k2").unwrap(), Some("v2".to_string()));
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn test_delete() {
         let db = temp_db("delete");
         db.put("key1", "val1").unwrap();
