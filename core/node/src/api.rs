@@ -224,6 +224,80 @@ async fn json_rpc_handler(
                 }
             }))
         },
+        "aincore_getQuorumCert" | "aincore_getLatestQuorumCertificate" | "aincore_getQuorumCertificate" => {
+            // QC Phase 2: return the stored quorum certificate (optionally for a
+            // specific [height]; default = latest) AND independently re-verify it
+            // against the trusted validator set so callers get a trust verdict,
+            // not just bytes.
+            let height = params.get(0).and_then(|v| v.as_u64()).or_else(|| {
+                data.storage
+                    .get("consensus:qc:latest_height")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.parse::<u64>().ok())
+            });
+            match height {
+                None => Ok(serde_json::json!({
+                    "available": false,
+                    "reason": "no quorum certificate produced yet"
+                })),
+                Some(h) => match data.storage.get(&format!("consensus:qc:{}", h)) {
+                    Ok(Some(qc_json)) => {
+                        match serde_json::from_str::<consensus::qc::QuorumCertificate>(&qc_json) {
+                            Ok(qc) => {
+                                let (verified, verify_error) =
+                                    match consensus::qc_producer::load_validator_set_v1(
+                                        &data.storage,
+                                    ) {
+                                        Some(vset) => match consensus::qc::verify_qc(&qc, &vset) {
+                                            Ok(()) => (true, String::new()),
+                                            Err(e) => (false, e.to_string()),
+                                        },
+                                        None => (false, "validator set unavailable".to_string()),
+                                    };
+                                Ok(serde_json::json!({
+                                    "available": true,
+                                    "height": h,
+                                    "verified": verified,
+                                    "verify_error": verify_error,
+                                    "quorum_certificate": qc,
+                                }))
+                            }
+                            Err(e) => Ok(serde_json::json!({
+                                "available": false,
+                                "height": h,
+                                "reason": format!("corrupt QC at height: {e}")
+                            })),
+                        }
+                    }
+                    _ => Ok(serde_json::json!({
+                        "available": false,
+                        "height": h,
+                        "reason": "no quorum certificate at height"
+                    })),
+                },
+            }
+        },
+        "aincore_verifyQuorumCertificate" => {
+            let qc_value = params.get(0).ok_or_else(|| JsonRpcError {
+                code: -32602,
+                message: "Invalid params: [quorum_certificate]".into(),
+            })?;
+            let qc: consensus::qc::QuorumCertificate =
+                serde_json::from_value(qc_value.clone()).map_err(|e| JsonRpcError {
+                    code: -32602,
+                    message: format!("Invalid quorum certificate: {e}"),
+                })?;
+            let validators = consensus::qc_producer::load_validator_set_v1(&data.storage)
+                .ok_or_else(|| JsonRpcError {
+                    code: -32000,
+                    message: "validator set unavailable".into(),
+                })?;
+            match consensus::qc::verify_qc(&qc, &validators) {
+                Ok(()) => Ok(serde_json::json!({ "valid": true })),
+                Err(e) => Ok(serde_json::json!({ "valid": false, "error": e.to_string() })),
+            }
+        },
         "aincore_getDag" => {
             let consensus = data.consensus.read().unwrap_or_else(|e| e.into_inner());
             let dag = consensus.dag.lock().unwrap_or_else(|e| e.into_inner());

@@ -17,11 +17,13 @@
 
 use crypto::bls::BLSEngine;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Domain tag mixed into every finality-vote message so a finality vote can
 /// never collide with a DAG vertex signature (which uses the same consensus DST
 /// at the BLS layer). Bump the suffix on any breaking change to the vote shape.
 const FINALITY_VOTE_DOMAIN: &[u8] = b"AINCORE_FINALITY_VOTE_V1";
+const VALIDATOR_BLS_DOMAIN: &[u8] = b"AINCORE_VALIDATOR_BLS_V1";
 
 /// Per-validator finality identity. `bls_public_key` / `bls_pop` are hex.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +134,28 @@ pub fn canonical_order(validators: &[ValidatorInfo]) -> Vec<ValidatorInfo> {
     let mut v = validators.to_vec();
     v.sort_by(|a, b| a.address.cmp(&b.address));
     v
+}
+
+/// Deterministically derive the validator BLS signing seed from the persistent
+/// node identity. This mirrors genesis B1 derivation exactly:
+/// `SHA256("AINCORE_VALIDATOR_BLS_V1" || node.key)`.
+pub fn derive_validator_bls_seed(node_identity: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(VALIDATOR_BLS_DOMAIN);
+    hasher.update(node_identity);
+    let digest = hasher.finalize();
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&digest);
+    seed
+}
+
+/// Canonical hash of the validator set whose order defines QC bitmap indices.
+/// This is included in every FinalityVote so a QC cannot be replayed against a
+/// different epoch/set with the same address ordering.
+pub fn validator_set_hash(validators: &[ValidatorInfo]) -> String {
+    let canonical = canonical_order(validators);
+    let bytes = bcs::to_bytes(&canonical).expect("ValidatorInfo is BCS-serializable");
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// Decode a positional bitmap into the set signer indices.
@@ -336,6 +360,34 @@ mod tests {
 
     fn sign_vote(sk_bytes: &[u8; 32], vote: &FinalityVote) -> Vec<u8> {
         BLSEngine::consensus().sign_raw(&vote.to_signing_bytes(), sk_bytes)
+    }
+
+    #[test]
+    fn validator_bls_seed_derivation_matches_live_reset_vector() {
+        // node.key preserved during the 2026-06-11 phase1-bls-stake-v1 reset.
+        let node_key = hex::decode(
+            "5fb8c5e0922cc2ddd1c399c5c44542578c68f7b17fc6d98f0019623bdc737e96",
+        )
+        .unwrap();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&node_key);
+        let seed = derive_validator_bls_seed(&key);
+        let pk = BLSEngine::consensus().pubkey_raw(&seed);
+        assert_eq!(
+            hex::encode(pk),
+            "a09c6a3120b4ce73927f435ce925c50d314f82bf6dca8c3ee6050f58f46bbeccc8dce4a22f0c109ae1e6a339c9a3fb3d"
+        );
+    }
+
+    #[test]
+    fn validator_set_hash_is_order_independent() {
+        let (a, _) = make_validator(1, 10);
+        let (b, _) = make_validator(2, 20);
+        assert_eq!(
+            validator_set_hash(&[a.clone(), b.clone()]),
+            validator_set_hash(&[b, a]),
+            "hash must canonicalize validator ordering"
+        );
     }
 
     #[test]

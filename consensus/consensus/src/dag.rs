@@ -855,15 +855,15 @@ impl DagConsensus {
             engine.try_commit(vertex.round, &dag, &round_idx, &validators)
         }; // All locks dropped here!
 
-        if let Some((hashes, anchor_leader)) = committed_result {
+        if let Some(commit) = committed_result {
             println!(
                 "⛓️  Consensus Reached! Executing {} vertices in order...",
-                hashes.len()
+                commit.sequence.len()
             );
 
             let executor = &self.executor;
             let mut block_txs = Vec::new();
-            let reward_recipient = anchor_leader; // C-10 FIX: Reward the anchor leader deterministically
+            let reward_recipient = commit.leader.clone(); // C-10 FIX: Reward the anchor leader deterministically
 
             // Re-acquire DAG read lock just to fetch payloads
             // We can optimize this by cloning necessary data in the previous block,
@@ -871,7 +871,7 @@ impl DagConsensus {
             // So we just re-acquire efficiently.
             let dag = self.dag.lock().expect("🚨 FATAL: DAG lock poisoned");
 
-            for hash in &hashes {
+            for hash in &commit.sequence {
                 if let Some(v) = dag.get(hash) {
                     // Clone payload to release DAG lock faster?
                     // No, looking up payload is fast. Execution is slow.
@@ -895,6 +895,11 @@ impl DagConsensus {
                 // We can use executor.execute_block_parallel(block_txs).
                 let execution_summary =
                     executor.execute_block_parallel(block_txs.clone(), &reward_recipient);
+
+                // QC Phase 2: capture the executed roots before they are moved
+                // into the Block (used to build the FinalityVote below).
+                let qc_state_root = execution_summary.state_root.clone();
+                let qc_receipts_root = execution_summary.receipts_root.clone();
 
                 // Create Block (Post-Execution)
                 use blockchain::Block;
@@ -976,6 +981,43 @@ impl DagConsensus {
                             );
                         }
                     }
+
+                    // === QC PHASE 2: quorum-certificate production ===
+                    // ADDITIVE & SIDE-EFFECT-ONLY: this contributes THIS node's
+                    // BLS signature over the committed block and, when this node's
+                    // stake alone meets the strict >2/3 quorum (the live
+                    // single-validator / supermajority topology), stores a
+                    // complete, externally-verifiable quorum certificate. It is
+                    // NOT a precondition for commit — any failure just skips the
+                    // attestation; consensus is unaffected. Multi-party vote
+                    // aggregation is Phase 3.
+                    {
+                        let epoch = self
+                            .storage
+                            .get("consensus:epoch")
+                            .ok()
+                            .flatten()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        let ctx = crate::qc_producer::CommitContext {
+                            chain_id: self.resolve_chain_id(),
+                            epoch,
+                            finalized_round: commit.anchor_round,
+                            anchor_round: commit.anchor_round,
+                            anchor_hash: commit.anchor_hash.clone(),
+                            block_height: self.latest_block_height,
+                            block_hash: self.latest_block_hash.clone(),
+                            state_root: qc_state_root.clone(),
+                            receipts_root: qc_receipts_root.clone(),
+                            finality_digest: commit.finality_digest.clone(),
+                        };
+                        let _ = crate::qc_producer::produce_and_store_qc(
+                            &self.storage,
+                            &self.node_key,
+                            &self.node_id,
+                            &ctx,
+                        );
+                    }
                 }
             }
 
@@ -988,7 +1030,7 @@ impl DagConsensus {
             // We can't look up round without DAG lock.
             // Let's Skip intricate pruning update for this hotfix.
             // Or re-acquire lock.
-            if !hashes.is_empty() {
+            if !commit.sequence.is_empty() {
                 // H-5 FIX: Prune only FINALIZED rounds (check ordering engine)
                 // M3 FIX: Derive the prune watermark from the MONOTONIC finality
                 // high-water mark, not committed_rounds.iter().min(). The old
@@ -1056,6 +1098,31 @@ impl DagConsensus {
                 }
             }
         }
+    }
+
+    fn resolve_chain_id(&self) -> String {
+        if let Ok(Some(chain_id)) = self.storage.get("sys:chain_id") {
+            if !chain_id.trim().is_empty() {
+                return chain_id;
+            }
+        }
+        if let Ok(chain_id) = std::env::var("AINCORE_CHAIN_ID") {
+            if !chain_id.trim().is_empty() {
+                return chain_id;
+            }
+        }
+        if let Ok(path) = std::env::var("AINCORE_GENESIS_PATH") {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                    if let Some(chain_id) = json.get("chain_id").and_then(|v| v.as_str()) {
+                        if !chain_id.trim().is_empty() {
+                            return chain_id.to_string();
+                        }
+                    }
+                }
+            }
+        }
+        "AINCORE-MAINNET-1".to_string()
     }
 
     fn broadcast_vertex(&self, vertex: &Vertex) {

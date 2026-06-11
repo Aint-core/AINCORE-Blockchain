@@ -1019,6 +1019,32 @@ mod tests {
         value: u128,
     }
 
+    /// QC Phase 2 anti-drift guard: the runtime BLS-seed derivation used by the
+    /// consensus QC producer MUST be byte-identical to the genesis derivation,
+    /// otherwise a validator signs finality votes with a key that is not the one
+    /// registered at genesis and every QC it produces fails verification (silent
+    /// keystone death). This test sees both definitions and pins them together.
+    #[test]
+    fn genesis_and_qc_producer_bls_derivation_match() {
+        for id_byte in [0u8, 1, 7, 42, 200, 255] {
+            let id = [id_byte; 32];
+            assert_eq!(
+                derive_validator_bls_seed(&id),
+                consensus::qc_producer::derive_validator_bls_seed(&id),
+                "BLS seed derivation drifted between genesis and qc_producer for id byte {id_byte}"
+            );
+            // And therefore the derived public keys must match too.
+            let bls = crypto::bls::BLSEngine::consensus();
+            let (genesis_pk, _) = derive_validator_bls_identity(&id);
+            let producer_seed = consensus::qc_producer::derive_validator_bls_seed(&id);
+            assert_eq!(
+                genesis_pk,
+                bls.pubkey_raw(&producer_seed),
+                "derived BLS pubkey drifted for id byte {id_byte}"
+            );
+        }
+    }
+
     fn temp_db(name: &str) -> Arc<StateDB> {
         let path = std::env::temp_dir().join(format!(
             "aincore_phase0_genesis_{}_{}",
