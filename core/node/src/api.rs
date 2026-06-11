@@ -279,23 +279,38 @@ async fn json_rpc_handler(
             }
         },
         "aincore_verifyQuorumCertificate" => {
-            let qc_value = params.get(0).ok_or_else(|| JsonRpcError {
-                code: -32602,
-                message: "Invalid params: [quorum_certificate]".into(),
-            })?;
-            let qc: consensus::qc::QuorumCertificate =
-                serde_json::from_value(qc_value.clone()).map_err(|e| JsonRpcError {
+            // Verify an externally-supplied QC against THIS node's trusted
+            // validator set (no `?` — this match arm must yield a Result, and the
+            // async handler returns `impl Responder`, not Result).
+            match params.get(0) {
+                None => Err(JsonRpcError {
                     code: -32602,
-                    message: format!("Invalid quorum certificate: {e}"),
-                })?;
-            let validators = consensus::qc_producer::load_validator_set_v1(&data.storage)
-                .ok_or_else(|| JsonRpcError {
-                    code: -32000,
-                    message: "validator set unavailable".into(),
-                })?;
-            match consensus::qc::verify_qc(&qc, &validators) {
-                Ok(()) => Ok(serde_json::json!({ "valid": true })),
-                Err(e) => Ok(serde_json::json!({ "valid": false, "error": e.to_string() })),
+                    message: "Invalid params: [quorum_certificate]".into(),
+                }),
+                Some(qc_value) => {
+                    match serde_json::from_value::<consensus::qc::QuorumCertificate>(
+                        qc_value.clone(),
+                    ) {
+                        Err(e) => Err(JsonRpcError {
+                            code: -32602,
+                            message: format!("Invalid quorum certificate: {e}"),
+                        }),
+                        Ok(qc) => match consensus::qc_producer::load_validator_set_v1(&data.storage)
+                        {
+                            None => Err(JsonRpcError {
+                                code: -32000,
+                                message: "validator set unavailable".into(),
+                            }),
+                            Some(validators) => match consensus::qc::verify_qc(&qc, &validators) {
+                                Ok(()) => Ok(serde_json::json!({ "valid": true })),
+                                Err(e) => Ok(serde_json::json!({
+                                    "valid": false,
+                                    "error": e.to_string()
+                                })),
+                            },
+                        },
+                    }
+                }
             }
         },
         "aincore_getDag" => {

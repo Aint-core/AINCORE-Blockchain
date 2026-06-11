@@ -627,7 +627,6 @@ pub fn initialize_genesis(
 
     #[derive(serde::Deserialize)]
     struct GenesisFile {
-        #[allow(dead_code)]
         chain_id: String,
         validators: Vec<GenesisValidatorConfig>,
         treasury_reserve: String,
@@ -662,8 +661,15 @@ pub fn initialize_genesis(
     let mut total_bootstrap_stake: u128 = 0;
     let treasury_reserve_amount: u128;
     let genesis_epoch_duration: u64;
+    let mut genesis_chain_id = "AINCORE-MAINNET-1".to_string();
 
     if let Some(config) = loaded_genesis {
+        if config.chain_id.trim().is_empty() {
+            return Err(GenesisError::InvalidData(
+                "genesis.json chain_id must not be empty".to_string(),
+            ));
+        }
+        genesis_chain_id = config.chain_id.clone();
         if config.validators.is_empty() {
             return Err(GenesisError::InvalidData(
                 "genesis.json must contain at least one validator".to_string(),
@@ -788,6 +794,8 @@ pub fn initialize_genesis(
             v1_validators.len()
         );
     }
+    storage.put("sys:chain_id", &genesis_chain_id)?;
+    println!("⛓️  Genesis Chain ID: {}", genesis_chain_id);
 
     // === GENESIS LOCK: Register the Genesis Validator address ===
     // This address will be PERMANENTLY BLOCKED from transfers (Anti-Rugpull).

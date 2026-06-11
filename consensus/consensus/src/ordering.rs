@@ -36,6 +36,15 @@ pub struct OrderingEngine {
 /// are rejected via the high-water comparison instead of set membership.
 const COMMITTED_ROUNDS_WINDOW: u64 = 256;
 
+#[derive(Debug, Clone)]
+pub struct CommitInfo {
+    pub sequence: Vec<String>,
+    pub leader: String,
+    pub anchor_round: u64,
+    pub anchor_hash: String,
+    pub finality_digest: String,
+}
+
 impl Default for OrderingEngine {
     fn default() -> Self {
         Self::new()
@@ -133,7 +142,7 @@ impl OrderingEngine {
         // get_validator_set_with_stake guarantees) so leader election is
         // deterministic across honest nodes.
         validators: &[(String, u64)],
-    ) -> Option<(Vec<String>, String)> {
+    ) -> Option<CommitInfo> {
         if current_round < 4 {
             return None;
         }
@@ -302,7 +311,13 @@ impl OrderingEngine {
         // This ensures unpredictable randomness for future leader selection
         self.update_random_beacon(anchor_vertex_hash.as_bytes());
 
-        Some((sequence, successful_leader))
+        Some(CommitInfo {
+            sequence,
+            leader: successful_leader,
+            anchor_round,
+            anchor_hash: anchor_vertex_hash.clone(),
+            finality_digest: Self::finality_digest(&self.committed_sequence),
+        })
     }
 
     /// H5 + M6 FIX: Leader selection now uses VDF random beacon for unpredictability.
