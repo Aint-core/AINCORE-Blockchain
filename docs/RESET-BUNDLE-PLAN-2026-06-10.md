@@ -94,6 +94,15 @@ schedule without a reset:
    soak + DEX stopped. No deletion.
 4. **Fresh genesis.** New DB/port from the bundled binary; fresh genesis with the
    new lineage (B1 validator BLS keys baked in).
+   - **PRESERVE `node.key` (learned 2026-06-11).** A reset that wipes the data
+     dir regenerates `node.key` → the node's address changes → it is no longer in
+     the genesis validator set → it boots as an **observer** and never produces
+     blocks. On the 2026-06-11 reset this happened and was recovered by restoring
+     the prior key from `fresh_data_key_keep/node.key` then restarting. **Before
+     reset, copy each validator's `node.key` aside; after fresh genesis, restore
+     it before first boot.** On a multi-validator set, losing `node.key` on >1/3
+     of nodes at once = loss of quorum — treat key preservation as mandatory, not
+     best-effort.
 5. **Re-seed observers.** Point VPS/Pi/laptop at the new lineage
    (`p2p.aincore.network:9042`), fresh data dirs.
 6. **Verify (checklist below) before calling it done.**
