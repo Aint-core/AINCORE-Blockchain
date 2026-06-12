@@ -233,23 +233,33 @@ pub async fn start_server<F>(
                                                         && peer_port != 0
                                                     {
                                                         let remote_ip = addr.ip();
-                                                        if is_docker_bridge_ip(remote_ip) {
-                                                            let _ = db_clone.remove_peer(&peer_id);
+                                                        let remote_ip_is_docker_bridge =
+                                                            is_docker_bridge_ip(remote_ip);
+                                                        let remote_ip = remote_ip.to_string();
+
+                                                        if let Ok(mut peers) = peers_clone.lock() {
+                                                            peers
+                                                                .insert(peer_id.clone(), peer_port);
                                                         } else {
-                                                            let remote_ip = remote_ip.to_string();
-                                                            if let Ok(mut peers) =
-                                                                peers_clone.lock()
-                                                            {
-                                                                peers.insert(
-                                                                    peer_id.clone(),
-                                                                    peer_port,
-                                                                );
-                                                            } else {
-                                                                eprintln!(
-                                                                    "⚠️ Peers lock poisoned, cannot register peer {}",
-                                                                    peer_id
-                                                                );
-                                                            }
+                                                            eprintln!(
+                                                                "⚠️ Peers lock poisoned, cannot register peer {}",
+                                                                peer_id
+                                                            );
+                                                        }
+
+                                                        if remote_ip_is_docker_bridge {
+                                                            // Docker publishes container ports through the bridge
+                                                            // gateway (commonly 172.23.0.1), so a legitimate inbound
+                                                            // peer can appear with that source address from inside the
+                                                            // container. Keep the authenticated peer in memory for this
+                                                            // session, but never persist the bridge gateway as a dial-back
+                                                            // address; doing so poisons reconnect with unreachable
+                                                            // 172.x:port entries.
+                                                            println!(
+                                                                "🤝 Authenticated Peer session: {} via Docker bridge (port {})",
+                                                                peer_id, peer_port
+                                                            );
+                                                        } else {
                                                             let _ = db_clone
                                                                 .save_peer(&peer_id, peer_port);
                                                             let _ = db_clone
