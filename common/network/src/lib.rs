@@ -15,6 +15,16 @@ const CONNECT_TIMEOUT_SECS: u64 = 5;
 const FRAME_LENGTH_TIMEOUT_SECS: u64 = 120;
 const FRAME_BODY_TIMEOUT_SECS: u64 = 120;
 
+fn is_docker_bridge_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            octets[0] == 172 && (16..=31).contains(&octets[1])
+        }
+        std::net::IpAddr::V6(_) => false,
+    }
+}
+
 struct ConnectionGuard {
     counter: Arc<AtomicUsize>,
 }
@@ -222,24 +232,33 @@ pub async fn start_server<F>(
                                                         && !peer_id.starts_with("__")
                                                         && peer_port != 0
                                                     {
-                                                        let remote_ip = addr.ip().to_string();
-                                                        if let Ok(mut peers) = peers_clone.lock() {
-                                                            peers
-                                                                .insert(peer_id.clone(), peer_port);
+                                                        let remote_ip = addr.ip();
+                                                        if is_docker_bridge_ip(remote_ip) {
+                                                            let _ = db_clone.remove_peer(&peer_id);
                                                         } else {
-                                                            eprintln!(
-                                                                "⚠️ Peers lock poisoned, cannot register peer {}",
-                                                                peer_id
+                                                            let remote_ip = remote_ip.to_string();
+                                                            if let Ok(mut peers) =
+                                                                peers_clone.lock()
+                                                            {
+                                                                peers.insert(
+                                                                    peer_id.clone(),
+                                                                    peer_port,
+                                                                );
+                                                            } else {
+                                                                eprintln!(
+                                                                    "⚠️ Peers lock poisoned, cannot register peer {}",
+                                                                    peer_id
+                                                                );
+                                                            }
+                                                            let _ = db_clone
+                                                                .save_peer(&peer_id, peer_port);
+                                                            let _ = db_clone
+                                                                .save_peer_ip(&peer_id, &remote_ip);
+                                                            println!(
+                                                                "🤝 Authenticated Peer registered: {} ({}:{})",
+                                                                peer_id, remote_ip, peer_port
                                                             );
                                                         }
-                                                        let _ =
-                                                            db_clone.save_peer(&peer_id, peer_port);
-                                                        let _ = db_clone
-                                                            .save_peer_ip(&peer_id, &remote_ip);
-                                                        println!(
-                                                            "🤝 Authenticated Peer registered: {} ({}:{})",
-                                                            peer_id, remote_ip, peer_port
-                                                        );
                                                     }
                                                 } else {
                                                     eprintln!(
