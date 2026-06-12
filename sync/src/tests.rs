@@ -30,6 +30,20 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn sync_skips_session_only_peer_without_persisted_ip() {
+        let sync = setup_sync("session_only_peer");
+        sync.storage.put("latest_height", "7").unwrap();
+        sync.peers
+            .lock()
+            .unwrap()
+            .insert("session_only".to_string(), 9032);
+
+        let height = sync.sync_from_peers().await;
+
+        assert_eq!(height, 7);
+    }
+
     fn rehash_block(block: &mut Block) {
         block.header.hash = blockchain::calculate_header_hash(&block.header);
     }

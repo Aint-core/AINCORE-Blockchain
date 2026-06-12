@@ -318,10 +318,13 @@ impl ChainSync {
         let mut final_height = my_height;
 
         for (peer_id, peer_port) in peers_map.iter() {
-            let peer_ip = self
-                .storage
-                .get_peer_ip(peer_id)
-                .unwrap_or_else(|| "127.0.0.1".to_string());
+            let Some(peer_ip) = self.storage.get_peer_ip(peer_id) else {
+                // Inbound peers behind Docker/NAT are useful as live sessions, but
+                // their accepted socket source is not a routable sync target. Only
+                // outbound handshakes persist peer_ip; skip session-only peers here
+                // instead of trying 127.0.0.1:<peer_port> and spamming refused logs.
+                continue;
+            };
 
             // Skip self-dials and bogus loopback entries. A stale peer record
             // pointing at our own port (e.g. 127.0.0.1:<my_port>) just wastes a
