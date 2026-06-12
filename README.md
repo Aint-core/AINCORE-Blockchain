@@ -133,6 +133,16 @@ temporary public seed while the NAS/Pi/private observers keep running on
 Tailscale. It is meant to prove that outside nodes can reach AINCORE P2P without
 turning the home NAS into the public entrypoint.
 
+Current public scope: **observer-only testnet access**.
+
+- External users may run observer peers and verify that they can sync blocks,
+  finality, and quorum certificates.
+- External users should **not** try to join as validators yet.
+- No real funds, BTC/WBTC custody, rewards, or production staking are active on
+  this public observer surface.
+- The chain can reset during testnet hardening. Always use a fresh data
+  directory for this branch.
+
 Current temporary public seed:
 
 ```text
@@ -201,6 +211,8 @@ Important notes:
 - Public RPC is intentionally not exposed here; only P2P seed ports are public.
 - This is still a testnet/fresh-chain surface, not a mainnet value network.
 - Do not use this path for real BTC/WBTC custody or production funds.
+- Keep your local RPC bound to localhost or firewalled. Do not expose your
+  observer RPC port to the public internet.
 
 ### Storage Mode
 
@@ -378,13 +390,23 @@ LimitNOFILE=65535
 ### Notes
 
 - Observer peers do **not** validate or earn rewards.
-- Validator registration still requires staking and the validator flow below.
+- Validator registration is not open to outside users on the current public
+  observer testnet. The validator runbook below is internal/future-facing.
 - Keep node-to-node traffic on Tailscale while this network is still in private testnet mode.
 - Do not compare an observer connected to the fresh Tailscale bootnode with an older soak chain if they use different data directories or genesis state.
 
 ---
 
-## Become a Validator (Step-by-Step)
+## Validator Guide (Not Active for Public Testnet)
+
+> ⚠️ **Current status:** the public testnet is open for **observer peers only**.
+> External validator onboarding, public staking, rewards, and slashing are not
+> active for outside users yet. Do not follow the validator flow below against
+> the current public observer testnet.
+>
+> This section is retained as an internal/future validator runbook. It becomes
+> relevant only after AINCORE announces a production-like or incentivized
+> validator testnet with explicit validator registration instructions.
 
 This guide walks you through becoming a validator on the AINCORE network.
 
@@ -601,7 +623,8 @@ curl -X POST http://localhost:8002/rpc \
 | Network | Chain ID | Usage |
 |---|---|---|
 | **Mainnet** | `AINCORE-MAINNET-1` | Production (set via `AINCORE_CHAIN_ID` env var) |
-| **Testnet** | `AINCORE-TESTNET-1` | Default if env var is not set |
+| **Current fresh public testnet** | `AINCORE-LATEST-FRESH-1` | Active public observer testnet lineage |
+| **Legacy testnet** | `AINCORE-TESTNET-1` | Older local/test fixtures only |
 
 ### Environment Variables
 
