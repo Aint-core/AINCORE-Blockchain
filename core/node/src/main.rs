@@ -510,9 +510,13 @@ async fn main() {
     {
         let node_consensus = Arc::clone(&consensus);
         let da_seq_clone = Arc::clone(&da_sequencer);
+        let shutdown_p2p_rx = Arc::clone(&shutdown);
 
         tokio::spawn(async move {
             while let Some(msg) = p2p_rx.recv().await {
+                if shutdown_p2p_rx.load(Ordering::SeqCst) {
+                    break;
+                }
                 // println!("📨 Main loop received P2P msg: {}", msg);
                 if msg.starts_with("TX:") || msg.starts_with('{') {
                     // READ LOCK usually sufficient if mempool is internally mutexed,
@@ -619,14 +623,21 @@ async fn main() {
         let bootnodes_clone = bootnodes.clone();
         let my_port = port;
         let signing_key_reconnect = Arc::clone(&node_signing_key);
+        let shutdown_reconnect = Arc::clone(&shutdown);
 
         tokio::spawn(async move {
             println!("🛡️ P2P Maintenance Service started (Auto-Reconnect every 15s)");
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+                if shutdown_reconnect.load(Ordering::SeqCst) {
+                    break;
+                }
 
                 // 1. Reconnect to Bootnodes
                 for bootnode_str in &bootnodes_clone {
+                    if shutdown_reconnect.load(Ordering::SeqCst) {
+                        break;
+                    }
                     let parts: Vec<&str> = bootnode_str.split('/').collect();
                     if parts.len() >= 5 {
                         let ip = parts[2];
@@ -652,6 +663,9 @@ async fn main() {
                 // NOT scan_peer_addrs() which stores libp2p multiaddrs with ephemeral ports
                 let saved_peers = storage_clone_reconnect.scan_peers();
                 for (peer_id, peer_port) in saved_peers {
+                    if shutdown_reconnect.load(Ordering::SeqCst) {
+                        break;
+                    }
                     if peer_port != 0 && peer_port != my_port {
                         let ip = storage_clone_reconnect
                             .get_peer_ip(&peer_id)
@@ -730,8 +744,15 @@ async fn main() {
     let consensus_post_sync = Arc::clone(&consensus);
     let storage_post_sync = Arc::clone(&storage);
     let node_id_post_sync = node_id.clone();
+    let shutdown_initial_sync = Arc::clone(&shutdown);
     tokio::spawn(async move {
+        if shutdown_initial_sync.load(Ordering::SeqCst) {
+            return;
+        }
         let synced_height = chain_sync_initial.sync_from_peers().await;
+        if shutdown_initial_sync.load(Ordering::SeqCst) {
+            return;
+        }
 
         // Reload consensus chain tip to prevent fork
         if synced_height > 0 {
@@ -767,10 +788,17 @@ async fn main() {
     // === PERIODIC BACKGROUND SYNC ===
     let chain_sync_periodic = Arc::clone(&chain_sync);
     let consensus_periodic = Arc::clone(&consensus);
+    let shutdown_periodic_sync = Arc::clone(&shutdown);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
+            if shutdown_periodic_sync.load(Ordering::SeqCst) {
+                break;
+            }
             let synced_height = chain_sync_periodic.sync_from_peers().await;
+            if shutdown_periodic_sync.load(Ordering::SeqCst) {
+                break;
+            }
             // Reload consensus chain tip after every sync
             if synced_height > 0 {
                 if let Ok(mut c) = consensus_periodic.write() {
