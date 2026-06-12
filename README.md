@@ -126,12 +126,11 @@ cargo run --release --bin bench_tps -- http://127.0.0.1:3030 1000
 
 ---
 
-## Public Testnet Burst (Temporary VPS Seed)
+## Public Observer Testnet
 
-This is the fastest public-connectivity test path. It uses the current VPS as a
-temporary public seed while the NAS/Pi/private observers keep running on
-Tailscale. It is meant to prove that outside nodes can reach AINCORE P2P without
-turning the home NAS into the public entrypoint.
+This is the public-connectivity path for outside users who want to run an
+observer peer. It is meant to prove that outside nodes can reach AINCORE P2P and
+sync the current fresh testnet without joining the validator set.
 
 Current public scope: **observer-only testnet access**.
 
@@ -143,24 +142,43 @@ Current public scope: **observer-only testnet access**.
 - The chain can reset during testnet hardening. Always use a fresh data
   directory for this branch.
 
-Current temporary public seed:
+### Public seed readiness gate
 
-```text
-/dns4/p2p.aincore.network/tcp/9042
+Before sharing this section with outside users, an operator must verify that the
+public seed is reachable from the open internet:
+
+```bash
+nc -vz aincore-nas.tail406584.ts.net 443
 ```
 
-Additional libp2p listener exposed for peer discovery experiments:
+If this check fails, do **not** publish the public observer instructions yet.
+The node can still be used privately over Tailscale, but outside users will not
+be able to sync.
+
+Current public seed:
 
 ```text
-/dns4/p2p.aincore.network/tcp/9142
+/dns4/aincore-nas.tail406584.ts.net/tcp/443
 ```
+
+### Operator: enable the public TCP seed
+
+The fresh NAS node listens for P2P on host port `9022`. To expose it as a
+temporary public TCP seed through Tailscale Funnel:
+
+```bash
+tailscale funnel --yes --bg --tcp 443 127.0.0.1:9022
+tailscale funnel status
+```
+
+If Tailscale says Funnel is not enabled on the tailnet, enable it from the
+Tailscale admin link shown by the command, then run the command again.
 
 Sanity check from a new machine:
 
 ```bash
-dig +short p2p.aincore.network A
-nc -vz p2p.aincore.network 9042
-nc -vz p2p.aincore.network 9142
+dig +short aincore-nas.tail406584.ts.net A
+nc -vz aincore-nas.tail406584.ts.net 443
 ```
 
 Run an observer against the public seed:
@@ -178,14 +196,7 @@ mkdir -p ./aincore-public-testnet-data
   --port 9032 \
   --rpc-port 8032 \
   --datadir ./aincore-public-testnet-data \
-  --bootnodes /dns4/p2p.aincore.network/tcp/9042
-```
-
-If DNS resolution is unavailable on your machine, use the temporary raw-IP
-fallback:
-
-```text
-/ip4/45.80.181.141/tcp/9042
+  --bootnodes /dns4/aincore-nas.tail406584.ts.net/tcp/443
 ```
 
 Verify local observer health:
@@ -207,8 +218,8 @@ Expected status:
 
 Important notes:
 
-- This VPS seed is temporary while the current VPS lease is still active.
-- Public RPC is intentionally not exposed here; only P2P seed ports are public.
+- This public seed is temporary and may be rotated during testnet hardening.
+- Public RPC is intentionally not exposed here; only the P2P seed is public.
 - This is still a testnet/fresh-chain surface, not a mainnet value network.
 - Do not use this path for real BTC/WBTC custody or production funds.
 - Keep your local RPC bound to localhost or firewalled. Do not expose your
