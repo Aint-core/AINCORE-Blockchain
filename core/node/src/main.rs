@@ -666,20 +666,45 @@ async fn main() {
                     if shutdown_reconnect.load(Ordering::SeqCst) {
                         break;
                     }
-                    if peer_port != 0 && peer_port != my_port {
-                        let ip = storage_clone_reconnect
-                            .get_peer_ip(&peer_id)
-                            .unwrap_or_else(|| "127.0.0.1".to_string());
-                        network::handshake(
-                            &node_id_reconnect,
-                            &ip,
-                            peer_port,
-                            my_port,
-                            Arc::clone(&peers_clone_reconnect),
-                            Arc::clone(&storage_clone_reconnect),
-                            Arc::clone(&signing_key_reconnect),
-                        );
+                    if peer_port == 0 || peer_port == my_port {
+                        continue;
                     }
+                    let ip = storage_clone_reconnect
+                        .get_peer_ip(&peer_id)
+                        .unwrap_or_else(|| "127.0.0.1".to_string());
+                    // Peer hygiene: a saved peer whose IP is an ephemeral
+                    // Docker-bridge address (172.16–31.x — e.g. the 172.23.0.1
+                    // gateway left behind by a stopped sibling container / old
+                    // lineage) is never a reachable node. Prune it instead of
+                    // re-handshaking it every 15s (which spams timeout noise).
+                    // Consistent with the boot-time skip already applied to
+                    // peer_addr entries.
+                    if is_docker_bridge_host(&ip) {
+                        match storage_clone_reconnect.remove_peer(&peer_id) {
+                            Ok(()) => {
+                                println!(
+                                    "🧹 Pruned stale Docker-bridge peer {} ({}:{})",
+                                    peer_id, ip, peer_port
+                                );
+                                if let Ok(mut p) = peers_clone_reconnect.lock() {
+                                    p.remove(&peer_id);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("⚠️ Failed to prune stale peer {}: {}", peer_id, e)
+                            }
+                        }
+                        continue;
+                    }
+                    network::handshake(
+                        &node_id_reconnect,
+                        &ip,
+                        peer_port,
+                        my_port,
+                        Arc::clone(&peers_clone_reconnect),
+                        Arc::clone(&storage_clone_reconnect),
+                        Arc::clone(&signing_key_reconnect),
+                    );
                 }
             }
         });

@@ -173,6 +173,17 @@ impl StateDB {
         }
     }
 
+    /// Peer hygiene: fully forget a peer — delete its `peer:`, `peer_ip:`, and
+    /// `peer_addr:` records so a stale/unreachable entry (e.g. an ephemeral
+    /// Docker-bridge address left over from a stopped sibling container) is not
+    /// reloaded and re-handshaked on every reconnect cycle.
+    pub fn remove_peer(&self, node_id: &str) -> std::result::Result<(), rocksdb::Error> {
+        self.delete(&format!("peer:{}", node_id))?;
+        self.delete(&format!("peer_ip:{}", node_id))?;
+        self.delete(&format!("peer_addr:{}", node_id))?;
+        Ok(())
+    }
+
     pub fn scan_peers(&self) -> Vec<(String, u16)> {
         let mut peers = Vec::new();
         let prefix = b"peer:";

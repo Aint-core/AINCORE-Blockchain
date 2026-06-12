@@ -27,6 +27,23 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_peer_clears_all_records() {
+        // Peer hygiene: remove_peer must delete peer:, peer_ip:, and peer_addr:
+        // for the node so it no longer shows up in scans / reconnect.
+        let db = temp_db("remove_peer");
+        db.save_peer("nodeX", 9032).unwrap();
+        db.save_peer_ip("nodeX", "172.23.0.1").unwrap();
+        db.save_peer_addr("nodeX", "/ip4/172.23.0.1/tcp/9032").unwrap();
+        assert_eq!(db.get_peer("nodeX"), Some(9032));
+
+        db.remove_peer("nodeX").unwrap();
+        assert_eq!(db.get_peer("nodeX"), None);
+        assert_eq!(db.get_peer_ip("nodeX"), None);
+        assert!(db.scan_peers().iter().all(|(id, _)| id != "nodeX"));
+        assert!(db.scan_peer_addrs().iter().all(|(id, _)| id != "nodeX"));
+    }
+
+    #[test]
     fn test_flush_persists_then_survives_reopen() {
         // #10 graceful-shutdown primitive: after flush(), data must be durable
         // across a fresh open of the same path (simulates clean stop + restart).
