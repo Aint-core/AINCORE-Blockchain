@@ -48,6 +48,10 @@ struct Cli {
     /// Path to wallet key file
     #[arg(short, long, default_value = "wallet.key")]
     keyfile: String,
+
+    /// Chain ID used in signed transactions (or AINCORE_CHAIN_ID env)
+    #[arg(long, default_value = "AINCORE-MAINNET-1")]
+    chain_id: String,
 }
 
 #[derive(Subcommand)]
@@ -117,6 +121,11 @@ enum KeysSubcommand {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let client = RpcClient::new(&cli.rpc);
+    let chain_id = if cli.chain_id == "AINCORE-MAINNET-1" {
+        std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| cli.chain_id.clone())
+    } else {
+        cli.chain_id.clone()
+    };
 
     match cli.command {
         Commands::Keygen => {
@@ -212,12 +221,12 @@ fn main() -> anyhow::Result<()> {
             // input_objects=[] here, gas_limit=5000, gas_price=1 (must match tx_json below).
             let message = format!(
                 "{}:{}:{}:{}:{}:{}:{}",
-                "AINCORE-MAINNET-1", sender, payload, seq_num, 5000u64, 1u128, ""
+                chain_id, sender, payload, seq_num, 5000u64, 1u128, ""
             );
             let signature = wallet.sign(message.as_bytes());
 
             let tx_json = json!({
-                "chain_id": "AINCORE-MAINNET-1",
+                "chain_id": chain_id,
                 "sender": sender,
                 "public_key": wallet.public_key(),
                 "input_objects": [],
@@ -334,7 +343,7 @@ fn main() -> anyhow::Result<()> {
             // F4: bind gas_limit/gas_price/input_objects. input_objects=[] for native transfer.
             let message = format!(
                 "{}:{}:{}:{}:{}:{}:{}",
-                "AINCORE-MAINNET-1", sender, payload, seq_num, gas_limit, gas_price, ""
+                chain_id, sender, payload, seq_num, gas_limit, gas_price, ""
             );
             let signature = wallet.sign(message.as_bytes());
 
@@ -342,7 +351,7 @@ fn main() -> anyhow::Result<()> {
             // Note: In Account-Based model, input_objects is empty for native coin transfers.
             // The dependency is implied by the sender address.
             let tx_json = json!({
-                "chain_id": "AINCORE-MAINNET-1",
+                "chain_id": chain_id,
                 "sender": sender,
                 "public_key": wallet.public_key(),
                 "input_objects": [],
@@ -444,13 +453,13 @@ fn main() -> anyhow::Result<()> {
             // F4: bind gas_limit/gas_price/input_objects (publish uses gas_limit 50000).
             let message = format!(
                 "{}:{}:{}:{}:{}:{}:{}",
-                "AINCORE-MAINNET-1", sender, payload, sequence_number, 50000u64, 1u128, ""
+                chain_id, sender, payload, sequence_number, 50000u64, 1u128, ""
             );
             let signature = wallet.sign(message.as_bytes());
 
             // 4. Send Transaction
             let tx_json = json!({
-                "chain_id": "AINCORE-MAINNET-1",
+                "chain_id": chain_id,
                 "sender": sender,
                 "public_key": wallet.public_key(),
                 "input_objects": [],
@@ -525,12 +534,12 @@ fn main() -> anyhow::Result<()> {
             // F4: bind gas_limit/gas_price/input_objects (register uses gas_limit 50000).
             let message = format!(
                 "{}:{}:{}:{}:{}:{}:{}",
-                "AINCORE-MAINNET-1", sender, payload, sequence_number, 50000u64, 1u128, ""
+                chain_id, sender, payload, sequence_number, 50000u64, 1u128, ""
             );
             let signature = wallet.sign(message.as_bytes());
 
             let tx_json = json!({
-                "chain_id": "AINCORE-MAINNET-1",
+                "chain_id": chain_id,
                 "sender": sender,
                 "public_key": wallet.public_key(),
                 "input_objects": [],
@@ -597,12 +606,12 @@ fn main() -> anyhow::Result<()> {
             // F4: bind gas_limit/gas_price/input_objects (faucet uses gas_limit 50000).
             let message = format!(
                 "{}:{}:{}:{}:{}:{}:{}",
-                "AINCORE-MAINNET-1", sender, payload, sequence_number, 50000u64, 1u128, ""
+                chain_id, sender, payload, sequence_number, 50000u64, 1u128, ""
             );
             let signature = wallet.sign(message.as_bytes());
 
             let tx_json = json!({
-                "chain_id": "AINCORE-MAINNET-1",
+                "chain_id": chain_id,
                 "sender": sender,
                 "public_key": wallet.public_key(),
                 "input_objects": [],

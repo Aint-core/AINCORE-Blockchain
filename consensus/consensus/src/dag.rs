@@ -1528,7 +1528,20 @@ impl DagConsensus {
     /// helper is extracted so cache misses and explicit refreshes share one
     /// implementation.
     fn read_validators_from_storage(&self) -> Vec<(String, u64)> {
-        // 1. FAST PATH: Native Consensus State sync'd from Move VM (sys:validators)
+        // 1. AUTHORITATIVE PATH: BLS/stake-aware validator set. Runtime joins
+        // update this key; legacy `sys:validators` is only a compatibility
+        // mirror and can lag on older nodes.
+        if let Ok(Some(json)) = self.storage.get("sys:validator_set:v1") {
+            if let Ok(vals) = serde_json::from_str::<Vec<ValidatorSetV1Entry>>(&json) {
+                let mut validators: Vec<(String, u64)> =
+                    vals.into_iter().map(|v| (v.address, v.stake)).collect();
+                validators.sort_by(|a, b| a.0.cmp(&b.0));
+                validators.dedup_by(|a, b| a.0 == b.0);
+                return validators;
+            }
+        }
+
+        // 2. LEGACY PATH: Native consensus mirror (`sys:validators`).
         if let Ok(Some(json)) = self.storage.get("sys:validators") {
             if let Ok(vals) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
                 let mut validators: Vec<(String, u64)> = vals;
@@ -1538,7 +1551,7 @@ impl DagConsensus {
             }
         }
 
-        // 2. SLOW PATH: Read BCS ValidatorSet Resource directly
+        // 3. SLOW PATH: Read BCS ValidatorSet Resource directly.
         let key = "resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::staking::ValidatorSet";
         if let Ok(Some(bytes_hex)) = self.storage.get(key) {
             if let Ok(bytes) = hex::decode(bytes_hex) {
@@ -1593,6 +1606,12 @@ struct ValidatorConfig {
 #[derive(serde::Deserialize)]
 struct ValidatorSet {
     validators: Vec<ValidatorConfig>,
+}
+
+#[derive(serde::Deserialize)]
+struct ValidatorSetV1Entry {
+    address: String,
+    stake: u64,
 }
 
 #[derive(serde::Deserialize, Debug)]

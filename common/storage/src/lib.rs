@@ -35,6 +35,12 @@ pub struct StateDB {
     pub db: DB,
 }
 
+#[derive(serde::Deserialize)]
+struct ValidatorSetV1Entry {
+    address: String,
+    stake: u64,
+}
+
 impl StateDB {
     pub const BLOCK_PRUNE_CURSOR_KEY: &'static str = "sys:block_prune_cursor_v1";
 
@@ -681,8 +687,20 @@ impl StateDB {
     // Scan method clearly not optimal for Mainnet, but "Real" enough for < 1000 validators.
     // In full prod, we'd use a separate column family or index.
     pub fn get_active_validators(&self) -> Vec<(String, u64)> {
-        // Logic: Check a "sys:validators" list.
-        // This is populated by genesis.json during node bootstrap.
+        // Prefer the BLS/stake-aware validator set. Runtime joins update this
+        // record first; legacy `sys:validators` remains as a compatibility
+        // mirror for old tooling.
+        if let Ok(Some(json)) = self.get("sys:validator_set:v1") {
+            if let Ok(vals) = serde_json::from_str::<Vec<ValidatorSetV1Entry>>(&json) {
+                let mut validators: Vec<(String, u64)> =
+                    vals.into_iter().map(|v| (v.address, v.stake)).collect();
+                validators.sort_by(|a, b| a.0.cmp(&b.0));
+                validators.dedup_by(|a, b| a.0 == b.0);
+                return validators;
+            }
+        }
+
+        // Legacy fallback populated by older genesis/tooling.
         if let Ok(Some(json)) = self.get("sys:validators") {
             if let Ok(vals) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
                 return vals;

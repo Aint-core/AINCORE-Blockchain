@@ -664,8 +664,10 @@ impl Executor {
 
     /// B1: keep `sys:validator_set:v1` live when a validator joins at runtime.
     /// Appends (or replaces by address) the new validator's finality identity and
-    /// stages it in the transaction update set. This MUST NOT write directly to
-    /// RocksDB: the production path commits updates atomically inside
+    /// stages it in the transaction update set. Also stages the legacy
+    /// `sys:validators` mirror because older consensus/tooling still reads the
+    /// `(address, stake)` list. This MUST NOT write directly to RocksDB: the
+    /// production path commits updates atomically inside
     /// `execute_block_parallel`, and the state-root hash is derived from that same
     /// update list.
     fn append_validator_set_v1_update(
@@ -673,6 +675,7 @@ impl Executor {
         updates: &mut Vec<(String, Option<String>)>,
         entry: ValidatorSetV1Entry,
     ) -> Result<(), String> {
+        let legacy_entry = (entry.address.clone(), entry.stake);
         let key = validator_set_v1_key();
         let existing_json = updates
             .iter()
@@ -690,6 +693,26 @@ impl Executor {
         let json = serde_json::to_string(&set)
             .map_err(|e| format!("serialize sys:validator_set:v1 failed: {e}"))?;
         updates.push((key.to_string(), Some(json)));
+
+        let legacy_key = "sys:validators";
+        let existing_legacy_json = updates
+            .iter()
+            .rev()
+            .find_map(|(k, v)| if k == legacy_key { v.as_deref() } else { None })
+            .map(str::to_string)
+            .or_else(|| self.db.get(legacy_key).ok().flatten());
+
+        let mut legacy_set: Vec<(String, u64)> = existing_legacy_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default();
+        legacy_set.retain(|(addr, _)| addr != &legacy_entry.0);
+        legacy_set.push(legacy_entry);
+        legacy_set.sort_by(|a, b| a.0.cmp(&b.0));
+        legacy_set.dedup_by(|a, b| a.0 == b.0);
+        let legacy_json = serde_json::to_string(&legacy_set)
+            .map_err(|e| format!("serialize sys:validators failed: {e}"))?;
+        updates.push((legacy_key.to_string(), Some(legacy_json)));
         Ok(())
     }
 
@@ -2483,11 +2506,19 @@ mod tests {
             db.get(validator_set_v1_key()).unwrap().is_none(),
             "execute_transaction helpers must not write sys:validator_set:v1 directly"
         );
-        assert_eq!(updates.len(), 1);
+        assert!(
+            db.get("sys:validators").unwrap().is_none(),
+            "execute_transaction helpers must not write legacy sys:validators directly"
+        );
+        assert_eq!(updates.len(), 2);
         assert_eq!(updates[0].0, validator_set_v1_key());
         let staged: Vec<ValidatorSetV1Entry> =
             serde_json::from_str(updates[0].1.as_deref().unwrap()).unwrap();
-        assert_eq!(staged, vec![entry]);
+        assert_eq!(staged, vec![entry.clone()]);
+        assert_eq!(updates[1].0, "sys:validators");
+        let legacy: Vec<(String, u64)> =
+            serde_json::from_str(updates[1].1.as_deref().unwrap()).unwrap();
+        assert_eq!(legacy, vec![(entry.address, entry.stake)]);
     }
 
     #[test]
