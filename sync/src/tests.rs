@@ -187,8 +187,46 @@ mod tests {
         };
 
         let err = sync.apply_finality_artifact(&artifact).unwrap_err();
-        assert!(err.contains("too far beyond local height"));
+        assert!(err.contains("too far beyond local synced round"));
         assert_eq!(sync.storage.get("consensus:finalized_round").unwrap(), None);
+    }
+
+    #[test]
+    fn test_apply_finality_artifact_round_not_height() {
+        // Regression: finality drift must compare round↔round, not round↔height.
+        // On a live chain rounds outrun height; a synced observer whose latest
+        // block is height 100 / round 9000 must ACCEPT finality for round 9000.
+        // The old height-based guard rejected it (9000 >> 100 + 1000), which froze
+        // observers' finalized_round forever.
+        let sync = setup_sync("finality_round_not_height");
+        let block = Block::new(100, 9000, "prev".to_string(), vec![], "node_1".to_string());
+        sync.storage
+            .save_block_json(100, &serde_json::to_string(&block).unwrap())
+            .unwrap();
+
+        // ACCEPT: finality at our synced round.
+        let ok = FinalityArtifact {
+            finalized_round: "9000".to_string(),
+            last_anchor_round: "9000".to_string(),
+            last_anchor_hash: "anchor".to_string(),
+            finality_digest: "digest".to_string(),
+        };
+        sync.apply_finality_artifact(&ok)
+            .expect("finality at the synced round must be accepted");
+        assert_eq!(
+            sync.storage.get("consensus:finalized_round").unwrap(),
+            Some("9000".to_string())
+        );
+
+        // REJECT: finality far beyond our synced round (anti-fast-forward intact).
+        let bad = FinalityArtifact {
+            finalized_round: "20000".to_string(),
+            last_anchor_round: "20000".to_string(),
+            last_anchor_hash: "anchor".to_string(),
+            finality_digest: "digest".to_string(),
+        };
+        let err = sync.apply_finality_artifact(&bad).unwrap_err();
+        assert!(err.contains("too far beyond local synced round"));
     }
 
     #[test]

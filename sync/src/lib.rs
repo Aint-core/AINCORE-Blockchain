@@ -171,6 +171,29 @@ impl ChainSync {
         self.storage.get_chain_height()
     }
 
+    /// Round of the latest locally-synced block (0 if none).
+    ///
+    /// Finality is measured in ROUNDS, not block height. The drift guard in
+    /// `apply_finality_artifact` must compare a remote finalized ROUND against
+    /// our latest synced ROUND — comparing it against block HEIGHT was a bug:
+    /// rounds outrun height on a live chain (empty/skipped rounds produce no
+    /// block), so once the round−height gap exceeded the limit the guard
+    /// rejected EVERY finality artifact, freezing observers'
+    /// `consensus:finalized_round` forever.
+    fn local_latest_round(&self) -> u64 {
+        let h = self.get_local_height();
+        if h == 0 {
+            return 0;
+        }
+        self.storage
+            .get(&format!("block_{}", h))
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str::<Block>(&json).ok())
+            .map(|b| b.header.round)
+            .unwrap_or(0)
+    }
+
     fn finalized_round_boundary(&self) -> u64 {
         self.storage
             .get("consensus:finalized_round")
@@ -237,11 +260,16 @@ impl ChainSync {
             return Ok(());
         }
 
-        let local_height = self.get_local_height();
-        if remote_finalized > local_height + Self::FINALITY_ROUND_DRIFT_LIMIT {
+        // Compare ROUND↔ROUND (not round↔height): only accept finality within
+        // FINALITY_ROUND_DRIFT_LIMIT of the latest ROUND we have actually synced.
+        // This still blocks a peer from fast-forwarding us to an unsynced round,
+        // but no longer spuriously rejects legitimate finality once the chain's
+        // round−height gap grows.
+        let local_round = self.local_latest_round();
+        if remote_finalized > local_round + Self::FINALITY_ROUND_DRIFT_LIMIT {
             return Err(format!(
-                "remote finality round {} is too far beyond local height {}",
-                remote_finalized, local_height
+                "remote finality round {} is too far beyond local synced round {}",
+                remote_finalized, local_round
             ));
         }
 
