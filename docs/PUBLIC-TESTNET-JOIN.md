@@ -91,6 +91,25 @@ scripts/testnet-join.sh \
 # then run the printed command; height should climb toward the seed.
 ```
 
+## Node-native auto-bootstrap (no script — for systemd/docker)
+
+The node can bootstrap itself. On a **fresh datadir**, set
+`AINCORE_BOOTSTRAP_SNAPSHOT` to a local path or http(s) URL of the snapshot
+tarball; the node extracts it before opening the DB, then self-sanitises
+(regenerates its own DA key, clears the seed's inherited peer table) — so no ldb
+and no manual key surgery on the joiner.
+
+```bash
+AINCORE_CHAIN_ID=AINCORE-LATEST-FRESH-1 AINCORE_P2P_LISTEN=0 \
+AINCORE_BOOTSTRAP_SNAPSHOT=https://<host>/aincore-testnet-snapshot.tar.gz \
+  ./node --port 9032 --rpc-port 8032 --datadir ~/.aincore-observer \
+         --bootnodes /ip4/100.111.32.83/tcp/9022
+```
+
+It is a strict no-op once a chain DB exists, so it is safe to leave set across
+restarts (re-deploying a fresh observer auto-recovers). Use this in an
+observer's systemd unit / docker-compose env.
+
 ## What must still be set up (admin prerequisites — not code)
 
 1. **Onboard participants to the tailnet.** Generate a Tailscale auth key

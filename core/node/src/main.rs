@@ -44,6 +44,73 @@ fn bootnode_host(addr: &str) -> Option<&str> {
     }
 }
 
+/// Automated state-sync bootstrap (public-testnet onboarding).
+///
+/// A fresh node cannot replay from genesis — the seed prunes old blocks. If the
+/// datadir is EMPTY and `AINCORE_BOOTSTRAP_SNAPSHOT` is set (a local path or an
+/// http(s) URL to a `validator_*.db` tarball), load that snapshot so the node
+/// starts near the current height and ChainSyncs only the small delta.
+///
+/// Safety: acts ONLY when `db_path` does not yet exist — it never touches or
+/// overwrites an existing chain DB. Returns true if a snapshot was installed
+/// (the caller then sanitises per-identity keys via the storage API).
+fn maybe_extract_bootstrap_snapshot(datadir: &str, db_path: &str, port: u16) -> bool {
+    if std::path::Path::new(db_path).exists() {
+        return false; // existing data — never overwrite
+    }
+    let snap = match std::env::var("AINCORE_BOOTSTRAP_SNAPSHOT") {
+        Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return false,
+    };
+    println!("📦 [bootstrap] fresh datadir + AINCORE_BOOTSTRAP_SNAPSHOT set → bootstrapping from {snap}");
+
+    let local = if snap.starts_with("http://") || snap.starts_with("https://") {
+        let dest = format!("{datadir}/.bootstrap-snapshot.tar.gz");
+        match std::process::Command::new("curl")
+            .args(["-fL", "--retry", "3", "-o", &dest, &snap])
+            .status()
+        {
+            Ok(s) if s.success() => dest,
+            _ => {
+                eprintln!("⚠️ [bootstrap] snapshot download failed — starting fresh (will not sync past the prune window)");
+                return false;
+            }
+        }
+    } else {
+        snap.clone()
+    };
+
+    if !matches!(
+        std::process::Command::new("tar").args(["xzf", &local, "-C", datadir]).status(),
+        Ok(s) if s.success()
+    ) {
+        eprintln!("⚠️ [bootstrap] snapshot extract failed — starting fresh");
+        return false;
+    }
+
+    // The snapshot holds one validator_*.db dir; rename it to THIS node's port.
+    let want = format!("validator_{port}.db");
+    if let Ok(entries) = std::fs::read_dir(datadir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.starts_with("validator_") || !name.ends_with(".db") {
+                continue;
+            }
+            if name == want {
+                println!("📦 [bootstrap] snapshot state in place at {want}");
+                return true;
+            }
+            let to = std::path::Path::new(datadir).join(&want);
+            if std::fs::rename(e.path(), &to).is_ok() {
+                println!("📦 [bootstrap] loaded snapshot state → {}", to.display());
+                return true;
+            }
+        }
+    }
+    eprintln!("⚠️ [bootstrap] no validator_*.db inside snapshot — starting fresh");
+    false
+}
+
 #[tokio::main]
 async fn main() {
     // === ARGUMENT PARSER ===
@@ -151,6 +218,13 @@ async fn main() {
     let node_id = node_addr_hex.clone(); // Use address as node_id for consensus matching
 
     let db_path = format!("{}/validator_{}.db", datadir, port);
+
+    // Automated state-sync bootstrap: on a fresh datadir, optionally load a
+    // published snapshot so a new public-testnet node starts near the tip
+    // instead of stalling at height 0 (the seed prunes old blocks). No-op if the
+    // DB already exists.
+    let bootstrapped_from_snapshot = maybe_extract_bootstrap_snapshot(&datadir, &db_path, port);
+
     // Open Database with error handling
     let storage = match StateDB::open(&db_path) {
         Ok(db) => Arc::new(db),
@@ -165,6 +239,24 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // Sanitise a freshly-bootstrapped snapshot: it carries the SEED's per-identity
+    // DA signing key (which this node cannot decrypt → boot panic) and the seed's
+    // peer table (dead peers this node would hammer). Drop both so this node
+    // generates its own DA key and discovers peers via its own bootnode. This is
+    // why joiners need no ldb / manual key surgery.
+    if bootstrapped_from_snapshot {
+        let _ = storage.delete("sys:da:signing_key_enc_v1");
+        let _ = storage.delete("sys:da:signing_key");
+        let inherited = storage.scan_peers();
+        for (peer_id, _) in &inherited {
+            let _ = storage.remove_peer(peer_id);
+        }
+        println!(
+            "🧼 [bootstrap] sanitised snapshot: DA key reset (regenerates) + cleared {} inherited peer(s)",
+            inherited.len()
+        );
+    }
 
     // === H-07 MIGRATION: one-shot tx_index backfill ===
     //
