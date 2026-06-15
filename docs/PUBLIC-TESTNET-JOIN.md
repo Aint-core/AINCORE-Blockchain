@@ -52,38 +52,56 @@ Observers run with `AINCORE_P2P_LISTEN=0` and are **never** in the validator set
 2. **Publish** the snapshot + `genesis.json` + prebuilt binaries (x86_64 +
    aarch64) where joiners can fetch them (GitHub release, object storage, or
    served from the seed host).
-3. **Expose the seed publicly** — pick one:
-   - **Tailscale Funnel** (free, no VPS): enable Funnel in the tailnet admin,
-     then `tailscale funnel --bg --tcp 443 127.0.0.1:9022`. Seed addr becomes
-     `/dns4/<node>.<tailnet>.ts.net/tcp/443`.
-   - **Public VPS seed**: run a node with the public IP; seed addr
-     `/ip4/<vps-ip>/tcp/9022`.
+3. **Let participants reach the seed — via the Tailscale tailnet (recommended).**
+   The seed is the validator's Tailscale IP (e.g. `100.111.32.83:9022`). This is
+   exactly how the existing observers connect — raw TCP over Tailscale, NAT
+   handled, zero cost. To onboard a participant: admin console → Settings → Keys
+   → generate an **auth key** (reusable, optionally tagged), and share it. They
+   `tailscale up --auth-key=<key>` to join your tailnet, then run the join script
+   pointed at the seed's Tailscale IP. "Invite-based public": anyone you give a
+   key can join from anywhere.
+
+   > **Why not Tailscale Funnel?** Funnel fronts everything with TLS/SNI (it's
+   > built for HTTPS). AINCORE P2P is raw TCP with its own encryption, not TLS,
+   > so a node cannot traverse Funnel without a joiner-side TLS tunnel
+   > (socat/stunnel) — fragile, and bandwidth-limited through Funnel relays. For
+   > a fully-open seed (no Tailscale on the joiner) use a **public-IP VPS**
+   > running a node (`/ip4/<vps-ip>/tcp/9022`) instead. Tailnet-invite is the
+   > robust path until then.
 
 Refresh the published snapshot periodically (e.g. daily) so new joiners start
 within the seed's prune window.
 
-## Joiner: one command
+## Joiner: steps
 
 ```bash
-# 1. get a node binary for your arch (release artifact, or build it):
+# 1. join the tailnet (one-time) with the auth key the operator gave you:
+sudo tailscale up --auth-key=<KEY-FROM-OPERATOR>
+
+# 2. get a node binary for your arch (release artifact, or build it):
 #      cargo build --release -p node   # -> target/release/node
-# 2. bootstrap:
+
+# 3. bootstrap (seed = the validator's Tailscale IP):
 scripts/testnet-join.sh \
   --binary ./node \
   --genesis ./genesis.json \
   --snapshot-url https://<host>/aincore-testnet-snapshot.tar.gz \
-  --seed /dns4/<node>.<tailnet>.ts.net/tcp/443 \
+  --seed /ip4/100.111.32.83/tcp/9022 \
   --datadir ~/.aincore-observer
 # then run the printed command; height should climb toward the seed.
 ```
 
 ## What must still be set up (admin prerequisites — not code)
 
-1. **A reachable public seed** (Tailscale Funnel enabled, or a VPS). Today the
-   internal nodes reach the seed over Tailscale/LAN; public-internet join needs
-   one of the above live.
-2. **A public host for the join package** (snapshot + genesis + binaries). The
-   old VPS that hosted this is expired.
+1. **Onboard participants to the tailnet.** Generate a Tailscale auth key
+   (admin → Settings → Keys) and share it; participants `tailscale up
+   --auth-key=<key>` then reach the seed at its Tailscale IP. This works today
+   (the existing observers use exactly this path). Funnel was evaluated and
+   rejected for P2P (TLS mismatch — see the operator note above); a public-IP
+   VPS is the only fully-open alternative.
+2. **A public host for the join package** (snapshot + genesis + binaries) so
+   joiners can fetch them — e.g. a GitHub release. The old VPS that hosted this
+   is expired.
 
 ## Honest limitations / the durable fix
 

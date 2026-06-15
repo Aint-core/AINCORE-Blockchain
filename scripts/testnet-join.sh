@@ -49,6 +49,22 @@ done
 [[ -f "$GENESIS" ]] || { echo "ERROR: genesis not found: $GENESIS" >&2; exit 2; }
 [[ -n "$SNAPSHOT_URL" || -n "$SNAPSHOT_FILE" ]] || { echo "ERROR: --snapshot-url or --snapshot required" >&2; exit 2; }
 
+# Reachability precheck: the seed is reached over the Tailscale tailnet. If you
+# cannot reach it, you are almost certainly not joined to the tailnet yet —
+# install Tailscale and `tailscale up --auth-key=<key-from-operator>` first.
+SEED_HOST="$(printf '%s' "$SEED" | sed -nE 's#^/(ip4|dns4)/([^/]+)/tcp/[0-9]+.*#\2#p')"
+SEED_PORT="$(printf '%s' "$SEED" | sed -nE 's#^.*/tcp/([0-9]+).*#\1#p')"
+if [[ -n "$SEED_HOST" && -n "$SEED_PORT" ]]; then
+  echo "==> Checking seed reachability ($SEED_HOST:$SEED_PORT)..."
+  if command -v nc >/dev/null && ! nc -z -w 6 "$SEED_HOST" "$SEED_PORT" 2>/dev/null; then
+    echo "   ⚠️  Cannot reach the seed. Are you on the tailnet?"
+    echo "      Install Tailscale, then: sudo tailscale up --auth-key=<key from operator>"
+    echo "      (Continuing anyway — the node will keep retrying once you're connected.)"
+  else
+    echo "   seed reachable ✓"
+  fi
+fi
+
 echo "==> Preparing datadir: $DATADIR"
 mkdir -p "$DATADIR"
 
