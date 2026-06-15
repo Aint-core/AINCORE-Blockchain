@@ -107,6 +107,32 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_request_signals_prune_horizon_when_pruned() {
+        // Seed retains only blocks 1000..=1005 (1..999 pruned); a fresh node
+        // requesting from height 0 gets an empty batch — the seed must signal the
+        // prune horizon so the node bootstraps from a snapshot instead of looping.
+        let sync = setup_sync("prune_horizon");
+        for h in 1000..=1005 {
+            let b = Block::new(h, h, "prev".to_string(), vec![], "node_1".to_string());
+            sync.storage
+                .save_block_json(h, &serde_json::to_string(&b).unwrap())
+                .unwrap();
+        }
+        let req = SyncRequest {
+            from_height: 0,
+            sender_id: "node_2".to_string(),
+            sender_port: 8081,
+        };
+        let resp = sync.handle_sync_request(req);
+        assert!(resp.blocks.is_empty(), "requested range is below prune horizon");
+        assert_eq!(
+            resp.prune_horizon,
+            Some(1000),
+            "seed should report lowest available block as the horizon"
+        );
+    }
+
+    #[test]
     fn test_handle_sync_request_message_parsing() {
         let sync = setup_sync("sync_req_msg");
         let block = Block::new(1, 1, "prev".to_string(), vec![], "node_1".to_string());

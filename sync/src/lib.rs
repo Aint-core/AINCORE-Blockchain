@@ -17,6 +17,13 @@ pub struct SyncResponse {
     pub blocks: Vec<Block>,
     #[serde(default)]
     pub finality: Option<FinalityArtifact>,
+    /// Set when the requested range is below the seed's prune horizon (the
+    /// requested blocks no longer exist). Carries the lowest block height the
+    /// seed can still serve, so the requester knows block-replay can't bridge
+    /// the gap and it must bootstrap from a state snapshot instead of looping on
+    /// empty responses. `None` from older peers (serde default).
+    #[serde(default)]
+    pub prune_horizon: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -453,6 +460,19 @@ impl ChainSync {
                                                                     );
                                                                 }
                                                             }
+                                                            // Below the peer's prune horizon: block-replay
+                                                            // cannot bridge this gap. Surface it clearly
+                                                            // instead of looping silently on empty replies.
+                                                            if let Some(horizon) = sync_resp.prune_horizon {
+                                                                if horizon > my_height + 1 {
+                                                                    eprintln!(
+                                                                        "🛑 [ChainSync] peer pruned below us: earliest block #{} but we are at #{}. \
+                                                                         Block-replay cannot bridge this — bootstrap from a state snapshot \
+                                                                         (set AINCORE_BOOTSTRAP_SNAPSHOT on a fresh datadir, or run testnet-join.sh).",
+                                                                        horizon, my_height
+                                                                    );
+                                                                }
+                                                            }
                                                             break; // No more blocks
                                                         }
                                                         let synced = self.process_blocks(
@@ -703,10 +723,46 @@ impl ChainSync {
                 }
             }
         }
+        // Prune-horizon signal: the requester asked for a range we should have
+        // (from_height < local_height) but we returned nothing — those blocks
+        // were pruned. Tell it the lowest height we can still serve so it
+        // bootstraps from a state snapshot rather than looping on empty replies.
+        let prune_horizon = if blocks_to_send.is_empty() && req.from_height < local_height {
+            Some(self.earliest_available_block(req.from_height + 1, local_height))
+        } else {
+            None
+        };
         SyncResponse {
             blocks: blocks_to_send,
             finality: Some(self.collect_finality_artifact()),
+            prune_horizon,
         }
+    }
+
+    /// Lowest block height still present, searched within `[lo, hi]`. After
+    /// prefix-pruning, block existence is monotonic (absent below the horizon,
+    /// present from it to the tip), so a binary search finds the horizon.
+    fn earliest_available_block(&self, lo: u64, hi: u64) -> u64 {
+        let exists = |h: u64| {
+            self.storage
+                .get(&format!("block_{}", h))
+                .ok()
+                .flatten()
+                .is_some()
+        };
+        if exists(lo) {
+            return lo;
+        }
+        let (mut lo, mut hi) = (lo, hi);
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if exists(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        hi
     }
 
     // Legacy Handler for compatibility if needed
