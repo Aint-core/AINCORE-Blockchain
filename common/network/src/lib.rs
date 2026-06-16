@@ -377,9 +377,53 @@ pub async fn start_server<F>(
                                         .flatten()
                                         .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok()),
                                 });
+                                // Prune-horizon signal (audit #9): fire whenever the FIRST
+                                // requested block is missing, not only when the whole batch is
+                                // empty. A request whose start is pruned but whose tail still
+                                // exists otherwise returns blocks the requester cannot apply
+                                // (height gap) AND no signal, so it never learns it must
+                                // state-sync. Mirrors chain_sync::handle_sync_request — kept
+                                // inline because common/network cannot depend on chain_sync.
+                                let first_block_pruned = from_height < local_height
+                                    && db_clone
+                                        .get(&format!("block_{}", from_height + 1))
+                                        .ok()
+                                        .flatten()
+                                        .is_none();
+                                let prune_horizon: Option<u64> = if first_block_pruned {
+                                    // Lowest block still present in [from_height+1, local_height].
+                                    // After prefix-pruning, existence is monotonic, so binary
+                                    // search finds the horizon (mirror earliest_available_block).
+                                    let exists = |h: u64| {
+                                        db_clone
+                                            .get(&format!("block_{}", h))
+                                            .ok()
+                                            .flatten()
+                                            .is_some()
+                                    };
+                                    let lo0 = from_height + 1;
+                                    let horizon = if exists(lo0) {
+                                        lo0
+                                    } else {
+                                        let (mut lo, mut hi) = (lo0, local_height);
+                                        while lo + 1 < hi {
+                                            let mid = lo + (hi - lo) / 2;
+                                            if exists(mid) {
+                                                hi = mid;
+                                            } else {
+                                                lo = mid;
+                                            }
+                                        }
+                                        hi
+                                    };
+                                    Some(horizon)
+                                } else {
+                                    None
+                                };
                                 let resp = serde_json::json!({
                                     "blocks": blocks_json,
                                     "finality": finality,
+                                    "prune_horizon": prune_horizon,
                                 });
                                 let msg = format!("SYNC_RESP:{}", resp);
                                 let _ = send_encrypted(&mut socket, &shared_key, &msg).await;

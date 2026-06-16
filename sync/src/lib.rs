@@ -470,12 +470,13 @@ impl ChainSync {
                                                             // cannot bridge this gap. Surface it clearly
                                                             // instead of looping silently on empty replies.
                                                             if let Some(horizon) = sync_resp.prune_horizon {
-                                                                if horizon > self.get_local_height() + 1 {
+                                                                let local_now = self.get_local_height();
+                                                                if horizon > local_now + 1 {
                                                                     eprintln!(
                                                                         "🛑 [ChainSync] peer pruned below us: earliest block #{} but we are at #{}. \
                                                                          Block-replay cannot bridge this — bootstrap from a state snapshot \
                                                                          (set AINCORE_BOOTSTRAP_SNAPSHOT on a fresh datadir, or run testnet-join.sh).",
-                                                                        horizon, my_height
+                                                                        horizon, local_now
                                                                     );
                                                                 }
                                                             }
