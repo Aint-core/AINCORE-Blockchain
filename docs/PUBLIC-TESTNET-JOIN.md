@@ -67,14 +67,18 @@ only reachable over the tailnet; a node pointed at it without Tailscale will log
 
 ## Step 2 — Bootstrap + run (pure paste)
 
-First **extract the package and `cd` into it** (skip the `tar` line if you were
-handed the folder directly). The package is a *directory* named
-`aincore-testnet-join-package`:
+**Get the package** from the testnet release (public, no auth needed), extract,
+and `cd` in:
 
 ```bash
-tar xzf aincore-testnet-join-package.tar.gz   # only if you received the .tar.gz
+curl -fL -o aincore-testnet-join-package.tar.gz \
+  https://github.com/Aint-core/AINCORE-Blockchain/releases/download/testnet-join-v1/aincore-testnet-join-package.tar.gz
+tar xzf aincore-testnet-join-package.tar.gz
 cd aincore-testnet-join-package
 ```
+
+(If the operator handed you the folder directly, just `cd` into it. The package
+is a *directory* named `aincore-testnet-join-package`.)
 
 Now paste this whole block. It verifies integrity (incl. the script itself),
 auto‑detects your CPU arch, and installs the snapshot:
@@ -208,10 +212,19 @@ delta. Observers run `AINCORE_P2P_LISTEN=0` and are never in the validator set.
   it's safe for any joiner. Re‑cut periodically so joiners sync a small delta.
 - **Refresh the package** when binaries change: drop new `node-x86_64-linux` /
   `node-aarch64-linux` in, regenerate the checksums (`sha256sum …`), re‑tar.
-- **Node‑native auto‑bootstrap (advanced):** instead of `testnet-join.sh`, a fresh
-  datadir can self‑bootstrap from `AINCORE_BOOTSTRAP_SNAPSHOT=https://<host>/snapshot.tar.gz`
+- **Node‑native auto‑bootstrap (advanced, most paste‑paste):** instead of
+  `testnet-join.sh`, a fresh datadir self‑bootstraps from the release snapshot URL
   (https‑only; the node extracts + self‑sanitises before opening the DB, then
-  no‑ops once a DB exists). Needs the snapshot hosted at an https URL.
+  no‑ops once a DB exists):
+  ```bash
+  AINCORE_CHAIN_ID=AINCORE-LATEST-FRESH-1 AINCORE_P2P_LISTEN=0 \
+  AINCORE_BOOTSTRAP_SNAPSHOT=https://github.com/Aint-core/AINCORE-Blockchain/releases/download/testnet-join-v1/aincore-testnet-snapshot.tar.gz \
+    ./node --port 9032 --rpc-port 8032 --datadir ~/.aincore-observer \
+           --bootnodes /ip4/100.111.32.83/tcp/9022
+  ```
+- **Cut a new release** when binaries/snapshot change: re‑tag (e.g. `testnet-join-v2`),
+  upload the refreshed `aincore-testnet-join-package.tar.gz` + `aincore-testnet-snapshot.tar.gz`
+  + `SHA256SUMS` as assets, and bump the URLs above.
 - **Going truly public (no invite):** forward `:9022` on the router with a DDNS
   host and publish `/dns4/<host>/tcp/9022`, or run a seed on a public VPS. Add a
   **second validator** before advertising it as decentralized — the testnet is
