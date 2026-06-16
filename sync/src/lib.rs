@@ -334,6 +334,20 @@ impl ChainSync {
     pub async fn sync_from_peers(&self) -> u64 {
         println!("🔄 [ChainSync] Starting Encrypted P2P Sync...");
 
+        // Audit #3: a prior state-root divergence must ACTUALLY stop syncing —
+        // otherwise the node loops, re-executing onto already-divergent state.
+        // `sync:halt_reason` is set by process_blocks on a state-root mismatch;
+        // refuse to sync while it is present. The operator clears it (deletes the
+        // key) after investigating (a state divergence is usually a node-binary
+        // mismatch against the seed).
+        if let Ok(Some(reason)) = self.storage.get("sync:halt_reason") {
+            eprintln!(
+                "🛑 [ChainSync] HALTED after a state divergence: {reason} — not syncing. \
+                 Investigate, then clear `sync:halt_reason` to resume."
+            );
+            return self.get_local_height();
+        }
+
         let peers_map = self.peers.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if peers_map.is_empty() {
             println!("📡 [ChainSync] No peers available.");
@@ -456,7 +470,7 @@ impl ChainSync {
                                                             // cannot bridge this gap. Surface it clearly
                                                             // instead of looping silently on empty replies.
                                                             if let Some(horizon) = sync_resp.prune_horizon {
-                                                                if horizon > my_height + 1 {
+                                                                if horizon > self.get_local_height() + 1 {
                                                                     eprintln!(
                                                                         "🛑 [ChainSync] peer pruned below us: earliest block #{} but we are at #{}. \
                                                                          Block-replay cannot bridge this — bootstrap from a state snapshot \
@@ -715,11 +729,19 @@ impl ChainSync {
                 }
             }
         }
-        // Prune-horizon signal: the requester asked for a range we should have
-        // (from_height < local_height) but we returned nothing — those blocks
-        // were pruned. Tell it the lowest height we can still serve so it
-        // bootstraps from a state snapshot rather than looping on empty replies.
-        let prune_horizon = if blocks_to_send.is_empty() && req.from_height < local_height {
+        // Prune-horizon signal (audit #9): trigger whenever the FIRST requested
+        // block is missing — not only when the whole batch is empty. Otherwise a
+        // request whose start is pruned but whose tail (e.g. from_height+50)
+        // still exists returns non-empty blocks the requester cannot apply (height
+        // gap) AND no signal, so it never learns it must state-sync.
+        let first_block_pruned = req.from_height < local_height
+            && self
+                .storage
+                .get(&format!("block_{}", req.from_height + 1))
+                .ok()
+                .flatten()
+                .is_none();
+        let prune_horizon = if first_block_pruned {
             Some(self.earliest_available_block(req.from_height + 1, local_height))
         } else {
             None
