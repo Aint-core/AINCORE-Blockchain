@@ -932,12 +932,23 @@ async fn main() {
     });
 
     // === PERIODIC BACKGROUND SYNC ===
+    // Pull-sync cadence. Observers pull committed blocks + the finality QC on this
+    // interval, so in steady state they trail the validator's tip by roughly
+    // (interval / block_time) blocks. Default 3s ≈ the block time, keeping observers
+    // within ~1 block of the tip (near-realtime) instead of the old fixed 30s lag.
+    // Tunable via AINCORE_SYNC_INTERVAL_MS (floored at 500ms to bound RPC load).
+    let sync_interval_ms = std::env::var("AINCORE_SYNC_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= 500)
+        .unwrap_or(3_000);
+    println!("⏱️ Periodic pull-sync interval: {}ms", sync_interval_ms);
     let chain_sync_periodic = Arc::clone(&chain_sync);
     let consensus_periodic = Arc::clone(&consensus);
     let shutdown_periodic_sync = Arc::clone(&shutdown);
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            tokio::time::sleep(Duration::from_millis(sync_interval_ms)).await;
             if shutdown_periodic_sync.load(Ordering::SeqCst) {
                 break;
             }
