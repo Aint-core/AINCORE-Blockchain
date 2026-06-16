@@ -316,6 +316,17 @@ pub async fn start_server<F>(
                                     .ok()
                                     .flatten()
                                     .unwrap_or_default(),
+                                // The quorum certificate is the ONLY field that authorises a
+                                // syncing node to advance its finalized round (the strings above
+                                // are unauthenticated hints). Embed the stored QC verbatim — it is
+                                // already a serialized `QuorumCertificate`, so it round-trips into
+                                // the peer's `Option<QuorumCertificate>`. Read as a raw Value to
+                                // avoid a circular dependency on the `consensus` crate here.
+                                "qc": db_clone
+                                    .get("consensus:qc:latest")
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok()),
                             });
                             let msg = format!("FINALITY:{}", artifact);
                             let _ = send_encrypted(&mut socket, &shared_key, &msg).await;
@@ -357,6 +368,14 @@ pub async fn start_server<F>(
                                         .ok()
                                         .flatten()
                                         .unwrap_or_default(),
+                                    // Carry the quorum certificate on the block-sync fast path too,
+                                    // so a peer that catches up via SYNC_REQ can advance its
+                                    // finalized round (QC-gated) without a separate GET_FINALITY.
+                                    "qc": db_clone
+                                        .get("consensus:qc:latest")
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok()),
                                 });
                                 let resp = serde_json::json!({
                                     "blocks": blocks_json,

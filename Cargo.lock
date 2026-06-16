@@ -1294,6 +1294,7 @@ name = "chain_sync"
 version = "0.1.0"
 dependencies = [
  "blockchain",
+ "consensus",
  "crypto",
  "executor",
  "hex",
