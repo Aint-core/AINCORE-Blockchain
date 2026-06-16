@@ -13,7 +13,7 @@ use executor::Executor;
 use mempool::Mempool;
 
 // === --- IMPORT FASE 3 (Chain Sync) --- ===
-use chain_sync::{ChainSync, SyncRequest, SyncResponse};
+use chain_sync::ChainSync;
 
 // === --- IMPORT FASE 4 (DA Sequencer) --- ===
 use da_sequencer::DASequencer;
@@ -684,7 +684,6 @@ async fn main() {
         let da_seq_clone = Arc::clone(&da_sequencer);
         let node_chain_sync = Arc::clone(&chain_sync);
         let server_node_id = node_id.clone();
-        let handler_storage = Arc::clone(&storage);
         let node_signing_key_server = Arc::clone(&node_signing_key);
 
         tokio::spawn(async move {
@@ -694,8 +693,7 @@ async fn main() {
                 node_peers,
                 Arc::clone(&node_storage),
                 node_signing_key_server,
-                move |msg: String| {
-                    let storage_clone = Arc::clone(&handler_storage);
+                move |msg: String| -> Option<String> {
                     println!("📨 [Server] Received msg: {:.50}...", msg);
                     if msg.starts_with("TX:") {
                         if let Ok(guard) = node_consensus.read() {
@@ -706,39 +704,31 @@ async fn main() {
                                 }
                             }
                         }
+                        None
                     } else if msg.starts_with("DAG_VERTEX:") || msg.starts_with("DOWNTIME_ATTEST:")
                     {
                         if let Ok(mut guard) = node_consensus.write() {
                             guard.handle_message(&msg);
                         }
+                        None
                     } else if let Some(stripped) = msg.strip_prefix("DA_COMMIT:") {
                         if let Ok(guard) = da_seq_clone.lock() {
                             guard.handle_incoming_batch(stripped);
                         }
-                    } else if let Some(content) = msg.strip_prefix("SYNC_REQUEST:") {
-                        // println!("🔍 [DEBUG] SYNC_REQUEST handler triggered!");
-                        if let Ok(req) = serde_json::from_str::<SyncRequest>(content) {
-                            // println!("🔍 [DEBUG] Parsed SYNC_REQUEST from {}", req.sender_id);
-                            let resp = node_chain_sync.handle_sync_request(req.clone());
-                            // println!("🔍 [DEBUG] Got {} blocks from handle_sync_request", resp.blocks.len());
-
-                            let resp_json = serde_json::to_string(&resp).unwrap_or_default();
-                            let response_msg = format!("SYNC_RESPONSE:{}", resp_json);
-
-                            let requester_ip = storage_clone
-                                .get_peer_ip(&req.sender_id)
-                                .unwrap_or_else(|| "127.0.0.1".to_string());
-                            let requester_addr = format!("{}:{}", requester_ip, req.sender_port);
-
-                            if let Err(e) = network::send_message(&requester_addr, &response_msg) {
-                                eprintln!("❌ Failed to send sync response error: {}", e);
-                            }
-                        }
-                    } else if let Some(content) = msg.strip_prefix("SYNC_RESPONSE:") {
-                        match serde_json::from_str::<SyncResponse>(content) {
-                            Ok(resp) => node_chain_sync.handle_sync_response(resp),
-                            Err(e) => eprintln!("❌ [Server] Failed to parse SYNC_RESPONSE: {}", e),
-                        }
+                        None
+                    } else if msg == "GET_HEIGHT"
+                        || msg == "GET_FINALITY"
+                        || msg.starts_with("SYNC_REQ:")
+                    {
+                        // Single serving implementation: chain_sync owns GET_HEIGHT,
+                        // GET_FINALITY (with the quorum certificate) and SYNC_REQ (blocks +
+                        // finality QC + prune_horizon). The returned response is sent back
+                        // over the same encrypted socket by network::start_server. Keeping
+                        // this here — instead of reimplementing it inline in the transport —
+                        // is what stops serving-side fixes from silently landing on dead code.
+                        node_chain_sync.handle_message(&msg)
+                    } else {
+                        None
                     }
                 },
             )

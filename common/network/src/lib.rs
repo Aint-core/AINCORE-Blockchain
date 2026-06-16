@@ -51,7 +51,7 @@ pub async fn start_server<F>(
     my_signing_key: Arc<ed25519_dalek::SigningKey>,
     handler: F,
 ) where
-    F: Fn(String) + Send + Sync + 'static,
+    F: Fn(String) -> Option<String> + Send + Sync + 'static,
 {
     use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 
@@ -285,151 +285,18 @@ pub async fn start_server<F>(
                                 let reply = format!("WELCOME:{}:{}", node_id_clone, port);
                                 let _ = send_encrypted(&mut socket, &shared_key, &reply).await;
                             }
-                        } else if msg == "GET_HEIGHT" {
-                            // Respond with chain height over the encrypted channel
-                            let height = db_clone.get_chain_height();
-                            let resp = format!("HEIGHT:{}", height);
-                            let _ = send_encrypted(&mut socket, &shared_key, &resp).await;
-                        } else if msg == "GET_FINALITY" {
-                            // ChainSync also has a higher-level finality response path, but this
-                            // legacy transport handles GET_HEIGHT/SYNC_REQ inline. Keep finality
-                            // available here too so observer nodes that sync over this fast path
-                            // can mirror the finalized boundary, not just the block height.
-                            let artifact = serde_json::json!({
-                                "finalized_round": db_clone
-                                    .get("consensus:finalized_round")
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or_else(|| "0".to_string()),
-                                "last_anchor_round": db_clone
-                                    .get("consensus:last_anchor_round")
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or_else(|| "0".to_string()),
-                                "last_anchor_hash": db_clone
-                                    .get("consensus:last_anchor_hash")
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or_default(),
-                                "finality_digest": db_clone
-                                    .get("consensus:finality_digest")
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or_default(),
-                                // The quorum certificate is the ONLY field that authorises a
-                                // syncing node to advance its finalized round (the strings above
-                                // are unauthenticated hints). Embed the stored QC verbatim — it is
-                                // already a serialized `QuorumCertificate`, so it round-trips into
-                                // the peer's `Option<QuorumCertificate>`. Read as a raw Value to
-                                // avoid a circular dependency on the `consensus` crate here.
-                                "qc": db_clone
-                                    .get("consensus:qc:latest")
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok()),
-                            });
-                            let msg = format!("FINALITY:{}", artifact);
-                            let _ = send_encrypted(&mut socket, &shared_key, &msg).await;
-                        } else if let Some(req_json) = msg.strip_prefix("SYNC_REQ:") {
-                            // Handle sync request inline (avoid circular dep with chain_sync)
-                            if let Ok(req) = serde_json::from_str::<serde_json::Value>(req_json) {
-                                let from_height = req["from_height"].as_u64().unwrap_or(0);
-                                let local_height = db_clone.get_chain_height();
-                                let end = std::cmp::min(local_height, from_height + 500);
-                                let mut blocks_json = Vec::new();
-                                for h in (from_height + 1)..=end {
-                                    let key = format!("block_{}", h);
-                                    if let Ok(Some(data)) = db_clone.get(&key) {
-                                        if let Ok(block) =
-                                            serde_json::from_str::<serde_json::Value>(&data)
-                                        {
-                                            blocks_json.push(block);
-                                        }
-                                    }
-                                }
-                                let finality = serde_json::json!({
-                                    "finalized_round": db_clone
-                                        .get("consensus:finalized_round")
-                                        .ok()
-                                        .flatten()
-                                        .unwrap_or_else(|| "0".to_string()),
-                                    "last_anchor_round": db_clone
-                                        .get("consensus:last_anchor_round")
-                                        .ok()
-                                        .flatten()
-                                        .unwrap_or_else(|| "0".to_string()),
-                                    "last_anchor_hash": db_clone
-                                        .get("consensus:last_anchor_hash")
-                                        .ok()
-                                        .flatten()
-                                        .unwrap_or_default(),
-                                    "finality_digest": db_clone
-                                        .get("consensus:finality_digest")
-                                        .ok()
-                                        .flatten()
-                                        .unwrap_or_default(),
-                                    // Carry the quorum certificate on the block-sync fast path too,
-                                    // so a peer that catches up via SYNC_REQ can advance its
-                                    // finalized round (QC-gated) without a separate GET_FINALITY.
-                                    "qc": db_clone
-                                        .get("consensus:qc:latest")
-                                        .ok()
-                                        .flatten()
-                                        .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok()),
-                                });
-                                // Prune-horizon signal (audit #9): fire whenever the FIRST
-                                // requested block is missing, not only when the whole batch is
-                                // empty. A request whose start is pruned but whose tail still
-                                // exists otherwise returns blocks the requester cannot apply
-                                // (height gap) AND no signal, so it never learns it must
-                                // state-sync. Mirrors chain_sync::handle_sync_request — kept
-                                // inline because common/network cannot depend on chain_sync.
-                                let first_block_pruned = from_height < local_height
-                                    && db_clone
-                                        .get(&format!("block_{}", from_height + 1))
-                                        .ok()
-                                        .flatten()
-                                        .is_none();
-                                let prune_horizon: Option<u64> = if first_block_pruned {
-                                    // Lowest block still present in [from_height+1, local_height].
-                                    // After prefix-pruning, existence is monotonic, so binary
-                                    // search finds the horizon (mirror earliest_available_block).
-                                    let exists = |h: u64| {
-                                        db_clone
-                                            .get(&format!("block_{}", h))
-                                            .ok()
-                                            .flatten()
-                                            .is_some()
-                                    };
-                                    let lo0 = from_height + 1;
-                                    let horizon = if exists(lo0) {
-                                        lo0
-                                    } else {
-                                        let (mut lo, mut hi) = (lo0, local_height);
-                                        while lo + 1 < hi {
-                                            let mid = lo + (hi - lo) / 2;
-                                            if exists(mid) {
-                                                hi = mid;
-                                            } else {
-                                                lo = mid;
-                                            }
-                                        }
-                                        hi
-                                    };
-                                    Some(horizon)
-                                } else {
-                                    None
-                                };
-                                let resp = serde_json::json!({
-                                    "blocks": blocks_json,
-                                    "finality": finality,
-                                    "prune_horizon": prune_horizon,
-                                });
-                                let msg = format!("SYNC_RESP:{}", resp);
-                                let _ = send_encrypted(&mut socket, &shared_key, &msg).await;
-                            }
                         } else {
-                            handler_clone(msg);
+                            // Delegate every non-handshake message to the node-provided
+                            // handler, which owns the SINGLE serving implementation
+                            // (chain_sync::handle_message for GET_HEIGHT / GET_FINALITY /
+                            // SYNC_REQ, plus TX / DAG_VERTEX / DA_COMMIT side effects). Any
+                            // response it returns is sent back over THIS encrypted socket.
+                            // GET_HEIGHT/GET_FINALITY/SYNC_REQ were previously reimplemented
+                            // inline here, silently shadowing chain_sync's handlers and
+                            // letting serving-side fixes (QC, prune-horizon) land on dead code.
+                            if let Some(response) = handler_clone(msg) {
+                                let _ = send_encrypted(&mut socket, &shared_key, &response).await;
+                            }
                         }
                     }
                     Err(_) => {
