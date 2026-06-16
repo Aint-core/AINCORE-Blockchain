@@ -1,150 +1,218 @@
-# AINCORE Public Testnet — Join Guide & Bootstrap Design
+# AINCORE Testnet — Join as an Observer (copy‑paste guide)
 
-Status: working procedure, codified from the 2026-06-15 multi-node bring-up
-(NAS validator + Pi + laptop observers, synced over Tailscale/LAN).
+This gets a brand‑new machine syncing the AINCORE testnet as an **observer** (it
+never mines; its address is never in the validator set). Follow it top to
+bottom — every command is paste‑ready.
 
-## TL;DR
+> **One step is not pasteable:** the testnet is reached over a private
+> [Tailscale](https://tailscale.com) tailnet (the seed has no public IP yet), so
+> the operator sends you a **Tailscale auth key** out of band. That's Step 1.
+> Everything after it is pure copy‑paste.
 
-A new node **cannot replay the chain from genesis** — the seed prunes old blocks
-(`block_1` no longer exists) and anti-jump guards reject a `0 -> current` leap.
-So joining = **state-snapshot bootstrap**: start from a recent snapshot, then
-sync the small (still-present) delta automatically.
+---
 
-- Operator publishes a sanitised snapshot:  `scripts/testnet-make-snapshot.sh`
-- Joiner bootstraps in one shot:             `scripts/testnet-join.sh`
+## Network facts (constants)
 
-## Why replay-from-0 fails (root cause, confirmed via ldb)
+| Field | Value |
+|---|---|
+| Chain ID | `AINCORE-LATEST-FRESH-1` |
+| Seed multiaddr | `/ip4/100.111.32.83/tcp/9022` (seed's Tailscale IP) |
+| Seed / genesis validator id | `64fff6085ad266e3fee5001e6b46f24e` |
+| Observer ports (default) | P2P `9032`, RPC `8032` |
+| Bootstrap | state snapshot + delta sync (the seed prunes old blocks, so a height‑0 node cannot replay from genesis) |
 
-```
-block_1     -> MISSING (pruned)
-block_100   -> MISSING (pruned)
-block_50000 -> exists
-```
-
-The seed keeps only recent history (anti-bloat). A fresh node requests
-`block_1..500`, gets an empty response, and stalls at height 0 forever. Wiping
-state makes it worse. The only fix is to hand the joiner recent **state**, not
-make it replay history.
-
-## Architecture
+### Package contents + checksums
 
 ```
-            (public internet / Tailscale)
- joiner ──────────────► PUBLIC SEED (NAS validator, exposed) ──► produces blocks + QC
-   │  1. download snapshot + genesis + binary
-   │  2. load snapshot state (≈ current height)
-   └─ 3. ChainSync the small delta from the seed  ──► tracking, healthy observer
+node-x86_64-linux                61b25a517b8e4be358e54d8661cfdbcc2e28264b8e7a85a0a32a61174b3c65aa
+node-aarch64-linux               8bf51a466d6a475feb8515365b75b47d63b3469b68c534ddbd48b23af1817e19
+aincore-testnet-snapshot.tar.gz  a24faf69f246e33978f9b83967d056eae74f60ee9ae0e81306344b81850e6a43
+genesis.json                     abf599cbbf98b0ef67bfc351dff797e1ff08ac88d04e7051e6999482c55b7507
 ```
 
-Observers run with `AINCORE_P2P_LISTEN=0` and are **never** in the validator set
-(their address ≠ a genesis validator), so they follow the chain but never mine.
+> Current binaries: QC‑verified finality, unified serving path, near‑realtime
+> 3 s sync. Different hash ⇒ you have an old package; ask the operator for the latest.
 
-## Operator: publish a snapshot + run the public seed
+---
 
-1. **Make a clean snapshot** (brief seed downtime; sanitises per-identity DA key
-   + peer table so any joiner can use it):
-   ```bash
-   scripts/testnet-make-snapshot.sh \
-     --container aincore-latest-fresh-node \
-     --db /home/alpha/aincore-latest-fresh-run/fresh_data/validator_9022.db \
-     --out /home/alpha/snapshot/aincore-testnet-snapshot.tar.gz
-   ```
-2. **Publish** the snapshot + `genesis.json` + prebuilt binaries (x86_64 +
-   aarch64) where joiners can fetch them (GitHub release, object storage, or
-   served from the seed host).
-3. **Let participants reach the seed — via the Tailscale tailnet (recommended).**
-   The seed is the validator's Tailscale IP (e.g. `100.111.32.83:9022`). This is
-   exactly how the existing observers connect — raw TCP over Tailscale, NAT
-   handled, zero cost. To onboard a participant: admin console → Settings → Keys
-   → generate an **auth key** (reusable, optionally tagged), and share it. They
-   `tailscale up --auth-key=<key>` to join your tailnet, then run the join script
-   pointed at the seed's Tailscale IP. "Invite-based public": anyone you give a
-   key can join from anywhere.
+## Prerequisites
 
-   > **Why not Tailscale Funnel?** Funnel fronts everything with TLS/SNI (it's
-   > built for HTTPS). AINCORE P2P is raw TCP with its own encryption, not TLS,
-   > so a node cannot traverse Funnel without a joiner-side TLS tunnel
-   > (socat/stunnel) — fragile, and bandwidth-limited through Funnel relays. For
-   > a fully-open seed (no Tailscale on the joiner) use a **public-IP VPS**
-   > running a node (`/ip4/<vps-ip>/tcp/9022`) instead. Tailnet-invite is the
-   > robust path until then.
+- **glibc‑based Linux** (Ubuntu/Debian) on **x86_64** or **aarch64 (ARM64)**. The
+  shipped binaries are dynamically linked against glibc — on Alpine/musl or a very
+  old glibc, build from source (`cargo build --release -p node`) instead.
+- Install the base tools first (fresh cloud images often lack `curl`):
+  ```bash
+  sudo apt-get update && sudo apt-get install -y curl tar coreutils
+  ```
+- The **join package** (this directory) and a **Tailscale auth key** from the operator.
 
-Refresh the published snapshot periodically (e.g. daily) so new joiners start
-within the seed's prune window.
+---
 
-## Joiner: steps
+## Step 1 — Join the tailnet (needs the operator's auth key)
+
+Install Tailscale, bring it up with your key, and confirm you can reach the seed:
 
 ```bash
-# 1. join the tailnet (one-time) with the auth key the operator gave you:
-sudo tailscale up --auth-key=<KEY-FROM-OPERATOR>
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up --auth-key="<AUTH-KEY-FROM-OPERATOR>"
+tailscale ping 100.111.32.83        # MUST succeed before continuing
+```
 
-# 2. get a node binary for your arch (release artifact, or build it):
-#      cargo build --release -p node   # -> target/release/node
+**Do not continue until `tailscale ping 100.111.32.83` succeeds** — if it doesn't,
+you're not on the tailnet (re‑run `tailscale up` with a valid key). The seed is
+only reachable over the tailnet; a node pointed at it without Tailscale will log
+`Secure Handshake Failed … TCP connect timeout` and never sync.
 
-# 3. bootstrap (seed = the validator's Tailscale IP):
-scripts/testnet-join.sh \
+---
+
+## Step 2 — Bootstrap + run (pure paste)
+
+First **extract the package and `cd` into it** (skip the `tar` line if you were
+handed the folder directly). The package is a *directory* named
+`aincore-testnet-join-package`:
+
+```bash
+tar xzf aincore-testnet-join-package.tar.gz   # only if you received the .tar.gz
+cd aincore-testnet-join-package
+```
+
+Now paste this whole block. It verifies integrity (incl. the script itself),
+auto‑detects your CPU arch, and installs the snapshot:
+
+```bash
+set -e
+# 1. integrity check (fails loudly on a corrupt/old file)
+sha256sum -c SHA256SUMS
+
+# 2. auto-pick the binary for THIS machine
+case "$(uname -m)" in
+  x86_64|amd64)  cp node-x86_64-linux  ./node ;;
+  aarch64|arm64) cp node-aarch64-linux ./node ;;
+  *) echo "unsupported arch $(uname -m) — build from source" >&2; exit 1 ;;
+esac
+chmod +x ./node testnet-join.sh
+
+# 3. load snapshot state + prepare datadir
+./testnet-join.sh \
   --binary ./node \
   --genesis ./genesis.json \
-  --snapshot-url https://<host>/aincore-testnet-snapshot.tar.gz \
+  --snapshot ./aincore-testnet-snapshot.tar.gz \
   --seed /ip4/100.111.32.83/tcp/9022 \
-  --datadir ~/.aincore-observer
-# then run the printed command; height should climb toward the seed.
+  --datadir "$HOME/.aincore-observer"
 ```
 
-## Node-native auto-bootstrap (no script — for systemd/docker)
-
-The node can bootstrap itself. On a **fresh datadir**, set
-`AINCORE_BOOTSTRAP_SNAPSHOT` to a local path or http(s) URL of the snapshot
-tarball; the node extracts it before opening the DB, then self-sanitises
-(regenerates its own DA key, clears the seed's inherited peer table) — so no ldb
-and no manual key surgery on the joiner.
+Then start the node. **Durable systemd service (recommended).** Paste this block
+**as your normal user** — it calls `sudo` itself; do **NOT** prefix the whole
+block with `sudo` (that would set the datadir to `/root/...` where there's no
+snapshot, and the node would silently start empty at height 0):
 
 ```bash
-AINCORE_CHAIN_ID=AINCORE-LATEST-FRESH-1 AINCORE_P2P_LISTEN=0 \
-AINCORE_BOOTSTRAP_SNAPSHOT=https://<host>/aincore-testnet-snapshot.tar.gz \
-  ./node --port 9032 --rpc-port 8032 --datadir ~/.aincore-observer \
-         --bootnodes /ip4/100.111.32.83/tcp/9022
+NODE="$(pwd)/node"; DD="$HOME/.aincore-observer"
+sudo tee /etc/systemd/system/aincore-observer.service >/dev/null <<UNIT
+[Unit]
+Description=AINCORE testnet observer
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+User=$USER
+Environment=AINCORE_CHAIN_ID=AINCORE-LATEST-FRESH-1
+Environment=AINCORE_P2P_LISTEN=0
+Environment=AINCORE_SYNC_INTERVAL_MS=3000
+Environment=RUST_LOG=info
+ExecStart=$NODE --port 9032 --rpc-port 8032 --datadir $DD --bootnodes /ip4/100.111.32.83/tcp/9022
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo systemctl daemon-reload
+sudo systemctl enable --now aincore-observer.service
 ```
 
-It is a strict no-op once a chain DB exists, so it is safe to leave set across
-restarts (re-deploying a fresh observer auto-recovers). Use this in an
-observer's systemd unit / docker-compose env.
+Or **foreground** (quick test, no sudo):
 
-## What must still be set up (admin prerequisites — not code)
+```bash
+AINCORE_CHAIN_ID=AINCORE-LATEST-FRESH-1 AINCORE_P2P_LISTEN=0 AINCORE_SYNC_INTERVAL_MS=3000 RUST_LOG=info \
+  ./node --port 9032 --rpc-port 8032 \
+    --datadir "$HOME/.aincore-observer" \
+    --bootnodes /ip4/100.111.32.83/tcp/9022
+```
 
-1. **Onboard participants to the tailnet.** Generate a Tailscale auth key
-   (admin → Settings → Keys) and share it; participants `tailscale up
-   --auth-key=<key>` then reach the seed at its Tailscale IP. This works today
-   (the existing observers use exactly this path). Funnel was evaluated and
-   rejected for P2P (TLS mismatch — see the operator note above); a public-IP
-   VPS is the only fully-open alternative.
-2. **A public host for the join package** (snapshot + genesis + binaries) so
-   joiners can fetch them — e.g. a GitHub release. The old VPS that hosted this
-   is expired.
+---
 
-## Honest limitations / the durable fix
+## Step 3 — Verify (paste)
 
-This snapshot flow is a **repeatable manual bootstrap**, not yet automatic:
+The node takes a few seconds to open its DB and bind the RPC, so the first
+samples may print `Connection refused` — **that is normal**; keep watching until
+`latest_height` appears and climbs:
 
-- If a node is offline longer than the seed's prune window, it falls too far
-  behind and must re-bootstrap from a fresh snapshot.
-- The snapshot must be re-published periodically.
+```bash
+for i in $(seq 1 10); do
+  curl -s --retry 5 --retry-connrefused --max-time 5 \
+    localhost:8032/rpc -H 'content-type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"aincore_getStatus","params":[]}'
+  echo; sleep 4
+done
+```
 
-The durable "perfect" fix is **automated peer state-sync**: a node booting with
-empty/far-behind data requests a verified state snapshot from its trusted
-bootnode over the wire and loads it, with no manual snapshot publishing. That is
-a protocol feature (a `SNAPSHOT_REQ/RESP` exchange in `sync/`), and it also
-unblocks multi-validator onboarding (same bootstrap gap). Sequence it after this
-manual flow is in use.
+Healthy = `latest_height` climbs each sample and tracks the seed within ~1 block;
+`finalized_round` advances. Finality is **QC‑gated**: your node only advances its
+finalized round after verifying the validators' >2/3‑stake BLS quorum
+certificate — a forged finality hint can never move it.
 
-## Field notes (gotchas already hit + handled)
+systemd logs: `journalctl -u aincore-observer.service -f`
+(look for `✅ [ChainSync] Applied QC-verified finality: round=…`).
 
-- **DA key panic** (`da/src/lib.rs`: "failed to decrypt DA signing key"): a raw
-  copy of the seed DB carries the seed's per-identity DA key. The snapshot
-  script strips `sys:da:signing_key*` so the joiner generates its own.
-- **Inherited peer table**: a raw copy makes the joiner hammer the seed's dead
-  peers. The snapshot script clears `peer:/peer_ip:/peer_addr:`.
-- **Stale binary**: a node binary older than the genesis reset cannot follow the
-  current consensus format — rebuild from the current source for the node's arch.
-- **node.key**: preserve per-node identity across reseeds; never copy one node's
-  `node.key` to another.
+---
+
+## Troubleshooting
+
+| Symptom | Cause → fix |
+|---|---|
+| `tailscale ping 100.111.32.83` fails | Not on the tailnet → redo Step 1 with a valid key. |
+| `sha256sum: … did NOT match` | Corrupt/old file → re‑get the package. |
+| `cannot execute binary file` | Wrong arch → Step 2 auto‑picks; if copied by hand, match `uname -m`. |
+| Height stuck at the snapshot value | Can't reach the seed → check `tailscale ping`; ensure `9032` is free. |
+| Log: `peer pruned below us … bootstrap from a state snapshot` | You fell behind the seed's retention window → get a **fresh** snapshot, redo Step 2. |
+| `Address already in use` | `9032`/`8032` taken → pass free `--port`/`--rpc-port` (update the systemd `ExecStart` too). |
+| Boot panic re: DA signing key | Un‑sanitised snapshot → use the operator's packaged snapshot (pre‑sanitised). |
+
+**Realtime tuning:** `AINCORE_SYNC_INTERVAL_MS` = pull cadence (default `3000` ms ≈
+block time → ~1‑block lag; floor `500`).
+
+---
+
+## Why snapshot bootstrap (not replay‑from‑genesis)
+
+The seed prunes old blocks (`block_1` is gone; confirmed via ldb), and a fresh
+node requesting `block_1..500` gets empty replies and stalls at height 0. So a
+joiner loads recent **state** from a snapshot and syncs only the still‑present
+delta. Observers run `AINCORE_P2P_LISTEN=0` and are never in the validator set.
+
+---
+
+## For operators
+
+- **Make/refresh the snapshot** (run on the seed host; ~15–30 s validator downtime):
+  ```bash
+  scripts/testnet-make-snapshot.sh \
+    --container aincore-latest-fresh-node \
+    --db /home/alpha/aincore-latest-fresh-run/fresh_data/validator_9022.db \
+    --out ./aincore-testnet-snapshot.tar.gz
+  ```
+  Stops the node for a consistent copy, restarts immediately, then **sanitises**
+  it (strips per‑identity DA key `sys:da:signing_key*` + the seed's peer table) so
+  it's safe for any joiner. Re‑cut periodically so joiners sync a small delta.
+- **Refresh the package** when binaries change: drop new `node-x86_64-linux` /
+  `node-aarch64-linux` in, regenerate the checksums (`sha256sum …`), re‑tar.
+- **Node‑native auto‑bootstrap (advanced):** instead of `testnet-join.sh`, a fresh
+  datadir can self‑bootstrap from `AINCORE_BOOTSTRAP_SNAPSHOT=https://<host>/snapshot.tar.gz`
+  (https‑only; the node extracts + self‑sanitises before opening the DB, then
+  no‑ops once a DB exists). Needs the snapshot hosted at an https URL.
+- **Going truly public (no invite):** forward `:9022` on the router with a DDNS
+  host and publish `/dns4/<host>/tcp/9022`, or run a seed on a public VPS. Add a
+  **second validator** before advertising it as decentralized — the testnet is
+  single‑validator today.

@@ -95,7 +95,7 @@ echo ""
 echo "    Run it (foreground shown; wrap in systemd/tmux for production):"
 echo ""
 cat <<EOF
-  AINCORE_CHAIN_ID=$CHAIN_ID AINCORE_P2P_LISTEN=0 RUST_LOG=info \\
+  AINCORE_CHAIN_ID=$CHAIN_ID AINCORE_P2P_LISTEN=0 AINCORE_SYNC_INTERVAL_MS=3000 RUST_LOG=info \\
     $BINARY --port $PORT --rpc-port $RPC_PORT \\
       --datadir $DATADIR --bootnodes $SEED
 
