@@ -64,51 +64,90 @@ fn maybe_extract_bootstrap_snapshot(datadir: &str, db_path: &str, port: u16) -> 
     };
     println!("📦 [bootstrap] fresh datadir + AINCORE_BOOTSTRAP_SNAPSHOT set → bootstrapping from {snap}");
 
-    let local = if snap.starts_with("http://") || snap.starts_with("https://") {
+    let local = if snap.starts_with("https://") {
+        // Audit #6: https-only, NO redirects (blocks SSRF via redirect to
+        // internal/metadata endpoints) and no protocol downgrade.
         let dest = format!("{datadir}/.bootstrap-snapshot.tar.gz");
-        match std::process::Command::new("curl")
-            .args(["-fL", "--retry", "3", "-o", &dest, &snap])
-            .status()
-        {
-            Ok(s) if s.success() => dest,
-            _ => {
-                eprintln!("⚠️ [bootstrap] snapshot download failed — starting fresh (will not sync past the prune window)");
-                return false;
+        let ok = matches!(
+            std::process::Command::new("curl")
+                .args([
+                    "-fsS", "--proto", "=https", "--max-redirs", "0", "--retry", "2", "-o", &dest,
+                    &snap,
+                ])
+                .status(),
+            Ok(s) if s.success()
+        );
+        if !ok {
+            eprintln!("⚠️ [bootstrap] snapshot download failed — starting fresh");
+            return false;
+        }
+        // Optional integrity check against AINCORE_BOOTSTRAP_SHA256 (supply-chain).
+        if let Ok(expected) = std::env::var("AINCORE_BOOTSTRAP_SHA256") {
+            let expected = expected.trim().to_lowercase();
+            if !expected.is_empty() {
+                let got = std::process::Command::new("sha256sum")
+                    .arg(&dest)
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .and_then(|s| s.split_whitespace().next().map(|x| x.to_lowercase()));
+                if got.as_deref() != Some(expected.as_str()) {
+                    eprintln!(
+                        "🚨 [bootstrap] snapshot SHA256 mismatch (expected {expected}, got {got:?}) — refusing"
+                    );
+                    let _ = std::fs::remove_file(&dest);
+                    return false;
+                }
+                println!("🔒 [bootstrap] snapshot SHA256 verified");
             }
         }
+        dest
+    } else if snap.starts_with("http://") {
+        eprintln!("🚨 [bootstrap] refusing insecure http:// snapshot URL (use https://) — starting fresh");
+        return false;
     } else {
-        snap.clone()
+        snap.clone() // local filesystem path
     };
 
-    if !matches!(
-        std::process::Command::new("tar").args(["xzf", &local, "-C", datadir]).status(),
+    // Audit #10: extract into a staging subdir so we move ONLY the snapshot's DB,
+    // never a pre-existing sibling validator_*.db already in the datadir.
+    let staging = format!("{datadir}/.bootstrap-staging");
+    let _ = std::fs::remove_dir_all(&staging);
+    if std::fs::create_dir_all(&staging).is_err() {
+        eprintln!("⚠️ [bootstrap] could not create staging dir — starting fresh");
+        return false;
+    }
+    let extracted = matches!(
+        std::process::Command::new("tar").args(["xzf", &local, "-C", &staging]).status(),
         Ok(s) if s.success()
-    ) {
+    );
+    if !extracted {
         eprintln!("⚠️ [bootstrap] snapshot extract failed — starting fresh");
+        let _ = std::fs::remove_dir_all(&staging);
         return false;
     }
 
-    // The snapshot holds one validator_*.db dir; rename it to THIS node's port.
+    // Move the single validator_*.db from staging to THIS node's port.
     let want = format!("validator_{port}.db");
-    if let Ok(entries) = std::fs::read_dir(datadir) {
+    let mut moved = false;
+    if let Ok(entries) = std::fs::read_dir(&staging) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if !name.starts_with("validator_") || !name.ends_with(".db") {
-                continue;
-            }
-            if name == want {
-                println!("📦 [bootstrap] snapshot state in place at {want}");
-                return true;
-            }
-            let to = std::path::Path::new(datadir).join(&want);
-            if std::fs::rename(e.path(), &to).is_ok() {
-                println!("📦 [bootstrap] loaded snapshot state → {}", to.display());
-                return true;
+            if name.starts_with("validator_") && name.ends_with(".db") {
+                let to = std::path::Path::new(datadir).join(&want);
+                if std::fs::rename(e.path(), &to).is_ok() {
+                    println!("📦 [bootstrap] loaded snapshot state → {}", to.display());
+                    moved = true;
+                }
+                break;
             }
         }
     }
-    eprintln!("⚠️ [bootstrap] no validator_*.db inside snapshot — starting fresh");
-    false
+    let _ = std::fs::remove_dir_all(&staging);
+    if !moved {
+        eprintln!("⚠️ [bootstrap] no validator_*.db inside snapshot — starting fresh");
+    }
+    moved
 }
 
 #[tokio::main]
