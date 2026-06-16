@@ -9,6 +9,7 @@ serde_json = "1.0"
 storage = { path = "../common/storage" }
 network = { path = "../common/network" }
 blockchain = { path = "../consensus/blockchain" }
+consensus = { path = "../consensus/consensus" }
 crypto = { path = "../common/crypto" }
 executor = { path = "../core/executor" }
 tokio = { version = "1.0", features = ["full"] }

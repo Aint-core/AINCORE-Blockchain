@@ -177,82 +177,102 @@ mod tests {
         assert_eq!(artifact.finality_digest, "def");
     }
 
-    #[test]
-    fn test_apply_finality_artifact_updates_observer_storage() {
-        let sync = setup_sync("apply_finality");
-        sync.storage.put("latest_height", "100").unwrap();
-
-        let artifact = FinalityArtifact {
-            finalized_round: "95".to_string(),
-            last_anchor_round: "95".to_string(),
-            last_anchor_hash: "anchor".to_string(),
-            finality_digest: "digest".to_string(),
-        };
-
-        sync.apply_finality_artifact(&artifact).unwrap();
-        assert_eq!(
-            sync.storage.get("consensus:finalized_round").unwrap(),
-            Some("95".to_string())
-        );
-        assert_eq!(
-            sync.storage.get("consensus:finality_digest").unwrap(),
-            Some("digest".to_string())
-        );
-    }
-
-    #[test]
-    fn test_apply_finality_artifact_rejects_absurd_future_round() {
-        let sync = setup_sync("apply_finality_future");
-        sync.storage.put("latest_height", "10").unwrap();
-
-        let artifact = FinalityArtifact {
-            finalized_round: "5000".to_string(),
-            last_anchor_round: "5000".to_string(),
-            last_anchor_hash: "anchor".to_string(),
-            finality_digest: "digest".to_string(),
-        };
-
-        let err = sync.apply_finality_artifact(&artifact).unwrap_err();
-        assert!(err.contains("too far beyond local synced round"));
-        assert_eq!(sync.storage.get("consensus:finalized_round").unwrap(), None);
-    }
-
-    #[test]
-    fn test_apply_finality_artifact_round_not_height() {
-        // Regression: finality drift must compare round↔round, not round↔height.
-        // On a live chain rounds outrun height; a synced observer whose latest
-        // block is height 100 / round 9000 must ACCEPT finality for round 9000.
-        // The old height-based guard rejected it (9000 >> 100 + 1000), which froze
-        // observers' finalized_round forever.
-        let sync = setup_sync("finality_round_not_height");
-        let block = Block::new(100, 9000, "prev".to_string(), vec![], "node_1".to_string());
+    /// Build a valid 1-of-1 quorum certificate and store the matching trusted
+    /// validator set (sys:validator_set:v1) so apply_finality_artifact can verify.
+    fn build_test_qc(
+        sync: &ChainSync,
+        finalized_round: u64,
+        anchor_round: u64,
+    ) -> consensus::qc::QuorumCertificate {
+        use consensus::qc::{build_qc, validator_set_hash, FinalityVote, ValidatorInfo};
+        let bls = crypto::bls::BLSEngine::consensus();
+        let seed = [7u8; 32];
+        let validators = vec![ValidatorInfo {
+            address: "validator_1".to_string(),
+            stake: 1000,
+            ed25519_public_key: "00".repeat(32),
+            bls_public_key: hex::encode(bls.pubkey_raw(&seed)),
+            bls_pop: hex::encode(bls.prove_possession_raw(&seed)),
+        }];
         sync.storage
-            .save_block_json(100, &serde_json::to_string(&block).unwrap())
+            .put(
+                "sys:validator_set:v1",
+                &serde_json::to_string(&validators).unwrap(),
+            )
             .unwrap();
-
-        // ACCEPT: finality at our synced round.
-        let ok = FinalityArtifact {
-            finalized_round: "9000".to_string(),
-            last_anchor_round: "9000".to_string(),
-            last_anchor_hash: "anchor".to_string(),
-            finality_digest: "digest".to_string(),
+        let vote = FinalityVote {
+            chain_id: "AINCORE-TEST-1".to_string(),
+            epoch: 0,
+            finalized_round,
+            anchor_round,
+            anchor_hash: "ab".repeat(32),
+            block_height: anchor_round,
+            block_hash: "cd".repeat(32),
+            state_root: "ef".repeat(32),
+            receipts_root: "12".repeat(32),
+            finality_digest: "34".repeat(32),
+            validator_set_hash: validator_set_hash(&validators),
         };
-        sync.apply_finality_artifact(&ok)
-            .expect("finality at the synced round must be accepted");
+        let sig = bls.sign_raw(&vote.to_signing_bytes(), &seed);
+        build_qc(&vote, &validators, &[0], &[sig]).unwrap()
+    }
+
+    #[test]
+    fn test_apply_finality_qc_verified_advances() {
+        let sync = setup_sync("finality_qc_ok");
+        let qc = build_test_qc(&sync, 9000, 8990);
+        let artifact = FinalityArtifact {
+            finalized_round: "9000".to_string(),
+            last_anchor_round: "8990".to_string(),
+            last_anchor_hash: "ab".repeat(32),
+            finality_digest: "34".repeat(32),
+            qc: Some(qc),
+        };
+        sync.apply_finality_artifact(&artifact)
+            .expect("a valid QC must advance finalized_round");
         assert_eq!(
             sync.storage.get("consensus:finalized_round").unwrap(),
             Some("9000".to_string())
         );
+    }
 
-        // REJECT: finality far beyond our synced round (anti-fast-forward intact).
-        let bad = FinalityArtifact {
-            finalized_round: "20000".to_string(),
-            last_anchor_round: "20000".to_string(),
-            last_anchor_hash: "anchor".to_string(),
-            finality_digest: "digest".to_string(),
+    #[test]
+    fn test_apply_finality_without_qc_is_noop() {
+        // Regression for the forgeable-guard halt (audit finding #1): an artifact
+        // carrying NO QC — even with a huge finalized_round — must NOT advance
+        // consensus:finalized_round. The old round-drift heuristic accepted it.
+        let sync = setup_sync("finality_no_qc");
+        let artifact = FinalityArtifact {
+            finalized_round: "5000000".to_string(),
+            last_anchor_round: "5000000".to_string(),
+            last_anchor_hash: "x".to_string(),
+            finality_digest: "d".to_string(),
+            qc: None,
         };
-        let err = sync.apply_finality_artifact(&bad).unwrap_err();
-        assert!(err.contains("too far beyond local synced round"));
+        sync.apply_finality_artifact(&artifact).unwrap();
+        assert_eq!(
+            sync.storage.get("consensus:finalized_round").unwrap(),
+            None,
+            "finality without a QC must never advance"
+        );
+    }
+
+    #[test]
+    fn test_apply_finality_invalid_qc_rejected() {
+        let sync = setup_sync("finality_bad_qc");
+        let mut qc = build_test_qc(&sync, 9000, 8990);
+        // Corrupt the aggregate signature -> BLS verification must fail.
+        qc.aggregate_signature = vec![0u8; qc.aggregate_signature.len()];
+        let artifact = FinalityArtifact {
+            finalized_round: "9000".to_string(),
+            last_anchor_round: "8990".to_string(),
+            last_anchor_hash: "ab".repeat(32),
+            finality_digest: "34".repeat(32),
+            qc: Some(qc),
+        };
+        let err = sync.apply_finality_artifact(&artifact).unwrap_err();
+        assert!(err.contains("QC verification failed"), "got: {err}");
+        assert_eq!(sync.storage.get("consensus:finalized_round").unwrap(), None);
     }
 
     #[test]

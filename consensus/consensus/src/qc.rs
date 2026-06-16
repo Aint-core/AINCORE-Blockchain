@@ -116,6 +116,9 @@ pub enum QcError {
     StakeMismatch { claimed: u128, recomputed: u128 },
     TotalStakeMismatch { claimed: u128, recomputed: u128 },
     BelowThreshold { signed: u128, total: u128 },
+    /// The QC's claimed validator_set_hash does not equal the hash of the trusted
+    /// validator set it is being verified against (binding promised by the spec).
+    ValidatorSetMismatch { claimed: String, recomputed: String },
     BadBlsKey(String),
     VerifyFailed(String),
 }
@@ -244,6 +247,19 @@ pub fn verify_qc(qc: &QuorumCertificate, validators: &[ValidatorInfo]) -> Result
         return Err(QcError::BelowThreshold {
             signed: signed_stake,
             total: total_stake,
+        });
+    }
+
+    // Bind the QC to the EXACT validator set it is verified against. The
+    // FinalityVote signs validator_set_hash, but the BLS check below reconstructs
+    // the vote from the QC's own (attacker-controllable) validator_set_hash field;
+    // without this binding a consumer could verify a QC against a different set
+    // than the one it certifies. Enforce that the trusted set's hash matches.
+    let expected_set_hash = validator_set_hash(&validators);
+    if expected_set_hash != qc.validator_set_hash {
+        return Err(QcError::ValidatorSetMismatch {
+            claimed: qc.validator_set_hash.clone(),
+            recomputed: expected_set_hash,
         });
     }
 
@@ -427,9 +443,10 @@ mod tests {
 
     #[test]
     fn single_validator_1_of_1_qc_verifies() {
-        let vote = sample_vote();
+        let mut vote = sample_vote();
         let (v, sk) = make_validator(1, 100);
         let validators = vec![v];
+        vote.validator_set_hash = validator_set_hash(&validators);
         let sig = sign_vote(&sk, &vote);
         let qc = build_qc(&vote, &validators, &[0], &[sig]).unwrap();
         // 100% stake signed -> valid 1-of-1 QC.
@@ -437,8 +454,28 @@ mod tests {
     }
 
     #[test]
+    fn qc_with_mismatched_validator_set_hash_rejected() {
+        // Finding #7: verify_qc must bind the QC to the exact validator set it is
+        // verified against. A QC carrying a validator_set_hash that does not match
+        // the trusted set must be rejected even if BLS/stake would otherwise pass.
+        let mut vote = sample_vote();
+        let (v, sk) = make_validator(1, 100);
+        let validators = vec![v];
+        vote.validator_set_hash = "00".repeat(32); // NOT validator_set_hash(&validators)
+        let sig = sign_vote(&sk, &vote);
+        let qc = build_qc(&vote, &validators, &[0], &[sig]).unwrap();
+        assert!(
+            matches!(
+                verify_qc(&qc, &validators),
+                Err(QcError::ValidatorSetMismatch { .. })
+            ),
+            "QC bound to a different validator set must be rejected"
+        );
+    }
+
+    #[test]
     fn multi_validator_supermajority_verifies_and_minority_fails() {
-        let vote = sample_vote();
+        let mut vote = sample_vote();
         // 4 validators, stakes 40/30/20/10 = 100 total. 2/3 threshold = >66.6.
         let mut set = vec![];
         let mut sks = vec![];
@@ -447,6 +484,7 @@ mod tests {
             set.push(v);
             sks.push(sk);
         }
+        vote.validator_set_hash = validator_set_hash(&set);
         let ord = canonical_order(&set);
         // Map a canonical-order validator -> its raw secret seed by matching pubkey.
         let sk_for = |info: &ValidatorInfo| -> [u8; 32] {
@@ -497,9 +535,10 @@ mod tests {
 
     #[test]
     fn wrong_message_qc_fails() {
-        let vote = sample_vote();
+        let mut vote = sample_vote();
         let (v, sk) = make_validator(1, 100);
         let validators = vec![v];
+        vote.validator_set_hash = validator_set_hash(&validators);
         // Sign a DIFFERENT vote than the QC will claim.
         let mut other = vote.clone();
         other.state_root = "99".repeat(32);

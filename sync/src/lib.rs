@@ -32,6 +32,13 @@ pub struct FinalityArtifact {
     pub last_anchor_round: String,
     pub last_anchor_hash: String,
     pub finality_digest: String,
+    /// The quorum certificate that cryptographically proves this finality (>2/3
+    /// stake BLS signature). This is the ONLY thing that authorises advancing
+    /// `consensus:finalized_round` on a syncing node — the legacy string fields
+    /// above are unauthenticated hints. `None` from pre-QC peers (serde default),
+    /// in which case finality is NOT advanced.
+    #[serde(default)]
+    pub qc: Option<consensus::qc::QuorumCertificate>,
 }
 
 pub struct ChainSync {
@@ -42,8 +49,6 @@ pub struct ChainSync {
 }
 
 impl ChainSync {
-    const FINALITY_ROUND_DRIFT_LIMIT: u64 = 1_000;
-
     pub fn new(
         node_id: String,
         my_port: u16,
@@ -178,29 +183,6 @@ impl ChainSync {
         self.storage.get_chain_height()
     }
 
-    /// Round of the latest locally-synced block (0 if none).
-    ///
-    /// Finality is measured in ROUNDS, not block height. The drift guard in
-    /// `apply_finality_artifact` must compare a remote finalized ROUND against
-    /// our latest synced ROUND — comparing it against block HEIGHT was a bug:
-    /// rounds outrun height on a live chain (empty/skipped rounds produce no
-    /// block), so once the round−height gap exceeded the limit the guard
-    /// rejected EVERY finality artifact, freezing observers'
-    /// `consensus:finalized_round` forever.
-    fn local_latest_round(&self) -> u64 {
-        let h = self.get_local_height();
-        if h == 0 {
-            return 0;
-        }
-        self.storage
-            .get(&format!("block_{}", h))
-            .ok()
-            .flatten()
-            .and_then(|json| serde_json::from_str::<Block>(&json).ok())
-            .map(|b| b.header.round)
-            .unwrap_or(0)
-    }
-
     fn finalized_round_boundary(&self) -> u64 {
         self.storage
             .get("consensus:finalized_round")
@@ -236,66 +218,76 @@ impl ChainSync {
                 .ok()
                 .flatten()
                 .unwrap_or_default(),
+            // Serve the quorum certificate so peers can cryptographically VERIFY
+            // (not trust) the finality we advertise.
+            qc: self
+                .storage
+                .get("consensus:qc:latest")
+                .ok()
+                .flatten()
+                .and_then(|j| serde_json::from_str::<consensus::qc::QuorumCertificate>(&j).ok()),
         }
     }
 
+    /// The trusted validator set (`sys:validator_set:v1`, written at genesis with
+    /// each validator's BLS key) that a finality QC is verified against.
+    fn trusted_validator_set(&self) -> Option<Vec<consensus::qc::ValidatorInfo>> {
+        consensus::qc_producer::load_validator_set_v1(&self.storage)
+    }
+
+    /// Apply a finality artifact — QC-GATED.
+    ///
+    /// SECURITY: only a quorum certificate that verifies (>2/3-stake aggregate
+    /// BLS signature over the canonical FinalityVote) against our trusted
+    /// validator set may advance `consensus:finalized_round`. The previous
+    /// round-drift heuristic was forgeable: an unsigned `block.header.round`
+    /// (blocks carry no proposer signature) could inflate the accepted round and
+    /// poison `consensus:finalized_round`, halting a validator. With QC-gating a
+    /// peer cannot move our finalized round without the validators' aggregate
+    /// signature; a peer that supplies no/invalid QC simply does not advance our
+    /// finality (a no-op, not a failure).
     fn apply_finality_artifact(&self, artifact: &FinalityArtifact) -> Result<(), String> {
-        let remote_finalized = artifact
-            .finalized_round
-            .parse::<u64>()
-            .map_err(|_| "remote finalized_round is not numeric".to_string())?;
-        let remote_anchor = artifact
-            .last_anchor_round
-            .parse::<u64>()
-            .map_err(|_| "remote last_anchor_round is not numeric".to_string())?;
+        let Some(qc) = artifact.qc.as_ref() else {
+            return Ok(()); // pre-QC peer: cannot move our finality, harmless
+        };
+        let validators = match self.trusted_validator_set() {
+            Some(v) => v,
+            None => return Ok(()), // no trusted set to verify against — skip
+        };
+        consensus::qc::verify_qc(qc, &validators)
+            .map_err(|e| format!("finality QC verification failed: {:?}", e))?;
 
-        if remote_finalized == 0 {
-            return Ok(());
+        let remote_finalized = qc.finalized_round;
+        if remote_finalized == 0 || remote_finalized <= self.finalized_round_boundary() {
+            return Ok(()); // not newer than what we already hold
         }
-        if remote_anchor > remote_finalized {
+        if qc.anchor_round > remote_finalized {
             return Err(format!(
-                "remote finality anchor {} exceeds finalized round {}",
-                remote_anchor, remote_finalized
-            ));
-        }
-        if artifact.finality_digest.is_empty() {
-            return Err("remote finality digest is empty".to_string());
-        }
-
-        let local_finalized = self.finalized_round_boundary();
-        if remote_finalized <= local_finalized {
-            return Ok(());
-        }
-
-        // Compare ROUND↔ROUND (not round↔height): only accept finality within
-        // FINALITY_ROUND_DRIFT_LIMIT of the latest ROUND we have actually synced.
-        // This still blocks a peer from fast-forwarding us to an unsynced round,
-        // but no longer spuriously rejects legitimate finality once the chain's
-        // round−height gap grows.
-        let local_round = self.local_latest_round();
-        if remote_finalized > local_round + Self::FINALITY_ROUND_DRIFT_LIMIT {
-            return Err(format!(
-                "remote finality round {} is too far beyond local synced round {}",
-                remote_finalized, local_round
+                "QC anchor round {} exceeds finalized round {}",
+                qc.anchor_round, remote_finalized
             ));
         }
 
         self.storage
-            .put("consensus:finalized_round", &artifact.finalized_round)
+            .put("consensus:finalized_round", &remote_finalized.to_string())
             .map_err(|e| format!("persist finalized_round failed: {}", e))?;
         self.storage
-            .put("consensus:last_anchor_round", &artifact.last_anchor_round)
+            .put("consensus:last_anchor_round", &qc.anchor_round.to_string())
             .map_err(|e| format!("persist last_anchor_round failed: {}", e))?;
         self.storage
-            .put("consensus:last_anchor_hash", &artifact.last_anchor_hash)
+            .put("consensus:last_anchor_hash", &qc.anchor_hash)
             .map_err(|e| format!("persist last_anchor_hash failed: {}", e))?;
         self.storage
-            .put("consensus:finality_digest", &artifact.finality_digest)
+            .put("consensus:finality_digest", &qc.finality_digest)
             .map_err(|e| format!("persist finality_digest failed: {}", e))?;
+        // Persist the verified QC so this node can serve the proof onward.
+        if let Ok(j) = serde_json::to_string(qc) {
+            let _ = self.storage.put("consensus:qc:latest", &j);
+        }
 
         println!(
-            "✅ [ChainSync] Applied finality artifact: finalized_round={} anchor_round={}",
-            artifact.finalized_round, artifact.last_anchor_round
+            "✅ [ChainSync] Applied QC-verified finality: round={} (signed_stake={}/{})",
+            remote_finalized, qc.signed_stake, qc.total_stake
         );
         Ok(())
     }
