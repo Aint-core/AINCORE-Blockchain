@@ -198,6 +198,22 @@ delta. Observers run `AINCORE_P2P_LISTEN=0` and are never in the validator set.
 
 ---
 
+## Operator — onboard a new joiner (Tailscale invite)
+
+The seed has no public IP (the home line is behind ISP CGNAT), so joiners reach it
+over the operator's Tailscale tailnet. To bring someone on:
+
+1. Tailscale admin console → **Settings → Keys → Generate auth key**:
+   - **Reusable** (one key for many joiners) or one‑off per joiner.
+   - Recommended: tag it (e.g. `tag:aincore-observer`) + set an expiry.
+2. Send the joiner **two things** (privately — the key is like a password):
+   - the **Tailscale auth key**, and
+   - the release link: <https://github.com/Aint-core/AINCORE-Blockchain/releases/tag/testnet-join-v1>
+3. The joiner runs Step 1–4 above (`tailscale up --auth-key=<key>` → download the
+   package → paste the bootstrap → synced). They need nothing else from you.
+
+Revoke access anytime: delete the key or remove the node in the Tailscale admin.
+
 ## For operators
 
 - **Make/refresh the snapshot** (run on the seed host; ~15–30 s validator downtime):
@@ -225,7 +241,9 @@ delta. Observers run `AINCORE_P2P_LISTEN=0` and are never in the validator set.
 - **Cut a new release** when binaries/snapshot change: re‑tag (e.g. `testnet-join-v2`),
   upload the refreshed `aincore-testnet-join-package.tar.gz` + `aincore-testnet-snapshot.tar.gz`
   + `SHA256SUMS` as assets, and bump the URLs above.
-- **Going truly public (no invite):** forward `:9022` on the router with a DDNS
-  host and publish `/dns4/<host>/tcp/9022`, or run a seed on a public VPS. Add a
-  **second validator** before advertising it as decentralized — the testnet is
+- **Going truly public (no invite):** the home seed line is behind **ISP CGNAT**
+  (WAN IP is private `10.x`), so router port‑forward cannot expose it — confirmed.
+  To drop the invite step, run a seed on a **public‑IP VPS** (or get a static
+  public IP from the ISP) and publish `/ip4/<vps-ip>/tcp/9022`. Add a **second
+  validator** before advertising it as decentralized — the testnet is
   single‑validator today.
