@@ -4,6 +4,14 @@ This gets a brand‑new machine syncing the AINCORE testnet as an **observer** (
 never mines; its address is never in the validator set). Follow it top to
 bottom — every command is paste‑ready.
 
+There are two supported paths:
+
+- **Linux x86_64 / ARM64:** use the prebuilt node binary inside the release
+  package.
+- **macOS:** use the same release package for `genesis.json` + snapshot, but
+  build the node binary from source first. The release package does **not** ship
+  a macOS binary.
+
 > **One step is not pasteable:** the testnet is reached over a private
 > [Tailscale](https://tailscale.com) tailnet (the seed has no public IP yet), so
 > the operator sends you a **Tailscale auth key** out of band. That's Step 1.
@@ -37,12 +45,32 @@ genesis.json                     abf599cbbf98b0ef67bfc351dff797e1ff08ac88d04e705
 
 ## Prerequisites
 
-- **glibc‑based Linux** (Ubuntu/Debian) on **x86_64** or **aarch64 (ARM64)**. The
-  shipped binaries are dynamically linked against glibc — on Alpine/musl or a very
-  old glibc, build from source (`cargo build --release -p node`) instead.
-- Install the base tools first (fresh cloud images often lack `curl`):
+- **Linux:** glibc‑based Linux (Ubuntu/Debian) on **x86_64** or **aarch64
+  (ARM64)**. The shipped binaries are dynamically linked against glibc — on
+  Alpine/musl or a very old glibc, build from source (`cargo build --release -p
+  node`) instead.
+- **macOS:** build the node from source. You need Xcode Command Line Tools,
+  Rust, git, CMake, pkg-config, and OpenSSL.
+- Install the base tools first:
+
+  **Linux:**
   ```bash
   sudo apt-get update && sudo apt-get install -y curl tar coreutils
+  ```
+
+  **macOS:**
+  ```bash
+  xcode-select --install || true
+
+  if ! command -v rustc >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  fi
+  source "$HOME/.cargo/env"
+
+  if ! command -v brew >/dev/null 2>&1; then
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  fi
+  brew install git cmake pkg-config openssl
   ```
 - The **join package** (this directory) and a **Tailscale auth key** from the operator.
 
@@ -50,12 +78,31 @@ genesis.json                     abf599cbbf98b0ef67bfc351dff797e1ff08ac88d04e705
 
 ## Step 1 — Join the tailnet (needs the operator's auth key)
 
-Install Tailscale, bring it up with your key, and confirm you can reach the seed:
+Install Tailscale, bring it up with your key, and confirm you can reach the seed.
+
+**Linux:**
 
 ```bash
 curl -fsSL https://tailscale.com/install.sh | sh
 sudo tailscale up --auth-key="<AUTH-KEY-FROM-OPERATOR>"
 tailscale ping 100.111.32.83        # MUST succeed before continuing
+```
+
+**macOS:**
+
+Install Tailscale first from the official macOS download page:
+<https://tailscale.com/download/mac>
+
+Then paste this block:
+
+```bash
+TS="tailscale"
+if ! command -v tailscale >/dev/null 2>&1; then
+  TS="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+fi
+
+sudo "$TS" up --auth-key="<AUTH-KEY-FROM-OPERATOR>"
+"$TS" ping 100.111.32.83        # MUST succeed before continuing
 ```
 
 **Do not continue until `tailscale ping 100.111.32.83` succeeds** — if it doesn't,
@@ -80,23 +127,36 @@ cd aincore-testnet-join-package
 (If the operator handed you the folder directly, just `cd` into it. The package
 is a *directory* named `aincore-testnet-join-package`.)
 
-Now paste this whole block. It verifies integrity (incl. the script itself),
-auto‑detects your CPU arch, and installs the snapshot:
+Now verify the package first:
 
 ```bash
 set -e
-# 1. integrity check (fails loudly on a corrupt/old file)
-sha256sum -c SHA256SUMS
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum -c SHA256SUMS
+elif command -v gsha256sum >/dev/null 2>&1; then
+  gsha256sum -c SHA256SUMS
+else
+  shasum -a 256 -c SHA256SUMS
+fi
+```
 
-# 2. auto-pick the binary for THIS machine
+Every line must end with `OK`. If any line says `FAILED`, delete the package and
+download it again.
+
+### Linux — use the packaged binary
+
+Paste this block on Linux. It auto‑detects your CPU arch, selects the bundled
+Linux binary, and installs the snapshot:
+
+```bash
+set -e
 case "$(uname -m)" in
   x86_64|amd64)  cp node-x86_64-linux  ./node ;;
   aarch64|arm64) cp node-aarch64-linux ./node ;;
-  *) echo "unsupported arch $(uname -m) — build from source" >&2; exit 1 ;;
+  *) echo "unsupported Linux arch $(uname -m) — build from source" >&2; exit 1 ;;
 esac
 chmod +x ./node testnet-join.sh
 
-# 3. load snapshot state + prepare datadir
 ./testnet-join.sh \
   --binary ./node \
   --genesis ./genesis.json \
@@ -105,7 +165,49 @@ chmod +x ./node testnet-join.sh
   --datadir "$HOME/.aincore-observer"
 ```
 
-Then start the node. **Durable systemd service (recommended).** Paste this block
+### macOS — build the node, then use the same snapshot package
+
+Paste this block on macOS. It builds the node from the `testnet` branch, copies
+the macOS binary into the join package as `./node`, then installs the snapshot:
+
+```bash
+set -e
+cd ..
+
+if [ ! -d AINCORE-Blockchain ]; then
+  git clone https://github.com/Aint-core/AINCORE-Blockchain.git
+fi
+
+cd AINCORE-Blockchain
+git fetch origin
+git checkout testnet
+git pull --ff-only origin testnet
+source "$HOME/.cargo/env"
+cargo build --release -p node
+
+cd ../aincore-testnet-join-package
+cp ../AINCORE-Blockchain/target/release/node ./node
+chmod +x ./node testnet-join.sh
+
+./testnet-join.sh \
+  --binary ./node \
+  --genesis ./genesis.json \
+  --snapshot ./aincore-testnet-snapshot.tar.gz \
+  --seed /ip4/100.111.32.83/tcp/9022 \
+  --datadir "$HOME/.aincore-observer"
+```
+
+The `curl -fL -o aincore-testnet-join-package.tar.gz ...` command is still
+required on macOS: it downloads the **genesis + snapshot + script**. Only the
+node binary is built locally.
+
+---
+
+## Step 3 — Start the node
+
+### Linux systemd service (recommended)
+
+Paste this block
 **as your normal user** — it calls `sudo` itself; do **NOT** prefix the whole
 block with `sudo` (that would set the datadir to `/root/...` where there's no
 snapshot, and the node would silently start empty at height 0):
@@ -136,7 +238,10 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now aincore-observer.service
 ```
 
-Or **foreground** (quick test, no sudo):
+### Foreground run (Linux or macOS)
+
+Use this for a quick test, or on macOS if you do not want to create a LaunchAgent
+yet. Keep this terminal open:
 
 ```bash
 AINCORE_CHAIN_ID=AINCORE-LATEST-FRESH-1 AINCORE_P2P_LISTEN=0 AINCORE_SYNC_INTERVAL_MS=3000 RUST_LOG=info \
@@ -147,7 +252,7 @@ AINCORE_CHAIN_ID=AINCORE-LATEST-FRESH-1 AINCORE_P2P_LISTEN=0 AINCORE_SYNC_INTERV
 
 ---
 
-## Step 3 — Verify (paste)
+## Step 4 — Verify (paste)
 
 The node takes a few seconds to open its DB and bind the RPC, so the first
 samples may print `Connection refused` — **that is normal**; keep watching until
@@ -178,7 +283,8 @@ systemd logs: `journalctl -u aincore-observer.service -f`
 |---|---|
 | `tailscale ping 100.111.32.83` fails | Not on the tailnet → redo Step 1 with a valid key. |
 | `sha256sum: … did NOT match` | Corrupt/old file → re‑get the package. |
-| `cannot execute binary file` | Wrong arch → Step 2 auto‑picks; if copied by hand, match `uname -m`. |
+| `sha256sum: command not found` | On macOS, use the portable checksum block above (`shasum -a 256 -c SHA256SUMS`). |
+| `cannot execute binary file` | Wrong OS/arch. Linux uses bundled binaries; macOS must build from source in the macOS block. |
 | Height stuck at the snapshot value | Can't reach the seed → check `tailscale ping`; ensure `9032` is free. |
 | Log: `peer pruned below us … bootstrap from a state snapshot` | You fell behind the seed's retention window → get a **fresh** snapshot, redo Step 2. |
 | `Address already in use` | `9032`/`8032` taken → pass free `--port`/`--rpc-port` (update the systemd `ExecStart` too). |
