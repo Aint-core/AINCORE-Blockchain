@@ -209,7 +209,7 @@ over the operator's Tailscale tailnet. To bring someone on:
 2. Send the joiner **two things** (privately — the key is like a password):
    - the **Tailscale auth key**, and
    - the release link: <https://github.com/Aint-core/AINCORE-Blockchain/releases/tag/testnet-join-v1>
-3. The joiner runs Step 1–4 above (`tailscale up --auth-key=<key>` → download the
+3. The joiner runs Step 1–3 above (`tailscale up --auth-key=<key>` → download the
    package → paste the bootstrap → synced). They need nothing else from you.
 
 Revoke access anytime: delete the key or remove the node in the Tailscale admin.
