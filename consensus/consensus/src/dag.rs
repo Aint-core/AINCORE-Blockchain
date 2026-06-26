@@ -605,6 +605,26 @@ impl DagConsensus {
             return;
         }
 
+        // PWN-003: bound vertex timestamp drift. The timestamp is folded into the
+        // signed vertex hash but its VALUE was never range-checked. Reject vertices
+        // dated too far in the future (clock-skew abuse / hash-grinding surface).
+        // Future-bound ONLY — a past/monotonic bound would reject legitimately
+        // delayed honest vertices and harm liveness.
+        {
+            const MAX_FUTURE_DRIFT_SECS: u64 = 30;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if vertex.timestamp > now.saturating_add(MAX_FUTURE_DRIFT_SECS) {
+                println!(
+                    "🚨 REJECTED [PWN-003/ts]: vertex timestamp {} exceeds now {} + {}s drift",
+                    vertex.timestamp, now, MAX_FUTURE_DRIFT_SECS
+                );
+                return;
+            }
+        }
+
         // C-10 FIX: Resolve the FULL Ed25519 public key from the account object in storage.
         // vertex.author is a truncated 16-byte address (32 hex chars), but Ed25519 verification
         // requires the full 32-byte public key (64 hex chars). Without this fix, signature

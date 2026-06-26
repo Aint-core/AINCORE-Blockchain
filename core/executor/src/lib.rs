@@ -1427,18 +1427,26 @@ impl Executor {
     pub fn promote_downtime_attestations_to_slash(&self) {
         // 1. Snapshot the active validator set so quorum is computed
         //    against a stable set within this routine.
-        let validators: Vec<String> = match self.db.get("sys:validators") {
+        let validator_stakes: Vec<(String, u64)> = match self.db.get("sys:validators") {
             Ok(Some(json)) => match serde_json::from_str::<Vec<(String, u64)>>(&json) {
-                Ok(vs) => vs.into_iter().map(|(addr, _)| addr).collect(),
+                Ok(vs) => vs,
                 Err(_) => return,
             },
             _ => return,
         };
-        if validators.is_empty() {
+        if validator_stakes.is_empty() {
             return;
         }
-        let n = validators.len();
-        let bft_quorum = ((n * 2) / 3) + 1;
+        // SEC-#17: gate on STAKE-weighted quorum (the chain-wide >2/3-stake
+        // threshold used by QC / DAG-parent / commit) — NOT validator COUNT — so a
+        // swarm of tiny-stake validators cannot reach quorum to slash a large
+        // honest one. (Predicate inlined: executor cannot depend on `consensus`.)
+        use std::collections::HashMap;
+        let stake_by_addr: HashMap<&str, u64> = validator_stakes
+            .iter()
+            .map(|(a, s)| (a.as_str(), *s))
+            .collect();
+        let total_stake: u128 = validator_stakes.iter().map(|(_, s)| *s as u128).sum();
 
         // 2. Scan attestations. Bounded by SCAN_PREFIX_HARD_CAP via
         //    `scan_prefix` so a Byzantine flood cannot blow up memory.
@@ -1463,7 +1471,7 @@ impl Executor {
             // Only count reporters that are currently active validators.
             // Stale reporters from a removed/slashed validator do not
             // count toward quorum (anti-grief).
-            if !validators.contains(&reporter) {
+            if !stake_by_addr.contains_key(reporter.as_str()) {
                 continue;
             }
 
@@ -1475,7 +1483,13 @@ impl Executor {
 
         // 4. Promote groups that hit BFT quorum.
         for ((offender, epoch), reporters) in groups {
-            if reporters.len() < bft_quorum {
+            // Sum distinct in-set reporter stake; require >2/3 of total stake
+            // (mirrors consensus::qc::stake_quorum_met: signed*3 > total*2).
+            let reporter_stake: u128 = reporters
+                .iter()
+                .map(|r| *stake_by_addr.get(r.as_str()).unwrap_or(&0) as u128)
+                .sum();
+            if reporter_stake.saturating_mul(3) <= total_stake.saturating_mul(2) {
                 continue;
             }
 
@@ -1486,7 +1500,7 @@ impl Executor {
             // governance-removed between attest and promote, they
             // could be slashed despite no longer being a validator.
             // Re-check offender ∈ current validator_set here.
-            if !validators.contains(&offender) {
+            if !stake_by_addr.contains_key(offender.as_str()) {
                 eprintln!(
                     "⚠️  [NEW-002] skipping promote: offender {} left validator set \
                      between attestation and quorum promotion",
@@ -1508,8 +1522,8 @@ impl Executor {
                 "epoch": epoch,
                 "reporters": reporters.iter().collect::<Vec<_>>(),
                 "reporter_count": reporters.len(),
-                "bft_quorum": bft_quorum,
-                "validator_set_size": n,
+                "reporter_stake": reporter_stake.to_string(),
+                "total_stake": total_stake.to_string(),
                 "reason": "downtime",
                 "penalty": "5% slash + 21-day unbonding"
             });
@@ -1534,11 +1548,11 @@ impl Executor {
             }
 
             println!(
-                "⛓️  BFT-quorum downtime slash queued for {} (reporters={}, quorum={}, n={})",
+                "⛓️  Stake-quorum downtime slash queued for {} (reporters={}, reporter_stake={}/{} total)",
                 offender,
                 reporters.len(),
-                bft_quorum,
-                n
+                reporter_stake,
+                total_stake
             );
         }
     }
@@ -5099,7 +5113,9 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&slash).unwrap();
         assert_eq!(parsed["reason"].as_str(), Some("downtime"));
         assert_eq!(parsed["reporter_count"].as_u64(), Some(3));
-        assert_eq!(parsed["bft_quorum"].as_u64(), Some(3));
+        // Stake-weighted quorum (SEC-#17): 3 reporters × 100 = 300 of 400 total > 2/3.
+        assert_eq!(parsed["reporter_stake"].as_str(), Some("300"));
+        assert_eq!(parsed["total_stake"].as_str(), Some("400"));
 
         // Attestations for the promoted (offender, epoch) are cleaned up.
         for reporter in &validators[1..] {
@@ -5117,6 +5133,41 @@ mod tests {
             .get(&format!("validator:jailed:{}", offender))
             .unwrap()
             .is_some());
+    }
+
+    /// SEC-#17: low-stake Sybil reporters that reach COUNT quorum but NOT
+    /// stake quorum must NOT slash a high-stake honest validator.
+    #[test]
+    fn downtime_lowstake_sybil_below_stake_quorum_does_not_slash() {
+        let db = temp_db("downtime_sybil_stake");
+        // 1 big honest validator + 3 tiny Sybil validators. Count quorum
+        // ((4*2/3)+1 = 3) is reachable by the 3 tinies, but their stake
+        // (3) is far below 2/3 of total (1003).
+        let validators: Vec<(String, u64)> = vec![
+            ("aaaa".repeat(8), 1000),
+            ("bbbb".repeat(8), 1),
+            ("cccc".repeat(8), 1),
+            ("dddd".repeat(8), 1),
+        ];
+        db.put("sys:validators", &serde_json::to_string(&validators).unwrap())
+            .unwrap();
+        let offender = &validators[0].0; // the big honest one
+        for reporter in &validators[1..] {
+            db.put(
+                &format!("sys:downtime_attestation:{}:{}:{}", offender, 9, reporter.0),
+                &serde_json::json!({"reason": "downtime", "round": 500}).to_string(),
+            )
+            .unwrap();
+        }
+        let executor = Executor::new(db.clone());
+        executor.promote_downtime_attestations_to_slash();
+        // No slash: 3 reporter-stake of 1003 total does not meet >2/3.
+        assert!(
+            db.get(&format!("sys:pending_slash:{}", offender))
+                .unwrap()
+                .is_none(),
+            "low-stake Sybil reporters must not reach stake quorum to slash"
+        );
     }
 
     /// Attestations from a non-validator reporter must not count toward
