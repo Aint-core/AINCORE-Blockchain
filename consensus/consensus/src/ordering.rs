@@ -100,12 +100,29 @@ impl OrderingEngine {
             }
         }
 
+        // SEC-#22: restore the leader-election beacon on restart. The live beacon
+        // is last_vdf_output = vdf.compute(committed_anchor_hash.as_bytes())
+        // (persisted as consensus:last_anchor_hash + fed to update_random_beacon at
+        // commit). A fresh restart that left it at zeros would select leaders off a
+        // different beacon than long-running peers — an agreement/liveness hazard
+        // until re-sync. Recompute it deterministically from the persisted anchor.
+        let mut last_vdf_output = vec![0u8; 32];
+        if let Some(ref v) = vdf {
+            if let Ok(Some(h)) = storage.get("consensus:last_anchor_hash") {
+                if !h.is_empty() {
+                    if let Ok((output, _proof)) = v.compute(h.as_bytes()) {
+                        last_vdf_output = output;
+                    }
+                }
+            }
+        }
+
         Self {
             committed_rounds,
             finalized_round,
             committed_sequence,
             vdf_engine: vdf,
-            last_vdf_output: vec![0u8; 32],
+            last_vdf_output,
             storage: Some(storage),
         }
     }

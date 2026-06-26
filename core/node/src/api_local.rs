@@ -1179,9 +1179,15 @@ fn handle_rpc_method(
         "aincore_tally" => {
              if let Some(pid) = params.get(0).and_then(|v| v.as_str()) {
                  let governance = data.governance.lock().map_err(|e| JsonRpcError { code: -32000, message: format!("Governance lock error: {}", e) })?;
-                 // Fix: Call tally instead of tally_votes
-                 let res = governance.tally(pid);
-                 Ok(serde_json::json!(res))
+                 // SEC-#32: READ-ONLY. Previously this called the mutating tally(),
+                 // letting any unauthenticated caller flip a proposal Active->Queued/
+                 // Rejected and persist it. The status transition must be driven
+                 // deterministically on-chain (epoch tick) — see governance-execution
+                 // task. Here we only REPORT the current persisted status.
+                 match governance.get_proposal(pid) {
+                     Some(p) => Ok(serde_json::json!({ "id": pid, "status": p.status })),
+                     None => Err(JsonRpcError { code: -32602, message: "Unknown proposal".into() }),
+                 }
              } else {
                  Err(JsonRpcError { code: -32602, message: "Missing proposal ID".into() })
              }

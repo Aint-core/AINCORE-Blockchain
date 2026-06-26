@@ -163,6 +163,7 @@ fn resolve_genesis_bls_identity(
     bls_public_key_hex: Option<&str>,
     bls_pop_hex: Option<&str>,
     node_identity: &[u8; 32],
+    single_node_fallback_allowed: bool,
 ) -> Result<(Vec<u8>, Vec<u8>), GenesisError> {
     let bls = crypto::bls::BLSEngine::consensus();
     match (bls_public_key_hex, bls_pop_hex) {
@@ -192,7 +193,21 @@ fn resolve_genesis_bls_identity(
                 ))),
             }
         }
-        (None, None) => Ok(derive_validator_bls_identity(node_identity)),
+        (None, None) => {
+            // SEC-#5: self-deriving a BLS identity from the LOCAL node identity is
+            // only correct for a single-validator genesis. With N>1 validators,
+            // every booting node would derive a DIFFERENT key for the same peer
+            // address -> each writes a divergent sys:validator_set:v1 -> QCs never
+            // verify. Require explicit PoP-verified keys for multi-validator genesis.
+            if !single_node_fallback_allowed {
+                return Err(GenesisError::InvalidData(
+                    "multi-validator genesis MUST supply bls_public_key + bls_pop for every \
+                     validator (cannot self-derive another node's BLS key)"
+                        .to_string(),
+                ));
+            }
+            Ok(derive_validator_bls_identity(node_identity))
+        }
         _ => Err(GenesisError::InvalidData(
             "Genesis validator must supply BOTH bls_public_key and bls_pop, or neither".to_string(),
         )),
@@ -683,6 +698,9 @@ pub fn initialize_genesis(
                 "genesis.json epoch_duration must be greater than 0".to_string(),
             ));
         }
+        // SEC-#5: BLS self-derivation from the local node identity is only valid
+        // for a single-validator genesis (see resolve_genesis_bls_identity).
+        let genesis_validator_count = config.validators.len();
         for val in config.validators {
             let stake = parse_genesis_amount(&val.stake, "validator stake")?;
             if stake == 0 {
@@ -701,6 +719,7 @@ pub fn initialize_genesis(
                 val.bls_public_key.as_deref(),
                 val.bls_pop.as_deref(),
                 node_identity,
+                genesis_validator_count == 1,
             )?;
 
             validator_configs.push(ValidatorConfig {
@@ -738,7 +757,9 @@ pub fn initialize_genesis(
         let account_addr = parse_move_addr(genesis_addr_hex)?;
         let public_key = parse_validator_public_key(genesis_pubkey_hex, genesis_addr_hex)?;
         // Single-node fallback: derive BLS identity from the local node identity.
-        let (bls_public_key, bls_pop) = resolve_genesis_bls_identity(None, None, node_identity)?;
+        // Single-node bootstrap fallback (no genesis.json validators) — self-derive allowed.
+        let (bls_public_key, bls_pop) =
+            resolve_genesis_bls_identity(None, None, node_identity, true)?;
 
         validator_configs.push(ValidatorConfig {
             validator_addr: account_addr,
@@ -1480,7 +1501,7 @@ mod tests {
         // initialize_genesis fallback cannot be exercised reliably here because a
         // real genesis.json exists at ../../genesis.json in the search path).
         let bls = crypto::bls::BLSEngine::consensus();
-        let (pk, pop) = resolve_genesis_bls_identity(None, None, &TEST_NODE_IDENTITY)
+        let (pk, pop) = resolve_genesis_bls_identity(None, None, &TEST_NODE_IDENTITY, true)
             .expect("fallback derivation succeeds");
         assert_eq!(pk.len(), 48, "derived bls_public_key must be 48 bytes");
         assert_eq!(pop.len(), 96, "derived bls_pop must be 96 bytes");
@@ -1496,6 +1517,20 @@ mod tests {
         let other = [9u8; 32];
         let (other_pk, _) = derive_validator_bls_identity(&other);
         assert_ne!(pk, other_pk);
+    }
+
+    /// SEC-#5: in a MULTI-validator genesis, a validator with no explicit
+    /// bls_public_key/bls_pop must NOT self-derive (each node would derive a
+    /// different key) — it must error.
+    #[test]
+    fn multi_validator_genesis_rejects_self_derived_bls() {
+        let err = resolve_genesis_bls_identity(None, None, &TEST_NODE_IDENTITY, false);
+        assert!(
+            err.is_err(),
+            "multi-validator genesis must reject self-derived BLS keys"
+        );
+        // Single-node fallback still allowed.
+        assert!(resolve_genesis_bls_identity(None, None, &TEST_NODE_IDENTITY, true).is_ok());
     }
 
     #[test]
@@ -1625,7 +1660,9 @@ mod tests {
             state_root: "cc".repeat(32),
             receipts_root: "dd".repeat(32),
             finality_digest: "ee".repeat(32),
-            validator_set_hash: "ff".repeat(32),
+            // Must equal validator_set_hash(set): verify_qc binds the QC to the
+            // exact validator set (the #7 binding). A dummy hash would be rejected.
+            validator_set_hash: consensus::qc::validator_set_hash(&set),
         };
         let sig = bls.sign_raw(&vote.to_signing_bytes(), &bls_seed);
         let qc = consensus::qc::build_qc(&vote, &set, &[0], &[sig]).expect("build qc");

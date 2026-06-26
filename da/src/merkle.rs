@@ -20,15 +20,7 @@ impl MerkleTree {
         }
 
         // Hash each shard to create leaves
-        let leaves: Vec<[u8; 32]> = shards
-            .iter()
-            .map(|shard| {
-                let h = hash(shard);
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&h[0..32]);
-                arr
-            })
-            .collect();
+        let leaves: Vec<[u8; 32]> = shards.iter().map(|shard| leaf_hash(shard)).collect();
 
         // Build tree levels
         let mut levels = vec![leaves.clone()];
@@ -103,10 +95,8 @@ impl MerkleTree {
         root: &[u8; 32],
         shard_index: usize,
     ) -> bool {
-        // Hash the shard
-        let h = hash(shard);
-        let mut current_hash = [0u8; 32];
-        current_hash.copy_from_slice(&h[0..32]);
+        // Hash the shard with the SAME leaf domain tag as MerkleTree::new.
+        let mut current_hash = leaf_hash(shard);
 
         let mut index = shard_index;
 
@@ -123,9 +113,10 @@ impl MerkleTree {
         &current_hash == root
     }
 
-    /// Hash two nodes together
+    /// Hash two internal nodes together (domain tag 0x01).
     fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-        let mut input = Vec::with_capacity(64);
+        let mut input = Vec::with_capacity(1 + 64);
+        input.push(0x01); // SEC-#19: internal-node domain tag
         input.extend_from_slice(left);
         input.extend_from_slice(right);
         let h = hash(&input);
@@ -133,6 +124,20 @@ impl MerkleTree {
         arr.copy_from_slice(&h[0..32]);
         arr
     }
+}
+
+/// SEC-#19: leaf hash with domain tag 0x00 — distinct from the internal-node
+/// tag (0x01) so a leaf can never be reinterpreted as an internal node
+/// (second-preimage / CVE-2012-2459 family). Used identically by tree build and
+/// proof verification.
+fn leaf_hash(shard: &[u8]) -> [u8; 32] {
+    let mut tagged = Vec::with_capacity(1 + shard.len());
+    tagged.push(0x00);
+    tagged.extend_from_slice(shard);
+    let h = hash(&tagged);
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&h[0..32]);
+    arr
 }
 
 #[cfg(test)]
