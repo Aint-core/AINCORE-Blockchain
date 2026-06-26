@@ -1172,45 +1172,9 @@ impl Executor {
             MAX_OBJECTS_PER_BLOCK
         );
 
-        // 2. Build Dependency Graph & Schedule
-        let mut batches: Vec<Vec<(Transaction, String)>> = Vec::new();
-        let mut current_batch: Vec<(Transaction, String)> = Vec::new();
-        let mut locked_objects: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
-        for (tx, raw) in parsed_txs {
-            let deps = self.get_tx_dependencies(&tx);
-            let mut conflict = false;
-
-            for dep in &deps {
-                if locked_objects.contains(dep) {
-                    conflict = true;
-                    break;
-                }
-            }
-
-            if conflict {
-                if !current_batch.is_empty() {
-                    batches.push(current_batch);
-                }
-                current_batch = Vec::new();
-                locked_objects.clear();
-
-                current_batch.push((tx.clone(), raw));
-                for dep in deps {
-                    locked_objects.insert(dep);
-                }
-            } else {
-                current_batch.push((tx.clone(), raw));
-                for dep in deps {
-                    locked_objects.insert(dep);
-                }
-            }
-        }
-        if !current_batch.is_empty() {
-            batches.push(current_batch);
-        }
-
+        // 2. Build Dependency Graph & Schedule (see schedule_batches — unknown
+        //    write sets are serialized into singleton batches, #1).
+        let batches = self.schedule_batches(parsed_txs);
         println!("📊 Scheduled {} execution batches.", batches.len());
 
         // 3. Execute Batches ATOMICALLY
@@ -1772,7 +1736,19 @@ impl Executor {
     }
 
     fn get_tx_dependencies(&self, tx: &Transaction) -> Vec<String> {
+        self.analyze_tx(tx).0
+    }
+
+    /// Analyze a tx: its conflict-dependency tokens AND whether its write set was
+    /// statically RECOGNIZED. An UNRECOGNIZED call (PublishModule, an unlisted
+    /// module/function, or an undecodable payload) has an unknown write set and
+    /// MUST be serialized (run alone) by the scheduler — otherwise two such calls
+    /// mutating the same global resource would race in one parallel batch and
+    /// fork the state root (#1). The allowlist below is a fast PATH for known
+    /// calls, NEVER the safety boundary.
+    fn analyze_tx(&self, tx: &Transaction) -> (Vec<String>, bool) {
         let mut deps = Vec::new();
+        let mut recognized = false;
         // H2 FIX: Canonicalize the sender into the SAME representation used for
         // recipients (Move `AccountAddress` Display, i.e. fully zero-padded
         // lowercase hex). `tx.sender` is the raw client-supplied string, which
@@ -1794,11 +1770,11 @@ impl Executor {
 
         let payload_bytes = match hex::decode(tx.payload.trim_start_matches("0x")) {
             Ok(bytes) => bytes,
-            Err(_) => return deps,
+            Err(_) => return (deps, recognized), // undecodable -> unknown -> serialize
         };
         let payload = match bcs::from_bytes::<vm_move::TransactionPayload>(&payload_bytes) {
             Ok(payload) => payload,
-            Err(_) => return deps,
+            Err(_) => return (deps, recognized), // undecodable -> unknown -> serialize
         };
 
         fn push_addr_arg(deps: &mut Vec<String>, args: &[Vec<u8>], index: usize) {
@@ -1817,13 +1793,17 @@ impl Executor {
             let function = call.function.as_str();
 
             if *module_addr == system_address() && module_name == "coin" && function == "transfer" {
+                recognized = true;
                 push_addr_arg(&mut deps, &call.args, 1);
             } else if *module_addr == system_address() && module_name == "staking" {
+                // staking locks the validator-set keys, serializing all staking txs.
+                recognized = true;
                 deps.push(validator_set_key());
                 deps.push(validator_set_v1_key().to_string());
             } else if *module_addr == system_address() && module_name == "delegation" {
                 match function {
                     "enable_delegation" => {
+                        recognized = true;
                         deps.push(format!(
                             "resource_{}_{}",
                             sender_token, "0x1::delegation::ValidatorPool"
@@ -1835,6 +1815,7 @@ impl Executor {
                         ));
                     }
                     "delegate" | "undelegate" | "claim_rewards" | "withdraw_unbonded" => {
+                        recognized = true;
                         push_addr_arg(&mut deps, &call.args, 1);
                         if let Some(bytes) = call.args.get(1) {
                             if let Ok(addr) = bcs::from_bytes::<
@@ -1851,6 +1832,7 @@ impl Executor {
                     _ => {}
                 }
             } else if *module_addr == system_address() && module_name == "governance" {
+                recognized = true;
                 deps.push(format!(
                     "resource_{}_{}",
                     system_address(),
@@ -1864,6 +1846,7 @@ impl Executor {
                 && module_name == "token_factory"
                 && function == "transfer"
             {
+                recognized = true;
                 push_addr_arg(&mut deps, &call.args, 2);
                 deps.push(format!(
                     "resource_{}_{}",
@@ -1880,6 +1863,7 @@ impl Executor {
                     }
                 }
             } else if *module_addr == system_address() && module_name == "token_factory" {
+                recognized = true;
                 deps.push(format!(
                     "resource_{}_{}",
                     system_address(),
@@ -1890,6 +1874,7 @@ impl Executor {
                     sender_token, "0x1::token_factory::TokenWallet"
                 ));
             } else if *module_addr == system_address() && module_name == "dex" {
+                recognized = true;
                 deps.push(dex_registry_key());
 
                 let sender_addr = parse_move_address(&tx.sender);
@@ -1917,7 +1902,54 @@ impl Executor {
                 }
             }
         }
-        deps
+        (deps, recognized)
+    }
+
+    /// Group block txs into execution batches. Txs WITHIN a batch run in parallel
+    /// and have disjoint conflict tokens; txs sharing a token go in later
+    /// (sequential) batches. A tx whose write set is NOT statically recognized
+    /// (`analyze_tx` -> recognized=false: PublishModule, unlisted module/function,
+    /// undecodable payload) is run ALONE in its own batch, fully serialized — we
+    /// cannot prove it conflict-free, and two such calls racing a shared global in
+    /// one parallel batch would fork the state root (#1).
+    fn schedule_batches(
+        &self,
+        parsed_txs: Vec<(Transaction, String)>,
+    ) -> Vec<Vec<(Transaction, String)>> {
+        let mut batches: Vec<Vec<(Transaction, String)>> = Vec::new();
+        let mut current_batch: Vec<(Transaction, String)> = Vec::new();
+        let mut locked_objects: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        for (tx, raw) in parsed_txs {
+            let (deps, recognized) = self.analyze_tx(&tx);
+
+            if !recognized {
+                // Unknown write set -> run alone (flush current, singleton, reset).
+                if !current_batch.is_empty() {
+                    batches.push(std::mem::take(&mut current_batch));
+                }
+                locked_objects.clear();
+                batches.push(vec![(tx, raw)]);
+                continue;
+            }
+
+            let conflict = deps.iter().any(|d| locked_objects.contains(d));
+            if conflict {
+                if !current_batch.is_empty() {
+                    batches.push(std::mem::take(&mut current_batch));
+                }
+                locked_objects.clear();
+            }
+            for dep in &deps {
+                locked_objects.insert(dep.clone());
+            }
+            current_batch.push((tx, raw));
+        }
+        if !current_batch.is_empty() {
+            batches.push(current_batch);
+        }
+        batches
     }
 
     /// Build the database update set for a single transaction.
@@ -3015,6 +3047,59 @@ mod tests {
             args,
         };
         hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap())
+    }
+
+    /// SEC-#1: a call whose write set is not statically recognized (unlisted
+    /// module / undecodable payload) must be serialized into its own singleton
+    /// batch; recognized disjoint calls still parallelize.
+    #[test]
+    fn sec1_unknown_calls_serialized_known_calls_parallel() {
+        let db = temp_db("sec1_sched");
+        let exec = Executor::new(db);
+        let mk = |sender: &str, payload: &str| Transaction {
+            chain_id: "AINCORE-MAINNET-1".to_string(),
+            sender: sender.to_string(),
+            input_objects: vec![],
+            payload: payload.to_string(),
+            args: vec![],
+            gas_limit: 10_000,
+            gas_price: 1,
+            sequence_number: 0,
+            public_key: String::new(),
+            signature: String::new(),
+            paymaster: None,
+            paymaster_signature: None,
+            zkp_proof: None,
+        };
+
+        let xfer = entry_payload("coin", "transfer", vec![], vec![]);
+        let unknown = entry_payload("universal_mining", "mine", vec![], vec![]);
+        // Recognition gate.
+        assert!(exec.analyze_tx(&mk(&"a".repeat(32), &xfer)).1, "coin::transfer recognized");
+        assert!(
+            !exec.analyze_tx(&mk(&"a".repeat(32), &unknown)).1,
+            "unlisted module must NOT be recognized"
+        );
+        assert!(
+            !exec.analyze_tx(&mk(&"a".repeat(32), "deadbeef")).1,
+            "undecodable payload must NOT be recognized"
+        );
+
+        // Two UNKNOWN calls with disjoint senders must each run alone.
+        let batches = exec.schedule_batches(vec![
+            (mk(&"a".repeat(32), &unknown), "ra".to_string()),
+            (mk(&"b".repeat(32), &unknown), "rb".to_string()),
+        ]);
+        assert_eq!(batches.len(), 2, "unknown calls must be serialized into singleton batches");
+        assert!(batches.iter().all(|b| b.len() == 1));
+
+        // Two recognized, disjoint coin::transfers still share one parallel batch.
+        let batches2 = exec.schedule_batches(vec![
+            (mk(&"c".repeat(32), &xfer), "rc".to_string()),
+            (mk(&"d".repeat(32), &xfer), "rd".to_string()),
+        ]);
+        assert_eq!(batches2.len(), 1, "disjoint known txs stay in one parallel batch");
+        assert_eq!(batches2[0].len(), 2);
     }
 
     fn validator_set_key() -> String {
