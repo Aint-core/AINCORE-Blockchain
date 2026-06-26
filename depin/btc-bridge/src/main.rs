@@ -64,7 +64,7 @@ async fn main() {
     println!("🔐 Required Confirmations: {}", CONFIRMATIONS);
 
     let btc = BtcClient::new(multisig_address);
-    let aincore = AincoreClient::new(aincore_rpc, bridge_key);
+    let aincore = AincoreClient::new(aincore_rpc, bridge_key.to_string());
     let mut db = Storage::new("processed_txs.json");
 
     loop {

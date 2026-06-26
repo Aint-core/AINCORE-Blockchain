@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 
 // Reserved for future rate limiting implementation
 const MAX_CONNECTIONS: usize = 100;
-#[allow(dead_code)]
+// Default per-IP concurrent inbound connection cap (SEC-#28). Env-tunable via
+// AINCORE_MAX_CONN_PER_IP — raise it for CGNAT/reverse-proxy deployments where
+// many honest peers legitimately share one source IP.
 const MAX_CONN_PER_IP_MIN: usize = 60;
 
 /// Max time allowed for the pre-message-loop handshake (each direction) and for
@@ -27,11 +29,21 @@ fn is_docker_bridge_ip(ip: std::net::IpAddr) -> bool {
 
 struct ConnectionGuard {
     counter: Arc<AtomicUsize>,
+    per_ip: Arc<Mutex<HashMap<std::net::IpAddr, usize>>>,
+    ip: std::net::IpAddr,
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Relaxed);
+        if let Ok(mut m) = self.per_ip.lock() {
+            if let Some(c) = m.get_mut(&self.ip) {
+                *c = c.saturating_sub(1);
+                if *c == 0 {
+                    m.remove(&self.ip);
+                }
+            }
+        }
     }
 }
 
@@ -66,6 +78,15 @@ pub async fn start_server<F>(
 
     let handler = Arc::new(handler);
     let active_connections = Arc::new(AtomicUsize::new(0));
+    // SEC-#28: per-IP concurrent inbound connection cap (anti-Sybil/eclipse).
+    // Env-tunable for CGNAT/reverse-proxy where honest peers share a source IP.
+    let per_ip_connections: Arc<Mutex<HashMap<std::net::IpAddr, usize>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let max_conn_per_ip = std::env::var("AINCORE_MAX_CONN_PER_IP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(MAX_CONN_PER_IP_MIN);
 
     loop {
         let (mut socket, addr) = match listener.accept().await {
@@ -84,6 +105,27 @@ pub async fn start_server<F>(
             continue;
         }
 
+        // SEC-#28: per-IP cap. Docker-bridge shared IPs (172.16-31.x) are exempt —
+        // many containers legitimately egress one bridge gateway. One source IP
+        // cannot otherwise open MAX_CONNECTIONS sessions and starve real peers.
+        let peer_ip = addr.ip();
+        if !is_docker_bridge_ip(peer_ip) {
+            match per_ip_connections.lock() {
+                Ok(mut ipm) => {
+                    let c = ipm.entry(peer_ip).or_insert(0);
+                    if *c >= max_conn_per_ip {
+                        eprintln!(
+                            "⚠️ Per-IP connection cap ({}) reached for {}; rejecting",
+                            max_conn_per_ip, peer_ip
+                        );
+                        continue;
+                    }
+                    *c += 1;
+                }
+                Err(_) => continue,
+            }
+        }
+
         let active_counter = active_connections.clone();
         active_counter.fetch_add(1, Ordering::Relaxed);
 
@@ -92,10 +134,13 @@ pub async fn start_server<F>(
         let db_clone = db.clone();
         let handler_clone = handler.clone();
         let signing_key_clone = Arc::clone(&my_signing_key);
+        let per_ip_for_guard = per_ip_connections.clone();
 
         tokio::spawn(async move {
             let _guard = ConnectionGuard {
                 counter: active_counter,
+                per_ip: per_ip_for_guard,
+                ip: peer_ip,
             };
             let (my_secret, my_public) = TransportEngine::generate_ephemeral();
 
