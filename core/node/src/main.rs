@@ -231,6 +231,17 @@ async fn main() {
         let new_key = SigningKey::generate(&mut csprng);
         match std::fs::write(key_path, new_key.to_bytes()) {
             Ok(_) => {
+                // node.key is the root secret: it re-derives the Ed25519 consensus
+                // identity, the validator BLS finality seed, and the DA at-rest key.
+                // Restrict to owner-only (0600) so it is never world-readable.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        key_path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
                 println!("✅ Generated new node key: {}", key_path);
                 println!(
                     "🔑 Public Key: {}",

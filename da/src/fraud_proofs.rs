@@ -100,12 +100,17 @@ impl FraudProofVerifier {
             FraudProofType::InvalidCommitment => Self::verify_invalid_commitment(proof),
             FraudProofType::InvalidShard => Self::verify_invalid_shard(proof),
             FraudProofType::MissingData => {
-                // This requires network sampling, handled separately
-                true
+                // Cannot be proven from the proof alone — needs live network
+                // sampling. NEVER auto-accept: returning `true` here would let
+                // anyone "prove" fraud (and, once slashing is wired, slash an
+                // honest validator) with an empty claim. Fail closed until the
+                // real sampling verifier is implemented.
+                false
             }
             FraudProofType::InvalidErasure => {
-                // This requires erasure code verification
-                true
+                // Cannot be proven without re-running erasure decoding over the
+                // claimed shards. Fail closed (see MissingData above).
+                false
             }
         }
     }

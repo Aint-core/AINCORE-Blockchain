@@ -1247,7 +1247,7 @@ impl Executor {
                             batch_hasher.update(b"DELETE");
                         }
                     }
-                    total_fees += gas_charged; // C-6 FIX: Accumulate actual gas cost
+                    total_fees = total_fees.saturating_add(gas_charged); // C-6 FIX: accumulate gas (saturating — defense-in-depth)
                 }
             }
 
@@ -1291,8 +1291,8 @@ impl Executor {
         let burn_pct = self.db.get_burn_percentage() as u128;
         let total_fees_u128 = total_fees;
 
-        let burnt_fees = (total_fees_u128 * burn_pct) / 100;
-        let miner_fees = total_fees_u128 - burnt_fees;
+        let burnt_fees = total_fees_u128.saturating_mul(burn_pct) / 100;
+        let miner_fees = total_fees_u128.saturating_sub(burnt_fees);
 
         // Miner reward = fees ONLY (no block inflation from executor)
         let reward_amount = miner_fees;
