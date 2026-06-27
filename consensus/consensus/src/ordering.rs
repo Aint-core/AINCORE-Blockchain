@@ -100,19 +100,24 @@ impl OrderingEngine {
             }
         }
 
-        // SEC-#22: restore the leader-election beacon on restart. The live beacon
-        // is last_vdf_output = vdf.compute(committed_anchor_hash.as_bytes())
-        // (persisted as consensus:last_anchor_hash + fed to update_random_beacon at
-        // commit). A fresh restart that left it at zeros would select leaders off a
-        // different beacon than long-running peers — an agreement/liveness hazard
-        // until re-sync. Recompute it deterministically from the persisted anchor.
+        // SEC-#22/#12: restore the leader-election beacon on restart. The beacon is
+        // a pure function of (last anchor round, cumulative finality digest) — both
+        // persisted every commit (consensus:last_anchor_round / consensus:finality_
+        // _digest) — so it recomputes deterministically and identically on every
+        // node without persisting the beacon itself. A fresh restart that left it at
+        // zeros would select leaders off a different beacon than long-running peers
+        // (agreement/liveness hazard until re-sync), so reconstruct it here.
         let mut last_vdf_output = vec![0u8; 32];
         if let Some(ref v) = vdf {
-            if let Ok(Some(h)) = storage.get("consensus:last_anchor_hash") {
-                if !h.is_empty() {
-                    if let Ok((output, _proof)) = v.compute(h.as_bytes()) {
-                        last_vdf_output = output;
-                    }
+            let anchor_round = storage
+                .get("consensus:last_anchor_round")
+                .ok()
+                .flatten()
+                .and_then(|s| s.parse::<u64>().ok());
+            let digest = storage.get("consensus:finality_digest").ok().flatten();
+            if let (Some(ar), Some(d)) = (anchor_round, digest) {
+                if let Ok((output, _proof)) = v.compute(&Self::beacon_challenge(ar, &d)) {
+                    last_vdf_output = output;
                 }
             }
         }
@@ -127,10 +132,29 @@ impl OrderingEngine {
         }
     }
 
-    /// Update random beacon using VDF (called after each commit)
-    pub fn update_random_beacon(&mut self, seed: &[u8]) {
+    /// SEC-#12: domain-separated leader-election beacon challenge.
+    ///
+    /// The beacon is seeded from `(anchor_round, finality_digest)` rather than the
+    /// bare proposer-chosen anchor-vertex hash. `finality_digest` is a cumulative
+    /// hash over the ENTIRE committed sequence, so the seed is bound to the whole
+    /// committed prefix — a single proposer can no longer grind one vertex (the old
+    /// cheap two-hash trial) to steer the next leader; it would have to control the
+    /// cumulative digest. (Full unbiasability needs the multi-party QC aggregate
+    /// signature — Step 2 — and a real delay-VDF is the longer-term roadmap; the
+    /// hash-chain VDF here provides determinism, not delay.)
+    fn beacon_challenge(anchor_round: u64, finality_digest: &str) -> Vec<u8> {
+        let mut c = Vec::with_capacity(17 + 8 + finality_digest.len());
+        c.extend_from_slice(b"AINCORE_BEACON_V1");
+        c.extend_from_slice(&anchor_round.to_le_bytes());
+        c.extend_from_slice(finality_digest.as_bytes());
+        c
+    }
+
+    /// Update random beacon using VDF (called after each commit). Deterministic
+    /// across nodes: same (anchor_round, finality_digest) → same beacon.
+    pub fn update_random_beacon(&mut self, anchor_round: u64, finality_digest: &str) {
         if let Some(ref vdf) = self.vdf_engine {
-            if let Ok((output, _proof)) = vdf.compute(seed) {
+            if let Ok((output, _proof)) = vdf.compute(&Self::beacon_challenge(anchor_round, finality_digest)) {
                 self.last_vdf_output = output;
             }
         }
@@ -297,6 +321,11 @@ impl OrderingEngine {
         }
         self.committed_sequence.extend(sequence.clone());
 
+        // Cumulative digest over the full committed sequence — used for persistence,
+        // the leader-election beacon (SEC-#12) and the returned CommitInfo. Computed
+        // once so all three see the identical value.
+        let digest = Self::finality_digest(&self.committed_sequence);
+
         // PERSIST committed state to DB (BUG #1 FIX)
         if let Some(ref storage) = self.storage {
             // committed_rounds is now bounded (<= COMMITTED_ROUNDS_WINDOW + 1
@@ -320,20 +349,20 @@ impl OrderingEngine {
             );
             let _ = storage.put("consensus:last_anchor_round", &anchor_round.to_string());
             let _ = storage.put("consensus:last_anchor_hash", anchor_vertex_hash);
-            let digest = Self::finality_digest(&self.committed_sequence);
             let _ = storage.put("consensus:finality_digest", &digest);
         }
 
-        // 6. Update VDF random beacon with committed anchor hash
-        // This ensures unpredictable randomness for future leader selection
-        self.update_random_beacon(anchor_vertex_hash.as_bytes());
+        // 6. Update the VDF leader-election beacon from (anchor_round, finality
+        // digest). SEC-#12: binding to the cumulative digest (not the bare
+        // proposer-chosen anchor hash) removes the cheap single-vertex grind.
+        self.update_random_beacon(anchor_round, &digest);
 
         Some(CommitInfo {
             sequence,
             leader: successful_leader,
             anchor_round,
             anchor_hash: anchor_vertex_hash.clone(),
-            finality_digest: Self::finality_digest(&self.committed_sequence),
+            finality_digest: digest,
         })
     }
 
@@ -516,6 +545,67 @@ mod tests {
         // total_stake==0 must not panic (uniform fallback).
         let zero = vec![("aaaa".to_string(), 0u64), ("bbbb".to_string(), 0u64)];
         let _ = engine.get_leader_with_fallback(1, &zero, 0);
+    }
+
+    /// SEC-#12: the leader-election beacon is deterministic across nodes and
+    /// bound to the cumulative finality digest (committed history) — not a single
+    /// proposer-chosen value.
+    #[test]
+    fn beacon_is_deterministic_and_history_dependent() {
+        let mut e1 = OrderingEngine::new_with_storage(temp_db("beacon_det1"));
+        let mut e2 = OrderingEngine::new_with_storage(temp_db("beacon_det2"));
+
+        // Same (anchor_round, finality_digest) → identical beacon on independent
+        // engines (consensus-critical: a divergent beacon forks leader election).
+        e1.update_random_beacon(7, "digest-AAAA");
+        e2.update_random_beacon(7, "digest-AAAA");
+        assert_eq!(e1.get_random_beacon(), e2.get_random_beacon());
+        assert_ne!(
+            e1.get_random_beacon(),
+            &[0u8; 32][..],
+            "beacon must actually be derived (VDF present)"
+        );
+
+        // A different finality digest → different beacon: the seed tracks the whole
+        // committed history, so an attacker must control the cumulative digest
+        // rather than cheaply grinding one anchor vertex.
+        let before = e1.get_random_beacon().to_vec();
+        e1.update_random_beacon(7, "digest-BBBB");
+        assert_ne!(e1.get_random_beacon(), &before[..]);
+
+        // A different anchor round → different beacon too.
+        let mut e3 = OrderingEngine::new_with_storage(temp_db("beacon_det3"));
+        e3.update_random_beacon(8, "digest-AAAA");
+        assert_ne!(e3.get_random_beacon(), e2.get_random_beacon());
+    }
+
+    /// SEC-#12/#22: on restart the beacon is reconstructed EXACTLY from the
+    /// persisted (last_anchor_round, finality_digest) — matching what a live
+    /// engine holds — without persisting the beacon itself.
+    #[test]
+    fn beacon_reconstructs_from_persisted_state_on_restart() {
+        let path = format!(
+            "/tmp/aincore_ordering_test_{}_beacon_restart",
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&path);
+        let db = Arc::new(StateDB::open(&path).unwrap());
+        db.put("consensus:last_anchor_round", "5").unwrap();
+        db.put("consensus:finality_digest", "deadbeef-digest").unwrap();
+
+        // Fresh engine reconstructs the beacon from persisted state...
+        let restored = OrderingEngine::new_with_storage(Arc::clone(&db));
+        // ...and it equals what a live engine derives from the same inputs.
+        let mut live = OrderingEngine::new_with_storage(temp_db("beacon_restart_live"));
+        live.update_random_beacon(5, "deadbeef-digest");
+
+        assert_eq!(
+            restored.get_random_beacon(),
+            live.get_random_beacon(),
+            "restart must reconstruct the exact beacon from persisted (round, digest)"
+        );
+        assert_ne!(restored.get_random_beacon(), &[0u8; 32][..]);
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     /// M3: a legacy node persisted committed_rounds as a huge unbounded Vec.
