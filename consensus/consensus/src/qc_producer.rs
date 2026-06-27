@@ -28,7 +28,9 @@ use storage::StateDB;
 
 pub use crate::qc::derive_validator_bls_seed;
 
-/// Load and parse the active validator set written by B1 at genesis.
+/// Load and parse the active validator set written by B1 at genesis. This is the
+/// LIVE set (`sys:validator_set:v1`) — it may change mid-epoch as validators
+/// join/leave. For QC production/verification prefer [`load_validator_set_for_epoch`].
 pub fn load_validator_set_v1(storage: &StateDB) -> Option<Vec<ValidatorInfo>> {
     let raw = storage.get("sys:validator_set:v1").ok()??;
     let set: Vec<ValidatorInfo> = serde_json::from_str(&raw).ok()?;
@@ -37,6 +39,26 @@ pub fn load_validator_set_v1(storage: &StateDB) -> Option<Vec<ValidatorInfo>> {
     } else {
         Some(set)
     }
+}
+
+/// SEC-#16: load the validator set FROZEN for a given consensus epoch.
+///
+/// QCs for any round in epoch `E` are produced AND verified against
+/// `sys:validator_set:epoch:{E}` — a snapshot taken at the `E-1 -> E` boundary by
+/// the executor — so the set (and its `validator_set_hash`) is stable for the
+/// whole epoch even if validators join/leave mid-epoch (a join during `E`
+/// activates in `E+1`, when the next snapshot captures it). Falls back to the
+/// live `sys:validator_set:v1` when no snapshot exists (epoch 0 / pre-rotation /
+/// older DBs), so single-validator and legacy behaviour is unchanged.
+pub fn load_validator_set_for_epoch(storage: &StateDB, epoch: u64) -> Option<Vec<ValidatorInfo>> {
+    if let Ok(Some(raw)) = storage.get(&format!("sys:validator_set:epoch:{}", epoch)) {
+        if let Ok(set) = serde_json::from_str::<Vec<ValidatorInfo>>(&raw) {
+            if !set.is_empty() {
+                return Some(set);
+            }
+        }
+    }
+    load_validator_set_v1(storage)
 }
 
 /// Commit context captured at the point a block is finalized + executed.
@@ -66,7 +88,10 @@ pub fn produce_and_store_qc(
     node_address: &str,
     ctx: &CommitContext,
 ) -> Option<QuorumCertificate> {
-    let validators = load_validator_set_v1(storage)?;
+    // SEC-#16: bind the QC to the validator set FROZEN for this commit's epoch,
+    // so the validator_set_hash is stable across the whole epoch (matches what
+    // verifiers use via load_validator_set_for_epoch(qc.epoch)).
+    let validators = load_validator_set_for_epoch(storage, ctx.epoch)?;
     let ordered = qc::canonical_order(&validators);
 
     // Position of this node in the canonical set, by validator address.
@@ -265,5 +290,33 @@ mod tests {
         let h1 = qc::validator_set_hash(&[a.clone(), b.clone()]);
         let h2 = qc::validator_set_hash(&[b, a]);
         assert_eq!(h1, h2, "set hash must be canonical-order invariant");
+    }
+
+    /// SEC-#16: epoch resolution prefers the frozen per-epoch snapshot and falls
+    /// back to the live set when no snapshot exists.
+    #[test]
+    fn load_validator_set_for_epoch_prefers_snapshot_then_falls_back() {
+        let dir = std::env::temp_dir().join(format!("qc_prod_epoch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = StateDB::open(dir.to_str().unwrap()).unwrap();
+
+        let live = vec![validator_for(&[1u8; 32], 100, "aaaa")];
+        let snap = vec![validator_for(&[2u8; 32], 200, "bbbb")];
+        storage
+            .put("sys:validator_set:v1", &serde_json::to_string(&live).unwrap())
+            .unwrap();
+        storage
+            .put(
+                "sys:validator_set:epoch:3",
+                &serde_json::to_string(&snap).unwrap(),
+            )
+            .unwrap();
+
+        // Exact snapshot for epoch 3.
+        let got3 = load_validator_set_for_epoch(&storage, 3).expect("epoch 3 snapshot");
+        assert_eq!(got3[0].address, "bbbb");
+        // No snapshot for epoch 9 → fall back to the live set.
+        let got9 = load_validator_set_for_epoch(&storage, 9).expect("fallback to live");
+        assert_eq!(got9[0].address, "aaaa");
     }
 }

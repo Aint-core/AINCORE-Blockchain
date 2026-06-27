@@ -924,11 +924,56 @@ impl Executor {
                     return;
                 }
                 self.sync_supply_trackers_from_validator_set();
+                self.rotate_validator_epoch(next_height);
                 println!("⏳ Epoch advanced at block {}", next_height);
             }
             Err(err) => {
                 eprintln!("⚠️ Epoch advance failed at block {}: {}", next_height, err);
             }
+        }
+    }
+
+    /// SEC-#16: at each epoch boundary, snapshot the active validator set for the
+    /// NEW epoch and advance the consensus epoch counter. Runs from
+    /// `maybe_advance_epoch`, which fires on BOTH the consensus (dag) and sync
+    /// (chain_sync) block-apply paths — so every node rotates identically and
+    /// deterministically (epoch = boundary_height / interval, set from on-chain
+    /// state only). QC production/verification bind to `sys:validator_set:epoch:{E}`,
+    /// so a validator that joins during epoch E becomes active in E+1 when the
+    /// next boundary captures the updated live set. These are consensus-metadata
+    /// keys (like consensus:committed_rounds) — not Move state, not in the state
+    /// root.
+    fn rotate_validator_epoch(&self, boundary_height: u64) {
+        let interval = Self::epoch_block_interval();
+        if interval == 0 {
+            return;
+        }
+        let new_epoch = boundary_height / interval;
+
+        // Freeze the current live set for the new epoch.
+        if let Ok(Some(active)) = self.db.get("sys:validator_set:v1") {
+            let _ = self
+                .db
+                .put(&format!("sys:validator_set:epoch:{}", new_epoch), &active);
+        }
+        let _ = self.db.put("consensus:epoch", &new_epoch.to_string());
+        let _ = self.db.put(
+            &format!("consensus:epoch_start_height:{}", new_epoch),
+            &boundary_height.saturating_add(1).to_string(),
+        );
+
+        // Retain a bounded window of historical snapshots so slightly-behind
+        // nodes can still verify QCs from recent past epochs, without unbounded
+        // growth. Older snapshots are safe to drop (a QC that old no longer
+        // advances finality).
+        const EPOCH_SNAPSHOT_RETENTION: u64 = 8;
+        if let Some(stale) = new_epoch.checked_sub(EPOCH_SNAPSHOT_RETENTION + 1) {
+            let _ = self
+                .db
+                .delete(&format!("sys:validator_set:epoch:{}", stale));
+            let _ = self
+                .db
+                .delete(&format!("consensus:epoch_start_height:{}", stale));
         }
     }
 
@@ -2852,6 +2897,37 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&path);
         Arc::new(StateDB::open(&path).expect("test DB opens"))
+    }
+
+    /// SEC-#16: an epoch boundary snapshots the live validator set for the new
+    /// epoch, advances consensus:epoch + epoch_start_height, and prunes snapshots
+    /// past the retention window. (Deterministic from height; runs on both the
+    /// consensus and sync block-apply paths via maybe_advance_epoch.)
+    #[test]
+    fn rotate_validator_epoch_snapshots_advances_and_prunes() {
+        let db = temp_db("rotate_epoch");
+        let exec = Executor::new(Arc::clone(&db));
+        db.put("sys:validator_set:v1", "[\"set-at-boundary\"]").unwrap();
+
+        // interval default 20 → boundary 40 = epoch 2.
+        exec.rotate_validator_epoch(40);
+        assert_eq!(db.get("consensus:epoch").unwrap().unwrap(), "2");
+        assert_eq!(
+            db.get("sys:validator_set:epoch:2").unwrap().unwrap(),
+            "[\"set-at-boundary\"]"
+        );
+        assert_eq!(
+            db.get("consensus:epoch_start_height:2").unwrap().unwrap(),
+            "41"
+        );
+
+        // Retention: rotating to epoch 9 prunes epoch (9 - 8 - 1) = 0.
+        db.put("sys:validator_set:epoch:0", "[\"old\"]").unwrap();
+        exec.rotate_validator_epoch(180); // epoch 9
+        assert!(
+            db.get("sys:validator_set:epoch:0").unwrap().is_none(),
+            "snapshot beyond the retention window must be pruned"
+        );
     }
 
     fn load_stdlib(db: &StateDB) {

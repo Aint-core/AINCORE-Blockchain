@@ -246,8 +246,9 @@ async fn json_rpc_handler(
                         match serde_json::from_str::<consensus::qc::QuorumCertificate>(&qc_json) {
                             Ok(qc) => {
                                 let (verified, verify_error) =
-                                    match consensus::qc_producer::load_validator_set_v1(
+                                    match consensus::qc_producer::load_validator_set_for_epoch(
                                         &data.storage,
+                                        qc.epoch,
                                     ) {
                                         Some(vset) => match consensus::qc::verify_qc(&qc, &vset) {
                                             Ok(()) => (true, String::new()),
@@ -295,8 +296,10 @@ async fn json_rpc_handler(
                             code: -32602,
                             message: format!("Invalid quorum certificate: {e}"),
                         }),
-                        Ok(qc) => match consensus::qc_producer::load_validator_set_v1(&data.storage)
-                        {
+                        Ok(qc) => match consensus::qc_producer::load_validator_set_for_epoch(
+                            &data.storage,
+                            qc.epoch,
+                        ) {
                             None => Err(JsonRpcError {
                                 code: -32000,
                                 message: "validator set unavailable".into(),

@@ -229,10 +229,12 @@ impl ChainSync {
         }
     }
 
-    /// The trusted validator set (`sys:validator_set:v1`, written at genesis with
-    /// each validator's BLS key) that a finality QC is verified against.
-    fn trusted_validator_set(&self) -> Option<Vec<consensus::qc::ValidatorInfo>> {
-        consensus::qc_producer::load_validator_set_v1(&self.storage)
+    /// The trusted validator set that a finality QC is verified against. SEC-#16:
+    /// resolved by the QC's epoch (`sys:validator_set:epoch:{epoch}`, the snapshot
+    /// frozen at that epoch's start) so a QC produced in an earlier epoch still
+    /// verifies against the set that produced it; falls back to the live set.
+    fn trusted_validator_set(&self, epoch: u64) -> Option<Vec<consensus::qc::ValidatorInfo>> {
+        consensus::qc_producer::load_validator_set_for_epoch(&self.storage, epoch)
     }
 
     /// Apply a finality artifact — QC-GATED.
@@ -250,7 +252,7 @@ impl ChainSync {
         let Some(qc) = artifact.qc.as_ref() else {
             return Ok(()); // pre-QC peer: cannot move our finality, harmless
         };
-        let validators = match self.trusted_validator_set() {
+        let validators = match self.trusted_validator_set(qc.epoch) {
             Some(v) => v,
             None => return Ok(()), // no trusted set to verify against — skip
         };
