@@ -19,9 +19,42 @@ struct RpcResponse<T> {
     error: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct BlockHeader {
+    // SEC-#18: bind bridge events to the block's hash so they can be checked
+    // against a quorum certificate (by scan height) before the bridge acts.
+    #[serde(default)]
+    pub hash: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Block {
+    #[serde(default)]
+    pub header: BlockHeader,
     pub transactions: Vec<String>, // Simplified: Txs are JSON strings in payload
+}
+
+/// SEC-#18: pure decision for whether a `aincore_getQuorumCertificate` response
+/// proves the given block is finalized. The block is accepted ONLY if the node
+/// reports the QC available AND independently verified (>2/3-stake aggregate BLS),
+/// AND the QC binds to exactly this `(height, hash)`. Extracted so the gate logic
+/// is unit-testable without a live RPC.
+fn qc_response_confirms(result: &serde_json::Value, height: u64, expected_hash: &str) -> bool {
+    if expected_hash.is_empty() {
+        return false;
+    }
+    if !result.get("available").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return false;
+    }
+    if !result.get("verified").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return false;
+    }
+    let Some(qc) = result.get("quorum_certificate") else {
+        return false;
+    };
+    let qc_height = qc.get("block_height").and_then(|v| v.as_u64());
+    let qc_hash = qc.get("block_hash").and_then(|v| v.as_str());
+    qc_height == Some(height) && qc_hash == Some(expected_hash)
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,6 +191,37 @@ impl AincoreClient {
         Ok(finalized)
     }
 
+    /// SEC-#18: verify that block `height` is finalized by a verified quorum
+    /// certificate bound to `expected_hash`. Queries `aincore_getQuorumCertificate`
+    /// and applies [`qc_response_confirms`]. Any RPC/parse failure → `false`
+    /// (fail-closed: the bridge must not act on state it cannot prove final).
+    pub async fn verify_block_finalized(&self, height: u64, expected_hash: &str) -> bool {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "aincore_getQuorumCertificate",
+            "params": [height],
+            "id": 1
+        });
+        let resp = match self.client.post(&self.rpc_url).json(&payload).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("⚠️ [SEC-#18] QC query failed for block {}: {}", height, e);
+                return false;
+            }
+        };
+        let rpc_resp: RpcResponse<serde_json::Value> = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("⚠️ [SEC-#18] QC response parse failed for block {}: {}", height, e);
+                return false;
+            }
+        };
+        match rpc_resp.result {
+            Some(result) => qc_response_confirms(&result, height, expected_hash),
+            None => false,
+        }
+    }
+
     /// Fetch bridge events from FINALIZED blocks only.
     ///
     /// Phase 3.5 / H-03 critical fix:
@@ -201,6 +265,19 @@ impl AincoreClient {
         // Map them back to absolute heights: scan_start, scan_start+1, ...
         for (block_offset, block) in blocks.iter().enumerate() {
             let block_height = scan_start + block_offset as u64;
+
+            // SEC-#18: require a verified QC binding this block's (height, hash) to
+            // >2/3-stake finality before emitting ANY lock event from it. A node
+            // that cannot prove finality cannot make the bridge mint on the far
+            // chain. Stop the scan at the first unprovable block and do NOT advance
+            // the cursor past it (it is retried next cycle once its QC is queryable).
+            if !self.verify_block_finalized(block_height, &block.header.hash).await {
+                warn!(
+                    "⚠️ [SEC-#18] block {} is not QC-finalized (or hash mismatch) — halting scan; bridge will retry",
+                    block_height
+                );
+                break;
+            }
             blocks_actually_returned += 1;
 
             for (tx_index, tx_str) in block.transactions.iter().enumerate() {
@@ -249,5 +326,47 @@ impl AincoreClient {
         );
 
         Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod qc_gate_tests {
+    use super::qc_response_confirms;
+    use serde_json::json;
+
+    fn qc_resp(available: bool, verified: bool, h: u64, hash: &str) -> serde_json::Value {
+        json!({
+            "available": available,
+            "verified": verified,
+            "quorum_certificate": { "block_height": h, "block_hash": hash }
+        })
+    }
+
+    // SEC-#18: the bridge accepts a block ONLY when the QC is available, verified,
+    // and bound to exactly this (height, hash).
+    #[test]
+    fn qc_confirms_only_when_available_verified_and_bound() {
+        let h = 42u64;
+        let hash = "ab".repeat(32);
+
+        assert!(qc_response_confirms(&qc_resp(true, true, h, &hash), h, &hash));
+
+        // Not verified / not available -> reject (forged or unfinalized state).
+        assert!(!qc_response_confirms(&qc_resp(true, false, h, &hash), h, &hash));
+        assert!(!qc_response_confirms(&qc_resp(false, true, h, &hash), h, &hash));
+
+        // Wrong height or hash -> reject (QC for a different block).
+        assert!(!qc_response_confirms(&qc_resp(true, true, h + 1, &hash), h, &hash));
+        assert!(!qc_response_confirms(&qc_resp(true, true, h, &"cd".repeat(32)), h, &hash));
+
+        // Empty expected hash cannot be bound -> reject.
+        assert!(!qc_response_confirms(&qc_resp(true, true, h, ""), h, ""));
+
+        // Missing quorum_certificate object -> reject.
+        assert!(!qc_response_confirms(
+            &json!({"available": true, "verified": true}),
+            h,
+            &hash
+        ));
     }
 }
