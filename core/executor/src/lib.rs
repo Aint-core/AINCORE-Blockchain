@@ -18,7 +18,9 @@ fn get_chain_id() -> String {
     std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string())
 }
 // V3 CONSTANTS
-#[allow(dead_code)]
+// SEC-#14: 150M AIN hard cap (in quanta). Minting is cap-clamped in
+// staking.move (distribute_rewards); this constant backs the executor-side
+// defense-in-depth tripwire in `append_supply_tracker_updates`.
 const MAX_SUPPLY: u128 = 150_000_000 * 1_000_000_000_000_000_000; // 150 Million AIN
                                                                   // Note: Block rewards handled exclusively by staking.move (Halving model)
                                                                   // Executor only distributes transaction fees — no inflationary minting here
@@ -775,6 +777,20 @@ impl Executor {
         let Some(new_supply) = new_supply else {
             return;
         };
+
+        // SEC-#14: defense-in-depth cap tripwire. Net supply is mirrored from the
+        // Move ValidatorSet.total_supply, whose minting is cap-clamped in
+        // staking.move (distribute_rewards), so it must never exceed MAX_SUPPLY
+        // here. If it ever does, a mint path has regressed past the 150M cap —
+        // surface it loudly for monitoring/forensics. This is a read-only alert:
+        // the executor must NOT abort an in-flight committed block (that would
+        // itself diverge state); the alarm is the actionable signal.
+        if new_supply > MAX_SUPPLY {
+            eprintln!(
+                "🚨 [SECURITY][SUPPLY_CAP] tracked supply {} exceeds MAX_SUPPLY {} — a mint path breached the 150M cap",
+                new_supply, MAX_SUPPLY
+            );
+        }
 
         let old_supply = self
             .db

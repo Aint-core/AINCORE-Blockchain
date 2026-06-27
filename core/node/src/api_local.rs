@@ -677,6 +677,9 @@ fn estimate_payload_gas(payload: &str) -> u64 {
     }
 }
 
+/// Net tracked supply. `sys:total_supply` is already NET of burns (it mirrors
+/// the Move ValidatorSet.total_supply — mints added — and is decremented by
+/// `burn_supply_trackers`). Despite the name, this is NOT gross minted.
 fn total_minted_supply(storage: &Arc<StateDB>) -> u128 {
     storage
         .get("sys:total_supply")
@@ -685,6 +688,18 @@ fn total_minted_supply(storage: &Arc<StateDB>) -> u128 {
         .or_else(|| storage.get("total_supply").ok().flatten())
         .and_then(|s| s.parse::<u128>().ok())
         .unwrap_or(0)
+}
+
+/// SEC-#15: derive the public supply view from the NET tracked supply + the
+/// cumulative burned total. Because the net supply already has burns removed,
+/// `circulating == net` and gross `total_minted == net + burned`. The previous
+/// RPC computed `circulating = net - burned`, subtracting burns a SECOND time
+/// and under-reporting circulating supply by exactly `total_burned`.
+/// Returns `(total_minted_gross, circulating)`.
+fn supply_view(net_supply: u128, total_burned: u128) -> (u128, u128) {
+    let total_minted = net_supply.saturating_add(total_burned);
+    let circulating = net_supply;
+    (total_minted, circulating)
 }
 
 fn stored_tx_receipt(storage: &Arc<StateDB>, tx_hash: &str) -> Option<serde_json::Value> {
@@ -1578,12 +1593,14 @@ fn handle_rpc_method(
             let max_supply: u128 = 150_000_000 * 1_000_000_000_000_000_000; // 150M AIN
 
             // Genesis writes sys:total_supply; keep total_supply as a legacy fallback only.
-            let total_minted = total_minted_supply(&data.storage);
+            // SEC-#15: sys:total_supply is already NET of burns, so circulating == net
+            // and gross total_minted == net + burned. Do NOT subtract burns again.
+            let net_supply = total_minted_supply(&data.storage);
             let total_burned = match data.storage.get("total_burned") {
                 Ok(Some(s)) => s.parse::<u128>().unwrap_or(0),
                 _ => 0,
             };
-            let circulating = total_minted.saturating_sub(total_burned);
+            let (total_minted, circulating) = supply_view(net_supply, total_burned);
 
             // S3: Calculate current reward from halving model (36 AIN base, halves every 2.1M blocks)
             let latest_height = data.storage.get_chain_height();
@@ -2805,5 +2822,20 @@ mod tests {
             .expect_err("legacy rpc must be disabled");
         assert_eq!(err.code, -32040);
         assert!(err.message.contains("disabled in secure mode"));
+    }
+
+    /// SEC-#15: circulating supply must NOT have burns subtracted twice.
+    #[test]
+    fn supply_view_does_not_double_subtract_burns() {
+        // Net = gross issued (1000) − burned (150) = 850.
+        let (total_minted, circulating) = supply_view(850, 150);
+        assert_eq!(total_minted, 1000, "gross minted = net + burned");
+        assert_eq!(circulating, 850, "circulating = net (NOT net - burned)");
+        // Self-consistent: circulating == total_minted − total_burned.
+        assert_eq!(circulating, total_minted - 150);
+
+        // No burns: minted == circulating == net.
+        let (m, c) = supply_view(500, 0);
+        assert_eq!((m, c), (500, 500));
     }
 }
