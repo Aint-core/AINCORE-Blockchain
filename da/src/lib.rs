@@ -349,7 +349,23 @@ impl DASequencer {
 
         println!("🌳 [DA] Merkle root: {}", merkle_root_hex);
 
-        // Step 4: Determine which shards this node should store
+        // Step 4: Determine which shards this node should store.
+        // SEC-#2: populate shard assignments from the live peer set + self FIRST.
+        // Without this, `update_validators` is never called, `shard_assignments`
+        // stays empty, `get_my_shards` returns [], and NO `da_shard_{epoch}_{id}`
+        // rows are ever written — the "32 shards / 3x replication" is computed and
+        // discarded. Seeding it makes sharded storage real; on a single-node
+        // topology all shards land locally, which makes DAS verifiable with no
+        // network (see `verify_local_availability`).
+        {
+            let mut validators: Vec<String> = self
+                .peers
+                .lock()
+                .map(|p| p.keys().cloned().collect())
+                .unwrap_or_default();
+            validators.push(self.node_id.clone());
+            self.shard_manager.update_validators(validators);
+        }
         let my_shards = self.shard_manager.get_my_shards(&self.node_id);
         println!(
             "🗂️  [DA] This node stores {} out of {} shards",
@@ -621,6 +637,57 @@ impl DASequencer {
         Ok((shards[shard_id].clone(), proof))
     }
 
+    /// SEC-#3: read the committed Merkle root for an epoch (`da_commitment_{epoch}`)
+    /// — the root that DAS verifies retrieved shards against. `None` if absent or
+    /// malformed.
+    pub fn get_commitment(&self, epoch: u64) -> Option<[u8; 32]> {
+        let hex_root = self
+            .storage
+            .get(&format!("da_commitment_{}", epoch))
+            .ok()
+            .flatten()?;
+        let bytes = hex::decode(hex_root).ok()?;
+        if bytes.len() != 32 {
+            return None;
+        }
+        let mut root = [0u8; 32];
+        root.copy_from_slice(&bytes);
+        Some(root)
+    }
+
+    /// SEC-#3: run DAS over this node's locally-stored shards for `epoch`,
+    /// verifying each sampled shard against the committed Merkle root. This is
+    /// deterministic and network-free, and proves the verify-on-sample path
+    /// end-to-end: it returns `Ok(true)` only when enough shards both load AND
+    /// verify against the commitment (a missing/corrupt shard set rebuilds a
+    /// different tree whose proofs fail against the committed root).
+    pub fn verify_local_availability(&self, epoch: u64) -> Result<bool, String> {
+        let root = self
+            .get_commitment(epoch)
+            .ok_or("DA commitment not found for epoch")?;
+        let meta = self
+            .storage
+            .get(&format!("da_meta_{}", epoch))
+            .map_err(|_| "Storage error")?
+            .ok_or("Epoch metadata not found")?;
+        let mut shard_count = serde_json::from_str::<serde_json::Value>(&meta)
+            .ok()
+            .and_then(|v| v["shards"].as_u64())
+            .unwrap_or(32) as u32;
+        if shard_count > 128 {
+            shard_count = 128;
+        }
+        if shard_count == 0 {
+            return Ok(false);
+        }
+        // DASampler::sample errors if sample_size > total; cap to the shard count.
+        let sample_size = 30usize.min(shard_count as usize);
+        let sampler = DASampler::new(sample_size, 0.999);
+        sampler.sample(shard_count, &root, |id| {
+            self.get_shard_proof(epoch, id as usize)
+        })
+    }
+
     /// Handle incoming P2P shard request and respond with shard + proof
     ///
     /// This enables distributed shard storage - nodes only store subset of shards
@@ -857,6 +924,53 @@ mod m09_tests {
         assert!(
             result.is_err(),
             "decrypting with the wrong identity must panic, not silently regenerate"
+        );
+    }
+
+    /// SEC-#2/#3: create_batch actually persists shards (previously zero rows),
+    /// and verify_local_availability verifies them against the committed root —
+    /// passing for an intact set, failing for a corrupted one.
+    #[test]
+    fn stage0_shards_persisted_and_local_availability_verifies() {
+        let db = temp_db("stage0_da");
+        let node_identity = [33u8; 32];
+        // Single-node (no peers) → all shards assigned locally.
+        let peers = Arc::new(Mutex::new(HashMap::new()));
+        let mut seq =
+            DASequencer::new_encrypted("test".into(), Arc::clone(&db), peers, &node_identity);
+
+        seq.create_batch("deadbeefroot".into(), 4);
+        let epoch = seq.epoch; // create_batch increments then uses self.epoch
+
+        // SEC-#2: shards are actually stored now.
+        let stored = (0..32)
+            .filter(|id| {
+                db.get(&format!("da_shard_{}_{}", epoch, id))
+                    .unwrap()
+                    .is_some()
+            })
+            .count();
+        assert!(stored > 0, "create_batch must persist da_shard rows (#2)");
+        assert!(
+            seq.get_commitment(epoch).is_some(),
+            "commitment must be stored"
+        );
+
+        // SEC-#3: DAS verifies the intact stored shards against the commitment.
+        assert_eq!(seq.verify_local_availability(epoch), Ok(true));
+
+        // Corrupt half the shards → the rebuilt tree diverges from the committed
+        // root → DAS must now report unavailable.
+        for id in 0..16 {
+            let k = format!("da_shard_{}_{}", epoch, id);
+            if db.get(&k).unwrap().is_some() {
+                db.put(&k, &hex::encode(b"corrupted-shard-bytes")).unwrap();
+            }
+        }
+        assert_eq!(
+            seq.verify_local_availability(epoch),
+            Ok(false),
+            "corrupted shards must fail DAS verification (#3)"
         );
     }
 }

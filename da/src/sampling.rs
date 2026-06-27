@@ -34,12 +34,21 @@ impl Default for DASampler {
 }
 
 impl DASampler {
-    /// Sample random shards to verify DA
+    /// Sample random shards to verify DA.
     ///
-    /// Returns true if data is available with high confidence
-    pub fn sample<F>(&self, total_shards: u32, shard_fetcher: F) -> Result<bool, String>
+    /// Returns true if data is available with high confidence. SEC-#3: each
+    /// fetched shard is verified against the committed `merkle_root` — a shard
+    /// that is retrieved but does NOT match its Merkle proof counts as
+    /// UNAVAILABLE, so a peer cannot fake availability by returning garbage.
+    /// The fetcher therefore returns `(shard_bytes, merkle_proof)`.
+    pub fn sample<F>(
+        &self,
+        total_shards: u32,
+        merkle_root: &[u8; 32],
+        shard_fetcher: F,
+    ) -> Result<bool, String>
     where
-        F: Fn(u32) -> Result<Vec<u8>, String>,
+        F: Fn(u32) -> Result<(Vec<u8>, Vec<[u8; 32]>), String>,
     {
         // Input validation
         if self.sample_size > total_shards as usize {
@@ -64,10 +73,13 @@ impl DASampler {
             }
             sampled.insert(shard_id);
 
-            // Try to fetch shard
+            // Fetch AND verify against the committed root. Retrieved-but-
+            // unverifiable bytes do NOT count toward availability.
             match shard_fetcher(shard_id) {
-                Ok(_data) => {
-                    successful_samples += 1;
+                Ok((data, proof)) => {
+                    if self.verify_shard(&data, shard_id as usize, &proof, merkle_root) {
+                        successful_samples += 1;
+                    }
                 }
                 Err(_) => {
                     // Shard not available
@@ -144,12 +156,18 @@ impl LightClient {
 
     /// Verify DA for a batch
     ///
-    /// Returns true if data is available with 99.9% confidence
-    pub fn verify_da<F>(&self, total_shards: u32, shard_fetcher: F) -> Result<bool, String>
+    /// Returns true if data is available with 99.9% confidence. SEC-#3: shards
+    /// are verified against `merkle_root`; see [`DASampler::sample`].
+    pub fn verify_da<F>(
+        &self,
+        total_shards: u32,
+        merkle_root: &[u8; 32],
+        shard_fetcher: F,
+    ) -> Result<bool, String>
     where
-        F: Fn(u32) -> Result<Vec<u8>, String>,
+        F: Fn(u32) -> Result<(Vec<u8>, Vec<[u8; 32]>), String>,
     {
-        self.sampler.sample(total_shards, shard_fetcher)
+        self.sampler.sample(total_shards, merkle_root, shard_fetcher)
     }
 }
 
@@ -157,51 +175,92 @@ impl LightClient {
 mod tests {
     use super::*;
 
+    /// Build `n` deterministic shards + their Merkle tree for sampling tests.
+    fn build_shards(n: u32) -> (Vec<Vec<u8>>, MerkleTree) {
+        let shards: Vec<Vec<u8>> = (0..n).map(|i| format!("shard-{i}").into_bytes()).collect();
+        let tree = MerkleTree::new(&shards);
+        (shards, tree)
+    }
+
     #[test]
     fn test_sampling_full_availability() {
         let sampler = DASampler::new(10, 0.99);
+        let (shards, tree) = build_shards(32);
+        let root = tree.root();
 
-        // Mock fetcher that always succeeds
-        let fetcher = |_shard_id: u32| -> Result<Vec<u8>, String> { Ok(vec![1, 2, 3, 4]) };
+        // Every shard returns correct bytes + a valid proof.
+        let fetcher = |id: u32| -> Result<(Vec<u8>, Vec<[u8; 32]>), String> {
+            Ok((shards[id as usize].clone(), tree.get_proof(id as usize).unwrap()))
+        };
 
-        let result = sampler.sample(32, fetcher).unwrap();
+        let result = sampler.sample(32, &root, fetcher).unwrap();
         assert!(result, "Should detect full availability");
     }
 
     #[test]
     fn test_sampling_partial_availability() {
         let sampler = DASampler::new(20, 0.99);
+        let (shards, tree) = build_shards(32);
+        let root = tree.root();
 
-        // Mock fetcher that fails 50% of the time
-        let fetcher = |shard_id: u32| -> Result<Vec<u8>, String> {
-            if shard_id.is_multiple_of(2) {
-                Ok(vec![1, 2, 3, 4])
+        // 50% of shards are unavailable (Err).
+        let fetcher = |id: u32| -> Result<(Vec<u8>, Vec<[u8; 32]>), String> {
+            if id.is_multiple_of(2) {
+                Ok((shards[id as usize].clone(), tree.get_proof(id as usize).unwrap()))
             } else {
                 Err("Not available".to_string())
             }
         };
 
-        let result = sampler.sample(32, fetcher).unwrap();
-        // With 50% availability, should fail (need 75%)
+        let result = sampler.sample(32, &root, fetcher).unwrap();
         assert!(!result, "Should detect insufficient availability");
     }
 
     #[test]
     fn test_sampling_high_availability() {
         let sampler = DASampler::new(30, 0.999);
+        let (shards, tree) = build_shards(32);
+        let root = tree.root();
 
-        // Mock fetcher with 80% availability
-        let fetcher = |shard_id: u32| -> Result<Vec<u8>, String> {
-            if shard_id.is_multiple_of(5) {
+        // ~80% available.
+        let fetcher = |id: u32| -> Result<(Vec<u8>, Vec<[u8; 32]>), String> {
+            if id.is_multiple_of(5) {
                 Err("Not available".to_string())
             } else {
-                Ok(vec![1, 2, 3, 4])
+                Ok((shards[id as usize].clone(), tree.get_proof(id as usize).unwrap()))
             }
         };
 
-        let result = sampler.sample(32, fetcher).unwrap();
-        // With 80% availability, should pass (need 75%)
+        let result = sampler.sample(32, &root, fetcher).unwrap();
         assert!(result, "Should detect sufficient availability");
+    }
+
+    /// SEC-#3 regression: shards that are RETRIEVED but do not verify against the
+    /// committed root must NOT count toward availability. Previously sample()
+    /// ignored the bytes and counted any successful fetch, so a peer could fake
+    /// availability with garbage.
+    #[test]
+    fn sample_rejects_unverifiable_shards() {
+        let sampler = DASampler::new(20, 0.99);
+        let (shards, tree) = build_shards(32);
+        let root = tree.root();
+
+        // Even ids: correct bytes + valid proof. Odd ids: GARBAGE bytes but a
+        // (real) proof for that index — verification must fail → ~50% verified.
+        let fetcher = |id: u32| -> Result<(Vec<u8>, Vec<[u8; 32]>), String> {
+            let proof = tree.get_proof(id as usize).unwrap();
+            if id.is_multiple_of(2) {
+                Ok((shards[id as usize].clone(), proof))
+            } else {
+                Ok((b"garbage-not-the-real-shard".to_vec(), proof))
+            }
+        };
+
+        let result = sampler.sample(32, &root, fetcher).unwrap();
+        assert!(
+            !result,
+            "garbage shards must not count as available (was a false-positive before #3)"
+        );
     }
 
     #[test]
