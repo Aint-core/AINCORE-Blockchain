@@ -275,6 +275,32 @@ fn stdlib_state_hash(modules: &[(String, Vec<u8>)]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// SEC-#30: fold the canonical genesis markers into a single chain-identity
+/// digest. All inputs are already computed and stored at genesis. The opt-in
+/// genesis-hash pin (`AINCORE_EXPECTED_GENESIS_HASH`) compares against this to
+/// refuse booting the wrong chain (wrong genesis.json / wrong datadir / wrong
+/// validator set). Length-prefixed + domain-tagged, mirroring `stdlib_state_hash`
+/// so it is deterministic and collision-resistant across nodes.
+fn genesis_identity_hash(
+    stdlib_hash: &str,
+    version: &str,
+    chain_id: &str,
+    validator_set_json: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        "AINCORE_GENESIS_ID_V1",
+        stdlib_hash,
+        version,
+        chain_id,
+        validator_set_json,
+    ] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
 fn load_stdlib_modules(stdlib_path: &str) -> Result<Vec<(String, Vec<u8>)>, GenesisError> {
     let entries = fs::read_dir(stdlib_path).map_err(|_| {
         GenesisError::InvalidData(format!(
@@ -543,6 +569,33 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
         decode_resource(storage, &system_resource_key("0x1::treasury::Treasury"))?;
     let _dex_registry: PoolRegistry =
         decode_resource(storage, &system_resource_key("0x1::dex::PoolRegistry"))?;
+
+    // SEC-#30: genesis-hash pin. Fold the canonical genesis markers into one
+    // chain-identity digest and, when AINCORE_EXPECTED_GENESIS_HASH is set, refuse
+    // to boot on mismatch — turning "silently runs a DIFFERENT chain" (wrong
+    // genesis.json / wrong CWD / wrong validator set) into a hard FATAL stop. When
+    // the env var is unset the check is a no-op (opt-in until the mainnet genesis
+    // hash is frozen), so dev/testnet behaviour is unchanged. chain_id/validator
+    // markers are read tolerantly so reopening any existing datadir never newly
+    // fails when the pin is not in use.
+    let chain_id = storage.get("sys:chain_id").ok().flatten().unwrap_or_default();
+    let validator_set_json = storage
+        .get("sys:validator_set:v1")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let identity = genesis_identity_hash(&expected_hash, &version, &chain_id, &validator_set_json);
+    println!("🧬 Genesis identity hash: {}", identity);
+    if let Ok(pin) = std::env::var("AINCORE_EXPECTED_GENESIS_HASH") {
+        let pin = pin.trim().to_lowercase();
+        if !pin.is_empty() && pin != identity {
+            return Err(GenesisError::InvalidData(format!(
+                "🚨 [SECURITY] genesis hash pin mismatch: expected {} computed {} — \
+                 refusing to boot (wrong genesis.json / wrong datadir / wrong chain)",
+                pin, identity
+            )));
+        }
+    }
 
     Ok(())
 }
@@ -1028,6 +1081,14 @@ pub fn initialize_genesis(
     );
 
     storage.put("genesis_initialized", "true")?;
+
+    // SEC-#30: run the integrity + genesis-hash-pin check on the freshly written
+    // state too. Without this, a brand-new datadir that self-bootstrapped the
+    // WRONG chain (e.g. wrong CWD / missing genesis.json fallback) would return
+    // Ok here and silently run — the pin only fires on reopen. Re-reading the
+    // markers we just wrote is cheap and makes the pin catch fresh init as well.
+    verify_genesis_integrity(storage)?;
+
     println!("✅ Genesis Initialization Complete!");
 
     Ok(())
@@ -1718,5 +1779,93 @@ mod tests {
 
         assert_eq!(coin_balance(&db, &sender), 899_750);
         assert_eq!(coin_balance(&db, &recipient), 250);
+    }
+
+    // ===== SEC-#30: genesis-hash pin =====
+
+    fn computed_identity(db: &StateDB) -> String {
+        let sh = db.get("genesis_stdlib_hash").unwrap().unwrap();
+        let v = db.get("genesis_version").unwrap().unwrap();
+        let cid = db.get("sys:chain_id").ok().flatten().unwrap_or_default();
+        let vs = db
+            .get("sys:validator_set:v1")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        genesis_identity_hash(&sh, &v, &cid, &vs)
+    }
+
+    /// With the pin env unset, genesis init + reopen behave exactly as before.
+    #[test]
+    fn test_genesis_pin_unset_is_noop() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+        let db = temp_db("pin_unset");
+        let key = SigningKey::from_bytes(&[31u8; 32]);
+        let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let pubkey = hex::encode(key.verifying_key().as_bytes());
+
+        initialize_genesis(&db, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY)
+            .expect("fresh genesis initializes with pin unset");
+        initialize_genesis(&db, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY)
+            .expect("genesis reopens with pin unset");
+    }
+
+    /// The identity hash is deterministic for identical genesis inputs (so every
+    /// honest node computes the same pin).
+    #[test]
+    fn test_genesis_identity_hash_is_deterministic() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+        let key = SigningKey::from_bytes(&[32u8; 32]);
+        let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let pubkey = hex::encode(key.verifying_key().as_bytes());
+
+        let db1 = temp_db("pin_det1");
+        let db2 = temp_db("pin_det2");
+        initialize_genesis(&db1, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY).unwrap();
+        initialize_genesis(&db2, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY).unwrap();
+        assert_eq!(computed_identity(&db1), computed_identity(&db2));
+    }
+
+    /// A matching pin allows boot (reopen path).
+    #[test]
+    fn test_genesis_pin_match_boots() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+        let db = temp_db("pin_match");
+        let key = SigningKey::from_bytes(&[33u8; 32]);
+        let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let pubkey = hex::encode(key.verifying_key().as_bytes());
+
+        initialize_genesis(&db, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY)
+            .expect("fresh init (pin unset)");
+        let identity = computed_identity(&db);
+
+        std::env::set_var("AINCORE_EXPECTED_GENESIS_HASH", &identity);
+        let res = initialize_genesis(&db, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY);
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+        res.expect("matching pin must boot");
+    }
+
+    /// A wrong pin refuses to boot a FRESH datadir (the silent-wrong-chain case).
+    #[test]
+    fn test_genesis_pin_mismatch_refuses_fresh_boot() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let db = temp_db("pin_mismatch");
+        let key = SigningKey::from_bytes(&[34u8; 32]);
+        let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let pubkey = hex::encode(key.verifying_key().as_bytes());
+
+        std::env::set_var("AINCORE_EXPECTED_GENESIS_HASH", "ab".repeat(32));
+        let res = initialize_genesis(&db, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY);
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+
+        let err = res.expect_err("a wrong pin must refuse to boot a fresh datadir");
+        assert!(
+            err.to_string().contains("genesis hash pin mismatch"),
+            "unexpected error: {}",
+            err
+        );
     }
 }
