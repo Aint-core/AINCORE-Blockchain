@@ -504,9 +504,13 @@ mod tests {
         assert!(err.contains("State root mismatch"));
     }
 
+    // SEC-#8: a non-finalized reorg that would orphan STATE-CHANGING blocks must
+    // halt for operator re-bootstrap rather than silently roll back — rollback
+    // does not revert Move/executor state, so re-executing the new fork over it
+    // would diverge this node. (Empty-orphan reorgs are covered by the next test.)
     #[test]
-    fn test_process_blocks_reorg_rolls_back_non_finalized_conflict() {
-        let sync = setup_sync("reorg_non_finalized");
+    fn test_process_blocks_reorg_state_changing_orphan_halts() {
+        let sync = setup_sync("reorg_state_changing_halts");
         set_validators(&sync, vec![("node_1", 100), ("node_2", 100)]);
 
         let mut local_b1 = Block::new(
@@ -525,7 +529,73 @@ mod tests {
             2,
             2,
             local_b1.header.hash.clone(),
-            vec!["b".to_string()],
+            vec!["b".to_string()], // non-empty → state-changing orphan
+            "node_1".to_string(),
+        );
+        rehash_block(&mut local_b2);
+        sync.storage
+            .save_block_json(2, &serde_json::to_string(&local_b2).unwrap())
+            .unwrap();
+
+        sync.storage.put("consensus:finalized_round", "0").unwrap();
+
+        let mut remote_b2 = Block::new(
+            2,
+            2,
+            local_b1.header.hash.clone(),
+            vec!["x".to_string()],
+            "node_2".to_string(),
+        );
+        rehash_block(&mut remote_b2);
+        let mut remote_b3 = Block::new(
+            3,
+            3,
+            remote_b2.header.hash.clone(),
+            vec!["y".to_string()],
+            "node_2".to_string(),
+        );
+        rehash_block(&mut remote_b3);
+
+        let new_height = sync.process_blocks(vec![remote_b2.clone(), remote_b3.clone()], 2);
+        // Reorg refused: height does not advance, local block preserved, halt latched.
+        assert_eq!(new_height, 2);
+
+        let stored_b2 = sync.storage.get("block_2").unwrap().unwrap();
+        let stored_b2: Block = serde_json::from_str(&stored_b2).unwrap();
+        assert_eq!(stored_b2.header.hash, local_b2.header.hash);
+
+        let halt = sync.storage.get("sync:halt_reason").unwrap();
+        assert!(
+            halt.as_deref().unwrap_or("").contains("state-changing reorg"),
+            "expected state-changing reorg halt to be latched, got {:?}",
+            halt
+        );
+    }
+
+    // SEC-#8: an empty (no-tx) orphan carries no state, so the reorg is safe to
+    // roll back and re-execute as before.
+    #[test]
+    fn test_process_blocks_reorg_empty_orphan_rolls_back() {
+        let sync = setup_sync("reorg_empty_orphan");
+        set_validators(&sync, vec![("node_1", 100), ("node_2", 100)]);
+
+        let mut local_b1 = Block::new(
+            1,
+            1,
+            "genesis".to_string(),
+            vec!["a".to_string()],
+            "node_1".to_string(),
+        );
+        rehash_block(&mut local_b1);
+        sync.storage
+            .save_block_json(1, &serde_json::to_string(&local_b1).unwrap())
+            .unwrap();
+
+        let mut local_b2 = Block::new(
+            2,
+            2,
+            local_b1.header.hash.clone(),
+            vec![], // empty → no state to revert
             "node_1".to_string(),
         );
         rehash_block(&mut local_b2);
@@ -558,6 +628,9 @@ mod tests {
         let stored_b2 = sync.storage.get("block_2").unwrap().unwrap();
         let stored_b2: Block = serde_json::from_str(&stored_b2).unwrap();
         assert_eq!(stored_b2.header.hash, remote_b2.header.hash);
+
+        // No halt should be latched on the safe empty-orphan path.
+        assert!(sync.storage.get("sync:halt_reason").unwrap().is_none());
     }
 
     #[test]

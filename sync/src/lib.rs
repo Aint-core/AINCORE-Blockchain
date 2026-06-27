@@ -631,6 +631,39 @@ impl ChainSync {
                             break;
                         }
                         let rollback_target = block.header.height.saturating_sub(1);
+                        // SEC-#8: `rollback_to_height` only deletes block records and resets the
+                        // height/hash pointers — it does NOT revert the Move/executor state writes
+                        // (CoinStore balances, staking, arbitrary resources) made by the orphaned
+                        // blocks. Re-executing the new fork over that un-reverted state silently
+                        // diverges this node from one that never saw the orphan (last-write-wins
+                        // leaves orphan-only resources behind). Until a full per-height state-undo
+                        // log exists, refuse to silently reorg across state-changing blocks: halt
+                        // for operator re-bootstrap from a snapshot. Empty (no-tx) orphans carry no
+                        // state and are safe to roll back + re-execute.
+                        let stored_tip = self.storage.get_chain_height();
+                        let mut state_changing_orphan = false;
+                        for h in (rollback_target + 1)..=stored_tip {
+                            let k = format!("block_{}", h);
+                            if let Ok(Some(j)) = self.storage.get(&k) {
+                                if let Ok(b) = serde_json::from_str::<Block>(&j) {
+                                    if !b.transactions.is_empty() {
+                                        state_changing_orphan = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if state_changing_orphan {
+                            let reason = format!(
+                                "state-changing reorg at height {} (orphaning {}..={}) requires state-undo; halting for operator re-bootstrap",
+                                block.header.height,
+                                rollback_target + 1,
+                                stored_tip
+                            );
+                            eprintln!("🚨 [SECURITY][SYNC_REORG_HALT] {}", reason);
+                            let _ = self.storage.put("sync:halt_reason", &reason);
+                            break;
+                        }
                         if let Err(err) = self.rollback_to_height(rollback_target) {
                             eprintln!("🚨 [SECURITY][SYNC_ROLLBACK_FAIL] {}", err);
                             break;
