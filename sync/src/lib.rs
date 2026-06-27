@@ -268,6 +268,34 @@ impl ChainSync {
             ));
         }
 
+        // SEC-#6/#24: bind finality to the block this node actually holds. The QC
+        // certifies (block_height, block_hash); only advance finality if we have
+        // that EXACT block locally. Otherwise the finalized marker could outrun or
+        // diverge from our canonical chain — precisely what light clients/bridges
+        // trust the QC to prevent. (qc.block_hash == the committed block's
+        // header.hash; see dag.rs CommitContext.)
+        let local_block_key = format!("block_{}", qc.block_height);
+        match self.storage.get(&local_block_key).ok().flatten() {
+            Some(json) => match serde_json::from_str::<Block>(&json) {
+                Ok(b) if b.header.hash == qc.block_hash => { /* certified block held — ok */ }
+                Ok(b) => {
+                    return Err(format!(
+                        "🚨 [SECURITY] finality QC block_hash {} != local block_{} hash {} — refusing to advance",
+                        qc.block_hash, qc.block_height, b.header.hash
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!("local block_{} unparsable: {}", qc.block_height, e));
+                }
+            },
+            None => {
+                // We do not yet hold the certified block (still catching up).
+                // Do NOT advance finality past a block we don't have (#24);
+                // this re-runs after block sync delivers it.
+                return Ok(());
+            }
+        }
+
         self.storage
             .put("consensus:finalized_round", &remote_finalized.to_string())
             .map_err(|e| format!("persist finalized_round failed: {}", e))?;

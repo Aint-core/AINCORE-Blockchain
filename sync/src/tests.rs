@@ -217,10 +217,22 @@ mod tests {
         build_qc(&vote, &validators, &[0], &[sig]).unwrap()
     }
 
+    // Store a local block at `height` whose header.hash == `hash` so the
+    // finality binding (#6/#24) sees the certified block as held.
+    fn store_block_with_hash(sync: &ChainSync, height: u64, hash: &str) {
+        let mut blk = Block::new(height, height, "ab".repeat(32), vec![], "validator_1".to_string());
+        blk.header.hash = hash.to_string();
+        sync.storage
+            .put(&format!("block_{}", height), &serde_json::to_string(&blk).unwrap())
+            .unwrap();
+    }
+
     #[test]
     fn test_apply_finality_qc_verified_advances() {
         let sync = setup_sync("finality_qc_ok");
         let qc = build_test_qc(&sync, 9000, 8990);
+        // #6/#24: the node must hold the certified block (height 8990, hash cd..).
+        store_block_with_hash(&sync, 8990, &"cd".repeat(32));
         let artifact = FinalityArtifact {
             finalized_round: "9000".to_string(),
             last_anchor_round: "8990".to_string(),
@@ -233,6 +245,51 @@ mod tests {
         assert_eq!(
             sync.storage.get("consensus:finalized_round").unwrap(),
             Some("9000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_apply_finality_without_local_block_is_noop() {
+        // SEC-#24: a valid QC for a block we don't hold yet must NOT advance
+        // finality past it (no local block_8990 stored).
+        let sync = setup_sync("finality_no_block");
+        let qc = build_test_qc(&sync, 9000, 8990);
+        let artifact = FinalityArtifact {
+            finalized_round: "9000".to_string(),
+            last_anchor_round: "8990".to_string(),
+            last_anchor_hash: "ab".repeat(32),
+            finality_digest: "34".repeat(32),
+            qc: Some(qc),
+        };
+        sync.apply_finality_artifact(&artifact).expect("no-op, not error");
+        assert_eq!(
+            sync.storage.get("consensus:finalized_round").unwrap(),
+            None,
+            "must not advance finality past a block we don't hold"
+        );
+    }
+
+    #[test]
+    fn test_apply_finality_block_hash_mismatch_rejected() {
+        // SEC-#6: a QC whose certified block_hash != our local block's hash at
+        // that height must be REJECTED (finality must not diverge from our chain).
+        let sync = setup_sync("finality_hash_mismatch");
+        let qc = build_test_qc(&sync, 9000, 8990);
+        store_block_with_hash(&sync, 8990, &"99".repeat(32)); // different hash
+        let artifact = FinalityArtifact {
+            finalized_round: "9000".to_string(),
+            last_anchor_round: "8990".to_string(),
+            last_anchor_hash: "ab".repeat(32),
+            finality_digest: "34".repeat(32),
+            qc: Some(qc),
+        };
+        assert!(
+            sync.apply_finality_artifact(&artifact).is_err(),
+            "QC block_hash != local block hash must be rejected"
+        );
+        assert_eq!(
+            sync.storage.get("consensus:finalized_round").unwrap(),
+            None
         );
     }
 
