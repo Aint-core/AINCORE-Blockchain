@@ -504,6 +504,68 @@ mod tests {
         assert!(err.contains("State root mismatch"));
     }
 
+    // SEC-#7 (cutover): empty execution roots are accepted by default (so the
+    // running testnet is not retroactively rejected).
+    #[test]
+    fn verify_execution_roots_empty_ok_when_not_required() {
+        let sync = setup_sync("roots_empty_default");
+        let block = Block::new_with_roots(
+            1,
+            1,
+            "genesis".to_string(),
+            vec![],
+            "node_1".to_string(),
+            String::new(),
+            String::new(),
+        );
+        let summary = executor::BlockExecutionSummary {
+            state_root: "s".to_string(),
+            receipts_root: "r".to_string(),
+            gas_charged: 0,
+            tx_count: 0,
+        };
+        assert!(sync.verify_execution_roots(&block, &summary).is_ok());
+    }
+
+    // SEC-#7 (cutover): with sys:config:require_exec_roots set, an empty-root
+    // block is rejected; a non-empty matching block still passes.
+    #[test]
+    fn verify_execution_roots_rejects_empty_when_required() {
+        let sync = setup_sync("roots_required");
+        sync.storage
+            .put("sys:config:require_exec_roots", "1")
+            .unwrap();
+        let summary = executor::BlockExecutionSummary {
+            state_root: "s".to_string(),
+            receipts_root: "r".to_string(),
+            gas_charged: 0,
+            tx_count: 0,
+        };
+
+        let empty = Block::new_with_roots(
+            1,
+            1,
+            "genesis".to_string(),
+            vec![],
+            "node_1".to_string(),
+            String::new(),
+            String::new(),
+        );
+        let err = sync.verify_execution_roots(&empty, &summary).unwrap_err();
+        assert!(err.contains("empty state_root"), "got: {}", err);
+
+        let good = Block::new_with_roots(
+            1,
+            1,
+            "genesis".to_string(),
+            vec![],
+            "node_1".to_string(),
+            "s".to_string(),
+            "r".to_string(),
+        );
+        assert!(sync.verify_execution_roots(&good, &summary).is_ok());
+    }
+
     // SEC-#8: a non-finalized reorg that would orphan STATE-CHANGING blocks must
     // halt for operator re-bootstrap rather than silently roll back — rollback
     // does not revert Move/executor state, so re-executing the new fork over it

@@ -49,6 +49,21 @@ pub struct ChainSync {
 }
 
 impl ChainSync {
+    /// SEC-#7 (cutover): whether blocks must commit to non-empty execution roots.
+    /// Resolved from the genesis-pinned `sys:config:require_exec_roots` (so it is
+    /// deterministic + identical across nodes — unlike a per-node env var), with
+    /// `AINCORE_REQUIRE_EXEC_ROOTS` as a dev fallback. Off by default: the running
+    /// testnet may hold empty-root blocks, so this is enabled only at the
+    /// fresh-genesis mainnet cutover.
+    fn require_exec_roots(&self) -> bool {
+        if let Ok(Some(v)) = self.storage.get("sys:config:require_exec_roots") {
+            return v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        std::env::var("AINCORE_REQUIRE_EXEC_ROOTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
     pub fn new(
         node_id: String,
         my_port: u16,
@@ -81,6 +96,27 @@ impl ChainSync {
         block: &Block,
         summary: &executor::BlockExecutionSummary,
     ) -> Result<(), String> {
+        // SEC-#7 (cutover): when AINCORE_REQUIRE_EXEC_ROOTS is set, a block MUST
+        // commit to NON-EMPTY execution roots. Otherwise the empty-root bypass
+        // below lets a producer ship blocks that don't bind to executed state
+        // (the header just omits the roots and the mismatch checks are skipped).
+        // Opt-in / off by default so the running testnet (which may hold
+        // empty-root blocks) is not retroactively rejected; enable at the
+        // fresh-genesis mainnet cutover.
+        if self.require_exec_roots() {
+            if block.header.state_root.is_empty() {
+                return Err(format!(
+                    "block {} has empty state_root but execution roots are required (cutover)",
+                    block.header.height
+                ));
+            }
+            if block.header.receipts_root.is_empty() {
+                return Err(format!(
+                    "block {} has empty receipts_root but execution roots are required (cutover)",
+                    block.header.height
+                ));
+            }
+        }
         if !block.header.state_root.is_empty() && block.header.state_root != summary.state_root {
             return Err(format!(
                 "State root mismatch at block {}: header={}, executed={}",
