@@ -4730,6 +4730,7 @@ dependencies = [
  "ed25519-dalek",
  "executor",
  "hex",
+ "move-core-types",
  "network",
  "pqcrypto-dilithium",
  "pqcrypto-traits",

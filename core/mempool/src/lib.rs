@@ -203,6 +203,35 @@ impl Mempool {
             return Err("Gas limit must be greater than 0".to_string());
         }
 
+        // SEC-#27: best-effort admission balance gate. The executor reserves the
+        // full gas_limit*gas_price upfront (Ethereum-style), so a sender that
+        // cannot cover it fails at execution and only wastes block space. Reject
+        // such txs at the gate when a committed balance is readable. Fail-open by
+        // construction — never false-rejects a valid tx:
+        //   * no storage handle, an unreadable/uninitialised CoinStore, or an
+        //     overflowing gas cost  -> admit (executor stays authoritative; an
+        //     account funded by an earlier same-block tx is not yet visible here),
+        //   * a paymaster-sponsored tx is paid by the paymaster, not the sender,
+        //     so the sender-balance check is skipped entirely.
+        if parsed_tx.paymaster.is_none() {
+            if let Some(storage) = &self.storage {
+                if let Some(gas_cost) =
+                    (parsed_tx.gas_limit as u128).checked_mul(parsed_tx.gas_price)
+                {
+                    if let Some(balance) =
+                        executor::committed_ain_balance(storage, &parsed_tx.sender)
+                    {
+                        if balance < gas_cost {
+                            return Err(format!(
+                                "Insufficient balance for gas: have {}, need {} (gas_limit {} × gas_price {})",
+                                balance, gas_cost, parsed_tx.gas_limit, parsed_tx.gas_price
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // Phase 5B.11 / PWN-004 + PWN-007 COMBINED: compute the canonical
         // dedup hash and check `seen_txs` IMMEDIATELY after parse + cheap
         // header checks. This:
@@ -488,16 +517,87 @@ impl Mempool {
     }
 
     pub fn get_pending_transactions(&mut self, limit: usize) -> Vec<String> {
-        let mut transactions = Vec::new();
-        let mut count = 0;
-        while count < limit && !self.pending_txs.is_empty() {
-            if let Some(tx) = self.pending_txs.pop_front() {
-                self.remove_pending_nonce(&tx);
-                transactions.push(tx);
-                count += 1;
+        if limit == 0 || self.pending_txs.is_empty() {
+            return Vec::new();
+        }
+
+        // SEC-#27 (fee market): select up to `limit` txs preferring higher
+        // gas_price, while preserving each sender's nonce (sequence_number)
+        // order — a sender's seq N MUST be chosen before seq N+1 or the executor
+        // rejects the gap. This is the geth-style "best head per sender" merge:
+        // repeatedly take the highest-gas_price *front* tx (lowest unselected
+        // nonce) across senders. Selection order is deterministic (gas_price desc,
+        // then original FIFO index) — the leader's block ordering only needs to be
+        // self-consistent; every node executes the block in the order it ships.
+        use std::collections::BTreeMap;
+
+        let raws: Vec<String> = self.pending_txs.iter().cloned().collect();
+
+        // sender -> [(sequence_number, gas_price, original_index)], nonce-ordered.
+        let mut by_sender: BTreeMap<String, Vec<(u64, u128, usize)>> = BTreeMap::new();
+        for (idx, raw) in raws.iter().enumerate() {
+            // Post-validation these always parse; an unparsable entry is simply
+            // never selected (left in the queue) rather than dropped.
+            if let Ok(t) = serde_json::from_str::<executor::Transaction>(raw) {
+                by_sender
+                    .entry(t.sender.clone())
+                    .or_default()
+                    .push((t.sequence_number, t.gas_price, idx));
             }
         }
-        transactions
+        for q in by_sender.values_mut() {
+            q.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
+        }
+
+        // Per-sender cursor into its nonce-ordered queue.
+        let mut cursor: BTreeMap<String, usize> =
+            by_sender.keys().map(|s| (s.clone(), 0usize)).collect();
+
+        let mut selected: Vec<usize> = Vec::with_capacity(limit.min(raws.len()));
+        while selected.len() < limit {
+            // Highest-gas_price eligible head; tie-break by FIFO index.
+            let mut best: Option<(u128, usize, String)> = None;
+            for (sender, q) in by_sender.iter() {
+                let c = cursor[sender];
+                if c < q.len() {
+                    let (_, gp, idx) = q[c];
+                    let take = match &best {
+                        None => true,
+                        Some((bgp, bidx, _)) => gp > *bgp || (gp == *bgp && idx < *bidx),
+                    };
+                    if take {
+                        best = Some((gp, idx, sender.clone()));
+                    }
+                }
+            }
+            match best {
+                Some((_, idx, _)) => {
+                    selected.push(idx);
+                    // advance the chosen sender's cursor
+                    if let Ok(t) = serde_json::from_str::<executor::Transaction>(&raws[idx]) {
+                        if let Some(c) = cursor.get_mut(&t.sender) {
+                            *c += 1;
+                        }
+                    }
+                }
+                None => break, // all sender queues exhausted
+            }
+        }
+
+        let selected_set: HashSet<usize> = selected.iter().copied().collect();
+        let result: Vec<String> = selected.iter().map(|&i| raws[i].clone()).collect();
+        for raw in &result {
+            self.remove_pending_nonce(raw);
+        }
+        // Keep unselected txs in their original FIFO order for the next round.
+        self.pending_txs = raws
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !selected_set.contains(i))
+            .map(|(_, r)| r)
+            .collect();
+
+        result
     }
 
     pub fn is_empty(&self) -> bool {

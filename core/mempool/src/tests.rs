@@ -711,3 +711,190 @@ fn pwn007_proper_replay_with_reordered_keys_rejected() {
         err
     );
 }
+
+/// SEC-#27 — fee-market ordering + admission balance gate.
+mod fee_market_admission {
+    use super::*;
+    use std::sync::Arc;
+    use storage::StateDB;
+
+    fn temp_db(name: &str) -> Arc<StateDB> {
+        let path = format!("/tmp/aincore_feemkt_mempool_{}_{}", std::process::id(), name);
+        let _ = std::fs::remove_dir_all(&path);
+        Arc::new(StateDB::open(&path).expect("open temp db"))
+    }
+
+    /// Build a valid Ed25519-signed tx with a sender derived from `seed_byte`
+    /// (distinct seed => distinct sender) and the given seq/gas. Returns
+    /// (json_tx, sender_address).
+    fn signed_tx(seed_byte: u8, seq: u64, gas_limit: u64, gas_price: u128) -> (String, String) {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let signing_key = SigningKey::from_bytes(&[seed_byte; 32]);
+        let public_key = hex::encode(signing_key.verifying_key().to_bytes());
+        let sender = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
+        let chain_id =
+            std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+        // Vary payload bytes by (seed, seq) so no two test txs collide on dedup.
+        let payload_struct =
+            vm_move::TransactionPayload::PublishModule(vec![vec![seed_byte, seq as u8]]);
+        let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
+        let message = format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            chain_id, sender, payload, seq, gas_limit, gas_price, ""
+        );
+        let signature = signing_key.sign(message.as_bytes());
+
+        let tx = serde_json::json!({
+            "chain_id": chain_id,
+            "sender": sender,
+            "input_objects": [],
+            "payload": payload,
+            "args": [],
+            "gas_limit": gas_limit,
+            "gas_price": gas_price,
+            "sequence_number": seq,
+            "public_key": public_key,
+            "signature": hex::encode(signature.to_bytes()),
+        })
+        .to_string();
+        (tx, sender)
+    }
+
+    /// Build the exact `0x1::coin::CoinStore<0x1::staking::AincoreCoin>` storage
+    /// key that `executor::committed_ain_balance` reads (and gas is charged from).
+    fn ain_store_key(sender: &str) -> String {
+        use move_core_types::{
+            account_address::AccountAddress,
+            identifier::Identifier,
+            language_storage::{StructTag, TypeTag},
+        };
+        let sys = AccountAddress::from_hex_literal("0x1").unwrap();
+        let coin_type = TypeTag::Struct(Box::new(StructTag {
+            address: sys,
+            module: Identifier::new("staking").unwrap(),
+            name: Identifier::new("AincoreCoin").unwrap(),
+            type_params: vec![],
+        }));
+        let store = StructTag {
+            address: sys,
+            module: Identifier::new("coin").unwrap(),
+            name: Identifier::new("CoinStore").unwrap(),
+            type_params: vec![coin_type],
+        };
+        let addr =
+            AccountAddress::from_hex_literal(&format!("0x{}", sender.trim_start_matches("0x")))
+                .unwrap();
+        format!("resource_{}_{}", addr, store)
+    }
+
+    // A struct {value: u128} encodes in BCS identically to a bare u128, so the
+    // executor's MoveCoin reader round-trips this.
+    fn fund(db: &Arc<StateDB>, sender: &str, balance: u128) {
+        db.put(
+            &ain_store_key(sender),
+            &hex::encode(bcs::to_bytes(&balance).unwrap()),
+        )
+        .unwrap();
+    }
+
+    fn gas_price_of(tx: &str) -> u128 {
+        serde_json::from_str::<executor::Transaction>(tx)
+            .unwrap()
+            .gas_price
+    }
+
+    fn seq_of(tx: &str) -> u64 {
+        serde_json::from_str::<executor::Transaction>(tx)
+            .unwrap()
+            .sequence_number
+    }
+
+    #[test]
+    fn fee_market_orders_by_gas_price_across_senders() {
+        let mut mp = Mempool::new(); // no storage -> admission gate fail-open
+        let (lo, _) = signed_tx(1, 0, 1000, 1);
+        let (hi, _) = signed_tx(2, 0, 1000, 50);
+        let (mid, _) = signed_tx(3, 0, 1000, 10);
+        mp.add_transaction(lo).unwrap();
+        mp.add_transaction(hi).unwrap();
+        mp.add_transaction(mid).unwrap();
+
+        let got = mp.get_pending_transactions(3);
+        let prices: Vec<u128> = got.iter().map(|t| gas_price_of(t)).collect();
+        assert_eq!(prices, vec![50, 10, 1], "must drain highest-fee first");
+    }
+
+    #[test]
+    fn fee_market_preserves_sender_nonce_order() {
+        let mut mp = Mempool::new();
+        // SAME sender: seq 0 (low fee) then seq 1 (high fee).
+        let (s0, _) = signed_tx(7, 0, 1000, 1);
+        let (s1, _) = signed_tx(7, 1, 1000, 100);
+        mp.add_transaction(s0).unwrap();
+        mp.add_transaction(s1).unwrap();
+
+        let got = mp.get_pending_transactions(2);
+        let seqs: Vec<u64> = got.iter().map(|t| seq_of(t)).collect();
+        assert_eq!(
+            seqs,
+            vec![0, 1],
+            "a sender's seq 0 must precede seq 1 even though seq 1 pays more"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_unaffordable_tx_when_balance_known() {
+        let db = temp_db("admission_reject");
+        let (tx, sender) = signed_tx(11, 0, 1000, 5); // needs 1000*5 = 5000
+        fund(&db, &sender, 100); // only 100 available
+        let mut mp = Mempool::with_storage(db);
+
+        let err = mp
+            .add_transaction(tx)
+            .expect_err("unaffordable tx must be rejected at the gate");
+        assert!(
+            err.contains("Insufficient balance for gas"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn admission_admits_affordable_tx() {
+        let db = temp_db("admission_affordable");
+        let (tx, sender) = signed_tx(12, 0, 1000, 5); // needs 5000
+        fund(&db, &sender, 10_000);
+        let mut mp = Mempool::with_storage(db);
+        mp.add_transaction(tx)
+            .expect("affordable tx must be admitted");
+    }
+
+    #[test]
+    fn admission_fails_open_when_store_missing() {
+        let db = temp_db("admission_no_store");
+        // No CoinStore written for this sender -> balance unknown -> admit.
+        let (tx, _sender) = signed_tx(13, 0, 1000, 5);
+        let mut mp = Mempool::with_storage(db);
+        mp.add_transaction(tx)
+            .expect("missing/uninitialised store must fail-open (admit)");
+    }
+
+    #[test]
+    fn admission_skips_check_for_paymaster_sponsored_tx() {
+        let db = temp_db("admission_paymaster");
+        let (tx, sender) = signed_tx(14, 0, 1000, 5); // needs 5000
+        fund(&db, &sender, 100); // sender is broke...
+
+        // ...but a paymaster sponsors the gas, so the sender check is skipped.
+        // (paymaster is not part of the signed canonical form, so injecting it
+        // post-signing keeps the sender signature valid.)
+        let mut v: serde_json::Value = serde_json::from_str(&tx).unwrap();
+        v["paymaster"] = serde_json::json!("deadbeef");
+        let tx_pm = v.to_string();
+
+        let mut mp = Mempool::with_storage(db);
+        mp.add_transaction(tx_pm)
+            .expect("paymaster-sponsored tx must skip the sender balance check");
+    }
+}

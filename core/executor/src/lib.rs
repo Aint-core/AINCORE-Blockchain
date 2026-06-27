@@ -67,6 +67,29 @@ struct MoveCoin {
     value: u128,
 }
 
+/// SEC-#27: best-effort read of an address's committed AIN balance from its
+/// `0x1::coin::CoinStore<0x1::staking::AincoreCoin>` resource.
+///
+/// Returns `None` when the address is unparseable, the CoinStore is absent, or
+/// the stored bytes don't decode. Callers MUST treat `None` as **unknown**
+/// (fail-open), never as zero: an account can be funded by an earlier
+/// transaction in the same block, so a missing/uninitialised store at admission
+/// time must not cause a false rejection. Mirrors the production read in
+/// `core/node/src/api_local.rs::coin_store_balance` byte-for-byte.
+pub fn committed_ain_balance(db: &StateDB, address: &str) -> Option<u128> {
+    let move_addr = parse_move_address(address)?;
+    let tag = move_core_types::language_storage::StructTag {
+        address: system_address(),
+        module: move_core_types::identifier::Identifier::new("coin").ok()?,
+        name: move_core_types::identifier::Identifier::new("CoinStore").ok()?,
+        type_params: vec![aincore_coin_type()],
+    };
+    let key = format!("resource_{}_{}", move_addr, tag);
+    let hex_value = db.get(&key).ok().flatten()?;
+    let bytes = hex::decode(hex_value).ok()?;
+    bcs::from_bytes::<MoveCoin>(&bytes).ok().map(|c| c.value)
+}
+
 /// Local mirror of `consensus::qc::ValidatorInfo` for `sys:validator_set:v1`.
 ///
 /// The executor cannot depend on the `consensus` crate (consensus depends on
@@ -2860,6 +2883,31 @@ mod tests {
         bcs::from_bytes::<TestCoin>(&bytes)
             .expect("coin store BCS")
             .value
+    }
+
+    // SEC-#27: `committed_ain_balance` is the mempool admission gate's balance
+    // reader. It MUST read the same CoinStore key the executor charges gas from,
+    // and MUST fail-open (None, never a panic) on a missing/corrupt store so the
+    // gate never false-rejects a valid tx.
+    #[test]
+    fn committed_ain_balance_reads_store_and_fails_open() {
+        let db = temp_db("committed_ain_balance");
+        let addr = "00000000000000000000000000000abc";
+
+        // Missing CoinStore -> None (caller treats as "unknown", not zero).
+        assert_eq!(committed_ain_balance(&db, addr), None);
+
+        // Present + well-formed -> Some(value), matching what gas is charged from.
+        set_coin_store(&db, addr, 7_500);
+        assert_eq!(committed_ain_balance(&db, addr), Some(7_500));
+
+        // Corrupt bytes at the store key -> None (never panics).
+        let move_addr = parse_move_address(addr).unwrap();
+        db.put(&coin_store_key(move_addr), "not-hex-zz").unwrap();
+        assert_eq!(committed_ain_balance(&db, addr), None);
+
+        // Unparseable address -> None.
+        assert_eq!(committed_ain_balance(&db, "not-an-address"), None);
     }
 
     fn wbtc_coin_type() -> move_core_types::language_storage::TypeTag {
