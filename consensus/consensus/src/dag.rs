@@ -13,6 +13,12 @@ use storage::StateDB;
 /// Cached active validator set as `(address, stake)` pairs, canonically sorted.
 type ValidatorStakeCache = Arc<Mutex<Option<Vec<(String, u64)>>>>;
 
+/// SEC-#10: how long equivocation evidence (`sys:equiv_seen:{offender}:{round}`)
+/// is retained past the DAG prune horizon before garbage collection. Set well
+/// beyond any realistic forensic/governance window; the slash is applied and
+/// finalized long before this, so older records are safe to discard.
+pub(crate) const EQUIV_EVIDENCE_RETENTION_ROUNDS: u64 = 100_000;
+
 pub struct DagConsensus {
     pub node_id: String,
     pub current_round: u64,
@@ -629,69 +635,9 @@ impl DagConsensus {
         // vertex.author is a truncated 16-byte address (32 hex chars), but Ed25519 verification
         // requires the full 32-byte public key (64 hex chars). Without this fix, signature
         // verification would always fail because hex::decode produces only 16 bytes.
-        let author_pubkey_hex = {
-            // First try: Look up the account object for the author's full public key
-            if let Some(account_obj) = self.storage.get_object(&vertex.author) {
-                // Parse AccountData to extract the full public_key field
-                if let Ok(account_data) =
-                    serde_json::from_slice::<serde_json::Value>(&account_obj.data)
-                {
-                    if let Some(pk) = account_data.get("public_key").and_then(|v| v.as_str()) {
-                        if pk.len() == 64 {
-                            match hex::decode(pk)
-                                .ok()
-                                .and_then(|bytes| crypto::derive_address(&bytes).ok())
-                            {
-                                Some(addr) if addr == vertex.author => pk.to_string(),
-                                _ => {
-                                    println!(
-                                        "🚨 REJECTED: Stored public key does not derive author {}",
-                                        vertex.author
-                                    );
-                                    return;
-                                }
-                            }
-                        } else {
-                            println!(
-                                "🚨 REJECTED: Missing full Ed25519 public key for author {}",
-                                vertex.author
-                            );
-                            return;
-                        }
-                    } else {
-                        println!(
-                            "🚨 REJECTED: Account object for {} has no public_key",
-                            vertex.author
-                        );
-                        return;
-                    }
-                } else {
-                    println!(
-                        "🚨 REJECTED: Account object for {} is not valid JSON",
-                        vertex.author
-                    );
-                    return;
-                }
-            } else if vertex.author == self.node_id {
-                let signing_key = crypto::SigningKey::from_bytes(&self.node_key);
-                let public_key = signing_key.verifying_key();
-                match crypto::derive_address(public_key.as_bytes()) {
-                    Ok(addr) if addr == vertex.author => hex::encode(public_key.as_bytes()),
-                    _ => {
-                        println!(
-                            "🚨 REJECTED: Local node key does not derive author {}",
-                            vertex.author
-                        );
-                        return;
-                    }
-                }
-            } else {
-                println!(
-                    "🚨 REJECTED: No public key available for vertex author {}",
-                    vertex.author
-                );
-                return;
-            }
+        let author_pubkey_hex = match self.resolve_author_pubkey(&vertex.author) {
+            Some(pk) => pk,
+            None => return,
         };
 
         if !vertex.verify_ed25519_signature(&author_pubkey_hex) {
@@ -768,32 +714,17 @@ impl DagConsensus {
                             println!("   Proof B: {}", vertex.hash);
                             println!("🔥 SLASHING STAKE OF {}", vertex.author);
 
-                            // === SLASH EXECUTION QUEUE (Equivocation) ===
-                            // C-01 FIX: reason MUST be "equivocation" so executor applies
-                            // the 100% slash + permanent removal path. Previously this wrote
-                            // "double_sign" which fell through to the 5% downtime branch and
-                            // copied the downtime penalty string — letting equivocators escape
-                            // with a slap on the wrist while the consensus alert above claimed
-                            // a critical slashing was happening. The mismatch was not caught
-                            // by unit tests because they wrote events directly with the
-                            // canonical "equivocation" reason instead of routing through DAG.
-                            let slash_event = serde_json::json!({
-                                "event": "equivocation_detected",
-                                "validator": vertex.author,
-                                "round": vertex.round,
-                                "proof_a": existing_hash,
-                                "proof_b": vertex.hash,
-                                "reason": "equivocation",
-                                "penalty": "100% slash + permanent removal"
-                            });
-                            let _ = self.storage.put(
-                                &format!("sys:pending_slash:{}", vertex.author),
-                                &slash_event.to_string(),
-                            );
-                            let _ = self.storage.put(
-                                &format!("validator:jailed:{}", vertex.author),
-                                &vertex.round.to_string(),
-                            );
+                            // SEC-#9/#10: route the slash through the shared
+                            // `apply_equivocation_slash` (idempotent + durable evidence) and
+                            // gossip the self-authenticating proof so every honest node
+                            // independently verifies and slashes — instead of slashing only
+                            // on whichever node happened to receive both conflicting vertices.
+                            // `proof_a` = the already-stored vertex, `proof_b` = the incoming
+                            // conflicting one (preserves the prior event field order).
+                            let proof_a = v_exist.clone();
+                            let proof_b = vertex.clone();
+                            self.apply_equivocation_slash(&proof_a, &proof_b);
+                            self.broadcast_equivocation_proof(&proof_a, &proof_b);
                             return;
                         }
                     }
@@ -1246,6 +1177,226 @@ impl DagConsensus {
         }
     }
 
+    /// Resolve the FULL 64-hex Ed25519 public key for a vertex author.
+    ///
+    /// (C-10) `vertex.author` is a truncated 16-byte address (32 hex chars) but
+    /// Ed25519 verification needs the full 32-byte key. Returns `None` (with a
+    /// diagnostic) when the key cannot be resolved or does not derive the claimed
+    /// author. Shared by `add_vertex` and equivocation-proof verification.
+    fn resolve_author_pubkey(&self, author: &str) -> Option<String> {
+        if let Some(account_obj) = self.storage.get_object(author) {
+            if let Ok(account_data) =
+                serde_json::from_slice::<serde_json::Value>(&account_obj.data)
+            {
+                if let Some(pk) = account_data.get("public_key").and_then(|v| v.as_str()) {
+                    if pk.len() == 64 {
+                        match hex::decode(pk)
+                            .ok()
+                            .and_then(|bytes| crypto::derive_address(&bytes).ok())
+                        {
+                            Some(addr) if addr == author => Some(pk.to_string()),
+                            _ => {
+                                println!(
+                                    "🚨 REJECTED: Stored public key does not derive author {}",
+                                    author
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        println!(
+                            "🚨 REJECTED: Missing full Ed25519 public key for author {}",
+                            author
+                        );
+                        None
+                    }
+                } else {
+                    println!("🚨 REJECTED: Account object for {} has no public_key", author);
+                    None
+                }
+            } else {
+                println!("🚨 REJECTED: Account object for {} is not valid JSON", author);
+                None
+            }
+        } else if author == self.node_id {
+            let signing_key = crypto::SigningKey::from_bytes(&self.node_key);
+            let public_key = signing_key.verifying_key();
+            match crypto::derive_address(public_key.as_bytes()) {
+                Ok(addr) if addr == author => Some(hex::encode(public_key.as_bytes())),
+                _ => {
+                    println!("🚨 REJECTED: Local node key does not derive author {}", author);
+                    None
+                }
+            }
+        } else {
+            println!("🚨 REJECTED: No public key available for vertex author {}", author);
+            None
+        }
+    }
+
+    /// SEC-#9: independently verify a self-authenticating equivocation proof.
+    ///
+    /// Returns `Some(offender)` only if BOTH vertices are signed by the same
+    /// author over the same round with distinct, body-bound hashes, and the
+    /// offender is a current validator. A forged proof cannot pass: producing
+    /// two distinct valid signatures over two distinct bodies at one round
+    /// requires the offender's own secret key.
+    fn verify_equivocation_proof(&self, a: &Vertex, b: &Vertex) -> Option<String> {
+        // 1. same author, same round, genuinely conflicting.
+        if a.author != b.author || a.round != b.round || a.hash == b.hash {
+            return None;
+        }
+        // 2. each hash must bind its body (PWN-001) — stops pairing a real
+        //    vertex with a body-tampered twin.
+        if a.hash != a.calculate_hash() || b.hash != b.calculate_hash() {
+            return None;
+        }
+        // 3. resolve the offender's full pubkey and verify BOTH signatures.
+        let pubkey_hex = self.resolve_author_pubkey(&a.author)?;
+        if !a.verify_ed25519_signature(&pubkey_hex) || !b.verify_ed25519_signature(&pubkey_hex) {
+            return None;
+        }
+        // 4. offender must be a current validator (SEC-N03: no slashing /
+        //    storage growth against arbitrary non-validators).
+        if !self.get_validator_set().contains(&a.author) {
+            return None;
+        }
+        Some(a.author.clone())
+    }
+
+    /// SEC-#9/#10: idempotent, deterministic single-apply of an equivocation
+    /// slash. Both the local detector and inbound gossip funnel through here.
+    /// The first writer latches the dedup/evidence key; later duplicates (same
+    /// offender+round, whether re-received or locally re-detected) short-circuit.
+    fn apply_equivocation_slash(&self, proof_a: &Vertex, proof_b: &Vertex) {
+        let offender = &proof_a.author;
+        let round = proof_a.round;
+
+        let seen_key = format!("sys:equiv_seen:{}:{}", offender, round);
+        if matches!(self.storage.get(&seen_key), Ok(Some(_))) {
+            return; // already handled — exactly-once.
+        }
+
+        // Durable, self-contained evidence (plain KV — never a `vertex:{hash}`
+        // row, so DAG pruning cannot destroy it: closes #10).
+        let evidence = serde_json::json!({
+            "offender": offender,
+            "round": round,
+            "vertex_a": proof_a,
+            "vertex_b": proof_b,
+        });
+        let _ = self.storage.put(&seen_key, &evidence.to_string());
+
+        // Canonical slash event — byte-stable across nodes (no timestamps /
+        // node-local fields) and matched by the executor's 100% equivocation path.
+        let slash_event = serde_json::json!({
+            "event": "equivocation_detected",
+            "validator": offender,
+            "round": round,
+            "proof_a": proof_a.hash,
+            "proof_b": proof_b.hash,
+            "reason": "equivocation",
+            "penalty": "100% slash + permanent removal"
+        });
+        let _ = self.storage.put(
+            &format!("sys:pending_slash:{}", offender),
+            &slash_event.to_string(),
+        );
+        let _ = self.storage.put(
+            &format!("validator:jailed:{}", offender),
+            &round.to_string(),
+        );
+    }
+
+    /// SEC-#9: gossip a self-authenticating equivocation proof (both signed
+    /// vertices) to all peers via Gossipsub + TCP fallback. Mirrors the
+    /// `broadcast_attestation` transport. No reporter signature is needed: the
+    /// embedded vertex signatures ARE the proof.
+    fn broadcast_equivocation_proof(&self, proof_a: &Vertex, proof_b: &Vertex) {
+        let payload = serde_json::json!({
+            "offender": proof_a.author,
+            "round": proof_a.round,
+            "vertex_a": proof_a,
+            "vertex_b": proof_b,
+        });
+        let serialized = match serde_json::to_string(&payload) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("❌ [SEC-#9] Failed to serialise equivocation proof: {}", e);
+                return;
+            }
+        };
+        let msg = format!("EQUIV_PROOF:{}", serialized);
+
+        // 1. Gossipsub.
+        if let Some(tx) = &self.p2p_tx {
+            let tx_clone = tx.clone();
+            let msg_clone = msg.clone();
+            tokio::spawn(async move {
+                let _ = tx_clone.send(msg_clone).await;
+            });
+        }
+
+        // 2. TCP fallback.
+        use network::send_message;
+        if let Ok(peers) = self.peers.lock() {
+            for (peer_id, port) in peers.iter() {
+                if *peer_id != self.node_id {
+                    let ip = self
+                        .storage
+                        .get_peer_ip(peer_id)
+                        .unwrap_or_else(|| "127.0.0.1".to_string());
+                    let addr = format!("{}:{}", ip, port);
+                    let _ = send_message(&addr, &msg);
+                }
+            }
+        }
+    }
+
+    /// SEC-#9: handle an inbound equivocation proof. Verify independently, then
+    /// — only on the FIRST valid receipt for this (offender, round) — apply the
+    /// slash and re-gossip once so the proof reaches nodes that saw only one of
+    /// the two conflicting vertices.
+    fn handle_remote_equivocation(&self, content: &str) {
+        let v: serde_json::Value = match serde_json::from_str(content) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("❌ [SEC-#9] Malformed equivocation proof JSON: {}", e);
+                return;
+            }
+        };
+        let a: Vertex = match serde_json::from_value(v["vertex_a"].clone()) {
+            Ok(x) => x,
+            Err(_) => {
+                eprintln!("❌ [SEC-#9] equivocation proof missing/invalid vertex_a");
+                return;
+            }
+        };
+        let b: Vertex = match serde_json::from_value(v["vertex_b"].clone()) {
+            Ok(x) => x,
+            Err(_) => {
+                eprintln!("❌ [SEC-#9] equivocation proof missing/invalid vertex_b");
+                return;
+            }
+        };
+
+        let offender = match self.verify_equivocation_proof(&a, &b) {
+            Some(o) => o,
+            None => {
+                eprintln!("❌ [SEC-#9] equivocation proof failed verification — dropping");
+                return;
+            }
+        };
+
+        // Re-gossip only on the FIRST application (dedup guards a broadcast storm).
+        let seen_key = format!("sys:equiv_seen:{}:{}", offender, a.round);
+        if matches!(self.storage.get(&seen_key), Ok(Some(_))) {
+            return;
+        }
+        self.apply_equivocation_slash(&a, &b);
+        self.broadcast_equivocation_proof(&a, &b);
+    }
+
     pub fn handle_message(&mut self, msg: &str) {
         if let Some(content) = msg.strip_prefix("DAG_VERTEX:") {
             if let Ok(vertex) = serde_json::from_str::<Vertex>(content) {
@@ -1255,6 +1406,11 @@ impl DagConsensus {
             // Phase 3 / H-02: Remote downtime attestation received from a peer.
             // Validate → store so executor can count towards BFT quorum.
             self.handle_remote_attestation(content);
+        } else if let Some(content) = msg.strip_prefix("EQUIV_PROOF:") {
+            // SEC-#9: a self-authenticating equivocation proof received from a
+            // peer. Independently verify (both vertices signed by the offender,
+            // same round, distinct bodies) before slashing, then re-gossip once.
+            self.handle_remote_equivocation(content);
         }
     }
 
@@ -1460,6 +1616,25 @@ impl DagConsensus {
                 "🧹 Garbage Collection: Pruned {} vertices older than round {} from Disk & Memory",
                 removed_count, min_round
             );
+        }
+
+        // SEC-#10: equivocation evidence (`sys:equiv_seen:{offender}:{round}`) is
+        // a plain KV row, never a `vertex:{hash}`, so it already survives the DAG
+        // prune above — this only bounds its growth long after the slash is
+        // finalized. Records are kept for a large retention window past the prune
+        // horizon; older ones are safe to discard (the slash is long applied).
+        let gc_below = min_round.saturating_sub(EQUIV_EVIDENCE_RETENTION_ROUNDS);
+        if gc_below > 0 {
+            for (key, _) in self.storage.scan_prefix("sys:equiv_seen:") {
+                // key = sys:equiv_seen:{offender}:{round}
+                if let Some(round_str) = key.rsplit(':').next() {
+                    if let Ok(r) = round_str.parse::<u64>() {
+                        if r < gc_below {
+                            let _ = self.storage.delete(&key);
+                        }
+                    }
+                }
+            }
         }
     }
 

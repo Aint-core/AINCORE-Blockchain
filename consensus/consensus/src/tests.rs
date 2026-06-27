@@ -1204,4 +1204,231 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&path);
     }
+
+    // ===== SEC-#9/#10: equivocation evidence gossip + prune retention =====
+
+    /// Build a vertex authored + signed by the consensus node (offender == self,
+    /// which is already a registered validator in `setup_dag`).
+    fn signed_vertex(consensus: &DagConsensus, round: u64, timestamp: u64) -> blockchain::Vertex {
+        let signing_key = crypto::SigningKey::from_bytes(&consensus.node_key);
+        let mut v = blockchain::Vertex {
+            round,
+            author: consensus.node_id.clone(),
+            timestamp,
+            payload: vec![],
+            parents: vec!["genesis".to_string()],
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+        };
+        v.hash = v.calculate_hash();
+        v.sign_with_ed25519(&signing_key);
+        v
+    }
+
+    fn equiv_proof_msg(
+        offender: &str,
+        a: &blockchain::Vertex,
+        b: &blockchain::Vertex,
+    ) -> String {
+        let payload = serde_json::json!({
+            "offender": offender,
+            "round": a.round,
+            "vertex_a": a,
+            "vertex_b": b,
+        });
+        format!("EQUIV_PROOF:{}", serde_json::to_string(&payload).unwrap())
+    }
+
+    /// Forged or non-conflicting "proofs" must NOT slash an (honest) validator.
+    #[test]
+    fn test_equiv_forged_evidence_rejected() {
+        let (mut consensus, path) = setup_dag("equiv_forged");
+        consensus.current_round = 1;
+        let offender = consensus.node_id.clone();
+        let pending_key = format!("sys:pending_slash:{}", offender);
+
+        let a = signed_vertex(&consensus, 1, 1_000);
+        let b = signed_vertex(&consensus, 1, 2_000);
+
+        // (i) same vertex twice — not actually conflicting.
+        consensus.handle_message(&equiv_proof_msg(&offender, &a, &a));
+        assert!(consensus.storage.get(&pending_key).unwrap().is_none());
+
+        // (ii) body tampered after signing — hash no longer binds the body.
+        let mut tampered = b.clone();
+        tampered.timestamp = 9_999; // hash/sig still bind ts=2000
+        consensus.handle_message(&equiv_proof_msg(&offender, &a, &tampered));
+        assert!(consensus.storage.get(&pending_key).unwrap().is_none());
+
+        // (iii) second vertex signed by an ATTACKER key — sig fails against the
+        // offender's pubkey, so a forger cannot frame an honest validator.
+        let attacker = crypto::SigningKey::from_bytes(&[7u8; 32]);
+        let mut forged = blockchain::Vertex {
+            round: 1,
+            author: offender.clone(),
+            timestamp: 3_000,
+            payload: vec![],
+            parents: vec!["genesis".to_string()],
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+        };
+        forged.hash = forged.calculate_hash();
+        forged.sign_with_ed25519(&attacker);
+        consensus.handle_message(&equiv_proof_msg(&offender, &a, &forged));
+
+        assert!(consensus.storage.get(&pending_key).unwrap().is_none());
+        assert!(consensus
+            .storage
+            .get(&format!("sys:equiv_seen:{}:1", offender))
+            .unwrap()
+            .is_none());
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A valid proof received by gossip (node saw NEITHER vertex locally) slashes.
+    #[test]
+    fn test_equiv_valid_evidence_slashes() {
+        let (mut consensus, path) = setup_dag("equiv_valid");
+        consensus.current_round = 1;
+        let offender = consensus.node_id.clone();
+        let a = signed_vertex(&consensus, 1, 1_000);
+        let b = signed_vertex(&consensus, 1, 2_000);
+
+        consensus.handle_message(&equiv_proof_msg(&offender, &a, &b));
+
+        let pending = consensus
+            .storage
+            .get(&format!("sys:pending_slash:{}", offender))
+            .unwrap()
+            .expect("valid equivocation proof must queue a slash");
+        let ev: serde_json::Value = serde_json::from_str(&pending).unwrap();
+        assert_eq!(ev["reason"].as_str(), Some("equivocation"));
+        assert_eq!(ev["event"].as_str(), Some("equivocation_detected"));
+        assert!(consensus
+            .storage
+            .get(&format!("validator:jailed:{}", offender))
+            .unwrap()
+            .is_some());
+        assert!(consensus
+            .storage
+            .get(&format!("sys:equiv_seen:{}:1", offender))
+            .unwrap()
+            .is_some());
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Re-receiving the proof AND local re-detection must slash exactly once
+    /// (byte-identical event), never duplicate.
+    #[test]
+    fn test_equiv_double_apply_is_idempotent() {
+        let (mut consensus, path) = setup_dag("equiv_idempotent");
+        consensus.current_round = 1;
+        let offender = consensus.node_id.clone();
+        let a = signed_vertex(&consensus, 1, 1_000);
+        let b = signed_vertex(&consensus, 1, 2_000);
+        let msg = equiv_proof_msg(&offender, &a, &b);
+
+        consensus.handle_message(&msg);
+        let first = consensus
+            .storage
+            .get(&format!("sys:pending_slash:{}", offender))
+            .unwrap()
+            .unwrap();
+
+        // Re-deliver the gossip, then locally detect the same equivocation.
+        consensus.handle_message(&msg);
+        consensus.add_vertex(a.clone());
+        consensus.add_vertex(b.clone());
+
+        let second = consensus
+            .storage
+            .get(&format!("sys:pending_slash:{}", offender))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first, second,
+            "slash event must be byte-identical after repeated applies"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Local detection in `add_vertex` must gossip the proof to peers.
+    #[tokio::test]
+    async fn test_equiv_local_detection_broadcasts() {
+        let path = get_test_db_path("equiv_broadcast");
+        let db = Arc::new(StateDB::open(&path).unwrap());
+        let mempool = Arc::new(Mutex::new(Mempool::new()));
+        let executor = Arc::new(Executor::new(Arc::clone(&db)));
+        let peers = Arc::new(Mutex::new(HashMap::new()));
+
+        let node_key = [42u8; 32];
+        let signing_key = crypto::SigningKey::from_bytes(&node_key);
+        let public_key = hex::encode(signing_key.verifying_key().to_bytes());
+        let node_id = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
+        let account = Object::new(
+            node_id.clone(),
+            Owner::Address(node_id.clone()),
+            serde_json::json!({ "public_key": public_key, "sequence_number": 0 })
+                .to_string()
+                .into_bytes(),
+            "0x1::account::AccountData".to_string(),
+        );
+        db.put_object(&account).unwrap();
+        db.put("sys:validators", &format!(r#"[["{}",1000]]"#, node_id))
+            .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+        let mut consensus =
+            DagConsensus::new(node_id, peers, mempool, executor, db, None, Some(tx), node_key);
+        consensus.current_round = 1;
+
+        let a = signed_vertex(&consensus, 1, 1_000);
+        let b = signed_vertex(&consensus, 1, 2_000);
+        consensus.add_vertex(a);
+        consensus.add_vertex(b); // conflict → detection → broadcast
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("equivocation proof must be broadcast")
+            .expect("channel open");
+        assert!(got.starts_with("EQUIV_PROOF:"), "got: {}", got);
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Evidence survives DAG pruning (#10), and is GC'd only past the retention
+    /// window.
+    #[test]
+    fn test_prune_preserves_equivocation_evidence() {
+        let (mut consensus, path) = setup_dag("equiv_prune");
+        consensus.current_round = 1;
+        let offender = consensus.node_id.clone();
+        let a = signed_vertex(&consensus, 1, 1_000);
+        let b = signed_vertex(&consensus, 1, 2_000);
+        consensus.handle_message(&equiv_proof_msg(&offender, &a, &b));
+
+        let seen_key = format!("sys:equiv_seen:{}:1", offender);
+        assert!(consensus.storage.get(&seen_key).unwrap().is_some());
+
+        // Pruning well past round 1 deletes DAG vertices but NOT the evidence KV.
+        consensus.prune_dag(50);
+        assert!(
+            consensus.storage.get(&seen_key).unwrap().is_some(),
+            "equivocation evidence must survive DAG pruning (#10)"
+        );
+
+        // Only beyond the retention window is the evidence garbage-collected.
+        consensus.prune_dag(crate::dag::EQUIV_EVIDENCE_RETENTION_ROUNDS + 5);
+        assert!(
+            consensus.storage.get(&seen_key).unwrap().is_none(),
+            "evidence past the retention window must be garbage-collected"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }
