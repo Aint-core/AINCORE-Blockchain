@@ -992,7 +992,7 @@ impl Executor {
     fn on_chain_epoch_clock_secs(&self) -> u64 {
         let key = format!(
             "resource_{}_0x1::epoch::Epoch",
-            "00000000000000000000000000000001"
+            "0000000000000000000000000000000000000000000000000000000000000001"
         );
         let raw = match self.db.get(&key) {
             Ok(Some(raw)) => raw,
@@ -1414,8 +1414,8 @@ impl Executor {
         //                 weighted by stake.
         //   If the validator set is empty or unreadable, fall back to
         //   the legacy single-miner path so we never burn the reward.
-        let miner_addr = if proposer_hex.len() > 32 {
-            &proposer_hex[0..32]
+        let miner_addr = if proposer_hex.len() > crypto::ADDRESS_HEX_LEN {
+            &proposer_hex[0..crypto::ADDRESS_HEX_LEN]
         } else {
             proposer_hex
         };
@@ -1707,7 +1707,7 @@ impl Executor {
             let slash_pct: u64 = if reason == "equivocation" { 100 } else { 5 };
 
             let module_id = ModuleId::new(
-                AccountAddress::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+                AccountAddress::ONE,
                 Identifier::new("staking").expect("staking identifier is valid"),
             );
 
@@ -1723,9 +1723,7 @@ impl Executor {
                 }
             };
 
-            let arg_sys = bcs::to_bytes(&AccountAddress::new([
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-            ]))
+            let arg_sys = bcs::to_bytes(&AccountAddress::ONE)
             .unwrap_or_default();
             let arg_val = bcs::to_bytes(&vm_addr).unwrap_or_default();
             let arg_bps = bcs::to_bytes(&(slash_pct * 100)).unwrap_or_default();
@@ -1764,7 +1762,7 @@ impl Executor {
                     // delegators share the penalty by the same bps. No-op if the
                     // validator never enabled delegation.
                     let deleg_module_id = ModuleId::new(
-                        AccountAddress::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+                        AccountAddress::ONE,
                         Identifier::new("delegation").expect("delegation identifier is valid"),
                     );
                     match self.vm.execute_public_entry_function(
@@ -2987,7 +2985,7 @@ mod tests {
         // Seed Epoch @0x1 = (epoch_number=7, epoch_start_time=123456, duration=10).
         let key = format!(
             "resource_{}_0x1::epoch::Epoch",
-            "00000000000000000000000000000001"
+            "0000000000000000000000000000000000000000000000000000000000000001"
         );
         let bytes = bcs::to_bytes(&(7u64, 123_456u64, 10u64)).unwrap();
         db.put(&key, &hex::encode(bytes)).unwrap();
@@ -3012,7 +3010,7 @@ mod tests {
         // On-chain clock at 5000s.
         let key = format!(
             "resource_{}_0x1::epoch::Epoch",
-            "00000000000000000000000000000001"
+            "0000000000000000000000000000000000000000000000000000000000000001"
         );
         let bytes = bcs::to_bytes(&(2u64, 5_000u64, 10u64)).unwrap();
         db.put(&key, &hex::encode(bytes)).unwrap();
@@ -3500,17 +3498,13 @@ mod tests {
         let executor = Executor::new(db.clone());
         let call = vm_move::EntryFunctionCall {
             module: move_core_types::language_storage::ModuleId::new(
-                move_core_types::account_address::AccountAddress::new([
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                ]),
+                move_core_types::account_address::AccountAddress::ONE,
                 move_core_types::identifier::Identifier::new("coin").unwrap(),
             ),
             function: "transfer".to_string(),
             ty_args: vec![move_core_types::language_storage::TypeTag::Struct(
                 Box::new(move_core_types::language_storage::StructTag {
-                    address: move_core_types::account_address::AccountAddress::new([
-                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                    ]),
+                    address: move_core_types::account_address::AccountAddress::ONE,
                     module: move_core_types::identifier::Identifier::new("staking").unwrap(),
                     name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
                     type_params: vec![],
@@ -3668,17 +3662,13 @@ mod tests {
         // signer slot — the attacker forges it to the VICTIM's address.
         let call = vm_move::EntryFunctionCall {
             module: move_core_types::language_storage::ModuleId::new(
-                move_core_types::account_address::AccountAddress::new([
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                ]),
+                move_core_types::account_address::AccountAddress::ONE,
                 move_core_types::identifier::Identifier::new("coin").unwrap(),
             ),
             function: "transfer".to_string(),
             ty_args: vec![move_core_types::language_storage::TypeTag::Struct(
                 Box::new(move_core_types::language_storage::StructTag {
-                    address: move_core_types::account_address::AccountAddress::new([
-                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                    ]),
+                    address: move_core_types::account_address::AccountAddress::ONE,
                     module: move_core_types::identifier::Identifier::new("staking").unwrap(),
                     name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
                     type_params: vec![],
@@ -3734,17 +3724,13 @@ mod tests {
         let executor = Executor::new(db.clone());
         let call = vm_move::EntryFunctionCall {
             module: move_core_types::language_storage::ModuleId::new(
-                move_core_types::account_address::AccountAddress::new([
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                ]),
+                move_core_types::account_address::AccountAddress::ONE,
                 move_core_types::identifier::Identifier::new("coin").unwrap(),
             ),
             function: "transfer".to_string(),
             ty_args: vec![move_core_types::language_storage::TypeTag::Struct(
                 Box::new(move_core_types::language_storage::StructTag {
-                    address: move_core_types::account_address::AccountAddress::new([
-                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                    ]),
+                    address: move_core_types::account_address::AccountAddress::ONE,
                     module: move_core_types::identifier::Identifier::new("staking").unwrap(),
                     name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
                     type_params: vec![],
@@ -3793,17 +3779,13 @@ mod tests {
         let executor = Executor::new(db.clone());
         let call = vm_move::EntryFunctionCall {
             module: move_core_types::language_storage::ModuleId::new(
-                move_core_types::account_address::AccountAddress::new([
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                ]),
+                move_core_types::account_address::AccountAddress::ONE,
                 move_core_types::identifier::Identifier::new("coin").unwrap(),
             ),
             function: "transfer".to_string(),
             ty_args: vec![move_core_types::language_storage::TypeTag::Struct(
                 Box::new(move_core_types::language_storage::StructTag {
-                    address: move_core_types::account_address::AccountAddress::new([
-                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                    ]),
+                    address: move_core_types::account_address::AccountAddress::ONE,
                     module: move_core_types::identifier::Identifier::new("staking").unwrap(),
                     name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
                     type_params: vec![],
@@ -3999,17 +3981,13 @@ mod tests {
 
         let call = vm_move::EntryFunctionCall {
             module: move_core_types::language_storage::ModuleId::new(
-                move_core_types::account_address::AccountAddress::new([
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                ]),
+                move_core_types::account_address::AccountAddress::ONE,
                 move_core_types::identifier::Identifier::new("coin").unwrap(),
             ),
             function: "transfer".to_string(),
             ty_args: vec![move_core_types::language_storage::TypeTag::Struct(
                 Box::new(move_core_types::language_storage::StructTag {
-                    address: move_core_types::account_address::AccountAddress::new([
-                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                    ]),
+                    address: move_core_types::account_address::AccountAddress::ONE,
                     module: move_core_types::identifier::Identifier::new("staking").unwrap(),
                     name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
                     type_params: vec![],
@@ -5186,7 +5164,7 @@ mod tests {
         //   epoch_number = 100, epoch_start_time = 1000 (accumulated), duration = 1e9.
         let epoch_key = format!(
             "resource_{}_0x1::epoch::Epoch",
-            "00000000000000000000000000000001"
+            "0000000000000000000000000000000000000000000000000000000000000001"
         );
         let seeded = bcs::to_bytes(&(100u64, 1000u64, 1_000_000_000u64)).unwrap();
         db.put(&epoch_key, &hex::encode(seeded)).unwrap();
@@ -5259,7 +5237,7 @@ mod tests {
 
         let um = |s: &str| {
             format!(
-                "resource_00000000000000000000000000000001_0x1::universal_mining::{}",
+                "resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::universal_mining::{}",
                 s
             )
         };

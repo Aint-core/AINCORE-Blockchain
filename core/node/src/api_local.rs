@@ -96,8 +96,8 @@ fn dex_registry_key() -> String {
 fn normalize_type_name(value: &str) -> String {
     let value = value.trim();
     match value.to_ascii_uppercase().as_str() {
-        "AIN" => return "00000000000000000000000000000001::staking::AincoreCoin".to_string(),
-        "WBTC" => return "00000000000000000000000000000001::wbtc::WBTC".to_string(),
+        "AIN" => return "0000000000000000000000000000000000000000000000000000000000000001::staking::AincoreCoin".to_string(),
+        "WBTC" => return "0000000000000000000000000000000000000000000000000000000000000001::wbtc::WBTC".to_string(),
         _ => {}
     }
 
@@ -105,8 +105,8 @@ fn normalize_type_name(value: &str) -> String {
     let mut parts: Vec<String> = trimmed.split("::").map(|part| part.to_string()).collect();
     if let Some(addr) = parts.get_mut(0) {
         *addr = addr.to_ascii_lowercase();
-        if addr.len() < 32 {
-            *addr = format!("{:0>32}", addr);
+        if addr.len() < crypto::ADDRESS_HEX_LEN {
+            *addr = format!("{:0>width$}", addr, width = crypto::ADDRESS_HEX_LEN);
         }
     }
     parts.join("::")
@@ -246,7 +246,7 @@ fn find_dex_pool_info<'a>(
         }
         (Some(value), None) => {
             let normalized_value = value.trim_start_matches("0x").to_ascii_lowercase();
-            if normalized_value.len() == 32
+            if normalized_value.len() == crypto::ADDRESS_HEX_LEN
                 && normalized_value.chars().all(|ch| ch.is_ascii_hexdigit())
             {
                 registry.pools.iter().find(|info| {
@@ -2057,7 +2057,7 @@ fn handle_rpc_method(
                     Ok(address) => Ok(serde_json::json!({
                         "public_key": pubkey_hex,
                         "address": address,
-                        "format": "hex(SHA256(pubkey)[0..16])"
+                        "format": "hex(SHA256(pubkey))"
                     })),
                     Err(e) => Err(JsonRpcError { code: -32000, message: format!("Derivation error: {}", e) })
                 }
@@ -2477,7 +2477,7 @@ mod tests {
         // "disabled" (-32030) path this test asserts.
         std::env::set_var("AINCORE_CHAIN_ID", "AINCORE-TESTNET-1");
         let db = temp_db("disabled");
-        let err = credit_testnet_faucet(&db, "00000000000000000000000000000001", 1, None)
+        let err = credit_testnet_faucet(&db, "0000000000000000000000000000000000000000000000000000000000000001", 1, None)
             .expect_err("faucet must be disabled by default");
         assert_eq!(err.code, -32030);
         std::env::remove_var("AINCORE_CHAIN_ID");
@@ -2541,7 +2541,7 @@ mod tests {
         let public_key = hex::encode(signing_key.verifying_key().as_bytes());
         let err = credit_testnet_faucet(
             &db,
-            "00000000000000000000000000000001",
+            "0000000000000000000000000000000000000000000000000000000000000001",
             1,
             Some(&public_key),
         )
@@ -2694,8 +2694,8 @@ mod tests {
             "0x11111111111111111111111111111111",
         )
         .unwrap();
-        let token_x = "00000000000000000000000000000001::staking::AincoreCoin";
-        let token_y = "00000000000000000000000000000001::wbtc::WBTC";
+        let token_x = "0000000000000000000000000000000000000000000000000000000000000001::staking::AincoreCoin";
+        let token_y = "0000000000000000000000000000000000000000000000000000000000000001::wbtc::WBTC";
         let pool_key = format!("{}::{}", token_x, token_y);
         let registry = DexPoolRegistry {
             pools: vec![DexPoolInfo {

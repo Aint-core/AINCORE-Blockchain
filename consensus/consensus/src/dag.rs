@@ -631,10 +631,11 @@ impl DagConsensus {
             }
         }
 
-        // C-10 FIX: Resolve the FULL Ed25519 public key from the account object in storage.
-        // vertex.author is a truncated 16-byte address (32 hex chars), but Ed25519 verification
-        // requires the full 32-byte public key (64 hex chars). Without this fix, signature
-        // verification would always fail because hex::decode produces only 16 bytes.
+        // C-10 FIX (#35): Resolve the FULL Ed25519 public key from the account object in storage.
+        // vertex.author is the 32-byte AINCORE address (64 hex chars) = hex(SHA256(pubkey)), but
+        // Ed25519 verification requires the full 32-byte public key (also 64 hex chars). The
+        // address cannot be expanded back into a key, so it is looked up and verified to derive
+        // the claimed author.
         let author_pubkey_hex = match self.resolve_author_pubkey(&vertex.author) {
             Some(pk) => pk,
             None => return,
@@ -1189,33 +1190,35 @@ impl DagConsensus {
 
     /// Resolve the FULL 64-hex Ed25519 public key for a vertex author.
     ///
-    /// (C-10) `vertex.author` is a truncated 16-byte address (32 hex chars) but
-    /// Ed25519 verification needs the full 32-byte key. Returns `None` (with a
-    /// diagnostic) when the key cannot be resolved or does not derive the claimed
-    /// author. Shared by `add_vertex` and equivocation-proof verification.
+    /// (C-10 / #35) `vertex.author` is the 32-byte AINCORE address (64 hex
+    /// chars) = hex(SHA256(pubkey)). Ed25519 verification needs the full 32-byte
+    /// public key (also 64 hex chars), so we resolve it from the account object
+    /// in storage and confirm it actually derives the claimed author via
+    /// `crypto::derive_address` — never via a hex-length heuristic, since address
+    /// and pubkey are now the same width. Returns `None` (with a diagnostic) when
+    /// the key cannot be resolved or does not derive the author. Shared by
+    /// `add_vertex` and equivocation-proof verification.
     fn resolve_author_pubkey(&self, author: &str) -> Option<String> {
         if let Some(account_obj) = self.storage.get_object(author) {
             if let Ok(account_data) =
                 serde_json::from_slice::<serde_json::Value>(&account_obj.data)
             {
                 if let Some(pk) = account_data.get("public_key").and_then(|v| v.as_str()) {
-                    if pk.len() == 64 {
-                        match hex::decode(pk)
-                            .ok()
-                            .and_then(|bytes| crypto::derive_address(&bytes).ok())
-                        {
-                            Some(addr) if addr == author => Some(pk.to_string()),
-                            _ => {
-                                println!(
-                                    "🚨 REJECTED: Stored public key does not derive author {}",
-                                    author
-                                );
-                                None
-                            }
-                        }
+                    // A valid Ed25519 public key is exactly 32 bytes (64 hex).
+                    // Resolution succeeds ONLY when the stored key derives the
+                    // claimed author address; an explicit derive-and-compare,
+                    // not a length test on `author`.
+                    let resolved = hex::decode(pk)
+                        .ok()
+                        .filter(|bytes| bytes.len() == 32)
+                        .and_then(|bytes| crypto::derive_address(&bytes).ok())
+                        .map(|addr| addr == author)
+                        .unwrap_or(false);
+                    if resolved {
+                        Some(pk.to_string())
                     } else {
                         println!(
-                            "🚨 REJECTED: Missing full Ed25519 public key for author {}",
+                            "🚨 REJECTED: Stored public key does not derive author {}",
                             author
                         );
                         None

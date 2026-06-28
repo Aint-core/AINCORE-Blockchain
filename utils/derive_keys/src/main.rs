@@ -12,7 +12,7 @@ fn main() {
         let sk = SigningKey::from_bytes(&key_bytes);
         let pk = sk.verifying_key();
         let pk_hex = hex::encode(pk.to_bytes());
-        let addr = pk_hex[0..32].to_string();
+        let addr = crypto::derive_address(&pk.to_bytes()).unwrap();
         println!("SK: {}", hex_sk);
         println!("PK: {}", pk_hex);
         println!("ADDR: {}", addr);

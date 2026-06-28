@@ -25,5 +25,5 @@ sha2 = "0.10"
 
 
 vm_move = { path = "../vm_move" }
-move-core-types = { git = "https://github.com/move-language/move", branch = "aptos-v1.3.0" }
+move-core-types = { git = "https://github.com/move-language/move", branch = "aptos-v1.3.0", features = ["address32"] }
 bcs = "0.1.3"

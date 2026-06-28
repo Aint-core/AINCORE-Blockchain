@@ -1,7 +1,7 @@
 fn parse_move_address(hex_str: &str) -> Option<move_core_types::account_address::AccountAddress> {
     let hex_str = hex_str.trim_start_matches("0x");
-    let mut bytes = [0u8; 16];
-    if hex_str.len() != 32 {
+    let mut bytes = [0u8; 32];
+    if hex_str.len() != 64 {
         return None;
     }
     match hex::decode_to_slice(hex_str, &mut bytes) {
@@ -200,9 +200,7 @@ fn main() -> anyhow::Result<()> {
             let device_bytes = hex::decode(&device).unwrap_or_else(|_| device.as_bytes().to_vec());
             let call = vm_move::EntryFunctionCall {
                 module: move_core_types::language_storage::ModuleId::new(
-                    move_core_types::account_address::AccountAddress::new([
-                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                    ]),
+                    move_core_types::account_address::AccountAddress::ONE,
                     move_core_types::identifier::Identifier::new("universal_mining").unwrap(),
                 ),
                 function: "submit_mining_proof".to_string(),
@@ -313,17 +311,13 @@ fn main() -> anyhow::Result<()> {
             // Construct payload
             let call = vm_move::EntryFunctionCall {
                 module: move_core_types::language_storage::ModuleId::new(
-                    move_core_types::account_address::AccountAddress::new([
-                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                    ]),
+                    move_core_types::account_address::AccountAddress::ONE,
                     move_core_types::identifier::Identifier::new("coin").unwrap(),
                 ),
                 function: "transfer".to_string(),
                 ty_args: vec![move_core_types::language_storage::TypeTag::Struct(
                     Box::new(move_core_types::language_storage::StructTag {
-                        address: move_core_types::account_address::AccountAddress::new([
-                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                        ]),
+                        address: move_core_types::account_address::AccountAddress::ONE,
                         module: move_core_types::identifier::Identifier::new("staking").unwrap(),
                         name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
                         type_params: vec![],
@@ -513,9 +507,7 @@ fn main() -> anyhow::Result<()> {
             let min_stake: u128 = 1_000_000_000_000_000_000_000; // 1000 AIN in quanta (smallest unit, 10^18)
             let call = vm_move::EntryFunctionCall {
                 module: move_core_types::language_storage::ModuleId::new(
-                    move_core_types::account_address::AccountAddress::new([
-                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                    ]),
+                    move_core_types::account_address::AccountAddress::ONE,
                     move_core_types::identifier::Identifier::new("staking").unwrap(),
                 ),
                 function: "join_validator_set".to_string(),
@@ -579,17 +571,13 @@ fn main() -> anyhow::Result<()> {
             let amount_quanta: u128 = amount as u128 * 1_000_000_000_000_000_000;
             let call = vm_move::EntryFunctionCall {
                 module: move_core_types::language_storage::ModuleId::new(
-                    move_core_types::account_address::AccountAddress::new([
-                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                    ]),
+                    move_core_types::account_address::AccountAddress::ONE,
                     move_core_types::identifier::Identifier::new("coin").unwrap(),
                 ),
                 function: "transfer".to_string(),
                 ty_args: vec![move_core_types::language_storage::TypeTag::Struct(
                     Box::new(move_core_types::language_storage::StructTag {
-                        address: move_core_types::account_address::AccountAddress::new([
-                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                        ]),
+                        address: move_core_types::account_address::AccountAddress::ONE,
                         module: move_core_types::identifier::Identifier::new("staking").unwrap(),
                         name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
                         type_params: vec![],

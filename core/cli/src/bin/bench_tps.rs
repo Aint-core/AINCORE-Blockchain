@@ -6,9 +6,7 @@ use std::time::Instant;
 fn aincore_coin_type() -> move_core_types::language_storage::TypeTag {
     move_core_types::language_storage::TypeTag::Struct(Box::new(
         move_core_types::language_storage::StructTag {
-            address: move_core_types::account_address::AccountAddress::new([
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-            ]),
+            address: move_core_types::account_address::AccountAddress::ONE,
             module: move_core_types::identifier::Identifier::new("staking").unwrap(),
             name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
             type_params: vec![],
@@ -24,9 +22,7 @@ fn parse_move_address(addr: &str) -> move_core_types::account_address::AccountAd
 fn transfer_payload(sender: &str, recipient: &str, amount: u128) -> String {
     let call = vm_move::EntryFunctionCall {
         module: move_core_types::language_storage::ModuleId::new(
-            move_core_types::account_address::AccountAddress::new([
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-            ]),
+            move_core_types::account_address::AccountAddress::ONE,
             move_core_types::identifier::Identifier::new("coin").unwrap(),
         ),
         function: "transfer".to_string(),

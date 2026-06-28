@@ -159,21 +159,28 @@ pub fn verify_signature(
     }
 }
 
+/// Width of an AINCORE address in bytes (matches Move AccountAddress::LENGTH
+/// when the `address32` feature is enabled).
+pub const ADDRESS_BYTES: usize = 32;
+
+/// Width of an AINCORE address as a hex string (no `0x` prefix).
+pub const ADDRESS_HEX_LEN: usize = ADDRESS_BYTES * 2;
+
 /// Derive AINCORE address from public key
 ///
-/// Address = hex(first 16 bytes of SHA256(public_key))
+/// Address = hex(SHA256(public_key)) — the full 32-byte digest
 ///
 /// # Arguments
 /// * `public_key` - 32-byte Ed25519 public key
 ///
 /// # Returns
-/// * 32-character hex string (16 bytes)
+/// * 64-character hex string (32 bytes)
 ///
 /// # Example
 /// ```
 /// let pubkey = [0u8; 32];
 /// let address = crypto::derive_address(&pubkey).unwrap();
-/// assert_eq!(address.len(), 32); // 16 bytes = 32 hex chars
+/// assert_eq!(address.len(), 64); // 32 bytes = 64 hex chars
 /// ```
 pub fn derive_address(public_key: &[u8]) -> Result<String, CryptoError> {
     if public_key.is_empty() {
@@ -183,7 +190,7 @@ pub fn derive_address(public_key: &[u8]) -> Result<String, CryptoError> {
     }
 
     let hash = hash(public_key);
-    Ok(hex::encode(&hash[0..16]))
+    Ok(hex::encode(hash))
 }
 
 #[cfg(test)]
@@ -212,7 +219,7 @@ mod tests {
     fn test_derive_address() {
         let pubkey = vec![0u8; 32]; // Dummy pubkey
         let address = derive_address(&pubkey).unwrap();
-        assert_eq!(address.len(), 32); // 16 bytes = 32 hex chars
+        assert_eq!(address.len(), 64); // 32 bytes = 64 hex chars
     }
 
     #[test]

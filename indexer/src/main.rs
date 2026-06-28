@@ -1186,7 +1186,7 @@ mod tests {
 
         assert_eq!(
             decoded_receiver.as_deref(),
-            Some("22222222222222222222222222222222")
+            Some("0000000000000000000000000000000022222222222222222222222222222222")
         );
         assert_eq!(decoded_amount, 1234);
     }

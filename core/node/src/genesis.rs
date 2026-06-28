@@ -16,15 +16,11 @@ use storage::StateDB;
 const GENESIS_VERSION: &str = "phase1-bls-stake-v1";
 const GENESIS_STDLIB_MODULES_KEY: &str = "genesis_stdlib_modules";
 const GENESIS_STDLIB_COUNT_KEY: &str = "genesis_stdlib_module_count";
-const REQUIRED_STDLIB_MODULES: &[&str] = &[
-    "module_00000000000000000000000000000001_signer",
-    "module_00000000000000000000000000000001_vector",
-    "module_00000000000000000000000000000001_bcs",
-    "module_00000000000000000000000000000001_hash",
-    "module_00000000000000000000000000000001_coin",
-    "module_00000000000000000000000000000001_staking",
-    "module_00000000000000000000000000000001_dex",
-];
+/// Module names that MUST be present in the stdlib bundle, published under the
+/// system address @0x1. The full storage key is built from `AccountAddress::ONE`
+/// so it tracks the address width (#35: 32 bytes / 64 hex via `address32`).
+const REQUIRED_STDLIB_MODULE_NAMES: &[&str] =
+    &["signer", "vector", "bcs", "hash", "coin", "staking", "dex"];
 
 #[derive(Debug)]
 pub enum GenesisError {
@@ -358,8 +354,9 @@ fn load_stdlib_modules(stdlib_path: &str) -> Result<Vec<(String, Vec<u8>)>, Gene
 
 fn validate_required_stdlib_modules(modules: &[(String, Vec<u8>)]) -> Result<(), GenesisError> {
     let available: BTreeSet<&str> = modules.iter().map(|(key, _)| key.as_str()).collect();
-    for required in REQUIRED_STDLIB_MODULES {
-        if !available.contains(required) {
+    for name in REQUIRED_STDLIB_MODULE_NAMES {
+        let required = format!("module_{}_{}", AccountAddress::ONE, name);
+        if !available.contains(required.as_str()) {
             return Err(GenesisError::InvalidData(format!(
                 "Stdlib bytecode is missing required module: {}",
                 required
@@ -1349,7 +1346,7 @@ mod tests {
         )
         .expect("valid genesis reopens");
 
-        db.delete("module_00000000000000000000000000000001_signer")
+        db.delete("module_0000000000000000000000000000000000000000000000000000000000000001_signer")
             .expect("corrupt stdlib delete");
         let err = initialize_genesis(
             &db,
@@ -1383,7 +1380,7 @@ mod tests {
         )
         .expect("fresh genesis initializes");
 
-        db.put("module_00000000000000000000000000000001_signer", "00")
+        db.put("module_0000000000000000000000000000000000000000000000000000000000000001_signer", "00")
             .expect("corrupt module bytes");
         let err = initialize_genesis(
             &db,
@@ -1452,11 +1449,11 @@ mod tests {
         .expect("fresh genesis initializes");
 
         let coin_bytes = db
-            .get("module_00000000000000000000000000000001_coin")
+            .get("module_0000000000000000000000000000000000000000000000000000000000000001_coin")
             .expect("coin read")
             .expect("coin exists");
         db.put(
-            "module_00000000000000000000000000000001_signer",
+            "module_0000000000000000000000000000000000000000000000000000000000000001_signer",
             &coin_bytes,
         )
         .expect("swap module bytes under signer key");

@@ -25,4 +25,4 @@ bcs = "0.1"
 # SEC-#27 admission-balance tests: build the exact CoinStore key the executor
 # reads, so the gate's reject path can be exercised end-to-end. Same git source
 # vm_move already pins (resolved in the workspace lockfile).
-move-core-types = { git = "https://github.com/move-language/move", branch = "aptos-v1.3.0" }
+move-core-types = { git = "https://github.com/move-language/move", branch = "aptos-v1.3.0", features = ["address32"] }

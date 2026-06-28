@@ -2032,6 +2032,7 @@ dependencies = [
 name = "derive_keys"
 version = "0.1.0"
 dependencies = [
+ "crypto",
  "ed25519-dalek",
  "hex",
 ]

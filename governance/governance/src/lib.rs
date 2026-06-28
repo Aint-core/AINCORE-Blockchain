@@ -622,9 +622,17 @@ mod tests {
     }
 
     fn put_coin_store(db: &StateDB, address: &str, amount: u128) {
+        // The Move VM writes CoinStore resource keys using the canonical
+        // AccountAddress Display (#35: 32 bytes / 64 hex), so the test seed must
+        // use the same normalization that query_move_vm_balance applies.
+        let canonical = move_core_types::account_address::AccountAddress::from_hex_literal(
+            &format!("0x{}", address.trim_start_matches("0x")),
+        )
+        .expect("valid test address")
+        .to_string();
         let key = format!(
             "resource_{}_0x1::coin::CoinStore<0x1::staking::AincoreCoin>",
-            address
+            canonical
         );
         db.put(&key, &hex::encode(amount.to_le_bytes()))
             .expect("write CoinStore");

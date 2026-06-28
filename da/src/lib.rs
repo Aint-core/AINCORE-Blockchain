@@ -528,8 +528,21 @@ impl DASequencer {
                                     return;
                                 }
 
-                                // Verify Identity matches
-                                let expected_id = hex::encode(&pubkey_bytes)[0..32].to_string();
+                                // Verify Identity matches.
+                                // Node identity is the canonical AINCORE address =
+                                // hex(SHA256(pubkey)) (crypto::derive_address), NOT a
+                                // prefix of the raw public key. Must stay in lockstep
+                                // with core/node's node_id derivation.
+                                let expected_id = match crypto::derive_address(&pubkey_bytes) {
+                                    Ok(id) => id,
+                                    Err(_) => {
+                                        eprintln!(
+                                            "🚨 [DA] Cannot derive proposer id for batch epoch {}",
+                                            payload.epoch
+                                        );
+                                        return;
+                                    }
+                                };
                                 if expected_id != payload.proposer_id {
                                     eprintln!(
                                         "🚨 [DA] Identity mismatch for batch epoch {}",

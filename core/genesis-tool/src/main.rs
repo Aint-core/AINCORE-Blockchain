@@ -14,8 +14,12 @@ struct Args {
     #[arg(short, long, default_value = "vm_move/stdlib/bytecode")]
     stdlib_path: String,
 
-    /// Genesis Validator Address (Hex)
-    #[arg(short, long, default_value = "00000000000000000000000000000001")]
+    /// Genesis Validator Address (Hex, 32 bytes = 64 hex chars)
+    #[arg(
+        short,
+        long,
+        default_value = "0000000000000000000000000000000000000000000000000000000000000001"
+    )]
     genesis_addr: String,
 
     /// Genesis Validator Public Key (Hex). Defaults to genesis_addr for legacy tooling.
