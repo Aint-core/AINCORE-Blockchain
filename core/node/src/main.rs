@@ -676,8 +676,10 @@ async fn main() {
                 } else if msg.starts_with("DAG_VERTEX:")
                     || msg.starts_with("DOWNTIME_ATTEST:")
                     || msg.starts_with("EQUIV_PROOF:")
+                    || msg.starts_with("QC_VOTE:")
                 {
-                    // WRITE LOCK required to update DAG / store remote attestation / slash equivocator
+                    // WRITE LOCK required to update DAG / store remote attestation /
+                    // slash equivocator / collect+aggregate QC finality votes
                     if let Ok(mut guard) = node_consensus.write() {
                         guard.handle_message(&msg);
                     }
@@ -722,6 +724,7 @@ async fn main() {
                     } else if msg.starts_with("DAG_VERTEX:")
                         || msg.starts_with("DOWNTIME_ATTEST:")
                         || msg.starts_with("EQUIV_PROOF:")
+                        || msg.starts_with("QC_VOTE:")
                     {
                         if let Ok(mut guard) = node_consensus.write() {
                             guard.handle_message(&msg);

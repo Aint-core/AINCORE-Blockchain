@@ -962,12 +962,22 @@ impl DagConsensus {
                             receipts_root: qc_receipts_root.clone(),
                             finality_digest: commit.finality_digest.clone(),
                         };
-                        let _ = crate::qc_producer::produce_and_store_qc(
+                        // Phase 3: if this node alone cannot finalize, broadcast
+                        // its partial finality vote so peers can aggregate a
+                        // multi-party QC. Side-effect-only; a send failure just
+                        // skips the gossip and consensus is unaffected.
+                        match crate::qc_producer::produce_and_store_qc(
                             &self.storage,
                             &self.node_key,
                             &self.node_id,
                             &ctx,
-                        );
+                        ) {
+                            crate::qc_producer::QcOutcome::Partial(vote_msg) => {
+                                self.broadcast_qc_vote(&vote_msg);
+                            }
+                            crate::qc_producer::QcOutcome::Complete(_)
+                            | crate::qc_producer::QcOutcome::Skipped => {}
+                        }
                     }
                 }
             }
@@ -1397,6 +1407,96 @@ impl DagConsensus {
         self.broadcast_equivocation_proof(&a, &b);
     }
 
+    /// QC Phase 3: gossip THIS node's partial finality vote so peers can
+    /// aggregate a multi-party quorum certificate. Mirrors the
+    /// `broadcast_attestation` transport (Gossipsub + TCP fallback). The vote is
+    /// self-authenticating: it carries a BLS signature the receiver verifies
+    /// against the signer's key in the frozen epoch validator set, so no extra
+    /// reporter signature is needed.
+    fn broadcast_qc_vote(&self, vote_msg: &crate::qc_producer::QcVoteMessage) {
+        let serialized = match serde_json::to_string(vote_msg) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("❌ [QC] Failed to serialise finality vote: {}", e);
+                return;
+            }
+        };
+        let msg = format!("QC_VOTE:{}", serialized);
+
+        // 1. Gossipsub.
+        if let Some(tx) = &self.p2p_tx {
+            let tx_clone = tx.clone();
+            let msg_clone = msg.clone();
+            tokio::spawn(async move {
+                let _ = tx_clone.send(msg_clone).await;
+            });
+        }
+
+        // 2. TCP fallback.
+        use network::send_message;
+        if let Ok(peers) = self.peers.lock() {
+            for (peer_id, port) in peers.iter() {
+                if *peer_id != self.node_id {
+                    let ip = self
+                        .storage
+                        .get_peer_ip(peer_id)
+                        .unwrap_or_else(|| "127.0.0.1".to_string());
+                    let addr = format!("{}:{}", ip, port);
+                    let _ = send_message(&addr, &msg);
+                }
+            }
+        }
+    }
+
+    /// QC Phase 3: handle an inbound peer finality vote. Verify the single BLS
+    /// signature against the signer's key in the frozen epoch validator set, bind
+    /// the vote to THIS node's committed block at the vote's anchor round, persist
+    /// it (deduped per (round, signer)), and — once the collected stake exceeds
+    /// 2/3 — deterministically aggregate, verify, and store a complete QC.
+    ///
+    /// Fully side-effect-only: any failure drops the vote and never affects
+    /// consensus. A QC is never stored unless it verifies (enforced inside
+    /// `collect_vote_and_try_aggregate`).
+    fn handle_remote_qc_vote(&self, content: &str) {
+        let vote_msg: crate::qc_producer::QcVoteMessage = match serde_json::from_str(content) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("❌ [QC] Malformed finality vote JSON: {}", e);
+                return;
+            }
+        };
+
+        // Bind the vote to OUR committed block at its anchor round, when known.
+        // We look up the block hash this node committed at the vote's height; if
+        // it disagrees the vote is for a different fork/block and is dropped by
+        // the aggregator. (When we have not committed that height yet, pass None
+        // and let the validator_set_hash + BLS-over-exact-vote binding guard it.)
+        let expected_block_hash = self
+            .storage
+            .get(&format!("block_{}", vote_msg.vote.block_height))
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|b| {
+                b.get("header")
+                    .and_then(|h| h.get("hash"))
+                    .and_then(|h| h.as_str())
+                    .map(|s| s.to_string())
+            });
+
+        let outcome = crate::qc_producer::collect_vote_and_try_aggregate(
+            &self.storage,
+            &vote_msg,
+            expected_block_hash.as_deref(),
+        );
+        if let crate::qc_producer::QcOutcome::Complete(qc) = outcome {
+            println!(
+                "✅ [QC] multi-party quorum certificate assembled for block #{}",
+                qc.block_height
+            );
+        }
+    }
+
     pub fn handle_message(&mut self, msg: &str) {
         if let Some(content) = msg.strip_prefix("DAG_VERTEX:") {
             if let Ok(vertex) = serde_json::from_str::<Vertex>(content) {
@@ -1411,6 +1511,10 @@ impl DagConsensus {
             // peer. Independently verify (both vertices signed by the offender,
             // same round, distinct bodies) before slashing, then re-gossip once.
             self.handle_remote_equivocation(content);
+        } else if let Some(content) = msg.strip_prefix("QC_VOTE:") {
+            // QC Phase 3: a peer's partial finality vote for multi-party QC
+            // aggregation. Verify + collect; aggregate a complete QC on quorum.
+            self.handle_remote_qc_vote(content);
         }
     }
 
