@@ -925,6 +925,11 @@ impl Executor {
                 }
                 self.sync_supply_trackers_from_validator_set();
                 self.rotate_validator_epoch(next_height);
+                // SEC-#32b: deterministic on-chain governance driver. Runs at the
+                // SAME epoch boundary on BOTH the consensus (dag) and sync paths,
+                // using the on-chain monotonic epoch clock (NOT wall-clock) so all
+                // nodes apply governance timelock transitions identically.
+                self.drive_governance(next_height);
                 println!("⏳ Epoch advanced at block {}", next_height);
             }
             Err(err) => {
@@ -975,6 +980,45 @@ impl Executor {
                 .db
                 .delete(&format!("consensus:epoch_start_height:{}", stale));
         }
+    }
+
+    /// SEC-#32b: read the deterministic on-chain monotonic clock (seconds) from
+    /// the Move `0x1::epoch::Epoch` resource. BCS layout is
+    /// `(epoch_number: u64, epoch_start_time: u64, duration: u64)`; the second
+    /// field is the accumulated virtual time and is identical across all nodes
+    /// after `advance_epoch` commits. Returns 0 if the resource is absent
+    /// (pre-genesis / no epoch state yet), which simply means no governance
+    /// timelock is due.
+    fn on_chain_epoch_clock_secs(&self) -> u64 {
+        let key = format!(
+            "resource_{}_0x1::epoch::Epoch",
+            "00000000000000000000000000000001"
+        );
+        let raw = match self.db.get(&key) {
+            Ok(Some(raw)) => raw,
+            _ => return 0,
+        };
+        let bytes = match hex::decode(raw) {
+            Ok(b) => b,
+            Err(_) => return 0,
+        };
+        match bcs::from_bytes::<(u64, u64, u64)>(&bytes) {
+            Ok((_epoch_number, epoch_start_time, _duration)) => epoch_start_time,
+            Err(_) => 0,
+        }
+    }
+
+    /// SEC-#32b: deterministic governance driver invoked from the epoch boundary
+    /// (single wiring point for BOTH consensus and sync paths). Uses the
+    /// on-chain epoch clock as `now_secs` so timelock decisions are identical on
+    /// every node and never depend on wall-clock or per-node environment.
+    fn drive_governance(&self, boundary_height: u64) {
+        let now_secs = self.on_chain_epoch_clock_secs();
+        if now_secs == 0 {
+            return;
+        }
+        let governance = governance::GovernanceManager::new(self.db.clone());
+        governance.process_due_proposals(now_secs, boundary_height);
     }
 
     fn burn_supply_trackers(&self, amount: u128) {
@@ -2928,6 +2972,81 @@ mod tests {
             db.get("sys:validator_set:epoch:0").unwrap().is_none(),
             "snapshot beyond the retention window must be pruned"
         );
+    }
+
+    /// #32b: the executor reads the on-chain monotonic clock (Epoch resource,
+    /// field 2 = epoch_start_time) as its deterministic governance time source.
+    #[test]
+    fn b32_on_chain_epoch_clock_reads_epoch_start_time() {
+        let db = temp_db("b32_clock");
+        let exec = Executor::new(Arc::clone(&db));
+
+        // No Epoch resource yet → clock reads 0 (nothing due).
+        assert_eq!(exec.on_chain_epoch_clock_secs(), 0);
+
+        // Seed Epoch @0x1 = (epoch_number=7, epoch_start_time=123456, duration=10).
+        let key = format!(
+            "resource_{}_0x1::epoch::Epoch",
+            "00000000000000000000000000000001"
+        );
+        let bytes = bcs::to_bytes(&(7u64, 123_456u64, 10u64)).unwrap();
+        db.put(&key, &hex::encode(bytes)).unwrap();
+
+        assert_eq!(
+            exec.on_chain_epoch_clock_secs(),
+            123_456,
+            "must return the accumulated monotonic epoch_start_time, not the epoch number"
+        );
+    }
+
+    /// #32b end-to-end at the executor wiring point: drive_governance, given a
+    /// queued proposal past its timelock and an on-chain clock past that time,
+    /// deterministically executes the proposal's action (federation key write).
+    /// This is the single point both the consensus and sync paths funnel through
+    /// via maybe_advance_epoch → drive_governance.
+    #[test]
+    fn b32_drive_governance_executes_due_proposal_via_onchain_clock() {
+        let db = temp_db("b32_drive");
+        let exec = Executor::new(Arc::clone(&db));
+
+        // On-chain clock at 5000s.
+        let key = format!(
+            "resource_{}_0x1::epoch::Epoch",
+            "00000000000000000000000000000001"
+        );
+        let bytes = bcs::to_bytes(&(2u64, 5_000u64, 10u64)).unwrap();
+        db.put(&key, &hex::encode(bytes)).unwrap();
+
+        // Seed a Queued proposal whose timelock matured at 4000s.
+        let gov = governance::GovernanceManager::new(Arc::clone(&db));
+        let proposal = governance::Proposal {
+            id: "exec_me".to_string(),
+            title: "t".to_string(),
+            description: "d".to_string(),
+            proposer: "0x1".to_string(),
+            action: Some(governance::GovernanceAction::UpdateFederationKey(
+                "NEWFED".to_string(),
+            )),
+            start_time: 0,
+            end_time: 100,
+            execution_time: Some(4_000),
+            yes_votes: 0,
+            no_votes: 0,
+            status: governance::ProposalStatus::Queued,
+            snapshot_block_height: 0,
+        };
+        gov.test_seed_proposal(&proposal);
+
+        // Drive at the epoch boundary — uses the on-chain clock (5000 ≥ 4000).
+        exec.drive_governance(60);
+
+        assert_eq!(
+            db.get_federation_key(),
+            "NEWFED",
+            "due queued proposal must execute deterministically from the epoch boundary"
+        );
+        let executed = gov.get_proposal("exec_me").unwrap();
+        assert_eq!(executed.status, governance::ProposalStatus::Executed);
     }
 
     fn load_stdlib(db: &StateDB) {

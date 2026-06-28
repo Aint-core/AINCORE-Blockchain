@@ -2674,6 +2674,7 @@ dependencies = [
  "bcs",
  "crypto",
  "ed25519-dalek",
+ "governance",
  "hex",
  "move-binary-format",
  "move-core-types",
