@@ -42,7 +42,14 @@ pub enum DepositStatus {
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 struct PersistedState {
-    /// tx_hash → DepositStatus
+    /// dedup_key → DepositStatus.
+    ///
+    /// Audit #33: the key is now PER-OUTPUT (`"{txid}:{vout}"`), not per-tx.
+    /// One BTC tx may carry two custody outputs (e.g. two OP_RETURN-tagged
+    /// payments) — each is an independent deposit and must get its own
+    /// tombstone, mirroring the EVM bridge's `(block_height, tx_index)`
+    /// uniqueness. Legacy entries (bare txids, from the pre-#33 schema) remain
+    /// valid keys and simply never collide with the new per-output keys.
     deposits: HashMap<String, DepositStatus>,
     /// Highest BTC block height we have ever observed a finalized deposit at.
     /// Informational — not used to skip scans (blockchain.info has no range).
@@ -106,27 +113,28 @@ impl Storage {
         None
     }
 
-    /// Returns true if the tx has any record (in_progress OR completed) — in
-    /// either case the caller must NOT re-mint without operator intervention.
-    pub fn is_seen(&self, tx_hash: &str) -> bool {
-        self.state.deposits.contains_key(tx_hash)
+    /// Returns true if this deposit key (`"{txid}:{vout}"`) has any record
+    /// (in_progress OR completed) — in either case the caller must NOT re-mint
+    /// without operator intervention.
+    pub fn is_seen(&self, key: &str) -> bool {
+        self.state.deposits.contains_key(key)
     }
 
     /// H-03 fix: tombstone BEFORE attempting the mint. If `save()` fails the
     /// caller MUST abort the mint — otherwise a crash after a successful mint
     /// but before `mark_completed` would cause a double-mint on next boot.
-    pub fn mark_in_progress(&mut self, tx_hash: String) -> Result<()> {
-        self.state
-            .deposits
-            .insert(tx_hash, DepositStatus::InProgress);
+    /// `key` is the per-output dedup key (`"{txid}:{vout}"`).
+    pub fn mark_in_progress(&mut self, key: String) -> Result<()> {
+        self.state.deposits.insert(key, DepositStatus::InProgress);
         self.save()
     }
 
     /// Promote an in-progress tombstone to completed after a successful mint.
-    pub fn mark_completed(&mut self, tx_hash: &str) -> Result<()> {
+    /// `key` is the per-output dedup key (`"{txid}:{vout}"`).
+    pub fn mark_completed(&mut self, key: &str) -> Result<()> {
         self.state
             .deposits
-            .insert(tx_hash.to_string(), DepositStatus::Completed);
+            .insert(key.to_string(), DepositStatus::Completed);
         self.save()
     }
 
@@ -197,6 +205,39 @@ mod tests {
             s2.is_seen("tx_xyz"),
             "in-progress tombstone must prevent re-mint"
         );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Audit #33: two custody outputs of the SAME btc tx (`txid:0`, `txid:1`)
+    /// must be tracked as two independent deposits, not collapsed by txid.
+    #[test]
+    fn per_output_dedup_two_outputs_distinct() {
+        let path = tmp_path("per_output_dedup");
+        let _ = fs::remove_file(&path);
+
+        let mut s = Storage::new(&path);
+        let k0 = "abcd:0";
+        let k1 = "abcd:1";
+        assert!(!s.is_seen(k0));
+        assert!(!s.is_seen(k1));
+
+        // Process the first custody output of the tx.
+        s.mark_in_progress(k0.to_string()).unwrap();
+        assert!(s.is_seen(k0), "first output must be tombstoned");
+        assert!(
+            !s.is_seen(k1),
+            "second custody output of the SAME tx must NOT be treated as seen"
+        );
+
+        // Now process the second output.
+        s.mark_in_progress(k1.to_string()).unwrap();
+        s.mark_completed(k0).unwrap();
+        s.mark_completed(k1).unwrap();
+
+        let s2 = Storage::new(&path);
+        assert!(s2.is_seen(k0));
+        assert!(s2.is_seen(k1));
 
         let _ = fs::remove_file(&path);
     }

@@ -16,3 +16,8 @@ rpassword = "7"
 log = "0.4"
 env_logger = "0.10"
 # Using a simpler hex/json approach for bridge to avoid heavy bitcoin lib dependency for just monitoring
+# Audit #33: custody scriptPubKey/address derivation (pure, deterministic — no wall-clock/RNG).
+sha2 = "0.10"
+ripemd = "0.1"
+bech32 = "0.9"
+bs58 = { version = "0.5", features = ["check"] }

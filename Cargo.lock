@@ -1121,14 +1121,18 @@ name = "btc-bridge"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bech32",
+ "bs58",
  "env_logger",
  "hex",
  "keystore",
  "log",
  "reqwest",
+ "ripemd",
  "rpassword",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
 ]
 
