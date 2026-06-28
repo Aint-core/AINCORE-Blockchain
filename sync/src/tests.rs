@@ -740,4 +740,174 @@ mod tests {
         let stored_b2: Block = serde_json::from_str(&stored_b2).unwrap();
         assert_eq!(stored_b2.header.hash, local_b2.header.hash);
     }
+
+    // ---- TASK-#29: seed-anchor / N-peer tip agreement ----
+
+    // (1) SEED PREFERENCE: seed/validator peers must be ordered FIRST, regardless of
+    // HashMap iteration order; remaining peers follow. Ordering is deterministic.
+    #[test]
+    fn test_order_peers_seed_first() {
+        let mut peers = HashMap::new();
+        peers.insert("zeta_peer".to_string(), 9001u16);
+        peers.insert("validator_b".to_string(), 9002u16);
+        peers.insert("alpha_peer".to_string(), 9003u16);
+        peers.insert("validator_a".to_string(), 9004u16);
+
+        let seeds = vec!["validator_a".to_string(), "validator_b".to_string()];
+        let ordered = ChainSync::order_peers_seed_first(&peers, &seeds);
+
+        let ids: Vec<&str> = ordered.iter().map(|(id, _)| id.as_str()).collect();
+        // Seeds first (sorted by id), then non-seeds (sorted by id).
+        assert_eq!(
+            ids,
+            vec!["validator_a", "validator_b", "alpha_peer", "zeta_peer"]
+        );
+        // Ports are carried through correctly.
+        assert_eq!(ordered[0], ("validator_a".to_string(), 9004));
+    }
+
+    #[test]
+    fn test_order_peers_seed_first_no_seeds_is_sorted() {
+        let mut peers = HashMap::new();
+        peers.insert("c".to_string(), 1u16);
+        peers.insert("a".to_string(), 2u16);
+        peers.insert("b".to_string(), 3u16);
+        let ordered = ChainSync::order_peers_seed_first(&peers, &[]);
+        let ids: Vec<&str> = ordered.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    // Helper: a verified-shaped QC with a chosen finalized tip. tip_agreement_decision
+    // is a PURE tally over already-verified QCs, so mutating block_height/block_hash
+    // here is sound for these unit tests (no re-verification happens in the tally).
+    fn qc_with_tip(sync: &ChainSync, height: u64, hash: &str) -> consensus::qc::QuorumCertificate {
+        let mut qc = build_test_qc(sync, 9000, 8990);
+        qc.block_height = height;
+        qc.block_hash = hash.to_string();
+        qc
+    }
+
+    // (2) N-PEER TIP AGREEMENT: with N=2, two seeds advertising the SAME tip agree.
+    #[test]
+    fn test_tip_agreement_requires_n_consistent_tips() {
+        let sync = setup_sync("tip_agree_n2_ok");
+        let tip_hash = "aa".repeat(32);
+        let tips = vec![
+            qc_with_tip(&sync, 100, &tip_hash),
+            qc_with_tip(&sync, 100, &tip_hash),
+        ];
+        let decision = ChainSync::tip_agreement_decision(&tips, 2);
+        assert_eq!(decision, Ok((100, tip_hash)));
+    }
+
+    // N=2 but only ONE seed advertised a tip -> shortfall -> refuse.
+    #[test]
+    fn test_tip_agreement_shortfall_refuses() {
+        let sync = setup_sync("tip_agree_shortfall");
+        let tips = vec![qc_with_tip(&sync, 100, &"aa".repeat(32))];
+        let err = ChainSync::tip_agreement_decision(&tips, 2).unwrap_err();
+        assert!(
+            err.contains("only 1 seed"),
+            "expected shortfall message, got: {err}"
+        );
+    }
+
+    // N=2, two seeds but DIFFERENT tips -> disagreement -> refuse.
+    #[test]
+    fn test_tip_agreement_disagreement_refuses() {
+        let sync = setup_sync("tip_agree_disagree");
+        let tips = vec![
+            qc_with_tip(&sync, 100, &"aa".repeat(32)),
+            qc_with_tip(&sync, 101, &"bb".repeat(32)),
+        ];
+        let err = ChainSync::tip_agreement_decision(&tips, 2).unwrap_err();
+        assert!(
+            err.contains("disagree") || err.contains("no tip reached"),
+            "expected disagreement message, got: {err}"
+        );
+    }
+
+    // Mixed: 2 of 3 seeds agree, 1 dissents, N=2 -> the agreeing tip wins.
+    #[test]
+    fn test_tip_agreement_majority_with_one_dissenter() {
+        let sync = setup_sync("tip_agree_majority");
+        let agreed = "aa".repeat(32);
+        let tips = vec![
+            qc_with_tip(&sync, 100, &agreed),
+            qc_with_tip(&sync, 100, &agreed),
+            qc_with_tip(&sync, 200, &"cc".repeat(32)),
+        ];
+        let decision = ChainSync::tip_agreement_decision(&tips, 2);
+        assert_eq!(decision, Ok((100, agreed)));
+    }
+
+    // N=1 PRESERVES CURRENT BEHAVIOUR: a single advertised tip is accepted.
+    #[test]
+    fn test_tip_agreement_n1_preserves_single_seed_behavior() {
+        let sync = setup_sync("tip_agree_n1");
+        let tip_hash = "aa".repeat(32);
+        let tips = vec![qc_with_tip(&sync, 100, &tip_hash)];
+        let decision = ChainSync::tip_agreement_decision(&tips, 1);
+        assert_eq!(decision, Ok((100, tip_hash)));
+    }
+
+    // N=0 is clamped to 1 (no env, deterministic floor).
+    #[test]
+    fn test_tip_agreement_n_zero_clamped_to_one() {
+        let sync = setup_sync("tip_agree_n0");
+        let tip_hash = "aa".repeat(32);
+        let tips = vec![qc_with_tip(&sync, 100, &tip_hash)];
+        let decision = ChainSync::tip_agreement_decision(&tips, 0);
+        assert_eq!(decision, Ok((100, tip_hash)));
+        // ...and an empty set with clamped-1 still fails (need >=1).
+        assert!(ChainSync::tip_agreement_decision(&[], 0).is_err());
+    }
+
+    // Config knob: default is 1 (current behaviour); a stored value overrides; bogus
+    // / sub-1 values clamp to 1.
+    #[test]
+    fn test_tip_agreement_n_config_knob() {
+        let sync = setup_sync("tip_n_config");
+        assert_eq!(sync.tip_agreement_n(), 1, "default must be 1");
+
+        sync.storage
+            .put("sys:config:tip_agreement_n", "3")
+            .unwrap();
+        assert_eq!(sync.tip_agreement_n(), 3);
+
+        sync.storage
+            .put("sys:config:tip_agreement_n", "0")
+            .unwrap();
+        assert_eq!(sync.tip_agreement_n(), 1, "0 clamps to 1");
+
+        sync.storage
+            .put("sys:config:tip_agreement_n", "garbage")
+            .unwrap();
+        assert_eq!(sync.tip_agreement_n(), 1, "unparsable falls back to 1");
+    }
+
+    // End-to-end-ish: with N=2 configured and no reachable seeds, sync_from_peers must
+    // REFUSE to advance (tip disagreement / shortfall) and return the local height.
+    #[tokio::test]
+    async fn test_sync_refuses_when_tip_agreement_unmet() {
+        let sync = setup_sync("tip_refuse_sync");
+        sync.storage.put("latest_height", "5").unwrap();
+        sync.storage
+            .put("sys:config:tip_agreement_n", "2")
+            .unwrap();
+        // Two validator seeds, but their peer_ip is never persisted -> unreachable,
+        // so zero verified tips are gathered -> shortfall -> refuse.
+        set_validators(&sync, vec![("validator_a", 100), ("validator_b", 100)]);
+        sync.peers
+            .lock()
+            .unwrap()
+            .insert("validator_a".to_string(), 9101);
+        sync.peers
+            .lock()
+            .unwrap()
+            .insert("validator_b".to_string(), 9102);
+
+        let height = sync.sync_from_peers().await;
+        assert_eq!(height, 5, "must not advance when tip agreement is unmet");
+    }
 }

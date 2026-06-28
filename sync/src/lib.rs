@@ -150,6 +150,99 @@ impl ChainSync {
             .collect()
     }
 
+    /// TASK-#29: number of distinct seed peers that must advertise a CONSISTENT
+    /// finalized tip before this node will accept it as the head to sync past.
+    ///
+    /// Resolved from the genesis-pinned `sys:config:tip_agreement_n` so it is
+    /// deterministic and identical across nodes (NO env var, NO wall-clock — this
+    /// path runs during sync and must not fork). Default 1 preserves the current
+    /// single-seed behaviour. A value below 1 is clamped to 1.
+    fn tip_agreement_n(&self) -> usize {
+        self.storage
+            .get("sys:config:tip_agreement_n")
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    /// TASK-#29 (pure, unit-testable): order peers so trusted seed/validator peers
+    /// are tried FIRST, then everyone else. HashMap iteration order is arbitrary;
+    /// seeding the sync from a validator peer (the trusted fallback-seed set) before
+    /// an unknown peer reduces the chance of being fed a bogus tip by a random peer.
+    ///
+    /// Ordering within each group, and the relative order of the two groups, is
+    /// stable/deterministic: peers are sorted by id, seeds (those whose id is in
+    /// `seed_set`) first. This keeps the iteration reproducible across nodes.
+    fn order_peers_seed_first(
+        peers: &HashMap<String, u16>,
+        seed_set: &[String],
+    ) -> Vec<(String, u16)> {
+        let is_seed = |id: &str| seed_set.iter().any(|s| s == id);
+        let mut ordered: Vec<(String, u16)> =
+            peers.iter().map(|(id, p)| (id.clone(), *p)).collect();
+        // Sort: seeds before non-seeds; then by peer id for determinism.
+        ordered.sort_by(|a, b| {
+            let (a_seed, b_seed) = (is_seed(&a.0), is_seed(&b.0));
+            b_seed.cmp(&a_seed).then_with(|| a.0.cmp(&b.0))
+        });
+        ordered
+    }
+
+    /// TASK-#29 (pure, unit-testable): decide whether a set of seed-advertised
+    /// finalized tips agree well enough to advance past.
+    ///
+    /// `tips` are the QCs gathered from DISTINCT seed peers (one entry per peer).
+    /// Each QC has ALREADY been cryptographically verified by the caller (the QC
+    /// crypto backstop in `apply_finality_artifact` is NOT weakened — this is an
+    /// additional N-of-seed agreement gate on top of it). We require at least `n`
+    /// of them to advertise the SAME `(block_height, block_hash)` finalized tip.
+    ///
+    /// Returns the agreed `(block_height, block_hash)` on success, or an `Err`
+    /// describing the disagreement/shortfall so the caller can refuse to advance
+    /// and log `🚨 [SECURITY][TIP_DISAGREEMENT]`.
+    fn tip_agreement_decision(
+        tips: &[consensus::qc::QuorumCertificate],
+        n: usize,
+    ) -> Result<(u64, String), String> {
+        let n = n.max(1);
+        if tips.len() < n {
+            return Err(format!(
+                "need {} agreeing seed tips but only {} seed(s) advertised a verifiable tip",
+                n,
+                tips.len()
+            ));
+        }
+        // Tally distinct (height, hash) tips.
+        let mut counts: HashMap<(u64, String), usize> = HashMap::new();
+        for qc in tips {
+            *counts
+                .entry((qc.block_height, qc.block_hash.clone()))
+                .or_insert(0) += 1;
+        }
+        // Pick the most-advertised tip (deterministic tie-break by height then hash).
+        let best = counts
+            .iter()
+            .max_by(|a, b| {
+                a.1.cmp(b.1)
+                    .then_with(|| a.0 .0.cmp(&b.0 .0))
+                    .then_with(|| a.0 .1.cmp(&b.0 .1))
+            })
+            .map(|((h, hash), c)| ((*h, hash.clone()), *c));
+
+        match best {
+            Some(((height, hash), count)) if count >= n => Ok((height, hash)),
+            Some((_, count)) => Err(format!(
+                "no tip reached {} agreeing seeds (best had {} of {}); seeds disagree on the finalized head",
+                n,
+                count,
+                tips.len()
+            )),
+            None => Err("no seed advertised a verifiable finalized tip".to_string()),
+        }
+    }
+
     fn validate_block(
         &self,
         block: &Block,
@@ -424,7 +517,39 @@ impl ChainSync {
         println!("📊 [ChainSync] Local Height: {}", my_height);
         let mut final_height = my_height;
 
-        for (peer_id, peer_port) in peers_map.iter() {
+        // TASK-#29 (1) SEED PREFERENCE: the trusted fallback-seed set is the active
+        // validator set. Try seed/validator peers FIRST so the sync is anchored on a
+        // trusted source rather than whichever peer HashMap iteration happened to
+        // surface first.
+        let seed_set = self.active_validator_addresses();
+        let ordered_peers = Self::order_peers_seed_first(&peers_map, &seed_set);
+
+        // TASK-#29 (2) N-PEER TIP AGREEMENT: when configured to require more than one
+        // seed (sys:config:tip_agreement_n > 1), demand that >= N distinct seed peers
+        // advertise a CONSISTENT, individually-verifiable finalized tip before we sync
+        // past it. On disagreement we refuse to advance. This is an ADDITIONAL gate on
+        // top of the per-artifact QC crypto backstop in apply_finality_artifact — it is
+        // not a replacement for it.
+        let tip_n = self.tip_agreement_n();
+        if tip_n > 1 {
+            match self
+                .gather_and_check_seed_tips(&ordered_peers, &seed_set, tip_n)
+                .await
+            {
+                Ok((height, hash)) => {
+                    println!(
+                        "✅ [ChainSync] Tip agreement reached: {} seeds agree on finalized tip height={} hash={}",
+                        tip_n, height, hash
+                    );
+                }
+                Err(e) => {
+                    eprintln!("🚨 [SECURITY][TIP_DISAGREEMENT] {} — refusing to advance", e);
+                    return final_height;
+                }
+            }
+        }
+
+        for (peer_id, peer_port) in ordered_peers.iter() {
             let Some(peer_ip) = self.storage.get_peer_ip(peer_id) else {
                 // Inbound peers behind Docker/NAT are useful as live sessions, but
                 // their accepted socket source is not a routable sync target. Only
@@ -639,6 +764,91 @@ impl ChainSync {
             }
         }
         final_height
+    }
+
+    /// TASK-#29: fetch one peer's advertised finalized tip and return its QC iff the
+    /// QC is cryptographically verifiable against our trusted validator set for the
+    /// QC's epoch (the SAME crypto backstop used by apply_finality_artifact). A peer
+    /// that supplies no QC, an unverifiable QC, or no reachable channel contributes
+    /// nothing to tip agreement (returns None) — it cannot dilute the gate.
+    async fn fetch_verified_tip(
+        &self,
+        peer_id: &str,
+        peer_ip: &str,
+        peer_port: u16,
+    ) -> Option<consensus::qc::QuorumCertificate> {
+        use rand::rngs::OsRng;
+        let mut csprng = OsRng;
+        let ephemeral_signing_key = crypto::SigningKey::generate(&mut csprng);
+
+        let (mut stream, shared_key, _peer_node_id) = secure_connect(
+            peer_ip,
+            peer_port,
+            "__sync__",
+            self.my_port,
+            Some(peer_id),
+            &ephemeral_signing_key,
+        )
+        .await
+        .ok()?;
+
+        send_encrypted_msg(&mut stream, &shared_key, "GET_FINALITY")
+            .await
+            .ok()?;
+        let resp = read_encrypted_msg(&mut stream, &shared_key).await.ok()?;
+        let json = resp.strip_prefix("FINALITY:")?;
+        let artifact = serde_json::from_str::<FinalityArtifact>(json).ok()?;
+        let qc = artifact.qc?;
+
+        // Verify the QC against the trusted validator set for its epoch. Only a
+        // verifiable QC counts toward agreement (the crypto backstop is preserved).
+        let validators = self.trusted_validator_set(qc.epoch)?;
+        match consensus::qc::verify_qc(&qc, &validators) {
+            Ok(()) => Some(qc),
+            Err(_) => None,
+        }
+    }
+
+    /// TASK-#29 (2): poll seed peers for their finalized tips and require >= `n`
+    /// distinct seed peers to advertise a CONSISTENT, individually-verifiable tip.
+    /// Returns the agreed `(block_height, block_hash)` or an `Err` the caller turns
+    /// into a `🚨 [SECURITY][TIP_DISAGREEMENT]` refusal. Only peers in `seed_set`
+    /// (the trusted validator set) are polled — a random peer cannot vote on the tip.
+    async fn gather_and_check_seed_tips(
+        &self,
+        ordered_peers: &[(String, u16)],
+        seed_set: &[String],
+        n: usize,
+    ) -> Result<(u64, String), String> {
+        let is_seed = |id: &str| seed_set.iter().any(|s| s == id);
+        let mut tips: Vec<consensus::qc::QuorumCertificate> = Vec::new();
+
+        for (peer_id, peer_port) in ordered_peers.iter() {
+            if !is_seed(peer_id) {
+                continue;
+            }
+            let Some(peer_ip) = self.storage.get_peer_ip(peer_id) else {
+                continue; // session-only peer without a routable IP
+            };
+            let is_loopback =
+                peer_ip == "127.0.0.1" || peer_ip == "localhost" || peer_ip == "::1";
+            if is_loopback && *peer_port == self.my_port {
+                continue; // self-dial
+            }
+            if let Some(qc) = self.fetch_verified_tip(peer_id, &peer_ip, *peer_port).await {
+                tips.push(qc);
+                // Enough verified tips collected to satisfy the gate even in the
+                // unanimous case — stop polling (no point hammering more seeds).
+                if tips.len() >= n {
+                    // Keep going only if we still might not agree; but a quick exit
+                    // once we have n verified tips is fine because the decision below
+                    // tolerates extra entries. Break to bound network work.
+                    break;
+                }
+            }
+        }
+
+        Self::tip_agreement_decision(&tips, n)
     }
 
     /// Process synced blocks — returns the final height reached
