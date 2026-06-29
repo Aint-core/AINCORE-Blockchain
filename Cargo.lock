@@ -3134,9 +3134,11 @@ name = "governance"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "move-binary-format",
  "move-core-types",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "storage",
 ]
 

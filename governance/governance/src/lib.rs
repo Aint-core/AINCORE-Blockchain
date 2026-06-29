@@ -1,6 +1,66 @@
+use move_binary_format::CompiledModule;
+use move_core_types::account_address::AccountAddress;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use storage::StateDB;
+
+// === #17: governance-gated on-chain Move stdlib module upgrade ===
+//
+// The Move stdlib bytecode is pinned at genesis (genesis_stdlib_hash). There is
+// no arbitrary-code path: the ONLY way to replace a system module post-genesis is
+// a governance proposal carrying a `GovernanceAction::UpgradeModule` that names an
+// allow-listed system module and the SHA256 of the approved bytecode. The actual
+// bytecode is staged out-of-band under `PENDING_MODULE_UPGRADE_PREFIX{name}`
+// (hex) so the proposal payload stays small and the hash is the binding
+// commitment. On execution the driver:
+//   1. reads the staged bytecode,
+//   2. verifies SHA256(bytecode) == approved hash (fail-closed on mismatch),
+//   3. verifies the bytes deserialize as a valid CompiledModule whose self-id is
+//      exactly @0x1::{name} (fail-closed — never install un-loadable bytecode
+//      that would brick the VM, never let one module masquerade as another),
+//   4. overwrites `module_{0x1}_{name}` (the resolver key the VM reads),
+//   5. bumps the `STDLIB_VERSION_KEY` counter,
+//   6. clears the staging key.
+// Every step is a pure function of on-chain state — identical on all nodes, no
+// wall-clock, no RNG.
+
+/// Allow-list of system (@0x1) module names that a governance proposal may
+/// upgrade. Anything outside this set is rejected — keeps the action enumerated
+/// and safe. Mirrors the genesis `REQUIRED_STDLIB_MODULE_NAMES` plus the other
+/// shipped system modules; an unknown name can never be installed.
+pub const UPGRADEABLE_SYSTEM_MODULES: &[&str] = &[
+    "signer",
+    "vector",
+    "bcs",
+    "hash",
+    "coin",
+    "staking",
+    "dex",
+    "epoch",
+    "governance",
+    "treasury",
+    "universal_mining",
+];
+
+/// Storage-key prefix under which the approved bytecode for a pending upgrade is
+/// staged (hex-encoded), keyed by module name: `sys:pending_module_upgrade:{name}`.
+const PENDING_MODULE_UPGRADE_PREFIX: &str = "sys:pending_module_upgrade:";
+
+/// Monotonic counter bumped on every successful module upgrade. Lets nodes /
+/// explorers detect that the live stdlib has diverged from genesis.
+const STDLIB_VERSION_KEY: &str = "sys:stdlib_version";
+
+/// Build the staging storage key for a pending module upgrade.
+pub fn pending_module_upgrade_key(module_name: &str) -> String {
+    format!("{}{}", PENDING_MODULE_UPGRADE_PREFIX, module_name)
+}
+
+/// The Move resolver key for a system (@0x1) module, matching
+/// `vm_move::AINCOREStorage::get_module` (`module_{address}_{name}`).
+fn system_module_storage_key(module_name: &str) -> String {
+    format!("module_{}_{}", AccountAddress::ONE, module_name)
+}
 
 fn serialize_u128_string<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -64,6 +124,18 @@ pub struct EconomicParams {
 pub enum GovernanceAction {
     UpdateFederationKey(String), // New Federation Address
     UpdateEconomicParams(EconomicParams),
+    /// #17: governance-gated upgrade of a single system (@0x1) Move module.
+    /// `module_name` MUST be in `UPGRADEABLE_SYSTEM_MODULES`; the approved
+    /// bytecode is staged separately under `pending_module_upgrade_key(name)`
+    /// and `new_bytecode_hash` is the lowercase-hex SHA256 of that bytecode.
+    /// No arbitrary code is carried in the proposal — only a name + a hash
+    /// commitment. Execution verifies the staged bytecode against this hash and
+    /// that it loads as a valid CompiledModule before installing it.
+    UpgradeModule {
+        module_name: String,
+        /// Lowercase-hex SHA256 of the approved module bytecode.
+        new_bytecode_hash: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -435,6 +507,17 @@ impl GovernanceManager {
                         )
                         .map_err(|e| e.to_string())?;
                 }
+                GovernanceAction::UpgradeModule {
+                    module_name,
+                    new_bytecode_hash,
+                } => {
+                    // #17: fail-closed module upgrade. If ANY check fails (unknown
+                    // module, missing staged bytecode, hash mismatch, un-loadable
+                    // or mismatched-id bytecode), we return Err WITHOUT mutating
+                    // module state — the proposal stays Queued and can be retried
+                    // once correct bytecode is staged. We never half-install.
+                    self.apply_module_upgrade(module_name, new_bytecode_hash)?;
+                }
             }
         }
 
@@ -443,6 +526,121 @@ impl GovernanceManager {
 
         self.save_proposal(&proposal)?;
         Ok(())
+    }
+
+    /// #17: deterministically install an approved system-module upgrade.
+    ///
+    /// Fail-closed: every error path returns `Err` and leaves module state
+    /// untouched, so an invalid upgrade can never brick the VM nor be partially
+    /// applied. Pure function of on-chain state (allow-list, staged bytecode,
+    /// approved hash) — identical on every node.
+    fn apply_module_upgrade(
+        &self,
+        module_name: &str,
+        new_bytecode_hash: &str,
+    ) -> Result<(), String> {
+        // 1. Allow-list: only enumerated system modules may be upgraded.
+        if !UPGRADEABLE_SYSTEM_MODULES.contains(&module_name) {
+            return Err(format!(
+                "UpgradeModule rejected: '{}' is not an upgradeable system module",
+                module_name
+            ));
+        }
+
+        // 2. Load the staged bytecode (hex) that was committed out-of-band.
+        let staging_key = pending_module_upgrade_key(module_name);
+        let staged_hex = self
+            .db
+            .get(&staging_key)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "UpgradeModule rejected: no staged bytecode at '{}'",
+                    staging_key
+                )
+            })?;
+        let bytecode = hex::decode(staged_hex.trim()).map_err(|e| {
+            format!(
+                "UpgradeModule rejected: staged bytecode for '{}' is not valid hex: {}",
+                module_name, e
+            )
+        })?;
+        if bytecode.is_empty() {
+            return Err(format!(
+                "UpgradeModule rejected: staged bytecode for '{}' is empty",
+                module_name
+            ));
+        }
+
+        // 3. Hash binding: the staged bytecode MUST match the approved hash that
+        //    voters ratified. Compared as lowercase hex of SHA256(bytecode).
+        let actual_hash = hex::encode(Sha256::digest(&bytecode));
+        let approved = new_bytecode_hash.trim().to_lowercase();
+        if actual_hash != approved {
+            return Err(format!(
+                "UpgradeModule rejected: bytecode hash mismatch for '{}': approved={} staged={}",
+                module_name, approved, actual_hash
+            ));
+        }
+
+        // 4. Fail-closed validity: the bytes MUST deserialize as a valid Move
+        //    module, and its self-id MUST be exactly @0x1::{module_name}. This
+        //    prevents installing garbage (VM brick) or a module masquerading as
+        //    another name/address.
+        let module = CompiledModule::deserialize(&bytecode).map_err(|e| {
+            format!(
+                "UpgradeModule rejected: staged bytecode for '{}' is not a loadable Move module: {}",
+                module_name, e
+            )
+        })?;
+        let id = module.self_id();
+        if *id.address() != AccountAddress::ONE {
+            return Err(format!(
+                "UpgradeModule rejected: module '{}' address is {} (expected @0x1)",
+                module_name,
+                id.address()
+            ));
+        }
+        if id.name().as_str() != module_name {
+            return Err(format!(
+                "UpgradeModule rejected: staged bytecode self-id '{}' does not match approved name '{}'",
+                id.name(),
+                module_name
+            ));
+        }
+
+        // 5. Install: overwrite the resolver key the VM reads. Stored hex-encoded,
+        //    matching genesis (`module_{addr}_{name}` = hex(bytecode)).
+        let module_key = system_module_storage_key(module_name);
+        self.db
+            .put(&module_key, &hex::encode(&bytecode))
+            .map_err(|e| e.to_string())?;
+
+        // 6. Bump the monotonic stdlib version counter.
+        let next_version = self.current_stdlib_version().saturating_add(1);
+        self.db
+            .put(STDLIB_VERSION_KEY, &next_version.to_string())
+            .map_err(|e| e.to_string())?;
+
+        // 7. Clear the staging slot so a later proposal can't accidentally reuse
+        //    stale bytecode and the key does not linger.
+        self.db.delete(&staging_key).map_err(|e| e.to_string())?;
+
+        println!(
+            "🧩 GOVERNANCE EXECUTION: Upgraded module @0x1::{} (hash {}), stdlib_version -> {}",
+            module_name, approved, next_version
+        );
+        Ok(())
+    }
+
+    /// Current on-chain stdlib version counter (0 if never upgraded).
+    pub fn current_stdlib_version(&self) -> u64 {
+        self.db
+            .get(STDLIB_VERSION_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
     }
 
     fn save_proposal(&self, proposal: &Proposal) -> Result<(), String> {
@@ -1018,6 +1216,283 @@ mod tests {
             gov.get_proposal("d_queued").unwrap().status,
             ProposalStatus::Executed
         );
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    // ========================================================================
+    // #17: governance-gated on-chain module upgrade tests
+    // ========================================================================
+
+    use super::{pending_module_upgrade_key, UPGRADEABLE_SYSTEM_MODULES};
+
+    /// Read a real compiled stdlib module (@0x1::{name}) from the vm_move bytecode
+    /// dir so the tests exercise the actual CompiledModule load + self-id checks
+    /// against genuine bytecode rather than a hand-rolled fixture.
+    fn real_stdlib_bytecode(module_name: &str) -> Vec<u8> {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../core/vm_move/stdlib/bytecode")
+            .join(format!("{module_name}.mv"));
+        std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("read stdlib bytecode {}: {}", path.display(), e))
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    fn module_storage_key(module_name: &str) -> String {
+        format!(
+            "module_{}_{}",
+            move_core_types::account_address::AccountAddress::ONE,
+            module_name
+        )
+    }
+
+    fn queued_upgrade_proposal(id: &str, module_name: &str, hash: &str) -> Proposal {
+        let mut p = base_proposal(id);
+        p.status = ProposalStatus::Queued;
+        p.execution_time = Some(100);
+        p.action = Some(GovernanceAction::UpgradeModule {
+            module_name: module_name.to_string(),
+            new_bytecode_hash: hash.to_string(),
+        });
+        p
+    }
+
+    /// Happy path: a queued UpgradeModule whose staged bytecode matches the
+    /// approved hash (and loads as a valid @0x1::{name} module) replaces the
+    /// `module_{0x1}_{name}` resolver key and bumps `sys:stdlib_version`.
+    #[test]
+    fn s17_upgrade_module_replaces_and_bumps_version() {
+        let path = temp_db_path("s17_upgrade_ok");
+        let db = Arc::new(StateDB::open(path.to_str().expect("utf8 path")).expect("open db"));
+        let gov = GovernanceManager::new(db.clone());
+
+        let module_name = "hash";
+        let bytecode = real_stdlib_bytecode(module_name);
+        let hash = sha256_hex(&bytecode);
+
+        // Seed the live module with placeholder bytes so we can prove it changes.
+        db.put(&module_storage_key(module_name), &hex::encode(b"OLD"))
+            .unwrap();
+        // Stage the approved bytecode out-of-band.
+        db.put(
+            &pending_module_upgrade_key(module_name),
+            &hex::encode(&bytecode),
+        )
+        .unwrap();
+
+        assert_eq!(gov.current_stdlib_version(), 0);
+        seed_proposal(&gov, queued_upgrade_proposal("up1", module_name, &hash));
+
+        gov.execute_proposal_at("up1", 100).expect("upgrade executes");
+
+        assert_eq!(
+            gov.get_proposal("up1").unwrap().status,
+            ProposalStatus::Executed
+        );
+        // Live module replaced with the approved bytecode (hex-encoded).
+        let installed = db.get(&module_storage_key(module_name)).unwrap().unwrap();
+        assert_eq!(installed, hex::encode(&bytecode));
+        // Version bumped.
+        assert_eq!(gov.current_stdlib_version(), 1);
+        // Staging slot cleared.
+        assert!(db
+            .get(&pending_module_upgrade_key(module_name))
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// A hash mismatch is rejected fail-closed: the proposal stays Queued, the
+    /// live module is NOT touched, and the version is NOT bumped.
+    #[test]
+    fn s17_upgrade_module_rejects_hash_mismatch() {
+        let path = temp_db_path("s17_upgrade_hashmismatch");
+        let db = Arc::new(StateDB::open(path.to_str().expect("utf8 path")).expect("open db"));
+        let gov = GovernanceManager::new(db.clone());
+
+        let module_name = "hash";
+        let bytecode = real_stdlib_bytecode(module_name);
+        // Approve a WRONG hash (all zeros) while staging real bytecode.
+        let wrong_hash = "0".repeat(64);
+
+        db.put(&module_storage_key(module_name), &hex::encode(b"OLD"))
+            .unwrap();
+        db.put(
+            &pending_module_upgrade_key(module_name),
+            &hex::encode(&bytecode),
+        )
+        .unwrap();
+
+        seed_proposal(
+            &gov,
+            queued_upgrade_proposal("up_bad", module_name, &wrong_hash),
+        );
+
+        let err = gov
+            .execute_proposal_at("up_bad", 100)
+            .expect_err("hash mismatch must be rejected");
+        assert!(err.contains("hash mismatch"), "got: {err}");
+
+        // Fail-closed: proposal stays Queued, module unchanged, version still 0.
+        assert_eq!(
+            gov.get_proposal("up_bad").unwrap().status,
+            ProposalStatus::Queued
+        );
+        assert_eq!(
+            db.get(&module_storage_key(module_name)).unwrap().unwrap(),
+            hex::encode(b"OLD")
+        );
+        assert_eq!(gov.current_stdlib_version(), 0);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// A non-system / unknown module name is rejected before any state is touched.
+    #[test]
+    fn s17_upgrade_module_rejects_unknown_module() {
+        let path = temp_db_path("s17_upgrade_unknown");
+        let db = Arc::new(StateDB::open(path.to_str().expect("utf8 path")).expect("open db"));
+        let gov = GovernanceManager::new(db.clone());
+
+        let module_name = "definitely_not_a_system_module";
+        assert!(!UPGRADEABLE_SYSTEM_MODULES.contains(&module_name));
+        // Even if (maliciously) staged, the allow-list rejects it first.
+        db.put(
+            &pending_module_upgrade_key(module_name),
+            &hex::encode(b"whatever"),
+        )
+        .unwrap();
+
+        seed_proposal(
+            &gov,
+            queued_upgrade_proposal("up_unknown", module_name, &sha256_hex(b"whatever")),
+        );
+
+        let err = gov
+            .execute_proposal_at("up_unknown", 100)
+            .expect_err("unknown module must be rejected");
+        assert!(
+            err.contains("not an upgradeable system module"),
+            "got: {err}"
+        );
+        assert_eq!(
+            gov.get_proposal("up_unknown").unwrap().status,
+            ProposalStatus::Queued
+        );
+        assert_eq!(gov.current_stdlib_version(), 0);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// Un-loadable bytecode (hash matches but bytes are not a valid Move module)
+    /// is rejected fail-closed — never installed, so the VM can never be bricked.
+    #[test]
+    fn s17_upgrade_module_rejects_unloadable_bytecode() {
+        let path = temp_db_path("s17_upgrade_unloadable");
+        let db = Arc::new(StateDB::open(path.to_str().expect("utf8 path")).expect("open db"));
+        let gov = GovernanceManager::new(db.clone());
+
+        let module_name = "coin";
+        let garbage = b"this is not valid move bytecode".to_vec();
+        let hash = sha256_hex(&garbage); // hash matches the garbage on purpose
+
+        db.put(&module_storage_key(module_name), &hex::encode(b"OLD"))
+            .unwrap();
+        db.put(
+            &pending_module_upgrade_key(module_name),
+            &hex::encode(&garbage),
+        )
+        .unwrap();
+
+        seed_proposal(
+            &gov,
+            queued_upgrade_proposal("up_garbage", module_name, &hash),
+        );
+
+        let err = gov
+            .execute_proposal_at("up_garbage", 100)
+            .expect_err("un-loadable bytecode must be rejected");
+        assert!(err.contains("not a loadable Move module"), "got: {err}");
+        // Live module untouched (no brick), version unchanged.
+        assert_eq!(
+            db.get(&module_storage_key(module_name)).unwrap().unwrap(),
+            hex::encode(b"OLD")
+        );
+        assert_eq!(gov.current_stdlib_version(), 0);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// A valid module whose self-id does not match the approved name is rejected
+    /// (anti-masquerade): stage `vector.mv` but approve it under the name `coin`.
+    #[test]
+    fn s17_upgrade_module_rejects_name_mismatch() {
+        let path = temp_db_path("s17_upgrade_namemismatch");
+        let db = Arc::new(StateDB::open(path.to_str().expect("utf8 path")).expect("open db"));
+        let gov = GovernanceManager::new(db.clone());
+
+        let approved_name = "coin"; // allow-listed, but bytecode is actually 'vector'
+        let bytecode = real_stdlib_bytecode("vector");
+        let hash = sha256_hex(&bytecode);
+
+        db.put(&module_storage_key(approved_name), &hex::encode(b"OLD"))
+            .unwrap();
+        db.put(
+            &pending_module_upgrade_key(approved_name),
+            &hex::encode(&bytecode),
+        )
+        .unwrap();
+
+        seed_proposal(
+            &gov,
+            queued_upgrade_proposal("up_masq", approved_name, &hash),
+        );
+
+        let err = gov
+            .execute_proposal_at("up_masq", 100)
+            .expect_err("self-id/name mismatch must be rejected");
+        assert!(err.contains("does not match approved name"), "got: {err}");
+        assert_eq!(gov.current_stdlib_version(), 0);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// Driver path: a due queued UpgradeModule is applied via
+    /// `process_due_proposals` (the same deterministic driver #32b uses), proving
+    /// the upgrade rides the executor's epoch-boundary governance driver.
+    #[test]
+    fn s17_upgrade_via_process_due_proposals() {
+        let path = temp_db_path("s17_upgrade_driver");
+        let db = Arc::new(StateDB::open(path.to_str().expect("utf8 path")).expect("open db"));
+        let gov = GovernanceManager::new(db.clone());
+
+        let module_name = "epoch";
+        let bytecode = real_stdlib_bytecode(module_name);
+        let hash = sha256_hex(&bytecode);
+
+        db.put(&module_storage_key(module_name), &hex::encode(b"OLD"))
+            .unwrap();
+        db.put(
+            &pending_module_upgrade_key(module_name),
+            &hex::encode(&bytecode),
+        )
+        .unwrap();
+
+        let mut p = queued_upgrade_proposal("up_drv", module_name, &hash);
+        p.execution_time = Some(200);
+        seed_proposal(&gov, p);
+
+        // now=300 ≥ exec_time(200) → driver executes.
+        gov.process_due_proposals(300, 7);
+
+        assert_eq!(
+            gov.get_proposal("up_drv").unwrap().status,
+            ProposalStatus::Executed
+        );
+        assert_eq!(
+            db.get(&module_storage_key(module_name)).unwrap().unwrap(),
+            hex::encode(&bytecode)
+        );
+        assert_eq!(gov.current_stdlib_version(), 1);
         let _ = std::fs::remove_dir_all(path);
     }
 }
