@@ -10,3 +10,6 @@ serde_json = "1.0"
 hex = "0.4"
 node = { path = "../node" }
 storage = { path = "../../common/storage" }
+crypto = { path = "../../common/crypto" }
+consensus = { path = "../../consensus/consensus" }
+ed25519-dalek = "2.0"
