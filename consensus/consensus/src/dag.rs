@@ -979,6 +979,21 @@ impl DagConsensus {
                             crate::qc_producer::QcOutcome::Complete(_)
                             | crate::qc_producer::QcOutcome::Skipped => {}
                         }
+
+                        // SEC-#12 Step-2: fold the COMPLETE QC's aggregate BLS
+                        // signature into the leader-election beacon for true
+                        // unbiasability. This runs ONLY when a complete (>2/3) QC
+                        // exists at consensus:qc:{height} — i.e. the single-
+                        // validator / supermajority case where produce_and_store_qc
+                        // just stored one. In the multi-party case no complete QC
+                        // exists here yet, so this is a no-op and the fold happens
+                        // later from handle_remote_qc_vote when aggregation
+                        // completes. Step-1's digest-bound beacon (set in
+                        // try_commit) is the base in both cases. Side-effect-only,
+                        // additive: a missing QC never alters consensus.
+                        if let Ok(mut engine) = self.ordering_engine.lock() {
+                            engine.fold_qc_for_height(self.latest_block_height);
+                        }
                     }
                 }
             }
@@ -1497,6 +1512,16 @@ impl DagConsensus {
                 "✅ [QC] multi-party quorum certificate assembled for block #{}",
                 qc.block_height
             );
+            // SEC-#12 Step-2: a complete (>2/3) multi-party QC now exists at
+            // consensus:qc:{height}. Fold its aggregate BLS signature into the
+            // leader-election beacon — the same fold every other validator performs
+            // when it assembles the identical QC for the same height, so the beacon
+            // stays byte-identical across nodes. `fold_qc_for_height` is idempotent
+            // and monotonic, so folding here is safe even if the commit path already
+            // attempted it (no complete QC then) or a later vote re-triggers it.
+            if let Ok(mut engine) = self.ordering_engine.lock() {
+                engine.fold_qc_for_height(qc.block_height);
+            }
         }
     }
 

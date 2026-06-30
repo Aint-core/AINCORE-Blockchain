@@ -25,8 +25,20 @@ pub struct OrderingEngine {
     pub committed_sequence: Vec<String>, // List of Vertex Hashes in order
     /// VDF engine for random beacon (unpredictable leader election)
     vdf_engine: Option<VDFEngine>,
-    /// Last VDF output for randomness
+    /// SEC-#12 Step-1 base beacon: the digest-bound VDF output BEFORE any QC fold.
+    /// Recomputed on every commit (`update_random_beacon`) and on restart. Kept
+    /// separately so a Step-2 QC fold always re-derives from this exact base
+    /// instead of chaining onto an already-folded value — that makes the post-fold
+    /// beacon a pure function of (Step-1 base, folded QC) and therefore identical
+    /// across nodes regardless of WHEN each node's complete QC arrives (commit-time
+    /// for a supermajority holder vs. later for multi-party aggregation).
+    step1_beacon: Vec<u8>,
+    /// Last VDF output for randomness (Step-1 base folded with the latest complete
+    /// QC's aggregate signature, when one exists).
     last_vdf_output: Vec<u8>,
+    /// Block height of the QC currently folded into `last_vdf_output`, if any.
+    /// Monotonic; mirrors the persisted `consensus:beacon_folded_qc_height`.
+    folded_qc_height: Option<u64>,
     /// Storage reference for persisting committed state
     storage: Option<Arc<StateDB>>,
 }
@@ -61,7 +73,9 @@ impl OrderingEngine {
             finalized_round: 0,
             committed_sequence: Vec::new(),
             vdf_engine: vdf,
+            step1_beacon: vec![0u8; 32],
             last_vdf_output: vec![0u8; 32],
+            folded_qc_height: None,
             storage: None,
         }
     }
@@ -107,17 +121,56 @@ impl OrderingEngine {
         // node without persisting the beacon itself. A fresh restart that left it at
         // zeros would select leaders off a different beacon than long-running peers
         // (agreement/liveness hazard until re-sync), so reconstruct it here.
+        let mut step1_beacon = vec![0u8; 32];
         let mut last_vdf_output = vec![0u8; 32];
+        let mut folded_qc_height: Option<u64> = None;
         if let Some(ref v) = vdf {
-            let anchor_round = storage
+            let last_anchor_round = storage
                 .get("consensus:last_anchor_round")
                 .ok()
                 .flatten()
                 .and_then(|s| s.parse::<u64>().ok());
             let digest = storage.get("consensus:finality_digest").ok().flatten();
-            if let (Some(ar), Some(d)) = (anchor_round, digest) {
-                if let Ok((output, _proof)) = v.compute(&Self::beacon_challenge(ar, &d)) {
-                    last_vdf_output = output;
+            if let (Some(ar), Some(d)) = (last_anchor_round, digest.as_ref()) {
+                if let Ok((output, _proof)) = v.compute(&Self::beacon_challenge(ar, d)) {
+                    step1_beacon = output;
+                }
+            }
+            // The post-fold beacon starts equal to the Step-1 base; a QC fold below
+            // overrides it.
+            last_vdf_output = step1_beacon.clone();
+
+            // SEC-#12 Step-2: re-apply the QC aggregate-signature fold on restart.
+            // The Step-1 base above is the pre-fold value; if a complete QC was
+            // folded before shutdown we persisted the folded block height +
+            // anchor round (consensus:beacon_folded_qc_height /
+            // consensus:beacon_folded_anchor_round). Re-folding that QC's aggregate
+            // signature onto the SAME Step-1 base with the SAME deterministic mix
+            // reproduces the exact post-fold beacon a live engine holds — no beacon
+            // bytes are persisted. The anchor-round guard ensures we ONLY re-fold
+            // when the marker matches the current Step-1 base (i.e. the latest
+            // committed anchor still carries that fold); a stale marker from an
+            // earlier base — whose later heights had no complete QC — is ignored, so
+            // restart matches the live unfolded beacon in that case. A missing QC
+            // (pruned) likewise falls back to the Step-1 base.
+            let folded_h = storage
+                .get("consensus:beacon_folded_qc_height")
+                .ok()
+                .flatten()
+                .and_then(|s| s.parse::<u64>().ok());
+            let folded_ar = storage
+                .get("consensus:beacon_folded_anchor_round")
+                .ok()
+                .flatten()
+                .and_then(|s| s.parse::<u64>().ok());
+            if let (Some(h), Some(far), Some(lar)) = (folded_h, folded_ar, last_anchor_round) {
+                if far == lar {
+                    if let Some(agg) = Self::load_qc_aggregate_signature(&storage, h) {
+                        if let Some(mixed) = Self::compute_qc_mix(v, &step1_beacon, &agg) {
+                            last_vdf_output = mixed;
+                            folded_qc_height = Some(h);
+                        }
+                    }
                 }
             }
         }
@@ -127,7 +180,9 @@ impl OrderingEngine {
             finalized_round,
             committed_sequence,
             vdf_engine: vdf,
+            step1_beacon,
             last_vdf_output,
+            folded_qc_height,
             storage: Some(storage),
         }
     }
@@ -151,11 +206,22 @@ impl OrderingEngine {
     }
 
     /// Update random beacon using VDF (called after each commit). Deterministic
-    /// across nodes: same (anchor_round, finality_digest) → same beacon.
+    /// across nodes: same (anchor_round, finality_digest) → same Step-1 base.
+    ///
+    /// This sets the Step-1 base (`step1_beacon`) and resets the live beacon to it.
+    /// Any QC fold (Step-2) for the newly committed height is layered on top
+    /// afterwards via [`fold_qc_for_height`], always re-derived from this base so
+    /// the post-fold beacon is timing-independent across nodes.
     pub fn update_random_beacon(&mut self, anchor_round: u64, finality_digest: &str) {
         if let Some(ref vdf) = self.vdf_engine {
-            if let Ok((output, _proof)) = vdf.compute(&Self::beacon_challenge(anchor_round, finality_digest)) {
+            if let Ok((output, _proof)) =
+                vdf.compute(&Self::beacon_challenge(anchor_round, finality_digest))
+            {
+                self.step1_beacon = output.clone();
                 self.last_vdf_output = output;
+                // A fresh Step-1 base supersedes any prior fold; the next
+                // fold_qc_for_height re-applies the current height's QC on top.
+                self.folded_qc_height = None;
             }
         }
     }
@@ -163,6 +229,118 @@ impl OrderingEngine {
     /// Get random bytes from beacon for leader selection
     pub fn get_random_beacon(&self) -> &[u8] {
         &self.last_vdf_output
+    }
+
+    /// SEC-#12 Step-2: domain-separated challenge folding a finalized block's QC
+    /// aggregate BLS signature into the running beacon.
+    ///
+    /// The aggregate signature is a >2/3 BLS aggregate over the canonical
+    /// `FinalityVote` — it is deterministic given the signer set + message and
+    /// cannot be forged or predicted by any sub-quorum, so no single proposer can
+    /// grind the next leader. Folding `prev_beacon` keeps the chain dependent on
+    /// the entire prior history (Step-1's digest binding remains the base).
+    fn qc_mix_challenge(prev_beacon: &[u8], aggregate_signature: &[u8]) -> Vec<u8> {
+        let mut c =
+            Vec::with_capacity(20 + prev_beacon.len() + aggregate_signature.len());
+        c.extend_from_slice(b"AINCORE_BEACON_QC_V1");
+        c.extend_from_slice(prev_beacon);
+        c.extend_from_slice(aggregate_signature);
+        c
+    }
+
+    /// Deterministically compute the post-fold beacon from a previous beacon and a
+    /// QC aggregate signature. Pure (no `self`/storage) so the restart path and the
+    /// live path share one definition. Returns `None` only if the VDF errors.
+    fn compute_qc_mix(
+        vdf: &VDFEngine,
+        prev_beacon: &[u8],
+        aggregate_signature: &[u8],
+    ) -> Option<Vec<u8>> {
+        vdf.compute(&Self::qc_mix_challenge(prev_beacon, aggregate_signature))
+            .ok()
+            .map(|(output, _proof)| output)
+    }
+
+    /// SEC-#12 Step-2: fold a QC aggregate signature into the beacon, deriving from
+    /// the Step-1 base: `last_vdf_output = VDF(domain || step1_beacon || aggregate_
+    /// signature)`. Folding from the immutable Step-1 base (rather than chaining
+    /// onto whatever `last_vdf_output` currently is) makes the result a pure
+    /// function of (Step-1 base, aggregate signature) — identical across nodes no
+    /// matter when each node's complete QC arrives. No-op if the VDF is unavailable.
+    pub fn mix_qc_into_beacon(&mut self, aggregate_signature: &[u8]) {
+        if let Some(ref vdf) = self.vdf_engine {
+            if let Some(mixed) =
+                Self::compute_qc_mix(vdf, &self.step1_beacon, aggregate_signature)
+            {
+                self.last_vdf_output = mixed;
+            }
+        }
+    }
+
+    /// Load a COMPLETE QC stored at `consensus:qc:{height}`. Returns `None` when no
+    /// complete QC exists for that height (the common case until a >2/3 quorum is
+    /// assembled) or it cannot be decoded.
+    fn load_qc(storage: &StateDB, height: u64) -> Option<crate::qc::QuorumCertificate> {
+        let raw = storage.get(&format!("consensus:qc:{}", height)).ok()??;
+        serde_json::from_str(&raw).ok()
+    }
+
+    /// Load just the `aggregate_signature` of a COMPLETE QC at `height`.
+    fn load_qc_aggregate_signature(storage: &StateDB, height: u64) -> Option<Vec<u8>> {
+        Self::load_qc(storage, height).map(|qc| qc.aggregate_signature)
+    }
+
+    /// SEC-#12 Step-2 entry point: if a COMPLETE QC exists for `height` and it has
+    /// not already been folded, fold its aggregate signature onto the CURRENT
+    /// Step-1 base beacon and persist the fold marker so restart reproduces the
+    /// exact beacon.
+    ///
+    /// DETERMINISM: every node folds the SAME complete QC (the aggregate signature
+    /// is identical given the signer set + message) for the SAME height onto the
+    /// SAME Step-1 base, so the post-fold beacon is byte-identical everywhere
+    /// regardless of WHEN each node assembles its complete QC. The monotonic
+    /// `height <= prev → skip` guard makes this idempotent (commit path then a late
+    /// QC_VOTE for the same height folds at most once) and prevents folding a stale
+    /// older-height QC onto a newer Step-1 base after the commit moved on.
+    ///
+    /// The persisted marker records BOTH the folded height and the QC's anchor
+    /// round; on restart the fold is re-applied ONLY when that anchor round matches
+    /// the Step-1 base's `last_anchor_round`, so a marker left over from an earlier
+    /// base (whose later heights had no complete QC) is not mis-folded.
+    ///
+    /// Returns `true` iff a fold actually happened.
+    pub fn fold_qc_for_height(&mut self, height: u64) -> bool {
+        let storage = match self.storage {
+            Some(ref s) => Arc::clone(s),
+            None => return false,
+        };
+        // Monotonic: never re-fold a height already folded and never fold an older
+        // height than the last folded one (out-of-order arrival would diverge).
+        let already = storage
+            .get("consensus:beacon_folded_qc_height")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u64>().ok());
+        if let Some(prev) = already {
+            if height <= prev {
+                return false;
+            }
+        }
+        let qc = match Self::load_qc(&storage, height) {
+            Some(q) => q,
+            None => return false, // no complete QC yet — Step-1 beacon still applies
+        };
+        self.mix_qc_into_beacon(&qc.aggregate_signature);
+        self.folded_qc_height = Some(height);
+        let _ = storage.put("consensus:beacon_folded_qc_height", &height.to_string());
+        // Bind the marker to the Step-1 base this fold sits on (the QC's anchor
+        // round == the commit's anchor round), so restart only re-folds when the
+        // base still corresponds to this fold.
+        let _ = storage.put(
+            "consensus:beacon_folded_anchor_round",
+            &qc.anchor_round.to_string(),
+        );
+        true
     }
 
     fn finality_digest(sequence: &[String]) -> String {
@@ -659,5 +837,194 @@ mod tests {
             engine.finalized_round, 9000,
             "explicit persisted high-water mark must win over the set max"
         );
+    }
+
+    // ===== SEC-#12 Step-2: QC aggregate-signature fold into the beacon =====
+
+    use crate::qc::QuorumCertificate;
+
+    /// Store a synthetic COMPLETE QC at `consensus:qc:{height}` with the given
+    /// aggregate signature + anchor round. Only the fields the beacon fold reads
+    /// (aggregate_signature, anchor_round, block_height) need be meaningful.
+    fn store_qc(db: &Arc<StateDB>, height: u64, anchor_round: u64, agg: &[u8]) {
+        let qc = QuorumCertificate {
+            version: 1,
+            chain_id: "AINCORE-TEST-1".into(),
+            epoch: 0,
+            finalized_round: anchor_round,
+            anchor_round,
+            anchor_hash: "ab".repeat(32),
+            block_height: height,
+            block_hash: "cd".repeat(32),
+            state_root: "ef".repeat(32),
+            receipts_root: "12".repeat(32),
+            finality_digest: "34".repeat(32),
+            validator_set_hash: "ff".repeat(32),
+            signer_bitmap: vec![0xff],
+            signed_stake: 100,
+            total_stake: 100,
+            aggregate_signature: agg.to_vec(),
+        };
+        db.put(
+            &format!("consensus:qc:{}", height),
+            &serde_json::to_string(&qc).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Folding the SAME complete QC onto the SAME Step-1 base on two independent
+    /// engines yields the SAME beacon (consensus-critical: divergence forks leader
+    /// election). A DIFFERENT aggregate signature yields a DIFFERENT beacon.
+    #[test]
+    fn qc_fold_is_deterministic_and_signature_dependent() {
+        let db1 = temp_db("qcfold_det1");
+        let db2 = temp_db("qcfold_det2");
+        store_qc(&db1, 10, 8, b"AGGREGATE-SIG-AAAA");
+        store_qc(&db2, 10, 8, b"AGGREGATE-SIG-AAAA");
+
+        let mut e1 = OrderingEngine::new_with_storage(Arc::clone(&db1));
+        let mut e2 = OrderingEngine::new_with_storage(Arc::clone(&db2));
+        // Identical Step-1 base on both.
+        e1.update_random_beacon(8, "digest-X");
+        e2.update_random_beacon(8, "digest-X");
+        let step1 = e1.get_random_beacon().to_vec();
+        assert_eq!(e1.get_random_beacon(), e2.get_random_beacon());
+
+        // Fold the (identical) complete QC: both engines move to the same beacon...
+        assert!(e1.fold_qc_for_height(10));
+        assert!(e2.fold_qc_for_height(10));
+        assert_eq!(
+            e1.get_random_beacon(),
+            e2.get_random_beacon(),
+            "same QC + same Step-1 base must yield identical folded beacon"
+        );
+        // ...and the fold actually changed the beacon away from the Step-1 base.
+        assert_ne!(
+            e1.get_random_beacon(),
+            &step1[..],
+            "folding a QC must move the beacon off the Step-1 base"
+        );
+
+        // A different aggregate signature → different folded beacon.
+        let db3 = temp_db("qcfold_det3");
+        store_qc(&db3, 10, 8, b"AGGREGATE-SIG-BBBB");
+        let mut e3 = OrderingEngine::new_with_storage(Arc::clone(&db3));
+        e3.update_random_beacon(8, "digest-X");
+        assert!(e3.fold_qc_for_height(10));
+        assert_ne!(
+            e3.get_random_beacon(),
+            e1.get_random_beacon(),
+            "different aggregate signature must yield a different beacon"
+        );
+    }
+
+    /// Folding is idempotent + monotonic: re-folding the same height is a no-op,
+    /// and folding an older height after a newer one is rejected (prevents a late
+    /// out-of-order QC_VOTE from folding a stale QC onto a newer base).
+    #[test]
+    fn qc_fold_is_idempotent_and_monotonic() {
+        let db = temp_db("qcfold_idem");
+        store_qc(&db, 9, 7, b"SIG-9");
+        store_qc(&db, 10, 8, b"SIG-10");
+        let mut e = OrderingEngine::new_with_storage(Arc::clone(&db));
+        e.update_random_beacon(8, "d");
+
+        assert!(e.fold_qc_for_height(10), "first fold of height 10 applies");
+        let after = e.get_random_beacon().to_vec();
+        // Re-folding the same height: no-op (idempotent).
+        assert!(!e.fold_qc_for_height(10), "re-fold of same height is a no-op");
+        assert_eq!(e.get_random_beacon(), &after[..]);
+        // Folding an OLDER height than the last folded one is rejected.
+        assert!(
+            !e.fold_qc_for_height(9),
+            "older-height fold after a newer one must be rejected"
+        );
+        assert_eq!(e.get_random_beacon(), &after[..]);
+    }
+
+    /// No complete QC for the height → fold is a no-op and the Step-1 (digest-bound)
+    /// beacon still applies (Step-1 remains the base).
+    #[test]
+    fn qc_fold_noop_without_complete_qc() {
+        let db = temp_db("qcfold_noqc");
+        let mut e = OrderingEngine::new_with_storage(Arc::clone(&db));
+        e.update_random_beacon(8, "digest-Z");
+        let step1 = e.get_random_beacon().to_vec();
+        assert!(
+            !e.fold_qc_for_height(10),
+            "no QC stored → nothing to fold"
+        );
+        assert_eq!(
+            e.get_random_beacon(),
+            &step1[..],
+            "without a complete QC the Step-1 beacon is unchanged"
+        );
+    }
+
+    /// Restart reproduces the EXACT folded beacon from persisted state: a fresh
+    /// engine re-derives the Step-1 base and re-applies the folded QC, matching a
+    /// live engine that committed + folded.
+    #[test]
+    fn qc_fold_reproduces_on_restart() {
+        let path = format!(
+            "/tmp/aincore_ordering_test_{}_qcfold_restart",
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&path);
+        let db = Arc::new(StateDB::open(&path).unwrap());
+        store_qc(&db, 10, 8, b"RESTART-AGG-SIG");
+        // Persist the Step-1 inputs exactly as the commit path does.
+        db.put("consensus:last_anchor_round", "8").unwrap();
+        db.put("consensus:finality_digest", "restart-digest").unwrap();
+
+        // Live engine: derive Step-1 base, then fold the complete QC for height 10.
+        let mut live = OrderingEngine::new_with_storage(Arc::clone(&db));
+        live.update_random_beacon(8, "restart-digest");
+        assert!(live.fold_qc_for_height(10));
+        let live_beacon = live.get_random_beacon().to_vec();
+
+        // Fresh restart from the SAME db must reconstruct the identical folded beacon
+        // (anchor-round marker == last_anchor_round → fold re-applied).
+        let restored = OrderingEngine::new_with_storage(Arc::clone(&db));
+        assert_eq!(
+            restored.get_random_beacon(),
+            &live_beacon[..],
+            "restart must reproduce the exact folded beacon from persisted state"
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A stale fold marker from an EARLIER Step-1 base (whose later heights had no
+    /// complete QC, so the live beacon advanced to a newer unfolded Step-1 base) is
+    /// NOT mis-applied on restart: the anchor-round guard keeps restart equal to the
+    /// live unfolded beacon.
+    #[test]
+    fn stale_fold_marker_not_reapplied_on_restart() {
+        let path = format!(
+            "/tmp/aincore_ordering_test_{}_qcfold_stale",
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&path);
+        let db = Arc::new(StateDB::open(&path).unwrap());
+        // A QC was folded at an OLD anchor round 8 / height 10...
+        store_qc(&db, 10, 8, b"OLD-AGG-SIG");
+        db.put("consensus:beacon_folded_qc_height", "10").unwrap();
+        db.put("consensus:beacon_folded_anchor_round", "8").unwrap();
+        // ...but the chain has since committed up to a NEWER anchor round 20 with no
+        // complete QC folded onto it (Step-1 base only).
+        db.put("consensus:last_anchor_round", "20").unwrap();
+        db.put("consensus:finality_digest", "newer-digest").unwrap();
+
+        let restored = OrderingEngine::new_with_storage(Arc::clone(&db));
+
+        // Expected: the pure Step-1 base for (20, "newer-digest") — NO fold applied.
+        let mut step1_only = OrderingEngine::new_with_storage(temp_db("qcfold_stale_ref"));
+        step1_only.update_random_beacon(20, "newer-digest");
+        assert_eq!(
+            restored.get_random_beacon(),
+            step1_only.get_random_beacon(),
+            "a stale fold marker for an earlier base must NOT be re-applied"
+        );
+        let _ = std::fs::remove_dir_all(&path);
     }
 }
