@@ -735,6 +735,17 @@ async fn main() {
                             guard.handle_incoming_batch(stripped);
                         }
                         None
+                    } else if msg.starts_with("DA_SHARD:") {
+                        // TASK #3 Stage-2 SERVE: route shard requests to the DA
+                        // sequencer. handle_p2p_message builds the ShardResponse
+                        // (DA_SHARD:{json}) which start_server writes back over the
+                        // same encrypted socket. Side-effect-only: serving shards
+                        // touches no consensus state, so it is determinism-safe.
+                        if let Ok(guard) = da_seq_clone.lock() {
+                            guard.handle_p2p_message(&msg)
+                        } else {
+                            None
+                        }
                     } else if msg == "GET_HEIGHT"
                         || msg == "GET_FINALITY"
                         || msg.starts_with("SYNC_REQ:")

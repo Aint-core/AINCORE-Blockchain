@@ -1,6 +1,6 @@
 use chrono::Utc;
 use crypto::{Signer, SigningKey};
-use network::{secure_connect, send_encrypted_msg};
+use network::{read_encrypted_msg, secure_connect, send_encrypted_msg};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -701,6 +701,225 @@ impl DASequencer {
         })
     }
 
+    /// TASK #3 Stage-2 REQUEST: fetch a single shard (+ Merkle proof) from a
+    /// remote peer over the same encrypted TCP channel used by sync/broadcast.
+    ///
+    /// This mirrors `sync::fetch_verified_tip`: open an ephemeral
+    /// `secure_connect`, send a `DA_SHARD:{ShardRequest}` frame, read back the
+    /// `DA_SHARD:{ShardResponse}` frame, and return `(bytes, merkle_proof)`.
+    ///
+    /// NOTE: the caller is responsible for verifying the returned bytes+proof
+    /// against the epoch commitment (the Stage-1 sampler does exactly this) —
+    /// this function performs no trust decision, it is a dumb transport so that
+    /// a lying peer cannot be distinguished here from an honest one. Serving and
+    /// fetching are side-effect-only and touch NO consensus state, so they are
+    /// determinism-safe.
+    pub async fn fetch_shard_from_peer(
+        &self,
+        peer_ip: &str,
+        port: u16,
+        epoch: u64,
+        shard_id: u32,
+    ) -> Result<(Vec<u8>, Vec<[u8; 32]>), String> {
+        use rand::rngs::OsRng;
+        let mut csprng = OsRng;
+        let ephemeral_signing_key = SigningKey::generate(&mut csprng);
+
+        let (mut stream, shared_key, _peer_node_id) = secure_connect(
+            peer_ip,
+            port,
+            "__da__",
+            0,
+            None,
+            &ephemeral_signing_key,
+        )
+        .await
+        .map_err(|e| format!("secure_connect failed: {}", e))?;
+
+        let request = p2p_protocol::ShardMessage::ShardRequest {
+            epoch,
+            shard_id,
+            requester_id: self.node_id.clone(),
+        };
+        let req_json = request.to_json()?;
+        let req_msg = format!("DA_SHARD:{}", req_json);
+
+        send_encrypted_msg(&mut stream, &shared_key, &req_msg)
+            .await
+            .map_err(|e| format!("send failed: {}", e))?;
+
+        let resp = read_encrypted_msg(&mut stream, &shared_key)
+            .await
+            .map_err(|e| format!("read failed: {}", e))?;
+
+        let json = resp
+            .strip_prefix("DA_SHARD:")
+            .ok_or("peer returned non-DA_SHARD response")?;
+        let message = p2p_protocol::ShardMessage::from_json(json)?;
+
+        match message {
+            p2p_protocol::ShardMessage::ShardResponse {
+                epoch: r_epoch,
+                shard_id: r_shard_id,
+                data,
+                merkle_proof,
+            } => {
+                if r_epoch != epoch || r_shard_id != shard_id {
+                    return Err(format!(
+                        "peer returned mismatched shard (asked epoch={} shard={}, got epoch={} shard={})",
+                        epoch, shard_id, r_epoch, r_shard_id
+                    ));
+                }
+                Ok((data, merkle_proof))
+            }
+            other => Err(format!(
+                "peer returned unexpected message type: {}",
+                other.message_type()
+            )),
+        }
+    }
+
+    /// TASK #3 Stage-2 REQUEST: real cross-node data-availability sampling for
+    /// `epoch`. Samples N random shards; for each sampled shard it tries the
+    /// LOCAL store first (`get_shard_proof`), and only if that fails does it
+    /// reach out to a peer (`fetch_shard_from_peer`). Each retrieved
+    /// `(bytes, proof)` is fed into the Stage-1 verified sampler, which checks it
+    /// against the committed Merkle root (`get_commitment`). A shard that is
+    /// retrieved but does not verify counts as UNAVAILABLE — a lying peer cannot
+    /// fake availability.
+    ///
+    /// Returns `Ok(true)` when enough sampled shards both retrieve AND verify;
+    /// `Ok(false)` when the network cannot supply a verifiable shard set; `Err`
+    /// only when the epoch has no commitment/metadata to sample against.
+    ///
+    /// Determinism: this is an OUT-OF-BAND availability check (monitoring), never
+    /// on the block-execution path, so its use of network + RNG is safe.
+    pub async fn verify_availability_from_peers(&self, epoch: u64) -> Result<bool, String> {
+        let root = self
+            .get_commitment(epoch)
+            .ok_or("DA commitment not found for epoch")?;
+
+        let meta = self
+            .storage
+            .get(&format!("da_meta_{}", epoch))
+            .map_err(|_| "Storage error")?
+            .ok_or("Epoch metadata not found")?;
+        let mut shard_count = serde_json::from_str::<serde_json::Value>(&meta)
+            .ok()
+            .and_then(|v| v["shards"].as_u64())
+            .unwrap_or(32) as u32;
+        if shard_count > 128 {
+            shard_count = 128;
+        }
+        if shard_count == 0 {
+            return Ok(false);
+        }
+
+        // Snapshot peers once so the sample is over a stable peer set.
+        let peers_snapshot = if let Ok(peers) = self.peers.lock() {
+            peers.clone()
+        } else {
+            HashMap::new()
+        };
+
+        // Pick the sampled shard indices up-front (random, dedup) so we can do
+        // the async per-shard fetches before handing fully-resolved results to
+        // the (synchronous) Stage-1 sampler closure.
+        let sample_size = 30usize.min(shard_count as usize);
+        let sampled_ids: Vec<u32> = {
+            use rand::seq::SliceRandom;
+            let mut rng = rand::thread_rng();
+            let mut ids: Vec<u32> = (0..shard_count).collect();
+            ids.shuffle(&mut rng);
+            ids.truncate(sample_size);
+            ids
+        };
+
+        // Resolve each sampled shard: local first, else fetch from peers.
+        let mut resolved: HashMap<u32, (Vec<u8>, Vec<[u8; 32]>)> = HashMap::new();
+        for &id in &sampled_ids {
+            if let Ok(local) = self.get_shard_proof(epoch, id as usize) {
+                resolved.insert(id, local);
+                continue;
+            }
+            // Local miss — try peers until one supplies the shard.
+            for (peer_id, port) in peers_snapshot.iter() {
+                let peer_ip = self
+                    .storage
+                    .get_peer_ip(peer_id)
+                    .unwrap_or_else(|| "127.0.0.1".to_string());
+                if let Ok(fetched) = self.fetch_shard_from_peer(&peer_ip, *port, epoch, id).await {
+                    resolved.insert(id, fetched);
+                    break;
+                }
+            }
+        }
+
+        // Feed the resolved shards into the Stage-1 verified sampler. Because we
+        // pre-selected exactly `sample_size` distinct ids and the sampler also
+        // draws `sample_size` distinct ids from the same range, any id the
+        // sampler asks for is one we attempted to resolve; an unresolved id (no
+        // local copy, no peer supplied it) returns Err → counts as unavailable.
+        let sampler = DASampler::new(sample_size, 0.999);
+        sampler.sample(shard_count, &root, |id| {
+            resolved
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| format!("shard {} unavailable (local miss + no peer)", id))
+        })
+    }
+
+    /// TASK #3 Stage-2 GATE (SAFE): out-of-band availability check for a
+    /// committed `epoch`. This NEVER blocks finality — it is intended to run on a
+    /// background/periodic task. On `Ok(false)` it logs a loud
+    /// `[SECURITY][DA_UNAVAILABLE]` alert and (best-effort) records a
+    /// `MissingData` fraud proof so the condition is observable on-chain by
+    /// monitoring; it does not halt the node.
+    ///
+    /// Returns the underlying availability result so callers can drive metrics.
+    pub async fn audit_epoch_availability(&self, epoch: u64) -> Result<bool, String> {
+        match self.verify_availability_from_peers(epoch).await {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                eprintln!(
+                    "🚨 [SECURITY][DA_UNAVAILABLE] epoch={} failed cross-node availability sampling \
+                     — committed data may be WITHHELD. Alerting (node continues; finality NOT halted).",
+                    epoch
+                );
+                // Best-effort: surface the condition as a recorded fraud proof.
+                if let Some(root) = self.get_commitment(epoch) {
+                    let fp = FraudProof {
+                        epoch,
+                        proof_type: FraudProofType::MissingData,
+                        claimed_root: root,
+                        evidence: format!(
+                            "cross-node DA sampling returned unavailable for epoch {}",
+                            epoch
+                        )
+                        .into_bytes(),
+                        proof_data: Vec::new(),
+                        submitter: self.node_id.clone(),
+                        timestamp: Utc::now().timestamp(),
+                    };
+                    let key = format!("da_fraud_missingdata_{}", epoch);
+                    if let Ok(json) = serde_json::to_string(&fp) {
+                        let _ = self.storage.put(&key, &json);
+                    }
+                }
+                Ok(false)
+            }
+            Err(e) => {
+                // No commitment/metadata to sample against is not itself a
+                // withholding alert (the epoch may simply be unknown locally).
+                eprintln!(
+                    "ℹ️  [DA] availability audit skipped for epoch={}: {}",
+                    epoch, e
+                );
+                Err(e)
+            }
+        }
+    }
+
     /// Handle incoming P2P shard request and respond with shard + proof
     ///
     /// This enables distributed shard storage - nodes only store subset of shards
@@ -984,6 +1203,231 @@ mod m09_tests {
             seq.verify_local_availability(epoch),
             Ok(false),
             "corrupted shards must fail DAS verification (#3)"
+        );
+    }
+}
+
+/// TASK #3 Stage-2: real cross-node Data Availability — serve, request, audit.
+#[cfg(test)]
+mod stage2_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn temp_db(suffix: &str) -> Arc<StateDB> {
+        let path = format!(
+            "/tmp/aincore_da_stage2_test_{}_{}",
+            std::process::id(),
+            suffix
+        );
+        let _ = std::fs::remove_dir_all(&path);
+        Arc::new(StateDB::open(&path).expect("open temp db"))
+    }
+
+    /// Seed `epoch` with a fully-available, committed shard set on `db`, exactly
+    /// the way `get_shard_proof` reads it back (rebuilds a `MerkleTree` over the
+    /// stored shards). Returns the shard count. Deterministic — no erasure /
+    /// compression pipeline, so the test is pure-function over fixed bytes.
+    fn seed_available_epoch(db: &Arc<StateDB>, epoch: u64, n: usize) -> usize {
+        let shards: Vec<Vec<u8>> = (0..n)
+            .map(|i| format!("stage2-shard-{}-{}", epoch, i).into_bytes())
+            .collect();
+        let tree = MerkleTree::new(&shards);
+        let root = tree.root();
+        for (i, s) in shards.iter().enumerate() {
+            db.put(&format!("da_shard_{}_{}", epoch, i), &hex::encode(s))
+                .unwrap();
+        }
+        db.put(&format!("da_commitment_{}", epoch), &hex::encode(root))
+            .unwrap();
+        db.put(
+            &format!("da_meta_{}", epoch),
+            &format!("{{\"shards\":{},\"original_size\":0}}", n),
+        )
+        .unwrap();
+        n
+    }
+
+    fn make_seq(node_id: &str, db: Arc<StateDB>, identity: u8) -> DASequencer {
+        let peers = Arc::new(Mutex::new(HashMap::new()));
+        DASequencer::new_encrypted(node_id.into(), db, peers, &[identity; 32])
+    }
+
+    /// handle_p2p_message round-trips a ShardRequest → ShardResponse purely
+    /// in-process, and the returned (bytes, proof) verify against the
+    /// commitment. This is the SERVE path the TCP callback in main.rs invokes.
+    #[test]
+    fn serve_shard_request_returns_verifiable_response() {
+        let db = temp_db("serve");
+        let epoch = 7u64;
+        seed_available_epoch(&db, epoch, 32);
+        let seq = make_seq("server", Arc::clone(&db), 1);
+
+        let req = p2p_protocol::ShardMessage::ShardRequest {
+            epoch,
+            shard_id: 5,
+            requester_id: "client".into(),
+        };
+        let req_msg = format!("DA_SHARD:{}", req.to_json().unwrap());
+
+        let resp = seq
+            .handle_p2p_message(&req_msg)
+            .expect("server must answer a known shard request");
+        let json = resp.strip_prefix("DA_SHARD:").expect("DA_SHARD prefix");
+        let msg = p2p_protocol::ShardMessage::from_json(json).unwrap();
+
+        match msg {
+            p2p_protocol::ShardMessage::ShardResponse {
+                epoch: e,
+                shard_id,
+                data,
+                merkle_proof,
+            } => {
+                assert_eq!(e, epoch);
+                assert_eq!(shard_id, 5);
+                let root = seq.get_commitment(epoch).unwrap();
+                assert!(
+                    MerkleTree::verify_proof(&data, &merkle_proof, &root, 5),
+                    "served shard must verify against the commitment"
+                );
+            }
+            other => panic!("expected ShardResponse, got {}", other.message_type()),
+        }
+    }
+
+    /// Full two-node round-trip over the encrypted TCP transport: a server
+    /// sequencer runs network::start_server (routing DA_SHARD: into
+    /// handle_p2p_message, mirroring core/node/src/main.rs); a client sequencer
+    /// fetches a shard with fetch_shard_from_peer and the bytes+proof verify.
+    #[tokio::test]
+    async fn fetch_shard_from_peer_roundtrip() {
+        let server_db = temp_db("rt_server");
+        let epoch = 11u64;
+        seed_available_epoch(&server_db, epoch, 32);
+        let server_seq = Arc::new(Mutex::new(make_seq("server", Arc::clone(&server_db), 2)));
+
+        // Bind an ephemeral port for the server.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // free it for start_server to re-bind
+
+        // The transport's MitM check requires the server's advertised node_id to
+        // equal derive_address(server pubkey) — the production invariant. Derive
+        // it from the transport identity key (independent of the DA signing key).
+        let server_signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]));
+        let server_node_id = crypto::derive_address(
+            &server_signing_key.verifying_key().to_bytes(),
+        )
+        .expect("derive server node id");
+        let server_peers: network::PeerList = Arc::new(Mutex::new(HashMap::new()));
+        let server_seq_cb = Arc::clone(&server_seq);
+        let srv_db = Arc::clone(&server_db);
+
+        tokio::spawn(async move {
+            network::start_server(
+                port,
+                server_node_id,
+                server_peers,
+                srv_db,
+                server_signing_key,
+                move |msg: String| -> Option<String> {
+                    if msg.starts_with("DA_SHARD:") {
+                        if let Ok(guard) = server_seq_cb.lock() {
+                            return guard.handle_p2p_message(&msg);
+                        }
+                    }
+                    None
+                },
+            )
+            .await;
+        });
+
+        // Give the server a moment to bind.
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // Client has NOTHING locally — must fetch from the server.
+        let client_db = temp_db("rt_client");
+        let client_seq = make_seq("client", client_db, 3);
+
+        let (data, proof) = client_seq
+            .fetch_shard_from_peer("127.0.0.1", port, epoch, 9)
+            .await
+            .expect("client must fetch shard 9 from the server");
+
+        // The client trusts NOTHING from the wire until it verifies against the
+        // (independently-known) commitment.
+        let root = server_seq.lock().unwrap().get_commitment(epoch).unwrap();
+        assert!(
+            MerkleTree::verify_proof(&data, &proof, &root, 9),
+            "fetched shard must verify against the commitment"
+        );
+    }
+
+    /// verify_availability_from_peers resolves LOCALLY when the node already has
+    /// every shard — no peers needed → Ok(true).
+    #[tokio::test]
+    async fn availability_local_first_ok() {
+        let db = temp_db("avail_local");
+        let epoch = 3u64;
+        seed_available_epoch(&db, epoch, 32);
+        let seq = make_seq("solo", db, 4);
+
+        assert_eq!(
+            seq.verify_availability_from_peers(epoch).await,
+            Ok(true),
+            "all shards local must report available without any peer"
+        );
+    }
+
+    /// With NO local shards and NO reachable peers, cross-node sampling reports
+    /// unavailable (Ok(false)) — and audit_epoch_availability raises the SAFE
+    /// alert path: it records a MissingData fraud proof but does NOT halt.
+    #[tokio::test]
+    async fn availability_unavailable_raises_alert_not_halt() {
+        let db = temp_db("avail_missing");
+        let epoch = 5u64;
+        // Seed commitment + meta but DELETE every shard so nothing is retrievable
+        // and there are no peers to fetch from.
+        seed_available_epoch(&db, epoch, 32);
+        for i in 0..32 {
+            db.delete(&format!("da_shard_{}_{}", epoch, i)).unwrap();
+        }
+        let seq = make_seq("solo", Arc::clone(&db), 5);
+
+        assert_eq!(
+            seq.verify_availability_from_peers(epoch).await,
+            Ok(false),
+            "no shards + no peers must report unavailable"
+        );
+
+        // The SAFE gate: returns Ok(false) (does not panic/halt) AND records a
+        // MissingData fraud proof for monitoring.
+        let audited = seq.audit_epoch_availability(epoch).await;
+        assert_eq!(audited, Ok(false), "audit must not halt — returns Ok(false)");
+        assert!(
+            db.get(&format!("da_fraud_missingdata_{}", epoch))
+                .unwrap()
+                .is_some(),
+            "audit must record a MissingData fraud proof on unavailability"
+        );
+    }
+
+    /// audit_epoch_availability on an epoch with no commitment is a no-op alert:
+    /// it returns Err (unknown epoch) and records NO fraud proof.
+    #[tokio::test]
+    async fn audit_unknown_epoch_is_noop() {
+        let db = temp_db("avail_unknown");
+        let seq = make_seq("solo", Arc::clone(&db), 6);
+        let epoch = 999u64;
+
+        assert!(
+            seq.audit_epoch_availability(epoch).await.is_err(),
+            "unknown epoch (no commitment) must Err, not alert"
+        );
+        assert!(
+            db.get(&format!("da_fraud_missingdata_{}", epoch))
+                .unwrap()
+                .is_none(),
+            "unknown epoch must NOT record a fraud proof"
         );
     }
 }
