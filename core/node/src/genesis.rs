@@ -14,6 +14,14 @@ use std::sync::Arc; // Force rebuild
 use storage::StateDB;
 
 const GENESIS_VERSION: &str = "phase1-bls-stake-v1";
+/// SEC-#13: storage key holding the canonical, genesis-pinned epoch-block
+/// interval. The executor reads this FIRST (deterministic across all nodes) and
+/// only falls back to the AINCORE_EPOCH_BLOCK_INTERVAL env var when it is absent
+/// (legacy DBs). Folded into the genesis identity hash so it is forge-proof.
+const GENESIS_EPOCH_BLOCK_INTERVAL_KEY: &str = "sys:config:epoch_block_interval";
+/// Canonical default for the epoch-block interval when genesis.json does not
+/// specify one. MUST match `Executor::DEFAULT_EPOCH_BLOCK_INTERVAL`.
+const DEFAULT_EPOCH_BLOCK_INTERVAL: u64 = 20;
 const GENESIS_STDLIB_MODULES_KEY: &str = "genesis_stdlib_modules";
 const GENESIS_STDLIB_COUNT_KEY: &str = "genesis_stdlib_module_count";
 /// Module names that MUST be present in the stdlib bundle, published under the
@@ -282,6 +290,7 @@ fn genesis_identity_hash(
     version: &str,
     chain_id: &str,
     validator_set_json: &str,
+    epoch_block_interval: &str,
 ) -> String {
     let mut hasher = Sha256::new();
     for part in [
@@ -290,6 +299,10 @@ fn genesis_identity_hash(
         version,
         chain_id,
         validator_set_json,
+        // SEC-#13: pin the epoch-block interval into chain identity so a node
+        // booting with a tampered/divergent interval is rejected by the genesis
+        // hash pin (it would advance epochs at different heights → fork).
+        epoch_block_interval,
     ] {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
@@ -581,7 +594,21 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
         .ok()
         .flatten()
         .unwrap_or_default();
-    let identity = genesis_identity_hash(&expected_hash, &version, &chain_id, &validator_set_json);
+    // SEC-#13: read tolerantly so reopening a legacy datadir that predates the
+    // pin never newly fails — an absent key folds the empty string, exactly as a
+    // pre-#13 DB would have hashed.
+    let epoch_block_interval = storage
+        .get(GENESIS_EPOCH_BLOCK_INTERVAL_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let identity = genesis_identity_hash(
+        &expected_hash,
+        &version,
+        &chain_id,
+        &validator_set_json,
+        &epoch_block_interval,
+    );
     println!("🧬 Genesis identity hash: {}", identity);
     if let Ok(pin) = std::env::var("AINCORE_EXPECTED_GENESIS_HASH") {
         let pin = pin.trim().to_lowercase();
@@ -696,6 +723,13 @@ pub fn initialize_genesis(
         validators: Vec<GenesisValidatorConfig>,
         treasury_reserve: String,
         epoch_duration: u64,
+        /// SEC-#13: optional canonical epoch-BLOCK interval (in blocks). This is
+        /// distinct from `epoch_duration` (a wall-clock seconds value used by the
+        /// Move epoch resource). When omitted, DEFAULT_EPOCH_BLOCK_INTERVAL is
+        /// used. Pinned into storage + the genesis identity hash so every node
+        /// advances epochs at identical heights (no per-node env fork hazard).
+        #[serde(default)]
+        epoch_block_interval: Option<u64>,
     }
 
     let genesis_paths = vec![
@@ -726,6 +760,8 @@ pub fn initialize_genesis(
     let mut total_bootstrap_stake: u128 = 0;
     let treasury_reserve_amount: u128;
     let genesis_epoch_duration: u64;
+    // SEC-#13: canonical epoch-block interval to pin into storage + identity hash.
+    let genesis_epoch_block_interval: u64;
     let mut genesis_chain_id = "AINCORE-MAINNET-1".to_string();
 
     if let Some(config) = loaded_genesis {
@@ -748,6 +784,17 @@ pub fn initialize_genesis(
                 "genesis.json epoch_duration must be greater than 0".to_string(),
             ));
         }
+        // SEC-#13: an explicit 0 is invalid (it would disable epoch advancement);
+        // omission falls back to the canonical default.
+        genesis_epoch_block_interval = match config.epoch_block_interval {
+            Some(0) => {
+                return Err(GenesisError::InvalidData(
+                    "genesis.json epoch_block_interval must be greater than 0".to_string(),
+                ));
+            }
+            Some(v) => v,
+            None => DEFAULT_EPOCH_BLOCK_INTERVAL,
+        };
         // SEC-#5: BLS self-derivation from the local node identity is only valid
         // for a single-validator genesis (see resolve_genesis_bls_identity).
         let genesis_validator_count = config.validators.len();
@@ -803,6 +850,7 @@ pub fn initialize_genesis(
         total_bootstrap_stake = stake;
         treasury_reserve_amount = 50_000 * 1_000_000_000_000_000_000;
         genesis_epoch_duration = 10;
+        genesis_epoch_block_interval = DEFAULT_EPOCH_BLOCK_INTERVAL;
 
         let account_addr = parse_move_addr(genesis_addr_hex)?;
         let public_key = parse_validator_public_key(genesis_pubkey_hex, genesis_addr_hex)?;
@@ -867,6 +915,19 @@ pub fn initialize_genesis(
     }
     storage.put("sys:chain_id", &genesis_chain_id)?;
     println!("⛓️  Genesis Chain ID: {}", genesis_chain_id);
+
+    // SEC-#13: pin the canonical epoch-block interval on-chain. The executor
+    // reads THIS deterministically on every node, eliminating the per-node
+    // AINCORE_EPOCH_BLOCK_INTERVAL env fork hazard. Folded into the genesis
+    // identity hash below so a tampered value is detected at boot.
+    storage.put(
+        GENESIS_EPOCH_BLOCK_INTERVAL_KEY,
+        &genesis_epoch_block_interval.to_string(),
+    )?;
+    println!(
+        "⏱️  Genesis Epoch-Block Interval pinned: {} block(s)",
+        genesis_epoch_block_interval
+    );
 
     // === GENESIS LOCK: Register the Genesis Validator address ===
     // This address will be PERMANENTLY BLOCKED from transfers (Anti-Rugpull).
@@ -1789,7 +1850,12 @@ mod tests {
             .ok()
             .flatten()
             .unwrap_or_default();
-        genesis_identity_hash(&sh, &v, &cid, &vs)
+        let ebi = db
+            .get(GENESIS_EPOCH_BLOCK_INTERVAL_KEY)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        genesis_identity_hash(&sh, &v, &cid, &vs, &ebi)
     }
 
     /// With the pin env unset, genesis init + reopen behave exactly as before.
@@ -1823,6 +1889,45 @@ mod tests {
         initialize_genesis(&db1, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY).unwrap();
         initialize_genesis(&db2, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY).unwrap();
         assert_eq!(computed_identity(&db1), computed_identity(&db2));
+    }
+
+    /// SEC-#13: genesis writes the canonical epoch-block interval to
+    /// sys:config:epoch_block_interval (default 20 when genesis.json omits it /
+    /// is absent — the single-node fallback path here).
+    #[test]
+    fn test_genesis_writes_epoch_block_interval_pin() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+        let db = temp_db("ebi_genesis_pin");
+        let key = SigningKey::from_bytes(&[40u8; 32]);
+        let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let pubkey = hex::encode(key.verifying_key().as_bytes());
+
+        initialize_genesis(&db, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY)
+            .expect("fresh genesis initializes");
+
+        let pinned = db
+            .get(GENESIS_EPOCH_BLOCK_INTERVAL_KEY)
+            .unwrap()
+            .expect("epoch-block interval must be pinned at genesis");
+        assert_eq!(
+            pinned,
+            DEFAULT_EPOCH_BLOCK_INTERVAL.to_string(),
+            "fallback genesis must pin the canonical default interval"
+        );
+    }
+
+    /// SEC-#13: the epoch-block interval is folded into the genesis identity hash,
+    /// so two otherwise-identical genesis states with different intervals produce
+    /// different chain identities (a tampered interval is caught by the pin).
+    #[test]
+    fn test_epoch_block_interval_changes_identity_hash() {
+        let base = genesis_identity_hash("sh", "v", "cid", "vs", "20");
+        let other = genesis_identity_hash("sh", "v", "cid", "vs", "21");
+        assert_ne!(
+            base, other,
+            "identity hash must depend on the epoch-block interval"
+        );
     }
 
     /// A matching pin allows boot (reopen path).

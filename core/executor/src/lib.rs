@@ -879,16 +879,49 @@ impl Executor {
         }
     }
 
-    fn epoch_block_interval() -> u64 {
-        std::env::var("AINCORE_EPOCH_BLOCK_INTERVAL")
+    /// SEC-#13: canonical, genesis-pinned default for the epoch-block interval.
+    /// Used only when neither the on-chain config key nor a dev override is set
+    /// (e.g. a fresh DB before genesis, or a legacy DB predating the pin).
+    const DEFAULT_EPOCH_BLOCK_INTERVAL: u64 = 20;
+
+    /// SEC-#13 (mainnet fork hazard): the epoch-block interval drives
+    /// `maybe_advance_epoch` (boundary check), `rotate_validator_epoch`
+    /// (`new_epoch = height / interval`), governance driving, and reward/halving
+    /// timing. If two nodes used different values they would advance epochs at
+    /// different heights → divergent validator-set snapshots + reward timing →
+    /// FORK. To make this deterministic and identical across nodes, the canonical
+    /// interval is written to `sys:config:epoch_block_interval` at genesis and
+    /// folded into the genesis identity hash (forge-proof).
+    ///
+    /// Resolution order (FIRST match wins):
+    ///   1. `sys:config:epoch_block_interval` in storage — the genesis-pinned
+    ///      value. On any genesis'd chain THIS ALWAYS WINS and the env var is
+    ///      ignored entirely, so a divergent operator env cannot fork the chain.
+    ///   2. `AINCORE_EPOCH_BLOCK_INTERVAL` env var — DEV-ONLY override, honored
+    ///      ONLY when the storage key is absent (legacy/older DBs that predate
+    ///      the genesis pin).
+    ///   3. `DEFAULT_EPOCH_BLOCK_INTERVAL` (20) — final fallback.
+    fn epoch_block_interval(&self) -> u64 {
+        // 1. Genesis-pinned on-chain value — deterministic, identical on all nodes.
+        if let Ok(Some(raw)) = self.db.get("sys:config:epoch_block_interval") {
+            if let Some(value) = raw.trim().parse::<u64>().ok().filter(|v| *v > 0) {
+                return value;
+            }
+        }
+        // 2. Dev override (only when the chain was never genesis-pinned).
+        if let Some(value) = std::env::var("AINCORE_EPOCH_BLOCK_INTERVAL")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(20)
+        {
+            return value;
+        }
+        // 3. Canonical default.
+        Self::DEFAULT_EPOCH_BLOCK_INTERVAL
     }
 
     fn maybe_advance_epoch(&self) {
-        let interval = Self::epoch_block_interval();
+        let interval = self.epoch_block_interval();
         let next_height = self.db.get_chain_height().saturating_add(1);
         if next_height == 0 || !next_height.is_multiple_of(interval) {
             return;
@@ -949,7 +982,7 @@ impl Executor {
     /// keys (like consensus:committed_rounds) — not Move state, not in the state
     /// root.
     fn rotate_validator_epoch(&self, boundary_height: u64) {
-        let interval = Self::epoch_block_interval();
+        let interval = self.epoch_block_interval();
         if interval == 0 {
             return;
         }
@@ -2939,6 +2972,81 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&path);
         Arc::new(StateDB::open(&path).expect("test DB opens"))
+    }
+
+    // SEC-#13: serialize env-mutating tests so a divergent AINCORE_EPOCH_BLOCK_INTERVAL
+    // set by one test cannot leak into another running in parallel.
+    static EPOCH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// SEC-#13: on a genesis'd chain the on-chain pinned interval is the single
+    /// source of truth and a divergent operator env var is IGNORED — this is the
+    /// fork-prevention invariant.
+    #[test]
+    fn epoch_block_interval_storage_pin_wins_over_env() {
+        let _g = EPOCH_ENV_LOCK.lock().unwrap();
+        let db = temp_db("ebi_pin_wins");
+        let exec = Executor::new(Arc::clone(&db));
+        // Genesis pinned 20; operator (maliciously or by mistake) sets a fork value.
+        db.put("sys:config:epoch_block_interval", "20").unwrap();
+        std::env::set_var("AINCORE_EPOCH_BLOCK_INTERVAL", "7");
+        assert_eq!(
+            exec.epoch_block_interval(),
+            20,
+            "genesis-pinned storage value must win over a divergent env var"
+        );
+        std::env::remove_var("AINCORE_EPOCH_BLOCK_INTERVAL");
+    }
+
+    /// SEC-#13: with NO storage pin (legacy/older DB), the env var is honored as a
+    /// dev override.
+    #[test]
+    fn epoch_block_interval_env_used_only_when_unpinned() {
+        let _g = EPOCH_ENV_LOCK.lock().unwrap();
+        let db = temp_db("ebi_env_fallback");
+        let exec = Executor::new(Arc::clone(&db));
+        // No sys:config:epoch_block_interval written.
+        std::env::set_var("AINCORE_EPOCH_BLOCK_INTERVAL", "5");
+        assert_eq!(
+            exec.epoch_block_interval(),
+            5,
+            "env override applies only when the genesis pin is absent"
+        );
+        std::env::remove_var("AINCORE_EPOCH_BLOCK_INTERVAL");
+    }
+
+    /// SEC-#13: with neither pin nor env, the canonical default is used.
+    #[test]
+    fn epoch_block_interval_falls_back_to_default() {
+        let _g = EPOCH_ENV_LOCK.lock().unwrap();
+        let db = temp_db("ebi_default");
+        let exec = Executor::new(Arc::clone(&db));
+        std::env::remove_var("AINCORE_EPOCH_BLOCK_INTERVAL");
+        assert_eq!(
+            exec.epoch_block_interval(),
+            Executor::DEFAULT_EPOCH_BLOCK_INTERVAL
+        );
+    }
+
+    /// SEC-#13: a zero/garbage pin is rejected and resolution proceeds to the next
+    /// source (here the default, since env is unset).
+    #[test]
+    fn epoch_block_interval_invalid_pin_is_skipped() {
+        let _g = EPOCH_ENV_LOCK.lock().unwrap();
+        let db = temp_db("ebi_invalid_pin");
+        let exec = Executor::new(Arc::clone(&db));
+        std::env::remove_var("AINCORE_EPOCH_BLOCK_INTERVAL");
+        db.put("sys:config:epoch_block_interval", "0").unwrap();
+        assert_eq!(
+            exec.epoch_block_interval(),
+            Executor::DEFAULT_EPOCH_BLOCK_INTERVAL,
+            "a zero pin must not disable epoch advancement"
+        );
+        db.put("sys:config:epoch_block_interval", "notanumber").unwrap();
+        assert_eq!(
+            exec.epoch_block_interval(),
+            Executor::DEFAULT_EPOCH_BLOCK_INTERVAL,
+            "a garbage pin must fall through to the default"
+        );
     }
 
     /// SEC-#16: an epoch boundary snapshots the live validator set for the new
