@@ -1060,6 +1060,7 @@ name = "bridge-rust"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "consensus",
  "crypto",
  "dotenv",
  "env_logger",

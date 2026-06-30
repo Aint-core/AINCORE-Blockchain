@@ -1,3 +1,5 @@
+use crate::validator_set::TrustedValidatorSet;
+use consensus::qc::{self, QuorumCertificate};
 use log::{error, info, warn};
 use reqwest::Client;
 use serde::Deserialize;
@@ -11,6 +13,11 @@ pub struct AincoreClient {
     rpc_url: String,
     client: Client,
     last_processed_height: u64, // Track last processed finalized block
+    // SEC-#18 Tier-B: the operator-shipped TRUSTED validator set, loaded
+    // independently of the RPC. Used to verify QC aggregate BLS signatures
+    // CLIENT-SIDE so the bridge never trusts the RPC node's `verified` flag.
+    // `None` => no trusted set configured => fail-closed (refuse every block).
+    trusted_validators: Option<TrustedValidatorSet>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,27 +41,113 @@ pub struct Block {
     pub transactions: Vec<String>, // Simplified: Txs are JSON strings in payload
 }
 
-/// SEC-#18: pure decision for whether a `aincore_getQuorumCertificate` response
-/// proves the given block is finalized. The block is accepted ONLY if the node
-/// reports the QC available AND independently verified (>2/3-stake aggregate BLS),
-/// AND the QC binds to exactly this `(height, hash)`. Extracted so the gate logic
-/// is unit-testable without a live RPC.
-fn qc_response_confirms(result: &serde_json::Value, height: u64, expected_hash: &str) -> bool {
+/// SEC-#18 Tier-B: pure decision for whether a `aincore_getQuorumCertificate`
+/// response proves the given block is finalized — verified CLIENT-SIDE.
+///
+/// The block is accepted ONLY if:
+///   1. the node says the QC is `available` (no QC -> nothing to verify),
+///   2. the embedded `quorum_certificate` deserializes into a
+///      [`consensus::qc::QuorumCertificate`],
+///   3. it binds to exactly this `(height, hash)`,
+///   4. and — crucially — the QC's aggregate BLS signature VERIFIES against the
+///      bridge's own TRUSTED validator set for `qc.epoch` via
+///      [`consensus::qc::verify_qc`] (> 2/3 stake, correct set hash, valid agg).
+///
+/// The node's own `verified` flag is now **advisory only**: a malicious RPC can
+/// set `verified: true` over a forged QC, so we recompute the result ourselves
+/// and merely log when the two disagree. Any parse/verify failure, or a missing
+/// trusted set, yields `false` (fail-closed). Extracted so the gate logic is
+/// unit-testable without a live RPC.
+fn qc_response_confirms(
+    result: &serde_json::Value,
+    height: u64,
+    expected_hash: &str,
+    trusted: Option<&TrustedValidatorSet>,
+) -> bool {
     if expected_hash.is_empty() {
         return false;
     }
-    if !result.get("available").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if !result
+        .get("available")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         return false;
     }
-    if !result.get("verified").and_then(|v| v.as_bool()).unwrap_or(false) {
-        return false;
-    }
-    let Some(qc) = result.get("quorum_certificate") else {
+
+    // The server's `verified` flag is advisory only — we re-verify below. Keep it
+    // for an operator-visible warning if the RPC disagrees with our verdict.
+    let server_verified = result
+        .get("verified")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let Some(qc_json) = result.get("quorum_certificate") else {
         return false;
     };
-    let qc_height = qc.get("block_height").and_then(|v| v.as_u64());
-    let qc_hash = qc.get("block_hash").and_then(|v| v.as_str());
-    qc_height == Some(height) && qc_hash == Some(expected_hash)
+
+    // Deserialize the QC into the canonical consensus type. A forged/garbled QC
+    // that does not match the type fails closed here.
+    let qc: QuorumCertificate = match serde_json::from_value(qc_json.clone()) {
+        Ok(q) => q,
+        Err(e) => {
+            warn!("⚠️ [SEC-#18-B] QC for block {} failed to deserialize: {}", height, e);
+            return false;
+        }
+    };
+
+    // Bind to exactly the block we are gating on BEFORE the (more expensive) BLS
+    // check. Wrong height/hash -> reject (QC is for a different block).
+    if qc.block_height != height || qc.block_hash != expected_hash {
+        warn!(
+            "⚠️ [SEC-#18-B] QC binds to ({}, {}) but expected ({}, {}) — reject",
+            qc.block_height, qc.block_hash, height, expected_hash
+        );
+        return false;
+    }
+
+    // CLIENT-SIDE cryptographic verification against the operator's trusted set.
+    let Some(trusted) = trusted else {
+        error!(
+            "🚨 [SEC-#18-B] no trusted validator set configured ({} unset?) — cannot verify QC for block {}; fail-closed",
+            crate::validator_set::VALIDATOR_SET_PATH_ENV,
+            height
+        );
+        return false;
+    };
+
+    // Resolve the trusted set for the QC's epoch (per-epoch sets supported; a
+    // single pinned set is used for every epoch). No set for this epoch ->
+    // fail-closed.
+    let Some(set) = trusted.resolve_for_epoch(qc.epoch) else {
+        error!(
+            "🚨 [SEC-#18-B] no trusted validator set for epoch {} (block {}) — fail-closed",
+            qc.epoch, height
+        );
+        return false;
+    };
+
+    match qc::verify_qc(&qc, set) {
+        Ok(()) => {
+            if !server_verified {
+                warn!(
+                    "⚠️ [SEC-#18-B] RPC reported verified=false for block {} but client-side verify_qc PASSED — trusting our own verification",
+                    height
+                );
+            }
+            true
+        }
+        Err(e) => {
+            // If the RPC claimed verified=true but the QC does NOT verify against
+            // our trusted set, the RPC is lying or compromised — this is exactly
+            // the attack Tier-B closes. Surface it loudly.
+            error!(
+                "🚨 [SEC-#18-B] CLIENT-SIDE QC verification FAILED for block {} (server_verified={}): {} — rejecting (bridge will not act)",
+                height, server_verified, e
+            );
+            false
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,11 +163,43 @@ pub struct Transaction {
 pub type BridgeEvent = (String, u64, String, u64, usize);
 
 impl AincoreClient {
+    /// Construct a client and load the TRUSTED validator set from
+    /// `AINCORE_VALIDATOR_SET_PATH` (SEC-#18 Tier-B). If the env is unset or the
+    /// file is unreadable/invalid, the trusted set stays `None` and every QC
+    /// verification fails closed (the bridge refuses to act). The error is logged
+    /// loudly at construction so operators notice the misconfiguration at boot.
     pub fn new(rpc_url: String) -> Self {
+        let trusted_validators = match TrustedValidatorSet::from_env() {
+            Ok(set) => {
+                info!("🔐 [SEC-#18-B] loaded trusted validator set for client-side QC verification");
+                Some(set)
+            }
+            Err(e) => {
+                error!(
+                    "🚨 [SEC-#18-B] could not load trusted validator set: {} — bridge will FAIL-CLOSED on every block until {} points to a valid validator-set file",
+                    e,
+                    crate::validator_set::VALIDATOR_SET_PATH_ENV
+                );
+                None
+            }
+        };
         Self {
             rpc_url,
             client: Client::new(),
             last_processed_height: 0,
+            trusted_validators,
+        }
+    }
+
+    /// Test/embedding constructor: supply the trusted validator set explicitly
+    /// instead of reading the environment.
+    #[allow(dead_code)]
+    pub fn with_trusted_validators(rpc_url: String, trusted: TrustedValidatorSet) -> Self {
+        Self {
+            rpc_url,
+            client: Client::new(),
+            last_processed_height: 0,
+            trusted_validators: Some(trusted),
         }
     }
 
@@ -191,10 +316,12 @@ impl AincoreClient {
         Ok(finalized)
     }
 
-    /// SEC-#18: verify that block `height` is finalized by a verified quorum
-    /// certificate bound to `expected_hash`. Queries `aincore_getQuorumCertificate`
-    /// and applies [`qc_response_confirms`]. Any RPC/parse failure → `false`
-    /// (fail-closed: the bridge must not act on state it cannot prove final).
+    /// SEC-#18 Tier-B: verify that block `height` is finalized by a quorum
+    /// certificate bound to `expected_hash`, verified CLIENT-SIDE against the
+    /// bridge's own trusted validator set. Queries `aincore_getQuorumCertificate`
+    /// and applies [`qc_response_confirms`] with `self.trusted_validators`. Any
+    /// RPC/parse/verify failure → `false` (fail-closed: the bridge must not act
+    /// on state it cannot itself prove final — it does NOT trust the RPC's flag).
     pub async fn verify_block_finalized(&self, height: u64, expected_hash: &str) -> bool {
         let payload = serde_json::json!({
             "jsonrpc": "2.0",
@@ -217,7 +344,12 @@ impl AincoreClient {
             }
         };
         match rpc_resp.result {
-            Some(result) => qc_response_confirms(&result, height, expected_hash),
+            Some(result) => qc_response_confirms(
+                &result,
+                height,
+                expected_hash,
+                self.trusted_validators.as_ref(),
+            ),
             None => false,
         }
     }
@@ -332,41 +464,246 @@ impl AincoreClient {
 #[cfg(test)]
 mod qc_gate_tests {
     use super::qc_response_confirms;
+    use crate::validator_set::TrustedValidatorSet;
+    use consensus::qc::{build_qc, validator_set_hash, FinalityVote, ValidatorInfo};
+    use crypto::bls::BLSEngine;
     use serde_json::json;
 
-    fn qc_resp(available: bool, verified: bool, h: u64, hash: &str) -> serde_json::Value {
+    // ---- helpers to build a REAL, BLS-valid QC the bridge can verify client-side ----
+
+    /// Build `n` validators with real deterministic BLS keys + PoP, plus their
+    /// raw secret seeds (so we can sign).
+    fn make_validators(specs: &[(u8, u64)]) -> (Vec<ValidatorInfo>, Vec<[u8; 32]>) {
+        let bls = BLSEngine::consensus();
+        let mut infos = Vec::new();
+        let mut sks = Vec::new();
+        for &(seed, stake) in specs {
+            let mut ikm = [0u8; 32];
+            ikm[0] = seed;
+            ikm[31] = seed.wrapping_add(7);
+            let pk = bls.pubkey_raw(&ikm);
+            let pop = bls.prove_possession_raw(&ikm);
+            infos.push(ValidatorInfo {
+                address: format!("{:032x}", seed as u128),
+                stake,
+                ed25519_public_key: "00".repeat(32),
+                bls_public_key: hex::encode(&pk),
+                bls_pop: hex::encode(&pop),
+            });
+            sks.push(ikm);
+        }
+        (infos, sks)
+    }
+
+    fn vote_for(height: u64, hash: &str, set_hash: &str) -> FinalityVote {
+        FinalityVote {
+            chain_id: "AINCORE-MAINNET-1".into(),
+            epoch: 0,
+            finalized_round: height,
+            anchor_round: height,
+            anchor_hash: "aa".repeat(32),
+            block_height: height,
+            block_hash: hash.to_string(),
+            state_root: "cc".repeat(32),
+            receipts_root: "dd".repeat(32),
+            finality_digest: "ee".repeat(32),
+            validator_set_hash: set_hash.to_string(),
+        }
+    }
+
+    /// Produce a QC JSON value the way the RPC would embed it, signed by all
+    /// validators in `sks` (canonical-order indices).
+    fn signed_qc_json(
+        height: u64,
+        hash: &str,
+        validators: &[ValidatorInfo],
+        sks: &[[u8; 32]],
+    ) -> serde_json::Value {
+        let bls = BLSEngine::consensus();
+        let set_hash = validator_set_hash(validators);
+        let vote = vote_for(height, hash, &set_hash);
+
+        // canonical order = address-sorted. Our addresses sort by seed, and we
+        // build specs in seed order, so indices line up; but be robust: sort.
+        let mut order: Vec<usize> = (0..validators.len()).collect();
+        order.sort_by(|&a, &b| validators[a].address.cmp(&validators[b].address));
+
+        let signer_indices: Vec<usize> = (0..order.len()).collect();
+        let sigs: Vec<Vec<u8>> = order
+            .iter()
+            .map(|&orig| bls.sign_raw(&vote.to_signing_bytes(), &sks[orig]))
+            .collect();
+
+        let qc = build_qc(&vote, validators, &signer_indices, &sigs).expect("build_qc");
+        serde_json::to_value(&qc).unwrap()
+    }
+
+    fn rpc_response(available: bool, verified: bool, qc: serde_json::Value) -> serde_json::Value {
         json!({
             "available": available,
             "verified": verified,
-            "quorum_certificate": { "block_height": h, "block_hash": hash }
+            "quorum_certificate": qc
         })
     }
 
-    // SEC-#18: the bridge accepts a block ONLY when the QC is available, verified,
-    // and bound to exactly this (height, hash).
+    fn single_set(validators: Vec<ValidatorInfo>) -> TrustedValidatorSet {
+        let json = serde_json::to_string(&validators).unwrap();
+        TrustedValidatorSet::from_json_str(&json).unwrap()
+    }
+
+    // ---- tests ----
+
+    // SEC-#18 Tier-B: a QC that VERIFIES against the trusted set is accepted.
     #[test]
-    fn qc_confirms_only_when_available_verified_and_bound() {
-        let h = 42u64;
-        let hash = "ab".repeat(32);
+    fn valid_qc_accepted_client_side() {
+        let h = 600u64;
+        let hash = "bb".repeat(32);
+        let (validators, sks) = make_validators(&[(1, 40), (2, 30), (3, 20)]); // 90 stake, 1-of-1 set
+        let qc = signed_qc_json(h, &hash, &validators, &sks);
+        let trusted = single_set(validators);
+        // 100% of the trusted set signed -> > 2/3 -> accepted.
+        assert!(qc_response_confirms(
+            &rpc_response(true, true, qc),
+            h,
+            &hash,
+            Some(&trusted)
+        ));
+    }
 
-        assert!(qc_response_confirms(&qc_resp(true, true, h, &hash), h, &hash));
+    // Even if the RPC LIES (verified=false), a cryptographically valid QC is still
+    // accepted — Tier-B trusts our own verification, not the RPC flag.
+    #[test]
+    fn valid_qc_accepted_even_if_rpc_says_unverified() {
+        let h = 7u64;
+        let hash = "cd".repeat(32);
+        let (validators, sks) = make_validators(&[(5, 100)]);
+        let qc = signed_qc_json(h, &hash, &validators, &sks);
+        let trusted = single_set(validators);
+        assert!(qc_response_confirms(
+            &rpc_response(true, false, qc),
+            h,
+            &hash,
+            Some(&trusted)
+        ));
+    }
 
-        // Not verified / not available -> reject (forged or unfinalized state).
-        assert!(!qc_response_confirms(&qc_resp(true, false, h, &hash), h, &hash));
-        assert!(!qc_response_confirms(&qc_resp(false, true, h, &hash), h, &hash));
+    // A tampered QC (mutated block_hash inside the QC) is rejected: the binding
+    // check fails (and the BLS signature would not match either).
+    #[test]
+    fn tampered_qc_rejected() {
+        let h = 600u64;
+        let hash = "bb".repeat(32);
+        let (validators, sks) = make_validators(&[(1, 60), (2, 40)]);
+        let mut qc = signed_qc_json(h, &hash, &validators, &sks);
+        // Attacker flips the block_hash but leaves the (now-invalid) signature.
+        qc["block_hash"] = json!("ff".repeat(32));
+        let trusted = single_set(validators);
+        // expected_hash still the original -> binding mismatch -> reject. And even
+        // if it matched, the signature is over the original hash -> BLS fail.
+        assert!(!qc_response_confirms(
+            &rpc_response(true, true, qc),
+            h,
+            &hash,
+            Some(&trusted)
+        ));
+    }
 
-        // Wrong height or hash -> reject (QC for a different block).
-        assert!(!qc_response_confirms(&qc_resp(true, true, h + 1, &hash), h, &hash));
-        assert!(!qc_response_confirms(&qc_resp(true, true, h, &"cd".repeat(32)), h, &hash));
+    // A QC verified against the WRONG validator set is rejected (validator_set_hash
+    // binding + BLS keys differ).
+    #[test]
+    fn wrong_validator_set_rejected() {
+        let h = 600u64;
+        let hash = "bb".repeat(32);
+        let (real, sks) = make_validators(&[(1, 60), (2, 40)]);
+        let qc = signed_qc_json(h, &hash, &real, &sks);
+        // Operator's trusted set is a DIFFERENT validator set.
+        let (other, _) = make_validators(&[(9, 60), (8, 40)]);
+        let trusted = single_set(other);
+        assert!(!qc_response_confirms(
+            &rpc_response(true, true, qc),
+            h,
+            &hash,
+            Some(&trusted)
+        ));
+    }
 
-        // Empty expected hash cannot be bound -> reject.
-        assert!(!qc_response_confirms(&qc_resp(true, true, h, ""), h, ""));
+    // Wrong height or wrong expected hash -> reject (QC for a different block).
+    #[test]
+    fn wrong_height_or_hash_rejected() {
+        let h = 600u64;
+        let hash = "bb".repeat(32);
+        let (validators, sks) = make_validators(&[(1, 100)]);
+        let qc = signed_qc_json(h, &hash, &validators, &sks);
+        let trusted = single_set(validators);
 
-        // Missing quorum_certificate object -> reject.
+        // Same QC, but gating a different height.
+        assert!(!qc_response_confirms(
+            &rpc_response(true, true, qc.clone()),
+            h + 1,
+            &hash,
+            Some(&trusted)
+        ));
+        // Same QC, but gating a different expected hash.
+        assert!(!qc_response_confirms(
+            &rpc_response(true, true, qc),
+            h,
+            &"cd".repeat(32),
+            Some(&trusted)
+        ));
+    }
+
+    // Missing trusted-set config -> fail-closed regardless of how good the QC is.
+    #[test]
+    fn missing_trusted_set_fails_closed() {
+        let h = 600u64;
+        let hash = "bb".repeat(32);
+        let (validators, sks) = make_validators(&[(1, 100)]);
+        let qc = signed_qc_json(h, &hash, &validators, &sks);
+        assert!(!qc_response_confirms(
+            &rpc_response(true, true, qc),
+            h,
+            &hash,
+            None
+        ));
+    }
+
+    // available=false / missing QC / empty expected hash -> reject (unchanged
+    // Tier-A guards, still enforced before any crypto).
+    #[test]
+    fn unavailable_or_malformed_rejected() {
+        let h = 600u64;
+        let hash = "bb".repeat(32);
+        let (validators, sks) = make_validators(&[(1, 100)]);
+        let qc = signed_qc_json(h, &hash, &validators, &sks);
+        let trusted = single_set(validators);
+
+        // available=false -> reject even with a valid QC.
+        assert!(!qc_response_confirms(
+            &rpc_response(false, true, qc.clone()),
+            h,
+            &hash,
+            Some(&trusted)
+        ));
+        // empty expected hash -> reject.
+        assert!(!qc_response_confirms(
+            &rpc_response(true, true, qc),
+            h,
+            "",
+            Some(&trusted)
+        ));
+        // missing quorum_certificate -> reject.
         assert!(!qc_response_confirms(
             &json!({"available": true, "verified": true}),
             h,
-            &hash
+            &hash,
+            Some(&trusted)
+        ));
+        // garbage quorum_certificate (wrong type) -> reject (deserialize fails).
+        assert!(!qc_response_confirms(
+            &json!({"available": true, "verified": true, "quorum_certificate": "nope"}),
+            h,
+            &hash,
+            Some(&trusted)
         ));
     }
 }

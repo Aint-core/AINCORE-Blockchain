@@ -1,6 +1,7 @@
 mod aincore_client;
 mod evm_client;
 mod nonce_store;
+mod validator_set;
 
 use aincore_client::AincoreClient;
 use dotenv::dotenv;
