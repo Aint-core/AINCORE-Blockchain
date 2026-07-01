@@ -3058,8 +3058,12 @@ mod tests {
         let db = temp_db("rotate_epoch");
         let exec = Executor::new(Arc::clone(&db));
         db.put("sys:validator_set:v1", "[\"set-at-boundary\"]").unwrap();
+        // SEC-#13: pin the interval in storage so this test is deterministic and
+        // immune to a concurrent test mutating the process-global
+        // AINCORE_EPOCH_BLOCK_INTERVAL env (storage always wins over env).
+        db.put("sys:config:epoch_block_interval", "20").unwrap();
 
-        // interval default 20 → boundary 40 = epoch 2.
+        // interval 20 → boundary 40 = epoch 2.
         exec.rotate_validator_epoch(40);
         assert_eq!(db.get("consensus:epoch").unwrap().unwrap(), "2");
         assert_eq!(
