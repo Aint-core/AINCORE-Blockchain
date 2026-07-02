@@ -109,10 +109,8 @@ enum KeysSubcommand {
         #[arg(long, default_value = "./keys")]
         out: String,
     },
-    /// Import a private key
+    /// Import a private key (entered at a hidden prompt — never via CLI arg)
     Import {
-        #[arg(long)]
-        priv_key: String,
         #[arg(long, default_value = "./keys")]
         out: String,
     },
@@ -149,9 +147,11 @@ fn main() -> anyhow::Result<()> {
             let pk_bytes = pk.as_bytes();
             let sk_bytes = sk.as_bytes();
 
-            // Derive address (first 16 bytes of SHA256 hash of public key)
-            let pk_hash = sha2::Sha256::digest(pk_bytes);
-            let address = hex::encode(&pk_hash[..16]);
+            // Derive the AINCORE address the same way the rest of the chain does:
+            // full 32-byte SHA256 of the public key (audit note: the old 16-byte
+            // truncation was inconsistent with the #35 32-byte hard fork).
+            let address = crypto::derive_address(pk_bytes)
+                .map_err(|e| anyhow::anyhow!("failed to derive PQC address: {e}"))?;
 
             // Save files
             let pk_path = format!("{}/pqc_pubkey.bin", out);
@@ -159,15 +159,36 @@ fn main() -> anyhow::Result<()> {
             let addr_path = format!("{}/pqc_address.txt", out);
 
             std::fs::write(&pk_path, pk_bytes)?;
-            std::fs::write(&sk_path, sk_bytes)?;
+            // SECURITY (audit H-5): the Dilithium5 secret key is a spendable signing
+            // identity — write it owner-only (0600), never world-readable, mirroring
+            // the node.key hardening in core/node/src/main.rs. Create with the
+            // restrictive mode from the start so there is no world-readable window.
+            {
+                #[cfg(unix)]
+                {
+                    use std::io::Write as _;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(&sk_path)?;
+                    f.write_all(sk_bytes)?;
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::write(&sk_path, sk_bytes)?;
+                }
+            }
             std::fs::write(&addr_path, &address)?;
 
             println!("Post-Quantum Keypair Generated (Dilithium5)");
             println!("Public Key:  {} ({} bytes)", pk_path, pk_bytes.len());
-            println!("Private Key: {} ({} bytes)", sk_path, sk_bytes.len());
+            println!("Private Key: {} ({} bytes, mode 0600)", sk_path, sk_bytes.len());
             println!("Address:     {}", address);
             println!();
-            println!("SECURITY: Keep pqc_privkey.bin secure!");
+            println!("SECURITY: Keep pqc_privkey.bin secure (stored owner-only 0600, unencrypted).");
         }
         Commands::Info => {
             let res = client.call("aincore_getStatus", json!([]))?;
@@ -475,8 +496,8 @@ fn main() -> anyhow::Result<()> {
             KeysSubcommand::Generate { out } => {
                 KeysCmd::generate(&out)?;
             }
-            KeysSubcommand::Import { priv_key, out } => {
-                KeysCmd::import(&priv_key, &out)?;
+            KeysSubcommand::Import { out } => {
+                KeysCmd::import(&out)?;
             }
         },
         Commands::RegisterValidator => {

@@ -33,17 +33,27 @@ impl KeysCmd {
         Ok(())
     }
 
-    pub fn import(private_key: &str, out_dir: &str) -> Result<()> {
+    pub fn import(out_dir: &str) -> Result<()> {
         let dir = Path::new(out_dir);
         if !dir.exists() {
             std::fs::create_dir_all(dir)?;
         }
 
         println!("🔐 Importing key into encrypted keystore in '{}'", out_dir);
+        // SECURITY (audit H-6): the private key MUST NOT be a CLI argument — process
+        // args (`ps`, /proc/<pid>/cmdline) and shell history leak the plaintext secret
+        // before it is ever encrypted. Read it from a no-echo prompt instead.
+        print!("🔑 Enter private key to import (hex, input hidden): ");
+        std::io::stdout().flush()?;
+        let private_key = rpassword::read_password().context("Failed to read private key")?;
+        let private_key = private_key.trim().to_string();
+        if private_key.is_empty() {
+            anyhow::bail!("No private key entered");
+        }
         let password = Self::prompt_password(true)?;
 
         println!("⏳ Encrypting key...");
-        let uuid = KeyManager::import(dir, private_key, &password)?;
+        let uuid = KeyManager::import(dir, &private_key, &password)?;
 
         let path = dir.join(&uuid);
         println!("✅ Key imported successfully!");

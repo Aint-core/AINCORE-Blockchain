@@ -48,8 +48,28 @@ impl Wallet {
                 );
             }
             let wallet = Self::new();
-            fs::write(path, hex::encode(wallet.key_pair.to_bytes()))
-                .context("Failed to write keyfile")?;
+            // SECURITY (audit M-6): wallet.key holds the plaintext spending key — write
+            // it owner-only (0600), matching the node.key hardening; never leave the
+            // secret world-readable (default 0644).
+            #[cfg(unix)]
+            {
+                use std::io::Write as _;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut f = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(path)
+                    .context("Failed to create keyfile")?;
+                f.write_all(hex::encode(wallet.key_pair.to_bytes()).as_bytes())
+                    .context("Failed to write keyfile")?;
+            }
+            #[cfg(not(unix))]
+            {
+                fs::write(path, hex::encode(wallet.key_pair.to_bytes()))
+                    .context("Failed to write keyfile")?;
+            }
             Ok(wallet)
         }
     }
