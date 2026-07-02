@@ -127,7 +127,7 @@ fn qc_response_confirms(
         return false;
     };
 
-    match qc::verify_qc(&qc, set) {
+    match qc::verify_qc(&qc, set, &qc::expected_chain_id()) {
         Ok(()) => {
             if !server_verified {
                 warn!(

@@ -119,6 +119,10 @@ pub enum QcError {
     /// The QC's claimed validator_set_hash does not equal the hash of the trusted
     /// validator set it is being verified against (binding promised by the spec).
     ValidatorSetMismatch { claimed: String, recomputed: String },
+    /// The QC's chain_id does not equal the verifier's expected chain_id. Prevents
+    /// a valid QC minted on one chain (fork/clone/staging that shares the validator
+    /// set) from being accepted as finality on another (audit M-1).
+    ChainIdMismatch { claimed: String, expected: String },
     BadBlsKey(String),
     VerifyFailed(String),
 }
@@ -202,13 +206,38 @@ pub fn encode_bitmap(indices: &[usize], n: usize) -> Vec<u8> {
     bitmap
 }
 
+/// The chain id a verifier should require of any QC it accepts as finality —
+/// the local node's `AINCORE_CHAIN_ID` (default `AINCORE-MAINNET-1`). Centralized
+/// so sync, the RPC handlers, and the bridge all bind QCs to the same chain
+/// (audit M-1). This is a boot-time identity read, not a per-block value.
+pub fn expected_chain_id() -> String {
+    std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string())
+}
+
 /// Verify a quorum certificate against a trusted validator set.
 ///
 /// `validators` is the trusted set for `qc.epoch` (any order — canonicalized
 /// internally). Returns Ok(()) only if the aggregate BLS signature is valid over
 /// the canonical finality-vote bytes for exactly the bitmap signers AND their
 /// stake strictly exceeds 2/3 of the total.
-pub fn verify_qc(qc: &QuorumCertificate, validators: &[ValidatorInfo]) -> Result<(), QcError> {
+pub fn verify_qc(
+    qc: &QuorumCertificate,
+    validators: &[ValidatorInfo],
+    expected_chain_id: &str,
+) -> Result<(), QcError> {
+    // SEC (audit M-1): bind the QC to the verifier's chain. The aggregate signature
+    // covers `chain_id` (via FinalityVote::to_signing_bytes), so a QC minted on chain
+    // A carries chain_id="A" and its signature cannot be re-labelled to "B" without
+    // breaking verification. Rejecting on `qc.chain_id != expected` therefore prevents
+    // a valid >2/3 QC produced on a fork / staging clone / relaunched chain that shares
+    // the genesis validator set from being accepted as finality here. Checked FIRST so
+    // no cross-chain QC ever reaches signature verification.
+    if qc.chain_id != expected_chain_id {
+        return Err(QcError::ChainIdMismatch {
+            claimed: qc.chain_id.clone(),
+            expected: expected_chain_id.to_string(),
+        });
+    }
     let validators = canonical_order(validators);
     let n = validators.len();
 
@@ -450,7 +479,7 @@ mod tests {
         let sig = sign_vote(&sk, &vote);
         let qc = build_qc(&vote, &validators, &[0], &[sig]).unwrap();
         // 100% stake signed -> valid 1-of-1 QC.
-        assert!(verify_qc(&qc, &validators).is_ok(), "1-of-1 QC must verify");
+        assert!(verify_qc(&qc, &validators, &qc.chain_id).is_ok(), "1-of-1 QC must verify");
     }
 
     #[test]
@@ -466,7 +495,7 @@ mod tests {
         let qc = build_qc(&vote, &validators, &[0], &[sig]).unwrap();
         assert!(
             matches!(
-                verify_qc(&qc, &validators),
+                verify_qc(&qc, &validators, &qc.chain_id),
                 Err(QcError::ValidatorSetMismatch { .. })
             ),
             "QC bound to a different validator set must be rejected"
@@ -510,7 +539,7 @@ mod tests {
             .map(|&i| sign_vote(&sk_for(&ord[i]), &vote))
             .collect();
         let qc = build_qc(&vote, &set, &signer_idx, &sigs).unwrap();
-        assert!(verify_qc(&qc, &set).is_ok(), "90/100 stake QC must verify");
+        assert!(verify_qc(&qc, &set, &qc.chain_id).is_ok(), "90/100 stake QC must verify");
 
         // A single 40-stake validator alone is NOT > 2/3.
         let lone_idx: Vec<usize> = ord
@@ -526,7 +555,7 @@ mod tests {
         let lone_qc = build_qc(&vote, &set, &lone_idx, &lone_sigs).unwrap();
         assert!(
             matches!(
-                verify_qc(&lone_qc, &set),
+                verify_qc(&lone_qc, &set, &lone_qc.chain_id),
                 Err(QcError::BelowThreshold { .. })
             ),
             "40/100 stake must be rejected below threshold"
@@ -545,7 +574,7 @@ mod tests {
         let sig = sign_vote(&sk, &other);
         let qc = build_qc(&vote, &validators, &[0], &[sig]).unwrap();
         assert!(
-            matches!(verify_qc(&qc, &validators), Err(QcError::VerifyFailed(_))),
+            matches!(verify_qc(&qc, &validators, &qc.chain_id), Err(QcError::VerifyFailed(_))),
             "QC signed over a different message must fail BLS verify"
         );
     }
@@ -561,7 +590,7 @@ mod tests {
         qc.signed_stake = 999;
         assert!(
             matches!(
-                verify_qc(&qc, &validators),
+                verify_qc(&qc, &validators, &qc.chain_id),
                 Err(QcError::StakeMismatch { .. })
             ),
             "forged signed_stake must be rejected"
@@ -579,7 +608,7 @@ mod tests {
         qc.signer_bitmap = vec![0b0000_0101]; // bits 0 and 2; only index 0 exists
         assert!(
             matches!(
-                verify_qc(&qc, &validators),
+                verify_qc(&qc, &validators, &qc.chain_id),
                 Err(QcError::SignerOutOfRange(_))
             ),
             "bitmap referencing a non-existent validator must be rejected"

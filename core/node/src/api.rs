@@ -250,7 +250,7 @@ async fn json_rpc_handler(
                                         &data.storage,
                                         qc.epoch,
                                     ) {
-                                        Some(vset) => match consensus::qc::verify_qc(&qc, &vset) {
+                                        Some(vset) => match consensus::qc::verify_qc(&qc, &vset, &consensus::qc::expected_chain_id()) {
                                             Ok(()) => (true, String::new()),
                                             Err(e) => (false, e.to_string()),
                                         },
@@ -304,7 +304,7 @@ async fn json_rpc_handler(
                                 code: -32000,
                                 message: "validator set unavailable".into(),
                             }),
-                            Some(validators) => match consensus::qc::verify_qc(&qc, &validators) {
+                            Some(validators) => match consensus::qc::verify_qc(&qc, &validators, &consensus::qc::expected_chain_id()) {
                                 Ok(()) => Ok(serde_json::json!({ "valid": true })),
                                 Err(e) => Ok(serde_json::json!({
                                     "valid": false,

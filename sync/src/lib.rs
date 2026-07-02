@@ -385,7 +385,7 @@ impl ChainSync {
             Some(v) => v,
             None => return Ok(()), // no trusted set to verify against — skip
         };
-        consensus::qc::verify_qc(qc, &validators)
+        consensus::qc::verify_qc(qc, &validators, &consensus::qc::expected_chain_id())
             .map_err(|e| format!("finality QC verification failed: {:?}", e))?;
 
         let remote_finalized = qc.finalized_round;
@@ -803,7 +803,7 @@ impl ChainSync {
         // Verify the QC against the trusted validator set for its epoch. Only a
         // verifiable QC counts toward agreement (the crypto backstop is preserved).
         let validators = self.trusted_validator_set(qc.epoch)?;
-        match consensus::qc::verify_qc(&qc, &validators) {
+        match consensus::qc::verify_qc(&qc, &validators, &consensus::qc::expected_chain_id()) {
             Ok(()) => Some(qc),
             Err(_) => None,
         }

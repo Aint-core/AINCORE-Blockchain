@@ -943,7 +943,7 @@ fn handle_rpc_method(
                                         &data.storage,
                                         qc.epoch,
                                     ) {
-                                        Some(vset) => match consensus::qc::verify_qc(&qc, &vset) {
+                                        Some(vset) => match consensus::qc::verify_qc(&qc, &vset, &consensus::qc::expected_chain_id()) {
                                             Ok(()) => (true, String::new()),
                                             Err(e) => (false, e.to_string()),
                                         },
@@ -988,7 +988,7 @@ fn handle_rpc_method(
                         code: -32000,
                         message: "validator set unavailable".into(),
                     })?;
-            match consensus::qc::verify_qc(&qc, &validators) {
+            match consensus::qc::verify_qc(&qc, &validators, &consensus::qc::expected_chain_id()) {
                 Ok(()) => Ok(serde_json::json!({ "valid": true })),
                 Err(e) => Ok(serde_json::json!({ "valid": false, "error": e.to_string() })),
             }

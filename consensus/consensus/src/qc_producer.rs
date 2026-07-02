@@ -219,7 +219,7 @@ pub fn produce_and_store_qc(
     };
 
     // Self-verify before storing: an unverifiable QC must never be persisted.
-    if let Err(e) = verify_qc(&qc, &validators) {
+    if let Err(e) = verify_qc(&qc, &validators, &qc.chain_id) {
         eprintln!("🚨 [QC] self-verify failed: {e} — not storing");
         return QcOutcome::Skipped;
     }
@@ -420,7 +420,7 @@ pub fn collect_vote_and_try_aggregate(
         }
     };
     // NEVER store an unverifiable QC.
-    if let Err(e) = verify_qc(&qc, &validators) {
+    if let Err(e) = verify_qc(&qc, &validators, &qc.chain_id) {
         eprintln!("🚨 [QC] aggregate self-verify failed: {e} — not storing");
         return QcOutcome::Skipped;
     }
@@ -500,7 +500,7 @@ mod tests {
             other => panic!("single validator must produce a complete QC, got {other:?}"),
         };
         // The produced QC verifies against the trusted set.
-        assert!(verify_qc(&qc, &[v]).is_ok());
+        assert!(verify_qc(&qc, &[v], &qc.chain_id).is_ok());
         // And it was stored at the height key.
         assert!(storage.get("consensus:qc:42").unwrap().is_some());
         assert_eq!(
@@ -678,7 +678,7 @@ mod tests {
             QcOutcome::Complete(qc) => qc,
             other => panic!("two votes (80/100) must aggregate into a complete QC, got {other:?}"),
         };
-        assert!(verify_qc(&qc, &set).is_ok(), "aggregated QC must verify");
+        assert!(verify_qc(&qc, &set, &qc.chain_id).is_ok(), "aggregated QC must verify");
         assert_eq!(qc.signed_stake, 80);
         assert_eq!(qc.total_stake, 100);
         // Stored under the canonical keys.

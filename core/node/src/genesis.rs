@@ -1798,7 +1798,7 @@ mod tests {
         let sig = bls.sign_raw(&vote.to_signing_bytes(), &bls_seed);
         let qc = consensus::qc::build_qc(&vote, &set, &[0], &[sig]).expect("build qc");
         assert!(
-            consensus::qc::verify_qc(&qc, &set).is_ok(),
+            consensus::qc::verify_qc(&qc, &set, &qc.chain_id).is_ok(),
             "1-of-1 QC over the genesis v1 set must verify"
         );
     }
