@@ -1036,9 +1036,30 @@ impl DASequencer {
                     proposer_id, epoch, shard_count
                 );
 
-                // Store commitment
+                // SECURITY (audit H-4): BatchAnnouncement is UNAUTHENTICATED — it carries
+                // no signature and no proposer pubkey. It MUST NOT establish or overwrite
+                // the trusted epoch commitment `da_commitment_{epoch}`. That key is the
+                // authoritative Merkle root for DAS verification (verify_local_availability,
+                // verify_availability_from_peers, DASampler::sample), the ShardResponse
+                // accept-and-store gate, and the light-client RPCs (aincore_sampleDA /
+                // aincore_getShardProof). A blind put here would let any peer that
+                // completes the transport handshake forge that root network-wide.
+                // The authoritative commitment comes ONLY from the signature-verified
+                // DA_COMMIT path (handle_incoming_batch) or this node's own create_batch().
+                // Treat the announcement purely as a hint to fetch shards; those shards are
+                // later verified against the authoritative commitment. Flag any conflict
+                // with an already-held commitment as possible equivocation, but never
+                // overwrite it.
                 let commitment_key = format!("da_commitment_{}", epoch);
-                let _ = self.storage.put(&commitment_key, &hex::encode(merkle_root));
+                if let Ok(Some(existing)) = self.storage.get(&commitment_key) {
+                    let announced = hex::encode(merkle_root);
+                    if existing != announced {
+                        eprintln!(
+                            "🚨 [SECURITY][DA] Unauthenticated BatchAnnouncement for epoch {} conflicts with the trusted commitment (announced={}, held={}) — IGNORED",
+                            epoch, announced, existing
+                        );
+                    }
+                }
 
                 // Determine which shards we need to request
                 let my_shards = self.shard_manager.get_my_shards(&self.node_id);

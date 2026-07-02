@@ -798,12 +798,24 @@ pub fn initialize_genesis(
         // SEC-#5: BLS self-derivation from the local node identity is only valid
         // for a single-validator genesis (see resolve_genesis_bls_identity).
         let genesis_validator_count = config.validators.len();
+        // SEC (audit M-4): genesis writes sys:validator_set:v1 directly, bypassing the
+        // Move staking module's MIN_STAKE check. scale_stake_to_whole_ain integer-divides
+        // quanta by 10^18, so ANY stake below 1 whole AIN silently becomes 0 whole-AIN
+        // voting power (registered but never counted for quorum/leader) — and an all-
+        // sub-1-AIN set yields total_stake==0, making strict >2/3 unsatisfiable → the
+        // chain never finalizes. Enforce the real minimum (1000 AIN) here, matching the
+        // Move staking module, so no genesis validator can be silently disenfranchised.
+        const MIN_VALIDATOR_STAKE_QUANTA: u128 = 1000 * 1_000_000_000_000_000_000; // 1000 AIN
         for val in config.validators {
             let stake = parse_genesis_amount(&val.stake, "validator stake")?;
-            if stake == 0 {
+            if stake < MIN_VALIDATOR_STAKE_QUANTA {
                 return Err(GenesisError::InvalidData(format!(
-                    "Genesis validator {} stake must be greater than 0",
-                    val.address
+                    "Genesis validator {} stake {} quanta is below the minimum {} quanta \
+                     (1000 AIN) and would scale to {} whole-AIN voting power",
+                    val.address,
+                    stake,
+                    MIN_VALIDATOR_STAKE_QUANTA,
+                    stake / 1_000_000_000_000_000_000
                 )));
             }
             genesis_validators.push((val.address.clone(), val.public_key.clone()));

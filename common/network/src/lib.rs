@@ -87,6 +87,14 @@ pub async fn start_server<F>(
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v >= 1)
         .unwrap_or(MAX_CONN_PER_IP_MIN);
+    // SEC (audit L-1): the docker-bridge (172.16-31.x) exemption from the per-IP cap
+    // voids the anti-Sybil control on any host where an attacker can source/spoof a
+    // 172.x address (shared docker host, co-tenant, on-link). Default to applying the
+    // cap to ALL IPs; only exempt bridge IPs when the operator explicitly opts in for
+    // a single-host compose deployment.
+    let trust_docker_bridge = std::env::var("AINCORE_TRUST_DOCKER_BRIDGE")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
 
     loop {
         let (mut socket, addr) = match listener.accept().await {
@@ -109,7 +117,7 @@ pub async fn start_server<F>(
         // many containers legitimately egress one bridge gateway. One source IP
         // cannot otherwise open MAX_CONNECTIONS sessions and starve real peers.
         let peer_ip = addr.ip();
-        if !is_docker_bridge_ip(peer_ip) {
+        if !(trust_docker_bridge && is_docker_bridge_ip(peer_ip)) {
             match per_ip_connections.lock() {
                 Ok(mut ipm) => {
                     let c = ipm.entry(peer_ip).or_insert(0);
@@ -191,6 +199,14 @@ pub async fn start_server<F>(
 
             // Loop for Encrypted Messages
             let mut len_buf = [0u8; 4];
+            // SEC (audit M-3): per-connection message-rate limit (anti-DoS). A peer that
+            // completes the DH can otherwise stream valid-format frames at line rate, each
+            // driving the consensus write lock + storage work with no slashable identity.
+            // Cap to ~100 msg/s (matching the gossipsub limit); drop the connection if
+            // exceeded.
+            const MAX_MSGS_PER_SEC: u32 = 100;
+            let mut rl_window_start = std::time::Instant::now();
+            let mut rl_msgs_in_window: u32 = 0;
             loop {
                 let read_len_res = tokio::time::timeout(
                     std::time::Duration::from_secs(60),
@@ -201,9 +217,26 @@ pub async fn start_server<F>(
                     Ok(Ok(_)) => {} // successfully read 4 bytes
                     _ => break,     // Timeout or EOF/connection closed
                 }
+
+                // rate-limit gate (audit M-3)
+                if rl_window_start.elapsed().as_secs() >= 1 {
+                    rl_window_start = std::time::Instant::now();
+                    rl_msgs_in_window = 0;
+                }
+                rl_msgs_in_window += 1;
+                if rl_msgs_in_window > MAX_MSGS_PER_SEC {
+                    eprintln!(
+                        "⚠️ Per-connection message rate limit exceeded from {} (>{} msg/s); dropping",
+                        addr, MAX_MSGS_PER_SEC
+                    );
+                    break;
+                }
+
                 let msg_len = u32::from_be_bytes(len_buf) as usize;
 
-                if msg_len > 10 * 1024 * 1024 {
+                // SEC (audit M-3): align the TCP max frame with the gossipsub 1 MiB cap
+                // (was 10 MiB) to bound per-message memory/CPU on the unauthenticated path.
+                if msg_len > 1024 * 1024 {
                     eprintln!("⚠️ Message too large from {}", addr);
                     break;
                 }
