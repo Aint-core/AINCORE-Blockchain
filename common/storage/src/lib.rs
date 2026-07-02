@@ -52,11 +52,17 @@ impl StateDB {
     /// - Corrupted database files
     ///
     /// # Security Hardening (Audit Remediation)
-    /// - WAL (Write-Ahead Log) is enabled with manual flush for crash recovery
-    /// - `sync` = true forces fsync on every write, ensuring durability even on
-    ///   power failure (prevents data loss that could cause state root divergence)
+    /// - WAL (Write-Ahead Log) is enabled (auto-flush) so every `put`/`delete`
+    ///   record reaches the OS on write (crash-recoverable).
+    /// - The durability-critical block-commit path (`write_batch`) is written with
+    ///   `WriteOptions.sync = true`, forcing an fsync so a committed state root
+    ///   survives power loss (prevents the state-root divergence that would fork
+    ///   validators). `set_use_fsync(true)` makes that sync a full fsync.
     /// - Checksums are enabled to detect silent data corruption
     /// - `create_if_missing` = true for first-run genesis bootstrap
+    /// NOTE (audit M-2): `set_manual_wal_flush(true)` was REMOVED — it left plain
+    /// `put`/`delete` records in RocksDB's in-process WAL buffer (lost on crash
+    /// despite returning Ok) and made `write_batch` a racy write-then-flush pair.
     pub fn open(path: &str) -> Result<Self, StorageError> {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
@@ -71,9 +77,11 @@ impl StateDB {
         // non-negotiable for a blockchain — data integrity > speed.
         opts.set_use_fsync(true);
 
-        // Manual WAL flush gives us control over when WAL is synced,
-        // allowing batch writes (WriteBatch) to be atomic + durable.
-        opts.set_manual_wal_flush(true);
+        // SEC (audit M-2): DO NOT enable manual WAL flush. It kept plain put()/delete()
+        // WAL records buffered in-process (silently lost on crash despite Ok) and forced
+        // write_batch into a racy write()-then-flush_wal() pair. With auto WAL flush,
+        // every write's WAL record reaches the OS immediately; the block-commit path
+        // adds an explicit fsync via write_batch's sync WriteOptions below.
 
         // Enable paranoid checks for detecting silent data corruption.
         // This adds CPU overhead but catches bit-rot before it propagates.
@@ -276,8 +284,14 @@ impl StateDB {
         &self,
         batch: rocksdb::WriteBatch,
     ) -> std::result::Result<(), rocksdb::Error> {
-        self.db.write(batch)?;
-        self.db.flush_wal(true)
+        // SEC (audit M-2): commit the batch as a SINGLE fsync'd write (sync=true +
+        // set_use_fsync) rather than write()-then-flush_wal() as two steps. This makes
+        // the block-commit (state root) atomically durable against power loss — a kill
+        // between the old two steps could lose an already-Ok'd batch, diverging the
+        // node's committed state from peers that did persist it.
+        let mut wo = rocksdb::WriteOptions::default();
+        wo.set_sync(true);
+        self.db.write_opt(batch, &wo)
     }
 
     /// Durably flush everything to disk: sync the WAL, then flush memtables to
@@ -658,10 +672,15 @@ impl StateDB {
 
     pub fn get_burn_percentage(&self) -> u8 {
         const DEFAULT_BURN: u8 = 10; // 10%
-        match self.get("sys:config:burn_percentage") {
+        // SEC (audit econ-LOW): clamp to <=100. An out-of-range value (from a buggy or
+        // malicious passed governance UpdateEconomicParams) would make burnt_fees exceed
+        // total_fees and over-decrement the supply trackers (deflationary drift). The
+        // fee split must never burn more than 100% of the fees.
+        let raw = match self.get("sys:config:burn_percentage") {
             Ok(Some(v)) => v.parse().unwrap_or(DEFAULT_BURN),
             _ => DEFAULT_BURN,
-        }
+        };
+        raw.min(100)
     }
 
     pub fn update_economic_config(

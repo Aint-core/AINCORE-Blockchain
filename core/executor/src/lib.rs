@@ -2567,6 +2567,33 @@ impl Executor {
                         println!("❌ Publish rejected: user transactions cannot publish to 0x1");
                         return None;
                     }
+                    // SEC (audit M-5): module publishing runs full bytecode verification
+                    // (deserialize + verify_module_bundle_for_publication + dependency
+                    // checks) with the move-vm gas meter ignored, and the executor charges
+                    // a flat gas_limit upfront (ignoring VM gas_used). A large adversarial
+                    // bundle could therefore force superlinear verification work on every
+                    // validator for a near-minimal fee (cheap chain-halt-grade DoS).
+                    // Require the declared gas_limit to cover a size-proportional floor so
+                    // the fee scales with the verification cost imposed on the network.
+                    const PUBLISH_GAS_PER_BYTE: u64 = 10;
+                    const PUBLISH_GAS_PER_MODULE: u64 = 5_000;
+                    let publish_bytes: u64 =
+                        modules.iter().map(|m| m.len() as u64).sum::<u64>();
+                    let publish_floor = publish_bytes
+                        .saturating_mul(PUBLISH_GAS_PER_BYTE)
+                        .saturating_add(
+                            (modules.len() as u64).saturating_mul(PUBLISH_GAS_PER_MODULE),
+                        );
+                    if tx.gas_limit < publish_floor {
+                        println!(
+                            "❌ Publish rejected: gas_limit {} below size-derived floor {} ({} bytes, {} modules)",
+                            tx.gas_limit,
+                            publish_floor,
+                            publish_bytes,
+                            modules.len()
+                        );
+                        return None;
+                    }
                     let mut actions = pre_actions.clone();
                     // 3-tuple arity (FIX #1). PublishModule ignores auth_signer
                     // (it uses the fn `sender` param for the 0x1 reservation check),

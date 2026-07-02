@@ -965,8 +965,25 @@ impl ChainSync {
             let execution_summary = executor
                 .execute_block_parallel(block.transactions.clone(), &block.header.proposer_id);
             if let Err(e) = self.verify_execution_roots(block, &execution_summary) {
-                eprintln!("🚨 [SECURITY][SYNC_EXECUTION_ROOT_REJECT] {}", e);
-                let _ = self.storage.put("sync:halt_reason", &e);
+                // SEC (audit H-3): synced blocks are UNAUTHENTICATED (no proposer
+                // signature — only a self-referential header hash + a public proposer_id
+                // string). A re-execution-root mismatch is EXPECTED adversarial input
+                // from a malicious peer, NOT proof of local divergence — so it must NOT
+                // latch a persistent, node-wide `sync:halt_reason` that survives restart
+                // and needs manual operator intervention. A single forged block from any
+                // peer could otherwise permanently halt the node (remote DoS). Reject
+                // this block and stop consuming THIS peer's batch; the QC-gated finality
+                // path (apply_finality_artifact + chain_id/set-bound verify_qc) remains
+                // the authenticated crypto backstop.
+                //
+                // RESIDUAL (tracked): the complete remediation authenticates blocks
+                // BEFORE execution (a verifiable QC covering the block, or a proposer
+                // vertex signature) so a forged block never executes at all — a block-
+                // format change, out of scope here.
+                eprintln!(
+                    "🚨 [SECURITY][SYNC_EXECUTION_ROOT_REJECT] rejecting divergent/forged block #{} from this peer (not halting): {}",
+                    block.header.height, e
+                );
                 break;
             }
 
