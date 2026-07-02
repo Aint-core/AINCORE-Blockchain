@@ -771,7 +771,14 @@ async fn main() {
         let peers_clone_reconnect = Arc::clone(&peers);
         let storage_clone_reconnect = Arc::clone(&storage);
         let node_id_reconnect = node_id.clone();
-        let bootnodes_clone = bootnodes.clone();
+        // Use the NORMALIZED bootnodes (`/ip4/<ip>/tcp/<port>`): the reconnect loop
+        // parses each entry with `split('/')` expecting a multiaddr (parts>=5). The raw
+        // `bootnodes` list is `<ip>:<port>` → split('/') yields 1 part → every bootnode is
+        // silently skipped → the auto-reconnect NEVER re-handshakes. On a real multi-machine
+        // cluster the boot-time handshakes race (peer TCP servers not up yet) and fail, and
+        // with the reconnect dead the peer mesh never recovers → no quorum → no finality.
+        // (Localhost hides this: boot handshakes succeed instantly.)
+        let bootnodes_clone = normalized_bootnodes.clone();
         let my_port = port;
         let signing_key_reconnect = Arc::clone(&node_signing_key);
         let shutdown_reconnect = Arc::clone(&shutdown);

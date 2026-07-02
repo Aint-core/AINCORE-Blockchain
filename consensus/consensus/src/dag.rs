@@ -760,8 +760,15 @@ impl DagConsensus {
             }
 
             // Fast-forward local round to match network if lagging behind (Amnesia Recovery)
-            // ONLY for remote vertices — try_create_vertex already increments for local ones
-            if vertex.author != self.node_id && vertex.round >= self.current_round {
+            // ONLY for remote vertices — try_create_vertex already increments for local ones.
+            // STRICTLY ahead (`>`, not `>=`): a remote vertex at OUR CURRENT round must not
+            // push us past it before we produce our own vertex for that round. Otherwise a
+            // bootstrapping validator that receives a peer's round-R vertex before its own
+            // ticker fires skips round R forever and never contributes to round R's quorum —
+            // a multi-machine bootstrap deadlock (Parents<quorum) that localhost never hits
+            // because peers connect within one round there. Genuine lag (round strictly
+            // greater) still fast-forwards for amnesia recovery.
+            if vertex.author != self.node_id && vertex.round > self.current_round {
                 self.current_round = vertex.round + 1;
                 let _ = self
                     .storage
