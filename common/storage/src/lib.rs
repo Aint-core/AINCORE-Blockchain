@@ -52,17 +52,19 @@ impl StateDB {
     /// - Corrupted database files
     ///
     /// # Security Hardening (Audit Remediation)
-    /// - WAL (Write-Ahead Log) is enabled (auto-flush) so every `put`/`delete`
-    ///   record reaches the OS on write (crash-recoverable).
+    ///
+    /// - WAL (Write-Ahead Log) is enabled (auto-flush) so every `put`/`delete` record
+    ///   reaches the OS on write (crash-recoverable).
     /// - The durability-critical block-commit path (`write_batch`) is written with
-    ///   `WriteOptions.sync = true`, forcing an fsync so a committed state root
-    ///   survives power loss (prevents the state-root divergence that would fork
-    ///   validators). `set_use_fsync(true)` makes that sync a full fsync.
-    /// - Checksums are enabled to detect silent data corruption
-    /// - `create_if_missing` = true for first-run genesis bootstrap
+    ///   `WriteOptions.sync = true`, forcing an fsync so a committed state root survives
+    ///   power loss (prevents state-root divergence that would fork validators);
+    ///   `set_use_fsync(true)` makes that sync a full fsync.
+    /// - Checksums are enabled to detect silent data corruption.
+    /// - `create_if_missing` = true for first-run genesis bootstrap.
+    ///
     /// NOTE (audit M-2): `set_manual_wal_flush(true)` was REMOVED — it left plain
-    /// `put`/`delete` records in RocksDB's in-process WAL buffer (lost on crash
-    /// despite returning Ok) and made `write_batch` a racy write-then-flush pair.
+    /// `put`/`delete` records in RocksDB's in-process WAL buffer (lost on crash despite
+    /// returning Ok) and made `write_batch` a racy write-then-flush pair.
     pub fn open(path: &str) -> Result<Self, StorageError> {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);

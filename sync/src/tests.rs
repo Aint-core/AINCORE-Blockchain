@@ -201,7 +201,9 @@ mod tests {
             )
             .unwrap();
         let vote = FinalityVote {
-            chain_id: "AINCORE-TEST-1".to_string(),
+            // Must match qc::expected_chain_id() (default AINCORE-MAINNET-1) so the
+            // chain_id binding added for audit M-1 accepts this test QC.
+            chain_id: "AINCORE-MAINNET-1".to_string(),
             epoch: 0,
             finalized_round,
             anchor_round,
