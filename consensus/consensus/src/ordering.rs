@@ -561,18 +561,32 @@ impl OrderingEngine {
             return String::new();
         }
 
-        // H5 FIX: Mix VDF beacon randomness into leader selection
-        // Convert VDF output bytes to a u64 seed for index calculation
-        let vdf_seed: u64 = if self.last_vdf_output.len() >= 8 {
+        // SEC (audit H-1): elect from the DETERMINISTIC Step-1 base `step1_beacon`
+        // (VDF over anchor_round + cumulative finality_digest), NOT from
+        // `last_vdf_output`. `last_vdf_output` is `step1_beacon` optionally folded with
+        // a COMPLETE multi-party QC aggregate signature, and that fold happens per node
+        // at a different moment (as each node assembles the complete QC from gossiped
+        // QC_VOTEs). Electing off `last_vdf_output` therefore let a node that had folded
+        // height H elect a DIFFERENT anchor leader than a node that had not yet folded
+        // it — a finality-safety FORK reachable with no Byzantine participant. The
+        // Step-1 base is a pure function of already-committed state, identical on every
+        // honest node at commit time, so leader selection is deterministic.
+        // NOTE: the Step-1 base is still proposer-biasable via chosen content (audit
+        // H-2) — closing that needs a real delay-VDF (or a QC fold bound to a height
+        // buried below a fixed finality lag so all nodes fold before electing); tracked
+        // as deferred. The QC-folded `last_vdf_output` remains available via
+        // get_random_beacon() for NON-consensus randomness only.
+        let election_beacon = &self.step1_beacon;
+        let vdf_seed: u64 = if election_beacon.len() >= 8 {
             let bytes: [u8; 8] = [
-                self.last_vdf_output[0],
-                self.last_vdf_output[1],
-                self.last_vdf_output[2],
-                self.last_vdf_output[3],
-                self.last_vdf_output[4],
-                self.last_vdf_output[5],
-                self.last_vdf_output[6],
-                self.last_vdf_output[7],
+                election_beacon[0],
+                election_beacon[1],
+                election_beacon[2],
+                election_beacon[3],
+                election_beacon[4],
+                election_beacon[5],
+                election_beacon[6],
+                election_beacon[7],
             ];
             u64::from_le_bytes(bytes)
         } else {
@@ -784,6 +798,44 @@ mod tests {
         );
         assert_ne!(restored.get_random_beacon(), &[0u8; 32][..]);
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// SEC (audit H-1): leader election must read the DETERMINISTIC Step-1 beacon,
+    /// NOT the QC-folded `last_vdf_output` (folded per node at different moments as
+    /// each assembles the complete QC from gossiped votes). Two engines that agree
+    /// on the Step-1 base but DISAGREE on the folded value must still elect identical
+    /// leaders every round — otherwise honest nodes fork finalized state with no
+    /// Byzantine participant. This test would fail on the pre-fix code (which seeded
+    /// election from `last_vdf_output`).
+    #[test]
+    fn leader_election_ignores_qc_fold_divergence() {
+        let mut e1 = OrderingEngine::new_with_storage(temp_db("h1_fold_a"));
+        let mut e2 = OrderingEngine::new_with_storage(temp_db("h1_fold_b"));
+        // Same committed state -> identical Step-1 base on both engines.
+        e1.update_random_beacon(11, "digest-COMMON");
+        e2.update_random_beacon(11, "digest-COMMON");
+        assert_eq!(
+            e1.step1_beacon, e2.step1_beacon,
+            "Step-1 base must match for identical committed state"
+        );
+        // Simulate a complete-QC fold that has landed on e1 but not yet on e2 (the
+        // real cross-node timing skew): their folded beacons now diverge...
+        e1.last_vdf_output = vec![0xABu8; 32];
+        e2.last_vdf_output = vec![0xCDu8; 32];
+        assert_ne!(e1.last_vdf_output, e2.last_vdf_output);
+        // ...yet leader election (now seeded from step1_beacon) must agree EVERY round.
+        let validators = vec![
+            ("aaaa".to_string(), 30u64),
+            ("bbbb".to_string(), 30u64),
+            ("cccc".to_string(), 40u64),
+        ];
+        for round in 0..500u64 {
+            assert_eq!(
+                e1.get_leader_with_fallback(round, &validators, 0),
+                e2.get_leader_with_fallback(round, &validators, 0),
+                "leader must be identical despite QC-fold divergence at round {round}"
+            );
+        }
     }
 
     /// M3: a legacy node persisted committed_rounds as a huge unbounded Vec.
