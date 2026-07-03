@@ -39,10 +39,10 @@ pub struct Block {
 
 /// audit #3: verify the RPC-supplied block is internally consistent — the transaction
 /// list hashes to `header.tx_hash` and the header hashes to `header.hash` — using the
-/// node's exact canonical hashing. Combined with the QC check binding `header.hash` to
-/// >2/3 finality, this proves `transactions` are the real finalized transactions, so a
-/// malicious RPC can no longer pair a genuine finalized hash with a forged tx list to
-/// fabricate bridge_lock events.
+/// node's exact canonical hashing. Combined with the QC check that binds `header.hash`
+/// to super-majority finality, this proves `transactions` are the real finalized
+/// transactions, so a malicious RPC can no longer pair a genuine finalized hash with a
+/// forged tx list to fabricate bridge_lock events.
 fn block_hash_binds_transactions(block: &Block) -> bool {
     if blockchain::calculate_tx_hash(&block.transactions) != block.header.tx_hash {
         return false;
