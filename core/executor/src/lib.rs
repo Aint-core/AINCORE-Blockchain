@@ -1877,6 +1877,30 @@ impl Executor {
                 }
             }
 
+            // SEC (audit C-2): also prune the slashed validator from the AUTHORITATIVE
+            // QC trust root `sys:validator_set:v1`. verify_qc resolves its set (stake +
+            // BLS key) from v1, but v1 was previously only upserted on join and NEVER
+            // pruned on slash/leave — so a slashed (even proven-equivocating) validator
+            // kept full QC stake weight forever, letting a departed/ghost set forge a
+            // >2/3 QC with no honest supermajority. Prune here to match the Move active
+            // set + the sys:validators mirror above.
+            if let Ok(Some(v1_json)) = self.db.get(validator_set_v1_key()) {
+                if let Ok(mut v1) = serde_json::from_str::<Vec<ValidatorSetV1Entry>>(&v1_json) {
+                    let v1_before = v1.len();
+                    v1.retain(|v| v.address != validator_addr);
+                    if v1.len() != v1_before {
+                        if let Ok(nj) = serde_json::to_string(&v1) {
+                            let _ = self.db.put(validator_set_v1_key(), &nj);
+                            println!(
+                                "   🔻 Removed slashed validator from sys:validator_set:v1 ({} -> {})",
+                                v1_before,
+                                v1.len()
+                            );
+                        }
+                    }
+                }
+            }
+
             // H-4 FIX: Write tombstone
             let _ = self.db.put(&tombstone_key, "1");
 
@@ -1923,6 +1947,23 @@ impl Executor {
             .map(|addr| addr.to_string())
             .unwrap_or_else(|| tx.sender.clone());
         deps.push(sender_token.clone());
+        // SEC (audit C-1): a paymaster-sponsored tx has `deduct_gas` DEBIT the
+        // PAYMASTER's CoinStore (`resource_{paymaster}_CoinStore`), not the sender's —
+        // but without a covering conflict token, two same-paymaster / different-sender
+        // txs land in the SAME parallel batch, both read the pre-batch paymaster
+        // balance B, both emit `resource_{P}_CoinStore = B - G`, and the last-write-wins
+        // atomic commit collapses N gas deductions into ONE while `total_fees` counts
+        // all N → the proposer is minted fees that were never actually burned (AIN
+        // created from nothing, breaching the supply cap). Tokenize the paymaster
+        // address (identical mechanism to `sender_token`) so same-paymaster txs — and
+        // a normal transfer FROM the paymaster racing a sponsored tx — serialize into
+        // separate batches and each observes the updated balance.
+        if let Some(pm) = &tx.paymaster {
+            let pm_token = parse_move_address(pm)
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| pm.clone());
+            deps.push(pm_token);
+        }
         for obj in &tx.input_objects {
             deps.push(obj.clone());
         }
