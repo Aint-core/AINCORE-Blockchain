@@ -26,19 +26,28 @@ struct RpcResponse<T> {
     error: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-pub struct BlockHeader {
-    // SEC-#18: bind bridge events to the block's hash so they can be checked
-    // against a quorum certificate (by scan height) before the bridge acts.
-    #[serde(default)]
-    pub hash: String,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct Block {
+    // audit #3: use the node's OWN canonical BlockHeader (all hash-committed fields:
+    // height, prev_hash, tx_hash, state_root, receipts_root, proposer_id, round,
+    // timestamp, hash) so the bridge can recompute the block hash and confirm the
+    // transaction list is bound to the QC-attested `header.hash` — not trusted from RPC.
     #[serde(default)]
-    pub header: BlockHeader,
-    pub transactions: Vec<String>, // Simplified: Txs are JSON strings in payload
+    pub header: blockchain::BlockHeader,
+    pub transactions: Vec<String>, // Txs are JSON strings in payload
+}
+
+/// audit #3: verify the RPC-supplied block is internally consistent — the transaction
+/// list hashes to `header.tx_hash` and the header hashes to `header.hash` — using the
+/// node's exact canonical hashing. Combined with the QC check binding `header.hash` to
+/// >2/3 finality, this proves `transactions` are the real finalized transactions, so a
+/// malicious RPC can no longer pair a genuine finalized hash with a forged tx list to
+/// fabricate bridge_lock events.
+fn block_hash_binds_transactions(block: &Block) -> bool {
+    if blockchain::calculate_tx_hash(&block.transactions) != block.header.tx_hash {
+        return false;
+    }
+    blockchain::calculate_header_hash(&block.header) == block.header.hash
 }
 
 /// SEC-#18 Tier-B: pure decision for whether a `aincore_getQuorumCertificate`
@@ -406,6 +415,18 @@ impl AincoreClient {
             if !self.verify_block_finalized(block_height, &block.header.hash).await {
                 warn!(
                     "⚠️ [SEC-#18] block {} is not QC-finalized (or hash mismatch) — halting scan; bridge will retry",
+                    block_height
+                );
+                break;
+            }
+            // audit #3: the QC above binds `header.hash` to >2/3 finality, but the QC
+            // says nothing about the `transactions` the RPC returned alongside it. Bind
+            // the tx list to that same hash by reconstructing it — otherwise a malicious
+            // RPC pairs the genuine finalized hash with a FORGED tx list and mints
+            // unbacked bridge_lock events. Reject the block on any mismatch.
+            if !block_hash_binds_transactions(block) {
+                warn!(
+                    "🚨 [SEC-#3] block {} transactions do NOT reconstruct its QC-attested header.hash (forged/mismatched tx list) — halting scan",
                     block_height
                 );
                 break;

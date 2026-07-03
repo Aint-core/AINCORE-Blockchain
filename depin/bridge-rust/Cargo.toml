@@ -19,5 +19,8 @@ crypto = { path = "../../common/crypto" }
 # SEC-#18 Tier-B: client-side QC verification (verify_qc / ValidatorInfo /
 # QuorumCertificate) so the bridge does NOT trust the RPC node's `verified` flag.
 consensus = { path = "../../consensus/consensus" }
+# audit #3: recompute the block hash from (header, tx_hash(transactions)) with the
+# node's OWN canonical hashing so the QC-attested hash binds the transaction list.
+blockchain = { path = "../../consensus/blockchain" }
 rpassword = "7.0"
 rand = "0.8"

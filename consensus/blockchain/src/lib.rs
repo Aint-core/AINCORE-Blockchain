@@ -2,7 +2,7 @@ use crypto::hash; // Use crypto module's hash function
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct BlockHeader {
     pub height: u64,
     pub prev_hash: String, // Hash dari blok sebelumnya
