@@ -902,14 +902,23 @@ impl ChainSync {
                             }
                         }
                         if state_changing_orphan {
-                            let reason = format!(
-                                "state-changing reorg at height {} (orphaning {}..={}) requires state-undo; halting for operator re-bootstrap",
+                            // SEC (audit C-2/H-3 sibling): the competing chain that would
+                            // orphan state-changing committed blocks arrived over the
+                            // UNAUTHENTICATED sync path (forgeable by any peer). Do NOT
+                            // latch a persistent, node-wide `sync:halt_reason` — that is
+                            // the same remote permanent-halt DoS the H-3 exec-root fix
+                            // removed, just reachable through the reorg branch. REJECT the
+                            // reorg (never roll back to an unauthenticated fork) and stop
+                            // consuming this peer's batch; the node keeps its current
+                            // QC-finality-backed chain intact (no state corruption, since
+                            // we do NOT roll back). A genuine reorg above the finalized
+                            // boundary cannot occur for a node following QC-gated finality.
+                            eprintln!(
+                                "🚨 [SECURITY][SYNC_REORG_REJECT] refusing unauthenticated state-changing reorg at height {} (orphaning {}..={}) from this peer (not halting)",
                                 block.header.height,
                                 rollback_target + 1,
                                 stored_tip
                             );
-                            eprintln!("🚨 [SECURITY][SYNC_REORG_HALT] {}", reason);
-                            let _ = self.storage.put("sync:halt_reason", &reason);
                             break;
                         }
                         if let Err(err) = self.rollback_to_height(rollback_target) {

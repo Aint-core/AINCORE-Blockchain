@@ -621,17 +621,22 @@ mod tests {
         rehash_block(&mut remote_b3);
 
         let new_height = sync.process_blocks(vec![remote_b2.clone(), remote_b3.clone()], 2);
-        // Reorg refused: height does not advance, local block preserved, halt latched.
+        // Reorg refused: height does not advance, local block preserved.
         assert_eq!(new_height, 2);
 
         let stored_b2 = sync.storage.get("block_2").unwrap().unwrap();
         let stored_b2: Block = serde_json::from_str(&stored_b2).unwrap();
         assert_eq!(stored_b2.header.hash, local_b2.header.hash);
 
+        // SEC (audit H-3 sibling): the unauthenticated state-changing reorg is REJECTED
+        // (local chain kept intact, no rollback) but must NOT latch a persistent,
+        // node-wide sync:halt_reason — that latch was a remote permanent-halt DoS a peer
+        // could trigger with forged blocks. The node keeps serving; no operator
+        // intervention required.
         let halt = sync.storage.get("sync:halt_reason").unwrap();
         assert!(
-            halt.as_deref().unwrap_or("").contains("state-changing reorg"),
-            "expected state-changing reorg halt to be latched, got {:?}",
+            halt.is_none(),
+            "state-changing reorg must be rejected WITHOUT latching a persistent halt (remote DoS), got {:?}",
             halt
         );
     }

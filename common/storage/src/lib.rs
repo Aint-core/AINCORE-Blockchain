@@ -106,7 +106,17 @@ impl StateDB {
     }
 
     pub fn put(&self, key: &str, value: &str) -> std::result::Result<(), rocksdb::Error> {
-        self.db.put(key, value)
+        // SEC (audit M-2 completion): fsync individual puts too. `write_batch` was made
+        // durable earlier, but plain `put`/`delete` on the critical path (equivocation
+        // slash records, sys:total_supply, validator-set updates, tombstones) were still
+        // WAL-buffered-only — durable against a process crash but lost on power loss,
+        // and durable a fsync BEHIND the synced state-root batch, so a power cut could
+        // leave state_root ahead of these settlement writes and diverge the node. Sync
+        // here so every acknowledged write is on disk. (fsync-per-write is the code's
+        // stated "integrity > speed" contract; cost is negligible at block cadence.)
+        let mut wo = rocksdb::WriteOptions::default();
+        wo.set_sync(true);
+        self.db.put_opt(key, value, &wo)
     }
 
     pub fn get(&self, key: &str) -> std::result::Result<Option<String>, rocksdb::Error> {
@@ -123,7 +133,11 @@ impl StateDB {
     }
 
     pub fn delete(&self, key: &str) -> std::result::Result<(), rocksdb::Error> {
-        self.db.delete(key)
+        // SEC (audit M-2 completion): fsync deletes too (see `put`) so a removal
+        // (e.g. clearing a pending-slash queue entry) is durable, not lost on power loss.
+        let mut wo = rocksdb::WriteOptions::default();
+        wo.set_sync(true);
+        self.db.delete_opt(key, &wo)
     }
 
     /// Hard ceiling on `scan_prefix` results so an unbounded namespace
