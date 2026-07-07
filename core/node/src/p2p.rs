@@ -327,6 +327,16 @@ pub async fn start_p2p(
                         }
 
                         println!("🤝 Connection established with {:?}", peer_id);
+                        // FIX (mesh propagation): register every established libp2p connection as
+                        // an explicit gossipsub peer, keyed on the peer id learned from the live
+                        // connection. Bootnodes are dialed as bare /ip4/<ip>/tcp/<port> (no
+                        // /p2p/<peerid> suffix) and the libp2p identity is ephemeral per boot, so
+                        // the bootnode loop never learns peer ids up-front and never calls
+                        // add_explicit_peer. In a small validator set (n=3) that left connected
+                        // validators OUT of each other's gossipsub mesh, so DAG vertices never
+                        // propagated and Parents stayed below quorum (chain stuck). Grafting on the
+                        // live peer id forces reliable forwarding regardless of how we dialed.
+                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                         match endpoint {
                             libp2p::core::ConnectedPoint::Dialer { address, .. } => {
                                 let _ = storage.save_peer_addr(&peer_id.to_string(), &address.to_string());

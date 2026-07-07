@@ -564,6 +564,51 @@ impl DagConsensus {
                 "⚡ Created Vertex {} (Round {}) [BLS Signed]",
                 vertex.hash, vertex.round
             );
+        } else {
+            // === BOOTSTRAP/PARTITION RECOVERY: RE-GOSSIP RECENT VERTICES ===
+            //
+            // Vertices are normally broadcast exactly once, at creation
+            // (above). On a multi-machine bootstrap a validator that was not
+            // yet connected — or whose peer_ip was not yet persisted, so the
+            // TCP fallback fell back to loopback — permanently misses that
+            // one-shot delivery. With a strict >2/3 stake quorum a small
+            // validator set (n=3 needs ALL three vertices per round) then
+            // deadlocks below parent quorum forever: no quorum → no new
+            // vertex → no new broadcast → no quorum. This is the
+            // multi-machine bootstrap deadlock noted in add_vertex's
+            // fast-forward comment; localhost never hits it because the
+            // loopback default address is actually correct there.
+            //
+            // Recovery: while stuck below parent quorum, re-gossip every
+            // vertex we hold from the recent round window — including peers'
+            // vertices, so delivery becomes transitive (A can relay B's
+            // vertex to C). By the time this fires, peer_ip entries are
+            // persisted and the TCP fallback reaches real LAN addresses.
+            // Duplicates are safe: add_vertex drops same-hash vertices
+            // before the equivocation check, so re-sending our own signed
+            // vertex can never read as a double-sign.
+            //
+            // Bounded: fires once per consensus tick and only while stuck;
+            // window is 4 rounds × n authors, trivially under the LiDAR
+            // per-peer rate limit for any realistic validator set.
+            let resend: Vec<Vertex> = {
+                let dag = self.dag.lock().expect("🚨 FATAL: DAG lock poisoned");
+                let min_round = self.current_round.saturating_sub(3);
+                dag.values()
+                    .filter(|v| v.round >= min_round)
+                    .cloned()
+                    .collect()
+            }; // DAG lock dropped before broadcasting.
+            if !resend.is_empty() {
+                println!(
+                    "🔁 [Consensus] Parent quorum not met at round {}; re-gossiping {} recent vertices (bootstrap/partition recovery)",
+                    self.current_round,
+                    resend.len()
+                );
+                for v in &resend {
+                    self.broadcast_vertex(v);
+                }
+            }
         }
     }
 
