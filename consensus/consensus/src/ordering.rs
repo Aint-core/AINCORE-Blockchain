@@ -23,6 +23,16 @@ pub struct OrderingEngine {
     /// fallen out of `committed_rounds`, and (b) derive the DAG prune watermark.
     pub finalized_round: u64,
     pub committed_sequence: Vec<String>, // List of Vertex Hashes in order
+    /// Rolling cumulative finality digest: `H(prev_digest_hex || new_hashes…)`,
+    /// chained on every commit and persisted as `consensus:finality_digest`. On
+    /// restart it CONTINUES from that persisted value, so it is a pure function of
+    /// the FULL committed history and stays identical across nodes regardless of
+    /// restarts. The old approach re-hashed the in-memory `committed_sequence`,
+    /// which is persisted truncated (last 10k) AND reversed — so after any restart
+    /// its digest diverged from long-running peers even though the chain agreed.
+    /// This value seeds the leader-election beacon, so the divergence was a latent
+    /// agreement hazard, not just a cosmetic reporting bug.
+    finality_digest: String,
     /// VDF engine for random beacon (unpredictable leader election)
     vdf_engine: Option<VDFEngine>,
     /// SEC-#12 Step-1 base beacon: the digest-bound VDF output BEFORE any QC fold.
@@ -72,6 +82,7 @@ impl OrderingEngine {
             committed_rounds: HashSet::new(),
             finalized_round: 0,
             committed_sequence: Vec::new(),
+            finality_digest: String::new(),
             vdf_engine: vdf,
             step1_beacon: vec![0u8; 32],
             last_vdf_output: vec![0u8; 32],
@@ -113,6 +124,16 @@ impl OrderingEngine {
                 committed_sequence = seq;
             }
         }
+
+        // Continue the rolling finality digest from its persisted value — the
+        // authoritative digest over the FULL committed history. Re-hashing the
+        // reloaded (truncated + reversed) committed_sequence would diverge from
+        // peers that never restarted, so we chain from the stored value instead.
+        let finality_digest = storage
+            .get("consensus:finality_digest")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
 
         // SEC-#22/#12: restore the leader-election beacon on restart. The beacon is
         // a pure function of (last anchor round, cumulative finality digest) — both
@@ -179,6 +200,7 @@ impl OrderingEngine {
             committed_rounds,
             finalized_round,
             committed_sequence,
+            finality_digest,
             vdf_engine: vdf,
             step1_beacon,
             last_vdf_output,
@@ -343,9 +365,16 @@ impl OrderingEngine {
         true
     }
 
-    fn finality_digest(sequence: &[String]) -> String {
+    /// Fold newly committed vertex hashes into the rolling finality digest:
+    /// `H(prev_digest_hex || h1 || h2 || …)`. Chaining from the previous digest
+    /// (persisted + reloaded on restart) makes the result a pure function of the
+    /// full committed history in commit order, identical on every node no matter
+    /// how much of `committed_sequence` is kept in memory or how many times a node
+    /// restarted. `prev` is the empty string at genesis.
+    fn fold_finality_digest(prev: &str, new_hashes: &[String]) -> String {
         let mut hasher = Sha256::new();
-        for hash in sequence {
+        hasher.update(prev.as_bytes());
+        for hash in new_hashes {
             hasher.update(hash.as_bytes());
         }
         hex::encode(hasher.finalize())
@@ -499,10 +528,15 @@ impl OrderingEngine {
         }
         self.committed_sequence.extend(sequence.clone());
 
-        // Cumulative digest over the full committed sequence — used for persistence,
-        // the leader-election beacon (SEC-#12) and the returned CommitInfo. Computed
-        // once so all three see the identical value.
-        let digest = Self::finality_digest(&self.committed_sequence);
+        // Fold this commit's newly-ordered vertex hashes into the rolling finality
+        // digest, chained from the previous (persisted) value — see the field doc.
+        // Bound to the full committed history, so every node derives the identical
+        // value for persistence, the leader-election beacon (SEC-#12) and the
+        // returned CommitInfo, and it survives restarts (unlike a re-hash over the
+        // truncated in-memory committed_sequence). `sequence` is already deduped
+        // against committed_sequence above, so no hash is folded twice.
+        self.finality_digest = Self::fold_finality_digest(&self.finality_digest, &sequence);
+        let digest = self.finality_digest.clone();
 
         // PERSIST committed state to DB (BUG #1 FIX)
         if let Some(ref storage) = self.storage {
