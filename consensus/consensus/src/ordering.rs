@@ -22,7 +22,11 @@ pub struct OrderingEngine {
     /// decreases. Used to (a) gate re-committing old anchors that have already
     /// fallen out of `committed_rounds`, and (b) derive the DAG prune watermark.
     pub finalized_round: u64,
-    pub committed_sequence: Vec<String>, // List of Vertex Hashes in order
+    pub committed_sequence: Vec<String>, // recent committed vertex hashes (bounded window)
+    /// O(1) membership mirror of `committed_sequence` for the commit-time de-dup
+    /// (`retain` / `contains`). Kept in lockstep with the Vec so the per-commit
+    /// de-dup no longer does a linear scan over an ever-growing list.
+    committed_set: std::collections::HashSet<String>,
     /// Rolling cumulative finality digest: `H(prev_digest_hex || new_hashes…)`,
     /// chained on every commit and persisted as `consensus:finality_digest`. On
     /// restart it CONTINUES from that persisted value, so it is a pure function of
@@ -58,6 +62,16 @@ pub struct OrderingEngine {
 /// are rejected via the high-water comparison instead of set membership.
 const COMMITTED_ROUNDS_WINDOW: u64 = 256;
 
+/// In-memory retention for the committed-hash de-dup index. The DAG is pruned at
+/// `finalized - 10`, so causal history never reaches back more than a handful of
+/// rounds — this window is deliberately generous. Persisted INCREMENTALLY as one
+/// small per-round key (`consensus:cseq:{round}`); the previous code re-serialised
+/// the WHOLE 10k-hash window to a single key on EVERY commit, i.e. ~700 KB/round
+/// of WAL write-amplification at the cap (measured ~90 KB/round even near-empty).
+const COMMITTED_SEQ_WINDOW: usize = 8192;
+/// Per-round committed-hash key prefix (append-only; pruned with the round window).
+const COMMITTED_SEQ_KEY_PREFIX: &str = "consensus:cseq:";
+
 #[derive(Debug, Clone)]
 pub struct CommitInfo {
     pub sequence: Vec<String>,
@@ -82,6 +96,7 @@ impl OrderingEngine {
             committed_rounds: HashSet::new(),
             finalized_round: 0,
             committed_sequence: Vec::new(),
+            committed_set: HashSet::new(),
             finality_digest: String::new(),
             vdf_engine: vdf,
             step1_beacon: vec![0u8; 32],
@@ -116,12 +131,52 @@ impl OrderingEngine {
             }
         }
 
-        // Load committed_sequence from DB
-        let mut committed_sequence = Vec::new();
-        if let Ok(Some(json)) = storage.get("consensus:committed_sequence") {
-            if let Ok(seq) = serde_json::from_str::<Vec<String>>(&json) {
-                println!("🔄 Restored {} committed vertex hashes from DB", seq.len());
-                committed_sequence = seq;
+        // Rebuild the bounded committed-hash de-dup index from the recent per-round
+        // keys (consensus:cseq:{round}). Only rounds still inside committed_rounds
+        // are read, so this is O(window) — and it replaces the previous single giant
+        // key that was rewritten in full on every commit.
+        let mut committed_sequence: Vec<String> = Vec::new();
+        let mut committed_set: HashSet<String> = HashSet::new();
+        {
+            let mut recent: Vec<u64> = committed_rounds.iter().copied().collect();
+            recent.sort_unstable();
+            for r in recent {
+                if let Ok(Some(json)) =
+                    storage.get(&format!("{}{}", COMMITTED_SEQ_KEY_PREFIX, r))
+                {
+                    if let Ok(hashes) = serde_json::from_str::<Vec<String>>(&json) {
+                        for h in hashes {
+                            if committed_set.insert(h.clone()) {
+                                committed_sequence.push(h);
+                            }
+                        }
+                    }
+                }
+            }
+            // Backward-compat: fold in the legacy single-key blob if present (older
+            // nodes wrote consensus:committed_sequence; ignored once cseq keys exist).
+            if committed_sequence.is_empty() {
+                if let Ok(Some(json)) = storage.get("consensus:committed_sequence") {
+                    if let Ok(seq) = serde_json::from_str::<Vec<String>>(&json) {
+                        for h in seq {
+                            if committed_set.insert(h.clone()) {
+                                committed_sequence.push(h);
+                            }
+                        }
+                    }
+                }
+            }
+            if committed_sequence.len() > COMMITTED_SEQ_WINDOW {
+                let excess = committed_sequence.len() - COMMITTED_SEQ_WINDOW;
+                for h in committed_sequence.drain(0..excess) {
+                    committed_set.remove(&h);
+                }
+            }
+            if !committed_sequence.is_empty() {
+                println!(
+                    "🔄 Restored {} committed vertex hashes (de-dup index)",
+                    committed_sequence.len()
+                );
             }
         }
 
@@ -200,6 +255,7 @@ impl OrderingEngine {
             committed_rounds,
             finalized_round,
             committed_sequence,
+            committed_set,
             finality_digest,
             vdf_engine: vdf,
             step1_beacon,
@@ -380,6 +436,24 @@ impl OrderingEngine {
         hex::encode(hasher.finalize())
     }
 
+    /// Record newly committed hashes into the bounded in-memory de-dup index
+    /// (Vec + HashSet mirror), evicting the oldest entries once the window is
+    /// exceeded. Front eviction is a single O(len) drain, done at most once per
+    /// commit — cheap relative to the removed per-round 700 KB re-serialisation.
+    fn record_committed(&mut self, new_hashes: &[String]) {
+        for h in new_hashes {
+            if self.committed_set.insert(h.clone()) {
+                self.committed_sequence.push(h.clone());
+            }
+        }
+        if self.committed_sequence.len() > COMMITTED_SEQ_WINDOW {
+            let excess = self.committed_sequence.len() - COMMITTED_SEQ_WINDOW;
+            for h in self.committed_sequence.drain(0..excess) {
+                self.committed_set.remove(&h);
+            }
+        }
+    }
+
     /// Mencoba melakukan commit pada ronde tertentu
     pub fn try_commit(
         &mut self,
@@ -512,8 +586,8 @@ impl OrderingEngine {
         // 5. Commit Causal History
         let mut sequence = self.find_causal_history(anchor_vertex_hash, dag);
 
-        // Filter yang sudah committed
-        sequence.retain(|h| !self.committed_sequence.contains(h));
+        // Filter yang sudah committed (O(1) membership via the mirror set).
+        sequence.retain(|h| !self.committed_set.contains(h));
 
         // Update state
         self.committed_rounds.insert(anchor_round);
@@ -522,11 +596,22 @@ impl OrderingEngine {
         // Trim the de-dup window so `committed_rounds` stays bounded regardless of
         // how many rounds are committed (this is the leak fix). Rounds below the
         // cutoff are still rejected by the high-water comparison in the guard.
+        // The evicted rounds also get their per-round cseq keys deleted below.
         let cutoff = self.finalized_round.saturating_sub(COMMITTED_ROUNDS_WINDOW);
-        if cutoff > 0 {
+        let evicted_cseq_rounds: Vec<u64> = if cutoff > 0 {
+            let ev: Vec<u64> = self
+                .committed_rounds
+                .iter()
+                .copied()
+                .filter(|r| *r < cutoff)
+                .collect();
             self.committed_rounds.retain(|r| *r >= cutoff);
-        }
-        self.committed_sequence.extend(sequence.clone());
+            ev
+        } else {
+            Vec::new()
+        };
+        // Bounded in-memory de-dup index (Vec + set), no unbounded growth.
+        self.record_committed(&sequence);
 
         // Fold this commit's newly-ordered vertex hashes into the rolling finality
         // digest, chained from the previous (persisted) value — see the field doc.
@@ -547,11 +632,20 @@ impl OrderingEngine {
             {
                 let _ = storage.put("consensus:committed_rounds", &json);
             }
-            // Only persist last 10000 committed hashes to prevent unbounded growth
-            let seq_to_save: Vec<&String> =
-                self.committed_sequence.iter().rev().take(10000).collect();
-            if let Ok(json) = serde_json::to_string(&seq_to_save) {
-                let _ = storage.put("consensus:committed_sequence", &json);
+            // Persist ONLY this commit's new hashes under a small per-round key,
+            // instead of re-serialising the whole de-dup window every commit (the
+            // old path wrote up to ~700 KB/round of pure WAL write-amplification).
+            // The index is rebuilt from the recent per-round keys on restart.
+            if !sequence.is_empty() {
+                if let Ok(json) = serde_json::to_string(&sequence) {
+                    let _ = storage
+                        .put(&format!("{}{}", COMMITTED_SEQ_KEY_PREFIX, anchor_round), &json);
+                }
+            }
+            // Drop per-round keys for rounds that just fell out of the retained
+            // window — exact eviction, so no cseq key ever leaks.
+            for r in &evicted_cseq_rounds {
+                let _ = storage.delete(&format!("{}{}", COMMITTED_SEQ_KEY_PREFIX, r));
             }
             // Persist the monotonic high-water mark directly (no longer derived
             // from the now-trimmed set).
@@ -669,8 +763,8 @@ impl OrderingEngine {
             if let Some(vertex) = dag.get(&hash) {
                 history.push(hash.clone());
                 for parent in &vertex.parents {
-                    if !self.committed_sequence.contains(parent) {
-                        // Optimization: Stop if already committed
+                    if !self.committed_set.contains(parent) {
+                        // Optimization: Stop if already committed (O(1) via mirror set)
                         stack.push(parent.clone());
                     }
                 }
