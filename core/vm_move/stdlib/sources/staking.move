@@ -4,10 +4,11 @@ module 0x1::staking {
     use std::error;
     use 0x1::coin::{Self, Coin};
 
-    // FIX #2: mint_reward inflates AIN supply and must only be reachable from
-    // other system (0x1) modules. Declare the legitimate in-0x1 callers as
-    // friends so `public(friend) fun mint_reward` is link-time restricted to
-    // them (enforced by the Move bytecode verifier; does NOT depend on F1).
+    // FIX #2: the pool mints (mint_delegation_reward / mint_depin_reward)
+    // create AIN and must only be reachable from other system (0x1) modules.
+    // Declare the legitimate in-0x1 callers as friends so the public(friend)
+    // mints are link-time restricted to them (enforced by the Move bytecode
+    // verifier; does NOT depend on F1).
     friend 0x1::delegation;
     friend 0x1::universal_mining;
 
@@ -28,11 +29,36 @@ module 0x1::staking {
     /// Max Supply: 150 Million AIN
     const MAX_SUPPLY: u128 = 150000000000000000000000000; 
     
-    /// Base Reward: 36 AIN per block
-    const BASE_REWARD: u128 = 36000000000000000000; 
-    
-    /// Halving Interval: 4 Years (2,102,400 blocks @ 60s)
-    const HALVING_INTERVAL: u64 = 2102400;
+    // === EMISSION v4: top-down, cap-anchored budget ===
+    //
+    // Design axiom: mint ONE cap-anchored number per epoch, then divide.
+    // Never divide, then mint. The previous engine did the inverse
+    // (BASE_REWARD x validator_count per epoch), so total emission SCALED
+    // WITH VALIDATOR COUNT and blew through the 150M cap in ~10 months,
+    // before the first halving could ever fire.
+    //
+    // Per-epoch drawdown of the REMAINING reserve:
+    //   e_epoch = remaining * DRAW_NUM / DRAW_DEN
+    // At a ~20s epoch cadence this emits ~11.4%/yr of the remaining
+    // reserve (annual decay ~0.88, reserve half-life ~5.4y, ~95% of the
+    // emission budget inside ~23.5y). Smooth geometric decay -- no halving
+    // cliffs -- and independent of validator count by construction.
+    // NOTE: the horizon assumes the ~20s epoch cadence; faster epoch
+    // advancement compresses it (total stays cap-bounded regardless).
+    const DRAW_NUM: u128 = 81;
+    const DRAW_DEN: u128 = 1000000000;
+    /// Bucket split (basis points of e_epoch): the delegation and DePIN
+    /// mint streams accrue into cap-reserved pool budgets; validators
+    /// receive the remainder (~90%). One master budget, three streams.
+    const DELEGATION_BPS: u128 = 500;
+    const DEPIN_BPS: u128 = 500;
+    const BPS_DEN: u128 = 10000;
+    /// Saturation clip (Cardano-k / Polkadot style): a validator's payout
+    /// weight is capped at total_stake / SATURATION_DIVISOR. Flattens
+    /// reward concentration for HONEST distributions; it is NOT
+    /// sybil-proof (a whale can split identities) -- documented limitation.
+    const SATURATION_DIVISOR: u128 = 50;
+
     const COIN_SCALE: u128 = 1000000000000000000;
     const EPOCH_SECONDS: u64 = 60;
     
@@ -70,6 +96,17 @@ module 0x1::staking {
         unbonding_queue: vector<UnbondingRequest>,
         total_supply: u128, // Track minted supply (u128)
         current_epoch: u64,
+    }
+
+    /// EMISSION v4: accrued, cap-reserved budgets for the non-validator mint
+    /// streams (delegation rewards, DePIN universal_mining). Amounts here were
+    /// already counted against MAX_SUPPLY at accrual time in
+    /// `distribute_rewards`, so drawing from a pool mints WITHOUT touching
+    /// `total_supply` -- the cap cannot be raced by independent minters.
+    /// Unused budget carries forward across epochs (empty-epoch sink).
+    struct EmissionPools has key {
+        delegation_budget: u128,
+        depin_budget: u128,
     }
 
     /// Initialize the staking module (called at genesis)
@@ -256,50 +293,99 @@ module 0x1::staking {
         abort error::not_found(ENOT_VALIDATOR)
     }
 
-    /// Calculate Halving Reward
-    fun calculate_reward(epoch: u64): u128 {
-        let halvings = epoch / HALVING_INTERVAL;
-        if (halvings >= 128) { return 0 }; // u128 limit
-        let reward = BASE_REWARD >> (halvings as u8);
-        reward
-    }
-
-    /// Distribute rewards to all validators (Inflation Logic)
-    public fun distribute_rewards(account: &signer) acquires ValidatorSet {
+    /// EMISSION v4: distribute rewards from ONE top-down, cap-anchored
+    /// per-epoch budget. Replaces the old `BASE_REWARD x validator_count`
+    /// engine (total emission scaled with N -- more validators literally
+    /// minted more AIN and the cap blew through in ~10 months).
+    ///
+    /// Invariants:
+    ///  * e_epoch is computed BEFORE any division and depends only on
+    ///    (MAX_SUPPLY - total_supply) -- validator count and stream count
+    ///    cannot inflate it.
+    ///  * total_supply grows by exactly (pool accruals + actual validator
+    ///    payouts) <= e_epoch <= remaining -- the cap holds at every epoch.
+    ///  * Division dust is NOT minted: it stays in the remaining reserve.
+    public fun distribute_rewards(account: &signer) acquires ValidatorSet, EmissionPools {
         let addr = signer::address_of(account);
         // Only 0x1 can call this (system)
         assert!(addr == @0x1, error::permission_denied(ENOT_VALIDATOR));
 
+        // Lazy-create the pool budgets resource (signer is @0x1 here).
+        if (!exists<EmissionPools>(@0x1)) {
+            move_to(account, EmissionPools { delegation_budget: 0, depin_budget: 0 });
+        };
+
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
-        
+
         // Update Epoch
         validator_set.current_epoch = validator_set.current_epoch + 1;
-        let current_reward = calculate_reward(validator_set.current_epoch);
 
-        let len = vector::length(&validator_set.validators);
-        if (len == 0 || current_reward == 0) {
-            return
-        };
         if (validator_set.total_supply >= MAX_SUPPLY) {
             return
         };
+        let remaining = MAX_SUPPLY - validator_set.total_supply;
 
-        let epoch_budget = current_reward * (len as u128);
-        if (validator_set.total_supply + epoch_budget > MAX_SUPPLY) {
-            epoch_budget = MAX_SUPPLY - validator_set.total_supply;
+        // Master budget: geometric drawdown of the remaining reserve.
+        // remaining < 1.5e26 and DRAW_NUM = 81, so remaining * DRAW_NUM
+        // < 1.3e28 -- far below u128::MAX; no overflow. Cap-safe by
+        // construction (DRAW_NUM << DRAW_DEN) plus a defensive clamp.
+        let e_epoch = (remaining * DRAW_NUM) / DRAW_DEN;
+        if (e_epoch > remaining) {
+            e_epoch = remaining;
         };
-        if (epoch_budget == 0) {
+        if (e_epoch == 0) {
             return
         };
 
-        let total_weight = 0u128;
+        // Bucket accrual: delegation + DePIN budgets are RESERVED against
+        // the cap now and drawn lazily later (mint_delegation_reward /
+        // mint_depin_reward), so those streams can never race the cap.
+        let delegation_cut = (e_epoch * DELEGATION_BPS) / BPS_DEN;
+        let depin_cut = (e_epoch * DEPIN_BPS) / BPS_DEN;
+        let val_pot = e_epoch - delegation_cut - depin_cut;
+
+        let pools = borrow_global_mut<EmissionPools>(@0x1);
+        pools.delegation_budget = pools.delegation_budget + delegation_cut;
+        pools.depin_budget = pools.depin_budget + depin_cut;
+        validator_set.total_supply =
+            validator_set.total_supply + delegation_cut + depin_cut;
+
+        // Validator pot: FIXED total, divided by saturation-clipped stake
+        // weight. Adding validators thins the slices; it cannot enlarge
+        // the pot.
+        let len = vector::length(&validator_set.validators);
+        if (len == 0 || val_pot == 0) {
+            return
+        };
+
+        let total_stake = 0u128;
         let j = 0;
         while (j < len) {
             let validator = vector::borrow(&validator_set.validators, j);
-            total_weight = total_weight + (coin::value(&validator.stake) / COIN_SCALE);
+            total_stake = total_stake + coin::value(&validator.stake);
             j = j + 1;
         };
+        if (total_stake == 0) {
+            return
+        };
 
+        // Saturation point: stake above z0 earns no additional weight.
+        let z0 = total_stake / SATURATION_DIVISOR;
+        if (z0 == 0) {
+            z0 = total_stake;
+        };
+
+        // Weights in whole-AIN units so `val_pot * weight` cannot overflow
+        // u128 (val_pot < 1.3e19 base units, weight < 1.5e8 whole AIN).
+        let total_weight = 0u128;
+        let k = 0;
+        while (k < len) {
+            let validator = vector::borrow(&validator_set.validators, k);
+            let s = coin::value(&validator.stake);
+            let clipped = if (s > z0) { z0 } else { s };
+            total_weight = total_weight + (clipped / COIN_SCALE);
+            k = k + 1;
+        };
         if (total_weight == 0) {
             return
         };
@@ -307,33 +393,67 @@ module 0x1::staking {
         let i = 0;
         while (i < len) {
             let v = vector::borrow_mut(&mut validator_set.validators, i);
-            let weight = coin::value(&v.stake) / COIN_SCALE;
-            let reward_amount = (epoch_budget * weight) / total_weight;
-            
+            let s = coin::value(&v.stake);
+            let clipped = if (s > z0) { z0 } else { s };
+            let weight = clipped / COIN_SCALE;
+            let reward_amount = (val_pot * weight) / total_weight;
+
             if (reward_amount > 0) {
                 let reward_coins = coin::mint<AincoreCoin>(reward_amount);
-                validator_set.total_supply = validator_set.total_supply + reward_amount;
-                coin::merge(&mut v.stake, reward_coins);
+                validator_set.total_supply =
+                    validator_set.total_supply + reward_amount;
+                // Liquid disposition (kills AUTOMATIC compounding -- the
+                // rich-get-richer feedback loop): deposit to the
+                // validator's CoinStore when one is registered. Fall back
+                // to merging into stake so the epoch can never abort.
+                // Restaking remains possible via add_stake (opt-in).
+                if (coin::has_store<AincoreCoin>(v.validator_addr)) {
+                    coin::deposit<AincoreCoin>(v.validator_addr, reward_coins);
+                } else {
+                    coin::merge(&mut v.stake, reward_coins);
+                };
             };
             i = i + 1;
         };
+        // val_pot - sum of  payouts (division dust) is intentionally unminted.
     }
 
-    /// Safe Minting for Ecosystem Rewards (DePIN/Mining)
-    /// Enforces MAX_SUPPLY hard cap.
-    /// FIX #2: restricted to friend modules (0x1::delegation, 0x1::universal_mining)
-    /// so it can never be invoked directly by a user-published module.
-    public(friend) fun mint_reward(amount: u128): Coin<AincoreCoin> acquires ValidatorSet {
-        let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
-        
-        // Hard Cap Check
-        if (validator_set.total_supply + amount > MAX_SUPPLY) {
-            // Cap reached: Return 0 value coin (No reward)
+    /// EMISSION v4: pool-bounded mint for the DELEGATION reward stream.
+    /// The pool budget was already reserved against MAX_SUPPLY at accrual
+    /// time in `distribute_rewards`, so this does NOT touch total_supply
+    /// and can never race the cap. Grants min(amount, pool); returns a
+    /// zero-value coin when the pool is dry (caller already handles 0).
+    /// FIX #2 retained: public(friend), unreachable from user modules.
+    public(friend) fun mint_delegation_reward(amount: u128): Coin<AincoreCoin> acquires EmissionPools {
+        if (!exists<EmissionPools>(@0x1)) {
             return coin::mint<AincoreCoin>(0)
         };
-        
-        validator_set.total_supply = validator_set.total_supply + amount;
-        coin::mint<AincoreCoin>(amount)
+        let pools = borrow_global_mut<EmissionPools>(@0x1);
+        let grant = if (amount > pools.delegation_budget) {
+            pools.delegation_budget
+        } else {
+            amount
+        };
+        pools.delegation_budget = pools.delegation_budget - grant;
+        coin::mint<AincoreCoin>(grant)
+    }
+
+    /// EMISSION v4: pool-bounded mint for the DePIN (universal_mining)
+    /// reward stream. Same reservation semantics as
+    /// `mint_delegation_reward`; per-proof draws are bounded by the accrued
+    /// pool with carry-forward across empty epochs.
+    public(friend) fun mint_depin_reward(amount: u128): Coin<AincoreCoin> acquires EmissionPools {
+        if (!exists<EmissionPools>(@0x1)) {
+            return coin::mint<AincoreCoin>(0)
+        };
+        let pools = borrow_global_mut<EmissionPools>(@0x1);
+        let grant = if (amount > pools.depin_budget) {
+            pools.depin_budget
+        } else {
+            amount
+        };
+        pools.depin_budget = pools.depin_budget - grant;
+        coin::mint<AincoreCoin>(grant)
     }
 
     /// Permanently burn AIN and update the canonical supply tracker.

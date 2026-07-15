@@ -278,7 +278,7 @@ module 0x1::universal_mining {
             
             if (reward_amount > 0) {
                  // FIXED: Use Staking Module to mint (enforces Supply Cap)
-                 let coins = 0x1::staking::mint_reward((reward_amount as u128));
+                 let coins = 0x1::staking::mint_depin_reward((reward_amount as u128));
                  
                  // If cap reached, value is 0
                  if (coin::value(&coins) > 0) {

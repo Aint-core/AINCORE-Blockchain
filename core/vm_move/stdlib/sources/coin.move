@@ -56,6 +56,13 @@ module 0x1::coin {
         let Coin { value: _ } = coin;
     }
 
+    /// True when `addr` has a registered CoinStore for CoinType. Lets callers
+    /// choose a non-aborting disposition path (deposit vs fallback) instead of
+    /// tripping deposit's assert.
+    public fun has_store<CoinType>(addr: address): bool {
+        exists<CoinStore<CoinType>>(addr)
+    }
+
     /// Withdraw coins from an account
     public fun withdraw<CoinType>(account: &signer, amount: u128): Coin<CoinType> acquires CoinStore {
         let addr = signer::address_of(account);

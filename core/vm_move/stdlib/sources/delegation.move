@@ -134,7 +134,7 @@ module 0x1::delegation {
                 // Claim pending rewards first
                 let pending = calculate_pending_reward(d, pool.accumulated_rewards_per_share);
                 if (pending > 0) {
-                    let reward_coins = 0x1::staking::mint_reward(pending);
+                    let reward_coins = 0x1::staking::mint_delegation_reward(pending);
                     if (coin::value(&reward_coins) > 0) {
                         coin::deposit<AincoreCoin>(delegator_addr, reward_coins);
                     } else {
@@ -202,7 +202,7 @@ module 0x1::delegation {
         let d = vector::borrow_mut(&mut pool.delegations, index);
         let pending = calculate_pending_reward(d, pool.accumulated_rewards_per_share);
         if (pending > 0) {
-            let reward_coins = 0x1::staking::mint_reward(pending);
+            let reward_coins = 0x1::staking::mint_delegation_reward(pending);
             if (coin::value(&reward_coins) > 0) {
                 coin::deposit<AincoreCoin>(delegator_addr, reward_coins);
             } else {
@@ -291,7 +291,7 @@ module 0x1::delegation {
             if (d.delegator == delegator_addr) {
                 let pending = calculate_pending_reward(d, pool.accumulated_rewards_per_share);
                 if (pending > 0) {
-                    let reward_coins = 0x1::staking::mint_reward(pending);
+                    let reward_coins = 0x1::staking::mint_delegation_reward(pending);
                     if (coin::value(&reward_coins) > 0) {
                         coin::deposit<AincoreCoin>(delegator_addr, reward_coins);
                     } else {
@@ -368,7 +368,7 @@ module 0x1::delegation {
         
         // Commission goes to validator
         if (commission > 0) {
-            let commission_coins = 0x1::staking::mint_reward(commission);
+            let commission_coins = 0x1::staking::mint_delegation_reward(commission);
             if (coin::value(&commission_coins) > 0) {
                 coin::deposit<AincoreCoin>(validator_addr, commission_coins);
             } else {
