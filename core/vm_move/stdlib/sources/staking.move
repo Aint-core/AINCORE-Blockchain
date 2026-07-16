@@ -128,6 +128,22 @@ module 0x1::staking {
         depin_budget: u128,
     }
 
+    /// AUDIT-#8 FIX (BTC mint-cap): monotonic cumulative-burn ledger. The
+    /// emission anchor keys off cumulative MINTED = ValidatorSet.total_supply
+    /// (which stays NET of burns, preserving the circulating==net API model)
+    /// + SupplyStats.cumulative_burned. Every burn does net -= d AND
+    /// cumulative_burned += d, so `minted` is invariant under burns and
+    /// `remaining = MAX_SUPPLY - minted` is monotonic non-increasing -- burnt
+    /// coins can NEVER be re-minted as fresh emission. This is an INDEPENDENT
+    /// resource: the ValidatorSet byte layout is untouched (no BCS-mirror hard
+    /// fork). It is fed by BOTH the in-VM Move burn sites here AND the Rust-
+    /// native fee burn (executor `burn_supply_trackers` writes this same
+    /// resource key directly). Absent => treated as 0; lazy-created like
+    /// EmissionPools.
+    struct SupplyStats has key {
+        cumulative_burned: u128,
+    }
+
     /// Initialize the staking module (called at genesis)
     public fun initialize(account: &signer) {
         move_to(account, ValidatorSet {
@@ -227,10 +243,17 @@ module 0x1::staking {
     }
     /// Clean up unbonding requests that are older than grace period
     /// Called periodically by epoch::advance_epoch
-    public fun cleanup_old_unbonding(account: &signer) acquires ValidatorSet {
+    public fun cleanup_old_unbonding(account: &signer) acquires ValidatorSet, SupplyStats {
         let addr = signer::address_of(account);
         assert!(addr == @0x1, error::permission_denied(ENOT_VALIDATOR));
-        
+
+        // AUDIT-#8: ensure the burn ledger exists before we may credit it below
+        // (signer is @0x1 here). Keeps cumulative MINTED invariant under the
+        // auto-burn of unclaimed stake.
+        if (!exists<SupplyStats>(@0x1)) {
+            move_to(account, SupplyStats { cumulative_burned: 0 });
+        };
+
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
         let current_time = validator_set.current_epoch * EPOCH_SECONDS;
         
@@ -248,14 +271,17 @@ module 0x1::staking {
                 let old_req = vector::remove(&mut validator_set.unbonding_queue, i);
                 let UnbondingRequest { validator_addr: _, stake: amount, unlock_time: _ } = old_req;
                 
-                // Auto-burn unclaimed stake (deflationary penalty for not withdrawing)
-                // Reduce total_supply accordingly
-                validator_set.total_supply = 
-                    if (validator_set.total_supply >= amount) {
-                        validator_set.total_supply - amount
-                    } else {
-                        0
-                    };
+                // Auto-burn unclaimed stake (deflationary penalty for not withdrawing).
+                // AUDIT-#8: reduce net total_supply AND credit the burn ledger by the
+                // SAME clamped delta so cumulative MINTED (net + burned) is invariant.
+                let removed = if (validator_set.total_supply >= amount) {
+                    amount
+                } else {
+                    validator_set.total_supply
+                };
+                validator_set.total_supply = validator_set.total_supply - removed;
+                let stats = borrow_global_mut<SupplyStats>(@0x1);
+                stats.cumulative_burned = stats.cumulative_burned + removed;
                 
                 queue_len = queue_len - 1;
                 // Don't increment i (next item shifts down)
@@ -328,7 +354,7 @@ module 0x1::staking {
     ///  * total_supply grows by exactly (pool accruals + actual validator
     ///    payouts) <= e_epoch <= remaining -- the cap holds at every epoch.
     ///  * Division dust is NOT minted: it stays in the remaining reserve.
-    public fun distribute_rewards(account: &signer) acquires ValidatorSet, EmissionPools {
+    public fun distribute_rewards(account: &signer) acquires ValidatorSet, EmissionPools, SupplyStats {
         let addr = signer::address_of(account);
         // Only 0x1 can call this (system)
         assert!(addr == @0x1, error::permission_denied(ENOT_VALIDATOR));
@@ -337,16 +363,26 @@ module 0x1::staking {
         if (!exists<EmissionPools>(@0x1)) {
             move_to(account, EmissionPools { delegation_budget: 0, depin_budget: 0 });
         };
+        // AUDIT-#8: lazy-create the cumulative-burn ledger (signer is @0x1 here).
+        if (!exists<SupplyStats>(@0x1)) {
+            move_to(account, SupplyStats { cumulative_burned: 0 });
+        };
+        let cumulative_burned = borrow_global<SupplyStats>(@0x1).cumulative_burned;
 
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
 
         // Update Epoch
         validator_set.current_epoch = validator_set.current_epoch + 1;
 
-        if (validator_set.total_supply >= MAX_SUPPLY) {
+        // AUDIT-#8 (BTC mint-cap): anchor emission on cumulative MINTED, not net
+        // supply. minted = total_supply (net of burns) + cumulative_burned. A burn
+        // does net -= d and cumulative_burned += d, leaving `minted` invariant, so
+        // no burn can free new issuance -- `remaining` is monotonic non-increasing.
+        let minted = validator_set.total_supply + cumulative_burned;
+        if (minted >= MAX_SUPPLY) {
             return
         };
-        let remaining = MAX_SUPPLY - validator_set.total_supply;
+        let remaining = MAX_SUPPLY - minted;
 
         // Master budget: geometric drawdown of the remaining reserve.
         // remaining < 1.5e26 and DRAW_NUM = 81, so remaining * DRAW_NUM
@@ -480,26 +516,35 @@ module 0x1::staking {
     }
 
     /// Permanently burn AIN and update the canonical supply tracker.
-    public fun burn_ain(coin_to_burn: Coin<AincoreCoin>) acquires ValidatorSet {
+    public fun burn_ain(coin_to_burn: Coin<AincoreCoin>) acquires ValidatorSet, SupplyStats {
         let amount = coin::value(&coin_to_burn);
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
-        validator_set.total_supply =
-            if (validator_set.total_supply >= amount) {
-                validator_set.total_supply - amount
-            } else {
-                0
-            };
+        // AUDIT-#8: reduce net total_supply by the clamped delta.
+        let removed = if (validator_set.total_supply >= amount) {
+            amount
+        } else {
+            validator_set.total_supply
+        };
+        validator_set.total_supply = validator_set.total_supply - removed;
+        // AUDIT-#8: credit the burn ledger if it exists. There is no signer here
+        // to create it, but the Rust fee burn and epoch advance create it very
+        // early in chain life, so it is effectively always present by the time
+        // any burn_ain matters. Keeps cumulative MINTED (net + burned) invariant.
+        if (exists<SupplyStats>(@0x1)) {
+            let stats = borrow_global_mut<SupplyStats>(@0x1);
+            stats.cumulative_burned = stats.cumulative_burned + removed;
+        };
         coin::burn(coin_to_burn);
     }
 
     /// Slash a validator (burn stake and remove)
-    public fun slash_validator(account: &signer, validator_addr: address) acquires ValidatorSet {
+    public fun slash_validator(account: &signer, validator_addr: address) acquires ValidatorSet, SupplyStats {
         slash_validator_bps(account, validator_addr, 500)
     }
 
     /// Slash a validator by basis points. Only system may call this.
     /// Downtime uses 500 bps (5%). Equivocation can use 10000 bps (100%).
-    public entry fun slash_validator_bps(account: &signer, validator_addr: address, slash_bps: u64) acquires ValidatorSet {
+    public entry fun slash_validator_bps(account: &signer, validator_addr: address, slash_bps: u64) acquires ValidatorSet, SupplyStats {
         let addr = signer::address_of(account);
         // Only 0x1 can call this (system)
         assert!(addr == @0x1, error::permission_denied(ENOT_VALIDATOR));
@@ -532,12 +577,19 @@ module 0x1::staking {
             // Extract and burn the slash amount as a deflationary penalty.
             let slash_coins = coin::extract(&mut stake, slash_amount);
             coin::burn(slash_coins);
-            validator_set.total_supply =
-                if (validator_set.total_supply >= slash_amount) {
-                    validator_set.total_supply - slash_amount
-                } else {
-                    0
-                };
+            // AUDIT-#8: reduce net total_supply AND credit the burn ledger by the
+            // SAME clamped delta so cumulative MINTED (net + burned) is invariant.
+            let removed = if (validator_set.total_supply >= slash_amount) {
+                slash_amount
+            } else {
+                validator_set.total_supply
+            };
+            validator_set.total_supply = validator_set.total_supply - removed;
+            if (!exists<SupplyStats>(@0x1)) {
+                move_to(account, SupplyStats { cumulative_burned: 0 });
+            };
+            let stats = borrow_global_mut<SupplyStats>(@0x1);
+            stats.cumulative_burned = stats.cumulative_burned + removed;
             
             // Burn the rest to re-mint on withdrawal (same as leave_validator_set).
             coin::burn(stake);

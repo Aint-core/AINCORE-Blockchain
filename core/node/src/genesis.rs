@@ -952,10 +952,17 @@ pub fn initialize_genesis(
         );
     }
 
+    // AUDIT-#7 FIX: the Move ValidatorSet.total_supply is the emission anchor —
+    // staking.move::distribute_rewards mints against `remaining = MAX_SUPPLY -
+    // total_supply`. It MUST include every coin already allocated at genesis, or
+    // emission treats the pre-allocated treasury as unminted head-room and over-
+    // mints by exactly the treasury reserve over the chain's lifetime (a silent
+    // ~50k AIN breach of the 150M cap). Seed it with bootstrap stake + treasury
+    // so it agrees with sys:total_supply (set below) and the cap actually holds.
     let validator_set = ValidatorSet {
         validators: validator_configs,
         unbonding_queue: vec![],
-        total_supply: total_bootstrap_stake,
+        total_supply: total_bootstrap_stake + treasury_reserve_amount,
         current_epoch: 0,
     };
 

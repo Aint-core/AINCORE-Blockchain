@@ -251,6 +251,16 @@ struct MoveValidatorSet {
     current_epoch: u64,
 }
 
+/// AUDIT-#8 mirror of the Move `0x1::staking::SupplyStats` resource. Independent
+/// of ValidatorSet (its byte layout is untouched), so this adds no BCS-mirror
+/// coupling to the on-chain validator set. Holds the monotonic cumulative-burn
+/// ledger the emission anchor keys off (minted = ValidatorSet.total_supply +
+/// SupplyStats.cumulative_burned).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MoveSupplyStats {
+    cumulative_burned: u128,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FeeSweepEntry {
     miner: String,
@@ -326,6 +336,22 @@ fn decode_validator_set_hex(value: &str) -> Option<MoveValidatorSet> {
 }
 
 fn encode_validator_set_hex(value: &MoveValidatorSet) -> Option<String> {
+    bcs::to_bytes(value).ok().map(hex::encode)
+}
+
+/// AUDIT-#8: db key of the Move `0x1::staking::SupplyStats` resource. Built
+/// identically to `validator_set_key()` so the Rust fee-burn writes the exact
+/// resource the Move VM reads via `borrow_global<SupplyStats>(@0x1)`.
+fn supply_stats_key() -> String {
+    format!("resource_{}_{}", system_address(), "0x1::staking::SupplyStats")
+}
+
+fn decode_supply_stats_hex(value: &str) -> Option<MoveSupplyStats> {
+    let bytes = hex::decode(value).ok()?;
+    bcs::from_bytes::<MoveSupplyStats>(&bytes).ok()
+}
+
+fn encode_supply_stats_hex(value: &MoveSupplyStats) -> Option<String> {
     bcs::to_bytes(value).ok().map(hex::encode)
 }
 
@@ -1161,6 +1187,33 @@ impl Executor {
                     let _ = self.db.put(&key, &encoded);
                 }
             }
+        }
+
+        // AUDIT-#8 (BTC mint-cap): the Move emission anchor now keys off
+        // cumulative MINTED = ValidatorSet.total_supply + SupplyStats.cumulative_burned
+        // (staking.move::distribute_rewards). This Rust-native fee burn just
+        // decremented total_supply by `amount`; credit the SAME `amount` into the
+        // Move SupplyStats resource (lazy-create if absent) so `minted` stays
+        // invariant and burnt fees can NEVER be re-minted as fresh emission.
+        // WITHOUT this, the fee-burn path silently re-opens finding #8 — exactly
+        // the hole the adversarial verifiers caught in the "minimal" hybrid.
+        // `amount` matches the convention used for `total_burned` above (both use
+        // the requested amount; total_supply's saturating_sub only differs in the
+        // impossible case total_supply < a single block's burnt fees).
+        let stats_key = supply_stats_key();
+        let prev_move_burned = self
+            .db
+            .get(&stats_key)
+            .ok()
+            .flatten()
+            .and_then(|v| decode_supply_stats_hex(&v))
+            .map(|s| s.cumulative_burned)
+            .unwrap_or(0);
+        let updated_stats = MoveSupplyStats {
+            cumulative_burned: prev_move_burned.saturating_add(amount),
+        };
+        if let Some(encoded) = encode_supply_stats_hex(&updated_stats) {
+            let _ = self.db.put(&stats_key, &encoded);
         }
     }
 
@@ -3723,6 +3776,66 @@ mod tests {
                 db.delete(&key).expect("update delete");
             }
         }
+    }
+
+    fn supply_stats_cumulative_burned(db: &StateDB) -> u128 {
+        db.get(&supply_stats_key())
+            .ok()
+            .flatten()
+            .and_then(|v| decode_supply_stats_hex(&v))
+            .map(|s| s.cumulative_burned)
+            .unwrap_or(0)
+    }
+
+    /// AUDIT-#8: BCS round-trip for the independent SupplyStats resource mirror.
+    #[test]
+    fn supply_stats_bcs_roundtrip() {
+        let s = MoveSupplyStats {
+            cumulative_burned: 123_456_789_000_000_000_000u128,
+        };
+        let hex = encode_supply_stats_hex(&s).expect("encode SupplyStats");
+        let back = decode_supply_stats_hex(&hex).expect("decode SupplyStats");
+        assert_eq!(back.cumulative_burned, s.cumulative_burned);
+    }
+
+    /// AUDIT-#8 (BTC mint-cap): a Rust-native fee burn must (a) decrement net
+    /// total_supply and (b) increment SupplyStats.cumulative_burned by the SAME
+    /// delta, so cumulative MINTED (= net + burned) — the emission anchor — is
+    /// INVARIANT under the burn. This is precisely the fee-path hole the
+    /// adversarial verifiers caught: without the SupplyStats credit, `minted`
+    /// would drop and burnt fees would become re-mintable emission head-room.
+    #[test]
+    fn fee_burn_keeps_cumulative_minted_invariant() {
+        let db = temp_db("supplystats_fee_burn");
+        let exec = Executor::new(Arc::clone(&db));
+        let start_supply: u128 = 1_000_000_000_000_000_000_000; // 1000 AIN net
+        set_validator_set(&db, "1", 500_000_000_000_000_000_000, start_supply);
+
+        let minted_before = validator_set(&db).total_supply + supply_stats_cumulative_burned(&db);
+        assert_eq!(minted_before, start_supply, "no burns yet: minted == net");
+
+        let burn: u128 = 7_000_000_000_000_000_000; // 7 AIN fee burn
+        exec.burn_supply_trackers(burn);
+
+        let net_after = validator_set(&db).total_supply;
+        let burned_after = supply_stats_cumulative_burned(&db);
+        assert_eq!(net_after, start_supply - burn, "net total_supply drops by the burn");
+        assert_eq!(burned_after, burn, "SupplyStats.cumulative_burned rises by the burn");
+
+        let minted_after = net_after + burned_after;
+        assert_eq!(
+            minted_after, minted_before,
+            "cumulative MINTED invariant under fee burn — emission anchor (MAX - minted) cannot rise, #8 stays closed"
+        );
+
+        // A second burn keeps the invariant and accumulates monotonically.
+        exec.burn_supply_trackers(3_000_000_000_000_000_000);
+        assert_eq!(supply_stats_cumulative_burned(&db), burn + 3_000_000_000_000_000_000);
+        assert_eq!(
+            validator_set(&db).total_supply + supply_stats_cumulative_burned(&db),
+            start_supply,
+            "minted still invariant after a second burn"
+        );
     }
 
     fn signed_tx(
