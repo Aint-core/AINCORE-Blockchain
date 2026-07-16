@@ -138,6 +138,24 @@ fn extract_join_validator_v1(
     })
 }
 
+/// AUDIT-#1: detect a `0x1::staking::leave_validator_set` entry call so the
+/// executor can prune the departing validator from the QC trust root
+/// (`sys:validator_set:v1`) and the `sys:validators` reward mirror after a
+/// successful execution. Move's `leave_validator_set` removes the validator from
+/// its live set and burns bonded stake into the 21-day unbonding queue, but the
+/// Rust-side mirrors were pruned ONLY on slash — so a departed (once-supermajority)
+/// coalition kept full QC stake weight forever and could forge a >2/3 QC at zero
+/// stake-at-risk (nothing-at-stake double-finality). Returns the leaving address.
+fn extract_leave_validator(call: &vm_move::EntryFunctionCall, sender: &str) -> Option<String> {
+    if *call.module.address() != system_address()
+        || call.module.name().as_str() != "staking"
+        || call.function != "leave_validator_set"
+    {
+        return None;
+    }
+    Some(sender.to_string())
+}
+
 /// Authoritative pre-dispatch gate for `0x1::staking::join_validator_set`.
 ///
 /// Move cannot run the BLS pairing check, so the proof-of-possession binding
@@ -741,6 +759,57 @@ impl Executor {
         Ok(())
     }
 
+    /// AUDIT-#1: prune a validator from BOTH the QC trust root
+    /// (`sys:validator_set:v1`) and the `sys:validators` reward mirror, staged
+    /// into the block's update batch. The slash path already prunes both; this
+    /// mirrors it for a VOLUNTARY `leave_validator_set` so a departed validator
+    /// cannot retain QC quorum weight (nothing-at-stake) or keep drawing fee
+    /// payouts. Reads the latest staged-or-committed value so it composes with a
+    /// same-block join.
+    fn append_validator_removal(
+        &self,
+        updates: &mut Vec<(String, Option<String>)>,
+        addr: &str,
+    ) -> Result<(), String> {
+        let key = validator_set_v1_key();
+        let existing = updates
+            .iter()
+            .rev()
+            .find_map(|(k, v)| if k == key { v.as_deref() } else { None })
+            .map(str::to_string)
+            .or_else(|| self.db.get(key).ok().flatten());
+        if let Some(json) = existing {
+            if let Ok(mut set) = serde_json::from_str::<Vec<ValidatorSetV1Entry>>(&json) {
+                let before = set.len();
+                set.retain(|v| v.address != addr);
+                if set.len() != before {
+                    let nj = serde_json::to_string(&set)
+                        .map_err(|e| format!("serialize sys:validator_set:v1 failed: {e}"))?;
+                    updates.push((key.to_string(), Some(nj)));
+                }
+            }
+        }
+        let legacy_key = "sys:validators";
+        let existing_legacy = updates
+            .iter()
+            .rev()
+            .find_map(|(k, v)| if k == legacy_key { v.as_deref() } else { None })
+            .map(str::to_string)
+            .or_else(|| self.db.get(legacy_key).ok().flatten());
+        if let Some(json) = existing_legacy {
+            if let Ok(mut legacy) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
+                let before = legacy.len();
+                legacy.retain(|(a, _)| a != addr);
+                if legacy.len() != before {
+                    let nj = serde_json::to_string(&legacy)
+                        .map_err(|e| format!("serialize sys:validators failed: {e}"))?;
+                    updates.push((legacy_key.to_string(), Some(nj)));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn current_state_root(&self) -> String {
         self.db
             .get("sys:state_root")
@@ -941,7 +1010,11 @@ impl Executor {
         match self.vm.execute_transaction_actions(
             vec![(action, true, system_address())],
             system_address(),
-            1_000_000,
+            // AUDIT-#2 FIX: raised from 1M. advance_epoch runs O(N) reward loops;
+            // paired with the Move-side MAX_VALIDATORS=1000 cap this leaves a wide
+            // margin (≈1000 validators worst-case ≪ this budget) so the epoch tx
+            // cannot OOG-abort and permanently halt emission + governance.
+            20_000_000,
         ) {
             Ok((_gas_used, mut updates, status)) => {
                 if !status.success {
@@ -1767,7 +1840,7 @@ impl Executor {
                 "slash_validator_bps",
                 vec![],
                 vec![arg_sys.clone(), arg_val.clone(), arg_bps.clone()],
-                500_000, // Gas budget for slash operation
+                10_000_000, // AUDIT-#3: raised from 500k for margin over bounded loops
                 // auth_signer: slash_validator_bps asserts signer==@0x1. With FIX #1
                 // binding the signer slot to auth_signer, this MUST be system_address()
                 // (the validator target is carried separately in arg_val, not the signer).
@@ -1804,7 +1877,11 @@ impl Executor {
                         "slash_pool",
                         vec![],
                         vec![arg_sys.clone(), arg_val.clone(), arg_bps.clone()],
-                        500_000,
+                        // AUDIT-#3 FIX: raised from 500k. Paired with the Move-side
+                        // MAX_UNBONDING_QUEUE=100 + MIN_UNDELEGATE floor, the slash
+                        // loop is bounded and can no longer be OOG-reverted to evade
+                        // delegated-stake slashing.
+                        10_000_000,
                         // slash_pool asserts signer==@0x1; FIX #1 binds the
                         // signer slot to this auth_signer.
                         system_address(),
@@ -2559,6 +2636,10 @@ impl Executor {
                     // moved into the action, so we can append it to the live
                     // sys:validator_set:v1 after a successful execution.
                     let join_v1_entry = extract_join_validator_v1(&call, &tx.sender);
+                    // AUDIT-#1: capture a leave_validator_set BEFORE the call is
+                    // moved, so we can prune the departing validator from the QC
+                    // trust root + reward mirror after a successful execution.
+                    let leave_addr = extract_leave_validator(&call, &tx.sender);
                     let mut actions = pre_actions.clone();
                     // SECURITY (FIX #1): the user's entry call may only act as the
                     // authenticated tx sender. bind_signer_args overwrites the
@@ -2587,6 +2668,20 @@ impl Executor {
                                         );
                                         return None;
                                     }
+                                }
+                                // AUDIT-#1: prune the departing validator from the
+                                // QC trust root + reward mirror on a successful leave.
+                                if let Some(addr) = leave_addr {
+                                    if let Err(e) =
+                                        self.append_validator_removal(&mut updates, &addr)
+                                    {
+                                        println!(
+                                            "❌ Failed to stage validator removal on leave: {}",
+                                            e
+                                        );
+                                        return None;
+                                    }
+                                    println!("   🔻 Pruned departed validator {} from QC trust root", addr);
                                 }
                             } else {
                                 println!(

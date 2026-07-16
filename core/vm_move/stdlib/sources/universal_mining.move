@@ -273,8 +273,13 @@ module 0x1::universal_mining {
 
         if (found) {
             // V3.0: Device Rewards align with Tail Emission scale (0.36 AIN base)
-            let base_reward = 360000000000000000; // 0.36 AIN
-            let reward_amount = (base_reward * bqi_score) / 100;
+            // AUDIT-#9 FIX: compute in u128. Previously `base_reward` was an
+            // untyped literal inferred as u64 (multiplied by u64 bqi_score), so
+            // 3.6e17 * bqi >= 52 overflowed u64 and ABORTED -- the whole upper
+            // half [52,100] of the quality curve (incl. bqi=100) could never be
+            // paid. u128 arithmetic removes the abort.
+            let base_reward: u128 = 360000000000000000; // 0.36 AIN
+            let reward_amount = (base_reward * (bqi_score as u128)) / 100;
             
             if (reward_amount > 0) {
                  // FIXED: Use Staking Module to mint (enforces Supply Cap)

@@ -21,9 +21,18 @@ module 0x1::staking {
     const EINVALID_SLASH_BPS: u64 = 6;
     const EINVALID_BLS_KEY: u64 = 7;
     const EINVALID_BLS_POP: u64 = 8;
+    /// AUDIT-#2: active validator set is full
+    const EMAX_VALIDATORS: u64 = 9;
 
     /// Minimum stake required to join validator set (1000 AIN)
-    const MIN_STAKE: u128 = 1000000000000000000000; 
+    const MIN_STAKE: u128 = 1000000000000000000000;
+
+    /// AUDIT-#2 FIX: hard cap on the active validator set. `advance_epoch`
+    /// runs O(N) reward loops under a bounded per-epoch gas budget; without a
+    /// cap a growing (or sybil-flooded) set eventually OOG-aborts the epoch tx,
+    /// permanently halting ALL emission + the governance driver. 1000 is far
+    /// above any realistic BFT active set and well below the OOG threshold.
+    const MAX_VALIDATORS: u64 = 1000;
 
     /// Tokenomics Constants (V3.0 FINAL)
     /// Max Supply: 150 Million AIN
@@ -49,9 +58,19 @@ module 0x1::staking {
     const DRAW_DEN: u128 = 1000000000;
     /// Bucket split (basis points of e_epoch): the delegation and DePIN
     /// mint streams accrue into cap-reserved pool budgets; validators
-    /// receive the remainder (~90%). One master budget, three streams.
-    const DELEGATION_BPS: u128 = 500;
-    const DEPIN_BPS: u128 = 500;
+    /// receive the remainder.
+    ///
+    /// AUDIT-#4 FIX: both set to 0 until the reward-DISTRIBUTION paths are
+    /// wired. Reason: `distribute_delegation_rewards` (which advances
+    /// `accumulated_rewards_per_share`) currently has ZERO callers, so a
+    /// non-zero delegation cut accrued into `total_supply` every epoch but
+    /// could never be paid to delegators -- permanently stranding ~5% of the
+    /// emission budget against the 150M cap. Routing 100% of e_epoch to
+    /// validators (the one distribution path that IS wired) is cap-safe,
+    /// N-independent, and loses nothing. To re-enable a stream, set its BPS
+    /// AND wire its per-pool distribution into `epoch::advance_epoch`.
+    const DELEGATION_BPS: u128 = 0;
+    const DEPIN_BPS: u128 = 0;
     const BPS_DEN: u128 = 10000;
     /// Saturation clip (Cardano-k / Polkadot style): a validator's payout
     /// weight is capped at total_stake / SATURATION_DIVISOR. Flattens
@@ -138,8 +157,12 @@ module 0x1::staking {
 
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
 
-        // Check if already a validator
+        // AUDIT-#2 FIX: bound the active set so advance_epoch's O(N) reward
+        // loops can never exhaust the epoch gas budget and halt emission.
         let len = vector::length(&validator_set.validators);
+        assert!((len as u64) < MAX_VALIDATORS, error::invalid_state(EMAX_VALIDATORS));
+
+        // Check if already a validator
         let i = 0;
         while (i < len) {
             let v = vector::borrow(&validator_set.validators, i);

@@ -20,9 +20,21 @@ module 0x1::delegation {
     const EUNAUTHORIZED: u64 = 7;
     /// FIX H1: slash basis points out of range (> 10000)
     const EINVALID_SLASH_BPS: u64 = 8;
+    /// AUDIT-#3: undelegate below floor / unbonding queue full
+    const EUNDELEGATE_TOO_SMALL: u64 = 9;
+    const EUNBONDING_QUEUE_FULL: u64 = 10;
 
     /// Max basis points (100%)
     const MAX_BPS: u64 = 10000;
+
+    /// AUDIT-#3 FIX: minimum per-undelegate amount + hard cap on the per-pool
+    /// unbonding queue. `slash_pool` loops this queue under a bounded gas
+    /// budget; without these an attacker spams tiny `undelegate` txs to pad the
+    /// queue until `slash_pool` OOG-reverts, evading delegated-stake slashing
+    /// (the property FIX H1 restores). 1-AIN floor + 100-entry cap keep the
+    /// slash loop bounded.
+    const MIN_UNDELEGATE: u128 = 1000000000000000000; // 1 AIN
+    const MAX_UNBONDING_QUEUE: u64 = 100;
 
     /// Minimum delegation amount: 1 AIN
     const MIN_DELEGATION: u128 = 1000000000000000000;
@@ -175,10 +187,21 @@ module 0x1::delegation {
         amount: u128
     ) acquires ValidatorPool {
         let delegator_addr = signer::address_of(delegator);
-        
+
+        // AUDIT-#3 FIX: floor the undelegate amount so the unbonding queue
+        // cannot be padded with dust entries to OOG the slash loop.
+        assert!(amount >= MIN_UNDELEGATE, error::invalid_argument(EUNDELEGATE_TOO_SMALL));
+
         assert!(exists<ValidatorPool>(validator_addr), error::not_found(EVALIDATOR_NOT_FOUND));
         let pool = borrow_global_mut<ValidatorPool>(validator_addr);
-        
+
+        // AUDIT-#3 FIX: bound the per-pool unbonding queue length so slash_pool
+        // (which loops it) can never exhaust its gas budget and revert the slash.
+        assert!(
+            (vector::length(&pool.unbonding_queue) as u64) < MAX_UNBONDING_QUEUE,
+            error::invalid_state(EUNBONDING_QUEUE_FULL)
+        );
+
         // Find delegation
         let len = vector::length(&pool.delegations);
         let i = 0;
