@@ -156,6 +156,24 @@ fn extract_leave_validator(call: &vm_move::EntryFunctionCall, sender: &str) -> O
     Some(sender.to_string())
 }
 
+/// AUDIT-#5: detect a `0x1::staking::add_stake(account, amount)` entry call so
+/// the executor can RESYNC the staker's weight in the QC trust root
+/// (`sys:validator_set:v1`) and the `sys:validators` reward mirror from the
+/// authoritative Move ValidatorSet after the stake grows. Without this, a
+/// validator's real stake increases but its QC quorum weight stays frozen at the
+/// join-time value — the >2/3 finality math drifts from actual stake-at-risk.
+/// Returns the staker address (an add_stake by a non-validator is a harmless
+/// no-op in the resync).
+fn extract_add_stake(call: &vm_move::EntryFunctionCall, sender: &str) -> Option<String> {
+    if *call.module.address() != system_address()
+        || call.module.name().as_str() != "staking"
+        || call.function != "add_stake"
+    {
+        return None;
+    }
+    Some(sender.to_string())
+}
+
 /// Authoritative pre-dispatch gate for `0x1::staking::join_validator_set`.
 ///
 /// Move cannot run the BLS pairing check, so the proof-of-possession binding
@@ -827,6 +845,100 @@ impl Executor {
                 let before = legacy.len();
                 legacy.retain(|(a, _)| a != addr);
                 if legacy.len() != before {
+                    let nj = serde_json::to_string(&legacy)
+                        .map_err(|e| format!("serialize sys:validators failed: {e}"))?;
+                    updates.push((legacy_key.to_string(), Some(nj)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// AUDIT-#5: resync one validator's stake in the QC trust root
+    /// (`sys:validator_set:v1`) and the `sys:validators` reward mirror from the
+    /// AUTHORITATIVE Move `ValidatorSet` after `add_stake`. Reads the latest
+    /// staged-or-committed Move set so it composes with same-block changes, and
+    /// derives the whole-AIN u64 weight exactly as the join path does
+    /// (`stake_quanta / 10^18`). No-op if the address is not an active validator
+    /// or has no v1 entry (e.g. a non-validator top-up), so it is always safe to
+    /// call. Staged into the block update batch — never a direct RocksDB write —
+    /// so it is covered by the state-root hash.
+    fn refresh_validator_set_v1_stake(
+        &self,
+        updates: &mut Vec<(String, Option<String>)>,
+        addr: &str,
+    ) -> Result<(), String> {
+        let want = match parse_move_address(addr) {
+            Some(a) => a,
+            None => return Ok(()),
+        };
+        // New authoritative stake (whole AIN, u64) from the Move ValidatorSet.
+        let vs_key = validator_set_key();
+        let move_set_hex = updates
+            .iter()
+            .rev()
+            .find_map(|(k, v)| if k == &vs_key { v.as_deref() } else { None })
+            .map(str::to_string)
+            .or_else(|| self.db.get(&vs_key).ok().flatten());
+        let Some(move_set) = move_set_hex.as_deref().and_then(decode_validator_set_hex) else {
+            return Ok(());
+        };
+        let Some(cfg) = move_set
+            .validators
+            .iter()
+            .find(|c| c.validator_addr == want)
+        else {
+            return Ok(()); // not an active validator — nothing to resync
+        };
+        const COIN_SCALE: u128 = 1_000_000_000_000_000_000;
+        let new_stake = match u64::try_from(cfg.stake.value / COIN_SCALE) {
+            Ok(s) => s,
+            Err(_) => return Ok(()),
+        };
+
+        // Update the v1 QC-trust-root entry's stake (matched by address).
+        let key = validator_set_v1_key();
+        let existing = updates
+            .iter()
+            .rev()
+            .find_map(|(k, v)| if k == key { v.as_deref() } else { None })
+            .map(str::to_string)
+            .or_else(|| self.db.get(key).ok().flatten());
+        if let Some(json) = existing {
+            if let Ok(mut set) = serde_json::from_str::<Vec<ValidatorSetV1Entry>>(&json) {
+                let mut changed = false;
+                for e in set.iter_mut() {
+                    if e.address == addr && e.stake != new_stake {
+                        e.stake = new_stake;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    let nj = serde_json::to_string(&set)
+                        .map_err(|e| format!("serialize sys:validator_set:v1 failed: {e}"))?;
+                    updates.push((key.to_string(), Some(nj)));
+                }
+            }
+        }
+
+        // Update the sys:validators reward mirror's stake.
+        let legacy_key = "sys:validators";
+        let existing_legacy = updates
+            .iter()
+            .rev()
+            .find_map(|(k, v)| if k == legacy_key { v.as_deref() } else { None })
+            .map(str::to_string)
+            .or_else(|| self.db.get(legacy_key).ok().flatten());
+        if let Some(json) = existing_legacy {
+            if let Ok(mut legacy) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
+                let mut changed = false;
+                for (a, s) in legacy.iter_mut() {
+                    if a == addr && *s != new_stake {
+                        *s = new_stake;
+                        changed = true;
+                    }
+                }
+                if changed {
                     let nj = serde_json::to_string(&legacy)
                         .map_err(|e| format!("serialize sys:validators failed: {e}"))?;
                     updates.push((legacy_key.to_string(), Some(nj)));
@@ -2693,6 +2805,10 @@ impl Executor {
                     // moved, so we can prune the departing validator from the QC
                     // trust root + reward mirror after a successful execution.
                     let leave_addr = extract_leave_validator(&call, &tx.sender);
+                    // AUDIT-#5: capture an add_stake BEFORE the call is moved, so we
+                    // can resync the staker's QC weight from the Move ValidatorSet
+                    // after a successful stake increase.
+                    let add_stake_addr = extract_add_stake(&call, &tx.sender);
                     let mut actions = pre_actions.clone();
                     // SECURITY (FIX #1): the user's entry call may only act as the
                     // authenticated tx sender. bind_signer_args overwrites the
@@ -2735,6 +2851,18 @@ impl Executor {
                                         return None;
                                     }
                                     println!("   🔻 Pruned departed validator {} from QC trust root", addr);
+                                }
+                                // AUDIT-#5: resync QC weight after a stake increase.
+                                if let Some(addr) = add_stake_addr {
+                                    if let Err(e) =
+                                        self.refresh_validator_set_v1_stake(&mut updates, &addr)
+                                    {
+                                        println!(
+                                            "❌ Failed to resync sys:validator_set:v1 stake on add_stake: {}",
+                                            e
+                                        );
+                                        return None;
+                                    }
                                 }
                             } else {
                                 println!(
@@ -3785,6 +3913,55 @@ mod tests {
             .and_then(|v| decode_supply_stats_hex(&v))
             .map(|s| s.cumulative_burned)
             .unwrap_or(0)
+    }
+
+    /// AUDIT-#5: add_stake must resync the QC trust root (sys:validator_set:v1)
+    /// and the sys:validators mirror to the validator's NEW authoritative stake
+    /// from the Move ValidatorSet — otherwise QC quorum weight stays frozen at the
+    /// join-time value while real stake-at-risk grows.
+    #[test]
+    fn add_stake_resyncs_v1_qc_weight() {
+        let db = temp_db("add_stake_resync");
+        let exec = Executor::new(Arc::clone(&db));
+        let addr = "0000000000000000000000000000000000000000000000000000000000000001";
+        // Move ValidatorSet is authoritative: validator now holds 1500 AIN.
+        set_validator_set(
+            &db,
+            addr,
+            1_500_000_000_000_000_000_000u128,
+            3_000_000_000_000_000_000_000u128,
+        );
+        // v1 trust root + mirror still carry the STALE join-time weight (1000 AIN).
+        let stale_v1 = vec![ValidatorSetV1Entry {
+            address: addr.to_string(),
+            stake: 1000,
+            ed25519_public_key: "aa".into(),
+            bls_public_key: "bb".into(),
+            bls_pop: "cc".into(),
+        }];
+        db.put(validator_set_v1_key(), &serde_json::to_string(&stale_v1).unwrap())
+            .unwrap();
+        db.put(
+            "sys:validators",
+            &serde_json::to_string(&vec![(addr.to_string(), 1000u64)]).unwrap(),
+        )
+        .unwrap();
+
+        let mut updates: Vec<(String, Option<String>)> = Vec::new();
+        exec.refresh_validator_set_v1_stake(&mut updates, addr)
+            .expect("resync ok");
+        apply_updates(&db, updates);
+
+        let v1: Vec<ValidatorSetV1Entry> =
+            serde_json::from_str(&db.get(validator_set_v1_key()).unwrap().unwrap()).unwrap();
+        assert_eq!(v1[0].stake, 1500, "v1 QC weight resynced to 1500 AIN");
+        assert_eq!(
+            v1[0].ed25519_public_key, "aa",
+            "identity fields (pubkey/bls/pop) preserved — only stake changed"
+        );
+        let mirror: Vec<(String, u64)> =
+            serde_json::from_str(&db.get("sys:validators").unwrap().unwrap()).unwrap();
+        assert_eq!(mirror[0].1, 1500, "sys:validators mirror resynced too");
     }
 
     /// AUDIT-#8: BCS round-trip for the independent SupplyStats resource mirror.
@@ -5608,6 +5785,8 @@ mod tests {
             owner_addr: move_core_types::account_address::AccountAddress,
             verified: bool,
             device_type: u8,
+            // AUDIT-#10: DeviceInfo gained a per-device per-epoch reward-limit field.
+            last_reward_epoch: u64,
         }
         #[derive(Serialize, Deserialize)]
         struct TRegistry {

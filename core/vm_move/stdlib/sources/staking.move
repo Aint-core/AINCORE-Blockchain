@@ -154,6 +154,15 @@ module 0x1::staking {
         });
     }
 
+    /// AUDIT-#10: read-only epoch getter so sibling modules (universal_mining)
+    /// can rate-limit per-epoch without new state or layout changes.
+    public fun get_current_epoch(): u64 acquires ValidatorSet {
+        if (!exists<ValidatorSet>(@0x1)) {
+            return 0
+        };
+        borrow_global<ValidatorSet>(@0x1).current_epoch
+    }
+
     /// Join the validator set
     public entry fun join_validator_set(
         account: &signer,

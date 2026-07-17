@@ -27,6 +27,12 @@ module 0x1::universal_mining {
         // 3=Mobile (Phone App)
         // 4=Desktop (Laptop/PC)
         // 5=Browser (Web Extension)
+        // AUDIT-#10: per-device per-epoch reward rate limit. The last staking
+        // epoch this device was PAID in; distribute_reward pays at most once per
+        // device per epoch (feeders could otherwise re-finalize the same device
+        // arbitrarily often -- each finalize is a fresh proof -- minting without
+        // bound). 0 = never paid; devices earn from epoch 1 onward.
+        last_reward_epoch: u64,
     }
 
     /// Device Type Constants
@@ -88,6 +94,7 @@ module 0x1::universal_mining {
             owner_addr,
             verified: false,
             device_type,
+            last_reward_epoch: 0,
         });
     }
 
@@ -170,7 +177,14 @@ module 0x1::universal_mining {
         assert!(signer::address_of(admin) == ORACLE_ADDRESS, error::permission_denied(ENOT_AUTHORIZED));
         let config = borrow_global_mut<OracleConfig>(@0x1);
         vector::push_back(&mut config.feeders, new_feeder);
-        config.threshold = config.threshold + 1; // Increase threshold as feeders grow
+        // AUDIT-#10: BFT-style threshold -- same formula as the chain's consensus
+        // quorum ((N*2)/3 + 1) -- instead of the old N-of-N (threshold+1 per
+        // feeder). N-of-N had ZERO fault tolerance: one offline feeder would halt
+        // DePIN finalization forever. NOTE: with N=1 this is still 1 (a single
+        // feeder can self-finalize) -- do NOT re-enable DEPIN_BPS in staking.move
+        // until the feeder set is >= 4.
+        let n = vector::length(&config.feeders);
+        config.threshold = (n * 2) / 3 + 1;
     }
 
     /// Validator submits a vote for a device's breath quality
@@ -210,9 +224,6 @@ module 0x1::universal_mining {
                 votes,
                 status: 0
             });
-            proof_idx = 0; // It's at the end wait... we appended.
-            // Actually catching the index of newly added is tricky in Move without index return.
-            // Let's assume size - 1.
             proof_idx = vector::length(&config.active_proofs) - 1;
         } else {
             // Add vote to existing
@@ -242,15 +253,28 @@ module 0x1::universal_mining {
                  k = k + 1;
              };
              let final_score = total_score / count;
-             
-             // EXECUTE REWARD
-             p.status = 1; // Mark finalized
+
+             // AUDIT-#10: PRUNE the finalized proof instead of leaving a
+             // status=1 tombstone forever. Tombstones made active_proofs grow
+             // without bound, and every vote linear-scans that vector -- gas per
+             // vote grows until submit_vote OOG-halts DePIN (same class as the
+             // AUDIT-#2 epoch OOG). swap_remove is O(1); PendingProof has no
+             // drop ability, so destructure it. (`status` is now always 0 for
+             // entries still in the vector; the field is kept for layout
+             // stability.)
+             let PendingProof { device_pubkey: _, votes: _, status: _ } =
+                 vector::swap_remove(&mut config.active_proofs, proof_idx);
+
+             // EXECUTE REWARD (per-device per-epoch rate limit inside).
              distribute_reward(device_pubkey, final_score);
         }
     }
 
     /// Internal function to distribute reward (Extracted from old submit_mining_proof)
     fun distribute_reward(device_pubkey: vector<u8>, bqi_score: u64) acquires DeviceRegistry {
+        // AUDIT-#10: current staking epoch drives the per-device rate limit.
+        let epoch = 0x1::staking::get_current_epoch();
+
         // Find device owner. SECURITY (H3): only a feeder-VERIFIED binding may be
         // paid. An unverified (e.g. front-run) registration is skipped, so a
         // pubkey squatted by an attacker who never passed feeder key-ownership
@@ -259,6 +283,7 @@ module 0x1::universal_mining {
         let len = vector::length(&registry.devices);
         let i = 0;
         let found = false;
+        let idx = 0;
         let owner = @0x0;
 
         while (i < len) {
@@ -266,9 +291,23 @@ module 0x1::universal_mining {
             if (dev.device_pubkey == device_pubkey && dev.verified) {
                 owner = dev.owner_addr;
                 found = true;
+                idx = i;
                 break
             };
             i = i + 1;
+        };
+
+        // AUDIT-#10: pay a verified device AT MOST ONCE per epoch. Feeders can
+        // re-finalize the same device arbitrarily often (each proof is fresh), so
+        // without this a colluding feeder set could mint the DePIN reward every
+        // block. `last_reward_epoch` = 0 means never paid; epoch starts at 1 once
+        // the chain advances, so the first epoch's reward is allowed.
+        if (found) {
+            let dev = vector::borrow_mut(&mut registry.devices, idx);
+            if (epoch <= dev.last_reward_epoch) {
+                return
+            };
+            dev.last_reward_epoch = epoch;
         };
 
         if (found) {
