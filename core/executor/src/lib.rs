@@ -4096,6 +4096,88 @@ mod tests {
         assert_eq!(sender_data.sequence_number, 1);
     }
 
+    /// AUDIT-B1 (transaction atomicity): an ABORTED Move transaction must commit
+    /// NOTHING except the gas charge.
+    ///
+    /// This is the audit's proof-of-concept, inverted into a regression test.
+    /// `coin::transfer` debits the sender in `coin::withdraw` and only afterwards
+    /// calls `coin::deposit`, which asserts the recipient has a CoinStore. Sending
+    /// to an unregistered recipient therefore aborts AFTER the debit.
+    ///
+    /// Before the staged-session fix, move-vm's changeset was finished on the abort
+    /// path and the partial write was committed: the sender ended at 899_900 and the
+    /// 100 AIN was destroyed by a transaction whose own receipt says "aborted".
+    /// With the fix the user session is dropped without `finish()`, so only the
+    /// prologue (gas) survives: 1_000_000 - 100_000 = 900_000.
+    #[test]
+    fn test_b1_aborted_transfer_commits_only_gas() {
+        let db = temp_db("b1_abort_atomicity");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[21u8; 32]);
+        let recipient_key = SigningKey::from_bytes(&[22u8; 32]);
+        let sender = create_account(&db, &sender_key);
+        let recipient = create_account(&db, &recipient_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        set_coin_store(&db, &sender, 1_000_000);
+        // NOTE: deliberately NO CoinStore for the recipient — this is what makes
+        // coin::deposit abort after coin::withdraw has already debited the sender.
+
+        let executor = Executor::new(db.clone());
+        let payload = coin_transfer_payload(&sender, &recipient, 100);
+        let (updates, gas) = executor
+            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1))
+            .expect("transaction is kept (gas is charged) even though the payload aborts");
+        assert_eq!(gas, 100_000, "gas must still be charged on an aborted tx");
+        apply_updates(&db, updates);
+
+        assert_eq!(
+            coin_balance(&db, &sender),
+            900_000,
+            "aborted transfer must debit ONLY gas — the 100 AIN write from the \
+             partially-executed payload must not be committed"
+        );
+
+        let recipient_addr = parse_move_address(&recipient).expect("recipient move address");
+        assert!(
+            db.get(&coin_store_key(recipient_addr))
+                .expect("coin store read")
+                .is_none(),
+            "the aborted payload must not have created a CoinStore for the recipient"
+        );
+    }
+
+    /// AUDIT-B1: the prologue (gas) write must survive the user payload aborting.
+    /// If a naive "drop the whole session on abort" were used instead of staged
+    /// sessions, gas would be refunded and aborts would be free — an unpriced spam
+    /// vector. Pairs with the test above: together they pin BOTH halves of the
+    /// contract (user writes discarded, gas write kept).
+    #[test]
+    fn test_b1_gas_survives_payload_abort() {
+        let db = temp_db("b1_gas_survives");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[23u8; 32]);
+        let recipient_key = SigningKey::from_bytes(&[24u8; 32]);
+        let sender = create_account(&db, &sender_key);
+        let recipient = create_account(&db, &recipient_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        set_coin_store(&db, &sender, 500_000);
+
+        let executor = Executor::new(db.clone());
+        let payload = coin_transfer_payload(&sender, &recipient, 1);
+        let (updates, _gas) = executor
+            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 50_000, 1))
+            .expect("aborted transaction is still kept and charged");
+        apply_updates(&db, updates);
+
+        assert_eq!(
+            coin_balance(&db, &sender),
+            450_000,
+            "gas must be deducted exactly once even though the payload aborted"
+        );
+    }
+
     /// Build a hex-encoded BCS `coin::transfer` payload from `from` to `to`.
     fn coin_transfer_payload(from: &str, to: &str, amount: u128) -> String {
         let call = vm_move::EntryFunctionCall {

@@ -6,11 +6,14 @@ use move_core_types::{
 };
 use move_vm_runtime::move_vm::MoveVM;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use storage::StateDB;
 
 mod gas;
+mod overlay;
 use gas::AINCOREGasMeter;
+use overlay::OverlayStorage;
 use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
 use serde::{Deserialize, Serialize};
 
@@ -459,6 +462,32 @@ impl AINCOREVM {
         self.execute_transaction_actions(actions, sender, gas_limit)
     }
 
+    /// Execute a transaction's actions with REAL abort atomicity.
+    ///
+    /// # Contract (AUDIT-B1)
+    ///
+    /// Actions are split into two stages, mirroring Aptos's
+    /// `PrologueSession` -> `UserSession` split (`aptos-move/aptos-vm/src/aptos_vm.rs`,
+    /// `execute_user_transaction_impl`):
+    ///
+    /// * **PROLOGUE** — the leading run of `must_succeed` actions (today: the
+    ///   `coin::deduct_gas` charge). Runs against storage. If any of them fails the
+    ///   whole transaction is discarded (`Err`), exactly like Aptos's
+    ///   `unwrap_or_discard!`. Its writes are materialized OUTSIDE the user session
+    ///   and are therefore kept even when the user payload aborts.
+    /// * **USER** — everything after the first non-`must_succeed` action. Runs in a
+    ///   SEPARATE session layered over the prologue's writes via [`OverlayStorage`].
+    ///   If it aborts, that session is **dropped without calling `finish()`**, so
+    ///   none of its partial writes can escape. This is the only correct rollback:
+    ///   move-vm marks a `GlobalValue` dirty at the mutating instruction and has no
+    ///   undo log, so filtering a finished changeset after the fact is impossible.
+    ///
+    /// Both stages share one [`AINCOREGasMeter`], so work performed by an aborting
+    /// payload is still charged and aborts are never free.
+    ///
+    /// Returns `(gas_used, writes, status)` where `writes` is
+    /// `prologue_writes ++ user_writes`, and `user_writes` is EMPTY whenever
+    /// `status` is aborted.
     pub fn execute_transaction_actions(
         &self,
         // (action, must_succeed, auth_signer): auth_signer is the AUTHENTICATED
@@ -469,91 +498,133 @@ impl AINCOREVM {
         sender: AccountAddress,
         gas_limit: u64,
     ) -> ExecutionResult {
-        let mut session = self.vm.new_session(&self.storage);
         let mut gas_meter = AINCOREGasMeter::new(gas_limit);
-        let mut status = ExecutionStatus::success();
 
-        for (action, must_succeed, auth_signer) in actions {
-            let result: Result<(), anyhow::Error> = match action {
-                MoveAction::PublishModule(modules) => {
-                    if sender == system_address() {
-                        Err(anyhow::anyhow!(
-                            "publishing to 0x1 is reserved for genesis/system upgrades"
-                        ))
-                    } else {
-                        session
-                            .publish_module_bundle(modules, sender, &mut gas_meter)
-                            .map_err(|e| anyhow::anyhow!("{}", e))
-                    }
-                }
-                MoveAction::CallEntryFunction(call) => {
-                    let ident =
-                        match move_core_types::identifier::Identifier::new(call.function.clone()) {
-                            Ok(id) => id,
-                            Err(e) => {
-                                let err = anyhow::anyhow!("invalid function identifier: {}", e);
-                                if must_succeed {
-                                    return Err(err);
-                                }
-                                if status.success {
-                                    status = ExecutionStatus::aborted(err.to_string());
-                                }
-                                continue;
-                            }
-                        };
-                    // SECURITY (FIX #1): bind &signer slots to the authenticated
-                    // principal. move-vm does NOT inject signers; it deserializes a
-                    // signer from raw arg bytes. Load the function signature, count
-                    // leading signer params, and overwrite those slots with the BCS
-                    // of auth_signer so a forged @0x1 (or any) signer is discarded.
-                    let bound_args = match Self::bind_signer_args(
-                        &session,
-                        &call.module,
-                        &ident,
-                        &call.ty_args,
-                        call.args,
-                        auth_signer,
-                    ) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            if must_succeed {
-                                return Err(e);
-                            }
-                            if status.success {
-                                status = ExecutionStatus::aborted(e.to_string());
-                            }
-                            continue;
-                        }
-                    };
-                    session
-                        .execute_entry_function(
-                            &call.module,
-                            &ident,
-                            call.ty_args,
-                            bound_args,
-                            &mut gas_meter,
-                        )
-                        .map(|_| ())
-                        .map_err(|e| anyhow::anyhow!("{}", e))
-                }
-            };
+        // Split at the first non-must_succeed action. Callers build the vector as
+        // [system pre-actions.., user payload], so this is a clean partition.
+        let split = actions
+            .iter()
+            .position(|(_, must_succeed, _)| !*must_succeed)
+            .unwrap_or(actions.len());
+        let mut actions = actions;
+        let user_actions = actions.split_off(split);
+        let prologue_actions = actions;
 
-            if let Err(e) = result {
-                if must_succeed {
-                    return Err(e);
-                } else {
-                    println!("⚠️ Payload execution failed (state reverted): {}", e);
-                    if status.success {
-                        status = ExecutionStatus::aborted(e.to_string());
-                    }
-                }
+        // Fail closed: a `must_succeed` action AFTER the user payload would be an
+        // epilogue, and an epilogue cannot live in the user session (it would be
+        // dropped on abort). No caller does this today; reject it loudly rather
+        // than silently re-breaking atomicity if one ever appears.
+        if user_actions.iter().any(|(_, must_succeed, _)| *must_succeed) {
+            anyhow::bail!(
+                "unsupported action ordering: a must_succeed action follows a fallible one; \
+                 epilogue actions need their own stage (see execute_transaction_actions)"
+            );
+        }
+
+        // === STAGE 1: PROLOGUE (all-or-nothing) ===
+        let mut staged: BTreeMap<String, Option<String>> = BTreeMap::new();
+        if !prologue_actions.is_empty() {
+            let mut session = self.vm.new_session(&self.storage);
+            for (action, _, auth_signer) in prologue_actions {
+                // A prologue failure discards the transaction entirely.
+                Self::run_action(&mut session, action, sender, auth_signer, &mut gas_meter)?;
+            }
+            let (changeset, _events) = session.finish()?;
+            for (key, value) in self.changeset_to_kv(changeset)? {
+                staged.insert(key, value);
             }
         }
 
-        let (changeset, _events) = session.finish()?;
-        let vm_changes = self.changeset_to_kv(changeset)?;
+        if user_actions.is_empty() {
+            let writes = staged.into_iter().collect();
+            return Ok((gas_meter.gas_used(), writes, ExecutionStatus::success()));
+        }
 
-        Ok((gas_meter.gas_used(), vm_changes, status))
+        // === STAGE 2: USER PAYLOAD (atomic — dropped wholesale on abort) ===
+        // Scoped so the overlay's borrow of `staged` ends before we consume it.
+        let (user_writes, status) = {
+            let overlay = OverlayStorage::new(&self.storage, &staged);
+            let mut session = self.vm.new_session(&overlay);
+            let mut abort_reason: Option<String> = None;
+
+            for (action, _, auth_signer) in user_actions {
+                if let Err(e) =
+                    Self::run_action(&mut session, action, sender, auth_signer, &mut gas_meter)
+                {
+                    abort_reason = Some(e.to_string());
+                    break;
+                }
+            }
+
+            match abort_reason {
+                Some(reason) => {
+                    // DROP the session without finishing it: its partial writes are
+                    // discarded along with the TransactionDataCache it owns. Gas
+                    // already consumed stays charged (shared gas_meter).
+                    drop(session);
+                    println!("⚠️ Payload aborted, user writes discarded: {}", reason);
+                    (Vec::new(), ExecutionStatus::aborted(reason))
+                }
+                None => {
+                    let (changeset, _events) = session.finish()?;
+                    (self.changeset_to_kv(changeset)?, ExecutionStatus::success())
+                }
+            }
+        };
+
+        let mut writes: Vec<(String, Option<String>)> = staged.into_iter().collect();
+        writes.extend(user_writes);
+
+        Ok((gas_meter.gas_used(), writes, status))
+    }
+
+    /// Run one action inside `session`. Errors are returned to the caller, which
+    /// decides whether they discard the transaction (prologue) or abort the user
+    /// stage (payload).
+    fn run_action<S: move_core_types::resolver::MoveResolver>(
+        session: &mut move_vm_runtime::session::Session<'_, '_, S>,
+        action: MoveAction,
+        sender: AccountAddress,
+        auth_signer: AccountAddress,
+        gas_meter: &mut AINCOREGasMeter,
+    ) -> Result<()> {
+        match action {
+            MoveAction::PublishModule(modules) => {
+                if sender == system_address() {
+                    anyhow::bail!("publishing to 0x1 is reserved for genesis/system upgrades");
+                }
+                session
+                    .publish_module_bundle(modules, sender, gas_meter)
+                    .map_err(|e| anyhow::anyhow!("{}", e))
+            }
+            MoveAction::CallEntryFunction(call) => {
+                let ident = move_core_types::identifier::Identifier::new(call.function.clone())
+                    .map_err(|e| anyhow::anyhow!("invalid function identifier: {}", e))?;
+                // SECURITY (FIX #1): bind &signer slots to the authenticated
+                // principal. move-vm does NOT inject signers; it deserializes a
+                // signer from raw arg bytes. Load the function signature, count
+                // leading signer params, and overwrite those slots with the BCS
+                // of auth_signer so a forged @0x1 (or any) signer is discarded.
+                let bound_args = Self::bind_signer_args(
+                    session,
+                    &call.module,
+                    &ident,
+                    &call.ty_args,
+                    call.args,
+                    auth_signer,
+                )?;
+                session
+                    .execute_entry_function(
+                        &call.module,
+                        &ident,
+                        call.ty_args,
+                        bound_args,
+                        gas_meter,
+                    )
+                    .map(|_| ())
+                    .map_err(|e| anyhow::anyhow!("{}", e))
+            }
+        }
     }
 
     /// Overwrite the leading signer parameters of an entry function with the
@@ -562,8 +633,8 @@ impl AINCOREVM {
     /// aptos-v1.3.0 a signer argument is deserialized from raw bytes via the
     /// Signer layout (== AccountAddress), so bcs::to_bytes(&address) is exactly
     /// the bytes the VM expects for a signer slot.
-    fn bind_signer_args(
-        session: &move_vm_runtime::session::Session<'_, '_, AINCOREStorage>,
+    fn bind_signer_args<S: move_core_types::resolver::MoveResolver>(
+        session: &move_vm_runtime::session::Session<'_, '_, S>,
         module: &ModuleId,
         function: &move_core_types::identifier::IdentStr,
         ty_args: &[move_core_types::language_storage::TypeTag],
