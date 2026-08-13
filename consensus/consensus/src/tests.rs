@@ -1431,4 +1431,108 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&path);
     }
+
+    /// AUDIT-B3: a remote vertex must NEVER be able to push this node to a round
+    /// it cannot build parents for.
+    ///
+    /// The bug: `add_vertex` did `self.current_round = vertex.round + 1` for any
+    /// strictly-ahead remote vertex, and persisted it. `try_create_vertex` then
+    /// looks for parents at `current_round - 1` — a round holding only that single
+    /// vertex, which can never reach the stake-weighted parent quorum. Block
+    /// production stopped network-wide and survived restarts. No Byzantine intent
+    /// needed: a validator with a slightly fast ticker does it.
+    ///
+    /// The fix advances only to `quorum_round + 1` (Narwhal's rule), so the local
+    /// round can never outrun the DAG's actual parent availability.
+    #[test]
+    fn test_b3_remote_vertex_cannot_wedge_round_advance() {
+        let (mut consensus, path) = setup_dag("b3_no_wedge");
+
+        // Add a SECOND validator so quorum genuinely requires both (>2/3 of 2000).
+        let remote_key = crypto::SigningKey::from_bytes(&[99u8; 32]);
+        let remote_pub = hex::encode(remote_key.verifying_key().to_bytes());
+        let remote_id = crypto::derive_address(remote_key.verifying_key().as_bytes()).unwrap();
+        let remote_account = Object::new(
+            remote_id.clone(),
+            Owner::Address(remote_id.clone()),
+            serde_json::json!({ "public_key": remote_pub, "sequence_number": 0 })
+                .to_string()
+                .into_bytes(),
+            "0x1::account::AccountData".to_string(),
+        );
+        consensus.storage.put_object(&remote_account).unwrap();
+        let validator_json = format!(
+            r#"[["{}",1000],["{}",1000]]"#,
+            consensus.node_id, remote_id
+        );
+        consensus.storage.put("sys:validators", &validator_json).unwrap();
+        consensus.invalidate_validators_cache();
+
+        let round_before = consensus.current_round;
+
+        // The remote validator emits a vertex FAR ahead of us.
+        let far_round = round_before + 500;
+        let mut far_vertex = blockchain::Vertex {
+            round: far_round,
+            author: remote_id.clone(),
+            timestamp: 1_000,
+            payload: vec![],
+            parents: vec!["genesis".to_string()],
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+        };
+        far_vertex.hash = far_vertex.calculate_hash();
+        far_vertex.sign_with_ed25519(&remote_key);
+
+        consensus.add_vertex(far_vertex);
+
+        // The vertex is STORED (it still counts toward its own round's quorum)...
+        {
+            let dag = consensus.dag.lock().unwrap();
+            assert_eq!(dag.len(), 1, "the far-ahead vertex must still be ingested");
+        }
+        // ...but it must NOT have dragged our proposal clock to far_round + 1.
+        assert!(
+            consensus.current_round <= round_before + 1,
+            "a single remote vertex must not fast-forward the local round: round went \
+             {} -> {} (would wedge: parents at current_round-1 can never reach quorum)",
+            round_before,
+            consensus.current_round
+        );
+        assert_ne!(
+            consensus.current_round,
+            far_round + 1,
+            "this is the exact wedge the audit found"
+        );
+
+        // Liveness: the round we would build on must still be one whose parents can
+        // actually exist. Before the fix, current_round jumped to far_round + 1 and
+        // `current_round - 1` (far_round) held exactly one vertex — permanently
+        // below the stake quorum, so try_create_vertex could never succeed again.
+        // (We assert the round invariant rather than calling try_create_vertex,
+        // because with 2 validators and no connected peers the separate split-brain
+        // guard intentionally suppresses mining — that is not what B3 is about.)
+        assert!(
+            consensus.current_round < far_round,
+            "local round must stay far below the claimed remote round; got {} vs {}",
+            consensus.current_round,
+            far_round
+        );
+
+        // The persisted value must not carry the wedge across a restart either.
+        let persisted = consensus
+            .storage
+            .get("latest_proposed_round")
+            .unwrap()
+            .map(|r| r.parse::<u64>().unwrap_or(0))
+            .unwrap_or(0);
+        assert!(
+            persisted < far_round,
+            "the wedge must not be persisted (was {})",
+            persisted
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }

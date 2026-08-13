@@ -342,6 +342,53 @@ impl DagConsensus {
         }
     }
 
+    /// Highest round for which this node already holds a STAKE QUORUM of vertices.
+    ///
+    /// AUDIT-B3. This is the Narwhal round-advance predicate: a validator moves to
+    /// round r+1 only once it has collected vertices from >2/3 of stake at round r,
+    /// because those vertices are exactly the parents its next vertex must
+    /// reference. Deriving the local round from this — instead of from whatever
+    /// round a single remote vertex happens to claim — makes the wedge
+    /// unrepresentable: we can never sit at a round whose predecessor lacks the
+    /// parents we need.
+    ///
+    /// Pure function of (round_index, dag, validators) so it is identical on every
+    /// node given the same DAG contents, and it takes the already-held guards
+    /// rather than `&self` so it can run inside the ingest critical section.
+    fn quorum_round(
+        round_index: &HashMap<u64, Vec<String>>,
+        dag: &HashMap<String, Vertex>,
+        validators: &[(String, u64)],
+    ) -> u64 {
+        let total_stake: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
+        if total_stake == 0 {
+            return 0;
+        }
+        let stake_by_addr: HashMap<&str, u64> =
+            validators.iter().map(|(a, s)| (a.as_str(), *s)).collect();
+
+        let mut best = 0u64;
+        for (round, hashes) in round_index.iter() {
+            if *round <= best {
+                continue; // cannot improve the maximum
+            }
+            let mut authors: HashSet<&str> = HashSet::new();
+            for h in hashes {
+                if let Some(v) = dag.get(h) {
+                    authors.insert(v.author.as_str());
+                }
+            }
+            let round_stake: u128 = authors
+                .iter()
+                .filter_map(|a| stake_by_addr.get(a).map(|s| *s as u128))
+                .sum();
+            if crate::qc::stake_quorum_met(round_stake, total_stake) {
+                best = *round;
+            }
+        }
+        best
+    }
+
     pub fn try_create_vertex(&mut self) {
         // 1. Check if we have enough parents from previous round
         let prev_round = self.current_round - 1;
@@ -725,8 +772,16 @@ impl DagConsensus {
             return;
         }
 
-        // C-2 FIX: Cross-check against the active ValidatorSet
-        let validators = self.get_validator_set();
+        // C-2 FIX: Cross-check against the active ValidatorSet.
+        // AUDIT-B3: fetch the STAKE-weighted set once, here, before any lock is
+        // taken — the quorum-gated round advance below needs stake weights, and
+        // it runs while the DAG/round-index guards are held, so it cannot call
+        // back into &self at that point.
+        let validators_with_stake = self.get_validator_set_with_stake();
+        let validators: Vec<String> = validators_with_stake
+            .iter()
+            .map(|(a, _)| a.clone())
+            .collect();
         if !validators.contains(&vertex.author) && self.current_round > 0 {
             println!(
                 "🚨 REJECTED: Vertex author {} is not in the active validator set",
@@ -819,20 +874,35 @@ impl DagConsensus {
                 }
             }
 
-            // Fast-forward local round to match network if lagging behind (Amnesia Recovery)
-            // ONLY for remote vertices — try_create_vertex already increments for local ones.
-            // STRICTLY ahead (`>`, not `>=`): a remote vertex at OUR CURRENT round must not
-            // push us past it before we produce our own vertex for that round. Otherwise a
-            // bootstrapping validator that receives a peer's round-R vertex before its own
-            // ticker fires skips round R forever and never contributes to round R's quorum —
-            // a multi-machine bootstrap deadlock (Parents<quorum) that localhost never hits
-            // because peers connect within one round there. Genuine lag (round strictly
-            // greater) still fast-forwards for amnesia recovery.
+            // Fast-forward local round to match the network (Amnesia Recovery),
+            // ONLY for remote vertices — try_create_vertex already increments for
+            // local ones.
+            //
+            // AUDIT-B3: this used to be `self.current_round = vertex.round + 1`,
+            // driven by a SINGLE remote vertex. That is a permanent chain wedge and
+            // it needs no Byzantine intent — a validator whose ticker runs slightly
+            // fast emits a vertex one round ahead, every node adopts round+1, and
+            // then `try_create_vertex` looks for parents at `current_round - 1`,
+            // a round that holds only that one vertex and can therefore NEVER reach
+            // the stake-weighted parent quorum. Block production stops network-wide,
+            // and because the value was persisted as `latest_proposed_round` it
+            // survived restarts.
+            //
+            // Narwhal's actual rule: a node advances to round r+1 only once it holds
+            // a stake quorum of round-r vertices. So we advance to
+            // `quorum_round + 1` — the highest round we can genuinely build parents
+            // for — and never to an arbitrary round some peer claims. A vertex far
+            // ahead is still stored and still counts toward its own round's quorum;
+            // it just cannot drag our proposal clock past what the DAG supports.
             if vertex.author != self.node_id && vertex.round > self.current_round {
-                self.current_round = vertex.round + 1;
-                let _ = self
-                    .storage
-                    .put("latest_proposed_round", &self.current_round.to_string());
+                let target =
+                    Self::quorum_round(&round_idx, &dag, &validators_with_stake).saturating_add(1);
+                if target > self.current_round {
+                    self.current_round = target;
+                    let _ = self
+                        .storage
+                        .put("latest_proposed_round", &self.current_round.to_string());
+                }
             }
         } // Locks dropped here!
 
