@@ -107,12 +107,23 @@ module 0x1::dex {
         let liquidity: u128;
         let used_x: u128;
         let used_y: u128;
+        // AUDIT: the permanently-locked minimum is COMPUTED here and written only
+        // once, together with the real mint, after every assert has passed and the
+        // user's coins have actually been taken. It used to be written to
+        // pool.lp_supply immediately (before the min_lp / used_x asserts and before
+        // coin::withdraw), which let anyone brick a fresh pool for the price of gas:
+        // call add_liquidity with an impossible min_lp, the assert aborts, but
+        // lp_supply was already 1000 with zero reserves -- so every later call takes
+        // the else-branch below and aborts on `reserve_x > 0`, and create_pool
+        // refuses to re-register the pair. Compute-then-write removes that window
+        // regardless of VM abort semantics.
+        let minimum_lock: u128;
         if (pool.lp_supply == 0) {
             assert_mul_safe(amount_x, amount_y);
             let raw_liquidity = sqrt(amount_x * amount_y);
             assert!(raw_liquidity > MINIMUM_LIQUIDITY, error::invalid_argument(EINVALID_LIQUIDITY));
             liquidity = raw_liquidity - MINIMUM_LIQUIDITY;
-            pool.lp_supply = pool.lp_supply + MINIMUM_LIQUIDITY;
+            minimum_lock = MINIMUM_LIQUIDITY;
             used_x = amount_x;
             used_y = amount_y;
         } else {
@@ -130,6 +141,7 @@ module 0x1::dex {
             assert_mul_safe(liquidity, reserve_y);
             used_x = (liquidity * reserve_x) / pool.lp_supply;
             used_y = (liquidity * reserve_y) / pool.lp_supply;
+            minimum_lock = 0;
         };
 
         assert!(liquidity > 0, error::invalid_argument(EINVALID_LIQUIDITY));
@@ -140,7 +152,10 @@ module 0x1::dex {
         let input_y = coin::withdraw<Y>(account, used_y);
         coin::merge(&mut pool.coin_x, input_x);
         coin::merge(&mut pool.coin_y, input_y);
-        pool.lp_supply = pool.lp_supply + liquidity;
+        // Single lp_supply write: the locked minimum (first deposit only) plus the
+        // liquidity actually minted to the user. Reserves have already been funded
+        // above, so lp_supply and the reserves can never disagree.
+        pool.lp_supply = pool.lp_supply + minimum_lock + liquidity;
 
         let user_addr = signer::address_of(account);
         if (!exists<LPToken<X, Y>>(user_addr)) {

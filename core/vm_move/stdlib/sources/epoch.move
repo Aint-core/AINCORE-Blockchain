@@ -24,6 +24,17 @@ module 0x1::epoch {
     }
 
     public entry fun advance_epoch(account: &signer) acquires Epoch {
+        // AUDIT-HIGH: advance_epoch had NO authorization guard while
+        // update_epoch_duration below it did. Any user could call this entry
+        // function and ratchet the on-chain epoch clock forward, which drives the
+        // 21-day unbonding deadlines and the slashing window. The inner
+        // staking::* calls do assert @0x1 and abort, but before the abort-atomicity
+        // fix those aborts still committed the epoch_number/epoch_start_time
+        // writes made above them. Guard it here too: authorization belongs at the
+        // entry point, not only in the callees.
+        let addr = signer::address_of(account);
+        assert!(addr == @0x1, 100);
+
         let epoch = borrow_global_mut<Epoch>(@0x1);
         epoch.epoch_number = epoch.epoch_number + 1;
         // H4 FIX: advance the monotonic clock by the CURRENT duration. Because we
