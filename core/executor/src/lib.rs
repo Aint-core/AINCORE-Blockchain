@@ -1596,10 +1596,33 @@ impl Executor {
             let mut batch_hasher = sha2::Sha256::new();
             use sha2::Digest;
 
-            for (_tx_hash, res) in results {
+            // AUDIT-B2 safety net: two transactions in ONE parallel batch writing
+            // the same key is, by construction, a conflict-token miss — both read
+            // pre-batch state, and this loop's last-write-wins silently erases one
+            // of them. That is exactly how the unbounded-mint bug worked. The
+            // scheduler is supposed to make this impossible; if it ever happens
+            // again (a new stdlib call path, a moved function), surface it loudly
+            // instead of silently corrupting state. Keyed by tx_hash so a single
+            // tx overwriting its own key across staged sessions is not flagged.
+            let mut writer_of_key: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+
+            for (tx_hash, res) in results {
                 if let Some((mut updates, gas_charged)) = res {
                     updates.sort_by(|left, right| left.0.cmp(&right.0));
                     for (key, val_opt) in updates {
+                        if let Some(prev_writer) = writer_of_key.get(&key) {
+                            if prev_writer != &tx_hash {
+                                eprintln!(
+                                    "🚨 [SECURITY][BATCH_CONFLICT] key {} written by two txs in one \
+                                     parallel batch ({} and {}) — analyze_tx is missing a conflict \
+                                     token for this path; one write is being lost",
+                                    key, prev_writer, tx_hash
+                                );
+                            }
+                        } else {
+                            writer_of_key.insert(key.clone(), tx_hash.clone());
+                        }
                         if let Some(val) = val_opt {
                             write_batch.put(key.as_bytes(), val.as_bytes());
                             batch_hasher.update(key.as_bytes());
@@ -2171,6 +2194,38 @@ impl Executor {
     /// mutating the same global resource would race in one parallel batch and
     /// fork the state root (#1). The allowlist below is a fast PATH for known
     /// calls, NEVER the safety boundary.
+    /// Conflict tokens for the `0x1::staking` global singletons.
+    ///
+    /// AUDIT-B2: `analyze_tx` declares dependencies per MODULE, but a module can
+    /// mutate resources it never names — Move calls into `0x1::staking` from
+    /// `governance`, `token_factory` and `delegation`, and those calls
+    /// `borrow_global_mut` the staking singletons:
+    ///
+    /// * `staking::burn_ain` (governance::create_proposal, token_factory::create_token,
+    ///   delegation's slash path) writes `ValidatorSet` AND `SupplyStats`.
+    /// * `staking::mint_delegation_reward` / `mint_depin_reward` write `EmissionPools`.
+    ///
+    /// Any branch that can reach those MUST declare these keys, or the scheduler
+    /// puts it in the same parallel batch as a `staking` tx; both execute against
+    /// pre-batch state and the last-write-wins commit silently erases one of the
+    /// two `ValidatorSet` blobs. That is the unbounded-mint bug: pair a
+    /// `withdraw_unbonded` (which removes the unbonding entry from `ValidatorSet`
+    /// but mints into a separate `CoinStore` key) with a hash-ground
+    /// `token_factory` tx and the payout survives while the queue entry is
+    /// restored — repeatable every block, and the `MAX_SUPPLY` tripwire never
+    /// fires because `withdraw_unbonded` does not touch `total_supply`.
+    fn staking_global_keys() -> [String; 3] {
+        [
+            validator_set_key(),
+            supply_stats_key(),
+            format!(
+                "resource_{}_{}",
+                system_address(),
+                "0x1::staking::EmissionPools"
+            ),
+        ]
+    }
+
     fn analyze_tx(&self, tx: &Transaction) -> (Vec<String>, bool) {
         let mut deps = Vec::new();
         let mut recognized = false;
@@ -2240,9 +2295,12 @@ impl Executor {
             } else if *module_addr == system_address() && module_name == "staking" {
                 // staking locks the validator-set keys, serializing all staking txs.
                 recognized = true;
-                deps.push(validator_set_key());
+                deps.extend(Self::staking_global_keys());
                 deps.push(validator_set_v1_key().to_string());
             } else if *module_addr == system_address() && module_name == "delegation" {
+                // AUDIT-B2: delegation reaches staking::mint_delegation_reward
+                // (EmissionPools) and staking::burn_ain (ValidatorSet + SupplyStats).
+                deps.extend(Self::staking_global_keys());
                 match function {
                     "enable_delegation" => {
                         recognized = true;
@@ -2275,6 +2333,9 @@ impl Executor {
                 }
             } else if *module_addr == system_address() && module_name == "governance" {
                 recognized = true;
+                // AUDIT-B2: governance::create_proposal burns the proposal fee via
+                // staking::burn_ain, mutating ValidatorSet + SupplyStats.
+                deps.extend(Self::staking_global_keys());
                 deps.push(format!(
                     "resource_{}_{}",
                     system_address(),
@@ -2289,6 +2350,11 @@ impl Executor {
                 && function == "transfer"
             {
                 recognized = true;
+                // AUDIT-B2: token_factory reaches staking::burn_ain (create_token
+                // burns the listing fee). Declared on BOTH token_factory branches
+                // so a future function moved between them cannot silently lose the
+                // dependency.
+                deps.extend(Self::staking_global_keys());
                 push_addr_arg(&mut deps, &call.args, 2);
                 deps.push(format!(
                     "resource_{}_{}",
@@ -2306,6 +2372,8 @@ impl Executor {
                 }
             } else if *module_addr == system_address() && module_name == "token_factory" {
                 recognized = true;
+                // AUDIT-B2: create_token burns the listing fee via staking::burn_ain.
+                deps.extend(Self::staking_global_keys());
                 deps.push(format!(
                     "resource_{}_{}",
                     system_address(),
@@ -3813,6 +3881,112 @@ mod tests {
         ]);
         assert_eq!(batches2.len(), 1, "disjoint known txs stay in one parallel batch");
         assert_eq!(batches2[0].len(), 2);
+    }
+
+    /// AUDIT-B2: the unbounded-mint exploit pairing must NEVER share a parallel
+    /// batch with a staking transaction.
+    ///
+    /// The attack: `staking::withdraw_unbonded` removes the unbonding entry from
+    /// `0x1::staking::ValidatorSet` and, separately, mints the payout into
+    /// `resource_{addr}_CoinStore`. A `token_factory` (or `governance`, or
+    /// `delegation`) transaction ALSO mutates `ValidatorSet` — through
+    /// `staking::burn_ain` — but never declared it. With disjoint declared
+    /// dependency sets the scheduler put both in one batch; both executed against
+    /// pre-batch state; the commit sorted by tx_hash and last-write-wins restored
+    /// the unbonding entry while the minted payout survived. Repeatable every
+    /// block, and `MAX_SUPPLY` never noticed because `withdraw_unbonded` does not
+    /// touch `total_supply`.
+    ///
+    /// The fix declares the staking singletons on every branch that can reach
+    /// them, so these transactions now serialize into separate batches.
+    #[test]
+    fn test_b2_staking_globals_serialize_cross_module_txs() {
+        let db = temp_db("b2_conflict_tokens");
+        let exec = Executor::new(db);
+        let mk = |sender: &str, payload: &str| Transaction {
+            chain_id: "AINCORE-MAINNET-1".to_string(),
+            sender: sender.to_string(),
+            input_objects: vec![],
+            payload: payload.to_string(),
+            args: vec![],
+            gas_limit: 10_000,
+            gas_price: 1,
+            sequence_number: 0,
+            public_key: String::new(),
+            signature: String::new(),
+            paymaster: None,
+            paymaster_signature: None,
+            zkp_proof: None,
+        };
+
+        let withdraw = entry_payload("staking", "withdraw_unbonded", vec![], vec![]);
+        let create_token = entry_payload("token_factory", "create_token", vec![], vec![]);
+        let propose = entry_payload("governance", "create_proposal", vec![], vec![]);
+        let delegate = entry_payload("delegation", "delegate", vec![], vec![]);
+
+        // Every one of these branches must now declare the staking singletons.
+        let vs = super::validator_set_key();
+        let ss = super::supply_stats_key();
+        for (name, payload) in [
+            ("staking", &withdraw),
+            ("token_factory", &create_token),
+            ("governance", &propose),
+            ("delegation", &delegate),
+        ] {
+            let (deps, recognized) = exec.analyze_tx(&mk(&"a".repeat(32), payload));
+            assert!(recognized, "{} must be recognized", name);
+            assert!(
+                deps.contains(&vs),
+                "{} must declare staking::ValidatorSet — it can reach it via staking::burn_ain / \
+                 mint_delegation_reward",
+                name
+            );
+            assert!(
+                deps.contains(&ss),
+                "{} must declare staking::SupplyStats (the emission cap ledger)",
+                name
+            );
+        }
+
+        // The exploit pairing itself: distinct senders, so nothing else forces a
+        // conflict — only the shared staking token can separate them.
+        let batches = exec.schedule_batches(vec![
+            (mk(&"a".repeat(32), &withdraw), "r_withdraw".to_string()),
+            (mk(&"b".repeat(32), &create_token), "r_token".to_string()),
+        ]);
+        assert_eq!(
+            batches.len(),
+            2,
+            "withdraw_unbonded and create_token must be SERIALIZED — sharing a parallel batch is \
+             the unbounded-mint bug"
+        );
+
+        // Same for the governance and delegation variants of the same attack.
+        for (label, payload) in [("governance", &propose), ("delegation", &delegate)] {
+            let batches = exec.schedule_batches(vec![
+                (mk(&"c".repeat(32), &withdraw), "r_w".to_string()),
+                (mk(&"d".repeat(32), payload), "r_x".to_string()),
+            ]);
+            assert_eq!(
+                batches.len(),
+                2,
+                "withdraw_unbonded and {} must be serialized",
+                label
+            );
+        }
+
+        // Sanity: the fix must not over-serialize unrelated traffic. Two plain
+        // coin::transfers between distinct accounts still share one batch.
+        let xfer = entry_payload("coin", "transfer", vec![], vec![]);
+        let batches = exec.schedule_batches(vec![
+            (mk(&"e".repeat(32), &xfer), "r1".to_string()),
+            (mk(&"f".repeat(32), &xfer), "r2".to_string()),
+        ]);
+        assert_eq!(
+            batches.len(),
+            1,
+            "plain transfers must still parallelize — the fix must not kill throughput"
+        );
     }
 
     fn validator_set_key() -> String {
