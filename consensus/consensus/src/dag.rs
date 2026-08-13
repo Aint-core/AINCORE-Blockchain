@@ -31,6 +31,9 @@ pub struct DagConsensus {
     pub ordering_engine: Arc<Mutex<OrderingEngine>>,
     pub latest_block_height: u64,
     pub latest_block_hash: String,
+    /// AUDIT-H1: timestamp of the chain tip, used to keep BFT block time
+    /// monotonic across blocks and across restarts.
+    pub latest_block_timestamp: u64,
     pub accumulator: Accumulator,
     pub da_sequencer: Option<Arc<Mutex<DASequencer>>>, // Added DA Sequencer
     pub p2p_tx: Option<tokio::sync::mpsc::Sender<String>>, // Added P2P Libp2p Channel
@@ -274,6 +277,17 @@ impl DagConsensus {
             _ => "genesis".to_string(),
         };
 
+        // AUDIT-H1: restore the tip's timestamp so BFT block time stays monotonic
+        // across a restart (otherwise the first block after a restart could move
+        // time backwards and diverge from peers that never restarted).
+        let latest_block_timestamp = storage
+            .get(&format!("block_{}", latest_block_height))
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str::<blockchain::Block>(&json).ok())
+            .map(|b| b.header.timestamp)
+            .unwrap_or(0);
+
         let explicit_max_round = match storage.get("latest_proposed_round") {
             Ok(Some(r)) => r.parse::<u64>().unwrap_or(0),
             _ => 0,
@@ -304,6 +318,7 @@ impl DagConsensus {
             ))),
             latest_block_height,
             latest_block_hash,
+            latest_block_timestamp,
             accumulator: Accumulator::new(),
             da_sequencer,
             p2p_tx,
@@ -873,6 +888,14 @@ impl DagConsensus {
             // We can optimize this by cloning necessary data in the previous block,
             // but identifying which vertices are committed before engine runs is hard.
             // So we just re-acquire efficiently.
+            // AUDIT-H1: collect the committed vertices' AUTHOR-SIGNED timestamps so
+            // the block timestamp can be derived deterministically (BFT-Time) rather
+            // than read from this node's wall clock. Vertex timestamps are inside
+            // Vertex::calculate_hash and signed, so every node sees identical values.
+            let stake_by_addr: std::collections::HashMap<String, u64> =
+                self.get_validator_set_with_stake().into_iter().collect();
+            let mut ts_samples: Vec<(String, u64, u64)> = Vec::new();
+
             let dag = self.dag.lock().expect("🚨 FATAL: DAG lock poisoned");
 
             for hash in &commit.sequence {
@@ -882,9 +905,15 @@ impl DagConsensus {
                     // But we must NOT hold DAG lock during execution.
                     // So we collect ALL txs first.
                     block_txs.extend(v.payload.clone());
+                    if let Some(stake) = stake_by_addr.get(&v.author) {
+                        ts_samples.push((v.author.clone(), *stake, v.timestamp));
+                    }
                 }
             }
             drop(dag); // DROP DAG LOCK NOW!
+
+            let block_timestamp =
+                blockchain::bft_block_timestamp(ts_samples, self.latest_block_timestamp);
 
             // NOW EXECUTE (Lock Free!)
             // We execute even if empty to trigger Block Rewards (Heartbeat Mining)
@@ -908,7 +937,11 @@ impl DagConsensus {
                 // Create Block (Post-Execution)
                 use blockchain::Block;
                 self.latest_block_height += 1;
-                let new_block = Block::new_with_roots(
+                // AUDIT-H1: new_with_roots_at, NOT new_with_roots — the latter reads
+                // the local clock, which made every node derive a different header
+                // hash for identical content and chained that divergence forward
+                // through prev_hash.
+                let new_block = Block::new_with_roots_at(
                     self.latest_block_height,
                     vertex.round, // Pass Round
                     self.latest_block_hash.clone(),
@@ -916,8 +949,10 @@ impl DagConsensus {
                     reward_recipient.clone(),
                     execution_summary.state_root,
                     execution_summary.receipts_root,
+                    block_timestamp,
                 );
                 self.latest_block_hash = new_block.header.hash.clone();
+                self.latest_block_timestamp = new_block.header.timestamp;
 
                 // Update Accumulator and DB
                 if let Ok(bytes) = hex::decode(&new_block.header.hash) {
