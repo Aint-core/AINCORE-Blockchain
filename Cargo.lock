@@ -853,17 +853,22 @@ checksum = "d86b93f97252c47b41663388e6d155714a9d0c398b99f1005cbc5f978b29f445"
 name = "bench-tps"
 version = "0.1.0"
 dependencies = [
+ "bcs",
+ "clap 4.5.53",
  "colored",
+ "crypto",
  "ed25519-dalek",
  "futures",
  "hex",
  "indicatif",
+ "move-core-types",
  "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "vm_move",
 ]
 
 [[package]]
@@ -1060,6 +1065,7 @@ name = "bridge-rust"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blockchain",
  "consensus",
  "crypto",
  "dotenv",
