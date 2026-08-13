@@ -683,51 +683,62 @@ impl OrderingEngine {
         validators: &[(String, u64)],
         attempt: u32,
     ) -> String {
+        Self::leader_for_round(round, validators, attempt)
+    }
+
+    /// Elect the anchor leader for `round` as a PURE function of the round, the
+    /// active validator set, and the fallback attempt.
+    ///
+    /// # Why this stopped using the VDF beacon (AUDIT-B4)
+    ///
+    /// Election used to seed from `self.step1_beacon`, which
+    /// `update_random_beacon` refreshes on every LOCAL commit. Two honest nodes at
+    /// different commit heights therefore held DIFFERENT beacons, and while both
+    /// were deciding the same anchor round they could elect DIFFERENT leaders —
+    /// a finality fork reachable with zero Byzantine participants, purely from one
+    /// node being a commit behind (exactly the situation during catch-up, which is
+    /// the common case on a real network).
+    ///
+    /// A previous fix (audit H-1) had already moved election off `last_vdf_output`
+    /// onto `step1_beacon` for the same class of reason, but stopped one step
+    /// short: `step1_beacon` is still per-node mutable state, not committed data.
+    ///
+    /// The seed is now `Sha256("AINCORE_LEADER_V2" || round || (addr,stake)*)`,
+    /// so every node computes the same leader for the same round given the same
+    /// validator set — the property Bullshark's anchor rule actually requires.
+    ///
+    /// Cost: leader identity becomes predictable in advance. That is the documented
+    /// H-2 trade-off and it is the correct one — predictability is a grinding
+    /// concern to be closed by a real delay-VDF, whereas non-determinism here is an
+    /// outright safety break. The QC-folded beacon remains available via
+    /// `get_random_beacon()` for NON-consensus randomness.
+    fn leader_for_round(round: u64, validators: &[(String, u64)], attempt: u32) -> String {
         if validators.is_empty() {
             // M6 FIX: Instead of hardcoded "node_9009", return empty string
             // The caller already handles the "no leader found" case properly
             return String::new();
         }
 
-        // SEC (audit H-1): elect from the DETERMINISTIC Step-1 base `step1_beacon`
-        // (VDF over anchor_round + cumulative finality_digest), NOT from
-        // `last_vdf_output`. `last_vdf_output` is `step1_beacon` optionally folded with
-        // a COMPLETE multi-party QC aggregate signature, and that fold happens per node
-        // at a different moment (as each node assembles the complete QC from gossiped
-        // QC_VOTEs). Electing off `last_vdf_output` therefore let a node that had folded
-        // height H elect a DIFFERENT anchor leader than a node that had not yet folded
-        // it — a finality-safety FORK reachable with no Byzantine participant. The
-        // Step-1 base is a pure function of already-committed state, identical on every
-        // honest node at commit time, so leader selection is deterministic.
-        // NOTE: the Step-1 base is still proposer-biasable via chosen content (audit
-        // H-2) — closing that needs a real delay-VDF (or a QC fold bound to a height
-        // buried below a fixed finality lag so all nodes fold before electing); tracked
-        // as deferred. The QC-folded `last_vdf_output` remains available via
-        // get_random_beacon() for NON-consensus randomness only.
-        let election_beacon = &self.step1_beacon;
-        let vdf_seed: u64 = if election_beacon.len() >= 8 {
-            let bytes: [u8; 8] = [
-                election_beacon[0],
-                election_beacon[1],
-                election_beacon[2],
-                election_beacon[3],
-                election_beacon[4],
-                election_beacon[5],
-                election_beacon[6],
-                election_beacon[7],
-            ];
-            u64::from_le_bytes(bytes)
-        } else {
-            0 // Fallback to deterministic if VDF not initialized yet (first few rounds)
-        };
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"AINCORE_LEADER_V2");
+        hasher.update(round.to_le_bytes());
+        hasher.update((attempt as u64).to_le_bytes());
+        // `validators` is canonically sorted by address by
+        // get_validator_set_with_stake, so this preimage is identical everywhere.
+        for (addr, stake) in validators {
+            hasher.update(addr.as_bytes());
+            hasher.update(stake.to_le_bytes());
+        }
+        let digest = hasher.finalize();
+        let seed = u64::from_le_bytes([
+            digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+        ]);
 
-        // B4: STAKE-WEIGHTED leader election. The seed mixes round + VDF beacon +
-        // fallback attempt (VDF changes every committed anchor -> unpredictable).
-        // A validator's chance of being leader is proportional to its stake.
-        // Deterministic across honest nodes: `validators` is canonically sorted
-        // by address, so the cumulative-stake walk picks the same leader for the
-        // same seed everywhere.
-        let seed = round.wrapping_add(vdf_seed).wrapping_add(attempt as u64);
+        // B4: STAKE-WEIGHTED leader election. A validator's chance of being leader
+        // is proportional to its stake. Deterministic across honest nodes:
+        // `validators` is canonically sorted by address, so the cumulative-stake
+        // walk picks the same leader for the same seed everywhere.
         let total_stake: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
 
         if total_stake == 0 {
@@ -1206,5 +1217,93 @@ mod tests {
             "a stale fold marker for an earlier base must NOT be re-applied"
         );
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// AUDIT-B4: anchor leader election must be a PURE function of (round,
+    /// validators) — never of per-node mutable state.
+    ///
+    /// Election used to seed from `step1_beacon`, which `update_random_beacon`
+    /// refreshes on every LOCAL commit. Two honest nodes at different commit
+    /// heights therefore held different beacons and, while both were deciding the
+    /// SAME anchor round, could elect DIFFERENT leaders — a finality fork with
+    /// zero Byzantine participants, and precisely the state a node is in while
+    /// catching up. This test pins the fix: two engines whose beacons have been
+    /// driven to different values must still agree on every round's leader.
+    #[test]
+    fn test_b4_leader_election_is_independent_of_local_beacon_state() {
+        let validators: Vec<(String, u64)> = vec![
+            ("aaaa000000000000000000000000000000000000000000000000000000000001".to_string(), 1000),
+            ("bbbb000000000000000000000000000000000000000000000000000000000002".to_string(), 1000),
+            ("cccc000000000000000000000000000000000000000000000000000000000003".to_string(), 1000),
+        ];
+
+        let mut node_a = OrderingEngine::new();
+        let mut node_b = OrderingEngine::new();
+
+        // Drive the two nodes' beacons apart, exactly as differing commit heights do.
+        node_a.update_random_beacon(7, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        node_b.update_random_beacon(99, "ffffffffffffffffffffffffffffffff");
+        assert_ne!(
+            node_a.get_random_beacon(),
+            node_b.get_random_beacon(),
+            "test setup invariant: the two nodes must hold different beacons"
+        );
+
+        for round in 1u64..200 {
+            for attempt in 0u32..3 {
+                assert_eq!(
+                    node_a.get_leader_with_fallback(round, &validators, attempt),
+                    node_b.get_leader_with_fallback(round, &validators, attempt),
+                    "nodes with different beacons must still elect the same leader \
+                     for round {} attempt {}",
+                    round,
+                    attempt
+                );
+            }
+        }
+    }
+
+    /// Election must still be stake-weighted and must still spread leadership
+    /// across the validator set (a constant leader would centralise proposals).
+    #[test]
+    fn test_b4_leader_election_still_rotates_and_covers_the_set() {
+        let validators: Vec<(String, u64)> = vec![
+            ("aaaa000000000000000000000000000000000000000000000000000000000001".to_string(), 1000),
+            ("bbbb000000000000000000000000000000000000000000000000000000000002".to_string(), 1000),
+            ("cccc000000000000000000000000000000000000000000000000000000000003".to_string(), 1000),
+        ];
+        let engine = OrderingEngine::new();
+        let mut seen = std::collections::HashSet::new();
+        for round in 1u64..500 {
+            seen.insert(engine.get_leader_with_fallback(round, &validators, 0));
+        }
+        assert_eq!(
+            seen.len(),
+            3,
+            "every equal-stake validator must be elected at some round, got {:?}",
+            seen
+        );
+    }
+
+    /// A validator that leaves or joins changes the leader schedule — the schedule
+    /// is bound to the validator set, so nodes MUST use the same set. This pins
+    /// that the set is part of the preimage (a regression here would silently
+    /// re-introduce cross-node divergence when sets differ).
+    #[test]
+    fn test_b4_leader_schedule_is_bound_to_the_validator_set() {
+        let set_a: Vec<(String, u64)> = vec![
+            ("aaaa000000000000000000000000000000000000000000000000000000000001".to_string(), 1000),
+            ("bbbb000000000000000000000000000000000000000000000000000000000002".to_string(), 1000),
+        ];
+        let mut set_b = set_a.clone();
+        set_b.push((
+            "cccc000000000000000000000000000000000000000000000000000000000003".to_string(),
+            1000,
+        ));
+        let engine = OrderingEngine::new();
+        let differs = (1u64..50)
+            .any(|r| engine.get_leader_with_fallback(r, &set_a, 0)
+                != engine.get_leader_with_fallback(r, &set_b, 0));
+        assert!(differs, "the validator set must be part of the election preimage");
     }
 }
