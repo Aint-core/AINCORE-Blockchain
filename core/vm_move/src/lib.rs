@@ -490,6 +490,33 @@ impl AINCOREVM {
     /// `status` is aborted.
     pub fn execute_transaction_actions(
         &self,
+        actions: Vec<(MoveAction, bool, AccountAddress)>,
+        sender: AccountAddress,
+        gas_limit: u64,
+    ) -> ExecutionResult {
+        self.execute_transaction_actions_with_prestaged(actions, sender, gas_limit, Vec::new())
+    }
+
+    /// As [`Self::execute_transaction_actions`], but with `prestaged` raw state
+    /// writes materialized BEFORE the prologue and visible to every stage.
+    ///
+    /// # Why this exists (CoinStore onboarding)
+    ///
+    /// Move cannot create a resource at an address without that address's
+    /// `signer`, and this VM exposes no `create_signer` native (Aptos's framework
+    /// has one; ours does not). That made a brand-new account unable to ever
+    /// receive its first AIN: `coin::deposit` aborts without a `CoinStore`, and
+    /// self-registering needs gas, which `coin::deduct_gas` will only take from an
+    /// existing `CoinStore`. A closed loop.
+    ///
+    /// The staged-session machinery added for abort atomicity solves it directly:
+    /// the adapter can materialize the empty `CoinStore` as a staged write, and
+    /// because every stage reads through [`OverlayStorage`], the Move code sees it
+    /// as if it had always been there. The write is returned in the result set, so
+    /// it lands in the same WriteBatch and the same state root as everything else —
+    /// deterministic on every node, not a side channel.
+    pub fn execute_transaction_actions_with_prestaged(
+        &self,
         // (action, must_succeed, auth_signer): auth_signer is the AUTHENTICATED
         // address this action may act as. Every leading &signer slot of an entry
         // function is overwritten with this address, so user-supplied bytes in a
@@ -497,6 +524,7 @@ impl AINCOREVM {
         actions: Vec<(MoveAction, bool, AccountAddress)>,
         sender: AccountAddress,
         gas_limit: u64,
+        prestaged: Vec<(String, Option<String>)>,
     ) -> ExecutionResult {
         let mut gas_meter = AINCOREGasMeter::new(gas_limit);
 
@@ -521,16 +549,30 @@ impl AINCOREVM {
             );
         }
 
-        // === STAGE 1: PROLOGUE (all-or-nothing) ===
+        // === STAGE 0: PRE-STAGED ADAPTER WRITES ===
+        // Materialized before anything runs and visible to every stage through the
+        // overlay. Used for state Move cannot create itself (see the doc comment).
         let mut staged: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for (key, value) in prestaged {
+            staged.insert(key, value);
+        }
+
+        // === STAGE 1: PROLOGUE (all-or-nothing) ===
+        // Runs over the overlay too, so it observes the pre-staged writes (an empty
+        // overlay resolves identically to the bare storage, so this is a no-op when
+        // nothing was pre-staged).
         if !prologue_actions.is_empty() {
-            let mut session = self.vm.new_session(&self.storage);
-            for (action, _, auth_signer) in prologue_actions {
-                // A prologue failure discards the transaction entirely.
-                Self::run_action(&mut session, action, sender, auth_signer, &mut gas_meter)?;
-            }
-            let (changeset, _events) = session.finish()?;
-            for (key, value) in self.changeset_to_kv(changeset)? {
+            let prologue_writes = {
+                let overlay = OverlayStorage::new(&self.storage, &staged);
+                let mut session = self.vm.new_session(&overlay);
+                for (action, _, auth_signer) in prologue_actions {
+                    // A prologue failure discards the transaction entirely.
+                    Self::run_action(&mut session, action, sender, auth_signer, &mut gas_meter)?;
+                }
+                let (changeset, _events) = session.finish()?;
+                self.changeset_to_kv(changeset)?
+            };
+            for (key, value) in prologue_writes {
                 staged.insert(key, value);
             }
         }

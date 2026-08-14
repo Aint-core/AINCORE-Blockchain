@@ -2226,6 +2226,65 @@ impl Executor {
         ]
     }
 
+    /// Pre-staged state writes that let a transaction reach an address which has
+    /// never held AIN.
+    ///
+    /// # The deadlock this breaks
+    ///
+    /// `coin::deposit` aborts unless the recipient already holds a
+    /// `CoinStore<AincoreCoin>` (coin.move:53). The only way to create one is
+    /// `coin::register`, which needs a transaction signed by that account — and
+    /// every transaction pays gas through `coin::deduct_gas`, which itself asserts
+    /// the payer already has a `CoinStore` (coin.move:104). So a brand-new address
+    /// could neither be paid nor pay to register itself: only genesis-seeded
+    /// addresses could ever hold AIN. That silently breaks the entire launch model
+    /// (buy on the DEX, then stake), and it is invisible to code review — it only
+    /// shows up when real transfers actually run, which is how the load generator
+    /// surfaced it.
+    ///
+    /// Move cannot fix this itself: creating a resource at another address requires
+    /// that address's `signer`, and this VM exposes no `create_signer` native.
+    /// So the adapter does it, using the same staged-write mechanism the abort
+    /// atomicity fix introduced: the empty store is materialized before execution
+    /// and made visible through `OverlayStorage`, then returned in the normal write
+    /// set so it lands in the same WriteBatch and the same state root as everything
+    /// else. It is therefore deterministic on every node, not a side channel.
+    ///
+    /// Deliberately narrow: only `0x1::coin::transfer`, only the declared recipient,
+    /// only when the store is genuinely absent, and only ever creating a ZERO
+    /// balance. It grants nothing — it just removes an impossible precondition.
+    fn auto_register_writes(
+        &self,
+        call: &vm_move::EntryFunctionCall,
+    ) -> Vec<(String, Option<String>)> {
+        if *call.module.address() != system_address()
+            || call.module.name().as_str() != "coin"
+            || call.function != "transfer"
+        {
+            return Vec::new();
+        }
+        // coin::transfer(from, to, amount) — arg 1 is the recipient.
+        let Some(recipient) = bcs_arg::<move_core_types::account_address::AccountAddress>(
+            &call.args, 1,
+        ) else {
+            return Vec::new();
+        };
+        let coin_type = match call.ty_args.first() {
+            Some(t) => t.clone(),
+            None => aincore_coin_type(),
+        };
+        let key = coin_store_key_for_type(recipient, coin_type);
+        if matches!(self.db.get(&key), Ok(Some(_))) {
+            return Vec::new(); // already registered — never overwrite a balance
+        }
+        // CoinStore<T> { coin: Coin<T> { value: u128 } } — BCS is the bare u128.
+        let Ok(empty) = bcs::to_bytes(&0u128) else {
+            return Vec::new();
+        };
+        println!("🪪 Auto-registering CoinStore for new recipient {}", recipient);
+        vec![(key, Some(hex::encode(empty)))]
+    }
+
     fn analyze_tx(&self, tx: &Transaction) -> (Vec<String>, bool) {
         let mut deps = Vec::new();
         let mut recognized = false;
@@ -2877,6 +2936,12 @@ impl Executor {
                     // can resync the staker's QC weight from the Move ValidatorSet
                     // after a successful stake increase.
                     let add_stake_addr = extract_add_stake(&call, &tx.sender);
+                    // ONBOARDING: a coin::transfer to an address that has never held
+                    // AIN would abort inside coin::deposit, and that address can never
+                    // fix it itself (registering costs gas, and gas is only taken from
+                    // an existing CoinStore). Pre-stage the empty store so the deposit
+                    // lands. See auto_register_writes.
+                    let prestaged = self.auto_register_writes(&call);
                     let mut actions = pre_actions.clone();
                     // SECURITY (FIX #1): the user's entry call may only act as the
                     // authenticated tx sender. bind_signer_args overwrites the
@@ -2887,10 +2952,12 @@ impl Executor {
                         false,
                         sender_addr,
                     ));
-                    match self
-                        .vm
-                        .execute_transaction_actions(actions, sender_addr, tx.gas_limit)
-                    {
+                    match self.vm.execute_transaction_actions_with_prestaged(
+                        actions,
+                        sender_addr,
+                        tx.gas_limit,
+                        prestaged,
+                    ) {
                         Ok((_gas_used, vm_changes, status)) => {
                             if absorb_vm_result!(vm_changes, status) {
                                 println!("✅ Move EntryFunction executed by {}", tx.sender);
@@ -4283,6 +4350,15 @@ mod tests {
     /// 100 AIN was destroyed by a transaction whose own receipt says "aborted".
     /// With the fix the user session is dropped without `finish()`, so only the
     /// prologue (gas) survives: 1_000_000 - 100_000 = 900_000.
+    /// NOTE ON THE ABORT VEHICLE: this test originally triggered the abort by
+    /// transferring to a recipient with no CoinStore, which made `coin::deposit`
+    /// abort AFTER `coin::withdraw` had already debited the sender — the audit's
+    /// exact proof-of-concept. That vehicle no longer exists: the onboarding fix
+    /// auto-registers an absent recipient store, so that transfer now succeeds by
+    /// design (see `test_transfer_to_brand_new_account_succeeds`). The property
+    /// under test is unchanged — an aborting payload must commit NOTHING but gas —
+    /// so the test now uses an over-balance transfer, which aborts inside
+    /// `coin::withdraw`.
     #[test]
     fn test_b1_aborted_transfer_commits_only_gas() {
         let db = temp_db("b1_abort_atomicity");
@@ -4294,11 +4370,10 @@ mod tests {
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         set_coin_store(&db, &sender, 1_000_000);
-        // NOTE: deliberately NO CoinStore for the recipient — this is what makes
-        // coin::deposit abort after coin::withdraw has already debited the sender.
 
         let executor = Executor::new(db.clone());
-        let payload = coin_transfer_payload(&sender, &recipient, 100);
+        // Far more than the sender holds -> the payload aborts.
+        let payload = coin_transfer_payload(&sender, &recipient, 999_999_999);
         let (updates, gas) = executor
             .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1))
             .expect("transaction is kept (gas is charged) even though the payload aborts");
@@ -4308,16 +4383,13 @@ mod tests {
         assert_eq!(
             coin_balance(&db, &sender),
             900_000,
-            "aborted transfer must debit ONLY gas — the 100 AIN write from the \
-             partially-executed payload must not be committed"
+            "an aborted transfer must debit ONLY gas — no write from the \
+             partially-executed payload may be committed"
         );
-
-        let recipient_addr = parse_move_address(&recipient).expect("recipient move address");
-        assert!(
-            db.get(&coin_store_key(recipient_addr))
-                .expect("coin store read")
-                .is_none(),
-            "the aborted payload must not have created a CoinStore for the recipient"
+        assert_eq!(
+            coin_balance(&db, &recipient),
+            0,
+            "the recipient must not be credited by an aborted transfer"
         );
     }
 
@@ -4339,7 +4411,8 @@ mod tests {
         set_coin_store(&db, &sender, 500_000);
 
         let executor = Executor::new(db.clone());
-        let payload = coin_transfer_payload(&sender, &recipient, 1);
+        // Over-balance transfer -> payload aborts (see the note on the test above).
+        let payload = coin_transfer_payload(&sender, &recipient, 999_999_999);
         let (updates, _gas) = executor
             .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 50_000, 1))
             .expect("aborted transaction is still kept and charged");
@@ -4349,6 +4422,86 @@ mod tests {
             coin_balance(&db, &sender),
             450_000,
             "gas must be deducted exactly once even though the payload aborted"
+        );
+    }
+
+    /// ONBOARDING: a transfer to an address that has NEVER held AIN must succeed.
+    ///
+    /// Found by the first real load test: `coin::deposit` aborts without a
+    /// `CoinStore`, and the recipient cannot create one (registering costs gas;
+    /// gas is only taken from an existing `CoinStore`). Only genesis-seeded
+    /// addresses could ever hold AIN, which silently breaks the whole launch model
+    /// — nobody could receive the AIN they bought.
+    ///
+    /// The adapter now pre-stages an EMPTY store for the declared recipient. This
+    /// test is the proof, and it is deliberately end-to-end: brand-new recipient,
+    /// no CoinStore anywhere, real Move execution.
+    #[test]
+    fn test_transfer_to_brand_new_account_succeeds() {
+        let db = temp_db("onboarding_new_account");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[31u8; 32]);
+        let recipient_key = SigningKey::from_bytes(&[32u8; 32]);
+        let sender = create_account(&db, &sender_key);
+        let recipient = create_account(&db, &recipient_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        set_coin_store(&db, &sender, 1_000_000);
+
+        // The recipient has NO CoinStore — exactly a fresh user's situation.
+        let recipient_addr = parse_move_address(&recipient).expect("recipient address");
+        assert!(
+            db.get(&coin_store_key(recipient_addr))
+                .expect("read")
+                .is_none(),
+            "test setup invariant: recipient must start with no CoinStore"
+        );
+
+        let executor = Executor::new(db.clone());
+        let payload = coin_transfer_payload(&sender, &recipient, 250);
+        let (updates, _gas) = executor
+            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1))
+            .expect("transaction accepted");
+        apply_updates(&db, updates);
+
+        assert_eq!(
+            coin_balance(&db, &recipient),
+            250,
+            "a brand-new account must be able to receive its first AIN"
+        );
+        assert_eq!(
+            coin_balance(&db, &sender),
+            1_000_000 - 100_000 - 250,
+            "sender pays gas + the transferred amount"
+        );
+    }
+
+    /// The auto-registration must never touch an EXISTING balance — it may only
+    /// create a store that is genuinely absent, and only ever with value 0.
+    #[test]
+    fn test_auto_register_never_overwrites_existing_balance() {
+        let db = temp_db("onboarding_no_clobber");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[33u8; 32]);
+        let recipient_key = SigningKey::from_bytes(&[34u8; 32]);
+        let sender = create_account(&db, &sender_key);
+        let recipient = create_account(&db, &recipient_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        set_coin_store(&db, &sender, 1_000_000);
+        set_coin_store(&db, &recipient, 777); // already funded
+
+        let executor = Executor::new(db.clone());
+        let payload = coin_transfer_payload(&sender, &recipient, 23);
+        let (updates, _gas) = executor
+            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1))
+            .expect("transaction accepted");
+        apply_updates(&db, updates);
+
+        assert_eq!(
+            coin_balance(&db, &recipient),
+            800,
+            "existing balance must be added to, never reset to zero"
         );
     }
 
