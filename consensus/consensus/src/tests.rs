@@ -315,6 +315,15 @@ mod tests {
     /// near genesis and the PWN-002 jump guard rejects every live peer vertex
     /// as "far future". The reload must therefore also adopt the synced block
     /// round from the persisted tip.
+    ///
+    /// AUDIT-B3: the adoption is now quorum-capped, because a blind
+    /// `current_round = block.round + 1` wedged a live 3-node cluster (this
+    /// node's DAG lacked the tip round's vertices, so it proposed at a round
+    /// whose predecessor could never reach parent quorum, and stopped producing
+    /// permanently). The catch-up FLOOR is what this test exercises: with a
+    /// 12_345-round gap and an empty DAG, quorum_round is 0, so the node lands
+    /// at `tip_next - MAX_ROUND_JUMP/2` — far enough forward that live vertices
+    /// are still accepted by the jump guard, without racing past the DAG.
     #[test]
     fn test_reload_chain_tip_updates_current_round_from_synced_block() {
         let (mut consensus, path) = setup_dag("reload_round_from_synced_tip");
@@ -335,14 +344,23 @@ mod tests {
         consensus.reload_chain_tip();
 
         assert_eq!(consensus.latest_block_height, 42);
-        assert_eq!(consensus.current_round, 12_346);
+        // Quorum-capped: the DAG is empty here, so the catch-up floor applies.
+        let expected = 12_346u64 - (5_000u64);
+        assert_eq!(
+            consensus.current_round, expected,
+            "reload must land on the catch-up floor, not blindly on tip+1"
+        );
+        assert!(
+            consensus.current_round + 10_000 >= 12_346,
+            "must stay inside the PWN-002 jump window so live vertices are accepted"
+        );
         assert_eq!(
             consensus
                 .storage
                 .get("latest_proposed_round")
                 .unwrap()
                 .as_deref(),
-            Some("12345")
+            Some(expected.to_string().as_str())
         );
 
         let _ = std::fs::remove_dir_all(&path);
@@ -1531,6 +1549,56 @@ mod tests {
             persisted < far_round,
             "the wedge must not be persisted (was {})",
             persisted
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// AUDIT-B3 (second door) — the exact wedge that stopped a live 3-node
+    /// cluster at round 85 AFTER the add_vertex quorum gate had already shipped.
+    ///
+    /// `reload_chain_tip` still did a blind `current_round = block.round + 1`.
+    /// A committed block's round says only that the round was FINALIZED; it says
+    /// nothing about whether THIS node holds that round's vertices — and those
+    /// vertices are exactly what try_create_vertex needs as parents. Two of the
+    /// three validators jumped to 85 without ever proposing at 84, so round 84
+    /// held a single vertex, could never reach parent quorum, and the chain
+    /// stopped producing permanently (the value is persisted, so it survived
+    /// restarts). Closing one door was not enough.
+    ///
+    /// Here the gap is small (as in the real incident), so the catch-up floor
+    /// does NOT apply and the cap must hold the node back.
+    #[test]
+    fn test_b3_reload_chain_tip_cannot_wedge_on_a_small_gap() {
+        let (mut consensus, path) = setup_dag("b3_reload_small_gap");
+
+        // Chain tip says round 84 was committed...
+        let synced_block = blockchain::Block::new(
+            10,
+            84,
+            "genesis".to_string(),
+            vec![],
+            "validator".into(),
+        );
+        consensus
+            .storage
+            .save_block_json(10, &serde_json::to_string(&synced_block).unwrap())
+            .unwrap();
+
+        // ...but this node's DAG has no vertices at all, so it cannot build
+        // parents for round 84.
+        let before = consensus.current_round;
+        consensus.reload_chain_tip();
+
+        assert!(
+            consensus.current_round < 85,
+            "must NOT blindly adopt tip+1 (=85) when the DAG cannot parent round \
+             84 — that is the wedge: got {}",
+            consensus.current_round
+        );
+        assert!(
+            consensus.current_round >= before,
+            "round must never go backwards"
         );
 
         let _ = std::fs::remove_dir_all(&path);

@@ -1961,16 +1961,57 @@ impl DagConsensus {
                 });
 
             if let Some(round) = synced_round {
-                let next_round = round.saturating_add(1);
+                // AUDIT-B3 (second door): this used to be a BLIND
+                // `self.current_round = block.round + 1`, the exact same defect
+                // that was fixed in `add_vertex` — and it wedged a live 3-node
+                // cluster at round 85 even after that fix, because closing one
+                // door is not enough. A committed block's round says only that
+                // the round was FINALIZED; it says nothing about whether this
+                // node holds the round's vertices, and those vertices are what
+                // `try_create_vertex` needs as parents. Jumping past them leaves
+                // the node proposing at a round whose predecessor can never reach
+                // parent quorum, so it stops producing — permanently, since the
+                // value is persisted.
+                //
+                // Same Narwhal rule as the ingest path: advance only to
+                // `quorum_round + 1`, the highest round we can genuinely build
+                // parents for. A node that synced blocks ahead of its DAG simply
+                // waits for gossip to deliver the vertices instead of racing past
+                // them.
+                // Validators fetched BEFORE the locks: quorum_round runs while the
+                // DAG/round-index guards are held and cannot call back into &self.
+                let validators = self.get_validator_set_with_stake();
+                let quorum_target = {
+                    let round_idx = self
+                        .round_index
+                        .lock()
+                        .expect("🚨 FATAL: Round index lock poisoned");
+                    let dag = self.dag.lock().expect("🚨 FATAL: DAG lock poisoned");
+                    Self::quorum_round(&round_idx, &dag, &validators).saturating_add(1)
+                };
+                // ...but a node that synced thousands of blocks must not be left
+                // so far behind that the PWN-002 jump guard rejects every live
+                // vertex as "far future" — that is the catch-up deadlock this
+                // reload exists to prevent, and it is why the blind jump was here
+                // in the first place. So the quorum cap has a floor: never sit
+                // more than half the jump allowance below the synced tip. Normal
+                // operation (a gap of a few rounds, like the round-85 wedge) is
+                // fully quorum-gated; only a genuinely stranded node uses the
+                // floor, and it lands inside the guard's window so gossip can
+                // refill the DAG and quorum_round takes over again.
+                let tip_next = round.saturating_add(1);
+                let catchup_floor = tip_next.saturating_sub(Self::MAX_ROUND_JUMP / 2);
+                let next_round = tip_next.min(quorum_target.max(catchup_floor));
                 if next_round > self.current_round {
                     println!(
-                        "🔄 [Consensus] Round reloaded from synced tip: {} -> {}",
-                        self.current_round, next_round
+                        "🔄 [Consensus] Round reloaded from synced tip: {} -> {} \
+                         (tip round {}, quorum cap {}, catch-up floor {})",
+                        self.current_round, next_round, round, quorum_target, catchup_floor
                     );
                     self.current_round = next_round;
                     let _ = self
                         .storage
-                        .put("latest_proposed_round", &round.to_string());
+                        .put("latest_proposed_round", &self.current_round.to_string());
                 }
             }
         }
