@@ -2573,8 +2573,52 @@ impl Executor {
                 return None;
             }
 
-            // 1. Fetch Sender Account Object
-            let sender_obj = self.db.get_object(&tx.sender)?;
+            // 1. Fetch Sender Account Object.
+            //
+            // ONBOARDING (second layer): a first-time sender has no AccountData
+            // object, and `get_object(...)?` used to drop its transaction SILENTLY
+            // — no log, no receipt, nothing. Combined with the CoinStore deadlock
+            // this meant a new account could neither receive NOR send; after the
+            // CoinStore fix it could receive but still never spend, which is the
+            // same launch-blocking dead end one step further in. Caught on the live
+            // cluster: 6 funded accounts each held exactly their 1 AIN and every one
+            // of their 60 outgoing transactions vanished without a trace.
+            //
+            // Accounts are therefore created IMPLICITLY on first send, the same way
+            // Aptos does it. This is safe because the address is not a free
+            // parameter: it is derived from the public key
+            // (`derive_address(pk) == tx.sender` is asserted a few lines below, and
+            // again in the mempool), and the signature is verified against that
+            // same key. So only the holder of the matching private key can produce
+            // a transaction for this address, and the synthesized account starts at
+            // sequence_number 0 — meaning the replay check below still forces the
+            // very first transaction to be nonce 0, exactly as for a pre-existing
+            // account. Nothing is granted here; an impossible precondition is
+            // removed.
+            let sender_obj = match self.db.get_object(&tx.sender) {
+                Some(obj) => obj,
+                None => {
+                    let fresh = aa::AccountData {
+                        public_key: tx.public_key.clone(),
+                        sequence_number: 0,
+                        ..Default::default()
+                    };
+                    let data = match serde_json::to_vec(&fresh) {
+                        Ok(d) => d,
+                        Err(_) => return None,
+                    };
+                    println!(
+                        "🆕 Implicitly creating account {} on its first transaction",
+                        tx.sender
+                    );
+                    storage::object::Object::new(
+                        tx.sender.clone(),
+                        storage::object::Owner::Address(tx.sender.clone()),
+                        data,
+                        "0x1::account::AccountData".to_string(),
+                    )
+                }
+            };
 
             // 2. Verify Signature (Sender)
             use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -4502,6 +4546,72 @@ mod tests {
             coin_balance(&db, &recipient),
             800,
             "existing balance must be added to, never reset to zero"
+        );
+    }
+
+    /// ONBOARDING (second layer): an account that has never sent must be able to
+    /// send. Caught live: after the CoinStore fix, 6 funded accounts each held
+    /// their 1 AIN and every one of their 60 outgoing transactions vanished
+    /// SILENTLY — `get_object(&tx.sender)?` dropped them because no AccountData
+    /// object existed. Receive-but-never-spend is the same launch-blocking dead
+    /// end one step further along.
+    #[test]
+    fn test_first_time_sender_can_spend_without_preexisting_account() {
+        let db = temp_db("onboarding_first_send");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[41u8; 32]);
+        let recipient_key = SigningKey::from_bytes(&[42u8; 32]);
+        // NOTE: create_account() is deliberately NOT called for the sender.
+        let sender = crypto::derive_address(sender_key.verifying_key().as_bytes()).unwrap();
+        let recipient = create_account(&db, &recipient_key);
+        db.set_federation_key("00000000000000000000000000000000").unwrap();
+        set_coin_store(&db, &sender, 1_000_000);
+
+        assert!(
+            db.get_object(&sender).is_none(),
+            "test setup invariant: sender must have no AccountData object"
+        );
+
+        let executor = Executor::new(db.clone());
+        let payload = coin_transfer_payload(&sender, &recipient, 500);
+        let (updates, _gas) = executor
+            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1))
+            .expect("a first-time sender must not be silently dropped");
+        apply_updates(&db, updates);
+
+        assert_eq!(
+            coin_balance(&db, &recipient),
+            500,
+            "the transfer from a brand-new sender must actually land"
+        );
+        assert!(
+            db.get_object(&sender).is_some(),
+            "the account must now exist on chain"
+        );
+    }
+
+    /// Implicit creation must NOT weaken replay protection: a first transaction
+    /// carrying a non-zero nonce must still be rejected.
+    #[test]
+    fn test_implicit_account_still_enforces_nonce_zero_first() {
+        let db = temp_db("onboarding_nonce_guard");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[43u8; 32]);
+        let recipient_key = SigningKey::from_bytes(&[44u8; 32]);
+        let sender = crypto::derive_address(sender_key.verifying_key().as_bytes()).unwrap();
+        let recipient = create_account(&db, &recipient_key);
+        db.set_federation_key("00000000000000000000000000000000").unwrap();
+        set_coin_store(&db, &sender, 1_000_000);
+
+        let executor = Executor::new(db.clone());
+        let payload = coin_transfer_payload(&sender, &recipient, 500);
+        // Nonce 7 on a brand-new account: must be refused, not silently accepted.
+        let out = executor.execute_transaction(&signed_tx(
+            &sender_key, &sender, &payload, 7, 100_000, 1,
+        ));
+        assert!(
+            out.is_none(),
+            "an implicitly-created account must still start at nonce 0"
         );
     }
 
