@@ -43,8 +43,18 @@ pub struct GenMultiArgs {
     /// `node_key_seed_hex` = 32-byte hex (64 chars) = the validator's node.key.
     /// Repeat the flag for each validator (order does not matter — the set hash
     /// is address-sorted and order-independent).
-    #[arg(long = "validator", value_name = "SEED_HEX:STAKE_AIN", required = true)]
+    ///
+    /// SECURITY: prefer `--seeds-file` — seeds passed on the command line leak
+    /// into shell history, `ps` output, and terminal transcripts.
+    #[arg(long = "validator", value_name = "SEED_HEX:STAKE_AIN")]
     pub validators: Vec<String>,
+
+    /// Read validator specs from a file instead of the command line: one
+    /// `<node_key_seed_hex>:<stake_whole_ain>` per line (blank lines and
+    /// `#` comments ignored). This keeps the secret seeds out of shell
+    /// history, `ps`, and terminal logs. May be combined with `--validator`.
+    #[arg(long = "seeds-file", value_name = "PATH")]
+    pub seeds_file: Option<PathBuf>,
 
     /// Output path for the generated genesis.json.
     #[arg(short, long, default_value = "genesis.json")]
@@ -216,8 +226,22 @@ pub fn build_genesis_file(
 pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("🛠️  AINCORE Multi-Validator Genesis Generator");
 
-    let mut specs = Vec::with_capacity(args.validators.len());
-    for raw in &args.validators {
+    let mut raw_specs: Vec<String> = args.validators.clone();
+    if let Some(path) = &args.seeds_file {
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read --seeds-file {}: {e}", path.display()))?;
+        for line in contents.lines() {
+            let line = line.trim();
+            if !line.is_empty() && !line.starts_with('#') {
+                raw_specs.push(line.to_string());
+            }
+        }
+    }
+    if raw_specs.is_empty() {
+        return Err("no validators given: pass --validator or --seeds-file".into());
+    }
+    let mut specs = Vec::with_capacity(raw_specs.len());
+    for raw in &raw_specs {
         specs.push(parse_validator_spec(raw)?);
     }
 
