@@ -25,8 +25,10 @@
 //!    own independent nonce sequence, which is what actually exercises parallel
 //!    execution and the conflict-token scheduler.
 //! 3. `--abort-rate` deliberately generates transactions that ABORT mid-payload
-//!    (transfer to an address with no CoinStore), so the failure paths — the ones
-//!    BLOCKER-1 rewrote — are exercised at scale instead of only the happy path.
+//!    (over-balance transfer, aborting inside coin::withdraw), so the failure
+//!    paths — the ones BLOCKER-1 rewrote — are exercised at scale instead of only
+//!    the happy path. (The original vehicle — transfer to an unregistered
+//!    address — stopped aborting once onboarding auto-registration shipped.)
 //!
 //! Measures SUBMISSION throughput and, with `--verify`, re-reads balances at the
 //! end so landed-vs-submitted is visible rather than assumed.
@@ -71,7 +73,8 @@ struct Args {
     fund_amount: u128,
 
     /// Fraction (0-100) of load transactions that should deliberately ABORT,
-    /// by targeting an address with no CoinStore. Exercises the failure path.
+    /// via an over-balance transfer (aborts in coin::withdraw). Exercises the
+    /// failure path BLOCKER-1 rewrote.
     #[arg(long, default_value_t = 20)]
     abort_rate: u8,
 
@@ -345,10 +348,26 @@ async fn main() {
             .progress_chars("#>-"),
     );
 
-    // A destination with no CoinStore: coin::withdraw debits, coin::deposit then
-    // aborts. Pre-BLOCKER-1 this silently destroyed the amount; now it must leave
-    // the sender at balance-minus-gas. Exercising it at scale is the point.
-    let abort_target = Account::random().address;
+    // ABORT VEHICLE.
+    //
+    // This used to target an address with no CoinStore, so coin::deposit aborted
+    // after coin::withdraw had already debited the sender. That vehicle is GONE:
+    // the onboarding fix auto-registers an absent recipient, so those transfers
+    // now succeed by design — and for one run this tool silently reported abort
+    // coverage it was no longer producing. A load generator that lies about what
+    // it exercised is worse than one that does less.
+    //
+    // The vehicle is now an OVER-BALANCE transfer, which aborts inside
+    // coin::withdraw's `store.coin.value >= amount` assert. The property under
+    // test is unchanged and is the BLOCKER-1 contract: an aborting payload must
+    // commit NOTHING but gas.
+    //
+    // `abort_probe` is a real funded account used only for the post-run assertion
+    // below; the aborting transfers are sent FROM the load accounts with an
+    // impossible amount, so nothing can ever legitimately credit it.
+    let abort_probe = Account::random().address;
+    // Far more than any account was funded with -> guaranteed withdraw abort.
+    let abort_amount = args.fund_amount.saturating_mul(1_000_000);
 
     let start = Instant::now();
     let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -367,16 +386,21 @@ async fn main() {
 
             // Deterministic spread of aborting txs across the run.
             let should_abort = (i * 100 / args.per_account.max(1)) < args.abort_rate as usize;
-            let dest = if should_abort {
-                abort_target.clone()
+            let (dest, amount) = if should_abort {
+                // Over-balance -> aborts in coin::withdraw. Sent to the probe so a
+                // credit there would prove an aborted payload committed state.
+                (abort_probe.clone(), abort_amount)
             } else {
                 // Send to another live account: real state contention between
                 // distinct senders, which is what the scheduler must handle.
-                live[(i + 1) % live.len()].0.address.clone()
+                (
+                    live[(i + 1) % live.len()].0.address.clone(),
+                    1_000_000_000_000u128,
+                )
             };
 
             inflight.push(tokio::spawn(async move {
-                let payload = transfer_payload(&acct.address, &dest, 1_000_000_000_000u128);
+                let payload = transfer_payload(&acct.address, &dest, amount);
                 let tx = signed_tx(&acct, &chain_id, &payload, seq, gas_limit, 1);
                 if submit(&client, &rpc_url, tx).await {
                     accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -426,12 +450,18 @@ async fn main() {
             moved,
             live.len()
         );
-        let abort_bal = fetch_balance(&client, &args.rpc, &abort_target).await;
-        println!(
-            "   abort-target balance: {} (MUST be 0 — a non-zero value means aborted \
-             transfers are still crediting, i.e. BLOCKER-1 regressed)",
-            abort_bal
-        );
+        let abort_bal = fetch_balance(&client, &args.rpc, &abort_probe).await;
+        if abort_bal == 0 {
+            println!(
+                "   abort probe balance: 0 OK - aborted payloads committed nothing (BLOCKER-1 holds)"
+            );
+        } else {
+            println!(
+                "   abort probe balance: {} !! MUST BE 0 - an aborted payload committed \
+                 state, i.e. BLOCKER-1 REGRESSED",
+                abort_bal
+            );
+        }
     }
     println!("{}", "─────────────────────────────────────────────".dimmed());
 }
