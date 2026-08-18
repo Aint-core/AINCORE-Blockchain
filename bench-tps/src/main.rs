@@ -194,9 +194,33 @@ async fn rpc(client: &Client, url: &str, method: &str, params: Value) -> Option<
 }
 
 /// Read an account's on-chain sequence number (0 if the account does not exist).
+///
+/// The nonce is NOT a top-level field of aincore_getBalance: it lives inside
+/// `result.data`, a byte array holding the AccountData JSON
+/// (`{"sequence_number":N,...}`). The first version of this function read
+/// `result.sequence_number`, which does not exist, so it always returned 0 —
+/// and every run on a fresh chain still worked, because a fresh funder's nonce
+/// IS 0. The first rerun against a used chain then had all its funding txs
+/// rejected with "Invalid Sequence Number". A default that coincides with the
+/// happy path is the worst kind of bug: this now decodes the real value.
 async fn fetch_seq(client: &Client, url: &str, address: &str) -> u64 {
     match rpc(client, url, "aincore_getBalance", json!([address])).await {
-        Some(v) => v["result"]["sequence_number"].as_u64().unwrap_or(0),
+        Some(v) => {
+            let r = &v["result"];
+            if let Some(bytes) = r["data"].as_array() {
+                let raw: Vec<u8> = bytes
+                    .iter()
+                    .filter_map(|b| b.as_u64().map(|x| x as u8))
+                    .collect();
+                if let Ok(inner) = serde_json::from_slice::<Value>(&raw) {
+                    if let Some(seq) = inner["sequence_number"].as_u64() {
+                        return seq;
+                    }
+                }
+            }
+            // Fallbacks: a future top-level field, else 0 (account not yet on chain).
+            r["sequence_number"].as_u64().unwrap_or(0)
+        }
         None => 0,
     }
 }
