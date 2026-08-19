@@ -1026,8 +1026,14 @@ impl DagConsensus {
                 // Use Executor parallel logic directly?
                 // The existing logic was: analyze deps -> schedule -> execute.
                 // We can use executor.execute_block_parallel(block_txs).
-                let execution_summary =
-                    executor.execute_block_parallel(block_txs.clone(), &reward_recipient);
+                let execution_summary = executor.execute_block_parallel_at(
+                    block_txs.clone(),
+                    &reward_recipient,
+                    // The block being BUILT: one above the current tip. Passed
+                    // explicitly so the epoch boundary is a pure function of this
+                    // block, immune to sync/local interleaving (see executor doc).
+                    self.latest_block_height + 1,
+                );
 
                 // QC Phase 2: capture the executed roots before they are moved
                 // into the Block (used to build the FinalityVote below).

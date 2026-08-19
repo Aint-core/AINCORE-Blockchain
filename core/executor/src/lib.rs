@@ -1127,10 +1127,23 @@ impl Executor {
         Self::DEFAULT_EPOCH_BLOCK_INTERVAL
     }
 
-    fn maybe_advance_epoch(&self) {
+    fn maybe_advance_epoch(&self, next_height: u64) {
         let interval = self.epoch_block_interval();
-        let next_height = self.db.get_chain_height().saturating_add(1);
         if next_height == 0 || !next_height.is_multiple_of(interval) {
+            return;
+        }
+        // Exactly-once guard: a sync import and a local build racing on the same
+        // height must not BOTH fire the boundary (double-minted rewards diverge
+        // state). The marker is written in the same atomic batch as the epoch
+        // state below.
+        let already = self
+            .db
+            .get("sys:last_epoch_boundary")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        if next_height <= already {
             return;
         }
 
@@ -1163,6 +1176,10 @@ impl Executor {
                     return;
                 }
                 self.append_supply_tracker_updates(&mut updates);
+                updates.push((
+                    "sys:last_epoch_boundary".to_string(),
+                    Some(next_height.to_string()),
+                ));
                 if let Err(err) = self.commit_kv_updates(updates, "epoch advance") {
                     eprintln!("🚨 [EPOCH_ADVANCE_COMMIT_FAIL] {}", err);
                     return;
@@ -1515,10 +1532,39 @@ impl Executor {
 
     /// Execute a batch of transactions in PARALLEL.
     /// This uses a Scheduler to group non-conflicting transactions.
+    /// Back-compat wrapper: derives the height from storage. Production block
+    /// paths (dag commit loop, chain sync) must use
+    /// [`Self::execute_block_parallel_at`] with the EXPLICIT height of the block
+    /// being executed — see that method's doc for why.
     pub fn execute_block_parallel(
         &self,
         txs_json: Vec<String>,
         proposer_hex: &str,
+    ) -> BlockExecutionSummary {
+        let height = self.db.get_chain_height().saturating_add(1);
+        self.execute_block_parallel_at(txs_json, proposer_hex, height)
+    }
+
+    /// AUDIT-B4b (epoch determinism): execute a block's transactions AS the
+    /// given height. The height must be the height of the block being
+    /// executed/built — NOT re-read from storage at execution time.
+    ///
+    /// Why: the epoch boundary (staking emission, validator rotation,
+    /// governance) fires as a function of the executing block's height. It used
+    /// to be derived from `get_chain_height()+1` INSIDE execution, i.e. from
+    /// mutable global state — so when a ChainSync import and a local commit
+    /// interleaved, a node could fire a boundary twice or skip it entirely.
+    /// Observed live on the 4-validator harness: epoch counts of 12 / 11 / 14
+    /// on three nodes over the SAME deterministic block sequence, minting
+    /// different rewards and diverging every state root from the first
+    /// tx-bearing block onward. Height-as-parameter makes the boundary a pure
+    /// function of the block, and the persisted `sys:last_epoch_boundary`
+    /// marker makes each boundary fire exactly once per node.
+    pub fn execute_block_parallel_at(
+        &self,
+        txs_json: Vec<String>,
+        proposer_hex: &str,
+        block_height: u64,
     ) -> BlockExecutionSummary {
         // SECURITY FIX: Acquire block-level lock to serialize state root calculation.
         // Individual transactions within a block still run in parallel (via Rayon),
@@ -1765,9 +1811,9 @@ impl Executor {
         // downtime or equivocation. We process them here to execute on-chain balance deduction.
         self.execute_pending_slashes();
 
-        // 8. Advance Move epoch on a deterministic block interval.
-        // This is the only path that triggers staking reward distribution.
-        self.maybe_advance_epoch();
+        // 8. Advance Move epoch on a deterministic block interval, AS the block
+        // being executed (see execute_block_parallel_at doc).
+        self.maybe_advance_epoch(block_height);
 
         let summary = BlockExecutionSummary {
             state_root: self.current_state_root(),

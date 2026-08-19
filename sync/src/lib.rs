@@ -972,7 +972,13 @@ impl ChainSync {
 
             // Execute transactions through the VM/Executor
             let execution_summary = executor
-                .execute_block_parallel(block.transactions.clone(), &block.header.proposer_id);
+                .execute_block_parallel_at(
+                    block.transactions.clone(),
+                    &block.header.proposer_id,
+                    // The synced block's own height (epoch determinism — see
+                    // executor::execute_block_parallel_at).
+                    block.header.height,
+                );
             if let Err(e) = self.verify_execution_roots(block, &execution_summary) {
                 // SEC (audit H-3): synced blocks are UNAUTHENTICATED (no proposer
                 // signature — only a self-referential header hash + a public proposer_id
