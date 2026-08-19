@@ -944,9 +944,14 @@ impl DagConsensus {
             engine.try_commit(vertex.round, &dag, &round_idx, &validators)
         }; // All locks dropped here!
 
-        if let Some(commit) = committed_result {
+        // AUDIT-B4b: try_commit now returns the anchors decided since the last
+        // call, in deterministic round order — ONE block per anchor, on every
+        // node identically. Iterating (instead of the old single-Option) is what
+        // aligns the height<->anchor mapping across nodes.
+        for commit in committed_result {
             println!(
-                "⛓️  Consensus Reached! Executing {} vertices in order...",
+                "⛓️  Consensus Reached! Anchor round {}: executing {} vertices...",
+                commit.anchor_round,
                 commit.sequence.len()
             );
 
@@ -1013,7 +1018,13 @@ impl DagConsensus {
                 // through prev_hash.
                 let new_block = Block::new_with_roots_at(
                     self.latest_block_height,
-                    vertex.round, // Pass Round
+                    // AUDIT-B4b: the block's round is the ANCHOR round — a pure
+                    // function of the commit sequence. It was `vertex.round`, the
+                    // round of whichever vertex happened to trigger this commit
+                    // locally, which differed per node (the live fork showed
+                    // height 50 built from round 52 on one node and 53 on
+                    // another) and poisoned the header hash.
+                    commit.anchor_round,
                     self.latest_block_hash.clone(),
                     block_txs.clone(), // This duplicates data, effectively block contains processed txs
                     reward_recipient.clone(),

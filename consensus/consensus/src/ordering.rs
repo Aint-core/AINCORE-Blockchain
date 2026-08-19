@@ -22,6 +22,14 @@ pub struct OrderingEngine {
     /// decreases. Used to (a) gate re-committing old anchors that have already
     /// fallen out of `committed_rounds`, and (b) derive the DAG prune watermark.
     pub finalized_round: u64,
+    /// AUDIT-B4b: the next anchor round whose commit/skip decision is PENDING.
+    /// Anchors are decided strictly in round order from this cursor — never from
+    /// whatever round an arriving vertex happens to carry. Persisted as
+    /// `consensus:next_anchor_round`; on restart it resumes at
+    /// max(persisted, finalized_round + 1), and rounds above it whose skip
+    /// decisions were lost are simply re-derived from the DAG (the decision is a
+    /// pure function of DAG contents, so the re-derivation is identical).
+    pub next_anchor_round: u64,
     pub committed_sequence: Vec<String>, // recent committed vertex hashes (bounded window)
     /// O(1) membership mirror of `committed_sequence` for the commit-time de-dup
     /// (`retain` / `contains`). Kept in lockstep with the Vec so the per-commit
@@ -95,6 +103,7 @@ impl OrderingEngine {
         Self {
             committed_rounds: HashSet::new(),
             finalized_round: 0,
+            next_anchor_round: 1,
             committed_sequence: Vec::new(),
             committed_set: HashSet::new(),
             finality_digest: String::new(),
@@ -251,9 +260,20 @@ impl OrderingEngine {
             }
         }
 
+        // AUDIT-B4b: resume the anchor cursor. Persisted value wins when it is
+        // ahead (it also encodes SKIP decisions past the last commit); otherwise
+        // derive from the finality high-water mark.
+        let mut next_anchor_round = finalized_round.saturating_add(1).max(1);
+        if let Ok(Some(s)) = storage.get("consensus:next_anchor_round") {
+            if let Ok(persisted) = s.parse::<u64>() {
+                next_anchor_round = next_anchor_round.max(persisted);
+            }
+        }
+
         Self {
             committed_rounds,
             finalized_round,
+            next_anchor_round,
             committed_sequence,
             committed_set,
             finality_digest,
@@ -455,144 +475,257 @@ impl OrderingEngine {
     }
 
     /// Mencoba melakukan commit pada ronde tertentu
+    /// AUDIT-B4b: decide anchors STRICTLY IN ROUND ORDER from a persisted
+    /// cursor, committing or skipping each one deterministically (Bullshark's
+    /// rule, Spiegelman et al., CCS 2022), and emit ONE CommitInfo per committed
+    /// anchor.
+    ///
+    /// # What was wrong
+    ///
+    /// This used to be called once per INCOMING VERTEX with that vertex's round
+    /// as the anchor cursor, and a "view change" fallback elected whichever
+    /// backup leader happened to have a vertex in the LOCAL DAG. Both made the
+    /// committed-anchor sequence a function of vertex ARRIVAL ORDER, which
+    /// differs per node — so nodes packaged different anchor rounds into the
+    /// same block height, and the first 4-validator cluster forked three ways at
+    /// the block level (identical DAG, different height<->round mapping;
+    /// LAP built height 50 from round 52, NAS from round 53).
+    ///
+    /// # The rule
+    ///
+    ///  * Anchor r commits DIRECTLY when a stake-quorum (>2/3) of round r+1
+    ///    vertices reference the round-r leader's vertex as a parent.
+    ///  * When anchor r' commits directly, every undecided round j < r' is
+    ///    decided by ANCESTRY, walking back down the committed-anchor chain:
+    ///    leader_vertex(j) in the chain's causal history -> commit j too,
+    ///    otherwise SKIP j permanently. No availability-driven backup leaders.
+    ///  * Quorum intersection makes this arrival-order independent: if round j
+    ///    ever had a direct quorum, every vertex at j+2 references >2/3 of the
+    ///    j+1 vertices, which intersects the >2/3 that voted for the leader —
+    ///    so leader_vertex(j) is an ancestor of EVERY later vertex, and a node
+    ///    that missed the votes still commits j via the ancestry walk. Early
+    ///    and late evaluators reach identical sequences.
+    ///
+    /// Anything not yet decidable — no direct anchor found ahead, or a HOLE (a
+    /// referenced vertex missing from the local DAG) — stops the scan; gossip
+    /// refills the DAG and a later call resumes from the same cursor. Deferring
+    /// is safe; guessing is what forked the chain.
+    ///
+    /// `_current_round` is kept for call-site compatibility; the cursor, not
+    /// the caller, decides what is evaluated.
     pub fn try_commit(
         &mut self,
-        current_round: u64,
+        _current_round: u64,
         dag: &HashMap<String, Vertex>,
         round_index: &HashMap<u64, Vec<String>>,
         // B4: (address, stake) pairs, canonically sorted by address (the order
         // get_validator_set_with_stake guarantees) so leader election is
         // deterministic across honest nodes.
         validators: &[(String, u64)],
-    ) -> Option<CommitInfo> {
-        if current_round < 4 {
-            return None;
+    ) -> Vec<CommitInfo> {
+        let mut out = Vec::new();
+        if validators.is_empty() {
+            return out;
         }
-
-        // 1. Tentukan Anchor Round (current - 2)
-        // Bullshark: We commit an anchor from round r-2 using votes from r-1.
-        // But here we are at current_round, so we look at current_round - 1 to see if it votes for current_round - 2?
-        // Let's stick to the plan: Commit round - 2.
-        // To commit Anchor at R, we need f+1 votes from R+1.
-        // So if we are at R+2 (current_round), we can check if R+1 voted for R.
-
-        let anchor_round = current_round - 2;
-        // Anti-double-commit invariant: reject if this anchor round was already
-        // committed. `committed_rounds` only retains a recent window, so we also
-        // reject anything at or below the monotonic high-water mark that is no
-        // longer in the set (those are definitively already finalized).
-        // `finalized_round` starts at 0 and round 0 is never a valid anchor here
-        // (current_round >= 4 implies anchor_round >= 2), so the `> 0` guard only
-        // skips the genesis no-op case.
-        if self.committed_rounds.contains(&anchor_round)
-            || (self.finalized_round > 0 && anchor_round <= self.finalized_round)
-        {
-            return None;
-        }
-
-        // CRITICAL-1 FIX: View Change Mechanism
-        // Try all validators if necessary (continuous round-robin fallback)
-        let max_attempts = if validators.is_empty() {
-            3
-        } else {
-            validators.len() as u32
-        };
-
-        let mut anchor_vertex_hash: Option<&String> = None;
-        let mut successful_leader = String::new();
-
-        for attempt in 0..max_attempts {
-            let leader_id = self.get_leader_with_fallback(anchor_round, validators, attempt);
-
-            // Try to find this leader's vertex in anchor round
-            if let Some(hashes) = round_index.get(&anchor_round) {
-                let found = hashes.iter().find(|h| {
-                    if let Some(v) = dag.get(*h) {
-                        v.author == leader_id
-                    } else {
-                        false
-                    }
-                });
-
-                if let Some(hash) = found {
-                    anchor_vertex_hash = Some(hash);
-                    successful_leader = leader_id.clone();
-                    if attempt > 0 {
-                        println!(
-                            "🔄 View Change: Backup leader {} selected (attempt {})",
-                            leader_id,
-                            attempt + 1
-                        );
-                    }
-                    break;
-                }
-            }
-
-            if attempt < max_attempts - 1 {
-                println!(
-                    "⚠️  Leader {} not found in anchor round {}, trying backup...",
-                    leader_id, anchor_round
-                );
-            }
-        }
-
-        let anchor_vertex_hash = if let Some(h) = anchor_vertex_hash {
-            h
-        } else {
-            println!("🚨 CRITICAL: All {} leader attempts failed for anchor round {} - possible network partition", 
-                max_attempts, anchor_round);
-            return None;
-        };
-
-        // 4. Cek Dukungan (Votes) dari Round R+1 (current_round - 1)
-        let vote_round = current_round - 1;
-        let votes = round_index.get(&vote_round)?;
-
-        // B4: stake-weighted commit quorum. Sum the stake of DISTINCT voter
-        // AUTHORS (one validator counts once even if it produced multiple
-        // vertices) that are in the active validator set, then require strict
-        // > 2/3 of TOTAL stake — the same predicate as qc::verify_qc and the DAG
-        // parent quorum.
-        let validator_stakes: HashMap<&str, u64> =
-            validators.iter().map(|(a, s)| (a.as_str(), *s)).collect();
         let total_stake: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
+        if total_stake == 0 {
+            return out;
+        }
+        let max_round = round_index.keys().copied().max().unwrap_or(0);
+        // Backstop against pathological cursor-to-tip gaps; the cursor normally
+        // trails the tip by a handful of rounds.
+        const MAX_SCAN: u64 = 10_000;
 
-        let mut voted_authors: HashSet<&str> = HashSet::new();
-        for voter_hash in votes {
-            if let Some(voter) = dag.get(voter_hash) {
-                if voter.parents.contains(anchor_vertex_hash) {
-                    voted_authors.insert(voter.author.as_str());
+        'outer: loop {
+            let start = self.next_anchor_round.max(1);
+            // 1. Find the SMALLEST directly-committable round >= cursor.
+            let mut direct: Option<(u64, String)> = None;
+            let mut r = start;
+            while r < max_round && r - start < MAX_SCAN {
+                if let Some(h) = Self::leader_vertex_hash(r, dag, round_index, validators) {
+                    if Self::direct_quorum_met(r, &h, dag, round_index, validators, total_stake)
+                    {
+                        direct = Some((r, h));
+                        break;
+                    }
+                }
+                r += 1;
+            }
+            let Some((r_direct, direct_hash)) = direct else {
+                break;
+            };
+
+            // 2. Walk BACK from the direct anchor, deciding every round in
+            //    [cursor, r_direct) by ancestry along the committed-anchor chain.
+            let mut to_commit: Vec<(u64, String)> = vec![(r_direct, direct_hash.clone())];
+            let mut chain = direct_hash;
+            for j in (start..r_direct).rev() {
+                let chain_round = match dag.get(&chain) {
+                    Some(v) => v.round,
+                    None => break 'outer, // cannot happen, but never guess
+                };
+                let Some(visited) =
+                    Self::walk_history(&chain, j, chain_round, dag, &self.committed_set)
+                else {
+                    // HOLE below the chain anchor: not decidable yet.
+                    break 'outer;
+                };
+                match Self::leader_vertex_hash(j, dag, round_index, validators) {
+                    Some(hj) if visited.contains(&hj) => {
+                        to_commit.push((j, hj.clone()));
+                        chain = hj;
+                    }
+                    // Leader vertex known and provably NOT an ancestor, or no
+                    // leader vertex exists anywhere in the chain's complete
+                    // history: SKIP j. (The walk above was complete, so absence
+                    // is proof, not a guess.)
+                    _ => {}
+                }
+            }
+
+            // 3. Commit in ascending round order, one CommitInfo per anchor.
+            to_commit.reverse();
+            for (anchor_round, anchor_hash) in to_commit {
+                let leader = Self::leader_for_round(anchor_round, validators, 0);
+                let Some(info) =
+                    self.commit_one_anchor(anchor_round, &anchor_hash, leader, dag)
+                else {
+                    // Incomplete history for this anchor: stop, retry later
+                    // from the same cursor.
+                    break 'outer;
+                };
+                out.push(info);
+            }
+            // Loop: later rounds may now be decidable too.
+        }
+        out
+    }
+
+    /// The round-r leader's vertex hash, if present in the local DAG.
+    /// Leader = `leader_for_round(r, validators, 0)` — the PURE function; no
+    /// availability-driven fallback attempts (those were half the fork).
+    fn leader_vertex_hash(
+        round: u64,
+        dag: &HashMap<String, Vertex>,
+        round_index: &HashMap<u64, Vec<String>>,
+        validators: &[(String, u64)],
+    ) -> Option<String> {
+        let leader = Self::leader_for_round(round, validators, 0);
+        round_index.get(&round)?.iter().find_map(|h| {
+            dag.get(h)
+                .filter(|v| v.author == leader)
+                .map(|_| h.clone())
+        })
+    }
+
+    /// Stake-weighted direct-commit check: do round r+1 vertices from a strict
+    /// >2/3 stake of DISTINCT authors reference `anchor_hash` as a parent?
+    fn direct_quorum_met(
+        round: u64,
+        anchor_hash: &str,
+        dag: &HashMap<String, Vertex>,
+        round_index: &HashMap<u64, Vec<String>>,
+        validators: &[(String, u64)],
+        total_stake: u128,
+    ) -> bool {
+        let Some(votes) = round_index.get(&(round + 1)) else {
+            return false;
+        };
+        let stakes: HashMap<&str, u64> =
+            validators.iter().map(|(a, s)| (a.as_str(), *s)).collect();
+        let mut voted: HashSet<&str> = HashSet::new();
+        for vh in votes {
+            if let Some(v) = dag.get(vh) {
+                if v.parents.iter().any(|p| p == anchor_hash) {
+                    voted.insert(v.author.as_str());
                 }
             }
         }
-        let signed_stake: u128 = voted_authors
+        let signed: u128 = voted
             .iter()
-            .filter_map(|a| validator_stakes.get(a).map(|s| *s as u128))
+            .filter_map(|a| stakes.get(a).map(|s| *s as u128))
             .sum();
+        crate::qc::stake_quorum_met(signed, total_stake)
+    }
 
-        if !crate::qc::stake_quorum_met(signed_stake, total_stake) {
-            println!(
-                "⚠️ Anchor Round {} (Leader {}) not committed. Stake {}/{} (need >2/3)",
-                anchor_round, successful_leader, signed_stake, total_stake
-            );
-            return None;
+    /// Walk the causal history of `from` down to rounds >= `floor`, returning
+    /// the set of visited vertex hashes — or None if the walk hits a HOLE: a
+    /// referenced parent that is neither in the local DAG, nor already
+    /// committed, nor the genesis sentinel. A complete walk is what makes a
+    /// SKIP decision a proof instead of a guess.
+    fn walk_history(
+        from: &str,
+        floor: u64,
+        from_round: u64,
+        dag: &HashMap<String, Vertex>,
+        committed_set: &std::collections::HashSet<String>,
+    ) -> Option<HashSet<String>> {
+        let _ = from_round; // bounded implicitly: rounds strictly decrease
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut stack = vec![from.to_string()];
+        while let Some(h) = stack.pop() {
+            if visited.contains(&h) {
+                continue;
+            }
+            let Some(v) = dag.get(&h) else {
+                if h == "genesis" || committed_set.contains(&h) {
+                    continue; // settled — not a hole
+                }
+                return None; // hole
+            };
+            visited.insert(h);
+            if v.round <= floor {
+                continue; // do not descend below the floor
+            }
+            for p in &v.parents {
+                if p != "genesis" && !committed_set.contains(p) {
+                    stack.push(p.clone());
+                }
+            }
         }
+        Some(visited)
+    }
 
-        println!(
-            "⚓ Committing Anchor Round {} (Leader {}) with stake {}/{} (>2/3)",
-            anchor_round, successful_leader, signed_stake, total_stake
-        );
+    /// Book-keeping for ONE committed anchor: complete causal history (deferred
+    /// on holes), de-dup, digest fold, persistence, beacon. Extracted verbatim
+    /// from the old commit tail; the only structural change is that the cursor
+    /// (`next_anchor_round`) advances and persists with each anchor.
+    fn commit_one_anchor(
+        &mut self,
+        anchor_round: u64,
+        anchor_vertex_hash: &str,
+        leader: String,
+        dag: &HashMap<String, Vertex>,
+    ) -> Option<CommitInfo> {
+        // Completeness gate: an anchor with a hole in its history must WAIT,
+        // not commit a partial sequence (the old find_causal_history silently
+        // dropped missing vertices, which would diverge across nodes).
+        let anchor_round_in_dag = dag.get(anchor_vertex_hash).map(|v| v.round)?;
+        Self::walk_history(
+            anchor_vertex_hash,
+            0,
+            anchor_round_in_dag,
+            dag,
+            &self.committed_set,
+        )?;
 
-        // 5. Commit Causal History
         let mut sequence = self.find_causal_history(anchor_vertex_hash, dag);
-
         // Filter yang sudah committed (O(1) membership via the mirror set).
         sequence.retain(|h| !self.committed_set.contains(h));
+
+        println!(
+            "⚓ Committing Anchor Round {} (Leader {}, {} vertices)",
+            anchor_round,
+            leader,
+            sequence.len()
+        );
 
         // Update state
         self.committed_rounds.insert(anchor_round);
         // Advance the monotonic finality high-water mark.
         self.finalized_round = self.finalized_round.max(anchor_round);
+        // Cursor: this anchor round is decided; never revisit it.
+        self.next_anchor_round = self.next_anchor_round.max(anchor_round + 1);
         // Trim the de-dup window so `committed_rounds` stays bounded regardless of
         // how many rounds are committed (this is the leak fix). Rounds below the
         // cutoff are still rejected by the high-water comparison in the guard.
@@ -614,44 +747,35 @@ impl OrderingEngine {
         self.record_committed(&sequence);
 
         // Fold this commit's newly-ordered vertex hashes into the rolling finality
-        // digest, chained from the previous (persisted) value — see the field doc.
-        // Bound to the full committed history, so every node derives the identical
-        // value for persistence, the leader-election beacon (SEC-#12) and the
-        // returned CommitInfo, and it survives restarts (unlike a re-hash over the
-        // truncated in-memory committed_sequence). `sequence` is already deduped
-        // against committed_sequence above, so no hash is folded twice.
+        // digest, chained from the previous (persisted) value. With the anchor
+        // sequence now deterministic, every node folds the SAME sequences in the
+        // SAME order, so the digest finally agrees across nodes too.
         self.finality_digest = Self::fold_finality_digest(&self.finality_digest, &sequence);
         let digest = self.finality_digest.clone();
 
         // PERSIST committed state to DB (BUG #1 FIX)
         if let Some(ref storage) = self.storage {
-            // committed_rounds is now bounded (<= COMMITTED_ROUNDS_WINDOW + 1
-            // entries), so this write is O(window), not O(history).
             if let Ok(json) =
                 serde_json::to_string(&self.committed_rounds.iter().collect::<Vec<_>>())
             {
                 let _ = storage.put("consensus:committed_rounds", &json);
             }
-            // Persist ONLY this commit's new hashes under a small per-round key,
-            // instead of re-serialising the whole de-dup window every commit (the
-            // old path wrote up to ~700 KB/round of pure WAL write-amplification).
-            // The index is rebuilt from the recent per-round keys on restart.
             if !sequence.is_empty() {
                 if let Ok(json) = serde_json::to_string(&sequence) {
                     let _ = storage
                         .put(&format!("{}{}", COMMITTED_SEQ_KEY_PREFIX, anchor_round), &json);
                 }
             }
-            // Drop per-round keys for rounds that just fell out of the retained
-            // window — exact eviction, so no cseq key ever leaks.
             for r in &evicted_cseq_rounds {
                 let _ = storage.delete(&format!("{}{}", COMMITTED_SEQ_KEY_PREFIX, r));
             }
-            // Persist the monotonic high-water mark directly (no longer derived
-            // from the now-trimmed set).
             let _ = storage.put(
                 "consensus:finalized_round",
                 &self.finalized_round.to_string(),
+            );
+            let _ = storage.put(
+                "consensus:next_anchor_round",
+                &self.next_anchor_round.to_string(),
             );
             let _ = storage.put("consensus:last_anchor_round", &anchor_round.to_string());
             let _ = storage.put("consensus:last_anchor_hash", anchor_vertex_hash);
@@ -659,31 +783,18 @@ impl OrderingEngine {
         }
 
         // 6. Update the VDF leader-election beacon from (anchor_round, finality
-        // digest). SEC-#12: binding to the cumulative digest (not the bare
-        // proposer-chosen anchor hash) removes the cheap single-vertex grind.
+        // digest). SEC-#12 note: since B4a the beacon no longer feeds leader
+        // election (which is a pure function); it remains for non-consensus
+        // randomness via get_random_beacon().
         self.update_random_beacon(anchor_round, &digest);
 
         Some(CommitInfo {
             sequence,
-            leader: successful_leader,
+            leader,
             anchor_round,
-            anchor_hash: anchor_vertex_hash.clone(),
+            anchor_hash: anchor_vertex_hash.to_string(),
             finality_digest: digest,
         })
-    }
-
-    /// H5 + M6 FIX: Leader selection now uses VDF random beacon for unpredictability.
-    /// Previously this was pure deterministic round-robin (idx = round % n),
-    /// making leader election fully predictable by any observer.
-    /// Now the VDF beacon output is mixed into the selection to add randomness.
-    /// Also removed the hardcoded "node_9009" dev fallback (M6 fix).
-    fn get_leader_with_fallback(
-        &self,
-        round: u64,
-        validators: &[(String, u64)],
-        attempt: u32,
-    ) -> String {
-        Self::leader_for_round(round, validators, attempt)
     }
 
     /// Elect the anchor leader for `round` as a PURE function of the round, the
@@ -847,14 +958,13 @@ mod tests {
     #[test]
     fn leader_election_is_stake_weighted_and_deterministic() {
         let db = temp_db("leader_stake");
-        let engine = OrderingEngine::new_with_storage(db);
+        let _engine = OrderingEngine::new_with_storage(db);
         // B holds 99% of stake; canonically sorted by address.
         let validators = vec![("aaaa".to_string(), 1u64), ("bbbb".to_string(), 99u64)];
 
         let (mut a, mut b) = (0u32, 0u32);
         for round in 0..1000u64 {
-            match engine
-                .get_leader_with_fallback(round, &validators, 0)
+            match OrderingEngine::leader_for_round(round, &validators, 0)
                 .as_str()
             {
                 "aaaa" => a += 1,
@@ -870,12 +980,12 @@ mod tests {
 
         // Determinism: identical (round, attempt, set) -> identical leader.
         assert_eq!(
-            engine.get_leader_with_fallback(42, &validators, 0),
-            engine.get_leader_with_fallback(42, &validators, 0),
+            OrderingEngine::leader_for_round(42, &validators, 0),
+            OrderingEngine::leader_for_round(42, &validators, 0),
         );
         // total_stake==0 must not panic (uniform fallback).
         let zero = vec![("aaaa".to_string(), 0u64), ("bbbb".to_string(), 0u64)];
-        let _ = engine.get_leader_with_fallback(1, &zero, 0);
+        let _ = OrderingEngine::leader_for_round(1, &zero, 0);
     }
 
     /// SEC-#12: the leader-election beacon is deterministic across nodes and
@@ -970,8 +1080,8 @@ mod tests {
         ];
         for round in 0..500u64 {
             assert_eq!(
-                e1.get_leader_with_fallback(round, &validators, 0),
-                e2.get_leader_with_fallback(round, &validators, 0),
+                OrderingEngine::leader_for_round(round, &validators, 0),
+                OrderingEngine::leader_for_round(round, &validators, 0),
                 "leader must be identical despite QC-fold divergence at round {round}"
             );
         }
@@ -1252,8 +1362,8 @@ mod tests {
         for round in 1u64..200 {
             for attempt in 0u32..3 {
                 assert_eq!(
-                    node_a.get_leader_with_fallback(round, &validators, attempt),
-                    node_b.get_leader_with_fallback(round, &validators, attempt),
+                    OrderingEngine::leader_for_round(round, &validators, attempt),
+                    OrderingEngine::leader_for_round(round, &validators, attempt),
                     "nodes with different beacons must still elect the same leader \
                      for round {} attempt {}",
                     round,
@@ -1272,10 +1382,10 @@ mod tests {
             ("bbbb000000000000000000000000000000000000000000000000000000000002".to_string(), 1000),
             ("cccc000000000000000000000000000000000000000000000000000000000003".to_string(), 1000),
         ];
-        let engine = OrderingEngine::new();
+        let _engine = OrderingEngine::new();
         let mut seen = std::collections::HashSet::new();
         for round in 1u64..500 {
-            seen.insert(engine.get_leader_with_fallback(round, &validators, 0));
+            seen.insert(OrderingEngine::leader_for_round(round, &validators, 0));
         }
         assert_eq!(
             seen.len(),
@@ -1300,10 +1410,230 @@ mod tests {
             "cccc000000000000000000000000000000000000000000000000000000000003".to_string(),
             1000,
         ));
-        let engine = OrderingEngine::new();
+        let _engine = OrderingEngine::new();
         let differs = (1u64..50)
-            .any(|r| engine.get_leader_with_fallback(r, &set_a, 0)
-                != engine.get_leader_with_fallback(r, &set_b, 0));
+            .any(|r| OrderingEngine::leader_for_round(r, &set_a, 0)
+                != OrderingEngine::leader_for_round(r, &set_b, 0));
         assert!(differs, "the validator set must be part of the election preimage");
+    }
+
+    // ===================== AUDIT-B4b determinism tests =====================
+    //
+    // These pin the exact property the live 4-validator cluster violated: the
+    // committed-anchor sequence (and therefore the block chain) must be a pure
+    // function of DAG contents, independent of vertex ARRIVAL ORDER and of WHEN
+    // each node happens to evaluate.
+
+    fn mk_validators(n: usize) -> Vec<(String, u64)> {
+        // Distinct, sorted addresses with equal stake.
+        (0..n)
+            .map(|i| (format!("{:0>64}", format!("{}a", i)), 1000u64))
+            .collect()
+    }
+
+    fn mk_vertex(
+        round: u64,
+        author: &str,
+        parents: Vec<String>,
+    ) -> (String, blockchain::Vertex) {
+        // Full author in the hash: synthetic addresses differ only at the END,
+        // so a prefix would collide and silently overwrite dag entries.
+        let hash = format!("v{}_{}", round, author);
+        (
+            hash.clone(),
+            blockchain::Vertex {
+                round,
+                author: author.to_string(),
+                timestamp: 1_000 + round,
+                payload: vec![],
+                parents,
+                hash,
+                signature: String::new(),
+                aggregated_signature: None,
+            },
+        )
+    }
+
+    /// Build a full-mesh DAG: every validator emits one vertex per round, each
+    /// referencing ALL of the previous round's vertices (parent quorum always
+    /// met, every leader always has direct votes).
+    #[allow(clippy::type_complexity)]
+    fn full_mesh(
+        validators: &[(String, u64)],
+        rounds: u64,
+    ) -> (
+        std::collections::HashMap<String, blockchain::Vertex>,
+        std::collections::HashMap<u64, Vec<String>>,
+    ) {
+        let mut dag = std::collections::HashMap::new();
+        let mut idx: std::collections::HashMap<u64, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut prev: Vec<String> = vec!["genesis".to_string()];
+        for r in 1..=rounds {
+            let mut this = Vec::new();
+            for (a, _) in validators {
+                let (h, v) = mk_vertex(r, a, prev.clone());
+                this.push(h.clone());
+                idx.entry(r).or_default().push(h.clone());
+                dag.insert(h, v);
+            }
+            prev = this;
+        }
+        (dag, idx)
+    }
+
+    fn commit_fingerprint(commits: &[super::CommitInfo]) -> Vec<(u64, String, Vec<String>)> {
+        commits
+            .iter()
+            .map(|c| (c.anchor_round, c.anchor_hash.clone(), c.sequence.clone()))
+            .collect()
+    }
+
+    /// THE fork scenario: one node evaluates incrementally as rounds arrive,
+    /// another evaluates once, late, with the full DAG. Their committed-anchor
+    /// sequences (rounds, hashes, per-anchor vertex sequences, digests) must be
+    /// IDENTICAL. Before B4b the early evaluator produced different height<->
+    /// round packaging than the late one — the live block fork.
+    #[test]
+    fn test_b4b_commit_sequence_is_arrival_order_independent() {
+        let validators = mk_validators(3);
+        let (full_dag, full_idx) = full_mesh(&validators, 10);
+
+        // Late evaluator: one call over the complete DAG.
+        let mut late = OrderingEngine::new();
+        let late_commits = late.try_commit(0, &full_dag, &full_idx, &validators);
+
+        // Incremental evaluator: DAG grows one round at a time, try_commit is
+        // called at EVERY step (the per-vertex cadence of add_vertex).
+        let mut early = OrderingEngine::new();
+        let mut early_commits = Vec::new();
+        let mut dag = std::collections::HashMap::new();
+        let mut idx: std::collections::HashMap<u64, Vec<String>> =
+            std::collections::HashMap::new();
+        for r in 1..=10u64 {
+            for h in &full_idx[&r] {
+                dag.insert(h.clone(), full_dag[h].clone());
+                idx.entry(r).or_default().push(h.clone());
+                early_commits.extend(early.try_commit(0, &dag, &idx, &validators));
+            }
+        }
+
+        assert!(
+            !late_commits.is_empty(),
+            "sanity: the full-mesh DAG must commit anchors"
+        );
+        assert_eq!(
+            commit_fingerprint(&late_commits),
+            commit_fingerprint(&early_commits),
+            "arrival cadence must not change the committed-anchor sequence"
+        );
+        assert_eq!(
+            late_commits.last().unwrap().finality_digest,
+            early_commits.last().unwrap().finality_digest,
+            "the rolling finality digest must agree once the same anchors are folded"
+        );
+    }
+
+    /// A missing leader is SKIPPED by proof, not guessed around: with 4
+    /// validators, drop the round-5 leader's vertex entirely. Both an early and
+    /// a late evaluator must produce the same sequence, with round 5 absent from
+    /// the anchor list — and no availability-driven "backup leader" invented.
+    #[test]
+    fn test_b4b_missing_leader_is_skipped_deterministically() {
+        let validators = mk_validators(4);
+        let (mut dag, mut idx) = full_mesh(&validators, 10);
+
+        let victim_round = 5u64;
+        let leader = OrderingEngine::leader_for_round(victim_round, &validators, 0);
+        let leader_hash = idx[&victim_round]
+            .iter()
+            .find(|h| dag[*h].author == leader)
+            .cloned()
+            .expect("full mesh has the leader vertex");
+        // Remove the leader's vertex AND every reference to it, as if it was
+        // never produced (the validator was down that round).
+        dag.remove(&leader_hash);
+        idx.get_mut(&victim_round).unwrap().retain(|h| h != &leader_hash);
+        for v in dag.values_mut() {
+            v.parents.retain(|p| p != &leader_hash);
+        }
+
+        let mut late = OrderingEngine::new();
+        let late_commits = late.try_commit(0, &dag, &idx, &validators);
+        let rounds: Vec<u64> = late_commits.iter().map(|c| c.anchor_round).collect();
+
+        assert!(
+            !rounds.contains(&victim_round),
+            "round {} has no leader vertex and must be SKIPPED, got anchors {:?}",
+            victim_round,
+            rounds
+        );
+        assert!(
+            rounds.iter().any(|r| *r > victim_round),
+            "the chain must continue PAST the skipped round (no stall): {:?}",
+            rounds
+        );
+        // The skipped round's OTHER vertices still get ordered — inside a later
+        // anchor's causal history, so no data is lost.
+        let all_committed: std::collections::HashSet<&String> = late_commits
+            .iter()
+            .flat_map(|c| c.sequence.iter())
+            .collect();
+        for h in &idx[&victim_round] {
+            assert!(
+                all_committed.contains(h),
+                "non-leader vertex {} of the skipped round must still be committed",
+                h
+            );
+        }
+    }
+
+    /// A HOLE defers, never guesses: if a committed-history walk references a
+    /// vertex the local DAG does not (yet) hold, the anchor must WAIT for
+    /// gossip, not commit a partial sequence that would diverge across nodes.
+    #[test]
+    fn test_b4b_hole_in_history_defers_until_filled() {
+        let validators = mk_validators(4);
+        let (full_dag, idx) = full_mesh(&validators, 8);
+
+        // Remove ONE round-3 vertex (not the leader) from the local DAG while
+        // round-4 vertices still reference it: a gossip gap.
+        let leader3 = OrderingEngine::leader_for_round(3, &validators, 0);
+        let missing = idx[&3]
+            .iter()
+            .find(|h| full_dag[*h].author != leader3)
+            .cloned()
+            .expect("a non-leader round-3 vertex exists");
+        let mut dag = full_dag.clone();
+        dag.remove(&missing);
+
+        let mut engine = OrderingEngine::new();
+        let first = engine.try_commit(0, &dag, &idx, &validators);
+        let first_rounds: Vec<u64> = first.iter().map(|c| c.anchor_round).collect();
+        assert!(
+            first_rounds.iter().all(|r| *r <= 3),
+            "no anchor whose history crosses the hole may commit; got {:?}",
+            first_rounds
+        );
+
+        // Gossip delivers the missing vertex -> the SAME cursor resumes and the
+        // rest commits, identical to a node that never had the gap.
+        dag.insert(missing.clone(), full_dag[&missing].clone());
+        let second = engine.try_commit(0, &dag, &idx, &validators);
+        assert!(
+            second.iter().any(|c| c.anchor_round == 4),
+            "anchor 4 must commit once the hole is filled"
+        );
+
+        // And the combined sequence equals a never-gapped evaluator's.
+        let mut clean = OrderingEngine::new();
+        let clean_commits = clean.try_commit(0, &full_dag, &idx, &validators);
+        let mut combined = first;
+        combined.extend(second);
+        assert_eq!(
+            commit_fingerprint(&clean_commits),
+            commit_fingerprint(&combined),
+            "deferral must not change the final sequence"
+        );
     }
 }
