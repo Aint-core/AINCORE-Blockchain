@@ -29,6 +29,17 @@ pub struct OrderingEngine {
     /// max(persisted, finalized_round + 1), and rounds above it whose skip
     /// decisions were lost are simply re-derived from the DAG (the decision is a
     /// pure function of DAG contents, so the re-derivation is identical).
+    ///
+    /// ANCHORS LIVE ON EVEN ROUNDS ONLY (Bullshark's two-round wave). This is
+    /// not a style choice — it is what makes commit/skip decisions CONVERGE.
+    /// The skip-proof walks the next committed anchor's causal history; quorum
+    /// intersection guarantees a voted anchor appears in that history only when
+    /// the next anchor is at least TWO rounds above (its 2f+1 parents at r+1
+    /// must intersect the 2f+1 voters at r+1). With anchors on EVERY round the
+    /// next anchor sat at r+1 and owed the voted anchor nothing — so one node
+    /// could commit round r on direct votes while another PROVED a skip from a
+    /// consistent-but-different DAG subset. Observed live at round 728: NAS
+    /// committed it, LAP/PI/LP4 skipped it, and the block chains split.
     pub next_anchor_round: u64,
     pub committed_sequence: Vec<String>, // recent committed vertex hashes (bounded window)
     /// O(1) membership mirror of `committed_sequence` for the commit-time de-dup
@@ -537,8 +548,9 @@ impl OrderingEngine {
         const MAX_SCAN: u64 = 10_000;
 
         'outer: loop {
-            let start = self.next_anchor_round.max(1);
-            // 1. Find the SMALLEST directly-committable round >= cursor.
+            // Anchors live on EVEN rounds only (see the next_anchor_round doc).
+            let start = Self::align_anchor(self.next_anchor_round.max(1));
+            // 1. Find the SMALLEST directly-committable anchor round >= cursor.
             let mut direct: Option<(u64, String)> = None;
             let mut r = start;
             while r < max_round && r - start < MAX_SCAN {
@@ -549,7 +561,7 @@ impl OrderingEngine {
                         break;
                     }
                 }
-                r += 1;
+                r += 2;
             }
             let Some((r_direct, direct_hash)) = direct else {
                 break;
@@ -559,7 +571,7 @@ impl OrderingEngine {
             //    [cursor, r_direct) by ancestry along the committed-anchor chain.
             let mut to_commit: Vec<(u64, String)> = vec![(r_direct, direct_hash.clone())];
             let mut chain = direct_hash;
-            for j in (start..r_direct).rev() {
+            for j in (start..r_direct).rev().filter(|j| j.is_multiple_of(2)) {
                 let chain_round = match dag.get(&chain) {
                     Some(v) => v.round,
                     None => break 'outer, // cannot happen, but never guess
@@ -599,6 +611,15 @@ impl OrderingEngine {
             // Loop: later rounds may now be decidable too.
         }
         out
+    }
+
+    /// Smallest EVEN round >= r (anchors live on even rounds — Bullshark waves).
+    fn align_anchor(r: u64) -> u64 {
+        if r.is_multiple_of(2) {
+            r
+        } else {
+            r + 1
+        }
     }
 
     /// The round-r leader's vertex hash, if present in the local DAG.
@@ -1543,7 +1564,9 @@ mod tests {
         let validators = mk_validators(4);
         let (mut dag, mut idx) = full_mesh(&validators, 10);
 
-        let victim_round = 5u64;
+        // EVEN round: anchors live on even rounds only (Bullshark waves), so an
+        // odd victim would make this test pass vacuously.
+        let victim_round = 6u64;
         let leader = OrderingEngine::leader_for_round(victim_round, &validators, 0);
         let leader_hash = idx[&victim_round]
             .iter()
@@ -1586,6 +1609,60 @@ mod tests {
                 h
             );
         }
+    }
+
+    /// THE round-728 live incident, pinned: a node that is MISSING an anchor's
+    /// leader vertex — while later vertices still CITE it — must DEFER, never
+    /// prove a false skip. Quorum intersection makes this sound only because
+    /// anchors sit two rounds apart: the next anchor's 2f+1 parents at r+1 must
+    /// intersect the 2f+1 voters at r+1, so the walk is guaranteed to reach a
+    /// citing vertex and hit the hole. With every-round anchors (the first B4b
+    /// cut) the next anchor sat at r+1 and owed the voters nothing — NAS
+    /// committed round 728 on direct votes while LAP proved a "skip" from a
+    /// consistent-but-incomplete DAG, and the block chains split.
+    #[test]
+    fn test_b4b_missing_voted_leader_defers_instead_of_false_skip() {
+        let validators = mk_validators(4);
+        let (full_dag, idx) = full_mesh(&validators, 10);
+
+        let victim = 6u64;
+        let leader = OrderingEngine::leader_for_round(victim, &validators, 0);
+        let leader_hash = idx[&victim]
+            .iter()
+            .find(|h| full_dag[*h].author == leader)
+            .cloned()
+            .expect("full mesh has the leader vertex");
+
+        // Node B's view: the leader vertex itself never arrived, but the
+        // round-7 vertices citing it as a parent DID (full mesh: all cite it).
+        let mut dag_b = full_dag.clone();
+        dag_b.remove(&leader_hash);
+
+        let mut engine_b = OrderingEngine::new();
+        let commits_b = engine_b.try_commit(0, &dag_b, &idx, &validators);
+        let rounds_b: Vec<u64> = commits_b.iter().map(|c| c.anchor_round).collect();
+
+        assert!(
+            rounds_b.iter().all(|r| *r < victim),
+            "with the voted leader missing but cited, everything from round {} on \
+             must DEFER (wait for gossip) — a skip here is the fork: got {:?}",
+            victim,
+            rounds_b
+        );
+
+        // Gossip delivers the vertex -> B resumes and matches a full-view node.
+        dag_b.insert(leader_hash, full_dag[&idx[&victim].iter().find(|h| full_dag[*h].author == leader).unwrap().clone()].clone());
+        let more = engine_b.try_commit(0, &dag_b, &idx, &validators);
+        let mut all_b = commits_b;
+        all_b.extend(more);
+
+        let mut engine_a = OrderingEngine::new();
+        let commits_a = engine_a.try_commit(0, &full_dag, &idx, &validators);
+        assert_eq!(
+            commit_fingerprint(&commits_a),
+            commit_fingerprint(&all_b),
+            "after the gap fills, both nodes must hold the identical sequence"
+        );
     }
 
     /// A HOLE defers, never guesses: if a committed-history walk references a
