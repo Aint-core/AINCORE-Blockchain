@@ -1625,6 +1625,17 @@ impl Executor {
         // 3. Execute Batches ATOMICALLY
         let mut total_fees: u128 = 0;
 
+        // AUDIT-B4b (root determinism): the state root used to be chained ONCE
+        // PER EXECUTION BATCH, which made it a function of how the conflict
+        // scheduler happened to PARTITION the block — and that partitioning is
+        // not canonical across nodes. Observed live: identical blocks, identical
+        // final balances on every node, different "state roots" (NAS f7d88fef vs
+        // PI 4de15e88 at height 69). The root now folds ONCE PER BLOCK over the
+        // block's EFFECTIVE writes (last-write-wins across batches), sorted by
+        // key — a pure function of the block's outcome, immune to partitioning.
+        let mut block_effective_writes: std::collections::BTreeMap<String, Option<String>> =
+            std::collections::BTreeMap::new();
+
         for batch in batches.iter() {
             // Execute in parallel to get updates
             #[allow(clippy::type_complexity)] // intrinsic to parallel TX result shape
@@ -1639,8 +1650,6 @@ impl Executor {
 
             // 4. Commit Batch Atomically
             let mut write_batch = WriteBatch::default();
-            let mut batch_hasher = sha2::Sha256::new();
-            use sha2::Digest;
 
             // AUDIT-B2 safety net: two transactions in ONE parallel batch writing
             // the same key is, by construction, a conflict-token miss — both read
@@ -1671,36 +1680,49 @@ impl Executor {
                         }
                         if let Some(val) = val_opt {
                             write_batch.put(key.as_bytes(), val.as_bytes());
-                            batch_hasher.update(key.as_bytes());
-                            batch_hasher.update(val.as_bytes());
+                            block_effective_writes.insert(key.clone(), Some(val));
                         } else {
                             write_batch.delete(key.as_bytes());
-                            batch_hasher.update(key.as_bytes()); // Hash key for delete
-                            batch_hasher.update(b"DELETE");
+                            block_effective_writes.insert(key.clone(), None);
                         }
                     }
                     total_fees = total_fees.saturating_add(gas_charged); // C-6 FIX: accumulate gas (saturating — defense-in-depth)
                 }
             }
 
-            // Calc Batch Hash
-            let batch_hash = batch_hasher.finalize();
+            // Per-batch DB commit stays (later batches must read earlier
+            // batches' writes); the ROOT fold moved to block level below.
+            if let Err(e) = self.db.write_batch(write_batch) {
+                eprintln!("❌ FATAL: RocksDB Write Batch Failed: {}", e);
+                panic!(
+                    "CRITICAL: database write failure - stopping node to prevent state corruption."
+                );
+            }
+        }
 
-            // Update Global State Root
-            // Get previous root
+        // Fold the state root ONCE PER BLOCK over the sorted effective writes
+        // (see block_effective_writes above). Empty blocks fold nothing, matching
+        // the previous behaviour of leaving the root untouched.
+        if !block_effective_writes.is_empty() {
+            use sha2::Digest;
+            let mut block_hasher = sha2::Sha256::new();
+            for (key, val_opt) in &block_effective_writes {
+                block_hasher.update(key.as_bytes());
+                match val_opt {
+                    Some(val) => block_hasher.update(val.as_bytes()),
+                    None => block_hasher.update(b"DELETE"),
+                }
+            }
+            let block_hash_digest = block_hasher.finalize();
             let prev_root = self.db.get("sys:state_root").unwrap_or(None).unwrap_or(
                 "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
             );
             let mut global_hasher = sha2::Sha256::new();
             global_hasher.update(hex::decode(&prev_root).unwrap_or(vec![0u8; 32]));
-            global_hasher.update(batch_hash);
+            global_hasher.update(block_hash_digest);
             let new_root = hex::encode(global_hasher.finalize());
-
-            // println!("🌳 State Root Updated: {} -> {}", &prev_root[0..8], &new_root[0..8]);
-            write_batch.put("sys:state_root", new_root.as_bytes());
-
-            if let Err(e) = self.db.write_batch(write_batch) {
-                eprintln!("❌ FATAL: RocksDB Write Batch Failed: {}", e);
+            if let Err(e) = self.db.put("sys:state_root", &new_root) {
+                eprintln!("❌ FATAL: state root persist failed: {}", e);
                 panic!(
                     "CRITICAL: database write failure - stopping node to prevent state corruption."
                 );
