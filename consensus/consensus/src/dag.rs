@@ -34,6 +34,15 @@ pub struct DagConsensus {
     /// AUDIT-H1: timestamp of the chain tip, used to keep BFT block time
     /// monotonic across blocks and across restarts.
     pub latest_block_timestamp: u64,
+    /// AUDIT-B4b (dedup): the ANCHOR ROUND of the chain-tip block. Blocks reach
+    /// the tip from TWO sources — the local commit loop and ChainSync imports —
+    /// and both must advance one shared stream. Without this, a node that synced
+    /// a peer's block for anchor A and then ran its own commit for A built a
+    /// SECOND block for the same anchor at the next height, shifting its whole
+    /// chain numbering by one forever (the residual ±1 fork the first B4b deploy
+    /// exposed: anchor 73 landed at height 67 on NAS and height 68 on LAP).
+    /// The commit loop skips block-building for any anchor <= this round.
+    pub latest_block_round: u64,
     pub accumulator: Accumulator,
     pub da_sequencer: Option<Arc<Mutex<DASequencer>>>, // Added DA Sequencer
     pub p2p_tx: Option<tokio::sync::mpsc::Sender<String>>, // Added P2P Libp2p Channel
@@ -280,13 +289,13 @@ impl DagConsensus {
         // AUDIT-H1: restore the tip's timestamp so BFT block time stays monotonic
         // across a restart (otherwise the first block after a restart could move
         // time backwards and diverge from peers that never restarted).
-        let latest_block_timestamp = storage
+        let (latest_block_timestamp, latest_block_round) = storage
             .get(&format!("block_{}", latest_block_height))
             .ok()
             .flatten()
             .and_then(|json| serde_json::from_str::<blockchain::Block>(&json).ok())
-            .map(|b| b.header.timestamp)
-            .unwrap_or(0);
+            .map(|b| (b.header.timestamp, b.header.round))
+            .unwrap_or((0, 0));
 
         let explicit_max_round = match storage.get("latest_proposed_round") {
             Ok(Some(r)) => r.parse::<u64>().unwrap_or(0),
@@ -319,6 +328,7 @@ impl DagConsensus {
             latest_block_height,
             latest_block_hash,
             latest_block_timestamp,
+            latest_block_round,
             accumulator: Accumulator::new(),
             da_sequencer,
             p2p_tx,
@@ -949,6 +959,21 @@ impl DagConsensus {
         // node identically. Iterating (instead of the old single-Option) is what
         // aligns the height<->anchor mapping across nodes.
         for commit in committed_result {
+            // AUDIT-B4b (dedup): if the chain tip already covers this anchor, a
+            // ChainSync import beat the local commit to it — the peer's block for
+            // this anchor is ALREADY on our chain, fully executed and state-root
+            // verified by the sync path. Building it again here would put the
+            // same anchor at two heights and shift this node's numbering off the
+            // network's forever. The ordering-engine bookkeeping (cursor, digest,
+            // committed-set) already happened inside try_commit and must happen;
+            // only the duplicate block build is skipped.
+            if commit.anchor_round <= self.latest_block_round {
+                println!(
+                    "⏭️  Anchor round {} already on chain via sync (tip round {}) — skipping duplicate block",
+                    commit.anchor_round, self.latest_block_round
+                );
+                continue;
+            }
             println!(
                 "⛓️  Consensus Reached! Anchor round {}: executing {} vertices...",
                 commit.anchor_round,
@@ -1034,6 +1059,7 @@ impl DagConsensus {
                 );
                 self.latest_block_hash = new_block.header.hash.clone();
                 self.latest_block_timestamp = new_block.header.timestamp;
+                self.latest_block_round = commit.anchor_round;
 
                 // Update Accumulator and DB
                 if let Ok(bytes) = hex::decode(&new_block.header.hash) {
@@ -1958,18 +1984,34 @@ impl DagConsensus {
             self.latest_block_height = new_height;
             self.latest_block_hash = new_hash;
 
-            let synced_round = self
+            let synced_block = self
                 .storage
                 .get(&format!("block_{}", new_height))
                 .ok()
                 .flatten()
-                .and_then(|block_json| serde_json::from_str::<serde_json::Value>(&block_json).ok())
-                .and_then(|block| {
-                    block
-                        .get("header")
-                        .and_then(|header| header.get("round"))
-                        .and_then(|round| round.as_u64())
-                });
+                .and_then(|block_json| serde_json::from_str::<serde_json::Value>(&block_json).ok());
+            let synced_round = synced_block.as_ref().and_then(|block| {
+                block
+                    .get("header")
+                    .and_then(|header| header.get("round"))
+                    .and_then(|round| round.as_u64())
+            });
+            // AUDIT-B4b (dedup): adopt the synced tip's anchor round so the local
+            // commit loop knows which anchors are ALREADY represented on chain and
+            // never builds a duplicate block for them. Adopt its timestamp too, so
+            // the next locally-built block's BFT-time clamps against the true
+            // parent — the same value on every node.
+            if let Some(r) = synced_round {
+                self.latest_block_round = self.latest_block_round.max(r);
+            }
+            if let Some(ts) = synced_block.as_ref().and_then(|block| {
+                block
+                    .get("header")
+                    .and_then(|header| header.get("timestamp"))
+                    .and_then(|t| t.as_u64())
+            }) {
+                self.latest_block_timestamp = self.latest_block_timestamp.max(ts);
+            }
 
             if let Some(round) = synced_round {
                 // AUDIT-B3 (second door): this used to be a BLIND
