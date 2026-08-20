@@ -898,3 +898,44 @@ mod fee_market_admission {
             .expect("paymaster-sponsored tx must skip the sender balance check");
     }
 }
+
+/// Orphan-loss fix: a pulled transaction that never executes must come BACK,
+/// and one that executed must be gone for good. This is the exact live
+/// failure: a briefly-lagging node orphaned its own vertex, the payload
+/// vanished, the sender's nonce sequence had a permanent hole, and every
+/// later transaction died with Invalid Sequence — the sender wedged forever.
+#[test]
+fn test_inflight_loan_ledger_requeues_orphans_and_settles_executed() {
+    let mut mp = Mempool::new();
+    let tx_a = make_test_tx(0);
+    let tx_b = make_test_tx(1);
+    mp.add_transaction(tx_a.clone()).expect("admit a");
+    mp.add_transaction(tx_b.clone()).expect("admit b");
+
+    // Pull both: they are LOANED, pending drains.
+    let pulled = mp.get_pending_transactions(10);
+    assert_eq!(pulled.len(), 2);
+    assert!(
+        mp.get_pending_transactions(10).is_empty(),
+        "pending must be drained after the pull"
+    );
+
+    // Block commits with only A executed; B (orphaned/deferred) stays loaned.
+    mp.mark_executed(std::slice::from_ref(&tx_a));
+
+    // Too young: nothing to reclaim yet.
+    assert_eq!(mp.requeue_stale(std::time::Duration::from_secs(3600)), 0);
+
+    // Old enough: B must come back — and ONLY B.
+    assert_eq!(mp.requeue_stale(std::time::Duration::from_secs(0)), 1);
+    let back = mp.get_pending_transactions(10);
+    assert_eq!(
+        back,
+        vec![tx_b.clone()],
+        "the unexecuted tx must return to pending"
+    );
+
+    // Resubmitting either is still refused (seen_txs dedup holds).
+    assert!(mp.add_transaction(tx_a).is_err(), "executed tx stays deduped");
+    assert!(mp.add_transaction(tx_b).is_err(), "requeued tx stays deduped");
+}

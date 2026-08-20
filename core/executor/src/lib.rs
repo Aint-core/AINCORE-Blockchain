@@ -728,6 +728,13 @@ pub struct BlockExecutionSummary {
     pub receipts_root: String,
     pub gas_charged: u128,
     pub tx_count: usize,
+    /// Orphan-loss fix: the RAW transactions that actually EXECUTED in this
+    /// block (accepted by the nonce/signature gates and committed their
+    /// writes). The consensus layer reports these to the mempool's loan ledger
+    /// (`mark_executed`); anything pulled but NOT in this list stays inflight
+    /// and is re-queued by `requeue_stale` — so an orphaned vertex or a
+    /// nonce-deferred transaction is a delay, never a permanent loss.
+    pub executed_raws: Vec<String>,
 }
 
 pub struct Executor {
@@ -1625,6 +1632,7 @@ impl Executor {
         // 3. Execute Batches ATOMICALLY
         let mut total_fees: u128 = 0;
 
+        let mut executed_raws: Vec<String> = Vec::new();
         // AUDIT-B4b (root determinism): the state root used to be chained ONCE
         // PER EXECUTION BATCH, which made it a function of how the conflict
         // scheduler happened to PARTITION the block — and that partitioning is
@@ -1641,10 +1649,11 @@ impl Executor {
             #[allow(clippy::type_complexity)] // intrinsic to parallel TX result shape
             let mut results: Vec<(
                 String,
+                String,
                 Option<(Vec<(String, Option<String>)>, u128)>,
             )> = batch
                 .par_iter()
-                .map(|(_tx, raw)| (tx_hash_hex(raw), self.execute_transaction(raw)))
+                .map(|(_tx, raw)| (tx_hash_hex(raw), raw.clone(), self.execute_transaction(raw)))
                 .collect();
             results.sort_by(|left, right| left.0.cmp(&right.0));
 
@@ -1662,8 +1671,9 @@ impl Executor {
             let mut writer_of_key: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
 
-            for (tx_hash, res) in results {
+            for (tx_hash, raw_tx, res) in results {
                 if let Some((mut updates, gas_charged)) = res {
+                    executed_raws.push(raw_tx);
                     updates.sort_by(|left, right| left.0.cmp(&right.0));
                     for (key, val_opt) in updates {
                         if let Some(prev_writer) = writer_of_key.get(&key) {
@@ -1841,6 +1851,7 @@ impl Executor {
             state_root: self.current_state_root(),
             receipts_root: self.receipts_root_for_block(&txs_json),
             gas_charged: total_fees,
+            executed_raws,
             tx_count: txs_json.len(),
         };
 

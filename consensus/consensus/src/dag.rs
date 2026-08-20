@@ -488,6 +488,11 @@ impl DagConsensus {
             // 2. Create Payload (Fetch from Mempool)
             let mut payload = Vec::new();
             if let Ok(mut mp) = self.mempool.lock() {
+                // Orphan-loss fix: before pulling, reclaim loaned transactions
+                // that never executed (orphaned vertex payloads and
+                // nonce-deferred txs). 30s ≈ well past commit latency, well
+                // short of user-visible loss.
+                let _ = mp.requeue_stale(std::time::Duration::from_secs(30));
                 // Throughput tuning: pull size per vertex. Narwhal is designed for
                 // large batches; 50 was a conservative bring-up cap and became the
                 // de-facto per-round throughput ceiling. Env-tunable so the burn-in
@@ -1043,6 +1048,12 @@ impl DagConsensus {
                     // block, immune to sync/local interleaving (see executor doc).
                     self.latest_block_height + 1,
                 );
+                // Orphan-loss fix: settle the mempool's loan ledger — only the
+                // transactions that actually EXECUTED leave it; the rest stay
+                // inflight and requeue_stale() returns them to pending later.
+                if let Ok(mut mp) = self.mempool.lock() {
+                    mp.mark_executed(&execution_summary.executed_raws);
+                }
 
                 // QC Phase 2: capture the executed roots before they are moved
                 // into the Block (used to build the FinalityVote below).

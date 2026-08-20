@@ -86,6 +86,16 @@ pub struct Mempool {
     seen_txs: HashSet<String>,       // Deduplication
     seen_order: VecDeque<String>,    // Bounded cache tracking
     pending_nonces: HashSet<String>, // sender:sequence_number in the pending queue
+    /// LOANED, NOT GONE (orphan-loss fix): transactions handed to consensus by
+    /// `get_pending_transactions` move HERE instead of vanishing. They leave for
+    /// good only when `mark_executed` reports them executed in a committed
+    /// block; anything still here after `requeue_stale`'s age limit goes back to
+    /// `pending_txs`. Before this, a vertex that never committed (a node
+    /// briefly behind the network orphans its own vertex) silently destroyed
+    /// its whole payload — the sender's nonce sequence then had a permanent
+    /// hole, every later transaction died with "Invalid Sequence", and the
+    /// account was wedged forever. Keyed by the RAW transaction string; value is loaned_at.
+    inflight: std::collections::HashMap<String, std::time::Instant>,
     /// Optional storage handle. When `Some`, `add_transaction` performs
     /// full Dilithium5 (PQC) verification by looking up the canonical
     /// `pqc_pubkey_{sender}` binding. When `None`, PQC submissions are
@@ -103,6 +113,7 @@ impl Mempool {
         Self {
             pending_txs: VecDeque::new(),
             seen_txs: HashSet::new(),
+            inflight: std::collections::HashMap::new(),
             seen_order: VecDeque::new(),
             pending_nonces: HashSet::new(),
             storage: None,
@@ -120,6 +131,7 @@ impl Mempool {
         Self {
             pending_txs: VecDeque::new(),
             seen_txs: HashSet::new(),
+            inflight: std::collections::HashMap::new(),
             seen_order: VecDeque::new(),
             pending_nonces: HashSet::new(),
             storage: Some(storage),
@@ -586,8 +598,11 @@ impl Mempool {
 
         let selected_set: HashSet<usize> = selected.iter().copied().collect();
         let result: Vec<String> = selected.iter().map(|&i| raws[i].clone()).collect();
+        let now = std::time::Instant::now();
         for raw in &result {
             self.remove_pending_nonce(raw);
+            // Loaned, not gone: see the `inflight` field doc.
+            self.inflight.insert(raw.clone(), now);
         }
         // Keep unselected txs in their original FIFO order for the next round.
         self.pending_txs = raws
@@ -610,6 +625,48 @@ impl Mempool {
 
     pub fn get_all_pending(&self) -> &VecDeque<String> {
         &self.pending_txs
+    }
+
+    /// Orphan-loss fix: consensus reports the raw transactions that actually
+    /// EXECUTED in a committed block; only those leave the loan ledger for good.
+    /// Deferred/failed ones stay inflight and come back via `requeue_stale`.
+    pub fn mark_executed(&mut self, raws: &[String]) {
+        for raw in raws {
+            self.inflight.remove(raw);
+        }
+    }
+
+    /// Return loaned transactions that never executed within `max_age` to the
+    /// pending queue. Heals both failure shapes the live cluster hit: a vertex
+    /// that never committed (orphaned payload), and a transaction that reached a
+    /// block ahead of its nonce and was refused by the executor. Re-queued
+    /// entries re-register their `sender:sequence` guard so a duplicate
+    /// submission is still refused at admission; `seen_txs` is intentionally
+    /// left alone (the tx has genuinely been seen — resubmission stays deduped).
+    /// Returns how many were re-queued.
+    pub fn requeue_stale(&mut self, max_age: std::time::Duration) -> usize {
+        let now = std::time::Instant::now();
+        let stale: Vec<String> = self
+            .inflight
+            .iter()
+            .filter(|(_, at)| now.duration_since(**at) > max_age)
+            .map(|(raw, _)| raw.clone())
+            .collect();
+        for raw in &stale {
+            self.inflight.remove(raw);
+            if let Ok(parsed) = serde_json::from_str::<executor::Transaction>(raw) {
+                self.pending_nonces
+                    .insert(format!("{}:{}", parsed.sender, parsed.sequence_number));
+            }
+            self.pending_txs.push_back(raw.clone());
+        }
+        if !stale.is_empty() {
+            println!(
+                "♻️  Mempool re-queued {} stale inflight tx(s) (orphaned or nonce-deferred)",
+                stale.len()
+            );
+        }
+        stale.len()
     }
 
     fn remove_pending_nonce(&mut self, tx: &str) {
