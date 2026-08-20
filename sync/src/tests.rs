@@ -496,6 +496,7 @@ mod tests {
             String::new(),
         );
         let summary = executor::BlockExecutionSummary {
+            executed_raws: Vec::new(),
             state_root: "actual_state".to_string(),
             receipts_root: String::new(),
             gas_charged: 0,
@@ -521,6 +522,7 @@ mod tests {
             String::new(),
         );
         let summary = executor::BlockExecutionSummary {
+            executed_raws: Vec::new(),
             state_root: "s".to_string(),
             receipts_root: "r".to_string(),
             gas_charged: 0,
@@ -538,6 +540,7 @@ mod tests {
             .put("sys:config:require_exec_roots", "1")
             .unwrap();
         let summary = executor::BlockExecutionSummary {
+            executed_raws: Vec::new(),
             state_root: "s".to_string(),
             receipts_root: "r".to_string(),
             gas_charged: 0,
