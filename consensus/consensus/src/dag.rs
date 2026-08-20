@@ -541,7 +541,31 @@ impl DagConsensus {
             // === DOWNTIME DETECTION (Jail System Trigger) ===
             // Track which validators participated in this round.
             // If a validator misses 100+ consecutive rounds (~100 minutes), mark for slashing.
-            const DOWNTIME_THRESHOLD: u64 = 100; // 100 rounds of absence = jail
+            // DOWNTIME TOLERANCE IS TIME-BASED, NOT ROUND-BASED.
+            //
+            // The old constant (100 rounds) silently coupled the jail window to
+            // the consensus tick: at the original 3s tick it meant ~5 minutes of
+            // tolerance, but when the tick was tuned to 500ms it became FIFTY
+            // SECONDS — and the live 4-validator cluster promptly jailed its two
+            // slowest validators for ordinary lag, shrinking the set to 3. A
+            // liveness knob must not silently change meaning when a performance
+            // knob is turned. The window is now ~5 minutes of wall time,
+            // converted to rounds using the SAME tick env the round ticker uses
+            // (deterministic enough: per-node detection only feeds the
+            // BFT-quorum downtime attestation, which is what actually jails).
+            // Overridable directly via AINCORE_DOWNTIME_THRESHOLD_ROUNDS.
+            let downtime_threshold: u64 = std::env::var("AINCORE_DOWNTIME_THRESHOLD_ROUNDS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v >= 10)
+                .unwrap_or_else(|| {
+                    let tick_ms = std::env::var("AINCORE_CONSENSUS_TICK_MS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|v| *v >= 100)
+                        .unwrap_or(3_000);
+                    (300_000 / tick_ms).max(100) // ~5 minutes of rounds, floor 100
+                });
 
             // Record our participation
             let _ = self.storage.put(
@@ -566,7 +590,7 @@ impl DagConsensus {
 
                     let rounds_missed = self.current_round.saturating_sub(last_seen);
 
-                    if rounds_missed >= DOWNTIME_THRESHOLD && last_seen > 0 {
+                    if rounds_missed >= downtime_threshold && last_seen > 0 {
                         // Check if already jailed (prevent double-slash)
                         let jail_key = format!("validator:jailed:{}", validator_id);
                         if let Ok(Some(_)) = self.storage.get(&jail_key) {
