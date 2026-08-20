@@ -488,7 +488,16 @@ impl DagConsensus {
             // 2. Create Payload (Fetch from Mempool)
             let mut payload = Vec::new();
             if let Ok(mut mp) = self.mempool.lock() {
-                payload = mp.get_pending_transactions(50);
+                // Throughput tuning: pull size per vertex. Narwhal is designed for
+                // large batches; 50 was a conservative bring-up cap and became the
+                // de-facto per-round throughput ceiling. Env-tunable so the burn-in
+                // and benchmark runs measure the config that will actually ship.
+                let pull = std::env::var("AINCORE_MEMPOOL_PULL")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|v| (1..=10_000).contains(v))
+                    .unwrap_or(500);
+                payload = mp.get_pending_transactions(pull);
                 if !payload.is_empty() {
                     println!("🚀 DAG PULLED {} TXS FROM MEMPOOL", payload.len());
                 }
