@@ -858,6 +858,35 @@ impl ChainSync {
         let total_blocks = blocks.len();
         let finalized_round = self.finalized_round_boundary();
 
+        // AUDIT-H2 (verify-before-execute, QC pin): `consensus:qc:latest` is only
+        // ever written AFTER apply_finality_artifact has cryptographically
+        // verified a quorum certificate (chain-id + trusted-validator-set bound)
+        // — so its (block_height, block_hash) is an AUTHENTICATED pin. If this
+        // downloaded batch claims to contain the certified height, its block
+        // there MUST carry the certified hash; a mismatch proves the peer is
+        // serving a fabricated chain, and the ENTIRE batch is rejected BEFORE a
+        // single transaction of it executes. Blocks above the pin (not yet
+        // certified) keep today's defense (execute + re-derived-root check +
+        // reject), and the executor's own signature/nonce gates bound what an
+        // unauthenticated block can do. This closes H-2's "forged block executes
+        // first, gets rejected after" window for everything at or below the
+        // latest certified height.
+        if let Ok(Some(qc_json)) = self.storage.get("consensus:qc:latest") {
+            if let Ok(qc) = serde_json::from_str::<consensus::qc::QuorumCertificate>(&qc_json) {
+                if let Some(b) = blocks.iter().find(|b| b.header.height == qc.block_height) {
+                    if b.header.hash != qc.block_hash {
+                        eprintln!(
+                            "🚨 [SECURITY][SYNC_QC_PIN_REJECT] peer's block #{} hash {} does not \
+                             match the QC-certified hash {} — rejecting the whole batch before \
+                             execution (fabricated chain)",
+                            qc.block_height, b.header.hash, qc.block_hash
+                        );
+                        return last_processed;
+                    }
+                }
+            }
+        }
+
         for (i, block) in blocks.iter().enumerate() {
             if block.header.height <= last_processed {
                 let key = format!("block_{}", block.header.height);
