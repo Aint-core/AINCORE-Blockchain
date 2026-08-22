@@ -1607,4 +1607,29 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&path);
     }
+
+    /// BFT-TIME DETERMINISM (burn-in finding at h=121): after a sync reload the
+    /// in-memory parent timestamp must EQUAL the canonical tip's timestamp — a
+    /// running max() let a stale-high value from a superseded local block skew
+    /// the next block's clamp by a second on one node only.
+    #[test]
+    fn test_reload_chain_tip_sets_parent_timestamp_from_canonical_tip() {
+        let (mut consensus, path) = setup_dag("reload_parent_ts");
+        consensus.latest_block_timestamp = 9_999_999; // stale-high local value
+        let tip = blockchain::Block::new_with_roots_at(
+            5, 10, "prev".to_string(), vec![], "validator".into(),
+            "s".into(), "r".into(), 1_000, vec![], String::new(), vec![],
+        );
+        consensus
+            .storage
+            .save_block_json(5, &serde_json::to_string(&tip).unwrap())
+            .unwrap();
+        consensus.reload_chain_tip();
+        assert_eq!(consensus.latest_block_height, 5);
+        assert_eq!(
+            consensus.latest_block_timestamp, 1_000,
+            "parent timestamp must be the canonical tip's, not a running max"
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }

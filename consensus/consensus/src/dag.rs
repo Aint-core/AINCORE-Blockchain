@@ -1066,8 +1066,22 @@ impl DagConsensus {
             }
             drop(dag); // DROP DAG LOCK NOW!
 
-            let block_timestamp =
-                blockchain::bft_block_timestamp(ts_samples, self.latest_block_timestamp);
+            // BFT-TIME DETERMINISM (burn-in finding, h=121): the monotonic clamp
+            // must use the CANONICAL parent's timestamp — the stored block at the
+            // current tip — never the in-memory field. That field was kept as a
+            // running max() across sync reloads, so a node that had built a local
+            // block later superseded by the synced chain carried a stale-high value
+            // into its next clamp and produced a header one second off from every
+            // other node (same vertices, same state, different hash).
+            let parent_ts = self
+                .storage
+                .get(&format!("block_{}", self.latest_block_height))
+                .ok()
+                .flatten()
+                .and_then(|j| serde_json::from_str::<blockchain::Block>(&j).ok())
+                .map(|b| b.header.timestamp)
+                .unwrap_or(self.latest_block_timestamp);
+            let block_timestamp = blockchain::bft_block_timestamp(ts_samples, parent_ts);
 
             // NOW EXECUTE (Lock Free!)
             // We execute even if empty to trigger Block Rewards (Heartbeat Mining)
@@ -2183,7 +2197,10 @@ impl DagConsensus {
                     .and_then(|header| header.get("timestamp"))
                     .and_then(|t| t.as_u64())
             }) {
-                self.latest_block_timestamp = self.latest_block_timestamp.max(ts);
+                // SET, not max(): the synced tip IS the canonical parent. A max()
+                // let a stale-high value from a superseded local block survive and
+                // skew the next block's BFT-time clamp (see the build site).
+                self.latest_block_timestamp = ts;
             }
 
             if let Some(round) = synced_round {
