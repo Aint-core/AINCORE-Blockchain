@@ -334,8 +334,26 @@ async fn main() {
     pb.finish_and_clear();
     println!("   accepted {}/{} funding txs", funded, args.accounts);
 
-    println!("   waiting 15s for funding to finalize…");
-    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    // Poll instead of a fixed wait: a fixed 15s produced false "0 accounts
+    // funded" verdicts whenever commit latency was merely slow, which then
+    // masqueraded as chain bugs. Give up only after a generous deadline.
+    println!("   waiting for funding to land (poll, up to 120s)…");
+    {
+        let deadline = Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let mut landed = 0usize;
+            for acct in &accounts {
+                if fetch_balance(&client, &args.rpc, &acct.address).await > 0 {
+                    landed += 1;
+                }
+            }
+            if landed >= funded || Instant::now() >= deadline {
+                println!("   {}/{} funding txs landed", landed, funded);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    }
 
     // Keep only accounts that actually received funds — submitting from an
     // unfunded account just measures rejection latency.
@@ -460,8 +478,25 @@ async fn main() {
     );
 
     if args.verify {
-        println!("\n{} Verifying landed state (30s settle)…", "🔍".cyan());
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        // Same principle for the landed-state check: poll until every live
+        // account shows movement (or the deadline passes) rather than guessing
+        // a settle time — the 30s constant produced false "0/8 changed" readings.
+        println!("\n{} Verifying landed state (poll, up to 120s)…", "🔍".cyan());
+        {
+            let deadline = Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                let mut moved = 0usize;
+                for (acct, _) in &live {
+                    if fetch_balance(&client, &args.rpc, &acct.address).await != args.fund_amount {
+                        moved += 1;
+                    }
+                }
+                if moved >= live.len() || Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
         let mut moved = 0usize;
         for (acct, _) in &live {
             let bal = fetch_balance(&client, &args.rpc, &acct.address).await;
