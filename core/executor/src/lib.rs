@@ -1580,7 +1580,7 @@ impl Executor {
         proposer_hex: &str,
     ) -> BlockExecutionSummary {
         let height = self.db.get_chain_height().saturating_add(1);
-        self.execute_block_parallel_at(txs_json, proposer_hex, height)
+        self.execute_block_parallel_at(txs_json, proposer_hex, height, &[])
     }
 
     /// AUDIT-B4b (epoch determinism): execute a block's transactions AS the
@@ -1603,6 +1603,8 @@ impl Executor {
         txs_json: Vec<String>,
         proposer_hex: &str,
         block_height: u64,
+        // RE-AUDIT HIGH: slash evidence CARRIED BY THE BLOCK (see apply_slash_evidence).
+        slash_evidence: &[String],
     ) -> BlockExecutionSummary {
         // SECURITY FIX: Acquire block-level lock to serialize state root calculation.
         // Individual transactions within a block still run in parallel (via Rayon),
@@ -1842,12 +1844,11 @@ impl Executor {
         //    reporters reach BFT quorum (Phase 2.3 / H-02). Equivocation
         //    slashes are written directly by the consensus equivocation
         //    detector and bypass this step.
-        self.promote_downtime_attestations_to_slash();
-
-        // 8. Process Pending Slashes from Consensus Engine
-        // The consensus layer writes sys:pending_slash:{address} entries when it detects
-        // downtime or equivocation. We process them here to execute on-chain balance deduction.
-        self.execute_pending_slashes();
+        // 7+8. RE-AUDIT HIGH: slashes are applied ONLY from the evidence the
+        // block carries, after independent verification — never from this
+        // node's gossip-dependent attestation/pending_slash state, which differs
+        // per node and made jail decisions (and therefore state) diverge.
+        self.apply_slash_evidence(slash_evidence);
 
         // 8. Advance Move epoch on a deterministic block interval, AS the block
         // being executed (see execute_block_parallel_at doc).
@@ -2069,40 +2070,183 @@ impl Executor {
         }
     }
 
-    /// Execute pending slash events written by the consensus engine.
-    /// This is the critical bridge between consensus-level detection and on-chain execution.
-    /// Reads sys:pending_slash:{addr}, deducts 5% of validator stake, removes from validator set.
+    /// PROPOSER SIDE (pure, no writes): gather self-authenticating slash evidence
+    /// from this node's local view so it can be CARRIED BY THE BLOCK. Capped at
+    /// 5 items per block (H-4). Every node re-verifies before applying.
+    pub fn collect_slash_evidence(&self) -> Vec<String> {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut out: Vec<String> = Vec::new();
+        let validators: Vec<(String, u64)> = self
+            .db
+            .get("sys:validators")
+            .ok()
+            .flatten()
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
+        if validators.is_empty() {
+            return out;
+        }
+        let stake: BTreeMap<&str, u64> = validators.iter().map(|(a, s)| (a.as_str(), *s)).collect();
+        let total: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
+
+        // (a) equivocation: durable self-contained proofs recorded by the DAG.
+        for (key, val) in self.db.scan_prefix("sys:equiv_seen:") {
+            if out.len() >= 5 { break; }
+            let Ok(ev) = serde_json::from_str::<serde_json::Value>(&val) else { continue };
+            let (Some(off), Some(round)) = (ev.get("offender").and_then(|v| v.as_str()), ev.get("round").and_then(|v| v.as_u64())) else { continue };
+            if matches!(self.db.get(&format!("sys:slashed:{}:{}", off, round)), Ok(Some(_))) { continue; }
+            if !stake.contains_key(off) { continue; }
+            let _ = key;
+            out.push(serde_json::json!({
+                "kind": "equivocation", "offender": off, "round": round,
+                "vertex_a": ev.get("vertex_a").cloned().unwrap_or(serde_json::Value::Null),
+                "vertex_b": ev.get("vertex_b").cloned().unwrap_or(serde_json::Value::Null),
+            }).to_string());
+        }
+
+        // (b) downtime: signed attestations grouped by (offender, epoch) that
+        // reach the stake quorum.
+        let mut groups: BTreeMap<(String, u64), Vec<serde_json::Value>> = BTreeMap::new();
+        for (_key, val) in self.db.scan_prefix("sys:downtime_attestation:") {
+            let Ok(a) = serde_json::from_str::<serde_json::Value>(&val) else { continue };
+            let (Some(off), Some(ep)) = (a.get("offender").and_then(|v| v.as_str()), a.get("epoch").and_then(|v| v.as_u64())) else { continue };
+            if a.get("signature").and_then(|v| v.as_str()).is_none() { continue; }
+            groups.entry((off.to_string(), ep)).or_default().push(a);
+        }
+        for ((off, ep), atts) in groups {
+            if out.len() >= 5 { break; }
+            if !stake.contains_key(off.as_str()) { continue; }
+            if matches!(self.db.get(&format!("validator:jailed:{}", off)), Ok(Some(_))) { continue; }
+            if matches!(self.db.get(&format!("sys:slashed:{}:{}", off, ep)), Ok(Some(_))) { continue; }
+            let reporters: BTreeSet<&str> = atts.iter().filter_map(|a| a.get("reporter").and_then(|v| v.as_str())).collect();
+            let rs: u128 = reporters.iter().filter_map(|r| stake.get(r).map(|s| *s as u128)).sum();
+            if rs.saturating_mul(3) <= total.saturating_mul(2) { continue; }
+            out.push(serde_json::json!({"kind": "downtime", "offender": off, "epoch": ep, "attestations": atts}).to_string());
+        }
+        out
+    }
+
+    /// Verify ONE evidence item against on-chain data only. Returns
+    /// (offender, reason, round_or_epoch) on success. Pure.
+    pub fn verify_slash_evidence(&self, item: &str) -> Result<(String, String, u64), String> {
+        use std::collections::{BTreeMap, BTreeSet};
+        let ev: serde_json::Value = serde_json::from_str(item).map_err(|e| format!("bad json: {e}"))?;
+        let validators: Vec<(String, u64)> = self
+            .db
+            .get("sys:validators")
+            .ok()
+            .flatten()
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
+        let stake: BTreeMap<&str, u64> = validators.iter().map(|(a, s)| (a.as_str(), *s)).collect();
+        let total: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
+        let offender = ev.get("offender").and_then(|v| v.as_str()).ok_or("missing offender")?.to_string();
+        if !stake.contains_key(offender.as_str()) {
+            return Err(format!("offender {offender} not in validator set"));
+        }
+        let pubkey_of = |addr: &str| -> Option<String> {
+            self.db.get_object(addr)
+                .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.data).ok())
+                .and_then(|v| v.get("public_key").and_then(|k| k.as_str()).map(String::from))
+        };
+        match ev.get("kind").and_then(|v| v.as_str()) {
+            Some("equivocation") => {
+                let round = ev.get("round").and_then(|v| v.as_u64()).ok_or("missing round")?;
+                let a: blockchain::Vertex = serde_json::from_value(ev.get("vertex_a").cloned().unwrap_or_default()).map_err(|e| format!("vertex_a: {e}"))?;
+                let b: blockchain::Vertex = serde_json::from_value(ev.get("vertex_b").cloned().unwrap_or_default()).map_err(|e| format!("vertex_b: {e}"))?;
+                if a.author != offender || b.author != offender { return Err("author != offender".into()); }
+                if a.round != round || b.round != round { return Err("round mismatch".into()); }
+                if a.hash == b.hash { return Err("identical vertices are not equivocation".into()); }
+                if a.calculate_hash() != a.hash || b.calculate_hash() != b.hash { return Err("vertex hash does not match body".into()); }
+                let pk = pubkey_of(&offender).ok_or("offender pubkey unresolvable")?;
+                if !a.verify_ed25519_signature(&pk) || !b.verify_ed25519_signature(&pk) { return Err("vertex signature invalid".into()); }
+                Ok((offender, "equivocation".into(), round))
+            }
+            Some("downtime") => {
+                use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+                let epoch = ev.get("epoch").and_then(|v| v.as_u64()).ok_or("missing epoch")?;
+                let atts = ev.get("attestations").and_then(|v| v.as_array()).ok_or("missing attestations")?;
+                let mut reporters: BTreeSet<String> = BTreeSet::new();
+                for a in atts {
+                    let off = a.get("offender").and_then(|v| v.as_str()).ok_or("att: offender")?;
+                    let ep = a.get("epoch").and_then(|v| v.as_u64()).ok_or("att: epoch")?;
+                    let rep = a.get("reporter").and_then(|v| v.as_str()).ok_or("att: reporter")?;
+                    let round = a.get("round").and_then(|v| v.as_u64()).ok_or("att: round")?;
+                    let pk_hex = a.get("reporter_pubkey").and_then(|v| v.as_str()).ok_or("att: pubkey")?;
+                    let sig_hex = a.get("signature").and_then(|v| v.as_str()).ok_or("att: signature")?;
+                    if off != offender || ep != epoch { return Err("attestation does not match item".into()); }
+                    if !stake.contains_key(rep) { continue; } // not a validator: does not count
+                    let pk_bytes = hex::decode(pk_hex).map_err(|_| "att: pubkey hex")?;
+                    let derived = crypto::derive_address(&pk_bytes).map_err(|e| format!("att: derive: {e}"))?;
+                    if derived != rep { return Err("att: pubkey does not derive to reporter".into()); }
+                    let pk_arr: [u8; 32] = pk_bytes.as_slice().try_into().map_err(|_| "att: pubkey len")?;
+                    let vk = VerifyingKey::from_bytes(&pk_arr).map_err(|_| "att: pubkey")?;
+                    let sig_bytes = hex::decode(sig_hex).map_err(|_| "att: sig hex")?;
+                    let sig = Signature::from_slice(&sig_bytes).map_err(|_| "att: sig")?;
+                    // Same canonical preimage as DagConsensus::broadcast_attestation.
+                    let canonical = format!("{}:{}:{}:{}", off, ep, rep, round);
+                    vk.verify(canonical.as_bytes(), &sig).map_err(|_| "att: signature invalid")?;
+                    reporters.insert(rep.to_string());
+                }
+                let rs: u128 = reporters.iter().filter_map(|r| stake.get(r.as_str()).map(|s| *s as u128)).sum();
+                if rs.saturating_mul(3) <= total.saturating_mul(2) {
+                    return Err(format!("downtime quorum not met: {rs}/{total}"));
+                }
+                Ok((offender, "downtime".into(), epoch))
+            }
+            _ => Err("unknown evidence kind".into()),
+        }
+    }
+
+    /// Apply the block's slash evidence: verify each item independently, then
+    /// execute. Invalid items are ignored (logged) — a proposer cannot slash
+    /// anyone without evidence every node can check.
+    fn apply_slash_evidence(&self, items: &[String]) {
+        for item in items.iter().take(5) {
+            match self.verify_slash_evidence(item) {
+                Ok((offender, reason, round)) => {
+                    let _ = self.logged_put(&format!("validator:jailed:{}", offender), &round.to_string());
+                    self.execute_one_slash(&offender, &reason, round);
+                    if reason == "downtime" {
+                        let prefix = format!("sys:downtime_attestation:{}:{}:", offender, round);
+                        for (k, _) in self.db.scan_prefix(&prefix) {
+                            let _ = self.logged_delete(&k);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("⚠️  [SLASH] rejecting block-carried evidence: {e}"),
+            }
+        }
+    }
+
+    /// TEST-ONLY compatibility shim for the pre-evidence unit tests: drain
+    /// locally queued `sys:pending_slash:*` entries through `execute_one_slash`.
+    /// The production block path never scans local state (see
+    /// apply_slash_evidence) — that scan was the determinism bug.
+    #[cfg(test)]
     fn execute_pending_slashes(&self) {
+        let slash_keys: Vec<_> = self.db.scan_prefix_limited("sys:pending_slash:", 5);
+        for (key, event_json) in &slash_keys {
+            let Some(addr) = key.strip_prefix("sys:pending_slash:") else { continue };
+            let ev: serde_json::Value = serde_json::from_str(event_json).unwrap_or_default();
+            let reason = ev.get("reason").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+            let round = ev.get("round").and_then(|v| v.as_u64()).unwrap_or(0);
+            self.execute_one_slash(addr, &reason, round);
+        }
+    }
+
+    /// Execute ONE verified slash (the body of the former pending-slash scan,
+    /// now driven exclusively by block-carried evidence). `round` is the
+    /// evidence round (equivocation) or epoch (downtime) used for the tombstone.
+    fn execute_one_slash(&self, validator_addr: &str, reason: &str, round: u64) {
         use move_core_types::account_address::AccountAddress;
         use move_core_types::identifier::Identifier;
         use move_core_types::language_storage::ModuleId;
 
-        // H-4 FIX: Cap processing to 5 slashes per block to prevent O(N) drain.
-        // M-06 FIX: enforce the cap at the storage scan instead of after
-        // materialising the entire queue.
-        let slash_keys: Vec<_> = self.db.scan_prefix_limited("sys:pending_slash:", 5);
-
-        for (key, event_json) in &slash_keys {
-            // Extract validator address from key: "sys:pending_slash:{addr}"
-            let validator_addr = match key.strip_prefix("sys:pending_slash:") {
-                Some(addr) => addr.to_string(),
-                None => continue,
-            };
-
-            // Parse the slash event
-            let (reason, round) =
-                if let Ok(event) = serde_json::from_str::<serde_json::Value>(event_json) {
-                    let r = event
-                        .get("reason")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let rd = event.get("round").and_then(|v| v.as_u64()).unwrap_or(0);
-                    (r, rd)
-                } else {
-                    ("unknown".to_string(), 0)
-                };
-
+        let validator_addr = validator_addr.to_string();
+        let reason = reason.to_string();
+        let key = &format!("sys:pending_slash:{}", validator_addr);
+        {
             // H-4 FIX: Tombstone check for replay protection
             let event_id = format!("{}:{}", validator_addr, round);
             let tombstone_key = format!("sys:slashed:{}", event_id);
@@ -2112,7 +2256,7 @@ impl Executor {
                     event_id
                 );
                 let _ = self.logged_delete(key);
-                continue;
+                return;
             }
 
             println!(
@@ -2139,7 +2283,7 @@ impl Executor {
                         validator_addr
                     );
                     let _ = self.logged_delete(key);
-                    continue;
+                    return;
                 }
             };
 
@@ -4748,6 +4892,102 @@ mod tests {
             out.is_none(),
             "an implicitly-created account must still start at nonce 0"
         );
+    }
+
+    /// RE-AUDIT HIGH (slash determinism): slashes come ONLY from block-carried
+    /// evidence that every node can verify. A proposer cannot slash anyone
+    /// without real evidence, and real evidence verifies identically everywhere.
+    #[test]
+    fn test_slash_evidence_verification_equivocation() {
+        let db = temp_db("evidence_equiv");
+        let key = SigningKey::from_bytes(&[51u8; 32]);
+        let offender = create_account(&db, &key);
+        db.put("sys:validators", &format!(r#"[["{}",1000],["other0000",1000]]"#, offender))
+            .unwrap();
+        let executor = Executor::new(db.clone());
+
+        let mk = |ts: u64| {
+            let mut v = blockchain::Vertex {
+                round: 9,
+                author: offender.clone(),
+                parents: vec!["genesis".into()],
+                payload: vec![],
+                timestamp: ts,
+                hash: String::new(),
+                signature: String::new(),
+                aggregated_signature: None,
+            };
+            v.hash = v.calculate_hash();
+            v.sign_with_ed25519(&key);
+            v
+        };
+        let a = mk(1);
+        let b = mk(2);
+        let item = |a: &blockchain::Vertex, b: &blockchain::Vertex| {
+            serde_json::json!({"kind":"equivocation","offender":offender,"round":9,"vertex_a":a,"vertex_b":b})
+                .to_string()
+        };
+
+        let ok = executor.verify_slash_evidence(&item(&a, &b)).expect("valid proof");
+        assert_eq!(ok, (offender.clone(), "equivocation".to_string(), 9));
+
+        // Same vertex twice is not equivocation.
+        assert!(executor.verify_slash_evidence(&item(&a, &a)).is_err());
+        // Tampered body (hash no longer matches) must fail.
+        let mut t = b.clone();
+        t.timestamp = 99;
+        assert!(executor.verify_slash_evidence(&item(&a, &t)).is_err());
+        // Forged: signed by someone else.
+        let mut f = b.clone();
+        f.sign_with_ed25519(&SigningKey::from_bytes(&[52u8; 32]));
+        assert!(executor.verify_slash_evidence(&item(&a, &f)).is_err());
+    }
+
+    #[test]
+    fn test_slash_evidence_verification_downtime_quorum_and_signatures() {
+        use ed25519_dalek::Signer;
+        let db = temp_db("evidence_downtime");
+        let k1 = SigningKey::from_bytes(&[61u8; 32]);
+        let k2 = SigningKey::from_bytes(&[62u8; 32]);
+        let k3 = SigningKey::from_bytes(&[63u8; 32]);
+        let r1 = create_account(&db, &k1);
+        let r2 = create_account(&db, &k2);
+        let off = create_account(&db, &k3);
+        db.put(
+            "sys:validators",
+            &format!(r#"[["{}",1000],["{}",1000],["{}",1000]]"#, r1, r2, off),
+        )
+        .unwrap();
+        let executor = Executor::new(db.clone());
+
+        let att = |k: &SigningKey, rep: &str, good: bool| {
+            let canonical = format!("{}:{}:{}:{}", off, 4, rep, 400);
+            let mut sig = hex::encode(k.sign(canonical.as_bytes()).to_bytes());
+            if !good { sig.replace_range(0..2, "00"); }
+            serde_json::json!({
+                "offender": off, "epoch": 4, "reporter": rep, "round": 400, "rounds_missed": 150,
+                "reporter_pubkey": hex::encode(k.verifying_key().to_bytes()), "signature": sig,
+            })
+        };
+        let item = |atts: Vec<serde_json::Value>| {
+            serde_json::json!({"kind":"downtime","offender":off,"epoch":4,"attestations":atts}).to_string()
+        };
+
+        // 1 of 3 (33%) -> no quorum.
+        assert!(executor.verify_slash_evidence(&item(vec![att(&k1, &r1, true)])).is_err());
+        // 2 of 3 is exactly 2/3 -> strict quorum NOT met.
+        assert!(executor
+            .verify_slash_evidence(&item(vec![att(&k1, &r1, true), att(&k2, &r2, true)]))
+            .is_err());
+        // 3 of 3 including the offender itself attesting? offender is a validator too.
+        let ok = executor
+            .verify_slash_evidence(&item(vec![att(&k1, &r1, true), att(&k2, &r2, true), att(&k3, &off, true)]))
+            .expect("3/3 stake meets quorum");
+        assert_eq!(ok, (off.clone(), "downtime".to_string(), 4));
+        // A bad signature invalidates the whole item (proposer cannot pad quorum).
+        assert!(executor
+            .verify_slash_evidence(&item(vec![att(&k1, &r1, true), att(&k2, &r2, true), att(&k3, &off, false)]))
+            .is_err());
     }
 
     /// Build a hex-encoded BCS `coin::transfer` payload from `from` to `to`.

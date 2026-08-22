@@ -296,6 +296,15 @@ impl ChainSync {
                 ));
             }
         }
+        if !block.header.evidence_root.is_empty() || !block.slash_evidence.is_empty() {
+            let computed = blockchain::calculate_evidence_root(&block.slash_evidence);
+            if computed != block.header.evidence_root {
+                return Err(format!(
+                    "Evidence root mismatch: expected {}, computed {}",
+                    block.header.evidence_root, computed
+                ));
+            }
+        }
 
         // S3-4a: Reject blocks with future timestamps (30s drift tolerance)
         let now = std::time::SystemTime::now()
@@ -1049,6 +1058,9 @@ impl ChainSync {
                     // The synced block's own height (epoch determinism — see
                     // executor::execute_block_parallel_at).
                     block.header.height,
+                    // RE-AUDIT HIGH: the block's own slash evidence, verified by
+                    // the executor — identical on every node.
+                    &block.slash_evidence,
                 );
             if let Err(e) = self.verify_execution_roots(block, &execution_summary) {
                 // SEC (audit H-3): synced blocks are UNAUTHENTICATED (no proposer

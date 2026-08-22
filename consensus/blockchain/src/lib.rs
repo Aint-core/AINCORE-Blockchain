@@ -16,6 +16,12 @@ pub struct BlockHeader {
     /// sequence can trust it belongs to this block. Empty only for legacy blocks.
     #[serde(default)]
     pub vertices_root: String,
+    /// RE-AUDIT HIGH (slash determinism): hash binding `Block::slash_evidence`
+    /// into the header. Slashes are decided from evidence CARRIED BY THE BLOCK
+    /// and verified by every executor — never from per-node, gossip-dependent
+    /// local state. Empty only for legacy blocks / no evidence.
+    #[serde(default)]
+    pub evidence_root: String,
     pub proposer_id: String, // ID node yang mengusulkan blok ini
     #[serde(default)]
     pub round: u64, // Consensus Round (DAG)
@@ -44,6 +50,14 @@ pub struct Block {
     /// rejects unsigned/mis-signed blocks before execution.
     #[serde(default)]
     pub proposer_signature: String,
+    /// RE-AUDIT HIGH (slash determinism): self-authenticating slash evidence
+    /// items (JSON). `{"kind":"downtime", offender, epoch, attestations:[signed
+    /// attestations...]}` or `{"kind":"equivocation", offender, round,
+    /// vertex_a, vertex_b}`. The proposer collects them from its local view;
+    /// EVERY node verifies them independently before applying, so the block —
+    /// not local gossip state — decides who is slashed and when.
+    #[serde(default)]
+    pub slash_evidence: Vec<String>,
 }
 
 impl Block {
@@ -183,6 +197,7 @@ impl Block {
             timestamp,
             Vec::new(),
             String::new(),
+            Vec::new(),
         )
     }
 
@@ -204,9 +219,11 @@ impl Block {
         timestamp: u64,
         committed_vertices: Vec<String>,
         anchor_hash: String,
+        slash_evidence: Vec<String>,
     ) -> Self {
         let tx_hash = calculate_tx_hash(&transactions);
         let vertices_root = calculate_vertices_root(&committed_vertices);
+        let evidence_root = calculate_evidence_root(&slash_evidence);
 
         let mut header = BlockHeader {
             height,
@@ -215,6 +232,7 @@ impl Block {
             state_root,
             receipts_root,
             vertices_root,
+            evidence_root,
             proposer_id,
             round,
             timestamp,
@@ -230,6 +248,7 @@ impl Block {
             committed_vertices,
             anchor_hash,
             proposer_signature: String::new(),
+            slash_evidence,
         }
     }
 }
@@ -258,6 +277,24 @@ pub fn calculate_header_hash(header: &BlockHeader) -> String {
     data.extend_from_slice(header.timestamp.to_string().as_bytes());
     if !header.vertices_root.is_empty() {
         data.extend_from_slice(header.vertices_root.as_bytes());
+    }
+    if !header.evidence_root.is_empty() {
+        data.extend_from_slice(header.evidence_root.as_bytes());
+    }
+    hex::encode(hash(&data))
+}
+
+/// Root binding a block's slash evidence list (order-sensitive). Empty list
+/// => empty root, so blocks without evidence keep their old header hash.
+pub fn calculate_evidence_root(items: &[String]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut data = Vec::new();
+    data.extend_from_slice((items.len() as u64).to_be_bytes().as_slice());
+    for it in items {
+        data.extend_from_slice((it.len() as u64).to_be_bytes().as_slice());
+        data.extend_from_slice(it.as_bytes());
     }
     hex::encode(hash(&data))
 }
@@ -452,6 +489,7 @@ mod bft_time_tests {
                 ts,
                 vec!["v1".to_string(), "v2".to_string()],
                 "v2".to_string(),
+                vec![],
             )
         };
         let samples = vec![
@@ -486,6 +524,7 @@ mod bft_time_tests {
                 1_000,
                 vs.into_iter().map(String::from).collect(),
                 "anchor".to_string(),
+                vec![],
             )
         };
         let a = mk(vec!["x", "y"]);
@@ -506,7 +545,7 @@ mod bft_time_tests {
         let other_pk = hex::encode(other.verifying_key().to_bytes());
         let mut b = Block::new_with_roots_at(
             3, 6, "prev".into(), vec![], "proposer".into(), "s".into(), "r".into(), 1_000,
-            vec!["v".into()], "v".into(),
+            vec!["v".into()], "v".into(), vec![],
         );
         assert!(!b.verify_proposer_signature(&pk), "unsigned must NOT verify");
         b.sign_proposer(&key);

@@ -1080,6 +1080,10 @@ impl DagConsensus {
                 // Use Executor parallel logic directly?
                 // The existing logic was: analyze deps -> schedule -> execute.
                 // We can use executor.execute_block_parallel(block_txs).
+                // RE-AUDIT HIGH: slash evidence is gathered by the PROPOSER from its
+                // local view and carried by the block; every node verifies it
+                // independently before applying (executor::apply_slash_evidence).
+                let slash_evidence = executor.collect_slash_evidence();
                 let execution_summary = executor.execute_block_parallel_at(
                     block_txs.clone(),
                     &reward_recipient,
@@ -1087,6 +1091,7 @@ impl DagConsensus {
                     // explicitly so the epoch boundary is a pure function of this
                     // block, immune to sync/local interleaving (see executor doc).
                     self.latest_block_height + 1,
+                    &slash_evidence,
                 );
                 // Orphan-loss fix: settle the mempool's loan ledger — only the
                 // transactions that actually EXECUTED leave it; the rest stay
@@ -1127,6 +1132,7 @@ impl DagConsensus {
                     // engine in exact parity (see OrderingEngine::adopt_synced_anchor).
                     commit.sequence.clone(),
                     commit.anchor_hash.clone(),
+                    slash_evidence,
                 );
                 // RE-AUDIT CRITICAL: authenticate the block to its proposer so
                 // followers only ever adopt/vote for validator-produced blocks.
@@ -1602,10 +1608,11 @@ impl DagConsensus {
             "reason": "equivocation",
             "penalty": "100% slash + permanent removal"
         });
-        let _ = self.storage.put(
-            &format!("sys:pending_slash:{}", offender),
-            &slash_event.to_string(),
-        );
+        // RE-AUDIT HIGH: no direct `sys:pending_slash` write any more — that made
+        // the slash a function of WHICH node saw both vertices. The durable
+        // `sys:equiv_seen` evidence row above is what the block proposer carries
+        // (executor::collect_slash_evidence) and every node verifies+applies.
+        let _ = slash_event;
         let _ = self.storage.put(
             &format!("validator:jailed:{}", offender),
             &round.to_string(),

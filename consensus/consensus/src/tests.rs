@@ -430,30 +430,34 @@ mod tests {
         consensus.add_vertex(vertex_a);
         consensus.add_vertex(vertex_b);
 
-        // Now inspect the pending_slash entry the DAG wrote — this is the contract
-        // surface the executor consumes from.
-        let pending_key = format!("sys:pending_slash:{}", author);
+        // RE-AUDIT HIGH (slash determinism): the DAG no longer queues a local
+        // `sys:pending_slash` — that made the slash a function of WHICH node saw
+        // both vertices. The contract surface is now the durable, self-contained
+        // evidence row the block proposer carries (executor::collect_slash_evidence)
+        // and every node verifies before applying.
         let raw = consensus
             .storage
-            .get(&pending_key)
+            .get(&format!("sys:equiv_seen:{}:1", author))
             .expect("storage read must not error")
-            .expect("equivocation must queue a pending slash event");
-
-        let event: serde_json::Value =
-            serde_json::from_str(&raw).expect("slash event must be valid JSON");
-
-        assert_eq!(
-            event.get("reason").and_then(|v| v.as_str()),
-            Some("equivocation"),
-            "DAG must queue reason == \"equivocation\" so executor applies the \
-             100% slash path. Got: {:?}",
-            event.get("reason")
-        );
-
-        assert_eq!(
-            event.get("event").and_then(|v| v.as_str()),
-            Some("equivocation_detected"),
-            "event tag should remain stable for monitoring/alerting consumers"
+            .expect("equivocation must record a self-contained evidence row");
+        let ev: serde_json::Value =
+            serde_json::from_str(&raw).expect("evidence row must be valid JSON");
+        assert_eq!(ev["offender"].as_str(), Some(author.as_str()));
+        assert_eq!(ev["round"].as_u64(), Some(1));
+        assert!(ev.get("vertex_a").is_some() && ev.get("vertex_b").is_some());
+        assert_ne!(ev["vertex_a"]["hash"], ev["vertex_b"]["hash"]);
+        assert!(consensus
+            .storage
+            .get(&format!("validator:jailed:{}", author))
+            .unwrap()
+            .is_some());
+        assert!(
+            consensus
+                .storage
+                .get(&format!("sys:pending_slash:{}", author))
+                .unwrap()
+                .is_none(),
+            "no local pending_slash may be written — slashes come from block evidence"
         );
 
         let _ = std::fs::remove_dir_all(&path);
@@ -1317,14 +1321,14 @@ mod tests {
 
         consensus.handle_message(&equiv_proof_msg(&offender, &a, &b));
 
-        let pending = consensus
+        let row = consensus
             .storage
-            .get(&format!("sys:pending_slash:{}", offender))
+            .get(&format!("sys:equiv_seen:{}:1", offender))
             .unwrap()
-            .expect("valid equivocation proof must queue a slash");
-        let ev: serde_json::Value = serde_json::from_str(&pending).unwrap();
-        assert_eq!(ev["reason"].as_str(), Some("equivocation"));
-        assert_eq!(ev["event"].as_str(), Some("equivocation_detected"));
+            .expect("valid equivocation proof must record evidence");
+        let ev: serde_json::Value = serde_json::from_str(&row).unwrap();
+        assert_eq!(ev["offender"].as_str(), Some(offender.as_str()));
+        assert!(ev.get("vertex_a").is_some() && ev.get("vertex_b").is_some());
         assert!(consensus
             .storage
             .get(&format!("validator:jailed:{}", offender))
@@ -1353,7 +1357,7 @@ mod tests {
         consensus.handle_message(&msg);
         let first = consensus
             .storage
-            .get(&format!("sys:pending_slash:{}", offender))
+            .get(&format!("sys:equiv_seen:{}:1", offender))
             .unwrap()
             .unwrap();
 
@@ -1364,7 +1368,7 @@ mod tests {
 
         let second = consensus
             .storage
-            .get(&format!("sys:pending_slash:{}", offender))
+            .get(&format!("sys:equiv_seen:{}:1", offender))
             .unwrap()
             .unwrap();
         assert_eq!(
