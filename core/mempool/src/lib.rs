@@ -71,6 +71,10 @@ fn verify_join_validator_pop_mempool(
 }
 
 const MAX_PENDING_TXS: usize = 5000;
+/// How many times a loaned transaction may return to the queue before it is
+/// dropped for good (orphaned payloads need one; a permanently failing tx must
+/// not loop forever).
+const MAX_REQUEUE_ATTEMPTS: u8 = 3;
 const MAX_SEEN_TXS: usize = 50000;
 const MIN_GAS_PRICE: u128 = 1;
 
@@ -95,7 +99,13 @@ pub struct Mempool {
     /// its whole payload — the sender's nonce sequence then had a permanent
     /// hole, every later transaction died with "Invalid Sequence", and the
     /// account was wedged forever. Keyed by the RAW transaction string; value is loaned_at.
-    inflight: std::collections::HashMap<String, std::time::Instant>,
+    inflight: std::collections::HashMap<String, (std::time::Instant, u8)>,
+    /// RE-AUDIT MEDIUM (perf): parsed (sender, sequence_number, gas_price) per
+    /// raw tx, filled once at admission so selection never re-parses every
+    /// pending transaction under the mempool lock on every tick.
+    meta: std::collections::HashMap<String, (String, u64, u128)>,
+    /// Attempt counter carried from `requeue_stale` back into the next pull.
+    requeue_attempts: std::collections::HashMap<String, u8>,
     /// Optional storage handle. When `Some`, `add_transaction` performs
     /// full Dilithium5 (PQC) verification by looking up the canonical
     /// `pqc_pubkey_{sender}` binding. When `None`, PQC submissions are
@@ -114,6 +124,8 @@ impl Mempool {
             pending_txs: VecDeque::new(),
             seen_txs: HashSet::new(),
             inflight: std::collections::HashMap::new(),
+            meta: std::collections::HashMap::new(),
+            requeue_attempts: std::collections::HashMap::new(),
             seen_order: VecDeque::new(),
             pending_nonces: HashSet::new(),
             storage: None,
@@ -132,6 +144,8 @@ impl Mempool {
             pending_txs: VecDeque::new(),
             seen_txs: HashSet::new(),
             inflight: std::collections::HashMap::new(),
+            meta: std::collections::HashMap::new(),
+            requeue_attempts: std::collections::HashMap::new(),
             seen_order: VecDeque::new(),
             pending_nonces: HashSet::new(),
             storage: Some(storage),
@@ -225,25 +239,6 @@ impl Mempool {
         //     account funded by an earlier same-block tx is not yet visible here),
         //   * a paymaster-sponsored tx is paid by the paymaster, not the sender,
         //     so the sender-balance check is skipped entirely.
-        if parsed_tx.paymaster.is_none() {
-            if let Some(storage) = &self.storage {
-                if let Some(gas_cost) =
-                    (parsed_tx.gas_limit as u128).checked_mul(parsed_tx.gas_price)
-                {
-                    if let Some(balance) =
-                        executor::committed_ain_balance(storage, &parsed_tx.sender)
-                    {
-                        if balance < gas_cost {
-                            return Err(format!(
-                                "Insufficient balance for gas: have {}, need {} (gas_limit {} × gas_price {})",
-                                balance, gas_cost, parsed_tx.gas_limit, parsed_tx.gas_price
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
         // Phase 5B.11 / PWN-004 + PWN-007 COMBINED: compute the canonical
         // dedup hash and check `seen_txs` IMMEDIATELY after parse + cheap
         // header checks. This:
@@ -493,10 +488,46 @@ impl Mempool {
         // (M-04: size guard was moved to the top of add_transaction so it
         // runs before any expensive parsing or signature verification.)
 
-        if self.pending_txs.len() >= MAX_PENDING_TXS {
+        // Economic gate runs AFTER authentication (Ed25519 / PQC) so a rejected
+        // signature is reported as such; the gate itself is a single storage read.
+        if parsed_tx.paymaster.is_none() {
+            if let Some(storage) = &self.storage {
+                if let Some(gas_cost) =
+                    (parsed_tx.gas_limit as u128).checked_mul(parsed_tx.gas_price)
+                {
+                    match executor::committed_ain_balance(storage, &parsed_tx.sender) {
+                        Some(balance) if balance < gas_cost => {
+                            return Err(format!(
+                                "Insufficient balance for gas: have {}, need {} (gas_limit {} × gas_price {})",
+                                balance, gas_cost, parsed_tx.gas_limit, parsed_tx.gas_price
+                            ));
+                        }
+                        Some(_) => {}
+                        // RE-AUDIT HIGH: this used to fail OPEN. An account with no
+                        // CoinStore can never pay gas (coin::deduct_gas asserts the
+                        // store exists), so admitting it buys an attacker free block
+                        // space with unlimited fresh keypairs: the executor refuses
+                        // the tx at zero cost, and the loan ledger re-queues it. A
+                        // sender without a store is rejected at the gate. (A
+                        // paymaster-sponsored tx skips this block entirely.)
+                        None => {
+                            return Err(
+                                "Sender has no AIN balance to pay gas (no CoinStore)".to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+
+        // RE-AUDIT HIGH: the cap must count LOANED transactions too, or a pull
+        // simply moves 500 into `inflight` and frees 500 slots for the attacker.
+        if self.pending_txs.len() + self.inflight.len() >= MAX_PENDING_TXS {
             return Err(format!(
-                "Mempool full ({}/{})",
+                "Mempool full ({}+{} inflight / {})",
                 self.pending_txs.len(),
+                self.inflight.len(),
                 MAX_PENDING_TXS
             ));
         }
@@ -519,6 +550,10 @@ impl Mempool {
         self.seen_txs.insert(tx_hash.clone());
         self.seen_order.push_back(tx_hash.clone());
         self.pending_nonces.insert(nonce_key);
+        self.meta.insert(
+            tx.clone(),
+            (parsed_tx.sender.clone(), parsed_tx.sequence_number, parsed_tx.gas_price),
+        );
         self.pending_txs.push_back(tx.clone());
 
         println!(
@@ -548,13 +583,13 @@ impl Mempool {
         // sender -> [(sequence_number, gas_price, original_index)], nonce-ordered.
         let mut by_sender: BTreeMap<String, Vec<(u64, u128, usize)>> = BTreeMap::new();
         for (idx, raw) in raws.iter().enumerate() {
-            // Post-validation these always parse; an unparsable entry is simply
-            // never selected (left in the queue) rather than dropped.
-            if let Ok(t) = serde_json::from_str::<executor::Transaction>(raw) {
+            // Metadata was parsed once at admission (see `meta`); a raw without
+            // it (should not happen) is simply never selected rather than dropped.
+            if let Some((sender, seq, gp)) = self.meta.get(raw) {
                 by_sender
-                    .entry(t.sender.clone())
+                    .entry(sender.clone())
                     .or_default()
-                    .push((t.sequence_number, t.gas_price, idx));
+                    .push((*seq, *gp, idx));
             }
         }
         for q in by_sender.values_mut() {
@@ -583,13 +618,11 @@ impl Mempool {
                 }
             }
             match best {
-                Some((_, idx, _)) => {
+                Some((_, idx, sender)) => {
                     selected.push(idx);
                     // advance the chosen sender's cursor
-                    if let Ok(t) = serde_json::from_str::<executor::Transaction>(&raws[idx]) {
-                        if let Some(c) = cursor.get_mut(&t.sender) {
-                            *c += 1;
-                        }
+                    if let Some(c) = cursor.get_mut(&sender) {
+                        *c += 1;
                     }
                 }
                 None => break, // all sender queues exhausted
@@ -601,8 +634,10 @@ impl Mempool {
         let now = std::time::Instant::now();
         for raw in &result {
             self.remove_pending_nonce(raw);
-            // Loaned, not gone: see the `inflight` field doc.
-            self.inflight.insert(raw.clone(), now);
+            // Loaned, not gone: see the `inflight` field doc. Attempts carry
+            // over across re-queues so a permanently failing tx is bounded.
+            let attempts = self.requeue_attempts.remove(raw).unwrap_or(0);
+            self.inflight.insert(raw.clone(), (now, attempts));
         }
         // Keep unselected txs in their original FIFO order for the next round.
         self.pending_txs = raws
@@ -633,6 +668,8 @@ impl Mempool {
     pub fn mark_executed(&mut self, raws: &[String]) {
         for raw in raws {
             self.inflight.remove(raw);
+            self.meta.remove(raw);
+            self.requeue_attempts.remove(raw);
         }
     }
 
@@ -646,27 +683,39 @@ impl Mempool {
     /// Returns how many were re-queued.
     pub fn requeue_stale(&mut self, max_age: std::time::Duration) -> usize {
         let now = std::time::Instant::now();
-        let stale: Vec<String> = self
+        let stale: Vec<(String, u8)> = self
             .inflight
             .iter()
-            .filter(|(_, at)| now.duration_since(**at) > max_age)
-            .map(|(raw, _)| raw.clone())
+            .filter(|(_, (at, _))| now.duration_since(*at) > max_age)
+            .map(|(raw, (_, n))| (raw.clone(), *n))
             .collect();
-        for raw in &stale {
+        let mut requeued = 0usize;
+        let mut dropped = 0usize;
+        for (raw, attempts) in &stale {
             self.inflight.remove(raw);
-            if let Ok(parsed) = serde_json::from_str::<executor::Transaction>(raw) {
-                self.pending_nonces
-                    .insert(format!("{}:{}", parsed.sender, parsed.sequence_number));
+            // RE-AUDIT HIGH: bounded. A tx that keeps failing (bad nonce forever,
+            // unpayable gas) must not become an immortal 30s loop that burns
+            // every validator's CPU and block space.
+            if *attempts + 1 >= MAX_REQUEUE_ATTEMPTS {
+                self.meta.remove(raw);
+                self.requeue_attempts.remove(raw);
+                dropped += 1;
+                continue;
+            }
+            self.requeue_attempts.insert(raw.clone(), attempts + 1);
+            if let Some((sender, seq, _)) = self.meta.get(raw) {
+                self.pending_nonces.insert(format!("{}:{}", sender, seq));
             }
             self.pending_txs.push_back(raw.clone());
+            requeued += 1;
         }
-        if !stale.is_empty() {
+        if requeued > 0 || dropped > 0 {
             println!(
-                "♻️  Mempool re-queued {} stale inflight tx(s) (orphaned or nonce-deferred)",
-                stale.len()
+                "♻️  Mempool re-queued {} stale inflight tx(s), dropped {} after {} attempts",
+                requeued, dropped, MAX_REQUEUE_ATTEMPTS
             );
         }
-        stale.len()
+        requeued
     }
 
     fn remove_pending_nonce(&mut self, tx: &str) {

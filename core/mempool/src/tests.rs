@@ -396,6 +396,9 @@ mod pqc_phase21 {
         let (sender, pk_bytes, sk, chain_id, payload) = fresh_pqc_identity();
         db.put(&format!("pqc_pubkey_{}", sender), &hex::encode(&pk_bytes))
             .unwrap();
+        // Admission now fails CLOSED for senders with no CoinStore (re-audit
+        // HIGH); a legitimate sender is funded, so fund this one.
+        super::fee_market_admission::fund(&db, &sender, 1_000_000);
         let sig_hex = sign_pqc_message(&sk, &chain_id, &sender, &payload, 0);
 
         let mut mempool = Mempool::with_storage(db);
@@ -790,7 +793,7 @@ mod fee_market_admission {
 
     // A struct {value: u128} encodes in BCS identically to a bare u128, so the
     // executor's MoveCoin reader round-trips this.
-    fn fund(db: &Arc<StateDB>, sender: &str, balance: u128) {
+    pub(crate) fn fund(db: &Arc<StateDB>, sender: &str, balance: u128) {
         db.put(
             &ain_store_key(sender),
             &hex::encode(bcs::to_bytes(&balance).unwrap()),
@@ -871,13 +874,19 @@ mod fee_market_admission {
     }
 
     #[test]
-    fn admission_fails_open_when_store_missing() {
+    /// RE-AUDIT HIGH: this gate used to fail OPEN ("balance unknown -> admit").
+    /// An account with no CoinStore can never pay gas, so admitting it handed an
+    /// attacker free block space with unlimited fresh keypairs. It now fails
+    /// CLOSED; a paymaster-sponsored tx still bypasses the sender check (see the
+    /// test below).
+    fn admission_fails_closed_when_store_missing() {
         let db = temp_db("admission_no_store");
-        // No CoinStore written for this sender -> balance unknown -> admit.
         let (tx, _sender) = signed_tx(13, 0, 1000, 5);
         let mut mp = Mempool::with_storage(db);
-        mp.add_transaction(tx)
-            .expect("missing/uninitialised store must fail-open (admit)");
+        let err = mp
+            .add_transaction(tx)
+            .expect_err("sender with no CoinStore must be rejected at admission");
+        assert!(err.contains("no CoinStore"), "got: {err}");
     }
 
     #[test]

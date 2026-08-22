@@ -14,6 +14,27 @@ mod tests {
         Arc::new(StateDB::open(&path).expect("Failed to open DB"))
     }
 
+
+    /// RE-AUDIT CRITICAL fixture: register the proposer's Ed25519 key as its
+    /// on-chain AccountData and sign the block, so validate_block's proposer
+    /// authentication passes for blocks a test expects to be VALID.
+    fn authenticate_block(sync: &ChainSync, block: &mut Block) {
+        use storage::object::{Object, Owner};
+        let key = crypto::SigningKey::from_bytes(&[77u8; 32]);
+        let pk = hex::encode(key.verifying_key().to_bytes());
+        let pid = block.header.proposer_id.clone();
+        let account = Object::new(
+            pid.clone(),
+            Owner::Address(pid),
+            serde_json::json!({ "public_key": pk, "sequence_number": 0 })
+                .to_string()
+                .into_bytes(),
+            "0x1::account::AccountData".to_string(),
+        );
+        sync.storage.put_object(&account).unwrap();
+        block.sign_proposer(&key);
+    }
+
     fn setup_sync(name: &str) -> ChainSync {
         let db = temp_db(name);
         let peers = Arc::new(Mutex::new(HashMap::new()));
@@ -337,13 +358,14 @@ mod tests {
     #[test]
     fn test_validate_block_success() {
         let sync = setup_sync("val_success");
-        let block = Block::new(
+        let mut block = Block::new(
             2,
             2,
             "prev_hash_1".to_string(),
             vec![],
             "node_1".to_string(),
         );
+        authenticate_block(&sync, &mut block);
 
         let result = sync.validate_block(&block, 2, "prev_hash_1");
         assert!(result.is_ok(), "Validation failed: {:?}", result.err());
@@ -613,6 +635,7 @@ mod tests {
             vec!["x".to_string()],
             "node_2".to_string(),
         );
+        authenticate_block(&sync, &mut remote_b2);
         rehash_block(&mut remote_b2);
         let mut remote_b3 = Block::new(
             3,
@@ -621,6 +644,7 @@ mod tests {
             vec!["y".to_string()],
             "node_2".to_string(),
         );
+        authenticate_block(&sync, &mut remote_b3);
         rehash_block(&mut remote_b3);
 
         let new_height = sync.process_blocks(vec![remote_b2.clone(), remote_b3.clone()], 2);
@@ -684,6 +708,7 @@ mod tests {
             vec!["x".to_string()],
             "node_2".to_string(),
         );
+        authenticate_block(&sync, &mut remote_b2);
         rehash_block(&mut remote_b2);
         let mut remote_b3 = Block::new(
             3,
@@ -692,6 +717,7 @@ mod tests {
             vec!["y".to_string()],
             "node_2".to_string(),
         );
+        authenticate_block(&sync, &mut remote_b3);
         rehash_block(&mut remote_b3);
 
         let new_height = sync.process_blocks(vec![remote_b2.clone(), remote_b3.clone()], 2);
@@ -742,6 +768,7 @@ mod tests {
             vec!["x".to_string()],
             "node_2".to_string(),
         );
+        authenticate_block(&sync, &mut remote_b2);
         rehash_block(&mut remote_b2);
         let new_height = sync.process_blocks(vec![remote_b2], 2);
         assert_eq!(new_height, 2);

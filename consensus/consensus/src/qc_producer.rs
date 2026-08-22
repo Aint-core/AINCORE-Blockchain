@@ -344,6 +344,18 @@ pub fn collect_vote_and_try_aggregate(
 
     // (2) Bind to the exact set this node verifies against.
     let expected_set_hash = qc::validator_set_hash(&validators);
+    // RE-AUDIT MEDIUM: bind every remote vote to THIS chain before it can
+    // contribute to a QC. A vote set from a foreign chain (same validator keys,
+    // e.g. a testnet reusing mainnet identities) could otherwise aggregate into
+    // a QC that self-verifies under ITS OWN chain_id and poison finality here.
+    if vote.chain_id != qc::expected_chain_id() {
+        eprintln!(
+            "🚨 [QC] remote vote for foreign chain_id {} (expected {}) — dropped",
+            vote.chain_id,
+            qc::expected_chain_id()
+        );
+        return QcOutcome::Skipped;
+    }
     if vote.validator_set_hash != expected_set_hash {
         // Vote is over a different validator set — cannot aggregate into a QC
         // that verifies against ours.
@@ -420,7 +432,7 @@ pub fn collect_vote_and_try_aggregate(
         }
     };
     // NEVER store an unverifiable QC.
-    if let Err(e) = verify_qc(&qc, &validators, &qc.chain_id) {
+    if let Err(e) = verify_qc(&qc, &validators, &qc::expected_chain_id()) {
         eprintln!("🚨 [QC] aggregate self-verify failed: {e} — not storing");
         return QcOutcome::Skipped;
     }
@@ -471,7 +483,7 @@ mod tests {
 
     fn ctx_for(height: u64) -> CommitContext {
         CommitContext {
-            chain_id: "AINCORE-TEST-1".into(),
+            chain_id: qc::expected_chain_id(),
             epoch: 0,
             finalized_round: height + 2,
             anchor_round: height,

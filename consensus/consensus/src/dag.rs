@@ -300,6 +300,17 @@ impl DagConsensus {
             .and_then(|json| serde_json::from_str::<blockchain::Block>(&json).ok())
             .map(|b| (b.header.timestamp, b.header.round))
             .unwrap_or((0, 0));
+        // RE-AUDIT MEDIUM: adoption cursor persisted across restarts (never above
+        // the tip), so a crash between sync persisting a block and its adoption
+        // cannot silently skip that block at boot.
+        let last_adopted_height = storage
+            .get("consensus:last_adopted_height")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|h| h.min(latest_block_height))
+            .unwrap_or(latest_block_height);
+
 
         let explicit_max_round = match storage.get("latest_proposed_round") {
             Ok(Some(r)) => r.parse::<u64>().unwrap_or(0),
@@ -333,7 +344,7 @@ impl DagConsensus {
             latest_block_hash,
             latest_block_timestamp,
             latest_block_round,
-            last_adopted_height: latest_block_height,
+            last_adopted_height,
             accumulator: Accumulator::new(),
             da_sequencer,
             p2p_tx,
@@ -1117,10 +1128,20 @@ impl DagConsensus {
                     commit.sequence.clone(),
                     commit.anchor_hash.clone(),
                 );
+                // RE-AUDIT CRITICAL: authenticate the block to its proposer so
+                // followers only ever adopt/vote for validator-produced blocks.
+                let mut new_block = new_block;
+                new_block.sign_proposer(&crypto::SigningKey::from_bytes(&self.node_key));
                 self.latest_block_hash = new_block.header.hash.clone();
                 self.latest_block_timestamp = new_block.header.timestamp;
                 self.latest_block_round = commit.anchor_round;
                 self.last_adopted_height = self.latest_block_height;
+                // RE-AUDIT MEDIUM: persist the adoption cursor so a crash between
+                // sync persisting a block and its adoption cannot skip it at boot.
+                let _ = self.storage.put(
+                    "consensus:last_adopted_height",
+                    &self.last_adopted_height.to_string(),
+                );
 
                 // Update Accumulator and DB
                 if let Ok(bytes) = hex::decode(&new_block.header.hash) {
@@ -2064,7 +2085,20 @@ impl DagConsensus {
                     else {
                         break;
                     };
-                    if !block.committed_vertices.is_empty() {
+                    // RE-AUDIT HIGH (loan ledger): every transaction carried by a
+                    // synced block is settled — included-in-committed-block is the
+                    // right notion of "done" here (a failed one would fail again
+                    // and is bounded by the requeue cap anyway).
+                    if !block.transactions.is_empty() {
+                        if let Ok(mut mp) = self.mempool.lock() {
+                            mp.mark_executed(&block.transactions);
+                        }
+                    }
+                    // RE-AUDIT CRITICAL: never adopt or vote for a block that does
+                    // not carry a proposer signature. ChainSync already rejects
+                    // unsigned/mis-signed blocks before execution; this is defense
+                    // in depth for anything that reached storage another way.
+                    if !block.committed_vertices.is_empty() && !block.proposer_signature.is_empty() {
                         let adopted = match self.ordering_engine.lock() {
                             Ok(mut engine) => engine.adopt_synced_anchor(
                                 block.header.round,
@@ -2110,6 +2144,9 @@ impl DagConsensus {
                         }
                     }
                     self.last_adopted_height = h;
+                    let _ = self
+                        .storage
+                        .put("consensus:last_adopted_height", &h.to_string());
                 }
             }
 

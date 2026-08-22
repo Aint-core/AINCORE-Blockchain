@@ -739,6 +739,12 @@ pub struct BlockExecutionSummary {
 
 pub struct Executor {
     db: Arc<StateDB>,
+    /// RE-AUDIT HIGH (state root): while a block is executing, every
+    /// post-transaction write (fee rewards, fee sweep, slashes, epoch advance)
+    /// is mirrored here so the block's state root covers them. It used to be
+    /// folded BEFORE these phases, so cross-node root comparison was blind to
+    /// exactly the writes most likely to diverge. `None` outside a block.
+    block_write_log: std::sync::Mutex<Option<std::collections::BTreeMap<String, Option<String>>>>,
     vm: AINCOREVM,
 }
 
@@ -753,7 +759,8 @@ fn short_hash(hash: &str) -> String {
 impl Executor {
     pub fn new(db: Arc<StateDB>) -> Self {
         let vm = AINCOREVM::new(Arc::clone(&db));
-        Self { db, vm }
+        Self {
+            block_write_log: std::sync::Mutex::new(None), db, vm }
     }
 
     /// B1: keep `sys:validator_set:v1` live when a validator joins at runtime.
@@ -1033,12 +1040,36 @@ impl Executor {
         }
     }
 
+    /// Mirror a write into the block write log when a block is executing.
+    fn log_block_write(&self, key: &str, val: Option<&str>) {
+        if let Ok(mut guard) = self.block_write_log.lock() {
+            if let Some(log) = guard.as_mut() {
+                log.insert(key.to_string(), val.map(|v| v.to_string()));
+            }
+        }
+    }
+
+    /// `db.put` that also feeds the block state root (see `block_write_log`).
+    fn logged_put(&self, key: &str, val: &str) -> Result<(), String> {
+        self.log_block_write(key, Some(val));
+        self.db.put(key, val).map_err(|e| e.to_string())
+    }
+
+    /// `db.delete` that also feeds the block state root.
+    fn logged_delete(&self, key: &str) -> Result<(), String> {
+        self.log_block_write(key, None);
+        self.db.delete(key).map_err(|e| e.to_string())
+    }
+
     fn commit_kv_updates(
         &self,
         mut updates: Vec<(String, Option<String>)>,
         context: &str,
     ) -> Result<(), String> {
         updates.sort_by(|left, right| left.0.cmp(&right.0));
+        for (key, val_opt) in &updates {
+            self.log_block_write(key, val_opt.as_deref());
+        }
         let mut write_batch = WriteBatch::default();
         for (key, val_opt) in updates {
             if let Some(value) = val_opt {
@@ -1464,8 +1495,8 @@ impl Executor {
 
         for (k, v) in vm_changes {
             match v {
-                Some(val) => self.db.put(&k, &val).map_err(|e| e.to_string())?,
-                None => self.db.delete(&k).map_err(|e| e.to_string())?,
+                Some(val) => self.logged_put(&k, &val).map_err(|e| e.to_string())?,
+                None => self.logged_delete(&k).map_err(|e| e.to_string())?,
             }
         }
 
@@ -1489,7 +1520,7 @@ impl Executor {
             attempts: 0,
         };
         if let Ok(json) = serde_json::to_string(&entry) {
-            let _ = self.db.put(&sweep_key, &json);
+            let _ = self.logged_put(&sweep_key, &json);
         }
     }
 
@@ -1510,14 +1541,14 @@ impl Executor {
             let amount = match entry.amount.parse::<u128>() {
                 Ok(amount) if amount > 0 => amount,
                 _ => {
-                    let _ = self.db.delete(&key);
+                    let _ = self.logged_delete(&key);
                     continue;
                 }
             };
 
             match self.deposit_fee_reward(&entry.miner, amount) {
                 Ok(()) => {
-                    let _ = self.db.delete(&key);
+                    let _ = self.logged_delete(&key);
                     println!(
                         "✅ Fee sweep recovered {} AIN for miner {}",
                         amount, entry.miner
@@ -1526,7 +1557,7 @@ impl Executor {
                 Err(e) => {
                     entry.attempts = entry.attempts.saturating_add(1);
                     if let Ok(json) = serde_json::to_string(&entry) {
-                        let _ = self.db.put(&key, &json);
+                        let _ = self.logged_put(&key, &json);
                     }
                     eprintln!(
                         "⚠️ Fee sweep retry failed for {} AIN to {}: {}",
@@ -1633,6 +1664,10 @@ impl Executor {
         let mut total_fees: u128 = 0;
 
         let mut executed_raws: Vec<String> = Vec::new();
+        // Start the block write log (post-loop phases mirror their writes here).
+        if let Ok(mut g) = self.block_write_log.lock() {
+            *g = Some(std::collections::BTreeMap::new());
+        }
         // AUDIT-B4b (root determinism): the state root used to be chained ONCE
         // PER EXECUTION BATCH, which made it a function of how the conflict
         // scheduler happened to PARTITION the block — and that partitioning is
@@ -1704,35 +1739,6 @@ impl Executor {
             // batches' writes); the ROOT fold moved to block level below.
             if let Err(e) = self.db.write_batch(write_batch) {
                 eprintln!("❌ FATAL: RocksDB Write Batch Failed: {}", e);
-                panic!(
-                    "CRITICAL: database write failure - stopping node to prevent state corruption."
-                );
-            }
-        }
-
-        // Fold the state root ONCE PER BLOCK over the sorted effective writes
-        // (see block_effective_writes above). Empty blocks fold nothing, matching
-        // the previous behaviour of leaving the root untouched.
-        if !block_effective_writes.is_empty() {
-            use sha2::Digest;
-            let mut block_hasher = sha2::Sha256::new();
-            for (key, val_opt) in &block_effective_writes {
-                block_hasher.update(key.as_bytes());
-                match val_opt {
-                    Some(val) => block_hasher.update(val.as_bytes()),
-                    None => block_hasher.update(b"DELETE"),
-                }
-            }
-            let block_hash_digest = block_hasher.finalize();
-            let prev_root = self.db.get("sys:state_root").unwrap_or(None).unwrap_or(
-                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-            );
-            let mut global_hasher = sha2::Sha256::new();
-            global_hasher.update(hex::decode(&prev_root).unwrap_or(vec![0u8; 32]));
-            global_hasher.update(block_hash_digest);
-            let new_root = hex::encode(global_hasher.finalize());
-            if let Err(e) = self.db.put("sys:state_root", &new_root) {
-                eprintln!("❌ FATAL: state root persist failed: {}", e);
                 panic!(
                     "CRITICAL: database write failure - stopping node to prevent state corruption."
                 );
@@ -1846,6 +1852,47 @@ impl Executor {
         // 8. Advance Move epoch on a deterministic block interval, AS the block
         // being executed (see execute_block_parallel_at doc).
         self.maybe_advance_epoch(block_height);
+
+        // Fold the state root ONCE PER BLOCK, at the very END, over the sorted
+        // effective writes of the transactions PLUS every post-loop write (fee
+        // rewards, fee sweep, slashes, epoch advance) mirrored in the block write
+        // log. RE-AUDIT HIGH: folding before those phases left the root blind to
+        // exactly the writes most likely to diverge across nodes. Post-loop
+        // writes are applied in a deterministic order, so last-write-wins is
+        // deterministic too. Empty blocks fold nothing (root untouched).
+        if let Ok(mut g) = self.block_write_log.lock() {
+            if let Some(log) = g.take() {
+                for (k, v) in log {
+                    block_effective_writes.insert(k, v);
+                }
+            }
+        }
+        if !block_effective_writes.is_empty() {
+            use sha2::Digest;
+            let mut block_hasher = sha2::Sha256::new();
+            for (key, val_opt) in &block_effective_writes {
+                block_hasher.update(key.as_bytes());
+                match val_opt {
+                    Some(val) => block_hasher.update(val.as_bytes()),
+                    None => block_hasher.update(b"DELETE"),
+                }
+            }
+            let block_hash_digest = block_hasher.finalize();
+            let prev_root = self.db.get("sys:state_root").unwrap_or(None).unwrap_or(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            );
+            let mut global_hasher = sha2::Sha256::new();
+            global_hasher.update(hex::decode(&prev_root).unwrap_or(vec![0u8; 32]));
+            global_hasher.update(block_hash_digest);
+            let new_root = hex::encode(global_hasher.finalize());
+            if let Err(e) = self.db.put("sys:state_root", &new_root) {
+                eprintln!("❌ FATAL: state root persist failed: {}", e);
+                panic!(
+                    "CRITICAL: database write failure - stopping node to prevent state corruption."
+                );
+            }
+        }
+
 
         let summary = BlockExecutionSummary {
             state_root: self.current_state_root(),
@@ -1994,11 +2041,11 @@ impl Executor {
             });
 
             // Queue the real slash and the jail marker.
-            let _ = self.db.put(
+            let _ = self.logged_put(
                 &format!("sys:pending_slash:{}", offender),
                 &slash_event.to_string(),
             );
-            let _ = self.db.put(
+            let _ = self.logged_put(
                 &jail_key,
                 &serde_json::to_string(&reporters).unwrap_or_default(),
             );
@@ -2009,7 +2056,7 @@ impl Executor {
             // future epochs are untouched.
             let prefix = format!("sys:downtime_attestation:{}:{}:", offender, epoch);
             for (key, _) in self.db.scan_prefix(&prefix) {
-                let _ = self.db.delete(&key);
+                let _ = self.logged_delete(&key);
             }
 
             println!(
@@ -2064,7 +2111,7 @@ impl Executor {
                     "   ⏭️  Skipping already processed slash event: {}",
                     event_id
                 );
-                let _ = self.db.delete(key);
+                let _ = self.logged_delete(key);
                 continue;
             }
 
@@ -2091,7 +2138,7 @@ impl Executor {
                         "   ❌ Invalid validator address for slash: {}",
                         validator_addr
                     );
-                    let _ = self.db.delete(key);
+                    let _ = self.logged_delete(key);
                     continue;
                 }
             };
@@ -2116,8 +2163,8 @@ impl Executor {
                 Ok((_gas_used, vm_changes, _)) => {
                     for (k, v) in vm_changes {
                         let _ = match v {
-                            Some(val) => self.db.put(&k, &val),
-                            None => self.db.delete(&k),
+                            Some(val) => self.logged_put(&k, &val),
+                            None => self.logged_delete(&k),
                         };
                     }
                     self.sync_supply_trackers_from_validator_set();
@@ -2156,8 +2203,8 @@ impl Executor {
                         Ok((_g, deleg_changes, _)) => {
                             for (k, v) in deleg_changes {
                                 let _ = match v {
-                                    Some(val) => self.db.put(&k, &val),
-                                    None => self.db.delete(&k),
+                                    Some(val) => self.logged_put(&k, &val),
+                                    None => self.logged_delete(&k),
                                 };
                             }
                             self.sync_supply_trackers_from_validator_set();
@@ -2210,7 +2257,7 @@ impl Executor {
                     if slashed {
                         vals.retain(|(_, w)| *w > 0);
                         if let Ok(new_json) = serde_json::to_string(&vals) {
-                            let _ = self.db.put("sys:validators", &new_json);
+                            let _ = self.logged_put("sys:validators", &new_json);
                             println!(
                                 "   ⛓️  Validator set updated ({} -> {} validators)",
                                 before_len,
@@ -2234,7 +2281,7 @@ impl Executor {
                     v1.retain(|v| v.address != validator_addr);
                     if v1.len() != v1_before {
                         if let Ok(nj) = serde_json::to_string(&v1) {
-                            let _ = self.db.put(validator_set_v1_key(), &nj);
+                            let _ = self.logged_put(validator_set_v1_key(), &nj);
                             println!(
                                 "   🔻 Removed slashed validator from sys:validator_set:v1 ({} -> {})",
                                 v1_before,
@@ -2246,10 +2293,10 @@ impl Executor {
             }
 
             // H-4 FIX: Write tombstone
-            let _ = self.db.put(&tombstone_key, "1");
+            let _ = self.logged_put(&tombstone_key, "1");
 
             // Delete the pending slash entry (processed)
-            let _ = self.db.delete(key);
+            let _ = self.logged_delete(key);
             println!("   ✅ Slash executed and cleared from queue.");
         }
     }
@@ -2348,13 +2395,22 @@ impl Executor {
         ) else {
             return Vec::new();
         };
+        // RE-AUDIT MEDIUM: onboarding is for AIN only. Allowing any type arg let
+        // anyone force-create CoinStore<T> for arbitrary T at arbitrary addresses
+        // (storage griefing; the pre-staged write survives the payload abort by
+        // design). Other coin types keep the explicit coin::register flow.
         let coin_type = match call.ty_args.first() {
-            Some(t) => t.clone(),
+            Some(t) if *t == aincore_coin_type() => t.clone(),
+            Some(_) => return Vec::new(),
             None => aincore_coin_type(),
         };
         let key = coin_store_key_for_type(recipient, coin_type);
-        if matches!(self.db.get(&key), Ok(Some(_))) {
-            return Vec::new(); // already registered — never overwrite a balance
+        // RE-AUDIT LOW: fail CLOSED on a storage read error. Treating Err as
+        // "absent" would overwrite a real balance with zero.
+        match self.db.get(&key) {
+            Ok(None) => {}
+            Ok(Some(_)) => return Vec::new(), // already registered — never overwrite
+            Err(_) => return Vec::new(),
         }
         // CoinStore<T> { coin: Coin<T> { value: u128 } } — BCS is the bare u128.
         let Ok(empty) = bcs::to_bytes(&0u128) else {

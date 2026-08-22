@@ -37,6 +37,37 @@ pub struct Block {
     /// The anchor vertex hash this block was built from (CommitInfo.anchor_hash).
     #[serde(default)]
     pub anchor_hash: String,
+    /// RE-AUDIT CRITICAL fix: Ed25519 signature by `header.proposer_id` over
+    /// `header.hash`. Blocks travel over the unauthenticated ChainSync path and
+    /// followers ADOPT their committed sequence and BLS-vote for them — so a
+    /// block must prove it was produced by a validator, not by any peer. Sync
+    /// rejects unsigned/mis-signed blocks before execution.
+    #[serde(default)]
+    pub proposer_signature: String,
+}
+
+impl Block {
+    /// Sign `header.hash` as the proposer (same Ed25519 scheme as vertices).
+    pub fn sign_proposer(&mut self, secret_key: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        let sig = secret_key.sign(self.header.hash.as_bytes());
+        self.proposer_signature = hex::encode(sig.to_bytes());
+    }
+
+    /// Verify `proposer_signature` against the proposer's Ed25519 public key
+    /// (hex). Empty or malformed signatures verify as FALSE.
+    pub fn verify_proposer_signature(&self, public_key_hex: &str) -> bool {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        if self.proposer_signature.is_empty() {
+            return false;
+        }
+        let Ok(sig_bytes) = hex::decode(&self.proposer_signature) else { return false };
+        let Ok(sig) = Signature::from_slice(&sig_bytes) else { return false };
+        let Ok(pk_bytes) = hex::decode(public_key_hex) else { return false };
+        let Ok(pk_arr) = <[u8; 32]>::try_from(pk_bytes.as_slice()) else { return false };
+        let Ok(vk) = VerifyingKey::from_bytes(&pk_arr) else { return false };
+        vk.verify(self.header.hash.as_bytes(), &sig).is_ok()
+    }
 }
 
 /// Maximum accepted drift for a block timestamp, shared with the DAG's vertex
@@ -198,6 +229,7 @@ impl Block {
             transactions,
             committed_vertices,
             anchor_hash,
+            proposer_signature: String::new(),
         }
     }
 }
@@ -463,5 +495,28 @@ mod bft_time_tests {
         assert_ne!(a.header.hash, b.header.hash, "order is part of the binding");
         assert_eq!(a.header.vertices_root, calculate_vertices_root(&a.committed_vertices));
         assert!(mk(vec![]).header.vertices_root.is_empty(), "empty sequence => empty root");
+    }
+
+    /// RE-AUDIT CRITICAL: a synced block must prove it came from its proposer.
+    #[test]
+    fn proposer_signature_binds_block_to_proposer_key() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let other = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let pk = hex::encode(key.verifying_key().to_bytes());
+        let other_pk = hex::encode(other.verifying_key().to_bytes());
+        let mut b = Block::new_with_roots_at(
+            3, 6, "prev".into(), vec![], "proposer".into(), "s".into(), "r".into(), 1_000,
+            vec!["v".into()], "v".into(),
+        );
+        assert!(!b.verify_proposer_signature(&pk), "unsigned must NOT verify");
+        b.sign_proposer(&key);
+        assert!(b.verify_proposer_signature(&pk));
+        assert!(!b.verify_proposer_signature(&other_pk), "wrong key must not verify");
+        // Tampering with the body after signing breaks the binding via the hash.
+        let mut t = b.clone();
+        t.committed_vertices.push("injected".into());
+        t.header.vertices_root = calculate_vertices_root(&t.committed_vertices);
+        t.header.hash = calculate_header_hash(&t.header);
+        assert!(!t.verify_proposer_signature(&pk), "re-hashed tampered block must not verify");
     }
 }

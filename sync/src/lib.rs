@@ -318,6 +318,35 @@ impl ChainSync {
         }
 
         self.verify_block_hash(block)?;
+        // RE-AUDIT CRITICAL: a synced block must PROVE it was produced by its
+        // proposer. Followers adopt its committed sequence into their ordering
+        // engine and cast a BLS finality vote for it (see
+        // OrderingEngine::adopt_synced_anchor / DagConsensus::reload_chain_tip);
+        // without this check any peer could hand honest followers a fabricated
+        // block with a self-consistent vertices_root and collect their votes on a
+        // fork. The proposer's Ed25519 key is the one registered in its on-chain
+        // AccountData (the same resolution the DAG uses for vertex signatures).
+        let proposer_pk = self
+            .storage
+            .get_object(&block.header.proposer_id)
+            .and_then(|obj| serde_json::from_slice::<serde_json::Value>(&obj.data).ok())
+            .and_then(|v| v.get("public_key").and_then(|k| k.as_str()).map(String::from));
+        match proposer_pk {
+            Some(pk) if block.verify_proposer_signature(&pk) => {}
+            Some(_) => {
+                return Err(format!(
+                    "Proposer signature invalid or missing on block #{} from {}",
+                    block.header.height, block.header.proposer_id
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "Cannot resolve proposer {} public key to authenticate block #{}",
+                    block.header.proposer_id, block.header.height
+                ));
+            }
+        }
+
         Ok(())
     }
 
