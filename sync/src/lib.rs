@@ -284,6 +284,19 @@ impl ChainSync {
             ));
         }
 
+        // LIVENESS/INTEGRITY: the block's committed vertex sequence is what a
+        // follower adopts into its ordering engine; bind it to the header so a
+        // peer cannot hand us a sequence that does not belong to this block.
+        if !block.header.vertices_root.is_empty() {
+            let computed = blockchain::calculate_vertices_root(&block.committed_vertices);
+            if computed != block.header.vertices_root {
+                return Err(format!(
+                    "Vertices root mismatch: expected {}, computed {}",
+                    block.header.vertices_root, computed
+                ));
+            }
+        }
+
         // S3-4a: Reject blocks with future timestamps (30s drift tolerance)
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

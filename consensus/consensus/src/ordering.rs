@@ -734,6 +734,27 @@ impl OrderingEngine {
         // Filter yang sudah committed (O(1) membership via the mirror set).
         sequence.retain(|h| !self.committed_set.contains(h));
 
+        Some(self.apply_anchor_bookkeeping(
+            anchor_round,
+            anchor_vertex_hash,
+            leader,
+            sequence,
+        ))
+    }
+
+    /// Shared bookkeeping for ONE anchor that has been DECIDED — either by this
+    /// node's own commit path or by adopting a synced block's committed
+    /// sequence (see `adopt_synced_anchor`). Identical state transitions on both
+    /// paths are what keep a catching-up follower in exact parity with the
+    /// validator that produced the block: same committed_set, same cursor, same
+    /// rolling finality digest.
+    fn apply_anchor_bookkeeping(
+        &mut self,
+        anchor_round: u64,
+        anchor_vertex_hash: &str,
+        leader: String,
+        sequence: Vec<String>,
+    ) -> CommitInfo {
         println!(
             "⚓ Committing Anchor Round {} (Leader {}, {} vertices)",
             anchor_round,
@@ -809,13 +830,55 @@ impl OrderingEngine {
         // randomness via get_random_beacon().
         self.update_random_beacon(anchor_round, &digest);
 
-        Some(CommitInfo {
+        CommitInfo {
             sequence,
             leader,
             anchor_round,
             anchor_hash: anchor_vertex_hash.to_string(),
             finality_digest: digest,
-        })
+        }
+    }
+
+    /// LIVENESS (burn-in finding): adopt an anchor that the NETWORK decided and
+    /// that reached this node as a synced block carrying its committed vertex
+    /// sequence.
+    ///
+    /// Why this exists: gossip is lossy (`Parents=3` is routine on the live
+    /// cluster). Once a follower's DAG has a hole below its cursor, the
+    /// completeness gate defers forever — correctly, but silently — and the
+    /// producing validator prunes the missing vertex long before re-gossip
+    /// could refill it. Observed live: two validators stuck at anchor 7110 and
+    /// one at 55942 for ~48h while the chain tip (via ChainSync) sat at 45k
+    /// blocks. A stalled follower also stops casting finality votes, so the
+    /// >2/3 QC quorum dies with it — and with it every QC-gated path.
+    ///
+    /// The synced block IS the network's decision for this anchor round. Folding
+    /// its sequence VERBATIM (not re-filtered — the producer already filtered
+    /// against its own committed set, which is a superset of ours at this point)
+    /// reproduces the producer's bookkeeping exactly, so the cursor jumps past
+    /// the hole and later local commits agree byte-for-byte.
+    ///
+    /// Returns the CommitInfo so the caller can cast this node's finality vote
+    /// for the block, restoring QC quorum. No-op for already-decided rounds.
+    pub fn adopt_synced_anchor(
+        &mut self,
+        anchor_round: u64,
+        anchor_hash: &str,
+        sequence: &[String],
+        validators: &[(String, u64)],
+    ) -> Option<CommitInfo> {
+        if anchor_round <= self.finalized_round || self.committed_rounds.contains(&anchor_round) {
+            return None;
+        }
+        let leader = Self::leader_for_round(anchor_round, validators, 0);
+        println!(
+            "⚓ Adopting synced anchor round {} ({} vertices): cursor {} -> {}",
+            anchor_round,
+            sequence.len(),
+            self.next_anchor_round,
+            anchor_round + 1
+        );
+        Some(self.apply_anchor_bookkeeping(anchor_round, anchor_hash, leader, sequence.to_vec()))
     }
 
     /// Elect the anchor leader for `round` as a PURE function of the round, the
@@ -1712,5 +1775,46 @@ mod tests {
             commit_fingerprint(&combined),
             "deferral must not change the final sequence"
         );
+    }
+
+    /// LIVENESS (burn-in finding): a follower that ADOPTS a synced anchor must
+    /// end in byte-for-byte parity with the node that COMMITTED it locally —
+    /// same cursor, same finalized round, same rolling finality digest, same
+    /// committed set — so every later local commit agrees across both.
+    #[test]
+    fn test_adopt_synced_anchor_matches_local_commit_bookkeeping() {
+        let validators: Vec<(String, u64)> = vec![
+            ("aaaa000000000000000000000000000000000000000000000000000000000001".to_string(), 1000),
+            ("bbbb000000000000000000000000000000000000000000000000000000000002".to_string(), 1000),
+        ];
+        // "Producer": commits anchors 2 and 4 through the shared bookkeeping.
+        let mut producer = OrderingEngine::new();
+        let seq2 = vec!["v2a".to_string(), "v2b".to_string()];
+        let seq4 = vec!["v4a".to_string()];
+        let leader2 = OrderingEngine::leader_for_round(2, &validators, 0);
+        let leader4 = OrderingEngine::leader_for_round(4, &validators, 0);
+        let info2 = producer.apply_anchor_bookkeeping(2, "anchor2", leader2, seq2.clone());
+        let info4 = producer.apply_anchor_bookkeeping(4, "anchor4", leader4, seq4.clone());
+
+        // "Follower": stalled with nothing decided; adopts the two synced blocks.
+        let mut follower = OrderingEngine::new();
+        let a2 = follower
+            .adopt_synced_anchor(2, "anchor2", &seq2, &validators)
+            .expect("anchor 2 adopted");
+        let a4 = follower
+            .adopt_synced_anchor(4, "anchor4", &seq4, &validators)
+            .expect("anchor 4 adopted");
+
+        assert_eq!(a2.finality_digest, info2.finality_digest, "digest parity after anchor 2");
+        assert_eq!(a4.finality_digest, info4.finality_digest, "digest parity after anchor 4");
+        assert_eq!(follower.finalized_round, producer.finalized_round);
+        assert_eq!(follower.next_anchor_round, producer.next_anchor_round);
+        assert_eq!(follower.committed_rounds, producer.committed_rounds);
+        assert_eq!(follower.committed_set, producer.committed_set);
+
+        // Idempotent: re-adopting an already-decided anchor is a no-op.
+        assert!(follower.adopt_synced_anchor(4, "anchor4", &seq4, &validators).is_none());
+        assert!(follower.adopt_synced_anchor(2, "anchor2", &seq2, &validators).is_none());
+        assert_eq!(follower.finality_digest, producer.finality_digest);
     }
 }

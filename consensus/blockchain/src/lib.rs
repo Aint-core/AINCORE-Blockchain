@@ -11,6 +11,11 @@ pub struct BlockHeader {
     pub state_root: String, // Post-execution state root. Empty only for legacy blocks.
     #[serde(default)]
     pub receipts_root: String, // Root of per-transaction receipts. Empty only for legacy blocks.
+    /// LIVENESS: hash binding `Block::committed_vertices` (the anchor's committed
+    /// vertex sequence) into the header, so a follower adopting a synced block's
+    /// sequence can trust it belongs to this block. Empty only for legacy blocks.
+    #[serde(default)]
+    pub vertices_root: String,
     pub proposer_id: String, // ID node yang mengusulkan blok ini
     #[serde(default)]
     pub round: u64, // Consensus Round (DAG)
@@ -22,6 +27,16 @@ pub struct BlockHeader {
 pub struct Block {
     pub header: BlockHeader,
     pub transactions: Vec<String>, // Daftar transaksi dalam blok
+    /// LIVENESS: the exact vertex hashes this block's anchor committed, in
+    /// commit order. A catching-up follower folds this VERBATIM into its own
+    /// ordering engine (OrderingEngine::adopt_synced_anchor) — the only way to
+    /// move its cursor past a gossip hole while staying in byte-for-byte parity
+    /// with the producer (same committed set, same cursor, same finality digest).
+    #[serde(default)]
+    pub committed_vertices: Vec<String>,
+    /// The anchor vertex hash this block was built from (CommitInfo.anchor_hash).
+    #[serde(default)]
+    pub anchor_hash: String,
 }
 
 /// Maximum accepted drift for a block timestamp, shared with the DAG's vertex
@@ -135,6 +150,8 @@ impl Block {
             state_root,
             receipts_root,
             timestamp,
+            Vec::new(),
+            String::new(),
         )
     }
 
@@ -144,6 +161,7 @@ impl Block {
     /// folds `timestamp`, so it must be a value every honest node derives
     /// identically from committed data.
     #[allow(clippy::too_many_arguments)] // header fields are intrinsic
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_roots_at(
         height: u64,
         round: u64,
@@ -153,8 +171,11 @@ impl Block {
         state_root: String,
         receipts_root: String,
         timestamp: u64,
+        committed_vertices: Vec<String>,
+        anchor_hash: String,
     ) -> Self {
         let tx_hash = calculate_tx_hash(&transactions);
+        let vertices_root = calculate_vertices_root(&committed_vertices);
 
         let mut header = BlockHeader {
             height,
@@ -162,6 +183,7 @@ impl Block {
             tx_hash,
             state_root,
             receipts_root,
+            vertices_root,
             proposer_id,
             round,
             timestamp,
@@ -174,6 +196,8 @@ impl Block {
         Block {
             header,
             transactions,
+            committed_vertices,
+            anchor_hash,
         }
     }
 }
@@ -200,6 +224,23 @@ pub fn calculate_header_hash(header: &BlockHeader) -> String {
     data.extend_from_slice(header.proposer_id.as_bytes());
     data.extend_from_slice(header.round.to_string().as_bytes());
     data.extend_from_slice(header.timestamp.to_string().as_bytes());
+    if !header.vertices_root.is_empty() {
+        data.extend_from_slice(header.vertices_root.as_bytes());
+    }
+    hex::encode(hash(&data))
+}
+
+/// Root binding a block's committed vertex sequence (order-sensitive). Empty
+/// sequence => empty root, so legacy/empty blocks keep their old header hash.
+pub fn calculate_vertices_root(vertices: &[String]) -> String {
+    if vertices.is_empty() {
+        return String::new();
+    }
+    let mut data = Vec::new();
+    data.extend_from_slice((vertices.len() as u64).to_be_bytes().as_slice());
+    for v in vertices {
+        data.extend_from_slice(v.as_bytes());
+    }
     hex::encode(hash(&data))
 }
 
@@ -377,6 +418,8 @@ mod bft_time_tests {
                 "state".to_string(),
                 "receipts".to_string(),
                 ts,
+                vec!["v1".to_string(), "v2".to_string()],
+                "v2".to_string(),
             )
         };
         let samples = vec![
@@ -392,5 +435,33 @@ mod bft_time_tests {
             mk(ts_node_b).header.hash,
             "same committed content must hash identically on every node"
         );
+    }
+
+    /// LIVENESS: the committed vertex sequence is bound into the header hash, so
+    /// a peer cannot swap the sequence a follower will adopt without changing
+    /// the block hash (which sync already verifies against the chain).
+    #[test]
+    fn vertices_root_is_bound_into_header_hash() {
+        let mk = |vs: Vec<&str>| {
+            Block::new_with_roots_at(
+                9,
+                44,
+                "prev".to_string(),
+                vec![],
+                "proposer".to_string(),
+                "s".to_string(),
+                "r".to_string(),
+                1_000,
+                vs.into_iter().map(String::from).collect(),
+                "anchor".to_string(),
+            )
+        };
+        let a = mk(vec!["x", "y"]);
+        let b = mk(vec!["y", "x"]); // same set, different order
+        let c = mk(vec!["x", "y"]);
+        assert_eq!(a.header.hash, c.header.hash, "identical sequence => identical hash");
+        assert_ne!(a.header.hash, b.header.hash, "order is part of the binding");
+        assert_eq!(a.header.vertices_root, calculate_vertices_root(&a.committed_vertices));
+        assert!(mk(vec![]).header.vertices_root.is_empty(), "empty sequence => empty root");
     }
 }

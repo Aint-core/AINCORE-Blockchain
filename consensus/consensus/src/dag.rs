@@ -43,6 +43,10 @@ pub struct DagConsensus {
     /// exposed: anchor 73 landed at height 67 on NAS and height 68 on LAP).
     /// The commit loop skips block-building for any anchor <= this round.
     pub latest_block_round: u64,
+    /// LIVENESS: highest block height whose anchor has been applied to the
+    /// ordering engine — by local commit or by adopting a synced block. Heights
+    /// above this that arrive via ChainSync are adopted in reload_chain_tip.
+    pub last_adopted_height: u64,
     pub accumulator: Accumulator,
     pub da_sequencer: Option<Arc<Mutex<DASequencer>>>, // Added DA Sequencer
     pub p2p_tx: Option<tokio::sync::mpsc::Sender<String>>, // Added P2P Libp2p Channel
@@ -329,6 +333,7 @@ impl DagConsensus {
             latest_block_hash,
             latest_block_timestamp,
             latest_block_round,
+            last_adopted_height: latest_block_height,
             accumulator: Accumulator::new(),
             da_sequencer,
             p2p_tx,
@@ -1106,10 +1111,16 @@ impl DagConsensus {
                     execution_summary.state_root,
                     execution_summary.receipts_root,
                     block_timestamp,
+                    // LIVENESS: the block carries the committed vertex sequence
+                    // so a follower can adopt this anchor into its own ordering
+                    // engine in exact parity (see OrderingEngine::adopt_synced_anchor).
+                    commit.sequence.clone(),
+                    commit.anchor_hash.clone(),
                 );
                 self.latest_block_hash = new_block.header.hash.clone();
                 self.latest_block_timestamp = new_block.header.timestamp;
                 self.latest_block_round = commit.anchor_round;
+                self.last_adopted_height = self.latest_block_height;
 
                 // Update Accumulator and DB
                 if let Ok(bytes) = hex::decode(&new_block.header.hash) {
@@ -2033,6 +2044,74 @@ impl DagConsensus {
             );
             self.latest_block_height = new_height;
             self.latest_block_hash = new_hash;
+
+            // LIVENESS (burn-in finding): every synced block above the last
+            // adopted height carries the network's committed vertex sequence for
+            // its anchor. Apply each one to the ordering engine IN ORDER so the
+            // local cursor moves past any gossip hole exactly as the producer's
+            // did, then cast this node's finality vote for the block — a stalled
+            // follower otherwise stops voting and the >2/3 QC quorum dies.
+            {
+                let validators = self.get_validator_set_with_stake();
+                let start_h = self.last_adopted_height.saturating_add(1);
+                for h in start_h..=new_height {
+                    let Some(block) = self
+                        .storage
+                        .get(&format!("block_{}", h))
+                        .ok()
+                        .flatten()
+                        .and_then(|j| serde_json::from_str::<blockchain::Block>(&j).ok())
+                    else {
+                        break;
+                    };
+                    if !block.committed_vertices.is_empty() {
+                        let adopted = match self.ordering_engine.lock() {
+                            Ok(mut engine) => engine.adopt_synced_anchor(
+                                block.header.round,
+                                &block.anchor_hash,
+                                &block.committed_vertices,
+                                &validators,
+                            ),
+                            Err(_) => None,
+                        };
+                        if let Some(info) = adopted {
+                            let epoch = self
+                                .storage
+                                .get("consensus:epoch")
+                                .ok()
+                                .flatten()
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(0);
+                            let ctx = crate::qc_producer::CommitContext {
+                                chain_id: self.resolve_chain_id(),
+                                epoch,
+                                finalized_round: info.anchor_round,
+                                anchor_round: info.anchor_round,
+                                anchor_hash: info.anchor_hash.clone(),
+                                block_height: h,
+                                block_hash: block.header.hash.clone(),
+                                state_root: block.header.state_root.clone(),
+                                receipts_root: block.header.receipts_root.clone(),
+                                finality_digest: info.finality_digest.clone(),
+                            };
+                            if let crate::qc_producer::QcOutcome::Partial(vote_msg) =
+                                crate::qc_producer::produce_and_store_qc(
+                                    &self.storage,
+                                    &self.node_key,
+                                    &self.node_id,
+                                    &ctx,
+                                )
+                            {
+                                self.broadcast_qc_vote(&vote_msg);
+                            }
+                            if let Ok(mut engine) = self.ordering_engine.lock() {
+                                engine.fold_qc_for_height(h);
+                            }
+                        }
+                    }
+                    self.last_adopted_height = h;
+                }
+            }
 
             let synced_block = self
                 .storage
