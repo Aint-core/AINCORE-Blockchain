@@ -1062,6 +1062,16 @@ impl DagConsensus {
                     if let Some(stake) = stake_by_addr.get(&v.author) {
                         ts_samples.push((v.author.clone(), *stake, v.timestamp));
                     }
+                } else {
+                    // A committed vertex MUST be present: the sequence was computed
+                    // from this DAG moments ago. If it is gone, something pruned it
+                    // mid-batch and this block's content is about to diverge from
+                    // every other node's. Never silent.
+                    eprintln!(
+                        "🚨 [SECURITY][COMMIT_VERTEX_MISSING] anchor round {} sequence hash {} \
+                         is not in the DAG at block-build time — block content will diverge",
+                        commit.anchor_round, hash
+                    );
                 }
             }
             drop(dag); // DROP DAG LOCK NOW!
@@ -1319,11 +1329,21 @@ impl DagConsensus {
                             0 // Don't prune if we can't verify finality
                         }
                     };
-                    // Keep a safety buffer of 10 rounds below the latest finalized
-                    // round. Anything older than this is causally settled and safe
-                    // to reclaim.
-                    if finalized_round > 10 {
-                        self.prune_dag(finalized_round - 10);
+                    // CATCH-UP FORK FIX: one try_commit call can yield MANY anchors
+                    // (a node catching up after a restart commits dozens at once).
+                    // The engine's finalized_round then already points at the LAST
+                    // anchor of the batch while this loop is still building blocks
+                    // for the earlier ones — pruning off finalized_round here
+                    // deleted vertices those later-built blocks still needed, so
+                    // `dag.get(hash)` silently returned None for them: fewer
+                    // BFT-time samples (a header that differed from every other
+                    // node by a few seconds — the live PI-only fork) and, under
+                    // load, DROPPED TRANSACTIONS. The horizon is therefore bounded
+                    // by the round of the block just BUILT, which is always the
+                    // lowest round still being assembled.
+                    let horizon = finalized_round.min(self.latest_block_round);
+                    if horizon > 10 {
+                        self.prune_dag(horizon - 10);
                     }
                 }
 
