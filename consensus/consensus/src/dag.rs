@@ -1161,7 +1161,7 @@ impl DagConsensus {
                 // RE-AUDIT CRITICAL: authenticate the block to its proposer so
                 // followers only ever adopt/vote for validator-produced blocks.
                 let mut new_block = new_block;
-                new_block.sign_proposer(&crypto::SigningKey::from_bytes(&self.node_key));
+                new_block.sign_proposer(&crypto::SigningKey::from_bytes(&self.node_key), &self.node_id);
                 self.latest_block_hash = new_block.header.hash.clone();
                 self.latest_block_timestamp = new_block.header.timestamp;
                 self.latest_block_round = commit.anchor_round;

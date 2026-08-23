@@ -327,31 +327,40 @@ impl ChainSync {
         }
 
         self.verify_block_hash(block)?;
-        // RE-AUDIT CRITICAL: a synced block must PROVE it was produced by its
-        // proposer. Followers adopt its committed sequence into their ordering
-        // engine and cast a BLS finality vote for it (see
-        // OrderingEngine::adopt_synced_anchor / DagConsensus::reload_chain_tip);
-        // without this check any peer could hand honest followers a fabricated
-        // block with a self-consistent vertices_root and collect their votes on a
-        // fork. The proposer's Ed25519 key is the one registered in its on-chain
-        // AccountData (the same resolution the DAG uses for vertex signatures).
-        let proposer_pk = self
+        // RE-AUDIT CRITICAL: a synced block must PROVE it was produced by a
+        // validator. Followers adopt its committed sequence and BLS-vote for it,
+        // so any peer able to forge a block could harvest votes on a fork. The
+        // signer is the validator that BUILT this copy (`proposer_signer`) — every
+        // validator builds every block deterministically, so binding to the anchor
+        // leader's key instead made blocks syncable only from the leader itself
+        // (98 rejections in one catch-up; a dead leader's blocks unsyncable).
+        let signer = block.proposer_signer.clone();
+        if signer.is_empty() {
+            return Err(format!("Block #{} carries no proposer signer", block.header.height));
+        }
+        if !validators.is_empty() && !validators.contains(&signer) {
+            return Err(format!(
+                "Block #{} signer {} is not an active validator",
+                block.header.height, signer
+            ));
+        }
+        let signer_pk = self
             .storage
-            .get_object(&block.header.proposer_id)
+            .get_object(&signer)
             .and_then(|obj| serde_json::from_slice::<serde_json::Value>(&obj.data).ok())
             .and_then(|v| v.get("public_key").and_then(|k| k.as_str()).map(String::from));
-        match proposer_pk {
+        match signer_pk {
             Some(pk) if block.verify_proposer_signature(&pk) => {}
             Some(_) => {
                 return Err(format!(
-                    "Proposer signature invalid or missing on block #{} from {}",
-                    block.header.height, block.header.proposer_id
+                    "Proposer signature invalid or missing on block #{} (signer {})",
+                    block.header.height, signer
                 ));
             }
             None => {
                 return Err(format!(
-                    "Cannot resolve proposer {} public key to authenticate block #{}",
-                    block.header.proposer_id, block.header.height
+                    "Cannot resolve signer {} public key to authenticate block #{}",
+                    signer, block.header.height
                 ));
             }
         }

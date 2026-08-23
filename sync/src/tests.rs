@@ -32,7 +32,8 @@ mod tests {
             "0x1::account::AccountData".to_string(),
         );
         sync.storage.put_object(&account).unwrap();
-        block.sign_proposer(&key);
+        let signer = block.header.proposer_id.clone();
+        block.sign_proposer(&key, &signer);
     }
 
     fn setup_sync(name: &str) -> ChainSync {

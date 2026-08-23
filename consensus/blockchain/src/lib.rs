@@ -50,6 +50,15 @@ pub struct Block {
     /// rejects unsigned/mis-signed blocks before execution.
     #[serde(default)]
     pub proposer_signature: String,
+    /// Validator address whose key produced `proposer_signature`. EVERY
+    /// validator deterministically builds EVERY block, so the signer is the
+    /// node that built this copy — not necessarily the anchor leader named in
+    /// `header.proposer_id`. Binding to the leader's key (the first cut) meant a
+    /// block could only be synced from the leader itself: 98 rejections in one
+    /// catch-up, and a dead leader's blocks would be unsyncable. Sync requires
+    /// the signer to be an active validator.
+    #[serde(default)]
+    pub proposer_signer: String,
     /// RE-AUDIT HIGH (slash determinism): self-authenticating slash evidence
     /// items (JSON). `{"kind":"downtime", offender, epoch, attestations:[signed
     /// attestations...]}` or `{"kind":"equivocation", offender, round,
@@ -62,10 +71,11 @@ pub struct Block {
 
 impl Block {
     /// Sign `header.hash` as the proposer (same Ed25519 scheme as vertices).
-    pub fn sign_proposer(&mut self, secret_key: &ed25519_dalek::SigningKey) {
+    pub fn sign_proposer(&mut self, secret_key: &ed25519_dalek::SigningKey, signer: &str) {
         use ed25519_dalek::Signer;
         let sig = secret_key.sign(self.header.hash.as_bytes());
         self.proposer_signature = hex::encode(sig.to_bytes());
+        self.proposer_signer = signer.to_string();
     }
 
     /// Verify `proposer_signature` against the proposer's Ed25519 public key
@@ -248,6 +258,7 @@ impl Block {
             committed_vertices,
             anchor_hash,
             proposer_signature: String::new(),
+            proposer_signer: String::new(),
             slash_evidence,
         }
     }
@@ -548,7 +559,7 @@ mod bft_time_tests {
             vec!["v".into()], "v".into(), vec![],
         );
         assert!(!b.verify_proposer_signature(&pk), "unsigned must NOT verify");
-        b.sign_proposer(&key);
+        b.sign_proposer(&key, "proposer");
         assert!(b.verify_proposer_signature(&pk));
         assert!(!b.verify_proposer_signature(&other_pk), "wrong key must not verify");
         // Tampering with the body after signing breaks the binding via the hash.
