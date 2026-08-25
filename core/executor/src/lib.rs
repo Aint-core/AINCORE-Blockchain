@@ -722,6 +722,31 @@ pub struct Transaction {
     pub zkp_proof: Option<String>, // Optional: STARK proof for computation (hex encoded)
 }
 
+/// Result of asking the executor to execute a block AT a height.
+///
+/// ROOT-CAUSE FIX (2026-08-25 burn-in): `sys:state_root` is a CHAIN —
+/// `H(prev_root || writes)` — and TWO paths execute blocks into it: ChainSync's
+/// import and the local commit loop. The block lock only covered execution, so
+/// when a node fell behind, sync could execute height H while the local loop was
+/// still building H-1; the local block's header then captured a root that
+/// already contained H's work. Observed live: the epoch advance for height 6640
+/// landed inside the block stored as 6639, permanently offsetting that node's
+/// prev_hash chain (51k "Parent hash mismatch" rejections, chain split 3 ways
+/// with zero transactions). Heights are now executed strictly one at a time, in
+/// order, enforced INSIDE the lock — so double execution is unrepresentable
+/// rather than merely unlikely.
+#[derive(Debug)]
+pub enum BlockExecOutcome {
+    /// The height was executed by this call; state root advanced.
+    Executed(BlockExecutionSummary),
+    /// Another path already executed this height. The caller must NOT build or
+    /// persist a block for it.
+    AlreadyExecuted { last_executed: u64 },
+    /// The chain state is behind the requested height; executing would skip a
+    /// block. The caller must let sync fill the gap first.
+    Gap { expected: u64, got: u64 },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlockExecutionSummary {
     pub state_root: String,
@@ -1574,13 +1599,39 @@ impl Executor {
     /// paths (dag commit loop, chain sync) must use
     /// [`Self::execute_block_parallel_at`] with the EXPLICIT height of the block
     /// being executed — see that method's doc for why.
+    /// Highest height whose execution has been consumed. Falls back to the
+    /// chain height for a chain that predates the marker.
+    pub fn last_executed_height(&self) -> u64 {
+        self.db
+            .get("sys:last_executed_height")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(|| self.db.get_chain_height())
+    }
+
+    /// Convenience wrapper for tools and tests: execute the next height in
+    /// order. Production consensus/sync paths call
+    /// [`Self::execute_block_parallel_at`] and handle the outcome explicitly.
     pub fn execute_block_parallel(
         &self,
         txs_json: Vec<String>,
         proposer_hex: &str,
     ) -> BlockExecutionSummary {
-        let height = self.db.get_chain_height().saturating_add(1);
-        self.execute_block_parallel_at(txs_json, proposer_hex, height, &[])
+        let height = self.last_executed_height().saturating_add(1);
+        match self.execute_block_parallel_at(txs_json, proposer_hex, height, &[]) {
+            BlockExecOutcome::Executed(summary) => summary,
+            other => {
+                eprintln!("⚠️ execute_block_parallel: {:?} — returning current roots", other);
+                BlockExecutionSummary {
+                    state_root: self.current_state_root(),
+                    receipts_root: self.receipts_root_for_block(&[]),
+                    gas_charged: 0,
+                    executed_raws: Vec::new(),
+                    tx_count: 0,
+                }
+            }
+        }
     }
 
     /// AUDIT-B4b (epoch determinism): execute a block's transactions AS the
@@ -1605,13 +1656,37 @@ impl Executor {
         block_height: u64,
         // RE-AUDIT HIGH: slash evidence CARRIED BY THE BLOCK (see apply_slash_evidence).
         slash_evidence: &[String],
-    ) -> BlockExecutionSummary {
+    ) -> BlockExecOutcome {
         // SECURITY FIX: Acquire block-level lock to serialize state root calculation.
         // Individual transactions within a block still run in parallel (via Rayon),
         // but two DIFFERENT blocks cannot execute concurrently.
         let _block_lock = BLOCK_EXECUTION_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+
+        // STRICT HEIGHT ORDER (see BlockExecOutcome). Checked INSIDE the lock and
+        // paired with the marker write at the end of this function, so the
+        // check-then-execute is atomic against the other execution path.
+        let last_executed = self.last_executed_height();
+        if block_height <= last_executed {
+            println!(
+                "⏭️  Height {} already executed (last_executed={}) — refusing to execute twice",
+                block_height, last_executed
+            );
+            return BlockExecOutcome::AlreadyExecuted { last_executed };
+        }
+        if block_height > last_executed.saturating_add(1) {
+            eprintln!(
+                "🚨 [SECURITY][EXEC_GAP] refusing to execute height {} with last_executed={} \
+                 — executing out of order would corrupt the state-root chain",
+                block_height, last_executed
+            );
+            return BlockExecOutcome::Gap {
+                expected: last_executed.saturating_add(1),
+                got: block_height,
+            };
+        }
+
         println!(
             "🚀 Starting Parallel Execution for {} transactions...",
             txs_json.len()
@@ -1895,6 +1970,16 @@ impl Executor {
         }
 
 
+        // Mark the height executed. Written INSIDE the block lock, after the root
+        // fold, so "root advanced" and "height consumed" are one atomic step.
+        if let Err(e) = self
+            .db
+            .put("sys:last_executed_height", &block_height.to_string())
+        {
+            eprintln!("❌ FATAL: last_executed_height persist failed: {}", e);
+            panic!("CRITICAL: database write failure - stopping node to prevent state corruption.");
+        }
+
         let summary = BlockExecutionSummary {
             state_root: self.current_state_root(),
             receipts_root: self.receipts_root_for_block(&txs_json),
@@ -1908,7 +1993,7 @@ impl Executor {
             short_hash(&summary.state_root),
             short_hash(&summary.receipts_root)
         );
-        summary
+        BlockExecOutcome::Executed(summary)
     }
 
     /// Phase 2.3 (H-02): promote downtime attestations to pending slashes
@@ -4988,6 +5073,66 @@ mod tests {
         assert!(executor
             .verify_slash_evidence(&item(vec![att(&k1, &r1, true), att(&k2, &r2, true), att(&k3, &off, false)]))
             .is_err());
+    }
+
+    /// ROOT-CAUSE REGRESSION (2026-08-25 burn-in): a height must be executable
+    /// exactly ONCE and only in order. Two paths (ChainSync import and the local
+    /// commit loop) execute into the single `sys:state_root` chain; when a node
+    /// fell behind, sync executed H while the local loop was still building H-1,
+    /// so the local block's header captured a root containing H's work. Live
+    /// result: the epoch advance for height 6640 landed in the block stored as
+    /// 6639, the node's prev_hash chain was permanently offset, and the 4-node
+    /// cluster split three ways with ZERO transactions.
+    #[test]
+    fn test_height_executes_exactly_once_and_only_in_order() {
+        let db = temp_db("exec_height_order");
+        load_stdlib(&db);
+        db.set_federation_key("00000000000000000000000000000000").unwrap();
+        let executor = Executor::new(db.clone());
+        let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
+
+        assert_eq!(executor.last_executed_height(), 0, "fresh chain starts at 0");
+
+        // In-order execution advances the marker and the root chain.
+        let root0 = executor.current_state_root();
+        let s1 = match executor.execute_block_parallel_at(vec![], proposer, 1, &[]) {
+            BlockExecOutcome::Executed(s) => s,
+            other => panic!("height 1 must execute: {:?}", other),
+        };
+        assert_eq!(executor.last_executed_height(), 1);
+
+        // Re-executing the SAME height is refused — this is the double execution
+        // that corrupted the root chain live.
+        match executor.execute_block_parallel_at(vec![], proposer, 1, &[]) {
+            BlockExecOutcome::AlreadyExecuted { last_executed } => {
+                assert_eq!(last_executed, 1)
+            }
+            other => panic!("re-executing height 1 must be refused, got {:?}", other),
+        }
+        assert_eq!(
+            executor.current_state_root(),
+            s1.state_root,
+            "a refused re-execution must not move the state root"
+        );
+
+        // Skipping ahead is refused: executing out of order corrupts the chain.
+        match executor.execute_block_parallel_at(vec![], proposer, 3, &[]) {
+            BlockExecOutcome::Gap { expected, got } => {
+                assert_eq!((expected, got), (2, 3))
+            }
+            other => panic!("height 3 after 1 must be a Gap, got {:?}", other),
+        }
+        assert_eq!(executor.last_executed_height(), 1, "a refused gap consumes nothing");
+
+        // The next height in order still works afterwards.
+        match executor.execute_block_parallel_at(vec![], proposer, 2, &[]) {
+            BlockExecOutcome::Executed(_) => {}
+            other => panic!("height 2 must execute after 1: {:?}", other),
+        }
+        assert_eq!(executor.last_executed_height(), 2);
+        // Empty blocks legitimately fold nothing, so the root is unchanged here;
+        // the height marker is what makes each height consumable exactly once.
+        assert_eq!(root0, executor.current_state_root());
     }
 
     /// Build a hex-encoded BCS `coin::transfer` payload from `from` to `to`.

@@ -1108,7 +1108,7 @@ impl DagConsensus {
                 // local view and carried by the block; every node verifies it
                 // independently before applying (executor::apply_slash_evidence).
                 let slash_evidence = executor.collect_slash_evidence();
-                let execution_summary = executor.execute_block_parallel_at(
+                let execution_summary = match executor.execute_block_parallel_at(
                     block_txs.clone(),
                     &reward_recipient,
                     // The block being BUILT: one above the current tip. Passed
@@ -1116,7 +1116,36 @@ impl DagConsensus {
                     // block, immune to sync/local interleaving (see executor doc).
                     self.latest_block_height + 1,
                     &slash_evidence,
-                );
+                ) {
+                    executor::BlockExecOutcome::Executed(summary) => summary,
+                    // ROOT-CAUSE FIX: ChainSync already executed this height, so a
+                    // block for it is on our chain, executed and root-verified.
+                    // Building a second one here is exactly what offset this
+                    // node's prev_hash chain in the burn-in. The ordering-engine
+                    // bookkeeping already happened inside try_commit and stands;
+                    // only the duplicate build is abandoned. Re-read the tip so
+                    // the next anchor builds on the synced block.
+                    executor::BlockExecOutcome::AlreadyExecuted { last_executed } => {
+                        println!(
+                            "⏭️  Anchor round {}: height {} already executed by sync (last_executed={}) — skipping duplicate build",
+                            commit.anchor_round,
+                            self.latest_block_height + 1,
+                            last_executed
+                        );
+                        self.reload_chain_tip();
+                        continue;
+                    }
+                    // Our chain state is BEHIND: sync has not filled the gap yet.
+                    // Executing would skip a block and corrupt the root chain.
+                    executor::BlockExecOutcome::Gap { expected, got } => {
+                        eprintln!(
+                            "⏸️  Anchor round {}: execution gap (expected height {}, wanted {}) — waiting for sync",
+                            commit.anchor_round, expected, got
+                        );
+                        self.reload_chain_tip();
+                        continue;
+                    }
+                };
                 // Orphan-loss fix: settle the mempool's loan ledger — only the
                 // transactions that actually EXECUTED leave it; the rest stay
                 // inflight and requeue_stale() returns them to pending later.

@@ -1060,17 +1060,38 @@ impl ChainSync {
             }
 
             // Execute transactions through the VM/Executor
-            let execution_summary = executor
-                .execute_block_parallel_at(
-                    block.transactions.clone(),
-                    &block.header.proposer_id,
-                    // The synced block's own height (epoch determinism — see
-                    // executor::execute_block_parallel_at).
-                    block.header.height,
-                    // RE-AUDIT HIGH: the block's own slash evidence, verified by
-                    // the executor — identical on every node.
-                    &block.slash_evidence,
-                );
+            let execution_summary = match executor.execute_block_parallel_at(
+                block.transactions.clone(),
+                &block.header.proposer_id,
+                // The synced block's own height (epoch determinism — see
+                // executor::execute_block_parallel_at).
+                block.header.height,
+                // RE-AUDIT HIGH: the block's own slash evidence, verified by
+                // the executor — identical on every node.
+                &block.slash_evidence,
+            ) {
+                executor::BlockExecOutcome::Executed(summary) => summary,
+                // ROOT-CAUSE FIX: this height is already executed locally. The
+                // hash-equal dedup above would have skipped an identical block,
+                // so reaching here means the peer offers a DIFFERENT block at an
+                // executed height — a fork. Never execute it, never persist it.
+                executor::BlockExecOutcome::AlreadyExecuted { last_executed } => {
+                    eprintln!(
+                        "🚨 [SECURITY][SYNC_HEIGHT_ALREADY_EXECUTED] peer's block #{} conflicts with \
+                         an already-executed height (last_executed={}) — rejecting this peer's batch",
+                        block.header.height, last_executed
+                    );
+                    break;
+                }
+                // Executing out of order would corrupt the state-root chain.
+                executor::BlockExecOutcome::Gap { expected, got } => {
+                    eprintln!(
+                        "⏸️  [ChainSync] execution gap: expected height {}, peer offered {} — stopping this batch",
+                        expected, got
+                    );
+                    break;
+                }
+            };
             if let Err(e) = self.verify_execution_roots(block, &execution_summary) {
                 // SEC (audit H-3): synced blocks are UNAUTHENTICATED (no proposer
                 // signature — only a self-referential header hash + a public proposer_id
