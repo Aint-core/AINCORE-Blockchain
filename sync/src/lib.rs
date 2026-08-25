@@ -1076,12 +1076,38 @@ impl ChainSync {
                 // so reaching here means the peer offers a DIFFERENT block at an
                 // executed height — a fork. Never execute it, never persist it.
                 executor::BlockExecOutcome::AlreadyExecuted { last_executed } => {
-                    eprintln!(
-                        "🚨 [SECURITY][SYNC_HEIGHT_ALREADY_EXECUTED] peer's block #{} conflicts with \
-                         an already-executed height (last_executed={}) — rejecting this peer's batch",
-                        block.header.height, last_executed
-                    );
-                    break;
+                    // The height is already executed. Two very different cases:
+                    //
+                    // (a) BENIGN RACE — the local commit loop executed this height
+                    //     moments ago and has not persisted its block yet, so the
+                    //     hash-equal dedup above could not see it. Deterministic
+                    //     execution means the peer's block equals ours. Skip just
+                    //     this block and keep consuming the batch; breaking here
+                    //     cost ~25% of blocks a wasted round-trip in the live test.
+                    // (b) FORK — we hold a DIFFERENT block at that height. Never
+                    //     execute or persist it; drop this peer's batch.
+                    let stored = self
+                        .storage
+                        .get(&format!("block_{}", block.header.height))
+                        .ok()
+                        .flatten()
+                        .and_then(|j| serde_json::from_str::<Block>(&j).ok())
+                        .map(|b| b.header.hash);
+                    match stored {
+                        Some(h) if h != block.header.hash => {
+                            eprintln!(
+                                "🚨 [SECURITY][SYNC_HEIGHT_ALREADY_EXECUTED] peer's block #{} hash {} \
+                                 conflicts with our stored {} at an executed height (last_executed={}) \
+                                 — rejecting this peer's batch",
+                                block.header.height, block.header.hash, h, last_executed
+                            );
+                            break;
+                        }
+                        _ => {
+                            last_processed = last_processed.max(block.header.height);
+                            continue;
+                        }
+                    }
                 }
                 // Executing out of order would corrupt the state-root chain.
                 executor::BlockExecOutcome::Gap { expected, got } => {
