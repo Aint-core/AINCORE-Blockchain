@@ -2158,7 +2158,47 @@ impl Executor {
     /// PROPOSER SIDE (pure, no writes): gather self-authenticating slash evidence
     /// from this node's local view so it can be CARRIED BY THE BLOCK. Capped at
     /// 5 items per block (H-4). Every node re-verifies before applying.
+    /// Slash evidence a block may carry.
+    ///
+    /// DIVERGENCE FIX (audit 2026-08-26, CRITICAL — disabled by default).
+    /// Block-carried evidence was introduced (b4bd6c6) to stop slashes being
+    /// decided from per-node gossip state. It moved the nondeterminism instead
+    /// of removing it: `evidence_root` is folded into the header hash, but the
+    /// evidence itself was gathered by scanning THIS node's storage — and EVERY
+    /// validator builds EVERY block. Three independent sources of per-node
+    /// content, all confirmed by the audit:
+    ///   * which `sys:downtime_attestation:*` rows a node holds depends purely
+    ///     on which gossip reached it;
+    ///   * `sys:equiv_seen:*` exists only on nodes that witnessed BOTH
+    ///     conflicting vertices, and recorded vertex_a/vertex_b in ARRIVAL
+    ///     order;
+    ///   * the `>= 5` cap truncates a differently-ordered set on each node.
+    ///
+    /// Any of them yields a different `evidence_root` for the same height, i.e.
+    /// a fork with zero Byzantine participants.
+    ///
+    /// Making this deterministic is a PROTOCOL change, not a patch: evidence has
+    /// to travel through the DAG and be ordered by the commit rule, the way
+    /// transactions are, so every node sees the identical set. Until that
+    /// exists, blocks carry NO evidence and consensus stays deterministic.
+    ///
+    /// Nothing is lost in the meantime: detection still runs and still writes
+    /// the durable `sys:equiv_seen:*` proof rows and the local jail marker, and
+    /// `verify_slash_evidence` / `apply_slash_evidence` are unchanged — so a
+    /// block that legitimately carries evidence (a future protocol version, or
+    /// an operator-driven path) is still verified independently by every node
+    /// before anything is applied. Set AINCORE_BLOCK_SLASH_EVIDENCE=1 to
+    /// re-enable collection for development of that protocol work.
     pub fn collect_slash_evidence(&self) -> Vec<String> {
+        if std::env::var("AINCORE_BLOCK_SLASH_EVIDENCE").as_deref() != Ok("1") {
+            return Vec::new();
+        }
+        self.collect_slash_evidence_nondeterministic()
+    }
+
+    /// The pre-fix collector, kept for the protocol work described above.
+    /// NOT deterministic across nodes — never call it on the block path.
+    fn collect_slash_evidence_nondeterministic(&self) -> Vec<String> {
         use std::collections::{BTreeMap, BTreeSet};
         let mut out: Vec<String> = Vec::new();
         let validators: Vec<(String, u64)> = self

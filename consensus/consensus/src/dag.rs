@@ -1003,6 +1003,9 @@ impl DagConsensus {
                 .lock()
                 .expect("🚨 FATAL: Round index lock poisoned");
             // B4: stake-aware set so the commit-side quorum is stake-weighted.
+            // Belt-and-braces with reload_chain_tip above: never decide an anchor
+            // from a validator set that a synced block may have just changed.
+            self.invalidate_validators_cache();
             let validators = self.get_validator_set_with_stake();
 
             engine.try_commit(vertex.round, &dag, &round_idx, &validators)
@@ -1683,11 +1686,20 @@ impl DagConsensus {
 
         // Durable, self-contained evidence (plain KV — never a `vertex:{hash}`
         // row, so DAG pruning cannot destroy it: closes #10).
+        // CANONICAL ORDER (audit 2026-08-26): record the pair ordered by vertex
+        // hash, never by arrival. Two nodes that both witness the same
+        // equivocation otherwise store byte-different proofs — harmless while
+        // the row is node-local, a fork the moment evidence is block-carried.
+        let (first, second) = if proof_a.hash <= proof_b.hash {
+            (proof_a, proof_b)
+        } else {
+            (proof_b, proof_a)
+        };
         let evidence = serde_json::json!({
             "offender": offender,
             "round": round,
-            "vertex_a": proof_a,
-            "vertex_b": proof_b,
+            "vertex_a": first,
+            "vertex_b": second,
         });
         let _ = self.storage.put(&seen_key, &evidence.to_string());
 
@@ -2166,6 +2178,16 @@ impl DagConsensus {
             );
             self.latest_block_height = new_height;
             self.latest_block_hash = new_hash;
+            // DIVERGENCE FIX (audit 2026-08-26, CRITICAL): the validator-set cache
+            // used to be invalidated ONLY when this node BUILT a block. A node
+            // catching up applies the very same slash/stake change to storage via
+            // ChainSync but never rebuilt, so it kept a STALE (addr,stake) list —
+            // and that list decides the anchor LEADER (hashed whole into
+            // leader_for_round), the reward recipient, the BFT-time stake weights
+            // and the >2/3 commit threshold. Two honest nodes then produce
+            // different proposer_id / timestamp / state_root for the same anchor.
+            // The tip advancing is exactly the moment the set may have changed.
+            self.invalidate_validators_cache();
 
             // LIVENESS (burn-in finding): every synced block above the last
             // adopted height carries the network's committed vertex sequence for
