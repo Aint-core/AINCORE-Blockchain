@@ -1034,7 +1034,9 @@ impl DagConsensus {
                 commit.sequence.len()
             );
 
-            let executor = &self.executor;
+            // Clone the Arc so the borrow of `self.executor` ends here: the
+            // anchor-placement retry below needs `&mut self` for reload_chain_tip.
+            let executor = std::sync::Arc::clone(&self.executor);
             let mut block_txs = Vec::new();
             let reward_recipient = commit.leader.clone(); // C-10 FIX: Reward the anchor leader deterministically
 
@@ -1108,43 +1110,72 @@ impl DagConsensus {
                 // local view and carried by the block; every node verifies it
                 // independently before applying (executor::apply_slash_evidence).
                 let slash_evidence = executor.collect_slash_evidence();
-                let execution_summary = match executor.execute_block_parallel_at(
-                    block_txs.clone(),
-                    &reward_recipient,
-                    // The block being BUILT: one above the current tip. Passed
-                    // explicitly so the epoch boundary is a pure function of this
-                    // block, immune to sync/local interleaving (see executor doc).
-                    self.latest_block_height + 1,
-                    &slash_evidence,
-                ) {
-                    executor::BlockExecOutcome::Executed(summary) => summary,
-                    // ROOT-CAUSE FIX: ChainSync already executed this height, so a
-                    // block for it is on our chain, executed and root-verified.
-                    // Building a second one here is exactly what offset this
-                    // node's prev_hash chain in the burn-in. The ordering-engine
-                    // bookkeeping already happened inside try_commit and stands;
-                    // only the duplicate build is abandoned. Re-read the tip so
-                    // the next anchor builds on the synced block.
-                    executor::BlockExecOutcome::AlreadyExecuted { last_executed } => {
-                        println!(
-                            "⏭️  Anchor round {}: height {} already executed by sync (last_executed={}) — skipping duplicate build",
-                            commit.anchor_round,
-                            self.latest_block_height + 1,
-                            last_executed
-                        );
-                        self.reload_chain_tip();
-                        continue;
+                // ANCHOR PLACEMENT (burn-in fix): every committed anchor must get
+                // EXACTLY ONE block, and "already done" is decided by ANCHOR ROUND,
+                // never by height. The first cut skipped on height alone, and the
+                // live log shows what that cost: three distinct anchors (12220,
+                // 12224, 12226) were all skipped against the SAME height 5073
+                // because reload_chain_tip had not yet seen sync's writes. Anchor
+                // 12226 therefore never got a block on that node while its peers
+                // placed it at 5075 — the node's anchor->height mapping was off by
+                // one from then on and it hard-forked (23,936 parent-hash
+                // rejections). Retry against the refreshed tip; only treat it as a
+                // duplicate when the chain genuinely already carries this anchor.
+                let mut placed: Option<executor::BlockExecutionSummary> = None;
+                let mut already_on_chain = false;
+                for _attempt in 0..4 {
+                    match executor.execute_block_parallel_at(
+                        block_txs.clone(),
+                        &reward_recipient,
+                        // The block being BUILT: one above the current tip.
+                        self.latest_block_height + 1,
+                        &slash_evidence,
+                    ) {
+                        executor::BlockExecOutcome::Executed(summary) => {
+                            placed = Some(summary);
+                            break;
+                        }
+                        executor::BlockExecOutcome::AlreadyExecuted { last_executed } => {
+                            self.reload_chain_tip();
+                            if commit.anchor_round <= self.latest_block_round {
+                                println!(
+                                    "⏭️  Anchor round {} already on chain via sync (tip round {}, last_executed={})",
+                                    commit.anchor_round, self.latest_block_round, last_executed
+                                );
+                                already_on_chain = true;
+                                break;
+                            }
+                            // Height was taken by a DIFFERENT anchor's block: our
+                            // anchor still needs one. Retry at the refreshed tip.
+                        }
+                        executor::BlockExecOutcome::Gap { expected, got } => {
+                            eprintln!(
+                                "⏸️  Anchor round {}: execution gap (expected height {}, wanted {}) — refreshing tip",
+                                commit.anchor_round, expected, got
+                            );
+                            self.reload_chain_tip();
+                            if commit.anchor_round <= self.latest_block_round {
+                                already_on_chain = true;
+                                break;
+                            }
+                        }
                     }
-                    // Our chain state is BEHIND: sync has not filled the gap yet.
-                    // Executing would skip a block and corrupt the root chain.
-                    executor::BlockExecOutcome::Gap { expected, got } => {
-                        eprintln!(
-                            "⏸️  Anchor round {}: execution gap (expected height {}, wanted {}) — waiting for sync",
-                            commit.anchor_round, expected, got
-                        );
-                        self.reload_chain_tip();
-                        continue;
-                    }
+                }
+                if already_on_chain {
+                    continue;
+                }
+                let Some(execution_summary) = placed else {
+                    // The anchor could not be placed. It is committed in the
+                    // ordering engine but has no block, so this node's
+                    // anchor->height mapping is about to diverge from the
+                    // network's. Never silent: this alarm is what turns a
+                    // multi-hour undetected fork into an immediate signal.
+                    eprintln!(
+                        "🚨 [SECURITY][ANCHOR_DROPPED] anchor round {} committed but no block could be \
+                         placed (tip height {}, tip round {}) — this node will diverge",
+                        commit.anchor_round, self.latest_block_height, self.latest_block_round
+                    );
+                    continue;
                 };
                 // Orphan-loss fix: settle the mempool's loan ledger — only the
                 // transactions that actually EXECUTED leave it; the rest stay
