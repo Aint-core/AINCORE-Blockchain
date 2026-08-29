@@ -101,7 +101,7 @@ User TX
 
 | Module | Fungsi |
 |--------|--------|
-| `lib.rs` | hash(SHA256), verify_signature(Ed25519), derive_address (16 byte = 32 hex) |
+| `lib.rs` | hash(SHA256), verify_signature(Ed25519), derive_address (32 byte = 64 hex) |
 | `ecdsa.rs` | ECDSACrypto, ECDSAError |
 | `bls/` | BLSEngine, aggregate BLS |
 | `threshold/threshold_bls.rs` | ThresholdBLS, PartialSignature, aggregate_bls |
@@ -113,7 +113,7 @@ User TX
 | `accumulator/` | Merkle accumulator untuk light clients |
 | `multi_sig.rs` | MultiSigVerifier, SignatureScheme |
 
-**Address derivation:** `hex(SHA256(pubkey)[0..16])` = 32 char hex string
+**Address derivation:** `hex(SHA256(pubkey))` = 64 char hex string (full 32-byte digest, NOT truncated)
 
 ---
 

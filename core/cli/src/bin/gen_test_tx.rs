@@ -59,7 +59,7 @@ fn main() {
 
     // 2. Format Keys
     let public_key_hex = hex::encode(verifying_key.to_bytes());
-    // In AINCORE, address is first 16 bytes (32 hex chars) of SHA256 of public key
+    // In AINCORE, address is the full 32-byte SHA256 of the public key (64 hex chars)
     let sender_addr = crypto::derive_address(verifying_key.as_bytes()).unwrap();
 
     // 3. Create Payload
