@@ -2090,6 +2090,367 @@ mod tests {
         assert!(registry.tokens.is_empty());
     }
 
+    // ===== DEX: first on-chain exercise of 0x1::dex =====
+
+    fn wbtc_type_tag() -> StructTag {
+        StructTag {
+            address: system_address(),
+            module: Identifier::new("wbtc").expect("valid module"),
+            name: Identifier::new("WBTC").expect("valid struct"),
+            type_params: vec![],
+        }
+    }
+
+    fn ain_type_tag() -> StructTag {
+        StructTag {
+            address: system_address(),
+            module: Identifier::new("staking").expect("valid module"),
+            name: Identifier::new("AincoreCoin").expect("valid struct"),
+            type_params: vec![],
+        }
+    }
+
+    /// dex::canonical_token_names asserts the pair is in lexicographic order of
+    /// the full type name, and "staking::AincoreCoin" sorts before "wbtc::WBTC",
+    /// so AIN is always X and wBTC always Y. Creating the pool the other way
+    /// round aborts on EINVALID_PAIR.
+    fn dex_pair_ty_args() -> Vec<TypeTag> {
+        vec![
+            TypeTag::Struct(Box::new(ain_type_tag())),
+            TypeTag::Struct(Box::new(wbtc_type_tag())),
+        ]
+    }
+
+    fn dex_resource_key(name: &str, pool_addr: &str) -> String {
+        let tag = StructTag {
+            address: system_address(),
+            module: Identifier::new("dex").expect("valid module"),
+            name: Identifier::new(name).expect("valid struct"),
+            type_params: dex_pair_ty_args(),
+        };
+        format!(
+            "resource_{}_{}",
+            parse_move_addr(pool_addr).expect("valid move address"),
+            tag
+        )
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DecodedPool {
+        coin_x: TestCoin,
+        coin_y: TestCoin,
+        lp_supply: u128,
+        fee_bp: u64,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DecodedLpToken {
+        balance: u128,
+    }
+
+    fn read_pool(db: &StateDB, pool_addr: &str) -> DecodedPool {
+        let raw = db
+            .get(&dex_resource_key("LiquidityPool", pool_addr))
+            .expect("pool read")
+            .expect("pool resource exists");
+        bcs::from_bytes(&hex::decode(raw).expect("pool hex")).expect("pool BCS")
+    }
+
+    /// Independent restatement of dex.move's quote_out. If the Move code and this
+    /// disagree, one of them is wrong -- which is the point of asserting against
+    /// it rather than against a number copied out of a previous run.
+    fn reference_quote_out(amount_in: u128, reserve_in: u128, reserve_out: u128, fee_bp: u64) -> u128 {
+        let fee_multiplier = 10_000u128 - fee_bp as u128;
+        let amount_in_with_fee = amount_in * fee_multiplier;
+        let numerator = amount_in_with_fee * reserve_out;
+        let denominator = (reserve_in * 10_000) + amount_in_with_fee;
+        numerator / denominator
+    }
+
+    fn integer_sqrt(y: u128) -> u128 {
+        if y < 4 {
+            return if y == 0 { 0 } else { 1 };
+        }
+        let mut z = y;
+        let mut x = y / 2 + 1;
+        while x < z {
+            z = x;
+            x = (y / x + x) / 2;
+        }
+        z
+    }
+
+    fn send(db: &StateDB, executor: &Executor, key: &SigningKey, addr: &str, payload: &str, seq: u64) {
+        let (updates, _) = executor
+            .execute_transaction(&signed_tx(key, addr, payload, seq, 100_000, 1))
+            .unwrap_or_else(|| panic!("tx seq {} for {} was rejected outright", seq, addr));
+        apply_updates(db, updates);
+    }
+
+    /// 0x1::dex had never executed once on any running chain. Drive the whole
+    /// lifecycle -- create_pool, add_liquidity, swap -- against the real executor
+    /// and check the results against an independent implementation of the CPMM
+    /// formulas, so a wrong constant or a swapped operand cannot pass.
+    #[test]
+    fn test_dex_pool_lifecycle_on_fresh_genesis() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let db = temp_db("dex_lifecycle");
+        let authority_key = SigningKey::from_bytes(&[51u8; 32]);
+        let authority = crypto::derive_address(authority_key.verifying_key().as_bytes()).unwrap();
+        let authority_pubkey = hex::encode(authority_key.verifying_key().as_bytes());
+
+        let path = write_genesis_json("dex_lifecycle", &authority, &authority_pubkey, None, None);
+        std::env::set_var("AINCORE_GENESIS_PATH", &path);
+        let res = initialize_genesis(
+            &db,
+            &stdlib_path(),
+            &authority,
+            &authority_pubkey,
+            &TEST_NODE_IDENTITY,
+        );
+        std::env::remove_var("AINCORE_GENESIS_PATH");
+        res.expect("fresh genesis initializes");
+
+        let lp_key = SigningKey::from_bytes(&[52u8; 32]);
+        let trader_key = SigningKey::from_bytes(&[53u8; 32]);
+        let lp = create_account(&db, &lp_key);
+        let trader = create_account(&db, &trader_key);
+        create_account(&db, &authority_key);
+
+        // Gas is charged at the full gas_limit per transaction, so fund AIN well
+        // clear of both the deposits and the gas the flow below burns.
+        set_coin_store(&db, &lp, 50_000_000);
+        set_coin_store(&db, &trader, 50_000_000);
+        set_coin_store(&db, &authority, 10_000_000);
+
+        let executor = Executor::new(db.clone());
+
+        // Both sides need a WBTC store before they can hold any.
+        let reg_lp = entry_payload(
+            "wbtc",
+            "register",
+            vec![],
+            vec![bcs::to_bytes(&parse_move_addr(&lp).unwrap()).unwrap()],
+        );
+        send(&db, &executor, &lp_key, &lp, &reg_lp, 0);
+        let reg_trader = entry_payload(
+            "wbtc",
+            "register",
+            vec![],
+            vec![bcs::to_bytes(&parse_move_addr(&trader).unwrap()).unwrap()],
+        );
+        send(&db, &executor, &trader_key, &trader, &reg_trader, 0);
+
+        let seed_wbtc = entry_payload(
+            "wbtc",
+            "mint",
+            vec![],
+            vec![
+                bcs::to_bytes(&parse_move_addr(&authority).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_addr(&lp).unwrap()).unwrap(),
+                bcs::to_bytes(&4_000_000u128).unwrap(),
+            ],
+        );
+        send(&db, &executor, &authority_key, &authority, &seed_wbtc, 0);
+        assert_eq!(wbtc_balance(&db, &lp), 4_000_000);
+
+        // create_pool: the pool lives at the creator's address.
+        let create = entry_payload(
+            "dex",
+            "create_pool",
+            dex_pair_ty_args(),
+            vec![bcs::to_bytes(&parse_move_addr(&lp).unwrap()).unwrap()],
+        );
+        send(&db, &executor, &lp_key, &lp, &create, 1);
+        let pool = read_pool(&db, &lp);
+        assert_eq!(pool.coin_x.value, 0);
+        assert_eq!(pool.coin_y.value, 0);
+        assert_eq!(pool.lp_supply, 0);
+        assert_eq!(pool.fee_bp, 30, "fee must be the fixed 30 bp the UI is told to expect");
+
+        // add_liquidity: first deposit locks MINIMUM_LIQUIDITY forever.
+        let (dep_x, dep_y) = (1_000_000u128, 4_000_000u128);
+        let add = entry_payload(
+            "dex",
+            "add_liquidity",
+            dex_pair_ty_args(),
+            vec![
+                bcs::to_bytes(&parse_move_addr(&lp).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_addr(&lp).unwrap()).unwrap(),
+                bcs::to_bytes(&dep_x).unwrap(),
+                bcs::to_bytes(&dep_y).unwrap(),
+                bcs::to_bytes(&0u128).unwrap(),
+            ],
+        );
+        send(&db, &executor, &lp_key, &lp, &add, 2);
+
+        let expected_minted = integer_sqrt(dep_x * dep_y) - 1000;
+        let pool = read_pool(&db, &lp);
+        assert_eq!(pool.coin_x.value, dep_x);
+        assert_eq!(pool.coin_y.value, dep_y);
+        assert_eq!(
+            pool.lp_supply,
+            expected_minted + 1000,
+            "lp_supply must be the minted amount plus the locked minimum, written once"
+        );
+
+        let lp_raw = db
+            .get(&dex_resource_key("LPToken", &lp))
+            .expect("lp token read")
+            .expect("lp token exists");
+        let lp_token: DecodedLpToken =
+            bcs::from_bytes(&hex::decode(lp_raw).expect("hex")).expect("LPToken BCS");
+        assert_eq!(
+            lp_token.balance, expected_minted,
+            "the locked minimum must NOT be credited to the depositor"
+        );
+        assert_eq!(wbtc_balance(&db, &lp), 4_000_000 - dep_y);
+
+        // swap: trader sells AIN for wBTC.
+        let amount_in = 10_000u128;
+        let expected_out = reference_quote_out(amount_in, dep_x, dep_y, 30);
+        assert!(expected_out > 0, "test setup must produce a non-zero quote");
+
+        let swap = entry_payload(
+            "dex",
+            "swap_x_to_y",
+            dex_pair_ty_args(),
+            vec![
+                bcs::to_bytes(&parse_move_addr(&trader).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_addr(&lp).unwrap()).unwrap(),
+                bcs::to_bytes(&amount_in).unwrap(),
+                bcs::to_bytes(&0u128).unwrap(),
+            ],
+        );
+        send(&db, &executor, &trader_key, &trader, &swap, 1);
+
+        assert_eq!(
+            wbtc_balance(&db, &trader),
+            expected_out,
+            "swap output must match the CPMM quote including the 30 bp fee"
+        );
+
+        let after = read_pool(&db, &lp);
+        assert_eq!(after.coin_x.value, dep_x + amount_in);
+        assert_eq!(after.coin_y.value, dep_y - expected_out);
+        assert_eq!(after.lp_supply, pool.lp_supply, "a swap must not mint LP");
+        assert!(
+            after.coin_x.value * after.coin_y.value > dep_x * dep_y,
+            "the fee must leave the invariant strictly larger after a swap"
+        );
+    }
+
+    /// A swap whose min_y_out cannot be met must abort cleanly: the trader keeps
+    /// their input and the pool is untouched. This is the "slippage protection
+    /// actually protects" case the DEX UI depends on.
+    #[test]
+    fn test_dex_swap_respects_min_out_and_refunds_nothing_but_gas() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let db = temp_db("dex_minout");
+        let authority_key = SigningKey::from_bytes(&[61u8; 32]);
+        let authority = crypto::derive_address(authority_key.verifying_key().as_bytes()).unwrap();
+        let authority_pubkey = hex::encode(authority_key.verifying_key().as_bytes());
+
+        let path = write_genesis_json("dex_minout", &authority, &authority_pubkey, None, None);
+        std::env::set_var("AINCORE_GENESIS_PATH", &path);
+        let res = initialize_genesis(
+            &db,
+            &stdlib_path(),
+            &authority,
+            &authority_pubkey,
+            &TEST_NODE_IDENTITY,
+        );
+        std::env::remove_var("AINCORE_GENESIS_PATH");
+        res.expect("fresh genesis initializes");
+
+        let lp_key = SigningKey::from_bytes(&[62u8; 32]);
+        let trader_key = SigningKey::from_bytes(&[63u8; 32]);
+        let lp = create_account(&db, &lp_key);
+        let trader = create_account(&db, &trader_key);
+        create_account(&db, &authority_key);
+        set_coin_store(&db, &lp, 50_000_000);
+        set_coin_store(&db, &trader, 50_000_000);
+        set_coin_store(&db, &authority, 10_000_000);
+
+        let executor = Executor::new(db.clone());
+        for (key, addr) in [(&lp_key, &lp), (&trader_key, &trader)] {
+            let reg = entry_payload(
+                "wbtc",
+                "register",
+                vec![],
+                vec![bcs::to_bytes(&parse_move_addr(addr).unwrap()).unwrap()],
+            );
+            send(&db, &executor, key, addr, &reg, 0);
+        }
+        let seed = entry_payload(
+            "wbtc",
+            "mint",
+            vec![],
+            vec![
+                bcs::to_bytes(&parse_move_addr(&authority).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_addr(&lp).unwrap()).unwrap(),
+                bcs::to_bytes(&4_000_000u128).unwrap(),
+            ],
+        );
+        send(&db, &executor, &authority_key, &authority, &seed, 0);
+
+        let create = entry_payload(
+            "dex",
+            "create_pool",
+            dex_pair_ty_args(),
+            vec![bcs::to_bytes(&parse_move_addr(&lp).unwrap()).unwrap()],
+        );
+        send(&db, &executor, &lp_key, &lp, &create, 1);
+        let add = entry_payload(
+            "dex",
+            "add_liquidity",
+            dex_pair_ty_args(),
+            vec![
+                bcs::to_bytes(&parse_move_addr(&lp).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_addr(&lp).unwrap()).unwrap(),
+                bcs::to_bytes(&1_000_000u128).unwrap(),
+                bcs::to_bytes(&4_000_000u128).unwrap(),
+                bcs::to_bytes(&0u128).unwrap(),
+            ],
+        );
+        send(&db, &executor, &lp_key, &lp, &add, 2);
+
+        let before = read_pool(&db, &lp);
+        let trader_ain_before = coin_balance(&db, &trader);
+
+        // Demand far more output than the curve can give.
+        let swap = entry_payload(
+            "dex",
+            "swap_x_to_y",
+            dex_pair_ty_args(),
+            vec![
+                bcs::to_bytes(&parse_move_addr(&trader).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_addr(&lp).unwrap()).unwrap(),
+                bcs::to_bytes(&10_000u128).unwrap(),
+                bcs::to_bytes(&u128::MAX).unwrap(),
+            ],
+        );
+        let (updates, gas) = executor
+            .execute_transaction(&signed_tx(&trader_key, &trader, &swap, 1, 100_000, 1))
+            .expect("an aborted payload is still a valid, gas-charged transaction");
+        apply_updates(&db, updates);
+
+        let after = read_pool(&db, &lp);
+        assert_eq!(after.coin_x.value, before.coin_x.value, "pool X untouched");
+        assert_eq!(after.coin_y.value, before.coin_y.value, "pool Y untouched");
+        assert_eq!(after.lp_supply, before.lp_supply, "pool LP untouched");
+        assert_eq!(
+            wbtc_balance(&db, &trader),
+            0,
+            "a rejected swap must not deliver output"
+        );
+        assert_eq!(
+            coin_balance(&db, &trader),
+            trader_ain_before - gas,
+            "the trader loses gas and nothing else"
+        );
+    }
+
     // ===== SEC-#30: genesis-hash pin =====
 
     fn computed_identity(db: &StateDB) -> String {
