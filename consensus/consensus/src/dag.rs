@@ -1126,7 +1126,24 @@ impl DagConsensus {
                 // duplicate when the chain genuinely already carries this anchor.
                 let mut placed: Option<executor::BlockExecutionSummary> = None;
                 let mut already_on_chain = false;
-                for _attempt in 0..4 {
+                // Retries are SPACED: the live alarm showed all four attempts
+                // firing inside the same millisecond, each hitting
+                // "height N already executed" because ChainSync had EXECUTED
+                // height N but not yet PERSISTED its block — so reload_chain_tip
+                // kept returning the stale tip and the anchor was dropped a beat
+                // before sync's write landed ("Synced up to block #52" appears on
+                // the very next line). A short wait between attempts lets that
+                // write become visible; total worst case ~2s, which the consensus
+                // ticker (>=500ms) absorbs.
+                for attempt in 0..8 {
+                    if attempt > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        self.reload_chain_tip();
+                        if commit.anchor_round <= self.latest_block_round {
+                            already_on_chain = true;
+                            break;
+                        }
+                    }
                     match executor.execute_block_parallel_at(
                         block_txs.clone(),
                         &reward_recipient,
@@ -1162,6 +1179,17 @@ impl DagConsensus {
                                 break;
                             }
                         }
+                    }
+                }
+                if already_on_chain {
+                    continue;
+                }
+                // Final check before declaring a drop: sync may have persisted the
+                // block during the last wait.
+                if placed.is_none() && !already_on_chain {
+                    self.reload_chain_tip();
+                    if commit.anchor_round <= self.latest_block_round {
+                        already_on_chain = true;
                     }
                 }
                 if already_on_chain {
