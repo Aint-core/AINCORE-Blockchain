@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc; // Force rebuild
 use storage::StateDB;
 
-const GENESIS_VERSION: &str = "phase1-bls-stake-v1";
+const GENESIS_VERSION: &str = "phase1-bls-stake-v2-wbtc-tokenfactory";
 /// SEC-#13: storage key holding the canonical, genesis-pinned epoch-block
 /// interval. The executor reads this FIRST (deterministic across all nodes) and
 /// only falls back to the AINCORE_EPOCH_BLOCK_INTERVAL env var when it is absent
@@ -501,6 +501,20 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
     struct PoolRegistry {
         pools: Vec<PoolInfo>,
     }
+    // Mirror the Move field order of 0x1::wbtc::BridgeConfig and
+    // 0x1::token_factory::TokenRegistry so a datadir missing either resource
+    // fails fast at reopen instead of forking on the first wBTC / token_factory
+    // transaction. Genesis seeds both (added in the v2 bump above).
+    #[derive(serde::Deserialize)]
+    struct WbtcBridgeConfig {
+        authority: AccountAddress,
+        total_minted: u128,
+        total_burned: u128,
+    }
+    #[derive(serde::Deserialize)]
+    struct TokenFactoryRegistry {
+        tokens: Vec<Vec<u8>>,
+    }
 
     fn decode_resource<T: DeserializeOwned>(
         storage: &Arc<StateDB>,
@@ -579,6 +593,10 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
         decode_resource(storage, &system_resource_key("0x1::treasury::Treasury"))?;
     let _dex_registry: PoolRegistry =
         decode_resource(storage, &system_resource_key("0x1::dex::PoolRegistry"))?;
+    let _bridge_config: WbtcBridgeConfig =
+        decode_resource(storage, &system_resource_key("0x1::wbtc::BridgeConfig"))?;
+    let _token_registry: TokenFactoryRegistry =
+        decode_resource(storage, &system_resource_key("0x1::token_factory::TokenRegistry"))?;
 
     // SEC-#30: genesis-hash pin. Fold the canonical genesis markers into one
     // chain-identity digest and, when AINCORE_EXPECTED_GENESIS_HASH is set, refuse
