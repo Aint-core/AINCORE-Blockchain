@@ -268,10 +268,35 @@ Endpoint umum lain: `aincore_sendTransaction`, `aincore_getBalance`,
 - **Determinisme.** Keempat validator menghasilkan blok, state root, dan
   finality digest identik.
 
-## 10. Yang BELUM terbukti — perlakukan dengan hati-hati
+## 10. Status pengujian `dex.move`
 
-- **`dex.move` belum pernah dieksekusi sekali pun di chain berjalan.** Kalian
-  kemungkinan besar akan jadi yang pertama menemukan bugnya. Laporkan apa pun
-  yang aneh, jangan dibungkus workaround.
+Sebelumnya modul ini **belum pernah dieksekusi sekali pun**. Sekarang seluruh
+siklusnya sudah dijalankan lewat executor sungguhan
+(`core/node/src/genesis.rs::test_dex_pool_lifecycle_on_fresh_genesis`):
+`wbtc::register` -> `wbtc::mint` -> `create_pool` -> `add_liquidity` -> `swap`.
+
+Yang sudah terbukti:
+
+- **Rumus swap benar.** Output dicocokkan dengan implementasi CPMM tandingan di
+  Rust, bukan angka hasil run sebelumnya. Contoh nyata: cadangan 1.000.000 AIN /
+  4.000.000 wBTC, masuk 10.000 AIN -> keluar **39.486 wBTC**. Dibuktikan lewat
+  mutasi: kalau fee dibuat 0 hasilnya 39.603 (tes gagal), kalau reserve tertukar
+  hasilnya 2.486 (tes gagal). Jadi fee 30 bp dan urutan operand memang dipakai.
+- **Invarian `k` naik setelah swap** (fee benar-benar mengendap di pool).
+- **MINIMUM_LIQUIDITY terkunci benar** — masuk ke `lp_supply` tapi **tidak**
+  dikreditkan ke LPToken penyetor, dan `lp_supply` ditulis tepat sekali.
+- **Slippage protection bekerja.** `min_y_out` yang mustahil membuat swap abort
+  bersih: cadangan pool tidak berubah, tidak ada output terkirim, dan trader
+  hanya kehilangan gas.
+
+Yang masih perlu perhatian:
+
+- **Urutan pasangan tidak bebas.** `canonical_token_names` mewajibkan urutan
+  leksikografis nama tipe, jadi **AIN selalu X dan wBTC selalu Y**. Memanggil
+  `create_pool<WBTC, AincoreCoin>` akan abort dengan `EINVALID_PAIR`. Kunci ini
+  di SDK kalian, jangan biarkan urutannya ditentukan input user.
+- **`pool_addr` = alamat pembuat pool.** Tidak ada alamat turunan; simpan.
+- Semua di atas diuji **satu proses**, belum di cluster 4 node berjalan (butuh
+  redeploy, Bagian 0/7). Perilaku multi-node belum dikonfirmasi.
 - Belum diuji lintas WAN (semua pengujian di LAN)
 - Slashing sementara dimatikan (alasan: determinisme) — tidak memengaruhi DEX
