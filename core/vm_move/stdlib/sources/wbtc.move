@@ -33,6 +33,10 @@ module 0x1::wbtc {
     /// Initialize the wBTC module with bridge authority
     public entry fun initialize(admin: &signer, bridge_authority: address) {
         let admin_addr = signer::address_of(admin);
+        // mint/burn/update_authority all read BridgeConfig at @0x1, so a config
+        // published anywhere else is unreachable dead state. Pin the address so
+        // this cannot be published to the wrong account.
+        assert!(admin_addr == @0x1, error::permission_denied(ENOT_BRIDGE_AUTHORITY));
         assert!(!exists<BridgeConfig>(admin_addr), error::already_exists(EALREADY_INITIALIZED));
         
         move_to(admin, BridgeConfig {

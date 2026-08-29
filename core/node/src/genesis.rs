@@ -1141,6 +1141,69 @@ pub fn initialize_genesis(
     storage.put(&dex_registry_key, &hex::encode(dex_registry_bytes))?;
     println!("💧 Initialized DEX Pool Registry");
 
+    // === Initialize wBTC Bridge Config ===
+    // wbtc::mint asserts exists<BridgeConfig>(@0x1) before it mints, and
+    // wbtc::initialize needs a 0x1 signer that no keypair can produce. Without
+    // this seed the bridge can never mint, which kills wBTC -- the chain's only
+    // non-AIN coin type, and therefore the only asset a DEX pool can pair AIN
+    // against. Seeded here for the same reason the DEX PoolRegistry is.
+    //
+    // The authority comes from genesis.json (validator #1), never from an env
+    // var: every node runs this function independently, so an env-sourced value
+    // would seed a different authority per node and fork the state root -- the
+    // same hazard SEC-#13 closed for the epoch interval. Rotate it afterwards
+    // with wbtc::update_authority.
+    #[derive(serde::Serialize)]
+    struct BridgeConfig {
+        authority: AccountAddress,
+        total_minted: u128,
+        total_burned: u128,
+    }
+
+    if let Some((first_addr, _)) = genesis_validators.first() {
+        let bridge_config = BridgeConfig {
+            authority: parse_move_addr(first_addr)?,
+            total_minted: 0,
+            total_burned: 0,
+        };
+        let bridge_key = system_resource_key("0x1::wbtc::BridgeConfig");
+        let bridge_bytes = bcs::to_bytes(&bridge_config)?;
+        storage.put(&bridge_key, &hex::encode(bridge_bytes))?;
+        println!(
+            "\u{20bf}  Initialized wBTC BridgeConfig (authority: {})",
+            first_addr
+        );
+    }
+
+    // === Initialize Token Factory Registry ===
+    // create_token, mint, burn, transfer and disable_minting all reach for
+    // borrow_global_mut<TokenRegistry>(@0x1), and token_factory::initialize is a
+    // `public fun` that likewise needs an unobtainable 0x1 signer. Without this
+    // seed every token_factory entry function aborts for the life of the chain.
+    #[derive(serde::Serialize)]
+    struct TokenInfo {
+        token_id: Vec<u8>,
+        name: Vec<u8>,
+        symbol: Vec<u8>,
+        decimals: u8,
+        max_supply: u128,
+        current_supply: u128,
+        creator: AccountAddress,
+        is_mintable: bool,
+        icon_url: Vec<u8>,
+        project_url: Vec<u8>,
+    }
+    #[derive(serde::Serialize)]
+    struct TokenRegistry {
+        tokens: Vec<TokenInfo>,
+    }
+
+    let token_registry = TokenRegistry { tokens: vec![] };
+    let token_registry_key = system_resource_key("0x1::token_factory::TokenRegistry");
+    let token_registry_bytes = bcs::to_bytes(&token_registry)?;
+    storage.put(&token_registry_key, &hex::encode(token_registry_bytes))?;
+    println!("🪙 Initialized Token Factory Registry");
+
     // === FINAL CHECK: SET TOTAL SUPPLY ===
     // Validators (1M) + Treasury (50k)
     let initial_total_supply = total_bootstrap_stake + treasury.reserve.value;
@@ -1856,6 +1919,175 @@ mod tests {
 
         assert_eq!(coin_balance(&db, &sender), 899_750);
         assert_eq!(coin_balance(&db, &recipient), 250);
+    }
+
+    fn entry_payload(
+        module: &str,
+        function: &str,
+        ty_args: Vec<TypeTag>,
+        args: Vec<Vec<u8>>,
+    ) -> String {
+        let call = vm_move::EntryFunctionCall {
+            module: ModuleId::new(
+                system_address(),
+                Identifier::new(module).expect("valid module"),
+            ),
+            function: function.to_string(),
+            ty_args,
+            args,
+        };
+        hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap())
+    }
+
+    fn wbtc_store_key(address: &str) -> String {
+        let wbtc = StructTag {
+            address: system_address(),
+            module: Identifier::new("wbtc").expect("valid module"),
+            name: Identifier::new("WBTC").expect("valid struct"),
+            type_params: vec![],
+        };
+        let tag = StructTag {
+            address: system_address(),
+            module: Identifier::new("coin").expect("valid module"),
+            name: Identifier::new("CoinStore").expect("valid struct"),
+            type_params: vec![TypeTag::Struct(Box::new(wbtc))],
+        };
+        format!(
+            "resource_{}_{}",
+            parse_move_addr(address).expect("valid move address"),
+            tag
+        )
+    }
+
+    fn wbtc_balance(db: &StateDB, address: &str) -> u128 {
+        let value = db
+            .get(&wbtc_store_key(address))
+            .expect("wbtc store read")
+            .expect("wbtc store exists");
+        bcs::from_bytes::<TestCoin>(&hex::decode(value).expect("wbtc store hex"))
+            .expect("wbtc store BCS")
+            .value
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DecodedBridgeConfig {
+        authority: AccountAddress,
+        total_minted: u128,
+        total_burned: u128,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DecodedTokenRegistry {
+        tokens: Vec<Vec<u8>>,
+    }
+
+    /// AincoreCoin and WBTC are the only two coin types this chain defines, so
+    /// WBTC is the only asset a DEX pool can pair AIN against. wbtc::mint refuses
+    /// to run unless BridgeConfig lives at @0x1, and wbtc::initialize requires a
+    /// 0x1 signer that no keypair can produce -- so if genesis does not seed the
+    /// resource, wBTC is unmintable for the life of the chain and no pool can ever
+    /// hold liquidity. Mint through the real executor path here, not just a read:
+    /// a correct-looking resource that the VM cannot decode would still be dead.
+    #[test]
+    fn test_fresh_genesis_enables_wbtc_mint() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let db = temp_db("wbtc_mint");
+        let authority_key = SigningKey::from_bytes(&[31u8; 32]);
+        let authority = crypto::derive_address(authority_key.verifying_key().as_bytes()).unwrap();
+        let authority_pubkey = hex::encode(authority_key.verifying_key().as_bytes());
+
+        // Pin the validator set to this key: the seeded bridge authority is
+        // genesis validator #1, and the test has to hold that key to sign a mint.
+        let path = write_genesis_json("wbtc_mint", &authority, &authority_pubkey, None, None);
+        std::env::set_var("AINCORE_GENESIS_PATH", &path);
+        let res = initialize_genesis(
+            &db,
+            &stdlib_path(),
+            &authority,
+            &authority_pubkey,
+            &TEST_NODE_IDENTITY,
+        );
+        std::env::remove_var("AINCORE_GENESIS_PATH");
+        res.expect("fresh genesis initializes");
+
+        let raw = db
+            .get(&system_resource_key("0x1::wbtc::BridgeConfig"))
+            .expect("storage read")
+            .expect("genesis seeds wbtc::BridgeConfig");
+        let cfg: DecodedBridgeConfig = bcs::from_bytes(&hex::decode(raw).expect("hex"))
+            .expect("BridgeConfig decodes in Move field order");
+        assert_eq!(cfg.authority, parse_move_addr(&authority).unwrap());
+        assert_eq!(cfg.total_minted, 0);
+        assert_eq!(cfg.total_burned, 0);
+
+        let holder_key = SigningKey::from_bytes(&[32u8; 32]);
+        let holder = create_account(&db, &holder_key);
+        set_coin_store(&db, &holder, 1_000_000);
+        create_account(&db, &authority_key);
+        set_coin_store(&db, &authority, 1_000_000);
+
+        let executor = Executor::new(db.clone());
+
+        // The signer slot is supplied as an explicit address argument, the same
+        // way transfer_payload passes `sender` for coin::transfer(from: &signer).
+        let register = entry_payload(
+            "wbtc",
+            "register",
+            vec![],
+            vec![bcs::to_bytes(&parse_move_addr(&holder).unwrap()).unwrap()],
+        );
+        let (updates, _) = executor
+            .execute_transaction(&signed_tx(&holder_key, &holder, &register, 0, 100_000, 1))
+            .expect("holder registers a WBTC store");
+        apply_updates(&db, updates);
+
+        let mint = entry_payload(
+            "wbtc",
+            "mint",
+            vec![],
+            vec![
+                bcs::to_bytes(&parse_move_addr(&authority).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_addr(&holder).unwrap()).unwrap(),
+                bcs::to_bytes(&5_000u128).unwrap(),
+            ],
+        );
+        let (updates, _) = executor
+            .execute_transaction(&signed_tx(&authority_key, &authority, &mint, 0, 100_000, 1))
+            .expect("bridge authority mints wBTC through the seeded BridgeConfig");
+        apply_updates(&db, updates);
+
+        assert_eq!(wbtc_balance(&db, &holder), 5_000);
+    }
+
+    /// Every token_factory entry function reaches for TokenRegistry at @0x1 and
+    /// its initialize() is a `public fun` needing the same unobtainable 0x1
+    /// signer, so an unseeded registry means create_token aborts forever.
+    #[test]
+    fn test_fresh_genesis_seeds_token_registry() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let db = temp_db("token_registry");
+        let key = SigningKey::from_bytes(&[33u8; 32]);
+        let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let pubkey = hex::encode(key.verifying_key().as_bytes());
+
+        let path = write_genesis_json("token_registry", &addr, &pubkey, None, None);
+        std::env::set_var("AINCORE_GENESIS_PATH", &path);
+        let res = initialize_genesis(&db, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY);
+        std::env::remove_var("AINCORE_GENESIS_PATH");
+        res.expect("fresh genesis initializes");
+
+        let raw = db
+            .get(&system_resource_key("0x1::token_factory::TokenRegistry"))
+            .expect("storage read")
+            .expect("genesis seeds token_factory::TokenRegistry");
+        let bytes = hex::decode(raw).expect("hex");
+        // An empty Move vector is a single uleb128 zero, so the element type does
+        // not matter for this decode -- only that the registry is present, empty,
+        // and consumes the whole value with nothing trailing.
+        assert_eq!(bytes, vec![0u8]);
+        let registry: DecodedTokenRegistry =
+            bcs::from_bytes(&bytes).expect("TokenRegistry decodes as an empty vector");
+        assert!(registry.tokens.is_empty());
     }
 
     // ===== SEC-#30: genesis-hash pin =====
