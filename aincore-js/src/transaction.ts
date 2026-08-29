@@ -595,8 +595,26 @@ export class Transaction {
         if (!this.chainId) {
             throw new Error('CRITICAL: Chain ID must be explicitly set to prevent replay attacks');
         }
-        // Include sender, chain ID, and sequence number in signature payload
-        const message = `${this.chainId}:${this.sender}:${this.payload}:${this.sequenceNumber}`;
+        // Must match the node byte for byte. Both the mempool gate
+        // (core/mempool/src/lib.rs) and the executor's re-verify
+        // (core/executor/src/lib.rs) rebuild:
+        //   chain_id:sender:payload:sequence_number:gas_limit:gas_price:input_objects
+        // where input_objects is Rust's Vec<String>::join(","), so an empty list
+        // yields the empty string and the message ends with a bare trailing colon.
+        //
+        // This used to sign only the first four fields. Everything built on it
+        // produced signatures the node rejects, because gas_limit, gas_price and
+        // input_objects are bound into the signature (F4) -- leaving them out is
+        // both a malleability hole and, in practice, a total submit failure.
+        const message = [
+            this.chainId,
+            this.sender,
+            this.payload,
+            this.sequenceNumber,
+            this.gasLimit,
+            this.gasPrice,
+            this.inputObjects.join(','),
+        ].join(':');
         this.signature = signer.sign(Buffer.from(message));
         this.publicKey = signer.publicKey;
     }

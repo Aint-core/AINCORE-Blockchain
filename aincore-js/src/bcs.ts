@@ -76,14 +76,22 @@ function writeString(s: string): Uint8Array {
     return writeBytes(encoded);
 }
 
+const ADDRESS_BYTES = 32;
+const ADDRESS_HEX_CHARS = ADDRESS_BYTES * 2;
+
 function writeAddress(hex: string): Uint8Array {
-    // AINCORE addresses are 16 bytes (128-bit)
+    // A Move AccountAddress is 32 bytes. This used to emit 16, which every node
+    // rejects with "Invalid BCS TransactionPayload: remaining input" because the
+    // args deserialize short. Addresses are hex(sha256(pubkey)) -- the FULL
+    // digest, not a truncation.
     const clean = hex.replace(/^0x/, '');
-    if (clean.length !== 32) {
-        throw new Error(`Invalid address length: expected 32 hex chars, got ${clean.length}`);
+    if (clean.length !== ADDRESS_HEX_CHARS) {
+        throw new Error(
+            `Invalid address length: expected ${ADDRESS_HEX_CHARS} hex chars, got ${clean.length}`
+        );
     }
-    const bytes = new Uint8Array(16);
-    for (let i = 0; i < 16; i++) {
+    const bytes = new Uint8Array(ADDRESS_BYTES);
+    for (let i = 0; i < ADDRESS_BYTES; i++) {
         bytes[i] = parseInt(clean.substring(i * 2, i * 2 + 2), 16);
     }
     return bytes;
@@ -105,7 +113,7 @@ function concat(...arrays: Uint8Array[]): Uint8Array {
 // ============================================================
 
 /**
- * Serialize a Move AccountAddress (16 bytes, raw, no length prefix)
+ * Serialize a Move AccountAddress (32 bytes, raw, no length prefix)
  */
 function serializeAccountAddress(hex: string): Uint8Array {
     return writeAddress(hex);
@@ -253,7 +261,7 @@ export function serializeTransactionPayload(payload: TransactionPayload): Uint8A
 // BCS Argument Serializers (for call.args)
 // ============================================================
 
-/** Serialize an AccountAddress as a BCS argument (16 bytes raw) */
+/** Serialize an AccountAddress as a BCS argument (32 bytes raw) */
 export function bcsAddress(hex: string): Uint8Array {
     return writeAddress(hex);
 }
@@ -307,7 +315,8 @@ export function bytesToHex(bytes: Uint8Array): string {
 // AINCORE Constants
 // ============================================================
 
-export const SYSTEM_ADDRESS = '00000000000000000000000000000001';
+export const SYSTEM_ADDRESS =
+    '0000000000000000000000000000000000000000000000000000000000000001';
 
 export const AINCORE_COIN_TYPE: TypeTag = {
     kind: 'Struct',

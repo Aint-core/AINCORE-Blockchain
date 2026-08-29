@@ -63,11 +63,15 @@ export class Keypair {
     }
 
     /**
-     * Get the AINCORE Address (First 16 bytes of SHA256(Public Key))
+     * Get the AINCORE address: the FULL SHA256 of the public key, 32 bytes /
+     * 64 hex chars. It used to be truncated to the first 16 bytes, which does
+     * not match crypto::derive_address on the node -- so the derived address
+     * never equalled the `sender` the node recomputes, and every transaction
+     * was rejected.
      */
     get address(): string {
         const hash = crypto.createHash('sha256').update(this._keypair.publicKey).digest();
-        return hash.subarray(0, 16).toString('hex');
+        return hash.toString('hex');
     }
 
     /**
