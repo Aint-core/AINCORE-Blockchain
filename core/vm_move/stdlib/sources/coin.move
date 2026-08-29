@@ -39,13 +39,19 @@ module 0x1::coin {
     }
 
     /// Register an account to receive coins
+    /// Idempotent on purpose. No RPC can tell a registered-with-zero store apart
+    /// from a missing one, so aborting on a second call forced every client to
+    /// guess whether it needed to register -- and guessing wrong cost the user a
+    /// failed transaction either way. Registering twice is a no-op: the existing
+    /// store is left exactly as it is, never overwritten, so no balance is at
+    /// risk. Callers that genuinely need to branch on existence have has_store.
     public entry fun register<CoinType>(account: &signer) {
         let addr = signer::address_of(account);
-        assert!(!exists<CoinStore<CoinType>>(addr), error::already_exists(EALREADY_INITIALIZED));
-        
-        move_to(account, CoinStore<CoinType> {
-            coin: Coin { value: 0 }
-        });
+        if (!exists<CoinStore<CoinType>>(addr)) {
+            move_to(account, CoinStore<CoinType> {
+                coin: Coin { value: 0 }
+            });
+        };
     }
 
     /// Deposit coins into an account

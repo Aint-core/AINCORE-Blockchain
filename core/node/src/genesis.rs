@@ -2340,6 +2340,75 @@ mod tests {
         );
     }
 
+    /// coin::register used to abort when the store already existed, which was a
+    /// trap: no RPC can tell "registered with zero" apart from "not registered",
+    /// so every client had to guess, and guessing wrong cost a failed tx either
+    /// way. It is idempotent now -- and the property that actually matters is
+    /// that a second register does not wipe the balance already sitting there.
+    #[test]
+    fn test_coin_register_is_idempotent_and_preserves_balance() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let db = temp_db("register_idempotent");
+        let authority_key = SigningKey::from_bytes(&[71u8; 32]);
+        let authority = crypto::derive_address(authority_key.verifying_key().as_bytes()).unwrap();
+        let authority_pubkey = hex::encode(authority_key.verifying_key().as_bytes());
+
+        let path = write_genesis_json("register_idem", &authority, &authority_pubkey, None, None);
+        std::env::set_var("AINCORE_GENESIS_PATH", &path);
+        let res = initialize_genesis(
+            &db,
+            &stdlib_path(),
+            &authority,
+            &authority_pubkey,
+            &TEST_NODE_IDENTITY,
+        );
+        std::env::remove_var("AINCORE_GENESIS_PATH");
+        res.expect("fresh genesis initializes");
+
+        let holder_key = SigningKey::from_bytes(&[72u8; 32]);
+        let holder = create_account(&db, &holder_key);
+        set_coin_store(&db, &holder, 10_000_000);
+        create_account(&db, &authority_key);
+        set_coin_store(&db, &authority, 10_000_000);
+
+        let executor = Executor::new(db.clone());
+        let reg = entry_payload(
+            "wbtc",
+            "register",
+            vec![],
+            vec![bcs::to_bytes(&parse_move_addr(&holder).unwrap()).unwrap()],
+        );
+
+        send(&db, &executor, &holder_key, &holder, &reg, 0);
+        assert_eq!(wbtc_balance(&db, &holder), 0);
+
+        let mint = entry_payload(
+            "wbtc",
+            "mint",
+            vec![],
+            vec![
+                bcs::to_bytes(&parse_move_addr(&authority).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_addr(&holder).unwrap()).unwrap(),
+                bcs::to_bytes(&7_777u128).unwrap(),
+            ],
+        );
+        send(&db, &executor, &authority_key, &authority, &mint, 0);
+        assert_eq!(wbtc_balance(&db, &holder), 7_777);
+
+        // Register a second time on a funded store. Must succeed, and must leave
+        // the balance completely alone.
+        send(&db, &executor, &holder_key, &holder, &reg, 1);
+        assert_eq!(
+            wbtc_balance(&db, &holder),
+            7_777,
+            "a repeat register must never overwrite a funded store"
+        );
+
+        // And a third time, so the client can call it unconditionally forever.
+        send(&db, &executor, &holder_key, &holder, &reg, 2);
+        assert_eq!(wbtc_balance(&db, &holder), 7_777);
+    }
+
     /// A swap whose min_y_out cannot be met must abort cleanly: the trader keeps
     /// their input and the pool is untouched. This is the "slippage protection
     /// actually protects" case the DEX UI depends on.
