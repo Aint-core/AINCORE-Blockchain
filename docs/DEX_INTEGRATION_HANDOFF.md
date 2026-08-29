@@ -9,11 +9,14 @@ Rantai target saat ini (testnet internal):
 |---|---|
 | Chain ID | `AINCORE-LOCALTEST-3V` |
 | Validator | 4 (r1/r2 di NAS `192.168.18.202`, r3/r4 di Pi `192.168.18.66`) |
-| RPC | r1 `:8201`, r2 `:8205`, r3 `:8203`, r4 `:8206` — **terikat localhost** |
+| RPC untuk aplikasi | **`http://192.168.18.202:8201/rpc`** (r1, terbuka ke LAN `192.168.18.0/24`) |
+| RPC node lain | r2 `:8205`, r3 `:8203`, r4 `:8206` — tetap localhost-only |
 | Waktu blok | ~3 detik (tick 1500 ms, anchor di ronde genap) |
 
-> RPC belum bisa dijangkau dari luar mesin validator. Ini pekerjaan operasional
-> di sisi chain — lihat **Bagian 7**.
+> Sudah diuji dari mesin lain di LAN: `aincore_getStatus`, `aincore_getDexPools`,
+> `aincore_getGasPrice`, `aincore_getSupply` semuanya menjawab. Rate limit 100
+> req/detik (burst 200). CORS bawaan mengizinkan origin `localhost:3000` dan
+> `localhost:5173`, jadi dev server di port itu bisa langsung memanggil.
 
 ---
 
@@ -234,9 +237,10 @@ Endpoint umum lain: `aincore_sendTransaction`, `aincore_getBalance`,
 
 ## 7. Yang perlu diminta ke sisi chain
 
-1. **Endpoint RPC publik.** RPC masih terikat localhost tiap validator.
-   Pekerjaan operasional (reverse proxy / binding), bukan pekerjaan aplikasi.
+1. ~~Endpoint RPC~~ — **selesai**, `http://192.168.18.202:8201/rpc` terbuka ke
+   LAN. Kalau nanti butuh dari luar LAN, itu permintaan terpisah.
 2. **Redeploy dengan genesis baru**, supaya `wbtc::mint` hidup (Bagian 0).
+   Ini yang menghalangi uji likuiditas sungguhan. Belum dilakukan.
 3. Opsional: memperluas auto-register agar mencakup jalur DEX (Bagian 2).
 
 ---
