@@ -337,7 +337,7 @@ export function structTypeTag(
     return {
         kind: 'Struct',
         value: {
-            address: address.replace(/^0x/, '').padStart(32, '0'),
+            address: address.replace(/^0x/, '').padStart(ADDRESS_HEX_CHARS, '0'),
             module,
             name,
             typeParams,

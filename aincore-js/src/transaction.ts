@@ -146,7 +146,19 @@ export class Transaction {
      * Register as a validator
      * Calls: 0x1::staking::join_validator_set(account, stake_amount, public_key)
      */
-    static createRegisterValidator(sender: Keypair, stakeAmount: bigint, sequenceNumber: number = 0): Transaction {
+    /// 0x1::staking::join_validator_set takes FIVE args: account, stake,
+    /// public_key, bls_public_key, bls_pop. The old helper sent only three and
+    /// the node rejected every call with NUMBER_OF_ARGUMENTS_MISMATCH. The BLS
+    /// proof-of-possession cannot be produced by this SDK (no BLS12-381 signing),
+    /// so blsPublicKey (48 bytes) and blsPop (96 bytes) must be obtained
+    /// out-of-band from the node keygen and passed in; there is no safe default.
+    static createRegisterValidator(
+        sender: Keypair,
+        stakeAmount: bigint,
+        blsPublicKey: Uint8Array,
+        blsPop: Uint8Array,
+        sequenceNumber: number = 0
+    ): Transaction {
         const tx = new Transaction();
         tx.sender = sender.address;
         const pkBytes = hexToBytes(sender.publicKey);
@@ -154,6 +166,8 @@ export class Transaction {
             bcsAddress(sender.address),
             bcsU128(stakeAmount),
             bcsVectorU8(pkBytes),
+            bcsVectorU8(blsPublicKey),
+            bcsVectorU8(blsPop),
         ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
