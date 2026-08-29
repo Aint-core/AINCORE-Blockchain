@@ -689,8 +689,18 @@ impl AINCOREVM {
             .load_function(module, function, ty_args)
             .map_err(|e| anyhow::anyhow!("failed to load function signature: {:?}", e))?;
 
-        let mut signer_count = 0usize;
-        for ty in &instantiation.parameters {
+        // Collect EVERY signer position, not just the leading run. The move-vm
+        // rule that signers must precede other parameters is deprecated for
+        // module version >= 5 and is not enforced at publication, and any account
+        // may publish its own modules (only 0x1 is reserved). So a module can
+        // declare `entry fun f(amount: u128, victim: &signer)`, where the signer
+        // is not leading. Stopping the scan at the first non-signer left that
+        // slot holding CALLER-SUPPLIED bytes, and move-vm builds a signer value
+        // straight from them -- a forged signer for any address the caller names,
+        // which could then be handed to `0x1::coin::transfer` (a public entry fun,
+        // callable cross-module) to move someone else's funds.
+        let mut signer_slots: Vec<usize> = Vec::new();
+        for (idx, ty) in instantiation.parameters.iter().enumerate() {
             let is_signer = match ty {
                 Type::Signer => true,
                 Type::Reference(inner) | Type::MutableReference(inner) => {
@@ -699,17 +709,16 @@ impl AINCOREVM {
                 _ => false,
             };
             if is_signer {
-                signer_count += 1;
-            } else {
-                break;
+                signer_slots.push(idx);
             }
         }
 
-        if args.len() < signer_count {
+        let required = signer_slots.last().map_or(0, |last| last + 1);
+        if args.len() < required {
             anyhow::bail!(
                 "argument count {} is fewer than the {} required signer slots for {}::{}",
                 args.len(),
-                signer_count,
+                required,
                 module,
                 function
             );
@@ -717,8 +726,8 @@ impl AINCOREVM {
 
         let signer_bytes = bcs::to_bytes(&auth_signer)
             .map_err(|e| anyhow::anyhow!("failed to serialize authenticated signer: {}", e))?;
-        for slot in args.iter_mut().take(signer_count) {
-            *slot = signer_bytes.clone();
+        for idx in signer_slots {
+            args[idx] = signer_bytes.clone();
         }
 
         Ok(args)

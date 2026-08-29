@@ -7351,4 +7351,101 @@ mod tests {
         let total: u128 = map.values().sum();
         assert_eq!(total, 1_000);
     }
+
+    /// SECURITY (forged non-leading signer): any account may publish its own
+    /// module, and `bind_signer_args` used to rebind only the LEADING run of
+    /// &signer parameters. A module whose signer is NOT first therefore received
+    /// caller-supplied bytes in that slot, which move-vm turns into a signer for
+    /// any address the caller names -- a forged signer that `0x1::coin::transfer`
+    /// (a public entry fun, callable cross-module) will honour, draining the
+    /// victim. This drives the whole thing through the real transaction path
+    /// (publish tx, then a call tx) against a module compiled to the attacker's
+    /// address, and asserts the victim keeps every coin.
+    ///
+    /// The fixture module (tests/fixtures/nonleading_signer_exploit.move):
+    ///   public entry fun steal<C>(amount: u128, victim: &signer, thief: address)
+    ///       { coin::transfer<C>(victim, thief, amount) }
+    /// is compiled to 0x0e1b4e0d..., the address derived from ATTACKER_SEED, so
+    /// only that key may publish it. If the derivation ever drifts from the
+    /// baked-in bytecode, the address assert below fails loudly rather than the
+    /// publish silently no-opping.
+    #[test]
+    fn security_nonleading_signer_cannot_forge_victim() {
+        const ATTACKER_SEED: [u8; 32] = [91u8; 32];
+        const VICTIM_SEED: [u8; 32] = [92u8; 32];
+
+        let db = temp_db("nonleading_signer_forge");
+        load_stdlib(&db);
+
+        let attacker_key = SigningKey::from_bytes(&ATTACKER_SEED);
+        let victim_key = SigningKey::from_bytes(&VICTIM_SEED);
+        let attacker = create_account(&db, &attacker_key);
+        let victim = create_account(&db, &victim_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+
+        // The exploit bytecode is compiled to the attacker's address; if the seed
+        // ever stops deriving that address the fixture is stale, so pin it.
+        assert_eq!(
+            attacker, "0e1b4e0d165bed857e8a3232ee9865b7001e4e7945887e6f7d149c5807ccaf08",
+            "attacker address drifted from the compiled fixture"
+        );
+
+        // Victim holds real coin; attacker holds enough to pay publish + call gas.
+        set_coin_store(&db, &victim, 1_000_000);
+        set_coin_store(&db, &attacker, 5_000_000);
+
+        let executor = Executor::new(db.clone());
+
+        // 1) Attacker publishes the exploit module.
+        let module_bytes = include_bytes!("../tests/fixtures/nonleading_signer_exploit.mv").to_vec();
+        let publish = vm_move::TransactionPayload::PublishModule(vec![module_bytes]);
+        let publish_hex = hex::encode(bcs::to_bytes(&publish).unwrap());
+        let (updates, _) = executor
+            .execute_transaction(&signed_tx(&attacker_key, &attacker, &publish_hex, 0, 1_000_000, 1))
+            .expect("publish tx accepted");
+        apply_updates(&db, updates);
+
+        // 2) Attacker calls steal(amount, victim, thief=attacker) with the victim
+        //    address sitting in the non-leading signer slot.
+        let ain = move_core_types::language_storage::TypeTag::Struct(Box::new(
+            move_core_types::language_storage::StructTag {
+                address: move_core_types::account_address::AccountAddress::ONE,
+                module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                type_params: vec![],
+            },
+        ));
+        let call = EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                parse_move_address(&attacker).unwrap(),
+                move_core_types::identifier::Identifier::new("exploit").unwrap(),
+            ),
+            function: "steal".to_string(),
+            ty_args: vec![ain],
+            args: vec![
+                bcs::to_bytes(&500_000u128).unwrap(),
+                bcs::to_bytes(&parse_move_address(&victim).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_address(&attacker).unwrap()).unwrap(),
+            ],
+        };
+        let payload = hex::encode(
+            bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap(),
+        );
+        // The call may succeed (signer rebound to attacker -> a self-transfer) or
+        // abort; either outcome is fine. What must hold is that the VICTIM is not
+        // touched. Include it in a block regardless.
+        if let Some((updates, _)) =
+            executor.execute_transaction(&signed_tx(&attacker_key, &attacker, &payload, 1, 1_000_000, 1))
+        {
+            apply_updates(&db, updates);
+        }
+
+        assert_eq!(
+            coin_balance(&db, &victim),
+            1_000_000,
+            "victim balance must be untouched: a non-leading signer slot must never \
+             carry a caller-supplied address"
+        );
+    }
 }
