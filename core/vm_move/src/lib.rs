@@ -642,11 +642,13 @@ impl AINCOREVM {
             MoveAction::CallEntryFunction(call) => {
                 let ident = move_core_types::identifier::Identifier::new(call.function.clone())
                     .map_err(|e| anyhow::anyhow!("invalid function identifier: {}", e))?;
-                // SECURITY (FIX #1): bind &signer slots to the authenticated
+                // SECURITY: bind EVERY &signer slot to the authenticated
                 // principal. move-vm does NOT inject signers; it deserializes a
-                // signer from raw arg bytes. Load the function signature, count
-                // leading signer params, and overwrite those slots with the BCS
-                // of auth_signer so a forged @0x1 (or any) signer is discarded.
+                // signer from raw arg bytes. Load the function signature, find
+                // ALL signer params (not just the leading run -- a non-leading
+                // signer is a real forge vector, see bind_signer_args), and
+                // overwrite each with the BCS of auth_signer so a forged signer
+                // for any address is discarded.
                 let bound_args = Self::bind_signer_args(
                     session,
                     &call.module,
@@ -669,8 +671,8 @@ impl AINCOREVM {
         }
     }
 
-    /// Overwrite the leading signer parameters of an entry function with the
-    /// BCS-serialized authenticated address, so a caller can never forge another
+    /// Overwrite ALL signer parameters of an entry function (leading or not)
+    /// with the BCS-serialized authenticated address, so a caller can never forge another
     /// principal's &signer by supplying crafted argument bytes. In move-vm
     /// aptos-v1.3.0 a signer argument is deserialized from raw bytes via the
     /// Signer layout (== AccountAddress), so bcs::to_bytes(&address) is exactly
@@ -689,27 +691,40 @@ impl AINCOREVM {
             .load_function(module, function, ty_args)
             .map_err(|e| anyhow::anyhow!("failed to load function signature: {:?}", e))?;
 
-        // Collect EVERY signer position, not just the leading run. The move-vm
-        // rule that signers must precede other parameters is deprecated for
-        // module version >= 5 and is not enforced at publication, and any account
-        // may publish its own modules (only 0x1 is reserved). So a module can
-        // declare `entry fun f(amount: u128, victim: &signer)`, where the signer
-        // is not leading. Stopping the scan at the first non-signer left that
-        // slot holding CALLER-SUPPLIED bytes, and move-vm builds a signer value
-        // straight from them -- a forged signer for any address the caller names,
-        // which could then be handed to `0x1::coin::transfer` (a public entry fun,
-        // callable cross-module) to move someone else's funds.
+        // Classify every parameter. A signer value is only safe when it sits in
+        // a REBINDABLE top-level slot -- `signer`, `&signer`, `&mut signer` --
+        // which we overwrite with the authenticated principal. A signer reached
+        // through anything else (vector<signer>, or a type parameter that the
+        // caller instantiated as signer) cannot be rebound: move-vm would
+        // manufacture a fully-usable signer straight from the caller's bytes for
+        // any address they name. That is a forged signer -- handed to
+        // `0x1::coin::transfer` it drains a victim, and forged as @0x1 it passes
+        // the system gate on `coin::deposit_fee_reward` and mints arbitrary AIN.
+        // move-vm does NOT enforce the "signers first / only top-level" rule for
+        // module version >= 5, and any account may publish modules (only 0x1 is
+        // reserved), so we enforce it here: rebind the top-level slots and REJECT
+        // the call outright if a signer hides anywhere else.
         let mut signer_slots: Vec<usize> = Vec::new();
         for (idx, ty) in instantiation.parameters.iter().enumerate() {
-            let is_signer = match ty {
-                Type::Signer => true,
-                Type::Reference(inner) | Type::MutableReference(inner) => {
-                    matches!(**inner, Type::Signer)
+            match ty {
+                Type::Signer => signer_slots.push(idx),
+                Type::Reference(inner) | Type::MutableReference(inner)
+                    if matches!(**inner, Type::Signer) =>
+                {
+                    signer_slots.push(idx)
                 }
-                _ => false,
-            };
-            if is_signer {
-                signer_slots.push(idx);
+                other => {
+                    if Self::type_yields_signer(other, ty_args) {
+                        anyhow::bail!(
+                            "entry function {}::{} parameter {} reaches a signer through a \
+                             non-rebindable position (vector<signer> or a signer-instantiated \
+                             type parameter); refusing to run to prevent a forged signer",
+                            module,
+                            function,
+                            idx
+                        );
+                    }
+                }
             }
         }
 
@@ -731,6 +746,42 @@ impl AINCOREVM {
         }
 
         Ok(args)
+    }
+
+    /// True when a runtime `Type` can materialise a `signer` value somewhere the
+    /// signer-rebinding pass cannot reach: inside a vector, behind a reference to
+    /// such a vector, or through a type parameter the caller instantiated as
+    /// signer. A bare `signer` / `&signer` handed in here (i.e. NOT a top-level
+    /// rebindable slot -- e.g. a vector element) also counts. Struct fields are
+    /// deliberately not traversed: `signer` lacks the `store` ability, so it can
+    /// never be a struct field, and a struct type argument being signer does not
+    /// deserialize any signer value.
+    fn type_yields_signer(
+        ty: &move_vm_types::loaded_data::runtime_types::Type,
+        ty_args: &[move_core_types::language_storage::TypeTag],
+    ) -> bool {
+        use move_vm_types::loaded_data::runtime_types::Type;
+        match ty {
+            Type::Signer => true,
+            Type::Vector(inner)
+            | Type::Reference(inner)
+            | Type::MutableReference(inner) => Self::type_yields_signer(inner, ty_args),
+            Type::TyParam(i) => ty_args
+                .get(*i)
+                .is_some_and(Self::type_tag_yields_signer),
+            _ => false,
+        }
+    }
+
+    /// TypeTag counterpart of `type_yields_signer`, used to resolve a type
+    /// parameter to the concrete type the caller supplied.
+    fn type_tag_yields_signer(tag: &move_core_types::language_storage::TypeTag) -> bool {
+        use move_core_types::language_storage::TypeTag;
+        match tag {
+            TypeTag::Signer => true,
+            TypeTag::Vector(inner) => Self::type_tag_yields_signer(inner),
+            _ => false,
+        }
     }
 
     fn changeset_to_kv(

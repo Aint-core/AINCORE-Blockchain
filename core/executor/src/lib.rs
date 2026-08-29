@@ -7448,4 +7448,84 @@ mod tests {
              carry a caller-supplied address"
         );
     }
+
+    /// SECURITY (forged signer via vector<signer>): the leading/non-leading fix
+    /// only inspected top-level signer slots. A signer reached through a
+    /// composite -- here `vector<signer>` -- was never rebound, so a published
+    /// module could forge @0x1 itself and call coin::deposit_fee_reward, whose
+    /// only guard is `address_of(sys) == @0x1`, minting AincoreCoin from nothing.
+    /// That is unlimited inflation, strictly worse than the drain. This drives it
+    /// through the real publish+call path and asserts no coin is minted.
+    ///
+    /// Fixture (tests/fixtures/vector_signer_mint_forge.move), compiled to the
+    /// attacker address 0e1b4e0d... (seed [91;32]):
+    ///   public entry fun forge_mint(sys: vector<signer>, to: address, amount: u128)
+    ///       { coin::deposit_fee_reward<staking::AincoreCoin>(vector::borrow(&sys,0), to, amount) }
+    #[test]
+    fn security_vector_signer_cannot_forge_system_mint() {
+        const ATTACKER_SEED: [u8; 32] = [91u8; 32];
+
+        let db = temp_db("vector_signer_mint_forge");
+        load_stdlib(&db);
+
+        let attacker_key = SigningKey::from_bytes(&ATTACKER_SEED);
+        let attacker = create_account(&db, &attacker_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        assert_eq!(
+            attacker, "0e1b4e0d165bed857e8a3232ee9865b7001e4e7945887e6f7d149c5807ccaf08",
+            "attacker address drifted from the compiled fixture"
+        );
+
+        // Attacker starts with a known AIN balance and a registered store.
+        set_coin_store(&db, &attacker, 5_000_000);
+        let start = coin_balance(&db, &attacker);
+
+        let executor = Executor::new(db.clone());
+
+        // 1) Publish the vector<signer> mint-forge module.
+        let module_bytes =
+            include_bytes!("../tests/fixtures/vector_signer_mint_forge.mv").to_vec();
+        let publish = vm_move::TransactionPayload::PublishModule(vec![module_bytes]);
+        let publish_hex = hex::encode(bcs::to_bytes(&publish).unwrap());
+        let (updates, _) = executor
+            .execute_transaction(&signed_tx(&attacker_key, &attacker, &publish_hex, 0, 1_000_000, 1))
+            .expect("publish tx accepted");
+        apply_updates(&db, updates);
+
+        // 2) Call forge_mint(vector<signer>=[@0x1], to=attacker, amount=1e9).
+        //    The vector-wrapped signer is the forged @0x1.
+        let one = move_core_types::account_address::AccountAddress::ONE;
+        let call = EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                parse_move_address(&attacker).unwrap(),
+                move_core_types::identifier::Identifier::new("vsigforge").unwrap(),
+            ),
+            function: "forge_mint".to_string(),
+            ty_args: vec![],
+            args: vec![
+                bcs::to_bytes(&vec![one]).unwrap(), // vector<signer> = [@0x1]
+                bcs::to_bytes(&parse_move_address(&attacker).unwrap()).unwrap(),
+                bcs::to_bytes(&1_000_000_000u128).unwrap(),
+            ],
+        };
+        let payload = hex::encode(
+            bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap(),
+        );
+        // Must be rejected by bind_signer_args (vector<signer> is non-rebindable).
+        // Include in a block regardless; the mint must not happen.
+        if let Some((updates, _)) = executor
+            .execute_transaction(&signed_tx(&attacker_key, &attacker, &payload, 1, 1_000_000, 1))
+        {
+            apply_updates(&db, updates);
+        }
+
+        let end = coin_balance(&db, &attacker);
+        assert!(
+            end <= start,
+            "attacker minted AIN via a forged @0x1 signer: {} -> {} (must never increase)",
+            start,
+            end
+        );
+    }
 }
