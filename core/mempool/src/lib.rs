@@ -666,11 +666,23 @@ impl Mempool {
     /// EXECUTED in a committed block; only those leave the loan ledger for good.
     /// Deferred/failed ones stay inflight and come back via `requeue_stale`.
     pub fn mark_executed(&mut self, raws: &[String]) {
+        if raws.is_empty() {
+            return;
+        }
+        let done: std::collections::HashSet<&str> = raws.iter().map(|s| s.as_str()).collect();
         for raw in raws {
             self.inflight.remove(raw);
+            // Also clear the nonce guard: an executed tx must not keep blocking
+            // a resubmission of the same sender:sequence.
+            self.remove_pending_nonce(raw);
             self.meta.remove(raw);
             self.requeue_attempts.remove(raw);
         }
+        // An executed tx can also be sitting in pending_txs (returned by
+        // return_unshipped or requeue_stale, then executed via another
+        // validator's vertex). Without meta it can never be selected again, so
+        // leaving it there pins it forever and it counts against MAX_PENDING_TXS.
+        self.pending_txs.retain(|r| !done.contains(r.as_str()));
     }
 
     /// Return loaned transactions that never executed within `max_age` to the

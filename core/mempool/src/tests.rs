@@ -40,6 +40,40 @@ fn make_test_tx(index: usize) -> String {
     .to_string()
 }
 
+/// A signed tx from a DISTINCT sender per `seed_byte`, all at sequence 0.
+/// Needed where the assertion is about FIFO order: get_pending_transactions
+/// sorts each sender's queue by sequence_number, so same-sender fixtures make
+/// an order assertion pass even when the ordering under test is broken.
+fn make_test_tx_distinct_sender(seed_byte: u8) -> String {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let signing_key = SigningKey::from_bytes(&[seed_byte; 32]);
+    let public_key = hex::encode(signing_key.verifying_key().to_bytes());
+    let sender = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
+    let chain_id =
+        std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+    let payload_struct =
+        vm_move::TransactionPayload::PublishModule(vec![vec![seed_byte; 4]]);
+    let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
+    let message = format!(
+        "{}:{}:{}:{}:{}:{}:{}",
+        chain_id, sender, payload, 0u64, 1000u64, 1u128, ""
+    );
+    let signature = signing_key.sign(message.as_bytes());
+    serde_json::json!({
+        "chain_id": chain_id,
+        "sender": sender,
+        "input_objects": [],
+        "payload": payload,
+        "gas_limit": 1000,
+        "gas_price": 1,
+        "sequence_number": 0,
+        "public_key": public_key,
+        "signature": hex::encode(signature.to_bytes()),
+    })
+    .to_string()
+}
+
 fn make_test_tx_with_payload(index: usize, payload: String) -> String {
     make_test_tx_with_payload_and_gas(index, payload, 1000, 1)
 }
@@ -951,15 +985,19 @@ fn test_inflight_loan_ledger_requeues_orphans_and_settles_executed() {
 
 /// The block builder trims transactions that do not fit the vertex byte budget.
 /// Those raws are still LOANED (get_pending_transactions moved them to
-/// inflight), so they must be handed back intact: same order, still counted
-/// against MAX_REQUEUE_ATTEMPTS, and immediately re-servable. Dropping them
-/// stranded a valid accepted transaction until requeue_stale, and after three
-/// trims deleted it outright.
+/// inflight), so they must be handed back intact and re-servable in their
+/// ORIGINAL payload order.
+///
+/// Uses DISTINCT senders on purpose: with one sender, get_pending_transactions
+/// sorts by sequence_number and the order assertion passes even when the
+/// return order is reversed — the first version of this test did exactly that
+/// and would not have caught the double-reverse bug it was written for.
 #[test]
 fn test_return_unshipped_restores_order_and_preserves_attempts() {
     let mut mempool = Mempool::new();
-    for i in 0..4 {
-        assert!(mempool.add_transaction(make_test_tx(i)).is_ok(), "tx {} accepted", i);
+    let txs: Vec<String> = (0..4).map(|i| make_test_tx_distinct_sender(70 + i)).collect();
+    for (i, t) in txs.iter().enumerate() {
+        assert!(mempool.add_transaction(t.clone()).is_ok(), "tx {} accepted", i);
     }
 
     let loaned = mempool.get_pending_transactions(4);
@@ -967,19 +1005,50 @@ fn test_return_unshipped_restores_order_and_preserves_attempts() {
     assert!(mempool.is_empty(), "loaned txs leave the pending queue");
 
     // The trimmer pops from the TAIL, so the returned slice is in reverse
-    // payload order: [3, 2] for a payload that kept [0, 1].
+    // payload order for a payload that kept [0, 1].
     let trimmed: Vec<String> = vec![loaned[3].clone(), loaned[2].clone()];
     mempool.return_unshipped(&trimmed);
 
     let again = mempool.get_pending_transactions(4);
+    assert_eq!(again.len(), 2, "exactly the two returned txs are re-servable");
     assert_eq!(
         again,
         vec![loaned[2].clone(), loaned[3].clone()],
-        "returned txs must be re-servable in their original payload order"
+        "returned txs must come back in their original payload order"
     );
 
     // A raw that is not on loan is ignored rather than duplicated.
-    let before = mempool.get_pending_transactions(4).len();
-    mempool.return_unshipped(&[make_test_tx(99)]);
-    assert_eq!(mempool.get_pending_transactions(4).len(), before);
+    mempool.return_unshipped(&[make_test_tx_distinct_sender(90)]);
+    assert!(
+        mempool.get_pending_transactions(4).is_empty(),
+        "a raw that was never loaned must not be injected into the queue"
+    );
+}
+
+/// An executed tx must not linger in pending_txs. mark_executed strips `meta`,
+/// and get_pending_transactions only selects raws that HAVE meta, so a raw left
+/// behind is unselectable forever and still counts against MAX_PENDING_TXS.
+#[test]
+fn test_mark_executed_evicts_from_pending_queue() {
+    let mut mempool = Mempool::new();
+    let a = make_test_tx_distinct_sender(80);
+    let b = make_test_tx_distinct_sender(81);
+    assert!(mempool.add_transaction(a.clone()).is_ok());
+    assert!(mempool.add_transaction(b.clone()).is_ok());
+
+    // Loan both out, then return them (as a byte-budget trim would).
+    let loaned = mempool.get_pending_transactions(2);
+    assert_eq!(loaned.len(), 2);
+    mempool.return_unshipped(&loaned);
+    assert!(!mempool.is_empty(), "returned txs are pending again");
+
+    // One of them lands via another validator's vertex.
+    mempool.mark_executed(&[a.clone()]);
+
+    let left = mempool.get_pending_transactions(4);
+    assert_eq!(left, vec![b.clone()], "only the unexecuted tx remains servable");
+    assert!(
+        mempool.is_empty(),
+        "no unselectable raw may be left pinned in pending_txs"
+    );
 }
