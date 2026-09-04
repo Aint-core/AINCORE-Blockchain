@@ -537,6 +537,45 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // VERTEX HASH V2 domain: chain_id + genesis identity, installed once,
+    // BEFORE any vertex is created or verified. Both are identical on every
+    // node of this chain (chain_id from config, identity from genesis state).
+    {
+        // Same precedence as DagConsensus::resolve_chain_id: persisted
+        // sys:chain_id, then AINCORE_CHAIN_ID, then the genesis file. Never a
+        // silent default: a wrong domain would make every vertex we produce
+        // unverifiable by the whole cluster.
+        let chain_id = storage
+            .get("sys:chain_id")
+            .ok()
+            .flatten()
+            .filter(|c| !c.trim().is_empty())
+            .or_else(|| std::env::var("AINCORE_CHAIN_ID").ok().filter(|c| !c.trim().is_empty()))
+            .or_else(|| {
+                std::env::var("AINCORE_GENESIS_PATH")
+                    .ok()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                    .and_then(|j| j.get("chain_id").and_then(|v| v.as_str()).map(String::from))
+                    .filter(|c| !c.trim().is_empty())
+            })
+            .unwrap_or_else(|| {
+                eprintln!("❌ FATAL: chain_id unresolved (sys:chain_id / AINCORE_CHAIN_ID / genesis); refusing to boot");
+                std::process::exit(1);
+            });
+        let genesis_identity = storage
+            .get("genesis_identity")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if genesis_identity.is_empty() {
+            eprintln!("❌ FATAL: genesis_identity missing after genesis init; refusing to boot");
+            std::process::exit(1);
+        }
+        blockchain::set_vertex_domain(&chain_id, &genesis_identity);
+        println!("🔏 Vertex hash domain installed: chain={} genesis={}", chain_id, &genesis_identity[..16]);
+    }
+
     let executor = Arc::new(Executor::new(Arc::clone(&storage)));
     // Phase 2.1 (H-01): use with_storage so PQC (Dilithium5) submissions
     // are verified at the mempool gate against the canonical

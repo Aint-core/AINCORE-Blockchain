@@ -21,7 +21,9 @@
 //!   ❌ Byzantine peer behaviour (covered by the Phase 2.7 gossipsub
 //!      hardening config — separate concern)
 //!
-//! ## What closes the H-02 loop end-to-end (HONEST DECOMPOSITION)
+//! ## What this covers (HONEST DECOMPOSITION) — NOTE: downtime SLASHING is
+//! ## NOT LIVE in protocol v2 (attestation only); these tests exercise the
+//! ## retained, non-live promotion path.
 //!   1. The logic-level simulation in
 //!      `consensus::tests::test_h02_b2_simulated_cross_node_attestation_reaches_quorum`
 //!      proves the message format, signing, verification, storage,

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc; // Force rebuild
 use storage::StateDB;
 
-const GENESIS_VERSION: &str = "phase1-bls-stake-v2-wbtc-tokenfactory";
+const GENESIS_VERSION: &str = "phase1-bls-stake-v3-vertexhash-v2";
 /// SEC-#13: storage key holding the canonical, genesis-pinned epoch-block
 /// interval. The executor reads this FIRST (deterministic across all nodes) and
 /// only falls back to the AINCORE_EPOCH_BLOCK_INTERVAL env var when it is absent
@@ -607,11 +607,13 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
     // markers are read tolerantly so reopening any existing datadir never newly
     // fails when the pin is not in use.
     let chain_id = storage.get("sys:chain_id").ok().flatten().unwrap_or_default();
-    let validator_set_json = storage
-        .get("sys:validator_set:v1")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    // Genesis identity must be a CONSTANT of the chain: hash the FROZEN
+    // genesis snapshot, never the live set (which slashes/joins rewrite).
+    let validator_set_json = storage.get("genesis:validator_set:v1")?.ok_or_else(|| {
+        GenesisError::InvalidData(
+            "genesis:validator_set:v1 missing — datadir predates the frozen genesis snapshot; re-bootstrap".to_string(),
+        )
+    })?;
     // SEC-#13: read tolerantly so reopening a legacy datadir that predates the
     // pin never newly fails — an absent key folds the empty string, exactly as a
     // pre-#13 DB would have hashed.
@@ -628,6 +630,20 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
         &epoch_block_interval,
     );
     println!("🧬 Genesis identity hash: {}", identity);
+    // Persist ONCE so the node can install it as the vertex-hash domain at
+    // boot (blockchain::set_vertex_domain). On reopen it must match exactly:
+    // a changed identity means a different chain (or a tampered datadir), and
+    // installing it would make every vertex this node signs unverifiable.
+    match storage.get("genesis_identity")? {
+        Some(existing) if existing != identity => {
+            return Err(GenesisError::InvalidData(format!(
+                "🚨 [SECURITY] genesis identity changed on reopen: stored {} computed {} — refusing to boot",
+                existing, identity
+            )));
+        }
+        Some(_) => {}
+        None => storage.put("genesis_identity", &identity)?,
+    }
     if let Ok(pin) = std::env::var("AINCORE_EXPECTED_GENESIS_HASH") {
         let pin = pin.trim().to_lowercase();
         if !pin.is_empty() && pin != identity {
@@ -938,6 +954,11 @@ pub fn initialize_genesis(
     // Shape == Vec<consensus::qc::ValidatorInfo> { address, stake, ed25519_public_key, bls_public_key, bls_pop }.
     if let Ok(json) = serde_json::to_string(&v1_validators) {
         storage.put("sys:validator_set:v1", &json)?;
+        // FROZEN genesis snapshot: never rewritten. The genesis identity (and
+        // therefore the vertex-hash domain) is derived from THIS, not from the
+        // live set, so a slash/join/stake change followed by a restart can never
+        // change a node's domain and brick it out of consensus.
+        storage.put("genesis:validator_set:v1", &json)?;
         println!(
             "🔐 sys:validator_set:v1 written: {} validator(s)",
             v1_validators.len()
@@ -2544,8 +2565,10 @@ mod tests {
         let sh = db.get("genesis_stdlib_hash").unwrap().unwrap();
         let v = db.get("genesis_version").unwrap().unwrap();
         let cid = db.get("sys:chain_id").ok().flatten().unwrap_or_default();
+        // Must mirror production: the identity is hashed from the FROZEN
+        // genesis snapshot, never the live set (which slashes/joins rewrite).
         let vs = db
-            .get("sys:validator_set:v1")
+            .get("genesis:validator_set:v1")
             .ok()
             .flatten()
             .unwrap_or_default();
@@ -2588,6 +2611,74 @@ mod tests {
         initialize_genesis(&db1, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY).unwrap();
         initialize_genesis(&db2, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY).unwrap();
         assert_eq!(computed_identity(&db1), computed_identity(&db2));
+    }
+
+    /// RE-AUDIT CRITICAL: the vertex-hash domain is derived from the genesis
+    /// identity. If that identity tracked the LIVE validator set, then any
+    /// join / stake change / slash followed by a restart would give the node a
+    /// DIFFERENT domain — every vertex it signed would hash differently and be
+    /// unverifiable to the rest of the cluster, i.e. the node bricks itself out
+    /// of consensus after the first slash. The identity must be frozen at
+    /// genesis and must not move when the live set changes.
+    #[test]
+    fn test_genesis_identity_is_frozen_against_validator_set_changes() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+        let key = SigningKey::from_bytes(&[77u8; 32]);
+        let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let pubkey = hex::encode(key.verifying_key().as_bytes());
+
+        let db = temp_db("identity_frozen");
+        initialize_genesis(&db, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY).unwrap();
+        let stored = db
+            .get("genesis_identity")
+            .unwrap()
+            .expect("genesis persists the identity for the vertex-hash domain");
+        let frozen = db
+            .get("genesis:validator_set:v1")
+            .unwrap()
+            .expect("genesis freezes the validator-set snapshot");
+
+        // Simulate a slash / join: the LIVE set changes.
+        db.put("sys:validator_set:v1", r#"[{"address":"deadbeef","stake":1}]"#)
+            .unwrap();
+
+        // Reopen: identity must be unchanged, and the frozen snapshot untouched.
+        initialize_genesis(&db, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY)
+            .expect("reopen must succeed after a live validator-set change");
+        assert_eq!(
+            db.get("genesis_identity").unwrap().unwrap(),
+            stored,
+            "genesis identity must NOT track the live validator set"
+        );
+        assert_eq!(
+            db.get("genesis:validator_set:v1").unwrap().unwrap(),
+            frozen,
+            "the frozen genesis snapshot must never be rewritten"
+        );
+    }
+
+    /// A datadir whose stored identity does not match the computed one is a
+    /// different chain (or tampered): boot must refuse rather than silently
+    /// install a domain that makes this node's vertices unverifiable.
+    #[test]
+    fn test_genesis_identity_mismatch_refuses_boot() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+        let key = SigningKey::from_bytes(&[78u8; 32]);
+        let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let pubkey = hex::encode(key.verifying_key().as_bytes());
+
+        let db = temp_db("identity_mismatch");
+        initialize_genesis(&db, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY).unwrap();
+        db.put("genesis_identity", &"00".repeat(32)).unwrap();
+        let err = initialize_genesis(&db, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY)
+            .expect_err("a changed genesis identity must refuse to boot");
+        assert!(
+            format!("{}", err).contains("genesis identity changed"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     /// SEC-#13: genesis writes the canonical epoch-block interval to

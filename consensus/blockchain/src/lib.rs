@@ -59,12 +59,15 @@ pub struct Block {
     /// the signer to be an active validator.
     #[serde(default)]
     pub proposer_signer: String,
-    /// RE-AUDIT HIGH (slash determinism): self-authenticating slash evidence
-    /// items (JSON). `{"kind":"downtime", offender, epoch, attestations:[signed
-    /// attestations...]}` or `{"kind":"equivocation", offender, round,
-    /// vertex_a, vertex_b}`. The proposer collects them from its local view;
-    /// EVERY node verifies them independently before applying, so the block —
-    /// not local gossip state — decides who is slashed and when.
+    /// PROTOCOL v2 (deterministic slashing): self-authenticating equivocation
+    /// evidence items (JSON) `{"kind":"equivocation", offender, round,
+    /// vertex_a, vertex_b}` where both vertices are COMPACT proofs (payload and
+    /// parents stripped, their roots carried). They are NOT collected from any
+    /// node's local view: they ride through the DAG as SLASH_EVIDENCE: vertex
+    /// payload items and are extracted from the COMMITTED sequence, verified
+    /// against on-chain state, deduped and capped -- identically on every node.
+    /// Only "equivocation" is ordered this way; a "downtime" kind is rejected by
+    /// producer and consumer alike.
     #[serde(default)]
     pub slash_evidence: Vec<String>,
 }
@@ -338,6 +341,64 @@ pub struct Vertex {
     /// Aggregated BLS signatures from validators (optional, for committed vertices)
     #[serde(default)]
     pub aggregated_signature: Option<String>,
+    /// COMPACT PROOF ONLY. A vertex that travels as equivocation evidence
+    /// carries its payload's Merkle-style root here and an EMPTY `payload`, so
+    /// the proof is a few hundred bytes regardless of how large the offending
+    /// vertex was (an equivocator could otherwise size its conflicting vertices
+    /// to push every honest reporter's next vertex over the 1 MiB transport
+    /// cap). `calculate_hash` folds this root in, so hash + signature still
+    /// bind the full body. A vertex arriving on the DAG ingress with this set
+    /// is REJECTED (add_vertex): only proofs may use it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_root: Option<String>,
+    /// COMPACT PROOF ONLY (see payload_root). Parents are hashed through this
+    /// root so a proof can strip them too: parents are otherwise unbounded and
+    /// an equivocator could inflate them to make its own evidence undeliverable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parents_root: Option<String>,
+}
+
+/// Domain separation for vertex hashing: (chain_id, genesis_identity). Set once
+/// at node boot AFTER genesis init (see core/node main.rs). Both values are
+/// identical on every node of the same chain, so hashes stay deterministic,
+/// and a validator's vertex from another chain / another genesis of the same
+/// chain_id can never be replayed as "equivocation" here.
+static VERTEX_DOMAIN: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+/// Install the vertex hashing domain. Idempotent; the first caller wins.
+pub fn set_vertex_domain(chain_id: &str, genesis_identity: &str) {
+    let _ = VERTEX_DOMAIN.set((chain_id.to_string(), genesis_identity.to_string()));
+}
+
+/// The installed domain, or empty strings if none was installed (tests).
+pub fn vertex_domain() -> (String, String) {
+    VERTEX_DOMAIN.get().cloned().unwrap_or_default()
+}
+
+/// Root over the payload items: count-prefixed, each item length-prefixed,
+/// domain-separated. Unambiguous -- ["A","B"] and ["AB"] differ -- unlike the
+/// old bare concatenation, which let one validator ship two bodies with the
+/// same hash (one of them splitting a SLASH_EVIDENCE: item off a transaction).
+pub fn parents_root_of(parents: &[String]) -> String {
+    let mut data = Vec::new();
+    data.extend_from_slice(b"AINCORE_PARENTS_V2");
+    data.extend_from_slice(&(parents.len() as u32).to_be_bytes());
+    for p in parents {
+        data.extend_from_slice(&(p.len() as u64).to_be_bytes());
+        data.extend_from_slice(p.as_bytes());
+    }
+    hex::encode(hash(&data))
+}
+
+pub fn payload_root_of(items: &[String]) -> String {
+    let mut data = Vec::new();
+    data.extend_from_slice(b"AINCORE_PAYLOAD_V2");
+    data.extend_from_slice(&(items.len() as u32).to_be_bytes());
+    for it in items {
+        data.extend_from_slice(&(it.len() as u64).to_be_bytes());
+        data.extend_from_slice(it.as_bytes());
+    }
+    hex::encode(hash(&data))
 }
 
 impl Vertex {
@@ -356,9 +417,47 @@ impl Vertex {
             hash: String::new(),
             signature: String::new(),
             aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
         };
         v.hash = v.calculate_hash();
         v
+    }
+
+    /// The parents root this vertex commits to: explicit compact root if
+    /// present, else computed from the parents.
+    pub fn parents_root(&self) -> String {
+        match &self.parents_root {
+            Some(r) => r.clone(),
+            None => parents_root_of(&self.parents),
+        }
+    }
+
+    /// True for a vertex that may live in the DAG: neither proof-only root is
+    /// set. Proofs (compact form) must never be inserted as live vertices --
+    /// they would pass hash recomputation with an arbitrary real body.
+    pub fn is_live_form(&self) -> bool {
+        self.payload_root.is_none() && self.parents_root.is_none()
+    }
+
+    /// The payload root this vertex commits to: the explicit compact root if
+    /// present, else computed from the payload.
+    pub fn payload_root(&self) -> String {
+        match &self.payload_root {
+            Some(r) => r.clone(),
+            None => payload_root_of(&self.payload),
+        }
+    }
+
+    /// A payload-free copy that hashes and verifies identically: the evidence
+    /// form. Safe to gossip and to carry inside another vertex.
+    pub fn to_compact_proof(&self) -> Vertex {
+        let mut c = self.clone();
+        c.payload_root = Some(self.payload_root());
+        c.parents_root = Some(self.parents_root());
+        c.payload = Vec::new();
+        c.parents = Vec::new();
+        c
     }
 
     /// Sign the vertex hash with Ed25519 and set the signature field
@@ -407,18 +506,103 @@ impl Vertex {
     // fundamentally insecure. Per-vertex signing uses Ed25519.
     // BLS aggregate signatures for consensus quorum certificates will be
     // applied externally by DagConsensus using crypto::BLSEngine.
+    /// VERTEX HASH V2. Domain-separated (chain_id + genesis identity) and
+    /// unambiguous (every variable-length field is length-prefixed, lists are
+    /// count-prefixed). The payload enters only through `payload_root()`, so a
+    /// compact proof (payload stripped, root carried) hashes identically to the
+    /// full vertex and the executor can verify equivocation without the bodies.
     pub fn calculate_hash(&self) -> String {
+        let (chain_id, genesis_identity) = vertex_domain();
+        self.calculate_hash_with_domain(&chain_id, &genesis_identity)
+    }
+
+    /// Pure hashing core (testable with explicit domains).
+    pub fn calculate_hash_with_domain(&self, chain_id: &str, genesis_identity: &str) -> String {
         let mut data = Vec::new();
-        data.extend_from_slice(self.round.to_string().as_bytes());
-        data.extend_from_slice(self.author.as_bytes());
-        for p in &self.parents {
-            data.extend_from_slice(p.as_bytes());
-        }
-        for tx in &self.payload {
-            data.extend_from_slice(tx.as_bytes());
-        }
-        data.extend_from_slice(self.timestamp.to_string().as_bytes());
+        let put = |data: &mut Vec<u8>, bytes: &[u8]| {
+            data.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+            data.extend_from_slice(bytes);
+        };
+        data.extend_from_slice(b"AINCORE_VERTEX_V2");
+        put(&mut data, chain_id.as_bytes());
+        put(&mut data, genesis_identity.as_bytes());
+        data.extend_from_slice(&self.round.to_be_bytes());
+        put(&mut data, self.author.as_bytes());
+        put(&mut data, self.parents_root().as_bytes());
+        // Fold the aggregate-signature slot in: it is deserialised from
+        // untrusted gossip and was OUTSIDE the hash, so two byte-different
+        // vertices could share one hash+signature (and a compact proof was not
+        // byte-canonical). Empty when unset, which is the normal case.
+        put(
+            &mut data,
+            self.aggregated_signature.as_deref().unwrap_or("").as_bytes(),
+        );
+        data.extend_from_slice(&self.timestamp.to_be_bytes());
+        put(&mut data, self.payload_root().as_bytes());
         hex::encode(hash(&data))
+    }
+}
+
+#[cfg(test)]
+mod vertex_hash_v2_tests {
+    use super::*;
+
+    fn v(payload: Vec<String>) -> Vertex {
+        let mut x = Vertex {
+            round: 7,
+            author: "a".into(),
+            parents: vec!["genesis".into()],
+            payload,
+            timestamp: 1,
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
+        };
+        x.hash = x.calculate_hash();
+        x
+    }
+
+    /// The old bare concatenation let ["A","B"] and ["AB"] hash identically,
+    /// which is exactly how one validator could ship two bodies under one
+    /// signature (splitting a SLASH_EVIDENCE: item off a transaction).
+    #[test]
+    fn payload_root_is_unambiguous() {
+        assert_ne!(payload_root_of(&["A".into(), "B".into()]), payload_root_of(&["AB".into()]));
+        assert_ne!(v(vec!["A".into(), "B".into()]).hash, v(vec!["AB".into()]).hash);
+        assert_ne!(payload_root_of(&[]), payload_root_of(&["".into()]));
+    }
+
+    /// A compact proof (payload stripped, root carried) must hash and therefore
+    /// verify identically to the full vertex -- that is what lets evidence stay
+    /// tiny no matter how large the offending vertex was.
+    #[test]
+    fn compact_proof_hashes_identically() {
+        let full = v(vec!["tx1".into(), "tx2".into(), "x".repeat(50_000)]);
+        let compact = full.to_compact_proof();
+        assert!(compact.payload.is_empty());
+        assert!(compact.parents.is_empty(), "compact proof strips parents too");
+        assert!(!compact.is_live_form() && full.is_live_form());
+        assert_eq!(compact.payload_root.as_deref(), Some(full.payload_root().as_str()));
+        assert_eq!(compact.calculate_hash(), full.calculate_hash());
+        assert_eq!(compact.hash, full.hash);
+        // (byte-size of the serialized proof is asserted end-to-end in the
+        // executor's compact-proof test, which has serde_json available)
+    }
+
+    /// Same body, different chain or different genesis -> different hash, so a
+    /// validator's vertex from another instance can never be replayed here as
+    /// "equivocation".
+    #[test]
+    fn hash_is_domain_separated() {
+        let x = v(vec!["tx".into()]);
+        let a = x.calculate_hash_with_domain("AINCORE-MAINNET-1", "g1");
+        let b = x.calculate_hash_with_domain("AINCORE-LOCALTEST-3V", "g1");
+        let c = x.calculate_hash_with_domain("AINCORE-MAINNET-1", "g2");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(a, x.calculate_hash_with_domain("AINCORE-MAINNET-1", "g1"));
     }
 }
 

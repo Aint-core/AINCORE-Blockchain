@@ -25,7 +25,7 @@ AINCORE is a high-performance Layer-1 blockchain built entirely in Rust, featuri
 - **DEX:** Built-in AMM (Constant Product x*y=k) with 0.3% fee
 - **DePIN Integration:** Bio-Oracle for real-world data mining (Universal Mining)
 - **Security:** Ed25519 + Dilithium5 (PQC) signatures, ChaCha20-Poly1305 encrypted P2P, full-transaction replay protection
-- **Downtime Detection:** Validators missing 100+ rounds are automatically jailed and slashed
+- **Downtime Detection:** Validators missing 100+ rounds are detected and attested (gossip) but NOT slashed in this protocol version; only equivocation is slashed (100%, deterministic via DAG-carried evidence)
 
 ---
 
@@ -555,7 +555,7 @@ If you wish to stop validating:
 |---|---|---|
 | **Genesis Lock** | Transfers from Genesis address permanently blocked | `executor/src/lib.rs` |
 | **Jail System** | 5% slash + 21-day forced unbonding for misbehavior | `staking.move` |
-| **Downtime Detection** | Auto-slash after 100+ missed rounds | `consensus/dag.rs` |
+| **Downtime Detection** | Detected + attested after 100+ missed rounds; NOT slashed (equivocation only) | `consensus/dag.rs` |
 | **Double-Sign Detection** | Equivocation proof triggers immediate slash | `consensus/dag.rs` |
 | **Replay Protection** | Full transaction signing: `chain_id:sender:payload:seq_num` | `executor/src/lib.rs` |
 | **Chain ID Isolation** | Transactions rejected if chain_id mismatches | `executor/src/lib.rs` |

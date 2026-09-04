@@ -547,7 +547,9 @@ impl OrderingEngine {
         // trails the tip by a handful of rounds.
         const MAX_SCAN: u64 = 10_000;
 
-        'outer: loop {
+        // ONE anchor per call (see step 3): no outer loop -- the caller executes
+        // the returned anchor, re-samples the validator set, and calls again.
+        {
             // Anchors live on EVEN rounds only (see the next_anchor_round doc).
             let start = Self::align_anchor(self.next_anchor_round.max(1));
             // 1. Find the SMALLEST directly-committable anchor round >= cursor.
@@ -564,7 +566,7 @@ impl OrderingEngine {
                 r += 2;
             }
             let Some((r_direct, direct_hash)) = direct else {
-                break;
+                return out;
             };
 
             // 2. Walk BACK from the direct anchor, deciding every round in
@@ -574,13 +576,13 @@ impl OrderingEngine {
             for j in (start..r_direct).rev().filter(|j| j.is_multiple_of(2)) {
                 let chain_round = match dag.get(&chain) {
                     Some(v) => v.round,
-                    None => break 'outer, // cannot happen, but never guess
+                    None => return out, // cannot happen, but never guess
                 };
                 let Some(visited) =
                     Self::walk_history(&chain, j, chain_round, dag, &self.committed_set)
                 else {
                     // HOLE below the chain anchor: not decidable yet.
-                    break 'outer;
+                    return out;
                 };
                 match Self::leader_vertex_hash(j, dag, round_index, validators) {
                     Some(hj) if visited.contains(&hj) => {
@@ -595,20 +597,24 @@ impl OrderingEngine {
                 }
             }
 
-            // 3. Commit in ascending round order, one CommitInfo per anchor.
+            // 3. Commit the LOWEST decidable anchor -- ONE per call.
+            // PROTOCOL (re-audit HIGH): the caller executes this anchor's block
+            // (which may slash / join / leave and rewrite the validator set),
+            // re-samples the set, and calls again. Deciding a whole batch from
+            // one sample let a node that batched [k, k+1] elect k+1's leader
+            // from the PRE-k set while a node that decided k+1 after executing
+            // k used the POST-k set -- different leader/reward -> fork.
             to_commit.reverse();
-            for (anchor_round, anchor_hash) in to_commit {
+            if let Some((anchor_round, anchor_hash)) = to_commit.into_iter().next() {
                 let leader = Self::leader_for_round(anchor_round, validators, 0);
-                let Some(info) =
+                // Incomplete history for this anchor: return nothing, retry
+                // later from the same cursor.
+                if let Some(info) =
                     self.commit_one_anchor(anchor_round, &anchor_hash, leader, dag)
-                else {
-                    // Incomplete history for this anchor: stop, retry later
-                    // from the same cursor.
-                    break 'outer;
-                };
-                out.push(info);
+                {
+                    out.push(info);
+                }
             }
-            // Loop: later rounds may now be decidable too.
         }
         out
     }
@@ -907,7 +913,7 @@ impl OrderingEngine {
     /// concern to be closed by a real delay-VDF, whereas non-determinism here is an
     /// outright safety break. The QC-folded beacon remains available via
     /// `get_random_beacon()` for NON-consensus randomness.
-    fn leader_for_round(round: u64, validators: &[(String, u64)], attempt: u32) -> String {
+    pub(crate) fn leader_for_round(round: u64, validators: &[(String, u64)], attempt: u32) -> String {
         if validators.is_empty() {
             // M6 FIX: Instead of hardcoded "node_9009", return empty string
             // The caller already handles the "no leader found" case properly
@@ -1008,6 +1014,28 @@ mod tests {
     use super::{OrderingEngine, COMMITTED_ROUNDS_WINDOW};
     use std::sync::Arc;
     use storage::StateDB;
+
+    /// PROTOCOL (re-audit HIGH): try_commit now decides ONE anchor per call so
+    /// the caller can execute it and re-sample the validator set before the
+    /// next. Tests that reason about "everything decidable right now" drain
+    /// the engine the way DagConsensus does: call until it returns nothing.
+    fn drain(
+        engine: &mut super::OrderingEngine,
+        dag: &std::collections::HashMap<String, blockchain::Vertex>,
+        idx: &std::collections::HashMap<u64, Vec<String>>,
+        validators: &[(String, u64)],
+    ) -> Vec<super::CommitInfo> {
+        let mut out = Vec::new();
+        loop {
+            let mut one = engine.try_commit(0, dag, idx, validators);
+            if one.is_empty() {
+                break;
+            }
+            out.append(&mut one);
+        }
+        out
+    }
+
 
     fn temp_db(suffix: &str) -> Arc<StateDB> {
         let path = format!(
@@ -1534,6 +1562,8 @@ mod tests {
                 hash,
                 signature: String::new(),
                 aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
             },
         )
     }
@@ -1585,7 +1615,7 @@ mod tests {
 
         // Late evaluator: one call over the complete DAG.
         let mut late = OrderingEngine::new();
-        let late_commits = late.try_commit(0, &full_dag, &full_idx, &validators);
+        let late_commits = drain(&mut late, &full_dag, &full_idx, &validators);
 
         // Incremental evaluator: DAG grows one round at a time, try_commit is
         // called at EVERY step (the per-vertex cadence of add_vertex).
@@ -1598,7 +1628,7 @@ mod tests {
             for h in &full_idx[&r] {
                 dag.insert(h.clone(), full_dag[h].clone());
                 idx.entry(r).or_default().push(h.clone());
-                early_commits.extend(early.try_commit(0, &dag, &idx, &validators));
+                early_commits.extend(drain(&mut early, &dag, &idx, &validators));
             }
         }
 
@@ -1645,7 +1675,7 @@ mod tests {
         }
 
         let mut late = OrderingEngine::new();
-        let late_commits = late.try_commit(0, &dag, &idx, &validators);
+        let late_commits = drain(&mut late, &dag, &idx, &validators);
         let rounds: Vec<u64> = late_commits.iter().map(|c| c.anchor_round).collect();
 
         assert!(
@@ -1702,7 +1732,7 @@ mod tests {
         dag_b.remove(&leader_hash);
 
         let mut engine_b = OrderingEngine::new();
-        let commits_b = engine_b.try_commit(0, &dag_b, &idx, &validators);
+        let commits_b = drain(&mut engine_b, &dag_b, &idx, &validators);
         let rounds_b: Vec<u64> = commits_b.iter().map(|c| c.anchor_round).collect();
 
         assert!(
@@ -1715,12 +1745,12 @@ mod tests {
 
         // Gossip delivers the vertex -> B resumes and matches a full-view node.
         dag_b.insert(leader_hash, full_dag[&idx[&victim].iter().find(|h| full_dag[*h].author == leader).unwrap().clone()].clone());
-        let more = engine_b.try_commit(0, &dag_b, &idx, &validators);
+        let more = drain(&mut engine_b, &dag_b, &idx, &validators);
         let mut all_b = commits_b;
         all_b.extend(more);
 
         let mut engine_a = OrderingEngine::new();
-        let commits_a = engine_a.try_commit(0, &full_dag, &idx, &validators);
+        let commits_a = drain(&mut engine_a, &full_dag, &idx, &validators);
         assert_eq!(
             commit_fingerprint(&commits_a),
             commit_fingerprint(&all_b),
@@ -1748,7 +1778,7 @@ mod tests {
         dag.remove(&missing);
 
         let mut engine = OrderingEngine::new();
-        let first = engine.try_commit(0, &dag, &idx, &validators);
+        let first = drain(&mut engine, &dag, &idx, &validators);
         let first_rounds: Vec<u64> = first.iter().map(|c| c.anchor_round).collect();
         assert!(
             first_rounds.iter().all(|r| *r <= 3),
@@ -1759,7 +1789,7 @@ mod tests {
         // Gossip delivers the missing vertex -> the SAME cursor resumes and the
         // rest commits, identical to a node that never had the gap.
         dag.insert(missing.clone(), full_dag[&missing].clone());
-        let second = engine.try_commit(0, &dag, &idx, &validators);
+        let second = drain(&mut engine, &dag, &idx, &validators);
         assert!(
             second.iter().any(|c| c.anchor_round == 4),
             "anchor 4 must commit once the hole is filled"
@@ -1767,7 +1797,7 @@ mod tests {
 
         // And the combined sequence equals a never-gapped evaluator's.
         let mut clean = OrderingEngine::new();
-        let clean_commits = clean.try_commit(0, &full_dag, &idx, &validators);
+        let clean_commits = drain(&mut clean, &full_dag, &idx, &validators);
         let mut combined = first;
         combined.extend(second);
         assert_eq!(

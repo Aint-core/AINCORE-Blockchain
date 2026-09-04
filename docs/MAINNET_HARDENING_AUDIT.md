@@ -77,7 +77,7 @@ The 32-byte build was also runtime-smoke-tested live (solo validator: mined 20 b
 | `f755b46` | #1 | serialize unknown-write-set txs (parallel-exec consensus split) |
 | `fc9e630` | #5/#22/#32/#19 | genesis BLS guard, VDF beacon restore, read-only tally, DA merkle domain-sep |
 | `28cbc00` | #34/#28 | zeroize keystore secrets + per-IP connection cap |
-| `705c5ba` | #26/#17 | vertex timestamp future-drift cap + stake-weighted downtime slash |
+| `705c5ba` | #26/#17 | vertex timestamp future-drift cap + stake-weighted downtime slash (downtime slash later made NON-LIVE in protocol v2: attestation only) |
 | `bd11af8` | #4/#20/#36 | node.key 0600, fraud-proof fail-closed, saturating fee math |
 
 ---
@@ -210,7 +210,7 @@ Format: **Problem → Fix → Key files/symbols → Verify → Audit focus.**
 ## 3. Mechanical/lower-severity batch (earlier commits)
 
 - `bd11af8` (#4/#20/#36): `node.key` written `0600` (unix perms); `da/fraud_proofs.rs` MissingData/InvalidErasure arms return `false` (fail-closed); fee math `saturating_*`.
-- `705c5ba` (#26/#17): `add_vertex` rejects `vertex.timestamp > now + 30s` (future-drift); `promote_downtime_attestations_to_slash` uses **stake-weighted** quorum (`reporter_stake*3 > total_stake*2`).
+- `705c5ba` (#26/#17): `add_vertex` rejects `vertex.timestamp > now + 30s` (future-drift); `promote_downtime_attestations_to_slash` uses **stake-weighted** quorum (`reporter_stake*3 > total_stake*2`). **Protocol v2 note:** downtime slashing is NOT LIVE (attestation only; no deterministic DAG producer); only equivocation is slashed, via DAG-carried compact proofs.
 - `28cbc00` (#34/#28): keystore `create`/`decrypt` return `zeroize::Zeroizing<String>`; `ConnectionGuard` per-IP cap (`AINCORE_MAX_CONN_PER_IP`).
 - `fc9e630` (#5/#22/#32/#19): multi-validator genesis rejects self-derived BLS; VDF beacon restored on boot; `aincore_tally` made read-only; DA merkle leaf(0x00)/internal(0x01) domain separation (CVE-2012-2459 family).
 - `e03c2b8`: cli `Zeroizing<String>` deref for the key printout (workspace build fix).

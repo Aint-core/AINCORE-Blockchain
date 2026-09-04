@@ -296,6 +296,19 @@ impl ChainSync {
                 ));
             }
         }
+        // Consumer-side invariant: only equivocation evidence is ordered
+        // through the DAG. Reject a block carrying any other kind outright.
+        if let Some(bad) = block
+            .slash_evidence
+            .iter()
+            .find(|it| !consensus::DagConsensus::is_equivocation_item(it))
+        {
+            return Err(format!(
+                "block {} carries non-equivocation slash evidence kind: {}",
+                block.header.height,
+                bad.chars().take(80).collect::<String>()
+            ));
+        }
         if !block.header.evidence_root.is_empty() || !block.slash_evidence.is_empty() {
             let computed = blockchain::calculate_evidence_root(&block.slash_evidence);
             if computed != block.header.evidence_root {

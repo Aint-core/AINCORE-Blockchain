@@ -404,6 +404,8 @@ mod tests {
             hash: String::new(),
             signature: String::new(),
             aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
         };
         vertex_a.hash = vertex_a.calculate_hash();
         vertex_a.sign_with_ed25519(&signing_key);
@@ -417,6 +419,8 @@ mod tests {
             hash: String::new(),
             signature: String::new(),
             aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
         };
         vertex_b.hash = vertex_b.calculate_hash();
         vertex_b.sign_with_ed25519(&signing_key);
@@ -682,6 +686,8 @@ mod tests {
             hash: String::new(),
             signature: String::new(),
             aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
         };
         // Tamper: set hash to garbage, then sign over the garbage hash.
         vertex.hash = "deadbeef".repeat(8);
@@ -719,6 +725,8 @@ mod tests {
             hash: String::new(),
             signature: String::new(),
             aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
         };
         vertex.hash = vertex.calculate_hash();
         vertex.sign_with_ed25519(&signing_key);
@@ -1028,6 +1036,10 @@ mod tests {
     ///   via DIRECT `handle_message()` calls (simulating successful
     ///   gossip). After exchange, every node has 3 distinct reporter
     ///   attestations → executor promotes to pending slash on quorum.
+    ///
+    ///   NOTE (protocol v2): this exercises a NON-LIVE path. Downtime is
+    ///   attested but not slashed; promote_downtime_attestations_to_slash has
+    ///   no production caller. Retained for a future deterministic protocol.
     #[test]
     fn test_h02_b2_simulated_cross_node_attestation_reaches_quorum() {
         use crypto::{derive_address, Signer, SigningKey};
@@ -1242,6 +1254,8 @@ mod tests {
             hash: String::new(),
             signature: String::new(),
             aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
         };
         v.hash = v.calculate_hash();
         v.sign_with_ed25519(&signing_key);
@@ -1295,6 +1309,8 @@ mod tests {
             hash: String::new(),
             signature: String::new(),
             aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
         };
         forged.hash = forged.calculate_hash();
         forged.sign_with_ed25519(&attacker);
@@ -1307,6 +1323,293 @@ mod tests {
             .unwrap()
             .is_none());
 
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// PROTOCOL (deterministic slashing): once an equivocation is applied, the
+    /// canonical evidence item must ride in this node's NEXT vertex, prefixed
+    /// with SLASH_EVIDENCE_PREFIX, so consensus orders it and every node extracts
+    /// the identical set at block-build time. It must be carried exactly once.
+    #[test]
+    fn test_evidence_rides_in_next_vertex_exactly_once() {
+        // Unique per invocation: this harness can run a test body twice in one
+        // process, and RocksDB refuses to open a path whose LOCK it already holds.
+        let suffix = format!(
+            "evidence_carry_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let (mut consensus, path) = setup_dag(&suffix);
+        consensus.current_round = 1;
+        let offender = consensus.node_id.clone();
+        let a = signed_vertex(&consensus, 1, 1_000);
+        let b = signed_vertex(&consensus, 1, 2_000);
+
+        // Valid proof -> applied -> queued.
+        consensus.handle_message(&equiv_proof_msg(&offender, &a, &b));
+
+        // Next vertex carries it, FIRST in the payload, with the prefix.
+        consensus.try_create_vertex();
+        let carried: Vec<String> = {
+            let dag = consensus.dag.lock().unwrap();
+            let v = dag.values().max_by_key(|v| v.round).expect("vertex created");
+            v.payload.clone()
+        };
+        assert!(!carried.is_empty(), "vertex must carry the evidence");
+        let item = carried[0]
+            .strip_prefix(crate::dag::SLASH_EVIDENCE_PREFIX)
+            .expect("first payload item must be prefixed evidence");
+        let ev: serde_json::Value = serde_json::from_str(item).unwrap();
+        assert_eq!(ev["kind"].as_str(), Some("equivocation"));
+        assert_eq!(ev["offender"].as_str(), Some(offender.as_str()));
+        assert_eq!(ev["round"].as_u64(), Some(1));
+        assert!(ev.get("vertex_a").is_some() && ev.get("vertex_b").is_some());
+        // The executor must accept exactly this item (same verifier the block
+        // path uses), so a carried item is never dead weight.
+        consensus
+            .executor
+            .verify_slash_evidence(item)
+            .expect("carried item must verify on the executor");
+        // The durable marker is latched only when the item lands in a BLOCK we
+        // carried it into -- never at carry time -- so an orphaned or
+        // cap-dropped carry can be retried. Nothing has been committed here.
+        assert!(consensus
+            .storage
+            .get(&format!("sys:equiv_carried:{}:1", offender))
+            .unwrap()
+            .is_none());
+
+        // Within the in-flight TTL a second vertex must NOT carry it again.
+        consensus.current_round = 2;
+        consensus.try_create_vertex();
+        let again: Vec<String> = {
+            let dag = consensus.dag.lock().unwrap();
+            let v = dag.values().max_by_key(|v| v.round).expect("second vertex");
+            assert_eq!(v.round, 2);
+            v.payload.clone()
+        };
+        assert!(
+            again.iter().all(|p| !p.starts_with(crate::dag::SLASH_EVIDENCE_PREFIX)),
+            "evidence must not be re-carried while in flight"
+        );
+
+        // After the TTL with no inclusion, it is treated as orphaned and
+        // carried AGAIN (liveness: evidence in a never-committed vertex is not
+        // lost on this node). Exercise the carry decision directly -- vertex
+        // creation itself is gated on parents/quorum and is not what is under
+        // test here.
+        let ttl = crate::dag::INFLIGHT_TTL_ROUNDS;
+        // carried at round 1; still in flight through round ttl (1 + ttl - 1)
+        for r in 3..(1 + ttl) {
+            assert!(
+                consensus.drain_evidence_for_vertex(r).is_empty(),
+                "must not re-carry while in flight (round {})",
+                r
+            );
+        }
+        // first round where (r - 1) >= ttl -> orphaned -> re-carried
+        let retried = consensus.drain_evidence_for_vertex(1 + ttl);
+        assert_eq!(retried.len(), 1, "orphaned carry must be retried after INFLIGHT_TTL_ROUNDS");
+        assert!(retried[0].starts_with(crate::dag::SLASH_EVIDENCE_PREFIX));
+        // and it is in flight again from that round
+        assert!(consensus.drain_evidence_for_vertex(1 + ttl + 1).is_empty());
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// PROTOCOL: canonical_block_evidence is a pure function of the committed
+    /// sequence -- dedup by (offender, round) keeping the first in commit order,
+    /// skip malformed items, cap at five. Two nodes feeding it the same committed
+    /// payloads must get byte-identical output.
+    #[test]
+    fn test_canonical_block_evidence_dedup_order_cap() {
+        let mk = |off: &str, round: u64, tag: &str| {
+            serde_json::json!({"kind":"equivocation","offender":off,"round":round,"tag":tag}).to_string()
+        };
+        let input = vec![
+            mk("A", 1, "first"),
+            "not json".to_string(),
+            mk("A", 1, "dup-later"),
+            mk("B", 1, "b"),
+            mk("A", 2, "a2"),
+            serde_json::json!({"kind":"equivocation","offender":"C"}).to_string(), // no round
+            mk("D", 1, "d"),
+            mk("E", 1, "e"),
+            mk("F", 1, "f"),
+            mk("G", 1, "g"),
+        ];
+        // A permissive verifier (parses offender/round) to exercise dedup/cap.
+        let parse = |it: &str| -> Option<(String, u64)> {
+            let v: serde_json::Value = serde_json::from_str(it).ok()?;
+            Some((v.get("offender")?.as_str()?.to_string(), v.get("round")?.as_u64()?))
+        };
+        let out: Vec<String> = DagConsensus::canonical_block_evidence(input.clone(), parse)
+            .into_iter().map(|(it, _)| it).collect();
+        // first occurrence wins, malformed skipped, cap 5
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0], mk("A", 1, "first"));
+        assert_eq!(out[1], mk("B", 1, "b"));
+        assert_eq!(out[2], mk("A", 2, "a2"));
+        assert_eq!(out[3], mk("D", 1, "d"));
+        assert_eq!(out[4], mk("E", 1, "e"));
+        // deterministic: same input twice -> identical
+        let again: Vec<String> = DagConsensus::canonical_block_evidence(input.clone(), parse)
+            .into_iter().map(|(it, _)| it).collect();
+        assert_eq!(out, again);
+        // VERIFY-FIRST: a strict verifier that rejects offender "A" means A's
+        // junk can neither occupy a slot nor shadow later real items.
+        let strict = |it: &str| -> Option<(String, u64)> {
+            let k = parse(it)?;
+            if k.0 == "A" { None } else { Some(k) }
+        };
+        let strict_out: Vec<String> = DagConsensus::canonical_block_evidence(input, strict)
+            .into_iter().map(|(it, _)| it).collect();
+        assert_eq!(strict_out.len(), 5);
+        assert_eq!(strict_out[0], mk("B", 1, "b"));
+        assert!(strict_out.iter().all(|x| !x.contains("\"offender\":\"A\"")));
+    }
+
+    /// Only equivocation items may ride through the DAG. A "downtime" item
+    /// would make apply_slash_evidence touch node-local attestation rows.
+    #[test]
+    fn test_only_equivocation_items_pass_kind_filter() {
+        assert!(DagConsensus::is_equivocation_item(r#"{"kind":"equivocation","offender":"x","round":1}"#));
+        assert!(!DagConsensus::is_equivocation_item(r#"{"kind":"downtime","offender":"x","epoch":1,"round":1}"#));
+        assert!(!DagConsensus::is_equivocation_item(r#"{"offender":"x","round":1}"#));
+        assert!(!DagConsensus::is_equivocation_item("not json"));
+    }
+
+    /// A live vertex carrying `payload_root` (the proof-only compact field) is
+    /// rejected at ingress: it could otherwise pass hash recomputation with an
+    /// arbitrary real payload.
+    #[test]
+    fn test_ingress_rejects_live_vertex_with_payload_root() {
+        let (mut consensus, path) = setup_dag(&format!(
+            "payload_root_ingress_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        consensus.current_round = 1;
+        let full = signed_vertex(&consensus, 1, 5_000);
+        let mut compact = full.to_compact_proof(); // hash unchanged, payload stripped
+        compact.payload = vec!["smuggled".to_string()]; // body != root, hash still "matches"
+        let before = consensus.dag.lock().unwrap().len();
+        consensus.handle_message(&format!("DAG_VERTEX:{}", serde_json::to_string(&compact).unwrap()));
+        assert_eq!(consensus.dag.lock().unwrap().len(), before, "must be rejected");
+        // and the honest full vertex is accepted
+        consensus.handle_message(&format!("DAG_VERTEX:{}", serde_json::to_string(&full).unwrap()));
+        assert_eq!(consensus.dag.lock().unwrap().len(), before + 1);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Parents are bounded and unique at ingress; a proof-form vertex (either
+    /// root set) is never admitted as live.
+    #[test]
+    fn test_ingress_rejects_bad_parents_and_proof_form() {
+        let (mut consensus, path) = setup_dag(&format!(
+            "parents_ingress_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        consensus.current_round = 1;
+        // Copy identity out so the closure does not borrow `consensus`
+        // (handle_message below needs it mutably).
+        let key = crypto::SigningKey::from_bytes(&consensus.node_key);
+        let author = consensus.node_id.clone();
+        let mk = move |parents: Vec<String>| {
+            let mut v = blockchain::Vertex {
+                round: 1,
+                author: author.clone(),
+                timestamp: 7_000,
+                payload: vec![],
+                parents,
+                hash: String::new(),
+                signature: String::new(),
+                aggregated_signature: None,
+                payload_root: None,
+                parents_root: None,
+            };
+            v.hash = v.calculate_hash();
+            v.sign_with_ed25519(&key);
+            v
+        };
+        let before = consensus.dag.lock().unwrap().len();
+        // too many parents
+        let many: Vec<String> = (0..(crate::dag::MAX_PARENTS + 1)).map(|i| format!("{:064x}", i)).collect();
+        consensus.handle_message(&format!("DAG_VERTEX:{}", serde_json::to_string(&mk(many)).unwrap()));
+        assert_eq!(consensus.dag.lock().unwrap().len(), before, "too many parents must be rejected");
+        // duplicate parents
+        consensus.handle_message(&format!("DAG_VERTEX:{}", serde_json::to_string(&mk(vec!["genesis".into(), "genesis".into()])).unwrap()));
+        assert_eq!(consensus.dag.lock().unwrap().len(), before, "duplicate parents must be rejected");
+        // parents_root set on a live vertex
+        let mut pr = mk(vec!["genesis".into()]);
+        pr.parents_root = Some(pr.parents_root());
+        pr.parents = vec![];
+        consensus.handle_message(&format!("DAG_VERTEX:{}", serde_json::to_string(&pr).unwrap()));
+        assert_eq!(consensus.dag.lock().unwrap().len(), before, "parents_root on a live vertex must be rejected");
+        // honest vertex accepted
+        consensus.handle_message(&format!("DAG_VERTEX:{}", serde_json::to_string(&mk(vec!["genesis".into()])).unwrap()));
+        assert_eq!(consensus.dag.lock().unwrap().len(), before + 1);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// The carry skip is ROUND-SCOPED. An earlier cut skipped whenever the
+    /// offender had ANY sys:slashed row, on the assumption "slashed once => out
+    /// of the validator set forever" -- nothing enforces that (join_validator_set
+    /// is not blocked for a slashed address), so it handed a re-joined
+    /// equivocator permanent immunity from ever being slashed again. Rows that
+    /// are genuinely unverifiable are dropped by the block-side verifier, which
+    /// is the deterministic gate.
+    #[test]
+    fn test_drain_skip_is_round_scoped_not_offender_wide() {
+        let (mut consensus, path) = setup_dag(&format!(
+            "drain_slashed_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        consensus.current_round = 1;
+        let offender = consensus.node_id.clone();
+        let a = signed_vertex(&consensus, 1, 1_000);
+        let b = signed_vertex(&consensus, 1, 2_000);
+        consensus.handle_message(&equiv_proof_msg(&offender, &a, &b));
+
+        // A slash for a DIFFERENT round must NOT suppress this round's evidence.
+        consensus
+            .storage
+            .put(&format!("sys:slashed:{}:999", offender), "1")
+            .unwrap();
+        let carried = consensus.drain_evidence_for_vertex(2);
+        assert_eq!(
+            carried.len(),
+            1,
+            "a slash at another round must not grant immunity at this one"
+        );
+
+        // A slash for THIS round does suppress it (exactly-once, no re-carry).
+        consensus
+            .storage
+            .put(&format!("sys:slashed:{}:1", offender), "1")
+            .unwrap();
+        assert!(
+            consensus
+                .drain_evidence_for_vertex(2 + crate::dag::INFLIGHT_TTL_ROUNDS)
+                .is_empty(),
+            "an executed slash for this exact round must stop the carry"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// An oversize DAG_VERTEX message is rejected before parsing.
+    #[test]
+    fn test_ingress_rejects_oversize_vertex() {
+        let (mut consensus, path) = setup_dag(&format!(
+            "oversize_ingress_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let before = consensus.dag.lock().unwrap().len();
+        let junk = "x".repeat(crate::dag::MAX_VERTEX_BYTES + 1);
+        consensus.handle_message(&format!("DAG_VERTEX:{}", junk));
+        assert_eq!(consensus.dag.lock().unwrap().len(), before);
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -1503,6 +1806,8 @@ mod tests {
             hash: String::new(),
             signature: String::new(),
             aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
         };
         far_vertex.hash = far_vertex.calculate_hash();
         far_vertex.sign_with_ed25519(&remote_key);

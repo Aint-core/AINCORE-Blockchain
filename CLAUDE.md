@@ -124,7 +124,7 @@ User TX
 - **Validator set:** dibaca dari `sys:validators` (storage) atau BCS `ValidatorSet` resource
 - **Observer mode:** node yang bukan validator tidak boleh mine
 - **Split-brain prevention:** validator terisolasi (no peers) berhenti mine
-- **Downtime detection:** `DOWNTIME_THRESHOLD = 100 rounds` → jail + 5% slash
+- **Downtime detection:** `DOWNTIME_THRESHOLD = 100 rounds` → attestation only (NOT slashed in protocol v2; only equivocation is slashed, 100%, via DAG-carried compact proofs)
 - **Equivocation (double-sign):** deteksi same author + same round + different hash → instant slash
 - **Checkpoint:** setiap 100 round, simpan DAG checkpoint untuk fast recovery
 - **Pruning:** setiap 10 blok, prune round < `min_committed_round - 10`

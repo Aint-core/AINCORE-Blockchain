@@ -681,6 +681,27 @@ impl Mempool {
     /// submission is still refused at admission; `seen_txs` is intentionally
     /// left alone (the tx has genuinely been seen — resubmission stays deduped).
     /// Returns how many were re-queued.
+    /// Return transactions that were LOANED by `get_pending_transactions` but
+    /// never shipped in a vertex (the block-builder trimmed them to fit the
+    /// vertex byte budget). They are put back at the FRONT of the queue in
+    /// their original order and their nonce guard is re-registered.
+    ///
+    /// Deliberately does NOT touch `requeue_attempts`: a byte-budget trim is
+    /// not a failed execution, and counting it would let a large-but-valid
+    /// transaction be deleted after three proposals it never even entered.
+    pub fn return_unshipped(&mut self, raws: &[String]) {
+        for raw in raws.iter().rev() {
+            if self.inflight.remove(raw).is_none() {
+                // Not on loan (already executed or re-queued elsewhere): ignore.
+                continue;
+            }
+            if let Some((sender, seq, _)) = self.meta.get(raw) {
+                self.pending_nonces.insert(format!("{}:{}", sender, seq));
+            }
+            self.pending_txs.push_front(raw.clone());
+        }
+    }
+
     pub fn requeue_stale(&mut self, max_age: std::time::Duration) -> usize {
         let now = std::time::Instant::now();
         let stale: Vec<(String, u8)> = self

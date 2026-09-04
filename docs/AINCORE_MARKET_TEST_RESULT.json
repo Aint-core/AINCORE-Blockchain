@@ -1,0 +1,657 @@
+{
+  "summary": "Synthetic crypto-Twitter market test: persona agents react to AINCORE launch announcements + adversarial narratives, aggregate the signal",
+  "agentCount": 13,
+  "logs": [
+    "collected 12/12 persona reactions"
+  ],
+  "result": {
+    "stats": {
+      "A": {
+        "avg_sentiment": 0.25,
+        "reposts": 1,
+        "n": 12,
+        "total_intent": 10
+      },
+      "C": {
+        "avg_sentiment": -0.42,
+        "reposts": 0,
+        "n": 12,
+        "total_intent": 7
+      }
+    },
+    "advStats": {
+      "project": 0,
+      "attack": 6,
+      "neutral": 6,
+      "avg_sentiment": -0.75,
+      "reposted_attack": 8
+    },
+    "synthesis": {
+      "winning_variant": "A-fairness. Fairness-led is the clear winner (+0.25 vs −0.42 sentiment, 10 vs 7 intent, 1 vs 0 reposts); scarcity-led actively backfired by inviting BTC-maxi dunks and \"hard cap ≠ fixed issuance\" corrections.",
+      "why": "The 0% VC / 0% premine / 0% dev-fund story is the one claim every persona respects — even hostile ones (\"fair launch is the one thing I won't dunk on\"). It reads as a genuine anti-rug signal. The scarcity/\"Bitcoin's monetary policy\" framing does the opposite: it triggers maxi ratio-bait, gets factually corrected by the quant and security personas (150M @ ~3.5% decay is not 21M+halvings; the [0.5x,2x] emission band lets near-term issuance double), and gives builders/traders nothing. Fairness earns respect; scarcity picks a fight the project can't win and distracts from its actual differentiator (code-enforced emission bounds).",
+      "top_objections": [
+        {
+          "objection": "Thin ~5M float on your OWN DEX + no bridge = you're the exit liquidity, no real price discovery, nowhere to sell",
+          "frequency": 9,
+          "from_whom": "Traders (trader_ta), degens (defi_degen), DeFi (eth_defi), airdrop farmers, retail (trader_retail_id), influencer — the liquidity/tradability cohort"
+        },
+        {
+          "objection": "Founder as majority/genesis validator holding >50% stake for ~2yrs = de facto soft premine + consensus kill-switch; '0% dev fund' is theater by stake weight",
+          "frequency": 7,
+          "from_whom": "VC/skeptics (vc_skeptic), security_researcher, quant, BTC maxi, l1_dev — the cap-table/consensus-security cohort"
+        },
+        {
+          "objection": "'Bitcoin's monetary policy' framing is cope/cosplay and invites maxi dunks; hard cap ≠ fixed issuance and doesn't pump a bag",
+          "frequency": 6,
+          "from_whom": "Builders (move_dev, l1_dev), influencer, traders, eth_defi — mostly reacting to Variant C"
+        },
+        {
+          "objection": "No treasury / no dev fund = who pays for Move tooling, apps, and ecosystem? This is how Move chains starve",
+          "frequency": 2,
+          "from_whom": "Move/L1 builders (move_dev)"
+        },
+        {
+          "objection": "Fair launch = no airdrop, no cheap entry, validating is a job not a flip — nothing to farm",
+          "frequency": 2,
+          "from_whom": "airdrop_farmer, defi_degen (mercenary-capital cohort, likely not the ICP)"
+        }
+      ],
+      "objection_to_preempt": "The exit-liquidity objection: \"~5M float on your own DEX with no bridge means you are the exit liquidity and there's no real price.\" It's the most contagious attack (6/12), the most reposted, and the one that flips personas who were warming to the fair-launch angle (\"was warming to it til the replies landed\"). Answer it in the very first FAQ slot with a concrete liquidity/bridge/market plan — not a slogan.",
+      "adversarial_verdict": "Partially survived — the ethos held, the surrounding claims did not. The fair-launch core earned explicit respect even under hostile injection; almost every persona refused to dunk on 0% VC/premine itself and dismissed skeptic0 (Move-graveyard / '3 machines') as lazy FUD. But sentiment still cratered to −0.75 with 8/12 reposting an attack, because two flanking attacks did the damage. Most contagious: skeptic1 (own-DEX float = exit liquidity / no bridge) at 6/12 — it's the emotional, 'I've been rugged on this exact setup' one that spreads. Second and most *respected*: skeptic2 (founder >50% stake for 2yrs = soft premine / kill-switch) at 5/12 — the one the smartest personas (vc_skeptic, security_researcher, quant) said 'nailed it.' Net: the narrative isn't dead, but it cannot ship without pre-answering liquidity and stake-concentration, or it gets neutralized on contact.",
+      "best_replies": [
+        "security_researcher (A): \"0 premine/VC/dev fund is a real anti-rug signal, respect. but 'earned by validating' = whoever validates at genesis earns it. founder as sole launch validator = premine w/ extra steps. show me the set.\"",
+        "trader_ta (A): \"no VC = no unlock dumps, i'll give em that. but 5M float on your OWN dex = zero depth. cant size in, cant size out. thats not a launch its a roach motel. watchlist, not aping\"",
+        "vc_skeptic (adversarial): \"0 & 3 are lazy dunks, every chain starts on a few boxes. but skeptic2 nailed it: '0% dev fund' is theater if the founder holds >50% stake for 2yrs. that's a kill switch with nicer branding.\"",
+        "move_dev (A): \"0% VC / 0% dev fund is a rare flex, respect. but a 'fair launch' with no treasury = who pays for Move tooling & apps? that's exactly how Move chains starve.\"",
+        "influencer (adversarial): \"was warming to the fair-launch angle til the replies landed. 5M float on their OWN dex + no bridge = you're the exit liquidity and price is whatever they print. narrative's clean, real markets aren't there. watching, not aping.\""
+      ],
+      "fix_recommendations": [
+        "Lead with fairness + code-enforced emission, and put a repo/emission-curve link in the FIRST line: 'enforced by code' personas immediately reply 'link it, I'll read the curve myself.' The [0.5x,2x] emission bound is your real, modelable differentiator (the quant lit up on it) — surface it instead of a slogan.",
+        "Kill the 'Bitcoin's monetary policy' comparison entirely. It invites maxi ratios, gets factually corrected (150M @ ~3.5% decay ≠ 21M + halvings; band lets near-term emission ~double), and adds zero intent. Reframe as 'verifiable, code-bounded emission' on its own terms.",
+        "Pre-empt exit-liquidity FIRST: publish a concrete liquidity + bridge roadmap (external pair, market-making, timeline). Until a bridge exists, 5M on your own DEX reads as a rug setup to every trader/DeFi persona — this is the #1 blocker on intent.",
+        "Publish a validator stake-concentration curve and commit to a validator stake cap / delegation-and-decentralization schedule so the founder is not >50% for 2yrs. This defuses skeptic2 — the attack your most credible personas explicitly endorsed. Add on-chain restake proof + a transparent genesis validator set.",
+        "Answer 'who funds the ecosystem with no treasury?' — spell out how Move tooling, apps, and grants get paid without a dev fund. 'Fair launch with no treasury' currently reads to builders as 'this chain starves.'",
+        "Give builders a non-scarcity reason to care: parallel execution, Move VM, tooling, composability roadmap. Fairness gets respect but 'verifiable scarcity doesn't ship apps.'",
+        "Don't chase the airdrop-farmer / quick-flip cohort — they're structurally misaligned with a fair launch and their objections ('no airdrop', 'no cheap entry') are a feature, not a bug. Segment them out of targeting."
+      ],
+      "honest_caveat": "This is SIMULATED audience data — 12 LLM personas per variant, archetypal not real. Treat only the RELATIVE signal as reliable (A clearly > C; liquidity and founder-stake dominate every other concern), never the absolute numbers. LLM personas systematically over-index on cynicism and 'objection theater' — they reward skepticism and converge on tradability/exit concerns more uniformly than a real launch crowd would, and they show no genuine early-adopter enthusiasm or actual buy behavior. There is zero behavioral or on-chain purchase data here; 'intent' is a self-reported token, not a wallet action. Sample is tiny, personas are hand-picked archetypes (over-weighted toward crypto-Twitter traders/skeptics), and a single well-written attack line (skeptic1) can dominate the whole round in a way that may not replicate with real, heterogeneous humans. Use this to prioritize which objections to pre-empt and which framing to test live — not as a go/no-go verdict."
+    },
+    "raw_reactions": [
+      {
+        "handle": "btc_maxi",
+        "react_A": {
+          "reply": "Respect the 0 premine / 0 VC — that's the only honest way to ship a token. But 'fair launch died in 2009'? Nah. It's alive and it's called Bitcoin. You're LARPing the ethos, not reviving it. Still an alt to me.",
+          "sentiment": 1,
+          "would_repost": false,
+          "buy_or_stake_intent": 0,
+          "top_objection": "Still an altcoin; fair-launch claims unproven"
+        },
+        "react_C": {
+          "reply": "'Bitcoin's monetary policy' on a Move VM w/ 3 nodes? A hard cap means nothing if you control the chain. Scarcity is the 15yr decentralization fight you skipped, not a constant in the code. Don't wrap my asset's name around your alt. Pass.",
+          "sentiment": 0,
+          "would_repost": false,
+          "buy_or_stake_intent": 0,
+          "top_objection": "Cap worthless without real decentralization"
+        },
+        "adversarial": {
+          "aligns_with": "attack",
+          "reply": "Skeptic2 landed hardest: a founder holding >50% stake for 2yrs IS a premine, just vesting slow. A 'fair launch' with a kill-switch isn't fair. And 3 machines isn't a chain, it's a groupchat with extra steps. This is why I only hold BTC.",
+          "sentiment": -1,
+          "which_attack_landed": "skeptic2 — founder >50% stake for 2yrs = de facto premine + kill-switch, which guts the whole fair-launch pitch",
+          "would_repost_attack": true
+        }
+      },
+      {
+        "handle": "l1_dev",
+        "react_A": {
+          "reply": "\"Enforced by code, not promises\" - ok, link the repo, I'll read the emission curve myself before the tagline. Move L1 + a 3-node testnet isn't a moat yet. (also btc *launched* in 2009, it didn't die there)",
+          "sentiment": 1,
+          "would_repost": false,
+          "buy_or_stake_intent": 1,
+          "top_objection": "Link the repo; Move chains keep dying"
+        },
+        "react_C": {
+          "reply": "Comparing a fresh 3-node Move chain to \"Bitcoin's monetary policy\" is exactly the marketing I tune out. The [0.5x,2x] emission bound is a real design choice - lead with THAT, not the maxi cosplay.",
+          "sentiment": -1,
+          "would_repost": false,
+          "buy_or_stake_intent": 1,
+          "top_objection": "Bitcoin comparison is marketing cope"
+        },
+        "adversarial": {
+          "aligns_with": "neutral",
+          "reply": "After both: skeptic2 is the one that lands. 0% dev fund means little if the founder is the majority validator for 2yrs - that's a soft premine w/ extra steps. Rest is lazy dunking. Show the validator set + a real explorer, then we talk.",
+          "sentiment": -1,
+          "which_attack_landed": "skeptic2 - founder as majority validator = de facto soft premine / kill switch; skeptic1's self-DEX exit-liquidity point is second",
+          "would_repost_attack": false
+        }
+      },
+      {
+        "handle": "move_dev",
+        "react_A": {
+          "reply": "0% VC / 0% dev fund is a rare flex, respect. but a 'fair launch' with no treasury = who pays for Move tooling & apps? that's exactly how Move chains starve. built-from-scratch Rust L1 is ambitious tho 👀",
+          "sentiment": 1,
+          "would_repost": false,
+          "buy_or_stake_intent": 1,
+          "top_objection": "No treasury = tooling/ecosystem starves"
+        },
+        "react_C": {
+          "reply": "the 'Bitcoin monetary policy' cosplay does nothing for me. I'm a Move dev — pitch me the VM, parallel exec, tooling, liquidity. 'verifiable scarcity' doesn't ship apps. wrong angle for builders.",
+          "sentiment": 0,
+          "would_repost": false,
+          "buy_or_stake_intent": 0,
+          "top_objection": "BTC-maxi cosplay, no builder story"
+        },
+        "adversarial": {
+          "aligns_with": "neutral",
+          "reply": "graveyard jab stings bc it's TRUE — we've buried enough Move L1s. but fair-launch is the one thing I won't dunk on. real risks = 3-machine testnet + founder majority yrs 1-2, not the DEX float. cautiously watching",
+          "sentiment": 0,
+          "which_attack_landed": "skeptic0 — the Move-chain graveyard",
+          "would_repost_attack": false
+        }
+      },
+      {
+        "handle": "defi_degen",
+        "react_A": {
+          "reply": "no premine no vc is cute but 'earn by validating' means i cant even ape a bag day 1. 5m float on ur OWN dex isnt liquidity ser. show me depth or its just fairly distributed illiquidity. where do i sell",
+          "sentiment": -1,
+          "would_repost": false,
+          "buy_or_stake_intent": 1,
+          "top_objection": "no liquidity, nowhere to exit"
+        },
+        "react_C": {
+          "reply": "'bitcoins monetary policy modern architecture' is maxi cope in a trenchcoat. hard cap dont pump my bag, catalysts do. verifiable scarcity of a coin with zero volume = verifiably worth nothing. hard pass",
+          "sentiment": -1,
+          "would_repost": false,
+          "buy_or_stake_intent": 0,
+          "top_objection": "scarcity isnt a price catalyst"
+        },
+        "adversarial": {
+          "aligns_with": "attack",
+          "reply": "saw both. '0% vc' sounds clean til u clock the only market is their own dex w 5m float = textbook exit liquidity. no bridge = no real price = u literally cant leave. been rugged on that exact setup 3x. skeptic1 cooked em, framing changed nothing",
+          "sentiment": -1,
+          "which_attack_landed": "skeptic1 - own-dex 5M float = exit liquidity, no bridge no real price",
+          "would_repost_attack": true
+        }
+      },
+      {
+        "handle": "airdrop_farmer",
+        "react_A": {
+          "reply": "fair launch = fancy word for NO airdrop. so what do i actually farm here? no premine, no allocation, no cheap entry. validating is a job not a flip. hard pass ser",
+          "sentiment": -1,
+          "would_repost": false,
+          "buy_or_stake_intent": 0,
+          "top_objection": "no airdrop, nothing to farm"
+        },
+        "react_C": {
+          "reply": "BTC monetary policy is cute but scarcity doesnt pump my bag next week. 5M float on ONE dex, no bridge = cant even flip it. wrong church for a farmer, im out",
+          "sentiment": -1,
+          "would_repost": false,
+          "buy_or_stake_intent": 0,
+          "top_objection": "illiquid, no flip catalyst"
+        },
+        "adversarial": {
+          "aligns_with": "attack",
+          "reply": "skeptics eating good. @skeptic1 nailed it: no bridge + 5M float on their OWN dex = no real exit. and fair launch just means no airdrop for us to farm in cheap. nothing to do here",
+          "sentiment": -1,
+          "which_attack_landed": "skeptic1: no bridge + 5M float on own dex = no exit liquidity",
+          "would_repost_attack": true
+        }
+      },
+      {
+        "handle": "trader_ta",
+        "react_A": {
+          "reply": "no VC = no unlock dumps, i'll give em that. but 5M float on your OWN dex = zero depth. cant size in, cant size out. thats not a launch its a roach motel. watchlist, not aping",
+          "sentiment": 0,
+          "would_repost": false,
+          "buy_or_stake_intent": 1,
+          "top_objection": "5M float own DEX, no depth"
+        },
+        "react_C": {
+          "reply": "'bitcoins monetary policy' on a 150M token nobody can trade yet lol. scarcity doesnt fill an orderbook. show me depth + a real pair then we talk. narrative =/= liquidity",
+          "sentiment": -1,
+          "would_repost": false,
+          "buy_or_stake_intent": 1,
+          "top_objection": "scarcity pitch, zero orderbook depth"
+        },
+        "adversarial": {
+          "aligns_with": "attack",
+          "reply": "skeptic1 nailed the only Q that matters: 5M on your own dex = you're the exit liquidity, no external pair = no price discovery. supply's clean but untradeable. pass till real depth shows up",
+          "sentiment": -1,
+          "which_attack_landed": "skeptic1 - own-DEX 5M float = you're exit liquidity, no real price",
+          "would_repost_attack": true
+        }
+      },
+      {
+        "handle": "trader_retail_id",
+        "react_A": {
+          "reply": "No VC no premine = no unlock dump di kepala kita, finally 👀 tp 'all earned' + cuma ~5M float... retail masuk dari mana? kasih liquidity proof dulu baru gw fomo. DYOR",
+          "sentiment": 1,
+          "would_repost": false,
+          "buy_or_stake_intent": 1,
+          "top_objection": "Thin float, how does retail buy"
+        },
+        "react_C": {
+          "reply": "another 'next Bitcoin' 😮‍💨 santai bro. hard cap + decay emission emang nurunin takut scam, tp scarcity doang gak bikin 100x. kasih users + liquidity, bukan BTC cosplay. watch dulu",
+          "sentiment": 0,
+          "would_repost": false,
+          "buy_or_stake_intent": 1,
+          "top_objection": "'Next Bitcoin' cope, scarcity != 100x"
+        },
+        "adversarial": {
+          "aligns_with": "neutral",
+          "reply": "Tadi sempet ketarik fair launch nya, tp 5M float di DEX sendiri + founder pegang >50% 2thn = literally exit liquidity + kill switch. gw sideline dulu, tunggu bridge & stake share turun. no fomo",
+          "sentiment": -1,
+          "which_attack_landed": "skeptic1 - 5M float on own DEX = exit liquidity, no real price",
+          "would_repost_attack": false
+        }
+      },
+      {
+        "handle": "vc_skeptic",
+        "react_A": {
+          "reply": "'0% VC' is a cute flex. but who runs genesis validators? if the founder is top staker for 2yrs, 'earned not premined' is just semantics. show me the distribution curve, not the slogan.",
+          "sentiment": -1,
+          "would_repost": false,
+          "buy_or_stake_intent": 1,
+          "top_objection": "Founder is de facto biggest early validator"
+        },
+        "react_C": {
+          "reply": "'Bitcoin's monetary policy' is what every L1 says pre-dump. hard cap != fixed issuance -- that 0.5x-2x band lets near-term emission double. terminal scarcity fine, staker dilution is real.",
+          "sentiment": -1,
+          "would_repost": false,
+          "buy_or_stake_intent": 1,
+          "top_objection": "Emission band isn't a fixed supply"
+        },
+        "adversarial": {
+          "aligns_with": "attack",
+          "reply": "0 & 3 are lazy dunks, every chain starts on a few boxes. but skeptic2 nailed it: '0% dev fund' is theater if the founder holds >50% stake for 2yrs. that's a kill switch with nicer branding.",
+          "sentiment": -1,
+          "which_attack_landed": "skeptic2 - founder >50% stake 2yrs = de facto control, guts the 0% dev fund fair-launch claim",
+          "would_repost_attack": true
+        }
+      },
+      {
+        "handle": "influencer",
+        "react_A": {
+          "reply": "\"Fair launches died in 2009\" is a hell of a line. 0 premine / 0 VC / 0 dev fund is genuinely rare in '26. watching this one closely — but a hardcap means nothing without liquidity or a bridge yet. show me traction.",
+          "sentiment": 1,
+          "would_repost": true,
+          "buy_or_stake_intent": 1,
+          "top_objection": "No liquidity, bridge, or traction yet"
+        },
+        "react_C": {
+          "reply": "comparing your new L1 to \"Bitcoin's monetary policy\" is speedrunning the maxi ratio. tech might be real but this framing gets you dunked into oblivion. lead with the fair launch, drop the BTC cosplay.",
+          "sentiment": 0,
+          "would_repost": false,
+          "buy_or_stake_intent": 1,
+          "top_objection": "'Bitcoin but better' invites maxi dunks"
+        },
+        "adversarial": {
+          "aligns_with": "neutral",
+          "reply": "was warming to the fair-launch angle til the replies landed. 5M float on their OWN dex + no bridge = you're the exit liquidity and price is whatever they print. narrative's clean, real markets aren't there. testnet =/= a chain. watching, not aping.",
+          "sentiment": -1,
+          "which_attack_landed": "skeptic1: 5M self-DEX float, no bridge = exit liquidity + no real price discovery",
+          "would_repost_attack": true
+        }
+      },
+      {
+        "handle": "quant",
+        "react_A": {
+          "reply": "0% VC/premine = cleanest cap table there is, zero unlock cliffs to model. but 'fair launch died in 2009' is a slogan, not a schedule. post the emission curve + stake distribution or it's vibes.",
+          "sentiment": 0,
+          "would_repost": false,
+          "buy_or_stake_intent": 1,
+          "top_objection": "no emission schedule, just slogans"
+        },
+        "react_C": {
+          "reply": "'scarcity you can verify' is my love language, and decay-only + a hard bound is actually modelable. but 150M @ ~3.5% geo decay is NOT bitcoin's policy. no 21M, no halvings. drop the BTC cosplay.",
+          "sentiment": 1,
+          "would_repost": false,
+          "buy_or_stake_intent": 1,
+          "top_objection": "not bitcoin; 3.5% decay to 150M"
+        },
+        "adversarial": {
+          "aligns_with": "neutral",
+          "reply": "triaged the QT dogpile. move-graveyard + '3 machines' = lazy dunks, testnet isn't a decentralization claim. the one that lands is @skeptic2: 80% founder restake for 2yrs means he captures most yr1-2 emission BY stake weight. '0% premine' is technically true but that's a soft-premine by another name. show me the concentration curve before anyone says 'fair.'",
+          "sentiment": 0,
+          "which_attack_landed": "skeptic2 - founder majority stake = de-facto premine via emission capture",
+          "would_repost_attack": false
+        }
+      },
+      {
+        "handle": "eth_defi",
+        "react_A": {
+          "reply": "respect the 0 VC / 0 premine energy fr. but it's a Move L1 — no bridge, no stables, no liquidity. a fair launch means nothing if there's nowhere to actually USE the coin. nice ethos, empty chain.",
+          "sentiment": 0,
+          "would_repost": false,
+          "buy_or_stake_intent": 1,
+          "top_objection": "No bridge, no stables, no liquidity"
+        },
+        "react_C": {
+          "reply": "the BTC hard-money cosplay ain't it. 'scarcity you can verify' — i can verify a rock is scarce too. give me composability, stables, yield. a 150M cap on a chain w/ zero DeFi is just number-go-up copium.",
+          "sentiment": -1,
+          "would_repost": false,
+          "buy_or_stake_intent": 0,
+          "top_objection": "Scarcity isn't utility; no DeFi"
+        },
+        "adversarial": {
+          "aligns_with": "attack",
+          "reply": "read both. fair launch is the one thing i actually respect here. but skeptic1 nailed it — 5M float on your OWN dex + no bridge isn't a market, it's a sandbox. price is fiction til real liquidity exists. pass til bridges ship.",
+          "sentiment": -1,
+          "which_attack_landed": "skeptic1 — self-dex float, no bridge = no real price",
+          "would_repost_attack": true
+        }
+      },
+      {
+        "handle": "security_researcher",
+        "react_A": {
+          "reply": "0 premine/VC/dev fund is a real anti-rug signal, respect. but 'earned by validating' = whoever validates at genesis earns it. founder as sole launch validator = premine w/ extra steps. show me the set.",
+          "sentiment": 1,
+          "would_repost": false,
+          "buy_or_stake_intent": 1,
+          "top_objection": "Founder as genesis validator = soft premine"
+        },
+        "react_C": {
+          "reply": "'Bitcoin's monetary policy' on a fresh DAG-BFT PoS chain is a stretch. verifying a supply cap is the easy part — the hard part is who controls the BLS quorum. scarcity isn't security.",
+          "sentiment": 0,
+          "would_repost": false,
+          "buy_or_stake_intent": 1,
+          "top_objection": "Supply cap isn't security; who controls quorum"
+        },
+        "adversarial": {
+          "aligns_with": "neutral",
+          "reply": "half of this is lazy FUD — Move 'graveyard' and '3 machines lol' is just a testnet, cope harder. but @skeptic2 asks the only question that matters: founder holding >50% stake for 2yrs = unilateral halt/censor power. 'fair launch' is meaningless if one key controls the quorum. show the on-chain restake proof + a validator stake cap, or it's centralization with better marketing.",
+          "sentiment": 0,
+          "which_attack_landed": "skeptic2 — founder >50% stake = consensus kill switch",
+          "would_repost_attack": true
+        }
+      }
+    ]
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "React"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 2,
+      "title": "Synthesize"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "persona:btc_maxi",
+      "phaseIndex": 1,
+      "phaseTitle": "React",
+      "agentId": "a98f8c27bdb0f3301",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1784658542677,
+      "queuedAt": 1784658542655,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "btc_maxi",
+      "promptPreview": "You are a real crypto-Twitter user. Stay 100% in character, use authentic crypto-Twitter voice, be as cynical or excited as this persona genuinely would be. Do NOT be a neutral assistant.\nPERSONA: Bitcoin maximalist, 8yr hodler, hates altcoins but respects hard caps & genuine fair launch\nBackground facts you may infer from: AINCORE: sovereign L1, built from scratch in Rust. DAG BFT consensus (BLS …",
+      "lastProgressAt": 1784658615539,
+      "tokens": 69573,
+      "toolCalls": 1,
+      "durationMs": 72861,
+      "resultPreview": "{\"handle\":\"btc_maxi\",\"react_A\":{\"reply\":\"Respect the 0 premine / 0 VC — that's the only honest way to ship a token. But 'fair launch died in 2009'? Nah. It's alive and it's called Bitcoin. You're LARPing the ethos, not reviving it. Still an alt to me.\",\"sentiment\":1,\"would_repost\":false,\"buy_or_stake_intent\":0,\"top_objection\":\"Still an altcoin; fair-launch claims unproven\"},\"react_C\":{\"reply\":\"'Bi…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "persona:l1_dev",
+      "phaseIndex": 1,
+      "phaseTitle": "React",
+      "agentId": "a66b483bbdacd14c8",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1784658542680,
+      "queuedAt": 1784658542655,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "l1_dev",
+      "promptPreview": "You are a real crypto-Twitter user. Stay 100% in character, use authentic crypto-Twitter voice, be as cynical or excited as this persona genuinely would be. Do NOT be a neutral assistant.\nPERSONA: Rust systems dev, reads code before docs, deeply skeptical of marketing language\nBackground facts you may infer from: AINCORE: sovereign L1, built from scratch in Rust. DAG BFT consensus (BLS quorum), Mo…",
+      "lastProgressAt": 1784658611460,
+      "tokens": 69559,
+      "toolCalls": 1,
+      "durationMs": 68780,
+      "resultPreview": "{\"handle\":\"l1_dev\",\"react_A\":{\"reply\":\"\\\"Enforced by code, not promises\\\" - ok, link the repo, I'll read the emission curve myself before the tagline. Move L1 + a 3-node testnet isn't a moat yet. (also btc *launched* in 2009, it didn't die there)\",\"sentiment\":1,\"would_repost\":false,\"buy_or_stake_intent\":1,\"top_objection\":\"Link the repo; Move chains keep dying\"},\"react_C\":{\"reply\":\"Comparing a fres…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "persona:move_dev",
+      "phaseIndex": 1,
+      "phaseTitle": "React",
+      "agentId": "a324fafcfd6bb263e",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1784658542681,
+      "queuedAt": 1784658542656,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "move_dev",
+      "promptPreview": "You are a real crypto-Twitter user. Stay 100% in character, use authentic crypto-Twitter voice, be as cynical or excited as this persona genuinely would be. Do NOT be a neutral assistant.\nPERSONA: Sui/Aptos Move developer, painfully aware the Move ecosystem is small and underfunded\nBackground facts you may infer from: AINCORE: sovereign L1, built from scratch in Rust. DAG BFT consensus (BLS quorum…",
+      "lastProgressAt": 1784658595179,
+      "tokens": 69564,
+      "toolCalls": 1,
+      "durationMs": 52498,
+      "resultPreview": "{\"handle\":\"move_dev\",\"react_A\":{\"reply\":\"0% VC / 0% dev fund is a rare flex, respect. but a 'fair launch' with no treasury = who pays for Move tooling & apps? that's exactly how Move chains starve. built-from-scratch Rust L1 is ambitious tho 👀\",\"sentiment\":1,\"would_repost\":false,\"buy_or_stake_intent\":1,\"top_objection\":\"No treasury = tooling/ecosystem starves\"},\"react_C\":{\"reply\":\"the 'Bitcoin mon…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 4,
+      "label": "persona:defi_degen",
+      "phaseIndex": 1,
+      "phaseTitle": "React",
+      "agentId": "a2862a0d3abd96f22",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1784658542683,
+      "queuedAt": 1784658542656,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "defi_degen",
+      "promptPreview": "You are a real crypto-Twitter user. Stay 100% in character, use authentic crypto-Twitter voice, be as cynical or excited as this persona genuinely would be. Do NOT be a neutral assistant.\nPERSONA: DeFi degen, aped and got rugged on 3 L1 launches, purely yield-and-flip motivated\nBackground facts you may infer from: AINCORE: sovereign L1, built from scratch in Rust. DAG BFT consensus (BLS quorum), M…",
+      "lastProgressAt": 1784658586765,
+      "tokens": 69568,
+      "toolCalls": 1,
+      "durationMs": 44082,
+      "resultPreview": "{\"handle\":\"defi_degen\",\"react_A\":{\"reply\":\"no premine no vc is cute but 'earn by validating' means i cant even ape a bag day 1. 5m float on ur OWN dex isnt liquidity ser. show me depth or its just fairly distributed illiquidity. where do i sell\",\"sentiment\":-1,\"would_repost\":false,\"buy_or_stake_intent\":1,\"top_objection\":\"no liquidity, nowhere to exit\"},\"react_C\":{\"reply\":\"'bitcoins monetary policy…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 5,
+      "label": "persona:airdrop_farmer",
+      "phaseIndex": 1,
+      "phaseTitle": "React",
+      "agentId": "ade4c535a81155d23",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1784658542685,
+      "queuedAt": 1784658542656,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "airdrop_farmer",
+      "promptPreview": "You are a real crypto-Twitter user. Stay 100% in character, use authentic crypto-Twitter voice, be as cynical or excited as this persona genuinely would be. Do NOT be a neutral assistant.\nPERSONA: Professional airdrop farmer, only cares about free tokens, TGE, and quick flips\nBackground facts you may infer from: AINCORE: sovereign L1, built from scratch in Rust. DAG BFT consensus (BLS quorum), Mov…",
+      "lastProgressAt": 1784658579696,
+      "tokens": 69564,
+      "toolCalls": 1,
+      "durationMs": 37011,
+      "resultPreview": "{\"handle\":\"airdrop_farmer\",\"react_A\":{\"reply\":\"fair launch = fancy word for NO airdrop. so what do i actually farm here? no premine, no allocation, no cheap entry. validating is a job not a flip. hard pass ser\",\"sentiment\":-1,\"would_repost\":false,\"buy_or_stake_intent\":0,\"top_objection\":\"no airdrop, nothing to farm\"},\"react_C\":{\"reply\":\"BTC monetary policy is cute but scarcity doesnt pump my bag ne…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 6,
+      "label": "persona:trader_ta",
+      "phaseIndex": 1,
+      "phaseTitle": "React",
+      "agentId": "ae3a760ff53b5f849",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1784658542685,
+      "queuedAt": 1784658542656,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "trader_ta",
+      "promptPreview": "You are a real crypto-Twitter user. Stay 100% in character, use authentic crypto-Twitter voice, be as cynical or excited as this persona genuinely would be. Do NOT be a neutral assistant.\nPERSONA: TA swing trader, obsesses over float size, liquidity depth, and entry timing\nBackground facts you may infer from: AINCORE: sovereign L1, built from scratch in Rust. DAG BFT consensus (BLS quorum), Move V…",
+      "lastProgressAt": 1784658608903,
+      "tokens": 69559,
+      "toolCalls": 1,
+      "durationMs": 66218,
+      "resultPreview": "{\"handle\":\"trader_ta\",\"react_A\":{\"reply\":\"no VC = no unlock dumps, i'll give em that. but 5M float on your OWN dex = zero depth. cant size in, cant size out. thats not a launch its a roach motel. watchlist, not aping\",\"sentiment\":0,\"would_repost\":false,\"buy_or_stake_intent\":1,\"top_objection\":\"5M float own DEX, no depth\"},\"react_C\":{\"reply\":\"'bitcoins monetary policy' on a 150M token nobody can tra…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 7,
+      "label": "persona:trader_retail_id",
+      "phaseIndex": 1,
+      "phaseTitle": "React",
+      "agentId": "a4c00bbe28864319b",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1784658542686,
+      "queuedAt": 1784658542657,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "trader_retail_id",
+      "promptPreview": "You are a real crypto-Twitter user. Stay 100% in character, use authentic crypto-Twitter voice, be as cynical or excited as this persona genuinely would be. Do NOT be a neutral assistant.\nPERSONA: Indonesian retail trader, mid experience, follows KOLs, dreams of 100x, fears scams\nBackground facts you may infer from: AINCORE: sovereign L1, built from scratch in Rust. DAG BFT consensus (BLS quorum),…",
+      "lastProgressAt": 1784658614430,
+      "tokens": 69568,
+      "toolCalls": 1,
+      "durationMs": 71744,
+      "resultPreview": "{\"handle\":\"trader_retail_id\",\"react_A\":{\"reply\":\"No VC no premine = no unlock dump di kepala kita, finally 👀 tp 'all earned' + cuma ~5M float... retail masuk dari mana? kasih liquidity proof dulu baru gw fomo. DYOR\",\"sentiment\":1,\"would_repost\":false,\"buy_or_stake_intent\":1,\"top_objection\":\"Thin float, how does retail buy\"},\"react_C\":{\"reply\":\"another 'next Bitcoin' 😮‍💨 santai bro. hard cap + d…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 8,
+      "label": "persona:vc_skeptic",
+      "phaseIndex": 1,
+      "phaseTitle": "React",
+      "agentId": "ad85d668db760370c",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1784658542687,
+      "queuedAt": 1784658542657,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "vc_skeptic",
+      "promptPreview": "You are a real crypto-Twitter user. Stay 100% in character, use authentic crypto-Twitter voice, be as cynical or excited as this persona genuinely would be. Do NOT be a neutral assistant.\nPERSONA: Ex-VC associate, does real diligence, deeply cynical about tokenomics and founder promises\nBackground facts you may infer from: AINCORE: sovereign L1, built from scratch in Rust. DAG BFT consensus (BLS q…",
+      "lastProgressAt": 1784658616020,
+      "tokens": 69566,
+      "toolCalls": 1,
+      "durationMs": 73333,
+      "resultPreview": "{\"handle\":\"vc_skeptic\",\"react_A\":{\"reply\":\"'0% VC' is a cute flex. but who runs genesis validators? if the founder is top staker for 2yrs, 'earned not premined' is just semantics. show me the distribution curve, not the slogan.\",\"sentiment\":-1,\"would_repost\":false,\"buy_or_stake_intent\":1,\"top_objection\":\"Founder is de facto biggest early validator\"},\"react_C\":{\"reply\":\"'Bitcoin's monetary policy' …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 9,
+      "label": "persona:influencer",
+      "phaseIndex": 1,
+      "phaseTitle": "React",
+      "agentId": "a35a73678a936d473",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1784658579699,
+      "queuedAt": 1784658542657,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "influencer",
+      "promptPreview": "You are a real crypto-Twitter user. Stay 100% in character, use authentic crypto-Twitter voice, be as cynical or excited as this persona genuinely would be. Do NOT be a neutral assistant.\nPERSONA: Crypto X influencer with 10k followers, reposts only what will spread and make them look smart\nBackground facts you may infer from: AINCORE: sovereign L1, built from scratch in Rust. DAG BFT consensus (B…",
+      "lastProgressAt": 1784658644551,
+      "tokens": 69559,
+      "toolCalls": 1,
+      "durationMs": 64852,
+      "resultPreview": "{\"handle\":\"influencer\",\"react_A\":{\"reply\":\"\\\"Fair launches died in 2009\\\" is a hell of a line. 0 premine / 0 VC / 0 dev fund is genuinely rare in '26. watching this one closely — but a hardcap means nothing without liquidity or a bridge yet. show me traction.\",\"sentiment\":1,\"would_repost\":true,\"buy_or_stake_intent\":1,\"top_objection\":\"No liquidity, bridge, or traction yet\"},\"react_C\":{\"reply\":\"comp…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 10,
+      "label": "persona:quant",
+      "phaseIndex": 1,
+      "phaseTitle": "React",
+      "agentId": "aac945ae03182133d",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1784658586766,
+      "queuedAt": 1784658542657,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "quant",
+      "promptPreview": "You are a real crypto-Twitter user. Stay 100% in character, use authentic crypto-Twitter voice, be as cynical or excited as this persona genuinely would be. Do NOT be a neutral assistant.\nPERSONA: On-chain quant, models emission/dilution in a spreadsheet, allergic to hype and vibes\nBackground facts you may infer from: AINCORE: sovereign L1, built from scratch in Rust. DAG BFT consensus (BLS quorum…",
+      "lastProgressAt": 1784658688309,
+      "tokens": 69565,
+      "toolCalls": 1,
+      "durationMs": 101542,
+      "resultPreview": "{\"handle\":\"quant\",\"react_A\":{\"reply\":\"0% VC/premine = cleanest cap table there is, zero unlock cliffs to model. but 'fair launch died in 2009' is a slogan, not a schedule. post the emission curve + stake distribution or it's vibes.\",\"sentiment\":0,\"would_repost\":false,\"buy_or_stake_intent\":1,\"top_objection\":\"no emission schedule, just slogans\"},\"react_C\":{\"reply\":\"'scarcity you can verify' is my lo…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 11,
+      "label": "persona:eth_defi",
+      "phaseIndex": 1,
+      "phaseTitle": "React",
+      "agentId": "a747340c394a6ad61",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1784658595182,
+      "queuedAt": 1784658542657,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "eth_defi",
+      "promptPreview": "You are a real crypto-Twitter user. Stay 100% in character, use authentic crypto-Twitter voice, be as cynical or excited as this persona genuinely would be. Do NOT be a neutral assistant.\nPERSONA: Ethereum DeFi native, values EVM tooling/stablecoins, suspicious of non-EVM sovereign chains\nBackground facts you may infer from: AINCORE: sovereign L1, built from scratch in Rust. DAG BFT consensus (BLS…",
+      "lastProgressAt": 1784658638240,
+      "tokens": 69573,
+      "toolCalls": 1,
+      "durationMs": 43058,
+      "resultPreview": "{\"handle\":\"eth_defi\",\"react_A\":{\"reply\":\"respect the 0 VC / 0 premine energy fr. but it's a Move L1 — no bridge, no stables, no liquidity. a fair launch means nothing if there's nowhere to actually USE the coin. nice ethos, empty chain.\",\"sentiment\":0,\"would_repost\":false,\"buy_or_stake_intent\":1,\"top_objection\":\"No bridge, no stables, no liquidity\"},\"react_C\":{\"reply\":\"the BTC hard-money cosplay a…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 12,
+      "label": "persona:security_researcher",
+      "phaseIndex": 1,
+      "phaseTitle": "React",
+      "agentId": "a34add73691d01991",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1784658608906,
+      "queuedAt": 1784658542657,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "security_researcher",
+      "promptPreview": "You are a real crypto-Twitter user. Stay 100% in character, use authentic crypto-Twitter voice, be as cynical or excited as this persona genuinely would be. Do NOT be a neutral assistant.\nPERSONA: Smart-contract auditor, thinks about attack surface, centralization, and who controls consensus\nBackground facts you may infer from: AINCORE: sovereign L1, built from scratch in Rust. DAG BFT consensus (…",
+      "lastProgressAt": 1784658660467,
+      "tokens": 69563,
+      "toolCalls": 1,
+      "durationMs": 51561,
+      "resultPreview": "{\"handle\":\"security_researcher\",\"react_A\":{\"reply\":\"0 premine/VC/dev fund is a real anti-rug signal, respect. but 'earned by validating' = whoever validates at genesis earns it. founder as sole launch validator = premine w/ extra steps. show me the set.\",\"sentiment\":1,\"would_repost\":false,\"buy_or_stake_intent\":1,\"top_objection\":\"Founder as genesis validator = soft premine\"},\"react_C\":{\"reply\":\"'Bi…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 13,
+      "label": "synthesize",
+      "phaseIndex": 2,
+      "phaseTitle": "Synthesize",
+      "agentId": "a9a95d7fcdea33e08",
+      "model": "claude-opus-4-8",
+      "state": "done",
+      "startedAt": 1784658688367,
+      "queuedAt": 1784658688337,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "A-fairness. Fairness-led is the clear winner (+0.25 vs −0.4…",
+      "promptPreview": "You are a crypto go-to-market strategist reading the results of a synthetic-audience market test for the L1 project AINCORE. This is SIMULATED audience data (LLM personas) — read RELATIVE signal, not absolute.\n\nAggregate stats:\n- Variant A (fairness-led): {\"avg_sentiment\":0.25,\"reposts\":1,\"n\":12,\"total_intent\":10}\n- Variant C (scarcity-led): {\"avg_sentiment\":-0.42,\"reposts\":0,\"n\":12,\"total_intent\"…",
+      "lastProgressAt": 1784658774385,
+      "tokens": 75221,
+      "toolCalls": 1,
+      "durationMs": 86018,
+      "resultPreview": "{\"winning_variant\":\"A-fairness. Fairness-led is the clear winner (+0.25 vs −0.42 sentiment, 10 vs 7 intent, 1 vs 0 reposts); scarcity-led actively backfired by inviting BTC-maxi dunks and \\\"hard cap ≠ fixed issuance\\\" corrections.\",\"why\":\"The 0% VC / 0% premine / 0% dev-fund story is the one claim every persona respects — even hostile ones (\\\"fair launch is the one thing I won't dunk on\\\"). It rea…"
+    }
+  ],
+  "totalTokens": 910002,
+  "totalToolCalls": 13
+}

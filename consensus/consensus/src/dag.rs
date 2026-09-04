@@ -13,6 +13,32 @@ use storage::StateDB;
 /// Cached active validator set as `(address, stake)` pairs, canonically sorted.
 type ValidatorStakeCache = Arc<Mutex<Option<Vec<(String, u64)>>>>;
 
+/// PROTOCOL (deterministic slashing): a vertex payload item carrying this
+/// prefix is equivocation evidence, not a transaction. It rides through the DAG
+/// and is ordered by the commit rule exactly like a tx, so every node extracts
+/// the IDENTICAL evidence set at block-build time. Never send it to the mempool
+/// or the executor as a tx.
+pub const SLASH_EVIDENCE_PREFIX: &str = "SLASH_EVIDENCE:";
+/// Upper bound on evidence items carried per vertex and applied per block
+/// (matches executor::apply_slash_evidence's `.take(5)`).
+const MAX_EVIDENCE_PER_VERTEX: usize = 5;
+/// Rounds a carried-but-not-yet-included evidence item stays in flight before
+/// it is treated as orphaned/cap-dropped and re-carried. Local bookkeeping.
+pub const INFLIGHT_TTL_ROUNDS: u64 = 8;
+/// Hard byte budget for a serialized vertex, comfortably under the 1 MiB
+/// gossipsub / TCP transport cap (core/node/src/p2p.rs, common/network). A
+/// vertex over this is undeliverable, so it is never BUILT (try_create_vertex
+/// trims to fit) and never ACCEPTED (ingress rejects before parsing).
+pub const MAX_VERTEX_BYTES: usize = 768 * 1024;
+/// Hard cap on parents per vertex at ingress. A Narwhal-style vertex references
+/// at most one vertex per validator of the previous round; anything beyond a
+/// generous bound is an inflation attack (unbounded parents made an
+/// equivocator's own evidence undeliverable before parents were rooted).
+pub const MAX_PARENTS: usize = 256;
+/// Upper bound on a single evidence item we are willing to store/queue/carry.
+/// With payload and parents stripped a proof is ~1 KiB; this is belt-and-braces.
+const MAX_EVIDENCE_ITEM_BYTES: usize = 64 * 1024;
+
 /// SEC-#10: how long equivocation evidence (`sys:equiv_seen:{offender}:{round}`)
 /// is retained past the DAG prune horizon before garbage collection. Set well
 /// beyond any realistic forensic/governance window; the slash is applied and
@@ -62,6 +88,18 @@ pub struct DagConsensus {
     /// the only time validator set may legitimately change during normal
     /// operation is via a slash, which happens during block execution).
     validators_cache: ValidatorStakeCache,
+    /// PROTOCOL: equivocation evidence waiting to ride in this node's NEXT
+    /// vertex (see SLASH_EVIDENCE_PREFIX). Local-only queue; the durable source
+    /// of truth is `sys:equiv_seen:*`, which try_create_vertex also re-scans so
+    /// a restart cannot lose evidence that was detected but not yet carried.
+    evidence_queue: Arc<Mutex<Vec<String>>>,
+    /// (offender, round) -> round at which we carried it, for items carried in
+    /// a vertex of ours not yet seen INCLUDED in a block. Stops consecutive
+    /// vertices re-carrying the same item; an entry older than
+    /// INFLIGHT_TTL_ROUNDS is treated as orphaned or cap-dropped and re-carried.
+    /// Cleared, and the durable marker latched, only when the item lands in a
+    /// block's slash_evidence carried by us.
+    evidence_inflight: Arc<Mutex<std::collections::BTreeMap<(String, u64), u64>>>,
 }
 
 impl DagConsensus {
@@ -187,7 +225,26 @@ impl DagConsensus {
                                 .entry(vertex.round)
                                 .or_default()
                                 .push(vertex.hash.clone());
-                            dag_map.insert(vertex.hash.clone(), vertex);
+                            if !vertex.is_live_form() {
+                        eprintln!("🚨 recovery: refusing proof-form vertex {} as live", vertex.hash);
+                        continue;
+                    }
+                    // Never revive a SECOND vertex from the same author at the
+                    // same round: that is an equivocating pair, and admitting
+                    // both would give this node a DAG its peers do not have.
+                    if round_idx_map
+                        .get(&vertex.round)
+                        .is_some_and(|hs| hs.iter().any(|h| {
+                            dag_map.get(h).is_some_and(|e: &Vertex| e.author == vertex.author)
+                        }))
+                    {
+                        eprintln!(
+                            "🚨 recovery: refusing second vertex from {} at round {}",
+                            vertex.author, vertex.round
+                        );
+                        continue;
+                    }
+                    dag_map.insert(vertex.hash.clone(), vertex);
                             accepted += 1;
                         }
                         println!(
@@ -230,6 +287,25 @@ impl DagConsensus {
                         .entry(vertex.round)
                         .or_default()
                         .push(vertex.hash.clone());
+                    if !vertex.is_live_form() {
+                        eprintln!("🚨 recovery: refusing proof-form vertex {} as live", vertex.hash);
+                        continue;
+                    }
+                    // Never revive a SECOND vertex from the same author at the
+                    // same round: that is an equivocating pair, and admitting
+                    // both would give this node a DAG its peers do not have.
+                    if round_idx_map
+                        .get(&vertex.round)
+                        .is_some_and(|hs| hs.iter().any(|h| {
+                            dag_map.get(h).is_some_and(|e: &Vertex| e.author == vertex.author)
+                        }))
+                    {
+                        eprintln!(
+                            "🚨 recovery: refusing second vertex from {} at round {}",
+                            vertex.author, vertex.round
+                        );
+                        continue;
+                    }
                     dag_map.insert(vertex.hash.clone(), vertex);
                     replayed_tail += 1;
                 }
@@ -262,6 +338,25 @@ impl DagConsensus {
                         .entry(vertex.round)
                         .or_default()
                         .push(vertex.hash.clone());
+                    if !vertex.is_live_form() {
+                        eprintln!("🚨 recovery: refusing proof-form vertex {} as live", vertex.hash);
+                        continue;
+                    }
+                    // Never revive a SECOND vertex from the same author at the
+                    // same round: that is an equivocating pair, and admitting
+                    // both would give this node a DAG its peers do not have.
+                    if round_idx_map
+                        .get(&vertex.round)
+                        .is_some_and(|hs| hs.iter().any(|h| {
+                            dag_map.get(h).is_some_and(|e: &Vertex| e.author == vertex.author)
+                        }))
+                    {
+                        eprintln!(
+                            "🚨 recovery: refusing second vertex from {} at round {}",
+                            vertex.author, vertex.round
+                        );
+                        continue;
+                    }
                     dag_map.insert(vertex.hash.clone(), vertex);
                 }
             }
@@ -353,6 +448,8 @@ impl DagConsensus {
             // populates it from storage. Subsequent reads are cache hits
             // until the next block commit invalidates.
             validators_cache: Arc::new(Mutex::new(None)),
+            evidence_queue: Arc::new(Mutex::new(Vec::new())),
+            evidence_inflight: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         }
     }
 
@@ -425,6 +522,15 @@ impl DagConsensus {
                 .expect("🚨 FATAL: Round index lock poisoned");
             round_idx.get(&prev_round).cloned().unwrap_or_default()
         };
+        // Producer-side bound matching the ingress rule (add_vertex rejects
+        // > MAX_PARENTS): without this a validator set larger than MAX_PARENTS
+        // makes every node build a vertex that every peer rejects — the chain
+        // stops. Deterministic selection (sorted by hash) so honest nodes that
+        // see the same previous round pick the same parents.
+        if parents.len() > MAX_PARENTS {
+            parents.sort_unstable();
+            parents.truncate(MAX_PARENTS);
+        }
 
         // Ensure Round 1 links to genesis
         if prev_round == 0 && parents.is_empty() {
@@ -524,6 +630,79 @@ impl DagConsensus {
                 }
             }
 
+            // PROTOCOL: carry queued equivocation evidence in this vertex so it
+            // is ordered by consensus and extracted identically on every node.
+            let carried = self.drain_evidence_for_vertex(self.current_round);
+            if !carried.is_empty() {
+                println!(
+                    "⚖️  DAG carrying {} slash evidence item(s) in this vertex",
+                    carried.len()
+                );
+                let mut with_evidence = carried;
+                with_evidence.extend(payload);
+                payload = with_evidence;
+            }
+            // BYTE BUDGET: never build a vertex the transport cannot deliver.
+            // Measure what is actually shipped -- the serialized JSON of the
+            // whole DAG_VERTEX message -- not an estimate: JSON escaping and the
+            // fixed fields made an estimate under-count, so a "trimmed" vertex
+            // was still rejected on the wire. Drop from the END (txs first,
+            // evidence last) until it fits.
+            {
+                // Fixed overhead measured ONCE with an empty payload, then a
+                // running total of each item's escaped contribution. The first
+                // cut re-serialised the whole remaining payload on every pop,
+                // which is quadratic in payload bytes under the consensus lock.
+                let empty_probe = Vertex {
+                    round: self.current_round,
+                    author: self.node_id.clone(),
+                    timestamp: u64::MAX,
+                    payload: Vec::new(),
+                    parents: parents.clone(),
+                    hash: "0".repeat(64),
+                    signature: "0".repeat(128),
+                    aggregated_signature: None,
+                    payload_root: None,
+                    parents_root: None,
+                };
+                let overhead = serde_json::to_string(&empty_probe)
+                    .map(|s| s.len())
+                    .unwrap_or(usize::MAX)
+                    + "DAG_VERTEX:".len();
+                let item_cost = |it: &String| -> usize {
+                    // escaped JSON string + the separating comma
+                    serde_json::to_string(it).map(|s| s.len()).unwrap_or(usize::MAX) + 1
+                };
+                let mut total: usize = overhead.saturating_add(
+                    payload.iter().map(item_cost).sum::<usize>(),
+                );
+                let mut trimmed_txs: Vec<String> = Vec::new();
+                while total > MAX_VERTEX_BYTES && !payload.is_empty() {
+                    if let Some(d) = payload.pop() {
+                        total = total.saturating_sub(item_cost(&d));
+                        if d.starts_with(SLASH_EVIDENCE_PREFIX) {
+                            eprintln!("⚠️  evidence item deferred: vertex byte budget");
+                        } else {
+                            // A trimmed tx was LOANED by the mempool
+                            // (get_pending_transactions moved it to inflight).
+                            // Dropping it here would strand it until
+                            // requeue_stale, and after MAX_REQUEUE_ATTEMPTS a
+                            // valid accepted transaction is deleted outright.
+                            trimmed_txs.push(d);
+                        }
+                    }
+                }
+                if !trimmed_txs.is_empty() {
+                    if let Ok(mut mp) = self.mempool.lock() {
+                        mp.return_unshipped(&trimmed_txs);
+                    }
+                    println!(
+                        "↩️  returned {} tx(s) to the mempool: vertex byte budget",
+                        trimmed_txs.len()
+                    );
+                }
+            }
+
             // 3. Create Vertex
             let mut vertex = Vertex {
                 round: self.current_round,
@@ -537,6 +716,8 @@ impl DagConsensus {
                 hash: String::new(),
                 signature: String::new(),
                 aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
             };
 
             vertex.hash = vertex.calculate_hash();
@@ -544,6 +725,13 @@ impl DagConsensus {
             // C-2 FIX: Use Ed25519 signing (BLS was actually symmetric MAC)
             let signing_key = crypto::SigningKey::from_bytes(&self.node_key);
             vertex.sign_with_ed25519(&signing_key);
+            // Final guard on the EXACT wire size (never ship an undeliverable vertex).
+            if serde_json::to_string(&vertex).map(|s| s.len()).unwrap_or(usize::MAX) + "DAG_VERTEX:".len()
+                > MAX_VERTEX_BYTES
+            {
+                eprintln!("🚫 not broadcasting vertex at round {}: exceeds MAX_VERTEX_BYTES after trim", vertex.round);
+                return;
+            }
 
             // 4. Add & Broadcast
             self.add_vertex(vertex.clone());
@@ -624,22 +812,14 @@ impl DagConsensus {
                         // open to griefing (a Byzantine validator slashing
                         // honest peers).
                         //
-                        // Phase 2.3 replaces the direct slash queue with an
-                        // attestation: this node records *its own* downtime
-                        // observation for (offender, epoch). The executor
-                        // promotes the attestation set to a real pending
-                        // slash only when distinct reporters reach BFT
-                        // quorum.
-                        //
-                        // Without cross-validator gossip of attestations
-                        // (Phase 3 work) only THIS node's attestations exist
-                        // locally; BFT quorum cannot be reached and no
-                        // downtime slash will fire. That is the intended
-                        // safety stance until the gossip protocol lands —
-                        // false positives stop NOW; real offenders are
-                        // punished AFTER gossip is wired. Equivocation
-                        // slashing (provable from local data) is unaffected
-                        // and continues to apply.
+                        // This node records and gossips *its own* downtime
+                        // observation for (offender, epoch). PROTOCOL v2: that
+                        // is where it ends -- downtime is DETECTED and ATTESTED
+                        // but NOT slashed. Only equivocation is slashed, and only
+                        // through evidence ordered by the DAG (see
+                        // SLASH_EVIDENCE_PREFIX). A deterministic downtime
+                        // protocol would have to order attestations the same
+                        // way before any downtime slash can be re-enabled.
                         const DOWNTIME_EPOCH_ROUNDS: u64 = 50;
                         let epoch = self.current_round / DOWNTIME_EPOCH_ROUNDS;
 
@@ -667,19 +847,15 @@ impl DagConsensus {
                             "rounds_missed": rounds_missed,
                         });
 
-                        // Phase 3 / H-02: Broadcast to peers so they can add
-                        // their own view and collectively reach BFT quorum.
-                        self.broadcast_attestation(&attestation);
-
-                        let _ = self.storage.put(&attestation_key, &attestation.to_string());
-
-                        // Log the local observation in the audit trail. The
-                        // executor will scan attestations and queue a real
-                        // slash once BFT quorum is reached.
-                        let _ = self.storage.put(
-                            &format!("slash_event:{}", self.current_round),
-                            &attestation.to_string(),
-                        );
+                        // Attest ONCE per (offender, epoch): re-attesting every
+                        // 10 rounds only re-broadcast and re-wrote the same row.
+                        // NOTE: downtime is detected and attested but NOT slashed
+                        // in this protocol version (no deterministic DAG producer);
+                        // no unbounded slash_event rows are written any more.
+                        if matches!(self.storage.get(&attestation_key), Ok(None)) {
+                            self.broadcast_attestation(&attestation);
+                            let _ = self.storage.put(&attestation_key, &attestation.to_string());
+                        }
                     }
                 }
             }
@@ -826,6 +1002,35 @@ impl DagConsensus {
         // vertex body — letting one malicious validator emit two vertices
         // with the same hash + signature but different `payload` / `parents`
         // / `timestamp`, splitting state across honest peers.
+        // Only equivocation PROOFS may carry the compact roots. A live vertex
+        // with either set could make hash recomputation pass while its actual
+        // body is anything at all. Reject at ingress.
+        if !vertex.is_live_form() {
+            println!(
+                "🚨 REJECTED: live vertex from {} carries proof-only root fields",
+                vertex.author
+            );
+            return;
+        }
+        // Parents are bounded and unique: an unbounded/duplicated parent list is
+        // pure inflation (it once let an equivocator size its own evidence past
+        // the transport cap) and references nothing a valid DAG needs.
+        if vertex.parents.len() > MAX_PARENTS {
+            println!(
+                "🚨 REJECTED: vertex from {} has {} parents (> MAX_PARENTS {})",
+                vertex.author,
+                vertex.parents.len(),
+                MAX_PARENTS
+            );
+            return;
+        }
+        {
+            let mut uniq: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            if !vertex.parents.iter().all(|p| uniq.insert(p.as_str())) {
+                println!("🚨 REJECTED: vertex from {} has duplicate parents", vertex.author);
+                return;
+            }
+        }
         let recomputed = vertex.calculate_hash();
         if recomputed != vertex.hash {
             println!(
@@ -868,15 +1073,14 @@ impl DagConsensus {
                 return;
             }
 
-            // Persist to DB
-            if let Ok(v_json) = serde_json::to_string(&vertex) {
-                if let Err(e) = self
-                    .storage
-                    .put(&format!("vertex:{}", vertex.hash), &v_json)
-                {
-                    println!("❌ Failed to persist DAG vertex: {}", e);
-                }
-            }
+            // NOTE: persistence happens AFTER the double-sign check below.
+            // Persisting first stored the SECOND vertex of an equivocating pair
+            // under vertex:{hash}; the check then returned without inserting it
+            // into `dag`/`round_index`, so prune_dag (which walks the in-memory
+            // DAG) never deleted it and the boot recovery loops revived it as a
+            // live vertex. A restarted node then had two vertices from one
+            // author at one round while its peers had one -> divergent commit
+            // sequences.
 
             // === SLASHING DETECTION (Double-Sign) ===
             let mut round_idx = self.round_index.lock()
@@ -908,6 +1112,16 @@ impl DagConsensus {
                             return;
                         }
                     }
+                }
+            }
+
+            // Persist only a vertex that survived every check and is now live.
+            if let Ok(v_json) = serde_json::to_string(&vertex) {
+                if let Err(e) = self
+                    .storage
+                    .put(&format!("vertex:{}", vertex.hash), &v_json)
+                {
+                    println!("❌ Failed to persist DAG vertex: {}", e);
                 }
             }
 
@@ -992,7 +1206,15 @@ impl DagConsensus {
         // We need read access to DAG and RoundIndex for ordering check, BUT we don't need write.
         // And we definitly don't want to hold them during execution.
 
-        let committed_result = {
+        // PROTOCOL (re-audit HIGH): decide ONE anchor per try_commit call, execute
+        // its block, then RE-SAMPLE the validator set and decide the next. A
+        // slash / join / leave executed by anchor k rewrites the set; deciding a
+        // whole batch from one pre-k sample elected k+1's leader from the wrong
+        // set on nodes that happened to batch (gossip holes make batching
+        // node-dependent) -> different reward recipient / anchor -> fork.
+        // Every `continue` below re-enters this loop and re-decides.
+        loop {
+        let commit = {
             let mut engine = self
                 .ordering_engine
                 .lock()
@@ -1003,19 +1225,19 @@ impl DagConsensus {
                 .lock()
                 .expect("🚨 FATAL: Round index lock poisoned");
             // B4: stake-aware set so the commit-side quorum is stake-weighted.
-            // Belt-and-braces with reload_chain_tip above: never decide an anchor
-            // from a validator set that a synced block may have just changed.
+            // Re-sampled on EVERY iteration: the previous anchor's block may have
+            // just changed it.
             self.invalidate_validators_cache();
             let validators = self.get_validator_set_with_stake();
 
-            engine.try_commit(vertex.round, &dag, &round_idx, &validators)
+            let mut batch = engine.try_commit(vertex.round, &dag, &round_idx, &validators);
+            if batch.is_empty() {
+                break;
+            }
+            batch.remove(0)
         }; // All locks dropped here!
 
-        // AUDIT-B4b: try_commit now returns the anchors decided since the last
-        // call, in deterministic round order — ONE block per anchor, on every
-        // node identically. Iterating (instead of the old single-Option) is what
-        // aligns the height<->anchor mapping across nodes.
-        for commit in committed_result {
+        // AUDIT-B4b: ONE block per anchor, on every node identically.
             // AUDIT-B4b (dedup): if the chain tip already covers this anchor, a
             // ChainSync import beat the local commit to it — the peer's block for
             // this anchor is ALREADY on our chain, fully executed and state-root
@@ -1041,7 +1263,10 @@ impl DagConsensus {
             // anchor-placement retry below needs `&mut self` for reload_chain_tip.
             let executor = std::sync::Arc::clone(&self.executor);
             let mut block_txs = Vec::new();
-            let reward_recipient = commit.leader.clone(); // C-10 FIX: Reward the anchor leader deterministically
+            // PROTOCOL: evidence carried by committed vertices, in commit order,
+            // with the carrying author (to latch our own markers on inclusion).
+            let mut carried_evidence: Vec<(String, String)> = Vec::new();
+            let mut reward_recipient = commit.leader.clone(); // C-10 FIX: Reward the anchor leader deterministically
 
             // Re-acquire DAG read lock just to fetch payloads
             // We can optimize this by cloning necessary data in the previous block,
@@ -1051,9 +1276,12 @@ impl DagConsensus {
             // the block timestamp can be derived deterministically (BFT-Time) rather
             // than read from this node's wall clock. Vertex timestamps are inside
             // Vertex::calculate_hash and signed, so every node sees identical values.
-            let stake_by_addr: std::collections::HashMap<String, u64> =
-                self.get_validator_set_with_stake().into_iter().collect();
-            let mut ts_samples: Vec<(String, u64, u64)> = Vec::new();
+            // Keep the RAW per-vertex BFT-time inputs. Stake weights (and
+            // which authors count at all) are joined in later against a set
+            // sampled at the tip we actually build on -- the first cut baked in
+            // one pre-loop sample, so a tip move produced a timestamp weighted
+            // by the OLD validator set while peers used the new one.
+            let mut ts_raw: Vec<(String, u64)> = Vec::new();
 
             let dag = self.dag.lock().expect("🚨 FATAL: DAG lock poisoned");
 
@@ -1063,10 +1291,29 @@ impl DagConsensus {
                     // No, looking up payload is fast. Execution is slow.
                     // But we must NOT hold DAG lock during execution.
                     // So we collect ALL txs first.
-                    block_txs.extend(v.payload.clone());
-                    if let Some(stake) = stake_by_addr.get(&v.author) {
-                        ts_samples.push((v.author.clone(), *stake, v.timestamp));
+                    // PROTOCOL: split the committed payload. `SLASH_EVIDENCE:` items
+                    // are evidence ordered by consensus; everything else is a tx.
+                    let mut per_vertex = 0usize;
+                    for item in &v.payload {
+                        if let Some(ev) = item.strip_prefix(SLASH_EVIDENCE_PREFIX) {
+                            // Bound verification work per committed vertex: an
+                            // honest carrier never exceeds this; extra items from
+                            // a spammer are ignored.
+                            if per_vertex >= MAX_EVIDENCE_PER_VERTEX {
+                                continue;
+                            }
+                            // Only the kind this protocol orders through the DAG.
+                            // A "downtime" item reaching the block path would fold
+                            // node-local attestation rows into the state root.
+                            if Self::is_equivocation_item(ev) {
+                                per_vertex += 1;
+                                carried_evidence.push((v.author.clone(), ev.to_string()));
+                            }
+                        } else {
+                            block_txs.push(item.clone());
+                        }
                     }
+                    ts_raw.push((v.author.clone(), v.timestamp));
                 } else {
                     // A committed vertex MUST be present: the sequence was computed
                     // from this DAG moments ago. If it is gone, something pruned it
@@ -1096,7 +1343,20 @@ impl DagConsensus {
                 .and_then(|j| serde_json::from_str::<blockchain::Block>(&j).ok())
                 .map(|b| b.header.timestamp)
                 .unwrap_or(self.latest_block_timestamp);
-            let block_timestamp = blockchain::bft_block_timestamp(ts_samples, parent_ts);
+            // Join raw samples with a freshly sampled stake map: both the
+            // membership filter and the weights must come from the set as of the
+            // tip we are building on.
+            let weigh = |raw: &Vec<(String, u64)>,
+                         stakes: &std::collections::HashMap<String, u64>|
+             -> Vec<(String, u64, u64)> {
+                raw.iter()
+                    .filter_map(|(a, ts)| stakes.get(a).map(|s| (a.clone(), *s, *ts)))
+                    .collect()
+            };
+            let stakes_now: std::collections::HashMap<String, u64> =
+                self.get_validator_set_with_stake().into_iter().collect();
+            let mut block_timestamp =
+                blockchain::bft_block_timestamp(weigh(&ts_raw, &stakes_now), parent_ts);
 
             // NOW EXECUTE (Lock Free!)
             // We execute even if empty to trigger Block Rewards (Heartbeat Mining)
@@ -1109,10 +1369,19 @@ impl DagConsensus {
                 // Use Executor parallel logic directly?
                 // The existing logic was: analyze deps -> schedule -> execute.
                 // We can use executor.execute_block_parallel(block_txs).
-                // RE-AUDIT HIGH: slash evidence is gathered by the PROPOSER from its
-                // local view and carried by the block; every node verifies it
-                // independently before applying (executor::apply_slash_evidence).
-                let slash_evidence = executor.collect_slash_evidence();
+                // PROTOCOL (deterministic slashing): evidence is NOT gathered from
+                // this node's local view any more -- that made the block a function
+                // of which node saw what and forked the chain. It is extracted from
+                // the COMMITTED vertices above, which are identical on every node,
+                // then canonicalised (dedup by offender+round, first in commit
+                // order, capped). Every node still verifies each item independently
+                // before applying (executor::apply_slash_evidence).
+                let mut slash_evidence: Vec<String> =
+                    Self::canonicalize_evidence(&executor, &carried_evidence);
+                // Evidence and the BFT timestamp were computed against THIS tip.
+                // If a reload inside the retry loop moves the tip, both are
+                // recomputed there before executing at the new height.
+                let mut verified_tip = self.latest_block_height;
                 // ANCHOR PLACEMENT (burn-in fix): every committed anchor must get
                 // EXACTLY ONE block, and "already done" is decided by ANCHOR ROUND,
                 // never by height. The first cut skipped on height alone, and the
@@ -1143,6 +1412,37 @@ impl DagConsensus {
                             already_on_chain = true;
                             break;
                         }
+                    }
+                    if self.latest_block_height != verified_tip {
+                        // Tip moved under us (sync landed a block). Recompute the
+                        // tip-dependent inputs at the NEW tip so the block we build
+                        // is exactly the one every other node would build here.
+                        eprintln!(
+                            "🔁 tip moved {} -> {} while placing anchor {}; recomputing evidence + timestamp",
+                            verified_tip, self.latest_block_height, commit.anchor_round
+                        );
+                        let parent_ts_now = self
+                            .storage
+                            .get(&format!("block_{}", self.latest_block_height))
+                            .ok()
+                            .flatten()
+                            .and_then(|j| serde_json::from_str::<blockchain::Block>(&j).ok())
+                            .map(|b| b.header.timestamp)
+                            .unwrap_or(self.latest_block_timestamp);
+                        // EVERY validator-set-derived input must move with the
+                        // tip, not just the timestamp: the leader (reward
+                        // recipient, a hashed header field) and the BFT-time
+                        // stake weights are drawn from the same set.
+                        self.invalidate_validators_cache();
+                        let vset_now = self.get_validator_set_with_stake();
+                        let stakes_after: std::collections::HashMap<String, u64> =
+                            vset_now.iter().cloned().collect();
+                        reward_recipient =
+                            OrderingEngine::leader_for_round(commit.anchor_round, &vset_now, 0);
+                        block_timestamp =
+                            blockchain::bft_block_timestamp(weigh(&ts_raw, &stakes_after), parent_ts_now);
+                        slash_evidence = Self::canonicalize_evidence(&executor, &carried_evidence);
+                        verified_tip = self.latest_block_height;
                     }
                     match executor.execute_block_parallel_at(
                         block_txs.clone(),
@@ -1194,6 +1494,20 @@ impl DagConsensus {
                 }
                 if already_on_chain {
                     continue;
+                }
+                // Latch the durable carried-marker ONLY now that the block is
+                // actually placed, and only for items WE carried that the block
+                // really contains. Doing it at canonicalisation time marked
+                // items that a later recompute dropped, and they were never
+                // re-carried.
+                if placed.is_some() {
+                    Self::latch_carried(
+                        &self.storage,
+                        &self.evidence_inflight,
+                        &self.node_id,
+                        &carried_evidence,
+                        &slash_evidence,
+                    );
                 }
                 let Some(execution_summary) = placed else {
                     // The anchor could not be placed. It is committed in the
@@ -1669,6 +1983,200 @@ impl DagConsensus {
         }
     }
 
+    /// PROTOCOL: turn the durable `sys:equiv_seen` row into the item that
+    /// rides in a vertex, and queue it. Byte-stable: the row is hash-ordered.
+    fn enqueue_evidence_item(&self, row: &serde_json::Value) {
+        let item = serde_json::json!({
+            "kind": "equivocation",
+            "offender": row.get("offender").cloned().unwrap_or(serde_json::Value::Null),
+            "round": row.get("round").cloned().unwrap_or(serde_json::Value::Null),
+            "vertex_a": row.get("vertex_a").cloned().unwrap_or(serde_json::Value::Null),
+            "vertex_b": row.get("vertex_b").cloned().unwrap_or(serde_json::Value::Null),
+        })
+        .to_string();
+        if let Ok(mut q) = self.evidence_queue.lock() {
+            if !q.contains(&item) {
+                q.push(item);
+            }
+        }
+    }
+
+    /// PROTOCOL: evidence items (WITH prefix) to carry in the vertex being built.
+    /// Drains the in-memory queue and re-scans durable `sys:equiv_seen` rows
+    /// (cheap: offender+round come from the KEY, markers are checked before the
+    /// value is parsed). An item is skipped if already slashed (`sys:slashed`,
+    /// written by block execution), already latched as included
+    /// (`sys:equiv_carried`, written only when it lands in a block we carried
+    /// it into), or in flight in a recent vertex of ours. No durable marker is
+    /// written here, so an orphaned or cap-dropped carry is re-carried after
+    /// INFLIGHT_TTL_ROUNDS. Local bookkeeping only -- never a state-root write.
+    pub(crate) fn drain_evidence_for_vertex(&self, current_round: u64) -> Vec<String> {
+        use std::collections::BTreeSet;
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: BTreeSet<(String, u64)> = BTreeSet::new();
+
+        let mut consider = |off: String, round: u64, item: String, out: &mut Vec<String>| {
+            if out.len() >= MAX_EVIDENCE_PER_VERTEX || seen.contains(&(off.clone(), round)) {
+                return;
+            }
+            if matches!(self.storage.get(&format!("sys:slashed:{}:{}", off, round)), Ok(Some(_)))
+                || matches!(self.storage.get(&format!("sys:equiv_carried:{}:{}", off, round)), Ok(Some(_)))
+            {
+                return;
+            }
+            // NOTE: deliberately round-scoped. An earlier cut skipped whenever
+            // the offender had ANY sys:slashed row, assuming "slashed once =>
+            // out of the set forever". Nothing enforces that (join_validator_set
+            // is not blocked for a slashed address), so it handed a re-joined
+            // equivocator permanent immunity. Unverifiable rows are dropped by
+            // the block-side verifier instead, which is the deterministic gate.
+            if let Ok(mut inflight) = self.evidence_inflight.lock() {
+                if let Some(&at) = inflight.get(&(off.clone(), round)) {
+                    if current_round.saturating_sub(at) < INFLIGHT_TTL_ROUNDS {
+                        return;
+                    }
+                }
+                inflight.insert((off.clone(), round), current_round);
+            }
+            seen.insert((off, round));
+            out.push(format!("{}{}", SLASH_EVIDENCE_PREFIX, item));
+        };
+
+        // 1. queued this session (already canonical JSON)
+        let queued: Vec<String> = self
+            .evidence_queue
+            .lock()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap_or_default();
+        for item in queued {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&item) else { continue };
+            let (Some(off), Some(round)) = (
+                v.get("offender").and_then(|x| x.as_str()).map(String::from),
+                v.get("round").and_then(|x| x.as_u64()),
+            ) else {
+                continue;
+            };
+            consider(off, round, item, &mut out);
+        }
+
+        // 2. durable rows: parse the KEY, check markers, only then parse the value
+        for (key, row) in self.storage.scan_prefix("sys:equiv_seen:") {
+            if out.len() >= MAX_EVIDENCE_PER_VERTEX {
+                break;
+            }
+            let Some(rest) = key.strip_prefix("sys:equiv_seen:") else { continue };
+            let Some((off, round_s)) = rest.rsplit_once(':') else { continue };
+            let Ok(round) = round_s.parse::<u64>() else { continue };
+            // Cheap marker checks from the KEY alone; the `seen` dedup lives
+            // inside `consider` (it owns the mutable borrow).
+            if matches!(self.storage.get(&format!("sys:slashed:{}:{}", off, round)), Ok(Some(_)))
+                || matches!(self.storage.get(&format!("sys:equiv_carried:{}:{}", off, round)), Ok(Some(_)))
+            {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&row) else { continue };
+            let item = serde_json::json!({
+                "kind": "equivocation",
+                "offender": v.get("offender").cloned().unwrap_or(serde_json::Value::Null),
+                "round": v.get("round").cloned().unwrap_or(serde_json::Value::Null),
+                "vertex_a": v.get("vertex_a").cloned().unwrap_or(serde_json::Value::Null),
+                "vertex_b": v.get("vertex_b").cloned().unwrap_or(serde_json::Value::Null),
+            })
+            .to_string();
+            consider(off.to_string(), round, item, &mut out);
+        }
+        out
+    }
+
+    /// PROTOCOL: verify -> dedup -> cap the evidence extracted from committed
+    /// vertices, and latch OUR durable carried-marker (plain put, never state
+    /// root) + release the in-flight entry only for items that actually land in
+    /// the block and that WE carried. Anything else (orphaned, junk, cap-dropped)
+    /// is re-carried after INFLIGHT_TTL_ROUNDS. Pure w.r.t. block content: the
+    /// output depends only on `carried` (from the committed sequence) and the
+    /// executor's on-chain-state verifier.
+    fn canonicalize_evidence(executor: &Executor, carried: &[(String, String)]) -> Vec<String> {
+        let items: Vec<String> = carried.iter().map(|(_, it)| it.clone()).collect();
+        Self::canonical_block_evidence(items, |it| {
+            executor.verify_slash_evidence(it).ok().map(|(off, _reason, round)| (off, round))
+        })
+        .into_iter()
+        .map(|(it, _)| it)
+        .collect()
+    }
+
+    /// Latch the durable carried-marker (plain put, never state root) and release
+    /// the in-flight entry for the items THIS node carried that actually made it
+    /// into the placed block. Called only after placement, so an item dropped by
+    /// a recompute, the cap, or a failed placement is re-carried after the TTL.
+    fn latch_carried(
+        storage: &StateDB,
+        inflight: &Arc<Mutex<std::collections::BTreeMap<(String, u64), u64>>>,
+        node_id: &str,
+        carried: &[(String, String)],
+        included: &[String],
+    ) {
+        let mine: std::collections::HashSet<&str> = carried
+            .iter()
+            .filter(|(a, _)| a == node_id)
+            .map(|(_, it)| it.as_str())
+            .collect();
+        for item in included {
+            if !mine.contains(item.as_str()) {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(item) else { continue };
+            let (Some(off), Some(round)) = (
+                v.get("offender").and_then(|x| x.as_str()),
+                v.get("round").and_then(|x| x.as_u64()),
+            ) else {
+                continue;
+            };
+            let _ = storage.put(&format!("sys:equiv_carried:{}:{}", off, round), "1");
+            if let Ok(mut f) = inflight.lock() {
+                f.remove(&(off.to_string(), round));
+            }
+        }
+    }
+
+    /// PROTOCOL: the only evidence kind ordered through the DAG. Anything else
+    /// (notably "downtime", whose apply path touches node-local rows) is
+    /// dropped at the block-build split before it can reach the executor.
+    pub fn is_equivocation_item(item: &str) -> bool {
+        serde_json::from_str::<serde_json::Value>(item)
+            .ok()
+            .and_then(|x| x.get("kind").and_then(|k| k.as_str()).map(|k| k == "equivocation"))
+            .unwrap_or(false)
+    }
+
+    /// PROTOCOL: canonicalise the evidence extracted from committed vertices.
+    /// `verify` is the executor's on-chain-state verifier (pure at a given
+    /// height, so identical on every node): it returns the VERIFIED
+    /// (offender, round) or None. Items are verified FIRST, then deduped on
+    /// the verified key keeping the first in commit order, then capped -- so a
+    /// junk item can neither occupy a slot nor pre-empt a real item's key (an
+    /// equivocator used to be able to self-shield by planting a junk item
+    /// under its own (offender, round) ahead of the real proof). Returns the
+    /// surviving items and their verified keys, in order.
+    pub fn canonical_block_evidence<F>(items: Vec<String>, verify: F) -> Vec<(String, (String, u64))>
+    where
+        F: Fn(&str) -> Option<(String, u64)>,
+    {
+        use std::collections::BTreeSet;
+        let mut seen: BTreeSet<(String, u64)> = BTreeSet::new();
+        let mut out: Vec<(String, (String, u64))> = Vec::new();
+        for item in items {
+            if out.len() >= MAX_EVIDENCE_PER_VERTEX {
+                break;
+            }
+            let Some(key) = verify(&item) else { continue };
+            if seen.insert(key.clone()) {
+                out.push((item, key));
+            }
+        }
+        out
+    }
+
     /// SEC-#9: independently verify a self-authenticating equivocation proof.
     ///
     /// Returns `Some(offender)` only if BOTH vertices are signed by the same
@@ -1723,13 +2231,38 @@ impl DagConsensus {
         } else {
             (proof_b, proof_a)
         };
+        // COMPACT: strip payloads, carry payload_root. Hash + signature still
+        // bind the full body (blockchain::Vertex::calculate_hash), so the
+        // executor verifies the proof without the bodies, and the item stays a
+        // few hundred bytes no matter how large the equivocator made them.
+        let (first, second) = (first.to_compact_proof(), second.to_compact_proof());
         let evidence = serde_json::json!({
             "offender": offender,
             "round": round,
             "vertex_a": first,
             "vertex_b": second,
         });
-        let _ = self.storage.put(&seen_key, &evidence.to_string());
+        let evidence_str = evidence.to_string();
+        if evidence_str.len() > MAX_EVIDENCE_ITEM_BYTES {
+            // Cannot happen with payload+parents stripped (~1 KiB), but never let
+            // an oversize row enter the carry path. Jail locally regardless.
+            //
+            // The dedup latch is written EITHER WAY: handle_remote_equivocation
+            // uses this key as its only duplicate suppressor before re-gossiping,
+            // so skipping it here turned an oversize proof into an unbounded
+            // broadcast amplifier (every receipt re-broadcast to every peer).
+            eprintln!(
+                "⚠️  equivocation evidence for {} round {} is {} bytes (> {}); not carrying",
+                offender, round, evidence_str.len(), MAX_EVIDENCE_ITEM_BYTES
+            );
+            let _ = self.storage.put(&seen_key, "oversize");
+        } else {
+            let _ = self.storage.put(&seen_key, &evidence_str);
+            // PROTOCOL: queue the canonical item to ride in our next vertex. Built
+            // from the hash-ordered row above, so two nodes that both witness the
+            // same equivocation carry byte-identical items.
+            self.enqueue_evidence_item(&evidence);
+        }
 
         // Canonical slash event — byte-stable across nodes (no timestamps /
         // node-local fields) and matched by the executor's 100% equivocation path.
@@ -1761,8 +2294,8 @@ impl DagConsensus {
         let payload = serde_json::json!({
             "offender": proof_a.author,
             "round": proof_a.round,
-            "vertex_a": proof_a,
-            "vertex_b": proof_b,
+            "vertex_a": proof_a.to_compact_proof(),
+            "vertex_b": proof_b.to_compact_proof(),
         });
         let serialized = match serde_json::to_string(&payload) {
             Ok(s) => s,
@@ -1944,6 +2477,17 @@ impl DagConsensus {
 
     pub fn handle_message(&mut self, msg: &str) {
         if let Some(content) = msg.strip_prefix("DAG_VERTEX:") {
+            // Byte budget BEFORE parsing: an oversize vertex could never have
+            // been delivered by an honest transport anyway, and parsing it is
+            // the attacker's cheapest lever.
+            if content.len() > MAX_VERTEX_BYTES {
+                eprintln!(
+                    "🚫 REJECTED oversize DAG_VERTEX: {} bytes > {} budget",
+                    content.len(),
+                    MAX_VERTEX_BYTES
+                );
+                return;
+            }
             if let Ok(vertex) = serde_json::from_str::<Vertex>(content) {
                 self.add_vertex(vertex);
             }

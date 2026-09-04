@@ -1692,6 +1692,22 @@ impl Executor {
             txs_json.len()
         );
 
+        // 0. PROTOCOL: apply block-carried slash evidence FIRST, before any
+        //    transaction, so apply-time verification sees the SAME parent-state
+        //    snapshot the block builder verified against. It used to run after
+        //    the tx loop, where a leave_validator_set tx in the same block could
+        //    remove the offender and let the slash silently fail while the block
+        //    still committed to the item.
+        //
+        //    The write log MUST be armed before this: apply_slash_evidence
+        //    writes through logged_put/logged_delete, and those writes only
+        //    reach the state root if the log is open. Arming it after the hoist
+        //    silently excluded every slash write from the block state root.
+        if let Ok(mut g) = self.block_write_log.lock() {
+            *g = Some(std::collections::BTreeMap::new());
+        }
+        self.apply_slash_evidence(slash_evidence);
+
         // 1. Parse all transactions with N-2 FIX: cumulative object limit
         let mut parsed_txs = Vec::new();
         let mut total_block_objects: usize = 0;
@@ -1741,10 +1757,7 @@ impl Executor {
         let mut total_fees: u128 = 0;
 
         let mut executed_raws: Vec<String> = Vec::new();
-        // Start the block write log (post-loop phases mirror their writes here).
-        if let Ok(mut g) = self.block_write_log.lock() {
-            *g = Some(std::collections::BTreeMap::new());
-        }
+        // (write log already armed at step 0, before apply_slash_evidence)
         // AUDIT-B4b (root determinism): the state root used to be chained ONCE
         // PER EXECUTION BATCH, which made it a function of how the conflict
         // scheduler happened to PARTITION the block — and that partitioning is
@@ -1919,11 +1932,7 @@ impl Executor {
         //    reporters reach BFT quorum (Phase 2.3 / H-02). Equivocation
         //    slashes are written directly by the consensus equivocation
         //    detector and bypass this step.
-        // 7+8. RE-AUDIT HIGH: slashes are applied ONLY from the evidence the
-        // block carries, after independent verification — never from this
-        // node's gossip-dependent attestation/pending_slash state, which differs
-        // per node and made jail decisions (and therefore state) diverge.
-        self.apply_slash_evidence(slash_evidence);
+        // 7. Slash evidence was applied at step 0 (parent-state snapshot).
 
         // 8. Advance Move epoch on a deterministic block interval, AS the block
         // being executed (see execute_block_parallel_at doc).
@@ -2022,6 +2031,11 @@ impl Executor {
     /// positives) but not yet *live* (real offenders are not punished).
     /// Equivocation slashing is unaffected — it's provable from local
     /// DAG data and continues to apply through the equivocation detector.
+    ///
+    /// NOT LIVE (protocol v2): nothing on the block path calls this. Downtime
+    /// slashing has no deterministic DAG producer and is filtered out of
+    /// block-carried evidence (only "equivocation" is ordered through the DAG).
+    /// Retained, with its tests, for a future deterministic downtime protocol.
     pub fn promote_downtime_attestations_to_slash(&self) {
         // 1. Snapshot the active validator set so quorum is computed
         //    against a stable set within this routine.
@@ -2155,102 +2169,6 @@ impl Executor {
         }
     }
 
-    /// PROPOSER SIDE (pure, no writes): gather self-authenticating slash evidence
-    /// from this node's local view so it can be CARRIED BY THE BLOCK. Capped at
-    /// 5 items per block (H-4). Every node re-verifies before applying.
-    /// Slash evidence a block may carry.
-    ///
-    /// DIVERGENCE FIX (audit 2026-08-26, CRITICAL — disabled by default).
-    /// Block-carried evidence was introduced (b4bd6c6) to stop slashes being
-    /// decided from per-node gossip state. It moved the nondeterminism instead
-    /// of removing it: `evidence_root` is folded into the header hash, but the
-    /// evidence itself was gathered by scanning THIS node's storage — and EVERY
-    /// validator builds EVERY block. Three independent sources of per-node
-    /// content, all confirmed by the audit:
-    ///   * which `sys:downtime_attestation:*` rows a node holds depends purely
-    ///     on which gossip reached it;
-    ///   * `sys:equiv_seen:*` exists only on nodes that witnessed BOTH
-    ///     conflicting vertices, and recorded vertex_a/vertex_b in ARRIVAL
-    ///     order;
-    ///   * the `>= 5` cap truncates a differently-ordered set on each node.
-    ///
-    /// Any of them yields a different `evidence_root` for the same height, i.e.
-    /// a fork with zero Byzantine participants.
-    ///
-    /// Making this deterministic is a PROTOCOL change, not a patch: evidence has
-    /// to travel through the DAG and be ordered by the commit rule, the way
-    /// transactions are, so every node sees the identical set. Until that
-    /// exists, blocks carry NO evidence and consensus stays deterministic.
-    ///
-    /// Nothing is lost in the meantime: detection still runs and still writes
-    /// the durable `sys:equiv_seen:*` proof rows and the local jail marker, and
-    /// `verify_slash_evidence` / `apply_slash_evidence` are unchanged — so a
-    /// block that legitimately carries evidence (a future protocol version, or
-    /// an operator-driven path) is still verified independently by every node
-    /// before anything is applied. Set AINCORE_BLOCK_SLASH_EVIDENCE=1 to
-    /// re-enable collection for development of that protocol work.
-    pub fn collect_slash_evidence(&self) -> Vec<String> {
-        if std::env::var("AINCORE_BLOCK_SLASH_EVIDENCE").as_deref() != Ok("1") {
-            return Vec::new();
-        }
-        self.collect_slash_evidence_nondeterministic()
-    }
-
-    /// The pre-fix collector, kept for the protocol work described above.
-    /// NOT deterministic across nodes — never call it on the block path.
-    fn collect_slash_evidence_nondeterministic(&self) -> Vec<String> {
-        use std::collections::{BTreeMap, BTreeSet};
-        let mut out: Vec<String> = Vec::new();
-        let validators: Vec<(String, u64)> = self
-            .db
-            .get("sys:validators")
-            .ok()
-            .flatten()
-            .and_then(|j| serde_json::from_str(&j).ok())
-            .unwrap_or_default();
-        if validators.is_empty() {
-            return out;
-        }
-        let stake: BTreeMap<&str, u64> = validators.iter().map(|(a, s)| (a.as_str(), *s)).collect();
-        let total: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
-
-        // (a) equivocation: durable self-contained proofs recorded by the DAG.
-        for (key, val) in self.db.scan_prefix("sys:equiv_seen:") {
-            if out.len() >= 5 { break; }
-            let Ok(ev) = serde_json::from_str::<serde_json::Value>(&val) else { continue };
-            let (Some(off), Some(round)) = (ev.get("offender").and_then(|v| v.as_str()), ev.get("round").and_then(|v| v.as_u64())) else { continue };
-            if matches!(self.db.get(&format!("sys:slashed:{}:{}", off, round)), Ok(Some(_))) { continue; }
-            if !stake.contains_key(off) { continue; }
-            let _ = key;
-            out.push(serde_json::json!({
-                "kind": "equivocation", "offender": off, "round": round,
-                "vertex_a": ev.get("vertex_a").cloned().unwrap_or(serde_json::Value::Null),
-                "vertex_b": ev.get("vertex_b").cloned().unwrap_or(serde_json::Value::Null),
-            }).to_string());
-        }
-
-        // (b) downtime: signed attestations grouped by (offender, epoch) that
-        // reach the stake quorum.
-        let mut groups: BTreeMap<(String, u64), Vec<serde_json::Value>> = BTreeMap::new();
-        for (_key, val) in self.db.scan_prefix("sys:downtime_attestation:") {
-            let Ok(a) = serde_json::from_str::<serde_json::Value>(&val) else { continue };
-            let (Some(off), Some(ep)) = (a.get("offender").and_then(|v| v.as_str()), a.get("epoch").and_then(|v| v.as_u64())) else { continue };
-            if a.get("signature").and_then(|v| v.as_str()).is_none() { continue; }
-            groups.entry((off.to_string(), ep)).or_default().push(a);
-        }
-        for ((off, ep), atts) in groups {
-            if out.len() >= 5 { break; }
-            if !stake.contains_key(off.as_str()) { continue; }
-            if matches!(self.db.get(&format!("validator:jailed:{}", off)), Ok(Some(_))) { continue; }
-            if matches!(self.db.get(&format!("sys:slashed:{}:{}", off, ep)), Ok(Some(_))) { continue; }
-            let reporters: BTreeSet<&str> = atts.iter().filter_map(|a| a.get("reporter").and_then(|v| v.as_str())).collect();
-            let rs: u128 = reporters.iter().filter_map(|r| stake.get(r).map(|s| *s as u128)).sum();
-            if rs.saturating_mul(3) <= total.saturating_mul(2) { continue; }
-            out.push(serde_json::json!({"kind": "downtime", "offender": off, "epoch": ep, "attestations": atts}).to_string());
-        }
-        out
-    }
-
     /// Verify ONE evidence item against on-chain data only. Returns
     /// (offender, reason, round_or_epoch) on success. Pure.
     pub fn verify_slash_evidence(&self, item: &str) -> Result<(String, String, u64), String> {
@@ -2328,14 +2246,31 @@ impl Executor {
     /// anyone without evidence every node can check.
     fn apply_slash_evidence(&self, items: &[String]) {
         for item in items.iter().take(5) {
+            // Consumer-side invariant (defense in depth, mirrors the producer's
+            // split filter): only equivocation is ordered through the DAG. A
+            // "downtime" item's apply path touched node-local rows.
+            let is_equiv = serde_json::from_str::<serde_json::Value>(item)
+                .ok()
+                .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(|k| k == "equivocation"))
+                .unwrap_or(false);
+            if !is_equiv {
+                eprintln!("⚠️  [SLASH] rejecting non-equivocation evidence kind in block");
+                continue;
+            }
             match self.verify_slash_evidence(item) {
                 Ok((offender, reason, round)) => {
                     let _ = self.logged_put(&format!("validator:jailed:{}", offender), &round.to_string());
                     self.execute_one_slash(&offender, &reason, round);
                     if reason == "downtime" {
+                        // These attestation rows are NODE-LOCAL bookkeeping (written
+                        // with plain put by the local detector and by whatever gossip
+                        // this node happened to receive). They were never state-root
+                        // writes, so their deletion must not be either: logged_delete
+                        // here folded a per-node key set into the state root and forked
+                        // honest nodes on identical blocks. Plain delete.
                         let prefix = format!("sys:downtime_attestation:{}:{}:", offender, round);
                         for (k, _) in self.db.scan_prefix(&prefix) {
-                            let _ = self.logged_delete(&k);
+                            let _ = self.db.delete(&k);
                         }
                     }
                 }
@@ -5041,6 +4976,8 @@ mod tests {
                 hash: String::new(),
                 signature: String::new(),
                 aggregated_signature: None,
+            payload_root: None,
+                parents_root: None,
             };
             v.hash = v.calculate_hash();
             v.sign_with_ed25519(&key);
@@ -5066,6 +5003,38 @@ mod tests {
         let mut f = b.clone();
         f.sign_with_ed25519(&SigningKey::from_bytes(&[52u8; 32]));
         assert!(executor.verify_slash_evidence(&item(&a, &f)).is_err());
+
+        // COMPACT proofs (payload stripped, payload_root carried) must verify
+        // identically -- this is what keeps DAG-carried evidence tiny.
+        let mk_big = |ts: u64| {
+            let mut v = blockchain::Vertex {
+                round: 9,
+                author: offender.clone(),
+                parents: vec!["genesis".into()],
+                payload: vec!["z".repeat(200_000)],
+                timestamp: ts,
+                hash: String::new(),
+                signature: String::new(),
+                aggregated_signature: None,
+                payload_root: None,
+                parents_root: None,
+            };
+            v.hash = v.calculate_hash();
+            v.sign_with_ed25519(&key);
+            v
+        };
+        let (ba, bb) = (mk_big(3), mk_big(4));
+        let (ca, cb) = (ba.to_compact_proof(), bb.to_compact_proof());
+        let compact_item = item(&ca, &cb);
+        assert!(compact_item.len() < 2_000, "compact proof must be small: {}", compact_item.len());
+        assert_eq!(
+            executor.verify_slash_evidence(&compact_item).expect("compact proof verifies"),
+            (offender.clone(), "equivocation".to_string(), 9)
+        );
+        // A compact proof whose root was tampered fails hash binding.
+        let mut bad = ca.clone();
+        bad.payload_root = Some("00".repeat(32));
+        assert!(executor.verify_slash_evidence(&item(&bad, &cb)).is_err());
     }
 
     #[test]
