@@ -686,14 +686,22 @@ impl Mempool {
     /// vertex byte budget). They are put back at the FRONT of the queue in
     /// their original order and their nonce guard is re-registered.
     ///
-    /// Deliberately does NOT touch `requeue_attempts`: a byte-budget trim is
-    /// not a failed execution, and counting it would let a large-but-valid
-    /// transaction be deleted after three proposals it never even entered.
+    /// Does not INCREMENT `requeue_attempts` (a byte-budget trim is not a failed
+    /// execution) but does PRESERVE any count carried in the loan: the loan
+    /// stashes the counter inside the inflight tuple, so simply dropping it
+    /// would reset a repeatedly-failing transaction's history to zero and defeat
+    /// MAX_REQUEUE_ATTEMPTS.
+    ///
+    /// `raws` arrives in reverse-payload order (the trimmer pops from the tail),
+    /// so pushing to the front in THAT order restores the original sequence.
     pub fn return_unshipped(&mut self, raws: &[String]) {
-        for raw in raws.iter().rev() {
-            if self.inflight.remove(raw).is_none() {
+        for raw in raws.iter() {
+            let Some((_, attempts)) = self.inflight.remove(raw) else {
                 // Not on loan (already executed or re-queued elsewhere): ignore.
                 continue;
+            };
+            if attempts > 0 {
+                self.requeue_attempts.insert(raw.clone(), attempts);
             }
             if let Some((sender, seq, _)) = self.meta.get(raw) {
                 self.pending_nonces.insert(format!("{}:{}", sender, seq));

@@ -1707,6 +1707,22 @@ impl Executor {
             *g = Some(std::collections::BTreeMap::new());
         }
         self.apply_slash_evidence(slash_evidence);
+        // Drain the slash writes NOW and re-arm. They happened BEFORE the tx
+        // batches in RocksDB, so they must be the OLDEST entries in the
+        // effective-write map: the end-of-block merge is last-write-wins, and
+        // leaving them in the log until then let a slash value overwrite the tx
+        // value for a key both touched (e.g. the staking ValidatorSet resource),
+        // committing the root to a state the block never had.
+        let pre_tx_writes: std::collections::BTreeMap<String, Option<String>> = {
+            let mut taken = std::collections::BTreeMap::new();
+            if let Ok(mut g) = self.block_write_log.lock() {
+                if let Some(log) = g.take() {
+                    taken = log;
+                }
+                *g = Some(std::collections::BTreeMap::new());
+            }
+            taken
+        };
 
         // 1. Parse all transactions with N-2 FIX: cumulative object limit
         let mut parsed_txs = Vec::new();
@@ -1766,8 +1782,10 @@ impl Executor {
         // PI 4de15e88 at height 69). The root now folds ONCE PER BLOCK over the
         // block's EFFECTIVE writes (last-write-wins across batches), sorted by
         // key — a pure function of the block's outcome, immune to partitioning.
+        // Seeded with the step-0 slash writes so a later tx write to the same
+        // key correctly wins (matching RocksDB's actual ordering).
         let mut block_effective_writes: std::collections::BTreeMap<String, Option<String>> =
-            std::collections::BTreeMap::new();
+            pre_tx_writes;
 
         for batch in batches.iter() {
             // Execute in parallel to get updates

@@ -948,3 +948,38 @@ fn test_inflight_loan_ledger_requeues_orphans_and_settles_executed() {
     assert!(mp.add_transaction(tx_a).is_err(), "executed tx stays deduped");
     assert!(mp.add_transaction(tx_b).is_err(), "requeued tx stays deduped");
 }
+
+/// The block builder trims transactions that do not fit the vertex byte budget.
+/// Those raws are still LOANED (get_pending_transactions moved them to
+/// inflight), so they must be handed back intact: same order, still counted
+/// against MAX_REQUEUE_ATTEMPTS, and immediately re-servable. Dropping them
+/// stranded a valid accepted transaction until requeue_stale, and after three
+/// trims deleted it outright.
+#[test]
+fn test_return_unshipped_restores_order_and_preserves_attempts() {
+    let mut mempool = Mempool::new();
+    for i in 0..4 {
+        assert!(mempool.add_transaction(make_test_tx(i)).is_ok(), "tx {} accepted", i);
+    }
+
+    let loaned = mempool.get_pending_transactions(4);
+    assert_eq!(loaned.len(), 4, "all four are loaned out");
+    assert!(mempool.is_empty(), "loaned txs leave the pending queue");
+
+    // The trimmer pops from the TAIL, so the returned slice is in reverse
+    // payload order: [3, 2] for a payload that kept [0, 1].
+    let trimmed: Vec<String> = vec![loaned[3].clone(), loaned[2].clone()];
+    mempool.return_unshipped(&trimmed);
+
+    let again = mempool.get_pending_transactions(4);
+    assert_eq!(
+        again,
+        vec![loaned[2].clone(), loaned[3].clone()],
+        "returned txs must be re-servable in their original payload order"
+    );
+
+    // A raw that is not on loan is ignored rather than duplicated.
+    let before = mempool.get_pending_transactions(4).len();
+    mempool.return_unshipped(&[make_test_tx(99)]);
+    assert_eq!(mempool.get_pending_transactions(4).len(), before);
+}

@@ -221,10 +221,6 @@ impl DagConsensus {
                             if vertex.round > max_round {
                                 max_round = vertex.round;
                             }
-                            round_idx_map
-                                .entry(vertex.round)
-                                .or_default()
-                                .push(vertex.hash.clone());
                             if !vertex.is_live_form() {
                         eprintln!("🚨 recovery: refusing proof-form vertex {} as live", vertex.hash);
                         continue;
@@ -244,6 +240,14 @@ impl DagConsensus {
                         );
                         continue;
                     }
+                    // Index ONLY vertices that were actually admitted: a refused
+                    // vertex left in round_index becomes a parent hash that no
+                    // peer can resolve (try_create_vertex uses round_index
+                    // verbatim), so the vertex we build is unverifiable.
+                    round_idx_map
+                        .entry(vertex.round)
+                        .or_default()
+                        .push(vertex.hash.clone());
                     dag_map.insert(vertex.hash.clone(), vertex);
                             accepted += 1;
                         }
@@ -283,10 +287,6 @@ impl DagConsensus {
                     if vertex.round > max_round {
                         max_round = vertex.round;
                     }
-                    round_idx_map
-                        .entry(vertex.round)
-                        .or_default()
-                        .push(vertex.hash.clone());
                     if !vertex.is_live_form() {
                         eprintln!("🚨 recovery: refusing proof-form vertex {} as live", vertex.hash);
                         continue;
@@ -306,6 +306,14 @@ impl DagConsensus {
                         );
                         continue;
                     }
+                    // Index ONLY vertices that were actually admitted: a refused
+                    // vertex left in round_index becomes a parent hash that no
+                    // peer can resolve (try_create_vertex uses round_index
+                    // verbatim), so the vertex we build is unverifiable.
+                    round_idx_map
+                        .entry(vertex.round)
+                        .or_default()
+                        .push(vertex.hash.clone());
                     dag_map.insert(vertex.hash.clone(), vertex);
                     replayed_tail += 1;
                 }
@@ -334,10 +342,6 @@ impl DagConsensus {
                     if vertex.round > max_round {
                         max_round = vertex.round;
                     }
-                    round_idx_map
-                        .entry(vertex.round)
-                        .or_default()
-                        .push(vertex.hash.clone());
                     if !vertex.is_live_form() {
                         eprintln!("🚨 recovery: refusing proof-form vertex {} as live", vertex.hash);
                         continue;
@@ -357,6 +361,14 @@ impl DagConsensus {
                         );
                         continue;
                     }
+                    // Index ONLY vertices that were actually admitted: a refused
+                    // vertex left in round_index becomes a parent hash that no
+                    // peer can resolve (try_create_vertex uses round_index
+                    // verbatim), so the vertex we build is unverifiable.
+                    round_idx_map
+                        .entry(vertex.round)
+                        .or_default()
+                        .push(vertex.hash.clone());
                     dag_map.insert(vertex.hash.clone(), vertex);
                 }
             }
@@ -2255,7 +2267,11 @@ impl DagConsensus {
                 "⚠️  equivocation evidence for {} round {} is {} bytes (> {}); not carrying",
                 offender, round, evidence_str.len(), MAX_EVIDENCE_ITEM_BYTES
             );
-            let _ = self.storage.put(&seen_key, "oversize");
+            // Do NOT write the sentinel into sys:equiv_seen: that key is the
+            // exactly-once gate for a REAL, carryable proof. Poisoning it would
+            // make a later, correctly-sized proof for the same (offender, round)
+            // early-return forever -- permanent evidence suppression. The
+            // re-gossip storm is suppressed by its own key instead.
         } else {
             let _ = self.storage.put(&seen_key, &evidence_str);
             // PROTOCOL: queue the canonical item to ride in our next vertex. Built
@@ -2366,13 +2382,19 @@ impl DagConsensus {
             }
         };
 
-        // Re-gossip only on the FIRST application (dedup guards a broadcast storm).
-        let seen_key = format!("sys:equiv_seen:{}:{}", offender, a.round);
-        if matches!(self.storage.get(&seen_key), Ok(Some(_))) {
-            return;
-        }
+        // Re-gossip only ONCE per (offender, round), tracked by a dedicated key
+        // so it never blocks a real proof from being recorded. sys:equiv_seen is
+        // reserved for carryable evidence and must not double as a gossip latch.
+        let gossip_key = format!("sys:equiv_gossiped:{}:{}", offender, a.round);
+        let already_gossiped = matches!(self.storage.get(&gossip_key), Ok(Some(_)));
+        // Applying is idempotent (apply_equivocation_slash latches on
+        // sys:equiv_seen), so run it even if we have re-gossiped before: an
+        // earlier oversize proof may have left no carryable evidence behind.
         self.apply_equivocation_slash(&a, &b);
-        self.broadcast_equivocation_proof(&a, &b);
+        if !already_gossiped {
+            let _ = self.storage.put(&gossip_key, "1");
+            self.broadcast_equivocation_proof(&a, &b);
+        }
     }
 
     /// QC Phase 3: gossip THIS node's partial finality vote so peers can
