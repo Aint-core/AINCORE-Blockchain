@@ -1014,6 +1014,21 @@ impl DagConsensus {
         // vertex body — letting one malicious validator emit two vertices
         // with the same hash + signature but different `payload` / `parents`
         // / `timestamp`, splitting state across honest peers.
+        // `aggregated_signature` is deserialised from untrusted gossip, is
+        // unbounded, and (since it is folded into the signed hash) is fully
+        // attacker-chosen padding. An equivocator used it to inflate its OWN
+        // conflicting vertices past MAX_EVIDENCE_ITEM_BYTES, which sends every
+        // honest reporter down the oversize branch -- no carryable evidence is
+        // recorded and the equivocator suppresses its own slash. Nothing in the
+        // tree ever sets this field, so a live vertex carrying it is rejected
+        // outright, exactly like the proof-only root fields below.
+        if vertex.aggregated_signature.is_some() {
+            println!(
+                "🚨 REJECTED: live vertex from {} carries aggregated_signature (unset by design)",
+                vertex.author
+            );
+            return;
+        }
         // Only equivocation PROOFS may carry the compact roots. A live vertex
         // with either set could make hash recomputation pass while its actual
         // body is anything at all. Reject at ingress.
@@ -2026,6 +2041,8 @@ impl DagConsensus {
         use std::collections::BTreeSet;
         let mut out: Vec<String> = Vec::new();
         let mut seen: BTreeSet<(String, u64)> = BTreeSet::new();
+        let current_validators: std::collections::HashSet<String> =
+            self.get_validator_set().into_iter().collect();
 
         let mut consider = |off: String, round: u64, item: String, out: &mut Vec<String>| {
             if out.len() >= MAX_EVIDENCE_PER_VERTEX || seen.contains(&(off.clone(), round)) {
@@ -2034,6 +2051,15 @@ impl DagConsensus {
             if matches!(self.storage.get(&format!("sys:slashed:{}:{}", off, round)), Ok(Some(_)))
                 || matches!(self.storage.get(&format!("sys:equiv_carried:{}:{}", off, round)), Ok(Some(_)))
             {
+                return;
+            }
+            // MEMBERSHIP, not slash history: an offender outside the current
+            // validator set can never pass verify_slash_evidence, so carrying
+            // its rows only burns vertex space every TTL until the ~100k-round
+            // GC. Keyed on membership rather than "has any sys:slashed row", so
+            // a re-joined equivocator is still slashable (the immunity bug the
+            // round-3 fix closed does not come back).
+            if !current_validators.contains(&off) {
                 return;
             }
             // NOTE: deliberately round-scoped. An earlier cut skipped whenever

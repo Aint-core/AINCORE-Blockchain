@@ -1128,7 +1128,11 @@ impl Executor {
             .and_then(|s| s.parse::<u128>().ok());
 
         if old_supply != Some(new_supply) {
-            let _ = self.db.put("sys:total_supply", &new_supply.to_string());
+            // Through the write log: this key feeds a later epoch block's
+            // logged update, so leaving it outside the root means a divergence
+            // here is invisible until it resurfaces in a block that cannot
+            // explain it.
+            let _ = self.logged_put("sys:total_supply", &new_supply.to_string());
         }
 
         if let Some(old_supply) = old_supply {
@@ -1141,7 +1145,7 @@ impl Executor {
                     .flatten()
                     .and_then(|s| s.parse::<u128>().ok())
                     .unwrap_or(0);
-                let _ = self.db.put(
+                let _ = self.logged_put(
                     "total_burned",
                     &prev_burned.saturating_add(burned_delta).to_string(),
                 );
@@ -1357,7 +1361,7 @@ impl Executor {
             .flatten()
             .and_then(|s| s.parse::<u128>().ok())
             .unwrap_or(0);
-        let _ = self.db.put(
+        let _ = self.logged_put(
             "total_burned",
             &prev_burned.saturating_add(amount).to_string(),
         );
@@ -1376,7 +1380,7 @@ impl Executor {
             if let Some(mut set) = decode_validator_set_hex(&value) {
                 set.total_supply = set.total_supply.saturating_sub(amount);
                 if let Some(encoded) = encode_validator_set_hex(&set) {
-                    let _ = self.db.put(&key, &encoded);
+                    let _ = self.logged_put(&key, &encoded);
                 }
             }
         }
@@ -1405,7 +1409,7 @@ impl Executor {
             cumulative_burned: prev_move_burned.saturating_add(amount),
         };
         if let Some(encoded) = encode_supply_stats_hex(&updated_stats) {
-            let _ = self.db.put(&stats_key, &encoded);
+            let _ = self.logged_put(&stats_key, &encoded);
         }
     }
 

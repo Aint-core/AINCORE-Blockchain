@@ -703,9 +703,16 @@ impl Mempool {
             if attempts > 0 {
                 self.requeue_attempts.insert(raw.clone(), attempts);
             }
-            if let Some((sender, seq, _)) = self.meta.get(raw) {
-                self.pending_nonces.insert(format!("{}:{}", sender, seq));
-            }
+            // A raw with no live `meta` is unselectable: get_pending_transactions
+            // builds its per-sender queues only from raws that have one, and
+            // mark_executed removes meta when the tx lands via another
+            // validator's vertex. Re-queuing it would pin it in pending_txs
+            // forever, so drop it instead.
+            let Some((sender, seq, _)) = self.meta.get(raw).cloned() else {
+                self.requeue_attempts.remove(raw);
+                continue;
+            };
+            self.pending_nonces.insert(format!("{}:{}", sender, seq));
             self.pending_txs.push_front(raw.clone());
         }
     }
