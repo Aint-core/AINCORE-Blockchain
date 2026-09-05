@@ -2364,9 +2364,12 @@ pub async fn start_api_server(
     });
 
     // M1: Rate limiter — 100 requests/second per IP, burst up to 200.
-    // Mirrors the (previously dead) config in api.rs so the LIVE server is throttled.
+    // Mirrors the config in api.rs so the LIVE server is throttled.
+    // NOTE: actix-governor 0.4 `per_second(n)` = replenish one cell every n
+    // SECONDS, so per_second(100) throttled every IP to ~1 req/100s after a 200
+    // burst — a frontend-bricking bug. per_millisecond(10) = true 100 req/s.
     let governor_conf = GovernorConfigBuilder::default()
-        .per_second(100)
+        .per_millisecond(10)
         .burst_size(200)
         .finish()
         .expect("governor config is valid");

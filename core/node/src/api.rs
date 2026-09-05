@@ -582,9 +582,14 @@ pub async fn start_api_server(
         storage,
     });
 
-    // Rate limiter: 100 requests per second per IP
+    // Rate limiter: 100 requests/second per IP, burst 200.
+    // NOTE: actix-governor 0.4 `per_second(n)` sets the replenish PERIOD to n
+    // SECONDS per cell, i.e. per_second(100) = one request every 100s (not
+    // 100 req/s). That silently throttled any IP to ~1 req/100s after a 200
+    // burst — enough to brick a wallet/explorer/DEX frontend. Use
+    // per_millisecond(10) = one cell every 10ms = a true 100 req/s.
     let governor_conf = GovernorConfigBuilder::default()
-        .per_second(100)
+        .per_millisecond(10)
         .burst_size(200)
         .finish()
         .unwrap();
