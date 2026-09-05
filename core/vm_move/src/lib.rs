@@ -177,11 +177,87 @@ pub fn system_address() -> AccountAddress {
 }
 
 impl AINCOREVM {
+    /// GATE-CRITICAL (pre-mainnet): stdlib natives were registered with
+    /// `GasParameters::zeros()`, so EVERY native cost nothing -- hashing, BCS
+    /// serialization, string and vector operations alike. MAX_GAS_LIMIT bounds
+    /// how many instructions a transaction may execute, but with free natives
+    /// each instruction can do unbounded WORK: sha3_256 over a multi-megabyte
+    /// vector, or repeated bcs::to_bytes, was billed as zero. That left the very
+    /// chain-halt MAX_GAS_LIMIT was added to close wide open, since every
+    /// validator performs the work deterministically and nothing times it out.
+    ///
+    /// The per-BYTE parameters are load-bearing: they are what make billed gas
+    /// track real work instead of instruction count. Values are conservative
+    /// multiples of the interpreter's base charge of 1 unit per simple
+    /// instruction (see AINCOREGasMeter), so a byte of hashing or serialization
+    /// is never cheaper than an instruction.
+    ///
+    /// This changes gas_used, hence balances, hence the state root: it is a
+    /// consensus-breaking change and must ship with a fresh genesis.
+    fn native_gas_params() -> move_stdlib::natives::GasParameters {
+        use move_stdlib::natives::{bcs, hash, signer, string, type_name, vector};
+        move_stdlib::natives::GasParameters {
+            bcs: bcs::GasParameters {
+                to_bytes: bcs::ToBytesGasParameters {
+                    per_byte_serialized: 2.into(),
+                    legacy_min_output_size: 1.into(),
+                    failure: 100.into(),
+                },
+            },
+            hash: hash::GasParameters {
+                sha2_256: hash::Sha2_256GasParameters {
+                    base: 100.into(),
+                    per_byte: 3.into(),
+                    legacy_min_input_len: 1.into(),
+                },
+                sha3_256: hash::Sha3_256GasParameters {
+                    base: 100.into(),
+                    per_byte: 3.into(),
+                    legacy_min_input_len: 1.into(),
+                },
+            },
+            type_name: type_name::GasParameters {
+                get: type_name::GetGasParameters {
+                    base: 50.into(),
+                    per_byte: 2.into(),
+                },
+            },
+            signer: signer::GasParameters {
+                borrow_address: signer::BorrowAddressGasParameters { base: 10.into() },
+            },
+            string: string::GasParameters {
+                check_utf8: string::CheckUtf8GasParameters {
+                    base: 20.into(),
+                    per_byte: 2.into(),
+                },
+                is_char_boundary: string::IsCharBoundaryGasParameters { base: 10.into() },
+                sub_string: string::SubStringGasParameters {
+                    base: 20.into(),
+                    per_byte: 2.into(),
+                },
+                index_of: string::IndexOfGasParameters {
+                    base: 20.into(),
+                    per_byte_pattern: 2.into(),
+                    per_byte_searched: 2.into(),
+                },
+            },
+            vector: vector::GasParameters {
+                empty: vector::EmptyGasParameters { base: 10.into() },
+                length: vector::LengthGasParameters { base: 10.into() },
+                push_back: vector::PushBackGasParameters {
+                    base: 10.into(),
+                    legacy_per_abstract_memory_unit: 2.into(),
+                },
+                borrow: vector::BorrowGasParameters { base: 10.into() },
+                pop_back: vector::PopBackGasParameters { base: 10.into() },
+                destroy_empty: vector::DestroyEmptyGasParameters { base: 10.into() },
+                swap: vector::SwapGasParameters { base: 10.into() },
+            },
+        }
+    }
+
     pub fn new(db: Arc<StateDB>) -> Self {
-        let natives = move_stdlib::natives::all_natives(
-            system_address(),
-            move_stdlib::natives::GasParameters::zeros(),
-        );
+        let natives = move_stdlib::natives::all_natives(system_address(), Self::native_gas_params());
         let vm = MoveVM::new(natives).unwrap_or_else(|e| {
             eprintln!("⚠️  WARNING: Failed to create MoveVM: {}", e);
             panic!("Critical: MoveVM initialization failed")

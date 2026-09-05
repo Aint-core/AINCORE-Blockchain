@@ -39,6 +39,15 @@ const MAX_OBJECTS_PER_BLOCK: usize = 10_000;
 /// executor (consensus path, authoritative) and the mempool (admission).
 pub const MAX_GAS_LIMIT: u64 = 10_000_000;
 
+/// Protocol ceiling on the SUM of `gas_limit` across one block.
+///
+/// GATE-CRITICAL (pre-mainnet). MAX_GAS_LIMIT alone bounds a single
+/// transaction, so a block packed with transactions at that ceiling reaches the
+/// same unbounded-execution halt by volume. 200M is 20 transactions at the
+/// per-tx maximum, or ~2000 ordinary ones, while capping the work any single
+/// block can force on every validator.
+pub const MAX_BLOCK_GAS_LIMIT: u64 = 200_000_000;
+
 const OBJECT_LOAD_GAS: u64 = 100;
 const MIN_GAS_PRICE: u128 = 1;
 
@@ -1777,6 +1786,44 @@ impl Executor {
             total_block_objects,
             MAX_OBJECTS_PER_BLOCK
         );
+
+        // GATE-CRITICAL (pre-mainnet): MAX_GAS_LIMIT bounds ONE transaction;
+        // nothing bounded a BLOCK. A proposer (or an attacker filling the
+        // mempool) could pack a block with transactions each at the per-tx
+        // ceiling, and every validator would execute the sum deterministically,
+        // with no wall-clock timeout — the same halt, reached by volume instead
+        // of by a single huge transaction.
+        //
+        // The trim is deterministic: it walks the block's transactions in their
+        // fixed order and stops at the first one that would cross the ceiling,
+        // so every node keeps byte-identical prefix and computes the same state
+        // root. Trimming (rather than rejecting the whole block) keeps a
+        // malicious proposer from halting the chain by making blocks nobody can
+        // execute.
+        let parsed_txs = {
+            let mut kept = Vec::with_capacity(parsed_txs.len());
+            let mut budget: u64 = 0;
+            let mut dropped = 0usize;
+            for tx in parsed_txs.into_iter() {
+                let cost = tx.0.gas_limit;
+                if budget.saturating_add(cost) > MAX_BLOCK_GAS_LIMIT {
+                    dropped += 1;
+                    continue;
+                }
+                budget = budget.saturating_add(cost);
+                kept.push(tx);
+            }
+            if dropped > 0 {
+                println!(
+                    "✂️  block gas ceiling: kept {} tx ({} gas), dropped {} over MAX_BLOCK_GAS_LIMIT {}",
+                    kept.len(),
+                    budget,
+                    dropped,
+                    MAX_BLOCK_GAS_LIMIT
+                );
+            }
+            kept
+        };
 
         // 2. Build Dependency Graph & Schedule (see schedule_batches — unknown
         //    write sets are serialized into singleton batches, #1).

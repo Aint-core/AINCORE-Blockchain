@@ -31,9 +31,23 @@ chain pribadi menjadi jaringan.
 
 ```
 AINCORE_CHAIN_ID              AINCORE-LOCALTEST-3V
-AINCORE_EXPECTED_GENESIS_HASH b0331d0e1fd1e6672205372998c30cf1985239e165d70d7abd6f377141c257af
+AINCORE_EXPECTED_GENESIS_HASH <minta ke operator — lihat catatan di bawah>
 AINCORE_BOOTNODES             /ip4/192.168.18.202/tcp/9201,/ip4/192.168.18.202/tcp/9205,/ip4/192.168.18.66/tcp/9203
 ```
+
+> **Nilai genesis hash TIDAK dicantumkan di sini dengan sengaja.** Hash itu
+> berubah setiap kali genesis diubah (versi stdlib, parameter konsensus, set
+> validator awal), jadi angka yang ditulis di dokumen akan basi tanpa ada yang
+> sadar — dan calon validator yang memakai angka basi akan gagal boot atau,
+> lebih buruk, mengira dirinya sudah bergabung. Operator mengambil nilai yang
+> berlaku dari node yang sedang jalan:
+>
+> ```bash
+> journalctl -u aincore-r1 --no-pager | grep -oE 'Genesis identity hash: [0-9a-f]{64}' | tail -1
+> ```
+>
+> Verifikasi nilainya lewat jalur terpisah (telepon, pesan langsung), jangan
+> hanya dari file yang dikirimkan bersama genesis.json.
 
 > **`AINCORE_EXPECTED_GENESIS_HASH` bukan opsional.** Tanpa itu, genesis.json
 > yang salah membuat kamu diam-diam menjalankan **chain yang berbeda** — node-mu
@@ -49,7 +63,7 @@ Minta `genesis.json` ke operator dan simpan sebagai `genesis.json`.
 
 ```bash
 export AINCORE_CHAIN_ID=AINCORE-LOCALTEST-3V
-export AINCORE_EXPECTED_GENESIS_HASH=b0331d0e1fd1e6672205372998c30cf1985239e165d70d7abd6f377141c257af
+export AINCORE_EXPECTED_GENESIS_HASH=<nilai dari operator>   # WAJIB, lihat catatan di atas
 export AINCORE_GENESIS_PATH=./genesis.json
 export AINCORE_BOOTNODES=/ip4/192.168.18.202/tcp/9201,/ip4/192.168.18.202/tcp/9205,/ip4/192.168.18.66/tcp/9203
 export AINCORE_P2P_PORT=9301          # pilih port yang bebas di mesinmu
