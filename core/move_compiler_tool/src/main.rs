@@ -16,6 +16,11 @@ struct Args {
     /// Output directory for compiled bytecode
     #[arg(short, long, default_value = "./build")]
     output: PathBuf,
+
+    /// Dependency sources compiled but not emitted (e.g. the 0x1 stdlib).
+    /// Required to compile a module that `use`s 0x1::coin, 0x1::staking, etc.
+    #[arg(short, long, num_args = 0..)]
+    deps: Vec<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -27,7 +32,14 @@ fn main() -> Result<()> {
         .iter()
         .map(|p| p.to_string_lossy().to_string())
         .collect();
-    let deps = vec![]; // Standard library paths would go here
+    let deps: Vec<String> = args
+        .deps
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    if !deps.is_empty() {
+        println!("   with {} dependency source(s)", deps.len());
+    }
 
     // Compiler::from_files expects <Paths, NamedAddress>
     // Paths must implement Into<Symbol> (String does)

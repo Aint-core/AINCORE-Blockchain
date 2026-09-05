@@ -229,6 +229,17 @@ impl Mempool {
             return Err("Gas limit must be greater than 0".to_string());
         }
 
+        // AUDIT-CRITICAL (pre-mainnet B5): mirror the executor's protocol
+        // ceiling so an over-limit transaction is refused at admission rather
+        // than occupying a mempool slot it can never be executed from.
+        if parsed_tx.gas_limit > executor::MAX_GAS_LIMIT {
+            return Err(format!(
+                "Gas limit {} exceeds MAX_GAS_LIMIT {}",
+                parsed_tx.gas_limit,
+                executor::MAX_GAS_LIMIT
+            ));
+        }
+
         // SEC-#27: best-effort admission balance gate. The executor reserves the
         // full gas_limit*gas_price upfront (Ethereum-style), so a sender that
         // cannot cover it fails at execution and only wastes block space. Reject

@@ -1052,3 +1052,38 @@ fn test_mark_executed_evicts_from_pending_queue() {
         "no unselectable raw may be left pinned in pending_txs"
     );
 }
+
+/// AUDIT-CRITICAL (pre-mainnet B5). `gas_limit` had no ceiling, so a ~0.001 AIN
+/// transaction could buy 1e15 units of Move execution on EVERY validator at once
+/// and halt the chain (no wall-clock timeout exists on Move execution). Admission
+/// must refuse anything above the protocol ceiling.
+#[test]
+fn test_gas_limit_above_protocol_ceiling_is_rejected() {
+    let mut mempool = Mempool::new();
+
+    // The chain-halt shape: enormous gas_limit at the minimum gas price.
+    let halt = make_test_tx_with_payload_and_gas(
+        1,
+        hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![1u8; 4]])).unwrap()),
+        1_000_000_000_000_000,
+        1,
+    );
+    let err = mempool.add_transaction(halt).expect_err("must be rejected");
+    assert!(
+        err.contains("MAX_GAS_LIMIT"),
+        "rejection must name the ceiling, got: {}",
+        err
+    );
+
+    // Exactly at the ceiling is still admissible.
+    let ok_tx = make_test_tx_with_payload_and_gas(
+        2,
+        hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![2u8; 4]])).unwrap()),
+        executor::MAX_GAS_LIMIT,
+        1,
+    );
+    assert!(
+        mempool.add_transaction(ok_tx).is_ok(),
+        "a transaction at exactly MAX_GAS_LIMIT must still be accepted"
+    );
+}

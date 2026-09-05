@@ -724,6 +724,35 @@ impl AINCOREVM {
                             idx
                         );
                     }
+                    // AUDIT-CRITICAL (pre-mainnet B1): signer-reachability is NOT the
+                    // only way a parameter forges value. move-vm's `deserialize_args`
+                    // builds ANY declared parameter straight from caller-supplied BCS
+                    // bytes, so a struct/resource value parameter is minted from thin
+                    // air: an attacker publishes a module to their own address taking
+                    // `0x1::coin::Coin<AincoreCoin>` by value, calls it with the u128
+                    // of their choice, and deposits a coin the protocol never issued.
+                    // The two earlier forge fixes closed signer REACHABILITY and left
+                    // this class open. move-vm deliberately delegates argument-type
+                    // validation to the adapter (Aptos does it in `is_valid_txn_arg`),
+                    // so the boundary has to live here.
+                    //
+                    // Fail CLOSED: only primitives, address and vectors of those are
+                    // admissible. Every real stdlib entry function uses exactly this
+                    // set (&signer / address / u8,u64,u128 / vector<u8> / bool), so
+                    // this rejects attacks without narrowing legitimate calls.
+                    if !Self::entry_arg_type_permitted(other, ty_args) {
+                        anyhow::bail!(
+                            "entry function {}::{} parameter {} has a type that is not \
+                             admissible as a transaction argument (only signer, bool, \
+                             integers, address and vectors of those are allowed). A \
+                             struct or resource value parameter would be constructed \
+                             from caller-supplied bytes, forging a value the protocol \
+                             never issued; refusing to run",
+                            module,
+                            function,
+                            idx
+                        );
+                    }
                 }
             }
         }
@@ -746,6 +775,59 @@ impl AINCOREVM {
         }
 
         Ok(args)
+    }
+
+    /// Allowlist for transaction argument types. Fail-closed: anything not
+    /// explicitly named here is refused, including every struct and resource
+    /// type. move-vm will happily deserialize a declared struct parameter from
+    /// caller bytes, which is indistinguishable from minting it, so the adapter
+    /// must gate the set of admissible argument types itself.
+    ///
+    /// `signer` / `&signer` never reach here: they are matched as rebindable
+    /// top-level slots before this is consulted, and any signer hiding in a
+    /// non-rebindable position is rejected by `type_yields_signer` first.
+    fn entry_arg_type_permitted(
+        ty: &move_vm_types::loaded_data::runtime_types::Type,
+        ty_args: &[move_core_types::language_storage::TypeTag],
+    ) -> bool {
+        use move_vm_types::loaded_data::runtime_types::Type;
+        match ty {
+            Type::Bool
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::U128
+            | Type::U256
+            | Type::Address => true,
+            Type::Vector(inner) => Self::entry_arg_type_permitted(inner, ty_args),
+            Type::TyParam(i) => ty_args
+                .get(*i)
+                .is_some_and(Self::type_tag_permitted_as_entry_arg),
+            // Struct, StructInstantiation, Signer in a non-top-level position,
+            // references to non-signer types, and anything a future move-vm adds.
+            _ => false,
+        }
+    }
+
+    /// `TypeTag` mirror of `entry_arg_type_permitted`, used to resolve a
+    /// `TyParam` against what the caller actually instantiated it with.
+    fn type_tag_permitted_as_entry_arg(
+        tag: &move_core_types::language_storage::TypeTag,
+    ) -> bool {
+        use move_core_types::language_storage::TypeTag;
+        match tag {
+            TypeTag::Bool
+            | TypeTag::U8
+            | TypeTag::U16
+            | TypeTag::U32
+            | TypeTag::U64
+            | TypeTag::U128
+            | TypeTag::U256
+            | TypeTag::Address => true,
+            TypeTag::Vector(inner) => Self::type_tag_permitted_as_entry_arg(inner),
+            _ => false,
+        }
     }
 
     /// True when a runtime `Type` can materialise a `signer` value somewhere the

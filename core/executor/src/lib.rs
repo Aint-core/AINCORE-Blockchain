@@ -29,6 +29,16 @@ const MAX_SUPPLY: u128 = 150_000_000 * 1_000_000_000_000_000_000; // 150 Million
 // 10,000 TXs × 128 objects = 1.28M objects → 1.28GB RAM. Cap at 10K total.
 const MAX_OBJECTS_PER_BLOCK: usize = 10_000;
 // Gas cost per input object loaded (prevents zero-cost object flooding)
+/// Protocol ceiling on a single transaction's `gas_limit`.
+///
+/// AUDIT-CRITICAL (pre-mainnet B5). Real transactions here use 1_000..100_000
+/// gas, so this leaves ~100x headroom while bounding the work one transaction
+/// can force every validator to perform. Without it `gas_limit` was unbounded
+/// and a ~0.001 AIN transaction could run an unbounded Move loop on every node
+/// at once (there is no wall-clock timeout on execution). Enforced in BOTH the
+/// executor (consensus path, authoritative) and the mempool (admission).
+pub const MAX_GAS_LIMIT: u64 = 10_000_000;
+
 const OBJECT_LOAD_GAS: u64 = 100;
 const MIN_GAS_PRICE: u128 = 1;
 
@@ -3109,6 +3119,23 @@ impl Executor {
 
             if tx.gas_limit == 0 {
                 println!("❌ Gas limit must be greater than 0");
+                return None;
+            }
+
+            // AUDIT-CRITICAL (pre-mainnet B5): gas_limit had NO upper bound. The
+            // sender pre-pays gas_limit * gas_price, but with MIN_GAS_PRICE = 1 a
+            // gas_limit of 1e15 costs ~0.001 AIN and buys 1e15 units of Move
+            // execution that EVERY validator performs deterministically, on both
+            // the consensus and the sync path. There is no wall-clock timeout on
+            // Move execution, so one cheap transaction halts the whole chain.
+            // This gate lives in the executor, not only the mempool, because a
+            // malicious validator can place a transaction straight into a vertex
+            // and never offer it for admission.
+            if tx.gas_limit > MAX_GAS_LIMIT {
+                println!(
+                    "❌ REJECTED: gas_limit {} exceeds MAX_GAS_LIMIT {}",
+                    tx.gas_limit, MAX_GAS_LIMIT
+                );
                 return None;
             }
 
@@ -7515,6 +7542,88 @@ mod tests {
         assert!(
             end <= start,
             "attacker minted AIN via a forged @0x1 signer: {} -> {} (must never increase)",
+            start,
+            end
+        );
+    }
+
+    /// PRE-MAINNET AUDIT B1 (CRITICAL). The two earlier forge fixes both closed
+    /// signer REACHABILITY. This attack forges no signer at all, so neither guard
+    /// fires: the attacker declares a plain `Coin<AincoreCoin>` VALUE parameter.
+    /// move-vm's `deserialize_args` builds any declared parameter from the
+    /// caller's BCS bytes, so `Coin { value: N }` is manufactured from nothing and
+    /// deposited -- unlimited inflation from a two-line module any account may
+    /// publish. move-vm deliberately delegates argument-type validation to the
+    /// adapter, so the fix is an allowlist in `bind_signer_args`.
+    ///
+    /// Fixture (tests/fixtures/coin_value_arg_forge.move), compiled against the
+    /// real stdlib to the attacker address 0e1b4e0d... (seed [91;32]):
+    ///   public entry fun forge_coin(to: address, c: coin::Coin<staking::AincoreCoin>)
+    ///       { coin::deposit<staking::AincoreCoin>(to, c) }
+    /// The Move compiler ACCEPTS that signature -- nothing below the adapter stops it.
+    #[test]
+    fn security_struct_value_arg_cannot_forge_coin() {
+        const ATTACKER_SEED: [u8; 32] = [91u8; 32];
+
+        let db = temp_db("coin_value_arg_forge");
+        load_stdlib(&db);
+
+        let attacker_key = SigningKey::from_bytes(&ATTACKER_SEED);
+        let attacker = create_account(&db, &attacker_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        assert_eq!(
+            attacker, "0e1b4e0d165bed857e8a3232ee9865b7001e4e7945887e6f7d149c5807ccaf08",
+            "attacker address drifted from the compiled fixture"
+        );
+
+        set_coin_store(&db, &attacker, 5_000_000);
+        let start = coin_balance(&db, &attacker);
+
+        let executor = Executor::new(db.clone());
+
+        // 1) Publish the coin-value-argument forge module to the attacker's own address.
+        let module_bytes = include_bytes!("../tests/fixtures/coin_value_arg_forge.mv").to_vec();
+        let publish = vm_move::TransactionPayload::PublishModule(vec![module_bytes]);
+        let publish_hex = hex::encode(bcs::to_bytes(&publish).unwrap());
+        let (updates, _) = executor
+            .execute_transaction(&signed_tx(&attacker_key, &attacker, &publish_hex, 0, 1_000_000, 1))
+            .expect("publish tx accepted");
+        apply_updates(&db, updates);
+
+        // 2) Call forge_coin(to = attacker, c = Coin { value: 1e15 }).
+        //    `Coin` is `struct Coin<phantom CoinType> has store { value: u128 }`,
+        //    so its BCS encoding is exactly the u128 -- the attacker simply names
+        //    the amount they wish to conjure.
+        const FORGED: u128 = 1_000_000_000_000_000;
+        let call = EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                parse_move_address(&attacker).unwrap(),
+                move_core_types::identifier::Identifier::new("coinforge").unwrap(),
+            ),
+            function: "forge_coin".to_string(),
+            ty_args: vec![],
+            args: vec![
+                bcs::to_bytes(&parse_move_address(&attacker).unwrap()).unwrap(),
+                bcs::to_bytes(&FORGED).unwrap(), // Coin { value: 1e15 }, from thin air
+            ],
+        };
+        let payload = hex::encode(
+            bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap(),
+        );
+        // Must be refused by the entry-argument allowlist. Included in a block
+        // either way; the mint must not happen.
+        if let Some((updates, _)) = executor
+            .execute_transaction(&signed_tx(&attacker_key, &attacker, &payload, 1, 1_000_000, 1))
+        {
+            apply_updates(&db, updates);
+        }
+
+        let end = coin_balance(&db, &attacker);
+        assert!(
+            end <= start,
+            "attacker minted {} AIN from a struct value parameter: {} -> {} (must never increase)",
+            FORGED,
             start,
             end
         );
