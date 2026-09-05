@@ -240,7 +240,17 @@ pub async fn start_p2p(
     // === LiDAR DDoS Protection ===
     let mut lidar_tracker: std::collections::HashMap<PeerId, (std::time::Instant, u32)> =
         std::collections::HashMap::new();
+
+    // AUDIT-CRITICAL (pre-mainnet B6): bans must EXPIRE. `blacklist_peer` was
+    // called with no counterpart anywhere in the tree (`remove_blacklisted_peer`
+    // appeared nowhere), so a single burst removed a peer permanently, for the
+    // life of the process, with no operator visibility.
+    let mut blacklist_until: std::collections::HashMap<PeerId, std::time::Instant> =
+        std::collections::HashMap::new();
     const MAX_MSG_PER_SEC: u32 = 100; // Production Grade Limit
+    /// How long a rate-limit ban lasts. Bounded so a transient burst, or a
+    /// misattributed one, cannot remove a validator from the mesh for good.
+    const LIDAR_BAN_SECS: u64 = 300;
 
     // === Event Loop ===
     tokio::spawn(async move {
@@ -286,7 +296,35 @@ pub async fn start_p2p(
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Gossipsub(GossipsubEvent::Message { propagation_source: peer_id, message_id: _, message })) => {
                         // 🛡️ LiDAR PROTECTION LOGIC
                         let now = std::time::Instant::now();
-                        let (last_time, count) = lidar_tracker.entry(peer_id).or_insert((now, 0));
+
+                        // Expire finished bans first, so a ban is a cooldown and
+                        // not a permanent excommunication.
+                        if !blacklist_until.is_empty() {
+                            let expired: Vec<PeerId> = blacklist_until
+                                .iter()
+                                .filter(|(_, until)| now >= **until)
+                                .map(|(p, _)| *p)
+                                .collect();
+                            for p in expired {
+                                blacklist_until.remove(&p);
+                                swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&p);
+                                println!("♻️  LiDAR ban expired for {:?}", p);
+                            }
+                        }
+
+                        // AUDIT-CRITICAL (pre-mainnet B6): rate-limit the PUBLISHER,
+                        // not `propagation_source`. `propagation_source` is the
+                        // neighbour that RELAYED the message, which in a gossip mesh
+                        // is an honest validator forwarding someone else's traffic.
+                        // Keying the limiter on it let any unauthenticated stranger
+                        // publish >MAX_MSG_PER_SEC and make honest validators
+                        // permanently blacklist EACH OTHER — a remote, unauthenticated
+                        // partition of the validator set. Gossipsub runs with
+                        // MessageAuthenticity::Signed + ValidationMode::Strict, so
+                        // `message.source` is the authenticated publisher; fall back to
+                        // the relay only if it is somehow absent.
+                        let publisher = message.source.unwrap_or(peer_id);
+                        let (last_time, count) = lidar_tracker.entry(publisher).or_insert((now, 0));
 
                         if now.duration_since(*last_time) > std::time::Duration::from_secs(1) {
                             // Reset window
@@ -297,11 +335,22 @@ pub async fn start_p2p(
                         *count += 1;
 
                         if *count > MAX_MSG_PER_SEC {
-                            println!("⛔ LiDAR DETECTED ATTACK: Banning Peer {:?} (Rate: {}/s)", peer_id, *count);
-                            // Ban action: Disconnect
-                            let _ = swarm.disconnect_peer_id(peer_id);
-                            // Optional: Blacklist in Gossipsub to prevent reconnect
-                            swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
+                            let rate = *count;
+                            println!(
+                                "⛔ LiDAR: rate limit hit by publisher {:?} ({}/s) — banning for {}s",
+                                publisher, rate, LIDAR_BAN_SECS
+                            );
+                            swarm.behaviour_mut().gossipsub.blacklist_peer(&publisher);
+                            blacklist_until.insert(
+                                publisher,
+                                now + std::time::Duration::from_secs(LIDAR_BAN_SECS),
+                            );
+                            // Only drop the transport connection when the flooder is
+                            // the peer we are actually connected to. Disconnecting the
+                            // relay would punish the messenger.
+                            if publisher == peer_id {
+                                let _ = swarm.disconnect_peer_id(peer_id);
+                            }
                             continue; // DROP MESSAGE
                         }
 

@@ -13,12 +13,20 @@ use std::path::PathBuf;
 use std::sync::Arc; // Force rebuild
 use storage::StateDB;
 
-const GENESIS_VERSION: &str = "phase1-bls-stake-v3-vertexhash-v2";
+const GENESIS_VERSION: &str = "phase1-bls-stake-v4-execroots";
 /// SEC-#13: storage key holding the canonical, genesis-pinned epoch-block
 /// interval. The executor reads this FIRST (deterministic across all nodes) and
 /// only falls back to the AINCORE_EPOCH_BLOCK_INTERVAL env var when it is absent
 /// (legacy DBs). Folded into the genesis identity hash so it is forge-proof.
 const GENESIS_EPOCH_BLOCK_INTERVAL_KEY: &str = "sys:config:epoch_block_interval";
+/// AUDIT-CRITICAL (pre-mainnet B2). ChainSync::require_exec_roots() reads this
+/// to decide whether a synced block MUST commit to non-empty execution roots.
+/// It was documented as "the fresh-genesis mainnet cutover" control but NOTHING
+/// in any deployment path ever wrote it — the only writer in the tree was a unit
+/// test — so every real chain ran with root binding OFF, and a peer could feed a
+/// follower blocks with empty roots that skipped the comparison entirely.
+/// Armed here at genesis so it is on from block 0 and identical on every node.
+const GENESIS_REQUIRE_EXEC_ROOTS_KEY: &str = "sys:config:require_exec_roots";
 /// Canonical default for the epoch-block interval when genesis.json does not
 /// specify one. MUST match `Executor::DEFAULT_EPOCH_BLOCK_INTERVAL`.
 const DEFAULT_EPOCH_BLOCK_INTERVAL: u64 = 20;
@@ -291,6 +299,7 @@ fn genesis_identity_hash(
     chain_id: &str,
     validator_set_json: &str,
     epoch_block_interval: &str,
+    require_exec_roots: &str,
 ) -> String {
     let mut hasher = Sha256::new();
     for part in [
@@ -303,6 +312,12 @@ fn genesis_identity_hash(
         // booting with a tampered/divergent interval is rejected by the genesis
         // hash pin (it would advance epochs at different heights → fork).
         epoch_block_interval,
+        // AUDIT-CRITICAL (pre-mainnet B2): pin execution-root binding too. It is
+        // a consensus-relevant switch — with it off a follower accepts blocks
+        // that skip root comparison — so a node that flipped it would diverge
+        // from the network. Folding it here makes that node refuse to boot
+        // instead of silently forking.
+        require_exec_roots,
     ] {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
@@ -622,12 +637,21 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
         .ok()
         .flatten()
         .unwrap_or_default();
+    // AUDIT-CRITICAL (pre-mainnet B2): read tolerantly, exactly like the epoch
+    // interval above — an absent key folds the empty string so reopening a
+    // datadir written before this pin does not newly fail.
+    let require_exec_roots = storage
+        .get(GENESIS_REQUIRE_EXEC_ROOTS_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let identity = genesis_identity_hash(
         &expected_hash,
         &version,
         &chain_id,
         &validator_set_json,
         &epoch_block_interval,
+        &require_exec_roots,
     );
     println!("🧬 Genesis identity hash: {}", identity);
     // Persist ONCE so the node can install it as the vertex-hash domain at
@@ -979,6 +1003,13 @@ pub fn initialize_genesis(
         "⏱️  Genesis Epoch-Block Interval pinned: {} block(s)",
         genesis_epoch_block_interval
     );
+
+    // AUDIT-CRITICAL (pre-mainnet B2): arm execution-root binding from block 0.
+    // A fresh genesis has no legacy empty-root blocks, so there is no reason to
+    // leave the cutover control off — and leaving it off is what let a synced
+    // block skip root comparison altogether.
+    storage.put(GENESIS_REQUIRE_EXEC_ROOTS_KEY, "1")?;
+    println!("🔗 Execution-root binding armed at genesis (require_exec_roots=1)");
 
     // === GENESIS LOCK: Register the Genesis Validator address ===
     // This address will be PERMANENTLY BLOCKED from transfers (Anti-Rugpull).
@@ -2577,7 +2608,12 @@ mod tests {
             .ok()
             .flatten()
             .unwrap_or_default();
-        genesis_identity_hash(&sh, &v, &cid, &vs, &ebi)
+        let rer = db
+            .get(GENESIS_REQUIRE_EXEC_ROOTS_KEY)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        genesis_identity_hash(&sh, &v, &cid, &vs, &ebi, &rer)
     }
 
     /// With the pin env unset, genesis init + reopen behave exactly as before.
@@ -2712,8 +2748,8 @@ mod tests {
     /// different chain identities (a tampered interval is caught by the pin).
     #[test]
     fn test_epoch_block_interval_changes_identity_hash() {
-        let base = genesis_identity_hash("sh", "v", "cid", "vs", "20");
-        let other = genesis_identity_hash("sh", "v", "cid", "vs", "21");
+        let base = genesis_identity_hash("sh", "v", "cid", "vs", "20", "1");
+        let other = genesis_identity_hash("sh", "v", "cid", "vs", "21", "1");
         assert_ne!(
             base, other,
             "identity hash must depend on the epoch-block interval"

@@ -35,6 +35,12 @@ pub const MAX_VERTEX_BYTES: usize = 768 * 1024;
 /// generous bound is an inflation attack (unbounded parents made an
 /// equivocator's own evidence undeliverable before parents were rooted).
 pub const MAX_PARENTS: usize = 256;
+/// Cap on vertices parked waiting for a missing parent. Bounded so a peer that
+/// streams vertices citing hashes that will never exist cannot grow memory
+/// without limit — the buffer is a reordering cushion, not a queue.
+const MAX_ORPHANS: usize = 2_000;
+/// How far below the current round a parked vertex is still worth keeping.
+const ORPHAN_ROUND_TTL: u64 = 20;
 /// Upper bound on a single evidence item we are willing to store/queue/carry.
 /// With payload and parents stripped a proof is ~1 KiB; this is belt-and-braces.
 const MAX_EVIDENCE_ITEM_BYTES: usize = 64 * 1024;
@@ -55,6 +61,17 @@ pub struct DagConsensus {
     pub storage: Arc<StateDB>,
     pub peers: PeerList,
     pub ordering_engine: Arc<Mutex<OrderingEngine>>,
+    /// AUDIT-CRITICAL (pre-mainnet B3/B4): vertices held back because at least
+    /// one parent is not yet resolvable, keyed by the missing parent hash.
+    ///
+    /// Admitting such a vertex was a single-message, network-wide chain halt:
+    /// `walk_history` is fail-closed on an unresolvable ancestor, honest
+    /// proposers cite every hash in `round_index[prev]` verbatim, so one vertex
+    /// naming a parent that will never exist entered every node's causal cone
+    /// and no anchor could ever commit again. Dropping such vertices outright
+    /// would instead break liveness under ordinary gossip reordering, so they
+    /// are parked here and replayed when the missing parent arrives.
+    orphans: HashMap<String, Vec<Vertex>>,
     pub latest_block_height: u64,
     pub latest_block_hash: String,
     /// AUDIT-H1: timestamp of the chain tip, used to keep BFT block time
@@ -447,6 +464,7 @@ impl DagConsensus {
             ordering_engine: Arc::new(Mutex::new(OrderingEngine::new_with_storage(
                 storage_for_ordering,
             ))),
+            orphans: HashMap::new(),
             latest_block_height,
             latest_block_hash,
             latest_block_timestamp,
@@ -945,7 +963,31 @@ impl DagConsensus {
     const ABSOLUTE_ROUND_CEILING: u64 = u64::MAX / 2;
     const MAX_ROUND_JUMP: u64 = 10_000;
 
+    /// Admit a vertex, then replay anything that was waiting on it.
+    ///
+    /// AUDIT-CRITICAL (pre-mainnet B3/B4). `add_vertex_inner` parks a vertex
+    /// whose parents are not yet resolvable instead of admitting it (admitting
+    /// one wedges the commit loop forever) and instead of dropping it (dropping
+    /// breaks liveness under ordinary gossip reordering). When a parent finally
+    /// lands, its parked children become admissible, and so may THEIR children,
+    /// so this drains transitively through an explicit work queue rather than
+    /// recursing -- an attacker-shaped chain of parked vertices would otherwise
+    /// be a stack-overflow primitive.
     pub fn add_vertex(&mut self, vertex: Vertex) {
+        let mut queue = vec![vertex];
+        while let Some(v) = queue.pop() {
+            let hash = v.hash.clone();
+            if self.add_vertex_inner(v) {
+                if let Some(waiting) = self.orphans.remove(&hash) {
+                    if !waiting.is_empty() {
+                        println!("🔓 replaying {} vertex(es) unblocked by {}", waiting.len(), hash);
+                    }
+                    queue.extend(waiting);
+                }
+            }
+        }
+    }
+    fn add_vertex_inner(&mut self, vertex: Vertex) -> bool {
         // Anti-overflow: any vertex above ABSOLUTE_ROUND_CEILING is malicious
         // — the chain cannot legitimately reach this magnitude.
         if vertex.round > Self::ABSOLUTE_ROUND_CEILING {
@@ -954,7 +996,7 @@ impl DagConsensus {
                 vertex.round,
                 Self::ABSOLUTE_ROUND_CEILING
             );
-            return;
+            return false;
         }
 
         // Anti-grief: reject "one giant jump" that an attacker could use to
@@ -967,7 +1009,7 @@ impl DagConsensus {
                 self.current_round,
                 Self::MAX_ROUND_JUMP
             );
-            return;
+            return false;
         }
 
         // PWN-003: bound vertex timestamp drift. The timestamp is folded into the
@@ -986,7 +1028,7 @@ impl DagConsensus {
                     "🚨 REJECTED [PWN-003/ts]: vertex timestamp {} exceeds now {} + {}s drift",
                     vertex.timestamp, now, MAX_FUTURE_DRIFT_SECS
                 );
-                return;
+                return false;
             }
         }
 
@@ -997,7 +1039,7 @@ impl DagConsensus {
         // the claimed author.
         let author_pubkey_hex = match self.resolve_author_pubkey(&vertex.author) {
             Some(pk) => pk,
-            None => return,
+            None => return false,
         };
 
         if !vertex.verify_ed25519_signature(&author_pubkey_hex) {
@@ -1005,7 +1047,7 @@ impl DagConsensus {
                 "🚨 REJECTED: Invalid Ed25519 signature from author {}",
                 vertex.author
             );
-            return;
+            return false;
         }
 
         // Phase 5B.1 / PWN-001 CRITICAL: vertex.hash MUST equal a fresh
@@ -1027,7 +1069,7 @@ impl DagConsensus {
                 "🚨 REJECTED: live vertex from {} carries aggregated_signature (unset by design)",
                 vertex.author
             );
-            return;
+            return false;
         }
         // Only equivocation PROOFS may carry the compact roots. A live vertex
         // with either set could make hash recomputation pass while its actual
@@ -1037,7 +1079,7 @@ impl DagConsensus {
                 "🚨 REJECTED: live vertex from {} carries proof-only root fields",
                 vertex.author
             );
-            return;
+            return false;
         }
         // Parents are bounded and unique: an unbounded/duplicated parent list is
         // pure inflation (it once let an equivocator size its own evidence past
@@ -1049,13 +1091,13 @@ impl DagConsensus {
                 vertex.parents.len(),
                 MAX_PARENTS
             );
-            return;
+            return false;
         }
         {
             let mut uniq: std::collections::HashSet<&str> = std::collections::HashSet::new();
             if !vertex.parents.iter().all(|p| uniq.insert(p.as_str())) {
                 println!("🚨 REJECTED: vertex from {} has duplicate parents", vertex.author);
-                return;
+                return false;
             }
         }
         let recomputed = vertex.calculate_hash();
@@ -1065,7 +1107,7 @@ impl DagConsensus {
                  recomputed hash {} — body tampered after signing",
                 vertex.hash, recomputed
             );
-            return;
+            return false;
         }
 
         // C-2 FIX: Cross-check against the active ValidatorSet.
@@ -1083,7 +1125,75 @@ impl DagConsensus {
                 "🚨 REJECTED: Vertex author {} is not in the active validator set",
                 vertex.author
             );
-            return;
+            return false;
+        }
+
+        // AUDIT-CRITICAL (pre-mainnet B3/B4): every parent must already be
+        // resolvable, using the SAME predicate the commit loop applies.
+        // `walk_history` returns None -- a hole -- for any referenced hash that
+        // is neither "genesis", nor in the DAG, nor committed, and a hole stops
+        // `commit_one_anchor` permanently. Since honest proposers cite every
+        // hash in `round_index[prev]` verbatim, ONE admitted vertex naming a
+        // parent that will never exist propagates into every node's causal cone
+        // and no anchor can ever commit again -- a network-wide halt from a
+        // single 1 KB gossip message, unrecoverable without hand-purging every
+        // node's RocksDB.
+        //
+        // A parent may also be legitimately unknown-for-now (ordinary gossip
+        // reordering), so an unresolved vertex is PARKED, not dropped, and
+        // replayed when the parent lands. The lock order is ordering_engine ->
+        // dag, matching try_commit; taking them the other way round here would
+        // deadlock the consensus this gate exists to protect.
+        {
+            let unresolved: Vec<String> = {
+                let engine = match self.ordering_engine.lock() {
+                    Ok(e) => e,
+                    Err(_) => {
+                        println!("🚨 REJECTED: ordering lock poisoned; refusing vertex");
+                        return false;
+                    }
+                };
+                let dag_guard = self.dag.lock().expect(
+                    "🚨 FATAL: DAG lock poisoned - consensus integrity compromised. Node must restart.",
+                );
+                vertex
+                    .parents
+                    .iter()
+                    .filter(|p| !engine.is_settled(p) && !dag_guard.contains_key(p.as_str()))
+                    .cloned()
+                    .collect()
+            };
+
+            if !unresolved.is_empty() {
+                // Park under the first missing parent; it is replayed when that
+                // parent arrives. Bounded in both count and age so a peer citing
+                // hashes that will never exist cannot grow this without limit.
+                let total: usize = self.orphans.values().map(|v| v.len()).sum();
+                if total >= MAX_ORPHANS {
+                    let floor = self.current_round.saturating_sub(ORPHAN_ROUND_TTL);
+                    self.orphans.retain(|_, waiting| {
+                        waiting.retain(|v| v.round >= floor);
+                        !waiting.is_empty()
+                    });
+                }
+                let total: usize = self.orphans.values().map(|v| v.len()).sum();
+                if total >= MAX_ORPHANS {
+                    println!(
+                        "🚫 orphan buffer full ({}); dropping vertex {} from {}",
+                        total, vertex.hash, vertex.author
+                    );
+                    return false;
+                }
+                println!(
+                    "⏳ parking vertex {} (round {}): {} unresolved parent(s)",
+                    vertex.hash, vertex.round, unresolved.len()
+                );
+                self.orphans
+                    .entry(unresolved[0].clone())
+                    .or_default()
+                    .push(vertex);
+                return false;
+            }
         }
 
         // 1. Scope for DAG and RoundIndex modification
@@ -1097,7 +1207,7 @@ impl DagConsensus {
             );
             if dag.contains_key(&vertex.hash) {
                 println!("DEBUG: add_vertex: Duplicate hash! Skipping.");
-                return;
+                return false;
             }
 
             // NOTE: persistence happens AFTER the double-sign check below.
@@ -1136,7 +1246,7 @@ impl DagConsensus {
                             let proof_b = vertex.clone();
                             self.apply_equivocation_slash(&proof_a, &proof_b);
                             self.broadcast_equivocation_proof(&proof_a, &proof_b);
-                            return;
+                            return false;
                         }
                     }
                 }
@@ -1224,7 +1334,7 @@ impl DagConsensus {
                     self.current_round
                 );
             }
-            return;
+            return false;
         }
 
         // --- ORDERING LOGIC (Bullshark-lite) ---
@@ -1823,6 +1933,9 @@ impl DagConsensus {
                 }
             }
         }
+
+        // Reached the end: the vertex passed every gate and is now live.
+        true
     }
 
     fn resolve_chain_id(&self) -> String {

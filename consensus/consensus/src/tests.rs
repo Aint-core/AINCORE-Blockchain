@@ -1937,4 +1937,88 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&path);
     }
+
+    /// AUDIT-CRITICAL (pre-mainnet B3/B4). A vertex naming a parent that does not
+    /// exist must NEVER enter the DAG. `walk_history` is fail-closed on an
+    /// unresolvable ancestor, and honest proposers cite every hash in
+    /// `round_index[prev]` verbatim, so one admitted poison vertex propagates into
+    /// every node's causal cone and no anchor can ever commit again -- a
+    /// network-wide halt from one gossip message, unrecoverable without hand-purging
+    /// every node's RocksDB.
+    ///
+    /// It must also not be DROPPED: the same condition arises from ordinary gossip
+    /// reordering, so it is parked and replayed once the parent lands.
+    #[test]
+    fn test_unresolvable_parent_is_parked_then_replayed() {
+        let (mut consensus, path) = setup_dag(&format!(
+            "unresolvable_parent_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        consensus.current_round = 1;
+        let key = crypto::SigningKey::from_bytes(&consensus.node_key);
+        let author = consensus.node_id.clone();
+        let mk = move |round: u64, parents: Vec<String>, ts: u64| {
+            let mut v = blockchain::Vertex {
+                round,
+                author: author.clone(),
+                timestamp: ts,
+                payload: vec![],
+                parents,
+                hash: String::new(),
+                signature: String::new(),
+                aggregated_signature: None,
+                payload_root: None,
+                parents_root: None,
+            };
+            v.hash = v.calculate_hash();
+            v.sign_with_ed25519(&key);
+            v
+        };
+
+        let before = consensus.dag.lock().unwrap().len();
+
+        // The halt primitive: a well-formed, correctly signed vertex whose only
+        // parent is a hash that will never exist.
+        let poison = mk(1, vec![format!("{:064x}", 0xdeadbeefu64)], 7_000);
+        consensus.handle_message(&format!(
+            "DAG_VERTEX:{}",
+            serde_json::to_string(&poison).unwrap()
+        ));
+        assert_eq!(
+            consensus.dag.lock().unwrap().len(),
+            before,
+            "a vertex with an unresolvable parent must never enter the DAG"
+        );
+
+        // Reordering case: a child arrives before its parent, then the parent lands
+        // and the child must be replayed automatically.
+        let parent = mk(1, vec!["genesis".into()], 7_100);
+        let child = mk(2, vec![parent.hash.clone()], 7_200);
+
+        consensus.handle_message(&format!(
+            "DAG_VERTEX:{}",
+            serde_json::to_string(&child).unwrap()
+        ));
+        assert_eq!(
+            consensus.dag.lock().unwrap().len(),
+            before,
+            "the child must be parked while its parent is unknown, not admitted"
+        );
+
+        consensus.handle_message(&format!(
+            "DAG_VERTEX:{}",
+            serde_json::to_string(&parent).unwrap()
+        ));
+        let dag = consensus.dag.lock().unwrap();
+        assert!(
+            dag.contains_key(&parent.hash),
+            "the parent must be admitted"
+        );
+        assert!(
+            dag.contains_key(&child.hash),
+            "the parked child must be replayed once its parent lands"
+        );
+        drop(dag);
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }
