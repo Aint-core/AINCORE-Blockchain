@@ -2021,4 +2021,137 @@ mod tests {
         drop(dag);
         let _ = std::fs::remove_dir_all(&path);
     }
+
+    /// GATE-HIGH regression. `add_vertex_inner`'s bool answers ONE question:
+    /// did the vertex reach `dag.insert`? It briefly doubled as "should the
+    /// caller continue", so the observer-mode guard returned false for a vertex
+    /// it had already admitted. On every non-validator node — indexer, explorer,
+    /// RPC, DEX backend, a jailed or not-yet-joined validator — that made the
+    /// orphan buffer write-only: parked children were never replayed and
+    /// ordinary gossip reordering left permanent DAG holes.
+    ///
+    /// The node in this test is deliberately NOT in the validator set, so it
+    /// takes the observer path on every vertex.
+    #[test]
+    fn test_observer_node_still_replays_parked_vertices() {
+        let (mut consensus, path) = setup_dag(&format!(
+            "observer_replay_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        consensus.current_round = 1;
+
+        // A REAL validator that is not this node: it authors the vertices, so
+        // they pass the author-in-validator-set check, while this node stays an
+        // observer and takes the skip-ordering path on every one of them.
+        let val_key = crypto::SigningKey::from_bytes(&[77u8; 32]);
+        let val_pub = hex::encode(val_key.verifying_key().to_bytes());
+        let val_addr = crypto::derive_address(val_key.verifying_key().as_bytes()).unwrap();
+        consensus
+            .storage
+            .put_object(&Object::new(
+                val_addr.clone(),
+                Owner::Address(val_addr.clone()),
+                serde_json::json!({ "public_key": val_pub, "sequence_number": 0 })
+                    .to_string()
+                    .into_bytes(),
+                "0x1::account::AccountData".to_string(),
+            ))
+            .unwrap();
+        consensus
+            .storage
+            .put("sys:validators", &format!(r#"[["{}",1000]]"#, val_addr))
+            .unwrap();
+        assert_ne!(
+            consensus.node_id, val_addr,
+            "this node must NOT be in the validator set, so it runs as an observer"
+        );
+
+        let author = val_addr.clone();
+        let mk = move |round: u64, parents: Vec<String>, ts: u64| {
+            let mut v = blockchain::Vertex {
+                round,
+                author: author.clone(),
+                timestamp: ts,
+                payload: vec![],
+                parents,
+                hash: String::new(),
+                signature: String::new(),
+                aggregated_signature: None,
+                payload_root: None,
+                parents_root: None,
+            };
+            v.hash = v.calculate_hash();
+            v.sign_with_ed25519(&val_key);
+            v
+        };
+
+        let parent = mk(1, vec!["genesis".into()], 8_100);
+        let child = mk(2, vec![parent.hash.clone()], 8_200);
+
+        // Child first (ordinary gossip reordering), then its parent.
+        consensus.handle_message(&format!(
+            "DAG_VERTEX:{}",
+            serde_json::to_string(&child).unwrap()
+        ));
+        assert_eq!(
+            consensus.parked_vertex_count(),
+            1,
+            "the child must be parked while its parent is unknown"
+        );
+
+        consensus.handle_message(&format!(
+            "DAG_VERTEX:{}",
+            serde_json::to_string(&parent).unwrap()
+        ));
+
+        let dag = consensus.dag.lock().unwrap();
+        assert!(dag.contains_key(&parent.hash), "parent must be admitted");
+        assert!(
+            dag.contains_key(&child.hash),
+            "an OBSERVER must still replay the parked child once its parent lands"
+        );
+        drop(dag);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// GATE-MEDIUM regression. Every vertex is delivered over gossipsub AND
+    /// direct TCP, and the recovery loop re-broadcasts a round window on every
+    /// tick, so the same bytes arrive repeatedly. Parking must be idempotent per
+    /// vertex hash or the bounded buffer fills with copies of one vertex and
+    /// starts dropping genuinely new ones.
+    #[test]
+    fn test_parking_the_same_vertex_twice_stores_one_copy() {
+        let (mut consensus, path) = setup_dag(&format!(
+            "orphan_dedup_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        consensus.current_round = 1;
+        let key = crypto::SigningKey::from_bytes(&consensus.node_key);
+        let author = consensus.node_id.clone();
+        let mut orphan = blockchain::Vertex {
+            round: 2,
+            author,
+            timestamp: 8_300,
+            payload: vec![],
+            parents: vec![format!("{:064x}", 0xfeedu64)],
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
+        };
+        orphan.hash = orphan.calculate_hash();
+        orphan.sign_with_ed25519(&key);
+
+        let wire = format!("DAG_VERTEX:{}", serde_json::to_string(&orphan).unwrap());
+        for _ in 0..5 {
+            consensus.handle_message(&wire);
+        }
+        assert_eq!(
+            consensus.parked_vertex_count(),
+            1,
+            "re-delivery of the same vertex must not park additional copies"
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }

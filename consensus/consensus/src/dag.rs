@@ -72,6 +72,14 @@ pub struct DagConsensus {
     /// would instead break liveness under ordinary gossip reordering, so they
     /// are parked here and replayed when the missing parent arrives.
     orphans: HashMap<String, Vec<Vertex>>,
+    /// Hashes currently parked in `orphans`. GATE-MEDIUM: every vertex is
+    /// delivered over BOTH gossipsub and direct TCP (broadcast_vertex sends
+    /// both, and the TCP path has no duplicate suppression), and the
+    /// partition-recovery helper re-broadcasts a 4-round window on every
+    /// consensus tick. Without this set the buffer filled with copies of the
+    /// SAME few vertices during ordinary bootstrap — the exact situation the
+    /// cushion exists for — and then dropped genuinely new ones.
+    orphan_hashes: std::collections::HashSet<String>,
     pub latest_block_height: u64,
     pub latest_block_hash: String,
     /// AUDIT-H1: timestamp of the chain tip, used to keep BFT block time
@@ -465,6 +473,7 @@ impl DagConsensus {
                 storage_for_ordering,
             ))),
             orphans: HashMap::new(),
+            orphan_hashes: std::collections::HashSet::new(),
             latest_block_height,
             latest_block_hash,
             latest_block_timestamp,
@@ -963,6 +972,17 @@ impl DagConsensus {
     const ABSOLUTE_ROUND_CEILING: u64 = u64::MAX / 2;
     const MAX_ROUND_JUMP: u64 = 10_000;
 
+    /// Number of DISTINCT vertices currently parked waiting on a parent.
+    /// Distinct is the point: the buffer is bounded per vertex hash, not per
+    /// delivery, because the same vertex arrives over two transports and is
+    /// re-gossiped by the recovery loop.
+    pub fn parked_vertex_count(&self) -> usize {
+        // Count the vertices ACTUALLY stored, not the dedup set — the stored
+        // copies are what consume memory, and reading the HashSet here would
+        // make this blind to the very duplication it is meant to detect.
+        self.orphans.values().map(|v| v.len()).sum()
+    }
+
     /// Admit a vertex, then replay anything that was waiting on it.
     ///
     /// AUDIT-CRITICAL (pre-mainnet B3/B4). `add_vertex_inner` parks a vertex
@@ -982,12 +1002,27 @@ impl DagConsensus {
                     if !waiting.is_empty() {
                         println!("🔓 replaying {} vertex(es) unblocked by {}", waiting.len(), hash);
                     }
+                    for v in &waiting {
+                        self.orphan_hashes.remove(&v.hash);
+                    }
                     queue.extend(waiting);
                 }
             }
         }
     }
     fn add_vertex_inner(&mut self, vertex: Vertex) -> bool {
+        // GATE-HIGH: the return value answers exactly one question — "did this
+        // vertex reach dag.insert?" — and nothing else. EVERY exit below reports
+        // this flag rather than a literal, so if the insert point ever moves the
+        // return value follows it automatically instead of silently lying. It
+        // previously doubled as "should the caller continue", so the
+        // observer-mode guard returned false for a vertex it had ALREADY
+        // admitted. On every non-validator node (indexer, explorer, RPC, DEX
+        // backend, a jailed or not-yet-joined validator) that made the orphan
+        // buffer write-only: parked children were never replayed, and ordinary
+        // gossip reordering left permanent DAG holes.
+        let mut admitted = false;
+
         // Anti-overflow: any vertex above ABSOLUTE_ROUND_CEILING is malicious
         // — the chain cannot legitimately reach this magnitude.
         if vertex.round > Self::ABSOLUTE_ROUND_CEILING {
@@ -996,7 +1031,7 @@ impl DagConsensus {
                 vertex.round,
                 Self::ABSOLUTE_ROUND_CEILING
             );
-            return false;
+            return admitted;
         }
 
         // Anti-grief: reject "one giant jump" that an attacker could use to
@@ -1009,7 +1044,7 @@ impl DagConsensus {
                 self.current_round,
                 Self::MAX_ROUND_JUMP
             );
-            return false;
+            return admitted;
         }
 
         // PWN-003: bound vertex timestamp drift. The timestamp is folded into the
@@ -1028,7 +1063,7 @@ impl DagConsensus {
                     "🚨 REJECTED [PWN-003/ts]: vertex timestamp {} exceeds now {} + {}s drift",
                     vertex.timestamp, now, MAX_FUTURE_DRIFT_SECS
                 );
-                return false;
+                return admitted;
             }
         }
 
@@ -1039,7 +1074,7 @@ impl DagConsensus {
         // the claimed author.
         let author_pubkey_hex = match self.resolve_author_pubkey(&vertex.author) {
             Some(pk) => pk,
-            None => return false,
+            None => return admitted,
         };
 
         if !vertex.verify_ed25519_signature(&author_pubkey_hex) {
@@ -1047,7 +1082,7 @@ impl DagConsensus {
                 "🚨 REJECTED: Invalid Ed25519 signature from author {}",
                 vertex.author
             );
-            return false;
+            return admitted;
         }
 
         // Phase 5B.1 / PWN-001 CRITICAL: vertex.hash MUST equal a fresh
@@ -1069,7 +1104,7 @@ impl DagConsensus {
                 "🚨 REJECTED: live vertex from {} carries aggregated_signature (unset by design)",
                 vertex.author
             );
-            return false;
+            return admitted;
         }
         // Only equivocation PROOFS may carry the compact roots. A live vertex
         // with either set could make hash recomputation pass while its actual
@@ -1079,7 +1114,7 @@ impl DagConsensus {
                 "🚨 REJECTED: live vertex from {} carries proof-only root fields",
                 vertex.author
             );
-            return false;
+            return admitted;
         }
         // Parents are bounded and unique: an unbounded/duplicated parent list is
         // pure inflation (it once let an equivocator size its own evidence past
@@ -1091,13 +1126,13 @@ impl DagConsensus {
                 vertex.parents.len(),
                 MAX_PARENTS
             );
-            return false;
+            return admitted;
         }
         {
             let mut uniq: std::collections::HashSet<&str> = std::collections::HashSet::new();
             if !vertex.parents.iter().all(|p| uniq.insert(p.as_str())) {
                 println!("🚨 REJECTED: vertex from {} has duplicate parents", vertex.author);
-                return false;
+                return admitted;
             }
         }
         let recomputed = vertex.calculate_hash();
@@ -1107,7 +1142,7 @@ impl DagConsensus {
                  recomputed hash {} — body tampered after signing",
                 vertex.hash, recomputed
             );
-            return false;
+            return admitted;
         }
 
         // C-2 FIX: Cross-check against the active ValidatorSet.
@@ -1125,7 +1160,7 @@ impl DagConsensus {
                 "🚨 REJECTED: Vertex author {} is not in the active validator set",
                 vertex.author
             );
-            return false;
+            return admitted;
         }
 
         // AUDIT-CRITICAL (pre-mainnet B3/B4): every parent must already be
@@ -1150,7 +1185,7 @@ impl DagConsensus {
                     Ok(e) => e,
                     Err(_) => {
                         println!("🚨 REJECTED: ordering lock poisoned; refusing vertex");
-                        return false;
+                        return admitted;
                     }
                 };
                 let dag_guard = self.dag.lock().expect(
@@ -1168,31 +1203,47 @@ impl DagConsensus {
                 // Park under the first missing parent; it is replayed when that
                 // parent arrives. Bounded in both count and age so a peer citing
                 // hashes that will never exist cannot grow this without limit.
-                let total: usize = self.orphans.values().map(|v| v.len()).sum();
-                if total >= MAX_ORPHANS {
+                // Already parked (re-delivered over the other transport, or
+                // re-gossiped by the recovery loop) — nothing to do.
+                if self.orphan_hashes.contains(&vertex.hash) {
+                    return admitted;
+                }
+                if self.orphan_hashes.len() >= MAX_ORPHANS {
                     let floor = self.current_round.saturating_sub(ORPHAN_ROUND_TTL);
+                    let mut evicted: Vec<String> = Vec::new();
                     self.orphans.retain(|_, waiting| {
-                        waiting.retain(|v| v.round >= floor);
+                        waiting.retain(|v| {
+                            let keep = v.round >= floor;
+                            if !keep {
+                                evicted.push(v.hash.clone());
+                            }
+                            keep
+                        });
                         !waiting.is_empty()
                     });
+                    for h in evicted {
+                        self.orphan_hashes.remove(&h);
+                    }
                 }
-                let total: usize = self.orphans.values().map(|v| v.len()).sum();
-                if total >= MAX_ORPHANS {
+                if self.orphan_hashes.len() >= MAX_ORPHANS {
                     println!(
                         "🚫 orphan buffer full ({}); dropping vertex {} from {}",
-                        total, vertex.hash, vertex.author
+                        self.orphan_hashes.len(),
+                        vertex.hash,
+                        vertex.author
                     );
-                    return false;
+                    return admitted;
                 }
                 println!(
                     "⏳ parking vertex {} (round {}): {} unresolved parent(s)",
                     vertex.hash, vertex.round, unresolved.len()
                 );
+                self.orphan_hashes.insert(vertex.hash.clone());
                 self.orphans
                     .entry(unresolved[0].clone())
                     .or_default()
                     .push(vertex);
-                return false;
+                return admitted;
             }
         }
 
@@ -1207,7 +1258,7 @@ impl DagConsensus {
             );
             if dag.contains_key(&vertex.hash) {
                 println!("DEBUG: add_vertex: Duplicate hash! Skipping.");
-                return false;
+                return admitted;
             }
 
             // NOTE: persistence happens AFTER the double-sign check below.
@@ -1246,7 +1297,7 @@ impl DagConsensus {
                             let proof_b = vertex.clone();
                             self.apply_equivocation_slash(&proof_a, &proof_b);
                             self.broadcast_equivocation_proof(&proof_a, &proof_b);
-                            return false;
+                            return admitted;
                         }
                     }
                 }
@@ -1263,6 +1314,7 @@ impl DagConsensus {
             }
 
             dag.insert(vertex.hash.clone(), vertex.clone());
+            admitted = true;
             round_idx
                 .entry(vertex.round)
                 .or_default()
@@ -1334,7 +1386,9 @@ impl DagConsensus {
                     self.current_round
                 );
             }
-            return false;
+            // Skipping ORDERING, not admission: the vertex above is already in
+            // `dag`. Returning false here would strand its parked children.
+            return admitted;
         }
 
         // --- ORDERING LOGIC (Bullshark-lite) ---
@@ -1934,8 +1988,9 @@ impl DagConsensus {
             }
         }
 
-        // Reached the end: the vertex passed every gate and is now live.
-        true
+        // Reached the end. Report whether the vertex actually reached
+        // `dag.insert` — the wrapper drains orphans on exactly that condition.
+        admitted
     }
 
     fn resolve_chain_id(&self) -> String {

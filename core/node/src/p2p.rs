@@ -247,10 +247,24 @@ pub async fn start_p2p(
     // life of the process, with no operator visibility.
     let mut blacklist_until: std::collections::HashMap<PeerId, std::time::Instant> =
         std::collections::HashMap::new();
+    // GATE-HIGH: keying ONLY on the authenticated publisher removed the
+    // per-connection bound entirely. Gossipsub relays messages authored by peers
+    // we are not connected to, and Strict mode validates a signature against the
+    // key embedded in the message — it does not require that identity to be known
+    // or connected. So an attacker mints N identities offline, signs one message
+    // each, and pushes them all down ONE connection: every `publisher` is
+    // distinct, every count stays at 1, and the limiter never fires. Both budgets
+    // are needed — the publisher counter to attribute and ban, and this
+    // per-connection counter to bound total inbound traffic regardless of author.
+    let mut conn_tracker: std::collections::HashMap<PeerId, (std::time::Instant, u32)> =
+        std::collections::HashMap::new();
     const MAX_MSG_PER_SEC: u32 = 100; // Production Grade Limit
     /// How long a rate-limit ban lasts. Bounded so a transient burst, or a
     /// misattributed one, cannot remove a validator from the mesh for good.
     const LIDAR_BAN_SECS: u64 = 300;
+    /// Cap on distinct publishers tracked at once. The key space is chosen by
+    /// whoever signs the messages, so this map must be swept.
+    const MAX_TRACKED_PUBLISHERS: usize = 10_000;
 
     // === Event Loop ===
     tokio::spawn(async move {
@@ -323,7 +337,40 @@ pub async fn start_p2p(
                         // MessageAuthenticity::Signed + ValidationMode::Strict, so
                         // `message.source` is the authenticated publisher; fall back to
                         // the relay only if it is somehow absent.
+                        // Per-CONNECTION budget first: bounds what one peer can
+                        // push at us no matter who signed it.
+                        {
+                            let (c_last, c_count) =
+                                conn_tracker.entry(peer_id).or_insert((now, 0));
+                            if now.duration_since(*c_last) > std::time::Duration::from_secs(1) {
+                                *c_last = now;
+                                *c_count = 0;
+                            }
+                            *c_count += 1;
+                            if *c_count > MAX_MSG_PER_SEC {
+                                println!(
+                                    "⛔ LiDAR: connection {:?} over budget ({}/s) — banning for {}s",
+                                    peer_id, *c_count, LIDAR_BAN_SECS
+                                );
+                                swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
+                                blacklist_until.insert(
+                                    peer_id,
+                                    now + std::time::Duration::from_secs(LIDAR_BAN_SECS),
+                                );
+                                let _ = swarm.disconnect_peer_id(peer_id);
+                                continue;
+                            }
+                        }
+
                         let publisher = message.source.unwrap_or(peer_id);
+                        // Bound the publisher map: its key space is attacker-chosen
+                        // (minted identities), so without a sweep it is a remote
+                        // memory leak. Drop entries whose 1s window has passed.
+                        if lidar_tracker.len() > MAX_TRACKED_PUBLISHERS {
+                            lidar_tracker.retain(|_, (t, _)| {
+                                now.duration_since(*t) <= std::time::Duration::from_secs(1)
+                            });
+                        }
                         let (last_time, count) = lidar_tracker.entry(publisher).or_insert((now, 0));
 
                         if now.duration_since(*last_time) > std::time::Duration::from_secs(1) {
