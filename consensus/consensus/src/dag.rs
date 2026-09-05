@@ -972,6 +972,29 @@ impl DagConsensus {
     const ABSOLUTE_ROUND_CEILING: u64 = u64::MAX / 2;
     const MAX_ROUND_JUMP: u64 = 10_000;
 
+    /// Re-offer every parked vertex after the committed set advances.
+    ///
+    /// GATE-HIGH. The orphan buffer is drained only when the specific missing
+    /// parent is admitted through `add_vertex`. But a parent can also become
+    /// resolvable because the ordering engine COMMITTED it -- which is what
+    /// adopting a synced anchor does. Without this, a validator that fell behind
+    /// and caught up via ChainSync keeps everything it parked while it was
+    /// behind, forever, which is precisely when the buffer holds the most.
+    ///
+    /// Vertices that are still unresolvable simply park again, so this is safe to
+    /// call repeatedly; it is bounded by the buffer's own MAX_ORPHANS cap.
+    pub fn retry_parked_vertices(&mut self) {
+        if self.orphans.is_empty() {
+            return;
+        }
+        let parked: Vec<Vertex> = self.orphans.drain().flat_map(|(_, v)| v).collect();
+        self.orphan_hashes.clear();
+        println!("🔁 re-offering {} parked vertex(es) after committed set advanced", parked.len());
+        for v in parked {
+            self.add_vertex(v);
+        }
+    }
+
     /// Number of DISTINCT vertices currently parked waiting on a parent.
     /// Distinct is the point: the buffer is bounded per vertex hash, not per
     /// delivery, because the same vertex arrives over two transports and is
@@ -3019,6 +3042,17 @@ impl DagConsensus {
                             ),
                             Err(_) => None,
                         };
+                        if adopted.is_some() {
+                            // GATE-HIGH: adopting a synced anchor advances
+                            // `committed_set`, which can make a parked vertex's
+                            // parent settled. Nothing else re-examines the orphan
+                            // buffer -- the drain only runs when a vertex is
+                            // admitted through add_vertex -- so a validator that
+                            // caught up via sync would strand everything it parked
+                            // while it was behind, exactly when the buffer is
+                            // fullest. Re-offer them now that the set has moved.
+                            self.retry_parked_vertices();
+                        }
                         if let Some(info) = adopted {
                             let epoch = self
                                 .storage
