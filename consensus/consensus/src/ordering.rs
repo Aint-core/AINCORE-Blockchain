@@ -913,16 +913,6 @@ impl OrderingEngine {
     /// concern to be closed by a real delay-VDF, whereas non-determinism here is an
     /// outright safety break. The QC-folded beacon remains available via
     /// `get_random_beacon()` for NON-consensus randomness.
-    /// AUDIT-CRITICAL (pre-mainnet B3/B4). The EXACT predicate `walk_history`
-    /// uses to decide a referenced hash is settled rather than a hole:
-    /// `"genesis"` or already committed. `add_vertex` mirrors it at ingress so a
-    /// vertex whose parent would be a hole never enters the DAG in the first
-    /// place. Keeping the two in one place is the point — if they ever drift,
-    /// an admitted vertex can wedge the commit loop forever.
-    pub(crate) fn is_settled(&self, hash: &str) -> bool {
-        hash == "genesis" || self.committed_set.contains(hash)
-    }
-
     pub(crate) fn leader_for_round(round: u64, validators: &[(String, u64)], attempt: u32) -> String {
         if validators.is_empty() {
             // M6 FIX: Instead of hardcoded "node_9009", return empty string

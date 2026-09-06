@@ -241,12 +241,6 @@ pub async fn start_p2p(
     let mut lidar_tracker: std::collections::HashMap<PeerId, (std::time::Instant, u32)> =
         std::collections::HashMap::new();
 
-    // AUDIT-CRITICAL (pre-mainnet B6): bans must EXPIRE. `blacklist_peer` was
-    // called with no counterpart anywhere in the tree (`remove_blacklisted_peer`
-    // appeared nowhere), so a single burst removed a peer permanently, for the
-    // life of the process, with no operator visibility.
-    let mut blacklist_until: std::collections::HashMap<PeerId, std::time::Instant> =
-        std::collections::HashMap::new();
     // GATE-HIGH: keying ONLY on the authenticated publisher removed the
     // per-connection bound entirely. Gossipsub relays messages authored by peers
     // we are not connected to, and Strict mode validates a signature against the
@@ -259,9 +253,6 @@ pub async fn start_p2p(
     let mut conn_tracker: std::collections::HashMap<PeerId, (std::time::Instant, u32)> =
         std::collections::HashMap::new();
     const MAX_MSG_PER_SEC: u32 = 100; // Production Grade Limit
-    /// How long a rate-limit ban lasts. Bounded so a transient burst, or a
-    /// misattributed one, cannot remove a validator from the mesh for good.
-    const LIDAR_BAN_SECS: u64 = 300;
     /// Cap on distinct publishers tracked at once. The key space is chosen by
     /// whoever signs the messages, so this map must be swept.
     const MAX_TRACKED_PUBLISHERS: usize = 10_000;
@@ -277,31 +268,8 @@ pub async fn start_p2p(
         let mut inbound_connections_by_host: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
 
-        // GATE-HIGH: ban expiry used to run ONLY inside the gossip Message arm.
-        // A node that had blacklisted all of its peers therefore received no
-        // gossip, so the expiry code never executed and the ban never lifted —
-        // the isolation was self-sustaining and survived until process restart.
-        // This tick drives expiry independently of inbound traffic.
-        let mut ban_sweep = tokio::time::interval(std::time::Duration::from_secs(10));
-        ban_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
         loop {
             tokio::select! {
-                _ = ban_sweep.tick() => {
-                    if !blacklist_until.is_empty() {
-                        let now = std::time::Instant::now();
-                        let expired: Vec<PeerId> = blacklist_until
-                            .iter()
-                            .filter(|(_, until)| now >= **until)
-                            .map(|(p, _)| *p)
-                            .collect();
-                        for p in expired {
-                            blacklist_until.remove(&p);
-                            swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&p);
-                            println!("♻️  LiDAR ban expired for {:?}", p);
-                        }
-                    }
-                }
                 Some(msg) = rx_in.recv() => {
                     // println!("📤 Broadcasting TX via P2P: {}", msg);
                     let _ = swarm.behaviour_mut().gossipsub.publish(IdentTopic::new("aincore-gossip"), msg.as_bytes());
@@ -385,50 +353,49 @@ pub async fn start_p2p(
                             }
                         }
 
+                        // GATE-CRITICAL: this limiter NEVER bans. Four review
+                        // rounds produced a ban-the-wrong-peer bug every time the
+                        // ban existed:
+                        //   * keyed on propagation_source it banned honest RELAYS
+                        //     (B6), partitioning the validator set;
+                        //   * keyed on message.source it banned the VICTIM, because
+                        //     gossipsub messages are self-authenticating and an
+                        //     attacker can replay a validator's own old signed
+                        //     messages back at its peers;
+                        //   * either way a node's own honest recovery burst (the
+                        //     re-gossip loop sends 4 rounds x n authors per tick)
+                        //     trips it once the validator set grows.
+                        // Attribution is not reliable enough here to justify a
+                        // punishment that can partition consensus. Dropping the
+                        // excess already bounds the work an attacker can impose,
+                        // and gossipsub's own peer scoring handles persistent
+                        // misbehaviour without the risk of removing an honest
+                        // validator from the mesh.
                         let publisher = message.source.unwrap_or(peer_id);
-                        // Bound the publisher map: its key space is attacker-chosen
-                        // (minted identities), so without a sweep it is a remote
-                        // memory leak. Drop entries whose 1s window has passed.
                         if lidar_tracker.len() > MAX_TRACKED_PUBLISHERS {
                             lidar_tracker.retain(|_, (t, _)| {
                                 now.duration_since(*t) <= std::time::Duration::from_secs(1)
                             });
                         }
-                        // conn_tracker is keyed by connected peer, but a churning
-                        // attacker can still mint connections, so sweep it too.
                         if conn_tracker.len() > MAX_TRACKED_PUBLISHERS {
                             conn_tracker.retain(|_, (t, _)| {
                                 now.duration_since(*t) <= std::time::Duration::from_secs(1)
                             });
                         }
                         let (last_time, count) = lidar_tracker.entry(publisher).or_insert((now, 0));
-
                         if now.duration_since(*last_time) > std::time::Duration::from_secs(1) {
-                            // Reset window
                             *last_time = now;
                             *count = 0;
                         }
-
                         *count += 1;
-
                         if *count > MAX_MSG_PER_SEC {
-                            let rate = *count;
-                            println!(
-                                "⛔ LiDAR: rate limit hit by publisher {:?} ({}/s) — banning for {}s",
-                                publisher, rate, LIDAR_BAN_SECS
-                            );
-                            swarm.behaviour_mut().gossipsub.blacklist_peer(&publisher);
-                            blacklist_until.insert(
-                                publisher,
-                                now + std::time::Duration::from_secs(LIDAR_BAN_SECS),
-                            );
-                            // Only drop the transport connection when the flooder is
-                            // the peer we are actually connected to. Disconnecting the
-                            // relay would punish the messenger.
-                            if publisher == peer_id {
-                                let _ = swarm.disconnect_peer_id(peer_id);
+                            if count.is_multiple_of(500) {
+                                println!(
+                                    "⚠️  LiDAR: publisher {:?} over budget ({}/s) — dropping excess",
+                                    publisher, *count
+                                );
                             }
-                            continue; // DROP MESSAGE
+                            continue; // drop only
                         }
 
                         let msg_content = String::from_utf8_lossy(&message.data).to_string();
