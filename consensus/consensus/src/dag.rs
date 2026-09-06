@@ -35,12 +35,6 @@ pub const MAX_VERTEX_BYTES: usize = 768 * 1024;
 /// generous bound is an inflation attack (unbounded parents made an
 /// equivocator's own evidence undeliverable before parents were rooted).
 pub const MAX_PARENTS: usize = 256;
-/// Cap on vertices parked waiting for a missing parent. Bounded so a peer that
-/// streams vertices citing hashes that will never exist cannot grow memory
-/// without limit — the buffer is a reordering cushion, not a queue.
-const MAX_ORPHANS: usize = 2_000;
-/// How far below the current round a parked vertex is still worth keeping.
-const ORPHAN_ROUND_TTL: u64 = 20;
 /// Upper bound on a single evidence item we are willing to store/queue/carry.
 /// With payload and parents stripped a proof is ~1 KiB; this is belt-and-braces.
 const MAX_EVIDENCE_ITEM_BYTES: usize = 64 * 1024;
@@ -61,25 +55,6 @@ pub struct DagConsensus {
     pub storage: Arc<StateDB>,
     pub peers: PeerList,
     pub ordering_engine: Arc<Mutex<OrderingEngine>>,
-    /// AUDIT-CRITICAL (pre-mainnet B3/B4): vertices held back because at least
-    /// one parent is not yet resolvable, keyed by the missing parent hash.
-    ///
-    /// Admitting such a vertex was a single-message, network-wide chain halt:
-    /// `walk_history` is fail-closed on an unresolvable ancestor, honest
-    /// proposers cite every hash in `round_index[prev]` verbatim, so one vertex
-    /// naming a parent that will never exist entered every node's causal cone
-    /// and no anchor could ever commit again. Dropping such vertices outright
-    /// would instead break liveness under ordinary gossip reordering, so they
-    /// are parked here and replayed when the missing parent arrives.
-    orphans: HashMap<String, Vec<Vertex>>,
-    /// Hashes currently parked in `orphans`. GATE-MEDIUM: every vertex is
-    /// delivered over BOTH gossipsub and direct TCP (broadcast_vertex sends
-    /// both, and the TCP path has no duplicate suppression), and the
-    /// partition-recovery helper re-broadcasts a 4-round window on every
-    /// consensus tick. Without this set the buffer filled with copies of the
-    /// SAME few vertices during ordinary bootstrap — the exact situation the
-    /// cushion exists for — and then dropped genuinely new ones.
-    orphan_hashes: std::collections::HashSet<String>,
     pub latest_block_height: u64,
     pub latest_block_hash: String,
     /// AUDIT-H1: timestamp of the chain tip, used to keep BFT block time
@@ -472,8 +447,6 @@ impl DagConsensus {
             ordering_engine: Arc::new(Mutex::new(OrderingEngine::new_with_storage(
                 storage_for_ordering,
             ))),
-            orphans: HashMap::new(),
-            orphan_hashes: std::collections::HashSet::new(),
             latest_block_height,
             latest_block_hash,
             latest_block_timestamp,
@@ -972,78 +945,22 @@ impl DagConsensus {
     const ABSOLUTE_ROUND_CEILING: u64 = u64::MAX / 2;
     const MAX_ROUND_JUMP: u64 = 10_000;
 
-    /// Re-offer every parked vertex after the committed set advances.
+    /// Admit a vertex.
     ///
-    /// GATE-HIGH. The orphan buffer is drained only when the specific missing
-    /// parent is admitted through `add_vertex`. But a parent can also become
-    /// resolvable because the ordering engine COMMITTED it -- which is what
-    /// adopting a synced anchor does. Without this, a validator that fell behind
-    /// and caught up via ChainSync keeps everything it parked while it was
-    /// behind, forever, which is precisely when the buffer holds the most.
-    ///
-    /// Vertices that are still unresolvable simply park again, so this is safe to
-    /// call repeatedly; it is bounded by the buffer's own MAX_ORPHANS cap.
-    pub fn retry_parked_vertices(&mut self) {
-        if self.orphans.is_empty() {
-            return;
-        }
-        let parked: Vec<Vertex> = self.orphans.drain().flat_map(|(_, v)| v).collect();
-        self.orphan_hashes.clear();
-        println!("🔁 re-offering {} parked vertex(es) after committed set advanced", parked.len());
-        for v in parked {
-            self.add_vertex(v);
-        }
-    }
-
-    /// Number of DISTINCT vertices currently parked waiting on a parent.
-    /// Distinct is the point: the buffer is bounded per vertex hash, not per
-    /// delivery, because the same vertex arrives over two transports and is
-    /// re-gossiped by the recovery loop.
-    pub fn parked_vertex_count(&self) -> usize {
-        // Count the vertices ACTUALLY stored, not the dedup set — the stored
-        // copies are what consume memory, and reading the HashSet here would
-        // make this blind to the very duplication it is meant to detect.
-        self.orphans.values().map(|v| v.len()).sum()
-    }
-
-    /// Admit a vertex, then replay anything that was waiting on it.
-    ///
-    /// AUDIT-CRITICAL (pre-mainnet B3/B4). `add_vertex_inner` parks a vertex
-    /// whose parents are not yet resolvable instead of admitting it (admitting
-    /// one wedges the commit loop forever) and instead of dropping it (dropping
-    /// breaks liveness under ordinary gossip reordering). When a parent finally
-    /// lands, its parked children become admissible, and so may THEIR children,
-    /// so this drains transitively through an explicit work queue rather than
-    /// recursing -- an attacker-shaped chain of parked vertices would otherwise
-    /// be a stack-overflow primitive.
+    /// Kept as a thin wrapper over `add_vertex_inner` so the ingress pipeline has
+    /// exactly one entry point and the inner function can report, via its return
+    /// value, whether the vertex actually reached `dag.insert`.
     pub fn add_vertex(&mut self, vertex: Vertex) {
-        let mut queue = vec![vertex];
-        while let Some(v) = queue.pop() {
-            let hash = v.hash.clone();
-            if self.add_vertex_inner(v) {
-                if let Some(waiting) = self.orphans.remove(&hash) {
-                    if !waiting.is_empty() {
-                        println!("🔓 replaying {} vertex(es) unblocked by {}", waiting.len(), hash);
-                    }
-                    for v in &waiting {
-                        self.orphan_hashes.remove(&v.hash);
-                    }
-                    queue.extend(waiting);
-                }
-            }
-        }
+        let _ = self.add_vertex_inner(vertex);
     }
+
     fn add_vertex_inner(&mut self, vertex: Vertex) -> bool {
-        // GATE-HIGH: the return value answers exactly one question — "did this
-        // vertex reach dag.insert?" — and nothing else. EVERY exit below reports
-        // this flag rather than a literal, so if the insert point ever moves the
-        // return value follows it automatically instead of silently lying. It
-        // previously doubled as "should the caller continue", so the
-        // observer-mode guard returned false for a vertex it had ALREADY
-        // admitted. On every non-validator node (indexer, explorer, RPC, DEX
-        // backend, a jailed or not-yet-joined validator) that made the orphan
-        // buffer write-only: parked children were never replayed, and ordinary
-        // gossip reordering left permanent DAG holes.
+        // The return value answers exactly one question — "did this vertex reach
+        // dag.insert?" — and nothing else. EVERY exit below reports this flag
+        // rather than a literal, so if the insert point ever moves the return
+        // value follows it automatically instead of silently lying. It once
+        // doubled as "should the caller continue", and the observer-mode guard
+        // duly returned false for a vertex it had ALREADY admitted.
         let mut admitted = false;
 
         // Anti-overflow: any vertex above ABSOLUTE_ROUND_CEILING is malicious
@@ -1197,13 +1114,22 @@ impl DagConsensus {
         // single 1 KB gossip message, unrecoverable without hand-purging every
         // node's RocksDB.
         //
-        // A parent may also be legitimately unknown-for-now (ordinary gossip
-        // reordering), so an unresolved vertex is PARKED, not dropped, and
-        // replayed when the parent lands. The lock order is ordering_engine ->
-        // dag, matching try_commit; taking them the other way round here would
-        // deadlock the consensus this gate exists to protect.
+        // Unresolvable vertices are DROPPED, not buffered. An earlier revision
+        // parked them in an orphan buffer to survive gossip reordering; three
+        // review rounds found six defects in that buffer alone (unbounded bytes,
+        // a TTL that could not evict future rounds, per-block re-validation
+        // amplification, and a re-entrancy hole), because it duplicated a
+        // recovery mechanism the node already has. `try_create_vertex` re-gossips
+        // every vertex it holds from a 4-round window, INCLUDING peers' vertices,
+        // on every tick that it sits below parent quorum -- and dropping a vertex
+        // is precisely what puts a node below parent quorum. Redelivery is
+        // therefore self-correcting, with no state to bound, expire or drain.
+        //
+        // The lock order is ordering_engine -> dag, matching try_commit; taking
+        // them the other way round here would deadlock the consensus this gate
+        // exists to protect.
         {
-            let unresolved: Vec<String> = {
+            let unresolved: usize = {
                 let engine = match self.ordering_engine.lock() {
                     Ok(e) => e,
                     Err(_) => {
@@ -1218,54 +1144,15 @@ impl DagConsensus {
                     .parents
                     .iter()
                     .filter(|p| !engine.is_settled(p) && !dag_guard.contains_key(p.as_str()))
-                    .cloned()
-                    .collect()
+                    .count()
             };
 
-            if !unresolved.is_empty() {
-                // Park under the first missing parent; it is replayed when that
-                // parent arrives. Bounded in both count and age so a peer citing
-                // hashes that will never exist cannot grow this without limit.
-                // Already parked (re-delivered over the other transport, or
-                // re-gossiped by the recovery loop) — nothing to do.
-                if self.orphan_hashes.contains(&vertex.hash) {
-                    return admitted;
-                }
-                if self.orphan_hashes.len() >= MAX_ORPHANS {
-                    let floor = self.current_round.saturating_sub(ORPHAN_ROUND_TTL);
-                    let mut evicted: Vec<String> = Vec::new();
-                    self.orphans.retain(|_, waiting| {
-                        waiting.retain(|v| {
-                            let keep = v.round >= floor;
-                            if !keep {
-                                evicted.push(v.hash.clone());
-                            }
-                            keep
-                        });
-                        !waiting.is_empty()
-                    });
-                    for h in evicted {
-                        self.orphan_hashes.remove(&h);
-                    }
-                }
-                if self.orphan_hashes.len() >= MAX_ORPHANS {
-                    println!(
-                        "🚫 orphan buffer full ({}); dropping vertex {} from {}",
-                        self.orphan_hashes.len(),
-                        vertex.hash,
-                        vertex.author
-                    );
-                    return admitted;
-                }
+            if unresolved > 0 {
                 println!(
-                    "⏳ parking vertex {} (round {}): {} unresolved parent(s)",
-                    vertex.hash, vertex.round, unresolved.len()
+                    "⏳ REJECTED: vertex {} (round {}) has {} unresolvable parent(s); \
+                     awaiting re-gossip",
+                    vertex.hash, vertex.round, unresolved
                 );
-                self.orphan_hashes.insert(vertex.hash.clone());
-                self.orphans
-                    .entry(unresolved[0].clone())
-                    .or_default()
-                    .push(vertex);
                 return admitted;
             }
         }
@@ -2012,7 +1899,7 @@ impl DagConsensus {
         }
 
         // Reached the end. Report whether the vertex actually reached
-        // `dag.insert` — the wrapper drains orphans on exactly that condition.
+        // `dag.insert`.
         admitted
     }
 
@@ -3042,17 +2929,6 @@ impl DagConsensus {
                             ),
                             Err(_) => None,
                         };
-                        if adopted.is_some() {
-                            // GATE-HIGH: adopting a synced anchor advances
-                            // `committed_set`, which can make a parked vertex's
-                            // parent settled. Nothing else re-examines the orphan
-                            // buffer -- the drain only runs when a vertex is
-                            // admitted through add_vertex -- so a validator that
-                            // caught up via sync would strand everything it parked
-                            // while it was behind, exactly when the buffer is
-                            // fullest. Re-offer them now that the set has moved.
-                            self.retry_parked_vertices();
-                        }
                         if let Some(info) = adopted {
                             let epoch = self
                                 .storage

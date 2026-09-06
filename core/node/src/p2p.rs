@@ -265,14 +265,43 @@ pub async fn start_p2p(
     /// Cap on distinct publishers tracked at once. The key space is chosen by
     /// whoever signs the messages, so this map must be swept.
     const MAX_TRACKED_PUBLISHERS: usize = 10_000;
+    /// Aggregate inbound budget for ONE connection, across all publishers whose
+    /// traffic that peer relays. Sized well above a single publisher's limit
+    /// because a relay legitimately carries the whole mesh's traffic. Exceeding
+    /// it drops messages; it never bans, because the peer being measured is the
+    /// messenger, not necessarily the author.
+    const MAX_CONN_MSG_PER_SEC: u32 = 2_000;
 
     // === Event Loop ===
     tokio::spawn(async move {
         let mut inbound_connections_by_host: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
 
+        // GATE-HIGH: ban expiry used to run ONLY inside the gossip Message arm.
+        // A node that had blacklisted all of its peers therefore received no
+        // gossip, so the expiry code never executed and the ban never lifted —
+        // the isolation was self-sustaining and survived until process restart.
+        // This tick drives expiry independently of inbound traffic.
+        let mut ban_sweep = tokio::time::interval(std::time::Duration::from_secs(10));
+        ban_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
+                _ = ban_sweep.tick() => {
+                    if !blacklist_until.is_empty() {
+                        let now = std::time::Instant::now();
+                        let expired: Vec<PeerId> = blacklist_until
+                            .iter()
+                            .filter(|(_, until)| now >= **until)
+                            .map(|(p, _)| *p)
+                            .collect();
+                        for p in expired {
+                            blacklist_until.remove(&p);
+                            swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&p);
+                            println!("♻️  LiDAR ban expired for {:?}", p);
+                        }
+                    }
+                }
                 Some(msg) = rx_in.recv() => {
                     // println!("📤 Broadcasting TX via P2P: {}", msg);
                     let _ = swarm.behaviour_mut().gossipsub.publish(IdentTopic::new("aincore-gossip"), msg.as_bytes());
@@ -311,21 +340,6 @@ pub async fn start_p2p(
                         // 🛡️ LiDAR PROTECTION LOGIC
                         let now = std::time::Instant::now();
 
-                        // Expire finished bans first, so a ban is a cooldown and
-                        // not a permanent excommunication.
-                        if !blacklist_until.is_empty() {
-                            let expired: Vec<PeerId> = blacklist_until
-                                .iter()
-                                .filter(|(_, until)| now >= **until)
-                                .map(|(p, _)| *p)
-                                .collect();
-                            for p in expired {
-                                blacklist_until.remove(&p);
-                                swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&p);
-                                println!("♻️  LiDAR ban expired for {:?}", p);
-                            }
-                        }
-
                         // AUDIT-CRITICAL (pre-mainnet B6): rate-limit the PUBLISHER,
                         // not `propagation_source`. `propagation_source` is the
                         // neighbour that RELAYED the message, which in a gossip mesh
@@ -337,8 +351,21 @@ pub async fn start_p2p(
                         // MessageAuthenticity::Signed + ValidationMode::Strict, so
                         // `message.source` is the authenticated publisher; fall back to
                         // the relay only if it is somehow absent.
-                        // Per-CONNECTION budget first: bounds what one peer can
-                        // push at us no matter who signed it.
+                        // Per-CONNECTION budget: bounds how much one peer can push
+                        // at us regardless of who authored it, closing the
+                        // identity-rotation bypass of the publisher counter.
+                        //
+                        // GATE-CRITICAL: this must only DROP. `peer_id` here is
+                        // `propagation_source` — the neighbour that RELAYED the
+                        // message — so banning on it re-creates the very B6
+                        // partition the publisher counter was introduced to fix:
+                        // a stranger publishing from throwaway identities makes
+                        // honest relays exceed the budget and get blacklisted by
+                        // their own peers. Only the authenticated publisher below
+                        // may earn a ban. The budget is also an AGGREGATE, not the
+                        // per-publisher constant: legitimate relayed traffic is
+                        // n_validators * their rate, and the bootstrap re-gossip
+                        // loop alone sends 4 rounds x n authors in a tick.
                         {
                             let (c_last, c_count) =
                                 conn_tracker.entry(peer_id).or_insert((now, 0));
@@ -347,18 +374,14 @@ pub async fn start_p2p(
                                 *c_count = 0;
                             }
                             *c_count += 1;
-                            if *c_count > MAX_MSG_PER_SEC {
-                                println!(
-                                    "⛔ LiDAR: connection {:?} over budget ({}/s) — banning for {}s",
-                                    peer_id, *c_count, LIDAR_BAN_SECS
-                                );
-                                swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
-                                blacklist_until.insert(
-                                    peer_id,
-                                    now + std::time::Duration::from_secs(LIDAR_BAN_SECS),
-                                );
-                                let _ = swarm.disconnect_peer_id(peer_id);
-                                continue;
+                            if *c_count > MAX_CONN_MSG_PER_SEC {
+                                if c_count.is_multiple_of(500) {
+                                    println!(
+                                        "⚠️  LiDAR: connection {:?} over aggregate budget ({}/s) — dropping excess",
+                                        peer_id, *c_count
+                                    );
+                                }
+                                continue; // drop this message only; never ban a relay
                             }
                         }
 
@@ -368,6 +391,13 @@ pub async fn start_p2p(
                         // memory leak. Drop entries whose 1s window has passed.
                         if lidar_tracker.len() > MAX_TRACKED_PUBLISHERS {
                             lidar_tracker.retain(|_, (t, _)| {
+                                now.duration_since(*t) <= std::time::Duration::from_secs(1)
+                            });
+                        }
+                        // conn_tracker is keyed by connected peer, but a churning
+                        // attacker can still mint connections, so sweep it too.
+                        if conn_tracker.len() > MAX_TRACKED_PUBLISHERS {
+                            conn_tracker.retain(|_, (t, _)| {
                                 now.duration_since(*t) <= std::time::Duration::from_secs(1)
                             });
                         }

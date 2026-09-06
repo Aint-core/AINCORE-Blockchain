@@ -1806,6 +1806,19 @@ impl Executor {
             let mut dropped = 0usize;
             for tx in parsed_txs.into_iter() {
                 let cost = tx.0.gas_limit;
+                // GATE-CRITICAL: budget on a VALIDATED gas_limit. `gas_limit` is
+                // an attacker-declared field, and the per-tx ceiling is enforced
+                // later, inside execution. Budgeting on the raw value let one
+                // transaction declaring an absurd gas_limit consume the entire
+                // block budget and push every honest transaction out — free,
+                // deterministic censorship, and free block-space reservation,
+                // since the transaction is then rejected and never pays. A
+                // transaction over the per-tx ceiling cannot execute at all, so
+                // it is skipped here without charging the block for it.
+                if cost > MAX_GAS_LIMIT {
+                    dropped += 1;
+                    continue;
+                }
                 if budget.saturating_add(cost) > MAX_BLOCK_GAS_LIMIT {
                     dropped += 1;
                     continue;
