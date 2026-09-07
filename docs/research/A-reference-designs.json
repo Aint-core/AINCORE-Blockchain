@@ -1,0 +1,87 @@
+{
+  "findings": [
+    {
+      "topic": "Narwhal \u2014 why fake parents are impossible",
+      "fact": "A block may only cite parents that carry a certificate of availability: 2f+1 signatures from validators that have STORED the block. Quorum intersection means >= f+1 honest validators hold any cited parent, so a cited hash that does not exist anywhere cannot be constructed by a single Byzantine author.",
+      "evidence": "Danezis et al., Narwhal & Tusk (EuroSys'22, arXiv 2105.11827) \u00a73.1 'A valid block must ... (3) contain certificates for at least 2f+1 blocks of round r-1'; \u00a73.1 'Intuitions behind security argument: a certificate of availability includes 2f+1 signatures, i.e. at least f+1 honest validators have checked and stored the block'.",
+      "implication_for_design": "AINCORE cites parents by bare hash with NO availability proof. That single structural gap is why 'late vs never' is undecidable in AINCORE and why every buffer/drop heuristic was gameable. The design must add an availability signal, either explicit (certificates: costs a round-trip per vertex) or implicit (Beluga ImPoA, below)."
+    },
+    {
+      "topic": "Narwhal \u2014 pull from certificate signers",
+      "fact": "Missing causal history is obtained by PULL, addressed to validators that signed the certificate; probability of a correct response grows exponentially with a handful of asks.",
+      "evidence": "\u00a74.1 'Upon receiving a certificate for a block at round r+1 validators can request all blocks in its causal history from validators that signed the certificates: since at least f+1 honest validators store each block, the probability of receiving a correct response grows exponentially after asking a handful of validators.'",
+      "implication_for_design": "Whom to ask is derived from evidence of who HOLDS it, never from the citing author alone (the citer may be the adversary). In AINCORE the equivalent evidence is the set of DISTINCT AUTHORS whose vertices cite the hash."
+    },
+    {
+      "topic": "Narwhal \u2014 request bounding",
+      "fact": "Only O(1) requests per missing block are active at a time; all pending requests for a block are dropped on the first correct response; worst case O(n) requests only under active link attack.",
+      "evidence": "\u00a74.1 'This pull mechanism is DoS resistant and efficient: At any time only O(1) requests for each block are active, and all pending requests can be dropped after receiving a correct response ... unless the adversary actively attacks the network links, requiring O(n) requests at most.'",
+      "implication_for_design": "Per-missing-hash outstanding-request cap of O(1) (e.g. 2-3 in flight), cancel-on-first-valid-response, escalate toward O(n) only on timeout."
+    },
+    {
+      "topic": "Narwhal \u2014 re-transmission storage bounded by round advance",
+      "fact": "A validator stops re-transmitting and drops all pending undelivered messages for rounds < r+1 once it advances to r+1; storage for re-transmission is bounded by the time to advance a round.",
+      "evidence": "\u00a74.1 'Once a validator advances to round r+1 it stops re-transmission and drops all pending undelivered messages for rounds smaller than r+1'; \u00a74.1 'Storage for re-transmissions is bounded by the time it takes to advance a round ... taking space bounded by O(n) in the size of the quorum'.",
+      "implication_for_design": "Held-vertex lifetime must be tied to the RECEIVER's own round progression (a quantity the sender cannot inflate), not to the sender-declared vertex.round. This is the direct answer to the attacker-controlled-TTL failures (I3)."
+    },
+    {
+      "topic": "Narwhal \u2014 parents must be exactly round r-1; first-received wins",
+      "fact": "Validity requires certificates for 2f+1 blocks of round r-1 exactly, and the block must be the first received from its creator for round r (second is discarded).",
+      "evidence": "\u00a73.1 validity rules (2) 'be at the local round r of the validator checking it', (3) '... blocks of round r-1', (4) 'be the first one received from the creator for round r'.",
+      "implication_for_design": "An exact-round parent rule shrinks the resolvability question to a single previous round. In Narwhal dropping the second equivocating block is safe ONLY because it can never be certified and therefore never cited; AINCORE has no certificate, so the same drop creates a citable-but-unobtainable hash (failure I9)."
+    },
+    {
+      "topic": "Beluga \u2014 Implicit Proof-of-Availability (ImPoA)",
+      "fact": "A missing block is deemed 'implicitly available' when it is referenced by at least f+1 blocks from subsequent rounds. f+1 referencers guarantee at least one honest referencer, and an honest node references only what it holds, so the block exists and is fetchable.",
+      "evidence": "Beluga: Block Synchronization for BFT Consensus Protocols (arXiv 2511.15517), synchronizer design: 'a missing block is deemed implicitly available if it is referenced (via strong or weak links) by at least f+1 blocks from subsequent rounds'.",
+      "implication_for_design": "THIS is the certificate-free, deterministic late-vs-never rule AINCORE lacks. A hash cited by >= f+1 DISTINCT AUTHORS is worth fetching and will be found. A hash cited by fewer is not yet trusted: the CITING vertex is what gets held, cheaply, and the missing hash is not chased. A single Byzantine author's fake hash never reaches f+1 (only <= f Byzantine authors would cite it)."
+    },
+    {
+      "topic": "Beluga \u2014 pull-induction attack",
+      "fact": "Adversary withholds a block from most honest validators during dissemination so they must pull it; repeatable every round; measured 50x latency and 15x throughput degradation in existing systems.",
+      "evidence": "Beluga \u00a7pull-induction: 'selectively withhold messages during initial dissemination so that only a small subset of honest validators receive a block' ... 'latency increase by at least 50x'.",
+      "implication_for_design": "The synchronizer must be designed so being FORCED to pull is cheap and bounded, and so a validator that habitually forces pulls is deprioritized (Beluga uses reputation). AINCORE already has downtime attestation machinery that could carry a 'poor disseminator' signal later; out of scope for v1."
+    },
+    {
+      "topic": "Beluga \u2014 live vs bulk split and whom to ask",
+      "fact": "Live blocks (blocking round progress) are pulled from ALL validators deterministically; bulk blocks (off critical path, already implicitly available) are pulled from a random O(1) set, rotating on timeout \u0394bk.",
+      "evidence": "Beluga: 'sends the pull requests for all missing blocks specified in B_lv to all validators' (live); 'randomly chooses a small set of validators (with the set size of O(1)) to send the pull request' (bulk), retry with a different random set after \u0394bk.",
+      "implication_for_design": "Two request classes with different fan-out. For AINCORE v1: ask the authors that CITED the hash first (they demonstrably hold it), then widen."
+    },
+    {
+      "topic": "Beluga \u2014 explicit bounds and gaps",
+      "fact": "Beluga states round-progression 4\u0394, live pull 2\u03b4, per-round timeout Trd=5\u0394, reputation penalty RL=10,000, but NO explicit per-peer request cap, byte quota, or buffer size; it relies on Narwhal GC and reputation.",
+      "evidence": "Beluga bounds table (Lemma 3, Trd = 5\u0394); the paper states no per-peer request limits or byte quotas.",
+      "implication_for_design": "The byte/count/per-author bounds must be supplied by AINCORE's design; the reference does not hand them over. These are exactly the bounds the failure catalog (I3, I4) requires."
+    },
+    {
+      "topic": "Beluga \u2014 liveness theorems",
+      "fact": "Machine-checked (Lean) theorems: block accepted => eventually stored; accepted => every causal ancestor eventually accepted; every round >= 2f+1 validators create blocks; each honest validator accepts >= 2f+1 proposals per round \u2014 all after GST.",
+      "evidence": "Beluga Theorems 1, 2, 4, 5 (Appendix I, Lean proofs).",
+      "implication_for_design": "The design's test plan should target the same four properties as observable assertions on a 4-node cluster, since they are exactly the properties AINCORE's four failed attempts violated."
+    },
+    {
+      "topic": "Mysticeti \u2014 validity rule in an uncertified DAG",
+      "fact": "A block must reference at least 2f+1 distinct blocks from round r-1 exactly, may additionally reference older rounds, and its first parent is its author's own previous block.",
+      "evidence": "Mysticeti (arXiv 2310.14821) \u00a7II-C: 'at least 2f+1 distinct hashes of blocks from the previous round, along potentially others from all previous rounds'; first parent links the proposer's own previous-round block.",
+      "implication_for_design": "Same exact-round core rule as Narwhal, without certificates. AINCORE's try_create_vertex cites all of round_index[prev]; the design can keep that but must require the 2f+1-from-r-1 structure at INGRESS as a cheap filter."
+    },
+    {
+      "topic": "Mysticeti \u2014 equivocation without certificates",
+      "fact": "Mysticeti does not drop the second equivocating block at ingress; safety comes from the commit rule: at most one of two equivocating blocks can gather 2f+1 support, and the deterministic support/DFS rule selects consistently.",
+      "evidence": "Mysticeti \u00a7II-C: 'At most one of these equivocating blocks can gather support from 2f+1 validators.'",
+      "implication_for_design": "Directly answers Track C open question #2 and failure I9: in a certificate-free DAG, ADMIT both equivocating vertices (both are validly signed) so every citation resolves, and let the ordering rule + the existing slash handle it. Must be checked against AINCORE ordering.rs's actual support rule before adopting."
+    },
+    {
+      "topic": "Mysticeti \u2014 what the paper does NOT specify",
+      "fact": "The Mysticeti paper does not specify ancestor fetching, hold bounds, fetch sources, or handling of nonexistent references; Beluga (integrated into Mysticeti) is the reference for those.",
+      "evidence": "Mysticeti paper: no section on synchronization; Beluga abstract: 'integrates the Beluga block synchronizer' into Mysticeti.",
+      "implication_for_design": "Use Mysticeti for DAG structure/equivocation and Beluga for synchronization; do not expect either alone to be complete."
+    }
+  ],
+  "open_questions": [
+    "Does AINCORE's ordering.rs have a 'support'-style commit rule that stays safe if BOTH equivocating vertices are admitted? (Mysticeti relies on it; must verify before adopting admit-both.)",
+    "Beluga's ImPoA threshold is f+1 by COUNT of validators; AINCORE quorum is STAKE-weighted (>2/3). Should ImPoA be 'distinct authors whose stake > 1/3 total' rather than f+1 by count?",
+    "Beluga has no byte quotas; what byte budget is right for a Raspberry Pi validator (2 of AINCORE's 4 run on Pi)?"
+  ]
+}

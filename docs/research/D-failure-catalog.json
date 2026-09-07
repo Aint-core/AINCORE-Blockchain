@@ -1,0 +1,132 @@
+{
+  "invariants": [
+    {
+      "id": "I1",
+      "invariant": "A parent hash must be resolvable (genesis | in dag | committed) before the citing vertex can enter any node's causal cone; the commit path must never encounter a hole from an admitted vertex.",
+      "violated_by": "One well-formed signed vertex citing a hash that will never exist; walk_history returns None forever; no anchor commits again.",
+      "round": "audit-119",
+      "file": "consensus/consensus/src/dag.rs:1045",
+      "why_it_failed": "Ingress trusted the citer; resolvability was only checked at commit time, where the only response was to stop."
+    },
+    {
+      "id": "I2",
+      "invariant": "Redelivery must be a PULL from a node that HOLDS the vertex. No mechanism may require a node to already hold data in order to obtain it.",
+      "violated_by": "Dropping unresolved vertices and relying on the re-gossip loop, which pushes dag.values() only while the node is BELOW parent quorum \u2014 the holders are above quorum and never re-send.",
+      "round": "gate-r3",
+      "file": "consensus/consensus/src/dag.rs:1150",
+      "why_it_failed": "The redelivery argument was inverted: it could only move data from a node that lacked it, never from one that had it."
+    },
+    {
+      "id": "I3",
+      "invariant": "Every eviction/TTL key for held vertices must be a quantity the SENDER cannot inflate. vertex.round is sender-chosen up to current_round+10_000 and is inadmissible.",
+      "violated_by": "2000 vertices at round current+9_000 citing a fake parent; TTL sweep (round < current-20) never fires; buffer pinned for ~10k rounds, honest vertices dropped.",
+      "round": "gate-r1, gate-r2",
+      "file": "consensus/consensus/src/dag.rs:1174,1235,1239",
+      "why_it_failed": "Age was measured on attacker-declared data instead of the receiver's own clock/round progression."
+    },
+    {
+      "id": "I4",
+      "invariant": "Held-vertex capacity must be bounded in BYTES and PER-AUTHOR, not only by count.",
+      "violated_by": "MAX_ORPHANS=2000 x MAX_VERTEX_BYTES=768KiB = ~1.5GiB pinned on every node (OOM on Pi) by one validator.",
+      "round": "gate-r2",
+      "file": "consensus/consensus/src/dag.rs:1235",
+      "why_it_failed": "Count bound ignored that each entry is attacker-sized; no per-author quota let one key take every slot."
+    },
+    {
+      "id": "I5",
+      "invariant": "Holding must be idempotent per vertex hash: the same vertex arrives via gossipsub, direct TCP, and the re-gossip loop.",
+      "violated_by": "Unconditional push into the buffer parked ~2 copies/sec of the same vertex during ordinary bootstrap.",
+      "round": "gate-r1",
+      "file": "consensus/consensus/src/dag.rs:1191",
+      "why_it_failed": "The buffer counted deliveries, not distinct vertices; and the parent gate ran BEFORE the duplicate-hash check."
+    },
+    {
+      "id": "I6",
+      "invariant": "Any 'admitted' signal that triggers downstream release must be true iff the vertex reached dag.insert, on validator AND observer nodes alike.",
+      "violated_by": "add_vertex_inner returned false at the observer guard AFTER inserting; orphans never drained on indexer/RPC/DEX/jailed nodes.",
+      "round": "gate-r1",
+      "file": "consensus/consensus/src/dag.rs:1331,1337",
+      "why_it_failed": "One boolean answered two questions ('inserted?' and 'continue ordering?')."
+    },
+    {
+      "id": "I7",
+      "invariant": "Releasing held vertices must be O(newly-settled hashes), keyed by the settled hash, and must not re-run full signature/hash verification per replay.",
+      "violated_by": "retry_parked_vertices drained and re-verified the whole buffer once per synced block: O(blocks x orphans) Ed25519 + SHA-256 during catch-up; a restarted validator could never rejoin.",
+      "round": "gate-r2",
+      "file": "consensus/consensus/src/dag.rs:3054",
+      "why_it_failed": "Replay was blind (drain everything) instead of indexed (release what the new settlement unblocks)."
+    },
+    {
+      "id": "I8",
+      "invariant": "A hash becoming settled via SYNC (adopt_synced_anchor -> committed_set) must release held dependents exactly as arrival via gossip does.",
+      "violated_by": "Release only ran inside add_vertex; sync-settled parents never released their children.",
+      "round": "gate-r1",
+      "file": "consensus/consensus/src/dag.rs:980",
+      "why_it_failed": "Two settlement paths, one release hook."
+    },
+    {
+      "id": "I9",
+      "invariant": "Equivocation must never create a citable-but-unobtainable hash. If the second vertex is dropped, peers that saw it first WILL cite it.",
+      "violated_by": "Byzantine V sends A to N1,N2 and B to N3,N4; each pair cites its own; neither can obtain the other; commit wedges on both sides; the slash never lands.",
+      "round": "audit-119",
+      "file": "consensus/consensus/src/dag.rs:1139",
+      "why_it_failed": "Narwhal's drop-second is safe only because certificates prevent citing the dropped one; AINCORE copied the drop without the certificate."
+    },
+    {
+      "id": "I10",
+      "invariant": "A restarted or newly-joined validator must be able to re-enter the DAG from a gap LARGER than any re-gossip window, without already holding recent vertices.",
+      "violated_by": "Validator down 30-60 rounds returns; every live vertex cites parents it lacks; nothing re-requests them; it builds one stale vertex and sits below quorum forever; reload_chain_tip caps at its own starved quorum_round.",
+      "round": "gate-r3",
+      "file": "consensus/consensus/src/dag.rs:608",
+      "why_it_failed": "Re-entry depended on the node's own (empty) recent view."
+    },
+    {
+      "id": "I11",
+      "invariant": "Far-future vertices must be bounded in memory and storage; MAX_ROUND_JUMP=10_000 x 768KiB is ~7GB per validator key.",
+      "violated_by": "One vertex per round for 10_000 future rounds, each 768KiB of payload, all stored and replayed at boot.",
+      "round": "audit-119",
+      "file": "consensus/consensus/src/dag.rs:963",
+      "why_it_failed": "Round-jump cap bounded the round number, not the bytes admitted per author per window."
+    },
+    {
+      "id": "I12",
+      "invariant": "The gossip limiter must NEVER ban or disconnect on any identity the sender can influence. propagation_source is the relay; message.source is replayable. Drop-only.",
+      "violated_by": "Keyed on relay: strangers make validators ban each other. Keyed on publisher: replaying a victim's own signed messages bans the victim. Honest recovery burst (4 rounds x n authors) trips it at n>=26.",
+      "round": "audit-119, gate-r2, gate-r3",
+      "file": "core/node/src/p2p.rs:289,342,350,352,355,414,261",
+      "why_it_failed": "Attribution in gossipsub is not reliable enough to justify a punishment that can partition consensus."
+    },
+    {
+      "id": "I13",
+      "invariant": "Every remote-keyed map must be swept or bounded.",
+      "violated_by": "conn_tracker / lidar_tracker keyed by attacker-minted identities with no sweep.",
+      "round": "gate-r1, gate-r2",
+      "file": "core/node/src/p2p.rs:259,326",
+      "why_it_failed": "Key space was attacker-chosen."
+    },
+    {
+      "id": "I14",
+      "invariant": "Any timed action (expiry, retry) must run independently of inbound traffic.",
+      "violated_by": "Ban expiry lived inside the Message handler; a node that banned everyone received nothing and never un-banned.",
+      "round": "gate-r2",
+      "file": "core/node/src/p2p.rs:316",
+      "why_it_failed": "The event that should trigger recovery was the event the failure suppressed."
+    },
+    {
+      "id": "I15",
+      "invariant": "Inbound TCP session capacity must reserve slots for validators or evict, so unauthenticated peers cannot deny sync/fetch service.",
+      "violated_by": "100 sessions live after a 32-byte X25519 exchange, no eviction; honest validators' secure_connect fails.",
+      "round": "audit-119",
+      "file": "common/network/src/lib.rs:108",
+      "why_it_failed": "Capacity was first-come with no notion of who matters."
+    },
+    {
+      "id": "I16",
+      "invariant": "Lock order is ordering_engine -> dag (as in try_commit); add_vertex must never be re-entered while either lock is held; no path may take dag then ordering_engine.",
+      "violated_by": "reload_chain_tip -> retry_parked_vertices -> add_vertex re-entered ingress during block placement.",
+      "round": "gate-r2",
+      "file": "consensus/consensus/src/dag.rs:3054",
+      "why_it_failed": "A release hook was called from inside a path that already held state."
+    }
+  ]
+}
