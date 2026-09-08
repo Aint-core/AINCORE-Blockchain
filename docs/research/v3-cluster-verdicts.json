@@ -1,0 +1,57 @@
+{
+  "run": "wddvqd38e",
+  "clusters_verified": 15,
+  "confirmed": [
+    {
+      "id": "P1-E",
+      "severity": "HIGH"
+    },
+    {
+      "id": "P1-F",
+      "severity": "HIGH"
+    },
+    {
+      "id": "P1-G",
+      "severity": "MEDIUM"
+    },
+    {
+      "id": "P2-A",
+      "severity": "CRITICAL"
+    },
+    {
+      "id": "P2-B",
+      "severity": "CRITICAL"
+    },
+    {
+      "id": "P2-C",
+      "severity": "CRITICAL"
+    },
+    {
+      "id": "P2-D",
+      "severity": "HIGH"
+    },
+    {
+      "id": "P2-E",
+      "severity": "HIGH"
+    },
+    {
+      "id": "P2-F",
+      "severity": "HIGH"
+    },
+    {
+      "id": "P2-G",
+      "severity": "HIGH"
+    },
+    {
+      "id": "P2-J",
+      "severity": "MEDIUM"
+    }
+  ],
+  "refuted": [
+    "P1-D",
+    "P2-H",
+    "P2-I",
+    "P2-K"
+  ],
+  "unverified": []
+}
