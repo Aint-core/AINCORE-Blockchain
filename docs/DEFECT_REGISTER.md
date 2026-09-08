@@ -482,6 +482,45 @@ needs a simulated ChainSync writer at the storage-visibility point. The `placeme
 seam is the hook for it (it fires between retry attempts, exactly where sync's write
 becomes visible), and the seam is in — the writer is not.
 
+**THE B4b RACE IS NOW REACHABLE DELIBERATELY — the last gap in the DST plan is closed.**
+`consensus/consensus/src/tests.rs`,
+`test_b4b_sync_landing_mid_placement_must_not_produce_a_duplicate_anchor`. GREEN at HEAD,
+deterministic across 6 separate processes in both profiles, no real clock and no real sleep.
+
+The race is decided by REAL TIME — whether ChainSync's write becomes visible before or
+after this node finishes placing its own anchor — which is why no message-ordering harness
+can reach it, and why the clock seam was a prerequisite rather than a nicety.
+`placement_sleep` is the hook: it fires BETWEEN retry attempts, at exactly the point where
+sync's write would land.
+
+Scenario: the node has committed anchor round 4 and is placing its block. Mid-placement,
+the simulated ChainSync writer lands the NETWORK's block for that same anchor at height 2
+and publishes the tip. Reaching the retry loop at all needs the first execute attempt to
+fail, arranged the way it happens live — `sys:last_executed_height` already ahead of the
+node's tip, because sync executed the height before the node reloaded. A `fired` assertion
+guards against the whole race being silently skipped.
+
+**MUTATION — and it reproduces the live fork exactly.** Delete the AUDIT-B4b dedup line
+from `reload_chain_tip`:
+
+    if let Some(r) = synced_round { self.latest_block_round = self.latest_block_round.max(r); }
+
+and the map becomes:
+
+    [(1, 2), (2, 4), (3, 4)]
+
+Anchor round 4 at BOTH height 2 and height 3 — the node built a duplicate block for an
+anchor the network had already placed, and its anchor->height map diverged from every
+peer's. That is the live B4b block fork, on demand, in 0.01 s.
+
+**What this establishes:** the existing dedup fix is not merely present, it is PROVEN
+load-bearing. Before this, "B4b is fixed" rested on a code reading; now removing the fix
+reproduces the fork and restoring it removes it.
+
+B4b now has all four legs: not manifesting on the live cluster (measured, 300 heights);
+the fix proven necessary (mutation); the race reachable deterministically (this test); and
+the invariant checkable in production (`check-anchor-height-map.sh`).
+
 **Rejected outright:** exhaustive model checking (FACT 2; and `held: BTreeSet` collapses
 every delivery permutation into one fingerprint, making the root defect H2 *unrepresentable*);
 the record/replay recorder (it misses ChainSync's client path, `sync/src/lib.rs:722`, the

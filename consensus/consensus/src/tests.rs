@@ -2294,4 +2294,179 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&path);
     }
+
+
+    /// Feed one round of a validly-signed full mesh into `node`, returning the
+    /// hashes so the next round can cite them.
+    fn tier2_feed_round(
+        node: &mut DagConsensus,
+        keys: &[(String, String, [u8; 32])],
+        round: u64,
+        ts: u64,
+        parents: &[String],
+    ) -> Vec<String> {
+        node.current_round = round;
+        let mut out = Vec::new();
+        for (addr, _, key) in keys {
+            let sk = crypto::SigningKey::from_bytes(key);
+            let mut v = blockchain::Vertex {
+                round,
+                author: addr.clone(),
+                timestamp: ts,
+                payload: vec![],
+                parents: parents.to_vec(),
+                hash: String::new(),
+                signature: String::new(),
+                aggregated_signature: None,
+                payload_root: None,
+                parents_root: None,
+            };
+            v.hash = v.calculate_hash();
+            v.sign_with_ed25519(&sk);
+            out.push(v.hash.clone());
+            node.add_vertex(v);
+        }
+        out
+    }
+
+    /// Every (height, anchor_round) pair this node has on disk.
+    fn tier2_anchor_height_map(node: &DagConsensus) -> Vec<(u64, u64)> {
+        let tip = node
+            .storage
+            .get("latest_height")
+            .ok()
+            .flatten()
+            .and_then(|h| h.parse::<u64>().ok())
+            .unwrap_or(0);
+        (1..=tip)
+            .filter_map(|h| {
+                node.storage
+                    .get(&format!("block_{}", h))
+                    .ok()
+                    .flatten()
+                    .and_then(|j| serde_json::from_str::<blockchain::Block>(&j).ok())
+                    .map(|b| (h, b.header.round))
+            })
+            .collect()
+    }
+
+    /// AUDIT B4b — the sync-versus-local placement race, driven DELIBERATELY.
+    ///
+    /// This is the race behind the live block fork: one node built height 50 from
+    /// round 52 while another built it from round 53. It is decided by REAL TIME
+    /// — whether ChainSync's write becomes visible before or after this node
+    /// finishes placing its own anchor — which is why no message-ordering harness
+    /// can reach it. The `placement_sleep` seam is the hook: it fires between
+    /// retry attempts, at exactly the point where sync's write would land.
+    ///
+    /// The scenario: this node has committed anchor round 4 and is placing its
+    /// block. Mid-placement, ChainSync lands the network's block for THAT SAME
+    /// ANCHOR at height 2. The node must recognise it and place nothing —
+    /// producing a second block for one anchor is what makes its anchor->height
+    /// map diverge from every peer's.
+    ///
+    /// Reaching the retry loop at all needs the first execute attempt to fail,
+    /// which is arranged the way it happens live: `sys:last_executed_height` is
+    /// already ahead of this node's tip, because sync executed the height before
+    /// this node reloaded.
+    ///
+    /// MUTATION: delete `self.latest_block_round = self.latest_block_round.max(r)`
+    /// from `reload_chain_tip` — the AUDIT-B4b dedup line — and this test fails:
+    /// the node no longer knows the synced tip's anchor round and builds the
+    /// duplicate.
+    #[test]
+    fn test_b4b_sync_landing_mid_placement_must_not_produce_a_duplicate_anchor() {
+        const PINNED: u64 = 1_700_000_000;
+        let keys: Vec<(String, String, [u8; 32])> =
+            (1..=4u8).map(|i| tier2_keypair(i + 10)).collect();
+        let known: Vec<(String, String)> =
+            keys.iter().map(|(a, p, _)| (a.clone(), p.clone())).collect();
+
+        let path = get_test_db_path("b4b_race");
+        let mut node = tier2_open(11, &path, &known);
+        node.now_secs = Arc::new(|| PINNED);
+
+        // Rounds 1-3: anchor round 2 commits and is placed locally at height 1.
+        let mut prev = vec!["genesis".to_string()];
+        for r in 1..=3u64 {
+            prev = tier2_feed_round(&mut node, &keys, r, PINNED, &prev);
+        }
+        assert_eq!(
+            tier2_anchor_height_map(&node),
+            vec![(1, 2)],
+            "setup: anchor round 2 must be placed at height 1"
+        );
+        let r4_parents = tier2_feed_round(&mut node, &keys, 4, PINNED, &prev);
+
+        // The simulated ChainSync writer: on its first firing it lands the
+        // NETWORK's block for anchor round 4 at height 2 — exactly what a peer
+        // would have produced — and publishes the tip the way sync does.
+        let store = Arc::clone(&node.storage);
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_c = Arc::clone(&fired);
+        node.placement_sleep = Arc::new(move |_d| {
+            if fired_c.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let mut b = blockchain::Block::new(
+                2,
+                4, // the SAME anchor round this node is placing
+                "prev".to_string(),
+                vec![],
+                "peer".to_string(),
+            );
+            b.header.timestamp = PINNED;
+            let json = serde_json::to_string(&b).unwrap();
+            let _ = store.put("block_2", &json);
+            let _ = store.put("latest_height", "2");
+            let _ = store.put("latest_block_hash", &b.header.hash);
+        });
+
+        // Sync already EXECUTED height 2 before this node reloaded its tip — the
+        // live precondition, and what forces the placement loop past attempt 0.
+        node.storage.put("sys:last_executed_height", "2").unwrap();
+
+        // Round 5 commits anchor round 4 and enters the placement loop.
+        let _ = tier2_feed_round(&mut node, &keys, 5, PINNED, &r4_parents);
+
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the placement retry loop never ran, so the race was never reached and \
+             this test asserted nothing. The first execute attempt must fail — check \
+             that sys:last_executed_height is still ahead of the node's tip."
+        );
+
+        let map = tier2_anchor_height_map(&node);
+        let placements_of_4: Vec<u64> = map
+            .iter()
+            .filter(|(_, r)| *r == 4)
+            .map(|(h, _)| *h)
+            .collect();
+        assert_eq!(
+            placements_of_4,
+            vec![2],
+            "P_ANCHOR_HEIGHT: anchor round 4 must appear at EXACTLY ONE height — \
+             the one sync landed. Map was {:?}. More than one entry means this node \
+             built a duplicate block for an anchor the network had already placed, \
+             and its anchor->height mapping has diverged from every peer's. That is \
+             the live B4b block fork.",
+            map
+        );
+
+        let mut rounds: Vec<u64> = map.iter().map(|(_, r)| *r).collect();
+        let unique = {
+            let mut u = rounds.clone();
+            u.sort_unstable();
+            u.dedup();
+            u
+        };
+        rounds.sort_unstable();
+        assert_eq!(
+            rounds, unique,
+            "P_ANCHOR_HEIGHT (injectivity): two heights share an anchor round. Map {:?}",
+            map
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }
