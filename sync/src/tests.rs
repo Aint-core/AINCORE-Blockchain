@@ -3,7 +3,8 @@
 mod tests {
     use crate::{
         ChainSync, FinalityArtifact, SyncRequest, SyncResponse, VertexRequest,
-        MAX_VERTEX_REQ_HASHES, MAX_VERTEX_RESP_BYTES,
+        MAX_CONCURRENT_VERTEX_SERVES, MAX_VERTEX_REQ_HASHES, MAX_VERTEX_RESP_BYTES,
+        VERTEX_SERVE_BURST,
     };
     use blockchain::Block;
     use std::collections::HashMap;
@@ -1070,6 +1071,138 @@ mod tests {
         assert!(
             !resp.unknown.is_empty(),
             "bodies dropped for budget must be reported unknown so they are re-asked"
+        );
+    }
+
+    /// AUDIT H8. `handle_vertex_request` runs on the tokio worker that owns the
+    /// requesting peer's connection and does BLOCKING RocksDB reads; those workers
+    /// also drive gossip ingress and the block pipeline. Unbounded, one peer's
+    /// request rate becomes consensus latency. Three bounds guard it — concurrency,
+    /// rate, deadline — and every shed hash must still be REPORTED, because a
+    /// requester that saw a silent omission would conclude the vertex does not
+    /// exist and stop asking, which is the exact unobtainability this pull exists
+    /// to fix.
+    ///
+    /// COVERAGE: the concurrency and rate bounds are mutation-proven (disabling
+    /// either fails a test here). The DEADLINE bound is not — asserting it needs
+    /// injectable time or a stallable StateDB, neither of which exists yet. It is
+    /// a backstop for the other two, not the primary bound.
+    #[test]
+    fn vertex_serve_concurrency_is_capped_and_slots_are_released() {
+        let cs = setup_sync("vertex_serve_concurrency");
+
+        let mut held: Vec<_> = (0..MAX_CONCURRENT_VERTEX_SERVES)
+            .map(|i| {
+                cs.serve_budget
+                    .try_enter()
+                    .unwrap_or_else(|| panic!("slot {} must be grantable", i))
+            })
+            .collect();
+
+        assert!(
+            cs.serve_budget.try_enter().is_none(),
+            "serve {} must be SHED — a queued request still owns its tokio worker, \
+             which is the resource being protected",
+            MAX_CONCURRENT_VERTEX_SERVES + 1
+        );
+
+        held.pop();
+        assert!(
+            cs.serve_budget.try_enter().is_some(),
+            "a released slot must be reusable, or the server wedges after one burst"
+        );
+    }
+
+    #[test]
+    fn vertex_serve_rate_bucket_bursts_then_starves_then_refills() {
+        let cs = setup_sync("vertex_serve_rate");
+        let burst = VERTEX_SERVE_BURST as usize;
+
+        assert_eq!(
+            cs.serve_budget.take_lookups(burst),
+            burst,
+            "an idle node must serve a full catch-up burst without waiting"
+        );
+        assert_eq!(
+            cs.serve_budget.take_lookups(burst),
+            0,
+            "the bucket must be empty immediately after a full burst"
+        );
+
+        // 50 ms at VERTEX_SERVE_LOOKUPS_PER_SEC = 512 refills ~25 tokens, so a
+        // request for 3 is granted in full. Sleeping longer only grants more, so
+        // this cannot flake on a slow machine — it can only fail if refill is gone.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            cs.serve_budget.take_lookups(3),
+            3,
+            "the bucket must refill with elapsed time"
+        );
+    }
+
+    #[test]
+    fn vertex_serve_shed_load_is_reported_never_dropped() {
+        let cs = setup_sync("vertex_serve_shed");
+        let hashes: Vec<String> = (0..MAX_VERTEX_REQ_HASHES)
+            .map(|i| format!("{:064x}", i))
+            .collect();
+        for h in &hashes {
+            cs.storage
+                .put(&format!("vertex:{}", h), "{\"body\":1}")
+                .unwrap();
+        }
+        let ask = || VertexRequest {
+            hashes: hashes.clone(),
+            requester_id: "r".into(),
+        };
+
+        // Baseline: with budget available, every planted body is served. Without
+        // this the shed assertions below would pass on a server that never serves.
+        let resp = cs.handle_vertex_request(ask());
+        assert_eq!(
+            resp.vertices.len(),
+            MAX_VERTEX_REQ_HASHES,
+            "an unloaded node must serve every planted body"
+        );
+        assert!(resp.unknown.is_empty());
+
+        // Concurrency shed. Deterministic: the slots are held for the whole call.
+        {
+            let _slots: Vec<_> = (0..MAX_CONCURRENT_VERTEX_SERVES)
+                .map(|_| cs.serve_budget.try_enter().expect("slot"))
+                .collect();
+            let resp = cs.handle_vertex_request(ask());
+            assert!(
+                resp.vertices.is_empty(),
+                "no storage read may happen while every serve slot is occupied"
+            );
+            assert_eq!(
+                resp.unknown.len(),
+                MAX_VERTEX_REQ_HASHES,
+                "every hash shed for concurrency must be reported, or the requester \
+                 reads back-pressure as absence and stops asking"
+            );
+        }
+
+        // Rate shed. Drain the bucket, then ask for rows that ARE present.
+        for _ in 0..10_000 {
+            if cs.serve_budget.take_lookups(VERTEX_SERVE_BURST as usize) == 0 {
+                break;
+            }
+        }
+        let resp = cs.handle_vertex_request(ask());
+        assert!(
+            resp.vertices.len() < MAX_VERTEX_REQ_HASHES,
+            "a drained bucket must stop storage reads; serving all {} means the rate \
+             bound is not consulted (refilling {} tokens would take ~62 ms, so this \
+             cannot flake)",
+            MAX_VERTEX_REQ_HASHES,
+            MAX_VERTEX_REQ_HASHES
+        );
+        assert_eq!(
+            resp.vertices.len() + resp.unknown.len(),
+            MAX_VERTEX_REQ_HASHES,
+            "every named hash must come back served or reported — never omitted"
         );
     }
 }

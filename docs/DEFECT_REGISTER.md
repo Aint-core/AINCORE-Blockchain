@@ -44,7 +44,7 @@ Severity is the reviewed severity. Status vocabulary: **CONFIRMED** = attack/def
 | **H5** | CRITICAL | CONFIRMED (read this session) | `dag.rs:1090-1116` (standing comment), `:1046-1060` (only parent checks), `:1183` (insert), `ordering.rs:697-702`, `:584-586` | **The B3/B4 halt itself.** A vertex naming a never-existing parent enters the DAG and wedges `commit_one_anchor` permanently; the tree's own comment records both prior repair attempts and why each was worse. Still open. |
 | **H6** | CRITICAL (blocking prerequisite for Regime C) | CONFIRMED (read this session) | `core/executor/src/lib.rs:2047-2067`; read at `:1009-1015`; contiguity at `:1693-1710`; cursor `sys:last_executed_height` at `:1627-1631` | **No state-derived commitment exists.** `sys:state_root = H(prev_root ‖ H(sorted effective writes of this block))` is a commitment to execution *history*, not to state contents; `current_state_root()` is a bare KV read and nothing recomputes it from the KV set. No Merkle/IAVL/Jellyfish trie over AINCORE state exists anywhere in the tree. Any downloaded-state mechanism is unverifiable in principle, not merely unimplemented. |
 | **H7** | HIGH | CONFIRMED (read this session) | `sync/src/lib.rs:773-786`; `core/node/src/main.rs:57-60`; retention `common/storage/src/lib.rs:493-500` (`AINCORE_BLOCK_RETENTION` default 100_000) | **Rejoin below the block-prune horizon has no in-protocol regime.** On hitting a peer's `prune_horizon` the client prints advice to set `AINCORE_BOOTSTRAP_SNAPSHOT`; `maybe_extract_bootstrap_snapshot` returns `false` immediately when `db_path` exists (`main.rs:58-60`), and a node that has been *down* has a datadir. The remedy is unreachable from the state that triggers it. The snapshot path itself is a raw RocksDB tarball over HTTPS with an optional tarball-SHA256 — trust-by-URL, no consensus signature. |
-| **H8** | HIGH | CONFIRMED (read this session) | `sync/src/lib.rs:1272-1301` (loop at `:1277`, storage get at `:1284`); `common/network/src/lib.rs:6,10,207`; `core/node/src/main.rs:153` (`#[tokio::main]`, no `worker_threads`) | **Serving path has no lookup budget, no deadline, no per-peer budget, no concurrency cap, no metrics.** A 32-hash all-miss request executes 32 RocksDB `get`s while `bytes` stays 0, so the 900 KiB cap cannot fire. Transport admits 60 conns/IP × 100 msg/s = 6,000 req/s = 192,000 lookups/s from one IP; the handler runs blocking RocksDB reads directly on tokio workers shared with every consensus loop. `DA_SHARD` (`main.rs:777-786`) is a second unauthenticated serving endpoint on the same budget. |
+| **H8** | HIGH | **FIXED** (see H8-FIX below) — was CONFIRMED | `sync/src/lib.rs:1272-1301` (loop at `:1277`, storage get at `:1284`); `common/network/src/lib.rs:6,10,207`; `core/node/src/main.rs:153` (`#[tokio::main]`, no `worker_threads`) | **Serving path has no lookup budget, no deadline, no per-peer budget, no concurrency cap, no metrics.** A 32-hash all-miss request executes 32 RocksDB `get`s while `bytes` stays 0, so the 900 KiB cap cannot fire. Transport admits 60 conns/IP × 100 msg/s = 6,000 req/s = 192,000 lookups/s from one IP; the handler runs blocking RocksDB reads directly on tokio workers shared with every consensus loop. `DA_SHARD` (`main.rs:777-786`) is a second unauthenticated serving endpoint on the same budget. |
 | **F1** | — | **FIXED-PARTIAL (serving only; no client)** | `sync/src/lib.rs:1272-1301`, consts `:46` (`MAX_VERTEX_REQ_HASHES = 32`), `:48` (`MAX_VERTEX_RESP_BYTES = 900 KiB`), dispatch `:1242-1250`, route `core/node/src/main.rs:788-801` | VERTEX_REQ/VERTEX_RESP **server** shipped at `59926d8`: storage reads only, no consensus lock, 64-hex key guard, over-budget hashes reported `unknown` so the requester re-asks rather than concluding absence. Additive; changes no consensus decision. **No client exists** — verified by grep: no `VertexRequest` is constructed outside `sync/src/tests.rs`. Until a client exists, F1 repairs nothing, and it cannot repair the twin case at all while H1 stands (a served twin is re-dropped at `dag.rs:1167`). |
 
 **Unverified-open backlog.** The v3 critique run exhausted usage credits with 89 of 110 agents failing; `docs/DAG_VERTEX_SYNC_DESIGN.md:4` records **43 findings left unverified and treated as OPEN**, deduplicated into the 15 clusters in `docs/research/v3-clusters.json`. Eleven clusters are adjudicated above (P1-D…P2-K). Any cluster in that file not appearing in the table above remains **UNVERIFIED-OPEN** and must not be assumed closed.
@@ -95,6 +95,42 @@ Three regimes by deficit from the tip. **A:** deficit < ~10 rounds (`dag.rs:1806
 - **P1 Charged on misses, not only bytes.** Every disk lookup the serving path performs decrements a budget whether or not it yields bytes. **Test:** a 32-hash all-miss request consumes at least as much budget as one returning 900 KiB. Fails at `sync/src/lib.rs:1277-1293`. *(geth `ServiceGetBlockBodiesQuery` breaks on `bytes >= softResponseLimit || len(bodies) >= maxBodiesServe || lookups >= 2*maxBodiesServe`; snap adds `maxTrieNodeTimeSpent = 5*time.Second`, justified because overrunning it means "there's a fairly high chance of timing out at the remote side, which means all the work is in vain".)*
 - **P2 Keyed on something the requester cannot cheaply inflate** (**I3** applied to the serving path). **Test:** enumerate what the attacker spends for a second budget. Today the only keys are a TCP connection (one socket, 100 msg/s, `common/network/src/lib.rs:207`) and a source IP (60 concurrent, `:10`); `requester_id` is unread and self-declared. *(libp2p's transient scope is "a DMZ … for connections and streams that are not fully established"; only after `SetProtocol` does a stream move onto per-peer/per-protocol budgets.)*
 - **P3 Aggregate ceiling set from the slowest validator's measured serving capacity, not from the transport's frame budget.** **Test:** worst-case sustained work admitted by the transport ÷ **measured** single-node serving throughput on the Pi must be ≤ 1. Transport admits 6,000 req/s from one IP; a Pi at an *estimated* 0.5-2 ms per cold point lookup sustains roughly 60-250 req/s across 4 tokio workers — **≈24-100× over capacity**. That estimate must be replaced by a measurement on the actual Pi validators before any number is chosen.
+### H8-FIX — vertex serving is bounded (closed)
+
+`sync/src/lib.rs`: `VertexServeBudget` on `ChainSync` (per-node, not a process
+global, so tests cannot starve each other). Three bounds now stand between an
+unauthenticated TCP peer and RocksDB:
+
+| Bound | Value | Effect |
+|---|---|---|
+| Concurrency | `MAX_CONCURRENT_VERTEX_SERVES = 4` | over that, requests are **shed**, not queued — a queued request still owns its tokio worker, which is the resource being protected |
+| Rate | `VERTEX_SERVE_LOOKUPS_PER_SEC = 512`, burst `1024` | node-wide token bucket; costed only for well-formed hashes, so malformed floods cannot drain an honest peer's allowance |
+| Deadline | `VERTEX_SERVE_DEADLINE_MS = 50` | caps worst-case worker blocking at 4 × 50 ms |
+
+Worst case reaching storage drops from 192,000 lookups/s (one IP) to 512/s
+node-wide. The all-miss amplification in the original report is closed by the rate
+bound, which is costed per *lookup*, not per byte returned.
+
+**Shed load is reported, never omitted** — every hash a request names comes back
+in `vertices` or in `unknown`. A silent omission would read as "peer does not have
+it", and the requester would stop asking: the exact unobtainability this pull was
+built to fix.
+
+Mutation-proven (`sync/src/tests.rs`): disabling the concurrency cap fails 2 tests,
+disabling the rate check fails 1, replacing the shed report with an empty `unknown`
+fails 1; restoring goes green. The **deadline is not mutation-proven** — that needs
+injectable time or a stallable `StateDB`, neither of which exists. It is a backstop
+for the other two.
+
+**NOT closed by this, deliberately:** the bucket is node-wide, not per-peer, so a
+spammer can still starve honest peers of *vertex service* (it can no longer starve
+*consensus*, which is what H8 was). Per-peer fairness is unreachable here —
+`requester_id` is an unauthenticated attacker-chosen string, and the peer's real
+address is not plumbed to the handler (`start_server` passes `Fn(&str) -> Option<String>`).
+Keying on `requester_id` would look like a control and be bypassed by varying one field.
+**`DA_SHARD` (`main.rs:777-786`) is a second unauthenticated serving endpoint and is
+still unbounded.**
+
 - **P4 Serving must not consume the resource consensus needs to advance.** **Acceptance test for the cluster:** 60 connections from one IP to r1 driving 6,000 miss-only VERTEX_REQ/s; assert (i) r1's round-advance interval unchanged within a stated tolerance, (ii) the other three validators can still open connections to r1, (iii) served bytes/s and lookups/s stay under configured ceilings. (iii) fails trivially (no ceilings exist); (i) and (ii) fail by construction (H8, P2-G).
 - **Missing budgets, named:** per-request lookup budget charged on misses; per-request wall-clock deadline; per-peer served-bytes/lookups bucket (unimplementable until P2-F is closed); global serving-concurrency semaphore + blocking-IO isolation; send-queue watermark with resumable serving *(Bitcoin `ProcessGetData` stops at `fPauseSend` and resumes from `vRecvGetData`)*; reserved slots/eviction for validator-set peers *(Bitcoin `AttemptToEvictConnection`; geth reserved trusted-peer slots)*; age/scope restriction on what may be served *(Bitcoin `MAX_BLOCKTXN_DEPTH = 10`, `HISTORICAL_BLOCK_AGE = 7d`)*; and **any counter at all** — grep for metric/counter/prometheus in `sync/src/lib.rs` returns nothing, so none of the above could be tuned or shown to have fired. Metrics first, budgets second.
 - **Note the shared budget:** `DA_SHARD` (`core/node/src/main.rs:777-786` → `da/src/lib.rs`) is a second unauthenticated storage-serving endpoint on the same per-connection allowance and the same worker threads. A budget scoped to VERTEX_REQ alone leaves the aggregate unbounded.
