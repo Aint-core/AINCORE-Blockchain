@@ -234,6 +234,46 @@ freeze loop itself unproven, the same trap one level down. Verified separately w
 assertion removed: M2 then fails inside the freeze loop at tick 0. **Both layers
 discriminate independently.**
 
+**THE SEEDED SCHEDULER IS LIVE** — `ordering.rs`, three gates plus a measurement probe.
+Action space INVERTED per FACT 2: start from a COMPLETE DAG, take things away. Actions are
+OMISSION and PERMUTATION, so every state is one step from interesting instead of thirty-eight.
+Measured throughput: **100,000 schedules in 7.42 s** (~13,500/s) — "millions overnight" is
+real at tier 1, and only at tier 1.
+
+| Gate | Claim | Mutation that must break it | Observed |
+|---|---|---|---|
+| 1 `corpus_honest_emissions_never_fork_and_never_reach_the_ancestry_arms` | honest-only never forks; ancestry arms unreachable | feed it the Byzantine menu | FAILS at seed 77 |
+| 2 `corpus_rediscovers_the_h3_witness_unaided` | the search re-finds H3 unaided, and the seed replays | neuter the Byzantine script | FAILS: exhausts all 100,000 |
+| 3 `corpus_permutation_is_inert_until_twins_are_injectable` | reordering changes nothing today | inject an equivocation twin | FAILS at seed 9 |
+
+**GATE 2 rediscovered H3 at seed 77** — three orders of magnitude inside the 100,000 budget,
+with the Byzantine AUTHOR drawn at random and no hint that the fork needs it to land on an
+anchor-round leader. Its shape matches the hand-written witness exactly (one view Commits an
+even round, another Skips it), and the seed replays identically three times. **This gate is
+what gives any future "the corpus found nothing" its meaning**: a search that cannot re-find
+a known answer proves nothing when it comes back empty.
+
+**NEW MEASURED FINDING — the ancestry walk-back gets ZERO coverage from honest traffic.**
+Across 20,000 schedules at world sizes of 6, 10 and 16 rounds, honest-only emissions
+exercised `ancestry_commit` and `ancestry_skip` **exactly zero times**, while direct commits
+ran to 153,030 at 16 rounds. Both non-direct arms are reachable only via a Byzantine thin
+anchor. **This is why H3 survived every audit**: the most subtle branch of the ordering
+algorithm is never touched by honest traffic — not in tests, and not in production either.
+No amount of honest running would have found it.
+
+**HONEST LIMIT, proven rather than assumed — permutation is currently INERT.** Every consumer
+of `round_index` order except one accumulates into a set (`direct_quorum_met` collects
+distinct authors, `walk_history` collects visited hashes). The only order-sensitive reader is
+`leader_vertex_hash`'s `find_map`, and it matters only when a round holds TWO vertices by one
+author — twins, which `add_vertex` drops at dag.rs:1167 (H1) and which this corpus does not
+yet inject. So half the action space explores nothing today. Gate 3's mutation makes this
+CAUSAL rather than a guess: inject a twin and gate 3 fails at seed 9. When step 4 lands,
+gate 3 must fail, and that failure is the proof the twins took effect.
+
+The FABRICATED-PARENT script (B3/B4) is deliberately excluded from the menu: it is a
+known-open wedge that would fire on nearly every seed and drown the agreement signal. It has
+its own characterisation test.
+
 **Rejected outright:** exhaustive model checking (FACT 2; and `held: BTreeSet` collapses
 every delivery permutation into one fingerprint, making the root defect H2 *unrepresentable*);
 the record/replay recorder (it misses ChainSync's client path, `sync/src/lib.rs:722`, the

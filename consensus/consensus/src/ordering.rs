@@ -1805,6 +1805,368 @@ mod tests {
         (validators, out, h2_leader, byz)
     }
 
+    // ===================================================================
+    // TIER-1 SEEDED SCHEDULER
+    //
+    // The action space is INVERTED, and that is the whole design. A reviewer
+    // built the obvious "deliver messages from an empty view" explorer and
+    // measured it: depth <=7 is 26,717,121 states, exhaustive, and NOT ONE
+    // COMMIT is reachable — the first commit sits at depth 38. Building up from
+    // nothing never reaches the interesting states.
+    //
+    // So: start from a COMPLETE DAG and take things away. The actions are
+    // OMISSION (a view never received a vertex) and PERMUTATION (it received
+    // them in a different order). Both are one step from an interesting state
+    // instead of thirty-eight.
+    //
+    // A failing schedule prints its SEED, and the seed reproduces it exactly.
+    // That is the property the whole exercise exists for.
+    // ===================================================================
+
+    const SCHED_ROUNDS: u64 = 6;
+    const SCHED_OMIT_P: f64 = 0.2;
+    const SCHED_VIEWS: usize = 3;
+
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    struct ArmCounts {
+        direct_commit: u64,
+        ancestry_commit: u64,
+        ancestry_skip: u64,
+        defer: u64,
+    }
+
+    impl ArmCounts {
+        fn add(&mut self, o: &ArmCounts) {
+            self.direct_commit += o.direct_commit;
+            self.ancestry_commit += o.ancestry_commit;
+            self.ancestry_skip += o.ancestry_skip;
+            self.defer += o.defer;
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ScheduleOutcome {
+        /// (round, view i, decision i, view j, decision j) of the first AD-1 breach.
+        violation: Option<(u64, usize, String, usize, String)>,
+        arms: ArmCounts,
+    }
+
+    /// Build the complete world for one schedule.
+    ///
+    /// `byz`, when set, plays the SPARSE-ANCHOR script: from round 2 on it emits
+    /// vertices with exactly ONE parent. Such a vertex passes real ingress
+    /// unchanged — `add_vertex` checks parents for count (dag.rs:1046-1052) and
+    /// uniqueness (:1054-1060) and nothing else.
+    ///
+    /// The FABRICATED-PARENT script (B3/B4) is deliberately NOT in the menu: it
+    /// is a known-open wedge that would fire on essentially every seed and drown
+    /// the agreement signal. It has its own characterisation test.
+    fn sched_universe(
+        validators: &[(String, u64)],
+        byz: Option<&str>,
+        rng: &mut rand::rngs::StdRng,
+    ) -> Vec<(String, blockchain::Vertex)> {
+        use rand::Rng;
+        let mut out = Vec::new();
+        let mut prev: Vec<String> = vec!["genesis".to_string()];
+        for r in 1..=SCHED_ROUNDS {
+            let mut this = Vec::new();
+            for (a, _) in validators {
+                let parents = if byz == Some(a.as_str()) && r >= 2 && !prev.is_empty() {
+                    vec![prev[rng.gen_range(0..prev.len())].clone()]
+                } else {
+                    prev.clone()
+                };
+                let (h, v) = mk_vertex(r, a, parents);
+                this.push(h.clone());
+                out.push((h, v));
+            }
+            prev = this;
+        }
+        out
+    }
+
+    /// Which arm of the decision function each round took, from OUTSIDE the
+    /// engine — no production instrumentation. A committed round that was not
+    /// directly committable in this view was reached by ancestry.
+    fn sched_classify(v: &View, validators: &[(String, u64)], arms: &mut ArmCounts) {
+        let total: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
+        let max_r = v.idx.keys().copied().max().unwrap_or(0);
+        let mut r = 2;
+        while r < max_r {
+            match v.decision(r) {
+                Decision::Commit(_) => {
+                    let direct = super::OrderingEngine::leader_vertex_hash(
+                        r, &v.dag, &v.idx, validators,
+                    )
+                    .map(|h| {
+                        super::OrderingEngine::direct_quorum_met(
+                            r, &h, &v.dag, &v.idx, validators, total,
+                        )
+                    })
+                    .unwrap_or(false);
+                    if direct {
+                        arms.direct_commit += 1;
+                    } else {
+                        arms.ancestry_commit += 1;
+                    }
+                }
+                Decision::Skip => arms.ancestry_skip += 1,
+                Decision::Undecided => arms.defer += 1,
+            }
+            r += 2;
+        }
+    }
+
+    /// Run ONE schedule. Deterministic in `seed`: same seed, same outcome, always.
+    ///
+    /// `permute` draws from a SEPARATE rng stream so that toggling it does not
+    /// shift the main stream — otherwise "same seed, permutation off" would be a
+    /// different world, and the inertness measurement would be meaningless.
+    fn sched_run(seed: u64, byzantine: bool, permute: bool) -> ScheduleOutcome {
+        use rand::seq::SliceRandom;
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut prng = rand::rngs::StdRng::seed_from_u64(seed ^ 0x5eed_0f5e_0007_u64);
+
+        let validators = mk_validators(4);
+        // The Byzantine author is RANDOM. The scheduler is not told that the
+        // fork needs it to land on an anchor-round leader — finding that is the
+        // search.
+        let byz_owned = if byzantine {
+            Some(validators[rng.gen_range(0..validators.len())].0.clone())
+        } else {
+            None
+        };
+        let universe = sched_universe(&validators, byz_owned.as_deref(), &mut rng);
+
+        let mut views: Vec<View> = Vec::new();
+        for i in 0..SCHED_VIEWS {
+            let mut v = View::new();
+            for (h, vx) in &universe {
+                // View 0 is fully connected. A deliberate bias toward FINDING a
+                // disagreeing pair — not a coverage claim. Which vertices the
+                // other views miss stays random.
+                if i > 0 && rng.gen_bool(SCHED_OMIT_P) {
+                    continue;
+                }
+                v.insert(h, vx);
+            }
+            if permute {
+                for list in v.idx.values_mut() {
+                    list.shuffle(&mut prng);
+                }
+            }
+            v.evaluate(&validators);
+            views.push(v);
+        }
+
+        let mut arms = ArmCounts::default();
+        for v in &views {
+            sched_classify(v, &validators, &mut arms);
+        }
+
+        let max_r = views
+            .iter()
+            .filter_map(|v| v.idx.keys().copied().max())
+            .max()
+            .unwrap_or(0);
+        let mut violation = None;
+        'outer: for i in 0..views.len() {
+            for j in (i + 1)..views.len() {
+                let mut r = 2;
+                while r < max_r {
+                    let (a, b) = (views[i].decision(r), views[j].decision(r));
+                    if !agree(&a, &b) {
+                        violation = Some((r, i, format!("{:?}", a), j, format!("{:?}", b)));
+                        break 'outer;
+                    }
+                    r += 2;
+                }
+            }
+        }
+        ScheduleOutcome { violation, arms }
+    }
+
+    /// Corpus size for the in-suite gates, scaled by profile: 3,000 schedules
+    /// cost 0.46 s in release but 15.8 s in DEBUG, which is what a plain
+    /// `cargo test` pays — too much to make the suite worth running.
+    ///
+    /// This is a deliberate, stated cap. Both gates below are still non-vacuous
+    /// at the debug size (asserted, not assumed), and the real numbers quoted in
+    /// their doc comments come from `probe_corpus_arm_distribution`, which runs
+    /// 20,000 per menu on demand:
+    ///   cargo test -p consensus --release --lib probe_corpus -- --ignored --nocapture
+    const SCHED_CORPUS: u64 = if cfg!(debug_assertions) { 400 } else { 3_000 };
+
+    /// GATE 1 — honest emissions must never fork, and the ancestry arms must
+    /// stay unreachable.
+    ///
+    /// The second half is a MEASURED property, not an assumption, and it is the
+    /// most useful thing this corpus produced. Across 20,000 schedules at world
+    /// sizes of 6, 10 and 16 rounds, honest-only emissions exercised the
+    /// ancestry walk-back EXACTLY ZERO TIMES — while direct commits ran to
+    /// 153,030 at 16 rounds. Both non-direct arms are reachable only via a
+    /// Byzantine thin anchor.
+    ///
+    /// That is why H3 lived there: the most subtle branch of the ordering
+    /// algorithm gets no coverage at all from honest traffic, so no amount of
+    /// honest testing — or honest production running — would ever have touched it.
+    #[test]
+    fn corpus_honest_emissions_never_fork_and_never_reach_the_ancestry_arms() {
+        let mut arms = ArmCounts::default();
+        for seed in 0..SCHED_CORPUS {
+            let o = sched_run(seed, false, true);
+            assert!(
+                o.violation.is_none(),
+                "AD-1 breach under HONEST-ONLY emissions at seed {}: {:?}\n\
+                 Reproduce with: sched_run({}, false, true)\n\
+                 This would be a NEW defect — honest nodes disagreeing from nothing \
+                 but packet loss and reordering.",
+                seed,
+                o.violation,
+                seed
+            );
+            arms.add(&o.arms);
+        }
+
+        // Non-vacuity. Without these the corpus could be asserting nothing at all.
+        assert!(
+            arms.direct_commit > 0 && arms.defer > 0,
+            "corpus is vacuous: direct={} defer={}",
+            arms.direct_commit,
+            arms.defer
+        );
+
+        assert_eq!(
+            (arms.ancestry_commit, arms.ancestry_skip),
+            (0, 0),
+            "honest traffic now REACHES the ancestry walk-back (commit={}, skip={}). \
+             Measured zero at 6/10/16 rounds over 20k schedules each. This is a \
+             coverage CHANGE, not necessarily a bug — confirm it is intended, and \
+             note that the ancestry arms are where H3 lived precisely because \
+             nothing honest ever exercised them.",
+            arms.ancestry_commit,
+            arms.ancestry_skip
+        );
+    }
+
+    /// GATE 2 — the scheduler must REDISCOVER a defect that is already sitting in
+    /// this repo as a failing test, without being told where it is.
+    ///
+    /// This is the gate that gives every future "the corpus found nothing" any
+    /// meaning at all. A search that cannot re-find a known answer proves nothing
+    /// when it comes back empty. The Byzantine AUTHOR is drawn at random and the
+    /// scheduler is not told that the fork needs it to land on an anchor-round
+    /// leader — finding that is the search.
+    ///
+    /// Observed: first breach at seed 77, three orders of magnitude inside the
+    /// 100,000 budget, and its SHAPE is the hand-written H3 witness exactly —
+    /// one view Commits an even round, another Skips it.
+    #[test]
+    fn corpus_rediscovers_the_h3_witness_unaided() {
+        const BUDGET: u64 = 100_000;
+        let mut found: Option<(u64, ScheduleOutcome)> = None;
+        for seed in 0..BUDGET {
+            let o = sched_run(seed, true, true);
+            if o.violation.is_some() {
+                found = Some((seed, o));
+                break;
+            }
+        }
+        let (seed, outcome) = found.expect(
+            "the scheduler failed to rediscover H3 within 100,000 schedules. \
+             Until it can re-find a defect already known to be there, a run that \
+             reports nothing means nothing.",
+        );
+
+        let (round, _i, di, _j, dj) = outcome.violation.clone().unwrap();
+        assert_eq!(round % 2, 0, "anchors live on even rounds");
+        assert!(
+            (di.starts_with("Commit") && dj == "Skip")
+                || (dj.starts_with("Commit") && di == "Skip"),
+            "seed {} breached AD-1 but not in the H3 shape (got {} vs {}). \
+             A different defect is not a failure — investigate it — but this gate \
+             is specifically that H3 is re-findable.",
+            seed,
+            di,
+            dj
+        );
+
+        // THE point of deterministic simulation: the seed IS the bug report.
+        for replay in 0..3 {
+            assert_eq!(
+                sched_run(seed, true, true),
+                outcome,
+                "replay {} of seed {} diverged — the corpus is not deterministic, \
+                 and a non-reproducible counterexample is worthless",
+                replay,
+                seed
+            );
+        }
+    }
+
+    /// GATE 3 — an honest measurement of what half the action space is worth today.
+    ///
+    /// PERMUTATION IS CURRENTLY INERT. Every consumer of `round_index` order
+    /// except one accumulates into a set: `direct_quorum_met` collects distinct
+    /// authors, `walk_history` collects visited hashes. The single order-sensitive
+    /// reader is `leader_vertex_hash`'s `find_map` — and it only matters when a
+    /// round holds TWO vertices by the same author, i.e. twins, which `add_vertex`
+    /// drops at dag.rs:1167 (H1) and which this corpus does not yet inject.
+    ///
+    /// So the reordering half of the action space explores nothing at present.
+    /// Recorded rather than quietly assumed, because a corpus that claims to
+    /// explore arrival order and does not is exactly the kind of false assurance
+    /// this whole harness exists to prevent. Injecting twins is step 4; when it
+    /// lands, THIS TEST MUST FAIL, and that failure is the proof the twins took
+    /// effect.
+    #[test]
+    fn corpus_permutation_is_inert_until_twins_are_injectable() {
+        for seed in 0..SCHED_CORPUS {
+            assert_eq!(
+                sched_run(seed, true, true),
+                sched_run(seed, true, false),
+                "seed {}: permutation changed the outcome. If twins are now being \
+                 injected this is EXPECTED — delete this test and assert the \
+                 order-dependence directly. If they are not, arrival order is \
+                 reaching a decision it should not.",
+                seed
+            );
+        }
+    }
+
+    /// MEASUREMENT, not an assertion. Run it to see what the corpus actually
+    /// exercises before trusting any claim about coverage:
+    ///   cargo test -p consensus --lib probe_corpus -- --ignored --nocapture
+    #[test]
+    #[ignore = "measurement probe, not a gate"]
+    fn probe_corpus_arm_distribution() {
+        for (label, byz) in [("honest", false), ("byzantine", true)] {
+            let mut arms = ArmCounts::default();
+            let mut violations = 0u64;
+            let mut first_violation: Option<u64> = None;
+            let n = 20_000u64;
+            for seed in 0..n {
+                let o = sched_run(seed, byz, true);
+                arms.add(&o.arms);
+                if o.violation.is_some() {
+                    violations += 1;
+                    if first_violation.is_none() {
+                        first_violation = Some(seed);
+                        println!("  {} first AD-1 breach at seed {}: {:?}", label, seed, o.violation);
+                    }
+                }
+            }
+            println!(
+                "{:>9}: {} schedules | AD-1 breaches {} | direct {} ancestry-commit {} \
+                 ancestry-SKIP {} defer {}",
+                label, n, violations, arms.direct_commit, arms.ancestry_commit,
+                arms.ancestry_skip, arms.defer
+            );
+        }
+    }
+
     /// P-LIVE: the anchor cursor advanced. Trivial to state, and the single most
     /// important predicate in this module.
     ///
