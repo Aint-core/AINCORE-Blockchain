@@ -1913,4 +1913,237 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+
+    // ===================================================================
+    // TIER 2 — NODE LEVEL. Real `DagConsensus`, real `StateDB`, real ingress.
+    //
+    // This tier is what ADJUDICATES the model layer. Tier 1 evaluates the
+    // decision function over hand-built DAGs and can hand you counterexamples
+    // for forks the real node cannot currently reach; tier 2 is the only thing
+    // that says which is telling the truth. No code change should ship off a
+    // tier-1 counterexample alone.
+    //
+    // It is also two to three orders of magnitude slower — ~1e3 schedules a
+    // night against tier 1's ~1e4 a SECOND. Never quote the tier-1 throughput
+    // as coverage for anything asserted here.
+    // ===================================================================
+
+    /// Address, public key hex, and raw key for a deterministic seed.
+    fn tier2_keypair(seed: u8) -> (String, String, [u8; 32]) {
+        let key = [seed; 32];
+        let sk = crypto::SigningKey::from_bytes(&key);
+        let pubkey = hex::encode(sk.verifying_key().to_bytes());
+        let addr = crypto::derive_address(sk.verifying_key().as_bytes()).unwrap();
+        (addr, pubkey, key)
+    }
+
+    /// Open a node at an EXPLICIT path, seeding every author it will be asked
+    /// about.
+    ///
+    /// Both preconditions fail SILENTLY if missed, which is why they are done
+    /// here rather than per test:
+    ///   * `resolve_author_pubkey` (dag.rs:998) hard-returns when the author has
+    ///     no `0x1::account::AccountData` object, so an unseeded author's vertex
+    ///     is dropped with nothing to distinguish it from a rejected one.
+    ///   * the validator-set gate (dag.rs:1082) rejects a non-validator author —
+    ///     but ONLY while `current_round > 0`, so a test that forgets to advance
+    ///     the round silently skips the check it meant to exercise.
+    fn tier2_open(
+        seed: u8,
+        path: &str,
+        known: &[(String, String)],
+    ) -> DagConsensus {
+        let db = Arc::new(StateDB::open(path).unwrap());
+        for (addr, pubkey) in known {
+            let account = Object::new(
+                addr.clone(),
+                Owner::Address(addr.clone()),
+                serde_json::json!({ "public_key": pubkey, "sequence_number": 0 })
+                    .to_string()
+                    .into_bytes(),
+                "0x1::account::AccountData".to_string(),
+            );
+            db.put_object(&account).unwrap();
+        }
+        let vset: Vec<String> = known
+            .iter()
+            .map(|(a, _)| format!(r#"["{}",1000]"#, a))
+            .collect();
+        db.put("sys:validators", &format!("[{}]", vset.join(",")))
+            .unwrap();
+
+        let node_key = [seed; 32];
+        let node_id = crypto::derive_address(
+            crypto::SigningKey::from_bytes(&node_key)
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap();
+        let mut c = DagConsensus::new(
+            node_id,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Mempool::new())),
+            Arc::new(Executor::new(Arc::clone(&db))),
+            db,
+            None,
+            None,
+            node_key,
+        );
+        // Past 0, or the validator-set gate above never runs.
+        c.current_round = 1;
+        c
+    }
+
+    /// A vertex validly signed by `key`. Two calls with different timestamps
+    /// produce a genuine equivocation: same author, same round, different hash,
+    /// both signatures real.
+    fn tier2_signed(key: &[u8; 32], author: &str, round: u64, ts: u64) -> blockchain::Vertex {
+        let sk = crypto::SigningKey::from_bytes(key);
+        let mut v = blockchain::Vertex {
+            round,
+            author: author.to_string(),
+            timestamp: ts,
+            payload: vec![],
+            parents: vec!["genesis".to_string()],
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
+        };
+        v.hash = v.calculate_hash();
+        v.sign_with_ed25519(&sk);
+        v
+    }
+
+    fn tier2_accepted(c: &DagConsensus) -> std::collections::BTreeSet<String> {
+        c.dag.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// AUDIT H1, at the node level. RED BY DESIGN — H1 is OPEN at HEAD.
+    ///
+    ///   cargo test -p consensus --lib test_h1_dropped_twin -- --ignored --nocapture
+    ///
+    /// `add_vertex` returns at dag.rs:1167 on detecting an equivocation, BEFORE
+    /// the persist at :1173-1181 and the `dag.insert` / `round_idx.push` at
+    /// :1183-1187. The losing twin is therefore destroyed — not quarantined, not
+    /// stored as evidence, destroyed. No production DAG BFT system does this: the
+    /// twin is the evidence, and a node that discards it can no longer prove what
+    /// it saw.
+    ///
+    /// The predicate is **P_VIEW_EQ**: two honest nodes that received the same
+    /// message SET hold the same accepted-vertex set. Deliberately NOT
+    /// `P_CLOSURE` ("every non-genesis parent of an accepted vertex is
+    /// retrievable"), which an earlier design named as the gate here and which
+    /// was MEASURED to run zero checks and print green both before AND after its
+    /// own mandatory fix-mutation — vacuous in exactly the scenario it was
+    /// written for.
+    ///
+    /// GATES:
+    ///   HEAD                     -> RED. X holds only the first twin it saw, Y
+    ///                               only the first IT saw. Same messages,
+    ///                               different final state.
+    ///   hoist the persist and the dag.insert above the `return;` at dag.rs:1167
+    ///                            -> GREEN, and P_RESTART_STABLE must STAY green.
+    ///
+    /// MEASURED RESULT — THE NAIVE HOIST IS NOT A FIX. Each leg isolated so
+    /// neither short-circuits the other:
+    ///
+    ///                        HEAD      naive hoist
+    ///   P_VIEW_EQ            RED       GREEN
+    ///   P_RESTART_STABLE     GREEN     RED
+    ///
+    /// It trades one defect for another. The recommendation that produced this
+    /// test named the hoist as the red->green flip, and two independent reviewers
+    /// had built and confirmed that flip — on P_VIEW_EQ alone. Persisting both
+    /// twins is only HALF a fix: something must then choose between them
+    /// deterministically, and today memory chooses by arrival order while boot
+    /// chooses by byte order.
+    ///
+    /// And the half that is missing is not local. Once a node can hold both
+    /// twins, H4 opens: `direct_quorum_met` counts one author's stake toward BOTH
+    /// (see `test_h2_h4_twin_...`, where the two twins together carry 200% of the
+    /// validator set). H1, H2 and H4 are ONE change set with a forced order, not
+    /// three fixes — exactly as the register says.
+    ///
+    /// P_RESTART_STABLE is not optional decoration. In memory the surviving twin
+    /// is chosen by ARRIVAL order; on reboot the recovery loops (dag.rs:245-256,
+    /// :318-330) refuse the second vertex from one author at one round and choose
+    /// by `scan_vertices` BYTE order (`prefix_iterator`, storage/lib.rs:280).
+    /// Those two orders are unrelated. At HEAD the question cannot arise — only
+    /// one twin is ever persisted — so this leg is green today for a reason that
+    /// the naive hoist REMOVES. A harness that goes green on the hoist without
+    /// re-checking restart has measured the instance and missed the class.
+    #[test]
+    #[ignore = "reproduces H1, an OPEN defect: RED by design until the losing twin is persisted"]
+    fn test_h1_dropped_twin_leaves_two_honest_nodes_holding_different_sets() {
+        let (off_addr, off_pub, off_key) = tier2_keypair(7);
+        let (x_addr, x_pub, _) = tier2_keypair(1);
+        let (y_addr, y_pub, _) = tier2_keypair(2);
+        let known = vec![
+            (off_addr.clone(), off_pub),
+            (x_addr, x_pub),
+            (y_addr, y_pub),
+        ];
+
+        let xp = get_test_db_path("h1_view_eq_x");
+        let yp = get_test_db_path("h1_view_eq_y");
+        let mut x = tier2_open(1, &xp, &known);
+        let mut y = tier2_open(2, &yp, &known);
+
+        let a = tier2_signed(&off_key, &off_addr, 1, 1_000);
+        let b = tier2_signed(&off_key, &off_addr, 1, 2_000);
+        assert_ne!(a.hash, b.hash, "the twins must be distinguishable");
+
+        // The ONLY difference between the two nodes is arrival order.
+        x.add_vertex(a.clone());
+        x.add_vertex(b.clone());
+        y.add_vertex(b.clone());
+        y.add_vertex(a.clone());
+
+        let sx = tier2_accepted(&x);
+        let sy = tier2_accepted(&y);
+
+        // Non-vacuity: if neither node accepted anything, P_VIEW_EQ below would
+        // pass trivially and this whole test would assert nothing.
+        assert!(
+            !sx.is_empty() && !sy.is_empty(),
+            "neither node accepted any vertex — a seeding precondition failed \
+             silently (AccountData for the author, or sys:validators). X={:?} Y={:?}",
+            sx,
+            sy
+        );
+
+        // ---- P_RESTART_STABLE, checked FIRST because P_VIEW_EQ is red at HEAD
+        //      and would otherwise short-circuit it out of the run entirely.
+        drop(x);
+        let x2 = tier2_open(1, &xp, &known);
+        assert_eq!(
+            tier2_accepted(&x2),
+            sx,
+            "P_RESTART_STABLE VIOLATED: a node changed its own mind about which \
+             twin it accepted, across nothing but a restart. In memory the winner \
+             is chosen by ARRIVAL order; on reboot by scan_vertices BYTE order \
+             (storage/lib.rs:280). If you have just hoisted the persist above \
+             dag.rs:1167, this is the defect the hoist introduced — persisting \
+             both twins is only half a fix without a deterministic choice between \
+             them."
+        );
+
+        // ---- P_VIEW_EQ
+        assert_eq!(
+            sx, sy,
+            "P_VIEW_EQ VIOLATED: two honest nodes received the SAME two vertices \
+             and hold different sets.\n  X (saw A then B) accepted {:?}\n  \
+             Y (saw B then A) accepted {:?}\n\
+             add_vertex returns at dag.rs:1167 before the persist at :1173 and the \
+             dag.insert at :1183, so the losing twin is destroyed and which one \
+             survives is decided by arrival order.",
+            sx,
+            sy
+        );
+
+        let _ = std::fs::remove_dir_all(&xp);
+        let _ = std::fs::remove_dir_all(&yp);
+    }
 }

@@ -340,6 +340,51 @@ with the seed visibly wandering (7, 9, 7) between runs. Production is NOT affect
 `find_causal_history` sorts by `(round, hash)` before returning, so traversal order does
 not leak there. Checked, not assumed.
 
+**TIER 2 IS LIVE, AND ITS FIRST RESULT REFUTES THE RECOMMENDED H1 FIX.**
+`consensus/consensus/src/tests.rs`,
+`test_h1_dropped_twin_leaves_two_honest_nodes_holding_different_sets`, RED by design:
+
+    cargo test -p consensus --lib test_h1_dropped_twin -- --ignored --nocapture
+
+Two real `DagConsensus` nodes, real `StateDB`, real ingress. The only difference between
+them is arrival order: X sees twin A then B, Y sees B then A. The predicate is
+**P_VIEW_EQ** — two honest nodes that received the same message SET hold the same
+accepted-vertex set. Deliberately NOT `P_CLOSURE`, which an earlier design named as the
+gate here and which was measured to run zero checks and print green both before AND after
+its own mandatory fix-mutation.
+
+**The measured result (each leg isolated so neither short-circuits the other):**
+
+| | HEAD | with the naive hoist |
+|---|---|---|
+| `P_VIEW_EQ` | **RED** | **GREEN** |
+| `P_RESTART_STABLE` | **GREEN** | **RED** |
+
+**The recommended fix — hoist the persist and `dag.insert` above the `return;` at
+dag.rs:1167 — trades one defect for another.** It was named as the one empirically
+established red→green flip in this whole line of work, and two independent reviewers had
+built and confirmed that flip. They confirmed it on `P_VIEW_EQ` alone.
+
+Why: in memory the surviving twin is chosen by ARRIVAL order; on reboot the recovery loops
+(dag.rs:245-256, :318-330) refuse the second vertex from one author at one round and choose
+by `scan_vertices` BYTE order (`prefix_iterator`, storage/lib.rs:280). Those orders are
+unrelated. At HEAD the question cannot arise, because only one twin is ever persisted — so
+`P_RESTART_STABLE` is green today for precisely the reason the hoist removes. A node would
+change its own mind about what it accepted, across nothing but a restart.
+
+**Persisting both twins is half a fix.** Something must then choose between them
+deterministically — and the missing half is not local: once a node can hold both twins, H4
+opens, because `direct_quorum_met` counts one author's stake toward BOTH (measured: the two
+twins together carry **200%** of the validator set). **H1, H2 and H4 are ONE change set
+with a forced order, not three fixes.** The register said so; this is the first
+experimental confirmation.
+
+Two silent-null preconditions are handled in `tier2_open` because missing either drops
+vertices with nothing to distinguish that from rejection: `resolve_author_pubkey`
+(dag.rs:998) hard-returns without an `0x1::account::AccountData` object for the author, and
+the validator-set gate (dag.rs:1082) only runs while `current_round > 0`. A non-vacuity
+assertion catches both.
+
 **Rejected outright:** exhaustive model checking (FACT 2; and `held: BTreeSet` collapses
 every delivery permutation into one fingerprint, making the root defect H2 *unrepresentable*);
 the record/replay recorder (it misses ChainSync's client path, `sync/src/lib.rs:722`, the
