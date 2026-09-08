@@ -2146,4 +2146,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&xp);
         let _ = std::fs::remove_dir_all(&yp);
     }
+
+    /// The clock seam (`now_secs`, `placement_sleep`) actually CONTROLS behaviour.
+    ///
+    /// Wiring a seam and never proving it is load-bearing is how a harness ends up
+    /// testing a program that does not ship. Two of the three sites are asserted
+    /// here by behaviour:
+    ///   * the vertex timestamp, which is folded into the SIGNED hash — so a
+    ///     simulation can produce reproducible vertex hashes at all
+    ///   * the MAX_FUTURE_DRIFT_SECS admission gate, on both sides of the boundary
+    ///
+    /// The third site — the 250 ms spacing in the anchor-placement retry loop — is
+    /// wired but NOT exercised here, and that is stated rather than implied.
+    /// Reaching it needs a commit whose first placement attempt fails against a
+    /// moving chain tip, which is the tier-2 block path. `std::thread::sleep`
+    /// appears exactly once in dag.rs now, inside the default constructor, so the
+    /// call site is wired by construction; it is simply not yet under test.
+    #[test]
+    fn test_clock_seam_controls_the_signed_timestamp_and_the_drift_gate() {
+        const PINNED: u64 = 1_700_000_000;
+        let (mut consensus, path) = setup_dag("clock_seam");
+        consensus.now_secs = Arc::new(|| PINNED);
+
+        // ---- site 1: the timestamp folded into the signed hash ----------------
+        consensus.try_create_vertex();
+        let stamps: Vec<u64> = consensus
+            .dag
+            .lock()
+            .unwrap()
+            .values()
+            .map(|v| v.timestamp)
+            .collect();
+        assert_eq!(
+            stamps,
+            vec![PINNED],
+            "the vertex timestamp must come from the seam. It is folded into \
+             calculate_hash, so without this a simulation cannot produce the same \
+             vertex hash twice and every seeded schedule is a different world."
+        );
+
+        // ---- site 2: the drift gate, on BOTH sides of the boundary ------------
+        // MAX_FUTURE_DRIFT_SECS is 30. Just inside must be admitted; just outside
+        // must be refused. Asserting only one side would pass on a gate that
+        // rejects everything, or on one that rejects nothing.
+        consensus.current_round = 1;
+
+        // Both probes sit at round 2, and OUT-OF-BOUND goes first. That ordering
+        // is deliberate: this node already authored a round-1 vertex above, so a
+        // second round-1 vertex from it would be refused as an EQUIVOCATION
+        // (dag.rs:1167) and the test would pass for entirely the wrong reason —
+        // which is exactly what happened on the first attempt at writing it.
+        // Sending the out-of-bound probe first also means that if the drift gate
+        // wrongly ADMITS it, the in-bound probe then collides with it and the
+        // second assertion fires too. Neither leg can pass by accident.
+        let outside = signed_vertex(&consensus, 2, PINNED + 31);
+        let inside = signed_vertex(&consensus, 2, PINNED + 29);
+        assert_ne!(inside.hash, outside.hash);
+
+        let before = consensus.dag.lock().unwrap().len();
+        consensus.add_vertex(outside.clone());
+        assert_eq!(
+            consensus.dag.lock().unwrap().len(),
+            before,
+            "a vertex 31s ahead of the SEAM's clock must be refused (drift bound is \
+             30s). If it was admitted, the gate is still reading the real wall \
+             clock — which is far past PINNED, so every timestamp here looks like \
+             the distant past and the bound is unreachable."
+        );
+
+        consensus.add_vertex(inside.clone());
+        assert_eq!(
+            consensus.dag.lock().unwrap().len(),
+            before + 1,
+            "a vertex 29s ahead of the SEAM's clock must be admitted. Refusal here \
+             means either the gate is not reading the seam, or the out-of-bound \
+             probe above was wrongly stored and this one collided with it."
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// The clock seam must not have cost DagConsensus its thread-safety: it is
+    /// held in an Arc<RwLock<..>> and driven from tokio tasks in core/node.
+    /// `Arc<dyn Fn>` without the `+ Send + Sync` bounds would compile here and
+    /// break only at the call site in another crate.
+    #[test]
+    fn test_dag_consensus_is_still_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<DagConsensus>();
+    }
 }

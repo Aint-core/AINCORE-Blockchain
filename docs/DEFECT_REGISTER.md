@@ -385,6 +385,56 @@ vertices with nothing to distinguish that from rejection: `resolve_author_pubkey
 the validator-set gate (dag.rs:1082) only runs while `current_round > 0`. A non-vacuity
 assertion catches both.
 
+**THE CLOCK SEAM IS IN — the first production change of this DST line, and the only one.**
+`dag.rs` gains two `pub` fields, defaulted in `new` to the real clock so production
+behaviour is unchanged:
+
+    pub now_secs:        Arc<dyn Fn() -> u64 + Send + Sync>
+    pub placement_sleep: Arc<dyn Fn(Duration) + Send + Sync>
+
+Three sites now read them — the vertex timestamp (folded into the SIGNED hash), the
+`MAX_FUTURE_DRIFT_SECS` admission gate, and the 250 ms spacing in the anchor-placement
+retry loop. `SystemTime::now` and `thread::sleep` appear exactly once each in dag.rs now,
+inside the default constructor.
+
+Deliberately NOT behind a `cfg`: a simulation-only branch means the harness tests a
+program that does not ship. No signature change, no `new_in`, no feature gate.
+
+`test_clock_seam_controls_the_signed_timestamp_and_the_drift_gate` proves two of the three
+sites by BEHAVIOUR, and both mutations were run: reverting the timestamp site fails the
+timestamp leg, reverting the drift site fails the drift leg. The drift gate is asserted on
+BOTH sides of the 30 s boundary — one side alone would pass on a gate that rejects
+everything, or one that rejects nothing.
+
+Note how the test had to be built, because it is the same trap in miniature: the first
+version placed both drift probes at round 1, where this node had already authored a
+vertex — so the refusal it measured was EQUIVOCATION (dag.rs:1167), not drift, and the
+test would have passed for entirely the wrong reason. Probes now sit at round 2 with the
+out-of-bound one first, so neither leg can pass by accident.
+
+The third site is wired but NOT under test: reaching it needs a commit whose first
+placement attempt fails against a moving chain tip. Stated rather than implied.
+
+`test_dag_consensus_is_still_send_and_sync` guards the bound: `Arc<dyn Fn>` without
+`+ Send + Sync` compiles inside this crate and breaks only at the call site in
+`core/node`, where `DagConsensus` is held in an `Arc<RwLock<..>>` and driven from tokio
+tasks.
+
+### The executable defect list
+
+Four tests are `#[ignore]`d. Three are RED BY DESIGN — they are the open defects, written
+as runnable statements rather than prose:
+
+| Test | Defect | Un-ignore when |
+|---|---|---|
+| `test_h3_sparse_anchor_forks_...` | H3 finality fork | ingress parent-quorum lands |
+| `test_h2_h4_twin_anchors_...` | H2 + H4 | anchor identity is certificate-bound |
+| `test_h1_dropped_twin_...` | H1 (+ the restart defect the naive fix adds) | both twins persisted AND the choice made deterministic |
+| `probe_corpus_arm_distribution` | — | (measurement probe, never a gate) |
+
+`test_b3b4_fabricated_parent_...` is NOT in this list: it is GREEN at HEAD because it
+CHARACTERISES the wedge. Green there does not mean healthy.
+
 **Rejected outright:** exhaustive model checking (FACT 2; and `held: BTreeSet` collapses
 every delivery permutation into one fingerprint, making the root defect H2 *unrepresentable*);
 the record/replay recorder (it misses ChainSync's client path, `sync/src/lib.rs:722`, the

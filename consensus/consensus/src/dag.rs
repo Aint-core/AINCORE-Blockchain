@@ -100,6 +100,27 @@ pub struct DagConsensus {
     /// Cleared, and the durable marker latched, only when the item lands in a
     /// block's slash_evidence carried by us.
     evidence_inflight: Arc<Mutex<std::collections::BTreeMap<(String, u64), u64>>>,
+    /// Wall-clock seam. Three sites in this file read real time, and each one
+    /// DECIDES something:
+    ///   * the vertex timestamp, which is folded into the SIGNED hash
+    ///   * the `MAX_FUTURE_DRIFT_SECS` admission gate
+    ///   * the spacing of the anchor-placement retry loop
+    ///
+    /// A deterministic harness cannot reproduce a schedule whose clock it does not
+    /// control, and the anchor->height race — the mechanism behind the live B4b
+    /// block fork, where one node built height 50 from round 52 and another from
+    /// round 53 — is decided by REAL TIME, not by message order. It is unreachable
+    /// without this seam. That was established by compiler error, not opinion:
+    /// `CommitInfo` carries no height, because height is fixed as
+    /// `latest_block_height + 1` inside the retry loop below.
+    ///
+    /// Defaulted to the real clock in `new`, so production behaviour is unchanged.
+    /// Deliberately NOT behind a `cfg`: a simulation-only branch means the harness
+    /// tests a program that does not ship.
+    pub now_secs: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// The pause between anchor-placement attempts. Separate from `now_secs`
+    /// because a simulation wants to skip the wait, not fake the clock.
+    pub placement_sleep: Arc<dyn Fn(std::time::Duration) + Send + Sync>,
 }
 
 impl DagConsensus {
@@ -462,6 +483,17 @@ impl DagConsensus {
             validators_cache: Arc::new(Mutex::new(None)),
             evidence_queue: Arc::new(Mutex::new(Vec::new())),
             evidence_inflight: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            // The real clock. The two call sites this replaces were written
+            // differently (`.unwrap_or(Duration::from_secs(0)).as_secs()` vs
+            // `.map(|d| d.as_secs()).unwrap_or(0)`) but are semantically equal;
+            // this is that value, not a verbatim move of either.
+            now_secs: Arc::new(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            }),
+            placement_sleep: Arc::new(std::thread::sleep),
         }
     }
 
@@ -719,10 +751,7 @@ impl DagConsensus {
             let mut vertex = Vertex {
                 round: self.current_round,
                 author: self.node_id.clone(),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or(std::time::Duration::from_secs(0))
-                    .as_secs(),
+                timestamp: (self.now_secs)(),
                 payload,
                 parents,
                 hash: String::new(),
@@ -978,10 +1007,7 @@ impl DagConsensus {
         // delayed honest vertices and harm liveness.
         {
             const MAX_FUTURE_DRIFT_SECS: u64 = 30;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let now = (self.now_secs)();
             if vertex.timestamp > now.saturating_add(MAX_FUTURE_DRIFT_SECS) {
                 println!(
                     "🚨 REJECTED [PWN-003/ts]: vertex timestamp {} exceeds now {} + {}s drift",
@@ -1463,7 +1489,7 @@ impl DagConsensus {
                 // ticker (>=500ms) absorbs.
                 for attempt in 0..8 {
                     if attempt > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        (self.placement_sleep)(std::time::Duration::from_millis(250));
                         self.reload_chain_tip();
                         if commit.anchor_round <= self.latest_block_round {
                             already_on_chain = true;
