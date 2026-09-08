@@ -274,6 +274,72 @@ The FABRICATED-PARENT script (B3/B4) is deliberately excluded from the menu: it 
 known-open wedge that would fire on nearly every seed and drown the agreement signal. It has
 its own characterisation test.
 
+**H2 + H4 ARE NOW EXPRESSED — written deliberately while H4 is UNREACHABLE end-to-end.**
+`ordering.rs`, `test_h2_h4_twin_anchors_double_count_stake_and_break_subset_independence`,
+RED by design:
+
+    cargo test -p consensus --lib test_h2_h4_twin -- --ignored --nocapture
+
+At HEAD `add_vertex` drops the losing twin at dag.rs:1167 before the persist at :1173, so
+no honest node ever HOLDS both twins, so no honest vertex ever cites both, so H4 cannot
+fire. **An end-to-end-only harness scores H4 green today, and fixing H1 silently opens
+it.** "Currently unreachable" is the reason to write the property, never the reason to
+skip it — patching what is reachable and calling the class closed is this project's
+documented failure mode.
+
+Three legs, each shown to fire INDEPENDENTLY (each isolated so no earlier assertion
+short-circuits a later one):
+
+| Property | Violation at HEAD |
+|---|---|
+| `P_NODOUBLECOUNT` | twin A backed by 4000 stake, twin B by 4000, total **200% of the whole validator set** |
+| `P_VIEWINDEP_SUBSET` | a node holding only twin A commits `#1`; one holding only twin B commits `#2` |
+| `P_VIEWINDEP_ORDER` | identical vertex SET, reversed arrival order, `#1` vs `#2` |
+
+**THE HALF-FIX GATE — measured, and this is the one that matters.** Sorting `round_index`
+before the `find_map`:
+
+| Leg | Under the sort |
+|---|---|
+| `P_VIEWINDEP_ORDER` | **GREEN** — the half-fix does repair this |
+| `P_VIEWINDEP_SUBSET` | **RED** — it does not |
+| `P_NODOUBLECOUNT` | **RED** — untouched; sorting never reaches `direct_quorum_met` |
+
+A harness asserting only ORDER would sign off on that sort and ship a fork. The real fix
+is not a tie-break: anchor identity has to be fixed by a 2f+1-weighted certificate over a
+specific hash, so "which twin" is not a question any individual node answers from its own
+view.
+
+**Corpus menu `Equivocate` added** — and the two Byzantine classes are measurably
+DIFFERENT defects, not one seen twice (20,000 schedules each):
+
+| Menu | AD-1 breaches | first seed | shape | ancestry arms |
+|---|---|---|---|---|
+| Honest | 0 | — | — | 0 / 0 |
+| SparseAnchor (H3) | 175 | 77 | Commit vs **Skip** | 157 / 184 |
+| Equivocate (H2) | **1,737** | 3 | Commit vs **Commit** | 0 / 0 |
+
+The twin fork is ~10x more frequent than H3 and runs entirely on the direct-commit path,
+never touching the ancestry arms. Gate 3 (permutation inert) is now SCOPED to
+SparseAnchor, and gate 4 asserts permutation is LIVE under Equivocate — the two standing
+side by side are what make gate 3's inertness CAUSAL rather than a broken harness.
+
+**A DEFECT IN OUR OWN HARNESS, found and fixed — worth recording because it would have
+invalidated everything above.** The corpus was process-DEPENDENT: permutations were
+applied by iterating `v.idx`, a `HashMap`, whose iteration order Rust randomises PER
+PROCESS. The same seed therefore built different worlds in different processes,
+destroying the one property the corpus exists for — that a seed IS a reproducible bug
+report. It surfaced as exactly ONE flaked debug run and nothing else; the within-process
+replay assertion could never catch it, because within one process the hasher seed is
+fixed.
+
+Fixed by walking rounds in sorted order, then guarded by **pinned first-breach seeds**
+(`H3_FIRST_BREACH_SEED = 77`, `TWIN_FIRST_BREACH_SEED = 3`). Verified stable 8/8 across
+separate processes in both profiles; and with the bug reintroduced the pin fires 6/6,
+with the seed visibly wandering (7, 9, 7) between runs. Production is NOT affected —
+`find_causal_history` sorts by `(round, hash)` before returning, so traversal order does
+not leak there. Checked, not assumed.
+
 **Rejected outright:** exhaustive model checking (FACT 2; and `held: BTreeSet` collapses
 every delivery permutation into one fingerprint, making the root defect H2 *unrepresentable*);
 the record/replay recorder (it misses ChainSync's client path, `sync/src/lib.rs:722`, the

@@ -1806,6 +1806,231 @@ mod tests {
     }
 
     // ===================================================================
+    // TIER-1 PURE-FUNCTION PROPERTIES: H2 (arrival order reaches the decision)
+    // and H4 (one author's stake counted toward two anchors).
+    //
+    // WRITTEN NOW, WHILE H4 IS UNREACHABLE END-TO-END, AND THAT IS THE POINT.
+    // At HEAD `add_vertex` drops the losing twin at dag.rs:1167 before the
+    // persist at :1173, so no honest node ever HOLDS both twins, so no honest
+    // vertex ever cites both, so H4 cannot fire. An end-to-end-only harness
+    // scores H4 green today — and **fixing H1 silently opens it**.
+    //
+    // "Currently unreachable" is the reason to write the property, never the
+    // reason to skip it. Patching what is reachable and calling the class closed
+    // is the documented failure mode of this project.
+    // ===================================================================
+
+    /// Same author, same round, different hash — a genuine equivocation. `mk_vertex`
+    /// derives the hash from (round, author) alone, so twins need an explicit nonce.
+    fn mk_twin(
+        round: u64,
+        author: &str,
+        parents: Vec<String>,
+        nonce: u32,
+    ) -> (String, blockchain::Vertex) {
+        let (base, mut v) = mk_vertex(round, author, parents);
+        let h = format!("{}#{}", base, nonce);
+        v.hash = h.clone();
+        (h, v)
+    }
+
+    /// The twin-anchor world: the round-2 leader equivocates, and every round-3
+    /// vertex cites BOTH twins.
+    ///
+    /// Citing both is what an honest node does once H1 is fixed and it holds both
+    /// — which is exactly why this scenario is the post-H1 world, not a fantasy.
+    #[allow(clippy::type_complexity)]
+    fn twin_scenario() -> (
+        Vec<(String, u64)>,
+        Vec<(String, blockchain::Vertex)>,
+        String,
+        String,
+    ) {
+        let validators = mk_validators(4);
+        let l2 = super::OrderingEngine::leader_for_round(2, &validators, 0);
+        let mut out: Vec<(String, blockchain::Vertex)> = Vec::new();
+
+        let mut r1: Vec<String> = Vec::new();
+        for (a, _) in &validators {
+            let (h, v) = mk_vertex(1, a, vec!["genesis".to_string()]);
+            r1.push(h.clone());
+            out.push((h, v));
+        }
+
+        let mut r2: Vec<String> = Vec::new();
+        let (mut twin_a, mut twin_b) = (String::new(), String::new());
+        for (a, _) in &validators {
+            if a == &l2 {
+                let (ha, va) = mk_twin(2, a, r1.clone(), 1);
+                let (hb, vb) = mk_twin(2, a, r1.clone(), 2);
+                twin_a = ha.clone();
+                twin_b = hb.clone();
+                r2.push(ha.clone());
+                r2.push(hb.clone());
+                out.push((ha, va));
+                out.push((hb, vb));
+            } else {
+                let (h, v) = mk_vertex(2, a, r1.clone());
+                r2.push(h.clone());
+                out.push((h, v));
+            }
+        }
+
+        // Round 3 and 4: full mesh over EVERYTHING at the previous round, so every
+        // round-3 vertex cites both twins.
+        let mut prev = r2;
+        for r in 3..=4u64 {
+            let mut this = Vec::new();
+            for (a, _) in &validators {
+                let (h, v) = mk_vertex(r, a, prev.clone());
+                this.push(h.clone());
+                out.push((h, v));
+            }
+            prev = this;
+        }
+        (validators, out, twin_a, twin_b)
+    }
+
+    /// Stake of the DISTINCT round-(r+1) authors citing `anchor`, i.e. exactly what
+    /// `direct_quorum_met` sums.
+    fn voter_stake(
+        round: u64,
+        anchor: &str,
+        dag: &std::collections::HashMap<String, blockchain::Vertex>,
+        idx: &std::collections::HashMap<u64, Vec<String>>,
+        validators: &[(String, u64)],
+    ) -> u128 {
+        let stakes: std::collections::HashMap<&str, u64> =
+            validators.iter().map(|(a, s)| (a.as_str(), *s)).collect();
+        let mut voted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for vh in idx.get(&(round + 1)).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if let Some(v) = dag.get(vh) {
+                if v.parents.iter().any(|p| p == anchor) {
+                    voted.insert(v.author.as_str());
+                }
+            }
+        }
+        voted
+            .iter()
+            .filter_map(|a| stakes.get(a).map(|s| *s as u128))
+            .sum()
+    }
+
+    /// Build one view over a chosen subset, in a chosen order.
+    fn twin_view(
+        vertices: &[(String, blockchain::Vertex)],
+        exclude: &[&str],
+        reverse_round2: bool,
+        validators: &[(String, u64)],
+    ) -> View {
+        let mut v = View::new();
+        for (h, vx) in vertices {
+            if exclude.contains(&h.as_str()) {
+                continue;
+            }
+            v.insert(h, vx);
+        }
+        if reverse_round2 {
+            if let Some(list) = v.idx.get_mut(&2) {
+                list.reverse();
+            }
+        }
+        v.evaluate(validators);
+        v
+    }
+
+    /// AUDIT H2 + H4. RED BY DESIGN — both are OPEN at HEAD.
+    ///
+    ///   cargo test -p consensus --lib test_h2_h4_twin -- --ignored --nocapture
+    ///
+    /// H4 (`direct_quorum_met`): the check is
+    /// `v.parents.iter().any(|p| p == anchor_hash)` over a set of distinct AUTHORS,
+    /// evaluated once per candidate anchor. A round-3 vertex citing both twins is
+    /// counted toward BOTH, so the stake summed across the two twins reaches 200%
+    /// of the total. Two anchors at one round can each hold a "quorum" that,
+    /// together, no honest validator set could have produced.
+    ///
+    /// H2 (`leader_vertex_hash`): with two candidates present the `find_map` returns
+    /// whichever the round vector holds FIRST — i.e. arrival order reaches the
+    /// decision function. In every production DAG BFT system the identity of the
+    /// decided vertex is fixed by a 2f+1 certificate over a specific hash; where
+    /// "first seen" appears it governs SIGNING, never DECIDING.
+    ///
+    /// THE GATE THAT MATTERS — the half-fix. Sorting `round_index` before the
+    /// `find_map` makes ORDER-independence pass while SUBSET-independence still
+    /// fails, because a node holding only twin A and a node holding only twin B
+    /// still decide differently no matter how either sorts its own vector. A
+    /// harness asserting only ORDER would sign off on that half-fix and ship a
+    /// fork. Both legs are asserted here for exactly that reason.
+    ///
+    /// MEASURED with the sort applied (each leg isolated so none short-circuits
+    /// another — the three legs were also each shown to fire independently):
+    ///   P_VIEWINDEP_ORDER   -> GREEN   the half-fix does repair this
+    ///   P_VIEWINDEP_SUBSET  -> RED     it does not repair this
+    ///   P_NODOUBLECOUNT     -> RED     untouched; sorting never reaches
+    ///                                  direct_quorum_met at all
+    ///
+    /// The real fix is not a tie-break. Anchor identity has to be fixed by a
+    /// 2f+1-weighted certificate over a specific hash, so that "which twin" is
+    /// not a question any individual node answers from its own view.
+    #[test]
+    #[ignore = "reproduces H2+H4, both OPEN: RED by design until anchor identity is certificate-bound"]
+    fn test_h2_h4_twin_anchors_double_count_stake_and_break_subset_independence() {
+        let (validators, vertices, twin_a, twin_b) = twin_scenario();
+        let total: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
+
+        let full = twin_view(&vertices, &[], false, &validators);
+        let sa = voter_stake(2, &twin_a, &full.dag, &full.idx, &validators);
+        let sb = voter_stake(2, &twin_b, &full.dag, &full.idx, &validators);
+
+        // ---- P_NODOUBLECOUNT ---------------------------------------------------
+        // No validator's stake may back two different anchors at one round. This
+        // is the property that CANNOT fire end-to-end today, because H1 stops any
+        // honest node from holding both twins. Fixing H1 opens it.
+        assert!(
+            sa + sb <= total,
+            "P_NODOUBLECOUNT VIOLATED at round 2: twin A backed by {} stake, twin B \
+             by {}, total {} = {}% of the whole validator set.\n\
+             direct_quorum_met is evaluated once per candidate anchor over distinct \
+             AUTHORS, so one round-3 vertex citing both twins is counted toward both.\n\
+             UNREACHABLE END-TO-END AT HEAD only because H1 drops the losing twin at \
+             dag.rs:1167 — fixing H1 without fixing this opens it.",
+            sa,
+            sb,
+            sa + sb,
+            (sa + sb) * 100 / total
+        );
+
+        // ---- P_VIEWINDEP_SUBSET ------------------------------------------------
+        // The leg the half-fix does NOT repair.
+        let only_a = twin_view(&vertices, &[twin_b.as_str()], false, &validators);
+        let only_b = twin_view(&vertices, &[twin_a.as_str()], false, &validators);
+        assert!(
+            agree(&only_a.decision(2), &only_b.decision(2)),
+            "P_VIEWINDEP_SUBSET VIOLATED: a node holding only twin A decided {:?}, \
+             a node holding only twin B decided {:?}. Same honest broadcast, \
+             different subsets, different FINAL decisions.\n\
+             Sorting round_index does not touch this: each node sorts a vector that \
+             contains only its own twin.",
+            only_a.decision(2),
+            only_b.decision(2)
+        );
+
+        // ---- P_VIEWINDEP_ORDER -------------------------------------------------
+        // The leg the half-fix DOES repair — which is what makes it seductive.
+        let rev = twin_view(&vertices, &[], true, &validators);
+        assert!(
+            agree(&full.decision(2), &rev.decision(2)),
+            "P_VIEWINDEP_ORDER VIOLATED: identical vertex SET, reversed arrival order, \
+             decisions {:?} vs {:?}. leader_vertex_hash's find_map reads the round \
+             vector in push order (dag.rs:1184-1187), so arrival order reaches the \
+             decision function.",
+            full.decision(2),
+            rev.decision(2)
+        );
+    }
+
+    // ===================================================================
     // TIER-1 SEEDED SCHEDULER
     //
     // The action space is INVERTED, and that is the whole design. A reviewer
@@ -1823,7 +2048,42 @@ mod tests {
     // That is the property the whole exercise exists for.
     // ===================================================================
 
+    /// What the Byzantine validator does. Kept as separate menus rather than one
+    /// mixed corpus so each gate below measures ONE mechanism: mixing them would
+    /// let a breach found under one script be credited to another.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Menu {
+        /// Everyone follows the protocol.
+        Honest,
+        /// One validator emits ONE-PARENT vertices from round 2 on (the H3 shape).
+        SparseAnchor,
+        /// One validator emits TWINS — same round, two hashes — and honest nodes
+        /// cite both. This is the POST-H1 world: at HEAD `add_vertex` drops the
+        /// loser at dag.rs:1167, so no honest node holds both and nothing here can
+        /// happen. Fixing H1 without binding anchor identity makes it happen.
+        Equivocate,
+    }
+
     const SCHED_ROUNDS: u64 = 6;
+
+    /// PINNED FIRST-BREACH SEEDS — the cross-process determinism guard.
+    ///
+    /// These are pinned because this harness was already process-DEPENDENT once,
+    /// and silently: permutations were applied by iterating `v.idx`, a HashMap,
+    /// whose iteration order is randomised PER PROCESS by Rust's default hasher.
+    /// The same seed therefore produced different worlds in different processes,
+    /// which destroys the single property the whole corpus exists for — that a
+    /// seed IS a reproducible bug report. It surfaced as one flaked run in debug
+    /// and nothing else; a within-process replay assertion could never catch it,
+    /// because within one process the hasher seed is fixed.
+    ///
+    /// Verified stable across 5 separate processes after the fix. If you change
+    /// SCHED_ROUNDS / SCHED_OMIT_P / SCHED_VIEWS or a menu, re-derive these from
+    /// `probe_corpus_arm_distribution`. **If you changed nothing and one of these
+    /// moved, something in the harness is reading process-dependent state — find
+    /// it rather than updating the constant.**
+    const H3_FIRST_BREACH_SEED: u64 = 77;
+    const TWIN_FIRST_BREACH_SEED: u64 = 3;
     const SCHED_OMIT_P: f64 = 0.2;
     const SCHED_VIEWS: usize = 3;
 
@@ -1864,6 +2124,7 @@ mod tests {
     fn sched_universe(
         validators: &[(String, u64)],
         byz: Option<&str>,
+        menu: Menu,
         rng: &mut rand::rngs::StdRng,
     ) -> Vec<(String, blockchain::Vertex)> {
         use rand::Rng;
@@ -1872,7 +2133,16 @@ mod tests {
         for r in 1..=SCHED_ROUNDS {
             let mut this = Vec::new();
             for (a, _) in validators {
-                let parents = if byz == Some(a.as_str()) && r >= 2 && !prev.is_empty() {
+                let is_byz = byz == Some(a.as_str()) && r >= 2 && !prev.is_empty();
+                if is_byz && menu == Menu::Equivocate {
+                    for nonce in 1..=2u32 {
+                        let (h, v) = mk_twin(r, a, prev.clone(), nonce);
+                        this.push(h.clone());
+                        out.push((h, v));
+                    }
+                    continue;
+                }
+                let parents = if is_byz && menu == Menu::SparseAnchor {
                     vec![prev[rng.gen_range(0..prev.len())].clone()]
                 } else {
                     prev.clone()
@@ -1923,7 +2193,7 @@ mod tests {
     /// `permute` draws from a SEPARATE rng stream so that toggling it does not
     /// shift the main stream — otherwise "same seed, permutation off" would be a
     /// different world, and the inertness measurement would be meaningless.
-    fn sched_run(seed: u64, byzantine: bool, permute: bool) -> ScheduleOutcome {
+    fn sched_run(seed: u64, menu: Menu, permute: bool) -> ScheduleOutcome {
         use rand::seq::SliceRandom;
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -1933,12 +2203,13 @@ mod tests {
         // The Byzantine author is RANDOM. The scheduler is not told that the
         // fork needs it to land on an anchor-round leader — finding that is the
         // search.
-        let byz_owned = if byzantine {
-            Some(validators[rng.gen_range(0..validators.len())].0.clone())
-        } else {
-            None
+        // The same draw is made for BOTH Byzantine menus so that a seed names the
+        // same author under either — otherwise the menus would not be comparable.
+        let byz_owned = match menu {
+            Menu::Honest => None,
+            _ => Some(validators[rng.gen_range(0..validators.len())].0.clone()),
         };
-        let universe = sched_universe(&validators, byz_owned.as_deref(), &mut rng);
+        let universe = sched_universe(&validators, byz_owned.as_deref(), menu, &mut rng);
 
         let mut views: Vec<View> = Vec::new();
         for i in 0..SCHED_VIEWS {
@@ -1953,8 +2224,19 @@ mod tests {
                 v.insert(h, vx);
             }
             if permute {
-                for list in v.idx.values_mut() {
-                    list.shuffle(&mut prng);
+                // Rounds MUST be walked in sorted order. `v.idx` is a HashMap and
+                // Rust's default hasher is seeded RANDOMLY PER PROCESS, so
+                // iterating it assigns the prng's draws to different rounds on
+                // every run — the same seed would then produce different worlds in
+                // different processes. Caught by this harness flaking exactly once
+                // in debug before the guard below was added; the entire value of a
+                // seeded corpus is that the seed IS the bug report.
+                let mut rounds: Vec<u64> = v.idx.keys().copied().collect();
+                rounds.sort_unstable();
+                for r in rounds {
+                    if let Some(list) = v.idx.get_mut(&r) {
+                        list.shuffle(&mut prng);
+                    }
                 }
             }
             v.evaluate(&validators);
@@ -2016,7 +2298,7 @@ mod tests {
     fn corpus_honest_emissions_never_fork_and_never_reach_the_ancestry_arms() {
         let mut arms = ArmCounts::default();
         for seed in 0..SCHED_CORPUS {
-            let o = sched_run(seed, false, true);
+            let o = sched_run(seed, Menu::Honest, true);
             assert!(
                 o.violation.is_none(),
                 "AD-1 breach under HONEST-ONLY emissions at seed {}: {:?}\n\
@@ -2068,7 +2350,7 @@ mod tests {
         const BUDGET: u64 = 100_000;
         let mut found: Option<(u64, ScheduleOutcome)> = None;
         for seed in 0..BUDGET {
-            let o = sched_run(seed, true, true);
+            let o = sched_run(seed, Menu::SparseAnchor, true);
             if o.violation.is_some() {
                 found = Some((seed, o));
                 break;
@@ -2080,6 +2362,11 @@ mod tests {
              reports nothing means nothing.",
         );
 
+        assert_eq!(
+            seed, H3_FIRST_BREACH_SEED,
+            "first breach moved to seed {} (pinned {}). See H3_FIRST_BREACH_SEED:              if the corpus parameters are unchanged, the harness has become              process-dependent and the seeds are no longer bug reports.",
+            seed, H3_FIRST_BREACH_SEED
+        );
         let (round, _i, di, _j, dj) = outcome.violation.clone().unwrap();
         assert_eq!(round % 2, 0, "anchors live on even rounds");
         assert!(
@@ -2096,7 +2383,7 @@ mod tests {
         // THE point of deterministic simulation: the seed IS the bug report.
         for replay in 0..3 {
             assert_eq!(
-                sched_run(seed, true, true),
+                sched_run(seed, Menu::SparseAnchor, true),
                 outcome,
                 "replay {} of seed {} diverged — the corpus is not deterministic, \
                  and a non-reproducible counterexample is worthless",
@@ -2115,22 +2402,110 @@ mod tests {
     /// round holds TWO vertices by the same author, i.e. twins, which `add_vertex`
     /// drops at dag.rs:1167 (H1) and which this corpus does not yet inject.
     ///
-    /// So the reordering half of the action space explores nothing at present.
+    /// So under this menu the reordering half of the action space explores nothing.
     /// Recorded rather than quietly assumed, because a corpus that claims to
     /// explore arrival order and does not is exactly the kind of false assurance
-    /// this whole harness exists to prevent. Injecting twins is step 4; when it
-    /// lands, THIS TEST MUST FAIL, and that failure is the proof the twins took
-    /// effect.
+    /// this harness exists to prevent.
+    ///
+    /// SCOPED, and the scope is the point: under `Menu::Equivocate` permutation is
+    /// LIVE — `corpus_equivocation_makes_arrival_order_decisive` asserts exactly
+    /// that. The two tests standing side by side are what make the inertness here
+    /// CAUSAL (it is the absence of twins) rather than a broken harness. If this
+    /// test ever fails, twins are reaching the sparse-anchor menu; do not "fix" it
+    /// by relaxing the assertion.
     #[test]
-    fn corpus_permutation_is_inert_until_twins_are_injectable() {
+    fn corpus_permutation_is_inert_under_sparse_anchors() {
         for seed in 0..SCHED_CORPUS {
             assert_eq!(
-                sched_run(seed, true, true),
-                sched_run(seed, true, false),
+                sched_run(seed, Menu::SparseAnchor, true),
+                sched_run(seed, Menu::SparseAnchor, false),
                 "seed {}: permutation changed the outcome. If twins are now being \
                  injected this is EXPECTED — delete this test and assert the \
                  order-dependence directly. If they are not, arrival order is \
                  reaching a decision it should not.",
+                seed
+            );
+        }
+    }
+
+    /// GATE 4 — under equivocation, arrival order becomes DECISIVE, and the corpus
+    /// must find that unaided too.
+    ///
+    /// The sibling of gate 3. Same scheduler, same seeds, one difference: the
+    /// Byzantine validator emits TWINS and honest nodes cite both. Permutation goes
+    /// from inert to decisive, which proves gate 3's inertness is caused by the
+    /// absence of twins and not by a harness that cannot see reordering.
+    ///
+    /// Measured over 20,000 schedules per menu:
+    ///     honest      0 AD-1 breaches
+    ///     sparse    175 breaches, first at seed 77   (H3: Commit vs Skip)
+    ///     equivocate 1,716 breaches, first at seed 7 (H2: Commit vs Commit)
+    ///
+    /// Note the shapes differ and so do the mechanisms: the sparse-anchor fork runs
+    /// through the ancestry arms (157 ancestry-commit, 184 ancestry-skip), while the
+    /// twin fork records ZERO in both and happens entirely on the direct-commit
+    /// path. Two distinct defects, not one seen twice.
+    ///
+    /// This gate PASSES at HEAD because H2 is open — it is a statement about the
+    /// corpus's power, not about the chain's safety. The safety assertion is
+    /// `test_h2_h4_twin_anchors_double_count_stake_and_break_subset_independence`,
+    /// which is RED by design.
+    #[test]
+    fn corpus_equivocation_makes_arrival_order_decisive() {
+        // (a) Permutation is LIVE here. Gate 3 asserts the exact opposite under
+        //     Menu::SparseAnchor; the contrast is the evidence.
+        let mut differed = 0u64;
+        for seed in 0..SCHED_CORPUS {
+            if sched_run(seed, Menu::Equivocate, true) != sched_run(seed, Menu::Equivocate, false)
+            {
+                differed += 1;
+            }
+        }
+        assert!(
+            differed > 0,
+            "reordering changed nothing under equivocation across {} schedules. \
+             Either twins stopped being injected, or the corpus cannot see arrival \
+             order at all — in which case gate 3's inertness result is meaningless.",
+            SCHED_CORPUS
+        );
+
+        // (b) The corpus must find the twin fork unaided, and it must be the
+        //     Commit-vs-Commit shape: two honest nodes finalising DIFFERENT
+        //     vertices at the SAME round.
+        const BUDGET: u64 = 100_000;
+        let mut found: Option<(u64, ScheduleOutcome)> = None;
+        for seed in 0..BUDGET {
+            let o = sched_run(seed, Menu::Equivocate, true);
+            if o.violation.is_some() {
+                found = Some((seed, o));
+                break;
+            }
+        }
+        let (seed, outcome) = found.expect("no twin fork found within 100,000 schedules");
+        assert_eq!(
+            seed, TWIN_FIRST_BREACH_SEED,
+            "first breach moved to seed {} (pinned {}). See H3_FIRST_BREACH_SEED's              doc — this is the menu where permutation is LIVE, so it is the one that              detects process-dependent iteration.",
+            seed, TWIN_FIRST_BREACH_SEED
+        );
+        let (round, _i, di, _j, dj) = outcome.violation.clone().unwrap();
+        assert_eq!(round % 2, 0);
+        assert!(
+            di.starts_with("Commit") && dj.starts_with("Commit") && di != dj,
+            "seed {} breached AD-1 but not in the twin shape ({} vs {}). The twin \
+             fork is two nodes COMMITTING different hashes, not one committing and \
+             one skipping — that is H3, a different defect.",
+            seed,
+            di,
+            dj
+        );
+
+        for replay in 0..3 {
+            assert_eq!(
+                sched_run(seed, Menu::Equivocate, true),
+                outcome,
+                "replay {} of seed {} diverged — a non-reproducible counterexample \
+                 is worthless",
+                replay,
                 seed
             );
         }
@@ -2142,7 +2517,7 @@ mod tests {
     #[test]
     #[ignore = "measurement probe, not a gate"]
     fn probe_corpus_arm_distribution() {
-        for (label, byz) in [("honest", false), ("byzantine", true)] {
+        for (label, byz) in [("honest", Menu::Honest), ("sparse", Menu::SparseAnchor), ("equivocate", Menu::Equivocate)] {
             let mut arms = ArmCounts::default();
             let mut violations = 0u64;
             let mut first_violation: Option<u64> = None;
