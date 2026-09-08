@@ -435,6 +435,53 @@ as runnable statements rather than prose:
 `test_b3b4_fabricated_parent_...` is NOT in this list: it is GREEN at HEAD because it
 CHARACTERISES the wedge. Green there does not mean healthy.
 
+**B4b: FIVE COPIES COLLAPSED TO ONE, AND THE INVARIANT IS NOW CHECKABLE — including
+against the live cluster.**
+
+The predicate `commit.anchor_round <= self.latest_block_round` existed as **five
+textually identical copies** across the placement path in `dag.rs`. Five copies of one
+safety condition is the shape that drifts: a later edit fixes four and the fifth silently
+becomes a fork. It is one function now, `anchor_already_on_chain`, with
+`assert_anchor_height_map` as its companion assertion at the moment of placement —
+which REPORTS (loud stderr + a durable `alarm:anchor_height_violation:{height}` row) and
+never changes behaviour, because a check that could itself drop a block would be worse
+than the defect it guards.
+
+`test_anchor_already_on_chain_is_decided_by_round_at_the_boundary` pins the meaning at
+the boundary, where an off-by-one becomes a fork. Both mutations RUN:
+
+| Mutation | What it is in practice | Caught by |
+|---|---|---|
+| `<=` → `<` | the "place it once more, just to be safe" edit — duplicates an anchor | boundary: anchor AT the tip round |
+| predicate reads HEIGHT instead of round | **the original burn-in bug** | boundary: anchor ABOVE the tip round |
+
+The test also asserts that moving `latest_block_height` to 5,073 and to 999,999 changes
+no answer. That independence IS the fix for the burn-in bug, so it is asserted rather
+than assumed.
+
+**Ops tool: `scripts/ops_tools/check-anchor-height-map.sh`.** P_ANCHOR_HEIGHT cannot be
+checked by a node alone — each node's own chain looks perfectly self-consistent, and the
+divergence is only visible by COMPARING nodes. This script does that, read-only, safe on
+production. Its detection logic is verified rather than assumed: against synthetic input
+it reports `round 210 maps to heights 105 and 106` (injectivity) and
+`height 105: r1=round 210, ... r4=round 211` (the live fork shape), and stays silent on an
+agreeing control.
+
+**Run against the live 4-validator cluster: P_ANCHOR_HEIGHT HOLDS.** 300 shared heights
+(50,304–50,603), injective on every node, with identical anchor round AND identical header
+hash across all four. The only bytes that differ between nodes are `proposer_signature`
+and `proposer_signer` — each node signs the block it stores with its own key, and neither
+field is in the header hash. Checked, not assumed: the four dumps had identical byte
+LENGTH, which looked like one node sampled four times; distinct MD5s disproved that, and
+a field-by-field diff identified the two signature fields as the only difference.
+
+**B4b is therefore not currently manifesting — and that is a window, not a proof.** The
+race needs a sync-vs-local conflict to fire; a quiet LAN may never produce one. The
+remaining gap is unchanged and is stated plainly: reaching the race DELIBERATELY still
+needs a simulated ChainSync writer at the storage-visibility point. The `placement_sleep`
+seam is the hook for it (it fires between retry attempts, exactly where sync's write
+becomes visible), and the seam is in — the writer is not.
+
 **Rejected outright:** exhaustive model checking (FACT 2; and `held: BTreeSet` collapses
 every delivery permutation into one fingerprint, making the root defect H2 *unrepresentable*);
 the record/replay recorder (it misses ChainSync's client path, `sync/src/lib.rs:722`, the

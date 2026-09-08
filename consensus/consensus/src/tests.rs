@@ -2235,4 +2235,63 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DagConsensus>();
     }
+
+    /// AUDIT B4b. The "anchor already on chain" predicate, asserted at the
+    /// BOUNDARY, because the boundary is where an off-by-one becomes a fork.
+    ///
+    /// This predicate existed as FIVE textually identical copies across the
+    /// placement path in dag.rs. Five copies of one safety condition is the shape
+    /// that drifts: a later edit fixes four and the fifth silently becomes a fork.
+    /// It is one function now, and this test pins its meaning.
+    ///
+    /// The rule is decided by ANCHOR ROUND, never by height. The live burn-in
+    /// showed what deciding by height cost: three distinct anchors (12220, 12224,
+    /// 12226) were all skipped against the SAME height 5073 because
+    /// reload_chain_tip had not yet seen sync\'s writes, so anchor 12226 never got
+    /// a block on that node while its peers placed it at 5075.
+    ///
+    /// MUTATION: change `<=` to `<` and the boundary case below fails. That is not
+    /// a hypothetical edit — it is exactly the "place it once more, just to be
+    /// safe" change that duplicates an anchor.
+    #[test]
+    fn test_anchor_already_on_chain_is_decided_by_round_at_the_boundary() {
+        let (mut consensus, path) = setup_dag("anchor_guard");
+        consensus.latest_block_round = 10;
+
+        assert!(
+            consensus.anchor_already_on_chain(9),
+            "an anchor BELOW the tip round is already on chain"
+        );
+        assert!(
+            consensus.anchor_already_on_chain(10),
+            "BOUNDARY: an anchor AT the tip round is already on chain. If this \
+             fails, the placement path builds a SECOND block for an anchor that \
+             already has one, and this node\'s anchor->height map diverges from \
+             the network\'s — the live B4b fork."
+        );
+        assert!(
+            !consensus.anchor_already_on_chain(11),
+            "BOUNDARY: an anchor ABOVE the tip round still needs a block. If this \
+             fails, every new anchor is skipped as a duplicate and the chain stops \
+             producing blocks entirely — the opposite failure, equally fatal."
+        );
+
+        // Height must not enter the decision at all. That independence IS the fix
+        // for the burn-in bug, so it is asserted rather than assumed.
+        for h in [5_073u64, 999_999u64] {
+            consensus.latest_block_height = h;
+            assert!(
+                consensus.anchor_already_on_chain(10),
+                "height {} changed the answer — the predicate is reading height again",
+                h
+            );
+            assert!(
+                !consensus.anchor_already_on_chain(11),
+                "height {} changed the answer — the predicate is reading height again",
+                h
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }

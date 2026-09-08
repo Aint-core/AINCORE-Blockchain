@@ -503,6 +503,56 @@ impl DagConsensus {
     /// operation (slash execution updates `sys:validators`). Public so
     /// out-of-band code paths (genesis init, integration tests,
     /// admin tooling that mutates storage directly) can force a refresh.
+    /// Has this anchor round already been placed on chain?
+    ///
+    /// AUDIT B4b — the single source of truth for "already done". It is decided by
+    /// ANCHOR ROUND, never by height. The live burn-in showed what deciding by
+    /// height costs: three distinct anchors (12220, 12224, 12226) were all skipped
+    /// against the SAME height 5073 because `reload_chain_tip` had not yet seen
+    /// sync's writes, so anchor 12226 never got a block on that node while its
+    /// peers placed it at 5075. The node's anchor->height mapping went out of step
+    /// with the network's, and the chain forked at the block level.
+    ///
+    /// This predicate previously existed as FIVE textually identical copies across
+    /// the placement path. Five copies of one safety condition is precisely the
+    /// shape that drifts — a later edit fixes four of them and the fifth becomes a
+    /// fork. It is one function now, and `anchor_height_map_intact` below is its
+    /// companion assertion at the moment of placement.
+    /// `pub(crate)` only so the boundary case can be asserted from `tests`, which
+    /// is a sibling module of `dag`, not a descendant. An off-by-one here is a
+    /// fork, so it must be testable.
+    #[inline]
+    pub(crate) fn anchor_already_on_chain(&self, anchor_round: u64) -> bool {
+        anchor_round <= self.latest_block_round
+    }
+
+    /// P_ANCHOR_HEIGHT, checked at the one moment it can be violated.
+    ///
+    /// The map `anchor_round -> block_height` must be injective and strictly
+    /// increasing along the chain. A block about to be placed for an anchor round
+    /// that is already at or below the tip's round would break that — and this is
+    /// the invariant whose violation WAS the live B4b fork.
+    ///
+    /// Reports; never changes behaviour. A check that could itself drop a block
+    /// would be a worse defect than the one it guards against.
+    fn assert_anchor_height_map(&self, anchor_round: u64, height: u64) {
+        if !self.anchor_already_on_chain(anchor_round) {
+            return;
+        }
+        eprintln!(
+            "🚨 P_ANCHOR_HEIGHT VIOLATED: placing anchor round {} at height {} while \
+             the tip is already at round {}. The anchor->height map is no longer \
+             strictly increasing, which is the live B4b block-fork signature. \
+             This node's mapping has diverged from the network's.",
+            anchor_round, height, self.latest_block_round
+        );
+        // Durable, so ops finds it after the fact rather than in a lost log line.
+        let _ = self.storage.put(
+            &format!("alarm:anchor_height_violation:{}", height),
+            &format!("{{\"anchor_round\":{},\"tip_round\":{}}}", anchor_round, self.latest_block_round),
+        );
+    }
+
     pub fn invalidate_validators_cache(&self) {
         if let Ok(mut guard) = self.validators_cache.lock() {
             *guard = None;
@@ -1329,7 +1379,7 @@ impl DagConsensus {
             // network's forever. The ordering-engine bookkeeping (cursor, digest,
             // committed-set) already happened inside try_commit and must happen;
             // only the duplicate block build is skipped.
-            if commit.anchor_round <= self.latest_block_round {
+            if self.anchor_already_on_chain(commit.anchor_round) {
                 println!(
                     "⏭️  Anchor round {} already on chain via sync (tip round {}) — skipping duplicate block",
                     commit.anchor_round, self.latest_block_round
@@ -1491,7 +1541,7 @@ impl DagConsensus {
                     if attempt > 0 {
                         (self.placement_sleep)(std::time::Duration::from_millis(250));
                         self.reload_chain_tip();
-                        if commit.anchor_round <= self.latest_block_round {
+                        if self.anchor_already_on_chain(commit.anchor_round) {
                             already_on_chain = true;
                             break;
                         }
@@ -1540,7 +1590,7 @@ impl DagConsensus {
                         }
                         executor::BlockExecOutcome::AlreadyExecuted { last_executed } => {
                             self.reload_chain_tip();
-                            if commit.anchor_round <= self.latest_block_round {
+                            if self.anchor_already_on_chain(commit.anchor_round) {
                                 println!(
                                     "⏭️  Anchor round {} already on chain via sync (tip round {}, last_executed={})",
                                     commit.anchor_round, self.latest_block_round, last_executed
@@ -1557,7 +1607,7 @@ impl DagConsensus {
                                 commit.anchor_round, expected, got
                             );
                             self.reload_chain_tip();
-                            if commit.anchor_round <= self.latest_block_round {
+                            if self.anchor_already_on_chain(commit.anchor_round) {
                                 already_on_chain = true;
                                 break;
                             }
@@ -1571,7 +1621,7 @@ impl DagConsensus {
                 // block during the last wait.
                 if placed.is_none() && !already_on_chain {
                     self.reload_chain_tip();
-                    if commit.anchor_round <= self.latest_block_round {
+                    if self.anchor_already_on_chain(commit.anchor_round) {
                         already_on_chain = true;
                     }
                 }
@@ -1652,6 +1702,7 @@ impl DagConsensus {
                 new_block.sign_proposer(&crypto::SigningKey::from_bytes(&self.node_key), &self.node_id);
                 self.latest_block_hash = new_block.header.hash.clone();
                 self.latest_block_timestamp = new_block.header.timestamp;
+                self.assert_anchor_height_map(commit.anchor_round, self.latest_block_height);
                 self.latest_block_round = commit.anchor_round;
                 self.last_adopted_height = self.latest_block_height;
                 // RE-AUDIT MEDIUM: persist the adoption cursor so a crash between
