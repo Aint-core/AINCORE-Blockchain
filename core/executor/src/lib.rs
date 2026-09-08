@@ -7688,4 +7688,247 @@ mod tests {
             end
         );
     }
+
+    /// AUDIT H6 (CRITICAL). RED BY DESIGN — no state-derived commitment exists
+    /// anywhere in AINCORE, so downloaded-state sync is unverifiable in principle.
+    ///
+    ///   cargo test -p executor --lib test_h6_ -- --ignored --nocapture
+    ///
+    /// `sys:state_root` is `H(prev_root || H(sorted effective writes))` — a hash
+    /// CHAIN over write-sets. It commits to the execution HISTORY, not to state
+    /// contents. Confirmed absent at HEAD: no IAVL, no Merkle-Patricia, no state
+    /// trie of any kind in the workspace; `Accumulator` appends BLOCK HASHES.
+    ///
+    /// Deliberately TWO tests rather than two legs of one: a single test
+    /// short-circuits at the first failure, so the second property would never
+    /// actually run — and an assertion that never runs is precisely the failure
+    /// this project has shipped before.
+    ///
+    /// WHAT A FIX MUST SATISFY, so neither is "fixed" alone: **the root must be a
+    /// pure function of the state map.** Both tests then pass together and neither
+    /// can pass without the other — the first says the function must see every
+    /// write, the second says it must depend on nothing else. A per-block
+    /// write-set hash satisfies neither.
+    ///
+    /// THIS TEST: the root is BLIND to state written outside block execution.
+    /// Not hypothetical — the faucet RPC writes objects straight into RocksDB and
+    /// nothing in any header disagrees. With a real commitment that write is
+    /// detectable at the next block; today it is invisible forever.
+    #[test]
+    #[ignore = "reproduces H6, an OPEN CRITICAL defect: RED by design until a state-derived commitment exists"]
+    fn test_h6_state_root_is_blind_to_out_of_band_writes() {
+        use storage::object::{Object, Owner};
+
+        let db = temp_db("h6_blind");
+        load_stdlib(&db);
+        db.set_federation_key("00000000000000000000000000000000").unwrap();
+        let exec = Executor::new(db.clone());
+        let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
+        match exec.execute_block_parallel_at(vec![], proposer, 1, &[]) {
+            BlockExecOutcome::Executed(_) => {}
+            other => panic!("height 1 must execute: {:?}", other),
+        }
+        let root_before = exec.current_state_root();
+
+        let id = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
+        let smuggled = Object::new(
+            id.to_string(),
+            Owner::Address("beef".to_string()),
+            b"{\"balance\":1000000000}".to_vec(),
+            "0x1::coin::CoinStore".to_string(),
+        );
+        db.put_object(&smuggled).unwrap();
+        assert!(
+            db.get(&format!("obj:{}", id)).unwrap().is_some(),
+            "precondition: the object really is in state"
+        );
+
+        assert_ne!(
+            exec.current_state_root(),
+            root_before,
+            "P_STATE_COMMITMENT VIOLATED: an object was written into state and the \
+             root did not move. The root is H(prev_root || write-set), so it sees \
+             only what block execution wrote — anything else is invisible to every \
+             header, forever."
+        );
+    }
+
+    /// AUDIT H6 (CRITICAL). RED BY DESIGN — no state-derived commitment exists
+    /// anywhere in AINCORE, so downloaded-state sync is unverifiable in principle.
+    ///
+    ///   cargo test -p executor --lib test_h6_ -- --ignored --nocapture
+    ///
+    /// `sys:state_root` is `H(prev_root || H(sorted effective writes))` — a hash
+    /// CHAIN over write-sets. It commits to the execution HISTORY, not to state
+    /// contents. Confirmed absent at HEAD: no IAVL, no Merkle-Patricia, no state
+    /// trie of any kind in the workspace; `Accumulator` appends BLOCK HASHES.
+    ///
+    /// Deliberately TWO tests rather than two legs of one: a single test
+    /// short-circuits at the first failure, so the second property would never
+    /// actually run — and an assertion that never runs is precisely the failure
+    /// this project has shipped before.
+    ///
+    /// WHAT A FIX MUST SATISFY, so neither is "fixed" alone: **the root must be a
+    /// pure function of the state map.** Both tests then pass together and neither
+    /// can pass without the other — the first says the function must see every
+    /// write, the second says it must depend on nothing else. A per-block
+    /// write-set hash satisfies neither.
+    ///
+    /// THIS TEST: a node handed a CORRUPTED state snapshot cannot detect it. The
+    /// root travels with the snapshot as a stored value rather than being computed
+    /// from it, so a tampered copy and a good one are indistinguishable. This is
+    /// the consequence of the blindness above, and it is what makes state sync
+    /// unsafe no matter how careful the receiving node is.
+    #[test]
+    #[ignore = "reproduces H6, an OPEN CRITICAL defect: RED by design until a state-derived commitment exists"]
+    fn test_h6_a_corrupted_state_snapshot_is_undetectable() {
+        let db_a = temp_db("h6_corrupt_a");
+        load_stdlib(&db_a);
+        db_a.set_federation_key("00000000000000000000000000000000").unwrap();
+        let exec_a = Executor::new(db_a.clone());
+        let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
+        match exec_a.execute_block_parallel_at(vec![], proposer, 1, &[]) {
+            BlockExecOutcome::Executed(_) => {}
+            other => panic!("height 1 must execute: {:?}", other),
+        }
+
+        // B receives a state snapshot from A — every row, root included, the way a
+        // syncing node would take it. Then ONE row is corrupted in transit.
+        let db_b = temp_db("h6_corrupt_b");
+        let exec_b = Executor::new(db_b.clone());
+        let rows = db_a.scan_prefix("");
+        assert!(!rows.is_empty(), "precondition: A must hold data to hand over");
+        let victim = rows
+            .iter()
+            .find(|(k, _)| k.starts_with("module_"))
+            .map(|(k, _)| k.clone())
+            .expect("precondition: A must hold at least one module row to corrupt");
+        for (k, v) in &rows {
+            if *k == victim {
+                db_b.put(k, "TAMPERED").unwrap();
+            } else {
+                db_b.put(k, v).unwrap();
+            }
+        }
+        assert_eq!(
+            db_b.get(&victim).unwrap().as_deref(),
+            Some("TAMPERED"),
+            "precondition: the corruption must actually be in B's state"
+        );
+        assert_ne!(
+            db_a.get(&victim).unwrap().as_deref(),
+            Some("TAMPERED"),
+            "precondition: A must be uncorrupted, or there is nothing to detect"
+        );
+
+        assert_ne!(
+            exec_b.current_state_root(),
+            exec_a.current_state_root(),
+            "P_STATE_COMMITMENT VIOLATED: B's state is CORRUPTED — row `{}` was \
+             replaced in transit — and B's root is bit-for-bit identical to A's, \
+             because the root travelled WITH the snapshot as a stored value rather \
+             than being computed FROM it. Nothing in the node can tell a good \
+             snapshot from a tampered one.\n\
+             This is distinct from the blindness test: that one shows the root does \
+             not see state; this one shows the CONSEQUENCE — state sync cannot be \
+             made safe by any amount of care at the receiving end, because there is \
+             no quantity to check against. It is unverifiable in PRINCIPLE, not \
+             merely unimplemented.",
+            victim
+        );
+    }
+
+    /// A CONTENT-DERIVED root satisfies BOTH H6 properties. GREEN — this is the
+    /// target, demonstrated rather than asserted.
+    ///
+    /// The two H6 tests above say what is broken. This one says what "fixed" means,
+    /// so the next attempt has something to aim at and so a partial fix cannot be
+    /// mistaken for a whole one: the root must be a PURE FUNCTION OF THE STATE MAP.
+    /// Nothing more exotic is required — the toy function below is a sorted hash
+    /// over every row, and it already passes both properties that
+    /// `H(prev_root || write-set)` fails.
+    ///
+    /// NOT a production proposal. Hashing the whole state per block is O(state) and
+    /// would be ruinous at any real size; that is exactly why production systems use
+    /// an incremental authenticated structure (IAVL, Merkle-Patricia) which
+    /// recomputes only the path to each changed key. The point here is narrower and
+    /// worth pinning: the PROPERTY is satisfiable, and it is satisfiable by anything
+    /// that reads state instead of history. The engineering question is which
+    /// structure, not whether.
+    #[test]
+    fn test_h6_a_content_derived_root_would_satisfy_both_properties() {
+        use storage::object::{Object, Owner};
+
+        /// Toy content root: sorted hash over every row. Reads STATE, never history.
+        fn content_root(db: &std::sync::Arc<storage::StateDB>) -> String {
+            use sha2::Digest;
+            let mut rows = db.scan_prefix("");
+            rows.sort();
+            let mut h = sha2::Sha256::new();
+            for (k, v) in &rows {
+                h.update((k.len() as u64).to_be_bytes());
+                h.update(k.as_bytes());
+                h.update((v.len() as u64).to_be_bytes());
+                h.update(v.as_bytes());
+            }
+            hex::encode(h.finalize())
+        }
+
+        let db_a = temp_db("h6_target_a");
+        load_stdlib(&db_a);
+        db_a.set_federation_key("00000000000000000000000000000000").unwrap();
+        let exec_a = Executor::new(db_a.clone());
+        let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
+        match exec_a.execute_block_parallel_at(vec![], proposer, 1, &[]) {
+            BlockExecOutcome::Executed(_) => {}
+            other => panic!("height 1 must execute: {:?}", other),
+        }
+
+        // PROPERTY 1 — sees an out-of-band write. `sys:state_root` does not.
+        let before = content_root(&db_a);
+        let id = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
+        db_a.put_object(&Object::new(
+            id.to_string(),
+            Owner::Address("beef".to_string()),
+            b"{\"balance\":1000000000}".to_vec(),
+            "0x1::coin::CoinStore".to_string(),
+        ))
+        .unwrap();
+        assert_ne!(
+            content_root(&db_a),
+            before,
+            "a content-derived root must see every state write, including the ones \
+             block execution did not make"
+        );
+
+        // PROPERTY 2 — a corrupted snapshot is detectable, and an honest one verifies.
+        let db_b = temp_db("h6_target_b");
+        let rows = db_a.scan_prefix("");
+        let victim = rows
+            .iter()
+            .find(|(k, _)| k.starts_with("module_"))
+            .map(|(k, _)| k.clone())
+            .expect("a module row to corrupt");
+        for (k, v) in &rows {
+            db_b.put(k, if *k == victim { "TAMPERED" } else { v }).unwrap();
+        }
+        assert_ne!(
+            content_root(&db_b),
+            content_root(&db_a),
+            "a content-derived root must expose a tampered snapshot"
+        );
+
+        // The honest control. Without it, a root that simply returned a random
+        // value would pass both assertions above and prove nothing at all.
+        let db_c = temp_db("h6_target_c");
+        for (k, v) in &rows {
+            db_c.put(k, v).unwrap();
+        }
+        assert_eq!(
+            content_root(&db_c),
+            content_root(&db_a),
+            "CONTROL: an HONEST copy must verify. A root that failed here would \
+             reject every legitimate snapshot — the opposite defect, and just as fatal."
+        );
+    }
 }

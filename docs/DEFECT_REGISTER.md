@@ -521,6 +521,55 @@ B4b now has all four legs: not manifesting on the live cluster (measured, 300 he
 the fix proven necessary (mutation); the race reachable deterministically (this test); and
 the invariant checkable in production (`check-anchor-height-map.sh`).
 
+**H6 IS NOW EXPRESSED — and the fix has a PROVEN target.** `core/executor/src/lib.rs`:
+
+    cargo test -p executor --lib test_h6_ -- --ignored --nocapture
+
+Confirmed absent at HEAD: no IAVL, no Merkle-Patricia, no state trie of any kind in the
+workspace; `Accumulator` appends BLOCK HASHES, not state. `sys:state_root` is
+`H(prev_root || H(sorted effective writes))` — a hash CHAIN over write-sets, committing
+to execution HISTORY rather than to state contents.
+
+**Two tests, not two legs of one.** A single test short-circuits at the first failure, so
+the second property would never actually run — an assertion that never runs is precisely
+the failure this project has shipped before.
+
+| Test | Statement | Status |
+|---|---|---|
+| `test_h6_state_root_is_blind_to_out_of_band_writes` | an object written into state moves no root | RED by design |
+| `test_h6_a_corrupted_state_snapshot_is_undetectable` | a tampered snapshot is bit-identical to an honest one | RED by design |
+| `test_h6_a_content_derived_root_would_satisfy_both_properties` | **the target**, demonstrated | GREEN |
+
+The first is not hypothetical: the faucet RPC writes objects straight into RocksDB and no
+header disagrees. The second is its consequence — the root travels WITH a snapshot as a
+stored value rather than being computed FROM it, so **state sync cannot be made safe by
+any care at the receiving end.** Unverifiable in PRINCIPLE, not merely unimplemented.
+
+**Two wrong-reason failures were caught by preconditions before any of this could be
+claimed**, and both are worth recording because either would have produced a confident
+false result:
+1. `scan_prefix("obj:")` returns nothing — Move state does not live under `obj:`, so the
+   first draft of the second test "passed its setup" while comparing empty sets.
+2. **Empty blocks fold nothing, so the state root does not advance** (the code asserts
+   this itself). A draft that compared two roots after three empty blocks was comparing
+   two DEFAULT roots and asserting nothing.
+Neither surfaced as a wrong answer; both surfaced as a precondition firing. That is what
+preconditions are for.
+
+**THE TARGET, demonstrated rather than asserted.** The third test defines what "fixed"
+means so a partial fix cannot be mistaken for a whole one: **the root must be a pure
+function of the state map.** A toy sorted hash over every row already satisfies both
+properties that `H(prev_root || write-set)` fails — and its honest-copy CONTROL passes,
+without which a root returning a random value would satisfy both assertions and prove
+nothing. Both mutations run: hashing keys but not values leaves corruption undetected;
+ignoring state entirely stops seeing writes.
+
+NOT a production proposal — hashing whole state per block is O(state) and ruinous at
+scale, which is exactly why real systems use an incremental authenticated structure that
+recomputes only the path to each changed key. **The point is narrower and worth pinning:
+the property is satisfiable, and satisfiable by anything that reads state instead of
+history. The open question is which structure, not whether.**
+
 **Rejected outright:** exhaustive model checking (FACT 2; and `held: BTreeSet` collapses
 every delivery permutation into one fingerprint, making the root defect H2 *unrepresentable*);
 the record/replay recorder (it misses ChainSync's client path, `sync/src/lib.rs:722`, the
