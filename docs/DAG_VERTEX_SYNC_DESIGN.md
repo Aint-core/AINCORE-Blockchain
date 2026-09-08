@@ -1,6 +1,8 @@
 # DAG Vertex Synchronization — Design
 
-**Status:** DRAFT v3 — v2 attacked by six critics: 34 claimed, 66/68 verified, **21 confirmed** (10 CRITICAL, 8 HIGH, 3 MEDIUM). All folded in. v3 is split into two independently-critiqued parts (§0). NOT approved for implementation.
+**Status:** DRAFT v3 — **REFUTED ON ITS CENTRAL STAGING CLAIM. DO NOT IMPLEMENT.**
+The v3 critique confirmed 5 holes (3 CRITICAL) and left **43 unverified — treated as OPEN** —
+when the run exhausted usage credits (89 of 110 agents failed). See §0.1.
 **Branch / HEAD:** `audit/mainnet-hardening` @ `3208d29`
 **Closes:** B3/B4 (audit-119 CRITICAL, open at HEAD, `dag.rs:1090-1115`)
 **Inputs:** `docs/research/{A,B,C,D}-*.json`; I1–I16; v1 critique (9 holes); v2 critique (21 holes, task `wczn6qne3`).
@@ -8,6 +10,44 @@
 Every AINCORE claim cites `file:line` at HEAD `3208d29`.
 
 ---
+
+## 0.1 v3 critique result — READ FIRST
+
+50 holes claimed by 8 critics. Only 13 of 100 verifier calls completed before credits ran
+out, so: **5 confirmed, 43 UNVERIFIED (open, not refuted)** — 4 CRITICAL and 5 HIGH of the
+unverified are against Part I, 14 CRITICAL against Part II.
+
+**The confirmed CRITICAL that changes the plan (c9, Part I):** *a real body delivered to
+one honest node is the same wedge as a fake hash.* Byzantine M builds a perfectly valid
+`X_k` — real edges, correct signature, nothing slashable — and delivers it over direct TCP
+to node A only. A resolves it and cites it in `A_{k+1}`. B and C admit `A_{k+1}` but
+`resolve_walk` returns `Unresolved{X_k}`, and **no trigger in Part I can ever flip it**:
+`X_k` is never admitted on B/C (nobody re-sends it — A is above quorum so it never enters
+the re-gossip branch at `dag.rs:881-926`, and M will not), and it never enters
+`committed_set`. A's output is excluded from every honest cone permanently; two such
+exclusions halt n=4.
+
+**Therefore Part I is NOT shippable alone.** Citation discipline without a way to *obtain*
+what you cannot resolve is a slower form of the same exclusion it was meant to prevent.
+This is invariant I2 ("no mechanism may require a node to already hold data in order to
+obtain it") applied to the design itself. The critic's words: *there is no Stage 1 without
+I2.* Any v4 must either ship the minimal pull (WANTED Tier A/B core, no shadow, no
+equivocation) **inside** Stage 1, or drop the claim that Stage 1 stands alone.
+
+Other confirmed holes:
+
+| # | Part | Sev | Substance |
+|---|---|---|---|
+| 1 | I | CRITICAL c8 | `validator_set_at` is written at *block execution*, i.e. at a node-local time. A departing author's round-(a+1) vote is valid on nodes that have not yet executed anchor a and invalid on those that have; the edge verdict is *Invalid* with no `blocked_on`, so no trigger can ever flip it. ~87 % chance of halting n=4 at a slash anchor. Same class as v2 #5/#6/#9, which v3 claimed to have closed. |
+| 3 | I | HIGH c7 | R4 (proposer) uses the **current** set; R4′ (commit) uses `validator_set_at(round−1)`. Different thresholds across a set change ⇒ an honestly-built leader vertex defers forever. |
+| 4 | I | HIGH c7 | `committed_set` is not identical across nodes: `vertices_root` is only checked when non-empty (`sync/src/lib.rs:290-297`), so a leader-signed block with an empty root carries an **unverified** `committed_vertices` list that `adopt_synced_anchor` adopts verbatim. |
+| 5 | I | CRITICAL c8 | R4′ "defers, never skips" on a **fully resolvable** sub-quorum leader vertex: one signed vertex with one valid parent pins every node's cursor forever. HEAD commits it fine — R4′ makes this worse than HEAD. |
+
+**Process note.** Claimed-hole counts across drafts (37 → 34 → 50) are not a quality
+signal; confirmation counts and *shape* are. v1's 9 were "no quorum". v2's 21 collapsed to
+one root cause (arrival-order anchor selection). v3's confirmed 5 collapse to two: *state
+that changes at a node-local time is not admissible in a validity rule*, and *a citing rule
+without a pull is a wedge*. The 43 unverified must be run before any v4 is trusted.
 
 ## 0. Structure of v3 and what v2 got wrong
 
