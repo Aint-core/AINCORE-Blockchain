@@ -1805,6 +1805,179 @@ mod tests {
         (validators, out, h2_leader, byz)
     }
 
+    /// P-LIVE: the anchor cursor advanced. Trivial to state, and the single most
+    /// important predicate in this module.
+    ///
+    /// Every safety property here — agreement, validity, no-fork — is satisfied
+    /// VACUOUSLY by a node that decides nothing. So "defer whenever unsure" passes
+    /// the entire safety set while wedging the chain, and B3/B4 *is* a wedge. A
+    /// harness without P-LIVE would sign off on a fix that halts mainnet.
+    fn p_live(cursor_before: u64, cursor_after: u64) -> bool {
+        cursor_after > cursor_before
+    }
+
+    /// A 64-hex hash that is not, and never was, any vertex. `add_vertex` would
+    /// accept a vertex citing it: parents are checked for count (dag.rs:1046-1052)
+    /// and uniqueness (:1054-1060) and nothing else — not existence, not
+    /// resolvability, not quorum.
+    const FABRICATED_PARENT: &str =
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+    /// Full mesh over 5 rounds; when `poison` is set, the round-2 LEADER's vertex
+    /// carries one extra parent that never existed.
+    #[allow(clippy::type_complexity)]
+    fn b3b4_scenario(
+        poison: bool,
+    ) -> (
+        Vec<(String, u64)>,
+        std::collections::HashMap<String, blockchain::Vertex>,
+        std::collections::HashMap<u64, Vec<String>>,
+        String,
+    ) {
+        let validators = mk_validators(4);
+        let l2 = super::OrderingEngine::leader_for_round(2, &validators, 0);
+        let mut dag = std::collections::HashMap::new();
+        let mut idx: std::collections::HashMap<u64, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut prev: Vec<String> = vec!["genesis".to_string()];
+        let mut h2_leader = String::new();
+
+        for r in 1..=5u64 {
+            let mut this = Vec::new();
+            for (a, _) in &validators {
+                let mut parents = prev.clone();
+                if poison && r == 2 && a == &l2 {
+                    parents.push(FABRICATED_PARENT.to_string());
+                }
+                let (h, v) = mk_vertex(r, a, parents);
+                if r == 2 && a == &l2 {
+                    h2_leader = h.clone();
+                }
+                this.push(h.clone());
+                idx.entry(r).or_default().push(h.clone());
+                dag.insert(h, v);
+            }
+            prev = this;
+        }
+        (validators, dag, idx, h2_leader)
+    }
+
+    /// AUDIT B3/B4 (open by design — see the standing comment in dag.rs). One
+    /// validly-signed vertex citing a parent that NEVER EXISTED wedges the anchor
+    /// cursor permanently, and no in-protocol path recovers it.
+    ///
+    /// This is a CHARACTERISATION test: it is GREEN at HEAD because it pins the
+    /// current behaviour. Green here does NOT mean "healthy" — read leg 2. When a
+    /// real fix lands, leg 2 must be inverted, and the fix is only acceptable if
+    /// leg 1 stays green.
+    ///
+    /// Why B3/B4 was left open: two code attempts and three designs to close it
+    /// were refuted, every time because the "fix" made ordinary packet loss halt
+    /// the chain — strictly worse than a defect that needs a Byzantine key. The
+    /// value of this test is that it makes both failure directions detectable.
+    ///
+    /// MUTATION GATES — both RUN and OBSERVED. B3/B4 can be "fixed" wrongly in two
+    /// opposite directions and this test must catch each:
+    ///   M1  FAIL-CLOSED — `walk_history` always returns None ("defer whenever
+    ///       unsure"). Every safety property still passes. **Leg 1 must fail
+    ///       P-LIVE.** This is the halt-as-fix trap.
+    ///   M2  FAIL-OPEN — `walk_history` treats a hole as settled. This is exactly
+    ///       the guessing that forked the chain live (see try_commit's doc).
+    ///       **Leg 2 must fail.**
+    ///
+    /// Observed detail worth keeping: under M2 leg 2 fails at mechanism assertion
+    /// (c), which short-circuits BEFORE the freeze loop — so (c) alone would leave
+    /// the freeze loop unproven, the same "passes against its own mutation" trap
+    /// one level down. Verified separately: with (c) removed, M2 fails in the
+    /// freeze loop at tick 0 ("committed under a fabricated parent"). Both layers
+    /// discriminate independently. Re-verify this if either is edited.
+    #[test]
+    fn test_b3b4_fabricated_parent_wedges_the_cursor_and_p_live_catches_it() {
+        // ---- LEG 1: P-LIVE positive control -----------------------------------
+        // Without this, leg 2's "cursor frozen" assertion would also pass on a
+        // harness that simply never commits anything. The control is what gives
+        // the freeze its meaning.
+        let (validators, dag, idx, _) = b3b4_scenario(false);
+        let mut healthy = super::OrderingEngine::new();
+        let before = healthy.next_anchor_round;
+        let commits = drain(&mut healthy, &dag, &idx, &validators);
+        assert!(
+            p_live(before, healthy.next_anchor_round),
+            "P-LIVE: a clean full mesh must decide something — cursor stayed at {}. \
+             If this fires, every safety assertion below is vacuous.",
+            before
+        );
+        assert!(!commits.is_empty());
+
+        // ---- LEG 2: the wedge --------------------------------------------------
+        let (validators, dag, idx, h2_leader) = b3b4_scenario(true);
+        let mut wedged = super::OrderingEngine::new();
+        let total_stake: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
+
+        // Pin the MECHANISM, not just the symptom. Three separate facts, so a
+        // future reader knows the wedge is the hole and nothing else:
+        //   (a) the round-2 leader vertex is present and IS the elected leader's
+        assert_eq!(
+            super::OrderingEngine::leader_vertex_hash(2, &dag, &idx, &validators).as_deref(),
+            Some(h2_leader.as_str())
+        );
+        //   (b) it is DIRECTLY committable — quorum is not the blocker
+        assert!(
+            super::OrderingEngine::direct_quorum_met(
+                2, &h2_leader, &dag, &idx, &validators, total_stake
+            ),
+            "the anchor must be directly committable, or the freeze proves nothing"
+        );
+        //   (c) its causal history has a HOLE — this is the actual blocker
+        assert!(
+            super::OrderingEngine::walk_history(
+                &h2_leader,
+                0,
+                2,
+                &dag,
+                &wedged.committed_set
+            )
+            .is_none(),
+            "walk_history must report a hole on the fabricated parent"
+        );
+
+        // Now the symptom: the cursor never moves, no matter how many times the
+        // node retries. On a live node this is every consensus tick, forever.
+        let frozen_at = wedged.next_anchor_round;
+        for tick in 0..32 {
+            let out = wedged.try_commit(0, &dag, &idx, &validators);
+            assert!(
+                out.is_empty(),
+                "tick {}: committed under a fabricated parent — that is fail-OPEN \
+                 guessing, the behaviour that forked the chain live",
+                tick
+            );
+            assert_eq!(
+                wedged.next_anchor_round, frozen_at,
+                "tick {}: cursor moved while the hole is unresolved",
+                tick
+            );
+        }
+        assert!(
+            !p_live(frozen_at, wedged.next_anchor_round),
+            "B3/B4 is OPEN at HEAD: this assertion failing means it was fixed — \
+             invert leg 2 and confirm leg 1 is still green"
+        );
+
+        // ---- LEG 3: the only escape -------------------------------------------
+        // The wedge is not recoverable in-protocol. `adopt_synced_anchor` bypasses
+        // walk_history entirely, so a node only escapes by being TOLD the answer
+        // out of band. That asymmetry is the whole reason B3/B4 is a liveness
+        // defect and not merely a slow path.
+        let seq: Vec<String> = vec![h2_leader.clone()];
+        let adopted = wedged.adopt_synced_anchor(2, &h2_leader, &seq, &validators);
+        assert!(adopted.is_some(), "sync adoption must succeed where consensus cannot");
+        assert!(
+            p_live(frozen_at, wedged.next_anchor_round),
+            "cursor must advance once the anchor is adopted out of band"
+        );
+    }
+
     /// AUDIT H3 (CRITICAL, safety fork). The soundness argument for the
     /// ancestry skip is written in this file's `try_commit` doc: "every vertex
     /// at j+2 references >2/3 of the j+1 vertices, which intersects the >2/3

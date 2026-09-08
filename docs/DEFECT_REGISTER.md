@@ -202,6 +202,38 @@ M2's limit, stated so it is never mistaken for validation: tier 1 does not run `
 so the filter is a SECOND IMPLEMENTATION of the ingress rule. It proves the property is
 ACHIEVABLE. Validating the production fix needs tier 2.
 
+**B3/B4 IS NOW PINNED** — `ordering.rs`,
+`test_b3b4_fabricated_parent_wedges_the_cursor_and_p_live_catches_it`. Unlike the H3
+test this one is **GREEN at HEAD, and green does NOT mean healthy**: it is a
+CHARACTERISATION test that pins current behaviour. When a real fix lands, leg 2 must be
+inverted and the fix is acceptable only if leg 1 stays green.
+
+Three legs: (1) P-LIVE positive control on a clean full mesh — without it, leg 2's
+"cursor frozen" assertion would also pass on a harness that never commits anything;
+(2) the wedge — the round-2 leader cites a 64-hex parent that never existed, and the
+mechanism is pinned in three separate facts (the leader vertex is present AND elected,
+it IS directly committable so quorum is not the blocker, and `walk_history` reports the
+hole) before the symptom is asserted over 32 consecutive ticks; (3) the escape —
+`adopt_synced_anchor` bypasses `walk_history` entirely, so a wedged node only recovers by
+being TOLD the answer out of band. That asymmetry is why B3/B4 is a liveness defect and
+not a slow path.
+
+**B3/B4 can be "fixed" wrongly in two OPPOSITE directions, and both are now caught:**
+
+| Mutation | Direction | Required | Observed |
+|---|---|---|---|
+| M1 `walk_history` always `None` | fail-CLOSED, "defer whenever unsure" | leg 1 fails P-LIVE | fails: "cursor stayed at 1" |
+| M2 hole treated as settled | fail-OPEN, the live-fork behaviour | leg 2 fails | fails |
+
+M1 is the halt-as-fix trap: under it **every safety property still passes**. That is the
+whole reason P-LIVE is asserted before anything else.
+
+Second-order check, because the first-order one was not enough: under M2 leg 2 fails at
+the *mechanism* assertion, which short-circuits before the freeze loop — leaving the
+freeze loop itself unproven, the same trap one level down. Verified separately with that
+assertion removed: M2 then fails inside the freeze loop at tick 0. **Both layers
+discriminate independently.**
+
 **Rejected outright:** exhaustive model checking (FACT 2; and `held: BTreeSet` collapses
 every delivery permutation into one fingerprint, making the root defect H2 *unrepresentable*);
 the record/replay recorder (it misses ChainSync's client path, `sync/src/lib.rs:722`, the
