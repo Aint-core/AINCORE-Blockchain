@@ -1,208 +1,204 @@
 # DAG Vertex Synchronization — Design
 
-**Status:** DRAFT v2 — v1 was attacked by six independent critics; 9 holes confirmed (7 CRITICAL). All folded in below. v2 awaits its own critique. NOT approved for implementation.
+**Status:** DRAFT v3 — v2 attacked by six critics: 34 claimed, 66/68 verified, **21 confirmed** (10 CRITICAL, 8 HIGH, 3 MEDIUM). All folded in. v3 is split into two independently-critiqued parts (§0). NOT approved for implementation.
 **Branch / HEAD:** `audit/mainnet-hardening` @ `3208d29`
-**Closes:** B3/B4 (audit-119 CRITICAL, open at HEAD, documented at `dag.rs:1090-1115`)
-**Inputs:** `docs/research/{A,B,C,D}-*.json`; invariants I1–I16; v1 critique (`scratchpad` task `wf13urqsh`).
+**Closes:** B3/B4 (audit-119 CRITICAL, open at HEAD, `dag.rs:1090-1115`)
+**Inputs:** `docs/research/{A,B,C,D}-*.json`; I1–I16; v1 critique (9 holes); v2 critique (21 holes, task `wczn6qne3`).
 
-Every AINCORE claim cites `file:line` at HEAD `3208d29`. Every reference claim cites its source.
+Every AINCORE claim cites `file:line` at HEAD `3208d29`.
 
 ---
 
-## 0. What v1 got wrong, in one paragraph
+## 0. Structure of v3 and what v2 got wrong
 
-v1 claimed the malicious never-existing-parent case was neutralised by a citing-side rule alone. The critics showed three things. (1) The rule as written was **one hop** — "every parent of V is in dag" — so the attacker's own next vertex, which cites the poison plus honest vertices, laundered it back into every honest cone. (2) Letting a node propose with fewer than 2/3-stake of cited parents broke the **quorum-intersection premise** of the existing ancestry skip (`ordering.rs:513-517`): a node that lacked a leader vertex could prove a *false* skip while its peers committed that round — a block-level fork. (3) The fetch trigger sat in `walk_history`, which only walks *committed* cones — which the rule guaranteed hole-free — so the trigger was unreachable exactly when fetching mattered, and 50 % of honest stake could be silently excluded from the committed order while the cursor kept advancing. Every one of these is a **quorum** mistake: Narwhal's validity rule 3 requires 2f+1 *certified* parents from round r−1; v1 copied the "cite only what you hold" half and dropped the "and hold ≥ 2/3 of them" half.
+v2's 21 holes have a shape. **Five CRITICALs (v2 #2, #3, #4, #8, #10) are one root cause:** the anchor decision for a round whose leader equivocated depended on `round_index` arrival order (`leader_vertex_hash`, `ordering.rs:641-646`, `find_map`), so v2's shadow bodies completed the walk on both sides while each side then selected a different twin — turning HEAD's *wedge* into a *fork*. Two more (v2 #6, #9) are one cause: the ingress membership check reads the *current* validator set (`dag.rs:1082`), so a fetched body from a since-slashed author is rejected forever. One (v2 #5) is admission being a function of *local* state. One (v2 #1) is a floor bug in R1's walk. The rest are bounds and tests.
 
-## 1. Problem statement
+The core citing-side rule (R1 + R4 + R4′) survived with **one** correction. The equivocation sub-design did not survive at all.
 
-A vertex cites its parents by **bare hash** (`consensus/blockchain/src/lib.rs` `Vertex.parents`). Ingress checks only count ≤ 256 and uniqueness (`dag.rs:1046-1061`). `walk_history` returns `None` on any absent, non-genesis, non-committed hash (`ordering.rs:697-702`); `commit_one_anchor` propagates it with `?` before touching state (`ordering.rs:731-737`).
+So v3 is **two parts with separate critiques and separate gates**:
 
-1. **Malicious never-existing parent.** A validator key plus a 64-hex string suffices (C4/C22). Honest proposers cite `round_index[prev]` verbatim (`dag.rs:529-536`); the poison enters every honest cone; no anchor commits again. Not slashable.
-2. **Honest late parent.** Loss is by design: drop-only limiter (`p2p.rs:345-352, 391-398`), 60 s gossipsub dedup (`p2p.rs:119-123`), restarts reload only what was admitted (`dag.rs:211-373`). The only redelivery is a **push** by nodes *below* parent quorum (`dag.rs:621, 881-926`); holders are above quorum and never re-send (C16/C24).
+- **Part I — Stage 1: citation discipline.** `dag.rs` + `ordering.rs`, no messages, no WANTED, no shadow. Closes the malicious wedge and the false-skip fork. Must be critiqued and shippable **alone**.
+- **Part II — Stages 2–4: fetch and equivocation.** Depends on Part I. Its equivocation section (§6) is the part that has failed twice; it is redesigned from the critics' converging fix and must pass its own critique before Stage 4 starts.
 
-**Root cause (Track A):** Narwhal makes (1) impossible by construction — a parent is citable only with a 2f+1 availability certificate, so ≥ f+1 honest holders exist. AINCORE has no certificate. "Late vs never" is therefore undecidable **at ingress**; every ingress buffer/drop policy was adversary-controlled. This design decides it on the **citing** side, with quorum enforced, and treats being-unable-to-cite as the fetch trigger.
+## 1. Problem statement (unchanged)
+
+Parents are cited by bare hash (`blockchain/src/lib.rs` `Vertex.parents`); ingress checks only count/uniqueness (`dag.rs:1046-1061`); `walk_history` returns `None` on any absent, non-genesis, non-committed hash (`ordering.rs:697-702`) and `commit_one_anchor` propagates it with `?` (`:731-737`). A Byzantine key can cite a hash that hashes nothing; honest proposers cite `round_index[prev]` verbatim (`dag.rs:529-536`); the poison enters every cone; no anchor commits again. Honest loss is routine (drop-only limiter `p2p.rs:345-352, 391-398`; 60 s dedup `:119-123`); the only redelivery is a push by nodes *below* quorum (`dag.rs:621, 881-926`). Narwhal avoids all of this with 2f+1 availability certificates (Track A §3.1); AINCORE has none, so "late vs never" is undecidable at ingress. v3 decides it on the citing side with quorum enforced, and makes *being unable to cite* the fetch trigger.
 
 ## 2. Vertex state model
 
-Per node, a hash `H` lives in four stores (C2): `dag`/`round_index` (`dag.rs:51-52`), row `vertex:{H}` (`dag.rs:1177`), `committed_set` (bounded 8192, `ordering.rs:90, 474-486`), `consensus:cseq:{round}`.
-
 | State | Definition | Written by |
 |---|---|---|
-| S0 UNKNOWN | in none | — |
-| S1 IN_DAG | `dag`, `round_index`, `vertex:H` written together | `dag.rs:1174-1187` |
-| S2 SETTLED | `H ∈ committed_set`; body may be absent (sync adoption) | `ordering.rs:739-748`; `ordering.rs:869-888` via `dag.rs:2852-2884` |
-| S3 PRUNED | gone from dag, round_index, `vertex:H` | `dag.rs:2770-2783`; only after a **local** block build, min_round = min(finalized, latest_block_round) − 10 (`dag.rs:1786-1808`) |
-| S4 SHADOW *(replaces v1's S4/S6)* | second vertex of an equivocating pair: **full body** stored under `vertex_shadow:{H}`, never in `round_index`, never leader-eligible | this design, §6 |
-| S5 WANTED *(new)* | cited by something this node holds, absent locally, tracked for fetch | this design, §5 |
+| S0 UNKNOWN | in no store | — |
+| S1 IN_DAG | `dag`, `round_index`, `vertex:H` (`dag.rs:1174-1187`) | ingress |
+| S2 SETTLED | `H ∈ committed_set`; body may be absent (`ordering.rs:739-748`; `:869-888` via `dag.rs:2852-2884`) | commit / sync |
+| S3 PRUNED | gone from all three; min_round = min(finalized, latest_block_round) − 10 (`dag.rs:1786-1808, 2770-2783`) | local block build |
+| S4 SHADOW *(Part II)* | body of the second twin of an equivocating pair; never in `round_index` | §6 |
+| S5 WANTED *(Part II)* | cited by something held, absent, tracked | §5 |
 
-Settled predicate used by commit today: `{dag} ∪ {"genesis"} ∪ committed_set` (C9). §6 extends the *walk* (not the predicate) with S4 shadow bodies.
+Settled predicate used by commit: `{dag} ∪ {"genesis"} ∪ committed_set` (`ordering.rs:697-702`).
 
-## 3. Citation discipline with enforced quorum
+---
 
-### R1 — full-history resolution (fixes holes 5, 7)
+# Part I — Stage 1: citation discipline
 
-`V` is **resolved** on this node iff `walk_history(V, floor = last_committed_anchor_round, dag ∪ shadow, committed_set)` returns `Some` — every path from `V` terminates in `"genesis"`, `committed_set`, or a body this node holds. **Not** one hop. Cached per hash in a bounded `HashMap<hash, Resolved{ at_round }>` (≤ 4096 entries, LRU by receiver round); a resolved vertex stays resolved until pruned; an unresolved one is re-walked only when a WANTED hash it depends on is admitted (§5.6). Cost bound: one walk per vertex per dependency arrival; each walk is bounded by the uncommitted cone, as `commit_one_anchor`'s already is (C10).
+## 3. R1 — full-history resolution (v2 #1, #5, #13 fixed)
 
-`try_create_vertex` cites only **resolved** round-(r−1) vertices.
+**Definition.** `V` is *resolved* on this node iff `resolve_walk(V)` returns `Some`, where `resolve_walk` is `walk_history` with **floor 0** — identical termination set to `commit_one_anchor`'s gate (`ordering.rs:731`: `walk_history(anchor, 0, …)`). Every path from `V` must terminate in `"genesis"` or `committed_set` through bodies this node holds.
 
-### R4 — cited-parent quorum, proposer side (fixes holes 1, 4)
+**Why floor 0 (v2 #1):** `walk_history` does not push the parents of a vertex whose `round <= floor` (`ordering.rs:704`). v2 used `floor = last_committed_anchor_round`, so a poison vertex sitting *at* that round was opaque — its fake parent was never examined — and the attacker's next vertex resolved, was cited, and re-created the original halt one anchor later. With floor 0 the walk descends through every held uncommitted body and stops only at `committed_set`, exactly as the commit walk does; the cost bound is the same as the commit walk's (C10).
 
-`parent_quorum_met` (`dag.rs:566-585`) is computed over the **R1-filtered** `parents` list — the list actually cited — exactly as HEAD computes it over `parents`. If the resolved subset's distinct-author stake is not > 2/3 total, **the node does not propose**; it falls into the existing below-quorum branch (`dag.rs:881`), which is now *also* the fetch trigger (§5.1). This restores the B4b premise verbatim: every honest vertex at j+2 cites > 2/3 of the j+1 vertices (`ordering.rs:513-517`).
+**Edge checks inside the walk (v2 #5).** Admission must be a pure function of the vertex bytes plus state identical on every node. Therefore round-exactness and author-membership are **not** ingress rejections (v2's R2 was evaluated on local state and produced admit-here/reject-there — an unrepairable, non-deterministic hole). They are **edge validity checks inside `resolve_walk`**: an edge `child → parent` is valid iff `parent.round == child.round − 1` (or `parent == "genesis"` and `child.round == 1`) **and** `parent.author ∈ validator_set_at(parent.round)` (§3.2). A vertex with an invalid edge is admitted everywhere and **resolves nowhere** — never cited by any honest node — which is deterministic.
 
-### R4′ — cited-parent quorum, ingress + commit side (fixes holes 4, 6)
+**Cache.** `resolved: HashMap<hash, Verdict{Resolved | Unresolved{blocked_on: BTreeSet<hash>}}>`, ≤ 4096 entries, LRU by receiver round. A `Resolved` entry is authoritative until the vertex is pruned. An `Unresolved` entry is **never** treated as resolved because of its round (v2 #1 corollary). It is re-walked when (a) any hash in `blocked_on` is admitted, **or** (b) any hash in `blocked_on` enters `committed_set` via sync adoption (v2 #13 — both settlement paths share the one release hook), **or** (c) **every tick while R4 is failing**, for the round-(r−1) candidates only (bounded by n walks per tick; needed because Stage 1 has no WANTED to drive (a)/(b)).
 
-Honest behaviour must not be the only guarantee. Two enforcement points:
+### 3.1 R4 — cited-parent quorum, proposer side (v1 #1, #4)
 
-- **Ingress:** for `round > 1`, `parents` must be non-empty, and every *locally-resolvable* parent's author must be in the validator set at exactly round r−1 (R2). Stake cannot be fully checked for absent parents at ingress; the load-bearing check is the next one.
-- **Commit side (`try_commit`):** a vertex is **anchor-eligible** — as the direct anchor in step 1 (`ordering.rs:558-567`) or as a chain link in step 2 (`ordering.rs:583-597`) — only if the distinct-author stake of its **present** parent bodies is > 2/3 total. An anchor with an absent parent **defers** (returns empty), it is never skipped. A parentless or sub-quorum vertex can therefore never anchor and never prove a skip. This is the check Narwhal performs on certificates; here it is performed on bodies.
+`try_create_vertex` cites only resolved round-(r−1) vertices. `parent_quorum_met` (`dag.rs:566-585`) is computed over that **cited** list. If the cited authors' distinct stake is not > 2/3 total, **the node does not propose** and takes the existing below-quorum branch (`dag.rs:881`). This restores the premise of the ancestry skip verbatim: "every vertex at j+2 references > 2/3 of the j+1 vertices" (`ordering.rs:513-517`).
 
-**Consequence for the malicious case, traced through HEAD code:** attacker `V_r` cites fake `P`. Honest nodes: R1 walk of `V_r` hits `P` → unresolved → not cited. Attacker `A_{r+1}` cites `[V_r, honest_r…]`: R1 walk of `A_{r+1}` reaches `V_r` → `P` → unresolved → **not cited** (full walk, hole 5/7 closed). The attacker's chain is an island that no honest vertex ever cites. If the attacker leads an even round, its vertex has < 2/3 present-parent stake among honest citers → not anchor-eligible → step 1 scans past it; step 2's skip is only reached for rounds whose chain links all satisfy R4′, so the skip proof's premise holds. No buffer, no fetch, no ingress rejection for this case.
+### 3.2 Validator set as of a round (v2 #6, #9)
 
-## 4. Ingress rules
+`dag.rs:1082` checks the author against the **current** set (`get_validator_set_with_stake`, `dag.rs:3024-3063`). After a slash or a voluntary leave (`executor/src/lib.rs:2532-2580, 866-912`) the author is gone, and any late or fetched body from it is rejected forever — while honest vertices already cite it. Stage 1 introduces `validator_set_at(round)`: the executor persists the set snapshot keyed by the anchor round at which it took effect (`sys:validator_set_at:{round}`, written where `sys:validator_set:v1` is written today, bounded to the unpruned window). Ingress membership (`:1082`) and the walk's edge check both use `validator_set_at(vertex.round)`. The **current** set is still used for `parent_quorum_met`, `direct_quorum_met`, and leader election — unchanged.
 
-Applied after the existing 12 checks (C4). **Reject** on failure:
+### 3.3 R4′ — commit-side anchor eligibility (v1 #4, #6)
 
-- **R2 (round exactness).** Every locally-resolvable parent `p ≠ "genesis"` has `p.round == vertex.round − 1`; `"genesis"` only at `round == 1`.
-- **R3 (age floor).** `vertex.round − 1 ≥ prune_horizon − 1`, `prune_horizon = min(finalized_round, latest_block_round) − 10` (`dag.rs:1806-1808`).
-- **R4′-ingress.** `round > 1 ⇒ parents non-empty`; resolvable parents' authors ∈ validator set.
+In `try_commit`, a vertex is **anchor-eligible** — as the direct anchor in step 1 (`ordering.rs:558-567`) or as a chain link in step 2 (`:583-597`) — only if the distinct-author stake of its **present** parent bodies is > 2/3 of `validator_set_at(round − 1)`. Otherwise it **defers** (returns empty); it is never skipped by proof. A parentless or sub-quorum vertex can therefore never anchor and never prove a skip.
 
-Unresolvable parents are **not** rejected — undecidable at ingress (§1). They are recorded as WANTED (§5.2) *and* the vertex is admitted.
+**Ingress keeps only what is a pure function of bytes:** `round > 1 ⇒ parents non-empty`; the existing 12 checks (C4). A parentless vertex at `round > 1` is rejected identically everywhere (v2 #16 resolved: the test asserts *skip*, see §10).
+
+### 3.4 Consequence for the malicious case, traced at HEAD
+
+Attacker `V_r` cites fake `P`. Every honest `resolve_walk(V_r)` reaches `P` → `Unresolved{P}`. Attacker `A_{r+1}` cites `[V_r, honest_r…]`: `resolve_walk(A_{r+1})` (floor 0) reaches `V_r` → `P` → `Unresolved`. Not cited. If the attacker leads an even round, its vertex is cited by no honest r+1 vertex → `direct_quorum_met` false → step 1 scans past; it is a chain link in step 2 only if some honest vertex cited it, which none did → never in `visited` → the existing skip (`test_b4b_missing_leader_is_skipped_deterministically`, `ordering.rs:1655`) applies, and its premise now holds because every honest vertex cites > 2/3 (R4). **No buffer, no fetch, no state.**
+
+## 4. Part I bounds, locks, exit
+
+- New state: the `resolved` cache (≤ 4096 × ~200 B) and `sys:validator_set_at:{round}` rows (one per set change, pruned with the DAG horizon). Nothing sender-inflatable.
+- Locks: `resolve_walk` runs where `try_create_vertex` already holds `dag`/`round_index` (`dag.rs:529-536`); the cache is a field on `DagConsensus` mutated under the same guards; no new lock, no re-entry (I16).
+- **Exit criterion:** tests §10 rows 1–7 green; adversarial gate on Part I alone returns no CRITICAL/HIGH; 48 h 4-node burn-in with **byte-identical committed sequences and identical `anchor_hash` per height** on every node — not merely "no stall" (v1's criterion was blind to silent exclusion).
+
+---
+
+# Part II — Stages 2–4: fetch and equivocation
 
 ## 5. Fetching
 
-### 5.1 Trigger — the lacker discovers what it lacks (fixes hole 2)
+### 5.1 Trigger
 
-The trigger is **R1's own walk**, run by `try_create_vertex` on this node's own tick (I14). When the walk of a candidate parent `C` fails at missing hash `H`: `WANTED[H].citers ∪= {C.author}` and `WANTED[H].first_seen = current_round`. This fires precisely on the node that lacks data, whether or not any committed cone ever contains `H`. `walk_history`'s hole in `try_commit` is kept as a **secondary** trigger (it surfaces holes below the cursor after sync adoption). The v1 trigger alone was unreachable.
+The trigger is the proposer's own `resolve_walk` (I14, v1 #2): each `Unresolved{blocked_on}` verdict inserts every hash in `blocked_on` into WANTED with the candidate's author as a witness. **The walk collects every missing hash reachable through present bodies**, not just the first (v2 #21). `walk_history`'s hole in `try_commit` is a secondary trigger (holes below the cursor after sync adoption).
 
-### 5.2 Fetch-worthiness — witnesses of holding (fixes holes 8, 9)
+### 5.2 Fetch-worthiness (v1 #8, #9; v2 #14, #21)
 
-`WANTED[H].citers` are **transitive** witnesses: every author whose vertex's R1 walk reached `H`. Under R1 an honest author holds everything its walk resolved, so each citer is a holder-claim. Two admission tiers:
+`WANTED[H] = { witnesses: BTreeSet<author>, first_seen_tick, attempts, in_flight, blocked: BTreeSet<vertex_hash>, tier }`.
 
-- **Tier A (witnessed):** distinct-citer stake > 1/3 total ⇒ ≥ 1 honest holder guaranteed (Byzantine ≤ 1/3) — fetch at full rate. (Stake-weighted Beluga ImPoA.)
-- **Tier B (author-claimed):** `H` is cited by a vertex whose author is `H.author` at round `H.round + 1` — the author signed a claim to hold its own vertex. Fetch **from that author only**, bounded to **one WANTED slot per (author, round)** so a Byzantine author citing fake "own" hashes occupies one slot per round and induces requests only to itself. This covers the self-vertex-lost-at-every-receiver case (hole 9).
-- Below both tiers: **probe** at the floor rate (one request per 16 ticks, to citers only), never hard-refuse — a low-citation hash can still be real (hole 8). A fake hash from one key sits in one Tier-B slot and costs one request per 16 ticks to the attacker itself.
+- **Tier A — witnessed:** distinct-witness stake > 1/3 total ⇒ ≥ 1 honest holder. Full rate.
+- **Tier B — author-claimed (observable form):** for each unresolvable parent of a vertex authored by `X` at round `r`, request it **from X only**, ≤ `MAX_PARENTS` hashes per `(X, r)`, one frame per 16 ticks per `(X, r)`. Defined on what the node can observe (the citer's author and round), not on the absent body's fields.
+- **Probe:** everything else, citers only, one request per 16 ticks.
 
-### 5.3 Messages — direct TCP only (unchanged from v1)
+**Quotas and eviction (v2 #11, #14, #17):** Tier A has its own budget of 256. Tier B + probe share a budget of 256 **with a per-witness-author quota of 4** (LRU within the author). Every entry carries a receiver-tick TTL of 64 ticks regardless of tier. WANTED is **never** populated at ingress for vertices with `round > current_round + 2`, and the boot walk skips them too (far-future admitted vertices are the I11 bound, tracked separately).
 
-Gossipsub cannot unicast (B10); `send_message` never reads a reply (B9). Model on `DA_SHARD` (`da/src/lib.rs:707-757`) and `SYNC_REQ` (`sync/src/lib.rs:625-699`, `network/src/lib.rs:375-377`).
+### 5.3 Messages — direct TCP only (unchanged)
 
-```
-VERTEX_REQ:{ "hashes": [String; ≤ 32], "requester_id": String }
-VERTEX_RESP:{ "vertices": [Vertex], "unknown": [String] }
-```
+`VERTEX_REQ:{hashes ≤ 32, requester_id}` / `VERTEX_RESP:{vertices, unknown}`, modelled on `DA_SHARD` (`da/src/lib.rs:707-757`). Server in `chain_sync`: `vertex:{H}` **or** `vertex_shadow:{H}`, no consensus lock, reply ≤ 1 MiB (`network/src/lib.rs:239`). Client: own task with `Arc<RwLock<DagConsensus>>`, `secure_connect(…, Some(peer_id), …)`, never via `tx_in` (B13). Each body enters through `handle_message` — the single gate — with membership evaluated by `validator_set_at(vertex.round)` (§3.2) so a body from a since-removed author is admissible (v2 #6, #9).
 
-Server in `chain_sync` (B24): per hash one `storage.get("vertex:{H}")` **or** `vertex_shadow:{H}` (§6), no consensus lock; trims reply to ≤ 1 MiB (`network/src/lib.rs:239`); echoes unknowns. Wired at `main.rs:788-798`. Client: own tokio task with `Arc<RwLock<DagConsensus>>`; `secure_connect(peer_ip, port, "__vsync__", 0, Some(peer_id), …)`; one frame out, one in; never via `tx_in` (B13). Each vertex is delivered as `DAG_VERTEX:{json}` to `handle_message` under a fresh write lock — the single gate (C25). Response bytes ≠ original broadcast, so no dedup suppression (C17).
+### 5.4 Request policy (v2 #12)
 
-### 5.4 Request policy
+- Whom: witnesses first (random order per attempt), then validators with `peer_ip`; Tier B: the author only.
+- **Per-request deadline: 2 receiver ticks**, independent of the transport's 120 s timeouts; abort on expiry.
+- In flight: ≤ 2 per hash; **≤ 2 per peer**; **separate pools** — Tier A ≤ 12, Tier B + probe ≤ 4 — so honest-guaranteed fetches never wait behind attacker-routed ones.
+- Exclude for that hash, until TTL, any peer that timed out, answered `unknown`, or returned an invalid body.
+- Backoff `min(2ᵏ, 16)` receiver ticks. Exit on admission, settlement, no dependents, or `round < prune_horizon`.
 
-- **Whom:** `WANTED[H].citers` first (holders by R1), then validators with a persisted `peer_ip` (`sync/src/lib.rs:625-632`). Tier B: the author only.
-- **Fan-out:** ≤ 2 in flight per hash; cancel on first valid (Narwhal §4.1). Global ≤ 16.
-- **Batching:** ≤ 32 hashes/frame (the 100 msg/s connection cutoff, B7).
-- **Backoff:** attempt k waits `min(2ᵏ, 16)` **receiver ticks** (I3).
-- **Exit from WANTED:** `H` admitted (S1/S4), or settled (S2), or no vertex in `dag` still depends on it, or `H.round < prune_horizon` (R3).
+### 5.5 Release (I7, I8)
 
-### 5.5 Bounds
+On admission **or** sync settlement of `H`: remove `WANTED[H]`, invalidate `resolved` entries listed in `blocked`, re-walk those on the next tick. O(dependents); never a drain.
 
-| Quantity | Bound | Sender cannot inflate because |
-|---|---|---|
-| WANTED entries | ≤ 256 Tier A/probe + ≤ 1 Tier B per (author, round) within the last 16 rounds | Tier A needs > 1/3 stake; Tier B is keyed per validator key per round |
-| citers per entry | ≤ n (bounded `BTreeSet<author>`) | authors ∈ validator set |
-| resolved-cache | ≤ 4096 entries, LRU by receiver round | receiver-owned |
-| in flight | ≤ 2 per hash, ≤ 16 total | fixed |
-| frames | req < 4 KiB; resp ≤ 1 MiB | fixed |
-| admitted bytes | each vertex re-enters the 768 KiB gate (`dag.rs:32`) | existing |
-| server work | ≤ 32 point reads, no lock | fixed |
+## 6. Equivocation — redesigned from the converging fix (v2 #2, #3, #4, #7, #8, #10, #15, #18, #19)
 
-Full WANTED ⇒ new holes logged and dropped; the node stays below parent quorum (R4) and keeps proposing nothing — a liveness degradation only under > 256 simultaneous holes, never a wedge and never a fork.
+**Principle.** A round whose leader is a known equivocator is **never decided by ancestry and never depends on which twin arrived first.** It is decided by **direct votes keyed on `(author, round)`**, which is a pure function of held bodies.
 
-### 5.6 Release on arrival
+**Rule E1 — twin-aware leader lookup.** `leader_vertex_hash(r)` returns **all** vertices by `leader(r)` at round `r` in `dag ∪ shadow` (a set, ordered by hash for determinism), not the first in `round_index`.
 
-When `H` is admitted (any path), remove `WANTED[H]` and invalidate the resolved-cache entries of vertices that recorded `H` as their blocking hash (stored on the WANTED entry: `blocked: BTreeSet<vertex_hash>`, bounded by the cache). Their next R1 evaluation re-walks them. This is O(dependents of H), never a drain of anything (I7). Sync adoption (`reload_chain_tip`) removes every hash now in `committed_set` from WANTED by lookup (I8).
+**Rule E2 — decision for a leader round.** Let `T` be the twins from E1 and `votes(t)` the distinct-author stake of held round-(r+1) bodies citing `t`.
+- Commit `r` at twin `t` iff `votes(t) > 2/3` (step 1, as today, but per twin — at most one twin can pass, by quorum intersection).
+- If the walked round-(r+1) set held ≥ 2/3 stake and `Σ_t votes(t) ≤ 1/3`: **skip** `r` (quorum intersection proves no direct quorum for any twin ever existed).
+- Otherwise **defer** and WANTED the missing round-(r+1) votes.
+- Step 2 never decides a twinned round by `visited` membership. For an untwinned leader, step 2 is unchanged.
 
-## 6. Equivocation — shadow bodies, no forked walk (fixes hole 3)
+This is consistent with a node that already committed `r` directly at `t` before any proof existed: it had `votes(t) > 2/3`, so no node can ever see `> 2/3` for another twin, and every node that later learns of the twin still reaches "commit at `t`" via E2. **No exclusion rule** is needed for anchor determinism (v2 #7, #18: the exclusion keyed on node-local `sys:equiv_seen` is dropped; the sequence orders whatever the cone contains, and the slash still lands via block-carried evidence, `dag.rs:2046`, `executor:2266-2339`).
 
-v1 made an equivocation *proof* a settled state; `to_compact_proof` strips `parents` (`blockchain/src/lib.rs:454-459`), so nodes holding twin A could not walk below B and vice-versa — the two sides committed different subtrees. v2:
+**Shadow storage (v2 #15, #19).** On equivocation detection, at most **one** shadow per `(author, round)` — the first counterpart — stored as compact form **plus parents** (the walk needs parents, not payload); any further same-round body from that author is dropped without writing (the existing `sys:equiv_seen` latch, `dag.rs:2287-2290`). The write happens after the ingress guards drop. Shadow rows are indexed by round and pruned by `prune_dag` under the same `min_round`. Ingress dedups by hash over `dag ∪ shadow` before the equivocation branch. Shadow rows are loaded at boot. The equivocation check runs **before** the membership check for hashes in WANTED (v2 #9).
 
-- On detection (`dag.rs:1143-1168`): keep slash + gossiped compact proof **unchanged**; additionally persist the **full body** of the rejected twin under `vertex_shadow:{hash}`. Shadow rows are never inserted into `round_index`, so `leader_vertex_hash` (`ordering.rs:641-643`, `find_map` in arrival order) is unaffected — admit-both is still rejected.
-- `walk_history` and `find_causal_history` read `dag ∪ shadow`. A citation of either twin resolves on every node once both bodies are present (the fetch, §5, is what brings the second one).
-- **Deterministic exclusion rule:** every vertex authored by an offender at round ≥ its equivocation round is excluded from the committed *sequence* on every node (its citers still resolve through it for walking purposes). Determinism follows because the exclusion keys on `(offender, round)`, which the gossiped proof fixes identically everywhere; before a node has the proof, its anchor **defers** (R4′ commit-side: the twin's body is absent → not anchor-eligible), it does not skip.
+**`resolve_walk` reads `dag ∪ shadow`** so a citation of either twin resolves once both are held; the fetch (§5) is what brings the second one.
 
-## 7. Interaction table
+## 7. Interaction table (Part II)
 
-| Situation | v2 behaviour | Invariant |
-|---|---|---|
-| Asymmetric equivocation (A→N1,N2; B→N3,N4) | N1's R1 walk of N3's vertex hits B → WANTED[B] Tier A (citers N3,N4 = 1/2 > 1/3). Fetch from N3. `add_vertex(B)` → equivocation branch → slash, proof, **shadow body**. Walk resolves through shadow; offender subtree excluded deterministically. | I9 |
-| `prune_dag` deletes `vertex:H` | server answers unknown; R3 keeps honest citations above horizon; entry exits WANTED when below horizon | I3 |
-| `committed_set` window eviction | body still in `dag` ⇒ resolvable; both evicted and pruned ⇒ below horizon ⇒ R3 | I3 |
-| Sync adoption settles hashes w/o bodies | preserved; WANTED swept by lookup; no replay | I7, I8, I16 |
-| Boot recovery loops | after load: R1-walk every loaded vertex; misses → WANTED with the loaded citers as witnesses | I10 |
-| Re-gossip else-branch | unchanged; now entered *by design* whenever R4 fails, and it coincides with fetching | I12 |
-| Gossip rate limiter | drop-only, untouched; VERTEX_* never traverse gossipsub | I12, I13 |
-| Observer node | serves `VERTEX_REQ` (deepest unpruned history, C27); no fetch client | — |
-| Validator restart after long gap | R1 blocks citing what it lacks; R4 stops it proposing; WANTED fills from the boot walk and from R1 misses; fetch + sync adoption bring it back; it never proposes a sub-quorum vertex | I10 |
-| Attacker withholds its own valid vertex from a subset | the subset's R1 walks fail at it → Tier A (honest citers > 1/3) or Tier B (author cited it) → fetched from citers/author. Under R4 the subset does not propose narrow vertices meanwhile, so no false skip | I2 |
-| Attacker floods `VERTEX_REQ` | ≤ 32 point reads/request, no lock, existing connection caps (B7) | I15 partial |
-| Forged `VERTEX_RESP` | full ingress gate (`dag.rs:999-1088`); rejected; next peer | I6 |
+| Situation | v3 |
+|---|---|
+| Asymmetric equivocation, offender **not** leader | witnesses of the missing twin > 1/3 ⇒ Tier A fetch ⇒ shadow; walks resolve; sequence identical (cone-determined). |
+| Asymmetric equivocation, offender **is** leader (v2 #2/#3/#4/#8/#10) | E2: each node commits `r` at the twin with `> 2/3` votes, or skips if ≤ 1/3 total, or defers and fetches votes. Arrival order irrelevant. Node that committed directly is consistent by intersection. |
+| Fetched body from slashed/left author (v2 #6/#9) | admitted via `validator_set_at(vertex.round)`. |
+| `prune_dag`, `committed_set` window, sync adoption, boot loops, re-gossip, limiter, observer, restart, forged `VERTEX_RESP`, `VERTEX_REQ` flood | as v2, with the §5 quotas/TTLs/deadlines. |
 
-## 8. Lock discipline (unchanged from v1)
+## 8. Lock discipline
 
-No new lock; no new nesting. R1 walks run in `try_create_vertex` under the locks it already takes (`dag.rs:529-536` region), producing a WANTED delta applied after the guards drop. The fetcher takes `consensus.write()` per received vertex, holds nothing across `.await`. Server: storage only. `reload_chain_tip` sweep: lookup only, no re-entry (I16).
+No new lock; no new nesting. `resolve_walk` and cache mutation under the guards `try_create_vertex` already holds. E1/E2 are pure functions inside `try_commit` over `dag ∪ shadow` (shadow read under the `dag` guard). Fetcher: `consensus.write()` per body, nothing held across `.await`. Server: storage only. Sync sweep: lookup + invalidate, no re-entry.
 
 ## 9. Invariant checklist
 
-| Inv | Satisfied by |
-|---|---|
-| I1 | R1 full walk + R4/R4′ quorum enforcement + existing deterministic skip whose premise now holds |
-| I2 | trigger is the lacker's own R1 walk (§5.1); pull from citers/author (§5.4) |
-| I3 | backoff/eviction on receiver ticks and prune horizon only |
-| I4 | no bodies held; WANTED + cache < 2 MiB at n = 64 |
-| I5 | WANTED and cache keyed by hash; dedup at `dag.rs:1082` |
-| I6 | single ingress gate for fetched vertices |
-| I7 | release is O(dependents) by index; no drain |
-| I8 | sync sweep by lookup |
-| I9 | shadow bodies + deterministic offender exclusion (§6) |
-| I10 | boot walk + R1/R4 + sync adoption |
-| I11 | **not addressed** (separate bound) |
-| I12 | no ban path |
-| I13 | all maps bounded |
-| I14 | fetch scheduling on the fetcher's own tick; trigger on the proposer's own tick |
-| I15 | server cost bounded; TCP slot reservation is Stage 5 |
-| I16 | §8 |
+| Inv | Part I | Part II |
+|---|---|---|
+| I1 | R1 floor 0 + R4 + R4′ + existing skip | — |
+| I2 | — | proposer-walk trigger; pull from witnesses |
+| I3 | cache LRU by receiver round | TTL 64 receiver ticks; per-author quota |
+| I4 | cache < 1 MiB | WANTED < 2 MiB; shadow ≤ 1 per (author, round), compact + parents |
+| I5 | cache by hash | WANTED by hash; shadow dedup by hash |
+| I6 | — | single gate; `validator_set_at` |
+| I7 | re-walk O(dependents) | release O(dependents) |
+| I8 | tick re-walk + sync hook | sync hook shares release |
+| I9 | — | E1/E2 direct-vote decision; no local-row keying |
+| I10 | tick re-walk while R4 fails | boot walk (bounded ≤ current+2) + fetch |
+| I11 | **not addressed** | **not addressed** (far-future byte bound, separate) |
+| I12–I14 | no ban; bounded maps; own-tick scheduling | same |
+| I15 | — | server cost bounded; TCP slots = Stage 5 |
+| I16 | §8 | §8 |
 
-## 10. Test plan — each test names the mutation that must fail it
+## 10. Test plan — each row names the mutation that must fail it (v2 #16, #20, #21 fixed)
 
 | Test | Asserts | Mutation |
 |---|---|---|
-| `poison_parent_never_enters_honest_cone` | attacker cites fake P; attacker's r+1 child cites [V, honest]; honest nodes commit r+2, r+4; WANTED never holds P in Tier A | make R1 one-hop |
-| `sub_quorum_cited_parents_do_not_propose` | node lacking the r leader vertex, leading r+2, **defers** (no anchor ≥ r) and enters the below-quorum branch | compute parent_quorum_met over present instead of cited |
-| `parentless_leader_cannot_anchor` | leader emits parents=[]; no node ever commits or skips via it; all defer identically | remove commit-side R4′ |
-| `lacker_triggers_fetch_without_committed_hole` | X dropped at N3,N4 only; both record WANTED[X] Tier A within 1 tick and admit X within ≤ 8 ticks; committed sequences identical on all four | move the trigger back to walk_history only |
-| `self_vertex_lost_everywhere_is_fetched_from_author` | X dropped at every receiver; Tier B fires; X admitted on all nodes; author's leader slots not skipped | remove Tier B |
-| `asymmetric_equivocation_converges` | A→{N1,N2}, B→{N3,N4}; all four hold both bodies (shadow + live), identical committed sequence, offender excluded | drop shadow storage (compact-proof-only) |
+| `poison_at_floor_round_is_not_laundered` | poison at round == last committed anchor; attacker link at +1; honest nodes do **not** cite the link; anchors r+2, r+4 commit | reintroduce `floor = last_committed` |
+| `one_hop_launder_rejected` | attacker's r+1 child citing [poison, honest] never cited | make R1 one-hop |
+| `sub_quorum_cited_parents_do_not_propose` | node lacking the r leader vertex, leading r+2, enters below-quorum branch; no anchor ≥ r on it; peers and it converge after redelivery | quorum over present instead of cited |
+| `parentless_vertex_rejected_and_round_skipped` | parents=[] at round>1 rejected on all nodes; round skipped identically; chain continues | remove the non-empty check |
+| `one_parent_leader_not_eligible` | leader with 1 present parent on all nodes → not anchor-eligible → skipped identically within 2 anchors | treat sub-quorum-present as eligible |
+| `bad_edge_admitted_everywhere_resolves_nowhere` | vertex citing a round-(r−5) parent: admitted on every node, cited by none, identical sequences | move round-exactness back to ingress |
 | `three_test_b4b_fingerprints_unchanged` | `ordering.rs:1655-1808` green | — |
-| `sync_adoption_sweeps_wanted_without_replay` | `add_vertex` invocations during adoption == 0 | reintroduce drain |
-| `restart_after_60_rounds_rejoins` | proposes a > 2/3-cited vertex within 32 ticks | remove boot walk |
-| `wanted_bounds_hold_under_attacker` | 1 Byzantine key emits 10 000 fake-parent vertices; WANTED ≤ 256 + 16 Tier B; requests to honest peers == 0 | remove per-(author,round) cap |
-| live | 4 validators, 5 % extra loss all links, 6 h: 0 fork, identical sequences, cursor lag ≤ 4 rounds | — |
+| `slashed_author_body_still_admissible_at_its_round` | after slash at height h, a fetched body from the offender at round < slash round is admitted | check current set |
+| `lacker_triggers_fetch_without_committed_hole` | X dropped at N3,N4; WANTED[X] Tier A within 1 tick; admitted ≤ 8 ticks; identical sequences | trigger only in walk_history |
+| `self_vertex_lost_everywhere_fetched_from_author` | X_r lost at all receivers; X_{r+1} cites it; Tier B requests **X only**; X_r admitted everywhere; X's leader slots not skipped | remove Tier B |
+| `leader_equivocation_A3_B1` / `_A2_B2` | offender leads r; twins split 3:1 and 2:2; **identical `anchor_hash` for r on all nodes** (commit at the > 2/3 twin, or skip) | decide r by `visited` |
+| `phantom_proof_does_not_change_anchors` | attacker sends `EQUIV_PROOF` for a never-gossiped twin to one node; sequences unchanged | key any decision on `sys:equiv_seen` |
+| `wanted_quotas_hold` | 1 key emits 300 fake-parent vertices; WANTED ≤ 4 entries for that author; honest holes still admitted | remove per-author quota |
+| `request_deadline_and_pools` | attacker peers stall; Tier A fetches complete within 4 ticks | single pool / no deadline |
+| `sync_settlement_rewalks_blocked` | ChainSync disabled except adoption; blocked candidates re-resolve after adoption with 0 `add_vertex` calls | drop the sync hook |
+| `restart_rejoin_without_chainsync` | ChainSync fully disabled; gap > uncommitted cone; node rejoins via tick re-walk + fetch | remove tick re-walk |
+| live | 4 validators, 5 % loss all links, 6 h: identical sequences and `anchor_hash` per height, cursor lag ≤ 4 | — |
 
 ## 11. Staged rollout
 
-**Stage 1 — Citation discipline + quorum.** R1 (full walk, cached), R4 (proposer), R4′ (ingress + commit-side), R2/R3. `dag.rs` + `ordering.rs`. No messages, no WANTED. Closes the malicious wedge and the false-skip fork. Exit: rows 1–3 and 7 of §10 green; adversarial gate clean; 48 h burn-in with identical sequences on all nodes (not merely "no stall").
-**Stage 2 — Serve.** `VERTEX_REQ/RESP` server + shadow rows. Exit: trim/unknown tests; no consensus lock on serve.
-**Stage 3 — Fetch.** WANTED, Tier A/B, fetcher task, release-on-arrival, boot walk. Exit: rows 4–5, 8–10; correlated-loss cluster test.
-**Stage 4 — Equivocation.** Shadow walk + deterministic exclusion. Exit: row 6.
-**Stage 5 (separate) — Inbound TCP reservation** (I15).
+**Stage 1 (Part I).** R1 floor 0 + edge checks; `validator_set_at`; R4; R4′; non-empty parents at ingress; tick re-walk. Gate: rows 1–8 + Part I critique + 48 h identical-sequence burn-in.
+**Stage 2.** Serve + shadow rows (bounded). **Stage 3.** WANTED, tiers, quotas, deadlines, fetcher, release. **Stage 4.** E1/E2. Gate for each: its rows + Part II critique. **Stage 5.** TCP slot reservation (I15).
 
 ## 12. Deliberately not done; residual risk
 
-- **I11** far-future storage: separate per-author byte bound at ingress.
-- **I15** TCP slot exhaustion: Stage 5.
-- **Timestamp drift is node-local** (`dag.rs:980-991`): a fetched vertex rejected for drift stays WANTED and retries; anchors defer. BFT-time bound is separate work.
-- **Partition:** WANTED probes at floor rate; bounded; deferral, never wedge or fork.
-- **R4 stops a lagging node from proposing** until it resolves > 2/3 of the previous round — this is the *intended* Narwhal behaviour and is what makes the skip proof sound.
-- **Pull-induction** (Beluga): one bounded fetch per withheld vertex per round; reputation is out of scope.
+- **I11** far-future vertex bytes per author — separate ingress bound; Part II avoids depending on it by not walking or WANTED-ing beyond `current + 2`.
+- **I15** — Stage 5.
+- Timestamp future-drift is node-local (`dag.rs:980-991`); deferral, retried; BFT-time bound is separate.
+- Partition: bounded probing; deferral, never wedge or fork.
+- R4 stops a lagging node from proposing until it resolves > 2/3 — intended (Narwhal), and what makes the skip proof sound.
+- Pull-induction (Beluga) — bounded per round; reputation out of scope.
 
 ## Changelog
 
-- **v2:** R1 redefined as a full cached walk (holes 5, 7). R4 — `parent_quorum_met` over cited parents, no proposal below quorum (holes 1, 4). R4′ — ingress non-empty/in-set parents and commit-side anchor eligibility on present-parent stake (holes 4, 6). Trigger moved to the proposer's R1 walk, `walk_history` secondary (hole 2). Transitive citers as witnesses; Tier B author-claim; probe instead of hard refuse (holes 8, 9). S6 replaced by shadow bodies + deterministic offender exclusion (hole 3). Stage 1 exit now requires identical sequences, not merely no stall.
-- **v1:** initial draft from tracks A–D.
+- **v3:** split into Part I / Part II with separate critiques. R1 floor → 0 (v2 #1). Round-exactness and membership moved from ingress into walk-edge checks so admission is a pure function of bytes (v2 #5). `validator_set_at(round)` (v2 #6, #9). Walk collects all missing hashes; Tier B on observables (v2 #21). WANTED per-author quota, receiver-tick TTL, no far-future entries, split budgets (v2 #11, #14, #17). Request deadline, per-peer cap, separate pools (v2 #12). Sync settlement shares the release hook; tick re-walk while R4 fails (v2 #13). Equivocation redesigned: twin-aware leader lookup + direct-vote decision keyed on (author, round), no local-row exclusion (v2 #2, #3, #4, #7, #8, #10, #18). Shadow bounded to one compact+parents per (author, round), pruned, written after guards drop (v2 #15, #19). Tests rewritten to pin skip outcomes and to isolate their mutations (v2 #16, #20, #21).
+- **v2:** quorum enforcement on the citing side; witnessed fetch; shadow bodies.
+- **v1:** initial.
