@@ -5,6 +5,48 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use storage::StateDB;
 
+/// Request for specific DAG vertices by hash.
+///
+/// AUDIT B3/B4: AINCORE has no way to ASK for a vertex. The only redelivery is a
+/// push (`try_create_vertex`'s re-gossip) performed by nodes that are BELOW parent
+/// quorum — i.e. by nodes that lack data, never by the ones holding it. So a vertex
+/// dropped by the rate limiter (`p2p.rs:345-352, 391-398`), suppressed by the 60 s
+/// gossipsub dedup (`p2p.rs:119-123`), or missed across a restart is unobtainable,
+/// and every vertex citing it stays unresolvable forever.
+///
+/// This pair is the missing pull. It is deliberately ADDITIVE: it changes no
+/// admission rule, no citation rule and no commit decision. A fetched body re-enters
+/// through the ordinary `add_vertex` gate, so it is validated exactly as a gossiped
+/// one. The only difference it makes is that a node can now hold a vertex it would
+/// otherwise never have received.
+///
+/// It does NOT close the malicious half of B3/B4: a hash that never existed is
+/// answered `unknown` by every peer. It closes the honest half — loss, dedup,
+/// restart — which is the half that happens in ordinary operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VertexRequest {
+    /// Hashes wanted. Server truncates to MAX_VERTEX_REQ_HASHES.
+    pub hashes: Vec<String>,
+    pub requester_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VertexResponse {
+    /// Bodies found, as stored. Serialized size is capped; the remainder is
+    /// reported in `unknown` so the requester re-asks instead of assuming absence.
+    pub vertices: Vec<String>,
+    /// Hashes this peer does not hold (or could not fit). Echoed so a requester can
+    /// tell "peer does not have it" from "peer never answered".
+    pub unknown: Vec<String>,
+}
+
+/// Hashes served per request. Mirrors the 500-block cap on SYNC_REQ, sized down
+/// because one vertex may be up to MAX_VERTEX_BYTES (768 KiB) while the transport
+/// frame cap is 1 MiB (`common/network/src/lib.rs:239`).
+pub const MAX_VERTEX_REQ_HASHES: usize = 32;
+/// Serialized response ceiling, under the 1 MiB inbound frame cap.
+pub const MAX_VERTEX_RESP_BYTES: usize = 900 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncRequest {
     pub from_height: u64,
@@ -1197,6 +1239,15 @@ impl ChainSync {
             return None;
         }
 
+        if let Some(req_json) = msg.strip_prefix("VERTEX_REQ:") {
+            if let Ok(req) = serde_json::from_str::<VertexRequest>(req_json) {
+                let resp = self.handle_vertex_request(req);
+                if let Ok(resp_json) = serde_json::to_string(&resp) {
+                    return Some(format!("VERTEX_RESP:{}", resp_json));
+                }
+            }
+            return None;
+        }
         if let Some(req_json) = msg.strip_prefix("SYNC_REQ:") {
             if let Ok(req) = serde_json::from_str::<SyncRequest>(req_json) {
                 let resp = self.handle_sync_request(req);
@@ -1206,6 +1257,47 @@ impl ChainSync {
             }
         }
         None
+    }
+
+    /// Serve requested vertex bodies from storage.
+    ///
+    /// Storage reads only — no consensus lock is taken, exactly as
+    /// `handle_sync_request` reads `block_{h}`. That matters because the consensus
+    /// RwLock is held across block execution (`dag.rs`), so touching it here would
+    /// let any unauthenticated TCP peer stall consensus.
+    ///
+    /// A vertex row exists only after it passed the full ingress gate on THIS node
+    /// (`dag.rs:1174-1181`), so nothing unvalidated is ever served. The requester
+    /// re-validates anyway, since a peer may be hostile.
+    pub fn handle_vertex_request(&self, req: VertexRequest) -> VertexResponse {
+        let mut vertices = Vec::new();
+        let mut unknown = Vec::new();
+        let mut bytes = 0usize;
+
+        for hash in req.hashes.iter().take(MAX_VERTEX_REQ_HASHES) {
+            // Reject anything that is not a plain hex hash before it reaches
+            // storage: the key is interpolated, and a caller-shaped key must not
+            // be able to address rows outside the vertex namespace.
+            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                unknown.push(hash.clone());
+                continue;
+            }
+            match self.storage.get(&format!("vertex:{}", hash)) {
+                Ok(Some(v_json)) => {
+                    if bytes.saturating_add(v_json.len()) > MAX_VERTEX_RESP_BYTES {
+                        // Over budget: report as unknown so the requester re-asks
+                        // rather than concluding the peer lacks it.
+                        unknown.push(hash.clone());
+                        continue;
+                    }
+                    bytes += v_json.len();
+                    vertices.push(v_json);
+                }
+                _ => unknown.push(hash.clone()),
+            }
+        }
+
+        VertexResponse { vertices, unknown }
     }
 
     pub fn handle_sync_request(&self, req: SyncRequest) -> SyncResponse {

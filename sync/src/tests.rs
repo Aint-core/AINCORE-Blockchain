@@ -1,7 +1,10 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod tests {
-    use crate::{ChainSync, FinalityArtifact, SyncRequest, SyncResponse};
+    use crate::{
+        ChainSync, FinalityArtifact, SyncRequest, SyncResponse, VertexRequest,
+        MAX_VERTEX_REQ_HASHES, MAX_VERTEX_RESP_BYTES,
+    };
     use blockchain::Block;
     use std::collections::HashMap;
     use std::fs;
@@ -947,5 +950,126 @@ mod tests {
 
         let height = sync.sync_from_peers().await;
         assert_eq!(height, 5, "must not advance when tip agreement is unmet");
+    }
+
+    /// AUDIT B3/B4 pull, server side. The vertex fetch is the mechanism AINCORE has
+    /// never had: without it a vertex lost to the rate limiter, suppressed by the
+    /// 60 s gossip dedup, or missed across a restart is unobtainable, and every
+    /// vertex citing it stays unresolvable forever. The server must be cheap and
+    /// unspoofable: storage reads only, a hard hash cap, a byte ceiling under the
+    /// 1 MiB frame limit, and a key a caller cannot shape.
+    #[test]
+    fn test_vertex_request_is_bounded_and_hex_only() {
+        let cs = setup_sync("vertex_req_bounded");
+
+        let good = "a".repeat(64);
+        cs.storage
+            .put(&format!("vertex:{}", good), "{\"body\":1}")
+            .unwrap();
+
+        let resp = cs.handle_vertex_request(VertexRequest {
+            hashes: vec![good.clone()],
+            requester_id: "r".into(),
+        });
+        assert_eq!(resp.vertices, vec!["{\"body\":1}".to_string()]);
+        assert!(resp.unknown.is_empty());
+
+        // A hash we do not hold is reported unknown, never silently omitted: the
+        // requester must distinguish "peer lacks it" from "peer never answered".
+        let missing = "b".repeat(64);
+        let resp = cs.handle_vertex_request(VertexRequest {
+            hashes: vec![missing.clone()],
+            requester_id: "r".into(),
+        });
+        assert!(resp.vertices.is_empty());
+        assert_eq!(resp.unknown, vec![missing]);
+
+        // Key shaping: a non-hex input must never be turned into a storage key.
+        // Proven by PLANTING rows at exactly the keys a shaped input would produce
+        // — without the hex guard the server would happily serve them. Asserting
+        // only "returns unknown" would pass either way, since a nonexistent key
+        // also returns unknown; the planted rows are what make this test able to
+        // fail.
+        let zeds = "z".repeat(64);
+        let shaped = ["../sys:validators", "vertex:evil", zeds.as_str(), "short", ""];
+        for bad in shaped {
+            cs.storage
+                .put(&format!("vertex:{}", bad), "LEAKED")
+                .unwrap();
+        }
+        for bad in shaped {
+            let resp = cs.handle_vertex_request(VertexRequest {
+                hashes: vec![bad.to_string()],
+                requester_id: "r".into(),
+            });
+            assert!(
+                resp.vertices.is_empty(),
+                "non-hex key {:?} was turned into a storage key and served: {:?}",
+                bad,
+                resp.vertices
+            );
+            assert_eq!(resp.unknown.len(), 1, "rejected hash must still be echoed");
+        }
+
+        // An over-long input must be rejected outright rather than concatenated
+        // into a multi-kilobyte RocksDB key.
+        let huge = "a".repeat(100_000);
+        let resp = cs.handle_vertex_request(VertexRequest {
+            hashes: vec![huge],
+            requester_id: "r".into(),
+        });
+        assert!(resp.vertices.is_empty());
+
+        // The hash count is capped server-side; the excess is not served at all.
+        let many: Vec<String> = (0..MAX_VERTEX_REQ_HASHES + 40)
+            .map(|i| format!("{:064x}", i))
+            .collect();
+        let resp = cs.handle_vertex_request(VertexRequest {
+            hashes: many,
+            requester_id: "r".into(),
+        });
+        assert_eq!(
+            resp.vertices.len() + resp.unknown.len(),
+            MAX_VERTEX_REQ_HASHES,
+            "server must answer at most MAX_VERTEX_REQ_HASHES entries"
+        );
+    }
+
+    /// The byte ceiling must hold even when every requested hash IS present: no peer
+    /// may pull a frame larger than the transport accepts.
+    #[test]
+    fn test_vertex_response_respects_byte_ceiling() {
+        let cs = setup_sync("vertex_bytes");
+
+        // 32 bodies of 100 KiB each = 3.2 MiB if unbounded.
+        let big = "x".repeat(100 * 1024);
+        let hashes: Vec<String> = (0..MAX_VERTEX_REQ_HASHES)
+            .map(|i| {
+                let h = format!("{:064x}", i);
+                cs.storage.put(&format!("vertex:{}", h), &big).unwrap();
+                h
+            })
+            .collect();
+
+        let resp = cs.handle_vertex_request(VertexRequest {
+            hashes: hashes.clone(),
+            requester_id: "r".into(),
+        });
+        let total: usize = resp.vertices.iter().map(|v| v.len()).sum();
+        assert!(
+            total <= MAX_VERTEX_RESP_BYTES,
+            "served {} bytes, ceiling is {}",
+            total,
+            MAX_VERTEX_RESP_BYTES
+        );
+        assert_eq!(
+            resp.vertices.len() + resp.unknown.len(),
+            hashes.len(),
+            "every requested hash must be accounted for, served or unknown"
+        );
+        assert!(
+            !resp.unknown.is_empty(),
+            "bodies dropped for budget must be reported unknown so they are re-asked"
+        );
     }
 }

@@ -788,10 +788,12 @@ async fn main() {
                     } else if msg == "GET_HEIGHT"
                         || msg == "GET_FINALITY"
                         || msg.starts_with("SYNC_REQ:")
+                        || msg.starts_with("VERTEX_REQ:")
                     {
                         // Single serving implementation: chain_sync owns GET_HEIGHT,
-                        // GET_FINALITY (with the quorum certificate) and SYNC_REQ (blocks +
-                        // finality QC + prune_horizon). The returned response is sent back
+                        // GET_FINALITY (with the quorum certificate), SYNC_REQ (blocks +
+                        // finality QC + prune_horizon) and VERTEX_REQ (DAG vertex bodies by
+                        // hash). The returned response is sent back
                         // over the same encrypted socket by network::start_server. Keeping
                         // this here — instead of reimplementing it inline in the transport —
                         // is what stops serving-side fixes from silently landing on dead code.
