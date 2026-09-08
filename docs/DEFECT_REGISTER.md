@@ -39,7 +39,7 @@ Severity is the reviewed severity. Status vocabulary: **CONFIRMED** = attack/def
 | **P2-K** | — | **REFUTED** | design `:152` (§5.5), `:136` (§5.2) | Limb 1 (key release on the WANTED entry) is textually correct but inert; the damaging limb rests on a premise the design explicitly contradicts, and a sibling section already covers the scenario. |
 | **H1** | CRITICAL | CONFIRMED (read this session) | `dag.rs:1140-1171`; persist `:1173-1181`; insert `:1183`; boot recovery `:231-250`, `:298-317` | **Twin-unstorability.** The equivocation branch `return`s at `:1167` before both the storage put and the DAG insert. Consequence: (a) the loser is unobtainable network-wide from any node that saw it second, (b) a peer that saw it *first* will serve it via VERTEX_REQ and the requester re-drops it at `:1167`, (c) which twin survives a restart is decided by storage-iteration order in the two recovery loops, so a restart can flip the answer. Violates the reference-system rule (Mysticeti §III-A, CometBFT `evidence.md`): no production system deletes the losing twin. |
 | **H2** | CRITICAL | CONFIRMED (read this session) | `ordering.rs:634-647` (`find_map` at `:641`); index push-ordered at `dag.rs:1183-1187` | **First-seen twin selection at the DECIDE step.** `leader_vertex_hash` returns the first leader-authored hash in an arrival-ordered vector, applying no quorum test to the choice. Narwhal's first-seen rule (§3.1 cond. 4) governs *signing* only; nothing in the reference set lets arrival order reach the decision function. |
-| **H3** | CRITICAL | CONFIRMED (read this session) | `ordering.rs:587-597` (skip arm `_ => {}` at `:596`); soundness comment at `:505-523`; producer-only enforcement at `dag.rs:566-585`; ingress checks at `dag.rs:1046-1060` | **Ancestry decision is not view-independent, and its published proof's premise is not an invariant.** The commit/skip arm tests `visited.contains(&hj)` for a locally-chosen hash, and the comment at `:505-523` argues soundness from "every vertex at j+2 references >2/3 of the j+1 vertices" — a rule enforced *only* in `try_create_vertex` (`dag.rs:566-585`, `qc::stake_quorum_met` over distinct parent authors) and never at ingress. A Byzantine anchor with one parent splits direct-committers from ancestry-skippers. **This is a safety fork that the H4/current halt currently masks; it is unmasked the moment a pull client lands.** |
+| **H3** | CRITICAL | **REPRODUCED** (test + 4 gates, see DST section) — CONFIRMED (read this session) | `ordering.rs:587-597` (skip arm `_ => {}` at `:596`); soundness comment at `:505-523`; producer-only enforcement at `dag.rs:566-585`; ingress checks at `dag.rs:1046-1060` | **Ancestry decision is not view-independent, and its published proof's premise is not an invariant.** The commit/skip arm tests `visited.contains(&hj)` for a locally-chosen hash, and the comment at `:505-523` argues soundness from "every vertex at j+2 references >2/3 of the j+1 vertices" — a rule enforced *only* in `try_create_vertex` (`dag.rs:566-585`, `qc::stake_quorum_met` over distinct parent authors) and never at ingress. A Byzantine anchor with one parent splits direct-committers from ancestry-skippers. **This is a safety fork that the H4/current halt currently masks; it is unmasked the moment a pull client lands.** |
 | **H4** | MEDIUM (hardening; not a safety break under the standard bound) | CONFIRMED (read this session) | `ordering.rs:664-670` | **Double-counted voter.** `v.parents.iter().any(\|p\| p == anchor_hash)` lets one round-(r+1) author's stake count toward *both* twins. Arithmetic checked: both twins exceeding >2/3 requires b > 1/3, so it does not break safety under the standard bound — but it consumes the entire margin, and Mysticeti's `IsVote`/`SupportedBlock` (Alg. 1:14-23) makes it structurally impossible for free. |
 | **H5** | CRITICAL | CONFIRMED (read this session) | `dag.rs:1090-1116` (standing comment), `:1046-1060` (only parent checks), `:1183` (insert), `ordering.rs:697-702`, `:584-586` | **The B3/B4 halt itself.** A vertex naming a never-existing parent enters the DAG and wedges `commit_one_anchor` permanently; the tree's own comment records both prior repair attempts and why each was worse. Still open. |
 | **H6** | CRITICAL (blocking prerequisite for Regime C) | CONFIRMED (read this session) | `core/executor/src/lib.rs:2047-2067`; read at `:1009-1015`; contiguity at `:1693-1710`; cursor `sys:last_executed_height` at `:1627-1631` | **No state-derived commitment exists.** `sys:state_root = H(prev_root ‖ H(sorted effective writes of this block))` is a commitment to execution *history*, not to state contents; `current_state_root()` is a bare KV read and nothing recomputes it from the KV set. No Merkle/IAVL/Jellyfish trie over AINCORE state exists anywhere in the tree. Any downloaded-state mechanism is unverifiable in principle, not merely unimplemented. |
@@ -130,6 +130,92 @@ address is not plumbed to the handler (`start_server` passes `Fn(&str) -> Option
 Keying on `requester_id` would look like a control and be bypassed by varying one field.
 **`DA_SHARD` (`main.rs:777-786`) is a second unauthenticated serving endpoint and is
 still unbounded.**
+
+### DST — deterministic simulation testing: decision and first result
+
+An 18-agent adversarial gate (map -> 4 rival designs -> 2 refuters each -> synthesis)
+ran before any harness code. **All four designs were refuted**, three by reviewers who
+compiled and ran code rather than arguing. What survived is worth more than a surviving
+design:
+
+**FACT 1 — H1 reproduces at HEAD with ZERO production change.** Two reviewers
+independently built it from the existing in-process test seam. This killed the
+justification for the invasive Clock/Egress refactor ("H1 is provably unreachable
+without injection") and for the record/replay recorder in one stroke.
+
+**FACT 2 — exhaustive model checking is dead.** A reviewer built the Stateright model and
+measured: depth <=7 is 26,717,121 states, exhaustive, and **not one commit is reachable**;
+the ground-truth witness sits at depth 38 and the space ceiling is ~1.1e12. The
+generalizable lesson: the interesting states are DEEP, so the action space must be
+inverted — seed a complete DAG and make OMISSION and PERMUTATION the actions, never
+"deliver from empty".
+
+**FACT 3 — 4 of 4 designs shipped a proof-of-life gate that could not discriminate.**
+One ran 0 checks and printed green both before and after its own mandatory fix-mutation.
+The failure mode is not consensus reasoning: **the author writes an assertion, predicts
+how it behaves under mutation, and is wrong.** Hence the standing rule below.
+
+> **DISCIPLINE RULE, outranking every technical choice: no predicate is believed until its
+> fix-mutation has been EXECUTED and observed to flip. A predicted mutation outcome is
+> worth nothing.**
+
+**AIM CHECK (run before building, result negative as predicted).** Tier 1 provably cannot
+express `P-ANCHOR-HEIGHT` — the `anchor_round -> block_height` map whose violation WAS the
+live B4b block fork. Measured, not argued:
+
+    error[E0609]: no field `height` on type `&CommitInfo`
+      = note: available fields are: sequence, leader, anchor_round, anchor_hash, finality_digest
+
+Height is fixed at `dag.rs:1508` as `latest_block_height + 1` **inside an 8x250ms retry
+loop** racing ChainSync's storage visibility (`dag.rs:1459-1512`), i.e. decided by real
+time, not message order. Consequences: (i) tier 1 sits one layer BELOW the live fork
+surface; (ii) the Clock seam is **required and pulled forward**, not optional "Stage B";
+(iii) the tier-2 corpus, which runs at ~1e3 schedules/night rather than 1e6, is the
+deliverable that bears on mainnet. Budget against 1e3.
+
+**H3 IS NOW REPRODUCED** — `ordering.rs`, `test_h3_sparse_anchor_forks_direct_committer_from_ancestry_skipper`,
+0.01 s, zero production lines changed, `#[ignore]`d only to keep `cargo test --workspace`
+usable:
+
+    cargo test -p consensus --lib test_h3_sparse -- --ignored --nocapture
+
+4 validators, equal stake. The round-4 leader emits ONE-PARENT vertices at r3 and r4 whose
+causal history is COMPLETE (no hole -> no deferral) but excludes the round-2 leader. X holds
+everything and direct-commits round 2 (3 votes, 9000 > 8000). Y is missing two honest r3
+vertices — **plain gossip loss, no second Byzantine act** — advances to the thin r4 anchor,
+finds the round-2 leader provably absent, and SKIPS round 2 permanently. Both decisions final.
+
+All four gates RUN and OBSERVED:
+
+| Gate | Required | Observed |
+|---|---|---|
+| HEAD | RED | RED — fork reproduced |
+| M0 `BYZ_HONEST=true` (negative control) | silent | silent — Y hits a real hole, defers, `Undecided` |
+| M1 min-hash tie-break on `round_index` (the H2-shaped fix) | stay RED | stayed RED |
+| M2 parent quorum at admission | GREEN + P-LIVE green | GREEN |
+
+`P-LIVE` is asserted FIRST and unconditionally: the trivially "safe" fix — defer
+everything — makes agreement vacuously true. **B3/B4 IS a halt**, so any safety-only
+harness reports green on a wedged chain.
+
+M2's limit, stated so it is never mistaken for validation: tier 1 does not run `add_vertex`,
+so the filter is a SECOND IMPLEMENTATION of the ingress rule. It proves the property is
+ACHIEVABLE. Validating the production fix needs tier 2.
+
+**Rejected outright:** exhaustive model checking (FACT 2; and `held: BTreeSet` collapses
+every delivery permutation into one fingerprint, making the root defect H2 *unrepresentable*);
+the record/replay recorder (it misses ChainSync's client path, `sync/src/lib.rs:722`, the
+very input driving the race it was sold on).
+
+**What this harness will NOT catch, written down because "green" gets cited as clearance:**
+B4b and the anchor->height race (real-time, not message order); the double-execution
+state-root race (two OS threads — a `loom` problem, not a DST problem); clock-skew admission
+P1-E (the harness's clock defence IS the blind spot); `try_create_vertex` and therefore the
+whole slashing-consequence path (`drain_evidence_for_vertex` has exactly one caller,
+`dag.rs:647`, inside it); heterogeneous config (every knob is a per-call `env::var`,
+`VERTEX_DOMAIN` is a process-global `OnceLock`); the transport and sync serving path — and
+**B3/B4 lives on exactly that path**. Green is evidence, never proof: if a property is
+mis-stated, every seed passes forever.
 
 - **P4 Serving must not consume the resource consensus needs to advance.** **Acceptance test for the cluster:** 60 connections from one IP to r1 driving 6,000 miss-only VERTEX_REQ/s; assert (i) r1's round-advance interval unchanged within a stated tolerance, (ii) the other three validators can still open connections to r1, (iii) served bytes/s and lookups/s stay under configured ceilings. (iii) fails trivially (no ceilings exist); (i) and (ii) fail by construction (H8, P2-G).
 - **Missing budgets, named:** per-request lookup budget charged on misses; per-request wall-clock deadline; per-peer served-bytes/lookups bucket (unimplementable until P2-F is closed); global serving-concurrency semaphore + blocking-IO isolation; send-queue watermark with resumable serving *(Bitcoin `ProcessGetData` stops at `fPauseSend` and resumes from `vRecvGetData`)*; reserved slots/eviction for validator-set peers *(Bitcoin `AttemptToEvictConnection`; geth reserved trusted-peer slots)*; age/scope restriction on what may be served *(Bitcoin `MAX_BLOCKTXN_DEPTH = 10`, `HISTORICAL_BLOCK_AGE = 7d`)*; and **any counter at all** — grep for metric/counter/prometheus in `sync/src/lib.rs` returns nothing, so none of the above could be tuned or shown to have fired. Metrics first, budgets second.

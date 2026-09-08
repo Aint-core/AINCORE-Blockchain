@@ -1603,6 +1603,326 @@ mod tests {
             .collect()
     }
 
+    // ===================================================================
+    // TIER-1 DST: the anchor decision function, evaluated over hand-built DAGs.
+    //
+    // WHY THIS EXISTS. The 35 existing consensus tests are hand-written EXAMPLES;
+    // a Byzantine validator picks from an unbounded space of schedules. This is
+    // the seam a seeded scheduler will drive: no storage, no clock, no
+    // signatures (`OrderingEngine::new()` sets `storage: None`), so it runs at
+    // ~0.01 s per schedule.
+    //
+    // KNOWN LIMIT, stated here because it will otherwise be forgotten: tier 1
+    // does NOT execute `add_vertex`, so any candidate fix expressed as an
+    // admission filter here is a SECOND IMPLEMENTATION of that rule. It proves
+    // a property is ACHIEVABLE; it does not validate the production fix. That
+    // needs a tier-2 (node-level) test.
+    //
+    // Tier 1 also provably cannot express P-ANCHOR-HEIGHT — the anchor_round ->
+    // block_height map whose violation WAS the live B4b fork. Measured, not
+    // assumed: `CommitInfo` (this file) has no height field, because height is
+    // fixed at dag.rs:1508 as `latest_block_height + 1` INSIDE an 8x250ms
+    // retry loop racing ChainSync's storage visibility. That is decided by real
+    // time, not message order, and is out of reach at this tier.
+    // ===================================================================
+
+    /// A round's outcome from ONE node's point of view.
+    ///
+    /// `Undecided` is load-bearing, not a nicety. `try_commit` records a SKIP
+    /// nowhere — the skip arm is a bare `_ => {}` and only the cursor advance
+    /// latches it — so "skipped" and "not yet reached" are indistinguishable
+    /// without tracking the cursor. Collapsing them makes the fork assertion
+    /// wrong in BOTH directions: it reports a fork in a healthy cluster (a node
+    /// that has simply not caught up), and it cannot tell a real skip from
+    /// silence.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Decision {
+        Commit(String),
+        Skip,
+        Undecided,
+    }
+
+    /// One node's view: its own engine plus the DAG subset it happens to hold.
+    struct View {
+        eng: super::OrderingEngine,
+        dag: std::collections::HashMap<String, blockchain::Vertex>,
+        idx: std::collections::HashMap<u64, Vec<String>>,
+        log: std::collections::BTreeMap<u64, Decision>,
+    }
+
+    impl View {
+        fn new() -> Self {
+            View {
+                eng: super::OrderingEngine::new(),
+                dag: std::collections::HashMap::new(),
+                idx: std::collections::HashMap::new(),
+                log: std::collections::BTreeMap::new(),
+            }
+        }
+
+        /// Mirrors `add_vertex`'s bookkeeping at dag.rs:1183-1187: insert into
+        /// the map, PUSH onto the round vector. Push order is arrival order,
+        /// which is exactly what `leader_vertex_hash`'s `find_map` reads.
+        fn insert(&mut self, h: &str, v: &blockchain::Vertex) {
+            self.idx.entry(v.round).or_default().push(h.to_string());
+            self.dag.insert(h.to_string(), v.clone());
+        }
+
+        /// Drain the engine to a fixpoint and reconstruct the full decision
+        /// stream, synthesizing the SKIPs that `try_commit` never records.
+        fn evaluate(&mut self, validators: &[(String, u64)]) {
+            loop {
+                let before = self.eng.next_anchor_round;
+                let commits = self.eng.try_commit(0, &self.dag, &self.idx, validators);
+                if commits.is_empty() {
+                    break;
+                }
+                for c in &commits {
+                    // Every even round the cursor stepped OVER was skipped.
+                    let mut j = super::OrderingEngine::align_anchor(before.max(1));
+                    while j < c.anchor_round {
+                        self.log.entry(j).or_insert(Decision::Skip);
+                        j += 2;
+                    }
+                    self.log
+                        .insert(c.anchor_round, Decision::Commit(c.anchor_hash.clone()));
+                }
+            }
+        }
+
+        fn decision(&self, round: u64) -> Decision {
+            if round >= self.eng.next_anchor_round {
+                return Decision::Undecided;
+            }
+            self.log.get(&round).cloned().unwrap_or(Decision::Skip)
+        }
+    }
+
+    /// AD-1 (agreement): two nodes that have BOTH decided round r must have
+    /// decided the same thing. A node that has not decided yet is not a
+    /// disagreement — see the `Undecided` doc.
+    fn agree(a: &Decision, b: &Decision) -> bool {
+        match (a, b) {
+            (Decision::Undecided, _) | (_, Decision::Undecided) => true,
+            _ => a == b,
+        }
+    }
+
+    /// The candidate fix, as an admission filter: admit a round>1 vertex only
+    /// when its DISTINCT parent authors carry >2/3 stake. This is the same test
+    /// `parent_quorum_met` already applies PRODUCER-side at dag.rs:566/592 —
+    /// H3 is that it is absent at INGRESS (`add_vertex` checks parents only for
+    /// count and uniqueness, dag.rs:1046-1060).
+    fn parent_quorum_ok(
+        v: &blockchain::Vertex,
+        dag: &std::collections::HashMap<String, blockchain::Vertex>,
+        validators: &[(String, u64)],
+    ) -> bool {
+        if v.round <= 1 {
+            return true; // round 1 cites the genesis sentinel
+        }
+        let total: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
+        let stakes: std::collections::HashMap<&str, u64> =
+            validators.iter().map(|(a, s)| (a.as_str(), *s)).collect();
+        let mut authors: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for p in &v.parents {
+            if p == "genesis" {
+                continue;
+            }
+            if let Some(pv) = dag.get(p) {
+                authors.insert(pv.author.as_str());
+            }
+        }
+        let signed: u128 = authors
+            .iter()
+            .filter_map(|a| stakes.get(a).map(|s| *s as u128))
+            .sum();
+        crate::qc::stake_quorum_met(signed, total)
+    }
+
+    /// Build the H3 scenario. Returns (validators, ordered (hash, vertex) list,
+    /// the round-2 leader's vertex hash, the Byzantine author).
+    ///
+    /// `byz_honest = true` is the M0 negative control: identical in every
+    /// respect except that the round-4 leader plays by the rules.
+    #[allow(clippy::type_complexity)]
+    fn h3_scenario(
+        byz_honest: bool,
+    ) -> (
+        Vec<(String, u64)>,
+        Vec<(String, blockchain::Vertex)>,
+        String,
+        String,
+    ) {
+        let validators = mk_validators(4);
+        // Verified by search, not assumed: with n=4 these are different authors.
+        let l2 = super::OrderingEngine::leader_for_round(2, &validators, 0);
+        let byz = super::OrderingEngine::leader_for_round(4, &validators, 0);
+        assert_ne!(l2, byz, "scenario requires distinct round-2 and round-4 leaders");
+
+        let mut out: Vec<(String, blockchain::Vertex)> = Vec::new();
+        let mut prev: Vec<String> = vec!["genesis".to_string()];
+        let mut h2_leader = String::new();
+        let mut byz_prev = String::new();
+
+        for r in 1..=5u64 {
+            let mut this = Vec::new();
+            for (a, _) in &validators {
+                let parents = if !byz_honest && a == &byz && (r == 3 || r == 4) {
+                    if r == 3 {
+                        // ONE parent, and deliberately NOT the round-2 leader:
+                        // the whole point is that h2_leader is absent from this
+                        // vertex's causal history.
+                        let non_leader = prev
+                            .iter()
+                            .find(|h| {
+                                out.iter()
+                                    .find(|(hh, _)| hh == *h)
+                                    .map(|(_, v)| v.author != l2)
+                                    .unwrap_or(false)
+                            })
+                            .expect("a non-leader round-2 vertex exists")
+                            .clone();
+                        vec![non_leader]
+                    } else {
+                        vec![byz_prev.clone()]
+                    }
+                } else {
+                    prev.clone()
+                };
+                let (h, v) = mk_vertex(r, a, parents);
+                if r == 2 && a == &l2 {
+                    h2_leader = h.clone();
+                }
+                if a == &byz {
+                    byz_prev = h.clone();
+                }
+                this.push(h.clone());
+                out.push((h, v));
+            }
+            prev = this;
+        }
+        (validators, out, h2_leader, byz)
+    }
+
+    /// AUDIT H3 (CRITICAL, safety fork). The soundness argument for the
+    /// ancestry skip is written in this file's `try_commit` doc: "every vertex
+    /// at j+2 references >2/3 of the j+1 vertices, which intersects the >2/3
+    /// that voted for the leader". That is a claim about vertices that MET
+    /// parent quorum — and nothing enforces it on ingress. `parent_quorum_met`
+    /// lives at dag.rs:566/592, inside `try_create_vertex`, i.e. producer-side
+    /// only; `add_vertex` checks parents for count (dag.rs:1046-1052) and
+    /// uniqueness (:1054-1060) and nothing else.
+    ///
+    /// So a Byzantine round-4 leader can emit a ONE-PARENT anchor whose causal
+    /// history is COMPLETE (no hole -> no deferral) but excludes the round-2
+    /// leader. A node with the round-3 votes commits round 2 directly; a node
+    /// missing two of them walks back from the thin anchor, finds the round-2
+    /// leader provably absent, and SKIPS round 2 permanently. Both decisions
+    /// are final. That is a finality fork from one Byzantine key and ordinary
+    /// gossip loss — no second Byzantine act required.
+    /// RED BY DESIGN. H3 is OPEN at HEAD, so this test FAILS, and that failure is
+    /// the point: it is the executable statement of the defect. It is `#[ignore]`d
+    /// only so `cargo test --workspace` stays a usable gate for everything else.
+    ///
+    ///   cargo test -p consensus --lib test_h3_sparse -- --ignored --nocapture
+    ///
+    /// Un-ignore it the moment the ingress parent-quorum gate lands; it is then
+    /// the regression test for that fix.
+    ///
+    /// MUTATION GATES — all four RUN and OBSERVED, never predicted (four designs
+    /// in a row shipped gates whose behaviour their author mispredicted):
+    ///   HEAD                              -> RED   (fork reproduced)
+    ///   M0  BYZ_HONEST = true             -> SILENT. The negative control. Y now
+    ///       hits a genuine HOLE under the fat anchor, `walk_history` returns None
+    ///       (this file, the hole arm), Y DEFERS -> Undecided. If this fires, the
+    ///       extractor conflates "not yet decided" with "skipped" and nothing
+    ///       downstream is trustworthy. Stop and fix it.
+    ///   M1  min-hash tie-break on round_index in `leader_vertex_hash` -> stays RED.
+    ///       The H2-shaped fix. This scenario has no twins and one round-2 leader
+    ///       vertex, so sorting cannot change any outcome. If M1 goes green, the
+    ///       test is measuring the wrong defect.
+    ///   M2  APPLY_PARENT_QUORUM = true    -> GREEN, with P-LIVE still green.
+    ///
+    /// M2's LIMIT, stated so it is not mistaken for validation of a production
+    /// fix: tier 1 does not run `add_vertex`, so the filter here is a SECOND
+    /// IMPLEMENTATION of the ingress rule. It proves the property is achievable.
+    /// Validating the real fix needs a tier-2 node-level test.
+    #[test]
+    #[ignore = "reproduces H3, an OPEN CRITICAL defect: RED by design until the ingress parent-quorum gate lands"]
+    fn test_h3_sparse_anchor_forks_direct_committer_from_ancestry_skipper() {
+        // M0 negative control: flip to true, the test must go SILENT.
+        const BYZ_HONEST: bool = false;
+        // M2 candidate fix: flip to true, the test must go GREEN.
+        const APPLY_PARENT_QUORUM: bool = false;
+
+        let (validators, vertices, h2_leader, _byz) = h3_scenario(BYZ_HONEST);
+
+        // Y is missing two of the three HONEST round-3 vertices. Plain gossip
+        // loss: no second Byzantine act, no equivocation, no partition.
+        let l2 = super::OrderingEngine::leader_for_round(2, &validators, 0);
+        let byz = super::OrderingEngine::leader_for_round(4, &validators, 0);
+        let dropped_for_y: Vec<String> = vertices
+            .iter()
+            .filter(|(_, v)| v.round == 3 && v.author != byz && v.author != l2)
+            .map(|(h, _)| h.clone())
+            .collect();
+        assert_eq!(dropped_for_y.len(), 2, "scenario requires exactly two omissions");
+
+        let mut x = View::new();
+        let mut y = View::new();
+        for (h, v) in &vertices {
+            if APPLY_PARENT_QUORUM && !parent_quorum_ok(v, &x.dag, &validators) {
+                // X and Y are filtered against their OWN views, exactly as an
+                // ingress rule would be.
+            } else {
+                x.insert(h, v);
+            }
+            if dropped_for_y.contains(h) {
+                continue;
+            }
+            if APPLY_PARENT_QUORUM && !parent_quorum_ok(v, &y.dag, &validators) {
+                continue;
+            }
+            y.insert(h, v);
+        }
+
+        x.evaluate(&validators);
+        y.evaluate(&validators);
+
+        let dx = x.decision(2);
+        let dy = y.decision(2);
+
+        // P-LIVE, checked FIRST and unconditionally. Without it the trivially
+        // "safe" fix — defer everything, decide nothing — makes AD-1 vacuously
+        // true and this test green. A harness that can be satisfied by a halt
+        // is worse than no harness: B3/B4 IS a halt.
+        assert!(
+            matches!(dx, Decision::Commit(_)) || matches!(dy, Decision::Commit(_)),
+            "P-LIVE: no view decided anything — a halt would satisfy AD-1 vacuously \
+             (X={:?} Y={:?})",
+            dx,
+            dy
+        );
+
+        // AD-1 (agreement). RED at HEAD: X commits round 2 on direct votes while
+        // Y proves a skip from a consistent-but-smaller subset.
+        assert!(
+            agree(&dx, &dy),
+            "AD-1 VIOLATED at round 2 — finality fork.\n  \
+             X (holds everything)                = {:?}\n  \
+             Y (missing 2 honest round-3 votes)  = {:?}\n  \
+             round-2 leader vertex               = {}\n\
+             X direct-commits round 2 (3 honest round-3 vertices cite it, 9000 > 8000).\n\
+             Y has 1 such vote, advances to the Byzantine one-parent round-4 anchor,\n\
+             whose causal history is COMPLETE (so no hole, no deferral) and does not\n\
+             contain the round-2 leader — so Y skips round 2 permanently.",
+            dx,
+            dy,
+            h2_leader
+        );
+    }
+
     /// THE fork scenario: one node evaluates incrementally as rounds arrive,
     /// another evaluates once, late, with the full DAG. Their committed-anchor
     /// sequences (rounds, hashes, per-anchor vertex sequences, digests) must be
