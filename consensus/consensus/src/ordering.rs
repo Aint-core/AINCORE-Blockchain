@@ -1543,6 +1543,22 @@ mod tests {
             .collect()
     }
 
+    /// Parse the synthetic fixture hash `v{round}_{author}` (or `..#{nonce}` for a
+    /// twin) back into (round, author).
+    ///
+    /// Fixtures must be INGRESS-SHAPED or the corpus is blind to any rule that
+    /// reads `parent_refs` — which, after the H3 fix, is the ingress gate itself.
+    /// Before this, `mk_vertex` hard-coded `parent_refs: Vec::new()`, so all
+    /// 20,000 schedules ran on vertices no honest producer emits and no ingress
+    /// rule could ever reject.
+    fn parse_fixture_hash(h: &str) -> Option<(u64, String)> {
+        let body = h.strip_prefix('v')?;
+        let (round_s, rest) = body.split_once('_')?;
+        let round = round_s.parse::<u64>().ok()?;
+        let author = rest.split('#').next()?.to_string();
+        Some((round, author))
+    }
+
     fn mk_vertex(
         round: u64,
         author: &str,
@@ -1551,6 +1567,18 @@ mod tests {
         // Full author in the hash: synthetic addresses differ only at the END,
         // so a prefix would collide and silently overwrite dag entries.
         let hash = format!("v{}_{}", round, author);
+        // Ingress-shaped refs, recovered from the fixture hash format. The
+        // genesis sentinel carries none, which matches a real round-1 vertex.
+        let refs: Vec<blockchain::ParentRef> = parents
+            .iter()
+            .filter_map(|p| {
+                parse_fixture_hash(p).map(|(r, a)| blockchain::ParentRef {
+                    round: r,
+                    author: a,
+                    digest: p.clone(),
+                })
+            })
+            .collect();
         (
             hash.clone(),
             blockchain::Vertex {
@@ -1562,9 +1590,9 @@ mod tests {
                 hash,
                 signature: String::new(),
                 aggregated_signature: None,
-            payload_root: None,
-            parents_root: None,
-            parent_refs: Vec::new(),
+                payload_root: None,
+                parents_root: None,
+                parent_refs: refs,
             },
         )
     }
@@ -1892,30 +1920,6 @@ mod tests {
         (validators, out, twin_a, twin_b)
     }
 
-    /// Stake of the DISTINCT round-(r+1) authors citing `anchor`, i.e. exactly what
-    /// `direct_quorum_met` sums.
-    fn voter_stake(
-        round: u64,
-        anchor: &str,
-        dag: &std::collections::HashMap<String, blockchain::Vertex>,
-        idx: &std::collections::HashMap<u64, Vec<String>>,
-        validators: &[(String, u64)],
-    ) -> u128 {
-        let stakes: std::collections::HashMap<&str, u64> =
-            validators.iter().map(|(a, s)| (a.as_str(), *s)).collect();
-        let mut voted: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for vh in idx.get(&(round + 1)).map(|v| v.as_slice()).unwrap_or(&[]) {
-            if let Some(v) = dag.get(vh) {
-                if v.parents.iter().any(|p| p == anchor) {
-                    voted.insert(v.author.as_str());
-                }
-            }
-        }
-        voted
-            .iter()
-            .filter_map(|a| stakes.get(a).map(|s| *s as u128))
-            .sum()
-    }
 
     /// Build one view over a chosen subset, in a chosen order.
     fn twin_view(
@@ -1981,25 +1985,32 @@ mod tests {
         let total: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
 
         let full = twin_view(&vertices, &[], false, &validators);
-        let sa = voter_stake(2, &twin_a, &full.dag, &full.idx, &validators);
-        let sb = voter_stake(2, &twin_b, &full.dag, &full.idx, &validators);
 
         // ---- P_NODOUBLECOUNT ---------------------------------------------------
-        // No validator's stake may back two different anchors at one round. This
-        // is the property that CANNOT fire end-to-end today, because H1 stops any
-        // honest node from holding both twins. Fixing H1 opens it.
+        // Asserted against PRODUCTION `direct_quorum_met`, not a test-local copy.
+        //
+        // The first version of this test summed stake with a private helper that
+        // duplicated the production logic — so editing `direct_quorum_met` could
+        // not move the assertion, and the test would have reported green on a
+        // fixed OR a broken implementation alike. That is the second-implementation
+        // trap this project keeps naming, found in its own harness.
+        //
+        // The property, stated over what production actually returns: AT MOST ONE
+        // twin at a round may meet direct quorum. Two would mean one validator's
+        // vote backed two conflicting anchors, and two nodes could each commit a
+        // different hash for the SAME round.
+        let quorum = |h: &str| {
+            super::OrderingEngine::direct_quorum_met(
+                2, h, &full.dag, &full.idx, &validators, total,
+            )
+        };
         assert!(
-            sa + sb <= total,
-            "P_NODOUBLECOUNT VIOLATED at round 2: twin A backed by {} stake, twin B \
-             by {}, total {} = {}% of the whole validator set.\n\
-             direct_quorum_met is evaluated once per candidate anchor over distinct \
-             AUTHORS, so one round-3 vertex citing both twins is counted toward both.\n\
-             UNREACHABLE END-TO-END AT HEAD only because H1 drops the losing twin at \
-             dag.rs:1167 — fixing H1 without fixing this opens it.",
-            sa,
-            sb,
-            sa + sb,
-            (sa + sb) * 100 / total
+            !(quorum(&twin_a) && quorum(&twin_b)),
+            "P_NODOUBLECOUNT VIOLATED at round 2: BOTH twins meet direct quorum.\n\
+             `direct_quorum_met` is evaluated once per candidate over distinct \
+             AUTHORS, so a round-3 vertex citing both twins is counted toward both \
+             and the two together carry more stake than the validator set has.\n\
+             Two nodes can then each commit a DIFFERENT hash for the same round."
         );
 
         // ---- P_VIEWINDEP_SUBSET ------------------------------------------------
@@ -2149,6 +2160,7 @@ mod tests {
         byz: Option<&str>,
         menu: Menu,
         fabricate_ppm: u32,
+        c1_legal: bool,
         rng: &mut rand::rngs::StdRng,
     ) -> Vec<(String, blockchain::Vertex)> {
         use rand::Rng;
@@ -2158,18 +2170,65 @@ mod tests {
             let mut this = Vec::new();
             for (a, _) in validators {
                 let is_byz = byz == Some(a.as_str()) && r >= 2 && !prev.is_empty();
+                // C1-LEGAL collapse, computed BEFORE the Byzantine branch.
+                //
+                // The first cut of this experiment computed it AFTER, so the
+                // Byzantine twin branch `continue`d past it and cited raw `prev`
+                // — leaving 16,000 of 58,000 vertices still naming a duplicate
+                // author. The "C1-legal" universe was therefore still illegal and
+                // the measurement was worthless. Found by validating the
+                // experiment against its own claim rather than trusting it.
+                let usable: Vec<String> = if c1_legal {
+                    let mut by_author: std::collections::BTreeMap<String, Vec<String>> =
+                        std::collections::BTreeMap::new();
+                    for h in &prev {
+                        let key = parse_fixture_hash(h)
+                            .map(|(_, a)| a)
+                            .unwrap_or_else(|| h.clone());
+                        by_author.entry(key).or_default().push(h.clone());
+                    }
+                    for v in by_author.values_mut() {
+                        v.sort();
+                    }
+                    by_author.values().map(|v| v[0].clone()).collect()
+                } else {
+                    prev.clone()
+                };
                 if is_byz && menu == Menu::Equivocate {
+                    // The STRONGEST C1-legal adversary: each twin is itself legal
+                    // (one parent per author), but the two twins cite DIFFERENT
+                    // previous-round twins where any exist — so the equivocation
+                    // propagates without ever naming an author twice.
                     for nonce in 1..=2u32 {
-                        let (h, v) = mk_twin(r, a, prev.clone(), nonce);
+                        let parents: Vec<String> = if c1_legal {
+                            let mut by_author: std::collections::BTreeMap<String, Vec<String>> =
+                                std::collections::BTreeMap::new();
+                            for h in &prev {
+                                let key = parse_fixture_hash(h)
+                                    .map(|(_, a)| a)
+                                    .unwrap_or_else(|| h.clone());
+                                by_author.entry(key).or_default().push(h.clone());
+                            }
+                            by_author
+                                .values_mut()
+                                .map(|v| {
+                                    v.sort();
+                                    v[(nonce as usize - 1).min(v.len() - 1)].clone()
+                                })
+                                .collect()
+                        } else {
+                            prev.clone()
+                        };
+                        let (h, v) = mk_twin(r, a, parents, nonce);
                         this.push(h.clone());
                         out.push((h, v));
                     }
                     continue;
                 }
                 let mut parents = if is_byz && menu == Menu::SparseAnchor {
-                    vec![prev[rng.gen_range(0..prev.len())].clone()]
+                    vec![usable[rng.gen_range(0..usable.len())].clone()]
                 } else {
-                    prev.clone()
+                    usable.clone()
                 };
                 // MASKING MECHANISM, restored for the experiment. The corpus
                 // deliberately EXCLUDES fabricated parents because they fire on
@@ -2250,6 +2309,16 @@ mod tests {
     }
 
     fn sched_run_fab(seed: u64, menu: Menu, permute: bool, fabricate_ppm: u32) -> ScheduleOutcome {
+        sched_run_full(seed, menu, permute, fabricate_ppm, false)
+    }
+
+    fn sched_run_full(
+        seed: u64,
+        menu: Menu,
+        permute: bool,
+        fabricate_ppm: u32,
+        c1_legal: bool,
+    ) -> ScheduleOutcome {
         use rand::seq::SliceRandom;
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -2266,7 +2335,7 @@ mod tests {
             _ => Some(validators[rng.gen_range(0..validators.len())].0.clone()),
         };
         let universe =
-            sched_universe(&validators, byz_owned.as_deref(), menu, fabricate_ppm, &mut rng);
+            sched_universe(&validators, byz_owned.as_deref(), menu, fabricate_ppm, c1_legal, &mut rng);
 
         let mut views: Vec<View> = Vec::new();
         for i in 0..SCHED_VIEWS {
@@ -3300,12 +3369,92 @@ mod tests {
             _ => Some(validators[rng.gen_range(0..validators.len())].0.clone()),
         };
         let universe =
-            sched_universe(&validators, byz.as_deref(), menu, fabricate_ppm, &mut rng);
+            sched_universe(&validators, byz.as_deref(), menu, fabricate_ppm, false, &mut rng);
         let mut v = View::new();
         for (h, vx) in &universe {
             v.insert(h, vx);
         }
         v.evaluate(&validators);
         v.eng.next_anchor_round
+    }
+
+    /// THE C1 DECISION EXPERIMENT.
+    ///
+    /// The corpus's Equivocate universe is ingress-ILLEGAL: `prev` holds both
+    /// twins and every honest vertex cites both, which a duplicate-author rule
+    /// refuses. So the headline 1,737 breaches were measured on a world no honest
+    /// node could produce, and neither that number nor C1's value was known.
+    ///
+    /// This re-runs the SAME seeds with exactly one change — honest authors cite
+    /// at most one vertex per (round, author), lowest digest, deterministically —
+    /// and splits the breaches by SHAPE, because the two shapes are two different
+    /// defects:
+    ///   Commit-vs-Commit — two nodes finalise DIFFERENT hashes for one round.
+    ///                      This is what a duplicate-author rule should remove.
+    ///   Commit-vs-Skip   — one commits, one skips. That is H1+H2 and needs the
+    ///                      fetch client; no ingress rule touches it.
+    ///
+    ///   cargo test -p consensus --release --lib probe_c1_decision -- --ignored --nocapture
+    #[test]
+    #[ignore = "the C1 decision experiment"]
+    fn probe_c1_decision_experiment() {
+        const N: u64 = 20_000;
+        println!("menu        c1_legal |  breaches |  C-vs-C |  C-vs-S |  rate");
+        for menu in [Menu::Honest, Menu::SparseAnchor, Menu::Equivocate] {
+            for c1 in [false, true] {
+                let (mut breaches, mut cc, mut cs) = (0u64, 0u64, 0u64);
+                let mut arms = ArmCounts::default();
+                for seed in 0..N {
+                    let o = sched_run_full(seed, menu, true, 0, c1);
+                    arms.add(&o.arms);
+                    if let Some((_, _, di, _, dj)) = &o.violation {
+                        breaches += 1;
+                        let a = di.starts_with("Commit");
+                        let b = dj.starts_with("Commit");
+                        if a && b {
+                            cc += 1;
+                        } else {
+                            cs += 1;
+                        }
+                    }
+                }
+                println!(
+                    "{:<11} {:>7} | {:>9} | {:>7} | {:>7} | {:.4}",
+                    format!("{:?}", menu), c1, breaches, cc, cs, arms.decided_rate()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "validate the experiment itself"]
+    fn probe_validate_c1_legal_universe() {
+        use rand::{Rng, SeedableRng};
+        for c1 in [false, true] {
+            let (mut dup_author_vertices, mut total, mut twins_seen) = (0u64, 0u64, 0u64);
+            for seed in 0..2000u64 {
+                let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+                let validators = mk_validators(4);
+                let byz = Some(validators[rng.gen_range(0..validators.len())].0.clone());
+                let uni = sched_universe(
+                    &validators, byz.as_deref(), Menu::Equivocate, 0, c1, &mut rng);
+                let mut by_slot: std::collections::HashMap<(u64, String), u32> =
+                    std::collections::HashMap::new();
+                for (_, v) in &uni {
+                    total += 1;
+                    *by_slot.entry((v.round, v.author.clone())).or_insert(0) += 1;
+                    let mut seen: std::collections::HashSet<&str> =
+                        std::collections::HashSet::new();
+                    if !v.parent_refs.iter().all(|r| seen.insert(r.author.as_str())) {
+                        dup_author_vertices += 1;
+                    }
+                }
+                twins_seen += by_slot.values().filter(|c| **c > 1).count() as u64;
+            }
+            println!(
+                "c1_legal={:<5} vertices={} | citing a DUPLICATE AUTHOR: {} | (author,round) slots holding twins: {}",
+                c1, total, dup_author_vertices, twins_seen
+            );
+        }
     }
 }

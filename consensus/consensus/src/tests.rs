@@ -3022,4 +3022,138 @@ mod tests {
              passes on a predicate that accepts everything"
         );
     }
+
+    /// C1 — a vertex may not name the same parent AUTHOR twice.
+    ///
+    /// Sui's `DuplicatedAncestorsAuthority`. Stateless: the predicate takes no
+    /// DAG, no storage, no `&self`, so the verdict is identical on every honest
+    /// node at any packet-loss level.
+    ///
+    /// What it stops: citing BOTH twins of an equivocating author. The
+    /// duplicate-DIGEST check already in `add_vertex` cannot catch that — twin A
+    /// and twin B are different digests — and without C1 that one vertex is
+    /// counted toward BOTH twins by `direct_quorum_met`, which is evaluated once
+    /// per candidate.
+    ///
+    /// MEASURED on the corpus, 20,000 schedules, with the universe made C1-legal
+    /// (validated separately: 0 duplicate-author citations, twins still present):
+    ///   before  1,737 breaches, ALL Commit-vs-Commit
+    ///   after     807 breaches, ZERO Commit-vs-Commit, all Commit-vs-Skip
+    /// So C1 closes the two-nodes-finalise-different-hashes shape completely, and
+    /// closes NOTHING of the Commit-vs-Skip residual, which is H1+H2 and needs a
+    /// vertex-fetch client. Claiming more than that would be a false report.
+    #[test]
+    fn test_c1_duplicate_parent_author_is_refused() {
+        let keys: Vec<(String, String, [u8; 32])> =
+            (1..=4u8).map(|i| tier2_keypair(i + 60)).collect();
+        let mut validators: Vec<(String, u64)> =
+            keys.iter().map(|(a, _, _)| (a.clone(), 1000u64)).collect();
+        validators.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Round-1 vertices, then a round-2 vertex citing all four — legal.
+        let r1: Vec<(String, u64, String)> = keys
+            .iter()
+            .map(|(addr, _, key)| {
+                let v = tier2_vertex(key, addr, 1, 1_000, &[("genesis".into(), 0, String::new())]);
+                (v.hash.clone(), 1, addr.clone())
+            })
+            .collect();
+        let legal = tier2_vertex(&keys[0].2, &keys[0].0, 2, 1_000, &r1);
+        assert!(
+            crate::qc::parent_refs_admissible(&legal, &validators).is_ok(),
+            "CONTROL: a vertex citing one vertex per author must be admitted, or \
+             this test passes on a predicate that rejects everything"
+        );
+
+        // Now duplicate ONE author, with a DISTINCT digest — the twin shape. The
+        // author list is 4 distinct + 1 repeat, so the stake clause is still
+        // satisfied and only C1 can catch it.
+        let mut twins = r1.clone();
+        twins.push((format!("{}#twin", r1[0].0), 1, r1[0].2.clone()));
+        let dup = tier2_vertex(&keys[0].2, &keys[0].0, 2, 1_000, &twins);
+        assert_eq!(dup.parent_refs.len(), 5);
+        assert_ne!(
+            dup.parents[0], dup.parents[4],
+            "the two entries must be DISTINCT digests, or the pre-existing \
+             duplicate-digest check would catch this and C1 would be unproven"
+        );
+        let verdict = crate::qc::parent_refs_admissible(&dup, &validators);
+        assert!(
+            verdict.is_err(),
+            "a vertex naming author {} twice must be refused",
+            r1[0].2
+        );
+        assert!(
+            format!("{:?}", verdict).contains("twice"),
+            "refused for the wrong reason: {:?} — it must be the duplicate-author \
+             clause, not the stake or round clause",
+            verdict
+        );
+    }
+
+    /// C1 at TIER 2, through real `add_vertex` and real `StateDB`.
+    ///
+    /// The unit test proves the predicate; this proves the predicate is WIRED.
+    #[test]
+    fn test_c1_tier2_vertex_citing_both_twins_is_not_ingested() {
+        const PINNED: u64 = 1_700_000_000;
+        let keys: Vec<(String, String, [u8; 32])> =
+            (1..=4u8).map(|i| tier2_keypair(i + 70)).collect();
+        let known: Vec<(String, String)> =
+            keys.iter().map(|(a, p, _)| (a.clone(), p.clone())).collect();
+
+        let path = get_test_db_path("c1_tier2");
+        let mut node = tier2_open(71, &path, &known);
+        node.now_secs = Arc::new(|| PINNED);
+
+        // Round 1 from all four.
+        let r1 = tier2_feed_round(
+            &mut node, &keys, 1, PINNED, &[("genesis".into(), 0, String::new())]);
+
+        // keys[0] equivocates at round 2: two vertices, same author and round,
+        // different timestamps and therefore different hashes.
+        let twin_a = tier2_vertex(&keys[0].2, &keys[0].0, 2, PINNED, &r1);
+        let twin_b = tier2_vertex(&keys[0].2, &keys[0].0, 2, PINNED + 1, &r1);
+        assert_ne!(twin_a.hash, twin_b.hash);
+        node.current_round = 2;
+        node.add_vertex(twin_a.clone());
+        node.add_vertex(twin_b.clone());
+
+        // The other three emit honest round-2 vertices, so a round-3 vertex can
+        // reach a stake quorum WITHOUT the duplicate.
+        let mut r2: Vec<(String, u64, String)> = vec![(twin_a.hash.clone(), 2, keys[0].0.clone())];
+        for (addr, _, key) in keys.iter().skip(1) {
+            let v = tier2_vertex(key, addr, 2, PINNED, &r1);
+            r2.push((v.hash.clone(), 2, addr.clone()));
+            node.add_vertex(v);
+        }
+
+        // A round-3 vertex citing BOTH twins plus the three honest round-2
+        // vertices. Five refs, four distinct authors — the stake clause passes.
+        let mut both = r2.clone();
+        both.push((twin_b.hash.clone(), 2, keys[0].0.clone()));
+        let citing_both = tier2_vertex(&keys[1].2, &keys[1].0, 3, PINNED, &both);
+        node.current_round = 3;
+        node.add_vertex(citing_both.clone());
+
+        assert!(
+            !node.dag.lock().unwrap().contains_key(&citing_both.hash),
+            "a round-3 vertex citing BOTH twins of an equivocating author was \
+             INGESTED. `direct_quorum_met` is evaluated once per candidate, so \
+             this one vertex would be counted toward both twins and the pair could \
+             carry more stake than the validator set has."
+        );
+
+        // Non-vacuity: the same vertex WITHOUT the duplicate must be ingested, or
+        // the assertion above passes on a node that refuses everything at round 3.
+        let citing_one = tier2_vertex(&keys[2].2, &keys[2].0, 3, PINNED, &r2);
+        node.add_vertex(citing_one.clone());
+        assert!(
+            node.dag.lock().unwrap().contains_key(&citing_one.hash),
+            "the gate refused an HONEST round-3 vertex — it is not discriminating, \
+             it is just rejecting"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }

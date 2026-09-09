@@ -640,6 +640,89 @@ increment's safety argument relies on at most one vertex per `(author, round)`, 
 guarantees only because `dag.rs:1167` drops the twin. Persisting both twins without
 landing the H4 fix would void it with no test failing.
 
+### H4 — closed (C1). H1 and H2 — STOP, and why.
+
+An 18-agent read-only literature gate refuted **all four** coupled designs, each by an
+independent FATAL, and the four fatals reduce to ONE root:
+
+> With both twins stored, a node routinely computes a correct verdict naming a digest whose
+> BODY IT DOES NOT HOLD. It then has two moves. **Skip** is a safety fork. **Defer** is a
+> permanent halt — `commit_one_anchor` opens with `dag.get(anchor)?` and `try_commit` breaks
+> once a candidate passes, so the cursor never advances. Every system in the literature that
+> keeps both twins pairs it with a PULL CLIENT (Sui `synchronizer.rs` + suspended blocks;
+> Aptos `dag_fetcher.rs`; Narwhal `notify_read_parent_certificates`).
+> **AINCORE has a VERTEX_REQ server and no client.** Nobody commits a block they do not hold,
+> and there is no third option.
+
+**The missing primitive, named:** Byzantine Consistent Broadcast (Cachin et al. Module 3.10)
+or Narwhal-style certification. Bullshark states non-equivocation as an ASSUMED INPUT to the
+ordering layer (§2.1: "if two honest parties have a vertex in round r by party p ... the
+vertices are identical") and its safety proof invokes it by name; DAG-Rider obtains it from
+BRB Integrity; Narwhal from certificates. AINCORE runs a Bullshark-shaped ordering layer on
+single-signed fire-and-forget Gossipsub — **no echo, no ack, no certificate** — so the
+premise the algorithm names is simply absent, and `dag.rs`'s equivocation `return`
+substitutes a receiver-relative fact ("I dropped the second one I saw") for it.
+
+**No reference system tie-breaks between twins.** Mysticeti keeps both and makes support a
+function of the VOTER's own signed bytes (§II-C); Sui's `base_committer::try_direct_decide`
+*panics* rather than choose when two candidates have support. That is why the measured
+sort-based half-fix scored `P_VIEWINDEP_ORDER` GREEN and `P_VIEWINDEP_SUBSET` RED — ordering
+was never the mechanism anywhere.
+
+**LANDED: C1 — no repeated parent AUTHOR** (`qc::parent_refs_admissible`, clause 4). Sui's
+`DuplicatedAncestorsAuthority`, expressible only because `ParentRef` carries the author. The
+duplicate-DIGEST check in `add_vertex` cannot catch it: twin A and twin B are distinct
+digests. Stateless — no DAG, no storage, no `&self`.
+
+**THE EXPERIMENT THAT DECIDED IT, and it reversed itself once validated.** The corpus's
+Equivocate universe was ingress-ILLEGAL — `prev` holds both twins, so every honest vertex
+cited both — meaning the headline 1,737 breaches were measured on a world no honest node can
+produce. Re-run on a C1-legal universe (same seeds, one change: honest producers cite one
+vertex per author):
+
+| universe | breaches | Commit-vs-**Commit** | Commit-vs-Skip | honest rate |
+|---|---|---|---|---|
+| illegal (as measured before) | 1,737 | 1,737 | 0 | 0.4382 |
+| **C1-legal** | 807 | **0** | 807 | 0.4382 |
+
+**C1 closes the two-nodes-finalise-different-hashes shape completely and closes NOTHING of
+the Commit-vs-Skip residual**, which is H1+H2 and needs the fetch client. Honest menu is
+bit-identical (0.4382 both ways) — C1 is inert where there are no twins, as it must be.
+
+**The first run of that experiment was WRONG and would have reversed the decision.** It
+reported 867 Commit-vs-Commit, which by the pre-registered rule means "do not ship C1". Cause:
+the Byzantine twin branch `continue`d BEFORE the C1-legal collapse, so 16,000 of 58,000
+vertices still named a duplicate author — the "C1-legal" universe was still illegal. Found by
+validating the experiment against its own claim (`probe_validate_c1_legal_universe`: 0
+duplicate-author citations, 10,000 twin slots still present) rather than trusting it.
+
+**A SECOND-IMPLEMENTATION TRAP FOUND IN OUR OWN HARNESS.** `P_NODOUBLECOUNT` asserted against
+`voter_stake`, a test-local DUPLICATE of `direct_quorum_met` — so editing production could not
+move the assertion, and the test would report green on a fixed OR a broken implementation
+alike. Deleted; the property now reads production directly and states the safety-relevant form:
+**at most one twin at a round may meet direct quorum.** Related: `mk_vertex` hard-coded
+`parent_refs: Vec::new()`, so all 20,000 tier-1 schedules ran on vertices no honest producer
+emits and no ingress rule could reject. Fixtures are now ingress-shaped.
+
+Mutations, all RUN: remove C1 → both new tests RED; key it on duplicate DIGEST instead of
+AUTHOR → both RED (proving they discriminate it from the pre-existing digest check); make the
+predicate unconditionally `Ok` → the C1 tests, BOTH tier-2 H3 witnesses and the thin-anchor
+control all RED (proving the gate reaches production).
+
+**NEXT, and it is not negotiable by cleverness: the VERTEX_REQ client.** Then, as ONE commit,
+twin storability + slot-decided anchor identity + a certificate-bound ancestry arm. And a
+coupling the register did not previously record: **the ancestry arm is sound today only
+because of non-equivocation** — `Some(hj) if visited.contains(&hj)` accepts an arrival-picked
+candidate on bare reachability, so the moment twins are storable both can sit in one anchor's
+`visited`. Fixing the direct arm and leaving the ancestry arm would be the second instance of
+the class.
+
+**C1 does NOT fix:** H1, H2 (the 807 Commit-vs-Skip breaches), the ancestry arm, B3/B4, H6,
+H7, B4b. **And it has a boot bypass:** `parent_refs_admissible` has one call site, inside
+`add_vertex`; the three recovery loops run only `calculate_hash()` and `is_live_form()`, so a
+duplicate-author vertex already on disk is revived unchecked. Pre-existing, not worsened, not
+covered — closing it needs the epoch committee at boot, which is node-local at that moment.
+
 **Rejected outright:** exhaustive model checking (FACT 2; and `held: BTreeSet` collapses
 every delivery permutation into one fingerprint, making the root defect H2 *unrepresentable*);
 the record/replay recorder (it misses ChainSync's client path, `sync/src/lib.rs:722`, the

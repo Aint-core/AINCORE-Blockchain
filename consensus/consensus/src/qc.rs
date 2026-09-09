@@ -229,6 +229,11 @@ pub fn stake_quorum_met(signed_stake: u128, total_stake: u128) -> bool {
 ///  3. the DISTINCT declared parent authors carry strict >2/3 stake — the
 ///     premise Bullshark's skip corollary quantifies over and that AINCORE
 ///     asserted in a doc comment while enforcing it only producer-side.
+///  4. no author is named TWICE. Sui's `DuplicatedAncestorsAuthority`. Without
+///     it a vertex may cite both twins of an equivocating author, and
+///     `direct_quorum_met` — evaluated once per candidate — counts that one
+///     vertex toward both, letting the two twins together carry 200% of the
+///     validator set.
 ///
 /// `committee` MUST be the epoch-frozen set. A live, node-local set would make
 /// the verdict time-varying and non-unanimous, which is the refuted rule by a
@@ -272,7 +277,25 @@ pub fn parent_refs_admissible(
         committee.iter().map(|(a, s)| (a.as_str(), *s)).collect();
     let mut authors: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for r in &vertex.parent_refs {
-        authors.insert(r.author.as_str());
+        // CLAUSE 4 — no repeated parent AUTHOR.
+        //
+        // Sui's `DuplicatedAncestorsAuthority` (`SignedBlockVerifier::verify_block`,
+        // a stateless `seen_ancestors: vec![false; committee.size()]`). Expressible
+        // here only because `ParentRef` carries the author; before that the set was
+        // built solely to sum stake and a repeat was silently absorbed.
+        //
+        // What it stops: a vertex citing BOTH twins of an equivocating author. The
+        // duplicate-DIGEST check in `add_vertex` cannot catch it — twin A and twin
+        // B are different digests. Without this clause one round-(r+1) vertex is
+        // counted toward BOTH twins in `direct_quorum_met`, which is evaluated once
+        // per candidate, so the two twins together can carry 200% of the validator
+        // set (measured exactly that).
+        if !authors.insert(r.author.as_str()) {
+            return Err(format!(
+                "parent_refs name author {} twice (duplicate-authority ancestor)",
+                r.author
+            ));
+        }
     }
     let signed: u128 = authors
         .iter()
