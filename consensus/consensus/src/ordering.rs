@@ -2125,6 +2125,11 @@ mod tests {
     struct ScheduleOutcome {
         /// (round, view i, decision i, view j, decision j) of the first AD-1 breach.
         violation: Option<(u64, usize, String, usize, String)>,
+        /// Cursors of the two disagreeing views AT the breach. A fork whose
+        /// forking nodes kept deciding past it is LIVE; one where both stopped
+        /// at the breach round was masked by a wedge and is not reachable in the
+        /// field today.
+        breach_cursors: Option<(u64, u64)>,
         arms: ArmCounts,
     }
 
@@ -2142,6 +2147,7 @@ mod tests {
         validators: &[(String, u64)],
         byz: Option<&str>,
         menu: Menu,
+        fabricate_ppm: u32,
         rng: &mut rand::rngs::StdRng,
     ) -> Vec<(String, blockchain::Vertex)> {
         use rand::Rng;
@@ -2159,11 +2165,24 @@ mod tests {
                     }
                     continue;
                 }
-                let parents = if is_byz && menu == Menu::SparseAnchor {
+                let mut parents = if is_byz && menu == Menu::SparseAnchor {
                     vec![prev[rng.gen_range(0..prev.len())].clone()]
                 } else {
                     prev.clone()
                 };
+                // MASKING MECHANISM, restored for the experiment. The corpus
+                // deliberately EXCLUDES fabricated parents because they fire on
+                // nearly every seed and drown the agreement signal — which means
+                // it measured H3's reachability in a world with the masking
+                // removed. That is exactly the gap this experiment closes.
+                // Gated on is_byz: an HONEST node never fabricates a parent. The
+                // first cut of this experiment let every validator fabricate,
+                // which models nothing real and inflates the wedge rate.
+                if is_byz && fabricate_ppm > 0 && r >= 2
+                    && rng.gen_range(0..1_000_000) < fabricate_ppm
+                {
+                    parents.push(format!("{:064x}", 0xdead_0000_0000_0000u64 + r));
+                }
                 let (h, v) = mk_vertex(r, a, parents);
                 this.push(h.clone());
                 out.push((h, v));
@@ -2226,6 +2245,10 @@ mod tests {
     /// shift the main stream — otherwise "same seed, permutation off" would be a
     /// different world, and the inertness measurement would be meaningless.
     fn sched_run(seed: u64, menu: Menu, permute: bool) -> ScheduleOutcome {
+        sched_run_fab(seed, menu, permute, 0)
+    }
+
+    fn sched_run_fab(seed: u64, menu: Menu, permute: bool, fabricate_ppm: u32) -> ScheduleOutcome {
         use rand::seq::SliceRandom;
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -2241,7 +2264,8 @@ mod tests {
             Menu::Honest => None,
             _ => Some(validators[rng.gen_range(0..validators.len())].0.clone()),
         };
-        let universe = sched_universe(&validators, byz_owned.as_deref(), menu, &mut rng);
+        let universe =
+            sched_universe(&validators, byz_owned.as_deref(), menu, fabricate_ppm, &mut rng);
 
         let mut views: Vec<View> = Vec::new();
         for i in 0..SCHED_VIEWS {
@@ -2284,6 +2308,7 @@ mod tests {
             sched_classify(v, &validators, max_r, &mut arms);
         }
         let mut violation = None;
+        let mut breach_cursors = None;
         'outer: for i in 0..views.len() {
             for j in (i + 1)..views.len() {
                 let mut r = 2;
@@ -2291,13 +2316,15 @@ mod tests {
                     let (a, b) = (views[i].decision(r), views[j].decision(r));
                     if !agree(&a, &b) {
                         violation = Some((r, i, format!("{:?}", a), j, format!("{:?}", b)));
+                        breach_cursors =
+                            Some((views[i].eng.next_anchor_round, views[j].eng.next_anchor_round));
                         break 'outer;
                     }
                     r += 2;
                 }
             }
         }
-        ScheduleOutcome { violation, arms }
+        ScheduleOutcome { violation, breach_cursors, arms }
     }
 
     /// Corpus size for the in-suite gates, scaled by profile: 3,000 schedules
@@ -3171,5 +3198,104 @@ mod tests {
         assert!(follower.adopt_synced_anchor(4, "anchor4", &seq4, &validators).is_none());
         assert!(follower.adopt_synced_anchor(2, "anchor2", &seq2, &validators).is_none());
         assert_eq!(follower.finality_digest, producer.finality_digest);
+    }
+
+    /// THE ORDERING EXPERIMENT. Is H3 reachable at HEAD, or is it MASKED by the
+    /// B3/B4 halt?
+    ///
+    /// The corpus deliberately EXCLUDES the fabricated-parent script, because it
+    /// fires on nearly every seed and drowns the agreement signal. So the corpus
+    /// measured H3's reachability in a world with the masking mechanism REMOVED —
+    /// and the register's own §4 note says H5's halt masks H3 today. If a
+    /// Byzantine thin anchor in the field almost always coexists with a
+    /// fabricated or missing parent somewhere, the cursor wedges before the
+    /// ancestry arm is ever reached, and H3 is a defect of the POST-pull-client
+    /// system rather than of the running one.
+    ///
+    /// That distinction decides the work order, so it is measured, not argued:
+    ///   breaches     — AD-1 broken despite the fabrication
+    ///   wedge-only   — no breach, and the FULL view never reached the top
+    ///
+    /// The LIVE/MASKED split is reported but is NEAR-TAUTOLOGICAL and must not be
+    /// read as evidence: a `Skip` verdict MEANS the view advanced past that round,
+    /// so any Commit-vs-Skip breach classifies as LIVE by construction. It is kept
+    /// only to make that visible. **The real signal is `breaches` staying non-zero
+    /// as fabrication rises.**
+    ///
+    /// MEASURED (20,000 seeds each, fabrication gated to the BYZANTINE node —
+    /// an honest node never fabricates a parent, and a first cut that let every
+    /// validator do so modelled nothing real and inflated the wedge rate):
+    ///
+    ///   fab rate |  breaches | wedge-only
+    ///         0% |       175 |          0
+    ///       0.1% |       165 |         51
+    ///         1% |       160 |        415
+    ///         5% |       141 |      1,985
+    ///        20% |        96 |      7,332
+    ///        50% |        26 |     15,080
+    ///
+    /// CONCLUSION: masking is REAL but WEAK, and never approaches zero. At any
+    /// plausible rate the breach count is barely attenuated (141-160 of 175), and
+    /// even with the Byzantine node fabricating on HALF its vertices, 26 of 20,000
+    /// schedules still fork. **H3 is live at HEAD, independently of the pull
+    /// client.** A fork is not recoverable; a halt is.
+    ///
+    ///   cargo test -p consensus --release --lib probe_is_h3_masked -- --ignored --nocapture
+    #[test]
+    #[ignore = "the ordering experiment"]
+    fn probe_is_h3_masked_by_the_b3b4_halt() {
+        const N: u64 = 20_000;
+        // max_r is 6 (SCHED_ROUNDS), anchors at 2 and 4, so a view that decided
+        // both has its cursor at 5. Below that it stopped.
+        const HEALTHY_CURSOR: u64 = 5;
+        println!("fab_ppm |  breaches |     LIVE |   MASKED | wedge-only | anc-skip");
+        for fab in [0u32, 1_000, 10_000, 50_000, 200_000, 500_000] {
+            let (mut breaches, mut live, mut masked, mut wedge_only) = (0u64, 0u64, 0u64, 0u64);
+            let mut arms = ArmCounts::default();
+            for seed in 0..N {
+                let o = sched_run_fab(seed, Menu::SparseAnchor, true, fab);
+                arms.add(&o.arms);
+                match (&o.violation, &o.breach_cursors) {
+                    (Some((r, ..)), Some((ci, cj))) => {
+                        breaches += 1;
+                        if *ci > r + 2 && *cj > r + 2 {
+                            live += 1;
+                        } else {
+                            masked += 1;
+                        }
+                    }
+                    _ => {
+                        // No breach. Did the FULL view (0) simply wedge?
+                        if sched_full_view_cursor(seed, Menu::SparseAnchor, fab) < HEALTHY_CURSOR {
+                            wedge_only += 1;
+                        }
+                    }
+                }
+            }
+            println!(
+                "{:>7} | {:>9} | {:>8} | {:>8} | {:>10} | {:>8}",
+                fab, breaches, live, masked, wedge_only, arms.ancestry_skip
+            );
+        }
+    }
+
+    /// Cursor of the fully-connected view — the one that cannot be behind for
+    /// any reason except a wedge.
+    fn sched_full_view_cursor(seed: u64, menu: Menu, fabricate_ppm: u32) -> u64 {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let validators = mk_validators(4);
+        let byz = match menu {
+            Menu::Honest => None,
+            _ => Some(validators[rng.gen_range(0..validators.len())].0.clone()),
+        };
+        let universe =
+            sched_universe(&validators, byz.as_deref(), menu, fabricate_ppm, &mut rng);
+        let mut v = View::new();
+        for (h, vx) in &universe {
+            v.insert(h, vx);
+        }
+        v.evaluate(&validators);
+        v.eng.next_anchor_round
     }
 }
