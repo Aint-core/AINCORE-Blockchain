@@ -2880,9 +2880,18 @@ mod tests {
     /// M2's LIMIT, stated so it is not mistaken for validation of a production
     /// fix: tier 1 does not run `add_vertex`, so the filter here is a SECOND
     /// IMPLEMENTATION of the ingress rule. It proves the property is achievable.
-    /// Validating the real fix needs a tier-2 node-level test.
+    ///
+    /// **STATUS: the production fix has since landed** — `qc::parent_refs_admissible`,
+    /// called from `add_vertex`, validated by `test_h3_tier2_stateless_gate_...`
+    /// and `test_h3_tier2_round_skipping_anchor_is_refused` through REAL ingress.
+    /// This test stays RED on purpose: it says the DECISION function is unsound in
+    /// isolation, which remains true — a thin anchor that somehow reached the DAG
+    /// would still fork it. The ingress gate is what stops one from reaching it.
+    /// Do not "fix" this by changing the ancestry arm; the arm is correct given
+    /// the premise, and the premise is now enforced where the literature enforces
+    /// it.
     #[test]
-    #[ignore = "reproduces H3, an OPEN CRITICAL defect: RED by design until the ingress parent-quorum gate lands"]
+    #[ignore = "the DECISION function remains unsound in isolation; the ingress gate is what stops a thin anchor reaching it — see test_h3_tier2_*"]
     fn test_h3_sparse_anchor_forks_direct_committer_from_ancestry_skipper() {
         // M0 negative control: flip to true, the test must go SILENT.
         const BYZ_HONEST: bool = false;

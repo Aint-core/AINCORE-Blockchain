@@ -783,11 +783,24 @@ mod tests {
         dag.storage.put("sys:validators", &validator_json).unwrap();
         dag.invalidate_validators_cache();
 
-        let mut parents = vec!["genesis".to_string()];
+        // Each vertex cites the previous one WITH a self-describing ref; the sole
+        // validator carries the whole stake, so the parent gate is satisfied.
+        let mut parents: Vec<blockchain::ParentRef> = Vec::new();
         for round in 1..=4 {
-            let mut vertex = Vertex::new(round, remote_addr.clone(), parents.clone(), vec![]);
+            let mut vertex = Vertex::new(
+                round,
+                remote_addr.clone(),
+                parents.iter().map(|r| r.digest.clone()).collect(),
+                vec![],
+            );
+            vertex.parent_refs = parents.clone();
+            vertex.hash = vertex.calculate_hash();
             vertex.sign_with_ed25519(&remote_sk);
-            parents = vec![vertex.hash.clone()];
+            parents = vec![blockchain::ParentRef {
+                round,
+                author: remote_addr.clone(),
+                digest: vertex.hash.clone(),
+            }];
             dag.add_vertex(vertex);
         }
 
@@ -1247,6 +1260,50 @@ mod tests {
 
     /// Build a vertex authored + signed by the consensus node (offender == self,
     /// which is already a registered validator in `setup_dag`).
+    /// A vertex signed by `consensus`'s own key, citing `parents`.
+    ///
+    /// Refs are RESOLVED from the node's DAG, the same way `try_create_vertex`
+    /// builds them. Without that, every vertex above round 1 is refused by the
+    /// stateless parent gate — correctly, since a real producer always emits
+    /// refs — and the fixture would be testing a vertex no honest node produces.
+    fn signed_vertex_citing(
+        consensus: &DagConsensus,
+        round: u64,
+        timestamp: u64,
+        parents: Vec<String>,
+    ) -> blockchain::Vertex {
+        let signing_key = crypto::SigningKey::from_bytes(&consensus.node_key);
+        let parent_refs = {
+            let dag = consensus.dag.lock().unwrap();
+            parents
+                .iter()
+                .filter_map(|h| {
+                    dag.get(h).map(|pv| blockchain::ParentRef {
+                        round: pv.round,
+                        author: pv.author.clone(),
+                        digest: h.clone(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut v = blockchain::Vertex {
+            round,
+            author: consensus.node_id.clone(),
+            timestamp,
+            payload: vec![],
+            parents,
+            parent_refs,
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
+        };
+        v.hash = v.calculate_hash();
+        v.sign_with_ed25519(&signing_key);
+        v
+    }
+
     fn signed_vertex(consensus: &DagConsensus, round: u64, timestamp: u64) -> blockchain::Vertex {
         let signing_key = crypto::SigningKey::from_bytes(&consensus.node_key);
         let mut v = blockchain::Vertex {
@@ -1822,10 +1879,62 @@ mod tests {
 
         consensus.add_vertex(far_vertex);
 
-        // The vertex is STORED (it still counts toward its own round's quorum)...
+        // LEG 1 (NEW, stronger): a far-ahead vertex declaring NO parent refs is
+        // now REFUSED outright by the stateless parent gate. No honest producer
+        // emits one, and the refusal costs nothing in liveness because the gate
+        // reads only the vertex's own bytes — it is not a test of what this node
+        // holds. This assertion was previously "must still be ingested", which
+        // was correct before the gate existed.
         {
             let dag = consensus.dag.lock().unwrap();
-            assert_eq!(dag.len(), 1, "the far-ahead vertex must still be ingested");
+            assert_eq!(
+                dag.len(),
+                0,
+                "a far-ahead vertex with no parent refs must be refused at ingress"
+            );
+        }
+
+        // LEG 2: the ORIGINAL property must survive. A far-ahead vertex that
+        // DECLARES a valid parent set is still admitted — the gate is stateless,
+        // so it does not check that those parents exist (that is B3/B4, open by
+        // design) — and it still must not drag the local proposal clock forward.
+        // Without this leg the test would have been weakened into "we now reject
+        // everything far ahead", which is a different and lesser claim.
+        let mut far_ok = blockchain::Vertex {
+            round: far_round,
+            author: remote_id.clone(),
+            timestamp: 1_000,
+            payload: vec![],
+            parents: vec![format!("{:064x}", 1u64), format!("{:064x}", 2u64)],
+            parent_refs: vec![
+                blockchain::ParentRef {
+                    round: far_round - 1,
+                    author: consensus.node_id.clone(),
+                    digest: format!("{:064x}", 1u64),
+                },
+                blockchain::ParentRef {
+                    round: far_round - 1,
+                    author: remote_id.clone(),
+                    digest: format!("{:064x}", 2u64),
+                },
+            ],
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
+        };
+        far_ok.hash = far_ok.calculate_hash();
+        far_ok.sign_with_ed25519(&remote_key);
+        consensus.add_vertex(far_ok);
+        {
+            let dag = consensus.dag.lock().unwrap();
+            assert_eq!(
+                dag.len(),
+                1,
+                "a far-ahead vertex declaring a valid parent quorum must still be \
+                 ingested — the gate is stateless and does not check existence"
+            );
         }
         // ...but it must NOT have dragged our proposal clock to far_round + 1.
         assert!(
@@ -2208,8 +2317,21 @@ mod tests {
         // Sending the out-of-bound probe first also means that if the drift gate
         // wrongly ADMITS it, the in-bound probe then collides with it and the
         // second assertion fires too. Neither leg can pass by accident.
-        let outside = signed_vertex(&consensus, 2, PINNED + 31);
-        let inside = signed_vertex(&consensus, 2, PINNED + 29);
+        // Cite the round-1 vertex this node just authored. A round-2 vertex
+        // citing "genesis" carries no resolvable parent refs and is refused by
+        // the stateless parent gate — correctly, since no producer emits one —
+        // which would make both probes fail for the wrong reason.
+        let r1: Vec<String> = consensus
+            .dag
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|v| v.round == 1)
+            .map(|v| v.hash.clone())
+            .collect();
+        assert_eq!(r1.len(), 1, "expected the node's own round-1 vertex");
+        let outside = signed_vertex_citing(&consensus, 2, PINNED + 31, r1.clone());
+        let inside = signed_vertex_citing(&consensus, 2, PINNED + 29, r1);
         assert_ne!(inside.hash, outside.hash);
 
         let before = consensus.dag.lock().unwrap().len();
@@ -2307,33 +2429,21 @@ mod tests {
 
     /// Feed one round of a validly-signed full mesh into `node`, returning the
     /// hashes so the next round can cite them.
+    /// Feed one round of a validly-signed full mesh, carrying self-describing
+    /// parent refs. Returns (digest, round, author) triples so the next round can
+    /// build its own refs without a DAG lookup.
     fn tier2_feed_round(
         node: &mut DagConsensus,
         keys: &[(String, String, [u8; 32])],
         round: u64,
         ts: u64,
-        parents: &[String],
-    ) -> Vec<String> {
+        parents: &[(String, u64, String)],
+    ) -> Vec<(String, u64, String)> {
         node.current_round = round;
         let mut out = Vec::new();
         for (addr, _, key) in keys {
-            let sk = crypto::SigningKey::from_bytes(key);
-            let mut v = blockchain::Vertex {
-                round,
-                author: addr.clone(),
-                timestamp: ts,
-                payload: vec![],
-                parents: parents.to_vec(),
-                hash: String::new(),
-                signature: String::new(),
-                aggregated_signature: None,
-                payload_root: None,
-                parents_root: None,
-                parent_refs: Vec::new(),
-            };
-            v.hash = v.calculate_hash();
-            v.sign_with_ed25519(&sk);
-            out.push(v.hash.clone());
+            let v = tier2_vertex(key, addr, round, ts, parents);
+            out.push((v.hash.clone(), round, addr.clone()));
             node.add_vertex(v);
         }
         out
@@ -2397,7 +2507,8 @@ mod tests {
         node.now_secs = Arc::new(|| PINNED);
 
         // Rounds 1-3: anchor round 2 commits and is placed locally at height 1.
-        let mut prev = vec!["genesis".to_string()];
+        let mut prev: Vec<(String, u64, String)> =
+            vec![("genesis".to_string(), 0, String::new())];
         for r in 1..=3u64 {
             prev = tier2_feed_round(&mut node, &keys, r, PINNED, &prev);
         }
@@ -2507,7 +2618,13 @@ mod tests {
         node.peers.lock().unwrap().insert("peer".to_string(), 9999);
 
         // Round 1 from all four validators, so round 2 has four parents.
-        let _ = tier2_feed_round(&mut node, &keys, 1, PINNED, &["genesis".to_string()]);
+        let _ = tier2_feed_round(
+            &mut node,
+            &keys,
+            1,
+            PINNED,
+            &[("genesis".to_string(), 0, String::new())],
+        );
         node.current_round = 2;
         node.try_create_vertex();
 
@@ -2547,5 +2664,362 @@ mod tests {
         }
         drop(dag);
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Build one signed vertex WITH self-describing parent refs, the way a real
+    /// producer does. `parents` carries (digest, round, author) so the refs can
+    /// be built without a DAG.
+    fn tier2_vertex(
+        key: &[u8; 32],
+        author: &str,
+        round: u64,
+        ts: u64,
+        parents: &[(String, u64, String)],
+    ) -> blockchain::Vertex {
+        let sk = crypto::SigningKey::from_bytes(key);
+        let mut v = blockchain::Vertex {
+            round,
+            author: author.to_string(),
+            timestamp: ts,
+            payload: vec![],
+            parents: parents.iter().map(|(d, _, _)| d.clone()).collect(),
+            parent_refs: parents
+                .iter()
+                .map(|(d, r, a)| blockchain::ParentRef {
+                    round: *r,
+                    author: a.clone(),
+                    digest: d.clone(),
+                })
+                .collect(),
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
+        };
+        v.hash = v.calculate_hash();
+        v.sign_with_ed25519(&sk);
+        v
+    }
+
+    /// AUDIT H3 AT TIER 2 — real `DagConsensus`, real `StateDB`, real ingress.
+    ///
+    /// The tier-1 test (`test_h3_sparse_...`) proves the property is ACHIEVABLE;
+    /// it cannot prove a production fix works, because tier 1 never executes
+    /// `add_vertex`. This does. It is the gate the register demands before any
+    /// H3 fix is believed, and the project has twice shipped broken fixes on a
+    /// code reading rather than this.
+    ///
+    /// Scenario, identical to the tier-1 witness: a Byzantine round-4 leader
+    /// emits ONE-PARENT vertices at r3 and r4 whose causal history is complete
+    /// but excludes the round-2 leader. X holds everything; Y is missing two
+    /// honest r3 vertices — plain gossip loss, no second Byzantine act.
+    ///
+    /// With the stateless parent gate in place both nodes REFUSE the thin
+    /// vertices — identically, from the vertices' own bytes — so Y never anchors
+    /// on one and the fork cannot form.
+    ///
+    /// MUTATION: disable `qc::parent_refs_admissible` at the ingress call site
+    /// and this must fail with the two nodes disagreeing about round 2.
+    #[test]
+    fn test_h3_tier2_stateless_gate_prevents_the_ancestry_fork() {
+        const PINNED: u64 = 1_700_000_000;
+        let keys: Vec<(String, String, [u8; 32])> =
+            (1..=4u8).map(|i| tier2_keypair(i + 30)).collect();
+        let known: Vec<(String, String)> =
+            keys.iter().map(|(a, p, _)| (a.clone(), p.clone())).collect();
+        // CANONICALLY SORTED BY ADDRESS. `leader_for_round` hashes the whole
+        // (addr, stake) list, and `get_validator_set_with_stake` — which is what
+        // the engine actually passes it — returns that list sorted. Building it
+        // in key-seed order here designates a DIFFERENT node as leader than the
+        // node itself elects, so the scenario silently marks the wrong validator
+        // Byzantine and no fork forms. That is exactly what happened on the first
+        // pass, and the mutation is what exposed it.
+        let mut validators: Vec<(String, u64)> =
+            known.iter().map(|(a, _)| (a.clone(), 1000u64)).collect();
+        validators.sort_by(|a, b| a.0.cmp(&b.0));
+        let l2 = crate::ordering::OrderingEngine::leader_for_round(2, &validators, 0);
+        let byz = crate::ordering::OrderingEngine::leader_for_round(4, &validators, 0);
+        assert_ne!(l2, byz, "scenario needs distinct round-2 and round-4 leaders");
+
+        // Build the universe once, as (hash, vertex), so both nodes see the same
+        // bytes and only the DELIVERY differs.
+        let mut universe: Vec<(String, blockchain::Vertex)> = Vec::new();
+        let mut prev: Vec<(String, u64, String)> =
+            vec![("genesis".to_string(), 0, String::new())];
+        let mut byz_prev: Option<(String, u64, String)> = None;
+        for r in 1..=5u64 {
+            let mut this = Vec::new();
+            for (addr, _, key) in &keys {
+                let parents: Vec<(String, u64, String)> = if addr == &byz && (r == 3 || r == 4) {
+                    if r == 3 {
+                        // ONE parent, and NOT the round-2 leader.
+                        vec![prev
+                            .iter()
+                            .find(|(_, _, a)| a != &l2)
+                            .expect("a non-leader parent exists")
+                            .clone()]
+                    } else {
+                        vec![byz_prev.clone().expect("byz r3")]
+                    }
+                } else {
+                    prev.clone()
+                };
+                let v = tier2_vertex(key, addr, r, PINNED, &parents);
+                let entry = (v.hash.clone(), r, addr.clone());
+                if addr == &byz {
+                    byz_prev = Some(entry.clone());
+                }
+                this.push(entry);
+                universe.push((v.hash.clone(), v));
+            }
+            prev = this;
+        }
+
+        // Y misses two of the three HONEST round-3 vertices.
+        let dropped: Vec<String> = universe
+            .iter()
+            .filter(|(_, v)| v.round == 3 && v.author != byz && v.author != l2)
+            .map(|(h, _)| h.clone())
+            .collect();
+        assert_eq!(dropped.len(), 2, "scenario needs exactly two omissions");
+
+        let xp = get_test_db_path("h3_tier2_x");
+        let yp = get_test_db_path("h3_tier2_y");
+        let mut x = tier2_open(31, &xp, &known);
+        let mut y = tier2_open(32, &yp, &known);
+        x.now_secs = Arc::new(|| PINNED);
+        y.now_secs = Arc::new(|| PINNED);
+
+        for (h, v) in &universe {
+            x.current_round = v.round;
+            x.add_vertex(v.clone());
+            if dropped.contains(h) {
+                continue;
+            }
+            y.current_round = v.round;
+            y.add_vertex(v.clone());
+        }
+
+        let decided = |n: &DagConsensus, r: u64| -> Option<bool> {
+            let e = n.ordering_engine.lock().unwrap();
+            if r >= e.next_anchor_round {
+                None // not decided yet
+            } else {
+                Some(e.committed_rounds.contains(&r))
+            }
+        };
+
+        // Non-vacuity: at least one node must have decided SOMETHING, or the
+        // agreement assertion below is satisfied by a chain that never ran.
+        assert!(
+            decided(&x, 2).is_some() || decided(&y, 2).is_some(),
+            "neither node decided round 2 — the scenario did not run, so nothing \
+             is being asserted. Check the seeding preconditions in tier2_open."
+        );
+
+        match (decided(&x, 2), decided(&y, 2)) {
+            (Some(a), Some(b)) => assert_eq!(
+                a, b,
+                "AD-1 VIOLATED at tier 2: X decided committed={} for round 2, Y \
+                 decided committed={}. Same honest broadcast, different arrival, \
+                 opposite FINAL verdicts — the H3 finality fork, through real \
+                 ingress.",
+                a, b
+            ),
+            _ => {} // one side undecided is not a disagreement
+        }
+
+        let _ = std::fs::remove_dir_all(&xp);
+        let _ = std::fs::remove_dir_all(&yp);
+    }
+
+    /// AUDIT H3, SECOND WITNESS — the ROUND-SKIPPING thin anchor.
+    ///
+    /// The first tier-2 witness is caught by the stake clause alone, so it leaves
+    /// the round clause unexercised: dropping `r.round != want_round` from
+    /// `parent_refs_admissible` does not make it fail. That was measured, not
+    /// assumed, and this test exists because of it.
+    ///
+    /// The attack the round clause is actually for, and which the literature names
+    /// explicitly: a Byzantine round-4 anchor citing the THREE NON-LEADER
+    /// ROUND-2 vertices. Its declared parent authors carry 3000 of 4000 stake, so
+    /// the stake clause is satisfied — a stake-only filter admits it. But its
+    /// causal history jumps straight past round 3 and never contains the round-2
+    /// leader, so a node anchoring on it SKIPS round 2 exactly as before.
+    ///
+    /// Every reference system states the round clause in the same breath as the
+    /// count — Sui `InvalidAncestorRound`; Aptos "invalid parent round";
+    /// DAG-Rider types `strongEdges` as round r−1; Aleph Def 3.1(2); Mysticeti
+    /// §II-C — and AINCORE's producer-side predicate omitted it. This is what
+    /// that omission costs.
+    ///
+    /// MUTATION: drop the round clause and this must fail.
+    #[test]
+    fn test_h3_tier2_round_skipping_anchor_is_refused() {
+        const PINNED: u64 = 1_700_000_000;
+        let keys: Vec<(String, String, [u8; 32])> =
+            (1..=4u8).map(|i| tier2_keypair(i + 40)).collect();
+        let known: Vec<(String, String)> =
+            keys.iter().map(|(a, p, _)| (a.clone(), p.clone())).collect();
+        let mut validators: Vec<(String, u64)> =
+            known.iter().map(|(a, _)| (a.clone(), 1000u64)).collect();
+        validators.sort_by(|a, b| a.0.cmp(&b.0));
+        let l2 = crate::ordering::OrderingEngine::leader_for_round(2, &validators, 0);
+        let byz = crate::ordering::OrderingEngine::leader_for_round(4, &validators, 0);
+        assert_ne!(l2, byz);
+
+        let mut universe: Vec<(String, blockchain::Vertex)> = Vec::new();
+        let mut by_round: std::collections::HashMap<u64, Vec<(String, u64, String)>> =
+            std::collections::HashMap::new();
+        let mut prev: Vec<(String, u64, String)> =
+            vec![("genesis".to_string(), 0, String::new())];
+        for r in 1..=5u64 {
+            let mut this = Vec::new();
+            for (addr, _, key) in &keys {
+                let parents: Vec<(String, u64, String)> = if addr == &byz && r == 4 {
+                    // ROUND-SKIPPING: cite the three NON-LEADER round-2 vertices.
+                    // Quorum-fat in authors (3000 of 4000), and the round-2 leader
+                    // is absent from the whole causal cone.
+                    by_round
+                        .get(&2)
+                        .expect("round 2 built")
+                        .iter()
+                        .filter(|(_, _, a)| a != &l2)
+                        .cloned()
+                        .collect()
+                } else {
+                    prev.clone()
+                };
+                let v = tier2_vertex(key, addr, r, PINNED, &parents);
+                this.push((v.hash.clone(), r, addr.clone()));
+                universe.push((v.hash.clone(), v));
+            }
+            by_round.insert(r, this.clone());
+            prev = this;
+        }
+
+        // Sanity: the crafted anchor really does carry a stake quorum, or the
+        // round clause is not the thing being tested.
+        let crafted = universe
+            .iter()
+            .find(|(_, v)| v.round == 4 && v.author == byz)
+            .map(|(_, v)| v.clone())
+            .expect("crafted anchor exists");
+        assert_eq!(crafted.parent_refs.len(), 3, "must cite three parents");
+        assert!(
+            crafted.parent_refs.iter().all(|r| r.round == 2),
+            "the crafted anchor must declare round-2 parents (it skips round 3)"
+        );
+        let authors: std::collections::HashSet<&str> =
+            crafted.parent_refs.iter().map(|r| r.author.as_str()).collect();
+        assert_eq!(authors.len(), 3);
+        assert!(
+            crate::qc::stake_quorum_met(3000, 4000),
+            "PRECONDITION: 3 of 4 validators IS a stake quorum, so a stake-only \
+             filter admits this vertex — that is the whole point"
+        );
+
+        let path = get_test_db_path("h3_tier2_roundskip");
+        let mut node = tier2_open(41, &path, &known);
+        node.now_secs = Arc::new(|| PINNED);
+        for (_, v) in &universe {
+            node.current_round = v.round;
+            node.add_vertex(v.clone());
+        }
+
+        let admitted = node.dag.lock().unwrap().contains_key(&crafted.hash);
+        assert!(
+            !admitted,
+            "a round-SKIPPING anchor was admitted. Its parents carry a full stake \
+             quorum, so the stake clause cannot catch it; only the round clause \
+             can. Without it the anchor's causal cone jumps past round 3 and never \
+             contains the round-2 leader, and a node anchoring on it skips round 2 \
+             permanently — H3 again, by a different door."
+        );
+
+        // Non-vacuity: the honest vertices around it must still be admitted, or
+        // the assertion above would pass on a node that refused everything.
+        let honest_r4 = universe
+            .iter()
+            .filter(|(_, v)| v.round == 4 && v.author != byz)
+            .count();
+        let honest_admitted = universe
+            .iter()
+            .filter(|(h, v)| v.round == 4 && v.author != byz
+                && node.dag.lock().unwrap().contains_key(h))
+            .count();
+        assert_eq!(
+            honest_admitted, honest_r4,
+            "the gate refused honest round-4 vertices too ({} of {}) — it is not \
+             discriminating, it is just rejecting",
+            honest_admitted, honest_r4
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// THE DISCRIMINATOR: the gate must reject ZERO honest vertices, at any level
+    /// of packet loss.
+    ///
+    /// This is the counter the two refuted ingress attempts did not have. A
+    /// genuine structural rule reads only the vertex's bytes and the committee,
+    /// so it CANNOT reject an honest emission no matter what the receiver is
+    /// missing — DAG-Rider Claim 2. One rejection means a DAG lookup leaked back
+    /// in and the rule has degenerated into the possession rule that measured
+    /// 0.3914 against a 0.42 floor.
+    ///
+    /// The strongest evidence is in the SIGNATURE, not the assertions:
+    /// `qc::parent_refs_admissible(&Vertex, &[(String, u64)])` takes no DAG, no
+    /// storage and no `&self`. What a node holds is not in scope, so it cannot
+    /// influence the verdict. The loop below is the behavioural confirmation of
+    /// what the type already guarantees.
+    #[test]
+    fn test_stateless_gate_rejects_zero_honest_vertices() {
+        const PINNED: u64 = 1_700_000_000;
+        let keys: Vec<(String, String, [u8; 32])> =
+            (1..=4u8).map(|i| tier2_keypair(i + 50)).collect();
+        let mut validators: Vec<(String, u64)> =
+            keys.iter().map(|(a, _, _)| (a.clone(), 1000u64)).collect();
+        validators.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut prev: Vec<(String, u64, String)> =
+            vec![("genesis".to_string(), 0, String::new())];
+        let mut checked = 0usize;
+        for r in 1..=12u64 {
+            let mut this = Vec::new();
+            for (addr, _, key) in &keys {
+                let v = tier2_vertex(key, addr, r, PINNED, &prev);
+                assert!(
+                    crate::qc::parent_refs_admissible(&v, &validators).is_ok(),
+                    "the gate REJECTED an honest vertex at round {} from {}: {:?}\n\
+                     A stateless rule cannot do this. If it fires, a possession \
+                     test has leaked back into the predicate and it will halt the \
+                     chain on ordinary packet loss.",
+                    r,
+                    addr,
+                    crate::qc::parent_refs_admissible(&v, &validators)
+                );
+                checked += 1;
+                this.push((v.hash.clone(), r, addr.clone()));
+            }
+            prev = this;
+        }
+        assert_eq!(checked, 48, "non-vacuity: 4 validators x 12 rounds");
+
+        // And the converse, so the test cannot pass on a predicate that accepts
+        // everything: a thin anchor IS refused, from the same bytes.
+        let thin = tier2_vertex(
+            &keys[0].2,
+            &keys[0].0,
+            13,
+            PINNED,
+            &prev[..1],
+        );
+        assert!(
+            crate::qc::parent_refs_admissible(&thin, &validators).is_err(),
+            "CONTROL: a one-parent anchor must still be refused, or this test \
+             passes on a predicate that accepts everything"
+        );
     }
 }

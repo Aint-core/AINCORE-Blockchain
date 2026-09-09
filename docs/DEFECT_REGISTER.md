@@ -570,6 +570,76 @@ recomputes only the path to each changed key. **The point is narrower and worth 
 the property is satisfiable, and satisfiable by anything that reads state instead of
 history. The open question is which structure, not whether.**
 
+### H3 — FIXED. The stateless parent gate.
+
+**Root cause, from a 14-agent read-only literature gate** (Narwhal/Tusk, Bullshark,
+Mysticeti, DAG-Rider, Aleph, plus Sui/Aptos/Narwhal production code): `Vertex.parents` was
+`Vec<String>` — bare digests, no author, no round. Every reference system carries a
+self-describing reference (Sui `BlockRef{round, author, digest}`; Aptos
+`parent.metadata()`; Narwhal/DAG-Rider `(source, round)` from the RBC), which is what makes
+their parent-quorum check a check on the block's OWN BYTES: stateless, unanimous, zero
+liveness cost. DAG-Rider Claim 2 names it — "computed locally based on v's fields".
+AINCORE had to resolve every parent against its local DAG, so the same rule at ingress was
+FORCED to become "do I currently HOLD >2/3 of the named parents" — the possession rule that
+measured 0.3914 against a 0.42 floor. **The seven attempts held the right predicate and
+could not put it in the right place, because the type made the right place unreachable.**
+
+**Landed in two commits, one network upgrade (BREAKING — needs a fresh genesis):**
+1. `ParentRef { round, author, digest }` + `Vertex.parent_refs`, folded into
+   `parents_root` (domain V2 → V3) so hash and signature bind WHO and WHICH ROUND each
+   parent is. The producer builds refs in the SAME pass that sums parent stake, which is
+   what guarantees index alignment.
+2. `qc::parent_refs_admissible(&Vertex, &committee)` called from `add_vertex` after the
+   hash recompute, so only AUTHENTICATED bytes are judged. Committee is the EPOCH-FROZEN
+   set (`epoch_committee()`), never the node-local live one — a time-varying set would make
+   the verdict non-unanimous, i.e. the refuted rule by another door.
+
+Three clauses, each independently mutation-proven:
+
+| Clause | Witness that catches its removal |
+|---|---|
+| refs index-aligned with `parents` | producer alignment test (4 parents, not 1 — see below) |
+| every declared parent round == `vertex.round - 1` | `test_h3_tier2_round_skipping_anchor_is_refused` |
+| distinct declared authors carry >2/3 stake | `test_h3_tier2_stateless_gate_prevents_the_ancestry_fork` |
+
+**THE GATE, at tier 2 through real ingress** — measured, both directions:
+
+| | X | Y | verdict |
+|---|---|---|---|
+| gate OFF | commits [2, 4] | commits [4] only | **AD-1 VIOLATED — the H3 fork** |
+| gate ON | commits [2] | undecided | agree |
+
+**Two wrong-reason failures caught before anything was claimed:**
+1. The first tier-2 witness passed with the gate DISABLED. Cause: the test built its
+   validator list in key-seed order, but `leader_for_round` hashes the list that
+   `get_validator_set_with_stake` returns, which is **sorted by address** — so the
+   scenario designated the wrong node Byzantine and no fork formed. Sorting fixed it.
+2. The first witness leaves the ROUND clause unexercised (the stake clause catches its
+   anchor first), so dropping the round check did not fail it. That is why the
+   round-skipping witness exists: an anchor citing the three NON-LEADER round-2 vertices
+   carries 3000/4000 stake — a stake-only filter admits it — while its causal cone jumps
+   past round 3 and never contains the round-2 leader.
+
+**The discriminator the two refuted attempts lacked:**
+`test_stateless_gate_rejects_zero_honest_vertices` — 48 honest vertices over 12 rounds,
+zero rejections. The strongest evidence is the SIGNATURE, not the assertions:
+`parent_refs_admissible(&Vertex, &[(String, u64)])` takes no DAG, no storage, no `&self`.
+What a node holds is not in scope, so it cannot influence the verdict. `corpus_honest_liveness_does_not_regress` stays green, floor unmoved.
+
+**Fixture churn is the format fork biting, and one test got STRONGER rather than merely
+updated:** `test_b3_remote_vertex_cannot_wedge_round_advance` previously asserted a
+far-ahead vertex "must still be ingested". With no parent refs it is now REFUSED — correct,
+since no honest producer emits one. Rather than weaken the test to "we now reject
+everything far ahead", it gained a second leg: a far-ahead vertex DECLARING a valid parent
+quorum is still ingested (the gate is stateless and does not check existence — that is
+B3/B4, open by design) and still must not drag the local proposal clock forward.
+
+**Still open, unchanged by this:** H1, H2/H4 (10x more frequent than H3 by measurement),
+B3/B4, H6. **And a coupling that must be written into H1's preconditions:** this
+increment's safety argument relies on at most one vertex per `(author, round)`, which HEAD
+guarantees only because `dag.rs:1167` drops the twin. Persisting both twins without
+landing the H4 fix would void it with no test failing.
+
 **Rejected outright:** exhaustive model checking (FACT 2; and `held: BTreeSet` collapses
 every delivery permutation into one fingerprint, making the root defect H2 *unrepresentable*);
 the record/replay recorder (it misses ChainSync's client path, `sync/src/lib.rs:722`, the

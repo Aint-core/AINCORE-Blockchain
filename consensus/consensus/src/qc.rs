@@ -195,6 +195,98 @@ pub fn stake_quorum_met(signed_stake: u128, total_stake: u128) -> bool {
     signed_stake.saturating_mul(3) > total_stake.saturating_mul(2)
 }
 
+/// AUDIT H3 — THE STATELESS PARENT GATE.
+///
+/// Decides admissibility from the vertex's OWN BYTES plus a committee, with ZERO
+/// access to the local DAG. That property is the entire point, and it is what
+/// separates this from the two ingress rules that were refuted:
+///
+/// * A rule that must RESOLVE parents to learn their authors is a test of what
+///   the receiver HOLDS. Two honest nodes with different packet loss then
+///   disagree about the same vertex, an honest vertex is refused for arriving
+///   late, and the chain halts with no attacker. Measured: the honest decided
+///   rate falls from 0.44 to 0.3914 against a 0.42 floor.
+/// * This rule reads `vertex.parent_refs`, which the vertex's own signature
+///   binds (`parents_root_of`, domain V3). Every honest node reaches the SAME
+///   verdict on the SAME bytes at ANY level of packet loss, so an honest vertex
+///   is never refused and the reject costs nothing in liveness.
+///
+/// DAG-Rider Claim 2 states exactly this as the licence for an ingress reject:
+/// the check is "computed locally based on v's fields". Sui's
+/// `SignedBlockVerifier::verify_block` performs no `DagState` lookup at all;
+/// Aptos's `Node::verify` reads `parent.metadata()`.
+///
+/// Three conditions, and all three are load-bearing:
+///  1. `parent_refs` is index-aligned with `parents` — same length, same order,
+///     matching digests. Without it the two views of the parent set could
+///     describe different sets and the check would be about the wrong one.
+///  2. every declared parent round is exactly `vertex.round - 1`. AINCORE's
+///     producer-side predicate omitted this clause, which a ROUND-SKIPPING thin
+///     anchor exploits; every reference system states it in the same breath as
+///     the stake count (Sui `InvalidAncestorRound`; Aptos "invalid parent
+///     round"; DAG-Rider types `strongEdges` as round r−1; Aleph Def 3.1(2);
+///     Mysticeti §II-C).
+///  3. the DISTINCT declared parent authors carry strict >2/3 stake — the
+///     premise Bullshark's skip corollary quantifies over and that AINCORE
+///     asserted in a doc comment while enforcing it only producer-side.
+///
+/// `committee` MUST be the epoch-frozen set. A live, node-local set would make
+/// the verdict time-varying and non-unanimous, which is the refuted rule by a
+/// different door.
+///
+/// Round <= 1 is exempt: those vertices cite the genesis sentinel.
+pub fn parent_refs_admissible(
+    vertex: &blockchain::Vertex,
+    committee: &[(String, u64)],
+) -> Result<(), String> {
+    if vertex.round <= 1 {
+        return Ok(());
+    }
+    if vertex.parent_refs.len() != vertex.parents.len() {
+        return Err(format!(
+            "parent_refs/parents length mismatch ({} vs {})",
+            vertex.parent_refs.len(),
+            vertex.parents.len()
+        ));
+    }
+    let want_round = vertex.round - 1;
+    for (i, r) in vertex.parent_refs.iter().enumerate() {
+        if r.digest != vertex.parents[i] {
+            return Err(format!(
+                "parent_refs[{}].digest does not match parents[{}]",
+                i, i
+            ));
+        }
+        if r.round != want_round {
+            return Err(format!(
+                "parent_refs[{}] declares round {}, expected {}",
+                i, r.round, want_round
+            ));
+        }
+    }
+    let total: u128 = committee.iter().map(|(_, s)| *s as u128).sum();
+    if total == 0 {
+        return Err("empty committee".to_string());
+    }
+    let stake_by_addr: std::collections::HashMap<&str, u64> =
+        committee.iter().map(|(a, s)| (a.as_str(), *s)).collect();
+    let mut authors: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for r in &vertex.parent_refs {
+        authors.insert(r.author.as_str());
+    }
+    let signed: u128 = authors
+        .iter()
+        .filter_map(|a| stake_by_addr.get(a).map(|s| *s as u128))
+        .sum();
+    if !stake_quorum_met(signed, total) {
+        return Err(format!(
+            "declared parent authors carry {} of {} stake, below the >2/3 quorum",
+            signed, total
+        ));
+    }
+    Ok(())
+}
+
 /// Encode signer indices into a positional bitmap.
 pub fn encode_bitmap(indices: &[usize], n: usize) -> Vec<u8> {
     let mut bitmap = vec![0u8; n.div_ceil(8)];

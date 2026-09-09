@@ -553,6 +553,35 @@ impl DagConsensus {
         );
     }
 
+    /// The EPOCH-FROZEN committee, for validity rules.
+    ///
+    /// A validity rule must reach the same verdict on every honest node, so it
+    /// cannot read a node-local, time-varying set. `get_validator_set_with_stake`
+    /// goes through a per-node cache and reflects joins/leaves the instant they
+    /// land, which would make an ingress reject non-unanimous — the refuted
+    /// possession rule by a different door.
+    ///
+    /// `load_validator_set_for_epoch` reads the `E-1 -> E` boundary snapshot and
+    /// itself falls back to the storage-backed `sys:validator_set:v1`. Only when
+    /// NEITHER exists (a fresh chain, or a test DB that seeds `sys:validators`
+    /// directly) does this fall through to the live set — at which point there is
+    /// no snapshot for anyone, so every node falls through identically.
+    fn epoch_committee(&self) -> Vec<(String, u64)> {
+        let epoch = self
+            .storage
+            .get("consensus:epoch")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        match crate::qc_producer::load_validator_set_for_epoch(&self.storage, epoch) {
+            Some(set) if !set.is_empty() => {
+                set.into_iter().map(|v| (v.address, v.stake)).collect()
+            }
+            _ => self.get_validator_set_with_stake(),
+        }
+    }
+
     pub fn invalidate_validators_cache(&self) {
         if let Ok(mut guard) = self.validators_cache.lock() {
             *guard = None;
@@ -1164,6 +1193,25 @@ impl DagConsensus {
                 "🚨 REJECTED [PWN-001]: vertex.hash {} does not match \
                  recomputed hash {} — body tampered after signing",
                 vertex.hash, recomputed
+            );
+            return;
+        }
+
+        // AUDIT H3 — the stateless parent gate. Placed AFTER the hash recompute
+        // so only AUTHENTICATED bytes are evaluated: `parent_refs` is folded into
+        // `parents_root` (domain V3), so passing the check above means the
+        // author signed exactly these refs.
+        //
+        // This is NOT the ingress rule the standing B3/B4 comment below warns
+        // against. That one had to RESOLVE parents against the local DAG, making
+        // admission a function of what this node happens to hold; this one reads
+        // the vertex's own bytes and the epoch-frozen committee, so every honest
+        // node reaches the same verdict at any level of packet loss and an
+        // honest vertex is never refused for arriving late.
+        if let Err(why) = crate::qc::parent_refs_admissible(&vertex, &self.epoch_committee()) {
+            println!(
+                "🚨 REJECTED [H3/parent-gate]: vertex {} from {} — {}",
+                vertex.hash, vertex.author, why
             );
             return;
         }
