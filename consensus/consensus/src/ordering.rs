@@ -593,15 +593,7 @@ impl OrderingEngine {
                     // leader vertex exists anywhere in the chain's complete
                     // history: SKIP j. (The walk above was complete, so absence
                     // is proof, not a guess.)
-                    _ => {
-                        // H3 EXPERIMENT: absence is proof ONLY if this history
-                        // witnesses the quorum-intersection argument at j.
-                        if !Self::skip_is_witnessed(
-                            &visited, j, dag, validators, total_stake,
-                        ) {
-                            return out;
-                        }
-                    }
+                    _ => {}
                 }
             }
 
@@ -688,48 +680,6 @@ impl OrderingEngine {
     /// referenced parent that is neither in the local DAG, nor already
     /// committed, nor the genesis sentinel. A complete walk is what makes a
     /// SKIP decision a proof instead of a guess.
-    /// H3 EXPERIMENT. Is a SKIP of round `j` PROVABLE from `visited` alone?
-    ///
-    /// try_commit's soundness argument requires a vertex at round j+2 that
-    /// references >2/3 stake of the round-(j+1) vertices. That is enforced only
-    /// producer-side. Here we do not assume it: we look for a WITNESS inside the
-    /// walked causal history. Pure function of (H, validator set, j).
-    fn skip_is_witnessed(
-        visited: &HashSet<String>,
-        j: u64,
-        dag: &HashMap<String, Vertex>,
-        validators: &[(String, u64)],
-        total_stake: u128,
-    ) -> bool {
-        let stakes: HashMap<&str, u64> =
-            validators.iter().map(|(a, s)| (a.as_str(), *s)).collect();
-        for h in visited {
-            let Some(v) = dag.get(h) else { continue };
-            if v.round != j + 2 {
-                continue;
-            }
-            let mut authors: HashSet<&str> = HashSet::new();
-            for p in &v.parents {
-                if !visited.contains(p) {
-                    continue;
-                }
-                if let Some(pv) = dag.get(p) {
-                    if pv.round == j + 1 {
-                        authors.insert(pv.author.as_str());
-                    }
-                }
-            }
-            let signed: u128 = authors
-                .iter()
-                .filter_map(|a| stakes.get(a).map(|s| *s as u128))
-                .sum();
-            if crate::qc::stake_quorum_met(signed, total_stake) {
-                return true;
-            }
-        }
-        false
-    }
-
     fn walk_history(
         from: &str,
         floor: u64,
@@ -2148,10 +2098,10 @@ mod tests {
     impl ArmCounts {
         /// Fraction of (view, anchor-round) opportunities that reached a COMMIT.
         ///
-        /// Size-independent, which is what makes it a usable gate: measured at
+        /// Size-independent, which is what makes it usable as a gate: measured at
         /// 0.4325 (n=200), 0.4346 (400), 0.4358 (800), 0.4373 (1600), 0.4407
         /// (3000) and 0.4382 (20,000). Any rule that starts refusing or deferring
-        /// honest data drives this DOWN, and that is the whole point of having it.
+        /// honest data drives this DOWN, which is the entire point of having it.
         fn decided_rate(&self) -> f64 {
             let opportunities = self.direct_commit
                 + self.ancestry_commit
@@ -2231,12 +2181,11 @@ mod tests {
     /// Using the view's own max round makes every counter blind to the failure it
     /// is meant to catch: a view that rejected so much data it holds nothing above
     /// round 1 contributes ZERO opportunities, so its total silence never reaches
-    /// the denominator and the "decided rate" is computed only over the views that
-    /// stayed healthy. Measured, not theorised — under a mutation rejecting any
-    /// vertex with an unresolved parent, the view-local denominator made the rate
-    /// RISE from 0.440 to 0.969 while 60% of all opportunities silently vanished
-    /// (12,000 -> 4,838). The gate would have passed the exact change it exists to
-    /// catch.
+    /// the denominator and the rate is computed only over views that stayed
+    /// healthy. Measured, not theorised — under a mutation rejecting any vertex
+    /// with an unresolved parent, the view-local denominator made the rate RISE
+    /// from 0.440 to 0.969 while 60% of all opportunities silently vanished
+    /// (12,000 -> 4,838). The gate passed the exact change it exists to catch.
     fn sched_classify(
         v: &View,
         validators: &[(String, u64)],
@@ -2596,28 +2545,29 @@ mod tests {
     /// sizes from 200 to 20,000; the floor sits at 0.42.
     const HONEST_DECIDED_RATE_FLOOR: f64 = 0.42;
 
-    /// GATE 5 — LIVENESS REGRESSION. **This is the instrument the two refuted
-    /// ingress fixes did not have, and it exists because of how they failed.**
+    /// GATE 5 — LIVENESS REGRESSION. **The instrument the two refuted ingress
+    /// fixes did not have, and it exists because of how they failed.**
     ///
     /// dag.rs carries a standing comment recording that rejecting a vertex at
     /// ingress was tried TWICE for B3/B4 and both attempts were WORSE THAN THE
-    /// BUG: a rule that is correct against an adversary made honest nodes refuse
-    /// data they had merely received LATE, and at n=4 with a strict >2/3 quorum
-    /// there is no slack. An orphan buffer was added for the same reason and
-    /// later deleted. Every one of those failures was found by REVIEW, after the
-    /// code was written, because nothing measured the cost.
+    /// BUG: a rule correct against an adversary made honest nodes refuse data
+    /// they had merely received LATE, and at n=4 with a strict >2/3 quorum there
+    /// is no slack. An orphan buffer was added for the same reason and later
+    /// deleted. Every one of those failures was found by REVIEW, after the code
+    /// was written, because nothing measured the cost.
     ///
     /// Now something does. The honest corpus already runs under 20% per-vertex
     /// omission across three views, so it IS the "honest node missing data"
     /// scenario. If a fix starts refusing or deferring honest vertices, the
-    /// decided rate falls and this test fails BEFORE review.
+    /// decided rate falls and this fails BEFORE review.
     ///
     /// Any change to admission or to the decision arms must keep this green. If
-    /// it cannot, the change is buying safety with liveness and that trade must
+    /// it cannot, the change is buying safety with liveness, and that trade must
     /// be made deliberately and out loud — never discovered afterwards.
     ///
-    /// MUTATION: make the corpus reject any vertex whose parents are not all
-    /// locally present — the shape of both refuted fixes — and the rate collapses.
+    /// MUTATION (run, not predicted): make the corpus reject any vertex whose
+    /// parents are not all locally present — the shape of both refuted fixes —
+    /// and the rate falls to 0.3914, below the floor.
     #[test]
     fn corpus_honest_liveness_does_not_regress() {
         let mut arms = ArmCounts::default();
@@ -2625,11 +2575,10 @@ mod tests {
             arms.add(&sched_run(seed, Menu::Honest, true).arms);
         }
 
-        // Non-vacuity first: a corpus that decided NOTHING would report a rate of
-        // 0.0 and fail below, but a corpus that ran nothing at all would report
-        // 0.0 too. These separate the two.
-        let opportunities = arms.direct_commit + arms.ancestry_commit
-            + arms.ancestry_skip + arms.defer;
+        // Non-vacuity first: a corpus that decided NOTHING reports 0.0 and fails
+        // below, but so does a corpus that ran nothing at all. These separate them.
+        let opportunities =
+            arms.direct_commit + arms.ancestry_commit + arms.ancestry_skip + arms.defer;
         assert!(
             opportunities > 0 && arms.direct_commit > 0,
             "corpus produced no decisions at all — it is measuring nothing \
@@ -2643,12 +2592,11 @@ mod tests {
             rate >= HONEST_DECIDED_RATE_FLOOR,
             "LIVENESS REGRESSION: honest decided-rate fell to {:.4}, floor {:.4}.\n  \
              direct={} ancestry={} skip={} defer={}\n\
-             Honest nodes are now failing to commit under nothing worse than packet \
+             Honest nodes are failing to commit under nothing worse than packet \
              loss. This is the exact failure mode that refuted the two previous \
-             ingress fixes for this family — a rule correct against an adversary \
-             that refuses data an honest node merely received late. If you are \
-             trading liveness for safety on purpose, say so and move the floor \
-             deliberately; do not discover it in review.",
+             ingress fixes for this family. If you are trading liveness for safety \
+             on purpose, say so and move the floor deliberately; do not discover \
+             it in review.",
             rate,
             HONEST_DECIDED_RATE_FLOOR,
             arms.direct_commit,
@@ -2944,20 +2892,11 @@ mod tests {
             y.insert(h, v);
         }
 
-        eprintln!("PROBE: total emitted vertices = {}", vertices.len());
-        eprintln!("PROBE: X admitted {} vertices; per-round {:?}", x.dag.len(),
-            x.idx.iter().map(|(r,v)|(*r,v.len())).collect::<std::collections::BTreeMap<_,_>>());
-        eprintln!("PROBE: Y admitted {} vertices; per-round {:?}", y.dag.len(),
-            y.idx.iter().map(|(r,v)|(*r,v.len())).collect::<std::collections::BTreeMap<_,_>>());
-        let honest_r4_dropped_by_y = vertices.iter().filter(|(h,v)| v.round==4 && !y.dag.contains_key(h)).count();
-        eprintln!("PROBE: round-4 vertices NOT admitted by Y = {}", honest_r4_dropped_by_y);
-
         x.evaluate(&validators);
         y.evaluate(&validators);
 
         let dx = x.decision(2);
         let dy = y.decision(2);
-        eprintln!("PROBE: dx={:?} dy={:?}", dx, dy);
 
         // P-LIVE, checked FIRST and unconditionally. Without it the trivially
         // "safe" fix — defer everything, decide nothing — makes AD-1 vacuously
