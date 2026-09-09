@@ -5087,6 +5087,7 @@ mod tests {
                 aggregated_signature: None,
             payload_root: None,
                 parents_root: None,
+                parent_refs: Vec::new(),
             };
             v.hash = v.calculate_hash();
             v.sign_with_ed25519(&key);
@@ -5127,6 +5128,7 @@ mod tests {
                 aggregated_signature: None,
                 payload_root: None,
                 parents_root: None,
+                parent_refs: Vec::new(),
             };
             v.hash = v.calculate_hash();
             v.sign_with_ed25519(&key);

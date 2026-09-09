@@ -406,6 +406,7 @@ mod tests {
             aggregated_signature: None,
             payload_root: None,
             parents_root: None,
+            parent_refs: Vec::new(),
         };
         vertex_a.hash = vertex_a.calculate_hash();
         vertex_a.sign_with_ed25519(&signing_key);
@@ -421,6 +422,7 @@ mod tests {
             aggregated_signature: None,
             payload_root: None,
             parents_root: None,
+            parent_refs: Vec::new(),
         };
         vertex_b.hash = vertex_b.calculate_hash();
         vertex_b.sign_with_ed25519(&signing_key);
@@ -688,6 +690,7 @@ mod tests {
             aggregated_signature: None,
             payload_root: None,
             parents_root: None,
+            parent_refs: Vec::new(),
         };
         // Tamper: set hash to garbage, then sign over the garbage hash.
         vertex.hash = "deadbeef".repeat(8);
@@ -727,6 +730,7 @@ mod tests {
             aggregated_signature: None,
             payload_root: None,
             parents_root: None,
+            parent_refs: Vec::new(),
         };
         vertex.hash = vertex.calculate_hash();
         vertex.sign_with_ed25519(&signing_key);
@@ -1256,6 +1260,7 @@ mod tests {
             aggregated_signature: None,
             payload_root: None,
             parents_root: None,
+            parent_refs: Vec::new(),
         };
         v.hash = v.calculate_hash();
         v.sign_with_ed25519(&signing_key);
@@ -1311,6 +1316,7 @@ mod tests {
             aggregated_signature: None,
             payload_root: None,
             parents_root: None,
+            parent_refs: Vec::new(),
         };
         forged.hash = forged.calculate_hash();
         forged.sign_with_ed25519(&attacker);
@@ -1528,6 +1534,7 @@ mod tests {
                 aggregated_signature: None,
                 payload_root: None,
                 parents_root: None,
+                parent_refs: Vec::new(),
             };
             v.hash = v.calculate_hash();
             v.sign_with_ed25519(&key);
@@ -1808,6 +1815,7 @@ mod tests {
             aggregated_signature: None,
             payload_root: None,
             parents_root: None,
+            parent_refs: Vec::new(),
         };
         far_vertex.hash = far_vertex.calculate_hash();
         far_vertex.sign_with_ed25519(&remote_key);
@@ -2010,6 +2018,7 @@ mod tests {
             aggregated_signature: None,
             payload_root: None,
             parents_root: None,
+            parent_refs: Vec::new(),
         };
         v.hash = v.calculate_hash();
         v.sign_with_ed25519(&sk);
@@ -2320,6 +2329,7 @@ mod tests {
                 aggregated_signature: None,
                 payload_root: None,
                 parents_root: None,
+                parent_refs: Vec::new(),
             };
             v.hash = v.calculate_hash();
             v.sign_with_ed25519(&sk);
@@ -2467,6 +2477,75 @@ mod tests {
             map
         );
 
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// The producer must EMIT self-describing parent refs, index-aligned with
+    /// `parents`. Without them the ingress predicate has nothing to read and the
+    /// whole format change is inert.
+    ///
+    /// FOUR validators deliberately, so round 2 cites FOUR parents. The first
+    /// version of this test used `setup_dag`, which has ONE validator and
+    /// therefore one parent — and a one-element list cannot exhibit
+    /// misalignment, so it passed a mutation that dropped every other entry from
+    /// `parents` while keeping every ref. Caught by running that mutation, which
+    /// is the only reason it is known.
+    #[test]
+    fn test_producer_emits_aligned_parent_refs() {
+        const PINNED: u64 = 1_700_000_000;
+        let keys: Vec<(String, String, [u8; 32])> =
+            (1..=4u8).map(|i| tier2_keypair(i + 20)).collect();
+        let known: Vec<(String, String)> =
+            keys.iter().map(|(a, p, _)| (a.clone(), p.clone())).collect();
+
+        let path = get_test_db_path("parent_refs_emitted");
+        // This node IS keys[0], so it can author.
+        let mut node = tier2_open(21, &path, &known);
+        node.now_secs = Arc::new(|| PINNED);
+        // RULE 2 (dag.rs): with more than one validator the producer refuses to
+        // mine while it sees no peers — split-brain prevention.
+        node.peers.lock().unwrap().insert("peer".to_string(), 9999);
+
+        // Round 1 from all four validators, so round 2 has four parents.
+        let _ = tier2_feed_round(&mut node, &keys, 1, PINNED, &["genesis".to_string()]);
+        node.current_round = 2;
+        node.try_create_vertex();
+
+        let dag = node.dag.lock().unwrap();
+        let mine: Vec<_> = dag
+            .values()
+            .filter(|v| v.round == 2 && v.author == node.node_id)
+            .collect();
+        assert_eq!(mine.len(), 1, "this node must have authored exactly one round-2 vertex");
+        let v = mine[0];
+
+        assert!(
+            v.parents.len() >= 3,
+            "round 2 must cite a quorum of round-1 vertices, got {} — with fewer \
+             than 3 this test cannot detect misalignment",
+            v.parents.len()
+        );
+        assert_eq!(
+            v.parent_refs.len(),
+            v.parents.len(),
+            "refs and parents must be the same length; the ingress predicate \
+             relies on index alignment"
+        );
+        for (i, r) in v.parent_refs.iter().enumerate() {
+            assert_eq!(
+                r.digest, v.parents[i],
+                "ref {} digest must equal parents[{}] — same order, not just the \
+                 same set",
+                i, i
+            );
+            assert_eq!(r.round, v.round - 1, "ref {} must declare round r-1", i);
+            assert!(
+                known.iter().any(|(a, _)| *a == r.author),
+                "ref {} must name a real validator, got {}",
+                i, r.author
+            );
+        }
+        drop(dag);
         let _ = std::fs::remove_dir_all(&path);
     }
 }

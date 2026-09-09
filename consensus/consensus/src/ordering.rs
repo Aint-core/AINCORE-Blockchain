@@ -1564,6 +1564,7 @@ mod tests {
                 aggregated_signature: None,
             payload_root: None,
             parents_root: None,
+            parent_refs: Vec::new(),
             },
         )
     }

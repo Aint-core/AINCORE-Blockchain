@@ -332,6 +332,19 @@ pub struct Vertex {
     pub round: u64,
     pub author: String,
     pub parents: Vec<String>, // Hashes of parent vertices (from round r-1)
+    /// Self-describing parent references, index-aligned with `parents`.
+    ///
+    /// See `ParentRef`. Kept ALONGSIDE `parents` rather than replacing it so
+    /// every existing resolver (walk_history, find_causal_history, the DAG
+    /// lookups) is untouched; the invariant that ties them together —
+    /// `parent_refs[i].digest == parents[i]`, same length, same order — is
+    /// enforced at ingress, so the two can never describe different parent sets.
+    ///
+    /// `#[serde(default)]` so a pre-upgrade vertex still deserialises; it then
+    /// carries an EMPTY ref list, which the ingress predicate refuses. That is
+    /// the intended behaviour of a format fork, not an oversight.
+    #[serde(default)]
+    pub parent_refs: Vec<ParentRef>,
     pub payload: Vec<String>, // Transactions (or batch IDs)
     pub timestamp: u64,
     pub hash: String,
@@ -379,13 +392,67 @@ pub fn vertex_domain() -> (String, String) {
 /// domain-separated. Unambiguous -- ["A","B"] and ["AB"] differ -- unlike the
 /// old bare concatenation, which let one validator ship two bodies with the
 /// same hash (one of them splitting a SLASH_EVIDENCE: item off a transaction).
-pub fn parents_root_of(parents: &[String]) -> String {
+/// A self-describing reference to a parent vertex: who authored it, at which
+/// round, and its digest.
+///
+/// THE fix for the whole H3 refutation family, and it is a DATA-FORMAT change
+/// rather than an algorithm one. `parents: Vec<String>` carries bare digests, so
+/// a receiver cannot tell WHO authored a parent or WHICH ROUND it belongs to
+/// without resolving it against its own DAG. Any parent-quorum rule at ingress
+/// is therefore forced to become a test of what the receiver HOLDS — a
+/// view-dependent predicate — and a view-dependent predicate in a reject
+/// position is what halted the chain in two previous attempts (measured: the
+/// honest decided-rate falls from 0.44 to 0.3914 against a 0.42 floor).
+///
+/// Every production DAG BFT system carries the identity in the reference itself:
+///   * Sui       `BlockRef { round, author, digest }`, summed in
+///                `SignedBlockVerifier::verify_block` with no DagState lookup
+///   * Aptos     `parent.metadata()`, round checked equal to `node_round - 1`
+///   * Narwhal   `(source, round)` supplied by the RBC instance
+///   * DAG-Rider Claim 2 names the enabling property outright — the check is
+///                "computed locally based on v's fields", hence unanimous
+///
+/// With this, the ingress predicate reads only the vertex's own bytes plus the
+/// epoch committee, so an honest vertex is admitted at ANY level of packet loss
+/// and the reject costs nothing in liveness.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ParentRef {
+    /// The round the parent was authored at. An ingress rule requires this to be
+    /// exactly `vertex.round - 1`; every reference system states that clause in
+    /// the same breath as the stake count, and AINCORE's producer-side predicate
+    /// omitted it, which a round-skipping thin anchor exploits.
+    pub round: u64,
+    /// The parent's author address. This is what makes stake countable without
+    /// holding the parent.
+    pub author: String,
+    /// The parent's vertex hash. MUST equal the corresponding entry of
+    /// `Vertex::parents` at the same index — checked at ingress, so the two
+    /// views of the parent set can never disagree.
+    pub digest: String,
+}
+
+/// Root over the parent set: both the digest list and the self-describing refs.
+///
+/// V3 folds `parent_refs` in, so the vertex hash and therefore the author's
+/// signature bind WHO and WHICH ROUND each parent is — an attacker cannot
+/// restate a vertex's parent identities without breaking its signature. The
+/// domain tag is bumped from V2 so a pre-upgrade vertex can never collide with a
+/// post-upgrade one; this is a signed-preimage change and needs a fresh genesis.
+pub fn parents_root_of(parents: &[String], parent_refs: &[ParentRef]) -> String {
     let mut data = Vec::new();
-    data.extend_from_slice(b"AINCORE_PARENTS_V2");
+    data.extend_from_slice(b"AINCORE_PARENTS_V3");
     data.extend_from_slice(&(parents.len() as u32).to_be_bytes());
     for p in parents {
         data.extend_from_slice(&(p.len() as u64).to_be_bytes());
         data.extend_from_slice(p.as_bytes());
+    }
+    data.extend_from_slice(&(parent_refs.len() as u32).to_be_bytes());
+    for r in parent_refs {
+        data.extend_from_slice(&r.round.to_be_bytes());
+        data.extend_from_slice(&(r.author.len() as u64).to_be_bytes());
+        data.extend_from_slice(r.author.as_bytes());
+        data.extend_from_slice(&(r.digest.len() as u64).to_be_bytes());
+        data.extend_from_slice(r.digest.as_bytes());
     }
     hex::encode(hash(&data))
 }
@@ -419,6 +486,7 @@ impl Vertex {
             aggregated_signature: None,
             payload_root: None,
             parents_root: None,
+            parent_refs: Vec::new(),
         };
         v.hash = v.calculate_hash();
         v
@@ -429,7 +497,7 @@ impl Vertex {
     pub fn parents_root(&self) -> String {
         match &self.parents_root {
             Some(r) => r.clone(),
-            None => parents_root_of(&self.parents),
+            None => parents_root_of(&self.parents, &self.parent_refs),
         }
     }
 
@@ -457,6 +525,11 @@ impl Vertex {
         c.parents_root = Some(self.parents_root());
         c.payload = Vec::new();
         c.parents = Vec::new();
+        // The refs are part of the parent set and are folded into
+        // `parents_root`, so a proof that stripped `parents` but kept
+        // `parent_refs` would still be unbounded in exactly the way the compact
+        // form exists to prevent.
+        c.parent_refs = Vec::new();
         c
     }
 
@@ -559,6 +632,7 @@ mod vertex_hash_v2_tests {
             aggregated_signature: None,
             payload_root: None,
             parents_root: None,
+            parent_refs: Vec::new(),
         };
         x.hash = x.calculate_hash();
         x
@@ -752,5 +826,120 @@ mod bft_time_tests {
         t.header.vertices_root = calculate_vertices_root(&t.committed_vertices);
         t.header.hash = calculate_header_hash(&t.header);
         assert!(!t.verify_proposer_signature(&pk), "re-hashed tampered block must not verify");
+    }
+
+    /// The vertex hash — and therefore the author's signature — must BIND the
+    /// self-describing parent refs.
+    ///
+    /// If it did not, an attacker could restate WHO authored a vertex's parents
+    /// and WHICH ROUND they came from while keeping the signature valid, which
+    /// would make the stateless ingress predicate trivially forgeable and the
+    /// entire format change pointless.
+    #[test]
+    fn parent_refs_are_bound_by_the_vertex_hash() {
+        let mk = |refs: Vec<ParentRef>| {
+            let mut x = Vertex {
+                round: 4,
+                author: "author-a".into(),
+                parents: vec!["p1".into(), "p2".into()],
+                parent_refs: refs,
+                payload: vec![],
+                timestamp: 99,
+                hash: String::new(),
+                signature: String::new(),
+                aggregated_signature: None,
+                payload_root: None,
+                parents_root: None,
+            };
+            x.hash = x.calculate_hash_with_domain("cid", "gid");
+            x
+        };
+        let r = |round, author: &str, digest: &str| ParentRef {
+            round,
+            author: author.into(),
+            digest: digest.into(),
+        };
+
+        let base = mk(vec![r(3, "A", "p1"), r(3, "B", "p2")]);
+        assert!(!base.hash.is_empty());
+
+        // No refs at all — a pre-upgrade vertex — must not share the hash.
+        assert_ne!(mk(vec![]).hash, base.hash, "absent refs must change the hash");
+
+        // Restating an AUTHOR must change the hash: this is the field stake is
+        // counted over, so forging it would forge quorum.
+        assert_ne!(
+            mk(vec![r(3, "ATTACKER", "p1"), r(3, "B", "p2")]).hash,
+            base.hash,
+            "a restated parent AUTHOR must change the hash"
+        );
+
+        // Restating a ROUND must change the hash: this is the field that stops a
+        // round-skipping thin anchor.
+        assert_ne!(
+            mk(vec![r(1, "A", "p1"), r(3, "B", "p2")]).hash,
+            base.hash,
+            "a restated parent ROUND must change the hash"
+        );
+
+        // And a digest that disagrees with `parents` must change it too.
+        assert_ne!(
+            mk(vec![r(3, "A", "OTHER"), r(3, "B", "p2")]).hash,
+            base.hash,
+            "a restated parent DIGEST must change the hash"
+        );
+
+        // Order matters: swapping two refs is a different parent set.
+        assert_ne!(
+            mk(vec![r(3, "B", "p2"), r(3, "A", "p1")]).hash,
+            base.hash,
+            "ref ORDER must be bound, or two orderings share one signature"
+        );
+
+        // Identical input, identical hash — the control. Without it every
+        // assertion above would pass on a hash function returning randomness.
+        assert_eq!(
+            mk(vec![r(3, "A", "p1"), r(3, "B", "p2")]).hash,
+            base.hash,
+            "CONTROL: identical refs must hash identically"
+        );
+    }
+
+    /// The compact proof strips `parent_refs` and still hashes identically.
+    ///
+    /// Refs are part of the parent set and are unbounded in the same way, so a
+    /// proof that stripped `parents` but kept `parent_refs` would still be
+    /// inflatable by an equivocator — exactly what the compact form exists to
+    /// prevent.
+    #[test]
+    fn compact_proof_strips_parent_refs_and_still_verifies() {
+        let mut v = Vertex {
+            round: 4,
+            author: "author-a".into(),
+            parents: vec!["p1".into(), "p2".into()],
+            parent_refs: vec![
+                ParentRef { round: 3, author: "A".into(), digest: "p1".into() },
+                ParentRef { round: 3, author: "B".into(), digest: "p2".into() },
+            ],
+            payload: vec!["tx1".into()],
+            timestamp: 99,
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
+        };
+        v.hash = v.calculate_hash_with_domain("cid", "gid");
+
+        let c = v.to_compact_proof();
+        assert!(c.parent_refs.is_empty(), "compact proof must strip parent_refs");
+        assert!(c.parents.is_empty());
+        assert_eq!(
+            c.calculate_hash_with_domain("cid", "gid"),
+            v.hash,
+            "the compact proof must hash identically to the full vertex, or \
+             evidence stops verifying"
+        );
+        assert!(!c.is_live_form(), "a proof must never be admissible as a vertex");
     }
 }

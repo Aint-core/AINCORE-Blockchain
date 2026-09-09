@@ -645,25 +645,46 @@ impl DagConsensus {
         // round bootstraps with no parents). This is the liveness/connectivity
         // gate; the BFT SAFETY gate is the stake-weighted COMMIT quorum in
         // try_commit. Same `qc::stake_quorum_met` predicate as QC verification.
-        let parent_quorum_met = if prev_round == 0 {
-            true
+        //
+        // The SAME pass also builds `parent_refs` — the self-describing
+        // (round, author, digest) triples the vertex will carry. Producing them
+        // here rather than in a second pass is what guarantees they are
+        // INDEX-ALIGNED with `parents`: both are appended together, so the two
+        // views of the parent set cannot drift apart. A parent this node cannot
+        // resolve is dropped from BOTH, because a vertex that cites a parent it
+        // cannot describe is precisely the B3/B4 shape.
+        let (parent_quorum_met, parent_refs) = if prev_round == 0 {
+            (true, Vec::<blockchain::ParentRef>::new())
         } else {
             let stake_by_addr: HashMap<&str, u64> =
                 validators.iter().map(|(a, s)| (a.as_str(), *s)).collect();
-            let parent_stake: u128 = {
+            let (parent_stake, refs, kept): (u128, Vec<blockchain::ParentRef>, Vec<String>) = {
                 let dag = self.dag.lock().expect("🚨 FATAL: DAG lock poisoned");
                 let mut authors: HashSet<&str> = HashSet::new();
+                let mut refs = Vec::with_capacity(parents.len());
+                let mut kept = Vec::with_capacity(parents.len());
                 for ph in &parents {
                     if let Some(v) = dag.get(ph) {
                         authors.insert(v.author.as_str());
+                        refs.push(blockchain::ParentRef {
+                            round: v.round,
+                            author: v.author.clone(),
+                            digest: ph.clone(),
+                        });
+                        kept.push(ph.clone());
                     }
                 }
-                authors
+                let stake = authors
                     .iter()
                     .filter_map(|a| stake_by_addr.get(a).map(|s| *s as u128))
-                    .sum()
+                    .sum();
+                (stake, refs, kept)
             };
-            crate::qc::stake_quorum_met(parent_stake, total_stake)
+            parents = kept;
+            (
+                crate::qc::stake_quorum_met(parent_stake, total_stake),
+                refs,
+            )
         };
 
         println!(
@@ -758,6 +779,7 @@ impl DagConsensus {
                     aggregated_signature: None,
                     payload_root: None,
                     parents_root: None,
+                    parent_refs: Vec::new(),
                 };
                 let overhead = serde_json::to_string(&empty_probe)
                     .map(|s| s.len())
@@ -807,8 +829,9 @@ impl DagConsensus {
                 hash: String::new(),
                 signature: String::new(),
                 aggregated_signature: None,
-            payload_root: None,
-            parents_root: None,
+                payload_root: None,
+                parents_root: None,
+                parent_refs,
             };
 
             vertex.hash = vertex.calculate_hash();
