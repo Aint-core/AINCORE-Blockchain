@@ -405,12 +405,12 @@ pub fn vertex_domain() -> (String, String) {
 /// honest decided-rate falls from 0.44 to 0.3914 against a 0.42 floor).
 ///
 /// Every production DAG BFT system carries the identity in the reference itself:
-///   * Sui       `BlockRef { round, author, digest }`, summed in
-///                `SignedBlockVerifier::verify_block` with no DagState lookup
-///   * Aptos     `parent.metadata()`, round checked equal to `node_round - 1`
-///   * Narwhal   `(source, round)` supplied by the RBC instance
-///   * DAG-Rider Claim 2 names the enabling property outright — the check is
-///                "computed locally based on v's fields", hence unanimous
+/// * Sui — `BlockRef { round, author, digest }`, summed in
+///   `SignedBlockVerifier::verify_block` with no DagState lookup at all
+/// * Aptos — `parent.metadata()`, round checked equal to `node_round - 1`
+/// * Narwhal — `(source, round)` supplied by the RBC instance
+/// * DAG-Rider — Claim 2 names the enabling property outright: the check is
+///   "computed locally based on v's fields", hence unanimous
 ///
 /// With this, the ingress predicate reads only the vertex's own bytes plus the
 /// epoch committee, so an honest vertex is admitted at ANY level of packet loss
