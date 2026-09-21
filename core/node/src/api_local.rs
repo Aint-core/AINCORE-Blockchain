@@ -919,9 +919,8 @@ fn handle_rpc_method(
             }))
         },
         "aincore_getQuorumCert" | "aincore_getLatestQuorumCertificate" | "aincore_getQuorumCertificate" => {
-            // QC Phase 2: return the stored quorum certificate (optionally for a
-            // specific [height]; default = latest) and independently verify it
-            // against the trusted validator set.
+            // Verify the stored certificate against local epoch/committee
+            // metadata. This is not a proof of execution or epoch transitions.
             let height = params.get(0).and_then(|v| v.as_u64()).or_else(|| {
                 data.storage
                     .get("consensus:qc:latest_height")
@@ -939,20 +938,15 @@ fn handle_rpc_method(
                         match serde_json::from_str::<consensus::qc::QuorumCertificate>(&qc_json) {
                             Ok(qc) => {
                                 let (verified, verify_error) =
-                                    match consensus::qc_producer::load_validator_set_for_epoch(
-                                        &data.storage,
-                                        qc.epoch,
-                                    ) {
-                                        Some(vset) => match consensus::qc::verify_qc(&qc, &vset, &consensus::qc::expected_chain_id()) {
-                                            Ok(()) => (true, String::new()),
-                                            Err(e) => (false, e.to_string()),
-                                        },
-                                        None => (false, "validator set unavailable".to_string()),
+                                    match node::qc_rpc::verify(&data.storage, &qc, Some(h)) {
+                                        Ok(()) => (true, String::new()),
+                                        Err(e) => (false, e.to_string()),
                                     };
                                 Ok(serde_json::json!({
                                     "available": true,
                                     "height": h,
                                     "verified": verified,
+                                    "verification_scope": node::qc_rpc::VERIFICATION_SCOPE,
                                     "verify_error": verify_error,
                                     "quorum_certificate": qc,
                                 }))
@@ -982,15 +976,20 @@ fn handle_rpc_method(
                     code: -32602,
                     message: format!("Invalid quorum certificate: {e}"),
                 })?;
-            let validators =
-                consensus::qc_producer::load_validator_set_for_epoch(&data.storage, qc.epoch)
-                    .ok_or_else(|| JsonRpcError {
-                        code: -32000,
-                        message: "validator set unavailable".into(),
-                    })?;
-            match consensus::qc::verify_qc(&qc, &validators, &consensus::qc::expected_chain_id()) {
-                Ok(()) => Ok(serde_json::json!({ "valid": true })),
-                Err(e) => Ok(serde_json::json!({ "valid": false, "error": e.to_string() })),
+            match node::qc_rpc::verify(&data.storage, &qc, None) {
+                Err(node::qc_rpc::VerificationError::Unavailable(message)) => Err(JsonRpcError {
+                    code: -32000,
+                    message: message.into(),
+                }),
+                Ok(()) => Ok(serde_json::json!({
+                    "valid": true,
+                    "verification_scope": node::qc_rpc::VERIFICATION_SCOPE
+                })),
+                Err(e) => Ok(serde_json::json!({
+                    "valid": false,
+                    "error": e.to_string(),
+                    "verification_scope": node::qc_rpc::VERIFICATION_SCOPE
+                })),
             }
         },
         "aincore_getDag" => {
@@ -2428,6 +2427,15 @@ pub async fn start_api_server(
 }
 
 #[cfg(test)]
+mod qc_rpc_tests {
+    use super::*;
+    fn state(db: Arc<StateDB>) -> AppState {
+        super::tests::test_state(db)
+    }
+    include!("qc_rpc_tests.rs");
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
@@ -2448,7 +2456,7 @@ mod tests {
         Arc::new(StateDB::open(path.to_str().expect("utf8 temp path")).expect("test DB opens"))
     }
 
-    fn test_state(db: Arc<StateDB>) -> AppState {
+    pub(super) fn test_state(db: Arc<StateDB>) -> AppState {
         let consensus = Arc::new(RwLock::new(consensus::DagConsensus::new(
             "node_test".to_string(),
             Arc::new(Mutex::new(std::collections::HashMap::new())),

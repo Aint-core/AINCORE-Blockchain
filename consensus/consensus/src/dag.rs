@@ -13,6 +13,9 @@ use storage::StateDB;
 /// Cached active validator set as `(address, stake)` pairs, canonically sorted.
 type ValidatorStakeCache = Arc<Mutex<Option<Vec<(String, u64)>>>>;
 
+#[cfg(test)]
+type LocalAcceptanceHook = fn(u8, &StateDB) -> Result<(), String>;
+
 /// PROTOCOL (deterministic slashing): a vertex payload item carrying this
 /// prefix is equivocation evidence, not a transaction. It rides through the DAG
 /// and is ordered by the commit rule exactly like a tx, so every node extracts
@@ -73,6 +76,7 @@ pub struct DagConsensus {
     /// ordering engine — by local commit or by adopting a synced block. Heights
     /// above this that arrive via ChainSync are adopted in reload_chain_tip.
     pub last_adopted_height: u64,
+    qc_retry_cursor: String,
     pub accumulator: Accumulator,
     pub da_sequencer: Option<Arc<Mutex<DASequencer>>>, // Added DA Sequencer
     pub p2p_tx: Option<tokio::sync::mpsc::Sender<String>>, // Added P2P Libp2p Channel
@@ -121,6 +125,8 @@ pub struct DagConsensus {
     /// The pause between anchor-placement attempts. Separate from `now_secs`
     /// because a simulation wants to skip the wait, not fake the clock.
     pub placement_sleep: Arc<dyn Fn(std::time::Duration) + Send + Sync>,
+    #[cfg(test)]
+    pub(crate) local_acceptance_hook: Option<LocalAcceptanceHook>,
 }
 
 impl DagConsensus {
@@ -141,6 +147,8 @@ impl DagConsensus {
 
         // OPTIMIZED RECOVERY: Use checkpoint instead of full scan (Aptos/Sui style)
         let checkpoint_round = storage.get_latest_checkpoint_round();
+        // An unusable checkpoint cannot justify skipping retained disk rows.
+        let mut recovered_checkpoint_round = 0;
 
         if checkpoint_round > 0 {
             // Fast path: Load from checkpoint with H-06 integrity verification.
@@ -230,9 +238,12 @@ impl DagConsensus {
                         let mut accepted = 0usize;
                         let mut rejected = 0usize;
                         for vertex in vertices {
-                            if vertex.calculate_hash() != vertex.hash {
+                            if vertex.calculate_hash() != vertex.hash
+                                || !vertex.is_live_form()
+                                || !vertex.verify_parent_identities()
+                            {
                                 eprintln!(
-                                    "🚨 [NEW-001/boot] checkpoint vertex hash tampered, \
+                                    "🚨 [NEW-001/boot] checkpoint vertex hash/form/parent proof invalid, \
                                      dropping (hash={})",
                                     vertex.hash
                                 );
@@ -272,9 +283,14 @@ impl DagConsensus {
                     dag_map.insert(vertex.hash.clone(), vertex);
                             accepted += 1;
                         }
+                        if rejected == 0 {
+                            recovered_checkpoint_round = checkpoint_round;
+                        }
+                        // Keep individually verified entries, but rescan all disk
+                        // rows when a partial checkpoint cannot justify tail-only replay.
                         println!(
-                            "⚡ Fast recovery from checkpoint: {} accepted / {} tampered-dropped, Round {}",
-                            accepted, rejected, checkpoint_round
+                            "Checkpoint inspection: {} valid / {} rejected, round {}; replay cutoff {}",
+                            accepted, rejected, checkpoint_round, recovered_checkpoint_round
                         );
                     }
                 }
@@ -293,13 +309,16 @@ impl DagConsensus {
             let mut tail_rejected = 0usize;
             for v_json in storage.scan_vertices() {
                 if let Ok(vertex) = serde_json::from_str::<Vertex>(&v_json) {
-                    if vertex.round <= checkpoint_round || dag_map.contains_key(&vertex.hash) {
+                    if vertex.round <= recovered_checkpoint_round || dag_map.contains_key(&vertex.hash) {
                         continue;
                     }
                     // Phase 5C.1 / NEW-001: hash-integrity check on tail replay.
-                    if vertex.calculate_hash() != vertex.hash {
+                    if vertex.calculate_hash() != vertex.hash
+                        || !vertex.is_live_form()
+                        || !vertex.verify_parent_identities()
+                    {
                         eprintln!(
-                            "🚨 [NEW-001/tail] tail vertex hash tampered, dropping (hash={})",
+                            "🚨 [NEW-001/tail] vertex hash/form/parent proof invalid (hash={})",
                             vertex.hash
                         );
                         tail_rejected += 1;
@@ -342,7 +361,7 @@ impl DagConsensus {
             if replayed_tail > 0 || tail_rejected > 0 {
                 println!(
                     "🔄 Replayed {} DAG vertices after checkpoint round {} ({} tampered-dropped)",
-                    replayed_tail, checkpoint_round, tail_rejected
+                    replayed_tail, recovered_checkpoint_round, tail_rejected
                 );
             }
         } else {
@@ -352,9 +371,12 @@ impl DagConsensus {
             for v_json in vertices_json {
                 if let Ok(vertex) = serde_json::from_str::<Vertex>(&v_json) {
                     // Phase 5C.1 / NEW-001: hash-integrity check on legacy scan.
-                    if vertex.calculate_hash() != vertex.hash {
+                    if vertex.calculate_hash() != vertex.hash
+                        || !vertex.is_live_form()
+                        || !vertex.verify_parent_identities()
+                    {
                         eprintln!(
-                            "🚨 [NEW-001/legacy] legacy vertex hash tampered, dropping (hash={})",
+                            "🚨 [NEW-001/legacy] vertex hash/form/parent proof invalid (hash={})",
                             vertex.hash
                         );
                         legacy_rejected += 1;
@@ -437,7 +459,7 @@ impl DagConsensus {
             .flatten()
             .and_then(|v| v.parse::<u64>().ok())
             .map(|h| h.min(latest_block_height))
-            .unwrap_or(latest_block_height);
+            .unwrap_or(0);
 
 
         let explicit_max_round = match storage.get("latest_proposed_round") {
@@ -473,6 +495,7 @@ impl DagConsensus {
             latest_block_timestamp,
             latest_block_round,
             last_adopted_height,
+            qc_retry_cursor: String::new(),
             accumulator: Accumulator::new(),
             da_sequencer,
             p2p_tx,
@@ -494,6 +517,8 @@ impl DagConsensus {
                     .unwrap_or(0)
             }),
             placement_sleep: Arc::new(std::thread::sleep),
+            #[cfg(test)]
+            local_acceptance_hook: None,
         }
     }
 
@@ -561,25 +586,27 @@ impl DagConsensus {
     /// land, which would make an ingress reject non-unanimous — the refuted
     /// possession rule by a different door.
     ///
-    /// `load_validator_set_for_epoch` reads the `E-1 -> E` boundary snapshot and
-    /// itself falls back to the storage-backed `sys:validator_set:v1`. Only when
-    /// NEITHER exists (a fresh chain, or a test DB that seeds `sys:validators`
-    /// directly) does this fall through to the live set — at which point there is
-    /// no snapshot for anyone, so every node falls through identically.
-    fn epoch_committee(&self) -> Vec<(String, u64)> {
-        let epoch = self
-            .storage
-            .get("consensus:epoch")
-            .ok()
-            .flatten()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        match crate::qc_producer::load_validator_set_for_epoch(&self.storage, epoch) {
-            Some(set) if !set.is_empty() => {
-                set.into_iter().map(|v| (v.address, v.stake)).collect()
-            }
-            _ => self.get_validator_set_with_stake(),
+    /// Do not bypass an unavailable historical committee by consulting the live
+    /// cache. Only legacy epoch-0 bootstrap may use `sys:validators` when no
+    /// BLS/genesis record exists. Bootstrap and assigning an epoch to delayed vertices
+    /// still need a protocol-level trust/transition contract.
+    fn epoch_committee(&self) -> Result<Vec<(String, u64)>, String> {
+        let current = self.storage.get("consensus:epoch").map_err(|e| e.to_string())?;
+        let epoch = match current {
+            Some(raw) => raw.parse::<u64>().map_err(|e| format!("invalid consensus epoch: {e}"))?,
+            None => 0,
+        };
+        if let Some(set) = crate::qc_producer::load_validator_set_for_epoch(&self.storage, epoch) {
+            return Ok(set.into_iter().map(|v| (v.address, v.stake)).collect());
         }
+        if epoch == 0
+            && self.storage.get("sys:validator_set:epoch:0").map_err(|e| e.to_string())?.is_none()
+            && self.storage.get("sys:validator_set:v1").map_err(|e| e.to_string())?.is_none()
+            && self.storage.get("genesis:validator_set:v1").map_err(|e| e.to_string())?.is_none()
+        {
+            return Ok(self.get_validator_set_with_stake());
+        }
+        Err(format!("validator committee unavailable for epoch {epoch}"))
     }
 
     pub fn invalidate_validators_cache(&self) {
@@ -636,6 +663,7 @@ impl DagConsensus {
     }
 
     pub fn try_create_vertex(&mut self) {
+        self.retry_qc_work();
         // 1. Check if we have enough parents from previous round
         let prev_round = self.current_round - 1;
         let mut parents = {
@@ -694,12 +722,15 @@ impl DagConsensus {
                 let mut kept = Vec::with_capacity(parents.len());
                 for ph in &parents {
                     if let Some(v) = dag.get(ph) {
+                        let Some(public_key) = self.resolve_author_pubkey(&v.author) else {
+                            continue;
+                        };
+                        let reference = blockchain::ParentRef::authenticated(v, public_key);
+                        if !reference.verify_identity() {
+                            continue;
+                        }
                         authors.insert(v.author.as_str());
-                        refs.push(blockchain::ParentRef {
-                            round: v.round,
-                            author: v.author.clone(),
-                            digest: ph.clone(),
-                        });
+                        refs.push(reference);
                         kept.push(ph.clone());
                     }
                 }
@@ -1205,10 +1236,17 @@ impl DagConsensus {
         // This is NOT the ingress rule the standing B3/B4 comment below warns
         // against. That one had to RESOLVE parents against the local DAG, making
         // admission a function of what this node happens to hold; this one reads
-        // the vertex's own bytes and the epoch-frozen committee, so every honest
-        // node reaches the same verdict at any level of packet loss and an
-        // honest vertex is never refused for arriving late.
-        if let Err(why) = crate::qc::parent_refs_admissible(&vertex, &self.epoch_committee()) {
+        // the vertex's own bytes and the resolved committee. Agreement still
+        // requires a shared epoch/committee; a missing snapshot must not be
+        // replaced with different keys or stake weights.
+        let committee = match self.epoch_committee() {
+            Ok(committee) => committee,
+            Err(why) => {
+                eprintln!("DAG vertex {} deferred: {why}", vertex.hash);
+                return;
+            }
+        };
+        if let Err(why) = crate::qc::parent_refs_admissible(&vertex, &committee) {
             println!(
                 "🚨 REJECTED [H3/parent-gate]: vertex {} from {} — {}",
                 vertex.hash, vertex.author, why
@@ -1231,6 +1269,10 @@ impl DagConsensus {
                 "🚨 REJECTED: Vertex author {} is not in the active validator set",
                 vertex.author
             );
+            return;
+        }
+        if !vertex.verify_parent_identities() {
+            println!("REJECTED: vertex {} has unauthenticated parent identities", vertex.hash);
             return;
         }
 
@@ -1417,9 +1459,10 @@ impl DagConsensus {
         // set on nodes that happened to batch (gossip holes make batching
         // node-dependent) -> different reward recipient / anchor -> fork.
         // Every `continue` below re-enters this loop and re-decides.
-        loop {
-        let commit = {
-            let mut engine = self
+        'anchors: loop {
+        self.reload_chain_tip();
+        let plan = {
+            let engine = self
                 .ordering_engine
                 .lock()
                 .expect("🚨 FATAL: Ordering engine lock poisoned");
@@ -1434,12 +1477,12 @@ impl DagConsensus {
             self.invalidate_validators_cache();
             let validators = self.get_validator_set_with_stake();
 
-            let mut batch = engine.try_commit(vertex.round, &dag, &round_idx, &validators);
-            if batch.is_empty() {
+            let Some(plan) = engine.prepare_commit(vertex.round, &dag, &round_idx, &validators) else {
                 break;
-            }
-            batch.remove(0)
+            };
+            plan
         }; // All locks dropped here!
+        let commit = plan.info.clone();
 
         // AUDIT-B4b: ONE block per anchor, on every node identically.
             // AUDIT-B4b (dedup): if the chain tip already covers this anchor, a
@@ -1448,17 +1491,17 @@ impl DagConsensus {
             // verified by the sync path. Building it again here would put the
             // same anchor at two heights and shift this node's numbering off the
             // network's forever. The ordering-engine bookkeeping (cursor, digest,
-            // committed-set) already happened inside try_commit and must happen;
-            // only the duplicate block build is skipped.
+            // committed-set) must be adopted from the durable block, not from
+            // this local speculative plan. reload_chain_tip above retries that.
             if self.anchor_already_on_chain(commit.anchor_round) {
                 println!(
                     "⏭️  Anchor round {} already on chain via sync (tip round {}) — skipping duplicate block",
                     commit.anchor_round, self.latest_block_round
                 );
-                continue;
+                break;
             }
             println!(
-                "⛓️  Consensus Reached! Anchor round {}: executing {} vertices...",
+                "Anchor round {} ready: preparing execution of {} vertices...",
                 commit.anchor_round,
                 commit.sequence.len()
             );
@@ -1470,7 +1513,7 @@ impl DagConsensus {
             // PROTOCOL: evidence carried by committed vertices, in commit order,
             // with the carrying author (to latch our own markers on inclusion).
             let mut carried_evidence: Vec<(String, String)> = Vec::new();
-            let mut reward_recipient = commit.leader.clone(); // C-10 FIX: Reward the anchor leader deterministically
+            let reward_recipient = commit.leader.clone(); // C-10 FIX: Reward the anchor leader deterministically
 
             // Re-acquire DAG read lock just to fetch payloads
             // We can optimize this by cloning necessary data in the previous block,
@@ -1525,9 +1568,10 @@ impl DagConsensus {
                     // every other node's. Never silent.
                     eprintln!(
                         "🚨 [SECURITY][COMMIT_VERTEX_MISSING] anchor round {} sequence hash {} \
-                         is not in the DAG at block-build time — block content will diverge",
+                         is not in the DAG at block-build time; deferring without partial acceptance",
                         commit.anchor_round, hash
                     );
+                    break 'anchors;
                 }
             }
             drop(dag); // DROP DAG LOCK NOW!
@@ -1559,10 +1603,10 @@ impl DagConsensus {
             };
             let stakes_now: std::collections::HashMap<String, u64> =
                 self.get_validator_set_with_stake().into_iter().collect();
-            let mut block_timestamp =
+            let block_timestamp =
                 blockchain::bft_block_timestamp(weigh(&ts_raw, &stakes_now), parent_ts);
 
-            // NOW EXECUTE (Lock Free!)
+            // Execute without holding DAG/round-index locks.
             // We execute even if empty to trigger Block Rewards (Heartbeat Mining)
             {
                 println!(
@@ -1580,12 +1624,11 @@ impl DagConsensus {
                 // then canonicalised (dedup by offender+round, first in commit
                 // order, capped). Every node still verifies each item independently
                 // before applying (executor::apply_slash_evidence).
-                let mut slash_evidence: Vec<String> =
+                let slash_evidence: Vec<String> =
                     Self::canonicalize_evidence(&executor, &carried_evidence);
-                // Evidence and the BFT timestamp were computed against THIS tip.
-                // If a reload inside the retry loop moves the tip, both are
-                // recomputed there before executing at the new height.
-                let mut verified_tip = self.latest_block_height;
+                // Every decision/input belongs to this parent. If sync moves
+                // it, re-plan ordering as well as evidence and BFT time.
+                let verified_tip = self.latest_block_height;
                 // ANCHOR PLACEMENT (burn-in fix): every committed anchor must get
                 // EXACTLY ONE block, and "already done" is decided by ANCHOR ROUND,
                 // never by height. The first cut skipped on height alone, and the
@@ -1597,7 +1640,7 @@ impl DagConsensus {
                 // one from then on and it hard-forked (23,936 parent-hash
                 // rejections). Retry against the refreshed tip; only treat it as a
                 // duplicate when the chain genuinely already carries this anchor.
-                let mut placed: Option<executor::BlockExecutionSummary> = None;
+                let mut placed: Option<(executor::BlockExecutionSummary, blockchain::Block)> = None;
                 let mut already_on_chain = false;
                 // Retries are SPACED: the live alarm showed all four attempts
                 // firing inside the same millisecond, each hitting
@@ -1618,48 +1661,73 @@ impl DagConsensus {
                         }
                     }
                     if self.latest_block_height != verified_tip {
-                        // Tip moved under us (sync landed a block). Recompute the
-                        // tip-dependent inputs at the NEW tip so the block we build
-                        // is exactly the one every other node would build here.
-                        eprintln!(
-                            "🔁 tip moved {} -> {} while placing anchor {}; recomputing evidence + timestamp",
-                            verified_tip, self.latest_block_height, commit.anchor_round
-                        );
-                        let parent_ts_now = self
-                            .storage
-                            .get(&format!("block_{}", self.latest_block_height))
-                            .ok()
-                            .flatten()
-                            .and_then(|j| serde_json::from_str::<blockchain::Block>(&j).ok())
-                            .map(|b| b.header.timestamp)
-                            .unwrap_or(self.latest_block_timestamp);
-                        // EVERY validator-set-derived input must move with the
-                        // tip, not just the timestamp: the leader (reward
-                        // recipient, a hashed header field) and the BFT-time
-                        // stake weights are drawn from the same set.
-                        self.invalidate_validators_cache();
-                        let vset_now = self.get_validator_set_with_stake();
-                        let stakes_after: std::collections::HashMap<String, u64> =
-                            vset_now.iter().cloned().collect();
-                        reward_recipient =
-                            OrderingEngine::leader_for_round(commit.anchor_round, &vset_now, 0);
-                        block_timestamp =
-                            blockchain::bft_block_timestamp(weigh(&ts_raw, &stakes_after), parent_ts_now);
-                        slash_evidence = Self::canonicalize_evidence(&executor, &carried_evidence);
-                        verified_tip = self.latest_block_height;
+                        continue 'anchors;
                     }
-                    match executor.execute_block_parallel_at(
-                        block_txs.clone(),
-                        &reward_recipient,
-                        // The block being BUILT: one above the current tip.
-                        self.latest_block_height + 1,
-                        &slash_evidence,
-                    ) {
-                        executor::BlockExecOutcome::Executed(summary) => {
-                            placed = Some(summary);
+                    let mut accepted_block = None;
+                    let engine_arc = Arc::clone(&self.ordering_engine);
+                    // Lock order: ordering -> executor -> storage writers. Sync
+                    // releases execution/storage before reload acquires ordering.
+                    // Never call reload_chain_tip while holding this guard.
+                    let outcome = {
+                        let mut engine = engine_arc.lock().expect("ordering engine lock poisoned");
+                        if !engine.prepared_is_current(&plan) {
+                            continue 'anchors;
+                        }
+                        let parent_height = self.latest_block_height;
+                        let parent_hash = self.latest_block_hash.clone();
+                        let qc_chain_id = self.resolve_chain_id();
+                        let outcome = executor.execute_block_checked_at(
+                            block_txs.clone(),
+                            &reward_recipient,
+                            // The block being BUILT: one above the current tip.
+                            self.latest_block_height + 1,
+                            &slash_evidence,
+                            |summary, view| {
+                                let stored_height = view.get("latest_height").map_err(|e| e.to_string())?
+                                    .map(|h| h.parse::<u64>()).transpose().map_err(|e| e.to_string())?
+                                    .unwrap_or(0);
+                                let stored_hash = view.get("latest_block_hash").map_err(|e| e.to_string())?
+                                    .unwrap_or_else(|| "genesis".to_string());
+                                if stored_height != parent_height || stored_hash != parent_hash {
+                                    return Err("local block parent changed before acceptance".to_string());
+                                }
+                                let mut block = blockchain::Block::new_with_roots_at(
+                                    parent_height + 1, commit.anchor_round, parent_hash.clone(),
+                                    block_txs.clone(), reward_recipient.clone(),
+                                    summary.state_root.clone(), summary.receipts_root.clone(),
+                                    block_timestamp, commit.sequence.clone(), commit.anchor_hash.clone(),
+                                    slash_evidence.clone(),
+                                );
+                                block.sign_proposer(&crypto::SigningKey::from_bytes(&self.node_key), &self.node_id);
+                                let json = serde_json::to_string(&block).map_err(|e| e.to_string())?;
+                                view.save_block_json(parent_height + 1, &json).map_err(|e| e.to_string())?;
+                                engine.stage_prepared_anchor(&plan, view)?;
+                                crate::qc_producer::stage_pending_qc(
+                                    view, &block, &plan.info, qc_chain_id.clone(),
+                                )?;
+                                view.put("consensus:last_adopted_height", &(parent_height + 1).to_string())
+                                    .map_err(|e| e.to_string())?;
+                                #[cfg(test)]
+                                if let Some(hook) = self.local_acceptance_hook { hook(0, view)?; }
+                                accepted_block = Some(block);
+                                Ok(())
+                            },
+                        );
+                        if matches!(&outcome, Ok(executor::BlockExecOutcome::Executed(_))) {
+                            #[cfg(test)]
+                            if let Some(hook) = self.local_acceptance_hook {
+                                hook(1, &self.storage).expect("post-commit test hook failed");
+                            }
+                            engine.publish_prepared_anchor(&plan);
+                        }
+                        outcome
+                    };
+                    match outcome {
+                        Ok(executor::BlockExecOutcome::Executed(summary)) => {
+                            placed = Some((summary, accepted_block.expect("accepted block missing")));
                             break;
                         }
-                        executor::BlockExecOutcome::AlreadyExecuted { last_executed } => {
+                        Ok(executor::BlockExecOutcome::AlreadyExecuted { last_executed }) => {
                             self.reload_chain_tip();
                             if self.anchor_already_on_chain(commit.anchor_round) {
                                 println!(
@@ -1672,7 +1740,7 @@ impl DagConsensus {
                             // Height was taken by a DIFFERENT anchor's block: our
                             // anchor still needs one. Retry at the refreshed tip.
                         }
-                        executor::BlockExecOutcome::Gap { expected, got } => {
+                        Ok(executor::BlockExecOutcome::Gap { expected, got }) => {
                             eprintln!(
                                 "⏸️  Anchor round {}: execution gap (expected height {}, wanted {}) — refreshing tip",
                                 commit.anchor_round, expected, got
@@ -1683,12 +1751,16 @@ impl DagConsensus {
                                 break;
                             }
                         }
+                        Err(err) => {
+                            eprintln!("[LOCAL_BLOCK_ACCEPTANCE_FAILED] anchor {}: {err}; ordering not advanced", commit.anchor_round);
+                            break;
+                        }
                     }
                 }
                 if already_on_chain {
                     continue;
                 }
-                // Final check before declaring a drop: sync may have persisted the
+                // Final check before deferring: sync may have persisted the
                 // block during the last wait.
                 if placed.is_none() && !already_on_chain {
                     self.reload_chain_tip();
@@ -1713,18 +1785,14 @@ impl DagConsensus {
                         &slash_evidence,
                     );
                 }
-                let Some(execution_summary) = placed else {
-                    // The anchor could not be placed. It is committed in the
-                    // ordering engine but has no block, so this node's
-                    // anchor->height mapping is about to diverge from the
-                    // network's. Never silent: this alarm is what turns a
-                    // multi-hour undetected fork into an immediate signal.
+                let Some((execution_summary, new_block)) = placed else {
+                    // Keep the plan retryable. Do not skip to the next anchor.
                     eprintln!(
-                        "🚨 [SECURITY][ANCHOR_DROPPED] anchor round {} committed but no block could be \
-                         placed (tip height {}, tip round {}) — this node will diverge",
+                        "[ANCHOR_DEFERRED] anchor round {} has no accepted block \
+                         (tip height {}, tip round {}); ordering cursor retained",
                         commit.anchor_round, self.latest_block_height, self.latest_block_round
                     );
-                    continue;
+                    break;
                 };
                 // Orphan-loss fix: settle the mempool's loan ledger — only the
                 // transactions that actually EXECUTED leave it; the rest stay
@@ -1733,80 +1801,21 @@ impl DagConsensus {
                     mp.mark_executed(&execution_summary.executed_raws);
                 }
 
-                // QC Phase 2: capture the executed roots before they are moved
-                // into the Block (used to build the FinalityVote below).
-                let qc_state_root = execution_summary.state_root.clone();
-                let qc_receipts_root = execution_summary.receipts_root.clone();
-
-                // Create Block (Post-Execution)
-                use blockchain::Block;
-                self.latest_block_height += 1;
-                // AUDIT-H1: new_with_roots_at, NOT new_with_roots — the latter reads
-                // the local clock, which made every node derive a different header
-                // hash for identical content and chained that divergence forward
-                // through prev_hash.
-                let new_block = Block::new_with_roots_at(
-                    self.latest_block_height,
-                    // AUDIT-B4b: the block's round is the ANCHOR round — a pure
-                    // function of the commit sequence. It was `vertex.round`, the
-                    // round of whichever vertex happened to trigger this commit
-                    // locally, which differed per node (the live fork showed
-                    // height 50 built from round 52 on one node and 53 on
-                    // another) and poisoned the header hash.
-                    commit.anchor_round,
-                    self.latest_block_hash.clone(),
-                    block_txs.clone(), // This duplicates data, effectively block contains processed txs
-                    reward_recipient.clone(),
-                    execution_summary.state_root,
-                    execution_summary.receipts_root,
-                    block_timestamp,
-                    // LIVENESS: the block carries the committed vertex sequence
-                    // so a follower can adopt this anchor into its own ordering
-                    // engine in exact parity (see OrderingEngine::adopt_synced_anchor).
-                    commit.sequence.clone(),
-                    commit.anchor_hash.clone(),
-                    slash_evidence,
-                );
-                // RE-AUDIT CRITICAL: authenticate the block to its proposer so
-                // followers only ever adopt/vote for validator-produced blocks.
-                let mut new_block = new_block;
-                new_block.sign_proposer(&crypto::SigningKey::from_bytes(&self.node_key), &self.node_id);
+                // Durable state, block, indexes and ordering already committed.
+                // Publish caches and external side effects only after that point.
+                self.latest_block_height = new_block.header.height;
                 self.latest_block_hash = new_block.header.hash.clone();
                 self.latest_block_timestamp = new_block.header.timestamp;
                 self.assert_anchor_height_map(commit.anchor_round, self.latest_block_height);
                 self.latest_block_round = commit.anchor_round;
                 self.last_adopted_height = self.latest_block_height;
-                // RE-AUDIT MEDIUM: persist the adoption cursor so a crash between
-                // sync persisting a block and its adoption cannot skip it at boot.
-                let _ = self.storage.put(
-                    "consensus:last_adopted_height",
-                    &self.last_adopted_height.to_string(),
-                );
 
                 // Update Accumulator and DB
                 if let Ok(bytes) = hex::decode(&new_block.header.hash) {
                     self.accumulator.append(&bytes);
                 }
 
-                if let Ok(block_json) = serde_json::to_string(&new_block) {
-                    // H-07 FIX: route through save_block_json so block,
-                    // latest_height, latest_block_hash, and the per-tx
-                    // index are all written in a single atomic batch.
-                    // Previously these were three separate put() calls,
-                    // which (a) was not crash-safe — a sync between
-                    // height and hash updates could leave the chain
-                    // pointing at the wrong block — and (b) skipped the
-                    // tx index entirely, forcing aincore_getTransaction
-                    // to scan the whole DAG under lock.
-                    if let Err(e) = self
-                        .storage
-                        .save_block_json(self.latest_block_height, &block_json)
-                    {
-                        eprintln!(
-                            "❌ Failed to persist block #{}: {}",
-                            self.latest_block_height, e
-                        );
-                    }
+                {
                     if let Some((keep_blocks, max_delete)) =
                         storage::StateDB::block_pruning_policy_from_env()
                     {
@@ -1850,67 +1859,9 @@ impl DagConsensus {
                         }
                     }
 
-                    // === QC PHASE 2: quorum-certificate production ===
-                    // ADDITIVE & SIDE-EFFECT-ONLY: this contributes THIS node's
-                    // BLS signature over the committed block and, when this node's
-                    // stake alone meets the strict >2/3 quorum (the live
-                    // single-validator / supermajority topology), stores a
-                    // complete, externally-verifiable quorum certificate. It is
-                    // NOT a precondition for commit — any failure just skips the
-                    // attestation; consensus is unaffected. Multi-party vote
-                    // aggregation is Phase 3.
-                    {
-                        let epoch = self
-                            .storage
-                            .get("consensus:epoch")
-                            .ok()
-                            .flatten()
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(0);
-                        let ctx = crate::qc_producer::CommitContext {
-                            chain_id: self.resolve_chain_id(),
-                            epoch,
-                            finalized_round: commit.anchor_round,
-                            anchor_round: commit.anchor_round,
-                            anchor_hash: commit.anchor_hash.clone(),
-                            block_height: self.latest_block_height,
-                            block_hash: self.latest_block_hash.clone(),
-                            state_root: qc_state_root.clone(),
-                            receipts_root: qc_receipts_root.clone(),
-                            finality_digest: commit.finality_digest.clone(),
-                        };
-                        // Phase 3: if this node alone cannot finalize, broadcast
-                        // its partial finality vote so peers can aggregate a
-                        // multi-party QC. Side-effect-only; a send failure just
-                        // skips the gossip and consensus is unaffected.
-                        match crate::qc_producer::produce_and_store_qc(
-                            &self.storage,
-                            &self.node_key,
-                            &self.node_id,
-                            &ctx,
-                        ) {
-                            crate::qc_producer::QcOutcome::Partial(vote_msg) => {
-                                self.broadcast_qc_vote(&vote_msg);
-                            }
-                            crate::qc_producer::QcOutcome::Complete(_)
-                            | crate::qc_producer::QcOutcome::Skipped => {}
-                        }
-
-                        // SEC-#12 Step-2: fold the COMPLETE QC's aggregate BLS
-                        // signature into the leader-election beacon for true
-                        // unbiasability. This runs ONLY when a complete (>2/3) QC
-                        // exists at consensus:qc:{height} — i.e. the single-
-                        // validator / supermajority case where produce_and_store_qc
-                        // just stored one. In the multi-party case no complete QC
-                        // exists here yet, so this is a no-op and the fold happens
-                        // later from handle_remote_qc_vote when aggregation
-                        // completes. Step-1's digest-bound beacon (set in
-                        // try_commit) is the base in both cases. Side-effect-only,
-                        // additive: a missing QC never alters consensus.
-                        if let Ok(mut engine) = self.ordering_engine.lock() {
-                            engine.fold_qc_for_height(self.latest_block_height);
-                        }
-                    }
+                    // The request committed with the block. Signing/gossip may
+                    // fail here; later ticks or reopen retry that same context.
+                    self.retry_qc_work();
                 }
             }
 
@@ -2002,6 +1953,26 @@ impl DagConsensus {
             }
         }
 
+    }
+
+    fn retry_qc_work(&mut self) {
+        let chain = self.resolve_chain_id();
+        match crate::qc_producer::retry_pending_qcs(
+            &self.storage, &self.node_key, &self.node_id, &chain, &mut self.qc_retry_cursor,
+        ) {
+            Ok(outcomes) => for outcome in outcomes {
+                match outcome {
+                    crate::qc_producer::QcOutcome::Partial(message) => self.broadcast_qc_vote(&message),
+                    crate::qc_producer::QcOutcome::Complete(cert) => {
+                        if let Ok(mut engine) = self.ordering_engine.lock() {
+                            engine.fold_qc_for_height(cert.block_height);
+                        }
+                    }
+                    crate::qc_producer::QcOutcome::Skipped => {}
+                }
+            },
+            Err(error) => eprintln!("[QC] pending work scan deferred: {error}"),
+        }
     }
 
     fn resolve_chain_id(&self) -> String {
@@ -2961,6 +2932,7 @@ impl DagConsensus {
     /// Reload chain tip from storage after external state changes (e.g. sync)
     /// This prevents consensus from forking by building on stale state.
     pub fn reload_chain_tip(&mut self) {
+        self.retry_qc_work();
         let new_height = match self.storage.get("latest_height") {
             Ok(Some(h)) => h.parse::<u64>().unwrap_or(0),
             _ => 0,
@@ -2970,11 +2942,17 @@ impl DagConsensus {
             _ => "genesis".to_string(),
         };
 
-        if new_height > self.latest_block_height {
-            println!(
+        // Adoption can lag a known tip after an I/O error. Retry that backlog
+        // even without another synced block, but never regress the known tip.
+        if new_height > self.latest_block_height
+            || (new_height == self.latest_block_height && self.last_adopted_height < new_height)
+        {
+            if new_height > self.latest_block_height {
+                println!(
                 "🔄 [Consensus] Chain tip reloaded: Block #{} -> #{} (Hash: {:.8}..)",
                 self.latest_block_height, new_height, new_hash
-            );
+                );
+            }
             self.latest_block_height = new_height;
             self.latest_block_hash = new_hash;
             // DIVERGENCE FIX (audit 2026-08-26, CRITICAL): the validator-set cache
@@ -3021,48 +2999,42 @@ impl DagConsensus {
                     // unsigned/mis-signed blocks before execution; this is defense
                     // in depth for anything that reached storage another way.
                     if !block.committed_vertices.is_empty() && !block.proposer_signature.is_empty() {
+                        let qc_chain_id = self.resolve_chain_id();
                         let adopted = match self.ordering_engine.lock() {
-                            Ok(mut engine) => engine.adopt_synced_anchor(
-                                block.header.round,
-                                &block.anchor_hash,
-                                &block.committed_vertices,
-                                &validators,
-                            ),
-                            Err(_) => None,
+                            Ok(mut engine) => {
+                                let already_decided = block.header.round <= engine.finalized_round
+                                    || engine.committed_rounds.contains(&block.header.round);
+                                let info = engine.adopt_synced_anchor_with(
+                                    block.header.round,
+                                    &block.anchor_hash,
+                                    &block.committed_vertices,
+                                    &validators,
+                                    |view, info| {
+                                        crate::qc_producer::stage_pending_qc(view, &block, info, qc_chain_id)?;
+                                        view.put("consensus:last_adopted_height", &h.to_string())
+                                            .map_err(|e| e.to_string())?;
+                                        #[cfg(test)]
+                                        if let Some(hook) = self.local_acceptance_hook { hook(2, view)?; }
+                                        Ok(())
+                                    },
+                                );
+                                if info.is_none() && !already_decided {
+                                    eprintln!("Anchor adoption at height {h} was not persisted; retry later");
+                                    break;
+                                }
+                                info
+                            }
+                            Err(_) => {
+                                eprintln!("Ordering lock unavailable at height {h}; adoption deferred");
+                                break;
+                            }
                         };
-                        if let Some(info) = adopted {
-                            let epoch = self
-                                .storage
-                                .get("consensus:epoch")
-                                .ok()
-                                .flatten()
-                                .and_then(|s| s.parse::<u64>().ok())
-                                .unwrap_or(0);
-                            let ctx = crate::qc_producer::CommitContext {
-                                chain_id: self.resolve_chain_id(),
-                                epoch,
-                                finalized_round: info.anchor_round,
-                                anchor_round: info.anchor_round,
-                                anchor_hash: info.anchor_hash.clone(),
-                                block_height: h,
-                                block_hash: block.header.hash.clone(),
-                                state_root: block.header.state_root.clone(),
-                                receipts_root: block.header.receipts_root.clone(),
-                                finality_digest: info.finality_digest.clone(),
-                            };
-                            if let crate::qc_producer::QcOutcome::Partial(vote_msg) =
-                                crate::qc_producer::produce_and_store_qc(
-                                    &self.storage,
-                                    &self.node_key,
-                                    &self.node_id,
-                                    &ctx,
-                                )
-                            {
-                                self.broadcast_qc_vote(&vote_msg);
+                        if adopted.is_some() {
+                            #[cfg(test)]
+                            if let Some(hook) = self.local_acceptance_hook {
+                                hook(3, &self.storage).expect("post-adoption test hook failed");
                             }
-                            if let Ok(mut engine) = self.ordering_engine.lock() {
-                                engine.fold_qc_for_height(h);
-                            }
+                            self.retry_qc_work();
                         }
                     }
                     self.last_adopted_height = h;

@@ -1,9 +1,9 @@
-//! QC Phase 2 — live quorum-certificate production (side-effect-only).
+//! QC production with durable signing guards and acceptance-staged retry work.
 //!
 //! This module wires the keystone (`crate::qc`) into the live commit path. After
 //! a block is committed AND executed (state root known), the node:
-//!   1. reads the active validator set (`sys:validator_set:v1`, written at genesis
-//!      by B1, carrying each validator's BLS public key + PoP),
+//!   1. resolves the block-height epoch and its retained validator snapshot
+//!      (epoch 0 uses the immutable genesis committee described below),
 //!   2. derives ITS OWN BLS secret from the persistent node identity (the SAME
 //!      derivation genesis used — `SHA256(VALIDATOR_BLS_DOMAIN || node_key)`),
 //!   3. signs the canonical `FinalityVote` for the committed block,
@@ -24,16 +24,26 @@
 //! same keys [`produce_and_store_qc`] uses. Aggregation is deterministic given
 //! the same collected vote set, and a QC is NEVER stored unless it verifies.
 //!
-//! ## SAFETY INVARIANT — additive only
-//! QC production is NOT a precondition for commit or finality. Every fallible
-//! step returns `None` / logs and the commit path continues unchanged. A bug
-//! here can at worst fail to produce an attestation; it can never fork, halt, or
-//! alter consensus. QC keys (`consensus:qc:*`) are consensus metadata, written
-//! with the same direct-`put` pattern as DAG checkpoints — they are not Move
-//! state and do not enter the state root.
+//! QC production is not a precondition for local block acceptance, but signer
+//! safety and durable publication are still security-critical. Local signing
+//! guards and QC indexes commit in one synced transaction before an outcome is
+//! returned for gossip. QC metadata is not Move state and does not enter the
+//! execution root. These guards do not establish the correctness of ordering,
+//! authenticated epoch transitions, or the caller's full supplied commit context.
+//! Signing, aggregation and finality import additionally check epoch activation
+//! intervals inside the same transaction as their publication.
+//! Production local acceptance and synced-anchor adoption stage an exact QC
+//! request atomically with their bookkeeping. The recovery worker retries it
+//! against the held executed block and retained committee, keeping partial work
+//! until a complete QC exists. This does not reconstruct historical requests
+//! lost before the outbox existed or authenticate a substituted local database.
 
 use crate::qc::{self, build_qc, verify_qc, FinalityVote, QuorumCertificate, ValidatorInfo};
+
+mod recovery;
+pub(crate) use recovery::{retry_pending_qcs, stage_pending_qc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use storage::StateDB;
 
 pub use crate::qc::derive_validator_bls_seed;
@@ -83,21 +93,71 @@ pub fn load_validator_set_v1(storage: &StateDB) -> Option<Vec<ValidatorInfo>> {
 /// `sys:validator_set:epoch:{E}` — a snapshot taken at the `E-1 -> E` boundary by
 /// the executor — so the set (and its `validator_set_hash`) is stable for the
 /// whole epoch even if validators join/leave mid-epoch (a join during `E`
-/// activates in `E+1`, when the next snapshot captures it). Falls back to the
-/// live `sys:validator_set:v1` when no snapshot exists (epoch 0 / pre-rotation /
-/// older DBs), so single-validator and legacy behaviour is unchanged.
+/// activates in `E+1`, when the next snapshot captures it). Missing, corrupt or
+/// empty snapshots MUST NOT be replaced with today's committee. This includes
+/// snapshots pruned by retention: absence is not evidence of membership.
+///
+/// Epoch 0 is defined by `genesis:validator_set:v1`, which genesis validation
+/// binds to the chain identity. If an epoch-0 alias also exists, it must agree.
+/// No epoch can borrow the mutable live set. This lookup trusts locally validated
+/// genesis/history; it does not replace a pinned genesis or transition proof.
 pub fn load_validator_set_for_epoch(storage: &StateDB, epoch: u64) -> Option<Vec<ValidatorInfo>> {
-    if let Ok(Some(raw)) = storage.get(&format!("sys:validator_set:epoch:{}", epoch)) {
-        if let Ok(set) = serde_json::from_str::<Vec<ValidatorInfo>>(&raw) {
-            if !set.is_empty() {
-                return Some(set);
+    if epoch == 0 {
+        let raw = storage.get("genesis:validator_set:v1").ok()??;
+        let set: Vec<ValidatorInfo> = serde_json::from_str(&raw).ok()?;
+        if set.is_empty() {
+            return None;
+        }
+        if let Some(alias) = storage.get("sys:validator_set:epoch:0").ok()? {
+            let alias: Vec<ValidatorInfo> = serde_json::from_str(&alias).ok()?;
+            if qc::canonical_order(&alias) != qc::canonical_order(&set) {
+                return None;
             }
         }
+        return Some(set);
     }
-    load_validator_set_v1(storage)
+    if let Some(raw) = storage.get(&format!("sys:validator_set:epoch:{}", epoch)).ok()? {
+        let set: Vec<ValidatorInfo> = serde_json::from_str(&raw).ok()?;
+        return (!set.is_empty()).then_some(set);
+    }
+    None
+}
+
+/// Resolve the committee epoch for a block, not the epoch of the current tip.
+/// The executor activates each new epoch at boundary_height + 1. Missing or
+/// malformed retained boundaries are not permission to use today's committee.
+/// This trusts locally executed metadata; it is not an epoch-transition proof.
+pub fn epoch_for_block_height(storage: &StateDB, height: u64) -> Option<u64> {
+    if height == 0 {
+        return None;
+    }
+    let mut epoch = match storage.get("consensus:epoch").ok()? {
+        Some(raw) => raw.parse::<u64>().ok()?,
+        None => 0,
+    };
+    let mut upper_start = None;
+    // Work bound, not a retention policy. The executor currently retains only
+    // nine epochs; never scan an attacker-sized range from corrupt metadata.
+    for _ in 0..64 {
+        if epoch == 0 {
+            return Some(0);
+        }
+        let start = storage.get(&format!("consensus:epoch_start_height:{epoch}")).ok()??
+            .parse::<u64>().ok()?;
+        if start < 2 || upper_start.is_some_and(|upper| start >= upper) {
+            return None;
+        }
+        if height >= start {
+            return Some(epoch);
+        }
+        upper_start = Some(start);
+        epoch -= 1;
+    }
+    None
 }
 
 /// Commit context captured at the point a block is finalized + executed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitContext {
     pub chain_id: String,
     pub epoch: u64,
@@ -143,19 +203,67 @@ pub fn produce_and_store_qc(
     node_address: &str,
     ctx: &CommitContext,
 ) -> QcOutcome {
+    with_durable_qc(storage, |view| produce_qc_staged(view, node_key, node_address, ctx))
+}
+
+fn with_durable_qc(
+    storage: &StateDB,
+    stage: impl FnOnce(&StateDB) -> Result<QcOutcome, String>,
+) -> QcOutcome {
+    let result = storage.transaction(|view| {
+        let outcome = stage(&view).map_err(storage::StorageError::DatabaseOperation)?;
+        #[cfg(test)]
+        qc_crash_boundary(0, &outcome);
+        Ok(outcome)
+    });
+    match result {
+        Ok(outcome) => {
+            #[cfg(test)]
+            qc_crash_boundary(1, &outcome);
+            if let QcOutcome::Complete(cert) = &outcome {
+                println!("[QC] durably stored certificate for block #{}", cert.block_height);
+            }
+            outcome
+        }
+        Err(error) => {
+            eprintln!("[QC] vote/certificate not published: {error}");
+            QcOutcome::Skipped
+        }
+    }
+}
+
+#[cfg(test)]
+fn qc_crash_boundary(boundary: u8, outcome: &QcOutcome) {
+    if std::env::var("AINCORE_TEST_QC_BOUNDARY").ok().as_deref() == Some(&boundary.to_string()) {
+        assert!(!matches!(outcome, QcOutcome::Skipped), "crash fixture never prepared a vote/QC");
+        std::process::exit(77);
+    }
+}
+
+// Only called inside the storage transaction. No signature may leave this
+// callback until its signing guards and public records are durably committed.
+fn produce_qc_staged(
+    storage: &StateDB,
+    node_key: &[u8; 32],
+    node_address: &str,
+    ctx: &CommitContext,
+) -> Result<QcOutcome, String> {
+    if epoch_for_block_height(storage, ctx.block_height) != Some(ctx.epoch) {
+        return Ok(QcOutcome::Skipped);
+    }
     // SEC-#16: bind the QC to the validator set FROZEN for this commit's epoch,
     // so the validator_set_hash is stable across the whole epoch (matches what
     // verifiers use via load_validator_set_for_epoch(qc.epoch)).
     let validators = match load_validator_set_for_epoch(storage, ctx.epoch) {
         Some(v) => v,
-        None => return QcOutcome::Skipped,
+        None => return Ok(QcOutcome::Skipped),
     };
     let ordered = qc::canonical_order(&validators);
 
     // Position of this node in the canonical set, by validator address.
     let my_idx = match ordered.iter().position(|v| v.address == node_address) {
         Some(i) => i,
-        None => return QcOutcome::Skipped,
+        None => return Ok(QcOutcome::Skipped),
     };
 
     let vote = FinalityVote {
@@ -178,15 +286,54 @@ pub fn produce_and_store_qc(
     // Derived pubkey MUST equal the genesis-registered key for our address; if it
     // does not, derivation drift / misconfig — abort (a QC that can never verify
     // must not be produced).
-    let our_pk = hex::encode(bls.pubkey_raw(&seed));
+    let public_key = bls.pubkey_raw(&seed);
+    let our_pk = hex::encode(&public_key);
     if our_pk != ordered[my_idx].bls_public_key {
         eprintln!(
             "🚨 [QC] derived BLS pubkey != genesis-registered key for {node_address} — skipping QC production"
         );
-        return QcOutcome::Skipped;
+        return Ok(QcOutcome::Skipped);
     }
-
-    let sig = bls.sign_raw(&vote.to_signing_bytes(), &seed);
+    let signing_bytes = vote.to_signing_bytes();
+    let guard_keys = signing_guard_keys(&vote, &our_pk);
+    let mut previous = None;
+    for key in &guard_keys {
+        if let Some(raw) = storage.get(key).map_err(|e| e.to_string())? {
+            let message: QcVoteMessage = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            if message.vote != vote || message.signer_address != node_address {
+                return Err("conflicting local vote at an already-signed height or anchor round".to_string());
+            }
+            let signature = hex::decode(&message.signature).map_err(|e| e.to_string())?;
+            if !bls.verify(&signing_bytes, &signature, &public_key).unwrap_or(false) {
+                return Err("invalid persisted local signature".to_string());
+            }
+            previous = Some(signature);
+        }
+    }
+    // Legacy stores contain only a signature, not the signed context. Validate
+    // it against this exact request; never overwrite a conflicting old vote.
+    for key in [
+        format!("consensus:qc_vote:{}:{}", ctx.anchor_round, node_address),
+        collected_vote_key(ctx.anchor_round, node_address),
+    ] {
+        if let Some(raw) = storage.get(&key).map_err(|e| e.to_string())? {
+            let signature = hex::decode(raw).map_err(|e| e.to_string())?;
+            if !bls.verify(&signing_bytes, &signature, &public_key).unwrap_or(false) {
+                return Err("legacy local vote conflicts with requested signing bytes".to_string());
+            }
+            previous = Some(signature);
+        }
+    }
+    ensure_certificate_slot(storage, &format!("consensus:qc:{}", ctx.block_height), &vote)?;
+    ensure_certificate_slot(storage, &format!("consensus:qc_by_round:{}", ctx.anchor_round), &vote)?;
+    let sig = previous.unwrap_or_else(|| bls.sign_raw(&signing_bytes, &seed));
+    let message = QcVoteMessage {
+        vote: vote.clone(), signer_address: node_address.to_string(), signature: hex::encode(&sig),
+    };
+    let encoded = serde_json::to_string(&message).map_err(|e| e.to_string())?;
+    for key in guard_keys {
+        storage.put(&key, &encoded).map_err(|e| e.to_string())?;
+    }
 
     // Does our stake alone meet the strict >2/3 quorum (single-validator or
     // supermajority holder)? If not, record the partial vote for Phase 3
@@ -198,57 +345,159 @@ pub fn produce_and_store_qc(
     if !qc::stake_quorum_met(my_stake, total_stake) {
         // Legacy single-vote key (kept for backward-compat / forensics).
         let key = format!("consensus:qc_vote:{}:{}", ctx.anchor_round, node_address);
-        let _ = storage.put(&key, &hex::encode(&sig));
+        storage.put(&key, &message.signature).map_err(|e| e.to_string())?;
         // Persist our own vote into the aggregation store so an incoming peer
         // vote can combine with it. Self-store can race a same-round QC already
         // built (idempotent) — harmless.
-        store_collected_vote(storage, ctx.anchor_round, node_address, &hex::encode(&sig));
-        return QcOutcome::Partial(QcVoteMessage {
-            vote,
-            signer_address: node_address.to_string(),
-            signature: hex::encode(&sig),
-        });
+        store_collected_vote(storage, ctx.anchor_round, node_address, &message.signature)?;
+        return Ok(QcOutcome::Partial(message));
     }
 
     let qc = match build_qc(&vote, &validators, &[my_idx], std::slice::from_ref(&sig)) {
         Ok(q) => q,
         Err(e) => {
             eprintln!("🚨 [QC] build_qc failed: {e} — skipping");
-            return QcOutcome::Skipped;
+            return Err(e.to_string());
         }
     };
 
     // Self-verify before storing: an unverifiable QC must never be persisted.
     if let Err(e) = verify_qc(&qc, &validators, &qc.chain_id) {
         eprintln!("🚨 [QC] self-verify failed: {e} — not storing");
-        return QcOutcome::Skipped;
+        return Err(e.to_string());
     }
+    store_certificate(storage, &qc)?;
+    Ok(QcOutcome::Complete(qc))
+}
 
-    match serde_json::to_string(&qc) {
-        Ok(json) => {
-            let _ = storage.put(&format!("consensus:qc:{}", ctx.block_height), &json);
-            let _ = storage.put(&format!("consensus:qc_by_round:{}", ctx.anchor_round), &json);
-            let _ = storage.put("consensus:qc:latest", &json);
-            let _ = storage.put(
-                "consensus:qc:latest_height",
-                &ctx.block_height.to_string(),
-            );
-            let _ = storage.put(
-                "consensus:qc:latest_round",
-                &ctx.anchor_round.to_string(),
-            );
-            println!(
-                "🔏 [QC] stored quorum cert for block #{} (signed_stake={}/{} > 2/3)",
-                ctx.block_height, qc.signed_stake, qc.total_stake
-            );
-        }
-        Err(e) => {
-            eprintln!("🚨 [QC] serialize failed: {e} — not storing");
-            return QcOutcome::Skipped;
+fn signing_guard_keys(vote: &FinalityVote, public_key: &str) -> [String; 2] {
+    let chain = hex::encode(Sha256::digest(vote.chain_id.as_bytes()));
+    let prefix = format!("consensus:qc_signing:v1:{chain}:{public_key}");
+    [format!("{prefix}:height:{}", vote.block_height), format!("{prefix}:round:{}", vote.anchor_round)]
+}
+
+fn ensure_certificate_slot(storage: &StateDB, key: &str, vote: &FinalityVote) -> Result<(), String> {
+    if let Some(raw) = storage.get(key).map_err(|e| e.to_string())? {
+        let previous: QuorumCertificate = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        if previous.finality_vote() != *vote {
+            return Err(format!("conflicting certificate at {key}"));
         }
     }
+    Ok(())
+}
 
-    QcOutcome::Complete(qc)
+// Caller supplies a transaction view. All indexes describe one accepted QC;
+// replay of an older height must not regress the latest pointer.
+fn store_certificate(storage: &StateDB, cert: &QuorumCertificate) -> Result<(), String> {
+    let height_key = format!("consensus:qc:{}", cert.block_height);
+    let round_key = format!("consensus:qc_by_round:{}", cert.anchor_round);
+    ensure_certificate_slot(storage, &height_key, &cert.finality_vote())?;
+    ensure_certificate_slot(storage, &round_key, &cert.finality_vote())?;
+    let latest_height = storage.get("consensus:qc:latest_height").map_err(|e| e.to_string())?
+        .map(|raw| raw.parse::<u64>()).transpose().map_err(|e| e.to_string())?;
+    let latest = storage.get("consensus:qc:latest").map_err(|e| e.to_string())?
+        .map(|raw| serde_json::from_str::<QuorumCertificate>(&raw)).transpose().map_err(|e| e.to_string())?;
+    if let (Some(height), Some(latest)) = (latest_height, &latest) {
+        if height != latest.block_height { return Err("inconsistent latest QC pointer".to_string()); }
+    }
+    if latest_height.is_some() != latest.is_some() {
+        return Err("incomplete latest QC pointer/body".to_string());
+    }
+    let high_water = latest.as_ref().map(|q| q.block_height).unwrap_or(0);
+    if latest.is_some() && cert.block_height == high_water {
+        ensure_certificate_slot(storage, "consensus:qc:latest", &cert.finality_vote())?;
+    }
+    let json = serde_json::to_string(cert).map_err(|e| e.to_string())?;
+    storage.put(&height_key, &json).map_err(|e| e.to_string())?;
+    storage.put(&round_key, &json).map_err(|e| e.to_string())?;
+    if cert.block_height >= high_water {
+        storage.put("consensus:qc:latest", &json).map_err(|e| e.to_string())?;
+        storage.put("consensus:qc:latest_height", &cert.block_height.to_string()).map_err(|e| e.to_string())?;
+        storage.put("consensus:qc:latest_round", &cert.anchor_round.to_string()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Verify an imported finality QC against local epoch membership and a held
+/// block, then publish all finality metadata and QC indexes in one durable batch.
+/// Returns false for missing committee/block or an already-finalized round.
+/// The held block must have passed the caller's block-acceptance pipeline; this
+/// does not execute blocks, prove epoch transitions, or advance ordering memory.
+pub fn import_finality_qc(storage: &StateDB, cert: &QuorumCertificate) -> Result<bool, String> {
+    let advanced = storage.transaction(|view| {
+        stage_imported_finality(&view, cert).map_err(storage::StorageError::DatabaseOperation)
+    }).map_err(|e| e.to_string())?;
+    #[cfg(test)]
+    if advanced {
+        qc_import_crash_boundary(2);
+    }
+    Ok(advanced)
+}
+
+fn stage_imported_finality(storage: &StateDB, cert: &QuorumCertificate) -> Result<bool, String> {
+    match epoch_for_block_height(storage, cert.block_height) {
+        None => return Ok(false),
+        Some(epoch) if epoch != cert.epoch => {
+            return Err("finality QC epoch does not match the block's retained activation interval".into());
+        }
+        Some(_) => {}
+    }
+    let Some(validators) = load_validator_set_for_epoch(storage, cert.epoch) else {
+        return Ok(false);
+    };
+    verify_qc(cert, &validators, &qc::expected_chain_id())
+        .map_err(|e| format!("finality QC verification failed: {e:?}"))?;
+    let current = storage.get("consensus:finalized_round").map_err(|e| e.to_string())?
+        .map(|raw| raw.parse::<u64>()).transpose().map_err(|e| e.to_string())?.unwrap_or(0);
+    if cert.finalized_round == 0 || cert.finalized_round <= current {
+        return Ok(false);
+    }
+    if cert.anchor_round > cert.finalized_round {
+        return Err("QC anchor round exceeds finalized round".into());
+    }
+    let Some(json) = storage.get(&format!("block_{}", cert.block_height)).map_err(|e| e.to_string())? else {
+        return Ok(false);
+    };
+    let block: blockchain::Block = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    if block.header.hash != cert.block_hash {
+        return Err(format!("finality QC block_hash differs from local block_{}", cert.block_height));
+    }
+    // A stored hash string alone does not bind the held body or the redundant
+    // fields signed in the QC. Validate before publishing any finality rows.
+    if block.header.height != cert.block_height
+        || block.header.round != cert.anchor_round
+        || block.anchor_hash != cert.anchor_hash
+        || block.header.state_root != cert.state_root
+        || block.header.receipts_root != cert.receipts_root
+    {
+        return Err("finality QC fields differ from the held block".into());
+    }
+    if blockchain::calculate_header_hash(&block.header) != block.header.hash
+        || blockchain::calculate_tx_hash(&block.transactions) != block.header.tx_hash
+        || blockchain::calculate_vertices_root(&block.committed_vertices) != block.header.vertices_root
+        || blockchain::calculate_evidence_root(&block.slash_evidence) != block.header.evidence_root
+    {
+        return Err("finality QC held block has inconsistent header/body commitments".into());
+    }
+
+    storage.put("consensus:finalized_round", &cert.finalized_round.to_string()).map_err(|e| e.to_string())?;
+    #[cfg(test)]
+    qc_import_crash_boundary(0);
+    storage.put("consensus:last_anchor_round", &cert.anchor_round.to_string()).map_err(|e| e.to_string())?;
+    storage.put("consensus:last_anchor_hash", &cert.anchor_hash).map_err(|e| e.to_string())?;
+    storage.put("consensus:finality_digest", &cert.finality_digest).map_err(|e| e.to_string())?;
+    // Conflict/serialization failure rolls back even the staged finality marker.
+    store_certificate(storage, cert)?;
+    #[cfg(test)]
+    qc_import_crash_boundary(1);
+    Ok(true)
+}
+
+#[cfg(test)]
+fn qc_import_crash_boundary(boundary: u8) {
+    if std::env::var("AINCORE_TEST_QC_IMPORT_BOUNDARY").ok().as_deref() == Some(&boundary.to_string()) {
+        std::process::exit(77);
+    }
 }
 
 /// Storage key prefix under which the per-(round, signer) collected votes live.
@@ -267,22 +516,22 @@ fn store_collected_vote(
     round: u64,
     signer_address: &str,
     sig_hex: &str,
-) -> bool {
+) -> Result<bool, String> {
     let key = collected_vote_key(round, signer_address);
     // Dedup per (round, signer): if we already have a vote for this signer at
     // this round, do not overwrite or re-count it.
-    if matches!(storage.get(&key), Ok(Some(_))) {
-        return false;
+    if storage.get(&key).map_err(|e| e.to_string())?.is_some() {
+        return Ok(false);
     }
     // Bound the number of distinct signers retained per round.
     if collected_signers(storage, round).len() >= MAX_VOTES_PER_ROUND {
         eprintln!(
             "⚠️ [QC] vote store for round {round} hit MAX_VOTES_PER_ROUND — dropping vote from {signer_address}"
         );
-        return false;
+        return Err("collected vote store is full".to_string());
     }
-    let _ = storage.put(&key, sig_hex);
-    true
+    storage.put(&key, sig_hex).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 /// Enumerate the distinct signer addresses that have a collected vote for `round`,
@@ -290,7 +539,7 @@ fn store_collected_vote(
 fn collected_signers(storage: &StateDB, round: u64) -> Vec<(String, String)> {
     let prefix = format!("consensus:qc_vote_agg:{}:", round);
     let mut out: Vec<(String, String)> = storage
-        .scan_prefix(&prefix)
+        .scan_prefix_limited(&prefix, MAX_VOTES_PER_ROUND)
         .into_iter()
         .filter_map(|(k, v)| {
             k.strip_prefix(&prefix)
@@ -333,12 +582,23 @@ pub fn collect_vote_and_try_aggregate(
     msg: &QcVoteMessage,
     expected_block_hash: Option<&str>,
 ) -> QcOutcome {
+    with_durable_qc(storage, |view| collect_vote_staged(view, msg, expected_block_hash))
+}
+
+fn collect_vote_staged(
+    storage: &StateDB,
+    msg: &QcVoteMessage,
+    expected_block_hash: Option<&str>,
+) -> Result<QcOutcome, String> {
     let vote = &msg.vote;
+    if epoch_for_block_height(storage, vote.block_height) != Some(vote.epoch) {
+        return Ok(QcOutcome::Skipped);
+    }
 
     // (1) Frozen validator set for the vote's epoch.
     let validators = match load_validator_set_for_epoch(storage, vote.epoch) {
         Some(v) => v,
-        None => return QcOutcome::Skipped,
+        None => return Ok(QcOutcome::Skipped),
     };
     let ordered = qc::canonical_order(&validators);
 
@@ -354,49 +614,49 @@ pub fn collect_vote_and_try_aggregate(
             vote.chain_id,
             qc::expected_chain_id()
         );
-        return QcOutcome::Skipped;
+        return Ok(QcOutcome::Skipped);
     }
     if vote.validator_set_hash != expected_set_hash {
         // Vote is over a different validator set — cannot aggregate into a QC
         // that verifies against ours.
-        return QcOutcome::Skipped;
+        return Ok(QcOutcome::Skipped);
     }
     // Bind to THIS node's committed block at this round when known.
     if let Some(bh) = expected_block_hash {
         if vote.block_hash != bh {
-            return QcOutcome::Skipped;
+            return Ok(QcOutcome::Skipped);
         }
     }
 
     // (3) Locate signer + verify the single BLS signature against its key.
     let signer_idx = match ordered.iter().position(|v| v.address == msg.signer_address) {
         Some(i) => i,
-        None => return QcOutcome::Skipped, // signer not in the trusted set
+        None => return Ok(QcOutcome::Skipped), // signer not in the trusted set
     };
     let sig_bytes = match hex::decode(&msg.signature) {
         Ok(b) => b,
-        Err(_) => return QcOutcome::Skipped,
+        Err(_) => return Ok(QcOutcome::Skipped),
     };
     let pk_bytes = match hex::decode(&ordered[signer_idx].bls_public_key) {
         Ok(b) => b,
-        Err(_) => return QcOutcome::Skipped,
+        Err(_) => return Ok(QcOutcome::Skipped),
     };
     let bls = crypto::bls::BLSEngine::consensus();
     let vote_bytes = vote.to_signing_bytes();
     match bls.verify(&vote_bytes, &sig_bytes, &pk_bytes) {
         Ok(true) => {}
-        _ => return QcOutcome::Skipped, // bad signature — drop, never store
+        _ => return Ok(QcOutcome::Skipped), // bad signature — drop, never store
     }
 
     // (4) Dedup-persist this signer's vote for the round.
-    store_collected_vote(storage, vote.anchor_round, &msg.signer_address, &msg.signature);
+    store_collected_vote(storage, vote.anchor_round, &msg.signer_address, &msg.signature)?;
 
     // If a complete QC for this round already exists, nothing more to do.
     if matches!(
         storage.get(&format!("consensus:qc_by_round:{}", vote.anchor_round)),
         Ok(Some(_))
     ) {
-        return QcOutcome::Skipped;
+        return Ok(QcOutcome::Skipped);
     }
 
     // (5) Attempt deterministic aggregation over the collected vote set.
@@ -414,6 +674,11 @@ pub fn collect_vote_and_try_aggregate(
         let Ok(raw) = hex::decode(sig_hex) else {
             continue;
         };
+        // Old records only contain signatures, not full messages. Count only
+        // signatures over this exact vote; one equivocator's other message
+        // must not poison an otherwise sufficient honest quorum.
+        let Ok(public_key) = hex::decode(&ordered[idx].bls_public_key) else { continue };
+        if !bls.verify(&vote_bytes, &raw, &public_key).unwrap_or(false) { continue; }
         indices.push(idx);
         sigs.push(raw);
         signed_stake += ordered[idx].stake as u128;
@@ -421,53 +686,70 @@ pub fn collect_vote_and_try_aggregate(
 
     if !qc::stake_quorum_met(signed_stake, total_stake) {
         // Not enough stake yet — keep collecting.
-        return QcOutcome::Skipped;
+        return Ok(QcOutcome::Skipped);
     }
 
     let qc = match build_qc(vote, &validators, &indices, &sigs) {
         Ok(q) => q,
         Err(e) => {
             eprintln!("🚨 [QC] aggregate build_qc failed: {e} — not storing");
-            return QcOutcome::Skipped;
+            return Err(e.to_string());
         }
     };
     // NEVER store an unverifiable QC.
     if let Err(e) = verify_qc(&qc, &validators, &qc::expected_chain_id()) {
         eprintln!("🚨 [QC] aggregate self-verify failed: {e} — not storing");
-        return QcOutcome::Skipped;
+        return Err(e.to_string());
     }
 
-    match serde_json::to_string(&qc) {
-        Ok(json) => {
-            let _ = storage.put(&format!("consensus:qc:{}", vote.block_height), &json);
-            let _ = storage.put(
-                &format!("consensus:qc_by_round:{}", vote.anchor_round),
-                &json,
-            );
-            let _ = storage.put("consensus:qc:latest", &json);
-            let _ = storage.put("consensus:qc:latest_height", &vote.block_height.to_string());
-            let _ = storage.put("consensus:qc:latest_round", &vote.anchor_round.to_string());
-            println!(
-                "🔏 [QC] AGGREGATED quorum cert for block #{} from {} votes (signed_stake={}/{} > 2/3)",
-                vote.block_height,
-                indices.len(),
-                qc.signed_stake,
-                qc.total_stake
-            );
-        }
-        Err(e) => {
-            eprintln!("🚨 [QC] aggregate serialize failed: {e} — not storing");
-            return QcOutcome::Skipped;
-        }
-    }
-
-    QcOutcome::Complete(qc)
+    store_certificate(storage, &qc)?;
+    Ok(QcOutcome::Complete(qc))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::qc::ValidatorInfo;
+    mod persistence {
+        include!("qc_persistence_tests.rs");
+    }
+
+    #[test]
+    fn local_vote_refuses_conflicting_context_after_reopen() {
+        for minority in [false, true] {
+            let dir = std::env::temp_dir().join(format!("qc-sign-conflict-{}-{}", std::process::id(), rand::random::<u64>()));
+            let db = StateDB::open(dir.to_str().unwrap()).unwrap();
+            let mut set = vec![validator_for(&[7; 32], 40, "local")];
+            if minority { set.push(validator_for(&[8; 32], 60, "other")); }
+            db.put("genesis:validator_set:v1", &serde_json::to_string(&set).unwrap()).unwrap();
+            let ctx = ctx_for(10);
+            assert!(!matches!(produce_and_store_qc(&db, &[7; 32], "local", &ctx), QcOutcome::Skipped));
+            drop(db);
+            let db = StateDB::open(dir.to_str().unwrap()).unwrap();
+            assert!(!matches!(produce_and_store_qc(&db, &[7; 32], "local", &ctx), QcOutcome::Skipped), "identical replay must remain possible");
+            let mut conflict = ctx_for(10);
+            conflict.block_hash = "99".repeat(32);
+            assert!(matches!(produce_and_store_qc(&db, &[7; 32], "local", &conflict), QcOutcome::Skipped), "signed two conflicting votes in one slot (minority={minority})");
+            drop(db);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn local_vote_must_not_escape_failed_native_write() {
+        for minority in [false, true] {
+            let dir = std::env::temp_dir().join(format!("qc-sign-readonly-{}-{}", std::process::id(), rand::random::<u64>()));
+            let db = StateDB::open(dir.to_str().unwrap()).unwrap();
+            let mut set = vec![validator_for(&[7; 32], 40, "local")];
+            if minority { set.push(validator_for(&[8; 32], 60, "other")); }
+            db.put("genesis:validator_set:v1", &serde_json::to_string(&set).unwrap()).unwrap();
+            drop(db);
+            let db = StateDB { db: storage::rocksdb::DB::open_for_read_only(&storage::rocksdb::Options::default(), &dir, false).unwrap().into() };
+            assert!(matches!(produce_and_store_qc(&db, &[7; 32], "local", &ctx_for(10)), QcOutcome::Skipped), "vote/certificate escaped despite failed durable write (minority={minority})");
+            drop(db);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 
     fn validator_for(node_key: &[u8; 32], stake: u64, address: &str) -> ValidatorInfo {
         let bls = crypto::bls::BLSEngine::consensus();
@@ -504,7 +786,7 @@ mod tests {
         let addr = "deadbeef";
         let v = validator_for(&node_key, 1_000_000, addr);
         storage
-            .put("sys:validator_set:v1", &serde_json::to_string(&vec![v.clone()]).unwrap())
+            .put("genesis:validator_set:v1", &serde_json::to_string(&vec![v.clone()]).unwrap())
             .unwrap();
 
         let qc = match produce_and_store_qc(&storage, &node_key, addr, &ctx_for(42)) {
@@ -535,7 +817,7 @@ mod tests {
         // Set contains a DIFFERENT validator; our node_key is not registered.
         let other = validator_for(&[9u8; 32], 1_000_000, "aaaa");
         storage
-            .put("sys:validator_set:v1", &serde_json::to_string(&vec![other]).unwrap())
+            .put("genesis:validator_set:v1", &serde_json::to_string(&vec![other]).unwrap())
             .unwrap();
 
         let got = produce_and_store_qc(&storage, &[7u8; 32], "deadbeef", &ctx_for(7));
@@ -557,7 +839,7 @@ mod tests {
         let big = validator_for(&[9u8; 32], 90, "aaaa");
         storage
             .put(
-                "sys:validator_set:v1",
+                "genesis:validator_set:v1",
                 &serde_json::to_string(&vec![me, big]).unwrap(),
             )
             .unwrap();
@@ -591,10 +873,9 @@ mod tests {
         assert_eq!(h1, h2, "set hash must be canonical-order invariant");
     }
 
-    /// SEC-#16: epoch resolution prefers the frozen per-epoch snapshot and falls
-    /// back to the live set when no snapshot exists.
+    /// Exact snapshots take precedence; unknown epochs cannot borrow live keys.
     #[test]
-    fn load_validator_set_for_epoch_prefers_snapshot_then_falls_back() {
+    fn load_validator_set_for_epoch_requires_exact_nonzero_snapshot() {
         let dir = std::env::temp_dir().join(format!("qc_prod_epoch_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let storage = StateDB::open(dir.to_str().unwrap()).unwrap();
@@ -602,7 +883,7 @@ mod tests {
         let live = vec![validator_for(&[1u8; 32], 100, "aaaa")];
         let snap = vec![validator_for(&[2u8; 32], 200, "bbbb")];
         storage
-            .put("sys:validator_set:v1", &serde_json::to_string(&live).unwrap())
+            .put("genesis:validator_set:v1", &serde_json::to_string(&live).unwrap())
             .unwrap();
         storage
             .put(
@@ -614,9 +895,11 @@ mod tests {
         // Exact snapshot for epoch 3.
         let got3 = load_validator_set_for_epoch(&storage, 3).expect("epoch 3 snapshot");
         assert_eq!(got3[0].address, "bbbb");
-        // No snapshot for epoch 9 → fall back to the live set.
-        let got9 = load_validator_set_for_epoch(&storage, 9).expect("fallback to live");
-        assert_eq!(got9[0].address, "aaaa");
+        assert!(load_validator_set_for_epoch(&storage, 9).is_none());
+        let bootstrap = load_validator_set_for_epoch(&storage, 0).expect("frozen genesis");
+        assert_eq!(bootstrap[0].address, "aaaa");
+        drop(storage);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     // ===== Phase 3: multi-party aggregation =====
@@ -668,7 +951,7 @@ mod tests {
         let c = validator_for(&[13u8; 32], 20, "cccc");
         let set = vec![a.clone(), b.clone(), c.clone()];
         storage
-            .put("sys:validator_set:v1", &serde_json::to_string(&set).unwrap())
+            .put("genesis:validator_set:v1", &serde_json::to_string(&set).unwrap())
             .unwrap();
 
         let ctx = ctx_for(100);
@@ -715,7 +998,7 @@ mod tests {
         let b = validator_for(&[12u8; 32], 20, "bbbb");
         let set = vec![a, b];
         storage
-            .put("sys:validator_set:v1", &serde_json::to_string(&set).unwrap())
+            .put("genesis:validator_set:v1", &serde_json::to_string(&set).unwrap())
             .unwrap();
 
         let ctx = ctx_for(101);
@@ -746,7 +1029,7 @@ mod tests {
         let b = validator_for(&[12u8; 32], 20, "bbbb");
         let set = vec![a, b];
         storage
-            .put("sys:validator_set:v1", &serde_json::to_string(&set).unwrap())
+            .put("genesis:validator_set:v1", &serde_json::to_string(&set).unwrap())
             .unwrap();
 
         let ctx = ctx_for(102);
@@ -779,7 +1062,7 @@ mod tests {
         let b = validator_for(&[12u8; 32], 20, "bbbb");
         let set = vec![a, b];
         storage
-            .put("sys:validator_set:v1", &serde_json::to_string(&set).unwrap())
+            .put("genesis:validator_set:v1", &serde_json::to_string(&set).unwrap())
             .unwrap();
 
         let ctx = ctx_for(103);
@@ -811,7 +1094,7 @@ mod tests {
         let c = validator_for(&[13u8; 32], 20, "cccc");
         let set = vec![a, b, c];
         storage
-            .put("sys:validator_set:v1", &serde_json::to_string(&set).unwrap())
+            .put("genesis:validator_set:v1", &serde_json::to_string(&set).unwrap())
             .unwrap();
 
         let ctx = ctx_for(104);

@@ -13,6 +13,10 @@ mod tests {
         StateDB::open(&path).expect("Failed to open test DB")
     }
 
+    mod validator_eligibility {
+        include!("validator_eligibility_tests.rs");
+    }
+
     #[test]
     fn test_put_get_roundtrip() {
         let db = temp_db("put_get");

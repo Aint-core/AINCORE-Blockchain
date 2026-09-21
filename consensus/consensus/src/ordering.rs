@@ -74,6 +74,8 @@ pub struct OrderingEngine {
     folded_qc_height: Option<u64>,
     /// Storage reference for persisting committed state
     storage: Option<Arc<StateDB>>,
+    #[cfg(test)]
+    anchor_persistence_hook: Option<fn(u8)>,
 }
 
 /// Number of most-recent committed anchor rounds retained in `committed_rounds`
@@ -100,6 +102,19 @@ pub struct CommitInfo {
     pub finality_digest: String,
 }
 
+/// A decision without side effects. The caller must hold the engine lock from
+/// validation through durable acceptance and memory publication.
+pub(crate) struct PreparedAnchor {
+    pub info: CommitInfo,
+    previous_finalized_round: u64,
+    previous_next_anchor_round: u64,
+    previous_digest: String,
+    committed_rounds: HashSet<u64>,
+    finalized_round: u64,
+    next_anchor_round: u64,
+    evicted_cseq_rounds: Vec<u64>,
+}
+
 impl Default for OrderingEngine {
     fn default() -> Self {
         Self::new()
@@ -123,6 +138,8 @@ impl OrderingEngine {
             last_vdf_output: vec![0u8; 32],
             folded_qc_height: None,
             storage: None,
+            #[cfg(test)]
+            anchor_persistence_hook: None,
         }
     }
 
@@ -293,6 +310,8 @@ impl OrderingEngine {
             last_vdf_output,
             folded_qc_height,
             storage: Some(storage),
+            #[cfg(test)]
+            anchor_persistence_hook: None,
         }
     }
 
@@ -526,6 +545,19 @@ impl OrderingEngine {
     /// the caller, decides what is evaluated.
     pub fn try_commit(
         &mut self,
+        current_round: u64,
+        dag: &HashMap<String, Vertex>,
+        round_index: &HashMap<u64, Vec<String>>,
+        validators: &[(String, u64)],
+    ) -> Vec<CommitInfo> {
+        let Some(plan) = self.prepare_commit(current_round, dag, round_index, validators) else {
+            return Vec::new();
+        };
+        self.persist_and_publish_anchor(plan).into_iter().collect()
+    }
+
+    pub(crate) fn prepare_commit(
+        &self,
         _current_round: u64,
         dag: &HashMap<String, Vertex>,
         round_index: &HashMap<u64, Vec<String>>,
@@ -533,14 +565,13 @@ impl OrderingEngine {
         // get_validator_set_with_stake guarantees) so leader election is
         // deterministic across honest nodes.
         validators: &[(String, u64)],
-    ) -> Vec<CommitInfo> {
-        let mut out = Vec::new();
+    ) -> Option<PreparedAnchor> {
         if validators.is_empty() {
-            return out;
+            return None;
         }
         let total_stake: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
         if total_stake == 0 {
-            return out;
+            return None;
         }
         let max_round = round_index.keys().copied().max().unwrap_or(0);
         // Backstop against pathological cursor-to-tip gaps; the cursor normally
@@ -565,9 +596,7 @@ impl OrderingEngine {
                 }
                 r += 2;
             }
-            let Some((r_direct, direct_hash)) = direct else {
-                return out;
-            };
+            let (r_direct, direct_hash) = direct?;
 
             // 2. Walk BACK from the direct anchor, deciding every round in
             //    [cursor, r_direct) by ancestry along the committed-anchor chain.
@@ -576,13 +605,13 @@ impl OrderingEngine {
             for j in (start..r_direct).rev().filter(|j| j.is_multiple_of(2)) {
                 let chain_round = match dag.get(&chain) {
                     Some(v) => v.round,
-                    None => return out, // cannot happen, but never guess
+                    None => return None, // cannot happen, but never guess
                 };
                 let Some(visited) =
                     Self::walk_history(&chain, j, chain_round, dag, &self.committed_set)
                 else {
                     // HOLE below the chain anchor: not decidable yet.
-                    return out;
+                    return None;
                 };
                 match Self::leader_vertex_hash(j, dag, round_index, validators) {
                     Some(hj) if visited.contains(&hj) => {
@@ -609,14 +638,10 @@ impl OrderingEngine {
                 let leader = Self::leader_for_round(anchor_round, validators, 0);
                 // Incomplete history for this anchor: return nothing, retry
                 // later from the same cursor.
-                if let Some(info) =
-                    self.commit_one_anchor(anchor_round, &anchor_hash, leader, dag)
-                {
-                    out.push(info);
-                }
+                return self.prepare_one_anchor(anchor_round, &anchor_hash, leader, dag);
             }
         }
-        out
+        None
     }
 
     /// Smallest EVEN round >= r (anchors live on even rounds — Bullshark waves).
@@ -713,17 +738,15 @@ impl OrderingEngine {
         Some(visited)
     }
 
-    /// Book-keeping for ONE committed anchor: complete causal history (deferred
-    /// on holes), de-dup, digest fold, persistence, beacon. Extracted verbatim
-    /// from the old commit tail; the only structural change is that the cursor
-    /// (`next_anchor_round`) advances and persists with each anchor.
-    fn commit_one_anchor(
-        &mut self,
+    /// Prepare one complete causal history and its bookkeeping without changing
+    /// storage or memory. Missing bodies defer the decision at the same cursor.
+    fn prepare_one_anchor(
+        &self,
         anchor_round: u64,
         anchor_vertex_hash: &str,
         leader: String,
         dag: &HashMap<String, Vertex>,
-    ) -> Option<CommitInfo> {
+    ) -> Option<PreparedAnchor> {
         // Completeness gate: an anchor with a hole in its history must WAIT,
         // not commit a partial sequence (the old find_causal_history silently
         // dropped missing vertices, which would diverge across nodes).
@@ -740,7 +763,7 @@ impl OrderingEngine {
         // Filter yang sudah committed (O(1) membership via the mirror set).
         sequence.retain(|h| !self.committed_set.contains(h));
 
-        Some(self.apply_anchor_bookkeeping(
+        Some(self.prepare_anchor_bookkeeping(
             anchor_round,
             anchor_vertex_hash,
             leader,
@@ -760,89 +783,133 @@ impl OrderingEngine {
         anchor_vertex_hash: &str,
         leader: String,
         sequence: Vec<String>,
-    ) -> CommitInfo {
-        println!(
-            "⚓ Committing Anchor Round {} (Leader {}, {} vertices)",
-            anchor_round,
-            leader,
-            sequence.len()
-        );
+    ) -> Option<CommitInfo> {
+        let plan = self.prepare_anchor_bookkeeping(anchor_round, anchor_vertex_hash, leader, sequence);
+        self.persist_and_publish_anchor(plan)
+    }
 
-        // Update state
-        self.committed_rounds.insert(anchor_round);
-        // Advance the monotonic finality high-water mark.
-        self.finalized_round = self.finalized_round.max(anchor_round);
-        // Cursor: this anchor round is decided; never revisit it.
-        self.next_anchor_round = self.next_anchor_round.max(anchor_round + 1);
+    fn prepare_anchor_bookkeeping(
+        &self,
+        anchor_round: u64,
+        anchor_vertex_hash: &str,
+        leader: String,
+        sequence: Vec<String>,
+    ) -> PreparedAnchor {
+        // Prepare the next metadata state without publishing it. A storage error
+        // must not consume the cursor or de-dup entries in the running engine.
+        let mut committed_rounds = self.committed_rounds.clone();
+        committed_rounds.insert(anchor_round);
+        let finalized_round = self.finalized_round.max(anchor_round);
+        let next_anchor_round = self.next_anchor_round.max(anchor_round.saturating_add(1));
         // Trim the de-dup window so `committed_rounds` stays bounded regardless of
         // how many rounds are committed (this is the leak fix). Rounds below the
         // cutoff are still rejected by the high-water comparison in the guard.
         // The evicted rounds also get their per-round cseq keys deleted below.
-        let cutoff = self.finalized_round.saturating_sub(COMMITTED_ROUNDS_WINDOW);
+        let cutoff = finalized_round.saturating_sub(COMMITTED_ROUNDS_WINDOW);
         let evicted_cseq_rounds: Vec<u64> = if cutoff > 0 {
-            let ev: Vec<u64> = self
-                .committed_rounds
+            let ev: Vec<u64> = committed_rounds
                 .iter()
                 .copied()
                 .filter(|r| *r < cutoff)
                 .collect();
-            self.committed_rounds.retain(|r| *r >= cutoff);
+            committed_rounds.retain(|r| *r >= cutoff);
             ev
         } else {
             Vec::new()
         };
-        // Bounded in-memory de-dup index (Vec + set), no unbounded growth.
-        self.record_committed(&sequence);
-
         // Fold this commit's newly-ordered vertex hashes into the rolling finality
-        // digest, chained from the previous (persisted) value. With the anchor
-        // sequence now deterministic, every node folds the SAME sequences in the
-        // SAME order, so the digest finally agrees across nodes too.
-        self.finality_digest = Self::fold_finality_digest(&self.finality_digest, &sequence);
-        let digest = self.finality_digest.clone();
-
-        // PERSIST committed state to DB (BUG #1 FIX)
-        if let Some(ref storage) = self.storage {
-            if let Ok(json) =
-                serde_json::to_string(&self.committed_rounds.iter().collect::<Vec<_>>())
-            {
-                let _ = storage.put("consensus:committed_rounds", &json);
-            }
-            if !sequence.is_empty() {
-                if let Ok(json) = serde_json::to_string(&sequence) {
-                    let _ = storage
-                        .put(&format!("{}{}", COMMITTED_SEQ_KEY_PREFIX, anchor_round), &json);
-                }
-            }
-            for r in &evicted_cseq_rounds {
-                let _ = storage.delete(&format!("{}{}", COMMITTED_SEQ_KEY_PREFIX, r));
-            }
-            let _ = storage.put(
-                "consensus:finalized_round",
-                &self.finalized_round.to_string(),
-            );
-            let _ = storage.put(
-                "consensus:next_anchor_round",
-                &self.next_anchor_round.to_string(),
-            );
-            let _ = storage.put("consensus:last_anchor_round", &anchor_round.to_string());
-            let _ = storage.put("consensus:last_anchor_hash", anchor_vertex_hash);
-            let _ = storage.put("consensus:finality_digest", &digest);
+        // digest, chained from the previous (persisted) value. Equal ordered
+        // sequences produce equal digests; this does not establish agreement
+        // of the ordering rule itself.
+        let digest = Self::fold_finality_digest(&self.finality_digest, &sequence);
+        PreparedAnchor {
+            info: CommitInfo {
+                sequence, leader, anchor_round,
+                anchor_hash: anchor_vertex_hash.to_string(), finality_digest: digest,
+            },
+            previous_finalized_round: self.finalized_round,
+            previous_next_anchor_round: self.next_anchor_round,
+            previous_digest: self.finality_digest.clone(),
+            committed_rounds, finalized_round, next_anchor_round, evicted_cseq_rounds,
         }
+    }
+
+    pub(crate) fn prepared_is_current(&self, plan: &PreparedAnchor) -> bool {
+        self.finalized_round == plan.previous_finalized_round
+            && self.next_anchor_round == plan.previous_next_anchor_round
+            && self.finality_digest == plan.previous_digest
+    }
+
+    /// Write through the supplied transaction view, never the base DB. This
+    /// does not mutate the engine, including its beacon and de-dup window.
+    pub(crate) fn stage_prepared_anchor(
+        &self,
+        plan: &PreparedAnchor,
+        storage: &StateDB,
+    ) -> Result<(), String> {
+        if !self.prepared_is_current(plan) {
+            return Err("ordering plan is stale".to_string());
+        }
+        let info = &plan.info;
+        let mut rounds: Vec<u64> = plan.committed_rounds.iter().copied().collect();
+        rounds.sort_unstable();
+        let rounds_json = serde_json::to_string(&rounds).map_err(|err| err.to_string())?;
+        let sequence_json = serde_json::to_string(&info.sequence).map_err(|err| err.to_string())?;
+        let mut batch = storage::rocksdb::WriteBatch::default();
+        batch.put(b"consensus:committed_rounds", rounds_json.as_bytes());
+        if !info.sequence.is_empty() {
+            batch.put(
+                format!("{}{}", COMMITTED_SEQ_KEY_PREFIX, info.anchor_round).as_bytes(),
+                sequence_json.as_bytes(),
+            );
+        }
+        for r in &plan.evicted_cseq_rounds {
+            batch.delete(format!("{}{}", COMMITTED_SEQ_KEY_PREFIX, r).as_bytes());
+        }
+        batch.put(b"consensus:finalized_round", plan.finalized_round.to_string().as_bytes());
+        batch.put(b"consensus:next_anchor_round", plan.next_anchor_round.to_string().as_bytes());
+        batch.put(b"consensus:last_anchor_round", info.anchor_round.to_string().as_bytes());
+        batch.put(b"consensus:last_anchor_hash", info.anchor_hash.as_bytes());
+        batch.put(b"consensus:finality_digest", info.finality_digest.as_bytes());
+        storage.write_batch(batch).map_err(|err| err.to_string())
+    }
+
+    fn persist_and_publish_anchor(&mut self, plan: PreparedAnchor) -> Option<CommitInfo> {
+        if let Some(ref storage) = self.storage {
+            #[cfg(test)]
+            if let Some(hook) = self.anchor_persistence_hook { hook(0); }
+            if let Err(err) = self.stage_prepared_anchor(&plan, storage) {
+                eprintln!("Cannot persist anchor {} bookkeeping; not advancing: {err}", plan.info.anchor_round);
+                return None;
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.anchor_persistence_hook { hook(1); }
+        }
+        self.publish_prepared_anchor(&plan);
+        Some(plan.info)
+    }
+
+    /// Only after the transaction containing this plan has committed, while
+    /// still holding the same engine lock used by `stage_prepared_anchor`.
+    pub(crate) fn publish_prepared_anchor(&mut self, plan: &PreparedAnchor) {
+        assert!(self.prepared_is_current(plan), "cannot publish stale ordering plan");
+        let info = &plan.info;
+        self.committed_rounds = plan.committed_rounds.clone();
+        self.finalized_round = plan.finalized_round;
+        self.next_anchor_round = plan.next_anchor_round;
+        self.record_committed(&info.sequence);
+        self.finality_digest = info.finality_digest.clone();
 
         // 6. Update the VDF leader-election beacon from (anchor_round, finality
         // digest). SEC-#12 note: since B4a the beacon no longer feeds leader
         // election (which is a pure function); it remains for non-consensus
         // randomness via get_random_beacon().
-        self.update_random_beacon(anchor_round, &digest);
+        self.update_random_beacon(info.anchor_round, &info.finality_digest);
 
-        CommitInfo {
-            sequence,
-            leader,
-            anchor_round,
-            anchor_hash: anchor_vertex_hash.to_string(),
-            finality_digest: digest,
-        }
+        println!(
+            "Committing Anchor Round {} (Leader {}, {} vertices)",
+            info.anchor_round, info.leader, info.sequence.len()
+        );
     }
 
     /// LIVENESS (burn-in finding): adopt an anchor that the NETWORK decided and
@@ -865,7 +932,8 @@ impl OrderingEngine {
     /// the hole and later local commits agree byte-for-byte.
     ///
     /// Returns the CommitInfo so the caller can cast this node's finality vote
-    /// for the block, restoring QC quorum. No-op for already-decided rounds.
+    /// for the block, restoring QC quorum. Returns None for already-decided
+    /// rounds or failed persistence; an I/O failure must not authorize a vote.
     pub fn adopt_synced_anchor(
         &mut self,
         anchor_round: u64,
@@ -878,13 +946,47 @@ impl OrderingEngine {
         }
         let leader = Self::leader_for_round(anchor_round, validators, 0);
         println!(
-            "⚓ Adopting synced anchor round {} ({} vertices): cursor {} -> {}",
+            "Attempting synced anchor round {} ({} vertices): cursor {} -> {}",
             anchor_round,
             sequence.len(),
             self.next_anchor_round,
-            anchor_round + 1
+            anchor_round.saturating_add(1)
         );
-        Some(self.apply_anchor_bookkeeping(anchor_round, anchor_hash, leader, sequence.to_vec()))
+        self.apply_anchor_bookkeeping(anchor_round, anchor_hash, leader, sequence.to_vec())
+    }
+
+    /// Adoption plus its durable follow-up work must commit before publishing
+    /// ordering memory. Production followers use this instead of a second write.
+    pub(crate) fn adopt_synced_anchor_with(
+        &mut self,
+        anchor_round: u64,
+        anchor_hash: &str,
+        sequence: &[String],
+        validators: &[(String, u64)],
+        stage: impl FnOnce(&StateDB, &CommitInfo) -> Result<(), String>,
+    ) -> Option<CommitInfo> {
+        if anchor_round <= self.finalized_round || self.committed_rounds.contains(&anchor_round) {
+            return None;
+        }
+        let storage = self.storage.as_ref()?.clone();
+        let leader = Self::leader_for_round(anchor_round, validators, 0);
+        let plan = self.prepare_anchor_bookkeeping(anchor_round, anchor_hash, leader, sequence.to_vec());
+        let result = storage.transaction(|view| {
+            self.stage_prepared_anchor(&plan, &view)
+                .map_err(storage::StorageError::DatabaseOperation)?;
+            stage(&view, &plan.info).map_err(storage::StorageError::DatabaseOperation)?;
+            #[cfg(test)]
+            if let Some(hook) = self.anchor_persistence_hook { hook(0); }
+            Ok(())
+        });
+        if let Err(error) = result {
+            eprintln!("Cannot persist adopted anchor and QC work: {error}");
+            return None;
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.anchor_persistence_hook { hook(1); }
+        self.publish_prepared_anchor(&plan);
+        Some(plan.info)
     }
 
     /// Elect the anchor leader for `round` as a PURE function of the round, the
@@ -1008,6 +1110,10 @@ impl OrderingEngine {
         history
     }
 }
+
+#[cfg(test)]
+#[path = "ordering_persistence_tests.rs"]
+mod persistence_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1576,6 +1682,7 @@ mod tests {
                     round: r,
                     author: a,
                     digest: p.clone(),
+                    proof: None,
                 })
             })
             .collect();
@@ -3254,8 +3361,8 @@ mod tests {
         let seq4 = vec!["v4a".to_string()];
         let leader2 = OrderingEngine::leader_for_round(2, &validators, 0);
         let leader4 = OrderingEngine::leader_for_round(4, &validators, 0);
-        let info2 = producer.apply_anchor_bookkeeping(2, "anchor2", leader2, seq2.clone());
-        let info4 = producer.apply_anchor_bookkeeping(4, "anchor4", leader4, seq4.clone());
+        let info2 = producer.apply_anchor_bookkeeping(2, "anchor2", leader2, seq2.clone()).unwrap();
+        let info4 = producer.apply_anchor_bookkeeping(4, "anchor4", leader4, seq4.clone()).unwrap();
 
         // "Follower": stalled with nothing decided; adopts the two synced blocks.
         let mut follower = OrderingEngine::new();

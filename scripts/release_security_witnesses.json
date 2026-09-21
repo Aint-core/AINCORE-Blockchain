@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "packages": {
+    "chain_sync": {
+      "required": [
+        "tests::tests::block_identity::sync_must_reject_resegmented_round_timestamp_with_reused_signature",
+        "tests::tests::block_identity::sync_must_reject_substituted_anchor_with_reused_signature",
+        "tests::tests::block_identity::unchanged_signed_block_is_accepted_identically_by_two_fresh_stores"
+      ],
+      "excluded_ignored": {}
+    },
+    "consensus": {
+      "required": [
+        "tests::tests::local_acceptance_tests::accepted_block_qc_work_survives_crash_before_attestation",
+        "tests::tests::local_acceptance_tests::adopted_block_qc_work_and_cursor_commit_together_across_crash",
+        "qc_producer::tests::persistence::recovery::crash_during_retry_atomically_keeps_work_or_publishes_guarded_outcome",
+        "tests::tests::test_h1_dropped_twin_leaves_two_honest_nodes_holding_different_sets",
+        "ordering::tests::test_h2_h4_twin_anchors_double_count_stake_and_break_subset_independence",
+        "tests::tests::equivocation_liveness_tests::equivocated_parent_must_not_permanently_block_supported_anchor",
+        "tests::tests::equivocation_liveness_tests::complete_signed_history_decides_after_retransmission_and_reopen",
+        "tests::tests::test_h3_tier2_stateless_gate_prevents_the_ancestry_fork",
+        "tests::tests::test_h3_tier2_round_skipping_anchor_is_refused"
+      ],
+      "excluded_ignored": {
+        "ordering::tests::probe_corpus_arm_distribution": "Measurement of scheduler corpus distribution, not a safety assertion.",
+        "ordering::tests::probe_is_h3_masked_by_the_b3b4_halt": "Ordering experiment with synthetic inputs, not the production ingress path.",
+        "ordering::tests::probe_c1_decision_experiment": "Experimental C1 decision model, not a production release witness.",
+        "ordering::tests::probe_validate_c1_legal_universe": "Validation of the experimental C1 corpus, not production execution.",
+        "ordering::tests::test_h3_sparse_anchor_forks_direct_committer_from_ancestry_skipper": "Direct ordering input bypasses the enforced thin-anchor ingress premise. Both test_h3_tier2 ingress controls are mandatory above. This exclusion does not establish that the decision function is sound in isolation."
+      }
+    },
+    "executor": {
+      "required": [
+        "tests::test_h6_state_root_is_blind_to_out_of_band_writes",
+        "tests::test_h6_a_corrupted_state_snapshot_is_undetectable"
+      ],
+      "excluded_ignored": {}
+    }
+  }
+}

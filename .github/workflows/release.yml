@@ -6,17 +6,49 @@ on:
   workflow_dispatch:
 
 jobs:
+  security-gate:
+    name: Release security witnesses and regression
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev protobuf-compiler clang libclang-dev
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Test gate itself
+        run: python3 -m unittest discover -s scripts/tests -p 'test_release_security_gate.py' -v
+      - name: Require security witnesses, including ignored blockers
+        run: python3 scripts/release_security_gate.py
+      - name: Regression suite
+        run: cargo test --locked -p blockchain -p chain_sync -p consensus -p executor -p governance -p node -p storage -p vm_move -- --test-threads=1
+      - name: Independent block identity vectors
+        run: node scripts/tests/block_identity_v2_vectors.mjs
+      - name: Strict admission-path lint
+        run: cargo clippy --locked -p storage -p chain_sync -p node --all-targets -- -D warnings
+      - name: Retain gate evidence even on failure
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-security-evidence
+          path: target/release-security-gate.json
+          if-no-files-found: error
+
   build:
+    needs: security-gate
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact_name: aincore-node
             asset_name: aincore-node-x86_64-unknown-linux-gnu.tar.gz
-          - os: macos-latest
+          - os: macos-14
             target: aarch64-apple-darwin
             artifact_name: aincore-node
             asset_name: aincore-node-aarch64-apple-darwin.tar.gz
@@ -24,13 +56,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install native dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev protobuf-compiler clang libclang-dev
+
+      - name: Install native dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install pkg-config openssl@3 protobuf
+
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.90.0
         with:
           targets: ${{ matrix.target }}
 
       - name: Build Release Binary
-        run: cargo build --release -p node --target ${{ matrix.target }}
+        run: cargo build --locked --release -p node --target ${{ matrix.target }}
 
       - name: Package Binary (Unix/macOS)
         run: |

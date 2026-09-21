@@ -201,6 +201,8 @@ pub struct ChainSync {
     /// AUDIT H8: bounds what VERTEX_REQ can push through blocking RocksDB reads
     /// on the tokio workers shared with consensus. See `VertexServeBudget`.
     serve_budget: VertexServeBudget,
+    #[cfg(test)]
+    before_execution_hook: Option<fn(&StateDB)>,
 }
 
 impl ChainSync {
@@ -210,8 +212,8 @@ impl ChainSync {
     /// `AINCORE_REQUIRE_EXEC_ROOTS` as a dev fallback. Off by default: the running
     /// testnet may hold empty-root blocks, so this is enabled only at the
     /// fresh-genesis mainnet cutover.
-    fn require_exec_roots(&self) -> bool {
-        if let Ok(Some(v)) = self.storage.get("sys:config:require_exec_roots") {
+    fn require_exec_roots(storage: &StateDB) -> bool {
+        if let Ok(Some(v)) = storage.get("sys:config:require_exec_roots") {
             return v == "1" || v.eq_ignore_ascii_case("true");
         }
         std::env::var("AINCORE_REQUIRE_EXEC_ROOTS")
@@ -231,10 +233,12 @@ impl ChainSync {
             peers,
             storage,
             serve_budget: VertexServeBudget::default(),
+            #[cfg(test)]
+            before_execution_hook: None,
         }
     }
 
-    fn verify_block_hash(&self, block: &Block) -> Result<bool, String> {
+    fn verify_block_hash(block: &Block) -> Result<bool, String> {
         let computed_hash = blockchain::calculate_header_hash(&block.header);
 
         if computed_hash == block.header.hash {
@@ -247,8 +251,17 @@ impl ChainSync {
         }
     }
 
+    #[cfg(test)]
     fn verify_execution_roots(
         &self,
+        block: &Block,
+        summary: &executor::BlockExecutionSummary,
+    ) -> Result<(), String> {
+        Self::verify_execution_roots_in(&self.storage, block, summary)
+    }
+
+    fn verify_execution_roots_in(
+        storage: &StateDB,
         block: &Block,
         summary: &executor::BlockExecutionSummary,
     ) -> Result<(), String> {
@@ -259,7 +272,7 @@ impl ChainSync {
         // Opt-in / off by default so the running testnet (which may hold
         // empty-root blocks) is not retroactively rejected; enable at the
         // fresh-genesis mainnet cutover.
-        if self.require_exec_roots() {
+        if Self::require_exec_roots(storage) {
             if block.header.state_root.is_empty() {
                 return Err(format!(
                     "block {} has empty state_root but execution roots are required (cutover)",
@@ -405,6 +418,15 @@ impl ChainSync {
         expected_height: u64,
         prev_hash: &str,
     ) -> Result<(), String> {
+        Self::validate_block_in(&self.storage, block, expected_height, prev_hash)
+    }
+
+    fn validate_block_in(
+        storage: &StateDB,
+        block: &Block,
+        expected_height: u64,
+        prev_hash: &str,
+    ) -> Result<(), String> {
         if block.header.height != expected_height {
             return Err(format!(
                 "Height mismatch: expected {}, got {}",
@@ -424,8 +446,10 @@ impl ChainSync {
             ));
         }
 
-        let validators = self.active_validator_addresses();
-        if !validators.is_empty() && !validators.contains(&block.header.proposer_id) {
+        let validators: Vec<String> = storage.get_active_validators_checked()
+            .map_err(|e| format!("cannot resolve validator eligibility: {e}"))?
+            .into_iter().map(|(address, _)| address).collect();
+        if !validators.contains(&block.header.proposer_id) {
             return Err(format!(
                 "Proposer {} is not in active validator set",
                 block.header.proposer_id
@@ -495,7 +519,7 @@ impl ChainSync {
             ));
         }
 
-        self.verify_block_hash(block)?;
+        Self::verify_block_hash(block)?;
         // RE-AUDIT CRITICAL: a synced block must PROVE it was produced by a
         // validator. Followers adopt its committed sequence and BLS-vote for it,
         // so any peer able to forge a block could harvest votes on a fork. The
@@ -507,14 +531,13 @@ impl ChainSync {
         if signer.is_empty() {
             return Err(format!("Block #{} carries no proposer signer", block.header.height));
         }
-        if !validators.is_empty() && !validators.contains(&signer) {
+        if !validators.contains(&signer) {
             return Err(format!(
                 "Block #{} signer {} is not an active validator",
                 block.header.height, signer
             ));
         }
-        let signer_pk = self
-            .storage
+        let signer_pk = storage
             .get_object(&signer)
             .and_then(|obj| serde_json::from_slice::<serde_json::Value>(&obj.data).ok())
             .and_then(|v| v.get("public_key").and_then(|k| k.as_str()).map(String::from));
@@ -535,6 +558,36 @@ impl ChainSync {
         }
 
         Ok(())
+    }
+
+    // Run before execution while holding the storage writer gate. In particular,
+    // do not reuse parent/key/QC reads from the unlocked network precheck.
+    fn validate_admission_in(storage: &StateDB, block: &Block) -> Result<(), String> {
+        let height = block.header.height;
+        if height == 0 {
+            return Err("cannot admit block height zero".into());
+        }
+        let parent_hash = if height == 1 {
+            "genesis".to_owned()
+        } else {
+            let parent_json = storage.get(&format!("block_{}", height - 1))
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "missing parent at admission".to_owned())?;
+            let parent: Block = serde_json::from_str(&parent_json)
+                .map_err(|e| format!("invalid parent at admission: {e}"))?;
+            if parent.header.height != height - 1 {
+                return Err("stored parent height mismatch at admission".into());
+            }
+            parent.header.hash
+        };
+        if let Some(json) = storage.get("consensus:qc:latest").map_err(|e| e.to_string())? {
+            let qc: consensus::qc::QuorumCertificate = serde_json::from_str(&json)
+                .map_err(|e| format!("invalid held QC at admission: {e}"))?;
+            if qc.block_height == height && qc.block_hash != block.header.hash {
+                return Err("held QC conflicts with block at admission".into());
+            }
+        }
+        Self::validate_block_in(storage, block, height, &parent_hash)
     }
 
     fn get_local_height(&self) -> u64 {
@@ -590,7 +643,8 @@ impl ChainSync {
     /// The trusted validator set that a finality QC is verified against. SEC-#16:
     /// resolved by the QC's epoch (`sys:validator_set:epoch:{epoch}`, the snapshot
     /// frozen at that epoch's start) so a QC produced in an earlier epoch still
-    /// verifies against the set that produced it; falls back to the live set.
+    /// verifies against the set that produced it. Missing historical snapshots
+    /// cannot be substituted with the live set (legacy epoch-0 bootstrap aside).
     fn trusted_validator_set(&self, epoch: u64) -> Option<Vec<consensus::qc::ValidatorInfo>> {
         consensus::qc_producer::load_validator_set_for_epoch(&self.storage, epoch)
     }
@@ -610,110 +664,15 @@ impl ChainSync {
         let Some(qc) = artifact.qc.as_ref() else {
             return Ok(()); // pre-QC peer: cannot move our finality, harmless
         };
-        let validators = match self.trusted_validator_set(qc.epoch) {
-            Some(v) => v,
-            None => return Ok(()), // no trusted set to verify against — skip
-        };
-        consensus::qc::verify_qc(qc, &validators, &consensus::qc::expected_chain_id())
-            .map_err(|e| format!("finality QC verification failed: {:?}", e))?;
-
-        let remote_finalized = qc.finalized_round;
-        if remote_finalized == 0 || remote_finalized <= self.finalized_round_boundary() {
-            return Ok(()); // not newer than what we already hold
+        // Membership, local-block binding, monotonicity, finality metadata and
+        // every QC index share one writer-gated transaction. Never publish just
+        // the latest body: the producer consumes its height/round indexes too.
+        if consensus::qc_producer::import_finality_qc(&self.storage, qc)? {
+            println!(
+                "✅ [ChainSync] Applied durable QC-verified finality: round={} (signed_stake={}/{})",
+                qc.finalized_round, qc.signed_stake, qc.total_stake
+            );
         }
-        if qc.anchor_round > remote_finalized {
-            return Err(format!(
-                "QC anchor round {} exceeds finalized round {}",
-                qc.anchor_round, remote_finalized
-            ));
-        }
-
-        // SEC-#6/#24: bind finality to the block this node actually holds. The QC
-        // certifies (block_height, block_hash); only advance finality if we have
-        // that EXACT block locally. Otherwise the finalized marker could outrun or
-        // diverge from our canonical chain — precisely what light clients/bridges
-        // trust the QC to prevent. (qc.block_hash == the committed block's
-        // header.hash; see dag.rs CommitContext.)
-        let local_block_key = format!("block_{}", qc.block_height);
-        match self.storage.get(&local_block_key).ok().flatten() {
-            Some(json) => match serde_json::from_str::<Block>(&json) {
-                Ok(b) if b.header.hash == qc.block_hash => { /* certified block held — ok */ }
-                Ok(b) => {
-                    return Err(format!(
-                        "🚨 [SECURITY] finality QC block_hash {} != local block_{} hash {} — refusing to advance",
-                        qc.block_hash, qc.block_height, b.header.hash
-                    ));
-                }
-                Err(e) => {
-                    return Err(format!("local block_{} unparsable: {}", qc.block_height, e));
-                }
-            },
-            None => {
-                // We do not yet hold the certified block (still catching up).
-                // Do NOT advance finality past a block we don't have (#24);
-                // this re-runs after block sync delivers it.
-                return Ok(());
-            }
-        }
-
-        self.storage
-            .put("consensus:finalized_round", &remote_finalized.to_string())
-            .map_err(|e| format!("persist finalized_round failed: {}", e))?;
-        self.storage
-            .put("consensus:last_anchor_round", &qc.anchor_round.to_string())
-            .map_err(|e| format!("persist last_anchor_round failed: {}", e))?;
-        self.storage
-            .put("consensus:last_anchor_hash", &qc.anchor_hash)
-            .map_err(|e| format!("persist last_anchor_hash failed: {}", e))?;
-        self.storage
-            .put("consensus:finality_digest", &qc.finality_digest)
-            .map_err(|e| format!("persist finality_digest failed: {}", e))?;
-        // Persist the verified QC so this node can serve the proof onward.
-        if let Ok(j) = serde_json::to_string(qc) {
-            let _ = self.storage.put("consensus:qc:latest", &j);
-        }
-
-        println!(
-            "✅ [ChainSync] Applied QC-verified finality: round={} (signed_stake={}/{})",
-            remote_finalized, qc.signed_stake, qc.total_stake
-        );
-        Ok(())
-    }
-
-    fn rollback_to_height(&self, target_height: u64) -> Result<(), String> {
-        let current_height = self.storage.get_chain_height();
-        if target_height >= current_height {
-            return Ok(());
-        }
-
-        for h in ((target_height + 1)..=current_height).rev() {
-            let key = format!("block_{}", h);
-            self.storage
-                .delete(&key)
-                .map_err(|e| format!("rollback delete failed at {}: {}", h, e))?;
-        }
-
-        let (new_hash, new_height) = if target_height == 0 {
-            ("genesis".to_string(), 0u64)
-        } else {
-            let key = format!("block_{}", target_height);
-            let hash = self
-                .storage
-                .get(&key)
-                .ok()
-                .flatten()
-                .and_then(|json| serde_json::from_str::<Block>(&json).ok())
-                .map(|b| b.header.hash)
-                .ok_or_else(|| format!("rollback target block {} missing", target_height))?;
-            (hash, target_height)
-        };
-
-        self.storage
-            .put("latest_height", &new_height.to_string())
-            .map_err(|e| format!("rollback latest_height update failed: {}", e))?;
-        self.storage
-            .put("latest_block_hash", &new_hash)
-            .map_err(|e| format!("rollback latest_block_hash update failed: {}", e))?;
         Ok(())
     }
 
@@ -1136,54 +1095,17 @@ impl ChainSync {
                             );
                             break;
                         }
-                        let rollback_target = block.header.height.saturating_sub(1);
-                        // SEC-#8: `rollback_to_height` only deletes block records and resets the
-                        // height/hash pointers — it does NOT revert the Move/executor state writes
-                        // (CoinStore balances, staking, arbitrary resources) made by the orphaned
-                        // blocks. Re-executing the new fork over that un-reverted state silently
-                        // diverges this node from one that never saw the orphan (last-write-wins
-                        // leaves orphan-only resources behind). Until a full per-height state-undo
-                        // log exists, refuse to silently reorg across state-changing blocks: halt
-                        // for operator re-bootstrap from a snapshot. Empty (no-tx) orphans carry no
-                        // state and are safe to roll back + re-execute.
-                        let stored_tip = self.storage.get_chain_height();
-                        let mut state_changing_orphan = false;
-                        for h in (rollback_target + 1)..=stored_tip {
-                            let k = format!("block_{}", h);
-                            if let Ok(Some(j)) = self.storage.get(&k) {
-                                if let Ok(b) = serde_json::from_str::<Block>(&j) {
-                                    if !b.transactions.is_empty() {
-                                        state_changing_orphan = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if state_changing_orphan {
-                            // SEC (audit C-2/H-3 sibling): the competing chain that would
-                            // orphan state-changing committed blocks arrived over the
-                            // UNAUTHENTICATED sync path (forgeable by any peer). Do NOT
-                            // latch a persistent, node-wide `sync:halt_reason` — that is
-                            // the same remote permanent-halt DoS the H-3 exec-root fix
-                            // removed, just reachable through the reorg branch. REJECT the
-                            // reorg (never roll back to an unauthenticated fork) and stop
-                            // consuming this peer's batch; the node keeps its current
-                            // QC-finality-backed chain intact (no state corruption, since
-                            // we do NOT roll back). A genuine reorg above the finalized
-                            // boundary cannot occur for a node following QC-gated finality.
-                            eprintln!(
-                                "🚨 [SECURITY][SYNC_REORG_REJECT] refusing unauthenticated state-changing reorg at height {} (orphaning {}..={}) from this peer (not halting)",
-                                block.header.height,
-                                rollback_target + 1,
-                                stored_tip
-                            );
-                            break;
-                        }
-                        if let Err(err) = self.rollback_to_height(rollback_target) {
-                            eprintln!("🚨 [SECURITY][SYNC_ROLLBACK_FAIL] {}", err);
-                            break;
-                        }
-                        last_processed = rollback_target;
+                        // A proposer signature or a longer peer chain is not a
+                        // fork-choice proof. Even zero-TX blocks advance execution
+                        // and may sweep fees or advance epochs. Deleting block rows
+                        // cannot undo that state, QC indexes or ordering history.
+                        // Until authenticated fork adoption and atomic state recovery
+                        // exist, reject every conflict without writes or a halt latch.
+                        eprintln!(
+                            "[SECURITY][SYNC_REORG_REJECT] conflict at height {} requires authenticated fork choice and complete state recovery; preserving local chain",
+                            block.header.height
+                        );
+                        break;
                     } else {
                         eprintln!(
                             "🚨 [SECURITY][SYNC_REORG_REJECT] corrupt local block json at height {}",
@@ -1228,8 +1150,13 @@ impl ChainSync {
                 break;
             }
 
-            // Execute transactions through the VM/Executor
-            let execution_summary = match executor.execute_block_parallel_at(
+            // Validate roots and stage block/index storage in the SAME transaction
+            // as execution. Rejection must not consume a nonce or execution height.
+            #[cfg(test)]
+            if let Some(hook) = self.before_execution_hook {
+                hook(&self.storage);
+            }
+            match executor.execute_block_admitted_at(
                 block.transactions.clone(),
                 &block.header.proposer_id,
                 // The synced block's own height (epoch determinism — see
@@ -1238,23 +1165,21 @@ impl ChainSync {
                 // RE-AUDIT HIGH: the block's own slash evidence, verified by
                 // the executor — identical on every node.
                 &block.slash_evidence,
+                |view| Self::validate_admission_in(view, block),
+                |summary, view| {
+                    Self::verify_execution_roots_in(view, block, summary)?;
+                    let json = serde_json::to_string(block).map_err(|e| e.to_string())?;
+                    view.save_block_json(block.header.height, &json).map_err(|e| e.to_string())
+                },
             ) {
-                executor::BlockExecOutcome::Executed(summary) => summary,
-                // ROOT-CAUSE FIX: this height is already executed locally. The
-                // hash-equal dedup above would have skipped an identical block,
-                // so reaching here means the peer offers a DIFFERENT block at an
-                // executed height — a fork. Never execute it, never persist it.
-                executor::BlockExecOutcome::AlreadyExecuted { last_executed } => {
-                    // The height is already executed. Two very different cases:
-                    //
-                    // (a) BENIGN RACE — the local commit loop executed this height
-                    //     moments ago and has not persisted its block yet, so the
-                    //     hash-equal dedup above could not see it. Deterministic
-                    //     execution means the peer's block equals ours. Skip just
-                    //     this block and keep consuming the batch; breaking here
-                    //     cost ~25% of blocks a wasted round-trip in the live test.
-                    // (b) FORK — we hold a DIFFERENT block at that height. Never
-                    //     execute or persist it; drop this peer's batch.
+                Ok(executor::BlockExecOutcome::Executed(_)) => {
+                    last_processed = block.header.height;
+                }
+                Ok(executor::BlockExecOutcome::AlreadyExecuted { last_executed }) => {
+                    // Execution completion alone does not identify the block.
+                    // Missing storage may mean an in-flight producer OR a crash
+                    // between execution and save_block_json. Wait for a matching
+                    // persisted block; never infer identity from the height.
                     let stored = self
                         .storage
                         .get(&format!("block_{}", block.header.height))
@@ -1272,50 +1197,37 @@ impl ChainSync {
                             );
                             break;
                         }
-                        _ => {
+                        Some(_) => {
                             last_processed = last_processed.max(block.header.height);
                             continue;
+                        }
+                        None => {
+                            eprintln!(
+                                "[ChainSync][EXECUTION_WITHOUT_BLOCK] height {} was executed \
+                                 (last_executed={}) but its stored block is missing or unreadable; \
+                                 stopping this batch without advancing sync",
+                                block.header.height, last_executed
+                            );
+                            break;
                         }
                     }
                 }
                 // Executing out of order would corrupt the state-root chain.
-                executor::BlockExecOutcome::Gap { expected, got } => {
+                Ok(executor::BlockExecOutcome::Gap { expected, got }) => {
                     eprintln!(
                         "⏸️  [ChainSync] execution gap: expected height {}, peer offered {} — stopping this batch",
                         expected, got
                     );
                     break;
                 }
-            };
-            if let Err(e) = self.verify_execution_roots(block, &execution_summary) {
-                // SEC (audit H-3): synced blocks are UNAUTHENTICATED (no proposer
-                // signature — only a self-referential header hash + a public proposer_id
-                // string). A re-execution-root mismatch is EXPECTED adversarial input
-                // from a malicious peer, NOT proof of local divergence — so it must NOT
-                // latch a persistent, node-wide `sync:halt_reason` that survives restart
-                // and needs manual operator intervention. A single forged block from any
-                // peer could otherwise permanently halt the node (remote DoS). Reject
-                // this block and stop consuming THIS peer's batch; the QC-gated finality
-                // path (apply_finality_artifact + chain_id/set-bound verify_qc) remains
-                // the authenticated crypto backstop.
-                //
-                // RESIDUAL (tracked): the complete remediation authenticates blocks
-                // BEFORE execution (a verifiable QC covering the block, or a proposer
-                // vertex signature) so a forged block never executes at all — a block-
-                // format change, out of scope here.
-                eprintln!(
-                    "🚨 [SECURITY][SYNC_EXECUTION_ROOT_REJECT] rejecting divergent/forged block #{} from this peer (not halting): {}",
-                    block.header.height, e
-                );
-                break;
-            }
-
-            if let Ok(json) = serde_json::to_string(&block) {
-                // save_block_json now atomically updates height + hash
-                if let Err(e) = self.storage.save_block_json(block.header.height, &json) {
-                    eprintln!("❌ DB Error: {}", e);
-                } else {
-                    last_processed = block.header.height;
+                Err(error) => {
+                    // The error can be invalid roots OR local storage failure.
+                    // Neither authorizes progress or a permanent peer-triggered halt.
+                    eprintln!(
+                        "[ChainSync][BLOCK_ACCEPTANCE_FAILED] block #{} was not accepted: {}",
+                        block.header.height, error
+                    );
+                    break;
                 }
             }
 

@@ -1,6 +1,12 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod tests {
+    mod local_acceptance_tests {
+        include!("local_acceptance_tests.rs");
+    }
+    mod equivocation_liveness_tests {
+        include!("equivocation_liveness_tests.rs");
+    }
     // use super::*; // Unused
     use crate::dag::DagConsensus;
     use executor::Executor;
@@ -101,6 +107,26 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn test_unplaced_local_anchor_does_not_consume_ordering_cursor() {
+        let (mut node, path) = setup_dag("unplaced_anchor_cursor");
+        node.placement_sleep = Arc::new(|_| {});
+        // Reproduce a legacy torn execution marker: no matching durable block.
+        node.storage.put("sys:last_executed_height", "1").unwrap();
+        for _ in 0..3 {
+            node.try_create_vertex();
+        }
+        let engine = node.ordering_engine.lock().unwrap();
+        assert_eq!(node.latest_block_height, 0);
+        assert_eq!(engine.finalized_round, 0, "unplaced anchor consumed finality");
+        assert_eq!(engine.next_anchor_round, 1);
+        assert!(node.storage.get("consensus:finalized_round").unwrap().is_none());
+        assert!(node.storage.get("consensus:cseq:2").unwrap().is_none());
+        drop(engine);
+        drop(node);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -366,6 +392,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    #[test]
+    fn test_reload_retries_failed_anchor_adoption_without_a_new_tip() {
+        static REACHED_ADOPTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let (mut consensus, path) = setup_dag("adoption_persistence_retry");
+        let readonly_path = get_test_db_path("adoption_persistence_readonly");
+        // Isolate an ordering-store write failure while the synced block is
+        // already present in the node's writable block store.
+        let mut block = blockchain::Block::new_with_roots_at(
+            1, 2, "genesis".to_string(), vec![], consensus.node_id.clone(),
+            "state-root".to_string(), "receipts-root".to_string(), 1000,
+            vec!["anchor-2".to_string()], "anchor-2".to_string(), vec![],
+        );
+        block.sign_proposer(
+            &crypto::SigningKey::from_bytes(&consensus.node_key), &consensus.node_id,
+        );
+        consensus.storage.save_block_json(1, &serde_json::to_string(&block).unwrap()).unwrap();
+        consensus.storage.put("sys:last_executed_height", "1").unwrap();
+        let seed = StateDB::open(&readonly_path).unwrap();
+        seed.save_block_json(1, &serde_json::to_string(&block).unwrap()).unwrap();
+        seed.put("sys:last_executed_height", "1").unwrap();
+        drop(seed);
+        let readonly = Arc::new(StateDB {
+            db: storage::rocksdb::DB::open_for_read_only(
+                &storage::rocksdb::Options::default(), &readonly_path, false,
+            ).unwrap().into(),
+        });
+        consensus.ordering_engine = Arc::new(Mutex::new(
+            crate::ordering::OrderingEngine::new_with_storage(readonly),
+        ));
+        REACHED_ADOPTION.store(false, std::sync::atomic::Ordering::SeqCst);
+        consensus.local_acceptance_hook = Some(|boundary, view| {
+            if boundary == 2 {
+                assert!(view.get("consensus:qc_pending:00000000000000000001").unwrap().is_some());
+                REACHED_ADOPTION.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        });
+        consensus.reload_chain_tip();
+        assert!(REACHED_ADOPTION.load(std::sync::atomic::Ordering::SeqCst), "did not reach native write attempt");
+        assert_eq!(consensus.latest_block_height, 1);
+        assert_eq!(consensus.ordering_engine.lock().unwrap().finalized_round, 0);
+        assert_eq!(consensus.last_adopted_height, 0, "failed anchor was marked adopted");
+        assert_eq!(consensus.storage.get("consensus:last_adopted_height").unwrap(), None);
+
+        consensus.ordering_engine = Arc::new(Mutex::new(
+            crate::ordering::OrderingEngine::new_with_storage(Arc::clone(&consensus.storage)),
+        ));
+        consensus.reload_chain_tip();
+        assert_eq!(consensus.latest_block_height, 1, "no new network tip was supplied");
+        assert_eq!(consensus.last_adopted_height, 1);
+        assert_eq!(consensus.ordering_engine.lock().unwrap().finalized_round, 2);
+        assert_eq!(consensus.storage.get("consensus:last_adopted_height").unwrap(), Some("1".into()));
+        let digest = consensus.storage.get("consensus:finality_digest").unwrap();
+        consensus.reload_chain_tip();
+        assert_eq!(consensus.storage.get("consensus:finality_digest").unwrap(), digest);
+        drop(consensus);
+        let _ = std::fs::remove_dir_all(path);
+        let _ = std::fs::remove_dir_all(readonly_path);
+    }
+
     /// C-01 REGRESSION TEST
     ///
     /// Ensures the equivocation slash event written to `sys:pending_slash:` uses
@@ -480,7 +566,7 @@ mod tests {
     /// could DELETE the signature blob to forge a checkpoint. Phase 4.A2
     /// closes that loophole — a node booting against unsigned checkpoint
     /// data now falls back to scan_vertices (in-memory DAG stays empty
-    /// because we never wrote individual vertex_:* rows in this test).
+    /// because this fixture removes the separately persisted vertex rows).
     #[test]
     fn h06_a2_unsigned_checkpoint_rejected() {
         let (mut consensus, path) = setup_dag("h06_a2_unsigned_rejected");
@@ -499,6 +585,15 @@ mod tests {
             .save_dag_checkpoint(2, &checkpoint_json)
             .unwrap();
         consensus.storage.put("latest_proposed_round", "2").unwrap();
+
+        // Isolate checkpoint rejection from the independent disk fallback.
+        // try_create_vertex persists rows, contrary to this test's old premise.
+        let vertices: Vec<blockchain::Vertex> = serde_json::from_str(&checkpoint_json).unwrap();
+        assert!(!vertices.is_empty());
+        for vertex in vertices {
+            consensus.storage.delete(&format!("vertex:{}", vertex.hash)).unwrap();
+        }
+        assert!(consensus.storage.scan_vertices().is_empty());
 
         let db = Arc::clone(&consensus.storage);
         let node_id = consensus.node_id.clone();
@@ -796,11 +891,9 @@ mod tests {
             vertex.parent_refs = parents.clone();
             vertex.hash = vertex.calculate_hash();
             vertex.sign_with_ed25519(&remote_sk);
-            parents = vec![blockchain::ParentRef {
-                round,
-                author: remote_addr.clone(),
-                digest: vertex.hash.clone(),
-            }];
+            parents = vec![blockchain::ParentRef::authenticated(
+                &vertex, hex::encode(remote_sk.verifying_key().to_bytes()),
+            )];
             dag.add_vertex(vertex);
         }
 
@@ -1278,11 +1371,9 @@ mod tests {
             parents
                 .iter()
                 .filter_map(|h| {
-                    dag.get(h).map(|pv| blockchain::ParentRef {
-                        round: pv.round,
-                        author: pv.author.clone(),
-                        digest: h.clone(),
-                    })
+                    dag.get(h).map(|pv| blockchain::ParentRef::authenticated(
+                        pv, hex::encode(signing_key.verifying_key().to_bytes()),
+                    ))
                 })
                 .collect::<Vec<_>>()
         };
@@ -1900,24 +1991,20 @@ mod tests {
         // design) — and it still must not drag the local proposal clock forward.
         // Without this leg the test would have been weakened into "we now reject
         // everything far ahead", which is a different and lesser claim.
+        let local_parent = tier2_signed(&consensus.node_key, &consensus.node_id, far_round - 1, 999);
+        let remote_parent = tier2_signed(&[99u8; 32], &remote_id, far_round - 1, 999);
+        let parent_refs = vec![
+            blockchain::ParentRef::authenticated(&local_parent,
+                hex::encode(crypto::SigningKey::from_bytes(&consensus.node_key).verifying_key().to_bytes())),
+            blockchain::ParentRef::authenticated(&remote_parent, remote_pub),
+        ];
         let mut far_ok = blockchain::Vertex {
             round: far_round,
             author: remote_id.clone(),
             timestamp: 1_000,
             payload: vec![],
-            parents: vec![format!("{:064x}", 1u64), format!("{:064x}", 2u64)],
-            parent_refs: vec![
-                blockchain::ParentRef {
-                    round: far_round - 1,
-                    author: consensus.node_id.clone(),
-                    digest: format!("{:064x}", 1u64),
-                },
-                blockchain::ParentRef {
-                    round: far_round - 1,
-                    author: remote_id.clone(),
-                    digest: format!("{:064x}", 2u64),
-                },
-            ],
+            parents: parent_refs.iter().map(|p| p.digest.clone()).collect(),
+            parent_refs,
             hash: String::new(),
             signature: String::new(),
             aggregated_signature: None,
@@ -2437,13 +2524,13 @@ mod tests {
         keys: &[(String, String, [u8; 32])],
         round: u64,
         ts: u64,
-        parents: &[(String, u64, String)],
-    ) -> Vec<(String, u64, String)> {
+        parents: &[TestParent],
+    ) -> Vec<TestParent> {
         node.current_round = round;
         let mut out = Vec::new();
         for (addr, _, key) in keys {
             let v = tier2_vertex(key, addr, round, ts, parents);
-            out.push((v.hash.clone(), round, addr.clone()));
+            out.push(test_parent(&v, key));
             node.add_vertex(v);
         }
         out
@@ -2507,8 +2594,8 @@ mod tests {
         node.now_secs = Arc::new(|| PINNED);
 
         // Rounds 1-3: anchor round 2 commits and is placed locally at height 1.
-        let mut prev: Vec<(String, u64, String)> =
-            vec![("genesis".to_string(), 0, String::new())];
+        let mut prev: Vec<TestParent> =
+            vec![("genesis".to_string(), 0, String::new(), None)];
         for r in 1..=3u64 {
             prev = tier2_feed_round(&mut node, &keys, r, PINNED, &prev);
         }
@@ -2623,7 +2710,7 @@ mod tests {
             &keys,
             1,
             PINNED,
-            &[("genesis".to_string(), 0, String::new())],
+            &[("genesis".to_string(), 0, String::new(), None)],
         );
         node.current_round = 2;
         node.try_create_vertex();
@@ -2669,12 +2756,20 @@ mod tests {
     /// Build one signed vertex WITH self-describing parent refs, the way a real
     /// producer does. `parents` carries (digest, round, author) so the refs can
     /// be built without a DAG.
+    type TestParent = (String, u64, String, Option<blockchain::ParentIdentityProof>);
+
+    fn test_parent(v: &blockchain::Vertex, key: &[u8; 32]) -> TestParent {
+        let reference = blockchain::ParentRef::authenticated(v,
+            hex::encode(crypto::SigningKey::from_bytes(key).verifying_key().to_bytes()));
+        (reference.digest, reference.round, reference.author, reference.proof)
+    }
+
     fn tier2_vertex(
         key: &[u8; 32],
         author: &str,
         round: u64,
         ts: u64,
-        parents: &[(String, u64, String)],
+        parents: &[TestParent],
     ) -> blockchain::Vertex {
         let sk = crypto::SigningKey::from_bytes(key);
         let mut v = blockchain::Vertex {
@@ -2682,13 +2777,14 @@ mod tests {
             author: author.to_string(),
             timestamp: ts,
             payload: vec![],
-            parents: parents.iter().map(|(d, _, _)| d.clone()).collect(),
+            parents: parents.iter().map(|(d, _, _, _)| d.clone()).collect(),
             parent_refs: parents
                 .iter()
-                .map(|(d, r, a)| blockchain::ParentRef {
+                .map(|(d, r, a, proof)| blockchain::ParentRef {
                     round: *r,
                     author: a.clone(),
                     digest: d.clone(),
+                    proof: proof.clone(),
                 })
                 .collect(),
             hash: String::new(),
@@ -2700,6 +2796,163 @@ mod tests {
         v.hash = v.calculate_hash();
         v.sign_with_ed25519(&sk);
         v
+    }
+
+    // All referenced bodies are already present. A mismatch must not be
+    // confused with a missing-parent timing decision or an invalid signature.
+    fn assert_parent_body_identity_checked(forge_round: bool) {
+        const PINNED: u64 = 1_700_000_000;
+        let keys: Vec<(String, String, [u8; 32])> =
+            (31..=34u8).map(tier2_keypair).collect();
+        let known: Vec<(String, String)> =
+            keys.iter().map(|(a, p, _)| (a.clone(), p.clone())).collect();
+        let suffix = if forge_round { "parent_body_round" } else { "parent_body_author" };
+        let path = get_test_db_path(suffix);
+        let mut node = tier2_open(31, &path, &known);
+        node.now_secs = Arc::new(|| PINNED);
+        let parents = tier2_feed_round(
+            &mut node,
+            &keys,
+            1,
+            PINNED,
+            &[("genesis".to_string(), 0, String::new(), None)],
+        );
+        assert!(parents.iter().all(|(h, _, _, _)| tier2_accepted(&node).contains(h)));
+
+        // Positive control: genuine round-1 references must reach the live DAG.
+        node.current_round = 2;
+        let honest = tier2_vertex(&keys[3].2, &keys[3].0, 2, PINNED, &parents);
+        let honest_hash = honest.hash.clone();
+        node.add_vertex(honest);
+        assert!(tier2_accepted(&node).contains(&honest_hash));
+
+        let child_round = if forge_round { 3 } else { 2 };
+        let mut declared = parents.clone();
+        for (i, (_, round, author, _)) in declared.iter_mut().enumerate() {
+            if forge_round {
+                *round = child_round - 1;
+            } else {
+                *author = parents[(i + 1) % parents.len()].2.clone();
+            }
+        }
+        let forged = tier2_vertex(&keys[0].2, &keys[0].0, child_round, PINNED, &declared);
+        let validators: Vec<(String, u64)> =
+            known.iter().map(|(a, _)| (a.clone(), 1000)).collect();
+        assert!(crate::qc::parent_refs_admissible(&forged, &validators).is_ok());
+        assert_eq!(forged.hash, forged.calculate_hash());
+        {
+            let dag = node.dag.lock().unwrap();
+            assert!(forged.parent_refs.iter().all(|r| {
+                let body = dag.get(&r.digest).expect("the referenced body is held");
+                r.round != body.round || r.author != body.author
+            }));
+        }
+
+        node.current_round = child_round;
+        let forged_hash = forged.hash.clone();
+        node.add_vertex(forged);
+        let admitted = tier2_accepted(&node).contains(&forged_hash);
+        let persisted = node.storage.get(&format!("vertex:{forged_hash}")).unwrap().is_some();
+        drop(node);
+        let _ = std::fs::remove_dir_all(&path);
+        assert!(
+            !admitted && !persisted,
+            "parent identity mismatch reached live DAG/storage: forge_round={forge_round}, \
+             admitted={admitted}, persisted={persisted}; all parent bodies were present"
+        );
+    }
+
+    #[test]
+    fn test_parent_body_identity_rejects_forged_round() {
+        assert_parent_body_identity_checked(true);
+    }
+
+    #[test]
+    fn test_parent_body_identity_rejects_forged_author() {
+        assert_parent_body_identity_checked(false);
+    }
+
+    fn assert_checkpoint_fallback_replays_retained_vertices(mode: &str) {
+        use crypto::Signer;
+        let (author, pubkey, key) = tier2_keypair(41);
+        let known = vec![(author.clone(), pubkey)];
+        let path = get_test_db_path(&format!("checkpoint_fallback_{mode}"));
+        let node = tier2_open(41, &path, &known);
+        let mut vertices = Vec::new();
+        let mut parents = vec![("genesis".to_string(), 0, String::new(), None)];
+        for round in 1..=3 {
+            let vertex = tier2_vertex(&key, &author, round, 1_700_000_000, &parents);
+            node.storage.put(
+                &format!("vertex:{}", vertex.hash),
+                &serde_json::to_string(&vertex).unwrap(),
+            ).unwrap();
+            parents = vec![test_parent(&vertex, &key)];
+            vertices.push(vertex);
+        }
+        let checkpoint = if mode == "malformed_json" {
+            "not JSON".to_string()
+        } else if mode == "valid" {
+            serde_json::to_string(&vertices[..2]).unwrap()
+        } else {
+            // A checkpoint-only record must not leak through the rejected blob.
+            let checkpoint_only = tier2_vertex(&key, &author, 4, 1_700_000_000, &parents);
+            serde_json::to_string(&vec![checkpoint_only]).unwrap()
+        };
+        match mode {
+            "missing" => node.storage.put("dag:checkpoint:latest", "2").unwrap(),
+            "unsigned" => node.storage.save_dag_checkpoint(2, &checkpoint).unwrap(),
+            _ => {
+                let signature = match mode {
+                    "bad_signature" => hex::encode([0u8; 64]),
+                    "malformed_signature" => "invalid-hex".to_string(),
+                    _ => hex::encode(crypto::SigningKey::from_bytes(&key)
+                        .sign(checkpoint.as_bytes()).to_bytes()),
+                };
+                node.storage.save_dag_checkpoint_signed(2, &checkpoint, &signature).unwrap();
+            }
+        }
+        node.storage.flush().unwrap();
+        drop(node);
+        let recovered = tier2_open(41, &path, &known);
+        let accepted = tier2_accepted(&recovered);
+        let indexed: std::collections::BTreeSet<String> = recovered.round_index
+            .lock().unwrap().values().flatten().cloned().collect();
+        let expected: std::collections::BTreeSet<String> = vertices.iter()
+            .map(|v| v.hash.clone()).collect();
+        drop(recovered);
+        std::fs::remove_dir_all(&path).unwrap();
+        assert_eq!(accepted, expected, "{mode}: retained pre-checkpoint vertices lost");
+        assert_eq!(indexed, expected, "{mode}: recovery index differs from DAG");
+    }
+
+    #[test]
+    fn test_checkpoint_fallback_unsigned_replays_retained_vertices() {
+        assert_checkpoint_fallback_replays_retained_vertices("unsigned");
+    }
+
+    #[test]
+    fn test_checkpoint_fallback_bad_signature_replays_retained_vertices() {
+        assert_checkpoint_fallback_replays_retained_vertices("bad_signature");
+    }
+
+    #[test]
+    fn test_checkpoint_fallback_malformed_signature_replays_retained_vertices() {
+        assert_checkpoint_fallback_replays_retained_vertices("malformed_signature");
+    }
+
+    #[test]
+    fn test_checkpoint_fallback_missing_replays_retained_vertices() {
+        assert_checkpoint_fallback_replays_retained_vertices("missing");
+    }
+
+    #[test]
+    fn test_checkpoint_fallback_malformed_json_replays_retained_vertices() {
+        assert_checkpoint_fallback_replays_retained_vertices("malformed_json");
+    }
+
+    #[test]
+    fn test_checkpoint_fallback_valid_checkpoint_and_tail_control() {
+        assert_checkpoint_fallback_replays_retained_vertices("valid");
     }
 
     /// AUDIT H3 AT TIER 2 — real `DagConsensus`, real `StateDB`, real ingress.
@@ -2745,18 +2998,18 @@ mod tests {
         // Build the universe once, as (hash, vertex), so both nodes see the same
         // bytes and only the DELIVERY differs.
         let mut universe: Vec<(String, blockchain::Vertex)> = Vec::new();
-        let mut prev: Vec<(String, u64, String)> =
-            vec![("genesis".to_string(), 0, String::new())];
-        let mut byz_prev: Option<(String, u64, String)> = None;
+        let mut prev: Vec<TestParent> =
+            vec![("genesis".to_string(), 0, String::new(), None)];
+        let mut byz_prev: Option<TestParent> = None;
         for r in 1..=5u64 {
             let mut this = Vec::new();
             for (addr, _, key) in &keys {
-                let parents: Vec<(String, u64, String)> = if addr == &byz && (r == 3 || r == 4) {
+                let parents: Vec<TestParent> = if addr == &byz && (r == 3 || r == 4) {
                     if r == 3 {
                         // ONE parent, and NOT the round-2 leader.
                         vec![prev
                             .iter()
-                            .find(|(_, _, a)| a != &l2)
+                            .find(|(_, _, a, _)| a != &l2)
                             .expect("a non-leader parent exists")
                             .clone()]
                     } else {
@@ -2766,7 +3019,7 @@ mod tests {
                     prev.clone()
                 };
                 let v = tier2_vertex(key, addr, r, PINNED, &parents);
-                let entry = (v.hash.clone(), r, addr.clone());
+                let entry = test_parent(&v, key);
                 if addr == &byz {
                     byz_prev = Some(entry.clone());
                 }
@@ -2818,16 +3071,16 @@ mod tests {
              is being asserted. Check the seeding preconditions in tier2_open."
         );
 
-        match (decided(&x, 2), decided(&y, 2)) {
-            (Some(a), Some(b)) => assert_eq!(
+        // One side undecided is not a disagreement.
+        if let (Some(a), Some(b)) = (decided(&x, 2), decided(&y, 2)) {
+            assert_eq!(
                 a, b,
                 "AD-1 VIOLATED at tier 2: X decided committed={} for round 2, Y \
                  decided committed={}. Same honest broadcast, different arrival, \
                  opposite FINAL verdicts — the H3 finality fork, through real \
                  ingress.",
                 a, b
-            ),
-            _ => {} // one side undecided is not a disagreement
+            );
         }
 
         let _ = std::fs::remove_dir_all(&xp);
@@ -2870,14 +3123,14 @@ mod tests {
         assert_ne!(l2, byz);
 
         let mut universe: Vec<(String, blockchain::Vertex)> = Vec::new();
-        let mut by_round: std::collections::HashMap<u64, Vec<(String, u64, String)>> =
+        let mut by_round: std::collections::HashMap<u64, Vec<TestParent>> =
             std::collections::HashMap::new();
-        let mut prev: Vec<(String, u64, String)> =
-            vec![("genesis".to_string(), 0, String::new())];
+        let mut prev: Vec<TestParent> =
+            vec![("genesis".to_string(), 0, String::new(), None)];
         for r in 1..=5u64 {
             let mut this = Vec::new();
             for (addr, _, key) in &keys {
-                let parents: Vec<(String, u64, String)> = if addr == &byz && r == 4 {
+                let parents: Vec<TestParent> = if addr == &byz && r == 4 {
                     // ROUND-SKIPPING: cite the three NON-LEADER round-2 vertices.
                     // Quorum-fat in authors (3000 of 4000), and the round-2 leader
                     // is absent from the whole causal cone.
@@ -2885,14 +3138,14 @@ mod tests {
                         .get(&2)
                         .expect("round 2 built")
                         .iter()
-                        .filter(|(_, _, a)| a != &l2)
+                        .filter(|(_, _, a, _)| a != &l2)
                         .cloned()
                         .collect()
                 } else {
                     prev.clone()
                 };
                 let v = tier2_vertex(key, addr, r, PINNED, &parents);
-                this.push((v.hash.clone(), r, addr.clone()));
+                this.push(test_parent(&v, key));
                 universe.push((v.hash.clone(), v));
             }
             by_round.insert(r, this.clone());
@@ -2983,8 +3236,8 @@ mod tests {
             keys.iter().map(|(a, _, _)| (a.clone(), 1000u64)).collect();
         validators.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let mut prev: Vec<(String, u64, String)> =
-            vec![("genesis".to_string(), 0, String::new())];
+        let mut prev: Vec<TestParent> =
+            vec![("genesis".to_string(), 0, String::new(), None)];
         let mut checked = 0usize;
         for r in 1..=12u64 {
             let mut this = Vec::new();
@@ -3001,7 +3254,7 @@ mod tests {
                     crate::qc::parent_refs_admissible(&v, &validators)
                 );
                 checked += 1;
-                this.push((v.hash.clone(), r, addr.clone()));
+                this.push(test_parent(&v, key));
             }
             prev = this;
         }
@@ -3051,11 +3304,11 @@ mod tests {
         validators.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Round-1 vertices, then a round-2 vertex citing all four — legal.
-        let r1: Vec<(String, u64, String)> = keys
+        let r1: Vec<TestParent> = keys
             .iter()
             .map(|(addr, _, key)| {
-                let v = tier2_vertex(key, addr, 1, 1_000, &[("genesis".into(), 0, String::new())]);
-                (v.hash.clone(), 1, addr.clone())
+                let v = tier2_vertex(key, addr, 1, 1_000, &[("genesis".into(), 0, String::new(), None)]);
+                test_parent(&v, key)
             })
             .collect();
         let legal = tier2_vertex(&keys[0].2, &keys[0].0, 2, 1_000, &r1);
@@ -3069,7 +3322,7 @@ mod tests {
         // author list is 4 distinct + 1 repeat, so the stake clause is still
         // satisfied and only C1 can catch it.
         let mut twins = r1.clone();
-        twins.push((format!("{}#twin", r1[0].0), 1, r1[0].2.clone()));
+        twins.push((format!("{}#twin", r1[0].0), 1, r1[0].2.clone(), r1[0].3.clone()));
         let dup = tier2_vertex(&keys[0].2, &keys[0].0, 2, 1_000, &twins);
         assert_eq!(dup.parent_refs.len(), 5);
         assert_ne!(
@@ -3108,7 +3361,7 @@ mod tests {
 
         // Round 1 from all four.
         let r1 = tier2_feed_round(
-            &mut node, &keys, 1, PINNED, &[("genesis".into(), 0, String::new())]);
+            &mut node, &keys, 1, PINNED, &[("genesis".into(), 0, String::new(), None)]);
 
         // keys[0] equivocates at round 2: two vertices, same author and round,
         // different timestamps and therefore different hashes.
@@ -3121,17 +3374,17 @@ mod tests {
 
         // The other three emit honest round-2 vertices, so a round-3 vertex can
         // reach a stake quorum WITHOUT the duplicate.
-        let mut r2: Vec<(String, u64, String)> = vec![(twin_a.hash.clone(), 2, keys[0].0.clone())];
+        let mut r2: Vec<TestParent> = vec![test_parent(&twin_a, &keys[0].2)];
         for (addr, _, key) in keys.iter().skip(1) {
             let v = tier2_vertex(key, addr, 2, PINNED, &r1);
-            r2.push((v.hash.clone(), 2, addr.clone()));
+            r2.push(test_parent(&v, key));
             node.add_vertex(v);
         }
 
         // A round-3 vertex citing BOTH twins plus the three honest round-2
         // vertices. Five refs, four distinct authors — the stake clause passes.
         let mut both = r2.clone();
-        both.push((twin_b.hash.clone(), 2, keys[0].0.clone()));
+        both.push(test_parent(&twin_b, &keys[0].2));
         let citing_both = tier2_vertex(&keys[1].2, &keys[1].0, 3, PINNED, &both);
         node.current_round = 3;
         node.add_vertex(citing_both.clone());

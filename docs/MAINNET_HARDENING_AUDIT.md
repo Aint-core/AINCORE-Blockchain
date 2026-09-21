@@ -110,11 +110,12 @@ Format: **Problem → Fix → Key files/symbols → Verify → Audit focus.**
 - **Files:** `sync/src/lib.rs` (`apply_finality_artifact`), tests in `sync/src/tests.rs`.
 - **Audit focus:** confirm `qc.block_hash` == the committed block header hash invariant (dag.rs commit path). Confirm the no-op path can't be abused to stall.
 
-#### #8 — Reorg over un-reverted state halts (`b4a9c28`)
+#### #8 — Historical reorg guard (`b4a9c28`), corrected locally on 2026-09-12
 - **Problem:** `rollback_to_height` only deletes block records + resets height/hash pointers; it does NOT revert Move/executor state (CoinStore, resources). Re-executing a new fork over un-reverted state silently diverges the node.
-- **Fix:** in `process_blocks`, a non-finalized reorg that would orphan **state-changing** blocks now latches `sync:halt_reason` and stops for operator re-bootstrap. Empty (no-tx) orphans still roll back + re-execute.
+- **Historical fix:** rejected reorgs over nonempty blocks; the original halt latch was later removed to avoid peer-triggered permanent halt. Empty (no-tx) orphans still rolled back. That exemption was unsafe, not evidence that empty blocks carry no state.
 - **Files:** `sync/src/lib.rs`.
-- **Audit focus / KNOWN LIMITATION:** this is an **interim** — there is no per-height state-undo log. A legitimate unfinalized-tip reorg with txs HALTS the node (safe but blunt). Verify finalized-boundary reorgs are rejected earlier (they are) so this only triggers above the finalized boundary.
+- **Current local correction:** isolated tests execute and persist empty blocks before sending unsigned/signed conflicts. Baseline deleted `block_2` and rewound the tip to 1 while `sys:last_executed_height` stayed 2. Removed `rollback_to_height`; all peer conflicts now preserve the database without a persistent halt. A proposer signature/longer chain is not fork-choice authority. This change is not deployed.
+- **OPEN:** authenticated fork selection plus complete atomic state/ordering/QC recovery is still required. Rejecting conflicts prevents destructive partial rollback; it does not prove eventual convergence from a genuinely divergent unfinalized tip. See `PRODUCTION_READINESS_GOAL.md` and `sync/src/reorg_acceptance_tests.rs`.
 
 #### #9/#10 — Equivocation gossip + prune retention (`4dfbc02`)
 - **Problem:** double-sign was detected + slashed only on the node that received both conflicting vertices; not gossiped; the proving vertices were deleted by normal prune.
@@ -234,7 +235,7 @@ Format: **Problem → Fix → Key files/symbols → Verify → Audit focus.**
 | Item | Status |
 |------|--------|
 | Real delay-VDF (class-group) for leader randomness (#12 full) | Deferred — current is digest-bound hash-chain + QC-agg fold; no proven time-delay |
-| Per-height state-undo log for reorgs (#8 full) | Deferred — interim **halts** the node on a state-changing unfinalized reorg (safe but blunt) |
+| Authenticated fork choice and complete state recovery (#8 full) | Open: local guard rejects all conflicting peer blocks without deleting history or latching a halt; no automatic divergent-tip recovery yet |
 | Move halving clock epoch→block (#13 remainder) | Deferred — needs Move stdlib recompile (avoided a second fork in this batch) |
 | BTC SPV / Merkle-proof of deposit + un-stub mint (#33 full) | Deferred — per-output dedup + custody verify done; SPV proof + actual mint still stubbed |
 | DA availability **enforcement/gating** (#3 Stage-3) | Deferred — Stage-2 is observe+alert only; must become disable-or-enforce before mainnet (§7) |

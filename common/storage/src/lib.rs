@@ -1,6 +1,8 @@
 pub use rocksdb;
 use rocksdb::DB; // Export for consumers
 pub mod object;
+mod transaction;
+pub use transaction::ReadStore;
 #[cfg(test)]
 mod tests;
 use object::Object;
@@ -32,7 +34,7 @@ impl From<rocksdb::Error> for StorageError {
 }
 
 pub struct StateDB {
-    pub db: DB,
+    pub db: ReadStore,
 }
 
 #[derive(serde::Deserialize)]
@@ -102,21 +104,15 @@ impl StateDB {
                 "Path: {}, Error: {}. Ensure no other process is using this directory and you have write permissions.",
                 path, e
             )))?;
-        Ok(Self { db })
+        Ok(Self { db: db.into() })
     }
 
     pub fn put(&self, key: &str, value: &str) -> std::result::Result<(), rocksdb::Error> {
-        // SEC (audit M-2 completion): fsync individual puts too. `write_batch` was made
-        // durable earlier, but plain `put`/`delete` on the critical path (equivocation
-        // slash records, sys:total_supply, validator-set updates, tombstones) were still
-        // WAL-buffered-only — durable against a process crash but lost on power loss,
-        // and durable a fsync BEHIND the synced state-root batch, so a power cut could
-        // leave state_root ahead of these settlement writes and diverge the node. Sync
-        // here so every acknowledged write is on disk. (fsync-per-write is the code's
-        // stated "integrity > speed" contract; cost is negligible at block cadence.)
-        let mut wo = rocksdb::WriteOptions::default();
-        wo.set_sync(true);
-        self.db.put_opt(key, value, &wo)
+        // Base writes are synced. In a transaction view, Ok means staged;
+        // durability is acknowledged only by the outer transaction's commit.
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(key, value);
+        self.write_batch(batch)
     }
 
     pub fn get(&self, key: &str) -> std::result::Result<Option<String>, rocksdb::Error> {
@@ -124,7 +120,10 @@ impl StateDB {
             Ok(Some(v)) => {
                 match String::from_utf8(v) {
                     Ok(s) => Ok(Some(s)),
-                    Err(_) => Ok(None), // Fail safe for invalid utf8
+                    Err(_) => {
+                        self.db.invalid_read();
+                        Ok(None)
+                    }
                 }
             }
             Ok(None) => Ok(None),
@@ -133,11 +132,10 @@ impl StateDB {
     }
 
     pub fn delete(&self, key: &str) -> std::result::Result<(), rocksdb::Error> {
-        // SEC (audit M-2 completion): fsync deletes too (see `put`) so a removal
-        // (e.g. clearing a pending-slash queue entry) is durable, not lost on power loss.
-        let mut wo = rocksdb::WriteOptions::default();
-        wo.set_sync(true);
-        self.db.delete_opt(key, &wo)
+        // Same durability/staging contract as put.
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete(key);
+        self.write_batch(batch)
     }
 
     /// Hard ceiling on `scan_prefix` results so an unbounded namespace
@@ -293,21 +291,16 @@ impl StateDB {
     pub fn put_object(&self, object: &Object) -> std::result::Result<(), rocksdb::Error> {
         let key = format!("obj:{}", object.id);
         let value = serde_json::to_string(object).unwrap_or_default(); // Safe default or error? Default is ok for prototype.
-        self.db.put(key, value)
+        self.put(&key, &value)
     }
 
     pub fn write_batch(
         &self,
         batch: rocksdb::WriteBatch,
     ) -> std::result::Result<(), rocksdb::Error> {
-        // SEC (audit M-2): commit the batch as a SINGLE fsync'd write (sync=true +
-        // set_use_fsync) rather than write()-then-flush_wal() as two steps. This makes
-        // the block-commit (state root) atomically durable against power loss — a kill
-        // between the old two steps could lose an already-Ok'd batch, diverging the
-        // node's committed state from peers that did persist it.
-        let mut wo = rocksdb::WriteOptions::default();
-        wo.set_sync(true);
-        self.db.write_opt(batch, &wo)
+        // The base path uses one sync=true RocksDB write. A transaction view
+        // merges these operations into its pending batch without touching disk.
+        self.db.write(batch)
     }
 
     /// Durably flush everything to disk: sync the WAL, then flush memtables to
@@ -316,7 +309,6 @@ impl StateDB {
     /// no reliance on crash recovery. Writes are already fsync'd per-op, so this
     /// is belt-and-suspenders, not a correctness requirement.
     pub fn flush(&self) -> std::result::Result<(), rocksdb::Error> {
-        self.db.flush_wal(true)?;
         self.db.flush()
     }
 
@@ -507,11 +499,11 @@ impl StateDB {
         let key = format!("obj:{}", object_id);
         match self.db.get(key) {
             Ok(Some(v)) => {
-                if let Ok(s) = String::from_utf8(v) {
-                    serde_json::from_str(&s).ok()
-                } else {
-                    None
+                let object = serde_json::from_slice(&v).ok();
+                if object.is_none() {
+                    self.db.invalid_read();
                 }
+                object
             }
             _ => None,
         }
@@ -721,6 +713,36 @@ impl StateDB {
 
     // Scan method clearly not optimal for Mainnet, but "Real" enough for < 1000 validators.
     // In full prod, we'd use a separate column family or index.
+    /// Strict current-state eligibility for admission, NOT an authenticated
+    /// historical committee or BLS/PoP verifier. Call on the acceptance view.
+    /// A present v1 record is authoritative: corruption cannot select legacy.
+    pub fn get_active_validators_checked(&self) -> Result<Vec<(String, u64)>, StorageError> {
+        let mut validators: Vec<(String, u64)> = if let Some(bytes) = self.db.get("sys:validator_set:v1")? {
+            serde_json::from_slice::<Vec<ValidatorSetV1Entry>>(&bytes)
+                .map_err(|e| StorageError::SerializationError(format!("invalid validator_set:v1: {e}")))?
+                .into_iter().map(|v| (v.address, v.stake)).collect()
+        } else {
+            let bytes = self.db.get("sys:validators")?
+                .ok_or_else(|| StorageError::DatabaseOperation("missing validator eligibility".into()))?;
+            serde_json::from_slice(&bytes)
+                .map_err(|e| StorageError::SerializationError(format!("invalid legacy validator eligibility: {e}")))?
+        };
+        validators.sort_by(|a, b| a.0.cmp(&b.0));
+        if validators.iter().any(|(address, _)| address.trim().is_empty()) {
+            return Err(StorageError::SerializationError("empty validator address".into()));
+        }
+        if validators.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(StorageError::SerializationError("duplicate validator address".into()));
+        }
+        validators.retain(|(_, stake)| *stake > 0);
+        if validators.is_empty() {
+            return Err(StorageError::DatabaseOperation("no positive-stake validator eligibility".into()));
+        }
+        Ok(validators)
+    }
+
+    /// Compatibility/discovery view; must not grant block admission on failure.
+    /// Consensus-sensitive callers should use a checked authoritative resolver.
     pub fn get_active_validators(&self) -> Vec<(String, u64)> {
         // Prefer the BLS/stake-aware validator set. Runtime joins update this
         // record first; legacy `sys:validators` remains as a compatibility

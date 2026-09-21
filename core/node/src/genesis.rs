@@ -2649,6 +2649,59 @@ mod tests {
         assert_eq!(computed_identity(&db1), computed_identity(&db2));
     }
 
+    #[test]
+    fn test_format_policy_proposal_binds_actual_genesis_without_migration() {
+        use blockchain::identity_v2::policy::{GenesisFormatProof, VerifiedFormatPolicy};
+
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+        let db = temp_db("format_policy_proposal");
+        let key = SigningKey::from_bytes(&[33u8; 32]);
+        let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let pubkey = hex::encode(key.verifying_key().as_bytes());
+        initialize_genesis(&db, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY).unwrap();
+        let rows = || {
+            db.db
+                .iterator(storage::rocksdb::IteratorMode::Start)
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        };
+        let before = rows();
+        let old_identity = computed_identity(&db);
+        let proof = GenesisFormatProof {
+            base_genesis_identity: hex::decode(&old_identity).unwrap().try_into().unwrap(),
+            chain_id: db.get("sys:chain_id").unwrap().unwrap(),
+            v2_from_height: 21,
+        };
+        // This test authorizes a candidate pin, not a production bootstrap.
+        let candidate = proof.proposed_genesis_identity().unwrap();
+        assert_ne!(candidate, proof.base_genesis_identity);
+        let policy = VerifiedFormatPolicy::verify_against_pin(candidate, &proof.encode().unwrap())
+            .unwrap();
+        assert_eq!(policy.chain_id(), proof.chain_id);
+        assert_eq!(policy.required_version(20).unwrap(), 1);
+        assert_eq!(policy.required_version(21).unwrap(), 2);
+        for mutate_base in [false, true] {
+            let mut other = proof.clone();
+            if mutate_base {
+                other.base_genesis_identity[0] ^= 1;
+            } else {
+                other.v2_from_height = 1;
+            }
+            assert!(
+                VerifiedFormatPolicy::verify_against_pin(candidate, &other.encode().unwrap())
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            rows(), before,
+            "proposal verification cannot migrate stored genesis"
+        );
+        initialize_genesis(&db, &stdlib_path(), &addr, &pubkey, &TEST_NODE_IDENTITY).unwrap();
+        assert_eq!(db.get("genesis_identity").unwrap().unwrap(), old_identity);
+        assert_eq!(rows(), before, "existing genesis still reopens unchanged");
+    }
+
     /// RE-AUDIT CRITICAL: the vertex-hash domain is derived from the genesis
     /// identity. If that identity tracked the LIVE validator set, then any
     /// join / stake change / slash followed by a restart would give the node a
@@ -2674,6 +2727,14 @@ mod tests {
             .get("genesis:validator_set:v1")
             .unwrap()
             .expect("genesis freezes the validator-set snapshot");
+        let expected_committee: Vec<consensus::qc::ValidatorInfo> =
+            serde_json::from_str(&frozen).unwrap();
+        assert!(db.get("sys:validator_set:epoch:0").unwrap().is_none());
+        assert_eq!(
+            consensus::qc_producer::load_validator_set_for_epoch(&db, 0),
+            Some(expected_committee.clone()),
+            "QC bootstrap must consume the actual frozen genesis record"
+        );
 
         // Simulate a slash / join: the LIVE set changes.
         db.put("sys:validator_set:v1", r#"[{"address":"deadbeef","stake":1}]"#)
@@ -2691,6 +2752,11 @@ mod tests {
             db.get("genesis:validator_set:v1").unwrap().unwrap(),
             frozen,
             "the frozen genesis snapshot must never be rewritten"
+        );
+        assert_eq!(
+            consensus::qc_producer::load_validator_set_for_epoch(&db, 0),
+            Some(expected_committee),
+            "reopening after a live set change must not change epoch-zero QC authority"
         );
     }
 

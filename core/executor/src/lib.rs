@@ -790,6 +790,8 @@ pub struct Executor {
     /// exactly the writes most likely to diverge. `None` outside a block.
     block_write_log: std::sync::Mutex<Option<std::collections::BTreeMap<String, Option<String>>>>,
     vm: AINCOREVM,
+    #[cfg(test)]
+    block_boundary_hook: Option<fn(u8, &StateDB)>,
 }
 
 fn default_state_root() -> String {
@@ -804,7 +806,12 @@ impl Executor {
     pub fn new(db: Arc<StateDB>) -> Self {
         let vm = AINCOREVM::new(Arc::clone(&db));
         Self {
-            block_write_log: std::sync::Mutex::new(None), db, vm }
+            block_write_log: std::sync::Mutex::new(None),
+            db,
+            vm,
+            #[cfg(test)]
+            block_boundary_hook: None,
+        }
     }
 
     /// B1: keep `sys:validator_set:v1` live when a validator joins at runtime.
@@ -1680,12 +1687,89 @@ impl Executor {
         // RE-AUDIT HIGH: slash evidence CARRIED BY THE BLOCK (see apply_slash_evidence).
         slash_evidence: &[String],
     ) -> BlockExecOutcome {
+        self.execute_block_checked_at(
+            txs_json, proposer_hex, block_height, slash_evidence, |_, _| Ok(()),
+        ).expect("block state transaction failed; no execution result may be published")
+    }
+
+    /// Stage execution, validate its result, and stage acceptance metadata before
+    /// ONE durable write. `accept` must use only its supplied view for DB writes.
+    /// Returning Err discards state, receipts, height, and acceptance writes.
+    /// Callers remain responsible for authenticating the block and its parent.
+    pub fn execute_block_checked_at(
+        &self,
+        txs_json: Vec<String>,
+        proposer_hex: &str,
+        block_height: u64,
+        slash_evidence: &[String],
+        accept: impl FnOnce(&BlockExecutionSummary, &StateDB) -> Result<(), String>,
+    ) -> Result<BlockExecOutcome, String> {
+        self.execute_block_admitted_at(
+            txs_json, proposer_hex, block_height, slash_evidence, |_| Ok(()), accept,
+        )
+    }
+
+    /// Revalidate admission on the writer-gated PRE-execution view, then stage
+    /// execution and acceptance in that same transaction. `admit` must only read
+    /// its supplied view; it must not use a captured base DB or mutate state.
+    /// Neither callback may write through a captured base DB (writer deadlock).
+    /// A prior network precheck is only an optimization, not admission authority.
+    pub fn execute_block_admitted_at(
+        &self,
+        txs_json: Vec<String>,
+        proposer_hex: &str,
+        block_height: u64,
+        slash_evidence: &[String],
+        admit: impl FnOnce(&StateDB) -> Result<(), String>,
+        accept: impl FnOnce(&BlockExecutionSummary, &StateDB) -> Result<(), String>,
+    ) -> Result<BlockExecOutcome, String> {
         // SECURITY FIX: Acquire block-level lock to serialize state root calculation.
         // Individual transactions within a block still run in parallel (via Rayon),
         // but two DIFFERENT blocks cannot execute concurrently.
+        // Keep poison detection fail-closed. Staging now discards execution writes
+        // on unwind, but this is not an automatic repair of pre-existing torn DBs.
         let _block_lock = BLOCK_EXECUTION_LOCK
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .expect("block execution lock poisoned; partial state requires recovery");
+
+        // Rebuild the VM on the private view, so module caches and ALL helper
+        // reads/writes (including governance) belong to this speculative block.
+        let outcome = self.db.transaction(|view| {
+            admit(&view).map_err(storage::StorageError::DatabaseOperation)?;
+            let executor = Executor::new(view.clone());
+            #[cfg(test)]
+            let executor = Executor {
+                block_boundary_hook: self.block_boundary_hook,
+                ..executor
+            };
+            let outcome = executor.execute_block_staged_at(
+                txs_json, proposer_hex, block_height, slash_evidence,
+            );
+            if let BlockExecOutcome::Executed(summary) = &outcome {
+                accept(summary, &view).map_err(storage::StorageError::DatabaseOperation)?;
+            }
+            Ok(outcome)
+        }).map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        if let Some(hook) = self.block_boundary_hook {
+            hook(4, &self.db);
+        }
+        if matches!(outcome, BlockExecOutcome::Executed(_)) {
+            println!("Execution state committed at height {}", block_height);
+        }
+        Ok(outcome)
+    }
+
+    // Only called with BLOCK_EXECUTION_LOCK and the storage writer gate held.
+    // This function sees its own staged writes; none are durable until the
+    // transaction driver publishes the complete result with one synced batch.
+    fn execute_block_staged_at(
+        &self,
+        txs_json: Vec<String>,
+        proposer_hex: &str,
+        block_height: u64,
+        slash_evidence: &[String],
+    ) -> BlockExecOutcome {
 
         // STRICT HEIGHT ORDER (see BlockExecOutcome). Checked INSIDE the lock and
         // paired with the marker write at the end of this function, so the
@@ -1728,6 +1812,10 @@ impl Executor {
         //    silently excluded every slash write from the block state root.
         if let Ok(mut g) = self.block_write_log.lock() {
             *g = Some(std::collections::BTreeMap::new());
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.block_boundary_hook {
+            hook(0, &self.db);
         }
         self.apply_slash_evidence(slash_evidence);
         // Drain the slash writes NOW and re-arm. They happened BEFORE the tx
@@ -1917,13 +2005,16 @@ impl Executor {
                 }
             }
 
-            // Per-batch DB commit stays (later batches must read earlier
-            // batches' writes); the ROOT fold moved to block level below.
+            // Later batches read these staged writes through the same view.
             if let Err(e) = self.db.write_batch(write_batch) {
                 eprintln!("❌ FATAL: RocksDB Write Batch Failed: {}", e);
                 panic!(
                     "CRITICAL: database write failure - stopping node to prevent state corruption."
                 );
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.block_boundary_hook {
+                hook(1, &self.db);
             }
         }
 
@@ -2036,7 +2127,8 @@ impl Executor {
         // log. RE-AUDIT HIGH: folding before those phases left the root blind to
         // exactly the writes most likely to diverge across nodes. Post-loop
         // writes are applied in a deterministic order, so last-write-wins is
-        // deterministic too. Empty blocks fold nothing (root untouched).
+        // deterministic too. Only blocks with NO effective state writes leave
+        // the root untouched; zero transactions do not imply zero post-loop writes.
         if let Ok(mut g) = self.block_write_log.lock() {
             if let Some(log) = g.take() {
                 for (k, v) in log {
@@ -2069,16 +2161,21 @@ impl Executor {
                 );
             }
         }
-
-
-        // Mark the height executed. Written INSIDE the block lock, after the root
-        // fold, so "root advanced" and "height consumed" are one atomic step.
+        #[cfg(test)]
+        if let Some(hook) = self.block_boundary_hook {
+            hook(2, &self.db);
+        }
+        // Staged with the root and all state writes, not a separate durable put.
         if let Err(e) = self
             .db
             .put("sys:last_executed_height", &block_height.to_string())
         {
             eprintln!("❌ FATAL: last_executed_height persist failed: {}", e);
             panic!("CRITICAL: database write failure - stopping node to prevent state corruption.");
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.block_boundary_hook {
+            hook(3, &self.db);
         }
 
         let summary = BlockExecutionSummary {
@@ -2090,7 +2187,7 @@ impl Executor {
         };
 
         println!(
-            "✅ Parallel Execution Complete. state_root={} receipts_root={}",
+            "Parallel Execution Prepared. state_root={} receipts_root={}",
             short_hash(&summary.state_root),
             short_hash(&summary.receipts_root)
         );
@@ -3601,6 +3698,9 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod block_crash_tests {
+        include!("block_crash_tests.rs");
+    }
     use ed25519_dalek::{Signer, SigningKey};
     use move_binary_format::CompiledModule;
     use std::fs;

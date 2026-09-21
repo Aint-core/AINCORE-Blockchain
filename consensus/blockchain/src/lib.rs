@@ -2,6 +2,8 @@ use crypto::hash; // Use crypto module's hash function
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod identity_v2;
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct BlockHeader {
     pub height: u64,
@@ -395,26 +397,10 @@ pub fn vertex_domain() -> (String, String) {
 /// A self-describing reference to a parent vertex: who authored it, at which
 /// round, and its digest.
 ///
-/// THE fix for the whole H3 refutation family, and it is a DATA-FORMAT change
-/// rather than an algorithm one. `parents: Vec<String>` carries bare digests, so
-/// a receiver cannot tell WHO authored a parent or WHICH ROUND it belongs to
-/// without resolving it against its own DAG. Any parent-quorum rule at ingress
-/// is therefore forced to become a test of what the receiver HOLDS — a
-/// view-dependent predicate — and a view-dependent predicate in a reject
-/// position is what halted the chain in two previous attempts (measured: the
-/// honest decided-rate falls from 0.44 to 0.3914 against a 0.42 floor).
-///
-/// Every production DAG BFT system carries the identity in the reference itself:
-/// * Sui — `BlockRef { round, author, digest }`, summed in
-///   `SignedBlockVerifier::verify_block` with no DagState lookup at all
-/// * Aptos — `parent.metadata()`, round checked equal to `node_round - 1`
-/// * Narwhal — `(source, round)` supplied by the RBC instance
-/// * DAG-Rider — Claim 2 names the enabling property outright: the check is
-///   "computed locally based on v's fields", hence unanimous
-///
-/// With this, the ingress predicate reads only the vertex's own bytes plus the
-/// epoch committee, so an honest vertex is admitted at ANY level of packet loss
-/// and the reject costs nothing in liveness.
+/// The child signature authenticates a CLAIM, not the truth of the parent's
+/// identity. A compact parent-signed header proof binds the declared metadata
+/// to the digest without relying on which full bodies the receiver holds.
+/// This does not certify availability, causal validity, or non-equivocation.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ParentRef {
     /// The round the parent was authored at. An ingress rule requires this to be
@@ -429,13 +415,78 @@ pub struct ParentRef {
     /// `Vertex::parents` at the same index — checked at ingress, so the two
     /// views of the parent set can never disagree.
     pub digest: String,
+    /// Transport evidence for the identity above, authenticated by the parent.
+    /// Not part of the child's hash: changing evidence cannot change a valid
+    /// identity, and missing/invalid evidence is rejected before admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<ParentIdentityProof>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ParentIdentityProof {
+    pub timestamp: u64,
+    pub payload_root: String,
+    pub parents_root: String,
+    pub public_key: String,
+    pub signature: String,
+}
+
+impl ParentRef {
+    pub fn authenticated(vertex: &Vertex, public_key: String) -> Self {
+        Self {
+            round: vertex.round,
+            author: vertex.author.clone(),
+            digest: vertex.hash.clone(),
+            proof: Some(ParentIdentityProof {
+                timestamp: vertex.timestamp,
+                payload_root: vertex.payload_root(),
+                parents_root: vertex.parents_root(),
+                public_key,
+                signature: vertex.signature.clone(),
+            }),
+        }
+    }
+
+    pub fn verify_identity(&self) -> bool {
+        let Some(proof) = &self.proof else { return false; };
+        if self.digest.len() != 64 || self.author.len() != 64
+            || proof.public_key.len() != 64 || proof.signature.len() != 128
+            || proof.payload_root.len() != 64 || proof.parents_root.len() != 64
+        {
+            return false;
+        }
+        if [&proof.payload_root, &proof.parents_root].iter().any(|root| {
+            !root.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            return false;
+        }
+        let Ok(key) = hex::decode(&proof.public_key) else { return false; };
+        if crypto::derive_address(&key).ok().as_deref() != Some(self.author.as_str()) {
+            return false;
+        }
+        let header = Vertex {
+            round: self.round,
+            author: self.author.clone(),
+            parents: Vec::new(),
+            parent_refs: Vec::new(),
+            payload: Vec::new(),
+            timestamp: proof.timestamp,
+            hash: self.digest.clone(),
+            signature: proof.signature.clone(),
+            aggregated_signature: None,
+            payload_root: Some(proof.payload_root.clone()),
+            parents_root: Some(proof.parents_root.clone()),
+        };
+        header.calculate_hash() == self.digest
+            && header.verify_ed25519_signature(&proof.public_key)
+    }
 }
 
 /// Root over the parent set: both the digest list and the self-describing refs.
 ///
 /// V3 folds `parent_refs` in, so the vertex hash and therefore the author's
-/// signature bind WHO and WHICH ROUND each parent is — an attacker cannot
-/// restate a vertex's parent identities without breaking its signature. The
+/// signature bind the CLAIMED identity of each parent. ParentIdentityProof
+/// separately authenticates that claim against the parent's signature. The
 /// domain tag is bumped from V2 so a pre-upgrade vertex can never collide with a
 /// post-upgrade one; this is a signed-preimage change and needs a fresh genesis.
 pub fn parents_root_of(parents: &[String], parent_refs: &[ParentRef]) -> String {
@@ -469,6 +520,20 @@ pub fn payload_root_of(items: &[String]) -> String {
 }
 
 impl Vertex {
+    /// Authenticates parent identities, not their availability or causal validity.
+    /// The committee/quorum check remains a separate consensus rule.
+    pub fn verify_parent_identities(&self) -> bool {
+        if self.round <= 1 {
+            return true;
+        }
+        self.parents.len() == self.parent_refs.len()
+            && !self.parents.is_empty()
+            && self.parents.iter().zip(&self.parent_refs).all(|(digest, parent)| {
+                digest == &parent.digest && parent.round == self.round - 1
+                    && parent.verify_identity()
+            })
+    }
+
     pub fn new(round: u64, author: String, parents: Vec<String>, payload: Vec<String>) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -858,6 +923,7 @@ mod bft_time_tests {
             round,
             author: author.into(),
             digest: digest.into(),
+            proof: None,
         };
 
         let base = mk(vec![r(3, "A", "p1"), r(3, "B", "p2")]);
@@ -918,8 +984,8 @@ mod bft_time_tests {
             author: "author-a".into(),
             parents: vec!["p1".into(), "p2".into()],
             parent_refs: vec![
-                ParentRef { round: 3, author: "A".into(), digest: "p1".into() },
-                ParentRef { round: 3, author: "B".into(), digest: "p2".into() },
+                ParentRef { round: 3, author: "A".into(), digest: "p1".into(), proof: None },
+                ParentRef { round: 3, author: "B".into(), digest: "p2".into(), proof: None },
             ],
             payload: vec!["tx1".into()],
             timestamp: 99,

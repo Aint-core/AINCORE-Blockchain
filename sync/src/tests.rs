@@ -46,6 +46,18 @@ mod tests {
         ChainSync::new("node_1".to_string(), 8080, peers, db)
     }
 
+    mod block_identity {
+        include!("block_identity_tests.rs");
+    }
+
+    mod reorg_acceptance {
+        include!("reorg_acceptance_tests.rs");
+    }
+
+    mod admission_snapshot {
+        include!("admission_snapshot_tests.rs");
+    }
+
     fn set_validators(sync: &ChainSync, validators: Vec<(&str, u64)>) {
         let vals: Vec<(String, u64)> = validators
             .into_iter()
@@ -210,6 +222,15 @@ mod tests {
         finalized_round: u64,
         anchor_round: u64,
     ) -> consensus::qc::QuorumCertificate {
+        build_test_qc_for_epoch(sync, finalized_round, anchor_round, 0)
+    }
+
+    fn build_test_qc_for_epoch(
+        sync: &ChainSync,
+        finalized_round: u64,
+        anchor_round: u64,
+        epoch: u64,
+    ) -> consensus::qc::QuorumCertificate {
         use consensus::qc::{build_qc, validator_set_hash, FinalityVote, ValidatorInfo};
         let bls = crypto::bls::BLSEngine::consensus();
         let seed = [7u8; 32];
@@ -226,16 +247,17 @@ mod tests {
                 &serde_json::to_string(&validators).unwrap(),
             )
             .unwrap();
+        sync.storage.put("genesis:validator_set:v1", &serde_json::to_string(&validators).unwrap()).unwrap();
         let vote = FinalityVote {
             // Must match qc::expected_chain_id() (default AINCORE-MAINNET-1) so the
             // chain_id binding added for audit M-1 accepts this test QC.
             chain_id: "AINCORE-MAINNET-1".to_string(),
-            epoch: 0,
+            epoch,
             finalized_round,
             anchor_round,
             anchor_hash: "ab".repeat(32),
             block_height: anchor_round,
-            block_hash: "cd".repeat(32),
+            block_hash: finality_test_block(anchor_round).header.hash,
             state_root: "ef".repeat(32),
             receipts_root: "12".repeat(32),
             finality_digest: "34".repeat(32),
@@ -245,10 +267,17 @@ mod tests {
         build_qc(&vote, &validators, &[0], &[sig]).unwrap()
     }
 
-    // Store a local block at `height` whose header.hash == `hash` so the
-    // finality binding (#6/#24) sees the certified block as held.
+    fn finality_test_block(height: u64) -> Block {
+        Block::new_with_roots_at(
+            height, height, "ab".repeat(32), vec![], "validator_1".into(),
+            "ef".repeat(32), "12".repeat(32), 1000, vec![], "ab".repeat(32), vec![],
+        )
+    }
+
+    // Positive fixtures use the constructor's actual hash. The mismatch test
+    // deliberately substitutes it to exercise rejection of inconsistent storage.
     fn store_block_with_hash(sync: &ChainSync, height: u64, hash: &str) {
-        let mut blk = Block::new(height, height, "ab".repeat(32), vec![], "validator_1".to_string());
+        let mut blk = finality_test_block(height);
         blk.header.hash = hash.to_string();
         sync.storage
             .put(&format!("block_{}", height), &serde_json::to_string(&blk).unwrap())
@@ -259,8 +288,8 @@ mod tests {
     fn test_apply_finality_qc_verified_advances() {
         let sync = setup_sync("finality_qc_ok");
         let qc = build_test_qc(&sync, 9000, 8990);
-        // #6/#24: the node must hold the certified block (height 8990, hash cd..).
-        store_block_with_hash(&sync, 8990, &"cd".repeat(32));
+        // The node must hold the actual block certified by this signature.
+        store_block_with_hash(&sync, 8990, &qc.block_hash);
         let artifact = FinalityArtifact {
             finalized_round: "9000".to_string(),
             last_anchor_round: "8990".to_string(),
@@ -274,6 +303,64 @@ mod tests {
             sync.storage.get("consensus:finalized_round").unwrap(),
             Some("9000".to_string())
         );
+    }
+
+    #[test]
+    fn test_unknown_epoch_cannot_borrow_live_committee_for_finality() {
+        let sync = setup_sync("finality_unknown_epoch");
+        let qc = build_test_qc_for_epoch(&sync, 9000, 8990, 9);
+        store_block_with_hash(&sync, 8990, &qc.block_hash);
+        sync.storage.put("consensus:epoch", "10").unwrap();
+        sync.storage.put("consensus:epoch_start_height:9", "8001").unwrap();
+        sync.storage.put("consensus:epoch_start_height:10", "9001").unwrap();
+        let artifact = FinalityArtifact {
+            finalized_round: "9000".to_string(),
+            last_anchor_round: "8990".to_string(),
+            last_anchor_hash: qc.anchor_hash.clone(),
+            finality_digest: qc.finality_digest.clone(),
+            qc: Some(qc),
+        };
+        let before: Vec<_> = sync.storage.db.iterator(storage::rocksdb::IteratorMode::Start)
+            .map(Result::unwrap).collect();
+        sync.apply_finality_artifact(&artifact).unwrap();
+        let after: Vec<_> = sync.storage.db.iterator(storage::rocksdb::IteratorMode::Start)
+            .map(Result::unwrap).collect();
+        assert_eq!(before, after, "unknown epoch advanced finality using the live committee");
+
+        // Positive control: an explicitly retained matching committee permits
+        // the same real BLS certificate through the production receiver.
+        let snapshot = sync.storage.get("sys:validator_set:v1").unwrap().unwrap();
+        sync.storage.put("sys:validator_set:epoch:9", &snapshot).unwrap();
+        sync.apply_finality_artifact(&artifact).unwrap();
+        assert_eq!(sync.storage.get("consensus:finalized_round").unwrap().as_deref(), Some("9000"));
+    }
+
+    #[test]
+    fn test_imported_qc_does_not_break_followup_aggregation() {
+        let sync = setup_sync("finality_then_aggregate");
+        let cert = build_test_qc(&sync, 9000, 8990);
+        store_block_with_hash(&sync, cert.block_height, &cert.block_hash);
+        let artifact = FinalityArtifact {
+            finalized_round: "9000".into(),
+            last_anchor_round: "8990".into(),
+            last_anchor_hash: cert.anchor_hash.clone(),
+            finality_digest: cert.finality_digest.clone(),
+            qc: Some(cert),
+        };
+        sync.apply_finality_artifact(&artifact).unwrap();
+        let next = build_test_qc(&sync, 9020, 9010);
+        let msg = consensus::qc_producer::QcVoteMessage {
+            vote: next.finality_vote(),
+            signer_address: "validator_1".into(),
+            signature: hex::encode(&next.aggregate_signature),
+        };
+        assert!(matches!(consensus::qc_producer::collect_vote_and_try_aggregate(
+            &sync.storage, &msg, Some(&next.block_hash)),
+            consensus::qc_producer::QcOutcome::Complete(_)),
+            "imported finality left a QC index state that poisons subsequent aggregation");
+        assert_eq!(sync.storage.get("consensus:qc:latest_height").unwrap().as_deref(), Some("9010"));
+        assert!(sync.storage.get("consensus:qc:8990").unwrap().is_some());
+        assert!(sync.storage.get("consensus:qc_by_round:8990").unwrap().is_some());
     }
 
     #[test]
@@ -295,6 +382,44 @@ mod tests {
             None,
             "must not advance finality past a block we don't hold"
         );
+    }
+
+    #[test]
+    fn test_finality_receiver_rejects_inconsistent_body_and_signed_roots() {
+        use consensus::qc::{build_qc, verify_qc};
+        for corrupt_body in [false, true] {
+            let sync = setup_sync(if corrupt_body { "finality_body_binding" } else { "finality_root_binding" });
+            let original = build_test_qc(&sync, 9000, 8990);
+            store_block_with_hash(&sync, 8990, &original.block_hash);
+            let mut cert = original.clone();
+            if corrupt_body {
+                let mut block = finality_test_block(8990);
+                block.transactions.push("unexpected transaction".into());
+                sync.storage.put("block_8990", &serde_json::to_string(&block).unwrap()).unwrap();
+            } else {
+                let mut vote = cert.finality_vote();
+                vote.state_root = "98".repeat(32);
+                let set = sync.trusted_validator_set(0).unwrap();
+                let sig = crypto::bls::BLSEngine::consensus().sign_raw(&vote.to_signing_bytes(), &[7; 32]);
+                cert = build_qc(&vote, &set, &[0], &[sig]).unwrap();
+            }
+            verify_qc(&cert, &sync.trusted_validator_set(0).unwrap(), &consensus::qc::expected_chain_id()).unwrap();
+            let mut artifact = FinalityArtifact {
+                finalized_round: "9000".into(), last_anchor_round: "8990".into(),
+                last_anchor_hash: original.anchor_hash.clone(), finality_digest: original.finality_digest.clone(),
+                qc: Some(cert),
+            };
+            let before: Vec<_> = sync.storage.db.iterator(storage::rocksdb::IteratorMode::Start).map(Result::unwrap).collect();
+            assert!(sync.apply_finality_artifact(&artifact).is_err());
+            let after: Vec<_> = sync.storage.db.iterator(storage::rocksdb::IteratorMode::Start).map(Result::unwrap).collect();
+            assert_eq!(before, after, "rejected finality changed database rows");
+            // Restore the fixture, not production recovery logic. The correct
+            // pair must remain acceptable after a rejected incoming artifact.
+            store_block_with_hash(&sync, 8990, &original.block_hash);
+            artifact.qc = Some(original);
+            sync.apply_finality_artifact(&artifact).unwrap();
+            assert_eq!(sync.storage.get("consensus:finalized_round").unwrap().as_deref(), Some("9000"));
+        }
     }
 
     #[test]
@@ -363,6 +488,7 @@ mod tests {
     #[test]
     fn test_validate_block_success() {
         let sync = setup_sync("val_success");
+        set_validators(&sync, vec![("node_1", 100)]);
         let mut block = Block::new(
             2,
             2,
@@ -379,6 +505,7 @@ mod tests {
     #[test]
     fn test_validate_block_future_timestamp() {
         let sync = setup_sync("val_future");
+        set_validators(&sync, vec![("node_1", 100)]);
         let mut block = Block::new(
             2,
             2,
@@ -412,6 +539,7 @@ mod tests {
     #[test]
     fn test_validate_block_too_many_txs() {
         let sync = setup_sync("val_txs");
+        set_validators(&sync, vec![("node_1", 100)]);
         // Create block with 10_001 transactions
         let txs = vec!["tx".to_string(); 10_001];
         let block = Block::new(2, 2, "prev_hash_1".to_string(), txs, "node_1".to_string());
@@ -424,6 +552,7 @@ mod tests {
     #[test]
     fn test_validate_block_hash_mismatch() {
         let sync = setup_sync("val_hash");
+        set_validators(&sync, vec![("node_1", 100)]);
         let mut block = Block::new(
             2,
             2,
@@ -443,6 +572,7 @@ mod tests {
     #[test]
     fn test_validate_block_rejects_bad_tx_hash_even_if_header_hash_matches() {
         let sync = setup_sync("val_tx_hash");
+        set_validators(&sync, vec![("node_1", 100)]);
         let mut block = Block::new(
             2,
             2,
@@ -487,8 +617,92 @@ mod tests {
     }
 
     #[test]
+    fn test_process_blocks_unpersisted_execution_does_not_advance() {
+        let sync = setup_sync(&format!(
+            "unpersisted_execution_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let key = crypto::SigningKey::from_bytes(&[77; 32]);
+        let proposer = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        set_validators(&sync, vec![(&proposer, 100)]);
+        let mut block = Block::new(1, 1, "genesis".to_string(), vec![], proposer);
+        authenticate_block(&sync, &mut block);
+        sync.validate_block(&block, 1, "genesis").unwrap();
+        // Model a crash or in-flight producer between execution and block storage.
+        sync.storage.put("sys:last_executed_height", "1").unwrap();
+
+        let mut conflict = block.clone();
+        conflict.header.round += 1;
+        rehash_block(&mut conflict);
+        authenticate_block(&sync, &mut conflict);
+        let conflict_json = serde_json::to_string(&conflict).unwrap();
+        for bad_row in [None, Some("not a block"), Some(conflict_json.as_str())] {
+            if let Some(row) = bad_row {
+                sync.storage.put("block_1", row).unwrap();
+            }
+            let before: Vec<_> = sync.storage.db
+                .iterator(storage::rocksdb::IteratorMode::Start)
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                sync.process_blocks(vec![block.clone()], 0), 0,
+                "an executed height without a valid stored block is not synced"
+            );
+            let after: Vec<_> = sync.storage.db
+                .iterator(storage::rocksdb::IteratorMode::Start)
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(after, before, "sync must not alter partially committed state");
+            assert_eq!(sync.storage.get_chain_height(), 0);
+        }
+
+        // Once the producer has persisted the SAME block, retry makes progress.
+        sync.storage
+            .save_block_json(1, &serde_json::to_string(&block).unwrap())
+            .unwrap();
+        assert_eq!(sync.process_blocks(vec![block.clone()], 0), 1);
+        assert_eq!(sync.process_blocks(vec![block], 1), 1);
+    }
+
+    #[test]
+    fn test_rejected_execution_roots_leave_state_untouched_then_valid_retry_succeeds() {
+        let sync = setup_sync("rejected_execution_atomic");
+        let key = crypto::SigningKey::from_bytes(&[77; 32]);
+        let proposer = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        set_validators(&sync, vec![(&proposer, 100)]);
+        let executor = executor::Executor::new(sync.storage.clone());
+        let mut valid = Block::new_with_roots(
+            1, 1, "genesis".into(), vec![], proposer,
+            executor.current_state_root(), executor.receipts_root_for_block(&[]),
+        );
+        authenticate_block(&sync, &mut valid);
+        for bad_state in [true, false] {
+            let mut invalid = valid.clone();
+            if bad_state { invalid.header.state_root = "ff".repeat(32); }
+            else { invalid.header.receipts_root = "ff".repeat(32); }
+            rehash_block(&mut invalid);
+            authenticate_block(&sync, &mut invalid);
+            sync.validate_block(&invalid, 1, "genesis").unwrap();
+            let before: Vec<_> = sync.storage.db.iterator(storage::rocksdb::IteratorMode::Start)
+                .map(Result::unwrap).collect();
+            assert_eq!(sync.process_blocks(vec![invalid], 0), 0);
+            let after: Vec<_> = sync.storage.db.iterator(storage::rocksdb::IteratorMode::Start)
+                .map(Result::unwrap).collect();
+            assert!(after == before, "a rejected signed block changed persistent state");
+        }
+        assert_eq!(sync.process_blocks(vec![valid.clone()], 0), 1);
+        assert_eq!(sync.storage.get("sys:last_executed_height").unwrap().as_deref(), Some("1"));
+        let stored: Block = serde_json::from_str(&sync.storage.get("block_1").unwrap().unwrap()).unwrap();
+        assert_eq!(stored.header.hash, valid.header.hash);
+        assert_eq!(sync.process_blocks(vec![valid], 1), 1);
+    }
+
+    #[test]
     fn test_validate_block_hash_commits_execution_roots() {
         let sync = setup_sync("val_roots_hash");
+        set_validators(&sync, vec![("node_1", 100)]);
         let mut block = Block::new_with_roots(
             2,
             2,
@@ -598,12 +812,9 @@ mod tests {
         assert!(sync.verify_execution_roots(&good, &summary).is_ok());
     }
 
-    // SEC-#8: a non-finalized reorg that would orphan STATE-CHANGING blocks must
-    // halt for operator re-bootstrap rather than silently roll back — rollback
-    // does not revert Move/executor state, so re-executing the new fork over it
-    // would diverge this node. (Empty-orphan reorgs are covered by the next test.)
+    // Conflicting peer blocks cannot authorize rollback or a persistent halt.
     #[test]
-    fn test_process_blocks_reorg_state_changing_orphan_halts() {
+    fn test_process_blocks_reorg_state_changing_orphan_is_rejected() {
         let sync = setup_sync("reorg_state_changing_halts");
         set_validators(&sync, vec![("node_1", 100), ("node_2", 100)]);
 
@@ -673,10 +884,10 @@ mod tests {
         );
     }
 
-    // SEC-#8: an empty (no-tx) orphan carries no state, so the reorg is safe to
-    // roll back and re-execute as before.
+    // Stored empty blocks are not permission to delete canonical history.
+    // The reorg_acceptance module also covers genuinely EXECUTED empty blocks.
     #[test]
-    fn test_process_blocks_reorg_empty_orphan_rolls_back() {
+    fn test_process_blocks_reorg_empty_orphan_is_rejected() {
         let sync = setup_sync("reorg_empty_orphan");
         set_validators(&sync, vec![("node_1", 100), ("node_2", 100)]);
 
@@ -696,7 +907,7 @@ mod tests {
             2,
             2,
             local_b1.header.hash.clone(),
-            vec![], // empty → no state to revert
+            vec![],
             "node_1".to_string(),
         );
         rehash_block(&mut local_b2);
@@ -726,13 +937,14 @@ mod tests {
         rehash_block(&mut remote_b3);
 
         let new_height = sync.process_blocks(vec![remote_b2.clone(), remote_b3.clone()], 2);
-        assert_eq!(new_height, 3);
+        assert_eq!(new_height, 2);
 
         let stored_b2 = sync.storage.get("block_2").unwrap().unwrap();
         let stored_b2: Block = serde_json::from_str(&stored_b2).unwrap();
-        assert_eq!(stored_b2.header.hash, remote_b2.header.hash);
+        assert_eq!(stored_b2.header.hash, local_b2.header.hash);
+        assert!(sync.storage.get("block_3").unwrap().is_none());
 
-        // No halt should be latched on the safe empty-orphan path.
+        // Reject the peer batch, not all future sync activity.
         assert!(sync.storage.get("sync:halt_reason").unwrap().is_none());
     }
 

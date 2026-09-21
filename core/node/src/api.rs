@@ -18,6 +18,32 @@ const MAX_LIMIT: u64 = 1000;
 use consensus::DagConsensus;
 use storage::StateDB;
 
+#[cfg(test)]
+mod qc_rpc_tests {
+    use super::*;
+    fn state(db: Arc<StateDB>) -> AppState {
+        let peers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mempool = Arc::new(Mutex::new(mempool::Mempool::new()));
+        let consensus = Arc::new(RwLock::new(DagConsensus::new(
+            "rpc-test".into(),
+            peers.clone(),
+            mempool.clone(),
+            Arc::new(executor::Executor::new(db.clone())),
+            db.clone(),
+            None,
+            None,
+            [3; 32],
+        )));
+        AppState {
+            consensus,
+            peers,
+            mempool,
+            storage: db,
+        }
+    }
+    include!("qc_rpc_tests.rs");
+}
+
 #[derive(Deserialize)]
 struct MoveCoin {
     value: u128,
@@ -225,10 +251,8 @@ async fn json_rpc_handler(
             }))
         },
         "aincore_getQuorumCert" | "aincore_getLatestQuorumCertificate" | "aincore_getQuorumCertificate" => {
-            // QC Phase 2: return the stored quorum certificate (optionally for a
-            // specific [height]; default = latest) AND independently re-verify it
-            // against the trusted validator set so callers get a trust verdict,
-            // not just bytes.
+            // Verify the stored certificate against local epoch/committee
+            // metadata. This is not a proof of execution or epoch transitions.
             let height = params.get(0).and_then(|v| v.as_u64()).or_else(|| {
                 data.storage
                     .get("consensus:qc:latest_height")
@@ -246,20 +270,15 @@ async fn json_rpc_handler(
                         match serde_json::from_str::<consensus::qc::QuorumCertificate>(&qc_json) {
                             Ok(qc) => {
                                 let (verified, verify_error) =
-                                    match consensus::qc_producer::load_validator_set_for_epoch(
-                                        &data.storage,
-                                        qc.epoch,
-                                    ) {
-                                        Some(vset) => match consensus::qc::verify_qc(&qc, &vset, &consensus::qc::expected_chain_id()) {
-                                            Ok(()) => (true, String::new()),
-                                            Err(e) => (false, e.to_string()),
-                                        },
-                                        None => (false, "validator set unavailable".to_string()),
+                                    match crate::qc_rpc::verify(&data.storage, &qc, Some(h)) {
+                                        Ok(()) => (true, String::new()),
+                                        Err(e) => (false, e.to_string()),
                                     };
                                 Ok(serde_json::json!({
                                     "available": true,
                                     "height": h,
                                     "verified": verified,
+                                    "verification_scope": crate::qc_rpc::VERIFICATION_SCOPE,
                                     "verify_error": verify_error,
                                     "quorum_certificate": qc,
                                 }))
@@ -296,21 +315,20 @@ async fn json_rpc_handler(
                             code: -32602,
                             message: format!("Invalid quorum certificate: {e}"),
                         }),
-                        Ok(qc) => match consensus::qc_producer::load_validator_set_for_epoch(
-                            &data.storage,
-                            qc.epoch,
-                        ) {
-                            None => Err(JsonRpcError {
+                        Ok(qc) => match crate::qc_rpc::verify(&data.storage, &qc, None) {
+                            Err(crate::qc_rpc::VerificationError::Unavailable(message)) => Err(JsonRpcError {
                                 code: -32000,
-                                message: "validator set unavailable".into(),
+                                message: message.into(),
                             }),
-                            Some(validators) => match consensus::qc::verify_qc(&qc, &validators, &consensus::qc::expected_chain_id()) {
-                                Ok(()) => Ok(serde_json::json!({ "valid": true })),
-                                Err(e) => Ok(serde_json::json!({
-                                    "valid": false,
-                                    "error": e.to_string()
-                                })),
-                            },
+                            Ok(()) => Ok(serde_json::json!({
+                                "valid": true,
+                                "verification_scope": crate::qc_rpc::VERIFICATION_SCOPE
+                            })),
+                            Err(e) => Ok(serde_json::json!({
+                                "valid": false,
+                                "error": e.to_string(),
+                                "verification_scope": crate::qc_rpc::VERIFICATION_SCOPE
+                            })),
                         },
                     }
                 }
