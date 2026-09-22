@@ -3409,4 +3409,111 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&path);
     }
+
+    // ── The 2026-09-12 mainnet halt ──────────────────────────────────────────
+
+    /// Restart a node whose top on-disk round was written by OTHER validators,
+    /// and report the round it decides to propose at.
+    ///
+    /// `authors_at_top` is how many of the four validators have a vertex in that
+    /// top round. Two is the live configuration on 2026-09-12: the two nodes
+    /// that never went down had published round 4, the two that restarted had
+    /// not. Four is the honest CONTROL, where the top round really does carry a
+    /// parent quorum.
+    fn boot_round_after_restart(suffix: &str, authors_at_top: usize) -> u64 {
+        const PINNED: u64 = 1_700_000_000;
+        let keys: Vec<(String, String, [u8; 32])> = (41..=44u8).map(tier2_keypair).collect();
+        let known: Vec<(String, String)> =
+            keys.iter().map(|(a, p, _)| (a.clone(), p.clone())).collect();
+        let path = get_test_db_path(suffix);
+        let mut node = tier2_open(41, &path, &known);
+        node.now_secs = Arc::new(|| PINNED);
+
+        // Rounds 1..=3 are a full mesh, so round 3 carries a genuine stake quorum.
+        let mut parents: Vec<TestParent> = vec![("genesis".to_string(), 0, String::new(), None)];
+        for round in 1..=3u64 {
+            parents = tier2_feed_round(&mut node, &keys, round, PINNED, &parents);
+        }
+
+        // Round 4 is written by the LAST `authors_at_top` validators — the ones
+        // that stayed up. This node (seed 41) is first, so it is among the
+        // missing whenever `authors_at_top < 4`.
+        node.current_round = 4;
+        for (addr, _, key) in keys.iter().skip(keys.len() - authors_at_top) {
+            node.add_vertex(tier2_vertex(key, addr, 4, PINNED, &parents));
+        }
+        assert_eq!(
+            node.round_index.lock().unwrap().get(&4).map(Vec::len),
+            Some(authors_at_top),
+            "round 4 did not receive the {authors_at_top} vertices this case needs — \
+             the scenario never got built, so whatever the boot path returns is \
+             meaningless"
+        );
+
+        // This node last proposed at round 3, then went down.
+        node.storage.put("latest_proposed_round", "3").unwrap();
+
+        let db = Arc::clone(&node.storage);
+        let node_id = node.node_id.clone();
+        let node_key = node.node_key;
+        let restarted = DagConsensus::new(
+            node_id,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Mempool::new())),
+            Arc::new(Executor::new(Arc::clone(&db))),
+            db,
+            None,
+            None,
+            node_key,
+        );
+        let round = restarted.current_round;
+        assert!(
+            !restarted.dag.lock().unwrap().is_empty(),
+            "boot replayed an EMPTY dag — the round it chose was not computed from \
+             the recovered vertices and this test proves nothing"
+        );
+
+        drop(restarted);
+        drop(node);
+        let _ = std::fs::remove_dir_all(&path);
+        round
+    }
+
+    /// AUDIT-B3, boot half. The live chain wedged here for ten days.
+    ///
+    /// Two of four validators restarted on 2026-09-12. On disk they held round-4
+    /// vertices from the two validators that never went down, so the boot path
+    /// set `current_round = max_round + 1 = 5`. A round-5 proposal needs parents
+    /// at round 4 — a round that only ever held 2 of 4 authors and so can never
+    /// reach the stake quorum. Both restarted nodes stopped proposing, round 4
+    /// stayed at two authors forever, and no block was produced again.
+    ///
+    /// It is the same defect AUDIT-B3 closed on the runtime path (dag.rs:1418):
+    /// a proposal clock driven by some other node's round rather than by the
+    /// highest round this node can genuinely build parents for. `max_round` is
+    /// the maximum over EVERY author's vertices, so it is exactly that mistake.
+    #[test]
+    fn test_boot_round_never_outruns_the_parent_quorum() {
+        assert_eq!(
+            boot_round_after_restart("boot_round_wedge", 2),
+            4,
+            "boot chose a round whose parent round cannot reach a stake quorum. \
+             The node will call try_create_vertex, find too few parents at \
+             current_round - 1, and propose nothing — forever. This is the \
+             2026-09-12 halt."
+        );
+    }
+
+    /// CONTROL for the witness above: when the top round really does carry a
+    /// parent quorum, boot must still advance past it. Without this, the fix
+    /// could be `current_round = 4` unconditionally and the witness would pass.
+    #[test]
+    fn test_boot_round_still_advances_when_the_top_round_has_quorum() {
+        assert_eq!(
+            boot_round_after_restart("boot_round_control", 4),
+            5,
+            "boot refused to advance past a round that HAS a quorum — the rule is \
+             not discriminating, it is just clamping"
+        );
+    }
 }

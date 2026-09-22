@@ -10,6 +10,12 @@
 # consistent -- the divergence is only visible by COMPARING nodes. That is what
 # this does.
 #
+# LEG 0 exists because this script LIED on 2026-09-21. It printed
+# "P_ANCHOR_HEIGHT: HOLDS" against a cluster that had been halted since
+# 2026-09-12. Agreement is not health: four nodes frozen at the same height
+# agree perfectly. Every run now proves the chain is MOVING before it says
+# anything about whether the nodes agree.
+#
 # Reads only. Safe to run against a production cluster at any time.
 #
 # The detection logic is VERIFIED, not assumed. Against synthetic input it reports:
@@ -18,9 +24,14 @@
 # and stays silent on an agreeing control set. A checker that has never been shown
 # to detect anything is not evidence.
 #
-#   ./check-anchor-height-map.sh [N_BLOCKS]     (default 400)
+#   ./check-anchor-height-map.sh [N_BLOCKS] [SLEEP_SECS] [STALE_SECS]
+#       N_BLOCKS    window compared across nodes            (default 400)
+#       SLEEP_SECS  gap between the two liveness samples    (default 20)
+#       STALE_SECS  tip older than this means HALTED        (default 120)
 set -uo pipefail
 N=${1:-400}
+SLEEP_SECS=${2:-20}
+STALE_SECS=${3:-120}
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 
@@ -46,10 +57,29 @@ for spec in "${NODES[@]}"; do
   printf "  %-3s %-14s port %-5s %8s bytes\n" "$label" "$host" "$port" "$sz"
 done
 
-python3 - "$OUT" "${NODES[@]}" <<'PY'
+# Second liveness sample. Only the tip is needed, so this is one block per node.
+echo "Waiting ${SLEEP_SECS}s for the second liveness sample..."
+sleep "$SLEEP_SECS"
+SAMPLE_GAP_START=$(date -u +%s)
+for spec in "${NODES[@]}"; do
+  host=${spec%%:*}; rest=${spec#*:}; port=${rest%%:*}; label=${rest#*:}
+  ssh -o ConnectTimeout=10 -o BatchMode=yes "$host" "bash -s $port 1" \
+      < "$OUT/dump.sh" > "$OUT/$label.tip.json" 2>/dev/null
+done
+NOW=$(date -u +%s)
+: "$SAMPLE_GAP_START"
+
+python3 - "$OUT" "$NOW" "$STALE_SECS" "$SLEEP_SECS" "${NODES[@]}" <<'PY'
 import json, sys, os
 out = sys.argv[1]
-labels = [s.split(":")[2] for s in sys.argv[2:]]
+now, stale_secs, sleep_secs = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+labels = [s.split(":")[2] for s in sys.argv[5:]]
+
+def tip_of(path):
+    """(height, round, timestamp) of the newest block in a getBlocks reply."""
+    res = json.load(open(path))["result"]
+    b = max(res, key=lambda b: b["header"]["height"])["header"]
+    return b["height"], b.get("round"), b.get("timestamp", 0)
 
 maps, hdrs = {}, {}
 for n in labels:
@@ -70,6 +100,38 @@ if len(maps) < len(labels):
           f"DOWN cannot disagree, so a PASS below covers only the nodes listed.")
 
 fail = 0
+halted = 0
+
+# LEG 0 — the chain is ALIVE. Runs first: if it is not moving, the agreement
+# legs below are measuring four copies of a frozen snapshot, and "HOLDS" would
+# be an answer to a question nobody asked.
+print("\nLEG 0 — liveness (the chain is producing blocks)")
+advanced = []
+for n in labels:
+    try:
+        h1, _, ts = tip_of(os.path.join(out, f"{n}.json"))
+        h2, _, _ = tip_of(os.path.join(out, f"{n}.tip.json"))
+    except Exception as e:
+        print(f"  {n}: UNREADABLE ({e}) — cannot vouch for liveness on this node")
+        continue
+    age = now - ts if ts else None
+    moved = h2 > h1
+    advanced.append(moved)
+    age_txt = "tip timestamp missing" if age is None else (
+        f"tip is {age}s old" if age <= stale_secs else
+        f"tip is {age}s old ({age/86400:.1f} DAYS) — STALE, threshold {stale_secs}s")
+    if not moved:
+        halted = 1
+        print(f"  {n}: NOT ADVANCING — height {h1} unchanged over {sleep_secs}s; {age_txt}")
+    elif age is not None and age > stale_secs:
+        halted = 1
+        print(f"  {n}: height {h1}->{h2} but {age_txt}")
+    else:
+        print(f"  {n}: ok — height {h1}->{h2} (+{h2-h1} in {sleep_secs}s), {age_txt}")
+
+if advanced and not any(advanced):
+    print("  ==> EVERY readable node is frozen. This is a HALT, not a slow chain.")
+
 print("\nLEG 1 — anchor_round -> height injective on each node")
 for n, m in maps.items():
     seen, dup = {}, []
@@ -101,8 +163,13 @@ else:
     else:
         print(f"  ok — {len(common)} shared heights, identical round AND header hash on every node")
 
-print("\nP_ANCHOR_HEIGHT: " + ("VIOLATED — this is the B4b signature" if fail else "HOLDS"))
-print("NOTE: a window of blocks, not a proof. B4b needs a sync-vs-local race to fire;")
+print("\nLIVENESS:        " + ("HALTED / STALLED — see LEG 0" if halted else "chain is advancing"))
+print("P_ANCHOR_HEIGHT: " + ("VIOLATED — this is the B4b signature" if fail
+                             else "holds over the window sampled"))
+if halted:
+    print("\n*** Agreement across FROZEN nodes is not health. Four nodes stopped at the")
+    print("*** same height agree perfectly. Fix liveness before reading the legs above.")
+print("\nNOTE: a window of blocks, not a proof. B4b needs a sync-vs-local race to fire;")
 print("a quiet LAN may simply never produce one. Re-run after any restart or partition.")
-sys.exit(1 if fail else 0)
+sys.exit(1 if (fail or halted) else 0)
 PY

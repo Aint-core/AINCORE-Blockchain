@@ -45,6 +45,7 @@ Severity is the reviewed severity. Status vocabulary: **CONFIRMED** = attack/def
 | **H6** | CRITICAL (blocking prerequisite for Regime C) | CONFIRMED (read this session) | `core/executor/src/lib.rs:2047-2067`; read at `:1009-1015`; contiguity at `:1693-1710`; cursor `sys:last_executed_height` at `:1627-1631` | **No state-derived commitment exists.** `sys:state_root = H(prev_root ‖ H(sorted effective writes of this block))` is a commitment to execution *history*, not to state contents; `current_state_root()` is a bare KV read and nothing recomputes it from the KV set. No Merkle/IAVL/Jellyfish trie over AINCORE state exists anywhere in the tree. Any downloaded-state mechanism is unverifiable in principle, not merely unimplemented. |
 | **H7** | HIGH | CONFIRMED (read this session) | `sync/src/lib.rs:773-786`; `core/node/src/main.rs:57-60`; retention `common/storage/src/lib.rs:493-500` (`AINCORE_BLOCK_RETENTION` default 100_000) | **Rejoin below the block-prune horizon has no in-protocol regime.** On hitting a peer's `prune_horizon` the client prints advice to set `AINCORE_BOOTSTRAP_SNAPSHOT`; `maybe_extract_bootstrap_snapshot` returns `false` immediately when `db_path` exists (`main.rs:58-60`), and a node that has been *down* has a datadir. The remedy is unreachable from the state that triggers it. The snapshot path itself is a raw RocksDB tarball over HTTPS with an optional tarball-SHA256 — trust-by-URL, no consensus signature. |
 | **H8** | HIGH | **FIXED** (see H8-FIX below) — was CONFIRMED | `sync/src/lib.rs:1272-1301` (loop at `:1277`, storage get at `:1284`); `common/network/src/lib.rs:6,10,207`; `core/node/src/main.rs:153` (`#[tokio::main]`, no `worker_threads`) | **Serving path has no lookup budget, no deadline, no per-peer budget, no concurrency cap, no metrics.** A 32-hash all-miss request executes 32 RocksDB `get`s while `bytes` stays 0, so the 900 KiB cap cannot fire. Transport admits 60 conns/IP × 100 msg/s = 6,000 req/s = 192,000 lookups/s from one IP; the handler runs blocking RocksDB reads directly on tokio workers shared with every consensus loop. `DA_SHARD` (`main.rs:777-786`) is a second unauthenticated serving endpoint on the same budget. |
+| **B3-BOOT** | CRITICAL | **FIXED** (see B3-BOOT section) — was live for 10 days | `dag.rs:470` (pre-fix); runtime twin `dag.rs:1418` | **The boot path set the proposal clock from another node's round.** `current_round = max(1, max_round + 1)`, where `max_round` is the maximum over EVERY recovered author's vertices. AUDIT-B3 fixed exactly this on the runtime path and left the boot path untouched. It halted the live 4-validator cluster on 2026-09-12 and it was still halted when found on 2026-09-22. |
 | **F1** | — | **FIXED-PARTIAL (serving only; no client)** | `sync/src/lib.rs:1272-1301`, consts `:46` (`MAX_VERTEX_REQ_HASHES = 32`), `:48` (`MAX_VERTEX_RESP_BYTES = 900 KiB`), dispatch `:1242-1250`, route `core/node/src/main.rs:788-801` | VERTEX_REQ/VERTEX_RESP **server** shipped at `59926d8`: storage reads only, no consensus lock, 64-hex key guard, over-budget hashes reported `unknown` so the requester re-asks rather than concluding absence. Additive; changes no consensus decision. **No client exists** — verified by grep: no `VertexRequest` is constructed outside `sync/src/tests.rs`. Until a client exists, F1 repairs nothing, and it cannot repair the twin case at all while H1 stands (a served twin is re-dropped at `dag.rs:1167`). |
 
 **Unverified-open backlog.** The v3 critique run exhausted usage credits with 89 of 110 agents failing; `docs/DAG_VERTEX_SYNC_DESIGN.md:4` records **43 findings left unverified and treated as OPEN**, deduplicated into the 15 clusters in `docs/research/v3-clusters.json`. Eleven clusters are adjudicated above (P1-D…P2-K). Any cluster in that file not appearing in the table above remains **UNVERIFIED-OPEN** and must not be assumed closed.
@@ -743,6 +744,94 @@ mis-stated, every seed passes forever.
 - **Note the shared budget:** `DA_SHARD` (`core/node/src/main.rs:777-786` → `da/src/lib.rs`) is a second unauthenticated storage-serving endpoint on the same per-connection allowance and the same worker threads. A budget scoped to VERTEX_REQ alone leaves the aggregate unbounded.
 
 ---
+
+---
+
+### B3-BOOT — the 2026-09-12 live halt. FIXED.
+
+**This one was not found by a test. It was found by looking at the live chain, ten
+days late, and only because a number I had reported as healthy turned out to be
+the same number as the day before.**
+
+**Mechanism, established on the live cluster before any code was touched.** r1
+(`dd48891f`) and r2 (`d3ac8b5d`) restarted at 2026-09-12 06:04 UTC with
+`NRestarts=0` — a deliberate restart, not a crash loop. Round 214901 on disk held
+vertices from r3 (`b89a4bfd`) and r4 (`c4ab03c2`) only: the two that never went
+down. Rounds 214897–214900 held all four. Both restarted nodes therefore recovered
+`max_round = 214901` and booted at 214902. A round-214902 proposal needs parents at
+214901, which holds 2 of 4 authors — 2000 of 4000 stake, not `> 2/3`. All four nodes
+then logged, forever:
+
+```
+Round 214902: Validators=4, Parents=2, StakeQuorum=false
+```
+
+Round 214901 could only be completed by r1 or r2, and neither would ever propose
+there again. Last block: height 98095, 2026-09-12 06:03 UTC. Measured block time
+before the halt: 6.65 s.
+
+**It is the same defect as AUDIT-B3, one path over.** The runtime comment at
+`dag.rs:1400-1417` spells the rule out — advance to `quorum_round + 1`, the highest
+round we can genuinely build parents for, never to a round some peer claims. The
+boot path computed `max_round + 1` instead, and `max_round` is a maximum over every
+author. One fix, two call sites, and only one of them was changed.
+
+**The fix** (`dag.rs`, boot path):
+
+```rust
+let boot_validators = Self::validators_from_storage(&storage);
+let quorum_start =
+    Self::quorum_round(&round_idx_map, &dag_map, &boot_validators).saturating_add(1);
+let mut final_start_round = std::cmp::max(1, quorum_start);
+if explicit_max_round >= final_start_round { … }   // safety: never reuse our own round
+```
+
+`max_round` no longer participates in the decision; it survives only in the boot
+banner, which previously printed `max_round + 1` and would have printed a round the
+node was not starting at. `read_validators_from_storage` was split so boot and
+runtime share ONE implementation of the validator read — a boot path with its own
+copy of the validator rules is a second implementation, and the two drift.
+
+The `latest_proposed_round` clamp is kept and deliberately overrides the quorum
+rule when they conflict: re-proposing a round we already used is equivocation and
+is slashed 100%, while stalling is not. That case is self-healing — once peers fill
+the round, `quorum_round` rises past it.
+
+**Witness and control** (`consensus/consensus/src/tests.rs`):
+
+| test | before fix | after fix | under the naive clamp mutant |
+|---|---|---|---|
+| `test_boot_round_never_outruns_the_parent_quorum` | **RED** (boot chose 5) | GREEN (4) | GREEN — passes by accident |
+| `test_boot_round_still_advances_when_the_top_round_has_quorum` | GREEN (5) | GREEN (5) | **RED** |
+
+Both legs executed, both flips observed. The mutant (`quorum_start = max_round`,
+i.e. clamp to the top on-disk round instead of the quorum round) was compiled and
+run: it satisfies the witness and is caught only by the control. Neither test is
+vacuous. Full suite after the fix: 162 passed, 0 failed, 8 ignored (the known
+RED-by-design witnesses, unchanged); `cargo clippy -p consensus --all-targets
+-- -D warnings` clean.
+
+**Deployment.** NOT deployed. The deployed binary is ~`5ab3309` (2026-09-04) and
+HEAD carries three BREAKING vertex-format commits, so HEAD must not be put on the
+current chain. Recovering that chain means backporting this boot change onto the
+deployed commit; the alternative is a fresh genesis on HEAD. That is a decision for
+the operator, not for this register.
+
+### The checker that said HOLDS on a dead chain
+
+`scripts/ops_tools/check-anchor-height-map.sh` reported `P_ANCHOR_HEIGHT: HOLDS`
+on 2026-09-21 against a cluster that had been halted for nine days. It was not
+wrong about what it measured — it measured agreement, and four frozen nodes agree
+perfectly. It was wrong about what it implied.
+
+It now runs **LEG 0 first**: two tip samples `SLEEP_SECS` apart plus the tip's age
+against wall clock. A node that does not advance, or whose tip is older than
+`STALE_SECS` (default 120), fails the leg, and the script exits non-zero no matter
+how well the nodes agree. Verified against the halted cluster — it reports
+`NOT ADVANCING — height 98095 unchanged over 20s; tip is 915642s old (10.6 DAYS)`
+and exits 1. A checker that has never been shown to detect anything is not evidence;
+this one has now been shown to detect the exact failure it previously missed.
+
 
 ## 4. Known UNWORKABLE — do not repeat
 

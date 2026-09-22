@@ -425,12 +425,6 @@ impl DagConsensus {
             }
         }
 
-        println!(
-            "✅ DAG Initialized: {} vertices, Starting Round {}",
-            dag_map.len(),
-            max_round + 1
-        );
-
         let latest_block_height = match storage.get("latest_height") {
             Ok(Some(h)) => h.parse::<u64>().unwrap_or(0),
             _ => 0,
@@ -467,7 +461,31 @@ impl DagConsensus {
             _ => 0,
         };
 
-        let mut final_start_round = std::cmp::max(1, max_round + 1);
+        // AUDIT-B3 (boot half). This used to be `max(1, max_round + 1)`, and
+        // `max_round` is the maximum over EVERY author's recovered vertices —
+        // not over the rounds this node can actually build parents for. That is
+        // the same mistake AUDIT-B3 removed from the runtime path below, and it
+        // wedged the live chain on 2026-09-12: two of four validators restarted
+        // holding round-N vertices written by the two that never went down, so
+        // they booted at N+1, whose parents live at round N — a round that only
+        // ever held 2 of 4 authors and can therefore never reach the stake
+        // quorum. Neither node proposed again and no block was produced for ten
+        // days.
+        //
+        // Narwhal's rule, restated for boot: propose at `quorum_round + 1`, the
+        // highest round whose parent round we hold a stake quorum for. Vertices
+        // above that are still recovered and still count toward their own
+        // round's quorum; they just cannot set our proposal clock.
+        let boot_validators = Self::validators_from_storage(&storage);
+        let quorum_start =
+            Self::quorum_round(&round_idx_map, &dag_map, &boot_validators).saturating_add(1);
+        let mut final_start_round = std::cmp::max(1, quorum_start);
+
+        // Safety beats liveness on the one input that is genuinely ours: a round
+        // we already proposed at must never be reused, because a second vertex
+        // at that round is equivocation and is slashed 100%. Stalling is not.
+        // This case is self-healing — once peers fill the round, `quorum_round`
+        // rises past it.
         if explicit_max_round >= final_start_round {
             println!(
                 "🔄 Restoring from explicitly saved proposed round: {}",
@@ -475,6 +493,13 @@ impl DagConsensus {
             );
             final_start_round = explicit_max_round + 1;
         }
+
+        println!(
+            "✅ DAG Initialized: {} vertices (max round {}), Starting Round {}",
+            dag_map.len(),
+            max_round,
+            final_start_round
+        );
 
         let storage_for_ordering = Arc::clone(&storage);
 
@@ -3169,10 +3194,17 @@ impl DagConsensus {
     /// helper is extracted so cache misses and explicit refreshes share one
     /// implementation.
     fn read_validators_from_storage(&self) -> Vec<(String, u64)> {
+        Self::validators_from_storage(&self.storage)
+    }
+
+    /// The same read, callable from `new()` — before `Self` exists. Extracted
+    /// rather than duplicated: a boot path with its own copy of the validator
+    /// rules is a second implementation, and the two drift.
+    fn validators_from_storage(storage: &StateDB) -> Vec<(String, u64)> {
         // 1. AUTHORITATIVE PATH: BLS/stake-aware validator set. Runtime joins
         // update this key; legacy `sys:validators` is only a compatibility
         // mirror and can lag on older nodes.
-        if let Ok(Some(json)) = self.storage.get("sys:validator_set:v1") {
+        if let Ok(Some(json)) = storage.get("sys:validator_set:v1") {
             if let Ok(vals) = serde_json::from_str::<Vec<ValidatorSetV1Entry>>(&json) {
                 let mut validators: Vec<(String, u64)> =
                     vals.into_iter().map(|v| (v.address, v.stake)).collect();
@@ -3183,7 +3215,7 @@ impl DagConsensus {
         }
 
         // 2. LEGACY PATH: Native consensus mirror (`sys:validators`).
-        if let Ok(Some(json)) = self.storage.get("sys:validators") {
+        if let Ok(Some(json)) = storage.get("sys:validators") {
             if let Ok(vals) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
                 let mut validators: Vec<(String, u64)> = vals;
                 validators.sort_by(|a, b| a.0.cmp(&b.0));
@@ -3194,7 +3226,7 @@ impl DagConsensus {
 
         // 3. SLOW PATH: Read BCS ValidatorSet Resource directly.
         let key = "resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::staking::ValidatorSet";
-        if let Ok(Some(bytes_hex)) = self.storage.get(key) {
+        if let Ok(Some(bytes_hex)) = storage.get(key) {
             if let Ok(bytes) = hex::decode(bytes_hex) {
                 if let Ok(val_set) = bcs::from_bytes::<ValidatorSet>(&bytes) {
                     let mut validators: Vec<(String, u64)> = val_set
