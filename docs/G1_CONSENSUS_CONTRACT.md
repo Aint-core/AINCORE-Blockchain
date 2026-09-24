@@ -7,6 +7,16 @@
 > - Citations inside `docs/DEFECT_REGISTER.md` are older. For example, the register cites `dag.rs:1167` for the equivocation `return`, which is now `dag.rs:1356`. Use the numbers in this document.
 > - Its author took no code, git, push, deploy or node action.
 
+> **Implementation status (2026-09-24).** S1 is implemented as a library in `consensus/consensus/src/vcert.rs`; S0 and S2–S11 are not. Nothing is wired: no ingress, production, ordering or recovery path calls it, and the release gate is unchanged at 7 red / 7 green.
+>
+> - **CE-2** `verify_vertex_cert` shares its stake and aggregate core with `qc::verify_qc` through the new `qc::verify_stake_aggregate`. `verify_qc`'s signature and behaviour are unchanged; 72 QC tests and 65 sync tests pass across the refactor.
+> - **AT-2** `attest_slot` reads, decides and writes the `vattest` guard inside one `StateDB::transaction`, and returns a signature only after the commit.
+> - **CE-1** `CertCollector` counts only attestations of its own body, keeps verified twin attestations as `ATTEST_EQUIV` evidence, and runs CE-2 on every certificate before returning it.
+> - **Acceptance.** All ten S1 criteria have a test in `vcert/tests.rs`, including the exhaustive n=4 check (exactly one certificate in all 8 honest delivery orders) and its negative control (two Byzantine attesters certify both twins in the 2 orders where the honest pair splits).
+> - **Mutation evidence.** Eight deliberate defects were compiled and run; all 14 mutation/test pairs went red, none stayed green.
+> - **Beyond the contract.** A persisted guard that is not a valid attestation by this key is refused and never overwritten, and a certificate whose author is outside C_E is refused.
+> - **Still open in S1's scope.** The durable `vcollect` rows (CE-1) and the `vcert` row (CE-3) are not written; the collector is in-memory. They belong with the wiring in S2+.
+
 ---
 
 ## Status and scope

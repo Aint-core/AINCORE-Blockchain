@@ -353,35 +353,63 @@ pub fn verify_qc(
             expected: expected_chain_id.to_string(),
         });
     }
+    verify_stake_aggregate(
+        validators,
+        &qc.signer_bitmap,
+        qc.signed_stake,
+        qc.total_stake,
+        &qc.validator_set_hash,
+        &qc.finality_vote().to_signing_bytes(),
+        &qc.aggregate_signature,
+    )
+}
+
+/// The stake-weighted aggregate check shared by finality QCs and vertex
+/// certificates (G1 contract, CE-2 steps 2-6): bitmap non-empty and in range,
+/// stake recomputed from the trusted set, strict >2/3 quorum, the claimed
+/// committee hash bound to that set, then `fast_aggregate_verify`.
+///
+/// ONE implementation. The two certificate kinds differ only in what they sign
+/// and in the identity fields checked before this runs; a second copy of these
+/// five checks is a second implementation, and the two drift.
+pub(crate) fn verify_stake_aggregate(
+    validators: &[ValidatorInfo],
+    signer_bitmap: &[u8],
+    claimed_signed_stake: u128,
+    claimed_total_stake: u128,
+    claimed_set_hash: &str,
+    signing_bytes: &[u8],
+    aggregate_signature: &[u8],
+) -> Result<(), QcError> {
     let validators = canonical_order(validators);
     let n = validators.len();
 
-    let signers = decode_bitmap(&qc.signer_bitmap, n);
+    let signers = decode_bitmap(signer_bitmap, n);
     if signers.is_empty() {
         return Err(QcError::NoSigners);
     }
     // Any set bit beyond the validator count is a malformed/forged bitmap.
-    let max_bit = qc.signer_bitmap.len() * 8;
+    let max_bit = signer_bitmap.len() * 8;
     for bit in 0..max_bit {
-        if qc.signer_bitmap[bit / 8] & (1u8 << (bit % 8)) != 0 && bit >= n {
+        if signer_bitmap[bit / 8] & (1u8 << (bit % 8)) != 0 && bit >= n {
             return Err(QcError::SignerOutOfRange(bit));
         }
     }
 
-    // Recompute stake authoritatively from the trusted set; the QC's own stake
-    // fields are only hints and must match.
+    // Recompute stake authoritatively from the trusted set; the certificate's
+    // own stake fields are only hints and must match.
     let signed_stake: u128 = signers.iter().map(|&i| validators[i].stake as u128).sum();
     let total_stake: u128 = validators.iter().map(|v| v.stake as u128).sum();
 
-    if signed_stake != qc.signed_stake {
+    if signed_stake != claimed_signed_stake {
         return Err(QcError::StakeMismatch {
-            claimed: qc.signed_stake,
+            claimed: claimed_signed_stake,
             recomputed: signed_stake,
         });
     }
-    if total_stake != qc.total_stake {
+    if total_stake != claimed_total_stake {
         return Err(QcError::TotalStakeMismatch {
-            claimed: qc.total_stake,
+            claimed: claimed_total_stake,
             recomputed: total_stake,
         });
     }
@@ -394,15 +422,15 @@ pub fn verify_qc(
         });
     }
 
-    // Bind the QC to the EXACT validator set it is verified against. The
-    // FinalityVote signs validator_set_hash, but the BLS check below reconstructs
-    // the vote from the QC's own (attacker-controllable) validator_set_hash field;
-    // without this binding a consumer could verify a QC against a different set
-    // than the one it certifies. Enforce that the trusted set's hash matches.
+    // Bind the certificate to the EXACT validator set it is verified against.
+    // The signed message carries the set hash, but the BLS check below rebuilds
+    // that message from the certificate's own (attacker-controllable) field;
+    // without this binding a consumer could verify a certificate against a
+    // different set than the one it certifies.
     let expected_set_hash = validator_set_hash(&validators);
-    if expected_set_hash != qc.validator_set_hash {
+    if expected_set_hash != claimed_set_hash {
         return Err(QcError::ValidatorSetMismatch {
-            claimed: qc.validator_set_hash.clone(),
+            claimed: claimed_set_hash.to_string(),
             recomputed: expected_set_hash,
         });
     }
@@ -415,9 +443,8 @@ pub fn verify_qc(
         pubkeys.push(pk);
     }
 
-    let vote_bytes = qc.finality_vote().to_signing_bytes();
     let bls = BLSEngine::consensus();
-    match bls.fast_aggregate_verify(&vote_bytes, &pubkeys, &qc.aggregate_signature) {
+    match bls.fast_aggregate_verify(signing_bytes, &pubkeys, aggregate_signature) {
         Ok(true) => Ok(()),
         Ok(false) => Err(QcError::VerifyFailed("aggregate signature invalid".into())),
         Err(e) => Err(QcError::VerifyFailed(format!("{:?}", e))),
