@@ -18,6 +18,9 @@ type ReadResult = Result<Row, rocksdb::Error>;
 struct Shared {
     raw: DB,
     writers: Mutex<()>,
+    /// Declared after `raw` on purpose: fields drop in declaration order, so the
+    /// directory becomes claimable again only after RocksDB has closed it.
+    _claim: Option<crate::DirectoryClaim>,
 }
 
 struct Stage {
@@ -55,6 +58,22 @@ impl From<DB> for ReadStore {
             shared: Arc::new(Shared {
                 raw,
                 writers: Mutex::new(()),
+                _claim: None,
+            }),
+            stage: None,
+        }
+    }
+}
+
+impl ReadStore {
+    /// A store that holds the process-wide claim on its directory until the
+    /// last handle to it, transaction views included, is dropped.
+    pub(crate) fn claimed(raw: DB, claim: crate::DirectoryClaim) -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                raw,
+                writers: Mutex::new(()),
+                _claim: Some(claim),
             }),
             stage: None,
         }

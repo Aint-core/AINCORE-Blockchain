@@ -17,6 +17,60 @@ mod tests {
         include!("validator_eligibility_tests.rs");
     }
 
+    /// A second handle to one directory, under ANY spelling, is refused while
+    /// the first is alive. RocksDB alone refused only the identical string, so
+    /// `db/.`, `db/` and a symlink each became an independent instance with its
+    /// own writer gate: two durable signing guards, one key, two signatures.
+    #[test]
+    fn a_second_handle_to_one_directory_is_refused_whatever_the_spelling() {
+        let base = std::env::temp_dir().join(format!("aincore-claim-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let path = base.join("db");
+        let p = path.to_str().unwrap().to_string();
+        let link = base.join("link");
+
+        let first = StateDB::open(&p).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        let mut spellings = vec![
+            p.clone(),
+            format!("{p}/."),
+            format!("{p}/"),
+            format!("{}/../db", p),
+        ];
+        #[cfg(unix)]
+        spellings.push(link.to_str().unwrap().to_string());
+        for spelling in &spellings {
+            assert!(
+                StateDB::open(spelling).is_err(),
+                "a second instance of one directory opened as {spelling}"
+            );
+        }
+
+        // A transaction view shares the first handle; dropping it must not
+        // release the directory.
+        first
+            .transaction(|view| {
+                view.put("k", "v").unwrap();
+                Ok(())
+            })
+            .unwrap();
+        assert!(StateDB::open(&format!("{p}/.")).is_err());
+
+        // Control: once the last handle is gone the directory opens again,
+        // under another spelling, with its data intact. Without this the test
+        // would pass on a store that refuses every open.
+        drop(first);
+        let reopened = StateDB::open(&format!("{p}/.")).unwrap();
+        assert_eq!(reopened.get("k").unwrap().as_deref(), Some("v"));
+        drop(reopened);
+
+        // A missing parent still fails, exactly as it did before the claim.
+        assert!(StateDB::open(base.join("absent/db").to_str().unwrap()).is_err());
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn test_put_get_roundtrip() {
         let db = temp_db("put_get");

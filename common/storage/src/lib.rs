@@ -6,7 +6,84 @@ pub use transaction::ReadStore;
 #[cfg(test)]
 mod tests;
 use object::Object;
+use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::Mutex;
+
+/// Every database directory this process currently has open, keyed by the
+/// directory's own identity rather than by the spelling of its path.
+///
+/// RocksDB keys its in-process lock table by the path STRING, and POSIX locks
+/// never conflict within one process. So `db`, `db/.`, `db/` and any symlink or
+/// bind mount pointing at it each opened a second, independent instance of one
+/// directory, with its own writer gate and its own memtable. Every durable
+/// one-signature guard in this codebase (`vattest`, `qc_signing`) assumes one
+/// instance per directory: two instances let one key sign twice. Refusing the
+/// second open closes that for every guard at once.
+static OPEN_DIRECTORIES: Mutex<BTreeSet<(u64, u64)>> = Mutex::new(BTreeSet::new());
+
+/// Held by an open database; releases its directory when dropped.
+pub(crate) struct DirectoryClaim((u64, u64));
+
+impl Drop for DirectoryClaim {
+    fn drop(&mut self) {
+        // Release even if another thread panicked while holding the lock: a
+        // leaked claim would make the directory unopenable for the rest of the
+        // process.
+        OPEN_DIRECTORIES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.0);
+    }
+}
+
+fn claim_directory(path: &str) -> Result<DirectoryClaim, StorageError> {
+    // One level, exactly like RocksDB's own `create_if_missing`: a path whose
+    // parent does not exist must still fail to open, as it did before.
+    if let Err(e) = std::fs::create_dir(path) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(StorageError::DatabaseOpen(format!(
+                "Path: {}, Error: {}",
+                path, e
+            )));
+        }
+    }
+    let id = directory_identity(path)?;
+    let mut open = OPEN_DIRECTORIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !open.insert(id) {
+        return Err(StorageError::DatabaseOpen(format!(
+            "Path: {}: this directory is already open in this process, under this or \
+             another spelling. A second instance would have its own writer gate, so a \
+             durable signing guard in it could sign twice.",
+            path
+        )));
+    }
+    Ok(DirectoryClaim(id))
+}
+
+/// (device, inode) of the directory itself: catches symlinks, dot segments,
+/// trailing slashes and bind mounts alike.
+#[cfg(unix)]
+fn directory_identity(path: &str) -> Result<(u64, u64), StorageError> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| StorageError::DatabaseOpen(format!("Path: {}, Error: {}", path, e)))?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+/// Without inodes, the canonical path: catches symlinks and dot segments, not
+/// bind mounts.
+#[cfg(not(unix))]
+fn directory_identity(path: &str) -> Result<(u64, u64), StorageError> {
+    use sha2::{Digest, Sha256};
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|e| StorageError::DatabaseOpen(format!("Path: {}, Error: {}", path, e)))?;
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    let word = |i: usize| u64::from_be_bytes(digest[i..i + 8].try_into().expect("8 bytes"));
+    Ok((word(0), word(8)))
+}
 
 #[derive(Debug, Clone)]
 pub enum StorageError {
@@ -99,12 +176,18 @@ impl StateDB {
         opts.set_allow_concurrent_memtable_write(true);
         opts.set_enable_write_thread_adaptive_yield(true);
 
+        // Claimed BEFORE RocksDB touches the directory: opening a second
+        // instance, even briefly, already writes to it. On any error below the
+        // claim drops and the directory is released.
+        let claim = claim_directory(path)?;
         let db = DB::open(&opts, path)
             .map_err(|e| StorageError::DatabaseOpen(format!(
                 "Path: {}, Error: {}. Ensure no other process is using this directory and you have write permissions.",
                 path, e
             )))?;
-        Ok(Self { db: db.into() })
+        Ok(Self {
+            db: ReadStore::claimed(db, claim),
+        })
     }
 
     pub fn put(&self, key: &str, value: &str) -> std::result::Result<(), rocksdb::Error> {
