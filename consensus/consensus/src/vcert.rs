@@ -141,8 +141,9 @@ pub enum VcertError {
         claimed: u64,
         expected: u64,
     },
-    /// A vertex author must be a committee member (IN-1 S4); a certificate for
-    /// a slot that cannot exist is refused rather than verified.
+    /// A vertex author must be a committee member with positive stake (IN-1
+    /// S4); a certificate or attestation for a slot that cannot exist is
+    /// refused rather than processed.
     AuthorNotInCommittee(String),
     SignerNotInCommittee(String),
     /// AT-1: this node is not a committee member with positive stake.
@@ -210,7 +211,7 @@ pub fn verify_vertex_cert(
             expected: expected_epoch,
         });
     }
-    if !committee.iter().any(|v| v.address == body.author) {
+    if !is_staked_member(committee, &body.author) {
         return Err(VcertError::AuthorNotInCommittee(body.author.clone()));
     }
     qc::verify_stake_aggregate(
@@ -296,7 +297,7 @@ pub fn attest_slot(
         .iter()
         .find(|v| v.address == self_address && v.stake > 0)
         .ok_or_else(|| VcertError::SelfNotInCommittee(self_address.to_string()))?;
-    if !ordered.iter().any(|v| v.address == body.author) {
+    if !is_staked_member(&ordered, &body.author) {
         return Err(VcertError::AuthorNotInCommittee(body.author.clone()));
     }
     let recomputed = qc::validator_set_hash(&ordered);
@@ -411,7 +412,7 @@ impl CertCollector {
                 recomputed,
             });
         }
-        if !committee.iter().any(|v| v.address == body.author) {
+        if !is_staked_member(&committee, &body.author) {
             return Err(VcertError::AuthorNotInCommittee(body.author.clone()));
         }
         Ok(Self {
@@ -519,14 +520,22 @@ impl CertCollector {
         }
     }
 
+    /// One pair per signer. A pair is already complete evidence; recording every
+    /// further digest a Byzantine signer chooses to sign for this slot would let
+    /// it grow the collector without bound, one BLS signature per entry.
     fn note_equivocation(&mut self, first: VertexAttestation, second: VertexAttestation) {
-        let known = self.evidence.iter().any(|(a, b)| {
-            a.signer == first.signer && a.body == first.body && b.body == second.body
-        });
-        if !known {
+        if !self.evidence.iter().any(|(a, _)| a.signer == first.signer) {
             self.evidence.push((first, second));
         }
     }
+}
+
+/// IN-1 S4's author rule, used by the verifier, the guard and the collector
+/// alike so the three can never disagree about which slots exist.
+fn is_staked_member(committee: &[ValidatorInfo], address: &str) -> bool {
+    committee
+        .iter()
+        .any(|v| v.address == address && v.stake > 0)
 }
 
 fn bit_set(bitmap: &[u8], i: usize) -> bool {

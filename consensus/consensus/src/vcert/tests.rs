@@ -94,9 +94,6 @@ impl TempDb {
         let _ = std::fs::remove_dir_all(&path);
         Self(path)
     }
-    fn at(path: PathBuf) -> Self {
-        Self(path)
-    }
     fn open(&self) -> StateDB {
         StateDB::open(self.0.to_str().unwrap()).unwrap()
     }
@@ -791,6 +788,115 @@ fn a_corrupted_guard_is_refused_and_never_overwritten() {
         db.get(&key).unwrap().as_deref(),
         Some(tampered_row.as_str())
     );
-    // Reusing the dir after the test: keep the path alive until here.
-    let _ = TempDb::at(dir.0.clone());
+}
+
+// ── review findings (2026-09-24) ────────────────────────────────────────────
+
+#[test]
+fn a_byzantine_signer_cannot_grow_the_evidence_without_bound() {
+    let members = committee4();
+    let committee = infos(&members);
+    let author = &members[1].info.address;
+    let ours = body(&committee, 0, 30, author, &digest('a'));
+    let mut collector = CertCollector::new(ours.clone(), &committee).unwrap();
+
+    collector
+        .add(&byzantine_attest(&members[3], &ours))
+        .unwrap();
+    // Fifty further digests for the same slot, every one validly signed.
+    for i in 0..50u32 {
+        let twin = body(&committee, 0, 30, author, &format!("{:064x}", i + 1));
+        assert_eq!(
+            collector
+                .add(&byzantine_attest(&members[3], &twin))
+                .unwrap(),
+            CollectOutcome::Foreign
+        );
+    }
+    assert_eq!(
+        collector.equivocations().len(),
+        1,
+        "one Byzantine signer grew the evidence list by one entry per digest it chose to sign"
+    );
+    // The bound is per signer, not global: a second equivocator is still recorded.
+    collector
+        .add(&byzantine_attest(&members[2], &ours))
+        .unwrap();
+    let twin = body(&committee, 0, 30, author, &digest('b'));
+    collector
+        .add(&byzantine_attest(&members[2], &twin))
+        .unwrap();
+    assert_eq!(collector.equivocations().len(), 2);
+}
+
+#[test]
+fn a_zero_stake_author_has_no_slot_anywhere() {
+    // Seeds 1..=4 with the last at zero stake, then canonical order.
+    let mut members: Vec<Member> = [(1u8, STAKE), (2, STAKE), (3, STAKE), (4, 0)]
+        .into_iter()
+        .map(|(s, st)| member(s, st))
+        .collect();
+    members.sort_by(|a, b| a.info.address.cmp(&b.info.address));
+    let committee = infos(&members);
+    let zero = members.iter().position(|m| m.info.stake == 0).unwrap();
+    let staked: Vec<usize> = (0..4).filter(|&i| i != zero).collect();
+    let signer = &members[staked[0]];
+
+    let at = |author: &str| body(&committee, 0, 32, author, &digest('a'));
+    // A certificate with genuine signatures from all three staked members.
+    let cert_for = |b: &AttestBody| {
+        let sigs: Vec<Vec<u8>> = staked
+            .iter()
+            .map(|&i| byzantine_attest(&members[i], b).signature)
+            .collect();
+        VertexCertificate {
+            version: CERT_VERSION,
+            body: b.clone(),
+            signer_bitmap: qc::encode_bitmap(&staked, 4),
+            signed_stake: 3 * STAKE as u128,
+            total_stake: 3 * STAKE as u128,
+            aggregate_signature: BLSEngine::consensus().aggregate_signatures(&sigs).unwrap(),
+        }
+    };
+
+    let zero_body = at(&members[zero].info.address);
+    let dir = TempDb::new("zero-stake");
+    let db = dir.open();
+    assert!(matches!(
+        attest_slot(
+            &db,
+            &zero_body,
+            &committee,
+            &signer.node_key,
+            &signer.info.address
+        ),
+        Err(VcertError::AuthorNotInCommittee(_))
+    ));
+    assert!(matches!(
+        CertCollector::new(zero_body.clone(), &committee),
+        Err(VcertError::AuthorNotInCommittee(_))
+    ));
+    assert!(matches!(
+        verify_vertex_cert(&cert_for(&zero_body), &committee, CHAIN, GENESIS, 0),
+        Err(VcertError::AuthorNotInCommittee(_))
+    ));
+
+    // Control: the same committee, a staked author, the same signers.
+    let live = at(&members[staked[1]].info.address);
+    assert!(matches!(
+        attest_slot(
+            &db,
+            &live,
+            &committee,
+            &signer.node_key,
+            &signer.info.address
+        )
+        .unwrap(),
+        AttestOutcome::Signed(_)
+    ));
+    assert!(CertCollector::new(live.clone(), &committee).is_ok());
+    assert_eq!(
+        verify_vertex_cert(&cert_for(&live), &committee, CHAIN, GENESIS, 0),
+        Ok(())
+    );
 }
