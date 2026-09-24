@@ -9,14 +9,24 @@
 
 > **Implementation status (2026-09-24).** S1 is implemented as a library in `consensus/consensus/src/vcert.rs`; S0 and S2–S11 are not. Nothing is wired: no ingress, production, ordering or recovery path calls it, and the release gate is unchanged at 7 red / 7 green.
 >
-> - **CE-2** `verify_vertex_cert` shares its stake and aggregate core with `qc::verify_qc` through the new `qc::verify_stake_aggregate`. `verify_qc`'s signature and behaviour are unchanged; 72 QC tests and 65 sync tests pass across the refactor.
-> - **AT-2** `attest_slot` reads, decides and writes the `vattest` guard inside one `StateDB::transaction`, and returns a signature only after the commit.
-> - **CE-1** `CertCollector` counts only attestations of its own body, keeps verified twin attestations as `ATTEST_EQUIV` evidence, and runs CE-2 on every certificate before returning it.
-> - **Acceptance.** All ten S1 criteria have a test in `vcert/tests.rs`, including the exhaustive n=4 check (exactly one certificate in all 8 honest delivery orders) and its negative control (two Byzantine attesters certify both twins in the 2 orders where the honest pair splits).
-> - **Mutation evidence.** Eight deliberate defects were compiled and run; all 14 mutation/test pairs went red, none stayed green.
-> - **Beyond the contract.** A persisted guard that is not a valid attestation by this key is refused and never overwritten, and a certificate whose author is outside C_E is refused.
-> - **Still open in S1's scope.** The durable `vcollect` rows (CE-1) and the `vcert` row (CE-3) are not written; the collector is in-memory. They belong with the wiring in S2+.
-
+> - **CE-2** `verify_vertex_cert` shares its stake and aggregate core with `qc::verify_qc` through the new `qc::verify_stake_aggregate`. `verify_qc`'s signature and behaviour are unchanged: an independent differential test against a verbatim copy of the old `verify_qc` found 0 divergences in 11,520 cases.
+> - **AT-2** has two entry points. `attest_slot_in` runs inside the CALLER's transaction, which is what AT-2 requires ("in the same transaction that stages the body"); `attest_slot` wraps it in a transaction of its own. Either way a signature is released only after the guard row commits.
+> - **CE-1** `CertCollector` counts only attestations of its own exact body, and records `ATTEST_EQUIV` evidence for any signer seen with two digests for one slot — whether or not either digest is its own, and whatever committee hash each claims. At most one pair per signer, so evidence is bounded by the committee size.
+> - **Acceptance.** All ten S1 criteria have a test in `vcert/tests.rs`, including the exhaustive n=4 check (exactly one certificate in all 8 honest delivery orders, with the certificate count as an independent witness of the guard) and its negative control.
+> - **Review.** Three independent adversarial reviewers (soundness, guard, contract conformance) attacked S1 before it was pushed. Their confirmed findings are fixed and each has a mutation-proven test:
+>   - one datadir under two spellings opened two instances, so one key could sign twice — fixed in `StateDB::open` for every guard (`c2da08d`);
+>   - `{cg}` was not injective (corrected above);
+>   - the guard could not join a caller's transaction (now `attest_slot_in`);
+>   - the same digest under another committee hash was reported as `Conflict` (now `CommitteeChangedWithinEpoch`);
+>   - a guard row for another slot, or one that is not UTF-8, is refused (`InvalidGuard`) before anything is signed;
+>   - evidence missed equivocations between two foreign digests and across committee hashes;
+>   - a non-canonical bitmap length is refused (`NonCanonicalBitmap`).
+> - **Beyond the contract.** A certificate or attestation whose author is not a committee member with positive stake is refused.
+> - **Known limits, stated rather than tested.**
+>   - The crash test kills the process with `exit(77)`, which keeps the OS page cache, so it cannot tell a synced guard write from an unsynced one. The write IS synced (`StateDB::transaction` → `write_durable`); proving it needs a power-loss harness.
+>   - A set signer bit proves the member's *registered key* signed, not the member: validator join does not yet refuse a BLS key another member holds. Lemma U is unaffected. Nothing may read per-member attribution from a bitmap until join rejects duplicate keys (a staking change, outside G1).
+>   - RC-3 guard continuity: `node.key` lives at `{datadir}/node.key` but the guard database is `{datadir}/validator_{port}.db`, so restarting with a different `--port` keeps the key and starts an empty guard. `consensus:guard_origin` must catch this when S2+ wires RC-3; the same hazard applies to the live `qc_signing` guard today.
+> - **Still open inside S1's scope.** The durable `vcollect` rows (CE-1) and the `vcert` row (CE-3) are not written; the collector is in-memory. They land with the wiring in S2+.
 ---
 
 ## Status and scope
@@ -267,7 +277,7 @@
 | `ATTEST_REQ{vertex}` / `ATTEST_RESP{attestation \| conflict \| pending}` | Request/response | Author → member | New |
 | `SYNC_REQ` / `SYNC_RESP` | As today (`sync:161-179, :1366-1403`) | — | Adds `qcs: Vec<QuorumCertificate>`, one per block, `#[serde(default)]` |
 
-**Durable keys.** Every write goes through `StateDB::transaction` (`common/storage/src/transaction.rs:245-290`) unless marked unsynced. `{cg}` is `hex(SHA256(chain_id ‖ 0x00 ‖ genesis_identity))`.
+**Durable keys.** Every write goes through `StateDB::transaction` (`common/storage/src/transaction.rs:245-290`) unless marked unsynced. `{cg}` is `hex(SHA256(put(chain_id) ‖ put(genesis_identity)))`, with `put` the u64 big-endian length prefix used throughout this contract. *(Corrected 2026-09-24: this contract first specified `chain_id ‖ 0x00 ‖ genesis_identity`, which is not injective once either string contains 0x00 — ("X\0Y", "Z") and ("X", "Y\0Z") hash the same bytes, so two chains would share one guard row. It is the same class of defect as the legacy block-header hash.)*
 
 | Key | Value | Written | Deleted |
 |---|---|---|---|

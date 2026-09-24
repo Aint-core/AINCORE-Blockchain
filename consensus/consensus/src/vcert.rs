@@ -24,7 +24,7 @@ use crypto::bls::BLSEngine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use storage::{StateDB, StorageError};
+use storage::StateDB;
 
 /// 24 bytes: the same length as `AINCORE_FINALITY_VOTE_V1`, with different
 /// content. Both kinds of signing bytes are `domain || BCS(body)`, so equal
@@ -54,14 +54,16 @@ impl AttestBody {
         out
     }
 
-    /// The same slot, whatever the digest.
+    /// The same slot — (chain, genesis, epoch, round, author) — whatever the
+    /// digest and whatever the committee hash. This is what a guard key and an
+    /// equivocation are both about: a signer that attests two digests for one
+    /// slot has equivocated even if it claimed a different committee each time.
     pub fn same_slot(&self, other: &AttestBody) -> bool {
         self.chain_id == other.chain_id
             && self.genesis_identity == other.genesis_identity
             && self.epoch == other.epoch
             && self.round == other.round
             && self.author == other.author
-            && self.committee_hash == other.committee_hash
     }
 }
 
@@ -158,6 +160,24 @@ pub enum VcertError {
         claimed: String,
         recomputed: String,
     },
+    /// The guard already holds THIS digest for this slot, signed under another
+    /// committee hash. C_E is fixed for an epoch, so this is a committee
+    /// inconsistency on this node. It is not a second digest (so not a
+    /// `Conflict`), and it is never answered with a new signature.
+    CommitteeChangedWithinEpoch {
+        guarded: String,
+        requested: String,
+    },
+    /// The guard row for this slot is not a valid attestation of this slot by
+    /// this key. It is refused and never overwritten.
+    InvalidGuard(String),
+    /// The signer bitmap is not exactly `ceil(n / 8)` bytes. Honest collectors
+    /// always produce that length; any other is a second encoding of the same
+    /// certificate and an unbounded loop in the verifier.
+    NonCanonicalBitmap {
+        len: usize,
+        expected: usize,
+    },
     BadSignature(String),
     /// The attestation is not for this collector's slot.
     WrongSlot,
@@ -179,9 +199,17 @@ impl From<QcError> for VcertError {
 }
 
 /// CE-2. Checks, in order: version; chain and genesis; epoch (C_E is the
-/// committee of exactly one epoch); author membership; then the shared core —
-/// bitmap non-empty and in range, stake recomputed from C_E, strict quorum,
-/// `committee_hash` bound to C_E, and `fast_aggregate_verify`.
+/// committee of exactly one epoch); author membership with stake; canonical
+/// bitmap length; then the shared core — bitmap non-empty and in range, stake
+/// recomputed from C_E, strict quorum, `committee_hash` bound to C_E, and
+/// `fast_aggregate_verify`.
+///
+/// A set bit proves that the member's REGISTERED KEY signed, not that the member
+/// did: validator registration does not yet refuse a BLS key another member
+/// already holds, so two members can share one key. Lemma U is unaffected — the
+/// shared key still signs one digest per slot — but nothing downstream may read
+/// individual attribution, for rewards or evidence, from a bitmap until join
+/// rejects duplicate keys.
 pub fn verify_vertex_cert(
     cert: &VertexCertificate,
     committee: &[ValidatorInfo],
@@ -214,6 +242,13 @@ pub fn verify_vertex_cert(
     if !is_staked_member(committee, &body.author) {
         return Err(VcertError::AuthorNotInCommittee(body.author.clone()));
     }
+    let expected = committee.len().div_ceil(8);
+    if cert.signer_bitmap.len() != expected {
+        return Err(VcertError::NonCanonicalBitmap {
+            len: cert.signer_bitmap.len(),
+            expected,
+        });
+    }
     qc::verify_stake_aggregate(
         committee,
         &cert.signer_bitmap,
@@ -226,14 +261,21 @@ pub fn verify_vertex_cert(
     Ok(())
 }
 
-/// `{cg}` in the contract's durable keys: `hex(SHA256(chain_id || 0x00 ||
-/// genesis_identity))`. Scoping the guard to one chain and one genesis means a
-/// key reused on another chain never finds, or is blocked by, this chain's rows.
+/// `{cg}` in the contract's durable keys:
+/// `hex(SHA256(put(chain_id) || put(genesis_identity)))`, where `put` is a u64
+/// big-endian length prefix. Scoping the guard to one chain and one genesis
+/// means a key reused on another chain never finds, or is blocked by, this
+/// chain's rows.
+///
+/// The contract's first draft joined the two with a single 0x00 byte. That is
+/// not injective once either string contains 0x00: ("X\0Y", "Z") and
+/// ("X", "Y\0Z") hashed the same bytes, so two chains shared one guard row.
 pub fn chain_genesis_tag(chain_id: &str, genesis_identity: &str) -> String {
     let mut h = Sha256::new();
-    h.update(chain_id.as_bytes());
-    h.update([0u8]);
-    h.update(genesis_identity.as_bytes());
+    for field in [chain_id, genesis_identity] {
+        h.update((field.len() as u64).to_be_bytes());
+        h.update(field.as_bytes());
+    }
     hex::encode(h.finalize())
 }
 
@@ -271,27 +313,27 @@ impl AttestOutcome {
     }
 }
 
-/// AT-2: sign at most one digest per slot, durably, and release a signature
-/// only after its guard is committed.
+/// What AT-1 establishes about this node before it may sign anything.
+struct Attester {
+    seed: [u8; 32],
+    public_key: Vec<u8>,
+    guard_key: String,
+}
+
+/// AT-1, the preconditions this library can check: `self_address` is a
+/// committee member with positive stake, the author is a member with positive
+/// stake, `body.committee_hash` is this committee's hash, and the BLS key derived
+/// from `node_key` is the one the committee registered.
 ///
-/// Preconditions this library enforces (AT-1): `self_address` is a committee
-/// member with positive stake, the author is a member, `body.committee_hash`
-/// is this committee's hash, and the BLS key derived from `node_key` is the
-/// one the committee registered. Preconditions the CALLER owns, because they
-/// depend on node state this library does not see: E is the active epoch,
-/// g < round <= cursor + LEAD, IN-1 passed including every parent certificate,
-/// and guard continuity (RC-3).
-///
-/// The read, the decision and the write happen inside one `StateDB::transaction`,
-/// which holds the single writer gate: two concurrent requests for one slot are
-/// serialized, so exactly one of them can ever sign.
-pub fn attest_slot(
-    storage: &StateDB,
+/// The CALLER owns the rest, because they depend on node state this library
+/// does not see: E is the active epoch, g < round <= cursor + LEAD, IN-1 passed
+/// including every parent certificate, and guard continuity (RC-3).
+fn prepare(
     body: &AttestBody,
     committee: &[ValidatorInfo],
     node_key: &[u8; 32],
     self_address: &str,
-) -> Result<AttestOutcome, VcertError> {
+) -> Result<Attester, VcertError> {
     let ordered = canonical_order(committee);
     let me = ordered
         .iter()
@@ -308,8 +350,7 @@ pub fn attest_slot(
         });
     }
     let seed = derive_validator_bls_seed(node_key);
-    let bls = BLSEngine::consensus();
-    let public_key = bls.pubkey_raw(&seed);
+    let public_key = BLSEngine::consensus().pubkey_raw(&seed);
     let pk_hex = hex::encode(&public_key);
     if pk_hex != me.bls_public_key {
         return Err(VcertError::KeyMismatch {
@@ -317,49 +358,114 @@ pub fn attest_slot(
             registered: me.bls_public_key.clone(),
         });
     }
+    Ok(Attester {
+        seed,
+        public_key,
+        guard_key: attest_guard_key(body, &pk_hex),
+    })
+}
 
-    let key = attest_guard_key(body, &pk_hex);
-    let bytes = body.signing_bytes();
-
-    let outcome = storage
-        .transaction(|view| {
-            if let Some(raw) = view.get(&key)? {
-                let prior: VertexAttestation = serde_json::from_str(&raw).map_err(|e| {
-                    StorageError::DatabaseOperation(format!("vattest guard undecodable: {e}"))
-                })?;
-                // A persisted guard is trusted only if it is ours and verifies.
-                // A guard that fails either check is refused, never overwritten:
-                // overwriting would let corruption erase the evidence that this
-                // key already signed something for the slot.
-                let verifies = bls
-                    .verify(&prior.body.signing_bytes(), &prior.signature, &public_key)
-                    .unwrap_or(false);
-                if prior.signer != self_address || !verifies {
-                    return Err(StorageError::DatabaseOperation(
-                        "vattest guard is not a valid attestation by this key".into(),
-                    ));
-                }
-                return Ok(if prior.body == *body {
-                    AttestOutcome::Reused(prior)
-                } else {
-                    AttestOutcome::Conflict(prior)
-                });
-            }
-            let attestation = VertexAttestation {
-                body: body.clone(),
-                signer: self_address.to_string(),
-                signature: bls.sign_raw(&bytes, &seed),
-            };
-            let encoded = serde_json::to_string(&attestation)
-                .map_err(|e| StorageError::SerializationError(e.to_string()))?;
-            view.put(&key, &encoded)?;
-            // Signed and staged, NOT committed. A crash here must leave no guard
-            // and must not have released the signature.
-            #[cfg(test)]
-            vcert_crash_boundary(0);
-            Ok(AttestOutcome::Signed(attestation))
-        })
+/// AT-2's read, decide and stage, against whatever transaction view the caller
+/// supplies. Nothing is committed here.
+fn stage_attestation(
+    view: &StateDB,
+    body: &AttestBody,
+    self_address: &str,
+    attester: &Attester,
+) -> Result<AttestOutcome, VcertError> {
+    let bls = BLSEngine::consensus();
+    // Raw bytes, not `StateDB::get`: that returns `None` for a row that is not
+    // UTF-8, and a guard that silently reads as absent lets this key sign again.
+    let row = view
+        .db
+        .get(&attester.guard_key)
         .map_err(|e| VcertError::Storage(e.to_string()))?;
+    if let Some(row) = row {
+        let prior: VertexAttestation = serde_json::from_slice(&row)
+            .map_err(|e| VcertError::InvalidGuard(format!("undecodable: {e}")))?;
+        // Trusted only if it is an attestation of THIS slot, by this key, that
+        // verifies. Anything else is refused and never overwritten: overwriting
+        // would let corruption erase the evidence that this key already signed
+        // something for the slot.
+        let verifies = bls
+            .verify(
+                &prior.body.signing_bytes(),
+                &prior.signature,
+                &attester.public_key,
+            )
+            .unwrap_or(false);
+        if prior.signer != self_address || !prior.body.same_slot(body) || !verifies {
+            return Err(VcertError::InvalidGuard(
+                "the row is not a valid attestation of this slot by this key".into(),
+            ));
+        }
+        return if prior.body == *body {
+            Ok(AttestOutcome::Reused(prior))
+        } else if prior.body.digest == body.digest {
+            Err(VcertError::CommitteeChangedWithinEpoch {
+                guarded: prior.body.committee_hash,
+                requested: body.committee_hash.clone(),
+            })
+        } else {
+            Ok(AttestOutcome::Conflict(prior))
+        };
+    }
+    let attestation = VertexAttestation {
+        body: body.clone(),
+        signer: self_address.to_string(),
+        signature: bls.sign_raw(&body.signing_bytes(), &attester.seed),
+    };
+    let encoded =
+        serde_json::to_string(&attestation).map_err(|e| VcertError::Storage(e.to_string()))?;
+    view.put(&attester.guard_key, &encoded)
+        .map_err(|e| VcertError::Storage(e.to_string()))?;
+    // Signed and staged, NOT committed. A crash here must leave no guard and
+    // must not have released the signature.
+    #[cfg(test)]
+    vcert_crash_boundary(0);
+    Ok(AttestOutcome::Signed(attestation))
+}
+
+/// AT-2 inside the CALLER's transaction. This is the form the contract
+/// requires: the guard is read and written "in the same transaction that stages
+/// the body", so the self-attested digest and its staged body commit or abort
+/// together, which ST-2's eviction argument depends on.
+///
+/// Nothing is committed here. The caller must release a returned signature only
+/// after ITS transaction commits; if that transaction aborts, the guard row
+/// aborts with it and the signature must be discarded.
+pub fn attest_slot_in(
+    view: &StateDB,
+    body: &AttestBody,
+    committee: &[ValidatorInfo],
+    node_key: &[u8; 32],
+    self_address: &str,
+) -> Result<AttestOutcome, VcertError> {
+    let attester = prepare(body, committee, node_key, self_address)?;
+    stage_attestation(view, body, self_address, &attester)
+}
+
+/// AT-2 in a transaction of its own: sign at most one digest per slot, durably,
+/// and return a signature only after its guard is committed.
+///
+/// The read, the decision and the write run inside one `StateDB::transaction`,
+/// which holds that database instance's single writer gate, so two concurrent
+/// requests for one slot are serialized and exactly one can sign. One instance
+/// per directory is enforced by `StateDB::open`.
+pub fn attest_slot(
+    storage: &StateDB,
+    body: &AttestBody,
+    committee: &[ValidatorInfo],
+    node_key: &[u8; 32],
+    self_address: &str,
+) -> Result<AttestOutcome, VcertError> {
+    let attester = prepare(body, committee, node_key, self_address)?;
+    // A refusal stages nothing, so committing it writes nothing; only `Signed`
+    // stages a row. A storage read error fails the commit itself, which
+    // discards the signature together with its guard.
+    let outcome = storage
+        .transaction(|view| Ok(stage_attestation(&view, body, self_address, &attester)))
+        .map_err(|e| VcertError::Storage(e.to_string()))??;
     // Committed, not yet handed to the sender.
     #[cfg(test)]
     vcert_crash_boundary(1);
@@ -379,8 +485,9 @@ pub enum CollectOutcome {
     Pending { signed_stake: u128 },
     /// This signer's attestation for this body is already recorded.
     Duplicate,
-    /// A verified attestation for a DIFFERENT digest of this slot. It never
-    /// counts toward this certificate; it is kept as potential evidence.
+    /// A verified attestation for this slot that is not this exact body:
+    /// another digest, or this digest under another committee hash. It never
+    /// counts toward this certificate.
     Foreign,
     /// This call reached quorum. The certificate has already passed
     /// `verify_vertex_cert`. Returned exactly once per collector.
@@ -397,7 +504,9 @@ pub struct CertCollector {
     body: AttestBody,
     committee: Vec<ValidatorInfo>,
     ours: BTreeMap<usize, Vec<u8>>,
-    foreign: BTreeMap<usize, VertexAttestation>,
+    /// The first verified attestation each signer produced for this slot, of
+    /// any body. One per signer, so bounded by the committee size.
+    first_seen: BTreeMap<usize, VertexAttestation>,
     evidence: Vec<(VertexAttestation, VertexAttestation)>,
     certificate: Option<VertexCertificate>,
 }
@@ -419,7 +528,7 @@ impl CertCollector {
             body,
             committee,
             ours: BTreeMap::new(),
-            foreign: BTreeMap::new(),
+            first_seen: BTreeMap::new(),
             evidence: Vec::new(),
             certificate: None,
         })
@@ -453,19 +562,25 @@ impl CertCollector {
             return Err(VcertError::BadSignature(att.signer.clone()));
         }
 
-        if att.body.digest != self.body.digest {
-            if let Some(sig) = self.ours.get(&idx) {
-                self.note_equivocation(self.own_attestation(idx, sig), att.clone());
+        // ATTEST_EQUIV (CE-1): a signer seen with two digests for one slot,
+        // whether or not either digest is this collector's own, and whatever
+        // committee hash each claims.
+        match self.first_seen.get(&idx) {
+            Some(first) if first.body.digest != att.body.digest => {
+                let first = first.clone();
+                self.note_equivocation(first, att.clone());
             }
-            self.foreign.entry(idx).or_insert_with(|| att.clone());
+            Some(_) => {}
+            None => {
+                self.first_seen.insert(idx, att.clone());
+            }
+        }
+        if att.body != self.body {
             return Ok(CollectOutcome::Foreign);
         }
 
         if self.ours.contains_key(&idx) {
             return Ok(CollectOutcome::Duplicate);
-        }
-        if let Some(prior) = self.foreign.get(&idx).cloned() {
-            self.note_equivocation(prior, att.clone());
         }
         // A signer that also attested a twin still counts here: certificates
         // count valid attestations, and Lemma U rests on honest attesters never
@@ -510,14 +625,6 @@ impl CertCollector {
         )?;
         self.certificate = Some(cert.clone());
         Ok(CollectOutcome::Certified(Box::new(cert)))
-    }
-
-    fn own_attestation(&self, idx: usize, signature: &[u8]) -> VertexAttestation {
-        VertexAttestation {
-            body: self.body.clone(),
-            signer: self.committee[idx].address.clone(),
-            signature: signature.to_vec(),
-        }
     }
 
     /// One pair per signer. A pair is already complete evidence; recording every

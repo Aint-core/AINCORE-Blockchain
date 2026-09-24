@@ -833,6 +833,44 @@ and exits 1. A checker that has never been shown to detect anything is not evide
 this one has now been shown to detect the exact failure it previously missed.
 
 
+---
+
+### Found while reviewing G1 S1 — outside G1, handed to their owners
+
+Three independent reviewers attacked `vcert` (G1 S1) before it was pushed. Everything
+inside `vcert` and `StateDB::open` is fixed (`c2da08d` and the S1 review commit). These
+two are not G1's to fix, and both reach code that is **live today**.
+
+**DUP-BLS — a validator can register another validator's BLS key.** LOW for safety,
+real for attribution. `core/vm_move/stdlib/sources/staking.move:167-209` rejects only a
+duplicate *address*, and the join path (`core/executor/src/lib.rs` ~257) checks only the
+proof of possession — which does not bind an address. So B can register honest A's
+`bls_public_key` and PoP. A QC or vertex certificate can then set B's bit with only A's
+signature counted twice: demonstrated against `vcert::verify_vertex_cert`,
+`CertCollector` and the live `qc::verify_qc` alike.
+- *Lemma U / QC uniqueness are unaffected:* B's stake is counted only where A's key
+  signed, and an honest A signs one digest per slot.
+- *What breaks is attribution:* a set bit proves the registered key signed, not the
+  member. Nothing reads per-member attribution from a bitmap today; rewards,
+  participation metrics or evidence that ever do will be wrong.
+- *Fix:* `join_validator_set` must refuse a `bls_public_key` already in the set.
+  **Do not** instead make the verifier refuse committees with duplicate keys: anyone
+  able to join could then register a duplicate and halt all certification.
+- *Owner:* staking / G5.
+
+**RC3-PORT — a restart with a different `--port` empties every signing guard.**
+`node.key` lives at `{datadir}/node.key` (`core/node/src/main.rs:174`), but the
+database holding every guard is `{datadir}/validator_{port}.db`. The same key restarted
+with another `--port` gets a fresh, empty database: the live `qc_signing` guard, and
+later `vattest`, no longer remember what that key signed.
+- Today this is mitigated in practice because finality votes are deterministic, so a
+  node replaying from empty re-signs identical votes. It is not a guarantee: any
+  divergence in what the node would vote for becomes a second signature.
+- *Fix:* the contract's RC-3 `consensus:guard_origin` row, checked at boot against the
+  key actually in use, with abstention on mismatch. Must land with G1 S2+ wiring and
+  should cover `qc_signing` too.
+- *Owner:* G1 (RC-3), shared with whoever owns the QC producer.
+
 ## 4. Known UNWORKABLE — do not repeat
 
 1. **v3's E2 rule (design `:154-172`).** Unsound as written (P2-A). Its skip arm — "if the walked round-(r+1) set held ≥ 2/3 stake and `Σ_t votes(t) ≤ 1/3`: skip" — and its commit arm both quantify over **bodies the deciding node happens to hold**, so two honest nodes with different holdings decide differently. It violates AD-3 directly. E2 also depends on two mechanisms that do not exist: shadow rows "as compact form **plus parents**", which `to_compact_proof()` cannot produce (P2-B, `blockchain/src/lib.rs:454-461`), and a one-shadow-per-`(author,round)` cap that assumes k=2 twins when nothing bounds k (P2-C). **E2 must be discarded, not patched.**
