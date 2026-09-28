@@ -231,7 +231,8 @@ mod tests {
             sender,
             hex::encode(account_data.as_bytes())
         );
-        let _ = db.put(&object_key, &object_json);
+        let _seed = db.seeding();
+        db.put(&object_key, &object_json).unwrap();
 
         // 5. Sign a message
         let payload = b"test_payload";

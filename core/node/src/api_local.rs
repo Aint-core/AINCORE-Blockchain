@@ -2713,6 +2713,63 @@ mod tests {
         );
     }
 
+    /// G3 WG-1 runtime witness (S3b review): every RPC method, called with a
+    /// spread of parameter shapes, writes no consensus state and no
+    /// unclassified key. The method list is read from this file, so a new RPC
+    /// is covered without editing this test.
+    #[test]
+    fn no_rpc_method_writes_consensus_state() {
+        let source = include_str!("api_local.rs");
+        let start = source.find("fn handle_rpc_method(").unwrap();
+        let end = start + source[start..].find("\n}\n").unwrap();
+        let mut methods = std::collections::BTreeSet::new();
+        for line in source[start..end].lines().map(str::trim) {
+            if !line.starts_with('"') {
+                continue;
+            }
+            let Some(arrow) = line.find("=>") else {
+                continue;
+            };
+            for token in line[..arrow].split('|') {
+                let name = token.trim().trim_matches('"');
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    methods.insert(name.to_string());
+                }
+            }
+        }
+        assert!(
+            methods.len() > 40,
+            "positive control: {} methods",
+            methods.len()
+        );
+        let db = temp_db("rpc_wg1");
+        {
+            let _seed = db.seeding();
+            db.put("sys:chain_id", "AINCORE-TEST").unwrap();
+            db.put(&format!("obj:{}", "ab".repeat(32)), "{}").unwrap();
+        }
+        let v0 = state_commit::seed_genesis(&db).unwrap();
+        db.write_batch(v0.batch).unwrap();
+        let state = test_state(Arc::clone(&db));
+        let before = db.db.state_class_stats();
+        let addr = "ab".repeat(32);
+        for method in &methods {
+            for params in [
+                serde_json::json!([]),
+                serde_json::json!([addr]),
+                serde_json::json!([addr, "AIN"]),
+                serde_json::json!([1]),
+                serde_json::json!(["sys:chain_id"]),
+                serde_json::json!([{}]),
+            ] {
+                let _ = handle_rpc_method(method, params, &state);
+            }
+        }
+        let after = db.db.state_class_stats();
+        assert_eq!(after.state_outside_block, before.state_outside_block);
+        assert_eq!(after.unclassified, before.unclassified);
+    }
+
     /// G3 PF-1: the proof RPC answers a present and an absent key with
     /// proofs the client verifier accepts against the root, and refuses
     /// non-state keys and heights outside the proven range.
@@ -2778,7 +2835,10 @@ mod tests {
             db.put("sys:chain_id", "X").is_err(),
             "state outside any block is refused"
         );
-        db.put("no:such:template:rpc", "x").unwrap();
+        assert!(
+            db.put("no:such:template:rpc", "x").is_err(),
+            "an unclassified key is refused (CL-1)"
+        );
         let after = read(&state);
         assert_eq!(
             after["state_outside_block"].as_u64().unwrap(),
@@ -2894,7 +2954,7 @@ mod tests {
     #[test]
     fn test_transaction_receipt_endpoint_reads_executor_receipt() {
         let db = temp_db("tx_receipt");
-        let tx_hash = "abc123";
+        let tx_hash = "abc123".repeat(10) + "abcd";
         db.put(
             &format!("tx_receipt:{}", tx_hash),
             &serde_json::json!({

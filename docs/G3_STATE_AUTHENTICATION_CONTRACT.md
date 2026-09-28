@@ -627,6 +627,14 @@ counters, never values.
     refused write silently. A test pins that every key they write outside a block is
     non-state (`best_effort_production_writes_are_never_state`). The executor's epoch keys
     are state, but they are written inside the block transaction.
+  - **After the S3b review:**
+    - CL-1 is enforced too: an unclassified key is refused in every context, the block
+      transaction included.
+    - A batch with any operation other than put or delete (a range delete names no keys
+      the gate could check) is refused, even while seeding.
+    - Runtime witnesses: driving consensus rounds, a sync import of block 1, and every
+      RPC method (the list is read from the source) write no state outside a block and no
+      unclassified key, with no seeding guard alive.
   - **Witness C1′ (storage half):** a state write through every `StateDB` entry point
     outside the block transaction is refused. The entry points are put, delete, a mixed
     batch, `put_object`, the federation key, the economic config and a plain transaction.

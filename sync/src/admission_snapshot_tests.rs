@@ -243,9 +243,12 @@ fn held_qc_arriving_after_precheck_is_rechecked() {
     qc = consensus::qc::build_qc(&vote, &validators, &[0], &[signature]).unwrap();
     assert!(sync.validate_block(&block, 1, "genesis").is_ok());
     assert_ne!(qc.block_hash, block.header.hash);
-    sync.storage
-        .put("test:prepared_qc", &serde_json::to_string(&qc).unwrap())
-        .unwrap();
+    {
+        let _seed = sync.storage.seeding();
+        sync.storage
+            .put("test:prepared_qc", &serde_json::to_string(&qc).unwrap())
+            .unwrap();
+    }
     let expected = expected_after(&sync.storage, publish_prepared_qc);
     sync.before_execution_hook = Some(publish_prepared_qc);
     assert_eq!(sync.process_blocks(vec![block], 0), 0);

@@ -7,7 +7,11 @@ struct LocalDir(String);
 impl LocalDir {
     fn seeded() -> Self {
         let (node, path) = setup_dag(&format!("local-atomic-{}", rand::random::<u64>()));
-        node.storage.put("sys:epoch_interval", "1000000").unwrap();
+        // The real pin (the old `sys:epoch_interval` key did nothing).
+        let _seed = node.storage.seeding();
+        node.storage
+            .put("sys:config:epoch_block_interval", "1000000")
+            .unwrap();
         drop(node);
         Self(path)
     }

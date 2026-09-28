@@ -8143,7 +8143,7 @@ mod tests {
     /// nothing in any header disagrees. With a real commitment that write is
     /// detectable at the next block; today it is invisible forever.
     #[test]
-    #[ignore = "reproduces H6, an OPEN CRITICAL defect: RED by design until a state-derived commitment exists"]
+    #[ignore = "H6 witness, superseded by C1'/C2' (G3 S3): WG-1 now refuses this test's own out-of-band setup write, so it fails at setup, not on the property; kept until the gate owner reviews the replacement witnesses"]
     fn test_h6_state_root_is_blind_to_out_of_band_writes() {
         use storage::object::{Object, Owner};
 
@@ -8208,7 +8208,7 @@ mod tests {
     /// the consequence of the blindness above, and it is what makes state sync
     /// unsafe no matter how careful the receiving node is.
     #[test]
-    #[ignore = "reproduces H6, an OPEN CRITICAL defect: RED by design until a state-derived commitment exists"]
+    #[ignore = "H6 witness, superseded by C1'/C2' (G3 S3): WG-1 now refuses this test's own out-of-band setup write, so it fails at setup, not on the property; kept until the gate owner reviews the replacement witnesses"]
     fn test_h6_a_corrupted_state_snapshot_is_undetectable() {
         let db_a = temp_db("h6_corrupt_a");
         load_stdlib(&db_a);

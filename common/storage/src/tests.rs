@@ -52,6 +52,7 @@ mod tests {
         // release the directory.
         first
             .transaction(|view| {
+                let _seed = view.seeding();
                 view.put("k", "v").unwrap();
                 Ok(())
             })
@@ -91,6 +92,7 @@ mod tests {
     #[test]
     fn test_put_get_roundtrip() {
         let db = temp_db("put_get");
+        let _seed = db.seeding();
         db.put("hello", "world").unwrap();
         assert_eq!(db.get("hello").unwrap(), Some("world".to_string()));
     }
@@ -127,6 +129,7 @@ mod tests {
         let _ = fs::remove_dir_all(path);
         {
             let db = StateDB::open(path).expect("open");
+            let _seed = db.seeding();
             db.put("k1", "v1").unwrap();
             db.put("k2", "v2").unwrap();
             db.flush().expect("flush must succeed");
@@ -140,6 +143,7 @@ mod tests {
     #[test]
     fn test_delete() {
         let db = temp_db("delete");
+        let _seed = db.seeding();
         db.put("key1", "val1").unwrap();
         db.delete("key1").unwrap();
         assert_eq!(db.get("key1").unwrap(), None);
@@ -175,8 +179,10 @@ mod tests {
     #[test]
     fn test_tx_index_roundtrip() {
         let db = temp_db("tx_index");
-        db.index_transaction("0xdeadbeef", 99).unwrap();
-        assert_eq!(db.get_tx_block_height("0xdeadbeef"), Some(99));
+        // Real transaction hashes are 64 hex (the `tx_index` template).
+        let hash = "de".repeat(32);
+        db.index_transaction(&hash, 99).unwrap();
+        assert_eq!(db.get_tx_block_height(&hash), Some(99));
         assert_eq!(db.get_tx_block_height("0xnonexistent"), None);
     }
 
@@ -404,6 +410,7 @@ mod tests {
     #[test]
     fn test_scan_prefix() {
         let db = temp_db("scan_prefix");
+        let _seed = db.seeding();
         db.put("metric:cpu", "50").unwrap();
         db.put("metric:mem", "80").unwrap();
         db.put("other:key", "val").unwrap();
@@ -423,8 +430,10 @@ mod tests {
 
         // Insert 200 keys under one prefix and a stray key under another.
         for i in 0..200u32 {
+            let _seed = db.seeding();
             db.put(&format!("queue:{:04}", i), &i.to_string()).unwrap();
         }
+        let _seed = db.seeding();
         db.put("other:key", "1").unwrap();
 
         // Explicit limit is respected.
@@ -595,6 +604,7 @@ mod tests {
     #[test]
     fn test_overwrite_value() {
         let db = temp_db("overwrite");
+        let _seed = db.seeding();
         db.put("key", "v1").unwrap();
         assert_eq!(db.get("key").unwrap(), Some("v1".to_string()));
 

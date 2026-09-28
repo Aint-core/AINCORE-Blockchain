@@ -157,24 +157,49 @@ impl ReadStore {
         self.iterator(IteratorMode::From(prefix.as_ref(), Direction::Forward))
     }
 
-    /// G3 WG-1: consensus state is written only inside the block transaction.
-    /// Anywhere else the whole batch is refused and nothing is written.
-    fn refuse_state_outside_block<'k>(
+    /// The write gate, enforced from G3 S3.
+    /// - CL-1: every key must be classified, in every context.
+    /// - WG-1: consensus state is written only inside the block transaction.
+    /// - Only plain puts and deletes pass. A range delete names no keys the
+    ///   gate could check, so it is refused.
+    ///
+    /// A refused batch is refused whole: nothing in it is written.
+    fn gate<'k>(
         &self,
         ctx: WriteContext,
-        mut keys: impl Iterator<Item = &'k [u8]>,
+        keys: impl Iterator<Item = &'k [u8]>,
+        visited: usize,
+        batch_len: usize,
     ) -> Result<(), StorageError> {
-        if ctx == WriteContext::Block || self.shared.seeding.load(Ordering::Acquire) > 0 {
+        // Refused even while seeding: the binding would not stage it.
+        if visited != batch_len {
+            return Err(StorageError::WriteGate(format!(
+                "a batch with {} operations other than put or delete (range delete?)",
+                batch_len - visited
+            )));
+        }
+        if self.shared.seeding.load(Ordering::Acquire) > 0 {
             return Ok(());
         }
-        match keys.find(|key| classify(key) == Some(KeyClass::State)) {
-            Some(key) => Err(StorageError::WriteGate(format!(
-                "state key {} written outside the block transaction ({} context)",
-                crate::class::mask(key),
-                ctx.as_str()
-            ))),
-            None => Ok(()),
+        for key in keys {
+            match classify(key) {
+                None => {
+                    return Err(StorageError::WriteGate(format!(
+                        "unclassified key {} (CL-1)",
+                        crate::class::mask(key)
+                    )))
+                }
+                Some(KeyClass::State) if ctx != WriteContext::Block => {
+                    return Err(StorageError::WriteGate(format!(
+                        "state key {} written outside the block transaction ({} context)",
+                        crate::class::mask(key),
+                        ctx.as_str()
+                    )))
+                }
+                Some(_) => {}
+            }
         }
+        Ok(())
     }
 
     pub(crate) fn write(&self, batch: WriteBatch) -> Result<(), StorageError> {
@@ -189,7 +214,12 @@ impl ReadStore {
             for key in collected.changes.keys() {
                 self.shared.observer.observe(key, ctx);
             }
-            self.refuse_state_outside_block(ctx, collected.changes.keys().map(Vec::as_slice))?;
+            self.gate(
+                ctx,
+                collected.changes.keys().map(Vec::as_slice),
+                collected.count,
+                batch.len(),
+            )?;
             if stage.sealed.load(Ordering::Acquire)
                 && collected
                     .changes
@@ -198,13 +228,6 @@ impl ReadStore {
             {
                 stage.seal_violated.store(true, Ordering::Release);
             }
-            // The binding only visits default-column puts/deletes. Never silently
-            // omit other operation kinds from a transaction's commit.
-            assert_eq!(
-                collected.count,
-                batch.len(),
-                "unsupported staged batch operation"
-            );
             let mut changes = stage.changes.lock().expect("transaction changes poisoned");
             stage.check_active();
             changes.extend(collected.changes);
@@ -215,10 +238,16 @@ impl ReadStore {
             // transient copy per base write, which the observer accepts.
             let mut keys = BatchKeys::default();
             batch.iterate(&mut keys);
-            for key in &keys.0 {
+            for key in &keys.keys {
                 self.shared.observer.observe(key, ctx);
             }
-            self.refuse_state_outside_block(ctx, keys.0.iter().map(|key| &key[..]))?;
+            self.gate(
+                ctx,
+                keys.keys.iter().map(|key| &key[..]),
+                keys.keys.len(),
+                batch.len(),
+            )?;
+
             let _guard = self
                 .shared
                 .writers
@@ -303,16 +332,20 @@ impl ReadStore {
 }
 
 /// The keys of a batch, without copying its values.
+/// The keys of a base batch's plain puts and deletes. Any other operation
+/// is not visited, so `keys.len() < batch.len()` reveals it.
 #[derive(Default)]
-struct BatchKeys(Vec<Box<[u8]>>);
+struct BatchKeys {
+    keys: Vec<Box<[u8]>>,
+}
 
 impl WriteBatchIterator for BatchKeys {
     fn put(&mut self, key: Box<[u8]>, _value: Box<[u8]>) {
-        self.0.push(key);
+        self.keys.push(key);
     }
 
     fn delete(&mut self, key: Box<[u8]>) {
-        self.0.push(key);
+        self.keys.push(key);
     }
 }
 
@@ -537,6 +570,7 @@ mod tests {
     fn staged_reads_scans_and_batches_commit_together() {
         let dir = TempDir::new();
         let db = dir.open();
+        let _seed = db.seeding();
         db.put("p:a", "old").unwrap();
         db.put("p:c", "keep").unwrap();
         db.put("q:a", "other").unwrap();
@@ -585,6 +619,7 @@ mod tests {
     fn rejected_transaction_discards_writes_and_seals_escaped_view() {
         let dir = TempDir::new();
         let db = dir.open();
+        let _seed = db.seeding();
         db.put("key", "old").unwrap();
         let before = rows(&db);
         let mut escaped = None;
@@ -614,6 +649,8 @@ mod tests {
     fn iterator_retains_staged_snapshot_while_view_changes() {
         let dir = TempDir::new();
         let db = dir.open();
+        // Mechanics only: generic keys, written under the test guard.
+        let _seed = db.seeding();
         db.transaction(|view| {
             view.put("key", "first")?;
             let iter = view.db.iterator(IteratorMode::Start);
@@ -639,6 +676,7 @@ mod tests {
         let dir = TempDir::new();
         {
             let db = dir.open();
+            let _seed = db.seeding();
             db.put("key", "old").unwrap();
         }
         let db = StateDB {
@@ -689,6 +727,7 @@ mod tests {
     fn outside_write_is_ordered_after_transaction() {
         let dir = TempDir::new();
         let db = Arc::new(dir.open());
+        let _seed = db.seeding();
         db.put("key", "old").unwrap();
         let mut writer = None;
         db.transaction(|view| {

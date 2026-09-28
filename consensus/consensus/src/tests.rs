@@ -284,6 +284,32 @@ mod tests {
     /// This catches any drift between the in-memory consensus state and
     /// the persisted state — historically a class of bug that lets a
     /// crashed node restart on a stale chain tip.
+    /// G3 WG-1 runtime witness (S3b review): driving consensus rounds, which
+    /// build and commit blocks, writes consensus state only inside block
+    /// transactions and writes no unclassified key. No seeding guard is alive
+    /// during the drive, so any such write would be refused and counted.
+    #[test]
+    fn consensus_rounds_write_state_only_inside_blocks() {
+        let (mut consensus, path) = setup_dag("wg1_drive");
+        let before = consensus.storage.db.state_class_stats();
+        for _ in 0..8 {
+            consensus.try_create_vertex();
+        }
+        let after = consensus.storage.db.state_class_stats();
+        assert!(
+            consensus.latest_block_height >= 1,
+            "positive control: blocks were committed"
+        );
+        assert!(
+            after.writes > before.writes,
+            "positive control: writes happened"
+        );
+        assert_eq!(after.state_outside_block, before.state_outside_block);
+        assert_eq!(after.unclassified, before.unclassified);
+        drop(consensus);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
     #[test]
     fn test_block_commit_keeps_consensus_and_storage_in_sync() {
         let (mut consensus, path) = setup_dag("commit_sync_invariant");

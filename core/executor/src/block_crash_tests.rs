@@ -145,7 +145,7 @@ fn admission_sees_parent_state_and_rejected_execution_remains_retryable() {
                     view.get("sys:last_executed_height").unwrap().as_deref(),
                     Some("1")
                 );
-                view.put("test:acceptance", "staged").unwrap();
+                view.put("consensus:last_adopted_height", "staged").unwrap();
                 Err("reject staged result".into())
             },
         )
@@ -164,7 +164,7 @@ fn admission_sees_parent_state_and_rejected_execution_remains_retryable() {
             },
             |summary, view| {
                 assert_eq!(summary.tx_count, 2);
-                view.put("test:acceptance", "committed")
+                view.put("consensus:last_adopted_height", "committed")
                     .map_err(|e| e.to_string())
             },
         )
@@ -173,7 +173,7 @@ fn admission_sees_parent_state_and_rejected_execution_remains_retryable() {
     let after = rows(&db);
     assert_ne!(after, before);
     assert_eq!(
-        db.get("test:acceptance").unwrap().as_deref(),
+        db.get("consensus:last_adopted_height").unwrap().as_deref(),
         Some("committed")
     );
     db.flush().unwrap();

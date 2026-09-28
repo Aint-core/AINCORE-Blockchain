@@ -750,7 +750,12 @@ mod tests {
         rehash_block(&mut block);
         authenticate_block(&sync, &mut block);
 
+        let before = sync.storage.db.state_class_stats();
         assert_eq!(sync.process_blocks(vec![block], 0), 1, "block 1 imported");
+        // WG-1 runtime witness: the import wrote state only in its block.
+        let after = sync.storage.db.state_class_stats();
+        assert_eq!(after.state_outside_block, before.state_outside_block);
+        assert_eq!(after.unclassified, before.unclassified);
         assert_eq!(
             state_commit::latest_version(&sync.storage).unwrap(),
             Some(1)
@@ -1273,10 +1278,14 @@ mod tests {
         // fail.
         let zeds = "z".repeat(64);
         let shaped = ["../sys:validators", "vertex:evil", zeds.as_str(), "short", ""];
-        for bad in shaped {
-            cs.storage
-                .put(&format!("vertex:{}", bad), "LEAKED")
-                .unwrap();
+        {
+            // Deliberately malformed keys: only the test may write them.
+            let _seed = cs.storage.seeding();
+            for bad in shaped {
+                cs.storage
+                    .put(&format!("vertex:{}", bad), "LEAKED")
+                    .unwrap();
+            }
         }
         for bad in shaped {
             let resp = cs.handle_vertex_request(VertexRequest {

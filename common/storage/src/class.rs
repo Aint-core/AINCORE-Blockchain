@@ -681,8 +681,17 @@ mod tests {
             .expect("the block transaction writes state");
         db.put("latest_height", "1")
             .expect("chain data on base: fine");
-        db.put("no:such:template", "x")
-            .expect("unclassified: counted, not refused");
+        assert!(
+            refused(db.put("no:such:template", "x")),
+            "unclassified (CL-1)"
+        );
+        let mut ranged = rocksdb::WriteBatch::default();
+        ranged.delete_range("obj:", "obj;");
+        assert!(
+            refused(db.write_batch(ranged)),
+            "a range delete names no keys"
+        );
+        assert_eq!(db.get(&state_key).unwrap().as_deref(), Some("block"));
         assert_eq!(db.get(&state_key).unwrap().as_deref(), Some("block"));
 
         {
@@ -723,7 +732,7 @@ mod tests {
         assert_eq!(patterns.len(), MAX_SAMPLES + 50, "positive control");
         for key in &patterns {
             assert_eq!(classify(key.as_bytes()), None, "{key} must be unclassified");
-            db.put(key, "x").unwrap();
+            assert!(db.put(key, "x").is_err(), "refused (CL-1), still counted");
         }
         let s = db.db.state_class_stats();
         assert_eq!(s.unclassified as usize, MAX_SAMPLES + 50);
@@ -845,6 +854,15 @@ mod best_effort_writes {
             format!("sys:equiv_local_jail:{h}"),
             "consensus:beacon_folded_qc_height".to_string(),
             "consensus:beacon_folded_anchor_round".to_string(),
+            "consensus:last_adopted_height".to_string(),
+            "latest_proposed_round".to_string(),
+            format!("peer:{h}"),
+            format!("peer_ip:{h}"),
+            "dag:checkpoint:7".to_string(),
+            "dag:checkpoint:latest".to_string(),
+            "da_commitment_5".to_string(),
+            "da_data_5".to_string(),
+            "da_meta_5".to_string(),
             "sys:da:signing_key_enc_v1".to_string(),
             "sys:da:signing_key".to_string(),
             "da_root_5".to_string(),

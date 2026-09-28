@@ -469,15 +469,19 @@ mod pqc_phase21 {
         let db = temp_db("binding");
         let (sender_a, pk_a, sk_a, chain_id, payload) = fresh_pqc_identity();
         // Register A's pubkey, but the tx claims sender B (different address).
+        let _seed = db.seeding();
         db.put(
-            &format!("pqc_pubkey_{}", "11111111111111111111111111111111"),
+            &format!(
+                "pqc_pubkey_{}",
+                "1111111111111111111111111111111111111111111111111111111111111111"
+            ),
             &hex::encode(&pk_a),
         )
         .unwrap();
         let _ = sender_a;
         // Sign with A's secret key but bind to the spoofed sender so the
         // mempool's storage lookup actually finds the pubkey.
-        let spoofed = "11111111111111111111111111111111";
+        let spoofed = "1111111111111111111111111111111111111111111111111111111111111111";
         let sig_hex = sign_pqc_message(&sk_a, &chain_id, spoofed, &payload, 0);
 
         let mut mempool = Mempool::with_storage(db);
