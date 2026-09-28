@@ -10,7 +10,7 @@ fn make_test_tx(index: usize) -> String {
     let sender = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
 
     let chain_id =
-        std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+        blockchain::chain_id();
     let payload_struct =
         vm_move::TransactionPayload::PublishModule(vec![index.to_le_bytes().to_vec()]);
     let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
@@ -51,7 +51,7 @@ fn make_test_tx_distinct_sender(seed_byte: u8) -> String {
     let public_key = hex::encode(signing_key.verifying_key().to_bytes());
     let sender = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
     let chain_id =
-        std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+        blockchain::chain_id();
     let payload_struct =
         vm_move::TransactionPayload::PublishModule(vec![vec![seed_byte; 4]]);
     let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
@@ -91,7 +91,7 @@ fn make_test_tx_with_payload_and_gas(
     let public_key = hex::encode(signing_key.verifying_key().to_bytes());
     let sender = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
     let chain_id =
-        std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+        blockchain::chain_id();
     let sequence_number = index as u64;
     // F4: bind gas_limit/gas_price/input_objects (input_objects=[] here).
     let message = format!(
@@ -258,8 +258,7 @@ fn test_oversized_tx_rejected_before_signature_verification() {
     let huge_payload = "ab".repeat(60 * 1024); // 120_000 bytes
 
     let tx = serde_json::json!({
-        "chain_id": std::env::var("AINCORE_CHAIN_ID")
-            .unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string()),
+        "chain_id": blockchain::chain_id(),
         "sender": "deadbeefdeadbeefdeadbeefdeadbeef",
         "input_objects": [],
         "payload": huge_payload,
@@ -308,7 +307,7 @@ fn test_pqc_signature_rejected_at_mempool_when_storage_absent() {
     let mut mempool = Mempool::new();
 
     let chain_id =
-        std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+        blockchain::chain_id();
     // 9254 hex chars = 4627 bytes raw = Dilithium5 detached signature length.
     let fake_pqc_sig = "ab".repeat(9254 / 2);
     assert_eq!(fake_pqc_sig.len(), 9254);
@@ -400,7 +399,7 @@ mod pqc_phase21 {
         let pk_bytes = pk.as_bytes().to_vec();
         let sender = crypto::derive_address(&pk_bytes).unwrap();
         let chain_id =
-            std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+            blockchain::chain_id();
         let payload = hex::encode(
             bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![9u8]])).unwrap(),
         );
@@ -554,7 +553,7 @@ fn test_zkp_garbage_hex_rejected_with_specific_diagnostic() {
     let public_key = hex::encode(signing_key.verifying_key().to_bytes());
     let sender = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
     let chain_id =
-        std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+        blockchain::chain_id();
     let payload = hex::encode(
         bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![7u8]])).unwrap(),
     );
@@ -619,7 +618,7 @@ fn test_zkp_replayed_proof_with_wrong_binding_rejected() {
     let public_key = hex::encode(signing_key.verifying_key().to_bytes());
     let sender = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
     let chain_id =
-        std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+        blockchain::chain_id();
     let payload = hex::encode(
         bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![7u8]])).unwrap(),
     );
@@ -683,7 +682,7 @@ fn pwn007_proper_replay_with_reordered_keys_rejected() {
     let pk = hex::encode(sk.verifying_key().to_bytes());
     let sender = crypto::derive_address(sk.verifying_key().as_bytes()).unwrap();
     let chain_id =
-        std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+        blockchain::chain_id();
     let payload = hex::encode(
         bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![
             b"pwn007".to_vec()
@@ -771,7 +770,7 @@ mod fee_market_admission {
         let public_key = hex::encode(signing_key.verifying_key().to_bytes());
         let sender = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
         let chain_id =
-            std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+            blockchain::chain_id();
         // Vary payload bytes by (seed, seq) so no two test txs collide on dedup.
         let payload_struct =
             vm_move::TransactionPayload::PublishModule(vec![vec![seed_byte, seq as u8]]);
@@ -1114,4 +1113,15 @@ fn test_gas_limit_above_protocol_ceiling_is_rejected() {
         mempool.add_transaction(ok_tx).is_ok(),
         "a transaction at exactly MAX_GAS_LIMIT must still be accepted"
     );
+}
+
+/// G3 FX-6: admission checks the chain id installed from `sys:chain_id`. The
+/// env is not a source; it is set here, naming another chain, only to prove
+/// that nothing reads it. Boot refuses such an env.
+#[test]
+fn admission_never_reads_the_chain_id_env() {
+    std::env::set_var("AINCORE_CHAIN_ID", "AINCORE-SOME-OTHER-CHAIN");
+    let result = Mempool::new().add_transaction(make_test_tx(0));
+    std::env::remove_var("AINCORE_CHAIN_ID");
+    result.expect("a transaction for the installed chain is admitted");
 }

@@ -203,9 +203,9 @@ impl Mempool {
         }
 
         // === CHAIN ID VALIDATION ===
-        // L5 FIX: Match mainnet genesis default to prevent unexpected rejections
-        let expected_chain =
-            std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string());
+        // `sys:chain_id`, installed at boot (G3 FX-6), the same value the
+        // executor checks. The env is not a source.
+        let expected_chain = blockchain::chain_id();
 
         // Parse the transaction to enforce Chain ID early
         use executor::Transaction;

@@ -4,6 +4,16 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# G3 FX-8 removed aincore_faucet, which this gate used to fund Alice and to
+# register Bob: it wrote balances into one node's database outside consensus.
+# Genesis gives no account a spendable balance (validator CoinStores start at
+# 0), so the gate now needs a funded key (for example the validator's, once it
+# has earned block rewards) that sends Alice a signed transfer. Until that is written, stop here with the reason instead of
+# failing later on an RPC error.
+echo "phase4 gate: aincore_faucet was removed (G3 FX-8); fund the test wallets" \
+     "with a signed transfer from a funded key before re-enabling this gate" >&2
+exit 2
+
 SOAK_SECONDS="${AINCORE_PHASE4_SECONDS:-45}"
 P2P_PORT="${AINCORE_PHASE4_P2P_PORT:-19100}"
 RPC_PORT="${AINCORE_PHASE4_RPC_PORT:-18100}"

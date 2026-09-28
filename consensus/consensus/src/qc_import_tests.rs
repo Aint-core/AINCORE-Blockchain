@@ -41,8 +41,7 @@ fn run_child(dir: &TestDir, boundary: Option<u8>) {
             "qc_producer::tests::persistence::imported::import_child",
             "--nocapture",
         ])
-        .env("AINCORE_TEST_QC_IMPORT_DB", &dir.0)
-        .env("AINCORE_CHAIN_ID", "AINCORE-MAINNET-1");
+        .env("AINCORE_TEST_QC_IMPORT_DB", &dir.0);
     if let Some(boundary) = boundary {
         command.env("AINCORE_TEST_QC_IMPORT_BOUNDARY", boundary.to_string());
     }

@@ -487,6 +487,25 @@ ran**. "0 tests ran", or an unapplied mutant, must never count as green.
 | **S0** | `state_class` in **observe mode** (CL-1, WG-1 counted, not refused); FX-1, FX-2, FX-3, FX-6, FX-8, FX-11; the gated test-seeding API. FX-14 ships separately and first (live halt path). | **No.** Rolling deploy; the counters show what enforcement would refuse. |
 | S1 | `StateCommitment` + `jmt` backend as a library: apply with CM-7 sequencing, prove, range proof, restore per SN-2; DT-2 and PF vectors; T storage (CM-8) | No |
 
+**S0 status (branch `audit/mainnet-hardening`, rolling).**
+- Part a is live: the classifier in observe mode, which classifies the FX-2 committee keys
+  as S; FX-1; the rent read and `update_validator_weight` removed.
+- Part b:
+  - **FX-6:** `blockchain::chain_id()` is the one accessor for transaction admission,
+    execution and QC signing and verification. The node installs it from `sys:chain_id`
+    at boot. The env is never read. Boot refuses to start when `sys:chain_id` is
+    missing, or when `AINCORE_CHAIN_ID` names another chain. The epoch interval comes
+    only from the genesis pin, and boot refuses a missing pin or an env that disagrees
+    with it. The node test race is gone: 10 of 10 parallel runs are green, where it used
+    to be 19 of 20 red, and the stopgap test lock is removed.
+  - **FX-8:** `aincore_faucet` and `aincore_testMintWbtc` are removed. The names answer
+    `-32030` with the reason, and nothing is written. The unverified snapshot install is
+    still there; it goes with SN.
+- Still open in S0:
+  - FX-3, which waits for the founder's governance decision;
+  - the rest of FX-11. `promote_downtime` is kept on purpose, and the downtime branches
+    wait for S2.
+
 **S1 notes.**
 - It lives in `common/state_commit` and pins `jmt = "=0.12.0"`, the version P1–P9 were
   measured on.

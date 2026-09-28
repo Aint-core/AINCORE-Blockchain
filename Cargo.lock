@@ -4794,6 +4794,7 @@ name = "mempool"
 version = "0.1.0"
 dependencies = [
  "bcs",
+ "blockchain",
  "crypto",
  "ed25519-dalek",
  "executor",

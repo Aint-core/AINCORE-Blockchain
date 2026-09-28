@@ -37,7 +37,6 @@ impl LocalDir {
             ])
             .env("AINCORE_TEST_LOCAL_DB", &self.0)
             .env("AINCORE_TEST_LOCAL_MODE", mode)
-            .env("AINCORE_CHAIN_ID", "AINCORE-MAINNET-1")
             .output()
             .unwrap();
         assert_eq!(

@@ -436,219 +436,6 @@ fn coin_balance(
     }))
 }
 
-/// Canonical mainnet chain id. Mirrors the default used by the mempool
-/// (`core/mempool/src/lib.rs`) and genesis (`core/node/src/genesis.rs`).
-const MAINNET_CHAIN_ID: &str = "AINCORE-MAINNET-1";
-
-/// Resolve the node's chain id using the same env contract as the mempool:
-/// `AINCORE_CHAIN_ID`, defaulting to the mainnet id when unset.
-fn resolve_chain_id() -> String {
-    std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| MAINNET_CHAIN_ID.to_string())
-}
-
-/// M2: Hard safety gate for ALL direct-write faucet/test-mint paths.
-///
-/// The faucet writes balances straight into RocksDB CoinStore keys, bypassing
-/// the executor, supply accounting and `BLOCK_EXECUTION_LOCK`. On mainnet that
-/// would be an unlimited-mint + state-root-race + supply-desync hole, so we
-/// refuse unconditionally when the resolved chain id is the mainnet id --
-/// EVEN IF `AINCORE_ENABLE_FAUCET` is set. Dev/testnet nodes (any other
-/// `AINCORE_CHAIN_ID`) are unaffected.
-fn faucet_chain_guard() -> Result<(), JsonRpcError> {
-    let chain_id = resolve_chain_id();
-    if chain_id == MAINNET_CHAIN_ID {
-        eprintln!(
-            "[SECURITY] Faucet/test-mint RPC refused: chain_id={} is mainnet. \
-             Direct-write faucet is permanently disabled on mainnet regardless of \
-             AINCORE_ENABLE_FAUCET. Set AINCORE_CHAIN_ID to a testnet id to use it.",
-            chain_id
-        );
-        return Err(JsonRpcError {
-            code: -32041,
-            message: "Faucet permanently disabled on mainnet (AINCORE-MAINNET-1).".into(),
-        });
-    }
-    Ok(())
-}
-
-fn faucet_enabled() -> bool {
-    std::env::var("AINCORE_ENABLE_FAUCET")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
-}
-
-fn credit_testnet_faucet(
-    storage: &Arc<StateDB>,
-    addr: &str,
-    amount: u128,
-    public_key_hex: Option<&str>,
-) -> Result<serde_json::Value, JsonRpcError> {
-    // M2: Mainnet refusal FIRST — never mints on AINCORE-MAINNET-1 even if the
-    // enable flag is set. Dev/testnet continues past this.
-    faucet_chain_guard()?;
-    if !faucet_enabled() {
-        return Err(JsonRpcError {
-            code: -32030,
-            message: "Faucet disabled. This RPC writes balances straight into one node's \
-                      database, bypassing consensus, which forks a multi-node network; \
-                      it is for single-node local tests only."
-                .into(),
-        });
-    }
-
-    let move_addr =
-        move_core_types::account_address::AccountAddress::from_hex_literal(&format!("0x{}", addr))
-            .map_err(|_| JsonRpcError {
-                code: -32602,
-                message: "Invalid address".into(),
-            })?;
-
-    if let Some(public_key) = public_key_hex {
-        let public_key_bytes = hex::decode(public_key).map_err(|_| JsonRpcError {
-            code: -32602,
-            message: "Invalid public key hex".into(),
-        })?;
-        let expected_addr =
-            crypto::derive_address(&public_key_bytes).map_err(|e| JsonRpcError {
-                code: -32602,
-                message: format!("Address derivation failed: {}", e),
-            })?;
-        if expected_addr != addr {
-            return Err(JsonRpcError {
-                code: -32602,
-                message: format!("Public key/address mismatch: expected {}", expected_addr),
-            });
-        }
-        if storage.get_object(addr).is_none() {
-            let account =
-                aa::AccountManager::create_account(addr.to_string(), public_key.to_string());
-            storage.put_object(&account).map_err(|e| JsonRpcError {
-                code: -32000,
-                message: format!("Failed to create faucet account: {}", e),
-            })?;
-        }
-    }
-
-    let key = move_coin_store_key(move_addr);
-    let current = storage
-        .get(&key)
-        .map_err(|e| JsonRpcError {
-            code: -32000,
-            message: format!("Failed to read CoinStore: {}", e),
-        })?
-        .and_then(|hex_value| hex::decode(hex_value).ok())
-        .and_then(|bytes| bcs::from_bytes::<MoveCoin>(&bytes).ok())
-        .map(|coin| coin.value)
-        .unwrap_or(0);
-    let new_balance = current.checked_add(amount).ok_or_else(|| JsonRpcError {
-        code: -32602,
-        message: "Faucet amount overflows balance".into(),
-    })?;
-    let bytes = bcs::to_bytes(&MoveCoin { value: new_balance }).map_err(|e| JsonRpcError {
-        code: -32000,
-        message: format!("Failed to encode CoinStore: {}", e),
-    })?;
-    storage
-        .put(&key, &hex::encode(bytes))
-        .map_err(|e| JsonRpcError {
-            code: -32000,
-            message: format!("Failed to write CoinStore: {}", e),
-        })?;
-
-    Ok(serde_json::json!({
-        "address": addr,
-        "amount": amount.to_string(),
-        "move_balance": new_balance.to_string(),
-        "balance_source": "move_coin_store",
-        "faucet_mode": "local_testnet_only"
-    }))
-}
-
-fn credit_testnet_wbtc(
-    storage: &Arc<StateDB>,
-    addr: &str,
-    amount: u128,
-    public_key_hex: Option<&str>,
-) -> Result<serde_json::Value, JsonRpcError> {
-    // M2: Mainnet refusal FIRST — never mints on AINCORE-MAINNET-1 even if the
-    // enable flag is set. Dev/testnet continues past this.
-    faucet_chain_guard()?;
-    if !faucet_enabled() {
-        return Err(JsonRpcError {
-            code: -32030,
-            message: "Test WBTC mint disabled. Set AINCORE_ENABLE_FAUCET=1 for local/testnet smoke tests."
-                .into(),
-        });
-    }
-
-    let move_addr =
-        move_core_types::account_address::AccountAddress::from_hex_literal(&format!("0x{}", addr))
-            .map_err(|_| JsonRpcError {
-                code: -32602,
-                message: "Invalid address".into(),
-            })?;
-
-    if let Some(public_key) = public_key_hex {
-        let public_key_bytes = hex::decode(public_key).map_err(|_| JsonRpcError {
-            code: -32602,
-            message: "Invalid public key hex".into(),
-        })?;
-        let expected_addr =
-            crypto::derive_address(&public_key_bytes).map_err(|e| JsonRpcError {
-                code: -32602,
-                message: format!("Address derivation failed: {}", e),
-            })?;
-        if expected_addr != addr {
-            return Err(JsonRpcError {
-                code: -32602,
-                message: format!("Public key/address mismatch: expected {}", expected_addr),
-            });
-        }
-        if storage.get_object(addr).is_none() {
-            let account =
-                aa::AccountManager::create_account(addr.to_string(), public_key.to_string());
-            storage.put_object(&account).map_err(|e| JsonRpcError {
-                code: -32000,
-                message: format!("Failed to create faucet account: {}", e),
-            })?;
-        }
-    }
-
-    let key = wbtc_coin_store_key(move_addr);
-    let current = storage
-        .get(&key)
-        .map_err(|e| JsonRpcError {
-            code: -32000,
-            message: format!("Failed to read WBTC CoinStore: {}", e),
-        })?
-        .and_then(|hex_value| hex::decode(hex_value).ok())
-        .and_then(|bytes| bcs::from_bytes::<MoveCoin>(&bytes).ok())
-        .map(|coin| coin.value)
-        .unwrap_or(0);
-    let new_balance = current.checked_add(amount).ok_or_else(|| JsonRpcError {
-        code: -32602,
-        message: "Test WBTC amount overflows balance".into(),
-    })?;
-    let bytes = bcs::to_bytes(&MoveCoin { value: new_balance }).map_err(|e| JsonRpcError {
-        code: -32000,
-        message: format!("Failed to encode WBTC CoinStore: {}", e),
-    })?;
-    storage
-        .put(&key, &hex::encode(bytes))
-        .map_err(|e| JsonRpcError {
-            code: -32000,
-            message: format!("Failed to write WBTC CoinStore: {}", e),
-        })?;
-
-    Ok(serde_json::json!({
-        "address": addr,
-        "amount": amount.to_string(),
-        "wbtc_balance": new_balance.to_string(),
-        "balance_source": "move_coin_store",
-        "faucet_mode": "local_testnet_only"
-    }))
-}
-
 fn estimate_payload_gas(payload: &str) -> u64 {
     let bytes = match hex::decode(payload.trim_start_matches("0x")) {
         Ok(bytes) => bytes,
@@ -913,37 +700,18 @@ fn handle_rpc_method(
                 message: "submit_transaction_with_key disabled in secure mode; submit signed transaction via aincore_sendTransaction".into(),
             })
         },
-        "aincore_faucet" => {
-            // params: [address, amount?, public_key?]
-            if let Some(addr) = params.get(0).and_then(|v| v.as_str()) {
-                let amount = params.get(1)
-                    .and_then(|v| v.as_str().and_then(|s| s.parse::<u128>().ok()).or_else(|| v.as_u64().map(|n| n as u128)))
-                    .unwrap_or(1_000_000_000_000_000_000);
-                let public_key = params.get(2).and_then(|v| v.as_str());
-                credit_testnet_faucet(&data.storage, addr, amount, public_key)
-            } else {
-                Err(JsonRpcError { code: -32602, message: "Invalid params: [address, amount?, public_key?]".into() })
-            }
-        },
-        "aincore_testMintWbtc" => {
-            // params: [address, amount, public_key?]
-            //
-            // Local/testnet-only helper for DEX market seeding. This never
-            // represents real BTC custody; production WBTC minting must go
-            // through the bridge authority path.
-            if let Some(addr) = params.get(0).and_then(|v| v.as_str()) {
-                let amount = params.get(1)
-                    .and_then(|v| v.as_str().and_then(|s| s.parse::<u128>().ok()).or_else(|| v.as_u64().map(|n| n as u128)))
-                    .ok_or_else(|| JsonRpcError {
-                        code: -32602,
-                        message: "Invalid params: [address, amount, public_key?]".into(),
-                    })?;
-                let public_key = params.get(2).and_then(|v| v.as_str());
-                credit_testnet_wbtc(&data.storage, addr, amount, public_key)
-            } else {
-                Err(JsonRpcError { code: -32602, message: "Invalid params: [address, amount, public_key?]".into() })
-            }
-        },
+        // G3 FX-8: both wrote balances straight into this node's database,
+        // outside consensus. That forks a multi-node network and would be an
+        // unlimited mint on any chain that enabled it. Fund an account with a
+        // signed transfer from a funded one instead.
+        "aincore_faucet" | "aincore_testMintWbtc" => Err(JsonRpcError {
+            code: -32030,
+            message: format!(
+                "{} was removed: it wrote balances outside consensus. Fund the account \
+                 with a signed transfer (aincore_sendTransaction) from a funded account.",
+                method
+            ),
+        }),
         "aincore_getCoinBalance" => {
             // params: [address, token]
             //
@@ -2445,7 +2213,7 @@ async fn get_network_info_handler(data: web::Data<AppState>) -> impl Responder {
         "tps": tps,
         // The chain this node actually runs. It used to say "AINCORE Mainnet
         // (Prototype)" on every network, including the public testnet.
-        "network": resolve_chain_id(),
+        "network": blockchain::chain_id(),
         "protocol_version": 1
     });
 
@@ -2592,11 +2360,20 @@ mod qc_rpc_tests {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
-    fn faucet_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    /// Writes a CoinStore balance straight into the test database.
+    fn seed_coin(db: &StateDB, key: String, value: u128) {
+        let coin = bcs::to_bytes(&MoveCoin { value }).unwrap();
+        db.put(&key, &hex::encode(coin)).expect("seed a balance");
+    }
+
+    fn move_address(address: &str) -> move_core_types::account_address::AccountAddress {
+        move_core_types::account_address::AccountAddress::from_hex_literal(&format!(
+            "0x{}",
+            address
+        ))
+        .unwrap()
     }
 
     fn temp_db(name: &str) -> Arc<StateDB> {
@@ -2681,9 +2458,6 @@ mod tests {
     /// so the receipt said "pending" forever.
     #[test]
     fn the_hash_send_returns_is_the_hash_the_receipt_is_found_under() {
-        // The faucet tests set AINCORE_CHAIN_ID process-wide, and the chain id is
-        // read both when this tx is signed and when the mempool validates it.
-        let _env = faucet_env_lock().lock().unwrap();
         let db = temp_db("send_lookup");
         let state = test_state(Arc::clone(&db));
 
@@ -2691,7 +2465,7 @@ mod tests {
         let key = SigningKey::from_bytes(&[91u8; 32]);
         let public_key = hex::encode(key.verifying_key().to_bytes());
         let sender = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
-        let chain_id = resolve_chain_id();
+        let chain_id = blockchain::chain_id();
         let payload = hex::encode(
             bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![
                 9, 1,
@@ -2745,96 +2519,40 @@ mod tests {
         );
     }
 
+    /// G3 FX-8: the faucet and the test WBTC mint wrote balances straight
+    /// into this node's database, outside consensus. Both are gone: the RPC
+    /// names answer with an explanation, and nothing is written.
     #[test]
-    fn test_faucet_disabled_by_default() {
-        let _guard = faucet_env_lock().lock().unwrap();
-        std::env::remove_var("AINCORE_ENABLE_FAUCET");
-        // Testnet chain id so the M2 mainnet guard passes and we reach the
-        // "disabled" (-32030) path this test asserts.
-        std::env::set_var("AINCORE_CHAIN_ID", "AINCORE-TESTNET-1");
-        let db = temp_db("disabled");
-        let err = credit_testnet_faucet(&db, "0000000000000000000000000000000000000000000000000000000000000001", 1, None)
-            .expect_err("faucet must be disabled by default");
-        assert_eq!(err.code, -32030);
-        std::env::remove_var("AINCORE_CHAIN_ID");
-    }
-
-    #[test]
-    fn test_faucet_creates_account_and_credits_move_coinstore() {
-        let _guard = faucet_env_lock().lock().unwrap();
-        std::env::set_var("AINCORE_ENABLE_FAUCET", "1");
-        std::env::set_var("AINCORE_CHAIN_ID", "AINCORE-TESTNET-1");
-        let db = temp_db("credit");
-        let signing_key = SigningKey::from_bytes(&[31u8; 32]);
-        let public_key = hex::encode(signing_key.verifying_key().as_bytes());
-        let address = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
-
-        let result = credit_testnet_faucet(&db, &address, 123, Some(&public_key))
-            .expect("faucet credits account");
-        assert_eq!(result["move_balance"], "123");
-        assert!(db.get_object(&address).is_some());
-        assert_eq!(move_balance(&db, &address), "123");
-
-        let result = credit_testnet_faucet(&db, &address, 7, Some(&public_key))
-            .expect("faucet increments account balance");
-        assert_eq!(result["move_balance"], "130");
-        assert_eq!(move_balance(&db, &address), "130");
-        std::env::remove_var("AINCORE_ENABLE_FAUCET");
-        std::env::remove_var("AINCORE_CHAIN_ID");
-    }
-
-    #[test]
-    fn test_faucet_refused_on_mainnet_even_when_enabled() {
-        let _guard = faucet_env_lock().lock().unwrap();
-        std::env::set_var("AINCORE_ENABLE_FAUCET", "1");
-        std::env::set_var("AINCORE_CHAIN_ID", "AINCORE-MAINNET-1");
-        let db = temp_db("mainnet_refused");
+    fn the_direct_write_faucets_are_removed_and_write_nothing() {
+        let db = temp_db("faucet_removed");
+        let state = test_state(Arc::clone(&db));
         let signing_key = SigningKey::from_bytes(&[34u8; 32]);
         let public_key = hex::encode(signing_key.verifying_key().as_bytes());
         let address = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
-
-        let err = credit_testnet_faucet(&db, &address, 1, Some(&public_key))
-            .expect_err("faucet must refuse on mainnet even when enabled");
-        assert_eq!(err.code, -32041);
-        // No CoinStore must have been written.
-        assert_eq!(move_balance(&db, &address), "0");
-
-        let err = credit_testnet_wbtc(&db, &address, 1, Some(&public_key))
-            .expect_err("wbtc mint must refuse on mainnet even when enabled");
-        assert_eq!(err.code, -32041);
-
-        std::env::remove_var("AINCORE_ENABLE_FAUCET");
-        std::env::remove_var("AINCORE_CHAIN_ID");
-    }
-
-    #[test]
-    fn test_faucet_rejects_public_key_address_mismatch() {
-        let _guard = faucet_env_lock().lock().unwrap();
-        std::env::set_var("AINCORE_ENABLE_FAUCET", "1");
-        std::env::set_var("AINCORE_CHAIN_ID", "AINCORE-TESTNET-1");
-        let db = temp_db("mismatch");
-        let signing_key = SigningKey::from_bytes(&[32u8; 32]);
-        let public_key = hex::encode(signing_key.verifying_key().as_bytes());
-        let err = credit_testnet_faucet(
-            &db,
-            "0000000000000000000000000000000000000000000000000000000000000001",
-            1,
-            Some(&public_key),
-        )
-        .expect_err("faucet rejects mismatched public key");
-
-        assert_eq!(err.code, -32602);
-        assert!(err.message.contains("Public key/address mismatch"));
-        std::env::remove_var("AINCORE_ENABLE_FAUCET");
-        std::env::remove_var("AINCORE_CHAIN_ID");
+        for method in ["aincore_faucet", "aincore_testMintWbtc"] {
+            let err = handle_rpc_method(
+                method,
+                serde_json::json!([address, "1000", public_key]),
+                &state,
+            )
+            .expect_err("the direct-write RPC is removed");
+            assert_eq!(err.code, -32030, "{method}");
+            assert!(
+                err.message.contains("was removed"),
+                "{method}: {}",
+                err.message
+            );
+        }
+        let key = |k: String| db.get(&k).unwrap();
+        assert_eq!(key(move_coin_store_key(move_address(&address))), None);
+        assert_eq!(key(wbtc_coin_store_key(move_address(&address))), None);
+        assert!(db.get_object(&address).is_none(), "no account was created");
     }
 
     /// Every address form reads the same account; a mistyped `A1n` is refused
     /// instead of silently reading an empty one.
     #[test]
     fn a1n_and_hex_addresses_read_the_same_account() {
-        // Seeds the CoinStore directly: touching AINCORE_CHAIN_ID here would
-        // race the QC RPC tests, which read it while building and verifying.
         let db = temp_db("a1n_address");
         let signing_key = SigningKey::from_bytes(&[44u8; 32]);
         let public_key = hex::encode(signing_key.verifying_key().as_bytes());
@@ -2959,23 +2677,15 @@ mod tests {
 
     #[test]
     fn test_coin_balance_endpoint_reads_ain_and_synthetic_wbtc_coinstores() {
-        let _guard = faucet_env_lock().lock().unwrap();
-        std::env::set_var("AINCORE_ENABLE_FAUCET", "1");
-        std::env::set_var("AINCORE_CHAIN_ID", "AINCORE-TESTNET-1");
         let db = temp_db("coin_balance");
         let signing_key = SigningKey::from_bytes(&[33u8; 32]);
-        let public_key = hex::encode(signing_key.verifying_key().as_bytes());
         let address = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
-
-        credit_testnet_faucet(
+        seed_coin(
             &db,
-            &address,
+            move_coin_store_key(move_address(&address)),
             123_000_000_000_000_000_000,
-            Some(&public_key),
-        )
-        .expect("AIN faucet credits CoinStore");
-        credit_testnet_wbtc(&db, &address, 42_000_000, Some(&public_key))
-            .expect("synthetic WBTC mint credits CoinStore");
+        );
+        seed_coin(&db, wbtc_coin_store_key(move_address(&address)), 42_000_000);
         let state = test_state(Arc::clone(&db));
 
         let ain = handle_rpc_method(
@@ -3007,7 +2717,6 @@ mod tests {
         )
         .expect_err("unsupported token rejected");
         assert!(err.message.contains("Supported tokens"));
-        std::env::remove_var("AINCORE_ENABLE_FAUCET");
     }
 
     #[test]

@@ -321,12 +321,12 @@ pub fn encode_bitmap(indices: &[usize], n: usize) -> Vec<u8> {
     bitmap
 }
 
-/// The chain id a verifier should require of any QC it accepts as finality —
-/// the local node's `AINCORE_CHAIN_ID` (default `AINCORE-MAINNET-1`). Centralized
-/// so sync, the RPC handlers, and the bridge all bind QCs to the same chain
-/// (audit M-1). This is a boot-time identity read, not a per-block value.
+/// The chain id a verifier should require of any QC it accepts as finality.
+/// Centralized so sync, the RPC handlers, and the bridge all bind QCs to the
+/// same chain (audit M-1). It is `sys:chain_id`, installed once at boot
+/// (G3 FX-6); the `AINCORE_CHAIN_ID` env is not a source.
 pub fn expected_chain_id() -> String {
-    std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-MAINNET-1".to_string())
+    blockchain::chain_id()
 }
 
 /// Verify a quorum certificate against a trusted validator set.
@@ -509,6 +509,22 @@ pub fn build_qc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G3 FX-6: QC signing and verification use the installed `sys:chain_id`.
+    /// The env is set here, naming another chain, only to prove nothing reads
+    /// it: before FX-6 this is what made the node QC tests race.
+    #[test]
+    fn the_expected_chain_id_never_comes_from_the_env() {
+        std::env::set_var("AINCORE_CHAIN_ID", "AINCORE-SOME-OTHER-CHAIN");
+        let expected = expected_chain_id();
+        std::env::remove_var("AINCORE_CHAIN_ID");
+        assert_eq!(expected, blockchain::chain_id());
+        assert_eq!(
+            expected,
+            blockchain::DEFAULT_CHAIN_ID,
+            "nothing installed in tests"
+        );
+    }
 
     fn sample_vote() -> FinalityVote {
         FinalityVote {

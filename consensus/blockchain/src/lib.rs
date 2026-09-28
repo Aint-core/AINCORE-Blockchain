@@ -390,6 +390,24 @@ pub fn vertex_domain() -> (String, String) {
     VERTEX_DOMAIN.get().cloned().unwrap_or_default()
 }
 
+/// The chain id before one is installed (unit tests and offline tools).
+pub const DEFAULT_CHAIN_ID: &str = "AINCORE-MAINNET-1";
+
+/// The chain id every validity rule checks: transaction admission and
+/// execution, QC signing and verification (G3 FX-6).
+///
+/// Its only source is the persisted `sys:chain_id`, which the node installs
+/// with the vertex domain at boot. The `AINCORE_CHAIN_ID` env is never read
+/// here. Boot refuses to start when that env disagrees with `sys:chain_id`.
+/// Before install it is [`DEFAULT_CHAIN_ID`].
+pub fn chain_id() -> String {
+    VERTEX_DOMAIN
+        .get()
+        .map(|(chain_id, _)| chain_id.clone())
+        .filter(|chain_id| !chain_id.is_empty())
+        .unwrap_or_else(|| DEFAULT_CHAIN_ID.to_string())
+}
+
 /// Root over the payload items: count-prefixed, each item length-prefixed,
 /// domain-separated. Unambiguous -- ["A","B"] and ["AB"] differ -- unlike the
 /// old bare concatenation, which let one validator ship two bodies with the

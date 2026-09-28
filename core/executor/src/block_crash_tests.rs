@@ -187,7 +187,6 @@ fn run_child(dir: &TestDir, boundary: Option<u8>, replay: bool) {
             "AINCORE_TEST_BLOCK_CRASH_REPLAY",
             if replay { "1" } else { "0" },
         )
-        .env("AINCORE_CHAIN_ID", "AINCORE-MAINNET-1")
         .output()
         .unwrap();
     assert_eq!(
@@ -354,7 +353,6 @@ fn block_panic_poison_refuses_retry() {
             "--test-threads=1",
         ])
         .env("AINCORE_TEST_BLOCK_PANIC_DB", &dir.0)
-        .env("AINCORE_CHAIN_ID", "AINCORE-MAINNET-1")
         .output()
         .unwrap();
     assert!(
@@ -375,7 +373,6 @@ fn run_checked_child(dir: &TestDir, mode: &str) {
         ])
         .env("AINCORE_TEST_CHECKED_DB", &dir.0)
         .env("AINCORE_TEST_CHECKED_MODE", mode)
-        .env("AINCORE_CHAIN_ID", "AINCORE-MAINNET-1")
         .output()
         .unwrap();
     assert_eq!(

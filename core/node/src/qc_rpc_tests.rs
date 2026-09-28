@@ -2,6 +2,10 @@ use consensus::qc::{
     build_qc, expected_chain_id, validator_set_hash, FinalityVote, QuorumCertificate, ValidatorInfo,
 };
 
+// The includer provides `state`. `cert` signs under `expected_chain_id()` and
+// the RPC verifies under it again. Both read `sys:chain_id` as installed at
+// boot, never the env, so no test can change it in between (G3 FX-6).
+
 struct QcDir(std::path::PathBuf);
 impl QcDir {
     fn new() -> Self {
