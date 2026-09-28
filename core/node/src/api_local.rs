@@ -80,7 +80,7 @@ fn move_coin_store_key_for(
         name: Identifier::new("CoinStore").expect("valid store"),
         type_params: vec![coin_type],
     };
-    format!("resource_{}_{}", addr, store)
+    vm_move::state_keys::resource_key(&addr, &store)
 }
 
 fn wbtc_coin_store_key(addr: move_core_types::account_address::AccountAddress) -> String {
@@ -90,7 +90,7 @@ fn wbtc_coin_store_key(addr: move_core_types::account_address::AccountAddress) -
 fn dex_registry_key() -> String {
     let system = move_core_types::account_address::AccountAddress::from_hex_literal("0x1")
         .expect("valid system address");
-    format!("resource_{}_{}", system, "0x1::dex::PoolRegistry")
+    vm_move::state_keys::resource_key_str(&system, "0x1::dex::PoolRegistry")
 }
 
 fn normalize_type_name(value: &str) -> String {
@@ -175,7 +175,7 @@ fn dex_pool_key(
         name: Identifier::new("LiquidityPool").ok()?,
         type_params: vec![x, y],
     };
-    Some(format!("resource_{}_{}", pool_addr, tag))
+    Some(vm_move::state_keys::resource_key(&pool_addr, &tag))
 }
 
 fn dex_lp_key(
@@ -195,7 +195,7 @@ fn dex_lp_key(
         name: Identifier::new("LPToken").ok()?,
         type_params: vec![x, y],
     };
-    Some(format!("resource_{}_{}", owner, tag))
+    Some(vm_move::state_keys::resource_key(&owner, &tag))
 }
 
 fn decode_dex_registry(storage: &Arc<StateDB>) -> DexPoolRegistry {

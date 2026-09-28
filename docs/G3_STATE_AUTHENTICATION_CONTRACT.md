@@ -632,7 +632,18 @@ counters, never values.
     batch, `put_object`, the federation key, the economic config and a plain transaction.
     The ignored H6 witnesses C1 and C2 stay as they are until the gate owner reviews
     C1′ and C2′. C1′'s RC-2 half and C2′ need S6 and S7.
-- **S3c (the rest of FX-9, the snapshot install) is next.**
+- **S3c is done.**
+  - SN-5: the unverified snapshot install (`AINCORE_BOOTSTRAP_SNAPSHOT`) is removed. A
+    node that still sets the variable refuses to start. Until S6, a node syncs from
+    genesis. The DR runbook, the join doc and the backup script say so.
+  - The rest of FX-9: the executor's stored-key builders, its conflict tokens and the
+    RPC read helpers all build `resource_…` keys through `vm_move::state_keys`. An
+    implicit account stores its public key in lower case, whatever case the client sent.
+    The strings were already identical; the one encoder now builds them all.
+  - Still hand-built, deliberately: governance's `system_module_storage_key`, the FX-3
+    upgrade path that waits for the founder's decision; and an unparseable sender's
+    conflict token, which only has to be distinct.
+- **S3 is complete.** S4 (proof RPC and verifiers) is next.
 | S4 | Proof RPC + Rust and JS verifiers (PF) | No, once S2 is live |
 | S5 | Committee record + FinalityVote V2 binding + transition log + `TA_LOG_*` (TA; joint with G1 EP-2/EP-4) | **Yes** |
 | S6 | Snapshot restore + bootstrap record + pinned versions + rejoin at every horizon (SN) | No |

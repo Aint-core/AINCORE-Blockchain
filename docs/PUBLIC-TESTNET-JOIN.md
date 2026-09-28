@@ -337,7 +337,8 @@ Revoke access anytime: delete the key or remove the node in the Tailscale admin.
   it's safe for any joiner. Re‑cut periodically so joiners sync a small delta.
 - **Refresh the package** when binaries change: drop new `node-x86_64-linux` /
   `node-aarch64-linux` in, regenerate the checksums (`sha256sum …`), re‑tar.
-- **Node‑native auto‑bootstrap (advanced, most paste‑paste):** instead of
+- **Node‑native auto‑bootstrap (pre‑G3 chain only; removed by G3 SN‑5, and a
+  G3 node refuses to start with `AINCORE_BOOTSTRAP_SNAPSHOT` set):** instead of
   `testnet-join.sh`, a fresh datadir self‑bootstraps from the release snapshot URL
   (https‑only; the node extracts + self‑sanitises before opening the DB, then
   no‑ops once a DB exists):

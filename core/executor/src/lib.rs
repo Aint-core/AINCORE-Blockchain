@@ -80,7 +80,7 @@ fn coin_store_key(addr: move_core_types::account_address::AccountAddress) -> Str
         name: move_core_types::identifier::Identifier::new("CoinStore").expect("valid struct"),
         type_params: vec![aincore_coin_type()],
     };
-    format!("resource_{}_{}", addr, tag)
+    vm_move::state_keys::resource_key(&addr, &tag)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,7 +105,7 @@ pub fn committed_ain_balance(db: &StateDB, address: &str) -> Option<u128> {
         name: move_core_types::identifier::Identifier::new("CoinStore").ok()?,
         type_params: vec![aincore_coin_type()],
     };
-    let key = format!("resource_{}_{}", move_addr, tag);
+    let key = vm_move::state_keys::resource_key(&move_addr, &tag);
     let hex_value = db.get(&key).ok().flatten()?;
     let bytes = hex::decode(hex_value).ok()?;
     bcs::from_bytes::<MoveCoin>(&bytes).ok().map(|c| c.value)
@@ -309,11 +309,7 @@ struct FeeSweepEntry {
 /// Storage key of the Move `0x1::staking::ValidatorSet` resource. Pinned to
 /// the canonical encoder (`vm_move::state_keys`) by a golden test.
 pub fn validator_set_key() -> String {
-    format!(
-        "resource_{}_{}",
-        system_address(),
-        "0x1::staking::ValidatorSet"
-    )
+    vm_move::state_keys::resource_key_str(&system_address(), "0x1::staking::ValidatorSet")
 }
 
 fn validator_set_v1_key() -> &'static str {
@@ -321,7 +317,7 @@ fn validator_set_v1_key() -> &'static str {
 }
 
 fn dex_registry_key() -> String {
-    format!("resource_{}_{}", system_address(), "0x1::dex::PoolRegistry")
+    vm_move::state_keys::resource_key_str(&system_address(), "0x1::dex::PoolRegistry")
 }
 
 fn coin_store_key_for_type(
@@ -334,7 +330,7 @@ fn coin_store_key_for_type(
         name: move_core_types::identifier::Identifier::new("CoinStore").expect("valid struct"),
         type_params: vec![coin_type],
     };
-    format!("resource_{}_{}", addr, tag)
+    vm_move::state_keys::resource_key(&addr, &tag)
 }
 
 fn dex_pool_key_for_type_args(
@@ -350,7 +346,7 @@ fn dex_pool_key_for_type_args(
         name: move_core_types::identifier::Identifier::new("LiquidityPool").ok()?,
         type_params: vec![ty_args[0].clone(), ty_args[1].clone()],
     };
-    Some(format!("resource_{}_{}", pool_addr, tag))
+    Some(vm_move::state_keys::resource_key(&pool_addr, &tag))
 }
 
 fn dex_lp_key_for_type_args(
@@ -366,7 +362,7 @@ fn dex_lp_key_for_type_args(
         name: move_core_types::identifier::Identifier::new("LPToken").ok()?,
         type_params: vec![ty_args[0].clone(), ty_args[1].clone()],
     };
-    Some(format!("resource_{}_{}", owner, tag))
+    Some(vm_move::state_keys::resource_key(&owner, &tag))
 }
 
 fn decode_validator_set_hex(value: &str) -> Option<MoveValidatorSet> {
@@ -382,7 +378,7 @@ fn encode_validator_set_hex(value: &MoveValidatorSet) -> Option<String> {
 /// identically to `validator_set_key()` so the Rust fee-burn writes the exact
 /// resource the Move VM reads via `borrow_global<SupplyStats>(@0x1)`.
 fn supply_stats_key() -> String {
-    format!("resource_{}_{}", system_address(), "0x1::staking::SupplyStats")
+    vm_move::state_keys::resource_key_str(&system_address(), "0x1::staking::SupplyStats")
 }
 
 fn decode_supply_stats_hex(value: &str) -> Option<MoveSupplyStats> {
@@ -2682,11 +2678,7 @@ impl Executor {
         [
             validator_set_key(),
             supply_stats_key(),
-            format!(
-                "resource_{}_{}",
-                system_address(),
-                "0x1::staking::EmissionPools"
-            ),
+            vm_move::state_keys::resource_key_str(&system_address(), "0x1::staking::EmissionPools"),
         ]
     }
 
@@ -2772,9 +2764,17 @@ impl Executor {
         // pre-batch balance, and the atomic last-write-wins commit on
         // `resource_{A}_CoinStore` would silently corrupt the balance and make
         // the state root non-deterministic (consensus-split risk).
-        let sender_token = parse_move_address(&tx.sender)
+        let sender_move_addr = parse_move_address(&tx.sender);
+        let sender_token = sender_move_addr
             .map(|addr| addr.to_string())
             .unwrap_or_else(|| tx.sender.clone());
+        // G3 KV-2: conflict tokens name the exact state keys, through the one
+        // encoder. An unparseable sender cannot execute; its token only has
+        // to be distinct.
+        let sender_resource = |tag: &str| match &sender_move_addr {
+            Some(addr) => vm_move::state_keys::resource_key_str(addr, tag),
+            None => format!("resource_{}_{}", tx.sender, tag),
+        };
         deps.push(sender_token.clone());
         // SEC (audit C-1): a paymaster-sponsored tx has `deduct_gas` DEBIT the
         // PAYMASTER's CoinStore (`resource_{paymaster}_CoinStore`), not the sender's —
@@ -2836,14 +2836,10 @@ impl Executor {
                 match function {
                     "enable_delegation" => {
                         recognized = true;
-                        deps.push(format!(
-                            "resource_{}_{}",
-                            sender_token, "0x1::delegation::ValidatorPool"
-                        ));
-                        deps.push(format!(
-                            "resource_{}_{}",
-                            system_address(),
-                            "0x1::delegation::DelegationRegistry"
+                        deps.push(sender_resource("0x1::delegation::ValidatorPool"));
+                        deps.push(vm_move::state_keys::resource_key_str(
+                            &system_address(),
+                            "0x1::delegation::DelegationRegistry",
                         ));
                     }
                     "delegate" | "undelegate" | "claim_rewards" | "withdraw_unbonded" => {
@@ -2854,9 +2850,9 @@ impl Executor {
                                 move_core_types::account_address::AccountAddress,
                             >(bytes)
                             {
-                                deps.push(format!(
-                                    "resource_{}_{}",
-                                    addr, "0x1::delegation::ValidatorPool"
+                                deps.push(vm_move::state_keys::resource_key_str(
+                                    &addr,
+                                    "0x1::delegation::ValidatorPool",
                                 ));
                             }
                         }
@@ -2868,15 +2864,11 @@ impl Executor {
                 // AUDIT-B2: governance::create_proposal burns the proposal fee via
                 // staking::burn_ain, mutating ValidatorSet + SupplyStats.
                 deps.extend(Self::staking_global_keys());
-                deps.push(format!(
-                    "resource_{}_{}",
-                    system_address(),
-                    "0x1::governance::GovernanceState"
+                deps.push(vm_move::state_keys::resource_key_str(
+                    &system_address(),
+                    "0x1::governance::GovernanceState",
                 ));
-                deps.push(format!(
-                    "resource_{}_{}",
-                    sender_token, "0x1::governance::VoteEscrow"
-                ));
+                deps.push(sender_resource("0x1::governance::VoteEscrow"));
             } else if *module_addr == system_address()
                 && module_name == "token_factory"
                 && function == "transfer"
@@ -2888,17 +2880,14 @@ impl Executor {
                 // dependency.
                 deps.extend(Self::staking_global_keys());
                 push_addr_arg(&mut deps, &call.args, 2);
-                deps.push(format!(
-                    "resource_{}_{}",
-                    sender_token, "0x1::token_factory::TokenWallet"
-                ));
+                deps.push(sender_resource("0x1::token_factory::TokenWallet"));
                 if let Some(bytes) = call.args.get(2) {
                     if let Ok(addr) =
                         bcs::from_bytes::<move_core_types::account_address::AccountAddress>(bytes)
                     {
-                        deps.push(format!(
-                            "resource_{}_{}",
-                            addr, "0x1::token_factory::TokenWallet"
+                        deps.push(vm_move::state_keys::resource_key_str(
+                            &addr,
+                            "0x1::token_factory::TokenWallet",
                         ));
                     }
                 }
@@ -2906,15 +2895,11 @@ impl Executor {
                 recognized = true;
                 // AUDIT-B2: create_token burns the listing fee via staking::burn_ain.
                 deps.extend(Self::staking_global_keys());
-                deps.push(format!(
-                    "resource_{}_{}",
-                    system_address(),
-                    "0x1::token_factory::TokenRegistry"
+                deps.push(vm_move::state_keys::resource_key_str(
+                    &system_address(),
+                    "0x1::token_factory::TokenRegistry",
                 ));
-                deps.push(format!(
-                    "resource_{}_{}",
-                    sender_token, "0x1::token_factory::TokenWallet"
-                ));
+                deps.push(sender_resource("0x1::token_factory::TokenWallet"));
             } else if *module_addr == system_address() && module_name == "dex" {
                 recognized = true;
                 deps.push(dex_registry_key());
@@ -3078,7 +3063,11 @@ impl Executor {
                     // G3 FX-10: the ONE account constructor genesis uses too,
                     // so a logical account has one encoding in the state tree
                     // whichever path created it.
-                    aa::AccountManager::create_account(tx.sender.clone(), tx.public_key.clone())
+                    // KV-2: one spelling of the key, whatever case the client sent.
+                    aa::AccountManager::create_account(
+                        tx.sender.clone(),
+                        tx.public_key.to_ascii_lowercase(),
+                    )
                 }
             };
 
@@ -3870,9 +3859,9 @@ mod tests {
     }
 
     fn delegation_pool_key(validator: &str) -> String {
-        format!(
-            "resource_{}_{}",
-            validator, "0x1::delegation::ValidatorPool"
+        vm_move::state_keys::resource_key_str(
+            &parse_move_address(validator).unwrap(),
+            "0x1::delegation::ValidatorPool",
         )
     }
 
@@ -4255,7 +4244,7 @@ mod tests {
             name: move_core_types::identifier::Identifier::new("CoinStore").unwrap(),
             type_params: vec![coin_type],
         };
-        format!("resource_{}_{}", addr, tag)
+        vm_move::state_keys::resource_key(&addr, &tag)
     }
 
     fn set_coin_store_for(
@@ -4304,7 +4293,7 @@ mod tests {
             name: move_core_types::identifier::Identifier::new("LiquidityPool").unwrap(),
             type_params: vec![x, y],
         };
-        format!("resource_{}_{}", pool_addr, tag)
+        vm_move::state_keys::resource_key(&pool_addr, &tag)
     }
 
     fn dex_lp_key(
@@ -4318,7 +4307,7 @@ mod tests {
             name: move_core_types::identifier::Identifier::new("LPToken").unwrap(),
             type_params: vec![x, y],
         };
-        format!("resource_{}_{}", owner, tag)
+        vm_move::state_keys::resource_key(&parse_move_address(owner).unwrap(), &tag)
     }
 
     fn set_dex_registry(db: &StateDB, pools: Vec<TestPoolInfo>) {
@@ -4585,27 +4574,28 @@ mod tests {
     }
 
     fn token_registry_key() -> String {
-        format!(
-            "resource_{}_{}",
-            system_address(),
-            "0x1::token_factory::TokenRegistry"
+        vm_move::state_keys::resource_key_str(
+            &system_address(),
+            "0x1::token_factory::TokenRegistry",
         )
     }
 
     fn token_wallet_key(addr: &str) -> String {
-        format!("resource_{}_{}", addr, "0x1::token_factory::TokenWallet")
-    }
-
-    fn governance_state_key() -> String {
-        format!(
-            "resource_{}_{}",
-            system_address(),
-            "0x1::governance::GovernanceState"
+        vm_move::state_keys::resource_key_str(
+            &parse_move_address(addr).unwrap(),
+            "0x1::token_factory::TokenWallet",
         )
     }
 
+    fn governance_state_key() -> String {
+        vm_move::state_keys::resource_key_str(&system_address(), "0x1::governance::GovernanceState")
+    }
+
     fn vote_escrow_key(addr: &str) -> String {
-        format!("resource_{}_{}", addr, "0x1::governance::VoteEscrow")
+        vm_move::state_keys::resource_key_str(
+            &parse_move_address(addr).unwrap(),
+            "0x1::governance::VoteEscrow",
+        )
     }
 
     fn set_governance_state(db: &StateDB, state: &TestGovernanceState) {
@@ -5953,7 +5943,13 @@ mod tests {
             };
             hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap())
         };
-        let tx = signed_tx(&key, &address, &payload, 0, 100_000, 1);
+        // The client sends its key in upper case; the preimage does not cover
+        // it, so the signature still verifies. The stored account must not
+        // depend on the spelling (KV-2).
+        let mut tx: serde_json::Value =
+            serde_json::from_str(&signed_tx(&key, &address, &payload, 0, 100_000, 1)).unwrap();
+        tx["public_key"] = serde_json::json!(public_key.to_ascii_uppercase());
+        let tx = tx.to_string();
         let Ok(BlockExecOutcome::Executed(summary)) = Executor::new(db.clone())
             .execute_block_checked_at(vec![tx], &address, 1, &[], |_, _| Ok(()))
         else {

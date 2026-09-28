@@ -829,8 +829,8 @@ impl ChainSync {
                                                                 if horizon > local_now + 1 {
                                                                     eprintln!(
                                                                         "🛑 [ChainSync] peer pruned below us: earliest block #{} but we are at #{}. \
-                                                                         Block-replay cannot bridge this — bootstrap from a state snapshot \
-                                                                         (set AINCORE_BOOTSTRAP_SNAPSHOT on a fresh datadir, or run testnet-join.sh).",
+                                                                         Block-replay cannot bridge this, and verified snapshot restore (G3 S6) \
+                                                                         is not available yet: sync from a peer that keeps history.",
                                                                         horizon, local_now
                                                                     );
                                                                 }

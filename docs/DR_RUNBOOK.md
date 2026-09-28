@@ -128,6 +128,12 @@ scripts/restore_node.sh \
 
 ## 5. Observer bootstrap flow (`AINCORE_BOOTSTRAP_SNAPSHOT`)
 
+> **Removed in G3 (SN-5), branch `g3/activation` onward.** The bootstrap path
+> installed a downloaded database without verifying its state: no state root,
+> no consensus signature. A G3 node refuses to start with the variable set. Until
+> verified snapshot restore lands (G3 S6), a fresh node syncs from genesis. The
+> text below describes the pre-G3 chain only.
+
 A fresh node at height 0 **cannot** replay from genesis once the network has
 pruned old blocks. Instead of `restore_node.sh`, you can hand the node the
 backup tarball directly via the built-in bootstrap path

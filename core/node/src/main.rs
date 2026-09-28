@@ -44,6 +44,20 @@ fn bootnode_host(addr: &str) -> Option<&str> {
     }
 }
 
+/// G3 SN-5: `AINCORE_BOOTSTRAP_SNAPSHOT` installed a downloaded database
+/// without verifying its state. It is removed, and a node that still sets it
+/// refuses to start rather than silently ignoring it.
+fn refuse_removed_snapshot_install(env: Option<String>) -> Result<(), String> {
+    match env {
+        Some(v) if !v.trim().is_empty() => Err(
+            "AINCORE_BOOTSTRAP_SNAPSHOT was removed (G3 SN-5): it installed unverified state. \
+             Unset it and sync from genesis; verified snapshot restore is G3 S6."
+                .to_string(),
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// G3 FX-6: the chain id comes only from `sys:chain_id`, which genesis
 /// writes. The `AINCORE_CHAIN_ID` env may repeat it, for tools that still
 /// read it, but it may not name another chain.
@@ -82,112 +96,6 @@ fn check_epoch_interval_pinned(stored: Option<String>, env: Option<String>) -> R
         }
     }
     Ok(pinned)
-}
-
-/// Automated state-sync bootstrap (public-testnet onboarding).
-///
-/// A fresh node cannot replay from genesis — the seed prunes old blocks. If the
-/// datadir is EMPTY and `AINCORE_BOOTSTRAP_SNAPSHOT` is set (a local path or an
-/// http(s) URL to a `validator_*.db` tarball), load that snapshot so the node
-/// starts near the current height and ChainSyncs only the small delta.
-///
-/// Safety: acts ONLY when `db_path` does not yet exist — it never touches or
-/// overwrites an existing chain DB. Returns true if a snapshot was installed
-/// (the caller then sanitises per-identity keys via the storage API).
-fn maybe_extract_bootstrap_snapshot(datadir: &str, db_path: &str, port: u16) -> bool {
-    if std::path::Path::new(db_path).exists() {
-        return false; // existing data — never overwrite
-    }
-    let snap = match std::env::var("AINCORE_BOOTSTRAP_SNAPSHOT") {
-        Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => return false,
-    };
-    println!("📦 [bootstrap] fresh datadir + AINCORE_BOOTSTRAP_SNAPSHOT set → bootstrapping from {snap}");
-
-    let local = if snap.starts_with("https://") {
-        // Audit #6: https-only, NO redirects (blocks SSRF via redirect to
-        // internal/metadata endpoints) and no protocol downgrade.
-        let dest = format!("{datadir}/.bootstrap-snapshot.tar.gz");
-        let ok = matches!(
-            std::process::Command::new("curl")
-                .args([
-                    "-fsS", "--proto", "=https", "--max-redirs", "0", "--retry", "2", "-o", &dest,
-                    &snap,
-                ])
-                .status(),
-            Ok(s) if s.success()
-        );
-        if !ok {
-            eprintln!("⚠️ [bootstrap] snapshot download failed — starting fresh");
-            return false;
-        }
-        // Optional integrity check against AINCORE_BOOTSTRAP_SHA256 (supply-chain).
-        if let Ok(expected) = std::env::var("AINCORE_BOOTSTRAP_SHA256") {
-            let expected = expected.trim().to_lowercase();
-            if !expected.is_empty() {
-                let got = std::process::Command::new("sha256sum")
-                    .arg(&dest)
-                    .output()
-                    .ok()
-                    .and_then(|o| String::from_utf8(o.stdout).ok())
-                    .and_then(|s| s.split_whitespace().next().map(|x| x.to_lowercase()));
-                if got.as_deref() != Some(expected.as_str()) {
-                    eprintln!(
-                        "🚨 [bootstrap] snapshot SHA256 mismatch (expected {expected}, got {got:?}) — refusing"
-                    );
-                    let _ = std::fs::remove_file(&dest);
-                    return false;
-                }
-                println!("🔒 [bootstrap] snapshot SHA256 verified");
-            }
-        }
-        dest
-    } else if snap.starts_with("http://") {
-        eprintln!("🚨 [bootstrap] refusing insecure http:// snapshot URL (use https://) — starting fresh");
-        return false;
-    } else {
-        snap.clone() // local filesystem path
-    };
-
-    // Audit #10: extract into a staging subdir so we move ONLY the snapshot's DB,
-    // never a pre-existing sibling validator_*.db already in the datadir.
-    let staging = format!("{datadir}/.bootstrap-staging");
-    let _ = std::fs::remove_dir_all(&staging);
-    if std::fs::create_dir_all(&staging).is_err() {
-        eprintln!("⚠️ [bootstrap] could not create staging dir — starting fresh");
-        return false;
-    }
-    let extracted = matches!(
-        std::process::Command::new("tar").args(["xzf", &local, "-C", &staging]).status(),
-        Ok(s) if s.success()
-    );
-    if !extracted {
-        eprintln!("⚠️ [bootstrap] snapshot extract failed — starting fresh");
-        let _ = std::fs::remove_dir_all(&staging);
-        return false;
-    }
-
-    // Move the single validator_*.db from staging to THIS node's port.
-    let want = format!("validator_{port}.db");
-    let mut moved = false;
-    if let Ok(entries) = std::fs::read_dir(&staging) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with("validator_") && name.ends_with(".db") {
-                let to = std::path::Path::new(datadir).join(&want);
-                if std::fs::rename(e.path(), &to).is_ok() {
-                    println!("📦 [bootstrap] loaded snapshot state → {}", to.display());
-                    moved = true;
-                }
-                break;
-            }
-        }
-    }
-    let _ = std::fs::remove_dir_all(&staging);
-    if !moved {
-        eprintln!("⚠️ [bootstrap] no validator_*.db inside snapshot — starting fresh");
-    }
-    moved
 }
 
 #[tokio::main]
@@ -312,7 +220,17 @@ async fn main() {
     // published snapshot so a new public-testnet node starts near the tip
     // instead of stalling at height 0 (the seed prunes old blocks). No-op if the
     // DB already exists.
-    let bootstrapped_from_snapshot = maybe_extract_bootstrap_snapshot(&datadir, &db_path, port);
+    // G3 SN-5: the snapshot install extracted a downloaded database and
+    // trusted it: no state root, no consensus signature, only an optional
+    // tarball hash. It is gone. Verified snapshot restore is G3 S6. Until
+    // then a node syncs from genesis. Refuse the old variable rather than
+    // silently ignore it.
+    if let Err(e) =
+        refuse_removed_snapshot_install(std::env::var("AINCORE_BOOTSTRAP_SNAPSHOT").ok())
+    {
+        eprintln!("❌ FATAL: {}", e);
+        std::process::exit(1);
+    }
 
     // Open Database with error handling
     let storage = match StateDB::open(&db_path) {
@@ -328,24 +246,6 @@ async fn main() {
             std::process::exit(1);
         }
     };
-
-    // Sanitise a freshly-bootstrapped snapshot: it carries the SEED's per-identity
-    // DA signing key (which this node cannot decrypt → boot panic) and the seed's
-    // peer table (dead peers this node would hammer). Drop both so this node
-    // generates its own DA key and discovers peers via its own bootnode. This is
-    // why joiners need no ldb / manual key surgery.
-    if bootstrapped_from_snapshot {
-        let _ = storage.delete("sys:da:signing_key_enc_v1");
-        let _ = storage.delete("sys:da:signing_key");
-        let inherited = storage.scan_peers();
-        for (peer_id, _) in &inherited {
-            let _ = storage.remove_peer(peer_id);
-        }
-        println!(
-            "🧼 [bootstrap] sanitised snapshot: DA key reset (regenerates) + cleared {} inherited peer(s)",
-            inherited.len()
-        );
-    }
 
     // === H-07 MIGRATION: one-shot tx_index backfill ===
     //
@@ -1127,7 +1027,18 @@ async fn main() {
 
 #[cfg(test)]
 mod boot_identity_tests {
-    use super::{check_epoch_interval_pinned, resolve_boot_chain_id};
+    use super::{
+        check_epoch_interval_pinned, refuse_removed_snapshot_install, resolve_boot_chain_id,
+    };
+
+    #[test]
+    fn the_removed_snapshot_install_refuses_to_start() {
+        assert!(refuse_removed_snapshot_install(None).is_ok());
+        assert!(refuse_removed_snapshot_install(Some("  ".into())).is_ok());
+        let err = refuse_removed_snapshot_install(Some("https://x/snap.tar.gz".into()))
+            .expect_err("a set snapshot variable refuses");
+        assert!(err.contains("SN-5"), "{err}");
+    }
 
     fn some(s: &str) -> Option<String> {
         Some(s.to_string())

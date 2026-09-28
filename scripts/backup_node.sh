@@ -150,8 +150,7 @@ echo "   sha256: $HASH"
 echo "   sha256 file: ${ARCHIVE}.sha256"
 echo ""
 echo "   Restore with:   scripts/restore_node.sh --backup '$ARCHIVE' --datadir <fresh> --port $PORT"
-echo "   Observer boot:  export AINCORE_BOOTSTRAP_SNAPSHOT='$ARCHIVE'"
-echo "                   export AINCORE_BOOTSTRAP_SHA256='$HASH'"
+echo "   (AINCORE_BOOTSTRAP_SNAPSHOT observer boot is pre-G3 only: G3 SN-5 removed it.)"
 
 # Optional retention: keep only the newest N backups for this port.
 if [[ "$KEEP" -gt 0 ]]; then
