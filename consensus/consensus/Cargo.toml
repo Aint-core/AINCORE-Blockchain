@@ -23,3 +23,7 @@ sha2 = "0.10"
 # Note: Cryptography now consolidated in common/crypto
 # ed25519-dalek removed - use crypto crate
 # sha256 removed - use crypto crate
+
+[dev-dependencies]
+# G3 S3: test fixtures commit state-tree version 0, as genesis does.
+state_commit = { path = "../../common/state_commit" }

@@ -28,6 +28,17 @@ mod tests {
         path.to_string_lossy().to_string()
     }
 
+    /// G3 S3: genesis commits version 0 of the state tree. A fixture that
+    /// writes its own genesis state ends the same way; like genesis, it is a
+    /// no-op on a database that already has one (a reopened node).
+    pub(crate) fn seed_state_tree(db: &Arc<StateDB>) {
+        if state_commit::latest_version(db).unwrap().is_some() {
+            return;
+        }
+        let seeded = state_commit::seed_genesis(db).expect("seed state tree v0");
+        db.write_batch(seeded.batch).unwrap();
+    }
+
     fn setup_dag(suffix: &str) -> (DagConsensus, String) {
         let path = get_test_db_path(suffix);
         let db = Arc::new(StateDB::open(&path).unwrap());
@@ -58,6 +69,7 @@ mod tests {
         // Format: Vec<(String, u64)> = [(address, stake_amount)]
         let validator_json = format!(r#"[["{}",1000]]"#, node_id);
         let _ = db.put("sys:validators", &validator_json);
+        seed_state_tree(&db);
 
         (
             DagConsensus::new(node_id, peers, mempool, executor, db, None, None, node_key),
@@ -2210,6 +2222,7 @@ mod tests {
             .collect();
         db.put("sys:validators", &format!("[{}]", vset.join(",")))
             .unwrap();
+        seed_state_tree(&db);
 
         let node_key = [seed; 32];
         let node_id = crypto::derive_address(

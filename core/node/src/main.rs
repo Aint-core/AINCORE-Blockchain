@@ -297,7 +297,6 @@ async fn main() {
     };
 
     let verifying_key = signing_key.verifying_key();
-    let pub_key_hex = hex::encode(verifying_key.to_bytes());
     let node_addr_hex = match crypto::derive_address(verifying_key.as_bytes()) {
         Ok(addr) => addr,
         Err(e) => {
@@ -547,7 +546,6 @@ async fn main() {
     }
 
     // === INISIALISASI MODUL INTI ===
-    // Pass node_addr_hex as genesis address
     // Fix path to point to phase1-core-prototype/vm_move/stdlib/bytecode
     let stdlib_path = if std::path::Path::new("core/vm_move/stdlib/bytecode").exists() {
         "core/vm_move/stdlib/bytecode"
@@ -558,17 +556,9 @@ async fn main() {
     } else {
         "core/vm_move/stdlib/bytecode" // Default, will error with clear message if missing
     };
-    // Initialize Genesis with error handling
-    // Pass the node identity (Ed25519 seed bytes) so the validator BLS key +
-    // PoP can be derived deterministically for the local/single-node fallback.
-    let genesis_node_identity = signing_key.to_bytes();
-    if let Err(e) = genesis::initialize_genesis(
-        &storage,
-        stdlib_path,
-        &node_addr_hex,
-        &pub_key_hex,
-        &genesis_node_identity,
-    ) {
+    // G3 FX-7: genesis depends on genesis.json and the stdlib only, never on
+    // this node's key, so every node builds the same state and identity.
+    if let Err(e) = genesis::initialize_genesis(&storage, stdlib_path) {
         eprintln!("❌ FATAL: Genesis initialization failed: {}", e);
         eprintln!("   This usually means:");
         eprintln!("   1. Stdlib bytecode is missing or corrupted");

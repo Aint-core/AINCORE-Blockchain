@@ -1793,16 +1793,8 @@ impl Executor {
         //    Every write it makes is staged in the block transaction, and the
         //    state root at the end covers all of them (G3 CM-1).
         //
-        // G3: version 0 of the state tree is the genesis state. It is built
-        // here, before block 1 changes anything, from the flat genesis keys.
-        if block_height == 1 && matches!(state_commit::latest_version(&self.db), Ok(None)) {
-            let seeded = state_commit::seed_genesis(&self.db).unwrap_or_else(|e| {
-                panic!("CRITICAL: cannot seed state tree version 0 from genesis: {e}")
-            });
-            if let Err(e) = self.db.write_batch(seeded.batch) {
-                panic!("CRITICAL: state tree genesis write failed: {e}");
-            }
-        }
+        // G3 S3: version 0 of the state tree is written by genesis itself
+        // (`commit_genesis`), so block 1 applies on top of it like any block.
         #[cfg(test)]
         if let Some(hook) = self.block_boundary_hook {
             hook(0, &self.db);
@@ -5244,6 +5236,7 @@ mod tests {
 
         assert_eq!(executor.last_executed_height(), 0, "fresh chain starts at 0");
 
+        seed_genesis_tree(&db);
         // In-order execution advances the marker and the root chain.
         let root0 = executor.current_state_root();
         let s1 = match executor.execute_block_parallel_at(vec![], proposer, 1, &[]) {
@@ -5281,11 +5274,13 @@ mod tests {
             other => panic!("height 2 must execute after 1: {:?}", other),
         }
         assert_eq!(executor.last_executed_height(), 2);
-        // G3: block 1 seeds the tree with the genesis state, so the root moves
-        // from all-zeros to the genesis root there. Empty blocks after it
-        // change no state, so the root stays at the genesis root; the height
+        // G3: genesis committed version 0, so the root starts at the genesis
+        // root. Empty blocks change no state, so it stays there; the height
         // marker is what makes each height consumable exactly once.
-        assert_ne!(root0, s1.state_root, "block 1 committed the genesis state");
+        assert_eq!(
+            root0, s1.state_root,
+            "an empty block keeps the genesis root"
+        );
         assert_eq!(s1.state_root, executor.current_state_root());
     }
 
@@ -5760,6 +5755,7 @@ mod tests {
         let payload =
             hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
         let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
+        seed_genesis_tree(&db);
 
         let executor = Executor::new(db.clone());
         executor.execute_block_parallel(vec![tx_json], &sender);
@@ -5779,6 +5775,13 @@ mod tests {
         assert_eq!(total_burned, 10_000);
         assert_eq!(total_supply, 999_990_000);
         assert_eq!(validator_set(&db).total_supply, 999_990_000);
+    }
+
+    /// G3 S3: genesis commits version 0 of the state tree (`commit_genesis`).
+    /// A fixture that writes its own genesis state ends the same way.
+    pub(crate) fn seed_genesis_tree(db: &Arc<StateDB>) {
+        let seeded = state_commit::seed_genesis(db).expect("seed state tree v0");
+        db.write_batch(seeded.batch).unwrap();
     }
 
     /// A funded sender, a recipient and one signed AIN transfer of 100, on a
@@ -5821,6 +5824,7 @@ mod tests {
         let payload =
             hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
         let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
+        seed_genesis_tree(&db);
         (db, sender, tx_json)
     }
 
@@ -6035,8 +6039,8 @@ mod tests {
         assert_eq!(db.get("obj:escapee").unwrap(), None);
         assert_eq!(
             state_commit::latest_version(&db).unwrap(),
-            None,
-            "no tree rows either"
+            Some(0),
+            "no tree rows beyond genesis either"
         );
 
         let accepted =
@@ -6089,6 +6093,7 @@ mod tests {
             hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
         let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
 
+        seed_genesis_tree(&db);
         // Seeding above wrote state on the base DB; that is the test's own
         // out-of-band setup, so measure from here.
         let before = db.db.state_class_stats();
@@ -8151,6 +8156,7 @@ mod tests {
         let db_a = temp_db("h6_corrupt_a");
         load_stdlib(&db_a);
         db_a.set_federation_key("00000000000000000000000000000000").unwrap();
+        seed_genesis_tree(&db_a);
         let exec_a = Executor::new(db_a.clone());
         let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
         match exec_a.execute_block_parallel_at(vec![], proposer, 1, &[]) {
@@ -8243,6 +8249,7 @@ mod tests {
         let db_a = temp_db("h6_target_a");
         load_stdlib(&db_a);
         db_a.set_federation_key("00000000000000000000000000000000").unwrap();
+        seed_genesis_tree(&db_a);
         let exec_a = Executor::new(db_a.clone());
         let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
         match exec_a.execute_block_parallel_at(vec![], proposer, 1, &[]) {

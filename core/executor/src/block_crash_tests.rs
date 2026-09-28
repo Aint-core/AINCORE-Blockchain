@@ -67,6 +67,17 @@ fn fixture(db: &StateDB, initialize: bool) -> (Vec<String>, String, String) {
     (txs, proposer, recipient)
 }
 
+/// The fixture's genesis, ending as genesis does: with state-tree version 0
+/// committed (G3 S3). Like genesis, it is idempotent: a crash child reruns it
+/// on a database its parent already initialized.
+fn genesis_fixture(db: &Arc<StateDB>) -> (Vec<String>, String, String) {
+    let fixture = fixture(db, true);
+    if state_commit::latest_version(db).unwrap().is_none() {
+        super::seed_genesis_tree(db);
+    }
+    fixture
+}
+
 fn rows(db: &StateDB) -> BTreeMap<Vec<u8>, Vec<u8>> {
     db.db
         .iterator(storage::rocksdb::IteratorMode::Start)
@@ -81,7 +92,7 @@ fn rows(db: &StateDB) -> BTreeMap<Vec<u8>, Vec<u8>> {
 fn rejected_admission_never_enters_execution_and_preserves_reopened_rows() {
     let dir = TestDir::new();
     let db = dir.open();
-    let (txs, proposer, _) = fixture(&db, true);
+    let (txs, proposer, _) = genesis_fixture(&db);
     let before = rows(&db);
     let mut executor = Executor::new(db.clone());
     executor.block_boundary_hook =
@@ -111,7 +122,7 @@ fn rejected_admission_never_enters_execution_and_preserves_reopened_rows() {
 fn admission_sees_parent_state_and_rejected_execution_remains_retryable() {
     let dir = TestDir::new();
     let db = dir.open();
-    let (txs, proposer, _) = fixture(&db, true);
+    let (txs, proposer, _) = genesis_fixture(&db);
     let before = rows(&db);
     let executor = Executor::new(db.clone());
     let admitted = std::cell::Cell::new(false);
@@ -205,7 +216,11 @@ fn block_crash_child() {
     };
     let db = Arc::new(StateDB::open(&path).unwrap());
     let replay = std::env::var("AINCORE_TEST_BLOCK_CRASH_REPLAY").unwrap() == "1";
-    let (txs, proposer, recipient) = fixture(&db, !replay);
+    let (txs, proposer, recipient) = if replay {
+        fixture(&db, false)
+    } else {
+        genesis_fixture(&db)
+    };
     let mut executor = Executor::new(Arc::clone(&db));
     executor.block_boundary_hook = Some(|point, _db| {
         if std::env::var("AINCORE_TEST_BLOCK_CRASH_POINT")
@@ -245,7 +260,7 @@ fn assert_crash_atomic(boundary: u8, retry: bool) {
     let interrupted = TestDir::new();
     let before = {
         let db = interrupted.open();
-        fixture(&db, true);
+        genesis_fixture(&db);
         rows(&db)
     };
     assert_ne!(before, after, "control must change state");
@@ -305,7 +320,7 @@ fn block_panic_child() {
         return;
     };
     let db = Arc::new(StateDB::open(&path).unwrap());
-    let (txs, proposer, _) = fixture(&db, true);
+    let (txs, proposer, _) = genesis_fixture(&db);
     let before = rows(&db);
     let mut executor = Executor::new(Arc::clone(&db));
     executor.block_boundary_hook = Some(|point, view| {
@@ -391,7 +406,11 @@ fn checked_block_child() {
     };
     let mode = std::env::var("AINCORE_TEST_CHECKED_MODE").unwrap();
     let db = Arc::new(StateDB::open(&path).unwrap());
-    let (txs, proposer, recipient) = fixture(&db, mode != "resume");
+    let (txs, proposer, recipient) = if mode == "resume" {
+        fixture(&db, false)
+    } else {
+        genesis_fixture(&db)
+    };
     let before = rows(&db);
     let mut executor = Executor::new(db.clone());
     executor.block_boundary_hook = Some(|point, _| {
@@ -466,7 +485,7 @@ fn checked_block_crash_and_rejected_metadata_are_atomic() {
         let dir = TestDir::new();
         let before = {
             let db = dir.open();
-            fixture(&db, true);
+            genesis_fixture(&db);
             rows(&db)
         };
         run_checked_child(&dir, mode);

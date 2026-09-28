@@ -708,13 +708,13 @@ mod tests {
         assert_eq!(sync.process_blocks(vec![valid], 1), 1);
     }
 
-    /// G3 S2 (found by the adversarial review): every other sync fixture
-    /// seeds tree version 0 first. A real follower has no tree when block 1
-    /// arrives: the executor seeds version 0 inside block 1's transaction.
-    /// The follower must reach the producer's root that way too.
+    /// G3 S3: a follower's genesis commits version 0 like the producer's
+    /// (here the fixture's `seed_state_tree`), so block 1 imports onto it and
+    /// reaches the producer's root. The producer's root is computed apart,
+    /// in memory, from the same genesis state (TA-1).
     #[test]
-    fn a_follower_without_a_tree_imports_block_one() {
-        let sync = setup_sync("block_one_no_tree");
+    fn a_follower_imports_block_one_onto_its_genesis_tree() {
+        let sync = setup_sync("block_one_genesis_tree");
         let key = crypto::SigningKey::from_bytes(&[77; 32]);
         let proposer = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
         set_validators(&sync, vec![(&proposer, 100)]);
@@ -730,14 +730,17 @@ mod tests {
         );
         // Writes the proposer's account: genesis state on both sides.
         authenticate_block(&sync, &mut block);
-        assert_eq!(
-            state_commit::latest_version(&sync.storage).unwrap(),
-            None,
-            "no tree yet"
-        );
-        // The producer's root for an empty block 1 is its genesis root. Only
-        // compute it here; nothing is written.
-        let producer_root = state_commit::seed_genesis(&sync.storage).unwrap().root;
+        let genesis_state: std::collections::BTreeMap<String, Vec<u8>> = sync
+            .storage
+            .db
+            .iterator(storage::rocksdb::IteratorMode::Start)
+            .map(Result::unwrap)
+            .filter(|(k, _)| storage::class::classify(k) == Some(storage::class::KeyClass::State))
+            .map(|(k, v)| (String::from_utf8(k.to_vec()).unwrap(), v.to_vec()))
+            .collect();
+        let producer_root = state_commit::genesis_root(&genesis_state).unwrap();
+        seed_state_tree(&sync);
+        assert_eq!(state_commit::root(&sync.storage, 0).unwrap(), producer_root);
         block.header.state_root = hex::encode(producer_root.0);
         block.header.receipts_root = executor.receipts_root_for_block(&[]);
         rehash_block(&mut block);
@@ -748,7 +751,6 @@ mod tests {
             state_commit::latest_version(&sync.storage).unwrap(),
             Some(1)
         );
-        assert_eq!(state_commit::root(&sync.storage, 0).unwrap(), producer_root);
         assert_eq!(state_commit::root(&sync.storage, 1).unwrap(), producer_root);
     }
 

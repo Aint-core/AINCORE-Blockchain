@@ -600,8 +600,17 @@ fn golden_root_for_a_fixed_state() {
         ),
         ("total_burned".into(), some("0")),
     ];
+    let in_memory: BTreeMap<String, Vec<u8>> = state
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone().unwrap()))
+        .collect();
     let root = commit(&db, 0, state);
     assert_eq!(hex::encode(root.0), GOLDEN_ROOT);
+    // TA-1: the in-memory genesis root is the same root, without a database.
+    assert_eq!(genesis_root(&in_memory).unwrap(), root);
+    let mut not_state = in_memory.clone();
+    not_state.insert("latest_height".into(), b"0".to_vec());
+    assert!(genesis_root(&not_state).is_err(), "only state keys");
     assert_eq!(
         hex::encode(key_hash("sys:chain_id").0),
         hex::encode(<Sha256 as sha2::Digest>::digest(b"sys:chain_id")),
@@ -638,7 +647,8 @@ fn two_restores_into_one_database_cannot_interleave() {
 #[test]
 fn boot_check_refuses_disagreeing_heights_and_a_half_done_restore() {
     let fresh = temp_db("boot_fresh");
-    boot_check(&fresh).expect("an empty database boots");
+    let err = boot_check(&fresh).expect_err("no tree after genesis");
+    assert!(err.to_string().contains("no state tree"), "{err}");
 
     let db = temp_db("boot");
     commit(&db, 0, vec![(k(1), some("a"))]);

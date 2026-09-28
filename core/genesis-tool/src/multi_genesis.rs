@@ -72,6 +72,11 @@ pub struct GenMultiArgs {
     #[arg(long, default_value_t = 10)]
     pub epoch_duration: u64,
 
+    /// The stdlib bytecode the chain starts from; its hash is pinned into
+    /// genesis.json (G3 FX-7).
+    #[arg(long, default_value = "core/vm_move/stdlib/bytecode")]
+    pub stdlib_path: String,
+
     /// Overwrite the output file if it already exists.
     #[arg(long, default_value_t = false)]
     pub force: bool,
@@ -102,6 +107,10 @@ pub struct GenesisFile {
     pub validators: Vec<GenesisValidatorConfig>,
     pub treasury_reserve: String,
     pub epoch_duration: u64,
+    /// G3 FX-7: the stdlib this chain starts from, by
+    /// `node::genesis::stdlib_hash_of`. A node whose stdlib differs refuses
+    /// the genesis.
+    pub stdlib_hash: String,
 }
 
 /// Derive every genesis field for one validator from its 32-byte node.key seed.
@@ -171,6 +180,7 @@ pub fn build_genesis_file(
     chain_id: &str,
     treasury_reserve_ain: u128,
     epoch_duration: u64,
+    stdlib_hash: &str,
 ) -> Result<GenesisFile, Box<dyn std::error::Error>> {
     if specs.is_empty() {
         return Err("at least one --validator is required".into());
@@ -180,6 +190,9 @@ pub fn build_genesis_file(
     }
     if epoch_duration == 0 {
         return Err("epoch_duration must be > 0".into());
+    }
+    if stdlib_hash.trim().is_empty() {
+        return Err("stdlib_hash must not be empty".into());
     }
 
     let mut validators = Vec::with_capacity(specs.len());
@@ -220,6 +233,7 @@ pub fn build_genesis_file(
         validators,
         treasury_reserve: treasury_reserve.to_string(),
         epoch_duration,
+        stdlib_hash: stdlib_hash.to_string(),
     })
 }
 
@@ -245,11 +259,14 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
         specs.push(parse_validator_spec(raw)?);
     }
 
+    let stdlib_hash = node::genesis::stdlib_hash_of(&args.stdlib_path)
+        .map_err(|e| format!("cannot hash the stdlib at {}: {e}", args.stdlib_path))?;
     let genesis = build_genesis_file(
         &specs,
         &args.chain_id,
         args.treasury_reserve_ain,
         args.epoch_duration,
+        &stdlib_hash,
     )?;
 
     if args.out.exists() && !args.force {
@@ -275,6 +292,7 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("🏦 Treasury reserve: {} quanta", genesis.treasury_reserve);
     println!("⏳ Epoch duration: {}s", genesis.epoch_duration);
+    println!("📚 Stdlib hash: {}", genesis.stdlib_hash);
     println!("✅ Wrote {}", args.out.display());
     println!(
         "ℹ️  Each validator must run with its node.key set to the SAME 32-byte seed \
@@ -378,7 +396,7 @@ mod tests {
                 stake_ain: 2000,
             },
         ];
-        let err = build_genesis_file(&specs, "AINCORE-MAINNET-1", 50_000, 10)
+        let err = build_genesis_file(&specs, "AINCORE-MAINNET-1", 50_000, 10, "stdlib-hash")
             .expect_err("duplicate must fail");
         assert!(err.to_string().contains("duplicate validator address"));
     }
@@ -399,7 +417,8 @@ mod tests {
                 stake_ain: 2_000_000,
             },
         ];
-        let genesis = build_genesis_file(&specs, "AINCORE-MAINNET-1", 50_000, 10).unwrap();
+        let genesis =
+            build_genesis_file(&specs, "AINCORE-MAINNET-1", 50_000, 10, "stdlib-hash").unwrap();
 
         // Reconstruct consensus::qc::ValidatorInfo from the emitted file (this is
         // the same shape genesis.rs writes to sys:validator_set:v1, with stake
@@ -445,7 +464,14 @@ mod tests {
                 stake_ain: 2_500_000,
             },
         ];
-        let genesis = build_genesis_file(&specs, "AINCORE-MAINNET-1", 50_000, 7).unwrap();
+        let genesis = build_genesis_file(
+            &specs,
+            "AINCORE-MAINNET-1",
+            50_000,
+            7,
+            &node::genesis::stdlib_hash_of(&stdlib_path()).unwrap(),
+        )
+        .unwrap();
 
         let dir = std::env::temp_dir().join(format!("aincore_genmulti_e2e_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -456,23 +482,11 @@ mod tests {
             serde_json::to_string_pretty(&genesis).unwrap(),
         )
         .unwrap();
-        std::env::set_var("AINCORE_GENESIS_PATH", &genesis_path);
-
-        // The loader's single-node-fallback args (genesis_addr/pubkey/node_identity)
-        // are irrelevant here because genesis.json supplies an explicit
-        // multi-validator set with embedded BLS keys.
+        // The node loads the tool's output as is: same field names, and the
+        // pinned stdlib_hash matches the stdlib it builds from.
         let db = temp_db("e2e_load");
-        let first = &genesis.validators[0];
-        node::genesis::initialize_genesis(
-            &db,
-            &stdlib_path(),
-            &first.address,
-            &first.public_key,
-            &seed(99), // arbitrary node identity; NOT used for BLS in multi mode
-        )
-        .expect("multi-validator genesis with embedded BLS keys must load");
-
-        std::env::remove_var("AINCORE_GENESIS_PATH");
+        node::genesis::initialize_genesis_from(&db, &stdlib_path(), &genesis_path)
+            .expect("multi-validator genesis with embedded BLS keys must load");
 
         // sys:validator_set:v1 must have been written with all validators.
         let stored = db

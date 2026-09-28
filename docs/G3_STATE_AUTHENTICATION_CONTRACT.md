@@ -574,6 +574,40 @@ Enforcement therefore requires all of the following:
 
 The `aincore_getStateClassStats` RPC is public. It exposes only masked key shapes and
 counters, never values.
+
+**S3 status (branch `g3/activation`).**
+- **Go/no-go evidence, 2026-09-29.** The live cluster runs observe mode.
+  - r1 and r2 logged no `[STATE_CLASS]` line in 40 hours across 4 restarts.
+  - All four validators report `unclassified = 0` and `state_outside_block = 0` across
+    190,000 to 500,000 writes since boot.
+  - The faucet is removed (S0b, live).
+  - Genesis now runs through WG-2 (S3a).
+  - The snapshot install remains, and goes in S3c.
+- **S3a (deterministic genesis) is done.**
+  - `build_genesis(genesis.json, stdlib)` builds the genesis state purely in memory. It
+    takes nothing from the booting node: not its key, CWD or env.
+  - `commit_genesis` writes it in one block transaction as state-tree version 0, and
+    checks that the tree root equals the in-memory root. Then it seals.
+  - The identity (`AINCORE_GENESIS_ID_V2`) binds `state_root(0)`. It is recomputed in
+    memory from genesis.json on every boot, and a database holding another genesis is
+    refused. It is never recomputed from the tree.
+  - FX-7:
+    - no self-account;
+    - explicit BLS keys for every validator;
+    - a missing or unparseable genesis.json is an error, and the `../` search paths are
+      gone;
+    - genesis.json pins `stdlib_hash`;
+    - `sys:config:burn_percentage` (default 10), `sys:config:tip_agreement_n` (default 1)
+      and `total_burned` are seeded;
+    - a validator listed twice, or any key written twice, is refused.
+  - FX-15 is complete: `sys:config:require_exec_roots` is no longer written.
+  - The executor's lazy v0 seeding is gone. RC-1 refuses a database with no tree after
+    genesis.
+  - `GENESIS_VERSION` is `g3-deterministic-v5`.
+  - **Activation note:** every genesis.json needs the `stdlib_hash` field and explicit
+    BLS keys. `genesis-tool gen-multi` writes both. The live `genesis.4r.json` has
+    neither, as expected: S3 activates only with the S8 fresh genesis.
+- **S3b (WG-1 enforcement) and S3c (the rest of FX-9, the snapshot install) are next.**
 | S4 | Proof RPC + Rust and JS verifiers (PF) | No, once S2 is live |
 | S5 | Committee record + FinalityVote V2 binding + transition log + `TA_LOG_*` (TA; joint with G1 EP-2/EP-4) | **Yes** |
 | S6 | Snapshot restore + bootstrap record + pinned versions + rejoin at every horizon (SN) | No |

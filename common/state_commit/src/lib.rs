@@ -345,6 +345,40 @@ fn apply_checked(
     })
 }
 
+/// A tree with no nodes. Version 0 of an empty tree reads nothing from its
+/// store, so its root needs no database.
+struct EmptyTree;
+
+impl TreeReader for EmptyTree {
+    fn get_node_option(&self, _: &NodeKey) -> Result<Option<Node>> {
+        Ok(None)
+    }
+    fn get_value_option(&self, _: Version, _: KeyHash) -> Result<Option<OwnedValue>> {
+        Ok(None)
+    }
+    fn get_rightmost_leaf(&self) -> Result<Option<(NodeKey, LeafNode)>> {
+        Ok(None)
+    }
+}
+
+/// TA-1 / FX-7: the root of version 0 over the genesis state, computed in
+/// memory from that state alone. The genesis identity binds this root. The
+/// tree on disk, which may later be pruned or restored, is never consulted
+/// for it.
+pub fn genesis_root(state: &BTreeMap<String, Vec<u8>>) -> Result<RootHash> {
+    let mut set = Vec::with_capacity(state.len());
+    for (key, value) in state {
+        ensure!(
+            classify(key.as_bytes()) == Some(KeyClass::State),
+            "not a state key: {key:?}"
+        );
+        set.push((key_hash(key), Some(value.clone())));
+    }
+    no_panic("genesis_root", || {
+        Ok(Sha256Jmt::new(&EmptyTree).put_value_set(set, 0)?.0)
+    })
+}
+
 /// Version 0 of an EMPTY tree from every consensus-state key in the flat
 /// store, i.e. the genesis state. It must run before block 1 executes: its
 /// scan reads whatever is staged, so running it later would fold block 1's
@@ -360,8 +394,9 @@ pub fn seed_genesis(db: &Arc<StateDB>) -> Result<Applied> {
     apply(db, 0, changes)
 }
 
-/// RC-1: at boot, the tree's latest version, the executed height and the
-/// stored chain height must agree, and no snapshot restore may be half done.
+/// RC-1: at boot, after genesis, the tree's latest version, the executed
+/// height and the stored chain height must agree, and no snapshot restore may
+/// be half done.
 /// The block transaction writes all three together, so a mismatch means the
 /// database is not something this node produced; it must refuse to start,
 /// never guess.
@@ -376,13 +411,13 @@ pub fn boot_check(db: &Arc<StateDB>) -> Result<()> {
         .transpose()
         .context("malformed sys:last_executed_height")?
         .unwrap_or(0);
+    // S3: genesis commits version 0, and this runs after genesis, so a
+    // database with no tree predates S3 or lost its tree.
     match (executed, latest_version(db)?) {
-        // Before block 1 (the tree is seeded when block 1 executes), or right
-        // after genesis seeded version 0.
-        (0, None) | (0, Some(0)) => {}
+        (_, None) => bail!("no state tree: genesis did not commit version 0"),
         (height, Some(version)) if version == height => {}
-        (height, version) => {
-            bail!("state tree is at version {version:?} but the executed height is {height}")
+        (height, Some(version)) => {
+            bail!("state tree is at version {version} but the executed height is {height}")
         }
     }
     match db
