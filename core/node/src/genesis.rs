@@ -1306,6 +1306,33 @@ pub fn initialize_genesis(
 
 #[cfg(test)]
 mod tests {
+
+    /// G3 KV-2 / FX-9: every system resource key genesis writes is exactly
+    /// the canonical encoder's output, so the genesis tree (version 0) and
+    /// every later proof use the same key hashes.
+    #[test]
+    fn genesis_system_resource_keys_match_the_canonical_encoder() {
+        use vm_move::state_keys::resource_key_str;
+        let one = move_core_types::account_address::AccountAddress::ONE;
+        for tag in [
+            "0x1::staking::ValidatorSet",
+            "0x1::epoch::Epoch",
+            "0x1::governance::GovernanceState",
+            "0x1::universal_mining::DeviceRegistry",
+            "0x1::universal_mining::OracleConfig",
+            "0x1::treasury::Treasury",
+            "0x1::dex::PoolRegistry",
+            "0x1::wbtc::BridgeConfig",
+            "0x1::token_factory::TokenRegistry",
+        ] {
+            assert_eq!(
+                super::system_resource_key(tag),
+                resource_key_str(&one, tag),
+                "{tag}"
+            );
+        }
+    }
+
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use executor::{Executor, Transaction};

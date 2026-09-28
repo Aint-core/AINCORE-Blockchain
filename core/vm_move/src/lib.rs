@@ -12,6 +12,7 @@ use storage::StateDB;
 
 mod gas;
 mod overlay;
+pub mod state_keys;
 use gas::AINCOREGasMeter;
 use overlay::OverlayStorage;
 use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
@@ -34,8 +35,7 @@ impl ModuleResolver for AINCOREStorage {
     type Error = anyhow::Error;
 
     fn get_module(&self, id: &ModuleId) -> Result<Option<Vec<u8>>, Self::Error> {
-        let key = format!("module_{}_{}", id.address(), id.name());
-        // println!("🔍 VM looking for module: {}", key);
+        let key = state_keys::module_key(id.address(), id.name().as_str());
         match self.db.get(&key) {
             Ok(Some(bytes_hex)) => {
                 // We store as hex in StateDB currently (based on put/get implementation)
@@ -59,7 +59,7 @@ impl ResourceResolver for AINCOREStorage {
         address: &AccountAddress,
         typ: &move_core_types::language_storage::StructTag,
     ) -> Result<Option<Vec<u8>>, Self::Error> {
-        let key = format!("resource_{}_{}", address, typ);
+        let key = state_keys::resource_key(address, typ);
         match self.db.get(&key) {
             Ok(Some(bytes_hex)) => {
                 let bytes = hex::decode(bytes_hex)?;
@@ -905,7 +905,7 @@ impl AINCOREVM {
             let (modules, resources) = account_changes.into_inner();
 
             for (struct_tag, change) in resources {
-                let key = format!("resource_{}_{}", addr, struct_tag);
+                let key = state_keys::resource_key(&addr, &struct_tag);
                 match change {
                     move_core_types::effects::Op::New(bytes)
                     | move_core_types::effects::Op::Modify(bytes) => {
@@ -919,7 +919,7 @@ impl AINCOREVM {
             }
             // Handle modules if any
             for (module_name, change) in modules {
-                let key = format!("module_{}_{}", addr, module_name);
+                let key = state_keys::module_key(&addr, module_name.as_str());
                 match change {
                     move_core_types::effects::Op::New(bytes)
                     | move_core_types::effects::Op::Modify(bytes) => {

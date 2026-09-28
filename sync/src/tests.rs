@@ -743,12 +743,12 @@ mod tests {
             vec![],
             "node_1".to_string(),
             "expected_state".to_string(),
-            String::new(),
+            "r".to_string(),
         );
         let summary = executor::BlockExecutionSummary {
             executed_raws: Vec::new(),
             state_root: "actual_state".to_string(),
-            receipts_root: String::new(),
+            receipts_root: "r".to_string(),
             gas_charged: 0,
             tx_count: 0,
         };
@@ -757,11 +757,15 @@ mod tests {
         assert!(err.contains("State root mismatch"));
     }
 
-    // SEC-#7 (cutover): empty execution roots are accepted by default (so the
-    // running testnet is not retroactively rejected).
+    // G3 FX-15: empty execution roots are always refused. The old
+    // `sys:config:require_exec_roots` switch (and its env fallback) no longer
+    // exists: even an explicit "0" cannot turn root binding off.
     #[test]
-    fn verify_execution_roots_empty_ok_when_not_required() {
+    fn empty_execution_roots_are_always_refused() {
         let sync = setup_sync("roots_empty_default");
+        sync.storage
+            .put("sys:config:require_exec_roots", "0")
+            .unwrap();
         let block = Block::new_with_roots(
             1,
             1,
@@ -778,7 +782,8 @@ mod tests {
             gas_charged: 0,
             tx_count: 0,
         };
-        assert!(sync.verify_execution_roots(&block, &summary).is_ok());
+        let err = sync.verify_execution_roots(&block, &summary).unwrap_err();
+        assert!(err.contains("empty state_root"), "{err}");
     }
 
     // SEC-#7 (cutover): with sys:config:require_exec_roots set, an empty-root

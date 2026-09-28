@@ -3259,8 +3259,9 @@ impl DagConsensus {
         }
 
         // 3. SLOW PATH: Read BCS ValidatorSet Resource directly.
-        let key = "resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::staking::ValidatorSet";
-        if let Ok(Some(bytes_hex)) = storage.get(key) {
+        // G3 FX-9: the canonical key, not a hand-written copy of it.
+        let key = executor::validator_set_key();
+        if let Ok(Some(bytes_hex)) = storage.get(&key) {
             if let Ok(bytes) = hex::decode(bytes_hex) {
                 if let Ok(val_set) = bcs::from_bytes::<ValidatorSet>(&bytes) {
                     let mut validators: Vec<(String, u64)> = val_set

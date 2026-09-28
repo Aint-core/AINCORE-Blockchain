@@ -70,7 +70,7 @@ impl ModuleResolver for OverlayStorage<'_> {
     type Error = anyhow::Error;
 
     fn get_module(&self, id: &ModuleId) -> Result<Option<Vec<u8>>, Self::Error> {
-        let key = format!("module_{}_{}", id.address(), id.name());
+        let key = crate::state_keys::module_key(id.address(), id.name().as_str());
         match self.staged_lookup(&key)? {
             Some(hit) => Ok(hit),
             None => self.base.get_module(id),
@@ -86,7 +86,7 @@ impl ResourceResolver for OverlayStorage<'_> {
         address: &AccountAddress,
         typ: &StructTag,
     ) -> Result<Option<Vec<u8>>, Self::Error> {
-        let key = format!("resource_{}_{}", address, typ);
+        let key = crate::state_keys::resource_key(address, typ);
         match self.staged_lookup(&key)? {
             Some(hit) => Ok(hit),
             None => self.base.get_resource(address, typ),

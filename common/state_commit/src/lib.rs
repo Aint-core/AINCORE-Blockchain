@@ -360,6 +360,45 @@ pub fn seed_genesis(db: &Arc<StateDB>) -> Result<Applied> {
     apply(db, 0, changes)
 }
 
+/// RC-1: at boot, the tree's latest version, the executed height and the
+/// stored chain height must agree, and no snapshot restore may be half done.
+/// The block transaction writes all three together, so a mismatch means the
+/// database is not something this node produced; it must refuse to start,
+/// never guess.
+pub fn boot_check(db: &StateDB) -> Result<()> {
+    ensure!(
+        db.get("sys:restore_in_progress")?.is_none(),
+        "a snapshot restore is incomplete; wipe the tree and restore again"
+    );
+    let executed: Version = db
+        .get("sys:last_executed_height")?
+        .map(|s| s.parse::<Version>())
+        .transpose()
+        .context("malformed sys:last_executed_height")?
+        .unwrap_or(0);
+    match (executed, latest_version(db)?) {
+        // Before block 1 (the tree is seeded when block 1 executes), or right
+        // after genesis seeded version 0.
+        (0, None) | (0, Some(0)) => {}
+        (height, Some(version)) if version == height => {}
+        (height, version) => {
+            bail!("state tree is at version {version:?} but the executed height is {height}")
+        }
+    }
+    if let Some(latest) = db
+        .get("latest_height")?
+        .map(|s| s.parse::<Version>())
+        .transpose()
+        .context("malformed latest_height")?
+    {
+        ensure!(
+            latest == executed,
+            "latest_height {latest} != executed height {executed}"
+        );
+    }
+    Ok(())
+}
+
 /// The root at `version`.
 pub fn root(db: &Arc<StateDB>, version: Version) -> Result<RootHash> {
     no_panic("root", || {

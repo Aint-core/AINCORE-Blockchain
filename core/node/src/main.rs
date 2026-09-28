@@ -576,6 +576,14 @@ async fn main() {
         println!("🔏 Vertex hash domain installed: chain={} genesis={}", chain_id, &genesis_identity[..16]);
     }
 
+    // G3 RC-1: the state tree, the executed height and the chain height are
+    // written together by every block. If they disagree, this database is not
+    // one this node produced; refuse to start rather than guess.
+    if let Err(e) = state_commit::boot_check(&storage) {
+        eprintln!("❌ FATAL: state tree boot check failed: {e}; refusing to boot");
+        std::process::exit(1);
+    }
+
     let executor = Arc::new(Executor::new(Arc::clone(&storage)));
     // Phase 2.1 (H-01): use with_storage so PQC (Dilithium5) submissions
     // are verified at the mempool gate against the canonical

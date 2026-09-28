@@ -220,6 +220,16 @@ impl ReadStore {
         )
     }
 
+    /// A value staged in THIS transaction only, never the base database:
+    /// `Some(Some(v))` written, `Some(None)` deleted, `None` untouched (or no
+    /// transaction). Used for data a block must derive from its own writes.
+    pub fn staged_get(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        let stage = self.stage.as_ref()?;
+        let changes = stage.changes.lock().expect("transaction changes poisoned");
+        stage.check_active();
+        changes.get(key).map(|v| v.as_ref().map(|v| v.to_vec()))
+    }
+
     /// G3 CM-2: seal consensus state once the root is computed. Returns false
     /// outside the block transaction, where sealing has no meaning.
     pub fn seal_state(&self) -> bool {
@@ -352,6 +362,11 @@ impl StateDB {
     /// G3 CM-2: seal consensus state in the block transaction.
     pub fn seal_state(&self) -> bool {
         self.db.seal_state()
+    }
+
+    /// A value staged in this transaction only (see `ReadStore::staged_get`).
+    pub fn staged_get(&self, key: &str) -> Option<Option<Vec<u8>>> {
+        self.db.staged_get(key.as_bytes())
     }
 
     /// Execute against a private write-behind view; publish one synced batch only

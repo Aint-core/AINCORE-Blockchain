@@ -9,6 +9,8 @@ executor = { path = "../executor" }
 mempool = { path = "../mempool" }
 vm_move = { path = "../vm_move" }
 storage = { path = "../../common/storage" }
+# G3 RC-1: boot consistency of the state tree.
+state_commit = { path = "../../common/state_commit" }
 network = { path = "../../common/network" }
 config = { path = "../../common/config" }
 crypto = { path = "../../common/crypto" }

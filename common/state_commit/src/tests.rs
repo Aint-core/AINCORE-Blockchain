@@ -633,3 +633,37 @@ fn two_restores_into_one_database_cannot_interleave() {
     let err = second.expect_err("the second restore must not overwrite the first");
     assert!(err.to_string().contains("overwrite"), "{err}");
 }
+
+/// RC-1: the three height markers must agree, or the node refuses to boot.
+#[test]
+fn boot_check_refuses_disagreeing_heights_and_a_half_done_restore() {
+    let fresh = temp_db("boot_fresh");
+    boot_check(&fresh).expect("an empty database boots");
+
+    let db = temp_db("boot");
+    commit(&db, 0, vec![(k(1), some("a"))]);
+    boot_check(&db).expect("genesis seeded, no block yet");
+    commit(&db, 1, vec![(k(1), some("b"))]);
+    db.put("sys:last_executed_height", "1").unwrap();
+    db.put("latest_height", "1").unwrap();
+    boot_check(&db).expect("positive control: consistent markers boot");
+
+    // Heights agree with each other, the tree lags behind both: only the
+    // tree check can see it.
+    db.put("sys:last_executed_height", "2").unwrap();
+    db.put("latest_height", "2").unwrap();
+    let err = boot_check(&db).expect_err("tree behind the executed height");
+    assert!(
+        err.to_string().contains("state tree is at version"),
+        "{err}"
+    );
+    db.put("sys:last_executed_height", "1").unwrap();
+    db.put("latest_height", "1").unwrap();
+    boot_check(&db).expect("positive control: consistent again");
+    db.put("latest_height", "7").unwrap();
+    assert!(boot_check(&db).is_err(), "chain height disagrees");
+    db.put("latest_height", "1").unwrap();
+    db.put("sys:restore_in_progress", "{}").unwrap();
+    let err = boot_check(&db).expect_err("half-done restore");
+    assert!(err.to_string().contains("restore"), "{err}");
+}

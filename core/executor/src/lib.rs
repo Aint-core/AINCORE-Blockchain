@@ -306,7 +306,9 @@ struct FeeSweepEntry {
     attempts: u64,
 }
 
-fn validator_set_key() -> String {
+/// Storage key of the Move `0x1::staking::ValidatorSet` resource. Pinned to
+/// the canonical encoder (`vm_move::state_keys`) by a golden test.
+pub fn validator_set_key() -> String {
     format!(
         "resource_{}_{}",
         system_address(),
@@ -1017,6 +1019,14 @@ impl Executor {
         }
     }
 
+    /// The receipts root of a block, from the receipts THIS block wrote.
+    ///
+    /// G3 FX-5: it used to read `tx_receipt:*` from the database, so a
+    /// transaction refused in this block but byte-identical to one executed
+    /// earlier hashed the STALE earlier receipt, and a node restored without
+    /// receipt history computed a different root. Only the block's own staged
+    /// receipts count now; outside a block transaction every transaction is
+    /// `NO_RECEIPT`.
     pub fn receipts_root_for_block(&self, txs_json: &[String]) -> String {
         use sha2::{Digest, Sha256};
 
@@ -1025,8 +1035,8 @@ impl Executor {
         for tx_json in txs_json {
             let tx_hash = tx_hash_hex(tx_json);
             hasher.update(tx_hash.as_bytes());
-            match self.db.get(&format!("tx_receipt:{}", tx_hash)) {
-                Ok(Some(receipt)) => hasher.update(receipt.as_bytes()),
+            match self.db.staged_get(&format!("tx_receipt:{}", tx_hash)) {
+                Some(Some(receipt)) => hasher.update(&receipt),
                 _ => hasher.update(b"NO_RECEIPT"),
             }
         }
@@ -2074,7 +2084,9 @@ impl Executor {
                     }
                 }
                 if !distributed {
-                    self.queue_fee_sweep(recipient, *share, self.db.get_chain_height());
+                    // G3 FX-4: keyed by the EXECUTING height, not `latest_height`
+                    // (chain data read into a state key name).
+                    self.queue_fee_sweep(recipient, *share, block_height);
                     eprintln!("🔴 Reward queued for sweep: {} AIN → {}", share, recipient);
                 }
             }
@@ -3079,25 +3091,14 @@ impl Executor {
             let sender_obj = match self.db.get_object(&tx.sender) {
                 Some(obj) => obj,
                 None => {
-                    let fresh = aa::AccountData {
-                        public_key: tx.public_key.clone(),
-                        sequence_number: 0,
-                        ..Default::default()
-                    };
-                    let data = match serde_json::to_vec(&fresh) {
-                        Ok(d) => d,
-                        Err(_) => return None,
-                    };
                     println!(
                         "🆕 Implicitly creating account {} on its first transaction",
                         tx.sender
                     );
-                    storage::object::Object::new(
-                        tx.sender.clone(),
-                        storage::object::Owner::Address(tx.sender.clone()),
-                        data,
-                        "0x1::account::AccountData".to_string(),
-                    )
+                    // G3 FX-10: the ONE account constructor genesis uses too,
+                    // so a logical account has one encoding in the state tree
+                    // whichever path created it.
+                    aa::AccountManager::create_account(tx.sender.clone(), tx.public_key.clone())
                 }
             };
 
@@ -3312,7 +3313,9 @@ impl Executor {
                     println!("❌ Paymaster specified without signature! Rejected.");
                     return None;
                 }
-                pm.clone()
+                // G3 FX-9: one canonical spelling, so case variants of the
+                // same key cannot address different account objects.
+                pm.to_ascii_lowercase()
             } else {
                 tx.sender.clone()
             };
@@ -5883,6 +5886,161 @@ mod tests {
             &old_proof,
         )
         .unwrap();
+    }
+
+    /// G3 KV-2 / FX-9: every hand-written system resource key is exactly what
+    /// the canonical encoder produces. A drift would make the executor read an
+    /// "absent" resource and proofs derive the wrong key hash.
+    #[test]
+    fn hand_written_state_keys_match_the_canonical_encoder() {
+        use vm_move::state_keys::resource_key_str;
+        let one = system_address();
+        assert_eq!(
+            super::validator_set_key(),
+            resource_key_str(&one, "0x1::staking::ValidatorSet")
+        );
+        assert_eq!(
+            super::dex_registry_key(),
+            resource_key_str(&one, "0x1::dex::PoolRegistry")
+        );
+        assert_eq!(
+            super::supply_stats_key(),
+            resource_key_str(&one, "0x1::staking::SupplyStats")
+        );
+    }
+
+    /// G3 FX-10: an account created implicitly by its first transaction is
+    /// byte-for-byte the object genesis would have written for it.
+    #[test]
+    fn an_implicit_account_has_the_canonical_encoding() {
+        let (db, _, _) = g3_burning_transfer("g3_implicit_account");
+        let key = SigningKey::from_bytes(&[33u8; 32]);
+        let public_key = hex::encode(key.verifying_key().as_bytes());
+        let address = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        set_coin_store(&db, &address, 1_000_000);
+        assert!(db.get_object(&address).is_none(), "no account object yet");
+        let payload = {
+            let call = vm_move::EntryFunctionCall {
+                module: move_core_types::language_storage::ModuleId::new(
+                    move_core_types::account_address::AccountAddress::ONE,
+                    move_core_types::identifier::Identifier::new("coin").unwrap(),
+                ),
+                function: "transfer".to_string(),
+                ty_args: vec![move_core_types::language_storage::TypeTag::Struct(
+                    Box::new(move_core_types::language_storage::StructTag {
+                        address: move_core_types::account_address::AccountAddress::ONE,
+                        module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                        name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                        type_params: vec![],
+                    }),
+                )],
+                args: vec![
+                    bcs::to_bytes(&parse_move_address(&address).unwrap()).unwrap(),
+                    bcs::to_bytes(&parse_move_address(&address).unwrap()).unwrap(),
+                    bcs::to_bytes(&1u128).unwrap(),
+                ],
+            };
+            hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap())
+        };
+        let tx = signed_tx(&key, &address, &payload, 0, 100_000, 1);
+        let Ok(BlockExecOutcome::Executed(summary)) = Executor::new(db.clone())
+            .execute_block_checked_at(vec![tx], &address, 1, &[], |_, _| Ok(()))
+        else {
+            panic!("block must execute");
+        };
+        assert_eq!(
+            summary.executed_raws.len(),
+            1,
+            "positive control: first tx executed"
+        );
+        let stored = db.get_object(&address).expect("implicitly created");
+        let mut canonical = aa::AccountManager::create_account(address.clone(), public_key);
+        // The first transaction bumped the nonce; everything else must match.
+        let mut data: aa::AccountData = serde_json::from_slice(&canonical.data).unwrap();
+        data.sequence_number = 1;
+        canonical.data = serde_json::to_vec(&data).unwrap();
+        canonical.version = stored.version;
+        assert_eq!(stored.type_struct, "0x1::account::Account");
+        assert_eq!(
+            serde_json::to_vec(&stored).unwrap(),
+            serde_json::to_vec(&canonical).unwrap()
+        );
+    }
+
+    /// G3 FX-5: a transaction refused in block 2 but byte-identical to one
+    /// executed in block 1 must count as NO_RECEIPT. The old code read the
+    /// stale block-1 receipt from the database.
+    #[test]
+    fn a_replayed_transaction_does_not_reuse_a_stale_receipt() {
+        let (db, sender, tx_json) = g3_burning_transfer("g3_stale_receipt");
+        let executor = Executor::new(db.clone());
+        let Ok(BlockExecOutcome::Executed(first)) = executor.execute_block_checked_at(
+            vec![tx_json.clone()],
+            &sender,
+            1,
+            &[],
+            |_, _| Ok(()),
+        ) else {
+            panic!("block 1 must execute");
+        };
+        assert_eq!(
+            first.executed_raws.len(),
+            1,
+            "positive control: block 1 executed it"
+        );
+        let receipt_key = format!("tx_receipt:{}", tx_hash_hex(&tx_json));
+        assert!(
+            db.get(&receipt_key).unwrap().is_some(),
+            "block 1 wrote a receipt"
+        );
+
+        let Ok(BlockExecOutcome::Executed(second)) = executor.execute_block_checked_at(
+            vec![tx_json.clone()],
+            &sender,
+            2,
+            &[],
+            |_, _| Ok(()),
+        ) else {
+            panic!("block 2 must execute");
+        };
+        assert!(second.executed_raws.is_empty(), "the replay is refused");
+        // Outside a transaction nothing is staged, so this is the root with
+        // the transaction counted as NO_RECEIPT.
+        assert_eq!(
+            second.receipts_root,
+            executor.receipts_root_for_block(std::slice::from_ref(&tx_json))
+        );
+        assert_ne!(second.receipts_root, first.receipts_root);
+    }
+
+    /// G3 FX-4: a fee share that cannot be paid is queued under the height
+    /// being executed. It used to take `latest_height`, which is still the
+    /// parent height while a block executes.
+    #[test]
+    fn a_queued_fee_is_keyed_by_the_executing_height() {
+        let (db, sender, tx_json) = g3_burning_transfer("g3_sweep_height");
+        let bad = "not_a_hex_validator";
+        db.put(
+            "sys:validators",
+            &serde_json::to_string(&vec![(sender.as_str(), 1000u64), (bad, 1000u64)]).unwrap(),
+        )
+        .unwrap();
+        let outcome = Executor::new(db.clone())
+            .execute_block_checked_at(vec![tx_json], &sender, 1, &[], |_, _| Ok(()))
+            .unwrap();
+        assert!(matches!(outcome, BlockExecOutcome::Executed(_)));
+        let queued: Vec<String> = db
+            .scan_prefix("sys:fee_sweep_queue:")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(!queued.is_empty(), "positive control: a share was queued");
+        assert!(
+            queued
+                .iter()
+                .all(|k| k.starts_with("sys:fee_sweep_queue:1:")),
+            "keyed by the executing height 1: {queued:?}"
+        );
     }
 
     /// G3 CM-2: a consensus-state write in `accept`, after the root is sealed,
