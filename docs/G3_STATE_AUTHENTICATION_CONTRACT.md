@@ -197,8 +197,10 @@ tree is tiny.
   - Every block-time write is already staged in one private view and published as one
     synced batch (`common/storage/src/transaction.rs:264-309`). The stage keeps the last
     write per key (`BTreeMap`, `:13`, `:155`, `:194-204`).
-  - At commit, the executor filters the staged changes to class S and diffs each against its
-    pre-block value.
+  - At commit, the executor filters the staged changes to class S and diffs each against the
+    **committed tree value at `h−1`**. That value equals the flat pre-block value whenever
+    RC-2 holds. Diffing against the tree keeps the result deterministic even if a flat key
+    drifted, and RC-2 catches the drift.
   - A delete of an absent key, or a same-bytes rewrite, is not a change. Today every slash
     stages such a delete (`lib.rs:2507`, `2534`, `2692`).
   - The write log (`block_effective_writes` / `block_write_log`) is deleted.
@@ -388,8 +390,10 @@ tree is tiny.
   2. walks the flat S templates. They share no prefix with the large families (`block_`,
      `consensus:qc*`, `da_`), so the cost is O(|S|), not O(DB).
 
-  Any divergence means it refuses to start and lists the keys. This detects an out-of-band
-  edit to a flat S key. It does **not** detect a self-consistent replacement (see RC-3).
+  Any divergence means it refuses to start and lists the keys. The comparison is against each
+  leaf's newest value row. This detects an out-of-band edit to a flat S key, and a stale
+  value row left behind (for example by a failed restore). It does **not** detect a
+  self-consistent replacement (see RC-3).
 - **RC-3:** When the node holds a QC-verified header for its latest height, or for any
   height at or above the floor, the tree root at that version must equal `qc.state_root`.
   That is how a self-consistent but foreign database (a restored backup, a copied datadir) is
@@ -481,6 +485,18 @@ ran**. "0 tests ran", or an unapplied mutant, must never count as green.
 |---|---|---|
 | **S0** | `state_class` in **observe mode** (CL-1, WG-1 counted, not refused); FX-1, FX-2, FX-3, FX-6, FX-8, FX-11; the gated test-seeding API. FX-14 ships separately and first (live halt path). | **No.** Rolling deploy; the counters show what enforcement would refuse. |
 | S1 | `StateCommitment` + `jmt` backend as a library: apply with CM-7 sequencing, prove, range proof, restore per SN-2; DT-2 and PF vectors; T storage (CM-8) | No |
+
+**S1 notes.**
+- It lives in `common/state_commit` and pins `jmt = "=0.12.0"`, the version P1–P9 were
+  measured on.
+- Every call into `jmt` is wrapped so that a panic becomes an error. `jmt` unwraps reader
+  results and asserts on restore state, so a corrupt row or a hostile peer could otherwise
+  crash the node. This relies on `panic = "unwind"`, the workspace default.
+- A restore that refuses one chunk is poisoned: `jmt` mutates its state before verifying and
+  never rolls back. The caller must `wipe_tree` and begin again.
+- `finish` returns the `jmt:latest` marker as a batch, for SN-1b to commit atomically.
+- Proof vectors for the JS verifier come with S4. S1 pins one golden root, reproduced
+  independently without `jmt`.
 | S2 | Executor integration: `Δ_h` from staged changes, seal, one batch, `state_root = root_h`. Includes FX-4, FX-5, FX-9, FX-10, FX-12, FX-15. | **Yes** |
 | S3 | Genesis as version 0; identity with `state_root(0)` in memory; **WG-1 enforcement on** | **Yes** |
 
@@ -608,7 +624,8 @@ once (FX-8, SN-5).
 
 ### T — tree internals (new; hex-encoded values, CM-8)
 - `jmt:node:{hex(NodeKey)}`
-- `jmt:val:{keyhash64}:{version:020}`: value history; empty means a tombstone
+- `jmt:val:{keyhash64}:{version:020}`: value history, encoded as `v{hex}` for a value (so an
+  empty value stays distinct) or `d` for a deletion
 - `jmt:stale:{stale_since:020}:{hex(NodeKey)}`
 - `jmt:pre:{keyhash64}`: key preimage
 - `jmt:latest`, `jmt:floor`, `jmt:pinned:{version:020}`

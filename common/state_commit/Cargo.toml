@@ -1,0 +1,17 @@
+[package]
+name = "state_commit"
+version = "0.1.0"
+edition = "2021"
+description = "G3 state commitment: a Jellyfish Merkle Tree over consensus-state keys"
+
+[dependencies]
+storage = { path = "../storage" }
+# Pinned exactly: P1-P9 in the G3 contract were measured on 0.12.0.
+jmt = { version = "=0.12.0", default-features = false, features = ["std", "sha2"] }
+sha2 = "0.10"
+hex = "0.4"
+borsh = "1"
+anyhow = "1"
+
+[dev-dependencies]
+rand = "0.8"
