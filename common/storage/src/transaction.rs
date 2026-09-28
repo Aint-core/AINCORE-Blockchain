@@ -3,6 +3,7 @@
 //! The raw database is private: all writers share the same gate. A transaction
 //! holds that gate while its callback runs, so base reads and prefix scans cannot
 //! race a writer. Only staged writes are copied; the database is not materialized.
+use crate::class::{Observer, StateClassStats, WriteContext};
 use crate::{StateDB, StorageError};
 use rocksdb::{Direction, IteratorMode, WriteBatch, WriteBatchIterator, DB};
 use std::collections::BTreeMap;
@@ -18,6 +19,9 @@ type ReadResult = Result<Row, rocksdb::Error>;
 struct Shared {
     raw: DB,
     writers: Mutex<()>,
+    /// G3 S0: counts unclassified keys and state written outside the block
+    /// transaction. Observes only; never refuses.
+    observer: Observer,
     /// Declared after `raw` on purpose: fields drop in declaration order, so the
     /// directory becomes claimable again only after RocksDB has closed it.
     _claim: Option<crate::DirectoryClaim>,
@@ -27,6 +31,8 @@ struct Stage {
     changes: Mutex<Changes>,
     active: AtomicBool,
     read_failed: AtomicBool,
+    /// True only for the executor's block transaction (G3 WG-1).
+    block: bool,
 }
 
 impl Stage {
@@ -58,6 +64,7 @@ impl From<DB> for ReadStore {
             shared: Arc::new(Shared {
                 raw,
                 writers: Mutex::new(()),
+                observer: Observer::default(),
                 _claim: None,
             }),
             stage: None,
@@ -73,6 +80,7 @@ impl ReadStore {
             shared: Arc::new(Shared {
                 raw,
                 writers: Mutex::new(()),
+                observer: Observer::default(),
                 _claim: Some(claim),
             }),
             stage: None,
@@ -140,9 +148,17 @@ impl ReadStore {
     }
 
     pub(crate) fn write(&self, batch: WriteBatch) -> Result<(), rocksdb::Error> {
+        let ctx = match &self.stage {
+            None => WriteContext::Base,
+            Some(stage) if stage.block => WriteContext::Block,
+            Some(_) => WriteContext::Transaction,
+        };
         if let Some(stage) = &self.stage {
             let mut collected = BatchChanges::default();
             batch.iterate(&mut collected);
+            for key in collected.changes.keys() {
+                self.shared.observer.observe(key, ctx);
+            }
             // The binding only visits default-column puts/deletes. Never silently
             // omit other operation kinds from a transaction's commit.
             assert_eq!(
@@ -155,6 +171,14 @@ impl ReadStore {
             changes.extend(collected.changes);
             Ok(())
         } else {
+            // Only the keys are kept. The rocksdb binding still copies each
+            // value to call `put`, then this collector drops it at once: one
+            // transient copy per base write, which the observer accepts.
+            let mut keys = BatchKeys::default();
+            batch.iterate(&mut keys);
+            for key in &keys.0 {
+                self.shared.observer.observe(key, ctx);
+            }
             let _guard = self
                 .shared
                 .writers
@@ -162,6 +186,11 @@ impl ReadStore {
                 .expect("storage writer gate poisoned");
             self.write_durable(batch)
         }
+    }
+
+    /// G3 S0 counters for this database.
+    pub fn state_class_stats(&self) -> StateClassStats {
+        self.shared.observer.stats()
     }
 
     fn write_durable(&self, batch: WriteBatch) -> Result<(), rocksdb::Error> {
@@ -182,6 +211,20 @@ impl ReadStore {
             .expect("storage writer gate poisoned");
         self.shared.raw.flush_wal(true)?;
         self.shared.raw.flush()
+    }
+}
+
+/// The keys of a batch, without copying its values.
+#[derive(Default)]
+struct BatchKeys(Vec<Box<[u8]>>);
+
+impl WriteBatchIterator for BatchKeys {
+    fn put(&mut self, key: Box<[u8]>, _value: Box<[u8]>) {
+        self.0.push(key);
+    }
+
+    fn delete(&mut self, key: Box<[u8]>) {
+        self.0.push(key);
     }
 }
 
@@ -265,6 +308,24 @@ impl StateDB {
         &self,
         work: impl FnOnce(Arc<StateDB>) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
+        self.transaction_with(false, work)
+    }
+
+    /// The executor's block transaction: the only place consensus state may
+    /// be written (G3 WG-1). Same semantics as `transaction`; the mark lets
+    /// the S0 observer tell block writes from every other writer.
+    pub fn block_transaction<T>(
+        &self,
+        work: impl FnOnce(Arc<StateDB>) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        self.transaction_with(true, work)
+    }
+
+    fn transaction_with<T>(
+        &self,
+        block: bool,
+        work: impl FnOnce(Arc<StateDB>) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
         if self.db.stage.is_some() {
             return Err(StorageError::DatabaseOperation(
                 "nested transaction refused".into(),
@@ -278,6 +339,7 @@ impl StateDB {
             changes: Mutex::new(BTreeMap::new()),
             active: AtomicBool::new(true),
             read_failed: AtomicBool::new(false),
+            block,
         });
         let _close = CloseStage(stage.clone());
         let view = Arc::new(StateDB {

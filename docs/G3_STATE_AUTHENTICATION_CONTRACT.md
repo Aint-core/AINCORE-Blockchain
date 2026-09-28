@@ -406,7 +406,7 @@ Each item was found by the inventory or a review, and re-checked at `b7ab25a`.
 
 | # | Fix | Where | Kind |
 |---|---|---|---|
-| FX-1 | `validator:jailed:{addr}` has two writers: the in-block jail (`lib.rs:2451`) and a consensus-local write when *this node* detects an equivocation (`dag.rs:2500`). The local value is the most recent round this node detected. Move the local write to its own L key (only reader: `dag.rs:999`) or drop it. | consensus | neutral |
+| FX-1 | `validator:jailed:{addr}` has two writers: the in-block jail (`lib.rs:2451`) and a consensus-local write when *this node* detects an equivocation (`dag.rs:2500`). The local value is the most recent round this node detected. The local write moves to its own L key, `sys:equiv_local_jail:{addr}`. The downtime detector skips a validator that holds either key. | consensus | neutral (done in S0) |
 | FX-2 | Classify the legacy committee keys `sys:validator_set:epoch:{E}`, `consensus:epoch` and `consensus:epoch_start_height:{E}` as S **for today's chain**. They feed QC verification and admission now. G1 EP-1 retires them from consensus at activation, when `sys:committee:{E}` replaces them. | classifier | neutral |
 | FX-3 | The governance module upgrade installs bytecode from `sys:pending_module_upgrade:{name}`, which **no production code writes** (only tests). It bypasses the VM verifier (`governance/lib.rs:550-627`). Remove the path until staging is an executed transaction and installation goes through VM publish. | governance | neutral (dead today) |
 | FX-4 | The fee-sweep key uses `latest_height` (C) instead of the executing block height. | `lib.rs:2105`, `1562` | changing |
@@ -483,6 +483,21 @@ ran**. "0 tests ran", or an unapplied mutant, must never count as green.
 | S1 | `StateCommitment` + `jmt` backend as a library: apply with CM-7 sequencing, prove, range proof, restore per SN-2; DT-2 and PF vectors; T storage (CM-8) | No |
 | S2 | Executor integration: `Δ_h` from staged changes, seal, one batch, `state_root = root_h`. Includes FX-4, FX-5, FX-9, FX-10, FX-12, FX-15. | **Yes** |
 | S3 | Genesis as version 0; identity with `state_root(0)` in memory; **WG-1 enforcement on** | **Yes** |
+
+**S3 go/no-go.** The S0 counters alone are not enough to switch enforcement on:
+- They live in memory and reset on every restart.
+- Databases built offline (`genesis-tool`) or installed as snapshots never pass through them.
+- Until S2 seals the stage, state written by the accept/admit closures still counts as a
+  block write.
+
+Enforcement therefore requires all of the following:
+- the logged `[STATE_CLASS]` lines, collected across restarts on every node, show no
+  legitimate refusal;
+- the snapshot install is gone (FX-8/SN-5);
+- genesis runs through WG-2.
+
+The `aincore_getStateClassStats` RPC is public. It exposes only masked key shapes and
+counters, never values.
 | S4 | Proof RPC + Rust and JS verifiers (PF) | No, once S2 is live |
 | S5 | Committee record + FinalityVote V2 binding + transition log + `TA_LOG_*` (TA; joint with G1 EP-2/EP-4) | **Yes** |
 | S6 | Snapshot restore + bootstrap record + pinned versions + rejoin at every horizon (SN) | No |
@@ -552,6 +567,7 @@ once (FX-8, SN-5).
 - **DAG:**
   - `vertex:{hash}`, `latest_proposed_round`, `validator:last_seen:{addr}`
   - `sys:downtime_attestation:*`, `sys:equiv_seen:*`, `sys:equiv_carried:*`, `sys:equiv_gossiped:*`
+  - `sys:equiv_local_jail:{addr}`: FX-1; this node's own equivocation detection
   - `dag:checkpoint:{r}`, `dag:checkpoint_sig:{r}`, `dag:checkpoint:latest`
 - **Ordering:**
   - `consensus:last_adopted_height`, `consensus:committed_rounds`, `consensus:cseq:{r}`

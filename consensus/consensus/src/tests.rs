@@ -538,11 +538,18 @@ mod tests {
         assert_eq!(ev["round"].as_u64(), Some(1));
         assert!(ev.get("vertex_a").is_some() && ev.get("vertex_b").is_some());
         assert_ne!(ev["vertex_a"]["hash"], ev["vertex_b"]["hash"]);
+        // G3 FX-1: local detection marks its own key; the state key is
+        // written only when block execution applies the carried evidence.
+        assert!(consensus
+            .storage
+            .get(&format!("sys:equiv_local_jail:{}", author))
+            .unwrap()
+            .is_some());
         assert!(consensus
             .storage
             .get(&format!("validator:jailed:{}", author))
             .unwrap()
-            .is_some());
+            .is_none());
         assert!(
             consensus
                 .storage
@@ -1768,6 +1775,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    /// G3 FX-1: the downtime detector skips a validator jailed either by a
+    /// committed slash (state key) or by this node's own equivocation
+    /// detection (local key), and only those.
+    #[test]
+    fn downtime_skip_sees_both_the_state_and_the_local_jail() {
+        let path = get_test_db_path("already_jailed");
+        let db = StateDB::open(&path).unwrap();
+        let (by_state, by_local, free) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        db.put(&format!("validator:jailed:{by_state}"), "7").unwrap();
+        db.put(&format!("sys:equiv_local_jail:{by_local}"), "7").unwrap();
+
+        assert!(DagConsensus::already_jailed(&db, &by_state));
+        assert!(DagConsensus::already_jailed(&db, &by_local));
+        assert!(
+            !DagConsensus::already_jailed(&db, &free),
+            "positive control: an unjailed validator is still checked"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     /// A valid proof received by gossip (node saw NEITHER vertex locally) slashes.
     #[test]
     fn test_equiv_valid_evidence_slashes() {
@@ -1787,11 +1815,18 @@ mod tests {
         let ev: serde_json::Value = serde_json::from_str(&row).unwrap();
         assert_eq!(ev["offender"].as_str(), Some(offender.as_str()));
         assert!(ev.get("vertex_a").is_some() && ev.get("vertex_b").is_some());
+        // G3 FX-1: local detection marks its own key; the state key is
+        // written only when block execution applies the carried evidence.
+        assert!(consensus
+            .storage
+            .get(&format!("sys:equiv_local_jail:{}", offender))
+            .unwrap()
+            .is_some());
         assert!(consensus
             .storage
             .get(&format!("validator:jailed:{}", offender))
             .unwrap()
-            .is_some());
+            .is_none());
         assert!(consensus
             .storage
             .get(&format!("sys:equiv_seen:{}:1", offender))

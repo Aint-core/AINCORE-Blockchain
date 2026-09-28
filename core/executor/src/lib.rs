@@ -1734,7 +1734,9 @@ impl Executor {
 
         // Rebuild the VM on the private view, so module caches and ALL helper
         // reads/writes (including governance) belong to this speculative block.
-        let outcome = self.db.transaction(|view| {
+        // The block transaction is the only place consensus state may be
+        // written (G3 WG-1); in S0 the mark only feeds the storage observer.
+        let outcome = self.db.block_transaction(|view| {
             admit(&view).map_err(storage::StorageError::DatabaseOperation)?;
             let executor = Executor::new(view.clone());
             #[cfg(test)]
@@ -5845,6 +5847,68 @@ mod tests {
         assert_eq!(total_burned, 10_000);
         assert_eq!(total_supply, 999_990_000);
         assert_eq!(validator_set(&db).total_supply, 999_990_000);
+    }
+
+    /// G3 S0: a real block writes its consensus state inside the marked block
+    /// transaction, so the storage observer counts none of it as out-of-band.
+    #[test]
+    fn block_execution_writes_state_only_inside_the_block_transaction() {
+        let db = temp_db("g3_s0_block_ctx");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[21u8; 32]);
+        let recipient_key = SigningKey::from_bytes(&[22u8; 32]);
+        let sender = create_account(&db, &sender_key);
+        let recipient = create_account(&db, &recipient_key);
+        set_coin_store(&db, &sender, 1_000_000);
+        set_coin_store(&db, &recipient, 0);
+        set_validator_set(&db, &sender, 0, 1_000_000_000);
+        db.put("sys:total_supply", "1000000000").unwrap();
+        db.put("total_burned", "0").unwrap();
+
+        let call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                move_core_types::account_address::AccountAddress::ONE,
+                move_core_types::identifier::Identifier::new("coin").unwrap(),
+            ),
+            function: "transfer".to_string(),
+            ty_args: vec![move_core_types::language_storage::TypeTag::Struct(
+                Box::new(move_core_types::language_storage::StructTag {
+                    address: move_core_types::account_address::AccountAddress::ONE,
+                    module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                    name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                    type_params: vec![],
+                }),
+            )],
+            args: vec![
+                bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_address(&recipient).unwrap()).unwrap(),
+                bcs::to_bytes(&100u128).unwrap(),
+            ],
+        };
+        let payload =
+            hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
+        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
+
+        // Seeding above wrote state on the base DB; that is the test's own
+        // out-of-band setup, so measure from here.
+        let before = db.db.state_class_stats();
+        Executor::new(db.clone()).execute_block_parallel(vec![tx_json], &sender);
+        let after = db.db.state_class_stats();
+
+        assert_eq!(
+            coin_balance(&db, &recipient),
+            100,
+            "positive control: the block really executed and moved coins"
+        );
+        assert!(
+            after.writes > before.writes,
+            "positive control: writes observed"
+        );
+        assert_eq!(
+            after.state_outside_block, before.state_outside_block,
+            "block execution wrote state outside the block transaction: {:?}",
+            after.samples
+        );
     }
 
     #[test]

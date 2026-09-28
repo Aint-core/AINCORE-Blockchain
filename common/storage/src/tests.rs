@@ -501,18 +501,15 @@ mod tests {
         let db = temp_db("validators");
         assert_eq!(db.get_active_validators().len(), 0);
 
-        db.update_validator_weight("pk_alice", 1000).unwrap();
-        db.update_validator_weight("pk_bob", 2000).unwrap();
+        // `sys:validators` is consensus state, written by block execution and
+        // genesis only (G3 WG-1); seed it directly to test the reader.
+        db.put("sys:validators", r#"[["pk_alice",1000],["pk_bob",2000]]"#)
+            .unwrap();
 
         let vals = db.get_active_validators();
         assert_eq!(vals.len(), 2);
         assert!(vals.iter().any(|(pk, w)| pk == "pk_alice" && *w == 1000));
         assert!(vals.iter().any(|(pk, w)| pk == "pk_bob" && *w == 2000));
-
-        // Update existing weight
-        db.update_validator_weight("pk_alice", 3000).unwrap();
-        let vals = db.get_active_validators();
-        assert!(vals.iter().any(|(pk, w)| pk == "pk_alice" && *w == 3000));
     }
 
     #[test]

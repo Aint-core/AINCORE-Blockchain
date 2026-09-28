@@ -2174,6 +2174,23 @@ fn handle_rpc_method(
             }
         },
 
+        "aincore_getStateClassStats" => {
+            // G3 S0 observe mode: what enforcement (S3) would refuse today.
+            let stats = data.storage.db.state_class_stats();
+            Ok(serde_json::json!({
+                "mode": "observe",
+                "writes": stats.writes,
+                "unclassified": stats.unclassified,
+                "state_outside_block": stats.state_outside_block,
+                "samples": stats.samples.iter().map(|x| serde_json::json!({
+                    "pattern": x.pattern,
+                    "violation": x.violation,
+                    "context": x.context,
+                    "count": x.count,
+                })).collect::<Vec<_>>(),
+            }))
+        },
+
         "aincore_formatAddress" => {
             // params: [address in any accepted form] → both display forms.
             let Some(input) = params.get(0).and_then(|v| v.as_str()) else {
@@ -2909,6 +2926,35 @@ mod tests {
                 .code,
             -32602
         );
+    }
+
+    /// G3 S0: the observe-mode counters are readable over RPC.
+    #[test]
+    fn state_class_stats_rpc_reports_out_of_block_state_writes() {
+        let db = temp_db("state_class_rpc");
+        let state = test_state(Arc::clone(&db));
+        let read = |state: &AppState| {
+            handle_rpc_method("aincore_getStateClassStats", serde_json::json!([]), state)
+                .expect("stats")
+        };
+        let before = read(&state);
+        assert_eq!(before["mode"], "observe");
+        db.put("sys:chain_id", "X").unwrap(); // state, outside any block
+        db.put("no:such:template:rpc", "x").unwrap();
+        let after = read(&state);
+        assert_eq!(
+            after["state_outside_block"].as_u64().unwrap(),
+            before["state_outside_block"].as_u64().unwrap() + 1
+        );
+        assert_eq!(
+            after["unclassified"].as_u64().unwrap(),
+            before["unclassified"].as_u64().unwrap() + 1
+        );
+        assert!(after["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["pattern"] == "sys:chain_id" && x["context"] == "base"));
     }
 
     #[test]

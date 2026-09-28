@@ -1,5 +1,6 @@
 pub use rocksdb;
 use rocksdb::DB; // Export for consumers
+pub mod class;
 pub mod object;
 mod transaction;
 pub use transaction::ReadStore;
@@ -856,21 +857,6 @@ impl StateDB {
 
         // Return empty if not initialized (genesis tool will populate this)
         vec![]
-    }
-
-    pub fn update_validator_weight(
-        &self,
-        pubkey: &str,
-        weight: u64,
-    ) -> std::result::Result<(), rocksdb::Error> {
-        let mut vals = self.get_active_validators();
-        if let Some(v) = vals.iter_mut().find(|v| v.0 == pubkey) {
-            v.1 = weight;
-        } else {
-            vals.push((pubkey.to_string(), weight));
-        }
-        let json = serde_json::to_string(&vals).unwrap_or_default();
-        self.put("sys:validators", &json)
     }
 
     // === DAG CHECKPOINT SYSTEM (Aptos/Sui Style) ===

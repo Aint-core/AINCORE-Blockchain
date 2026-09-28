@@ -687,6 +687,18 @@ impl DagConsensus {
         best
     }
 
+    /// Jailed by a committed slash (state key `validator:jailed:*`) or by
+    /// this node's own equivocation detection (local key
+    /// `sys:equiv_local_jail:*`, G3 FX-1). The downtime detector skips both.
+    pub(crate) fn already_jailed(storage: &StateDB, validator_id: &str) -> bool {
+        [
+            format!("validator:jailed:{}", validator_id),
+            format!("sys:equiv_local_jail:{}", validator_id),
+        ]
+        .iter()
+        .any(|key| matches!(storage.get(key), Ok(Some(_))))
+    }
+
     pub fn try_create_vertex(&mut self) {
         self.retry_qc_work();
         // 1. Check if we have enough parents from previous round
@@ -994,10 +1006,9 @@ impl DagConsensus {
                     let rounds_missed = self.current_round.saturating_sub(last_seen);
 
                     if rounds_missed >= downtime_threshold && last_seen > 0 {
-                        // Check if already jailed (prevent double-slash)
-                        let jail_key = format!("validator:jailed:{}", validator_id);
-                        if let Ok(Some(_)) = self.storage.get(&jail_key) {
-                            continue; // Already jailed, skip
+                        // Already jailed (prevent double-slash): skip.
+                        if Self::already_jailed(&self.storage, validator_id) {
+                            continue;
                         }
 
                         // === H-02 PROMOTED (Phase 2.3): BFT ATTESTATION, NOT UNILATERAL SLASH ===
@@ -2497,8 +2508,12 @@ impl DagConsensus {
         // `sys:equiv_seen` evidence row above is what the block proposer carries
         // (executor::collect_slash_evidence) and every node verifies+applies.
         let _ = slash_event;
+        // G3 FX-1: `validator:jailed:*` is consensus state, written only by
+        // block execution when the evidence is applied. What THIS node saw is
+        // a local fact, and it gets its own key: writing the state key here
+        // made its value depend on which equivocation a node saw first.
         let _ = self.storage.put(
-            &format!("validator:jailed:{}", offender),
+            &format!("sys:equiv_local_jail:{}", offender),
             &round.to_string(),
         );
     }

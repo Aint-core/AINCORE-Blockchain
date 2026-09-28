@@ -64,55 +64,9 @@ impl ResourceResolver for AINCOREStorage {
             Ok(Some(bytes_hex)) => {
                 let bytes = hex::decode(bytes_hex)?;
 
-                // === STATE RENT LOGIC (READ-ONLY — NO WRITES) ===
-                // SECURITY FIX: Previous implementation performed a db.put() on EVERY
-                // get_resource call, creating a catastrophic I/O DDoS amplification vector.
-                // An attacker could craft transactions that read thousands of resources,
-                // turning each into an unbatched disk write — amplifying a single tx
-                // into massive disk I/O that starves the node.
-                //
-                // FIX: The read path is now PURE — it only computes rent for logging.
-                // Actual rent metadata updates are deferred to the session commit phase
-                // (changeset_to_kv), where they are batched with all other state changes
-                // into a single atomic WriteBatch.
-                //
-                // TODO: Implement proper rent collection at commit time once the
-                // epoch-based rent settlement mechanism is designed.
-
-                let meta_key = format!("meta_{}", key);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-
-                let last_access = if let Ok(Some(meta_hex)) = self.db.get(&meta_key) {
-                    if let Ok(meta_bytes) = hex::decode(meta_hex) {
-                        let mut arr = [0u8; 8];
-                        if meta_bytes.len() == 8 {
-                            arr.copy_from_slice(&meta_bytes);
-                            u64::from_be_bytes(arr)
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    }
-                } else {
-                    0 // First access or legacy
-                };
-
-                if last_access > 0 {
-                    let elapsed = now.saturating_sub(last_access);
-                    if elapsed > 0 {
-                        let size = bytes.len() as u64;
-                        let _rent = size * elapsed;
-                        // Rent is computed but NOT written to disk here.
-                        // Collection happens at epoch boundaries via governance sweep.
-                    }
-                }
-
-                // NOTE: db.put() for meta_key REMOVED from read path.
-                // Last-access timestamps are now updated only during changeset commit.
+                // G3 FX-11: a state-rent read used to sit here. It read a
+                // `meta_resource_*` key and the wall clock on every resource
+                // load, then discarded the result; it is gone, not deferred.
 
                 Ok(Some(bytes))
             }
