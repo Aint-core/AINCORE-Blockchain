@@ -686,6 +686,32 @@ counters, never values.
 | S5 | Committee record + FinalityVote V2 binding + transition log + `TA_LOG_*` (TA; joint with G1 EP-2/EP-4) | **Yes** |
 | S6 | Snapshot restore + bootstrap record + pinned versions + rejoin at every horizon (SN) | No |
 | S7 | Pruning with the value rule; boot audits RC-2 and RC-3 | No |
+
+**S7 status (branch `g3/activation`).**
+- **GC-1:** `state_commit::prune(floor, pinned, max_rows)`.
+  - It raises `jmt:floor` first, so versions about to lose rows are refused (PF-3)
+    before any row goes.
+  - It removes nodes through `jmt`'s stale index, and value rows through a new
+    value-stale index (`jmt:vstale:*`, written by `apply`) under the value rule.
+  - Every pinned version keeps what it needs.
+  - A root that an empty block carries forward is marked stale, which `jmt` does not do.
+  - It is bounded per call and converges; the floor never goes down.
+- **Witness:** pruning to the tip leaves exactly the nodes of a fresh tree over the same
+  state, and every version at or above the floor stays whole with an unchanged root.
+- **Wiring:** the consensus commit path prunes state next to block history, under the
+  same `AINCORE_STORAGE_MODE` / `AINCORE_BLOCK_RETENTION` policy (`archive` never prunes).
+  Proofs are served exactly as long as blocks are. Epoch-boundary versions from the last
+  two windows are pinned (SN-4).
+- **RC-2** (`audit_flat_vs_tree`): at boot, every leaf equals its flat key and every flat
+  state key is a leaf. It walks `STATE_EXACT` and `STATE_PREFIXES`, which a test ties to
+  the classifier. Divergent keys are listed and the node refuses to start.
+- **RC-3** (`audit_root_against_qc`): at boot, the tree root at the latest stored QC's
+  height (when retained) must be `qc.state_root`.
+- **Witnesses C1′ and C2′, database halves:** an edited flat state key fails RC-2 and names
+  the key; a foreign root fails RC-3.
+- **Open parameters (founder decision):** the retention window and `T_restore_max`. The
+  defaults follow block retention: 100,000 blocks in full mode and 1,000 in observer mode,
+  with pins kept for two windows.
 | S8 | Activation in the shared fresh genesis with G1 S11 (AC) | Genesis |
 
 ## Open questions and founder decisions

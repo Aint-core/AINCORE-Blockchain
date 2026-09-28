@@ -915,3 +915,180 @@ fn pf_vectors_are_pinned() {
     let pinned = std::fs::read_to_string(PF_VECTORS).expect("the pinned vector file");
     assert_eq!(generated, pinned, "the proof vectors changed");
 }
+
+// ---- GC-1 pruning, RC-2 and RC-3 (S7) ----
+
+fn count_rows(db: &StateDB, prefix: &str) -> usize {
+    db.db
+        .prefix_iterator(prefix.as_bytes())
+        .map(Result::unwrap)
+        .take_while(|(k, _)| k.starts_with(prefix.as_bytes()))
+        .count()
+}
+
+/// A random history with updates, deletes and empty blocks. Returns the
+/// model of the flat state after each version.
+fn random_history(db: &Arc<StateDB>, seed: u64, versions: u64) -> Vec<BTreeMap<String, Vec<u8>>> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut model: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut states = Vec::new();
+    for version in 0..versions {
+        let mut changes: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
+        // Every fourth version is an empty block (its root is carried).
+        if version == 0 || version % 4 != 3 {
+            for _ in 0..rng.gen_range(1..8) {
+                let key = k(rng.gen_range(0..40));
+                let value = if version > 0 && rng.gen_bool(0.25) {
+                    None
+                } else {
+                    Some(format!("v{version}-{}", rng.gen::<u16>()).into_bytes())
+                };
+                changes.insert(key, value);
+            }
+        }
+        if version == 0 {
+            changes.retain(|_, v| v.is_some());
+        }
+        for (key, value) in &changes {
+            match value {
+                Some(v) => {
+                    model.insert(key.clone(), v.clone());
+                }
+                None => {
+                    model.remove(key);
+                }
+            }
+        }
+        commit(db, version, changes.into_iter().collect());
+        states.push(model.clone());
+    }
+    states
+}
+
+fn assert_version_is_whole(db: &Arc<StateDB>, version: Version, model: &BTreeMap<String, Vec<u8>>) {
+    let root = root(db, version).unwrap();
+    for i in 0..40 {
+        let key = k(i);
+        let (value, proof) = prove(db, &key, version).unwrap();
+        assert_eq!(value.as_ref(), model.get(&key), "{key} at {version}");
+        verify(root, &key, value.as_deref(), &proof).unwrap();
+    }
+}
+
+/// GC-1 / GC-2: pruning never changes a root, keeps every version at or
+/// above the floor whole, and after pruning to the tip leaves exactly the
+/// nodes of a fresh tree over the same state (no leak, including the roots
+/// empty blocks carry forward).
+#[test]
+fn pruning_keeps_every_retained_version_whole_and_leaks_nothing() {
+    let db = temp_db("prune_whole");
+    let states = random_history(&db, 7, 40);
+    let roots: Vec<RootHash> = (0..40).map(|v| root(&db, v).unwrap()).collect();
+    let stats = prune(&db, 25, &Default::default(), usize::MAX).unwrap();
+    assert!(
+        stats.nodes > 0 && stats.values > 0,
+        "positive control: {stats:?}"
+    );
+    assert_eq!(floor(&db).unwrap(), 25);
+    for version in 25..40u64 {
+        assert_eq!(root(&db, version).unwrap(), roots[version as usize]);
+        assert_version_is_whole(&db, version, &states[version as usize]);
+    }
+    // To the tip: exactly a fresh tree's nodes and one value row per key.
+    prune(&db, 39, &Default::default(), usize::MAX).unwrap();
+    let fresh = temp_db("prune_fresh");
+    commit(
+        &fresh,
+        0,
+        states[39]
+            .iter()
+            .map(|(k, v)| (k.clone(), Some(v.clone())))
+            .collect(),
+    );
+    assert_eq!(root(&fresh, 0).unwrap(), roots[39]);
+    assert_eq!(
+        count_rows(&db, NODE),
+        count_rows(&fresh, NODE),
+        "no node leaks"
+    );
+    assert_version_is_whole(&db, 39, &states[39]);
+}
+
+/// GC-1 value rule: each key keeps its newest value row at or below the
+/// floor and every newer one, and nothing else.
+#[test]
+fn pruning_follows_the_value_rule() {
+    let db = temp_db("prune_values");
+    commit(&db, 0, vec![(k(1), some("a")), (k(2), some("x"))]);
+    commit(&db, 1, vec![(k(1), some("b"))]);
+    commit(&db, 2, vec![(k(1), some("c")), (k(2), None)]);
+    commit(&db, 3, vec![(k(1), some("d"))]);
+    prune(&db, 2, &Default::default(), usize::MAX).unwrap();
+    // k1: the row at 2 (newest at or below the floor) and at 3. k2: its
+    // deletion row at 2.
+    assert_eq!(count_rows(&db, &val_prefix(&key_hash(&k(1)))), 2);
+    assert_eq!(count_rows(&db, &val_prefix(&key_hash(&k(2)))), 1);
+    assert_eq!(prove(&db, &k(1), 2).unwrap().0, some("c"));
+    assert_eq!(prove(&db, &k(1), 3).unwrap().0, some("d"));
+    assert_eq!(prove(&db, &k(2), 3).unwrap().0, None);
+}
+
+/// SN-4: a pinned version below the floor keeps everything it needs.
+#[test]
+fn a_pinned_version_survives_pruning() {
+    let db = temp_db("prune_pinned");
+    let states = random_history(&db, 11, 30);
+    let pinned: std::collections::BTreeSet<Version> = [10].into();
+    prune(&db, 29, &pinned, usize::MAX).unwrap();
+    assert_version_is_whole(&db, 10, &states[10]);
+    assert_version_is_whole(&db, 29, &states[29]);
+}
+
+/// Bounded work per call: the floor is raised first, and repeated calls
+/// converge on the same result as one unbounded call.
+#[test]
+fn bounded_pruning_converges() {
+    let (a, b) = (temp_db("prune_bounded"), temp_db("prune_unbounded"));
+    let states = random_history(&a, 5, 30);
+    random_history(&b, 5, 30);
+    let first = prune(&a, 20, &Default::default(), 3).unwrap();
+    assert!(first.more, "the limit was hit");
+    assert_eq!(floor(&a).unwrap(), 20, "the floor was raised first");
+    while prune(&a, 20, &Default::default(), 3).unwrap().more {}
+    prune(&b, 20, &Default::default(), usize::MAX).unwrap();
+    assert_eq!(count_rows(&a, NODE), count_rows(&b, NODE));
+    assert_eq!(count_rows(&a, VAL), count_rows(&b, VAL));
+    assert_version_is_whole(&a, 20, &states[20]);
+    // The floor never goes down.
+    prune(&a, 5, &Default::default(), usize::MAX).unwrap();
+    assert_eq!(floor(&a).unwrap(), 20);
+}
+
+/// RC-2: a flat state key edited out-of-band, and one that is not in the
+/// tree at all, are both listed; a consistent database lists nothing.
+#[test]
+fn rc2_lists_every_flat_key_the_tree_disagrees_with() {
+    let db = temp_db("rc2");
+    let _seed = db.seeding();
+    for i in 0..10 {
+        db.put(&k(i), &format!("v{i}")).unwrap();
+    }
+    let v0 = seed_genesis(&db).unwrap();
+    db.write_batch(v0.batch).unwrap();
+    assert_eq!(audit_flat_vs_tree(&db).unwrap(), Vec::<String>::new());
+    db.put(&k(3), "tampered").unwrap();
+    db.put("sys:config:base_reward", "999").unwrap();
+    let mut divergent = audit_flat_vs_tree(&db).unwrap();
+    divergent.sort();
+    assert_eq!(divergent, vec![k(3), "sys:config:base_reward".to_string()]);
+}
+
+/// RC-3: a self-consistent database whose root is not the network's QC root
+/// is refused; the network's root passes.
+#[test]
+fn rc3_refuses_a_root_that_is_not_the_networks() {
+    let db = temp_db("rc3");
+    let root = commit(&db, 0, vec![(k(1), some("a"))]);
+    audit_root_against_qc(&db, 0, &hex::encode(root.0)).unwrap();
+    assert!(audit_root_against_qc(&db, 0, &"00".repeat(32)).is_err());
+}

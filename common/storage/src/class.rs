@@ -296,6 +296,7 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         ["jmt", "node", n] if hex(n) => Tree,
         ["jmt", "val", kh, v] if hex64(kh) && dec20(v) => Tree,
         ["jmt", "stale", v, n] if dec20(v) && hex(n) => Tree,
+        ["jmt", "vstale", v, kh, prev] if dec20(v) && hex64(kh) && dec20(prev) => Tree,
         ["jmt", "pre", kh] if hex64(kh) => Tree,
         ["jmt", "pinned", v] if dec20(v) => Tree,
         ["ta", e] if dec20(e) => Log,
@@ -310,6 +311,45 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
     };
     Some(class)
 }
+
+/// Every exact key `classify` calls state (RC-2 walks these).
+pub const STATE_EXACT: &[&str] = &[
+    "sys:validators",
+    "sys:validator_set:v1",
+    "genesis:validator_set:v1",
+    "consensus:epoch",
+    "sys:last_epoch_boundary",
+    "sys:chain_id",
+    "sys:config:epoch_block_interval",
+    "sys:config:require_exec_roots",
+    "sys:config:federation_addr",
+    "sys:config:base_reward",
+    "sys:config:halving_interval",
+    "sys:config:burn_percentage",
+    "sys:config:tip_agreement_n",
+    "sys:total_supply",
+    "total_burned",
+    "gov:active_proposal_ids",
+    "sys:stdlib_version",
+];
+
+/// Every prefix under which `classify` finds state keys (RC-2 walks these,
+/// so its cost is O(|S|), not O(database)). A key under one of them still
+/// counts as state only if `classify` says so.
+pub const STATE_PREFIXES: &[&str] = &[
+    "resource_",
+    "module_",
+    "pqc_pubkey_",
+    "obj:",
+    "sys:validator_set:epoch:",
+    "consensus:epoch_start_height:",
+    "sys:fee_sweep_queue:",
+    "sys:slashed:",
+    "sys:pending_slash:",
+    "validator:jailed:",
+    "sys:pending_module_upgrade:",
+    "sys:committee:",
+];
 
 // ---- Write observation (S0) and the WG-1 refusal (S3) --------------------
 
@@ -460,8 +500,20 @@ mod tests {
     /// One concrete key per Appendix A template, with its expected class.
     #[test]
     fn every_appendix_a_template_has_its_class() {
+        let cases = appendix_a_cases();
+        for (key, class) in &cases {
+            assert_eq!(c(key), Some(*class), "{key}");
+        }
+        assert!(
+            cases.len() >= 100,
+            "positive control: {} cases",
+            cases.len()
+        );
+    }
+
+    fn appendix_a_cases() -> Vec<(String, KeyClass)> {
         let bls = "a".repeat(96);
-        let cases: Vec<(String, KeyClass)> = vec![
+        vec![
             // S
             (format!("resource_{H64}_0x1::coin::CoinStore<0x1::staking::AincoreCoin>"), State),
             (format!("resource_{H64}_0x1::dex::LiquidityPool<0x1::staking::AincoreCoin, 0x1::wbtc::WBTC>"), State),
@@ -568,19 +620,41 @@ mod tests {
             ("sys:fhe:global_public_key".into(), Dead),
             ("total_supply".into(), Dead),
             ("consensus:committed_sequence".into(), Dead),
-        ];
-        for (key, class) in &cases {
-            assert_eq!(c(key), Some(*class), "{key}");
-        }
-        assert!(
-            cases.len() >= 100,
-            "positive control: {} cases",
-            cases.len()
-        );
+        ]
     }
 
     /// The traps the reviews named: shared prefixes, zero-padding, and keys
     /// that look right but are not the template.
+    /// RC-2 walks `STATE_EXACT` and `STATE_PREFIXES` instead of the whole
+    /// database, so they must cover every state key `classify` knows: every
+    /// state template in the table above and in the measured census.
+    #[test]
+    fn the_state_key_inventory_covers_every_state_template() {
+        for key in STATE_EXACT {
+            assert_eq!(c(key), Some(State), "{key}");
+        }
+        let census = include_str!("fixtures/census_keys_r1.txt")
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string);
+        let table = appendix_a_cases().into_iter().map(|(k, _)| k);
+        let mut covered = 0;
+        for key in census.chain(table) {
+            if c(&key) == Some(State) {
+                assert!(
+                    STATE_EXACT.contains(&key.as_str())
+                        || STATE_PREFIXES.iter().any(|p| key.starts_with(p)),
+                    "state key {key} is outside the RC-2 inventory"
+                );
+                covered += 1;
+            }
+        }
+        assert!(
+            covered > 30,
+            "positive control: {covered} state keys checked"
+        );
+    }
+
     #[test]
     fn near_misses_are_not_classified() {
         for key in [

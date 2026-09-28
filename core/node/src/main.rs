@@ -44,6 +44,51 @@ fn bootnode_host(addr: &str) -> Option<&str> {
     }
 }
 
+/// G3 RC-2 and RC-3, at boot after RC-1.
+/// - RC-2: every flat consensus-state key equals its tree leaf, and the
+///   reverse. This catches an out-of-band edit of the database.
+/// - RC-3: when the node holds a QC for a height the tree still has, the tree
+///   root there is the QC's `state_root`. This catches a self-consistent but
+///   foreign database, such as a restored backup or a copied datadir.
+fn state_boot_audit(storage: &std::sync::Arc<StateDB>) -> Result<(), String> {
+    let divergent = state_commit::audit_flat_vs_tree(storage)
+        .map_err(|e| format!("state audit (RC-2) failed: {e}"))?;
+    if !divergent.is_empty() {
+        let shown: Vec<_> = divergent.iter().take(20).collect();
+        return Err(format!(
+            "{} consensus-state keys disagree with the state tree (RC-2), first: {:?}",
+            divergent.len(),
+            shown
+        ));
+    }
+    let qc_height = storage
+        .get("consensus:qc:latest_height")
+        .ok()
+        .flatten()
+        .and_then(|h| h.parse::<u64>().ok());
+    let Some(height) = qc_height else {
+        return Ok(());
+    };
+    let floor = state_commit::floor(storage).map_err(|e| e.to_string())?;
+    let latest = state_commit::latest_version(storage)
+        .map_err(|e| e.to_string())?
+        .unwrap_or(0);
+    if height < floor || height > latest {
+        return Ok(());
+    }
+    let Some(qc_json) = storage
+        .get(&format!("consensus:qc:{height}"))
+        .ok()
+        .flatten()
+    else {
+        return Ok(());
+    };
+    let qc: consensus::qc::QuorumCertificate = serde_json::from_str(&qc_json)
+        .map_err(|e| format!("stored QC at {height} is unreadable: {e}"))?;
+    state_commit::audit_root_against_qc(storage, height, &qc.state_root)
+        .map_err(|e| format!("this database is not the network's (RC-3): {e}"))
+}
+
 /// G3 SN-5: `AINCORE_BOOTSTRAP_SNAPSHOT` installed a downloaded database
 /// without verifying its state. It is removed, and a node that still sets it
 /// refuses to start rather than silently ignoring it.
@@ -514,6 +559,10 @@ async fn main() {
     // one this node produced; refuse to start rather than guess.
     if let Err(e) = state_commit::boot_check(&storage) {
         eprintln!("❌ FATAL: state tree boot check failed: {e}; refusing to boot");
+        std::process::exit(1);
+    }
+    if let Err(e) = state_boot_audit(&storage) {
+        eprintln!("❌ FATAL: {e}; refusing to boot");
         std::process::exit(1);
     }
 
@@ -1030,6 +1079,51 @@ mod boot_identity_tests {
     use super::{
         check_epoch_interval_pinned, refuse_removed_snapshot_install, resolve_boot_chain_id,
     };
+
+    /// G3 RC-2 / RC-3 at boot (witness C1′'s second half, C2′'s database half).
+    #[test]
+    fn the_boot_audit_refuses_a_tampered_or_foreign_database() {
+        use std::sync::Arc;
+        let path = std::env::temp_dir().join(format!("boot_audit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let db = Arc::new(storage::StateDB::open(path.to_str().unwrap()).unwrap());
+        {
+            let _seed = db.seeding();
+            db.put("sys:chain_id", "AINCORE-TEST").unwrap();
+            db.put(&format!("obj:{}", "ab".repeat(32)), "{}").unwrap();
+        }
+        let v0 = state_commit::seed_genesis(&db).unwrap();
+        db.write_batch(v0.batch).unwrap();
+        assert_eq!(super::state_boot_audit(&db), Ok(()), "consistent");
+
+        let qc = |root: String| {
+            serde_json::json!({
+                "version": 1, "chain_id": "AINCORE-TEST", "epoch": 0, "finalized_round": 0,
+                "anchor_round": 0, "anchor_hash": "", "block_height": 0, "block_hash": "",
+                "state_root": root, "receipts_root": "", "finality_digest": "",
+                "validator_set_hash": "", "signer_bitmap": [], "signed_stake": 0,
+                "total_stake": 0, "aggregate_signature": [],
+            })
+            .to_string()
+        };
+        db.put("consensus:qc:latest_height", "0").unwrap();
+        db.put("consensus:qc:0", &qc("00".repeat(32))).unwrap();
+        let err = super::state_boot_audit(&db).expect_err("a foreign root");
+        assert!(err.contains("RC-3"), "{err}");
+        let root = hex::encode(state_commit::root(&db, 0).unwrap().0);
+        db.put("consensus:qc:0", &qc(root)).unwrap();
+        assert_eq!(super::state_boot_audit(&db), Ok(()), "the network's root");
+
+        {
+            let _seed = db.seeding();
+            db.put("sys:chain_id", "TAMPERED").unwrap();
+        }
+        let err = super::state_boot_audit(&db).expect_err("an edited flat key");
+        assert!(
+            err.contains("RC-2") && err.contains("sys:chain_id"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn the_removed_snapshot_install_refuses_to_start() {

@@ -94,6 +94,12 @@ const VAL: &str = "jmt:val:";
 const STALE: &str = "jmt:stale:";
 /// Key preimages: `jmt:pre:{keyhash}` → the flat key.
 const PRE: &str = "jmt:pre:";
+/// Value-stale index (GC-1): `jmt:vstale:{v:020}:{kh}:{prev:020}` says the
+/// value row of `kh` at `prev` was superseded at `v`. `jmt`'s own stale index
+/// covers nodes only.
+const VSTALE: &str = "jmt:vstale:";
+/// PF-3 / GC-1: versions below this are pruned and never served.
+pub const FLOOR: &str = "jmt:floor";
 /// The latest applied version.
 pub const LATEST: &str = "jmt:latest";
 
@@ -121,6 +127,31 @@ fn stale_key(since: Version, k: &NodeKey) -> Result<String> {
         since,
         hex::encode(borsh::to_vec(k)?)
     ))
+}
+
+fn vstale_key(since: Version, kh: &KeyHash, prev: Version) -> String {
+    format!("{VSTALE}{:020}:{}:{:020}", since, hex::encode(kh.0), prev)
+}
+
+/// The version of `kh`'s newest value row at or below `max_version`.
+fn latest_value_version(
+    db: &StateDB,
+    kh: &KeyHash,
+    max_version: Version,
+) -> Result<Option<Version>> {
+    let prefix = val_prefix(kh);
+    let start = val_key(kh, max_version);
+    let mut it = db
+        .db
+        .iterator(IteratorMode::From(start.as_bytes(), Direction::Reverse));
+    match it.next() {
+        Some(Ok((k, _))) if k.starts_with(prefix.as_bytes()) => {
+            let version = std::str::from_utf8(&k[prefix.len()..])?.parse::<Version>()?;
+            Ok(Some(version))
+        }
+        Some(Err(e)) => Err(e.into()),
+        _ => Ok(None),
+    }
 }
 
 fn pre_key(kh: &KeyHash) -> String {
@@ -326,10 +357,43 @@ fn apply_checked(
         batch.put(key, hex::encode(borsh::to_vec(node)?));
     }
     for ((v, kh), value) in update.node_batch.values() {
+        // GC-1 value rule: the previous row is superseded at `v`.
+        if *v > 0 {
+            if let Some(prev) = latest_value_version(db, kh, v - 1)? {
+                batch.put(vstale_key(*v, kh, prev), "");
+            }
+        }
         batch.put(val_key(kh, *v), encode_value(value.as_deref()));
     }
+    let mut old_root_marked = false;
     for stale in &update.stale_node_index_batch {
+        if version > 0
+            && stale.node_key.version() == version - 1
+            && stale.node_key.nibble_path().is_empty()
+        {
+            old_root_marked = true;
+        }
         batch.put(stale_key(stale.stale_since_version, &stale.node_key)?, "");
+    }
+    // GC-1: an empty block carries the root forward as a new node at this
+    // version, but `jmt` does not mark the previous root stale
+    // (`tree_cache.rs:316-323`). Mark it, or it would never be pruned.
+    if version > 0 && !old_root_marked {
+        if let Some(new_root) = update
+            .node_batch
+            .nodes()
+            .keys()
+            .find(|nk| nk.version() == version && nk.nibble_path().is_empty())
+        {
+            // The same key at version - 1: borsh is the version (u64 LE)
+            // followed by the empty path.
+            let mut bytes = borsh::to_vec(new_root)?;
+            bytes[..8].copy_from_slice(&(version - 1).to_le_bytes());
+            let old_root: NodeKey = borsh::from_slice(&bytes)?;
+            if db.get(&node_key(&old_root)?)?.is_some() {
+                batch.put(stale_key(version, &old_root)?, "");
+            }
+        }
     }
     for (kh, key) in preimages {
         let pk = pre_key(&kh);
@@ -441,6 +505,189 @@ pub fn boot_check(db: &Arc<StateDB>) -> Result<()> {
         root(db, version)
             .with_context(|| format!("the root node of tree version {version} is missing"))?;
     }
+    Ok(())
+}
+
+/// The retention floor: versions below it may be pruned and are not served.
+pub fn floor(db: &StateDB) -> Result<Version> {
+    Ok(db
+        .get(FLOOR)?
+        .map(|s| s.parse::<Version>())
+        .transpose()
+        .context("malformed jmt:floor")?
+        .unwrap_or(0))
+}
+
+/// What one `prune` call removed.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PruneStats {
+    pub nodes: usize,
+    pub values: usize,
+    /// True when rows at or below the floor remain (the call hit its limit).
+    pub more: bool,
+}
+
+/// GC-1: prune the tree below `target_floor`, at most `max_rows` rows per
+/// call. Node-local and root-neutral (GC-2): only `jmt:*` rows go.
+///
+/// - The floor is raised first, in its own write, so a version about to lose
+///   rows is refused (PF-3) before any row goes. A crash mid-prune leaves
+///   nothing servable half-deleted.
+/// - Tree nodes go through `jmt`'s stale index: a node stale since `s` is
+///   needed only by versions below `s`.
+/// - Values follow the value rule: a row superseded at `v` is needed only by
+///   versions below `v`, so each key keeps its newest row at or below the
+///   floor plus every newer one.
+/// - A pinned version (SN-4) keeps every node and value row it needs.
+pub fn prune(
+    db: &Arc<StateDB>,
+    target_floor: Version,
+    pinned: &std::collections::BTreeSet<Version>,
+    max_rows: usize,
+) -> Result<PruneStats> {
+    let latest = latest_version(db)?.context("no state tree")?;
+    let target = target_floor.min(latest);
+    let current = floor(db)?;
+    if target > current {
+        db.put(FLOOR, &target.to_string())?;
+    }
+    let floor = target.max(current);
+    // A row live over [created, superseded) is kept if a pin falls in it.
+    let pinned_in = |from: Version, until: Version| pinned.range(from..until).next().is_some();
+    let mut stats = PruneStats::default();
+    let mut batch = WriteBatch::default();
+    let mut rows = 0usize;
+    for row in db.db.prefix_iterator(STALE.as_bytes()) {
+        let (k, _) = row?;
+        if !k.starts_with(STALE.as_bytes()) {
+            break;
+        }
+        let rest = std::str::from_utf8(&k[STALE.len()..])?;
+        let (since, node_hex) = rest.split_once(':').context("malformed stale row")?;
+        let since: Version = since.parse()?;
+        if since > floor {
+            break;
+        }
+        if rows >= max_rows {
+            stats.more = true;
+            break;
+        }
+        let nk: NodeKey = borsh::from_slice(&hex::decode(node_hex)?)?;
+        if pinned_in(nk.version(), since) {
+            continue;
+        }
+        batch.delete(node_key(&nk)?);
+        batch.delete(&k);
+        stats.nodes += 1;
+        rows += 1;
+    }
+    for row in db.db.prefix_iterator(VSTALE.as_bytes()) {
+        let (k, _) = row?;
+        if !k.starts_with(VSTALE.as_bytes()) {
+            break;
+        }
+        let rest = std::str::from_utf8(&k[VSTALE.len()..])?;
+        let mut parts = rest.splitn(3, ':');
+        let since: Version = parts.next().context("malformed vstale row")?.parse()?;
+        if since > floor {
+            break;
+        }
+        if rows >= max_rows {
+            stats.more = true;
+            break;
+        }
+        let kh = KeyHash(
+            hex::decode(parts.next().context("malformed vstale row")?)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("malformed vstale key hash"))?,
+        );
+        let prev: Version = parts.next().context("malformed vstale row")?.parse()?;
+        if pinned_in(prev, since) {
+            continue;
+        }
+        batch.delete(val_key(&kh, prev));
+        batch.delete(&k);
+        stats.values += 1;
+        rows += 1;
+    }
+    db.write_batch(batch)?;
+    Ok(stats)
+}
+
+/// RC-2: at boot, the flat consensus-state keys and the tree's leaves at the
+/// latest version must agree exactly. Returns every divergent key (empty:
+/// consistent). It detects an out-of-band edit of a flat state key and a
+/// stale value row, but not a self-consistent foreign database (RC-3).
+/// Cost: O(|S|), since it walks the tree's leaves and the state templates,
+/// never the whole database.
+pub fn audit_flat_vs_tree(db: &Arc<StateDB>) -> Result<Vec<String>> {
+    let Some(version) = latest_version(db)? else {
+        return Ok(Vec::new());
+    };
+    let mut divergent = Vec::new();
+    // 1. Every leaf equals its flat key.
+    let mut in_tree = std::collections::BTreeSet::new();
+    no_panic("audit", || {
+        let store = Arc::new(JmtStore::new(db.clone()));
+        for item in JellyfishMerkleIterator::new(store, version, KeyHash([0u8; 32]))? {
+            let (kh, value) = item?;
+            match db.get(&pre_key(&kh))? {
+                None => divergent.push(format!("leaf {} has no preimage", hex::encode(kh.0))),
+                Some(key) => {
+                    if db.db.get(&key)?.as_deref() != Some(value.as_slice()) {
+                        divergent.push(key.clone());
+                    }
+                    in_tree.insert(key);
+                }
+            }
+        }
+        Ok(())
+    })?;
+    // 2. Every flat state key is a leaf.
+    let mut flat_keys: Vec<Vec<u8>> = storage::class::STATE_EXACT
+        .iter()
+        .filter_map(|key| {
+            db.db
+                .get(key)
+                .ok()
+                .flatten()
+                .map(|_| key.as_bytes().to_vec())
+        })
+        .collect();
+    for prefix in storage::class::STATE_PREFIXES {
+        for row in db.db.prefix_iterator(prefix.as_bytes()) {
+            let (k, _) = row?;
+            if !k.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            flat_keys.push(k.to_vec());
+        }
+    }
+    for key in flat_keys {
+        if classify(&key) != Some(KeyClass::State) {
+            continue;
+        }
+        let key = String::from_utf8(key)?;
+        if !in_tree.contains(&key) {
+            divergent.push(key);
+        }
+    }
+    Ok(divergent)
+}
+
+/// RC-3: the tree root at `version` must equal the network's
+/// `qc.state_root` for it. This catches a self-consistent but foreign
+/// database (a restored backup, a copied datadir) that RC-2 cannot see.
+pub fn audit_root_against_qc(
+    db: &Arc<StateDB>,
+    version: Version,
+    qc_state_root: &str,
+) -> Result<()> {
+    let root = hex::encode(root(db, version)?.0);
+    ensure!(
+        root.eq_ignore_ascii_case(qc_state_root),
+        "tree root {root} at version {version} is not the network's {qc_state_root}"
+    );
     Ok(())
 }
 
