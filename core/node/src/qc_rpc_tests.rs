@@ -26,6 +26,7 @@ impl Drop for QcDir {
 }
 
 fn cert(db: &StateDB, epoch: u64, height: u64) -> QuorumCertificate {
+    let _seed = db.seeding();
     let bls = crypto::bls::BLSEngine::consensus();
     let mut target = vec![];
     for (e, seed) in [(0, [7; 32]), (1, [8; 32])] {
@@ -224,8 +225,10 @@ async fn rpc_unknown_history_or_committee_is_unavailable_not_valid() {
         db.put("consensus:qc:21", &serde_json::to_string(&qc).unwrap())
             .unwrap();
         if let Some(value) = replacement {
+            let _seed = db.seeding();
             db.put(key, value).unwrap();
         } else {
+            let _seed = db.seeding();
             db.delete(key).unwrap();
         }
         let value = call(

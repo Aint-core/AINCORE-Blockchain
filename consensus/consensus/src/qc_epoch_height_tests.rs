@@ -1,6 +1,7 @@
 use super::*;
 
 fn rotated(db: &StateDB) {
+    let _seed = db.seeding();
     for (epoch, seed) in [(0, 7), (1, 8)] {
         let set = vec![validator_for(&[seed; 32], 100, "local")];
         db.put(
@@ -141,6 +142,7 @@ fn resolver_uses_recorded_boundaries_across_reopen_not_current_interval() {
     {
         let db = dir.open();
         rotated(&db);
+        let _seed = db.seeding();
         db.put("consensus:epoch", "3").unwrap();
         db.put("consensus:epoch_start_height:2", "38").unwrap();
         db.put("consensus:epoch_start_height:3", "101").unwrap();
@@ -160,6 +162,7 @@ fn resolver_uses_recorded_boundaries_across_reopen_not_current_interval() {
         assert_eq!(epoch_for_block_height(&db, height), Some(epoch));
     }
     assert_eq!(epoch_for_block_height(&db, 0), None);
+    let _seed = db.seeding();
     db.delete("consensus:epoch_start_height:2").unwrap();
     assert_eq!(
         epoch_for_block_height(&db, 20),
@@ -191,6 +194,7 @@ fn invalid_or_missing_activation_metadata_cannot_publish_anything() {
             &[hex::decode(&msg.signature).unwrap()],
         )
         .unwrap();
+        let _seed = db.seeding();
         match invalid {
             Some(raw) => db.put("consensus:epoch_start_height:1", raw).unwrap(),
             None => db.delete("consensus:epoch_start_height:1").unwrap(),
@@ -215,6 +219,7 @@ fn resolver_rejects_nonmonotonic_history_and_malformed_current_epoch() {
     let dir = TestDir::new();
     let db = dir.open();
     rotated(&db);
+    let _seed = db.seeding();
     db.put("consensus:epoch", "2").unwrap();
     db.put("consensus:epoch_start_height:2", "21").unwrap();
     assert_eq!(

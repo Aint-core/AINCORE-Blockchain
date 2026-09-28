@@ -1457,6 +1457,7 @@ mod tests {
         let public_key_hex = hex::encode(public_key.as_bytes());
         let address = crypto::derive_address(public_key.as_bytes()).expect("canonical address");
         let object = aa::AccountManager::create_account(address.clone(), public_key_hex);
+        let _seed = db.seeding();
         db.put_object(&object).expect("account object stored");
         address
     }
@@ -1464,6 +1465,7 @@ mod tests {
     fn set_coin_store(db: &StateDB, address: &str, value: u128) {
         let move_addr = parse_move_addr(address).expect("valid move address");
         let bytes = bcs::to_bytes(&TestCoin { value }).expect("coin store BCS");
+        let _seed = db.seeding();
         db.put(&coin_store_key(move_addr), &hex::encode(bytes))
             .expect("coin store stored");
     }
@@ -1483,6 +1485,7 @@ mod tests {
     fn apply_updates(db: &StateDB, updates: Vec<(String, Option<String>)>) {
         for (key, value) in updates {
             if let Some(value) = value {
+                let _seed = db.seeding();
                 db.put(&key, &value).expect("update put");
             } else {
                 db.delete(&key).expect("update delete");
@@ -1620,6 +1623,7 @@ mod tests {
         init_genesis(&db, &genesis_addr, &genesis_pubkey).expect("fresh genesis initializes");
         init_genesis(&db, &genesis_addr, &genesis_pubkey).expect("valid genesis reopens");
 
+        let _seed = db.seeding();
         db.delete("module_0000000000000000000000000000000000000000000000000000000000000001_signer")
             .expect("corrupt stdlib delete");
         let err = init_genesis(&db, &genesis_addr, &genesis_pubkey)
@@ -1641,6 +1645,7 @@ mod tests {
 
         init_genesis(&db, &genesis_addr, &genesis_pubkey).expect("fresh genesis initializes");
 
+        let _seed = db.seeding();
         db.put(
             "module_0000000000000000000000000000000000000000000000000000000000000001_signer",
             "00",
@@ -1690,6 +1695,7 @@ mod tests {
             .get("module_0000000000000000000000000000000000000000000000000000000000000001_coin")
             .expect("coin read")
             .expect("coin exists");
+        let _seed = db.seeding();
         db.put(
             "module_0000000000000000000000000000000000000000000000000000000000000001_signer",
             &coin_bytes,
@@ -2722,6 +2728,7 @@ mod tests {
         );
 
         // Simulate a slash / join: the LIVE set changes.
+        let _seed = db.seeding();
         db.put(
             "sys:validator_set:v1",
             r#"[{"address":"deadbeef","stake":1}]"#,
@@ -3031,6 +3038,7 @@ mod tests {
         let _guard = GENESIS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let db = temp_db("s3_dirty");
+        let _seed = db.seeding();
         db.put("sys:config:base_reward", "999").unwrap();
         let err = initialize_genesis_from(
             &db,

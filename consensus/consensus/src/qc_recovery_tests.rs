@@ -166,6 +166,7 @@ fn missing_committee_defers_and_native_failure_never_releases_outcome() {
     let db = dir.open();
     pending(&db, 1);
     let set = db.get("genesis:validator_set:v1").unwrap().unwrap();
+    let _seed = db.seeding();
     db.delete("genesis:validator_set:v1").unwrap();
     let before = rows(&db);
     assert!(matches!(

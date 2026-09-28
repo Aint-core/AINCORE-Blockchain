@@ -72,3 +72,7 @@ libp2p = { version = "0.54", features = [
 futures = "0.3"
 prometheus = "0.13"
 lazy_static = "1.4"
+
+[dev-dependencies]
+# G3 WG-1: test fixtures seed their own genesis state (StateDB::seeding).
+storage = { path = "../../common/storage", features = ["test-seeding"] }

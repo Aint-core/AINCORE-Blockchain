@@ -20,8 +20,11 @@ struct Shared {
     raw: DB,
     writers: Mutex<()>,
     /// G3 S0: counts unclassified keys and state written outside the block
-    /// transaction. Observes only; never refuses.
+    /// transaction. The refusal itself is `ReadStore::write` (WG-1, S3).
     observer: Observer,
+    /// Live `SeedingGuard`s (tests only): while nonzero, a base write of a
+    /// state key is allowed, so a fixture can write its own genesis state.
+    seeding: Arc<std::sync::atomic::AtomicUsize>,
     /// Declared after `raw` on purpose: fields drop in declaration order, so the
     /// directory becomes claimable again only after RocksDB has closed it.
     _claim: Option<crate::DirectoryClaim>,
@@ -70,6 +73,7 @@ impl From<DB> for ReadStore {
                 raw,
                 writers: Mutex::new(()),
                 observer: Observer::default(),
+                seeding: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 _claim: None,
             }),
             stage: None,
@@ -86,6 +90,7 @@ impl ReadStore {
                 raw,
                 writers: Mutex::new(()),
                 observer: Observer::default(),
+                seeding: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 _claim: Some(claim),
             }),
             stage: None,
@@ -152,7 +157,27 @@ impl ReadStore {
         self.iterator(IteratorMode::From(prefix.as_ref(), Direction::Forward))
     }
 
-    pub(crate) fn write(&self, batch: WriteBatch) -> Result<(), rocksdb::Error> {
+    /// G3 WG-1: consensus state is written only inside the block transaction.
+    /// Anywhere else the whole batch is refused and nothing is written.
+    fn refuse_state_outside_block<'k>(
+        &self,
+        ctx: WriteContext,
+        mut keys: impl Iterator<Item = &'k [u8]>,
+    ) -> Result<(), StorageError> {
+        if ctx == WriteContext::Block || self.shared.seeding.load(Ordering::Acquire) > 0 {
+            return Ok(());
+        }
+        match keys.find(|key| classify(key) == Some(KeyClass::State)) {
+            Some(key) => Err(StorageError::WriteGate(format!(
+                "state key {} written outside the block transaction ({} context)",
+                crate::class::mask(key),
+                ctx.as_str()
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn write(&self, batch: WriteBatch) -> Result<(), StorageError> {
         let ctx = match &self.stage {
             None => WriteContext::Base,
             Some(stage) if stage.block => WriteContext::Block,
@@ -164,6 +189,7 @@ impl ReadStore {
             for key in collected.changes.keys() {
                 self.shared.observer.observe(key, ctx);
             }
+            self.refuse_state_outside_block(ctx, collected.changes.keys().map(Vec::as_slice))?;
             if stage.sealed.load(Ordering::Acquire)
                 && collected
                     .changes
@@ -192,13 +218,21 @@ impl ReadStore {
             for key in &keys.0 {
                 self.shared.observer.observe(key, ctx);
             }
+            self.refuse_state_outside_block(ctx, keys.0.iter().map(|key| &key[..]))?;
             let _guard = self
                 .shared
                 .writers
                 .lock()
                 .expect("storage writer gate poisoned");
-            self.write_durable(batch)
+            Ok(self.write_durable(batch)?)
         }
+    }
+
+    /// Tests only: see `StateDB::seeding`.
+    #[cfg(any(test, feature = "test-seeding"))]
+    pub(crate) fn seeding(&self) -> SeedingGuard {
+        self.shared.seeding.fetch_add(1, Ordering::AcqRel);
+        SeedingGuard(Arc::clone(&self.shared.seeding))
     }
 
     /// G3 CM-1: the consensus-state writes staged so far in this block
@@ -380,9 +414,10 @@ impl StateDB {
         self.transaction_with(false, work)
     }
 
-    /// The executor's block transaction: the only place consensus state may
-    /// be written (G3 WG-1). Same semantics as `transaction`; the mark lets
-    /// the S0 observer tell block writes from every other writer.
+    /// The executor's block transaction, and genesis's: the only place
+    /// consensus state may be written (G3 WG-1, enforced since S3).
+    /// Everywhere else such a write is refused. Otherwise it has the same
+    /// semantics as `transaction`.
     pub fn block_transaction<T>(
         &self,
         work: impl FnOnce(Arc<StateDB>) -> Result<T, StorageError>,
@@ -444,6 +479,21 @@ impl StateDB {
         }
         self.db.write_durable(batch)?;
         Ok(result)
+    }
+}
+
+/// Tests only (G3 WG-1): while it lives, base writes of state keys are allowed
+/// on its database. Never compiled into a production binary: it exists only
+/// for this crate's tests and the `test-seeding` feature, which other crates
+/// enable in `[dev-dependencies]` only.
+#[cfg(any(test, feature = "test-seeding"))]
+/// It holds only the counter, so it never keeps the database open.
+pub struct SeedingGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(any(test, feature = "test-seeding"))]
+impl Drop for SeedingGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -614,6 +664,7 @@ mod tests {
         let mut batch = WriteBatch::default();
         batch.put("bad_utf8", [0xff]);
         batch.put("obj:bad_object", "not json");
+        let _seed = db.seeding();
         db.write_batch(batch).unwrap();
         for object in [false, true] {
             let before = rows(&db);

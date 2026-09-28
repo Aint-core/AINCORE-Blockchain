@@ -108,7 +108,8 @@ mod tests {
         let db = temp_db("remove_peer");
         db.save_peer("nodeX", 9032).unwrap();
         db.save_peer_ip("nodeX", "172.23.0.1").unwrap();
-        db.save_peer_addr("nodeX", "/ip4/172.23.0.1/tcp/9032").unwrap();
+        db.save_peer_addr("nodeX", "/ip4/172.23.0.1/tcp/9032")
+            .unwrap();
         assert_eq!(db.get_peer("nodeX"), Some(9032));
 
         db.remove_peer("nodeX").unwrap();
@@ -476,6 +477,7 @@ mod tests {
     fn test_federation_key() {
         let db = temp_db("federation");
         assert_eq!(db.get_federation_key(), "");
+        let _seed = db.seeding();
         db.set_federation_key("0xFEDERATION").unwrap();
         assert_eq!(db.get_federation_key(), "0xFEDERATION");
     }
@@ -489,6 +491,7 @@ mod tests {
         assert_eq!(db.get_burn_percentage(), 10);
 
         // Update
+        let _seed = db.seeding();
         db.update_economic_config(Some(36), Some(2_102_400), Some(5))
             .unwrap();
         assert_eq!(db.get_base_reward(), 36);
@@ -503,6 +506,7 @@ mod tests {
 
         // `sys:validators` is consensus state, written by block execution and
         // genesis only (G3 WG-1); seed it directly to test the reader.
+        let _seed = db.seeding();
         db.put("sys:validators", r#"[["pk_alice",1000],["pk_bob",2000]]"#)
             .unwrap();
 
@@ -577,6 +581,7 @@ mod tests {
             b"hello world".to_vec(),
             "0x1::coin::Coin".to_string(),
         );
+        let _seed = db.seeding();
         db.put_object(&obj).unwrap();
 
         let loaded = db.get_object("obj_001");

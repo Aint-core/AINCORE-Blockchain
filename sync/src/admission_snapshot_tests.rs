@@ -46,6 +46,7 @@ fn rows(db: &StateDB) -> BTreeMap<Vec<u8>, Vec<u8>> {
 fn revoke_author(db: &StateDB) {
     let key = crypto::SigningKey::from_bytes(&[78; 32]);
     let address = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+    let _seed = db.seeding();
     db.put(
         "sys:validators",
         &serde_json::to_string(&vec![(address, 100u64)]).unwrap(),
@@ -68,6 +69,7 @@ fn replace_author_key(db: &StateDB) {
         "public_key": hex::encode(crypto::SigningKey::from_bytes(&[78; 32]).verifying_key().to_bytes()),
         "sequence_number": 0
     }).to_string().into_bytes();
+    let _seed = db.seeding();
     db.put_object(&account).unwrap();
 }
 
@@ -94,6 +96,7 @@ fn expected_after(db: &StateDB, mutation: fn(&StateDB)) -> BTreeMap<Vec<u8>, Vec
     // Restore only this isolated fixture's mutated rows before exercising the hook.
     for (key, value) in &before {
         if expected.get(key) != Some(value) {
+            let _seed = db.seeding();
             db.put(
                 std::str::from_utf8(key).unwrap(),
                 std::str::from_utf8(value).unwrap(),
@@ -102,6 +105,7 @@ fn expected_after(db: &StateDB, mutation: fn(&StateDB)) -> BTreeMap<Vec<u8>, Vec
         }
     }
     for key in expected.keys().filter(|key| !before.contains_key(*key)) {
+        let _seed = db.seeding();
         db.delete(std::str::from_utf8(key).unwrap()).unwrap();
     }
     expected
@@ -227,6 +231,7 @@ fn held_qc_arriving_after_precheck_is_rechecked() {
             .to_bytes(),
     );
     for key in ["sys:validator_set:v1", "genesis:validator_set:v1"] {
+        let _seed = sync.storage.seeding();
         sync.storage
             .put(key, &serde_json::to_string(&validators).unwrap())
             .unwrap();
@@ -259,6 +264,7 @@ fn malformed_held_qc_at_admission_fails_closed() {
 #[test]
 fn missing_committee_cannot_admit_a_signed_account() {
     let (sync, block, path) = fixture("missing_committee");
+    let _seed = sync.storage.seeding();
     sync.storage.delete("sys:validators").unwrap();
     let before = rows(&sync.storage);
     assert_eq!(sync.process_blocks(vec![block], 0), 0);
@@ -268,6 +274,7 @@ fn missing_committee_cannot_admit_a_signed_account() {
 #[test]
 fn empty_preferred_committee_cannot_admit_a_signed_account() {
     let (sync, block, path) = fixture("empty_committee");
+    let _seed = sync.storage.seeding();
     sync.storage.put("sys:validator_set:v1", "[]").unwrap();
     let before = rows(&sync.storage);
     assert_eq!(sync.process_blocks(vec![block], 0), 0);
@@ -277,6 +284,7 @@ fn empty_preferred_committee_cannot_admit_a_signed_account() {
 #[test]
 fn corrupt_preferred_committee_cannot_downgrade_to_legacy_mirror() {
     let (sync, block, path) = fixture("corrupt_committee");
+    let _seed = sync.storage.seeding();
     sync.storage
         .put("sys:validator_set:v1", "broken JSON")
         .unwrap();
@@ -304,6 +312,7 @@ fn duplicate_committee_addresses_are_not_silently_deduplicated() {
         {"address": block.header.proposer_id, "stake": 100},
         {"address": block.header.proposer_id, "stake": 200}
     ]);
+    let _seed = sync.storage.seeding();
     sync.storage
         .put("sys:validator_set:v1", &json.to_string())
         .unwrap();
@@ -313,6 +322,7 @@ fn duplicate_committee_addresses_are_not_silently_deduplicated() {
 }
 
 fn clear_preferred_committee(db: &StateDB) {
+    let _seed = db.seeding();
     db.put("sys:validator_set:v1", "[]").unwrap();
 }
 

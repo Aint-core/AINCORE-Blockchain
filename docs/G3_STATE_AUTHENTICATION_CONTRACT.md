@@ -612,7 +612,27 @@ counters, never values.
   - **Activation note:** every genesis.json needs the `stdlib_hash` field and explicit
     BLS keys. `genesis-tool gen-multi` writes both. The live `genesis.4r.json` has
     neither, as expected: S3 activates only with the S8 fresh genesis.
-- **S3b (WG-1 enforcement) and S3c (the rest of FX-9, the snapshot install) are next.**
+- **S3b (WG-1 enforcement) is done.**
+  - `ReadStore::write`, the single write funnel, refuses any batch holding a state key
+    outside the block transaction: base writes and plain transactions alike. The whole
+    batch is refused and nothing is written. The error is `StorageError::WriteGate`, and
+    `state_outside_block` counts the refusals. `aincore_getStateClassStats` reports
+    `mode: enforce`.
+  - The write APIs return `StorageError`. Every caller compiled unchanged.
+  - Tests seed genesis-like state through `StateDB::seeding()`, a scoped guard. It exists
+    only under `cfg(test)` and the `test-seeding` feature, which crates enable in
+    `[dev-dependencies]` only. `cargo tree -e normal,features` shows that no production
+    build of `node` has it. The guard holds only its counter, never the database.
+  - Production calls that ignore a write result (`let _ = storage.put(..)`) would lose a
+    refused write silently. A test pins that every key they write outside a block is
+    non-state (`best_effort_production_writes_are_never_state`). The executor's epoch keys
+    are state, but they are written inside the block transaction.
+  - **Witness C1′ (storage half):** a state write through every `StateDB` entry point
+    outside the block transaction is refused. The entry points are put, delete, a mixed
+    batch, `put_object`, the federation key, the economic config and a plain transaction.
+    The ignored H6 witnesses C1 and C2 stay as they are until the gate owner reviews
+    C1′ and C2′. C1′'s RC-2 half and C2′ need S6 and S7.
+- **S3c (the rest of FX-9, the snapshot install) is next.**
 | S4 | Proof RPC + Rust and JS verifiers (PF) | No, once S2 is live |
 | S5 | Committee record + FinalityVote V2 binding + transition log + `TA_LOG_*` (TA; joint with G1 EP-2/EP-4) | **Yes** |
 | S6 | Snapshot restore + bootstrap record + pinned versions + rejoin at every horizon (SN) | No |

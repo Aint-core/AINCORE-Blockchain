@@ -45,6 +45,7 @@ fn fixture(db: &StateDB, initialize: bool) -> (Vec<String>, String, String) {
         set_coin_store(db, &sender, 1_000_000);
         set_coin_store(db, &recipient, 0);
         set_coin_store(db, &proposer, 0);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         db.put("sys:config:epoch_block_interval", "1000000")

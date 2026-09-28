@@ -427,6 +427,7 @@ mod pqc_phase21 {
     fn happy_path_real_dilithium5_signature_accepted() {
         let db = temp_db("happy");
         let (sender, pk_bytes, sk, chain_id, payload) = fresh_pqc_identity();
+        let _seed = db.seeding();
         db.put(&format!("pqc_pubkey_{}", sender), &hex::encode(&pk_bytes))
             .unwrap();
         // Admission now fails CLOSED for senders with no CoinStore (re-audit
@@ -495,6 +496,7 @@ mod pqc_phase21 {
     fn tampered_message_rejected() {
         let db = temp_db("tampered_msg");
         let (sender, pk_bytes, sk, chain_id, payload) = fresh_pqc_identity();
+        let _seed = db.seeding();
         db.put(&format!("pqc_pubkey_{}", sender), &hex::encode(&pk_bytes))
             .unwrap();
         // Sign sequence_number=0 but submit sequence_number=1 → signature
@@ -517,6 +519,7 @@ mod pqc_phase21 {
     fn corrupt_signature_bytes_rejected() {
         let db = temp_db("corrupt_sig");
         let (sender, pk_bytes, _sk, chain_id, payload) = fresh_pqc_identity();
+        let _seed = db.seeding();
         db.put(&format!("pqc_pubkey_{}", sender), &hex::encode(&pk_bytes))
             .unwrap();
         // Construct a syntactically-correct-length signature filled with
@@ -855,6 +858,7 @@ mod fee_market_admission {
     // A struct {value: u128} encodes in BCS identically to a bare u128, so the
     // executor's MoveCoin reader round-trips this.
     pub(crate) fn fund(db: &Arc<StateDB>, sender: &str, balance: u128) {
+        let _seed = db.seeding();
         db.put(
             &ain_store_key(sender),
             &hex::encode(bcs::to_bytes(&balance).unwrap()),

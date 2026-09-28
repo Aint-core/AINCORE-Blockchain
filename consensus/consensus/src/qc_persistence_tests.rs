@@ -33,6 +33,7 @@ impl TestDir {
 
     fn seed(&self, minority: bool) {
         let db = self.open();
+        let _seed = db.seeding();
         let mut set = vec![validator_for(&[7; 32], 40, "local")];
         if minority {
             set.push(validator_for(&[8; 32], 60, "other"));
@@ -90,6 +91,7 @@ fn unknown_epoch_cannot_borrow_live_committee_to_sign() {
     let dir = TestDir::new();
     dir.seed(false);
     let db = dir.open();
+    let _seed = db.seeding();
     db.delete("genesis:validator_set:v1").unwrap();
     db.put("consensus:epoch", "10").unwrap();
     for epoch in [0, 9, 10, 11, u64::MAX] {
@@ -109,6 +111,7 @@ fn invalid_epoch_snapshot_cannot_fall_back_to_live_committee() {
             let dir = TestDir::new();
             dir.seed(false);
             let db = dir.open();
+            let _seed = db.seeding();
             db.put(&format!("sys:validator_set:epoch:{epoch}"), invalid).unwrap();
             let mut ctx = ctx_for(10);
             ctx.epoch = epoch;
@@ -125,6 +128,7 @@ fn remote_vote_needs_exact_epoch_snapshot_before_any_write() {
     let dir = TestDir::new();
     dir.seed(false);
     let db = dir.open();
+    let _seed = db.seeding();
     db.put("consensus:epoch", "3").unwrap();
     db.put("consensus:epoch_start_height:3", "9").unwrap();
     let set = load_validator_set_v1(&db).unwrap();
@@ -147,6 +151,7 @@ fn retained_epoch_survives_live_changes_but_pruned_epoch_fails_closed() {
     dir.seed(true);
     let db = dir.open();
     let snapshot = db.get("sys:validator_set:v1").unwrap().unwrap();
+    let _seed = db.seeding();
     db.put("sys:validator_set:epoch:3", &snapshot).unwrap();
     db.put("consensus:epoch", "3").unwrap();
     db.put("consensus:epoch_start_height:3", "9").unwrap();
@@ -166,6 +171,7 @@ fn retained_epoch_survives_live_changes_but_pruned_epoch_fails_closed() {
         panic!("retained historical committee must remain usable after reopen");
     };
     assert_eq!(original, replay);
+    let _seed = db.seeding();
     db.delete("sys:validator_set:epoch:3").unwrap();
     let before = rows(&db);
     assert!(matches!(produce_and_store_qc(&db, &[7; 32], "local", &ctx), QcOutcome::Skipped));
@@ -177,6 +183,7 @@ fn live_epoch_zero_is_never_used_without_frozen_genesis() {
     let dir = TestDir::new();
     dir.seed(false);
     let db = dir.open();
+    let _seed = db.seeding();
     db.delete("genesis:validator_set:v1").unwrap();
     assert!(load_validator_set_for_epoch(&db, 0).is_none());
     db.put("consensus:epoch", "0").unwrap();
@@ -269,6 +276,7 @@ fn every_context_field_and_either_slot_are_guarded() {
         // The changed-epoch case below also changes local activation metadata
         // to exercise the signing guard independently of epoch-range checks.
         let set = db.get("sys:validator_set:v1").unwrap().unwrap();
+        let _seed = db.seeding();
         db.put("sys:validator_set:epoch:1", &set).unwrap();
         assert!(!matches!(
             produce_and_store_qc(&db, &[7; 32], "local", &ctx_for(10)),
@@ -377,6 +385,7 @@ fn other_message_signature_does_not_poison_honest_quorum() {
     let set: Vec<_> = (1..=4u8)
         .map(|i| validator_for(&[i; 32], 25, &format!("v{i}")))
         .collect();
+    let _seed = db.seeding();
     db.put(
         "genesis:validator_set:v1",
         &serde_json::to_string(&set).unwrap(),

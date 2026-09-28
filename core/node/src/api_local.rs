@@ -1943,10 +1943,11 @@ fn handle_rpc_method(
         },
 
         "aincore_getStateClassStats" => {
-            // G3 S0 observe mode: what enforcement (S3) would refuse today.
+            // G3 WG-1 is enforced (S3): `state_outside_block` counts the
+            // consensus-state writes the gate refused.
             let stats = data.storage.db.state_class_stats();
             Ok(serde_json::json!({
-                "mode": "observe",
+                "mode": "enforce",
                 "writes": stats.writes,
                 "unclassified": stats.unclassified,
                 "state_outside_block": stats.state_outside_block,
@@ -2365,6 +2366,7 @@ mod tests {
     /// Writes a CoinStore balance straight into the test database.
     fn seed_coin(db: &StateDB, key: String, value: u128) {
         let coin = bcs::to_bytes(&MoveCoin { value }).unwrap();
+        let _seed = db.seeding();
         db.put(&key, &hex::encode(coin)).expect("seed a balance");
     }
 
@@ -2565,6 +2567,7 @@ mod tests {
             value: 7_000_000_000_000_000_000,
         })
         .unwrap();
+        let _seed = db.seeding();
         db.put(&move_coin_store_key(move_addr), &hex::encode(coin))
             .expect("seed a balance");
         let state = test_state(Arc::clone(&db));
@@ -2656,8 +2659,11 @@ mod tests {
                 .expect("stats")
         };
         let before = read(&state);
-        assert_eq!(before["mode"], "observe");
-        db.put("sys:chain_id", "X").unwrap(); // state, outside any block
+        assert_eq!(before["mode"], "enforce");
+        assert!(
+            db.put("sys:chain_id", "X").is_err(),
+            "state outside any block is refused"
+        );
         db.put("no:such:template:rpc", "x").unwrap();
         let after = read(&state);
         assert_eq!(
@@ -2722,6 +2728,7 @@ mod tests {
     #[test]
     fn test_supply_reads_genesis_total_supply_key() {
         let db = temp_db("supply");
+        let _seed = db.seeding();
         db.put("sys:total_supply", "42").expect("write sys supply");
         db.put("total_supply", "7").expect("write legacy supply");
 
@@ -2821,6 +2828,7 @@ mod tests {
                 active: true,
             }],
         };
+        let _seed = db.seeding();
         db.put(
             &dex_registry_key(),
             &hex::encode(bcs::to_bytes(&registry).unwrap()),

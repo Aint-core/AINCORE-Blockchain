@@ -3,6 +3,11 @@ name = "storage"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# G3 WG-1: `StateDB::seeding`, for test fixtures only. Enable it from
+# [dev-dependencies] only, never from [dependencies].
+test-seeding = []
+
 [dependencies]
 rocksdb = "0.21"
 serde = { version = "1.0", features = ["derive"] }

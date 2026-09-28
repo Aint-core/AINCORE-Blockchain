@@ -23,6 +23,7 @@ mod tests {
     /// on-chain AccountData and sign the block, so validate_block's proposer
     /// authentication passes for blocks a test expects to be VALID.
     fn authenticate_block(sync: &ChainSync, block: &mut Block) {
+        let _seed = sync.storage.seeding();
         use storage::object::{Object, Owner};
         let key = crypto::SigningKey::from_bytes(&[77u8; 32]);
         let pk = hex::encode(key.verifying_key().to_bytes());
@@ -67,6 +68,7 @@ mod tests {
     }
 
     fn set_validators(sync: &ChainSync, validators: Vec<(&str, u64)>) {
+        let _seed = sync.storage.seeding();
         let vals: Vec<(String, u64)> = validators
             .into_iter()
             .map(|(addr, stake)| (addr.to_string(), stake))
@@ -239,6 +241,7 @@ mod tests {
         anchor_round: u64,
         epoch: u64,
     ) -> consensus::qc::QuorumCertificate {
+        let _seed = sync.storage.seeding();
         use consensus::qc::{build_qc, validator_set_hash, FinalityVote, ValidatorInfo};
         let bls = crypto::bls::BLSEngine::consensus();
         let seed = [7u8; 32];
@@ -318,6 +321,7 @@ mod tests {
         let sync = setup_sync("finality_unknown_epoch");
         let qc = build_test_qc_for_epoch(&sync, 9000, 8990, 9);
         store_block_with_hash(&sync, 8990, &qc.block_hash);
+        let _seed = sync.storage.seeding();
         sync.storage.put("consensus:epoch", "10").unwrap();
         sync.storage.put("consensus:epoch_start_height:9", "8001").unwrap();
         sync.storage.put("consensus:epoch_start_height:10", "9001").unwrap();
@@ -809,6 +813,7 @@ mod tests {
     #[test]
     fn empty_execution_roots_are_always_refused() {
         let sync = setup_sync("roots_empty_default");
+        let _seed = sync.storage.seeding();
         sync.storage
             .put("sys:config:require_exec_roots", "0")
             .unwrap();
@@ -837,6 +842,7 @@ mod tests {
     #[test]
     fn verify_execution_roots_rejects_empty_when_required() {
         let sync = setup_sync("roots_required");
+        let _seed = sync.storage.seeding();
         sync.storage
             .put("sys:config:require_exec_roots", "1")
             .unwrap();
@@ -1184,6 +1190,7 @@ mod tests {
         let sync = setup_sync("tip_n_config");
         assert_eq!(sync.tip_agreement_n(), 1, "default must be 1");
 
+        let _seed = sync.storage.seeding();
         sync.storage
             .put("sys:config:tip_agreement_n", "3")
             .unwrap();
@@ -1206,6 +1213,7 @@ mod tests {
     async fn test_sync_refuses_when_tip_agreement_unmet() {
         let sync = setup_sync("tip_refuse_sync");
         sync.storage.put("latest_height", "5").unwrap();
+        let _seed = sync.storage.seeding();
         sync.storage
             .put("sys:config:tip_agreement_n", "2")
             .unwrap();

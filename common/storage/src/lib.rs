@@ -4,6 +4,8 @@ pub mod class;
 pub mod object;
 mod transaction;
 pub use transaction::ReadStore;
+#[cfg(any(test, feature = "test-seeding"))]
+pub use transaction::SeedingGuard;
 #[cfg(test)]
 mod tests;
 use object::Object;
@@ -91,6 +93,8 @@ pub enum StorageError {
     DatabaseOpen(String),
     DatabaseOperation(String),
     SerializationError(String),
+    /// G3 WG-1: a consensus-state key written outside the block transaction.
+    WriteGate(String),
 }
 
 impl fmt::Display for StorageError {
@@ -99,6 +103,7 @@ impl fmt::Display for StorageError {
             StorageError::DatabaseOpen(msg) => write!(f, "Failed to open database: {}", msg),
             StorageError::DatabaseOperation(msg) => write!(f, "Database operation failed: {}", msg),
             StorageError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
+            StorageError::WriteGate(msg) => write!(f, "Write refused (G3 WG-1): {}", msg),
         }
     }
 }
@@ -191,7 +196,17 @@ impl StateDB {
         })
     }
 
-    pub fn put(&self, key: &str, value: &str) -> std::result::Result<(), rocksdb::Error> {
+    /// Tests only (G3 WG-1): while the guard lives, this database accepts
+    /// base writes of consensus state, so a fixture can write its own genesis
+    /// state. Production code cannot call it: it exists only in this crate's
+    /// tests and under the `test-seeding` feature, which crates enable in
+    /// `[dev-dependencies]` only.
+    #[cfg(any(test, feature = "test-seeding"))]
+    pub fn seeding(&self) -> transaction::SeedingGuard {
+        self.db.seeding()
+    }
+
+    pub fn put(&self, key: &str, value: &str) -> std::result::Result<(), StorageError> {
         // Base writes are synced. In a transaction view, Ok means staged;
         // durability is acknowledged only by the outer transaction's commit.
         let mut batch = rocksdb::WriteBatch::default();
@@ -201,21 +216,19 @@ impl StateDB {
 
     pub fn get(&self, key: &str) -> std::result::Result<Option<String>, rocksdb::Error> {
         match self.db.get(key) {
-            Ok(Some(v)) => {
-                match String::from_utf8(v) {
-                    Ok(s) => Ok(Some(s)),
-                    Err(_) => {
-                        self.db.invalid_read();
-                        Ok(None)
-                    }
+            Ok(Some(v)) => match String::from_utf8(v) {
+                Ok(s) => Ok(Some(s)),
+                Err(_) => {
+                    self.db.invalid_read();
+                    Ok(None)
                 }
-            }
+            },
             Ok(None) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    pub fn delete(&self, key: &str) -> std::result::Result<(), rocksdb::Error> {
+    pub fn delete(&self, key: &str) -> std::result::Result<(), StorageError> {
         // Same durability/staging contract as put.
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete(key);
@@ -271,7 +284,7 @@ impl StateDB {
     }
 
     // === HELPER FOR PEER MAN AGEMENT ===
-    pub fn save_peer(&self, node_id: &str, port: u16) -> std::result::Result<(), rocksdb::Error> {
+    pub fn save_peer(&self, node_id: &str, port: u16) -> std::result::Result<(), StorageError> {
         let key = format!("peer:{}", node_id);
         self.put(&key, &port.to_string())
     }
@@ -289,7 +302,7 @@ impl StateDB {
     /// `peer_addr:` records so a stale/unreachable entry (e.g. an ephemeral
     /// Docker-bridge address left over from a stopped sibling container) is not
     /// reloaded and re-handshaked on every reconnect cycle.
-    pub fn remove_peer(&self, node_id: &str) -> std::result::Result<(), rocksdb::Error> {
+    pub fn remove_peer(&self, node_id: &str) -> std::result::Result<(), StorageError> {
         self.delete(&format!("peer:{}", node_id))?;
         self.delete(&format!("peer_ip:{}", node_id))?;
         self.delete(&format!("peer_addr:{}", node_id))?;
@@ -317,7 +330,7 @@ impl StateDB {
     }
 
     // === PEER IP TRACKING (for multi-node sync) ===
-    pub fn save_peer_ip(&self, node_id: &str, ip: &str) -> std::result::Result<(), rocksdb::Error> {
+    pub fn save_peer_ip(&self, node_id: &str, ip: &str) -> std::result::Result<(), StorageError> {
         let key = format!("peer_ip:{}", node_id);
         self.put(&key, ip)
     }
@@ -334,7 +347,7 @@ impl StateDB {
         &self,
         peer_id: &str,
         multiaddr: &str,
-    ) -> std::result::Result<(), rocksdb::Error> {
+    ) -> std::result::Result<(), StorageError> {
         self.put(&format!("peer_addr:{}", peer_id), multiaddr)
     }
 
@@ -372,16 +385,13 @@ impl StateDB {
         vertices
     }
 
-    pub fn put_object(&self, object: &Object) -> std::result::Result<(), rocksdb::Error> {
+    pub fn put_object(&self, object: &Object) -> std::result::Result<(), StorageError> {
         let key = format!("obj:{}", object.id);
         let value = serde_json::to_string(object).unwrap_or_default(); // Safe default or error? Default is ok for prototype.
         self.put(&key, &value)
     }
 
-    pub fn write_batch(
-        &self,
-        batch: rocksdb::WriteBatch,
-    ) -> std::result::Result<(), rocksdb::Error> {
+    pub fn write_batch(&self, batch: rocksdb::WriteBatch) -> std::result::Result<(), StorageError> {
         // The base path uses one sync=true RocksDB write. A transaction view
         // merges these operations into its pending batch without touching disk.
         self.db.write(batch)
@@ -415,7 +425,7 @@ impl StateDB {
     /// per-tx index in the same atomic batch we never observe a state
     /// where a block exists but its transactions are not yet indexable,
     /// and the lookup becomes O(1) → O(M) for the single block.
-    pub fn save_block_json(&self, height: u64, block_json: &str) -> Result<(), rocksdb::Error> {
+    pub fn save_block_json(&self, height: u64, block_json: &str) -> Result<(), StorageError> {
         let key = format!("block_{}", height);
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(key.as_bytes(), block_json.as_bytes());
@@ -514,7 +524,7 @@ impl StateDB {
         current_height: u64,
         keep_blocks: u64,
         max_delete_per_call: u64,
-    ) -> Result<usize, rocksdb::Error> {
+    ) -> Result<usize, StorageError> {
         if keep_blocks == 0 || max_delete_per_call == 0 || current_height <= keep_blocks {
             return Ok(0);
         }
@@ -604,11 +614,7 @@ impl StateDB {
     ///
     /// This enables O(1) transaction lookups instead of O(n) DAG scan.
     /// Call this after successfully executing a block.
-    pub fn index_transaction(
-        &self,
-        tx_hash: &str,
-        block_height: u64,
-    ) -> Result<(), rocksdb::Error> {
+    pub fn index_transaction(&self, tx_hash: &str, block_height: u64) -> Result<(), StorageError> {
         let key = format!("tx_index:{}", tx_hash);
         self.put(&key, &block_height.to_string())
     }
@@ -652,7 +658,7 @@ impl StateDB {
     /// Returns the number of `tx_index` entries inserted. A return of `0`
     /// with `already_done == true` (visible via the sentinel) means the
     /// migration was a no-op on this DB.
-    pub fn backfill_tx_index(&self) -> Result<usize, rocksdb::Error> {
+    pub fn backfill_tx_index(&self) -> Result<usize, StorageError> {
         use sha2::{Digest, Sha256};
 
         // Idempotency gate.
@@ -747,7 +753,7 @@ impl StateDB {
         }
     }
 
-    pub fn set_federation_key(&self, new_key: &str) -> std::result::Result<(), rocksdb::Error> {
+    pub fn set_federation_key(&self, new_key: &str) -> std::result::Result<(), StorageError> {
         self.put("sys:config:federation_addr", new_key)
     }
 
@@ -771,10 +777,10 @@ impl StateDB {
 
     pub fn get_burn_percentage(&self) -> u8 {
         const DEFAULT_BURN: u8 = 10; // 10%
-        // SEC (audit econ-LOW): clamp to <=100. An out-of-range value (from a buggy or
-        // malicious passed governance UpdateEconomicParams) would make burnt_fees exceed
-        // total_fees and over-decrement the supply trackers (deflationary drift). The
-        // fee split must never burn more than 100% of the fees.
+                                     // SEC (audit econ-LOW): clamp to <=100. An out-of-range value (from a buggy or
+                                     // malicious passed governance UpdateEconomicParams) would make burnt_fees exceed
+                                     // total_fees and over-decrement the supply trackers (deflationary drift). The
+                                     // fee split must never burn more than 100% of the fees.
         let raw = match self.get("sys:config:burn_percentage") {
             Ok(Some(v)) => v.parse().unwrap_or(DEFAULT_BURN),
             _ => DEFAULT_BURN,
@@ -787,7 +793,7 @@ impl StateDB {
         reward: Option<u64>,
         interval: Option<u64>,
         burn: Option<u8>,
-    ) -> std::result::Result<(), rocksdb::Error> {
+    ) -> std::result::Result<(), StorageError> {
         if let Some(r) = reward {
             self.put("sys:config:base_reward", &r.to_string())?;
         }
@@ -808,26 +814,44 @@ impl StateDB {
     /// historical committee or BLS/PoP verifier. Call on the acceptance view.
     /// A present v1 record is authoritative: corruption cannot select legacy.
     pub fn get_active_validators_checked(&self) -> Result<Vec<(String, u64)>, StorageError> {
-        let mut validators: Vec<(String, u64)> = if let Some(bytes) = self.db.get("sys:validator_set:v1")? {
-            serde_json::from_slice::<Vec<ValidatorSetV1Entry>>(&bytes)
-                .map_err(|e| StorageError::SerializationError(format!("invalid validator_set:v1: {e}")))?
-                .into_iter().map(|v| (v.address, v.stake)).collect()
-        } else {
-            let bytes = self.db.get("sys:validators")?
-                .ok_or_else(|| StorageError::DatabaseOperation("missing validator eligibility".into()))?;
-            serde_json::from_slice(&bytes)
-                .map_err(|e| StorageError::SerializationError(format!("invalid legacy validator eligibility: {e}")))?
-        };
+        let mut validators: Vec<(String, u64)> =
+            if let Some(bytes) = self.db.get("sys:validator_set:v1")? {
+                serde_json::from_slice::<Vec<ValidatorSetV1Entry>>(&bytes)
+                    .map_err(|e| {
+                        StorageError::SerializationError(format!("invalid validator_set:v1: {e}"))
+                    })?
+                    .into_iter()
+                    .map(|v| (v.address, v.stake))
+                    .collect()
+            } else {
+                let bytes = self.db.get("sys:validators")?.ok_or_else(|| {
+                    StorageError::DatabaseOperation("missing validator eligibility".into())
+                })?;
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    StorageError::SerializationError(format!(
+                        "invalid legacy validator eligibility: {e}"
+                    ))
+                })?
+            };
         validators.sort_by(|a, b| a.0.cmp(&b.0));
-        if validators.iter().any(|(address, _)| address.trim().is_empty()) {
-            return Err(StorageError::SerializationError("empty validator address".into()));
+        if validators
+            .iter()
+            .any(|(address, _)| address.trim().is_empty())
+        {
+            return Err(StorageError::SerializationError(
+                "empty validator address".into(),
+            ));
         }
         if validators.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            return Err(StorageError::SerializationError("duplicate validator address".into()));
+            return Err(StorageError::SerializationError(
+                "duplicate validator address".into(),
+            ));
         }
         validators.retain(|(_, stake)| *stake > 0);
         if validators.is_empty() {
-            return Err(StorageError::DatabaseOperation("no positive-stake validator eligibility".into()));
+            return Err(StorageError::DatabaseOperation(
+                "no positive-stake validator eligibility".into(),
+            ));
         }
         Ok(validators)
     }
@@ -871,7 +895,7 @@ impl StateDB {
         &self,
         round: u64,
         vertices_json: &str,
-    ) -> std::result::Result<(), rocksdb::Error> {
+    ) -> std::result::Result<(), StorageError> {
         self.put(&format!("dag:checkpoint:{}", round), vertices_json)?;
         self.put("dag:checkpoint:latest", &round.to_string())?;
         Ok(())
@@ -890,7 +914,7 @@ impl StateDB {
         round: u64,
         vertices_json: &str,
         signature_hex: &str,
-    ) -> std::result::Result<(), rocksdb::Error> {
+    ) -> std::result::Result<(), StorageError> {
         self.put(&format!("dag:checkpoint:{}", round), vertices_json)?;
         self.put(&format!("dag:checkpoint_sig:{}", round), signature_hex)?;
         self.put("dag:checkpoint:latest", &round.to_string())?;
@@ -937,7 +961,7 @@ impl StateDB {
         &self,
         current_round: u64,
         keep_rounds: u64,
-    ) -> std::result::Result<(), rocksdb::Error> {
+    ) -> std::result::Result<(), StorageError> {
         const DAG_CHECKPOINT_INTERVAL: u64 = 100;
 
         if current_round <= keep_rounds {

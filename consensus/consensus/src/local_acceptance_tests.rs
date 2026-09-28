@@ -316,6 +316,7 @@ fn seed_bls_identity(node: &DagConsensus) -> Vec<crate::qc::ValidatorInfo> {
         bls_pop: hex::encode(bls.prove_possession_raw(&seed)),
     }];
     let raw = serde_json::to_string(&set).unwrap();
+    let _seed = node.storage.seeding();
     node.storage.put("sys:validator_set:v1", &raw).unwrap();
     node.storage.put("genesis:validator_set:v1", &raw).unwrap();
     set
@@ -382,6 +383,7 @@ fn malformed_genesis_does_not_fall_through_to_legacy_ingress_committee() {
     let dir = LocalDir::seeded();
     let mut node = reopen(&dir.0);
     assert!(node.storage.get("sys:validator_set:v1").unwrap().is_none());
+    let _seed = node.storage.seeding();
     node.storage
         .put("genesis:validator_set:v1", "invalid")
         .unwrap();
@@ -455,6 +457,7 @@ fn producer_and_lagged_adoption_use_block_epoch_after_rotation() {
     let lagged_dir = LocalDir::seeded();
     let mut lagged = reopen(&lagged_dir.0);
     seed_bls_identity(&lagged);
+    let _seed = lagged.storage.seeding();
     lagged.storage.put("consensus:epoch", "2").unwrap();
     lagged
         .storage

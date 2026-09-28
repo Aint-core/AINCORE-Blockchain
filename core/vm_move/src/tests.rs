@@ -137,7 +137,8 @@ mod tests {
 
         // 3. Store Public Key in DB (simulating on-chain registration)
         let pk_key = format!("pqc_pubkey_{}", sender);
-        let _ = db.put(&pk_key, &hex::encode(pk.as_bytes()));
+        let _seed = db.seeding();
+        db.put(&pk_key, &hex::encode(pk.as_bytes())).unwrap();
 
         // 4. Sign a message
         let payload = b"Hello Quantum World";

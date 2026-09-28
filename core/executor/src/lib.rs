@@ -4009,6 +4009,7 @@ mod tests {
             Executor::DEFAULT_EPOCH_BLOCK_INTERVAL,
             "unpinned: the default, not the env"
         );
+        let _seed = db.seeding();
         db.put("sys:config:epoch_block_interval", "20").unwrap();
         assert_eq!(exec.epoch_block_interval(), 20, "pinned: the pin");
         std::env::remove_var("AINCORE_EPOCH_BLOCK_INTERVAL");
@@ -4031,6 +4032,7 @@ mod tests {
     fn epoch_block_interval_invalid_pin_is_skipped() {
         let db = temp_db("ebi_invalid_pin");
         let exec = Executor::new(Arc::clone(&db));
+        let _seed = db.seeding();
         db.put("sys:config:epoch_block_interval", "0").unwrap();
         assert_eq!(
             exec.epoch_block_interval(),
@@ -4053,6 +4055,7 @@ mod tests {
     fn rotate_validator_epoch_snapshots_advances_and_prunes() {
         let db = temp_db("rotate_epoch");
         let exec = Executor::new(Arc::clone(&db));
+        let _seed = db.seeding();
         db.put("sys:validator_set:v1", "[\"set-at-boundary\"]").unwrap();
         // SEC-#13: pin the interval, as genesis does.
         db.put("sys:config:epoch_block_interval", "20").unwrap();
@@ -4094,6 +4097,7 @@ mod tests {
             "0000000000000000000000000000000000000000000000000000000000000001"
         );
         let bytes = bcs::to_bytes(&(7u64, 123_456u64, 10u64)).unwrap();
+        let _seed = db.seeding();
         db.put(&key, &hex::encode(bytes)).unwrap();
 
         assert_eq!(
@@ -4119,6 +4123,7 @@ mod tests {
             "0000000000000000000000000000000000000000000000000000000000000001"
         );
         let bytes = bcs::to_bytes(&(2u64, 5_000u64, 10u64)).unwrap();
+        let _seed = db.seeding();
         db.put(&key, &hex::encode(bytes)).unwrap();
 
         // Seed a Queued proposal whose timelock matured at 4000s.
@@ -4154,6 +4159,7 @@ mod tests {
     }
 
     fn load_stdlib(db: &StateDB) {
+        let _seed = db.seeding();
         let bytecode_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vm_move/stdlib/bytecode");
         let mut paths: Vec<_> = fs::read_dir(&bytecode_dir)
@@ -4173,6 +4179,7 @@ mod tests {
     }
 
     fn create_account(db: &StateDB, signing_key: &SigningKey) -> String {
+        let _seed = db.seeding();
         let public_key = signing_key.verifying_key();
         let public_key_hex = hex::encode(public_key.as_bytes());
         let address = crypto::derive_address(public_key.as_bytes()).expect("canonical address");
@@ -4184,6 +4191,7 @@ mod tests {
     fn set_coin_store(db: &StateDB, address: &str, value: u128) {
         let move_addr = parse_move_address(address).expect("valid move address");
         let bytes = bcs::to_bytes(&TestCoin { value }).expect("coin store BCS");
+        let _seed = db.seeding();
         db.put(&coin_store_key(move_addr), &hex::encode(bytes))
             .expect("coin store stored");
     }
@@ -4218,6 +4226,7 @@ mod tests {
 
         // Corrupt bytes at the store key -> None (never panics).
         let move_addr = parse_move_address(addr).unwrap();
+        let _seed = db.seeding();
         db.put(&coin_store_key(move_addr), "not-hex-zz").unwrap();
         assert_eq!(committed_ain_balance(&db, addr), None);
 
@@ -4624,6 +4633,7 @@ mod tests {
     }
 
     fn set_validator_set(db: &StateDB, validator: &str, stake: u128, total_supply: u128) {
+        let _seed = db.seeding();
         let validator_addr = parse_move_address(validator).expect("validator move address");
         let (bls_public_key, bls_pop) = test_bls_identity(1);
         let set = TestValidatorSet {
@@ -4695,6 +4705,7 @@ mod tests {
             bls_public_key: "bb".into(),
             bls_pop: "cc".into(),
         }];
+        let _seed = db.seeding();
         db.put(validator_set_v1_key(), &serde_json::to_string(&stale_v1).unwrap())
             .unwrap();
         db.put(
@@ -4747,6 +4758,8 @@ mod tests {
         let minted_before = validator_set(&db).total_supply + supply_stats_cumulative_burned(&db);
         assert_eq!(minted_before, start_supply, "no burns yet: minted == net");
 
+        // Called directly, outside a block: test context.
+        let _seed = db.seeding();
         let burn: u128 = 7_000_000_000_000_000_000; // 7 AIN fee burn
         exec.burn_supply_trackers(burn);
 
@@ -4811,6 +4824,7 @@ mod tests {
         let recipient_key = SigningKey::from_bytes(&[8u8; 32]);
         let sender = create_account(&db, &sender_key);
         let recipient = create_account(&db, &recipient_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         set_coin_store(&db, &sender, 1_000_000);
@@ -4882,6 +4896,7 @@ mod tests {
         let recipient_key = SigningKey::from_bytes(&[22u8; 32]);
         let sender = create_account(&db, &sender_key);
         let recipient = create_account(&db, &recipient_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         set_coin_store(&db, &sender, 1_000_000);
@@ -4921,6 +4936,7 @@ mod tests {
         let recipient_key = SigningKey::from_bytes(&[24u8; 32]);
         let sender = create_account(&db, &sender_key);
         let recipient = create_account(&db, &recipient_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         set_coin_store(&db, &sender, 500_000);
@@ -4959,6 +4975,7 @@ mod tests {
         let recipient_key = SigningKey::from_bytes(&[32u8; 32]);
         let sender = create_account(&db, &sender_key);
         let recipient = create_account(&db, &recipient_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         set_coin_store(&db, &sender, 1_000_000);
@@ -5001,6 +5018,7 @@ mod tests {
         let recipient_key = SigningKey::from_bytes(&[34u8; 32]);
         let sender = create_account(&db, &sender_key);
         let recipient = create_account(&db, &recipient_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         set_coin_store(&db, &sender, 1_000_000);
@@ -5035,6 +5053,7 @@ mod tests {
         // NOTE: create_account() is deliberately NOT called for the sender.
         let sender = crypto::derive_address(sender_key.verifying_key().as_bytes()).unwrap();
         let recipient = create_account(&db, &recipient_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000").unwrap();
         set_coin_store(&db, &sender, 1_000_000);
 
@@ -5071,6 +5090,7 @@ mod tests {
         let recipient_key = SigningKey::from_bytes(&[44u8; 32]);
         let sender = crypto::derive_address(sender_key.verifying_key().as_bytes()).unwrap();
         let recipient = create_account(&db, &recipient_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000").unwrap();
         set_coin_store(&db, &sender, 1_000_000);
 
@@ -5094,6 +5114,7 @@ mod tests {
         let db = temp_db("evidence_equiv");
         let key = SigningKey::from_bytes(&[51u8; 32]);
         let offender = create_account(&db, &key);
+        let _seed = db.seeding();
         db.put("sys:validators", &format!(r#"[["{}",1000],["other0000",1000]]"#, offender))
             .unwrap();
         let executor = Executor::new(db.clone());
@@ -5181,6 +5202,7 @@ mod tests {
         let r1 = create_account(&db, &k1);
         let r2 = create_account(&db, &k2);
         let off = create_account(&db, &k3);
+        let _seed = db.seeding();
         db.put(
             "sys:validators",
             &format!(r#"[["{}",1000],["{}",1000],["{}",1000]]"#, r1, r2, off),
@@ -5230,6 +5252,7 @@ mod tests {
     fn test_height_executes_exactly_once_and_only_in_order() {
         let db = temp_db("exec_height_order");
         load_stdlib(&db);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000").unwrap();
         let executor = Executor::new(db.clone());
         let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
@@ -5403,6 +5426,7 @@ mod tests {
         let attacker = create_account(&db, &attacker_key);
         let victim = create_account(&db, &victim_key);
         let sink = create_account(&db, &sink_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         // Attacker can pay gas; victim holds the funds the attacker wants to steal.
@@ -5469,6 +5493,7 @@ mod tests {
         let recipient_key = SigningKey::from_bytes(&[10u8; 32]);
         let sender = create_account(&db, &sender_key);
         let recipient = create_account(&db, &recipient_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         set_coin_store(&db, &sender, 100_050);
@@ -5524,6 +5549,7 @@ mod tests {
         let recipient_key = SigningKey::from_bytes(&[13u8; 32]);
         let sender = create_account(&db, &sender_key);
         let recipient = create_account(&db, &recipient_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         set_coin_store(&db, &sender, 1_000);
@@ -5568,6 +5594,7 @@ mod tests {
         load_stdlib(&db);
         let sender_key = SigningKey::from_bytes(&[31u8; 32]);
         let sender = create_account(&db, &sender_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         set_coin_store(&db, &sender, 1_000_000);
@@ -5591,6 +5618,7 @@ mod tests {
         load_stdlib(&db);
         let sender_key = SigningKey::from_bytes(&[14u8; 32]);
         let sender = create_account(&db, &sender_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         set_coin_store(&db, &sender, 1_000_000);
@@ -5619,6 +5647,7 @@ mod tests {
         load_stdlib(&db);
         let sender_key = SigningKey::from_bytes(&[15u8; 32]);
         let sender = create_account(&db, &sender_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         set_coin_store(&db, &sender, 1_000_000);
@@ -5653,6 +5682,7 @@ mod tests {
         load_stdlib(&db);
         let sender_key = SigningKey::from_bytes(&[16u8; 32]);
         let sender = create_account(&db, &sender_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         set_coin_store(&db, &sender, 1_000_000);
@@ -5723,6 +5753,7 @@ mod tests {
         let recipient_key = SigningKey::from_bytes(&[20u8; 32]);
         let sender = create_account(&db, &sender_key);
         let recipient = create_account(&db, &recipient_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         set_coin_store(&db, &sender, 1_000_000);
@@ -5793,6 +5824,7 @@ mod tests {
         let recipient_key = SigningKey::from_bytes(&[32u8; 32]);
         let sender = create_account(&db, &sender_key);
         let recipient = create_account(&db, &recipient_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         set_coin_store(&db, &sender, 1_000_000);
@@ -5999,6 +6031,7 @@ mod tests {
     fn a_queued_fee_is_keyed_by_the_executing_height() {
         let (db, sender, tx_json) = g3_burning_transfer("g3_sweep_height");
         let bad = "not_a_hex_validator";
+        let _seed = db.seeding();
         db.put(
             "sys:validators",
             &serde_json::to_string(&vec![(sender.as_str(), 1000u64), (bad, 1000u64)]).unwrap(),
@@ -6066,6 +6099,7 @@ mod tests {
         set_coin_store(&db, &sender, 1_000_000);
         set_coin_store(&db, &recipient, 0);
         set_validator_set(&db, &sender, 0, 1_000_000_000);
+        let _seed = db.seeding();
         db.put("sys:total_supply", "1000000000").unwrap();
         db.put("total_burned", "0").unwrap();
 
@@ -6122,6 +6156,7 @@ mod tests {
         load_stdlib(&db);
         let trader_key = SigningKey::from_bytes(&[32u8; 32]);
         let trader = create_account(&db, &trader_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
 
@@ -6273,6 +6308,7 @@ mod tests {
         load_stdlib(&db);
         let trader_key = SigningKey::from_bytes(&[35u8; 32]);
         let trader = create_account(&db, &trader_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
 
@@ -6364,6 +6400,7 @@ mod tests {
         load_stdlib(&db);
         let trader_key = SigningKey::from_bytes(&[33u8; 32]);
         let trader = create_account(&db, &trader_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
 
@@ -6432,6 +6469,7 @@ mod tests {
         load_stdlib(&db);
         let trader_key = SigningKey::from_bytes(&[34u8; 32]);
         let trader = create_account(&db, &trader_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
 
@@ -6508,6 +6546,7 @@ mod tests {
         load_stdlib(&db);
         let trader_key = SigningKey::from_bytes(&[38u8; 32]);
         let trader = create_account(&db, &trader_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
 
@@ -6586,6 +6625,7 @@ mod tests {
         load_stdlib(&db);
         let trader_key = SigningKey::from_bytes(&[39u8; 32]);
         let trader = create_account(&db, &trader_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
 
@@ -6670,6 +6710,7 @@ mod tests {
         let maker = create_account(&db, &maker_key);
         let lp2_key = SigningKey::from_bytes(&[38u8; 32]);
         let lp2 = create_account(&db, &lp2_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
 
@@ -6768,6 +6809,7 @@ mod tests {
         load_stdlib(&db);
         let sender_key = SigningKey::from_bytes(&[23u8; 32]);
         let sender = create_account(&db, &sender_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         set_coin_store(&db, &sender, 200_000_000_000_000_000_000);
@@ -6820,6 +6862,7 @@ mod tests {
         load_stdlib(&db);
         let sender_key = SigningKey::from_bytes(&[24u8; 32]);
         let sender = create_account(&db, &sender_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         let starting_supply = 20_000_000_000_000_000_000_000u128;
@@ -6868,6 +6911,7 @@ mod tests {
         load_stdlib(&db);
         let voter_key = SigningKey::from_bytes(&[25u8; 32]);
         let voter = create_account(&db, &voter_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         let balance = 1_000_000_000_000_000_000_000u128;
@@ -6968,6 +7012,8 @@ mod tests {
         let executor = Executor::new(db.clone());
         let amount = 777_000u128;
 
+        // Called directly, outside a block: test context.
+        let _seed = db.seeding();
         executor.queue_fee_sweep("not_a_hex_address", amount, 42);
         executor.process_fee_sweep_queue();
         let queued = db
@@ -6999,6 +7045,7 @@ mod tests {
         load_stdlib(&db);
         let validator_key = SigningKey::from_bytes(&[21u8; 32]);
         let validator = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
+        let _seed = db.seeding();
         db.put(
             "sys:validators",
             &serde_json::to_string(&vec![
@@ -7044,6 +7091,7 @@ mod tests {
         load_stdlib(&db);
         let validator_key = SigningKey::from_bytes(&[22u8; 32]);
         let validator = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
+        let _seed = db.seeding();
         db.put(
             "sys:validators",
             &serde_json::to_string(&vec![(validator.clone(), 100u64)]).unwrap(),
@@ -7092,6 +7140,7 @@ mod tests {
         load_stdlib(&db);
         let validator_key = SigningKey::from_bytes(&[23u8; 32]);
         let validator = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
+        let _seed = db.seeding();
         db.put(
             "sys:validators",
             &serde_json::to_string(&vec![(validator.clone(), 100u64)]).unwrap(),
@@ -7166,6 +7215,7 @@ mod tests {
         load_stdlib(&db);
         let validator_key = SigningKey::from_bytes(&[31u8; 32]);
         let validator = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
+        let _seed = db.seeding();
         db.put(
             "sys:validators",
             &serde_json::to_string(&vec![(validator.clone(), 100u64)]).unwrap(),
@@ -7260,6 +7310,7 @@ mod tests {
             "0000000000000000000000000000000000000000000000000000000000000001"
         );
         let seeded = bcs::to_bytes(&(100u64, 1000u64, 1_000_000_000u64)).unwrap();
+        let _seed = db.seeding();
         db.put(&epoch_key, &hex::encode(seeded)).unwrap();
 
         // Advance one epoch through the real VM path (system signer).
@@ -7337,6 +7388,7 @@ mod tests {
             )
         };
         // Seed empty DeviceRegistry + OracleConfig with @0x1 as the trusted feeder.
+        let _seed = db.seeding();
         db.put(
             &um("DeviceRegistry"),
             &hex::encode(bcs::to_bytes(&TRegistry { devices: vec![] }).unwrap()),
@@ -7457,6 +7509,7 @@ mod tests {
             ("cccc".repeat(8), 100),
             ("dddd".repeat(8), 100),
         ];
+        let _seed = db.seeding();
         db.put(
             "sys:validators",
             &serde_json::to_string(&validators).unwrap(),
@@ -7503,6 +7556,7 @@ mod tests {
             ("cccc".repeat(8), 100),
             ("dddd".repeat(8), 100),
         ];
+        let _seed = db.seeding();
         db.put(
             "sys:validators",
             &serde_json::to_string(&validators).unwrap(),
@@ -7566,6 +7620,7 @@ mod tests {
             ("cccc".repeat(8), 1),
             ("dddd".repeat(8), 1),
         ];
+        let _seed = db.seeding();
         db.put("sys:validators", &serde_json::to_string(&validators).unwrap())
             .unwrap();
         let offender = &validators[0].0; // the big honest one
@@ -7599,6 +7654,7 @@ mod tests {
             ("cccc".repeat(8), 100),
             ("dddd".repeat(8), 100),
         ];
+        let _seed = db.seeding();
         db.put(
             "sys:validators",
             &serde_json::to_string(&validators).unwrap(),
@@ -7674,6 +7730,7 @@ mod tests {
             ("cccc".repeat(8), 100),
             ("dddd".repeat(8), 100),
         ];
+        let _seed = db.seeding();
         db.put(
             "sys:validators",
             &serde_json::to_string(&promote_time_validators).unwrap(),
@@ -7701,6 +7758,7 @@ mod tests {
     }
 
     fn set_validator_set_a1(db: &StateDB, vs: &[(&str, u64)]) {
+        let _seed = db.seeding();
         let owned: Vec<(String, u64)> = vs.iter().map(|(a, s)| (a.to_string(), *s)).collect();
         db.put("sys:validators", &serde_json::to_string(&owned).unwrap())
             .unwrap();
@@ -7830,6 +7888,7 @@ mod tests {
         let victim_key = SigningKey::from_bytes(&VICTIM_SEED);
         let attacker = create_account(&db, &attacker_key);
         let victim = create_account(&db, &victim_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
 
@@ -7919,6 +7978,7 @@ mod tests {
 
         let attacker_key = SigningKey::from_bytes(&ATTACKER_SEED);
         let attacker = create_account(&db, &attacker_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         assert_eq!(
@@ -8001,6 +8061,7 @@ mod tests {
 
         let attacker_key = SigningKey::from_bytes(&ATTACKER_SEED);
         let attacker = create_account(&db, &attacker_key);
+        let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         assert_eq!(
@@ -8248,6 +8309,7 @@ mod tests {
 
         let db_a = temp_db("h6_target_a");
         load_stdlib(&db_a);
+        let _seed = db_a.seeding();
         db_a.set_federation_key("00000000000000000000000000000000").unwrap();
         seed_genesis_tree(&db_a);
         let exec_a = Executor::new(db_a.clone());
@@ -8283,6 +8345,7 @@ mod tests {
             .map(|(k, _)| k.clone())
             .expect("a module row to corrupt");
         for (k, v) in &rows {
+            let _seed = db_b.seeding();
             db_b.put(k, if *k == victim { "TAMPERED" } else { v }).unwrap();
         }
         assert_ne!(
@@ -8295,6 +8358,7 @@ mod tests {
         // value would pass both assertions above and prove nothing at all.
         let db_c = temp_db("h6_target_c");
         for (k, v) in &rows {
+            let _seed = db_c.seeding();
             db_c.put(k, v).unwrap();
         }
         assert_eq!(

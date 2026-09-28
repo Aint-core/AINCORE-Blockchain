@@ -25,5 +25,7 @@ sha2 = "0.10"
 # sha256 removed - use crypto crate
 
 [dev-dependencies]
+# G3 WG-1: test fixtures seed their own genesis state (StateDB::seeding).
+storage = { path = "../../common/storage", features = ["test-seeding"] }
 # G3 S3: test fixtures commit state-tree version 0, as genesis does.
 state_commit = { path = "../../common/state_commit" }

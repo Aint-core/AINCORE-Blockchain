@@ -832,6 +832,7 @@ mod tests {
             "resource_{}_0x1::coin::CoinStore<0x1::staking::AincoreCoin>",
             canonical
         );
+        let _seed = db.seeding();
         db.put(&key, &hex::encode(amount.to_le_bytes()))
             .expect("write CoinStore");
     }
@@ -841,6 +842,7 @@ mod tests {
     /// Persist a fully-formed proposal directly (bypassing create_proposal's
     /// stake check) so timelock / driver behaviour can be tested in isolation.
     fn seed_proposal(gov: &GovernanceManager, p: Proposal) {
+        let _seed = gov.db.seeding();
         gov.save_proposal(&p).expect("seed proposal");
     }
 
@@ -865,6 +867,8 @@ mod tests {
     fn create_proposal_reads_canonical_move_balance() {
         let path = temp_db_path("proposal");
         let db = Arc::new(StateDB::open(path.to_str().expect("utf8 path")).expect("open db"));
+        // These governance calls run outside a block here: test context.
+        let _seed = db.seeding();
         let governance = GovernanceManager::new(db.clone());
         let address = "11111111111111111111111111111111";
         let min_stake = 10_000u128 * 1_000_000_000_000_000_000;
@@ -925,6 +929,8 @@ mod tests {
         // Simulate that we're at block height 42 when the proposal is created.
         db.put("latest_height", "42").unwrap();
 
+        // These governance calls run outside a block here: test context.
+        let _seed = db.seeding();
         let governance = GovernanceManager::new(db.clone());
         let address = "11111111111111111111111111111111";
         let min_stake = 10_000u128 * 1_000_000_000_000_000_000;
@@ -960,6 +966,8 @@ mod tests {
         let db = Arc::new(StateDB::open(path.to_str().expect("utf8 path")).expect("open db"));
         db.put("latest_height", "100").unwrap();
 
+        // These governance calls run outside a block here: test context.
+        let _seed = db.seeding();
         let governance = GovernanceManager::new(db.clone());
         let proposer = "22222222222222222222222222222222";
         let voter = "33333333333333333333333333333333";
@@ -1029,6 +1037,8 @@ mod tests {
         let db = Arc::new(StateDB::open(path.to_str().expect("utf8 path")).expect("open db"));
         let quorum: u128 = 1_000_000 * 1_000_000_000_000_000_000;
 
+        // These governance calls run outside a block here: test context.
+        let _seed = db.seeding();
         let g1 = GovernanceManager::new(db.clone());
         let mut p = base_proposal("det1");
         p.yes_votes = quorum;
@@ -1057,6 +1067,8 @@ mod tests {
     fn b32_timelock_boundary_reject_then_accept() {
         let path = temp_db_path("b32_timelock");
         let db = Arc::new(StateDB::open(path.to_str().expect("utf8 path")).expect("open db"));
+        // These governance calls run outside a block here: test context.
+        let _seed = db.seeding();
         let gov = GovernanceManager::new(db.clone());
 
         let mut p = base_proposal("tl1");
@@ -1087,6 +1099,8 @@ mod tests {
     fn b32_action_application_writes_config() {
         let path = temp_db_path("b32_action");
         let db = Arc::new(StateDB::open(path.to_str().expect("utf8 path")).expect("open db"));
+        // These governance calls run outside a block here: test context.
+        let _seed = db.seeding();
         let gov = GovernanceManager::new(db.clone());
 
         let mut p = base_proposal("act1");
@@ -1114,6 +1128,8 @@ mod tests {
     fn b32_execute_is_idempotent() {
         let path = temp_db_path("b32_idem");
         let db = Arc::new(StateDB::open(path.to_str().expect("utf8 path")).expect("open db"));
+        // These governance calls run outside a block here: test context.
+        let _seed = db.seeding();
         let gov = GovernanceManager::new(db.clone());
 
         let mut p = base_proposal("idem1");
@@ -1143,6 +1159,8 @@ mod tests {
     fn b32_process_due_proposals_end_to_end() {
         let path = temp_db_path("b32_driver");
         let db = Arc::new(StateDB::open(path.to_str().expect("utf8 path")).expect("open db"));
+        // These governance calls run outside a block here: test context.
+        let _seed = db.seeding();
         let gov = GovernanceManager::new(db.clone());
         let quorum: u128 = 1_000_000 * 1_000_000_000_000_000_000;
 
@@ -1274,6 +1292,7 @@ mod tests {
         let hash = sha256_hex(&bytecode);
 
         // Seed the live module with placeholder bytes so we can prove it changes.
+        let _seed = db.seeding();
         db.put(&module_storage_key(module_name), &hex::encode(b"OLD"))
             .unwrap();
         // Stage the approved bytecode out-of-band.
@@ -1318,6 +1337,7 @@ mod tests {
         // Approve a WRONG hash (all zeros) while staging real bytecode.
         let wrong_hash = "0".repeat(64);
 
+        let _seed = db.seeding();
         db.put(&module_storage_key(module_name), &hex::encode(b"OLD"))
             .unwrap();
         db.put(
@@ -1359,6 +1379,7 @@ mod tests {
         let module_name = "definitely_not_a_system_module";
         assert!(!UPGRADEABLE_SYSTEM_MODULES.contains(&module_name));
         // Even if (maliciously) staged, the allow-list rejects it first.
+        let _seed = db.seeding();
         db.put(
             &pending_module_upgrade_key(module_name),
             &hex::encode(b"whatever"),
@@ -1397,6 +1418,7 @@ mod tests {
         let garbage = b"this is not valid move bytecode".to_vec();
         let hash = sha256_hex(&garbage); // hash matches the garbage on purpose
 
+        let _seed = db.seeding();
         db.put(&module_storage_key(module_name), &hex::encode(b"OLD"))
             .unwrap();
         db.put(
@@ -1435,6 +1457,7 @@ mod tests {
         let bytecode = real_stdlib_bytecode("vector");
         let hash = sha256_hex(&bytecode);
 
+        let _seed = db.seeding();
         db.put(&module_storage_key(approved_name), &hex::encode(b"OLD"))
             .unwrap();
         db.put(
@@ -1469,6 +1492,7 @@ mod tests {
         let bytecode = real_stdlib_bytecode(module_name);
         let hash = sha256_hex(&bytecode);
 
+        let _seed = db.seeding();
         db.put(&module_storage_key(module_name), &hex::encode(b"OLD"))
             .unwrap();
         db.put(

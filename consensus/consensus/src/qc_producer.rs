@@ -721,6 +721,7 @@ mod tests {
             let db = StateDB::open(dir.to_str().unwrap()).unwrap();
             let mut set = vec![validator_for(&[7; 32], 40, "local")];
             if minority { set.push(validator_for(&[8; 32], 60, "other")); }
+            let _seed = db.seeding();
             db.put("genesis:validator_set:v1", &serde_json::to_string(&set).unwrap()).unwrap();
             let ctx = ctx_for(10);
             assert!(!matches!(produce_and_store_qc(&db, &[7; 32], "local", &ctx), QcOutcome::Skipped));
@@ -742,6 +743,7 @@ mod tests {
             let db = StateDB::open(dir.to_str().unwrap()).unwrap();
             let mut set = vec![validator_for(&[7; 32], 40, "local")];
             if minority { set.push(validator_for(&[8; 32], 60, "other")); }
+            let _seed = db.seeding();
             db.put("genesis:validator_set:v1", &serde_json::to_string(&set).unwrap()).unwrap();
             drop(db);
             let db = StateDB { db: storage::rocksdb::DB::open_for_read_only(&storage::rocksdb::Options::default(), &dir, false).unwrap().into() };
@@ -785,6 +787,7 @@ mod tests {
         let node_key = [7u8; 32];
         let addr = "deadbeef";
         let v = validator_for(&node_key, 1_000_000, addr);
+        let _seed = storage.seeding();
         storage
             .put("genesis:validator_set:v1", &serde_json::to_string(&vec![v.clone()]).unwrap())
             .unwrap();
@@ -816,6 +819,7 @@ mod tests {
         let storage = StateDB::open(dir.to_str().unwrap()).unwrap();
         // Set contains a DIFFERENT validator; our node_key is not registered.
         let other = validator_for(&[9u8; 32], 1_000_000, "aaaa");
+        let _seed = storage.seeding();
         storage
             .put("genesis:validator_set:v1", &serde_json::to_string(&vec![other]).unwrap())
             .unwrap();
@@ -837,6 +841,7 @@ mod tests {
         // Our node holds 10 of 100 total stake — far below >2/3.
         let me = validator_for(&my_key, 10, "bbbb");
         let big = validator_for(&[9u8; 32], 90, "aaaa");
+        let _seed = storage.seeding();
         storage
             .put(
                 "genesis:validator_set:v1",
@@ -882,6 +887,7 @@ mod tests {
 
         let live = vec![validator_for(&[1u8; 32], 100, "aaaa")];
         let snap = vec![validator_for(&[2u8; 32], 200, "bbbb")];
+        let _seed = storage.seeding();
         storage
             .put("genesis:validator_set:v1", &serde_json::to_string(&live).unwrap())
             .unwrap();
@@ -950,6 +956,7 @@ mod tests {
         let b = validator_for(&key_b, 40, "bbbb");
         let c = validator_for(&[13u8; 32], 20, "cccc");
         let set = vec![a.clone(), b.clone(), c.clone()];
+        let _seed = storage.seeding();
         storage
             .put("genesis:validator_set:v1", &serde_json::to_string(&set).unwrap())
             .unwrap();
@@ -997,6 +1004,7 @@ mod tests {
         let a = validator_for(&key_a, 80, "aaaa");
         let b = validator_for(&[12u8; 32], 20, "bbbb");
         let set = vec![a, b];
+        let _seed = storage.seeding();
         storage
             .put("genesis:validator_set:v1", &serde_json::to_string(&set).unwrap())
             .unwrap();
@@ -1028,6 +1036,7 @@ mod tests {
         let a = validator_for(&key_a, 80, "aaaa");
         let b = validator_for(&[12u8; 32], 20, "bbbb");
         let set = vec![a, b];
+        let _seed = storage.seeding();
         storage
             .put("genesis:validator_set:v1", &serde_json::to_string(&set).unwrap())
             .unwrap();
@@ -1061,6 +1070,7 @@ mod tests {
         let a = validator_for(&key_a, 80, "aaaa");
         let b = validator_for(&[12u8; 32], 20, "bbbb");
         let set = vec![a, b];
+        let _seed = storage.seeding();
         storage
             .put("genesis:validator_set:v1", &serde_json::to_string(&set).unwrap())
             .unwrap();
@@ -1093,6 +1103,7 @@ mod tests {
         let b = validator_for(&[12u8; 32], 40, "bbbb");
         let c = validator_for(&[13u8; 32], 20, "cccc");
         let set = vec![a, b, c];
+        let _seed = storage.seeding();
         storage
             .put("genesis:validator_set:v1", &serde_json::to_string(&set).unwrap())
             .unwrap();

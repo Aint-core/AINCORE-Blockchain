@@ -39,6 +39,7 @@ fn address(seed: u8) -> String {
 fn open(path: &TestDir) -> DagConsensus {
     let db = Arc::new(StateDB::open(path.0.to_str().unwrap()).unwrap());
     let committee: Vec<_> = (31..=34).map(|seed| (address(seed), 1000u64)).collect();
+    let _seed = db.seeding();
     db.put(
         "sys:validators",
         &serde_json::to_string(&committee).unwrap(),
@@ -148,6 +149,7 @@ fn parent_ingress_does_not_replace_missing_epoch_committee() {
     for (current, bad_snapshot) in [("3", None), ("3", Some("[]")), ("0", Some("not json")), ("invalid", None)] {
         let dir = TestDir::new();
         let mut node = open(&dir);
+        let _seed = node.storage.seeding();
         node.storage.put("consensus:epoch", current).unwrap();
         let epoch = current.parse::<u64>().unwrap_or(0);
         let snapshot_key = format!("sys:validator_set:epoch:{epoch}");

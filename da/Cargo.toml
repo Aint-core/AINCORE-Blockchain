@@ -20,3 +20,7 @@ ed25519-dalek = "2.0"
 zstd = "0.13"
 reed-solomon-erasure = "6.0"
 rand = "0.8"
+
+[dev-dependencies]
+# G3 WG-1: test fixtures seed their own genesis state (StateDB::seeding).
+storage = { path = "../common/storage", features = ["test-seeding"] }

@@ -311,7 +311,7 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
     Some(class)
 }
 
-// ---- S0 observe mode ---------------------------------------------------
+// ---- Write observation (S0) and the WG-1 refusal (S3) --------------------
 
 /// Where a write happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -355,7 +355,7 @@ pub struct StateClassStats {
     pub samples: Vec<Sample>,
 }
 
-/// Per-database counters. Stage S0 records; it never refuses.
+/// Per-database counters. The refusal itself is `ReadStore::write`.
 #[derive(Default)]
 pub(crate) struct Observer {
     writes: AtomicU64,
@@ -420,7 +420,7 @@ impl Observer {
 
 /// Mask hex runs of 16+ and every digit run, and cap the length, so a
 /// sample shows a key's shape without its values.
-fn mask(key: &[u8]) -> String {
+pub(crate) fn mask(key: &[u8]) -> String {
     let text = String::from_utf8_lossy(key);
     let mut out = String::new();
     let chars: Vec<char> = text.chars().collect();
@@ -641,32 +641,60 @@ mod tests {
         crate::StateDB::open(path.to_str().unwrap()).unwrap()
     }
 
-    /// S0 observes and never refuses. Only the block transaction may write
-    /// state without being counted.
+    /// G3 WG-1 (S3), the storage half of witness C1′: consensus state
+    /// written through any `StateDB` entry point outside the block transaction
+    /// is refused, whole batch included, and counted. The block transaction
+    /// and every other key class still write. The test-only seeding guard
+    /// allows state writes only while it lives.
     #[test]
-    fn observer_counts_state_outside_the_block_and_unclassified_keys() {
+    fn the_write_gate_refuses_state_outside_the_block_transaction() {
         let db = temp_db("observer");
         let state_key = format!("obj:{H64}");
+        let refused = |r: Result<(), crate::StorageError>| {
+            matches!(r, Err(crate::StorageError::WriteGate(_)))
+        };
 
-        db.put(&state_key, "base")
-            .expect("S0 never refuses a base write");
-        db.transaction(|v| v.put(&state_key, "txn").map_err(Into::into))
-            .expect("S0 never refuses a transaction write");
-        db.block_transaction(|v| v.put(&state_key, "block").map_err(Into::into))
-            .unwrap();
-        db.put("latest_height", "1").unwrap(); // chain data on base: fine
-        db.put("no:such:template", "x").unwrap();
+        assert!(refused(db.put(&state_key, "base")), "base put");
+        assert!(refused(db.delete(&state_key)), "base delete");
+        let mut mixed = rocksdb::WriteBatch::default();
+        mixed.put("latest_height", "9");
+        mixed.put(&state_key, "batch");
+        assert!(refused(db.write_batch(mixed)), "a batch holding state");
+        assert_eq!(db.get("latest_height").unwrap(), None, "the whole batch");
+        let object = crate::object::Object::new(
+            H64.to_string(),
+            crate::object::Owner::Address(H64.to_string()),
+            b"{}".to_vec(),
+            "0x1::account::Account".to_string(),
+        );
+        assert!(refused(db.put_object(&object)), "put_object");
+        assert!(refused(db.set_federation_key("f")), "federation key");
+        assert!(
+            refused(db.update_economic_config(Some(1), None, None)),
+            "economics"
+        );
+        let in_txn = db.transaction(|v| v.put(&state_key, "txn"));
+        assert!(refused(in_txn), "a plain transaction");
+        assert_eq!(db.get(&state_key).unwrap(), None, "nothing was written");
+
+        db.block_transaction(|v| v.put(&state_key, "block"))
+            .expect("the block transaction writes state");
+        db.put("latest_height", "1")
+            .expect("chain data on base: fine");
+        db.put("no:such:template", "x")
+            .expect("unclassified: counted, not refused");
+        assert_eq!(db.get(&state_key).unwrap().as_deref(), Some("block"));
+
+        {
+            let _seed = db.seeding();
+            db.put(&state_key, "seeded")
+                .expect("allowed while the guard lives");
+        }
+        assert!(refused(db.put(&state_key, "after")), "refused again after");
 
         let s = db.db.state_class_stats();
-        assert_eq!(s.writes, 5, "positive control: every write was seen");
-        assert_eq!(s.state_outside_block, 2, "base + plain transaction");
+        assert!(s.state_outside_block >= 7, "every refusal is counted");
         assert_eq!(s.unclassified, 1);
-        assert_eq!(
-            db.get(&state_key).unwrap().as_deref(),
-            Some("block"),
-            "nothing refused"
-        );
-
         let contexts: Vec<_> = s
             .samples
             .iter()
@@ -764,6 +792,7 @@ mod seal_tests {
     #[test]
     fn staged_state_changes_are_state_keys_last_write_wins() {
         let db = temp_db("staged");
+        let _seed = db.seeding();
         db.put("obj:old", "x").unwrap();
         assert_eq!(
             db.staged_state_changes(),
@@ -787,5 +816,45 @@ mod seal_tests {
                 ("obj:old".to_string(), None),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod best_effort_writes {
+    use super::{classify, KeyClass};
+
+    /// G3 WG-1 (S3): production writes these keys outside the block
+    /// transaction and ignores the result (`let _ = storage.put(..)`). A
+    /// refused write there would be silent, so none of them may be state.
+    /// Sites: dag.rs (anchor alarm, last_seen, downtime attestation, equiv
+    /// carried/seen/gossiped/local jail), ordering.rs (beacon fold markers),
+    /// da/src/lib.rs (DA key, roots, fraud proofs, shards), vertex pruning,
+    /// and the executor's attestation cleanup. The executor's own
+    /// best-effort writes of `consensus:epoch*` run inside the block
+    /// transaction (`maybe_advance_epoch`), so they are allowed to be state.
+    #[test]
+    fn best_effort_production_writes_are_never_state() {
+        let h = "a".repeat(64);
+        for key in [
+            "alarm:anchor_height_violation:12".to_string(),
+            format!("validator:last_seen:{h}"),
+            format!("sys:downtime_attestation:{h}:3:{h}"),
+            format!("sys:equiv_carried:{h}:9"),
+            format!("sys:equiv_seen:{h}:9"),
+            format!("sys:equiv_gossiped:{h}:9"),
+            format!("sys:equiv_local_jail:{h}"),
+            "consensus:beacon_folded_qc_height".to_string(),
+            "consensus:beacon_folded_anchor_round".to_string(),
+            "sys:da:signing_key_enc_v1".to_string(),
+            "sys:da:signing_key".to_string(),
+            "da_root_5".to_string(),
+            "da_fraud_missingdata_5".to_string(),
+            "da_shard_5_2".to_string(),
+            format!("vertex:{h}"),
+        ] {
+            let class = classify(key.as_bytes());
+            assert!(class.is_some(), "{key} must be classified");
+            assert_ne!(class, Some(KeyClass::State), "{key} is written best-effort");
+        }
     }
 }

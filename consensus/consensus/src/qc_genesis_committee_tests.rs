@@ -7,6 +7,7 @@ fn epoch_zero_uses_frozen_genesis_before_and_after_rotation() {
     {
         let db = dir.open();
         let initial = db.get("sys:validator_set:v1").unwrap().unwrap();
+        let _seed = db.seeding();
         db.put("genesis:validator_set:v1", &initial).unwrap();
         let changed = vec![validator_for(&[99; 32], 100, "replacement")];
         db.put(
@@ -44,6 +45,7 @@ fn mutable_live_set_alone_cannot_authorize_epoch_zero() {
     let dir = TestDir::new();
     dir.seed(false);
     let db = dir.open();
+    let _seed = db.seeding();
     db.delete("genesis:validator_set:v1").unwrap();
     let before = rows(&db);
     assert!(load_validator_set_for_epoch(&db, 0).is_none());
@@ -60,6 +62,7 @@ fn genesis_and_epoch_zero_snapshot_conflict_cannot_sign() {
     dir.seed(false);
     let db = dir.open();
     let frozen = db.get("sys:validator_set:v1").unwrap().unwrap();
+    let _seed = db.seeding();
     db.put("genesis:validator_set:v1", &frozen).unwrap();
     let conflicting = vec![validator_for(&[7; 32], 500, "local")];
     db.put(
@@ -83,6 +86,7 @@ fn missing_or_invalid_genesis_cannot_borrow_a_valid_epoch_zero_alias() {
         dir.seed(false);
         let db = dir.open();
         let frozen = db.get("genesis:validator_set:v1").unwrap().unwrap();
+        let _seed = db.seeding();
         db.put("sys:validator_set:epoch:0", &frozen).unwrap();
         match invalid {
             None => db.delete("genesis:validator_set:v1").unwrap(),
@@ -105,6 +109,7 @@ fn equivalent_alias_order_is_accepted_without_rewriting_genesis() {
     let db = dir.open();
     let mut set = load_validator_set_for_epoch(&db, 0).unwrap();
     set.reverse();
+    let _seed = db.seeding();
     db.put(
         "sys:validator_set:epoch:0",
         &serde_json::to_string(&set).unwrap(),

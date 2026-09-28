@@ -21,3 +21,7 @@ bcs = "0.1"
 sha2 = "0.10"
 crypto = { path = "../../common/crypto" }
 blockchain = { path = "../../consensus/blockchain" }
+
+[dev-dependencies]
+# G3 WG-1: test fixtures seed their own genesis state (StateDB::seeding).
+storage = { path = "../../common/storage", features = ["test-seeding"] }

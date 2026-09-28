@@ -14,4 +14,6 @@ borsh = "1"
 anyhow = "1"
 
 [dev-dependencies]
+# G3 WG-1: test fixtures seed their own genesis state (StateDB::seeding).
+storage = { path = "../storage", features = ["test-seeding"] }
 rand = "0.8"

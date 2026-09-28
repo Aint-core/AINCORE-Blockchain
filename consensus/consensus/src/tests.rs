@@ -42,6 +42,7 @@ mod tests {
     fn setup_dag(suffix: &str) -> (DagConsensus, String) {
         let path = get_test_db_path(suffix);
         let db = Arc::new(StateDB::open(&path).unwrap());
+        let _seed = db.seeding();
         let mempool = Arc::new(Mutex::new(Mempool::new()));
         let executor = Arc::new(Executor::new(Arc::clone(&db)));
         let peers = Arc::new(Mutex::new(HashMap::new()));
@@ -701,6 +702,7 @@ mod tests {
             r#"[["{}",1000],["{}",1000]]"#,
             seeded_node, "deadbeefdeadbeefdeadbeefdeadbeef"
         );
+        let _seed = consensus.storage.seeding();
         consensus
             .storage
             .put("sys:validators", &mutated_json)
@@ -889,6 +891,7 @@ mod tests {
             .into_bytes(),
             "0x1::account::AccountData".to_string(),
         );
+        let _seed = dag.storage.seeding();
         dag.storage.put_object(&remote_account).unwrap();
 
         // Make the local node an observer by removing it from the active
@@ -955,6 +958,7 @@ mod tests {
         let offender = "deadbeefdeadbeef".to_string();
         let vset: Vec<(String, u64)> =
             vec![(remote_addr.clone(), 1000u64), (offender.clone(), 1000u64)];
+        let _seed = dag.storage.seeding();
         dag.storage
             .put("sys:validators", &serde_json::to_string(&vset).unwrap())
             .unwrap();
@@ -1013,6 +1017,7 @@ mod tests {
 
         // Reporter IS in validator set, but offender is NOT.
         let vset: Vec<(String, u64)> = vec![(remote_addr.clone(), 1000u64)];
+        let _seed = dag.storage.seeding();
         dag.storage
             .put("sys:validators", &serde_json::to_string(&vset).unwrap())
             .unwrap();
@@ -1063,6 +1068,7 @@ mod tests {
         let addr = derive_address(vk.as_bytes()).expect("derive");
 
         let vset: Vec<(String, u64)> = vec![(addr.clone(), 1000u64)];
+        let _seed = dag.storage.seeding();
         dag.storage
             .put("sys:validators", &serde_json::to_string(&vset).unwrap())
             .unwrap();
@@ -1108,6 +1114,7 @@ mod tests {
         let remote_addr = derive_address(remote_vk.as_bytes()).expect("derive");
 
         let vset: Vec<(String, u64)> = vec![(remote_addr.clone(), 1000u64)];
+        let _seed = dag.storage.seeding();
         dag.storage
             .put("sys:validators", &serde_json::to_string(&vset).unwrap())
             .unwrap();
@@ -1251,6 +1258,7 @@ mod tests {
         ];
         let vset_json = serde_json::to_string(&vset).unwrap();
         for node in [&node_a, &node_b, &node_c] {
+            let _seed = node.storage.seeding();
             node.storage.put("sys:validators", &vset_json).unwrap();
             node.invalidate_validators_cache();
         }
@@ -1314,6 +1322,9 @@ mod tests {
         // 6. Executor on node A promotes attestations → pending slash.
         //    BFT quorum = (3*2/3)+1 = 3, exactly met.
         let executor_a = Executor::new(Arc::clone(&node_a.storage));
+        // Called directly, outside a block (the path is kept but not wired:
+        // FX-11), so its state write is test context.
+        let _seed = node_a.storage.seeding();
         executor_a.promote_downtime_attestations_to_slash();
 
         let slash_key = format!("sys:pending_slash:{}", offender);
@@ -1336,6 +1347,7 @@ mod tests {
 
         // Empty validator set — no one is registered.
         let vset: Vec<(String, u64)> = vec![];
+        let _seed = dag.storage.seeding();
         dag.storage
             .put("sys:validators", &serde_json::to_string(&vset).unwrap())
             .unwrap();
@@ -1747,6 +1759,7 @@ mod tests {
         consensus.handle_message(&equiv_proof_msg(&offender, &a, &b));
 
         // A slash for a DIFFERENT round must NOT suppress this round's evidence.
+        let _seed = consensus.storage.seeding();
         consensus
             .storage
             .put(&format!("sys:slashed:{}:999", offender), "1")
@@ -1795,6 +1808,7 @@ mod tests {
         let path = get_test_db_path("already_jailed");
         let db = StateDB::open(&path).unwrap();
         let (by_state, by_local, free) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        let _seed = db.seeding();
         db.put(&format!("validator:jailed:{by_state}"), "7").unwrap();
         db.put(&format!("sys:equiv_local_jail:{by_local}"), "7").unwrap();
 
@@ -1905,6 +1919,7 @@ mod tests {
                 .into_bytes(),
             "0x1::account::AccountData".to_string(),
         );
+        let _seed = db.seeding();
         db.put_object(&account).unwrap();
         db.put("sys:validators", &format!(r#"[["{}",1000]]"#, node_id))
             .unwrap();
@@ -1987,6 +2002,7 @@ mod tests {
                 .into_bytes(),
             "0x1::account::AccountData".to_string(),
         );
+        let _seed = consensus.storage.seeding();
         consensus.storage.put_object(&remote_account).unwrap();
         let validator_json = format!(
             r#"[["{}",1000],["{}",1000]]"#,
@@ -2205,6 +2221,7 @@ mod tests {
         known: &[(String, String)],
     ) -> DagConsensus {
         let db = Arc::new(StateDB::open(path).unwrap());
+        let _seed = db.seeding();
         for (addr, pubkey) in known {
             let account = Object::new(
                 addr.clone(),
