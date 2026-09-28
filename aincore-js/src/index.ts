@@ -14,3 +14,4 @@ export type {
 } from './connection';
 export * from './bcs';
 export * from './address';
+export * from './stateProof';

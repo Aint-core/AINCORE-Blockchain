@@ -1,0 +1,511 @@
+{
+  "description": "G3 PF-4 state proof vectors. Generated from real Jellyfish Merkle trees by common/state_commit (pf_vectors_are_pinned) and verified by common/state_proof and aincore-js. Values are the exact stored strings.",
+  "vectors": [
+    {
+      "key": "sys:chain_id",
+      "name": "inclusion: sys:chain_id at v0",
+      "proof": {
+        "leaf": {
+          "key_hash": "12fffce34d0cd0530b5fb65e0f6efa5a0e0f1975d35b1b44e775addfea3a947c",
+          "value_hash": "55cb3171f568682762d4ee700de5f5e2666f56f5a8bbba7e90e962a62792e42b"
+        },
+        "siblings": [
+          "d08bfeb3a509b5866a681604ed0aeceb164fbcbc8adb6fec0ecbca7c29924dc2",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "0ccc60030a6d5ad8eea74f6251765475f028e9706c3a51c907745a1718d91b0c",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "36cb84c6351212e7286bb07574816d86f931aa185f52cef96620799fad1aa63d",
+          "510b5a1e70389d725be5d72363845e9f3a105bd38cbb42b5266792558ffe1c1a",
+          "acb611bd78b967e4c35915752f6f09fbec0d10aeede6e4ef04cd8398eebd18dc",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "8135fd1474b1b0d7e0d9dd8476cb4604fb7823b253fe93edccec5fbab628534f",
+      "valid": true,
+      "value": "AINCORE-LOCALTEST-4V-HEAD"
+    },
+    {
+      "key": "sys:config:federation_addr",
+      "name": "inclusion: an empty value at v0",
+      "proof": {
+        "leaf": {
+          "key_hash": "3721128c4ba566bcf9227d1b108a50f5ae7ae34ad7d81fcd23f42e6ccffdadce",
+          "value_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "siblings": [
+          "ae0a328cfe89cf015c3cf4f747c8650ee94612c0059ab9b2ec54ac0ab8d4ecfa",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "d9fe63c560337b93955b4d4ac7445a1a29d5d03c1db342bca5d4b39c0e03cfff",
+          "acb611bd78b967e4c35915752f6f09fbec0d10aeede6e4ef04cd8398eebd18dc",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "8135fd1474b1b0d7e0d9dd8476cb4604fb7823b253fe93edccec5fbab628534f",
+      "valid": true,
+      "value": ""
+    },
+    {
+      "key": "sys:total_supply",
+      "name": "inclusion: an updated value at v1",
+      "proof": {
+        "leaf": {
+          "key_hash": "6db07cbe21160a0b9feed58b8ef0071aece31a63cb8d54ec2e24ea266510249a",
+          "value_hash": "b08498e82697bb15731357f58b38ee4f5ac2f559131a744342564cd7ee7f19a5"
+        },
+        "siblings": [
+          "b8a69cc2afe8f405c9ec84ea510b69417b744f2b7dc719829b336fe83d124d91",
+          "6a104ef160c31625fd06ee2ca2eef081bec5d145e7740c620fad92d7daed6a78",
+          "2a74607a6ab1f4d003cab674b95594b1a3e993de47c35f93dca5a2c11f6a9c77",
+          "1d80d2c99da4d701f462e383ba3c4a0bd3357e7b10565f0b01b35b07f28ff226",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "c6ac07685e2a0644f8ffbe63a6f67c52ca34b3b5de9beface277aa22559889ee",
+      "valid": true,
+      "value": "40081273249273785698770000"
+    },
+    {
+      "key": "obj:k3",
+      "name": "inclusion: a deleted key at the version before",
+      "proof": {
+        "leaf": {
+          "key_hash": "4498952263390c6349a9996899d296c3e8c8aad88e0eef422120a827d4344c9a",
+          "value_hash": "93f9c50853d1ba7b4dc6244a2a64b2f427cd612ae34a3cad638ef5bc14cc7ecb"
+        },
+        "siblings": [
+          "2a74607a6ab1f4d003cab674b95594b1a3e993de47c35f93dca5a2c11f6a9c77",
+          "c73d8d78c7b9c0624d3de7d596c6161cdd2646989a8f166a82b0d9e8c58fa483",
+          "1d80d2c99da4d701f462e383ba3c4a0bd3357e7b10565f0b01b35b07f28ff226",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "8135fd1474b1b0d7e0d9dd8476cb4604fb7823b253fe93edccec5fbab628534f",
+      "valid": true,
+      "value": "value-3"
+    },
+    {
+      "key": "obj:k3",
+      "name": "exclusion: a deleted key",
+      "proof": {
+        "leaf": {
+          "key_hash": "51c5ea5dd27fc97ee6c09814af4280caa3b64a3d2e4f5078650484e039f1d647",
+          "value_hash": "0c4b1e2d5a28ca7ddbeccaae0d4eb8f2286938d7741f92c833d36b4b1be77cde"
+        },
+        "siblings": [
+          "5741f85ee003933a840f205b4f0f6ed1481f7126868cdd0c62a8b504a3b48f4c",
+          "1d80d2c99da4d701f462e383ba3c4a0bd3357e7b10565f0b01b35b07f28ff226",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "c6ac07685e2a0644f8ffbe63a6f67c52ca34b3b5de9beface277aa22559889ee",
+      "valid": true,
+      "value": null
+    },
+    {
+      "key": "sys:never_written",
+      "name": "exclusion: a key never written",
+      "proof": {
+        "leaf": {
+          "key_hash": "8dc9b4d6f39093ee06f73de1219aaff4e81d071524942949374db357db282863",
+          "value_hash": "f5ca38f748a1d6eaf726b8a42fb575c3c71f1864a8143301782de13da2d9202b"
+        },
+        "siblings": [
+          "2b52990b5210a080b9456156be3e3b17aae589365004e035692938d751c4b5b9",
+          "8fae7377f55a7fb035dccd8d21fd34312df177e47f31577613806240fb33f35f",
+          "cde579a380aeb1da8e1d3c60fbb612949e419215d2d6f09323eaab87c91cbc6e",
+          "0c774df3529c59cbe1fa5e87e3a126bbcb14ca1b63623ea459ae6d4ca7e48baa",
+          "6380dcca234724985f1305b057c3da81709c51bc07230289be13880d50e42ce6"
+        ]
+      },
+      "root": "c6ac07685e2a0644f8ffbe63a6f67c52ca34b3b5de9beface277aa22559889ee",
+      "valid": true,
+      "value": null
+    },
+    {
+      "key": "sys:absent:0",
+      "name": "exclusion: absent key 0, another leaf on its path",
+      "proof": {
+        "leaf": {
+          "key_hash": "51c5ea5dd27fc97ee6c09814af4280caa3b64a3d2e4f5078650484e039f1d647",
+          "value_hash": "0c4b1e2d5a28ca7ddbeccaae0d4eb8f2286938d7741f92c833d36b4b1be77cde"
+        },
+        "siblings": [
+          "5741f85ee003933a840f205b4f0f6ed1481f7126868cdd0c62a8b504a3b48f4c",
+          "1d80d2c99da4d701f462e383ba3c4a0bd3357e7b10565f0b01b35b07f28ff226",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "c6ac07685e2a0644f8ffbe63a6f67c52ca34b3b5de9beface277aa22559889ee",
+      "valid": true,
+      "value": null
+    },
+    {
+      "key": "sys:absent:1",
+      "name": "exclusion: absent key 1, another leaf on its path",
+      "proof": {
+        "leaf": {
+          "key_hash": "51c5ea5dd27fc97ee6c09814af4280caa3b64a3d2e4f5078650484e039f1d647",
+          "value_hash": "0c4b1e2d5a28ca7ddbeccaae0d4eb8f2286938d7741f92c833d36b4b1be77cde"
+        },
+        "siblings": [
+          "5741f85ee003933a840f205b4f0f6ed1481f7126868cdd0c62a8b504a3b48f4c",
+          "1d80d2c99da4d701f462e383ba3c4a0bd3357e7b10565f0b01b35b07f28ff226",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "c6ac07685e2a0644f8ffbe63a6f67c52ca34b3b5de9beface277aa22559889ee",
+      "valid": true,
+      "value": null
+    },
+    {
+      "key": "sys:absent:2",
+      "name": "exclusion: absent key 2, another leaf on its path",
+      "proof": {
+        "leaf": {
+          "key_hash": "8dc9b4d6f39093ee06f73de1219aaff4e81d071524942949374db357db282863",
+          "value_hash": "f5ca38f748a1d6eaf726b8a42fb575c3c71f1864a8143301782de13da2d9202b"
+        },
+        "siblings": [
+          "2b52990b5210a080b9456156be3e3b17aae589365004e035692938d751c4b5b9",
+          "8fae7377f55a7fb035dccd8d21fd34312df177e47f31577613806240fb33f35f",
+          "cde579a380aeb1da8e1d3c60fbb612949e419215d2d6f09323eaab87c91cbc6e",
+          "0c774df3529c59cbe1fa5e87e3a126bbcb14ca1b63623ea459ae6d4ca7e48baa",
+          "6380dcca234724985f1305b057c3da81709c51bc07230289be13880d50e42ce6"
+        ]
+      },
+      "root": "c6ac07685e2a0644f8ffbe63a6f67c52ca34b3b5de9beface277aa22559889ee",
+      "valid": true,
+      "value": null
+    },
+    {
+      "key": "sys:absent:9",
+      "name": "exclusion: absent key 9, an empty subtree",
+      "proof": {
+        "leaf": null,
+        "siblings": [
+          "89392a1b6fe005815609fe2f8b793d53b63f4e52a4452418edbad9d61832302d",
+          "36cb84c6351212e7286bb07574816d86f931aa185f52cef96620799fad1aa63d",
+          "510b5a1e70389d725be5d72363845e9f3a105bd38cbb42b5266792558ffe1c1a",
+          "1e21f32fa846c9f580f37372a9423561dc3a9c9dfa1d20a3a66b33d33370cfed",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "c6ac07685e2a0644f8ffbe63a6f67c52ca34b3b5de9beface277aa22559889ee",
+      "valid": true,
+      "value": null
+    },
+    {
+      "key": "sys:absent:14",
+      "name": "exclusion: absent key 14, an empty subtree",
+      "proof": {
+        "leaf": null,
+        "siblings": [
+          "9d44e37b8caeef7198fa9c716d9e66e1066d824db07197325b8df6be0d456192",
+          "731eda172a8e101f065e9c5c4ac623c08c78d9f83747cb34a87c525f94699927",
+          "70c1c51b163e3765ef4fee99c99ea0f9ac66f246a93b2b2ff27748c37ec6305f",
+          "a299b8fb9d4ab39c612812f148841ac69891880cedbd35603c1780c9468a52f7",
+          "0c774df3529c59cbe1fa5e87e3a126bbcb14ca1b63623ea459ae6d4ca7e48baa",
+          "6380dcca234724985f1305b057c3da81709c51bc07230289be13880d50e42ce6"
+        ]
+      },
+      "root": "c6ac07685e2a0644f8ffbe63a6f67c52ca34b3b5de9beface277aa22559889ee",
+      "valid": true,
+      "value": null
+    },
+    {
+      "key": "sys:absent:16",
+      "name": "exclusion: absent key 16, an empty subtree",
+      "proof": {
+        "leaf": null,
+        "siblings": [
+          "909ee7a7e1f2cc9ccd0ec600c2397c2bb7a44da2020f8c32c0df14a3bc60e644",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "d9fe63c560337b93955b4d4ac7445a1a29d5d03c1db342bca5d4b39c0e03cfff",
+          "1e21f32fa846c9f580f37372a9423561dc3a9c9dfa1d20a3a66b33d33370cfed",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "c6ac07685e2a0644f8ffbe63a6f67c52ca34b3b5de9beface277aa22559889ee",
+      "valid": true,
+      "value": null
+    },
+    {
+      "key": "sys:chain_id",
+      "name": "invalid: wrong value",
+      "proof": {
+        "leaf": {
+          "key_hash": "12fffce34d0cd0530b5fb65e0f6efa5a0e0f1975d35b1b44e775addfea3a947c",
+          "value_hash": "55cb3171f568682762d4ee700de5f5e2666f56f5a8bbba7e90e962a62792e42b"
+        },
+        "siblings": [
+          "d08bfeb3a509b5866a681604ed0aeceb164fbcbc8adb6fec0ecbca7c29924dc2",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "0ccc60030a6d5ad8eea74f6251765475f028e9706c3a51c907745a1718d91b0c",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "36cb84c6351212e7286bb07574816d86f931aa185f52cef96620799fad1aa63d",
+          "510b5a1e70389d725be5d72363845e9f3a105bd38cbb42b5266792558ffe1c1a",
+          "acb611bd78b967e4c35915752f6f09fbec0d10aeede6e4ef04cd8398eebd18dc",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "8135fd1474b1b0d7e0d9dd8476cb4604fb7823b253fe93edccec5fbab628534f",
+      "valid": false,
+      "value": "AINCORE-MAINNET-1"
+    },
+    {
+      "key": "sys:total_supply",
+      "name": "invalid: another key",
+      "proof": {
+        "leaf": {
+          "key_hash": "12fffce34d0cd0530b5fb65e0f6efa5a0e0f1975d35b1b44e775addfea3a947c",
+          "value_hash": "55cb3171f568682762d4ee700de5f5e2666f56f5a8bbba7e90e962a62792e42b"
+        },
+        "siblings": [
+          "d08bfeb3a509b5866a681604ed0aeceb164fbcbc8adb6fec0ecbca7c29924dc2",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "0ccc60030a6d5ad8eea74f6251765475f028e9706c3a51c907745a1718d91b0c",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "36cb84c6351212e7286bb07574816d86f931aa185f52cef96620799fad1aa63d",
+          "510b5a1e70389d725be5d72363845e9f3a105bd38cbb42b5266792558ffe1c1a",
+          "acb611bd78b967e4c35915752f6f09fbec0d10aeede6e4ef04cd8398eebd18dc",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "8135fd1474b1b0d7e0d9dd8476cb4604fb7823b253fe93edccec5fbab628534f",
+      "valid": false,
+      "value": "AINCORE-LOCALTEST-4V-HEAD"
+    },
+    {
+      "key": "sys:chain_id",
+      "name": "invalid: another root",
+      "proof": {
+        "leaf": {
+          "key_hash": "12fffce34d0cd0530b5fb65e0f6efa5a0e0f1975d35b1b44e775addfea3a947c",
+          "value_hash": "55cb3171f568682762d4ee700de5f5e2666f56f5a8bbba7e90e962a62792e42b"
+        },
+        "siblings": [
+          "d08bfeb3a509b5866a681604ed0aeceb164fbcbc8adb6fec0ecbca7c29924dc2",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "0ccc60030a6d5ad8eea74f6251765475f028e9706c3a51c907745a1718d91b0c",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "36cb84c6351212e7286bb07574816d86f931aa185f52cef96620799fad1aa63d",
+          "510b5a1e70389d725be5d72363845e9f3a105bd38cbb42b5266792558ffe1c1a",
+          "acb611bd78b967e4c35915752f6f09fbec0d10aeede6e4ef04cd8398eebd18dc",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "0000000000000000000000000000000000000000000000000000000000000000",
+      "valid": false,
+      "value": "AINCORE-LOCALTEST-4V-HEAD"
+    },
+    {
+      "key": "sys:chain_id",
+      "name": "invalid: claims absence of a present key",
+      "proof": {
+        "leaf": {
+          "key_hash": "12fffce34d0cd0530b5fb65e0f6efa5a0e0f1975d35b1b44e775addfea3a947c",
+          "value_hash": "55cb3171f568682762d4ee700de5f5e2666f56f5a8bbba7e90e962a62792e42b"
+        },
+        "siblings": [
+          "d08bfeb3a509b5866a681604ed0aeceb164fbcbc8adb6fec0ecbca7c29924dc2",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "0ccc60030a6d5ad8eea74f6251765475f028e9706c3a51c907745a1718d91b0c",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "36cb84c6351212e7286bb07574816d86f931aa185f52cef96620799fad1aa63d",
+          "510b5a1e70389d725be5d72363845e9f3a105bd38cbb42b5266792558ffe1c1a",
+          "acb611bd78b967e4c35915752f6f09fbec0d10aeede6e4ef04cd8398eebd18dc",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "8135fd1474b1b0d7e0d9dd8476cb4604fb7823b253fe93edccec5fbab628534f",
+      "valid": false,
+      "value": null
+    },
+    {
+      "key": "sys:chain_id",
+      "name": "invalid: a sibling flipped",
+      "proof": {
+        "leaf": {
+          "key_hash": "12fffce34d0cd0530b5fb65e0f6efa5a0e0f1975d35b1b44e775addfea3a947c",
+          "value_hash": "55cb3171f568682762d4ee700de5f5e2666f56f5a8bbba7e90e962a62792e42b"
+        },
+        "siblings": [
+          "008bfeb3a509b5866a681604ed0aeceb164fbcbc8adb6fec0ecbca7c29924dc2",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "0ccc60030a6d5ad8eea74f6251765475f028e9706c3a51c907745a1718d91b0c",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "36cb84c6351212e7286bb07574816d86f931aa185f52cef96620799fad1aa63d",
+          "510b5a1e70389d725be5d72363845e9f3a105bd38cbb42b5266792558ffe1c1a",
+          "acb611bd78b967e4c35915752f6f09fbec0d10aeede6e4ef04cd8398eebd18dc",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "8135fd1474b1b0d7e0d9dd8476cb4604fb7823b253fe93edccec5fbab628534f",
+      "valid": false,
+      "value": "AINCORE-LOCALTEST-4V-HEAD"
+    },
+    {
+      "key": "sys:chain_id",
+      "name": "invalid: a sibling added",
+      "proof": {
+        "leaf": {
+          "key_hash": "12fffce34d0cd0530b5fb65e0f6efa5a0e0f1975d35b1b44e775addfea3a947c",
+          "value_hash": "55cb3171f568682762d4ee700de5f5e2666f56f5a8bbba7e90e962a62792e42b"
+        },
+        "siblings": [
+          "d08bfeb3a509b5866a681604ed0aeceb164fbcbc8adb6fec0ecbca7c29924dc2",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "0ccc60030a6d5ad8eea74f6251765475f028e9706c3a51c907745a1718d91b0c",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "36cb84c6351212e7286bb07574816d86f931aa185f52cef96620799fad1aa63d",
+          "510b5a1e70389d725be5d72363845e9f3a105bd38cbb42b5266792558ffe1c1a",
+          "acb611bd78b967e4c35915752f6f09fbec0d10aeede6e4ef04cd8398eebd18dc",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb",
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ]
+      },
+      "root": "8135fd1474b1b0d7e0d9dd8476cb4604fb7823b253fe93edccec5fbab628534f",
+      "valid": false,
+      "value": "AINCORE-LOCALTEST-4V-HEAD"
+    },
+    {
+      "key": "sys:chain_id",
+      "name": "invalid: a sibling removed",
+      "proof": {
+        "leaf": {
+          "key_hash": "12fffce34d0cd0530b5fb65e0f6efa5a0e0f1975d35b1b44e775addfea3a947c",
+          "value_hash": "55cb3171f568682762d4ee700de5f5e2666f56f5a8bbba7e90e962a62792e42b"
+        },
+        "siblings": [
+          "d08bfeb3a509b5866a681604ed0aeceb164fbcbc8adb6fec0ecbca7c29924dc2",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "0ccc60030a6d5ad8eea74f6251765475f028e9706c3a51c907745a1718d91b0c",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "36cb84c6351212e7286bb07574816d86f931aa185f52cef96620799fad1aa63d",
+          "510b5a1e70389d725be5d72363845e9f3a105bd38cbb42b5266792558ffe1c1a",
+          "acb611bd78b967e4c35915752f6f09fbec0d10aeede6e4ef04cd8398eebd18dc"
+        ]
+      },
+      "root": "8135fd1474b1b0d7e0d9dd8476cb4604fb7823b253fe93edccec5fbab628534f",
+      "valid": false,
+      "value": "AINCORE-LOCALTEST-4V-HEAD"
+    },
+    {
+      "key": "obj:k3",
+      "name": "invalid: claims a value for a deleted key",
+      "proof": {
+        "leaf": {
+          "key_hash": "51c5ea5dd27fc97ee6c09814af4280caa3b64a3d2e4f5078650484e039f1d647",
+          "value_hash": "0c4b1e2d5a28ca7ddbeccaae0d4eb8f2286938d7741f92c833d36b4b1be77cde"
+        },
+        "siblings": [
+          "5741f85ee003933a840f205b4f0f6ed1481f7126868cdd0c62a8b504a3b48f4c",
+          "1d80d2c99da4d701f462e383ba3c4a0bd3357e7b10565f0b01b35b07f28ff226",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "c6ac07685e2a0644f8ffbe63a6f67c52ca34b3b5de9beface277aa22559889ee",
+      "valid": false,
+      "value": "value-3"
+    },
+    {
+      "key": "sys:never_written",
+      "name": "invalid: claims a value for an absent key",
+      "proof": {
+        "leaf": {
+          "key_hash": "8dc9b4d6f39093ee06f73de1219aaff4e81d071524942949374db357db282863",
+          "value_hash": "f5ca38f748a1d6eaf726b8a42fb575c3c71f1864a8143301782de13da2d9202b"
+        },
+        "siblings": [
+          "2b52990b5210a080b9456156be3e3b17aae589365004e035692938d751c4b5b9",
+          "8fae7377f55a7fb035dccd8d21fd34312df177e47f31577613806240fb33f35f",
+          "cde579a380aeb1da8e1d3c60fbb612949e419215d2d6f09323eaab87c91cbc6e",
+          "0c774df3529c59cbe1fa5e87e3a126bbcb14ca1b63623ea459ae6d4ca7e48baa",
+          "6380dcca234724985f1305b057c3da81709c51bc07230289be13880d50e42ce6"
+        ]
+      },
+      "root": "c6ac07685e2a0644f8ffbe63a6f67c52ca34b3b5de9beface277aa22559889ee",
+      "valid": false,
+      "value": "x"
+    },
+    {
+      "key": "sys:chain_id",
+      "name": "invalid: a malformed sibling",
+      "proof": {
+        "leaf": {
+          "key_hash": "12fffce34d0cd0530b5fb65e0f6efa5a0e0f1975d35b1b44e775addfea3a947c",
+          "value_hash": "55cb3171f568682762d4ee700de5f5e2666f56f5a8bbba7e90e962a62792e42b"
+        },
+        "siblings": [
+          "zz",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "0ccc60030a6d5ad8eea74f6251765475f028e9706c3a51c907745a1718d91b0c",
+          "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+          "36cb84c6351212e7286bb07574816d86f931aa185f52cef96620799fad1aa63d",
+          "510b5a1e70389d725be5d72363845e9f3a105bd38cbb42b5266792558ffe1c1a",
+          "acb611bd78b967e4c35915752f6f09fbec0d10aeede6e4ef04cd8398eebd18dc",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "8135fd1474b1b0d7e0d9dd8476cb4604fb7823b253fe93edccec5fbab628534f",
+      "valid": false,
+      "value": "AINCORE-LOCALTEST-4V-HEAD"
+    },
+    {
+      "key": "sys:absent:9",
+      "name": "invalid: claims a value in an empty subtree",
+      "proof": {
+        "leaf": null,
+        "siblings": [
+          "89392a1b6fe005815609fe2f8b793d53b63f4e52a4452418edbad9d61832302d",
+          "36cb84c6351212e7286bb07574816d86f931aa185f52cef96620799fad1aa63d",
+          "510b5a1e70389d725be5d72363845e9f3a105bd38cbb42b5266792558ffe1c1a",
+          "1e21f32fa846c9f580f37372a9423561dc3a9c9dfa1d20a3a66b33d33370cfed",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "c6ac07685e2a0644f8ffbe63a6f67c52ca34b3b5de9beface277aa22559889ee",
+      "valid": false,
+      "value": "x"
+    },
+    {
+      "key": "obj:k3",
+      "name": "invalid: a neighbour's value claimed on an absent key's path",
+      "proof": {
+        "leaf": {
+          "key_hash": "51c5ea5dd27fc97ee6c09814af4280caa3b64a3d2e4f5078650484e039f1d647",
+          "value_hash": "0c4b1e2d5a28ca7ddbeccaae0d4eb8f2286938d7741f92c833d36b4b1be77cde"
+        },
+        "siblings": [
+          "5741f85ee003933a840f205b4f0f6ed1481f7126868cdd0c62a8b504a3b48f4c",
+          "1d80d2c99da4d701f462e383ba3c4a0bd3357e7b10565f0b01b35b07f28ff226",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "c6ac07685e2a0644f8ffbe63a6f67c52ca34b3b5de9beface277aa22559889ee",
+      "valid": false,
+      "value": "value-16"
+    },
+    {
+      "key": "sys:absent:9",
+      "name": "invalid: another key's leaf planted in an empty subtree",
+      "proof": {
+        "leaf": {
+          "key_hash": "12fffce34d0cd0530b5fb65e0f6efa5a0e0f1975d35b1b44e775addfea3a947c",
+          "value_hash": "55cb3171f568682762d4ee700de5f5e2666f56f5a8bbba7e90e962a62792e42b"
+        },
+        "siblings": [
+          "89392a1b6fe005815609fe2f8b793d53b63f4e52a4452418edbad9d61832302d",
+          "36cb84c6351212e7286bb07574816d86f931aa185f52cef96620799fad1aa63d",
+          "510b5a1e70389d725be5d72363845e9f3a105bd38cbb42b5266792558ffe1c1a",
+          "1e21f32fa846c9f580f37372a9423561dc3a9c9dfa1d20a3a66b33d33370cfed",
+          "05ccaa39eede61d2b0ed9d5398de5e812f8090268938583c443046f0fc1720fb"
+        ]
+      },
+      "root": "c6ac07685e2a0644f8ffbe63a6f67c52ca34b3b5de9beface277aa22559889ee",
+      "valid": false,
+      "value": null
+    }
+  ]
+}

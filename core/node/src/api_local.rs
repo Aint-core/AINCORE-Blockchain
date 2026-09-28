@@ -838,6 +838,70 @@ fn handle_rpc_method(
                 },
             }
         },
+        "aincore_getStateProof" => {
+            // G3 PF-1: params [key, height?]. The value of a consensus-state
+            // key (or its absence) with a proof against the state root at
+            // `height`, plus that block's header and quorum certificate. A
+            // client verifies the proof against `quorum_certificate.state_root`
+            // after verifying the QC itself (PF-2); `state_root` here is
+            // informational. The default height is the latest one with a QC.
+            let key = params.get(0).and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
+                code: -32602,
+                message: "Invalid params: [key, height?]".into(),
+            })?;
+            if storage::class::classify(key.as_bytes()) != Some(storage::class::KeyClass::State) {
+                return Err(JsonRpcError {
+                    code: -32602,
+                    message: format!("{key} is not a consensus-state key; only those are proven"),
+                });
+            }
+            let stored_u64 = |k: &str| {
+                data.storage.get(k).ok().flatten().and_then(|s| s.parse::<u64>().ok())
+            };
+            let latest = state_commit::latest_version(&data.storage)
+                .ok()
+                .flatten()
+                .ok_or_else(|| JsonRpcError { code: -32000, message: "no state tree yet".into() })?;
+            // PF-3: nothing below the retention floor (S7 prunes under it).
+            let floor = stored_u64("jmt:floor").unwrap_or(0);
+            let height = match params.get(1).and_then(|v| v.as_u64()) {
+                Some(h) => h,
+                None => stored_u64("consensus:qc:latest_height").unwrap_or(latest),
+            };
+            if height < floor || height > latest {
+                return Err(JsonRpcError {
+                    code: -32602,
+                    message: format!("height {height} is outside the proven range {floor}..={latest}"),
+                });
+            }
+            let (value, proof) = state_commit::wire_proof(&data.storage, key, height)
+                .map_err(|e| JsonRpcError { code: -32000, message: format!("proof failed: {e}") })?;
+            let state_root = state_commit::root(&data.storage, height)
+                .map(|r| hex::encode(r.0))
+                .map_err(|e| JsonRpcError { code: -32000, message: format!("root failed: {e}") })?;
+            let header = data
+                .storage
+                .get(&format!("block_{height}"))
+                .ok()
+                .flatten()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                .map(|block| block["header"].clone());
+            let qc = data
+                .storage
+                .get(&format!("consensus:qc:{height}"))
+                .ok()
+                .flatten()
+                .and_then(|json| serde_json::from_str::<consensus::qc::QuorumCertificate>(&json).ok());
+            Ok(serde_json::json!({
+                "key": key,
+                "value": value.map(|v| String::from_utf8_lossy(&v).into_owned()),
+                "height": height,
+                "state_root": state_root,
+                "proof": proof,
+                "header": header,
+                "quorum_certificate": qc,
+            }))
+        },
         "aincore_verifyQuorumCertificate" => {
             let qc_value = params.get(0).ok_or_else(|| JsonRpcError {
                 code: -32602,
@@ -2646,6 +2710,56 @@ mod tests {
                 .expect_err("short hex is not an account address")
                 .code,
             -32602
+        );
+    }
+
+    /// G3 PF-1: the proof RPC answers a present and an absent key with
+    /// proofs the client verifier accepts against the root, and refuses
+    /// non-state keys and heights outside the proven range.
+    #[test]
+    fn the_state_proof_rpc_answers_with_verifiable_proofs() {
+        let db = temp_db("state_proof_rpc");
+        {
+            let _seed = db.seeding();
+            db.put("sys:chain_id", "AINCORE-TEST").unwrap();
+            db.put(&format!("obj:{}", "ab".repeat(32)), "{}").unwrap();
+        }
+        let v0 = state_commit::seed_genesis(&db).unwrap();
+        db.write_batch(v0.batch).unwrap();
+        let state = test_state(Arc::clone(&db));
+        let call = |params| handle_rpc_method("aincore_getStateProof", params, &state);
+        let check = |answer: &serde_json::Value, key: &str, value: Option<&[u8]>| {
+            let root = state_proof::parse_hash(answer["state_root"].as_str().unwrap()).unwrap();
+            let proof: state_proof::WireProof =
+                serde_json::from_value(answer["proof"].clone()).unwrap();
+            state_proof::verify(&root, key, value, &proof)
+        };
+
+        let present = call(serde_json::json!(["sys:chain_id"])).unwrap();
+        assert_eq!(present["value"], "AINCORE-TEST");
+        assert_eq!(present["height"], 0);
+        assert_eq!(
+            check(&present, "sys:chain_id", Some(b"AINCORE-TEST")),
+            Ok(())
+        );
+        assert!(check(&present, "sys:chain_id", Some(b"forged")).is_err());
+
+        let absent = call(serde_json::json!(["sys:config:burn_percentage", 0])).unwrap();
+        assert!(absent["value"].is_null());
+        assert_eq!(check(&absent, "sys:config:burn_percentage", None), Ok(()));
+
+        assert!(
+            call(serde_json::json!(["latest_height"])).is_err(),
+            "not a state key"
+        );
+        assert!(
+            call(serde_json::json!(["sys:chain_id", 5])).is_err(),
+            "above the tree"
+        );
+        db.put("jmt:floor", "1").unwrap();
+        assert!(
+            call(serde_json::json!(["sys:chain_id", 0])).is_err(),
+            "below the floor"
         );
     }
 

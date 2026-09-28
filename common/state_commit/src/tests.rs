@@ -702,3 +702,216 @@ fn boot_check_refuses_disagreeing_heights_and_a_half_done_restore() {
         "{err}"
     );
 }
+
+// ---- PF-4: the shared proof vectors (Rust and JS verifiers) ----
+
+/// The vector file both verifiers read. Regenerated from real trees here and
+/// pinned byte for byte: a change to key hashing, value hashing, node hashing
+/// or the wire format breaks this test before it breaks a client.
+const PF_VECTORS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../state_proof/vectors/pf_vectors.json"
+);
+
+fn pf_vectors() -> serde_json::Value {
+    use serde_json::json;
+    let db = temp_db("pf_vectors");
+    // Version 0: the golden genesis-like state plus a few more keys.
+    let mut v0: Vec<(String, Option<Vec<u8>>)> = vec![
+        ("sys:chain_id".into(), some("AINCORE-LOCALTEST-4V-HEAD")),
+        (
+            "sys:total_supply".into(),
+            some("40081273249273785698770128"),
+        ),
+        (
+            "obj:dd48891f6d6799d5aa71e17b150ba3a8c30cbfbfb02544f546801f057aa65d42".into(),
+            some("{}"),
+        ),
+        ("total_burned".into(), some("0")),
+        ("sys:config:burn_percentage".into(), some("10")),
+        ("sys:config:epoch_block_interval".into(), some("20")),
+        ("sys:config:federation_addr".into(), some("")),
+    ];
+    for i in 0..24 {
+        v0.push((k(i), some(&format!("value-{i}"))));
+    }
+    commit(&db, 0, v0);
+    // Version 1: one update, one delete (the deleted key's proof is an
+    // exclusion proof at v1 and an inclusion proof at v0).
+    commit(
+        &db,
+        1,
+        vec![
+            (
+                "sys:total_supply".into(),
+                some("40081273249273785698770000"),
+            ),
+            (k(3), None),
+        ],
+    );
+    let mut vectors = Vec::new();
+    let mut emit = |name: &str, version: Version, key: &str| {
+        let root = root(&db, version).unwrap();
+        let (value, proof) = wire_proof(&db, key, version).unwrap();
+        let value = value.map(|v| String::from_utf8(v).unwrap());
+        let valid = json!({
+            "name": name, "valid": true, "root": hex::encode(root.0), "key": key,
+            "value": value, "proof": proof,
+        });
+        vectors.push(valid.clone());
+        (valid, root)
+    };
+    let (inc, _) = emit("inclusion: sys:chain_id at v0", 0, "sys:chain_id");
+    emit(
+        "inclusion: an empty value at v0",
+        0,
+        "sys:config:federation_addr",
+    );
+    emit("inclusion: an updated value at v1", 1, "sys:total_supply");
+    emit("inclusion: a deleted key at the version before", 0, &k(3));
+    let (del, _) = emit("exclusion: a deleted key", 1, &k(3));
+    let (abs, _) = emit("exclusion: a key never written", 1, "sys:never_written");
+    // Both exclusion shapes: another key's leaf on the path, and an empty
+    // subtree (no leaf at all).
+    let (mut with_leaf, mut empty) = (0, 0);
+    for i in 0..10_000 {
+        let key = format!("sys:absent:{i}");
+        let has_leaf = wire_proof(&db, &key, 1).unwrap().1.leaf.is_some();
+        if has_leaf && with_leaf < 3 {
+            with_leaf += 1;
+            emit(
+                &format!("exclusion: absent key {i}, another leaf on its path"),
+                1,
+                &key,
+            );
+        } else if !has_leaf && empty < 3 {
+            empty += 1;
+            emit(
+                &format!("exclusion: absent key {i}, an empty subtree"),
+                1,
+                &key,
+            );
+        }
+        if with_leaf == 3 && empty == 3 {
+            break;
+        }
+    }
+    assert_eq!((with_leaf, empty), (3, 3), "both exclusion shapes found");
+    let near = vectors
+        .iter()
+        .find(|v| {
+            v["valid"] == json!(true) && v["value"].is_null() && !v["proof"]["leaf"].is_null()
+        })
+        .cloned()
+        .unwrap();
+    // The value of the key whose leaf sits on `near`'s path.
+    let neighbour_value = {
+        let leaf_key = near["proof"]["leaf"]["key_hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut found = None;
+        for version in [1u64, 0] {
+            for key in (0..24).map(k).chain([
+                "sys:chain_id".to_string(),
+                "sys:total_supply".to_string(),
+                "total_burned".to_string(),
+                "sys:config:burn_percentage".to_string(),
+                "sys:config:epoch_block_interval".to_string(),
+                "sys:config:federation_addr".to_string(),
+                "obj:dd48891f6d6799d5aa71e17b150ba3a8c30cbfbfb02544f546801f057aa65d42".to_string(),
+            ]) {
+                if found.is_none() && hex::encode(key_hash(&key).0) == leaf_key {
+                    found = prove(&db, &key, version).unwrap().0;
+                }
+            }
+        }
+        String::from_utf8(found.expect("the neighbour is a known key")).unwrap()
+    };
+    let empty = vectors
+        .iter()
+        .find(|v| v["valid"] == json!(true) && v["proof"]["leaf"].is_null())
+        .cloned()
+        .unwrap();
+    // Invalid variants of the valid proofs above.
+    let mut bad = |name: &str, base: &serde_json::Value, f: &dyn Fn(&mut serde_json::Value)| {
+        let mut v = base.clone();
+        v["name"] = json!(name);
+        v["valid"] = json!(false);
+        f(&mut v);
+        vectors.push(v);
+    };
+    bad("invalid: wrong value", &inc, &|v| {
+        v["value"] = json!("AINCORE-MAINNET-1")
+    });
+    bad("invalid: another key", &inc, &|v| {
+        v["key"] = json!("sys:total_supply")
+    });
+    bad("invalid: another root", &inc, &|v| {
+        v["root"] = json!("00".repeat(32))
+    });
+    bad("invalid: claims absence of a present key", &inc, &|v| {
+        v["value"] = json!(null)
+    });
+    bad("invalid: a sibling flipped", &inc, &|v| {
+        let s = v["proof"]["siblings"][0].as_str().unwrap().to_string();
+        let flipped = format!("{}{}", if &s[..1] == "0" { "1" } else { "0" }, &s[1..]);
+        v["proof"]["siblings"][0] = json!(flipped);
+    });
+    bad("invalid: a sibling added", &inc, &|v| {
+        v["proof"]["siblings"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("00".repeat(32)));
+    });
+    bad("invalid: a sibling removed", &inc, &|v| {
+        v["proof"]["siblings"].as_array_mut().unwrap().pop();
+    });
+    bad("invalid: claims a value for a deleted key", &del, &|v| {
+        v["value"] = json!("value-3")
+    });
+    bad("invalid: claims a value for an absent key", &abs, &|v| {
+        v["value"] = json!("x")
+    });
+    bad("invalid: a malformed sibling", &inc, &|v| {
+        v["proof"]["siblings"][0] = json!("zz")
+    });
+    bad(
+        "invalid: claims a value in an empty subtree",
+        &empty,
+        &|v| v["value"] = json!("x"),
+    );
+    // The forgery the key check stops: the leaf on an absent key's path is
+    // another key's, and claiming that key's value for the absent key would
+    // otherwise reach the true root.
+    bad(
+        "invalid: a neighbour's value claimed on an absent key's path",
+        &near,
+        &|v| {
+            v["value"] = json!(neighbour_value.clone());
+        },
+    );
+    bad(
+        "invalid: another key's leaf planted in an empty subtree",
+        &empty,
+        &|v| {
+            v["proof"]["leaf"] = inc["proof"]["leaf"].clone();
+        },
+    );
+    json!({
+        "description": "G3 PF-4 state proof vectors. Generated from real Jellyfish Merkle trees by common/state_commit (pf_vectors_are_pinned) and verified by common/state_proof and aincore-js. Values are the exact stored strings.",
+        "vectors": vectors,
+    })
+}
+
+/// PF-4: regenerate the vectors from real trees and compare them with the
+/// pinned file. Set AINCORE_WRITE_PF_VECTORS=1 to write the file instead.
+#[test]
+fn pf_vectors_are_pinned() {
+    let generated = serde_json::to_string_pretty(&pf_vectors()).unwrap() + "\n";
+    if std::env::var_os("AINCORE_WRITE_PF_VECTORS").is_some() {
+        std::fs::write(PF_VECTORS, &generated).unwrap();
+    }
+    let pinned = std::fs::read_to_string(PF_VECTORS).expect("the pinned vector file");
+    assert_eq!(generated, pinned, "the proof vectors changed");
+}

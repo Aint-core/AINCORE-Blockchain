@@ -20,6 +20,8 @@ bcs = "0.1"
 hex = "0.4"
 rayon = "1.7"
 sha2 = "0.10"
+# G3 PF-2: the client check of a state proof.
+state_proof = { path = "../../common/state_proof" }
 # Note: Cryptography now consolidated in common/crypto
 # ed25519-dalek removed - use crypto crate
 # sha256 removed - use crypto crate

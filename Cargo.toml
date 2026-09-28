@@ -6,6 +6,7 @@ members = [
     "common/network",
     "common/storage",
     "common/state_commit",
+    "common/state_proof",
     "common/config",
     "common/keystore",
     # --- Core: Node, VM, Executor ---

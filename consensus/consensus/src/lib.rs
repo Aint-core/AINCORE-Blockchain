@@ -14,6 +14,7 @@ pub mod dag;
 pub mod ordering;
 pub mod qc;
 pub mod qc_producer;
+pub mod state_proof_client;
 pub mod vcert;
 
 #[cfg(test)]

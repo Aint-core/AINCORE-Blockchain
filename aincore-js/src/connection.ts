@@ -232,6 +232,26 @@ export class Connection {
     }
 
     /**
+     * G3 PF-1: the value of a consensus-state key (or its absence) with a
+     * Merkle proof, plus that height's header and quorum certificate. Check
+     * it with `verifyStateProof` against a root you trust, taken from a
+     * verified quorum certificate, never from `state_root` in the answer.
+     */
+    async getStateProof(key: string, height?: number): Promise<{
+        key: string;
+        value: string | null;
+        height: number;
+        state_root: string;
+        proof: import('./stateProof').WireProof;
+        header: any;
+        quorum_certificate: any;
+    }> {
+        const params: any[] = [key];
+        if (height !== undefined) params.push(height);
+        return await this.request('aincore_getStateProof', params);
+    }
+
+    /**
      * @deprecated Removed from the node (G3 FX-8). The faucet wrote balances
      * straight into one node's database, outside consensus. Fund an account
      * with a signed transfer from a funded account instead. Kept so callers

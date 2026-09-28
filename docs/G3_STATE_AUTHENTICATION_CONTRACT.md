@@ -645,6 +645,36 @@ counters, never values.
     conflict token, which only has to be distinct.
 - **S3 is complete.** S4 (proof RPC and verifiers) is next.
 | S4 | Proof RPC + Rust and JS verifiers (PF) | No, once S2 is live |
+
+**S4 status (branch `g3/activation`).**
+- **PF-1:** `aincore_getStateProof(key, height?)` returns `{key, value | null, height,
+  state_root, proof, header, quorum_certificate}`. It serves state keys only. The height
+  defaults to the latest one with a QC. It refuses heights outside `jmt:floor..=latest`
+  (PF-3).
+- **Wire proof:** `{leaf: {key_hash, value_hash} | null, siblings: [hash…]}`, all 64-hex,
+  with siblings from the bottom to the root. `state_commit::wire_proof` decodes `jmt`'s
+  borsh proof. The client verifier checks every proof against the tree's root before it
+  leaves the node.
+- **PF-4:**
+  - `common/state_proof` is a Rust verifier with no database and no `jmt`.
+  - `aincore-js/src/stateProof.ts` mirrors it line for line.
+  - Both pass `common/state_proof/vectors/pf_vectors.json`: 12 valid and 13 refused
+    vectors, generated from real trees and pinned byte for byte.
+  - The vectors cover inclusion, an empty value, an update, a deleted key before and
+    after, and both exclusion shapes. The refused ones include the neighbour-value forgery
+    that the key check stops.
+  - So `jmt`, the Rust verifier and the JS verifier agree.
+- **PF-2 client check:** `consensus::state_proof_client::verify_answer` runs checks
+  1-6:
+  - QC under the trusted committee and chain;
+  - expected epoch;
+  - QC height equals the answer height;
+  - freshness;
+  - proof against `qc.state_root`;
+  - key hash derived locally.
+
+  Until S5, the caller supplies the committee and epoch for the height. The JS SDK checks
+  the Merkle proof only; its BLS QC check is not built yet, and the SDK says so.
 | S5 | Committee record + FinalityVote V2 binding + transition log + `TA_LOG_*` (TA; joint with G1 EP-2/EP-4) | **Yes** |
 | S6 | Snapshot restore + bootstrap record + pinned versions + rejoin at every horizon (SN) | No |
 | S7 | Pruning with the value rule; boot audits RC-2 and RC-3 | No |

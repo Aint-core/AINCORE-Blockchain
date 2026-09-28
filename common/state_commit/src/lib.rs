@@ -463,6 +463,68 @@ pub fn prove(
     })
 }
 
+/// G3 PF-1: value and proof for `key` at `version`, in the wire format that
+/// clients verify with `state_proof::verify` (and its JS mirror). The proof
+/// is checked by that independent verifier against the tree's own root
+/// before it leaves the node, so a divergence between `jmt` and the client
+/// algorithm fails here, not at the client.
+pub fn wire_proof(
+    db: &Arc<StateDB>,
+    key: &str,
+    version: Version,
+) -> Result<(Option<OwnedValue>, state_proof::WireProof)> {
+    let (value, proof) = prove(db, key, version)?;
+    let wire = to_wire(&proof)?;
+    let root = root(db, version)?;
+    state_proof::verify(&root.0, key, value.as_deref(), &wire)
+        .map_err(|e| anyhow::anyhow!("wire proof fails the client check: {e}"))?;
+    Ok((value, wire))
+}
+
+/// `jmt` keeps the proof's siblings private; its borsh encoding is public and
+/// fixed: `leaf: Option<(key_hash, value_hash)>`, then a `u32` little-endian
+/// count of siblings, each tagged `0` null, `1` internal `(left, right)` or
+/// `2` leaf `(key_hash, value_hash)`. Each sibling becomes its hash.
+fn to_wire(proof: &SparseMerkleProof<Sha256>) -> Result<state_proof::WireProof> {
+    let bytes = borsh::to_vec(proof)?;
+    let mut rest = bytes.as_slice();
+    let mut take = |n: usize| -> Result<&[u8]> {
+        ensure!(rest.len() >= n, "truncated proof encoding");
+        let (head, tail) = rest.split_at(n);
+        rest = tail;
+        Ok(head)
+    };
+    let hash32 = |b: &[u8]| -> [u8; 32] { b.try_into().expect("32 bytes") };
+    let leaf = match take(1)?[0] {
+        0 => None,
+        1 => Some(state_proof::WireLeaf {
+            key_hash: hex::encode(take(32)?),
+            value_hash: hex::encode(take(32)?),
+        }),
+        tag => bail!("unknown leaf tag {tag}"),
+    };
+    let count = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+    ensure!(count <= state_proof::MAX_SIBLINGS, "{count} siblings");
+    let mut siblings = Vec::with_capacity(count);
+    for _ in 0..count {
+        let hash = match take(1)?[0] {
+            0 => state_proof::PLACEHOLDER,
+            1 => {
+                let left = hash32(take(32)?);
+                state_proof::internal_hash(&left, &hash32(take(32)?))
+            }
+            2 => {
+                let key = hash32(take(32)?);
+                state_proof::leaf_hash(&key, &hash32(take(32)?))
+            }
+            tag => bail!("unknown sibling tag {tag}"),
+        };
+        siblings.push(hex::encode(hash));
+    }
+    ensure!(rest.is_empty(), "trailing proof bytes");
+    Ok(state_proof::WireProof { leaf, siblings })
+}
+
 /// Verify `key` → `value` (or its absence, for `None`) against `root`. The
 /// key hash is computed here, never taken from the prover.
 pub fn verify(

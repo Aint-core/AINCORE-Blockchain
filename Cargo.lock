@@ -1631,6 +1631,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "state_commit",
+ "state_proof",
  "storage",
  "tokio",
 ]
@@ -5534,6 +5535,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "state_commit",
+ "state_proof",
  "storage",
  "tokio",
  "tokio-stream",
@@ -7670,8 +7672,20 @@ dependencies = [
  "hex",
  "jmt",
  "rand 0.8.5",
+ "serde_json",
  "sha2 0.10.9",
+ "state_proof",
  "storage",
+]
+
+[[package]]
+name = "state_proof"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

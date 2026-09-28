@@ -76,3 +76,5 @@ lazy_static = "1.4"
 [dev-dependencies]
 # G3 WG-1: test fixtures seed their own genesis state (StateDB::seeding).
 storage = { path = "../../common/storage", features = ["test-seeding"] }
+# G3 PF: tests verify the proof RPC with the client verifier.
+state_proof = { path = "../../common/state_proof" }
