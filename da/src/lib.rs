@@ -373,14 +373,47 @@ impl DASequencer {
             shards.len()
         );
 
-        // Step 5: Store only assigned shards (distributed storage)
+        // Step 5: Store the assigned shards, the commitment, the compressed data,
+        // the meta and the batch root as ONE durable write.
+        //
+        // PERF (2026-09-28): each row used to be its own synced `put` -- about 33
+        // fsyncs per block. On the NAS's spinning disk that measured 65 ms each,
+        // ~2 s per block, and it runs inside `add_vertex` while the consensus lock
+        // is held: the NAS validators ticked every ~2.5 s instead of 1.5 s, trailed
+        // the Pi by ~2 s per round, and every RPC that reads the consensus lock
+        // waited behind it. One `WriteBatch` is one synced write, so durability is
+        // unchanged -- and the rows are now atomic: a crash can no longer leave a
+        // commitment on disk without the shards it commits to.
+        let mut rows = storage::rocksdb::WriteBatch::default();
         let mut stored_count = 0;
         for shard_id in &my_shards {
             if let Some(shard_data) = shards.get(*shard_id as usize) {
-                let shard_key = format!("da_shard_{}_{}", self.epoch, shard_id);
-                let _ = self.storage.put(&shard_key, &hex::encode(shard_data));
+                rows.put(
+                    format!("da_shard_{}_{}", self.epoch, shard_id),
+                    hex::encode(shard_data),
+                );
                 stored_count += 1;
             }
+        }
+        // The Merkle root is the DA commitment.
+        rows.put(format!("da_commitment_{}", self.epoch), &merkle_root_hex);
+        // Full compressed data: in sharding we rely on p2p, but this phase keeps a
+        // redundant local copy.
+        rows.put(format!("da_data_{}", self.epoch), hex::encode(&compressed));
+        // Shard count, for reconstruction.
+        rows.put(
+            format!("da_meta_{}", self.epoch),
+            format!(
+                "{{\"shards\":{},\"original_size\":{}}}",
+                shards.len(),
+                batch_json.len()
+            ),
+        );
+        // Original batch info.
+        rows.put(format!("da_root_{}", self.epoch), &batch_json);
+        // Non-fatal, as each individual put was before -- but no longer silent.
+        if let Err(e) = self.storage.write_batch(rows) {
+            eprintln!("❌ [DA] storing batch epoch={} failed: {}", self.epoch, e);
         }
 
         println!("✅ [DA Sequencer] Batch epoch={} processed:", self.epoch);
@@ -391,28 +424,6 @@ impl DASequencer {
         println!("   - Shards created: {}", shards.len());
         println!("   - Shards stored locally: {}", stored_count);
         println!("   - Merkle root: {}", merkle_root_hex);
-
-        // Store Merkle root as DA commitment
-        let commitment_key = format!("da_commitment_{}", self.epoch);
-        let _ = self.storage.put(&commitment_key, &merkle_root_hex);
-
-        // Store compressed data (Full Data for simple nodes, but in sharding we rely on p2p)
-        // For redundant safety in this phase, we store full data locally too.
-        let data_key = format!("da_data_{}", self.epoch);
-        let _ = self.storage.put(&data_key, &hex::encode(&compressed));
-
-        // Store shard count for reconstruction
-        let meta_key = format!("da_meta_{}", self.epoch);
-        let meta = format!(
-            "{{\"shards\":{},\"original_size\":{}}}",
-            shards.len(),
-            batch_json.len()
-        );
-        let _ = self.storage.put(&meta_key, &meta);
-
-        // Store original batch info
-        let batch_key = format!("da_root_{}", self.epoch);
-        let _ = self.storage.put(&batch_key, &batch_json);
 
         // Cache in memory
         if let Ok(mut batches) = self.batches.lock() {
@@ -1178,6 +1189,51 @@ mod m09_tests {
             result.is_err(),
             "decrypting with the wrong identity must panic, not silently regenerate"
         );
+    }
+
+    /// PERF 2026-09-28: every row `create_batch` owns lands, with the right
+    /// value, from ONE durable write. The single write is what took ~33 fsyncs
+    /// per block to 1 on the NAS; this pins that no row was dropped doing it.
+    #[test]
+    fn create_batch_persists_every_row_it_owns() {
+        let db = temp_db("every_row");
+        let node_identity = [44u8; 32];
+        let peers = Arc::new(Mutex::new(HashMap::new()));
+        let mut seq =
+            DASequencer::new_encrypted("test".into(), Arc::clone(&db), peers, &node_identity);
+        seq.create_batch("cafebabe".into(), 7);
+        let epoch = seq.epoch;
+
+        let shards = (0..32)
+            .filter(|id| {
+                db.get(&format!("da_shard_{}_{}", epoch, id))
+                    .unwrap()
+                    .is_some()
+            })
+            .count();
+        assert_eq!(shards, 32, "single node: every shard is assigned locally");
+
+        let commitment = db
+            .get(&format!("da_commitment_{}", epoch))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            commitment.len(),
+            64,
+            "commitment is a hex SHA-256 Merkle root"
+        );
+        let data = db.get(&format!("da_data_{}", epoch)).unwrap().unwrap();
+        assert!(hex::decode(&data).is_ok() && !data.is_empty());
+        let meta: serde_json::Value =
+            serde_json::from_str(&db.get(&format!("da_meta_{}", epoch)).unwrap().unwrap()).unwrap();
+        assert_eq!(meta["shards"], 32);
+        let root = db.get(&format!("da_root_{}", epoch)).unwrap().unwrap();
+        assert!(
+            root.contains("cafebabe"),
+            "the batch root carries the block root hash"
+        );
+        // And the rows are consistent with each other.
+        assert_eq!(seq.verify_local_availability(epoch), Ok(true));
     }
 
     /// SEC-#2/#3: create_batch actually persists shards (previously zero rows),
