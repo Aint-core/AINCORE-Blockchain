@@ -71,6 +71,23 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// The RPC hands out `raw_tx_hash` as a transaction's lookup key; the block
+    /// index must be written under exactly that key. They drifted apart once,
+    /// and a client's receipt lookup then said "pending" forever.
+    #[test]
+    fn raw_tx_hash_is_the_key_the_block_index_uses() {
+        let db = temp_db("raw_tx_hash");
+        let tx = r#"{"sender":"ab","sequence_number":0}"#;
+        let block = serde_json::json!({ "header": {}, "transactions": [tx] }).to_string();
+        db.save_block_json(7, &block).unwrap();
+        assert_eq!(db.get_tx_block_height(&StateDB::raw_tx_hash(tx)), Some(7));
+        // Control: the key is over the exact bytes; one extra space is another key.
+        assert_eq!(
+            db.get_tx_block_height(&StateDB::raw_tx_hash(&format!("{tx} "))),
+            None
+        );
+    }
+
     #[test]
     fn test_put_get_roundtrip() {
         let db = temp_db("put_get");

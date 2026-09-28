@@ -489,7 +489,9 @@ fn credit_testnet_faucet(
     if !faucet_enabled() {
         return Err(JsonRpcError {
             code: -32030,
-            message: "Faucet disabled. Set AINCORE_ENABLE_FAUCET=1 for local/testnet smoke tests."
+            message: "Faucet disabled. This RPC writes balances straight into one node's \
+                      database, bypassing consensus, which forks a multi-node network; \
+                      it is for single-node local tests only."
                 .into(),
         });
     }
@@ -743,6 +745,36 @@ pub struct JsonRpcError {
     pub message: String,
 }
 
+/// Read the consensus state WITHOUT waiting for it.
+///
+/// The consensus loop holds this lock for whole block commits, measured at
+/// ~2 s per block on the NAS's spinning disk. An RPC that WAITS for it parks an
+/// actix worker for that long; the NAS runs 4 workers, so a handful of
+/// concurrent calls froze the entire public RPC (`aincore_getStatus` was seen
+/// hanging for 20-30 s). And a reader that holds the lock while doing slow work
+/// blocks the consensus loop from taking it. So handlers take what they need
+/// with `try_read`, drop the guard at once, and answer from storage or say
+/// "busy" when the lock is held.
+fn try_consensus(
+    data: &AppState,
+) -> Result<Option<std::sync::RwLockReadGuard<'_, DagConsensus>>, JsonRpcError> {
+    match data.consensus.try_read() {
+        Ok(guard) => Ok(Some(guard)),
+        Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+        Err(std::sync::TryLockError::Poisoned(e)) => Err(JsonRpcError {
+            code: -32000,
+            message: format!("Consensus lock error: {}", e),
+        }),
+    }
+}
+
+fn consensus_busy() -> JsonRpcError {
+    JsonRpcError {
+        code: -32005,
+        message: "Consensus is busy committing a block; retry shortly.".into(),
+    }
+}
+
 fn handle_rpc_method(
     method: &str,
     params: serde_json::Value,
@@ -805,8 +837,19 @@ fn handle_rpc_method(
             if let Some(tx_str) = tx_str_opt {
                 let mut mempool = data.mempool.lock()
                     .map_err(|e| JsonRpcError { code: -32000, message: format!("Mempool lock error: {}", e) })?;
+                // `tx_hash` is the key this transaction can be LOOKED UP by: blocks
+                // index a transaction under `StateDB::raw_tx_hash` of the exact
+                // string submitted. The mempool's own hash covers the signed
+                // fields -- right for deduplication, but nothing is stored under
+                // it, so returning it meant a client's receipt lookup said
+                // "pending" forever. It is still returned, as `canonical_hash`.
+                let lookup_hash = StateDB::raw_tx_hash(&tx_str);
                 match mempool.add_transaction(tx_str) {
-                    Ok(tx_hash) => Ok(serde_json::json!({ "status": "sent", "tx_hash": tx_hash })),
+                    Ok(canonical_hash) => Ok(serde_json::json!({
+                        "status": "sent",
+                        "tx_hash": lookup_hash,
+                        "canonical_hash": canonical_hash,
+                    })),
                     Err(reason) => Err(JsonRpcError {
                         code: -32010,
                         message: format!("Transaction rejected by mempool: {}", reason),
@@ -872,14 +915,27 @@ fn handle_rpc_method(
             }
         },
         "aincore_getStatus" => {
-             // CRITICAL: READ lock for high concurrency
-             let consensus = data.consensus.read().map_err(|e| JsonRpcError { code: -32000, message: format!("Consensus lock error: {}", e) })?;
-             let peers = data.peers.lock().map_err(|e| JsonRpcError { code: -32000, message: format!("Peers lock error: {}", e) })?;
+             // Never waits on the consensus lock (see `try_consensus`). While a
+             // block is being committed the two in-memory fields come from
+             // storage (or are null) and `consensus_busy` says so.
+             let (node_id, current_round, consensus_busy) = match try_consensus(data)? {
+                 Some(c) => (serde_json::json!(c.node_id), serde_json::json!(c.current_round), false),
+                 None => (
+                     serde_json::Value::Null,
+                     match data.storage.get("latest_proposed_round") {
+                         Ok(Some(r)) => r.parse::<u64>().map(|r| serde_json::json!(r)).unwrap_or(serde_json::Value::Null),
+                         _ => serde_json::Value::Null,
+                     },
+                     true,
+                 ),
+             };
+             let peers_count = data.peers.lock().map_err(|e| JsonRpcError { code: -32000, message: format!("Peers lock error: {}", e) })?.len();
 
              Ok(serde_json::json!({
-                 "node_id": consensus.node_id,
-                 "current_round": consensus.current_round,
-                 "peers_count": peers.len(),
+                 "node_id": node_id,
+                 "current_round": current_round,
+                 "consensus_busy": consensus_busy,
+                 "peers_count": peers_count,
                  "latest_height": match data.storage.get("latest_height") {
                      Ok(Some(h)) => h,
                      _ => "0".to_string(),
@@ -993,7 +1049,7 @@ fn handle_rpc_method(
             }
         },
         "aincore_getDag" => {
-            let consensus = data.consensus.read().map_err(|e| JsonRpcError { code: -32000, message: format!("Consensus lock error: {}", e) })?;
+            let consensus = try_consensus(data)?.ok_or_else(consensus_busy)?;
             let dag = consensus.dag.lock().map_err(|e| JsonRpcError { code: -32000, message: format!("DAG lock error: {}", e) })?;
 
             let vertices: Vec<_> = dag.values().cloned().collect();
@@ -1235,11 +1291,11 @@ fn handle_rpc_method(
              // Since we don't have "da:latest_epoch" index yet, let's just return what we know.
              // We could scan recent keys?
              // Better: Return the `node_id` which acts as DA Proposer ID if active.
-             let consensus = data.consensus.read().map_err(|e| JsonRpcError { code: -32000, message: format!("Consensus lock error: {}", e) })?;
+             let sequencer_id = try_consensus(data)?.ok_or_else(consensus_busy)?.node_id.clone();
 
              Ok(serde_json::json!({
                  "da_mode": "Sovereign",
-                 "sequencer_id": consensus.node_id,
+                 "sequencer_id": sequencer_id,
                  "erasure_coding": "Reed-Solomon (16/16)",
                  "da_epoch": "Synced with Block Height (Approx)" // Placeholder until we index DA epoch
              }))
@@ -1665,10 +1721,14 @@ fn handle_rpc_method(
                         "execution_receipt": receipt
                     }))
                 } else {
-                    // Check if it's in mempool
-                    let in_mempool = if let Ok(mp) = data.mempool.lock() {
-                        !mp.is_empty() // Simplified check
-                    } else { false };
+                    // Pending only if THIS transaction is still waiting. The old
+                    // check was "is the mempool non-empty", which reported every
+                    // unknown hash as pending whenever anyone had a tx queued.
+                    let in_mempool = data
+                        .mempool
+                        .lock()
+                        .map(|mp| mp.any_pending(|tx| StateDB::raw_tx_hash(tx) == tx_hash))
+                        .unwrap_or(false);
 
                     Ok(serde_json::json!({
                         "tx_hash": tx_hash,
@@ -2227,8 +2287,26 @@ async fn get_validators_handler(data: web::Data<AppState>) -> impl Responder {
 
 // GET /get_network_info
 async fn get_network_info_handler(data: web::Data<AppState>) -> impl Responder {
-    let peers = data.peers.lock().unwrap_or_else(|e| e.into_inner());
-    let consensus = data.consensus.read().unwrap_or_else(|e| e.into_inner());
+    // Copy what is needed and release both locks BEFORE the storage scan below:
+    // holding the consensus read lock across 20 block reads blocked the
+    // consensus loop from taking its write lock, from a public endpoint.
+    let peer_count = data.peers.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let (node_id, current_round) = match data.consensus.try_read() {
+        Ok(c) => (
+            serde_json::json!(c.node_id),
+            serde_json::json!(c.current_round),
+        ),
+        Err(std::sync::TryLockError::Poisoned(e)) => {
+            let c = e.into_inner();
+            (
+                serde_json::json!(c.node_id),
+                serde_json::json!(c.current_round),
+            )
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            (serde_json::Value::Null, serde_json::Value::Null)
+        }
+    };
     let height = data.storage.get_chain_height();
 
     // CALCULATE TPS (Transactions per Second)
@@ -2269,30 +2347,25 @@ async fn get_network_info_handler(data: web::Data<AppState>) -> impl Responder {
     }
 
     // Determine TPS
+    // Block timestamps are unix SECONDS (the BFT median of vertex timestamps).
+    // This used to divide by 1000 as if they were milliseconds, reporting a TPS
+    // a thousand times too high.
     let tps = if end_time > start_time {
-        let duration_ms = end_time.saturating_sub(start_time);
-        if duration_ms > 0 {
-            let duration_sec = duration_ms as f64 / 1000.0;
-            if duration_sec > 0.0 {
-                total_txs as f64 / duration_sec
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        }
+        total_txs as f64 / end_time.saturating_sub(start_time) as f64
     } else {
         0.0
     };
 
     let info = serde_json::json!({
-        "node_id": consensus.node_id,
+        "node_id": node_id,
         "version": "0.1.0-alpha",
-        "peer_count": peers.len(),
+        "peer_count": peer_count,
         "latest_block": height,
-        "current_round": consensus.current_round,
+        "current_round": current_round,
         "tps": tps,
-        "network": "AINCORE Mainnet (Prototype)",
+        // The chain this node actually runs. It used to say "AINCORE Mainnet
+        // (Prototype)" on every network, including the public testnet.
+        "network": resolve_chain_id(),
         "protocol_version": 1
     });
 
@@ -2478,6 +2551,118 @@ mod tests {
             governance,
             storage: db,
         }
+    }
+
+    /// The consensus loop holds its lock for whole block commits (~2 s on the
+    /// NAS). An RPC must never wait for it: a few concurrent waiters froze the
+    /// whole public RPC. Here another thread holds the write lock for 2 s,
+    /// exactly as during a commit; the old code waited out all 2 s.
+    #[test]
+    fn rpc_never_waits_on_a_held_consensus_lock() {
+        let db = temp_db("consensus_busy");
+        db.put("latest_proposed_round", "42").unwrap();
+        let state = test_state(db);
+
+        // Control: lock free -> the live fields, and not flagged busy.
+        let free = handle_rpc_method("aincore_getStatus", serde_json::json!([]), &state).unwrap();
+        assert_eq!(free["consensus_busy"], false);
+        assert_eq!(free["node_id"], "node_test");
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let consensus = Arc::clone(&state.consensus);
+        let holder = std::thread::spawn(move || {
+            let _commit = consensus.write().unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+        held_rx.recv().unwrap();
+        let t0 = std::time::Instant::now();
+        let busy = handle_rpc_method("aincore_getStatus", serde_json::json!([]), &state).unwrap();
+        let dag = handle_rpc_method("aincore_getDag", serde_json::json!([]), &state);
+        let elapsed = t0.elapsed();
+        holder.join().unwrap();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "an RPC waited {elapsed:?} on the consensus lock"
+        );
+        assert_eq!(busy["consensus_busy"], true);
+        assert_eq!(
+            busy["current_round"], 42,
+            "a busy status must still answer from storage"
+        );
+        assert_eq!(dag.unwrap_err().code, -32005);
+    }
+
+    /// The contract a tester relies on end to end: the hash
+    /// `aincore_sendTransaction` returns is the hash `aincore_getTransactionReceipt`
+    /// finds -- "pending" while queued, and at its block once included. It used
+    /// to return a hash over the signed fields, under which nothing is stored,
+    /// so the receipt said "pending" forever.
+    #[test]
+    fn the_hash_send_returns_is_the_hash_the_receipt_is_found_under() {
+        // The faucet tests set AINCORE_CHAIN_ID process-wide, and the chain id is
+        // read both when this tx is signed and when the mempool validates it.
+        let _env = faucet_env_lock().lock().unwrap();
+        let db = temp_db("send_lookup");
+        let state = test_state(Arc::clone(&db));
+
+        use ed25519_dalek::Signer;
+        let key = SigningKey::from_bytes(&[91u8; 32]);
+        let public_key = hex::encode(key.verifying_key().to_bytes());
+        let sender = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let chain_id = resolve_chain_id();
+        let payload = hex::encode(
+            bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![
+                9, 1,
+            ]]))
+            .unwrap(),
+        );
+        let (seq, gas_limit, gas_price) = (0u64, 100_000u64, 1u128);
+        let message = format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            chain_id, sender, payload, seq, gas_limit, gas_price, ""
+        );
+        let tx = serde_json::json!({
+            "chain_id": chain_id,
+            "sender": sender,
+            "input_objects": [],
+            "payload": payload,
+            "args": [],
+            "gas_limit": gas_limit,
+            "gas_price": gas_price,
+            "sequence_number": seq,
+            "public_key": public_key,
+            "signature": hex::encode(key.sign(message.as_bytes()).to_bytes()),
+        })
+        .to_string();
+
+        let sent = handle_rpc_method("aincore_sendTransaction", serde_json::json!([tx]), &state)
+            .expect("a signed transaction is admitted");
+        let hash = sent["tx_hash"].as_str().unwrap().to_string();
+        let receipt = |h: &str| {
+            handle_rpc_method(
+                "aincore_getTransactionReceipt",
+                serde_json::json!([h]),
+                &state,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            receipt(&hash)["status"],
+            "pending",
+            "the returned hash is not the one it is pending under"
+        );
+        // Control: an unknown hash is not "pending" merely because this tx is queued.
+        assert_eq!(receipt(&"00".repeat(32))["status"], "not_found");
+
+        let block = serde_json::json!({ "header": {}, "transactions": [tx] }).to_string();
+        db.save_block_json(1, &block).unwrap();
+        assert_eq!(
+            receipt(&hash)["block_height"],
+            1,
+            "once included, the returned hash does not find its block"
+        );
     }
 
     #[test]

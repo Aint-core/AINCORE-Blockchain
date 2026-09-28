@@ -798,6 +798,34 @@ mod fee_market_admission {
         (tx, sender)
     }
 
+    /// `any_pending` answers for THIS transaction only, through both states a
+    /// waiting transaction can be in: queued, and loaned to a vertex that has not
+    /// committed. The RPC's old "pending" check was `!is_empty()`, true for any
+    /// hash at all while anyone else had a transaction queued.
+    #[test]
+    fn any_pending_matches_this_transaction_while_queued_or_loaned() {
+        let db = temp_db("any_pending");
+        let (tx, sender) = signed_tx(71, 0, 100_000, 1);
+        fund(&db, &sender, 1_000_000_000_000_000_000);
+        let mut mp = Mempool::with_storage(db);
+        mp.add_transaction(tx.clone())
+            .expect("a funded, signed tx is admitted");
+        let hash = StateDB::raw_tx_hash(&tx);
+        let pending = |mp: &Mempool, h: &str| mp.any_pending(|t| StateDB::raw_tx_hash(t) == h);
+
+        assert!(pending(&mp, &hash), "a queued transaction must be pending");
+        assert!(
+            !pending(&mp, &"00".repeat(32)),
+            "an unknown hash was reported pending because another tx is queued"
+        );
+        let loaned = mp.get_pending_transactions(10);
+        assert_eq!(loaned, vec![tx], "the tx was not loaned out");
+        assert!(
+            pending(&mp, &hash),
+            "a loaned, uncommitted transaction must still be pending"
+        );
+    }
+
     /// Build the exact `0x1::coin::CoinStore<0x1::staking::AincoreCoin>` storage
     /// key that `executor::committed_ain_balance` reads (and gas is charged from).
     fn ain_store_key(sender: &str) -> String {
@@ -1043,7 +1071,7 @@ fn test_mark_executed_evicts_from_pending_queue() {
     assert!(!mempool.is_empty(), "returned txs are pending again");
 
     // One of them lands via another validator's vertex.
-    mempool.mark_executed(&[a.clone()]);
+    mempool.mark_executed(std::slice::from_ref(&a));
 
     let left = mempool.get_pending_transactions(4);
     assert_eq!(left, vec![b.clone()], "only the unexecuted tx remains servable");

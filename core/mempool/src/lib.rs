@@ -574,6 +574,17 @@ impl Mempool {
         Ok(tx_hash)
     }
 
+    /// Whether any transaction still waiting satisfies `matches`: queued, or
+    /// loaned to a vertex that has not committed yet. Read-only — unlike
+    /// `get_pending_transactions`, it never loans anything out.
+    ///
+    /// The RPC answers "pending" with this instead of "is the mempool
+    /// non-empty", which reported every unknown hash as pending whenever
+    /// anyone else had a transaction waiting.
+    pub fn any_pending(&self, matches: impl Fn(&str) -> bool) -> bool {
+        self.pending_txs.iter().any(|tx| matches(tx)) || self.inflight.keys().any(|tx| matches(tx))
+    }
+
     pub fn get_pending_transactions(&mut self, limit: usize) -> Vec<String> {
         if limit == 0 || self.pending_txs.is_empty() {
             return Vec::new();

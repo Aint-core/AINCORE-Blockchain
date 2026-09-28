@@ -431,9 +431,13 @@ impl StateDB {
             // Index transactions. Block JSON shape from blockchain::Block is
             // `{ "header": {...}, "transactions": [<tx_string>, ...] }`. Each
             // transaction is stored as the raw JSON string it was submitted
-            // as, and tx_hash is SHA-256 over those bytes — the same
-            // construction the mempool uses for dedupe and the API uses for
-            // its current O(N) scan, so the index is wire-compatible.
+            // as, and is indexed under `raw_tx_hash` of those bytes.
+            //
+            // NOT the mempool's hash: the mempool deduplicates on a hash of the
+            // SIGNED FIELDS, which no row is stored under. This comment used to
+            // claim the two were the same construction; they drifted apart, and
+            // `aincore_sendTransaction` handed clients a hash that no lookup
+            // could resolve. The RPC now answers with `raw_tx_hash` too.
             let tx_hashes = Self::tx_hashes_from_block_value(&block);
             if !tx_hashes.is_empty() {
                 let height_bytes = height.to_string().into_bytes();
@@ -457,23 +461,26 @@ impl StateDB {
         }
     }
 
-    fn tx_hashes_from_block_value(block: &serde_json::Value) -> Vec<String> {
+    /// The key a transaction is found under: hex SHA-256 of the exact string it
+    /// was submitted as — the string the mempool stores and blocks carry.
+    ///
+    /// ONE definition. The block index, the hash `aincore_sendTransaction` returns
+    /// and the "is it still pending" check all call this, so a client's lookup key
+    /// and the index can no longer drift apart.
+    pub fn raw_tx_hash(tx: &str) -> String {
         use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(tx.as_bytes()))
+    }
 
+    fn tx_hashes_from_block_value(block: &serde_json::Value) -> Vec<String> {
         block
             .get("transactions")
             .and_then(|v| v.as_array())
             .map(|txs| {
                 txs.iter()
-                    .map(|tx| {
-                        let tx_str_owned: String;
-                        let tx_bytes: &[u8] = if let Some(s) = tx.as_str() {
-                            s.as_bytes()
-                        } else {
-                            tx_str_owned = tx.to_string();
-                            tx_str_owned.as_bytes()
-                        };
-                        hex::encode(Sha256::digest(tx_bytes))
+                    .map(|tx| match tx.as_str() {
+                        Some(s) => Self::raw_tx_hash(s),
+                        None => Self::raw_tx_hash(&tx.to_string()),
                     })
                     .collect()
             })
