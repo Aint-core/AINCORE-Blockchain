@@ -109,8 +109,12 @@ print("\nLEG 0 — liveness (the chain is producing blocks)")
 advanced = []
 for n in labels:
     try:
-        h1, _, ts = tip_of(os.path.join(out, f"{n}.json"))
-        h2, _, _ = tip_of(os.path.join(out, f"{n}.tip.json"))
+        # Age is measured from the LATEST sample. It used to use the first one,
+        # which silently added SLEEP_SECS plus both collection passes (slow SSH to
+        # the Pi took 11 s per call once) and reported a ~100 s "finality lag"
+        # that was really this script's own delay; the true block lag was ~8 s.
+        h1, _, _ = tip_of(os.path.join(out, f"{n}.json"))
+        h2, _, ts = tip_of(os.path.join(out, f"{n}.tip.json"))
     except Exception as e:
         print(f"  {n}: UNREADABLE ({e}) — cannot vouch for liveness on this node")
         continue
