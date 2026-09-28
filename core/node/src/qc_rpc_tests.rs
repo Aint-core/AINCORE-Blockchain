@@ -2,10 +2,9 @@ use consensus::qc::{
     build_qc, expected_chain_id, validator_set_hash, FinalityVote, QuorumCertificate, ValidatorInfo,
 };
 
-// The includer provides `state` and `chain_id_env`. `cert` signs under
-// `expected_chain_id()` and the RPC verifies under it again, so every test
-// holds `chain_id_env()` for its whole body: a test that sets
-// `AINCORE_CHAIN_ID` in between makes a valid certificate fail.
+// The includer provides `state`. `cert` signs under `expected_chain_id()` and
+// the RPC verifies under it again. Both read `sys:chain_id` as installed at
+// boot, never the env, so no test can change it in between (G3 FX-6).
 
 struct QcDir(std::path::PathBuf);
 impl QcDir {
@@ -96,7 +95,6 @@ async fn call(db: Arc<StateDB>, method: &str, params: serde_json::Value) -> serd
 
 #[actix_web::test]
 async fn rpc_rejects_valid_bls_certificate_outside_epoch_height_range() {
-    let _env = chain_id_env();
     for (height, epoch) in [(20, 1), (21, 0)] {
         let dir = QcDir::new();
         let db = dir.open();
@@ -124,7 +122,6 @@ async fn rpc_rejects_valid_bls_certificate_outside_epoch_height_range() {
 
 #[actix_web::test]
 async fn rpc_external_verifier_rejects_wrong_epoch() {
-    let _env = chain_id_env();
     for (height, epoch) in [(20, 1), (21, 0)] {
         let dir = QcDir::new();
         let db = dir.open();
@@ -144,7 +141,6 @@ async fn rpc_external_verifier_rejects_wrong_epoch() {
 
 #[actix_web::test]
 async fn rpc_rejects_certificate_in_wrong_height_index() {
-    let _env = chain_id_env();
     let dir = QcDir::new();
     let db = dir.open();
     let qc = cert(&db, 1, 21);
@@ -159,7 +155,6 @@ async fn rpc_rejects_certificate_in_wrong_height_index() {
 
 #[actix_web::test]
 async fn rpc_accepts_boundary_and_successor_under_local_committee() {
-    let _env = chain_id_env();
     for (height, epoch) in [(20, 0), (21, 1)] {
         let dir = QcDir::new();
         let db = dir.open();
@@ -196,7 +191,6 @@ async fn rpc_accepts_boundary_and_successor_under_local_committee() {
 
 #[actix_web::test]
 async fn rpc_unknown_history_or_committee_is_unavailable_not_valid() {
-    let _env = chain_id_env();
     for (key, replacement, reason) in [
         (
             "consensus:epoch_start_height:1",
@@ -256,7 +250,6 @@ async fn rpc_unknown_history_or_committee_is_unavailable_not_valid() {
 
 #[actix_web::test]
 async fn rpc_still_rejects_tampered_signature_chain_and_vote() {
-    let _env = chain_id_env();
     for mutation in 0..3 {
         let dir = QcDir::new();
         let db = dir.open();
@@ -290,7 +283,6 @@ async fn rpc_still_rejects_tampered_signature_chain_and_vote() {
 
 #[actix_web::test]
 async fn rpc_preserves_invalid_params_errors_and_rejects_zero_height() {
-    let _env = chain_id_env();
     let dir = QcDir::new();
     let db = dir.open();
     let qc = cert(&db, 0, 0);

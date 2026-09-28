@@ -44,6 +44,46 @@ fn bootnode_host(addr: &str) -> Option<&str> {
     }
 }
 
+/// G3 FX-6: the chain id comes only from `sys:chain_id`, which genesis
+/// writes. The `AINCORE_CHAIN_ID` env may repeat it, for tools that still
+/// read it, but it may not name another chain.
+fn resolve_boot_chain_id(stored: Option<String>, env: Option<String>) -> Result<String, String> {
+    let chain_id = stored
+        .filter(|c| !c.trim().is_empty())
+        .ok_or("sys:chain_id is missing: genesis did not complete")?;
+    if let Some(env) = env.filter(|e| !e.trim().is_empty()) {
+        if env.trim() != chain_id {
+            return Err(format!(
+                "AINCORE_CHAIN_ID={} but this chain is {}; the env is not a source, \
+                 fix or remove it",
+                env, chain_id
+            ));
+        }
+    }
+    Ok(chain_id)
+}
+
+/// G3 FX-6: the epoch interval comes only from the genesis pin
+/// `sys:config:epoch_block_interval`. A database without the pin refuses to
+/// start instead of falling back to the env, and an env that disagrees with
+/// the pin is refused rather than silently ignored.
+fn check_epoch_interval_pinned(stored: Option<String>, env: Option<String>) -> Result<u64, String> {
+    let pinned = stored
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .ok_or("sys:config:epoch_block_interval is missing or invalid: genesis did not pin it")?;
+    if let Some(env) = env.filter(|e| !e.trim().is_empty()) {
+        if env.trim().parse::<u64>().ok() != Some(pinned) {
+            return Err(format!(
+                "AINCORE_EPOCH_BLOCK_INTERVAL={} but the chain pins {}; the env is not a \
+                 source, fix or remove it",
+                env, pinned
+            ));
+        }
+    }
+    Ok(pinned)
+}
+
 /// Automated state-sync bootstrap (public-testnet onboarding).
 ///
 /// A fresh node cannot replay from genesis — the seed prunes old blocks. If the
@@ -541,28 +581,31 @@ async fn main() {
     // BEFORE any vertex is created or verified. Both are identical on every
     // node of this chain (chain_id from config, identity from genesis state).
     {
-        // Same precedence as DagConsensus::resolve_chain_id: persisted
-        // sys:chain_id, then AINCORE_CHAIN_ID, then the genesis file. Never a
-        // silent default: a wrong domain would make every vertex we produce
-        // unverifiable by the whole cluster.
-        let chain_id = storage
-            .get("sys:chain_id")
-            .ok()
-            .flatten()
-            .filter(|c| !c.trim().is_empty())
-            .or_else(|| std::env::var("AINCORE_CHAIN_ID").ok().filter(|c| !c.trim().is_empty()))
-            .or_else(|| {
-                std::env::var("AINCORE_GENESIS_PATH")
-                    .ok()
-                    .and_then(|p| std::fs::read_to_string(p).ok())
-                    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-                    .and_then(|j| j.get("chain_id").and_then(|v| v.as_str()).map(String::from))
-                    .filter(|c| !c.trim().is_empty())
-            })
-            .unwrap_or_else(|| {
-                eprintln!("❌ FATAL: chain_id unresolved (sys:chain_id / AINCORE_CHAIN_ID / genesis); refusing to boot");
+        // G3 FX-6: `sys:chain_id`, written by genesis, is the only source of
+        // the chain id. Every validity rule reads it through
+        // `blockchain::chain_id()`, installed here with the domain. The env
+        // is checked, never used: a node whose env names another chain would
+        // otherwise admit transactions the rest of the cluster refuses.
+        let chain_id = match resolve_boot_chain_id(
+            storage.get("sys:chain_id").ok().flatten(),
+            std::env::var("AINCORE_CHAIN_ID").ok(),
+        ) {
+            Ok(chain_id) => chain_id,
+            Err(e) => {
+                eprintln!("❌ FATAL: {}; refusing to boot", e);
                 std::process::exit(1);
-            });
+            }
+        };
+        if let Err(e) = check_epoch_interval_pinned(
+            storage
+                .get("sys:config:epoch_block_interval")
+                .ok()
+                .flatten(),
+            std::env::var("AINCORE_EPOCH_BLOCK_INTERVAL").ok(),
+        ) {
+            eprintln!("❌ FATAL: {}; refusing to boot", e);
+            std::process::exit(1);
+        }
         let genesis_identity = storage
             .get("genesis_identity")
             .ok()
@@ -1081,5 +1124,50 @@ async fn main() {
         }
 
         thread::sleep(Duration::from_millis(250)); // Poll shutdown ~4x/sec; metrics tick
+    }
+}
+
+#[cfg(test)]
+mod boot_identity_tests {
+    use super::{check_epoch_interval_pinned, resolve_boot_chain_id};
+
+    fn some(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    #[test]
+    fn the_chain_id_comes_from_storage_and_the_env_may_only_repeat_it() {
+        assert_eq!(
+            resolve_boot_chain_id(some("CHAIN-A"), None).unwrap(),
+            "CHAIN-A"
+        );
+        assert_eq!(
+            resolve_boot_chain_id(some("CHAIN-A"), some("CHAIN-A")).unwrap(),
+            "CHAIN-A"
+        );
+        assert_eq!(
+            resolve_boot_chain_id(some("CHAIN-A"), some("")).unwrap(),
+            "CHAIN-A"
+        );
+        let err = resolve_boot_chain_id(some("CHAIN-A"), some("CHAIN-B")).unwrap_err();
+        assert!(err.contains("CHAIN-B") && err.contains("CHAIN-A"), "{err}");
+        // No stored id: the env cannot stand in for it.
+        assert!(resolve_boot_chain_id(None, some("CHAIN-A")).is_err());
+        assert!(resolve_boot_chain_id(some("  "), some("CHAIN-A")).is_err());
+    }
+
+    #[test]
+    fn the_epoch_interval_comes_from_the_genesis_pin_only() {
+        assert_eq!(check_epoch_interval_pinned(some("20"), None).unwrap(), 20);
+        assert_eq!(
+            check_epoch_interval_pinned(some("20"), some("20")).unwrap(),
+            20
+        );
+        assert!(check_epoch_interval_pinned(some("20"), some("7")).is_err());
+        assert!(check_epoch_interval_pinned(some("20"), some("x")).is_err());
+        // No pin: the env cannot stand in for it.
+        assert!(check_epoch_interval_pinned(None, some("20")).is_err());
+        assert!(check_epoch_interval_pinned(some("0"), None).is_err());
+        assert!(check_epoch_interval_pinned(some("abc"), None).is_err());
     }
 }

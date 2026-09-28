@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 network = { path = "../../common/network" }
 executor = { path = "../executor" }
+# G3 FX-6: the one chain-id accessor.
+blockchain = { path = "../../consensus/blockchain" }
 crypto = { path = "../../common/crypto" }
 vm_move = { path = "../vm_move" }
 # Phase 2.1 (H-01): mempool now performs full Dilithium5 verification

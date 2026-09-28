@@ -54,8 +54,7 @@ impl TestDir {
                 "--nocapture",
             ])
             .env("AINCORE_TEST_QC_DB", &self.0)
-            .env("AINCORE_TEST_QC_MODE", mode)
-            .env("AINCORE_CHAIN_ID", "AINCORE-MAINNET-1");
+            .env("AINCORE_TEST_QC_MODE", mode);
         if let Some(boundary) = boundary {
             command.env("AINCORE_TEST_QC_BOUNDARY", boundary.to_string());
         }

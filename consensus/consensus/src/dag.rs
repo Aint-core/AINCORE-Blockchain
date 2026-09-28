@@ -2011,29 +2011,12 @@ impl DagConsensus {
         }
     }
 
+    /// The chain id QC votes are signed under: the same `sys:chain_id` the
+    /// verifiers check (G3 FX-6). It used to prefer storage but fall back to
+    /// the env and then the genesis file, while verification read only the
+    /// env, so the two could disagree.
     fn resolve_chain_id(&self) -> String {
-        if let Ok(Some(chain_id)) = self.storage.get("sys:chain_id") {
-            if !chain_id.trim().is_empty() {
-                return chain_id;
-            }
-        }
-        if let Ok(chain_id) = std::env::var("AINCORE_CHAIN_ID") {
-            if !chain_id.trim().is_empty() {
-                return chain_id;
-            }
-        }
-        if let Ok(path) = std::env::var("AINCORE_GENESIS_PATH") {
-            if let Ok(contents) = std::fs::read_to_string(path) {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
-                    if let Some(chain_id) = json.get("chain_id").and_then(|v| v.as_str()) {
-                        if !chain_id.trim().is_empty() {
-                            return chain_id.to_string();
-                        }
-                    }
-                }
-            }
-        }
-        "AINCORE-MAINNET-1".to_string()
+        crate::qc::expected_chain_id()
     }
 
     fn broadcast_vertex(&self, vertex: &Vertex) {

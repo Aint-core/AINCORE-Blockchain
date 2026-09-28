@@ -15,9 +15,9 @@ use storage::StateDB;
 
 const GENESIS_VERSION: &str = "phase1-bls-stake-v4-execroots";
 /// SEC-#13: storage key holding the canonical, genesis-pinned epoch-block
-/// interval. The executor reads this FIRST (deterministic across all nodes) and
-/// only falls back to the AINCORE_EPOCH_BLOCK_INTERVAL env var when it is absent
-/// (legacy DBs). Folded into the genesis identity hash so it is forge-proof.
+/// interval. It is the only source (G3 FX-6): the node refuses to boot without
+/// it, and the AINCORE_EPOCH_BLOCK_INTERVAL env is never read. Folded into the
+/// genesis identity hash so it is forge-proof.
 const GENESIS_EPOCH_BLOCK_INTERVAL_KEY: &str = "sys:config:epoch_block_interval";
 /// AUDIT-CRITICAL (pre-mainnet B2). ChainSync::require_exec_roots() reads this
 /// to decide whether a synced block MUST commit to non-empty execution roots.

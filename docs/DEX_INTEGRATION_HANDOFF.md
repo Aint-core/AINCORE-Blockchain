@@ -187,27 +187,25 @@ Ada dua jalur, dan salah satunya berbahaya di cluster multi-node.
 
 ### Jalur aman: transaksi biasa lewat konsensus
 
-- **AIN**: transfer dari akun yang didanai genesis (validator genesis punya
-  saldo) memakai `coin::transfer`.
+- **AIN**: transfer memakai `coin::transfer` dari akun yang sudah punya
+  saldo. Genesis tidak memberi saldo yang bisa dibelanjakan ke akun mana pun
+  (CoinStore validator mulai dari 0), jadi saldo pertama berasal dari block
+  reward validator.
 - **wBTC**: `wbtc::mint` ditandatangani **bridge authority**. Setelah genesis
   baru, authority = alamat validator #1 di `genesis.json`, dan bisa dirotasi
   lewat `wbtc::update_authority`.
 
 Keduanya masuk blok, dieksekusi semua validator, aman.
 
-### Jalur berbahaya: RPC faucet (`aincore_faucet`, `aincore_testMintWbtc`)
+### Dihapus: RPC faucet (`aincore_faucet`, `aincore_testMintWbtc`)
 
-Kedua RPC ini **menulis langsung ke RocksDB node yang dihubungi**, di luar
-eksekusi blok. Di cluster 4 validator, akibatnya:
+Kedua RPC ini dulu **menulis langsung ke RocksDB node yang dihubungi**, di luar
+eksekusi blok. Di cluster multi-node, hanya node itu yang tahu saldonya. Begitu
+akun itu bertransaksi, node itu sukses sementara node lain meng-abort, sehingga
+state root berbeda dan terjadi **fork**.
 
-> Hanya node itu yang tahu saldo tersebut. Begitu akun yang didanai mengirim
-> transaksi, node itu mengeksekusi sukses sementara tiga node lain meng-abort
-> karena saldo tidak ada. Write set berbeda -> **state root berbeda -> fork.**
-
-Status saat ini: faucet **mati** (`AINCORE_ENABLE_FAUCET` tidak diset di unit
-systemd), dan permanen ditolak di `AINCORE-MAINNET-1`. Biarkan mati. Kalau
-benar-benar perlu, panggil dengan parameter **identik ke keempat node** sebelum
-akun itu bertransaksi — atau lebih baik, pakai jalur aman di atas.
+Sejak G3 FX-8 keduanya **dihapus**. Memanggilnya mengembalikan error `-32030`
+yang menjelaskan alasannya. Pakai jalur aman di atas.
 
 ---
 
