@@ -14,7 +14,7 @@ static BLOCK_EXECUTION_LOCK: std::sync::LazyLock<Mutex<()>> =
 
 /// The chain id transactions must carry: `sys:chain_id`, installed at boot
 /// (G3 FX-6). The `AINCORE_CHAIN_ID` env is not a source.
-fn get_chain_id() -> String {
+pub fn expected_chain_id() -> String {
     blockchain::chain_id()
 }
 // V3 CONSTANTS
@@ -3082,7 +3082,7 @@ impl Executor {
 
         if let Ok(tx) = serde_json::from_str::<Transaction>(tx_json) {
             // 0. Verify Chain ID
-            let expected_chain = get_chain_id();
+            let expected_chain = expected_chain_id();
             if tx.chain_id != expected_chain {
                 println!(
                     "❌ Invalid Chain ID: Expected {}, Got {}",
@@ -4041,7 +4041,7 @@ mod tests {
     #[test]
     fn the_execution_chain_id_never_comes_from_the_env() {
         std::env::set_var("AINCORE_CHAIN_ID", "AINCORE-SOME-OTHER-CHAIN");
-        let chain_id = get_chain_id();
+        let chain_id = expected_chain_id();
         std::env::remove_var("AINCORE_CHAIN_ID");
         assert_eq!(chain_id, blockchain::chain_id());
         assert_eq!(

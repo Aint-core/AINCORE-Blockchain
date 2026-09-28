@@ -25,7 +25,6 @@ set -euo pipefail
 
 BINARY=""; GENESIS=""; SNAPSHOT_URL=""; SNAPSHOT_FILE=""; SEED=""
 DATADIR="$HOME/.aincore-observer"; PORT=9032; RPC_PORT=8032
-CHAIN_ID="AINCORE-LATEST-FRESH-1"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,7 +36,9 @@ while [[ $# -gt 0 ]]; do
     --datadir)      DATADIR="$2"; shift 2 ;;
     --port)         PORT="$2"; shift 2 ;;
     --rpc-port)     RPC_PORT="$2"; shift 2 ;;
-    --chain-id)     CHAIN_ID="$2"; shift 2 ;;
+    # The node reads its chain id from its database (G3 FX-6); accepted and
+    # ignored so existing invocations keep working.
+    --chain-id)     echo "note: --chain-id is ignored; the chain id comes from the snapshot" >&2; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -88,14 +89,14 @@ mv "$SNAP_DB_DIR" "$DATADIR/validator_${PORT}.db"
 # genesis.json must match the seed's lineage.
 cp "$GENESIS" "$DATADIR/genesis.json"
 
-echo "==> Starting OBSERVER (chain_id=$CHAIN_ID, seed=$SEED)..."
+echo "==> Starting OBSERVER (seed=$SEED; chain id from the snapshot)..."
 echo "    (node.key auto-generates on first boot if absent; this node is an"
 echo "     observer — its address is not in the validator set, so it will not mine.)"
 echo ""
 echo "    Run it (foreground shown; wrap in systemd/tmux for production):"
 echo ""
 cat <<EOF
-  AINCORE_CHAIN_ID=$CHAIN_ID AINCORE_P2P_LISTEN=0 AINCORE_SYNC_INTERVAL_MS=3000 RUST_LOG=info \\
+  AINCORE_P2P_LISTEN=0 AINCORE_SYNC_INTERVAL_MS=3000 RUST_LOG=info \\
     $BINARY --port $PORT --rpc-port $RPC_PORT \\
       --datadir $DATADIR --bootnodes $SEED
 

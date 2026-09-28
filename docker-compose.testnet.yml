@@ -17,7 +17,7 @@ services:
     environment:
       - AINCORE_PORT=9000
       - AINCORE_API_PORT=8000
-      - AINCORE_CHAIN_ID=AINCORE-TESTNET-1
+      # The chain id comes from genesis.json (sys:chain_id), G3 FX-6.
       - RUST_LOG=info
     command: [ "node", "--port", "9000", "--rpc-port", "8000", "--datadir", "/root/.aincore/data", "--enable-mdns" ]
     networks:

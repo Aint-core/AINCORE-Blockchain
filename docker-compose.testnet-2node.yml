@@ -18,7 +18,7 @@ services:
     environment:
       - AINCORE_PORT=9000
       - AINCORE_API_PORT=8000
-      - AINCORE_CHAIN_ID=AINCORE-TESTNET-1
+      # The chain id comes from genesis.json (sys:chain_id), G3 FX-6.
       - RUST_LOG=info
     command:
       - "node"
@@ -53,7 +53,7 @@ services:
     environment:
       - AINCORE_PORT=9001
       - AINCORE_API_PORT=8001
-      - AINCORE_CHAIN_ID=AINCORE-TESTNET-1
+      # The chain id comes from genesis.json (sys:chain_id), G3 FX-6.
       - RUST_LOG=info
     command:
       - "node"

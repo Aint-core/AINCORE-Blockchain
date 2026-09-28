@@ -321,10 +321,12 @@ pub fn encode_bitmap(indices: &[usize], n: usize) -> Vec<u8> {
     bitmap
 }
 
-/// The chain id a verifier should require of any QC it accepts as finality.
-/// Centralized so sync, the RPC handlers, and the bridge all bind QCs to the
-/// same chain (audit M-1). It is `sys:chain_id`, installed once at boot
-/// (G3 FX-6); the `AINCORE_CHAIN_ID` env is not a source.
+/// The chain id this node requires of any QC it accepts as finality, so sync
+/// and the RPC handlers bind QCs to one chain (audit M-1). It is
+/// `sys:chain_id`, installed once at node boot (G3 FX-6); the
+/// `AINCORE_CHAIN_ID` env is not a source. Separate processes that install
+/// nothing (the EVM bridge) pass their configured chain id to `verify_qc`
+/// instead of calling this.
 pub fn expected_chain_id() -> String {
     blockchain::chain_id()
 }

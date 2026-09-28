@@ -111,6 +111,11 @@ export interface TransactionReceipt {
     } | null;
 }
 
+/** Why `requestFaucet` and `requestTestMintWbtc` throw (G3 FX-8). */
+const FAUCET_REMOVED =
+    'aincore_faucet and aincore_testMintWbtc were removed from the node: they wrote ' +
+    'balances outside consensus. Fund the account with a signed transfer from a funded account.';
+
 export class Connection {
     private rpcUrl: string;
     private client: AxiosInstance;
@@ -227,37 +232,21 @@ export class Connection {
     }
 
     /**
-     * Request local/testnet faucet funds. Node must run with AINCORE_ENABLE_FAUCET=1.
+     * @deprecated Removed from the node (G3 FX-8). The faucet wrote balances
+     * straight into one node's database, outside consensus. Fund an account
+     * with a signed transfer from a funded account instead. Kept so callers
+     * fail with the reason rather than a missing method.
      */
-    async requestFaucet(address: string, amount?: string | number, publicKey?: string): Promise<{
-        address: string;
-        amount: string;
-        move_balance: string;
-        balance_source: string;
-    }> {
-        const params: any[] = [address];
-        if (amount !== undefined) params.push(String(amount));
-        if (publicKey !== undefined) {
-            if (amount === undefined) params.push('1000000000000000000');
-            params.push(publicKey);
-        }
-        return await this.request('aincore_faucet', params);
+    async requestFaucet(_address: string, _amount?: string | number, _publicKey?: string): Promise<never> {
+        throw new Error(FAUCET_REMOVED);
     }
 
     /**
-     * Mint synthetic WBTC for local/testnet DEX smoke tests.
-     * This does not represent real BTC backing.
+     * @deprecated Removed from the node (G3 FX-8), like `requestFaucet`. WBTC
+     * is minted by the bridge authority through a signed `wbtc::mint`.
      */
-    async requestTestMintWbtc(address: string, amount: string | number, publicKey?: string): Promise<{
-        address: string;
-        amount: string;
-        wbtc_balance: string;
-        balance_source: string;
-        faucet_mode: string;
-    }> {
-        const params: any[] = [address, String(amount)];
-        if (publicKey !== undefined) params.push(publicKey);
-        return await this.request('aincore_testMintWbtc', params);
+    async requestTestMintWbtc(_address: string, _amount: string | number, _publicKey?: string): Promise<never> {
+        throw new Error(FAUCET_REMOVED);
     }
 
     /**

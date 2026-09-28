@@ -30,7 +30,6 @@ services:
     environment:
       - AINCORE_PORT=9002
       - AINCORE_API_PORT=8002
-      - AINCORE_ENABLE_FAUCET=1
       - AINCORE_PERMISSIVE_CORS=1
       - AINCORE_GENESIS_PATH=/root/.aincore/genesis.json
       - AINCORE_PEERS=
