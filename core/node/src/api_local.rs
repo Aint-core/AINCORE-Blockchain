@@ -2580,10 +2580,20 @@ pub async fn start_api_server(
 }
 
 #[cfg(test)]
+// Holding the chain-id lock across `.await` is safe: each `actix_web::test`
+// runs its own single-threaded runtime, so only other test threads contend.
+#[allow(clippy::await_holding_lock)]
 mod qc_rpc_tests {
     use super::*;
     fn state(db: Arc<StateDB>) -> AppState {
         super::tests::test_state(db)
+    }
+    /// The faucet tests set `AINCORE_CHAIN_ID` process-wide; wait them out.
+    /// A poisoned lock only means some other test already failed.
+    fn chain_id_env() -> std::sync::MutexGuard<'static, ()> {
+        super::tests::faucet_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     include!("qc_rpc_tests.rs");
 }
@@ -2594,7 +2604,10 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use std::sync::{Mutex, OnceLock};
 
-    fn faucet_env_lock() -> &'static Mutex<()> {
+    /// Serializes every test that reads or writes `AINCORE_CHAIN_ID`: the
+    /// faucet tests set it process-wide, and the QC RPC tests sign and verify
+    /// under it. Goes away with FX-6 (chain id from `sys:chain_id` only).
+    pub(super) fn faucet_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }

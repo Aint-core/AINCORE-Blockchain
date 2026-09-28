@@ -41,6 +41,12 @@ mod qc_rpc_tests {
             storage: db,
         }
     }
+    /// Nothing in this test binary sets `AINCORE_CHAIN_ID`, so there is no
+    /// writer to wait for.
+    struct NoChainIdWriter;
+    fn chain_id_env() -> NoChainIdWriter {
+        NoChainIdWriter
+    }
     include!("qc_rpc_tests.rs");
 }
 
