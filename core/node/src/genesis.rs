@@ -12,6 +12,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc; // Force rebuild
 use storage::class::{classify, KeyClass};
+use storage::rocksdb::IteratorMode;
 use storage::StateDB;
 
 /// v5 (G3 S3): genesis is built in memory from genesis.json alone, committed
@@ -742,43 +743,50 @@ pub fn stdlib_hash_of(stdlib_path: &str) -> Result<String, GenesisError> {
     Ok(stdlib_state_hash(&load_stdlib_modules(stdlib_path)?))
 }
 
-/// Initialize (or reopen) genesis from the genesis.json `genesis_file_path`
-/// finds.
+/// Initialize genesis from the genesis.json `genesis_file_path` finds, or
+/// reopen a database that already holds one (which needs no genesis.json).
 pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str) -> Result<(), GenesisError> {
+    if storage.get("genesis_initialized")?.is_some() {
+        return reopen_genesis(storage);
+    }
     initialize_genesis_from(storage, stdlib_path, &genesis_file_path()?)
 }
 
-/// Initialize (or reopen) genesis from `genesis_path`.
+/// Initialize genesis from `genesis_path`, or reopen a database that already
+/// holds one.
 ///
-/// The genesis is always built in memory first (TA-1). A fresh database gets
-/// it in one block transaction as state-tree version 0. A database that
-/// already has one must hold exactly this genesis, by identity, or the node
-/// refuses to start. Its identity is never recomputed from the database,
-/// which may be pruned or restored.
+/// A fresh database gets the in-memory genesis (TA-1) in one block
+/// transaction, as state-tree version 0.
+///
+/// A reopen reads neither genesis.json nor the stdlib and runs no genesis
+/// code. The identity was computed once, at genesis; recomputing it on every
+/// boot would make every later stdlib or genesis-code change refuse existing
+/// nodes. The operator's `AINCORE_EXPECTED_GENESIS_HASH` pin, checked against
+/// the stored identity, is what refuses a wrong datadir.
 pub fn initialize_genesis_from(
     storage: &Arc<StateDB>,
     stdlib_path: &str,
     genesis_path: &std::path::Path,
 ) -> Result<(), GenesisError> {
+    if storage.get("genesis_initialized")?.is_some() {
+        return reopen_genesis(storage);
+    }
     let file = load_genesis_file(genesis_path)?;
     let genesis = build_genesis(&file, &load_stdlib_modules(stdlib_path)?)?;
     check_genesis_pin(&genesis.identity)?;
-    if storage.get("genesis_initialized")?.is_some() {
-        match storage.get("genesis_identity")? {
-            Some(stored) if stored == genesis.identity => {}
-            stored => {
-                return Err(GenesisError::InvalidData(format!(
-                    "🚨 [SECURITY] this database holds genesis {}, but {} builds genesis {}; \
-                     refusing to boot (wrong genesis.json, stdlib or datadir)",
-                    stored.as_deref().unwrap_or("<none>"),
-                    genesis_path.display(),
-                    genesis.identity
-                )));
-            }
-        }
-        verify_genesis_integrity(storage)?;
-        println!("✨ Genesis already initialized: {}", genesis.identity);
-        return Ok(());
+    // Genesis state must be exactly the genesis writes. A state key already
+    // on disk would sit in the flat store but not in tree version 0.
+    if let Some(key) = storage
+        .db
+        .iterator(IteratorMode::Start)
+        .map_while(Result::ok)
+        .map(|(key, _)| key)
+        .find(|key| classify(key) == Some(KeyClass::State))
+    {
+        return Err(GenesisError::InvalidData(format!(
+            "genesis needs a clean database, but it already holds state key {}",
+            String::from_utf8_lossy(&key)
+        )));
     }
     println!("🌋 Initializing genesis from {}", genesis_path.display());
     commit_genesis(storage, &genesis)?;
@@ -789,6 +797,18 @@ pub fn initialize_genesis_from(
         hex::encode(genesis.state_root),
         genesis.identity
     );
+    Ok(())
+}
+
+/// Reopen: the stored identity, checked against the operator pin, plus the
+/// structural checks.
+fn reopen_genesis(storage: &Arc<StateDB>) -> Result<(), GenesisError> {
+    let identity = storage.get("genesis_identity")?.ok_or_else(|| {
+        GenesisError::InvalidData("genesis is initialized but genesis_identity is missing".into())
+    })?;
+    check_genesis_pin(&identity)?;
+    verify_genesis_integrity(storage)?;
+    println!("✨ Genesis already initialized: {}", identity);
     Ok(())
 }
 
@@ -840,7 +860,14 @@ fn commit_genesis(storage: &Arc<StateDB>, genesis: &GenesisState) -> Result<(), 
             view.put("genesis_initialized", "true")?;
             Ok(())
         })
-        .map_err(|e| GenesisError::StorageError(e.to_string()))
+        .map_err(|e| GenesisError::StorageError(e.to_string()))?;
+    // Crash witness: nothing genesis writes may come after its one
+    // transaction, so a crash here must leave a complete genesis.
+    #[cfg(test)]
+    if std::env::var_os("AINCORE_TEST_GENESIS_CRASH_AFTER_COMMIT").is_some() {
+        std::process::exit(77);
+    }
+    Ok(())
 }
 
 /// G3 FX-7 / TA-1: the genesis state, computed in memory from `genesis.json`
@@ -1085,10 +1112,15 @@ pub fn build_genesis(
     // mints by exactly the treasury reserve over the chain's lifetime (a silent
     // ~50k AIN breach of the 150M cap). Seed it with bootstrap stake + treasury
     // so it agrees with sys:total_supply (set below) and the cap actually holds.
+    let initial_total_supply = total_bootstrap_stake
+        .checked_add(treasury_reserve_amount)
+        .ok_or_else(|| {
+            GenesisError::InvalidData("genesis stake plus treasury overflows u128".to_string())
+        })?;
     let validator_set = ValidatorSet {
         validators: validator_configs,
         unbonding_queue: vec![],
-        total_supply: total_bootstrap_stake + treasury_reserve_amount,
+        total_supply: initial_total_supply,
         current_epoch: 0,
     };
 
@@ -1318,7 +1350,7 @@ pub fn build_genesis(
 
     // === FINAL CHECK: SET TOTAL SUPPLY ===
     // Validators (1M) + Treasury (50k)
-    let initial_total_supply = total_bootstrap_stake + treasury.reserve.value;
+
     storage.put("sys:total_supply", &initial_total_supply.to_string())?;
     storage.put("genesis_stdlib_hash", &stdlib_hash)?;
     storage.put(
@@ -1806,67 +1838,6 @@ mod tests {
                 .contains("must supply both bls_public_key and bls_pop"),
             "{err}"
         );
-    }
-
-    /// G3 DT-3 / FX-7 (found by the S2 adversarial review): a node that is
-    /// not a genesis validator must build the same genesis state as a
-    /// validator. Genesis used to write an account for the booting node's own
-    /// key; on a follower that was an extra leaf in version 0 of the state
-    /// tree, so its block-1 root differed and sync refused block 1 forever.
-    #[test]
-    fn a_follower_and_a_validator_agree_on_the_block_one_root() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
-        let validator_key = SigningKey::from_bytes(&[41u8; 32]);
-        let vaddr = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
-        let vpub = hex::encode(validator_key.verifying_key().as_bytes());
-        let bls = crypto::bls::BLSEngine::consensus();
-        let bls_seed = [42u8; 32];
-        let path = write_genesis_json(
-            "dt3_follower",
-            &vaddr,
-            &vpub,
-            Some(&hex::encode(bls.pubkey_raw(&bls_seed))),
-            Some(&hex::encode(bls.prove_possession_raw(&bls_seed))),
-        );
-        let vdb = temp_db("dt3_validator");
-        let validator = initialize_genesis_from(&vdb, &stdlib_path(), &path);
-        let follower_key = SigningKey::from_bytes(&[43u8; 32]);
-        let faddr = crypto::derive_address(follower_key.verifying_key().as_bytes()).unwrap();
-        let fdb = temp_db("dt3_follower");
-        let follower = initialize_genesis_from(&fdb, &stdlib_path(), &path);
-        validator.unwrap();
-        follower.unwrap();
-
-        let state_keys = |db: &StateDB| -> std::collections::BTreeMap<String, Vec<u8>> {
-            db.db
-                .iterator(storage::rocksdb::IteratorMode::Start)
-                .map(|r| r.unwrap())
-                .filter(|(k, _)| {
-                    storage::class::classify(k) == Some(storage::class::KeyClass::State)
-                })
-                .map(|(k, v)| (String::from_utf8(k.to_vec()).unwrap(), v.to_vec()))
-                .collect()
-        };
-        let (vs, fs) = (state_keys(&vdb), state_keys(&fdb));
-        let differing: Vec<_> = vs
-            .keys()
-            .chain(fs.keys())
-            .filter(|k| vs.get(*k) != fs.get(*k))
-            .collect();
-        assert!(differing.is_empty(), "genesis state differs: {differing:?}");
-        assert!(
-            fdb.get_object(&faddr).is_none(),
-            "no account for the node's own key"
-        );
-
-        let block_one_root = |db: &Arc<StateDB>| match Executor::new(Arc::clone(db))
-            .execute_block_checked_at(vec![], &vaddr, 1, &[], |_, _| Ok(()))
-            .unwrap()
-        {
-            executor::BlockExecOutcome::Executed(summary) => summary.state_root,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(block_one_root(&vdb), block_one_root(&fdb));
     }
 
     #[test]
@@ -2777,12 +2748,14 @@ mod tests {
         );
     }
 
-    /// A datadir whose stored identity does not match the computed one is a
-    /// different chain (or tampered): boot must refuse rather than silently
-    /// install a domain that makes this node's vertices unverifiable.
+    /// A reopened datadir is checked against the operator pin by its stored
+    /// identity (TA-1: computed once, at genesis). A datadir whose stored
+    /// identity differs from the pin is a different chain, or tampered: boot
+    /// must refuse rather than install a domain that makes this node's
+    /// vertices unverifiable.
     #[test]
     fn test_genesis_identity_mismatch_refuses_boot() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let key = SigningKey::from_bytes(&[78u8; 32]);
         let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
@@ -2790,11 +2763,14 @@ mod tests {
 
         let db = temp_db("identity_mismatch");
         init_genesis(&db, &addr, &pubkey).unwrap();
+        let identity = stored_identity(&db);
         db.put("genesis_identity", &"00".repeat(32)).unwrap();
-        let err = init_genesis(&db, &addr, &pubkey)
-            .expect_err("a changed genesis identity must refuse to boot");
+        std::env::set_var("AINCORE_EXPECTED_GENESIS_HASH", &identity);
+        let err = init_genesis(&db, &addr, &pubkey);
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+        let err = err.expect_err("a stored identity that is not the pinned one must refuse");
         assert!(
-            format!("{}", err).contains("this database holds genesis"),
+            format!("{}", err).contains("genesis hash pin mismatch"),
             "unexpected error: {}",
             err
         );
@@ -2936,6 +2912,8 @@ mod tests {
     /// block transaction.
     #[test]
     fn genesis_is_committed_as_state_tree_version_zero() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let file = s3_genesis_file();
         let path = write_file("v0", &file);
         let db = temp_db("s3_v0");
@@ -2950,13 +2928,17 @@ mod tests {
             outside_before,
             "genesis wrote state only inside its block transaction"
         );
-        // A from-scratch root over the flat state keys is the same root.
-        let fresh = temp_db("s3_v0_scratch");
-        for (key, value) in &built.writes {
-            fresh.put(key, value).unwrap();
-        }
+        // The root over this database's flat state keys is the same root:
+        // nothing on disk is outside the tree.
+        let flat: BTreeMap<String, Vec<u8>> = db
+            .db
+            .iterator(IteratorMode::Start)
+            .map(Result::unwrap)
+            .filter(|(k, _)| classify(k) == Some(KeyClass::State))
+            .map(|(k, v)| (String::from_utf8(k.to_vec()).unwrap(), v.to_vec()))
+            .collect();
         assert_eq!(
-            state_commit::seed_genesis(&fresh).unwrap().root.0,
+            state_commit::genesis_root(&flat).unwrap().0,
             built.state_root
         );
         state_commit::boot_check(&db).expect("a fresh genesis passes RC-1");
@@ -3019,22 +3001,150 @@ mod tests {
         }
     }
 
-    /// TA-1: a database initialized from one genesis.json refuses to reopen
-    /// under another, even one that differs only in genesis state.
+    /// Review finding (S3a): a reopen must not depend on genesis.json, the
+    /// stdlib on disk or today's genesis code. Otherwise every later stdlib
+    /// update, genesis-code change or restart without AINCORE_GENESIS_PATH
+    /// would refuse existing nodes.
     #[test]
-    fn reopening_under_another_genesis_is_refused() {
+    fn a_reopen_needs_neither_genesis_json_nor_the_stdlib() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let file = s3_genesis_file();
-        let db = temp_db("s3_reopen_other");
-        initialize_genesis_from(&db, &stdlib_path(), &write_file("reopen_a", &file)).unwrap();
-        let mut other = file.clone();
-        other.treasury_reserve = "1".to_string();
-        let err = initialize_genesis_from(&db, &stdlib_path(), &write_file("reopen_b", &other))
-            .expect_err("another genesis");
-        assert!(
-            err.to_string().contains("this database holds genesis"),
-            "{err}"
+        let db = temp_db("s3_reopen_bare");
+        initialize_genesis_from(&db, &stdlib_path(), &write_file("reopen_bare", &file)).unwrap();
+        let missing = temp_dir("s3_reopen_missing");
+        initialize_genesis_from(&db, missing.to_str().unwrap(), &missing.join("absent.json"))
+            .expect("reopen without genesis.json or stdlib");
+        initialize_genesis(&db, missing.to_str().unwrap()).expect("reopen by default path");
+        // The pin is still checked, against the stored identity.
+        std::env::set_var("AINCORE_EXPECTED_GENESIS_HASH", "ab".repeat(32));
+        let pinned = initialize_genesis(&db, missing.to_str().unwrap());
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+        assert!(pinned.is_err(), "a wrong pin refuses a reopen");
+    }
+
+    /// Review finding (S3a): genesis on a database that already holds state
+    /// is refused. That state would sit in the flat store but not in tree
+    /// version 0.
+    #[test]
+    fn genesis_on_a_database_that_holds_state_is_refused() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+        let db = temp_db("s3_dirty");
+        db.put("sys:config:base_reward", "999").unwrap();
+        let err = initialize_genesis_from(
+            &db,
+            &stdlib_path(),
+            &write_file("dirty", &s3_genesis_file()),
+        )
+        .expect_err("a database that holds state");
+        assert!(err.to_string().contains("clean database"), "{err}");
+        assert!(db.get("genesis_initialized").unwrap().is_none());
+    }
+
+    /// DT-3: genesis built in another process, from another working
+    /// directory and with another environment, is byte-identical.
+    #[test]
+    fn genesis_is_identical_across_processes_cwds_and_environments() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+        let path = write_file("dt3", &s3_genesis_file());
+        let db = temp_db("s3_dt3_here");
+        initialize_genesis_from(&db, &stdlib_path(), &path).unwrap();
+        let here = dt3_fingerprint(&db);
+        for (n, env) in [("a", "AINCORE-OTHER-CHAIN"), ("b", "")] {
+            let dir = temp_dir(&format!("s3_dt3_cwd_{n}"));
+            let out = dir.join("fingerprint");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "genesis::tests::dt3_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .current_dir(&dir)
+                .env("AINCORE_TEST_DT3_GENESIS", &path)
+                .env("AINCORE_TEST_DT3_DB", dir.join("db"))
+                .env("AINCORE_TEST_DT3_OUT", &out)
+                .env("AINCORE_CHAIN_ID", env)
+                .env("AINCORE_EPOCH_BLOCK_INTERVAL", "7")
+                .env_remove("AINCORE_GENESIS_PATH")
+                .status()
+                .unwrap();
+            assert!(status.success(), "child {n}");
+            assert_eq!(fs::read_to_string(&out).unwrap(), here, "child {n}");
+        }
+    }
+
+    /// Identity, root of version 0, and a digest of every stored state key.
+    fn dt3_fingerprint(db: &Arc<StateDB>) -> String {
+        use sha2::Digest;
+        let mut hasher = Sha256::new();
+        for row in db.db.iterator(IteratorMode::Start) {
+            let (key, value) = row.unwrap();
+            if classify(&key) == Some(KeyClass::State) {
+                hasher.update((key.len() as u64).to_le_bytes());
+                hasher.update(&key);
+                hasher.update((value.len() as u64).to_le_bytes());
+                hasher.update(&value);
+            }
+        }
+        format!(
+            "{} {} {}",
+            stored_identity(db),
+            hex::encode(state_commit::root(db, 0).unwrap().0),
+            hex::encode(hasher.finalize())
+        )
+    }
+
+    #[test]
+    fn dt3_child() {
+        let Some(path) = std::env::var_os("AINCORE_TEST_DT3_GENESIS") else {
+            return;
+        };
+        let db = Arc::new(
+            StateDB::open(std::env::var("AINCORE_TEST_DT3_DB").unwrap().as_str()).unwrap(),
         );
-        initialize_genesis_from(&db, &stdlib_path(), &write_file("reopen_c", &file))
-            .expect("positive control: the same genesis reopens");
+        initialize_genesis_from(&db, &stdlib_path(), std::path::Path::new(&path)).unwrap();
+        fs::write(
+            std::env::var("AINCORE_TEST_DT3_OUT").unwrap(),
+            dt3_fingerprint(&db),
+        )
+        .unwrap();
+    }
+
+    /// WG-2 atomicity: a crash right after genesis's one transaction leaves a
+    /// complete genesis that reopens. Writing any genesis marker after that
+    /// transaction would leave tree version 0 without `genesis_initialized`,
+    /// and every later boot would fail.
+    #[test]
+    fn a_crash_after_the_genesis_transaction_leaves_a_complete_genesis() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+        let path = write_file("crash", &s3_genesis_file());
+        let dir = temp_dir("s3_crash_db");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "genesis::tests::dt3_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("AINCORE_TEST_DT3_GENESIS", &path)
+            .env("AINCORE_TEST_DT3_DB", dir.join("db"))
+            .env("AINCORE_TEST_DT3_OUT", dir.join("unused"))
+            .env("AINCORE_TEST_GENESIS_CRASH_AFTER_COMMIT", "1")
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(77),
+            "the child crashed after the commit"
+        );
+        let db = Arc::new(StateDB::open(dir.join("db").to_str().unwrap()).unwrap());
+        assert!(db.get("genesis_initialized").unwrap().is_some());
+        assert_eq!(state_commit::latest_version(&db).unwrap(), Some(0));
+        initialize_genesis_from(&db, &stdlib_path(), &path).expect("the crashed genesis reopens");
+        state_commit::boot_check(&db).unwrap();
     }
 }

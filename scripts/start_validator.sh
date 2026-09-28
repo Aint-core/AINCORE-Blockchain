@@ -7,7 +7,9 @@ set -e
 # CONFIGURATION
 DATA_DIR="./data"
 DB_PATH="$DATA_DIR/validator.db"
-GENESIS_ADDR="00000000000000000000000000000001"
+# The genesis.json to initialize from (G3 FX-7: genesis depends on it and the
+# stdlib only; `genesis-tool gen-multi` writes it).
+GENESIS_PATH="${GENESIS_PATH:-genesis.json}"
 KEYSTORE_DIR="./secrets"
 
 echo "🚀 AINCORE Validator Launcher"
@@ -39,7 +41,7 @@ mkdir -p "$KEYSTORE_DIR"
 # 3. Check Genesis
 if [ ! -d "$DB_PATH" ]; then
     echo "⚡ Initializing Genesis..."
-    ./target/release/genesis-tool --db-path "$DB_PATH" --genesis-addr "$GENESIS_ADDR"
+    ./target/release/genesis-tool --db-path "$DB_PATH" --genesis "$GENESIS_PATH"
 else
     echo "✅ Genesis DB found."
 fi

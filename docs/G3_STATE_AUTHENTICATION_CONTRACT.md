@@ -588,9 +588,14 @@ counters, never values.
     takes nothing from the booting node: not its key, CWD or env.
   - `commit_genesis` writes it in one block transaction as state-tree version 0, and
     checks that the tree root equals the in-memory root. Then it seals.
-  - The identity (`AINCORE_GENESIS_ID_V2`) binds `state_root(0)`. It is recomputed in
-    memory from genesis.json on every boot, and a database holding another genesis is
-    refused. It is never recomputed from the tree.
+  - The identity (`AINCORE_GENESIS_ID_V2`) binds `state_root(0)`. It is computed once, in
+    memory, at genesis, and never recomputed: not from the tree, and not from genesis.json
+    on a reopen.
+  - A reopen reads neither genesis.json nor the stdlib. A rebuild on every boot would make
+    each later stdlib update or genesis-code change refuse existing nodes (S3a review,
+    MEDIUM). The operator's `AINCORE_EXPECTED_GENESIS_HASH`, checked against the stored
+    identity, refuses a wrong datadir.
+  - Genesis refuses a database that already holds any state key (S3a review, LOW).
   - FX-7:
     - no self-account;
     - explicit BLS keys for every validator;
