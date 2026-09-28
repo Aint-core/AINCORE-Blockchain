@@ -106,25 +106,19 @@ async function testMoveBalanceIsSourceOfTruth() {
         throw new Error('getBalance did not use Move CoinStore balance');
     }
 
-    let faucetParams: any[] | undefined;
-    (connection as any).request = async (method: string, params: any[]) => {
-        if (method !== 'aincore_faucet') {
-            throw new Error(`unexpected RPC method: ${method}`);
-        }
-        faucetParams = params;
-        return {
-            address: params[0],
-            amount: params[1],
-            move_balance: params[1],
-            balance_source: 'move_coin_store',
-        };
+    // G3 FX-8: the faucet is gone from the node; the SDK method must say so
+    // without sending anything.
+    (connection as any).request = async (method: string) => {
+        throw new Error(`unexpected RPC call: ${method}`);
     };
-    const faucet = await connection.requestFaucet(sender.address, '5000', sender.publicKey);
-    if (!faucetParams || faucetParams[0] !== sender.address || faucetParams[1] !== '5000' || faucetParams[2] !== sender.publicKey) {
-        throw new Error('requestFaucet did not build expected RPC params');
+    let faucetError = '';
+    try {
+        await connection.requestFaucet(sender.address, '5000', sender.publicKey);
+    } catch (e: any) {
+        faucetError = String(e?.message ?? e);
     }
-    if (faucet.move_balance !== '5000') {
-        throw new Error(`requestFaucet returned unexpected balance: ${faucet.move_balance}`);
+    if (!faucetError.includes('were removed')) {
+        throw new Error(`requestFaucet must fail with the removal reason, got: ${faucetError}`);
     }
 }
 

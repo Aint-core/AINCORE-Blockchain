@@ -18,6 +18,22 @@ pub struct AincoreClient {
     // CLIENT-SIDE so the bridge never trusts the RPC node's `verified` flag.
     // `None` => no trusted set configured => fail-closed (refuse every block).
     trusted_validators: Option<TrustedValidatorSet>,
+    // The chain whose QCs this bridge accepts. Operator config, like the
+    // trusted set, never taken from the RPC: a hostile RPC could otherwise
+    // name another chain the same validators sign for.
+    chain_id: String,
+}
+
+/// The chain the bridge follows: `AINCORE_CHAIN_ID`, else the mainnet id.
+/// The node itself no longer reads this env (G3 FX-6: it installs the id from
+/// `sys:chain_id`), but the bridge is a separate process and a client, so the
+/// env is its configuration.
+fn configured_chain_id() -> String {
+    std::env::var("AINCORE_CHAIN_ID")
+        .ok()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| blockchain::DEFAULT_CHAIN_ID.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,11 +83,12 @@ fn block_hash_binds_transactions(block: &Block) -> bool {
 /// and merely log when the two disagree. Any parse/verify failure, or a missing
 /// trusted set, yields `false` (fail-closed). Extracted so the gate logic is
 /// unit-testable without a live RPC.
-fn qc_response_confirms(
+fn qc_response_confirms_for(
     result: &serde_json::Value,
     height: u64,
     expected_hash: &str,
     trusted: Option<&TrustedValidatorSet>,
+    chain_id: &str,
 ) -> bool {
     if expected_hash.is_empty() {
         return false;
@@ -136,7 +153,7 @@ fn qc_response_confirms(
         return false;
     };
 
-    match qc::verify_qc(&qc, set, &qc::expected_chain_id()) {
+    match qc::verify_qc(&qc, set, chain_id) {
         Ok(()) => {
             if !server_verified {
                 warn!(
@@ -192,11 +209,14 @@ impl AincoreClient {
                 None
             }
         };
+        let chain_id = configured_chain_id();
+        info!("🔗 bridge follows chain {} (AINCORE_CHAIN_ID)", chain_id);
         Self {
             rpc_url,
             client: Client::new(),
             last_processed_height: 0,
             trusted_validators,
+            chain_id,
         }
     }
 
@@ -209,6 +229,7 @@ impl AincoreClient {
             client: Client::new(),
             last_processed_height: 0,
             trusted_validators: Some(trusted),
+            chain_id: configured_chain_id(),
         }
     }
 
@@ -353,11 +374,12 @@ impl AincoreClient {
             }
         };
         match rpc_resp.result {
-            Some(result) => qc_response_confirms(
+            Some(result) => qc_response_confirms_for(
                 &result,
                 height,
                 expected_hash,
                 self.trusted_validators.as_ref(),
+                &self.chain_id,
             ),
             None => false,
         }
@@ -484,7 +506,7 @@ impl AincoreClient {
 
 #[cfg(test)]
 mod qc_gate_tests {
-    use super::qc_response_confirms;
+    use super::qc_response_confirms_for;
     use crate::validator_set::TrustedValidatorSet;
     use consensus::qc::{build_qc, validator_set_hash, FinalityVote, ValidatorInfo};
     use crypto::bls::BLSEngine;
@@ -516,9 +538,25 @@ mod qc_gate_tests {
         (infos, sks)
     }
 
-    fn vote_for(height: u64, hash: &str, set_hash: &str) -> FinalityVote {
+    /// The bridge's check with the mainnet id, as configured by default.
+    fn qc_response_confirms(
+        result: &serde_json::Value,
+        height: u64,
+        expected_hash: &str,
+        trusted: Option<&TrustedValidatorSet>,
+    ) -> bool {
+        qc_response_confirms_for(
+            result,
+            height,
+            expected_hash,
+            trusted,
+            blockchain::DEFAULT_CHAIN_ID,
+        )
+    }
+
+    fn vote_on(chain_id: &str, height: u64, hash: &str, set_hash: &str) -> FinalityVote {
         FinalityVote {
-            chain_id: "AINCORE-MAINNET-1".into(),
+            chain_id: chain_id.into(),
             epoch: 0,
             finalized_round: height,
             anchor_round: height,
@@ -540,9 +578,19 @@ mod qc_gate_tests {
         validators: &[ValidatorInfo],
         sks: &[[u8; 32]],
     ) -> serde_json::Value {
+        signed_qc_json_on("AINCORE-MAINNET-1", height, hash, validators, sks)
+    }
+
+    fn signed_qc_json_on(
+        chain_id: &str,
+        height: u64,
+        hash: &str,
+        validators: &[ValidatorInfo],
+        sks: &[[u8; 32]],
+    ) -> serde_json::Value {
         let bls = BLSEngine::consensus();
         let set_hash = validator_set_hash(validators);
-        let vote = vote_for(height, hash, &set_hash);
+        let vote = vote_on(chain_id, height, hash, &set_hash);
 
         // canonical order = address-sorted. Our addresses sort by seed, and we
         // build specs in seed order, so indices line up; but be robust: sort.
@@ -573,6 +621,32 @@ mod qc_gate_tests {
     }
 
     // ---- tests ----
+
+    /// G3 FX-6 review: the bridge follows the chain its operator configured.
+    /// A QC for that chain is accepted; the same validators' QC for another
+    /// chain is refused.
+    #[test]
+    fn the_bridge_accepts_qcs_only_for_its_configured_chain() {
+        let h = 42u64;
+        let hash = "ab".repeat(32);
+        let (validators, sks) = make_validators(&[(1, 40), (2, 30), (3, 20)]);
+        let local = "AINCORE-LOCALTEST-4V-HEAD";
+        let trusted = single_set(validators.clone());
+        let on_local = signed_qc_json_on(local, h, &hash, &validators, &sks);
+        let on_mainnet = signed_qc_json(h, &hash, &validators, &sks);
+        let confirms = |qc: &serde_json::Value, chain: &str| {
+            qc_response_confirms_for(
+                &rpc_response(true, true, qc.clone()),
+                h,
+                &hash,
+                Some(&trusted),
+                chain,
+            )
+        };
+        assert!(confirms(&on_local, local), "its own chain");
+        assert!(!confirms(&on_mainnet, local), "another chain's QC");
+        assert!(!confirms(&on_local, blockchain::DEFAULT_CHAIN_ID));
+    }
 
     // SEC-#18 Tier-B: a QC that VERIFIES against the trusted set is accepted.
     #[test]

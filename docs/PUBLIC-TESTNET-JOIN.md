@@ -29,6 +29,10 @@ There are two supported paths:
 | Observer ports (default) | P2P `9032`, RPC `8032` |
 | Bootstrap | state snapshot + delta sync (the seed prunes old blocks, so a height‑0 node cannot replay from genesis) |
 
+The node reads its chain id from its own database (`sys:chain_id`, written by genesis
+and carried by the snapshot). You do not need `AINCORE_CHAIN_ID`. If you set it, it must
+name the same chain, or the node refuses to start.
+
 ### Package contents + checksums
 
 ```
@@ -222,7 +226,6 @@ Wants=network-online.target
 
 [Service]
 User=$USER
-Environment=AINCORE_CHAIN_ID=AINCORE-LATEST-FRESH-1
 Environment=AINCORE_P2P_LISTEN=0
 Environment=AINCORE_SYNC_INTERVAL_MS=3000
 Environment=RUST_LOG=info
@@ -244,7 +247,7 @@ Use this for a quick test, or on macOS if you do not want to create a LaunchAgen
 yet. Keep this terminal open:
 
 ```bash
-AINCORE_CHAIN_ID=AINCORE-LATEST-FRESH-1 AINCORE_P2P_LISTEN=0 AINCORE_SYNC_INTERVAL_MS=3000 RUST_LOG=info \
+AINCORE_P2P_LISTEN=0 AINCORE_SYNC_INTERVAL_MS=3000 RUST_LOG=info \
   ./node --port 9032 --rpc-port 8032 \
     --datadir "$HOME/.aincore-observer" \
     --bootnodes /ip4/100.111.32.83/tcp/9022
@@ -339,7 +342,7 @@ Revoke access anytime: delete the key or remove the node in the Tailscale admin.
   (https‑only; the node extracts + self‑sanitises before opening the DB, then
   no‑ops once a DB exists):
   ```bash
-  AINCORE_CHAIN_ID=AINCORE-LATEST-FRESH-1 AINCORE_P2P_LISTEN=0 \
+  AINCORE_P2P_LISTEN=0 \
   AINCORE_BOOTSTRAP_SNAPSHOT=https://github.com/Aint-core/AINCORE-Blockchain/releases/download/testnet-join-v1/aincore-testnet-snapshot.tar.gz \
     ./node --port 9032 --rpc-port 8032 --datadir ~/.aincore-observer \
            --bootnodes /ip4/100.111.32.83/tcp/9022
