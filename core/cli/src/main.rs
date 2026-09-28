@@ -1,13 +1,19 @@
-fn parse_move_address(hex_str: &str) -> Option<move_core_types::account_address::AccountAddress> {
-    let hex_str = hex_str.trim_start_matches("0x");
-    let mut bytes = [0u8; 32];
-    if hex_str.len() != 64 {
-        return None;
-    }
-    match hex::decode_to_slice(hex_str, &mut bytes) {
-        Ok(_) => Some(move_core_types::account_address::AccountAddress::new(bytes)),
-        Err(_) => None,
-    }
+/// Accepts `A1n…` (checksum enforced), 64-hex or `0x` + 64-hex.
+fn parse_move_address(input: &str) -> Option<move_core_types::account_address::AccountAddress> {
+    crypto::parse_address(input)
+        .ok()
+        .map(move_core_types::account_address::AccountAddress::new)
+}
+
+/// Like `parse_move_address`, but says why an address was refused (a typo in
+/// an `A1n` address fails its checksum instead of paying a stranger).
+fn require_address_hex(input: &str) -> anyhow::Result<String> {
+    crypto::canonical_address_hex(input)
+        .map_err(|e| anyhow::anyhow!("invalid address {:?}: {}", input.trim(), e))
+}
+
+fn a1n(hex_address: &str) -> String {
+    crypto::hex_to_a1n(hex_address).unwrap_or_else(|_| hex_address.to_string())
 }
 
 fn derive_validator_bls_identity(wallet: &Wallet) -> (Vec<u8>, Vec<u8>) {
@@ -130,7 +136,8 @@ fn main() -> anyhow::Result<()> {
             let path = Path::new(&cli.keyfile);
             let wallet = Wallet::load_or_create(path)?;
             println!("Wallet loaded/created at {:?}", path);
-            println!("Address: {}", wallet.address());
+            println!("Address: {}", a1n(&wallet.address()));
+            println!("Address (hex): {}", wallet.address());
             println!("Public Key: {}", wallet.public_key());
         }
         Commands::PqcKeygen { out } => {
@@ -186,7 +193,8 @@ fn main() -> anyhow::Result<()> {
             println!("Post-Quantum Keypair Generated (Dilithium5)");
             println!("Public Key:  {} ({} bytes)", pk_path, pk_bytes.len());
             println!("Private Key: {} ({} bytes, mode 0600)", sk_path, sk_bytes.len());
-            println!("Address:     {}", address);
+            println!("Address:     {}", a1n(&address));
+            println!("Address hex: {}", address);
             println!();
             println!("SECURITY: Keep pqc_privkey.bin secure (stored owner-only 0600, unencrypted).");
         }
@@ -261,13 +269,13 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Balance { address } => {
             let addr = if let Some(a) = address {
-                a
+                require_address_hex(&a)?
             } else {
                 let wallet = Wallet::load_or_create(Path::new(&cli.keyfile))?;
                 wallet.address()
             };
 
-            println!("🔍 Checking balance for: {}", addr);
+            println!("🔍 Checking balance for: {}", a1n(&addr));
             let res = client.call("aincore_getBalance", json!([addr]))?;
             // println!("{}", serde_json::to_string_pretty(&res)?); // Raw output bad
 
@@ -303,6 +311,7 @@ fn main() -> anyhow::Result<()> {
             amount,
             gas_limit,
         } => {
+            let to = require_address_hex(&to)?;
             let wallet = Wallet::load_or_create(Path::new(&cli.keyfile))?;
             let sender = wallet.address();
 
@@ -567,10 +576,11 @@ fn main() -> anyhow::Result<()> {
             println!("✅ Validator Registration Submitted: {}", res);
         }
         Commands::Faucet { to, amount } => {
+            let to = require_address_hex(&to)?;
             let wallet = Wallet::load_or_create(Path::new(&cli.keyfile))?;
             let sender = wallet.address();
 
-            println!("🚰 Faucet: Sending {} AIN to {}", amount, to);
+            println!("🚰 Faucet: Sending {} AIN to {}", amount, a1n(&to));
 
             // Get sequence number
             let res = client.call("aincore_getBalance", json!([sender]))?;
@@ -637,4 +647,34 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    const HEX: &str = "dd48891f6d6799d5aa71e17b150ba3a8c30cbfbfb02544f546801f057aa65d42";
+    const A1N: &str = "A1nB31ipYCNJJR7Gcsat1oE8J6kFPdEbJP5pAkq7u2ZLjdokxA3nH";
+
+    #[test]
+    fn recipient_accepts_a1n_and_hex_and_refuses_a_typo() {
+        assert_eq!(require_address_hex(A1N).unwrap(), HEX);
+        assert_eq!(require_address_hex(HEX).unwrap(), HEX);
+        assert_eq!(require_address_hex(&format!("0x{}", HEX)).unwrap(), HEX);
+        assert_eq!(
+            parse_move_address(A1N).unwrap(),
+            parse_move_address(HEX).unwrap()
+        );
+
+        let typo = A1N.replacen("YCNJ", "YCNK", 1);
+        assert_ne!(typo, A1N, "positive control: the typo was applied");
+        let err = require_address_hex(&typo).unwrap_err().to_string();
+        assert!(err.contains("checksum"), "{}", err);
+        assert!(parse_move_address(&typo).is_none());
+    }
+
+    #[test]
+    fn display_uses_a1n() {
+        assert_eq!(a1n(HEX), A1N);
+    }
 }

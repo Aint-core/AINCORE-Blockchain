@@ -775,11 +775,59 @@ fn consensus_busy() -> JsonRpcError {
     }
 }
 
+/// Parameter positions that carry an account address, per method.
+fn address_param_positions(method: &str) -> &'static [usize] {
+    match method {
+        "aincore_getBalance"
+        | "aincore_getObject"
+        | "aincore_getCoinBalance"
+        | "aincore_getAccountNonce"
+        | "aincore_getBtcBalance"
+        | "aincore_getTransactionsByAddress"
+        | "aincore_getDexLpBalance"
+        | "aincore_getTokenBalance"
+        | "aincore_getDelegations"
+        | "aincore_getUnbondingDelegations"
+        | "aincore_getValidatorPool" => &[0],
+        "aincore_getDelegation" => &[0, 1],
+        _ => &[],
+    }
+}
+
+/// Accept `A1n…` wherever an address is taken. An `A1n` string must decode
+/// with a valid checksum, so a typo is refused instead of silently reading an
+/// empty account. Full 64-hex (optionally `0x`, any case) becomes the
+/// canonical lowercase hex every storage key uses. Anything else passes
+/// through unchanged, so existing callers see no difference.
+fn normalize_address_params(
+    method: &str,
+    mut params: serde_json::Value,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let positions = address_param_positions(method);
+    if let Some(list) = params.as_array_mut() {
+        for &i in positions {
+            if let Some(serde_json::Value::String(s)) = list.get_mut(i) {
+                let trimmed = s.trim();
+                if trimmed.starts_with(crypto::A1N_PREFIX) {
+                    *s = crypto::canonical_address_hex(trimmed).map_err(|e| JsonRpcError {
+                        code: -32602,
+                        message: format!("Invalid address: {}", e),
+                    })?;
+                } else if let Ok(hex) = crypto::canonical_address_hex(trimmed) {
+                    *s = hex;
+                }
+            }
+        }
+    }
+    Ok(params)
+}
+
 fn handle_rpc_method(
     method: &str,
     params: serde_json::Value,
     data: &AppState,
 ) -> Result<serde_json::Value, JsonRpcError> {
+    let params = normalize_address_params(method, params)?;
     match method {
         "aincore_getBalance" => {
             // params: [address]
@@ -2116,12 +2164,27 @@ fn handle_rpc_method(
                     Ok(address) => Ok(serde_json::json!({
                         "public_key": pubkey_hex,
                         "address": address,
+                        "address_a1n": crypto::hex_to_a1n(&address).ok(),
                         "format": "hex(SHA256(pubkey))"
                     })),
                     Err(e) => Err(JsonRpcError { code: -32000, message: format!("Derivation error: {}", e) })
                 }
             } else {
                 Err(JsonRpcError { code: -32602, message: "Invalid params: [public_key_hex]".into() })
+            }
+        },
+
+        "aincore_formatAddress" => {
+            // params: [address in any accepted form] → both display forms.
+            let Some(input) = params.get(0).and_then(|v| v.as_str()) else {
+                return Err(JsonRpcError { code: -32602, message: "Invalid params: [address]".into() });
+            };
+            match crypto::parse_address(input) {
+                Ok(bytes) => Ok(serde_json::json!({
+                    "hex": hex::encode(bytes),
+                    "a1n": crypto::to_a1n(&bytes),
+                })),
+                Err(e) => Err(JsonRpcError { code: -32602, message: format!("Invalid address: {}", e) }),
             }
         },
 
@@ -2747,6 +2810,105 @@ mod tests {
         assert!(err.message.contains("Public key/address mismatch"));
         std::env::remove_var("AINCORE_ENABLE_FAUCET");
         std::env::remove_var("AINCORE_CHAIN_ID");
+    }
+
+    /// Every address form reads the same account; a mistyped `A1n` is refused
+    /// instead of silently reading an empty one.
+    #[test]
+    fn a1n_and_hex_addresses_read_the_same_account() {
+        // Seeds the CoinStore directly: touching AINCORE_CHAIN_ID here would
+        // race the QC RPC tests, which read it while building and verifying.
+        let db = temp_db("a1n_address");
+        let signing_key = SigningKey::from_bytes(&[44u8; 32]);
+        let public_key = hex::encode(signing_key.verifying_key().as_bytes());
+        let address = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
+        let move_addr = move_core_types::account_address::AccountAddress::from_hex_literal(
+            &format!("0x{}", address),
+        )
+        .unwrap();
+        let coin = bcs::to_bytes(&MoveCoin {
+            value: 7_000_000_000_000_000_000,
+        })
+        .unwrap();
+        db.put(&move_coin_store_key(move_addr), &hex::encode(coin))
+            .expect("seed a balance");
+        let state = test_state(Arc::clone(&db));
+        let a1n = crypto::hex_to_a1n(&address).unwrap();
+
+        let balance = |addr: &str| {
+            handle_rpc_method(
+                "aincore_getCoinBalance",
+                serde_json::json!([addr, "AIN"]),
+                &state,
+            )
+            .map(|v| v["balance"].clone())
+        };
+        let expected = serde_json::json!("7000000000000000000");
+        assert_eq!(balance(&address).unwrap(), expected, "control: plain hex");
+        assert_eq!(balance(&a1n).unwrap(), expected, "A1n");
+        assert_eq!(
+            balance(&format!(" {} ", a1n)).unwrap(),
+            expected,
+            "pasted with spaces"
+        );
+        assert_eq!(
+            balance(&address.to_uppercase()).unwrap(),
+            expected,
+            "upper-case hex"
+        );
+        assert_eq!(
+            balance(&format!("0x{}", address)).unwrap(),
+            expected,
+            "0x hex"
+        );
+
+        let by_a1n = handle_rpc_method("aincore_getBalance", serde_json::json!([a1n]), &state)
+            .expect("getBalance by A1n");
+        assert_eq!(by_a1n["move_balance"], expected);
+
+        // One wrong character: refused, never an empty account.
+        let mut typo: Vec<char> = a1n.chars().collect();
+        typo[10] = if typo[10] == 'x' { 'y' } else { 'x' };
+        let typo: String = typo.into_iter().collect();
+        let err = balance(&typo).expect_err("typo refused");
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("Invalid address"), "{}", err.message);
+        // getBalance answers any unknown string with an empty account, so only
+        // the A1n gate stands between a typo and a false "balance: 0".
+        let err = handle_rpc_method("aincore_getBalance", serde_json::json!([typo]), &state)
+            .expect_err("typo must not read as an empty account");
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("checksum"), "{}", err.message);
+
+        // Non-address object ids still pass through unchanged.
+        let obj = handle_rpc_method(
+            "aincore_getObject",
+            serde_json::json!(["proposal-7"]),
+            &state,
+        )
+        .expect("legacy id passes through");
+        assert!(obj.is_null());
+
+        let derived = handle_rpc_method(
+            "aincore_deriveAddress",
+            serde_json::json!([public_key]),
+            &state,
+        )
+        .expect("derive");
+        assert_eq!(derived["address"], serde_json::json!(address));
+        assert_eq!(derived["address_a1n"], serde_json::json!(a1n));
+
+        let formatted =
+            handle_rpc_method("aincore_formatAddress", serde_json::json!([a1n]), &state)
+                .expect("format");
+        assert_eq!(formatted["hex"], serde_json::json!(address));
+        assert_eq!(formatted["a1n"], serde_json::json!(a1n));
+        assert_eq!(
+            handle_rpc_method("aincore_formatAddress", serde_json::json!(["0x1"]), &state)
+                .expect_err("short hex is not an account address")
+                .code,
+            -32602
+        );
     }
 
     #[test]

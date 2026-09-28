@@ -13,3 +13,4 @@ export type {
   TransactionReceipt,
 } from './connection';
 export * from './bcs';
+export * from './address';

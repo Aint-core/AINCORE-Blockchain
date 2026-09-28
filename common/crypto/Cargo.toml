@@ -7,6 +7,8 @@ edition = "2021"
 sha2 = "0.10"
 ed25519-dalek = "2.0"
 hex = "0.4"
+# Human-readable `A1n…` addresses (Base58Check); already in the tree via libp2p.
+bs58 = "0.5"
 secp256k1 = { version = "0.29", features = ["rand", "recovery"] }
 rand = "0.8"
 blake3 = "1.5"

@@ -4,6 +4,7 @@ pub use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use std::fmt;
 
 // Core cryptographic primitives
+pub mod address;
 pub mod ecdsa;
 pub mod poseidon;
 
@@ -28,6 +29,9 @@ pub mod recursive;
 pub mod rollup;
 
 // Re-exports for convenient access
+pub use address::{
+    canonical_address_hex, from_a1n, hex_to_a1n, parse_address, to_a1n, AddressError, A1N_PREFIX,
+};
 pub use ecdsa::{ECDSACrypto, ECDSAError};
 pub use multi_sig::{MultiSigError, MultiSigVerifier, SignatureScheme};
 pub use vdf::{VDFEngine, VDFError};

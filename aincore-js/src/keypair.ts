@@ -1,6 +1,7 @@
 import * as nacl from 'tweetnacl';
 import * as bip39 from 'bip39';
 import * as crypto from 'crypto';
+import { toA1nAddress } from './address';
 
 export class Keypair {
     private _keypair: nacl.SignKeyPair;
@@ -72,6 +73,14 @@ export class Keypair {
     get address(): string {
         const hash = crypto.createHash('sha256').update(this._keypair.publicKey).digest();
         return hash.toString('hex');
+    }
+
+    /**
+     * The same address in its human-readable, checksummed form (`A1n…`).
+     * Show this to people; transactions keep using `address` (64-hex).
+     */
+    get addressA1n(): string {
+        return toA1nAddress(this.address);
     }
 
     /**
