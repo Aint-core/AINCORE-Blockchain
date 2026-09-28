@@ -438,6 +438,7 @@ Each item was found by the inventory or a review, and re-checked at `b7ab25a`.
 | FX-12 | The mempool reads state without a snapshot while a block commits (`mempool/lib.rs:504-532`). Read the chain id from `sys:chain_id` and balances from a committed snapshot. **Lands in S2**: it needs versioned reads. | mempool | neutral |
 | FX-13 | **For G1, recorded here:** vertex admission uses the node's tip epoch and committee (`dag.rs:619-634`, `1287-1297`); commit and skip decisions use the tip committee (`dag.rs:1502-1505`); QC chain-id sources differ (`dag.rs:2003-2026` vs `qc.rs:328`); sync admission reads L finality keys; and `verify_qc` never checks `qc.epoch` against the height (`qc.rs:338-360`). | consensus | G1 |
 | FX-14 | **Live halt path.** If Move `advance_epoch` aborts or errors, `maybe_advance_epoch` returns before rotating (`lib.rs:1263-1270`, `1289-1291`). That leaves a gap in `consensus:epoch_start_height:*`. At the next boundary `epoch_for_block_height` returns None (`qc_producer.rs:130-157`) and `stage_pending_qc` fails (`recovery.rs:32-33`) on every retry, so every validator halts. Rotate at every boundary whatever the Move outcome, with carry-over. The fix is tracked as its own task because today's chain runs this code. | executor | neutral on the success path |
+| FX-16 | **Found in S2:** the paymaster field is the payer's PUBLIC KEY, and it is used directly as the payer's object and CoinStore key (`obj:{pubkey}`, `resource_{pubkey}_…`), not the address `SHA-256(pubkey)` that every other account uses. S2 only canonicalizes its spelling (FX-9). Making the payer an address changes paymaster semantics and needs its own decision. | executor | changing (open) |
 | FX-15 | Make root binding unconditional. Remove the `sys:config:require_exec_roots` knob and its env fallback, and the empty-root bypass in sync (`sync/src/lib.rs:215-222`, `275-294`). | sync, genesis | changing |
 
 ### Activation (AC)
@@ -498,6 +499,25 @@ ran**. "0 tests ran", or an unapplied mutant, must never count as green.
 - Proof vectors for the JS verifier come with S4. S1 pins one golden root, reproduced
   independently without `jmt`.
 | S2 | Executor integration: `Δ_h` from staged changes, seal, one batch, `state_root = root_h`. Includes FX-4, FX-5, FX-9, FX-10, FX-12, FX-15. | **Yes** |
+
+**S2 status (branch `g3/activation`).**
+- CM-1/2/3/5/6 are done:
+  - the hash chain and write log are deleted;
+  - the root is `state_commit::apply` over the staged state changes, and the stage is then
+    sealed;
+  - version 0 is seeded when block 1 starts (S3 moves it into genesis).
+- RC-1 is done: `state_commit::boot_check` runs before the executor starts.
+- FX-4: the fee sweep is keyed by the executing height.
+- FX-5: `receipts_root` uses only the block's own staged receipts.
+- FX-9: one encoder, `vm_move::state_keys`. Golden tests pin every hand-written system key
+  in the executor and genesis, consensus uses the executor's key, and the paymaster
+  spelling is lowercased.
+- FX-10: implicit accounts use the genesis constructor.
+- FX-15: empty roots are always refused; the switch and its env fallback are gone.
+- FX-12 is closed by the design: every block write is staged and committed in one atomic
+  batch, so the mempool can no longer read a half-committed block. Its chain-id half is FX-6.
+- FX-16 is recorded above and still open.
+
 | S3 | Genesis as version 0; identity with `state_root(0)` in memory; **WG-1 enforcement on** | **Yes** |
 
 **S3 go/no-go.** The S0 counters alone are not enough to switch enforcement on:
