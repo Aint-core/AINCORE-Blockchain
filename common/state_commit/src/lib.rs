@@ -365,7 +365,7 @@ pub fn seed_genesis(db: &Arc<StateDB>) -> Result<Applied> {
 /// The block transaction writes all three together, so a mismatch means the
 /// database is not something this node produced; it must refuse to start,
 /// never guess.
-pub fn boot_check(db: &StateDB) -> Result<()> {
+pub fn boot_check(db: &Arc<StateDB>) -> Result<()> {
     ensure!(
         db.get("sys:restore_in_progress")?.is_none(),
         "a snapshot restore is incomplete; wipe the tree and restore again"
@@ -385,16 +385,26 @@ pub fn boot_check(db: &StateDB) -> Result<()> {
             bail!("state tree is at version {version:?} but the executed height is {height}")
         }
     }
-    if let Some(latest) = db
+    match db
         .get("latest_height")?
         .map(|s| s.parse::<Version>())
         .transpose()
         .context("malformed latest_height")?
     {
-        ensure!(
+        Some(latest) => ensure!(
             latest == executed,
             "latest_height {latest} != executed height {executed}"
-        );
+        ),
+        None => ensure!(
+            executed == 0,
+            "the executed height is {executed} but latest_height is missing"
+        ),
+    }
+    // The next block reads the latest root. A missing root node would only
+    // surface then, inside the block transaction.
+    if let Some(version) = latest_version(db)? {
+        root(db, version)
+            .with_context(|| format!("the root node of tree version {version} is missing"))?;
     }
     Ok(())
 }

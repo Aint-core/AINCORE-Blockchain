@@ -666,4 +666,29 @@ fn boot_check_refuses_disagreeing_heights_and_a_half_done_restore() {
     db.put("sys:restore_in_progress", "{}").unwrap();
     let err = boot_check(&db).expect_err("half-done restore");
     assert!(err.to_string().contains("restore"), "{err}");
+    db.delete("sys:restore_in_progress").unwrap();
+    boot_check(&db).expect("positive control: consistent again");
+
+    // Executed blocks but no chain height (found by the S2 review).
+    db.delete("latest_height").unwrap();
+    let err = boot_check(&db).expect_err("latest_height missing");
+    assert!(
+        err.to_string().contains("latest_height is missing"),
+        "{err}"
+    );
+    db.put("latest_height", "1").unwrap();
+
+    // The latest root node is gone: refused at boot, not at the next block.
+    let rows = root_node_rows(&db, 1);
+    assert_eq!(
+        rows.len(),
+        1,
+        "positive control: version 1 has one root row"
+    );
+    db.delete(&rows[0]).unwrap();
+    let err = boot_check(&db).expect_err("root node missing");
+    assert!(
+        err.to_string().contains("root node of tree version 1"),
+        "{err}"
+    );
 }

@@ -711,27 +711,12 @@ pub fn initialize_genesis(
         stdlib_modules.len()
     );
 
-    // === Create Genesis Account ===
-    // Address: genesis_addr_hex
-    let genesis_addr = genesis_addr_hex;
-    let genesis_pubkey = genesis_pubkey_hex;
-
+    // G3 FX-7: no account for the booting node's own key. Genesis state is a
+    // function of genesis.json alone. That account existed only on the node
+    // that wrote it, so a node that is not a genesis validator had one extra
+    // leaf in version 0 of the state tree and refused block 1 forever.
+    // Validators get their accounts from the validator loop below.
     use aa::AccountManager;
-    let mut account_obj =
-        AccountManager::create_account(genesis_addr.to_string(), genesis_pubkey.to_string());
-
-    // Update balance manually (since AccountManager creates with 0)
-    use aa::AccountData;
-    let mut data: AccountData = serde_json::from_slice(&account_obj.data)?;
-
-    // ZERO PRE-MINE: Start with 0 balance.
-    data.balance = 0;
-    account_obj.data = serde_json::to_vec(&data)?;
-    storage.put_object(&account_obj)?;
-    println!(
-        "💰 Created Genesis Account: {} (Balance: {})",
-        genesis_addr, data.balance
-    );
 
     // === Initialize Staking (Validator Set) ===
     // We manually create the ValidatorSet resource for the genesis validator
@@ -1829,6 +1814,70 @@ mod tests {
         );
         // Single-node fallback still allowed.
         assert!(resolve_genesis_bls_identity(None, None, &TEST_NODE_IDENTITY, true).is_ok());
+    }
+
+    /// G3 DT-3 / FX-7 (found by the S2 adversarial review): a node that is
+    /// not a genesis validator must build the same genesis state as a
+    /// validator. Genesis used to write an account for the booting node's own
+    /// key; on a follower that was an extra leaf in version 0 of the state
+    /// tree, so its block-1 root differed and sync refused block 1 forever.
+    #[test]
+    fn a_follower_and_a_validator_agree_on_the_block_one_root() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let validator_key = SigningKey::from_bytes(&[41u8; 32]);
+        let vaddr = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
+        let vpub = hex::encode(validator_key.verifying_key().as_bytes());
+        let bls = crypto::bls::BLSEngine::consensus();
+        let bls_seed = [42u8; 32];
+        let path = write_genesis_json(
+            "dt3_follower",
+            &vaddr,
+            &vpub,
+            Some(&hex::encode(bls.pubkey_raw(&bls_seed))),
+            Some(&hex::encode(bls.prove_possession_raw(&bls_seed))),
+        );
+        std::env::set_var("AINCORE_GENESIS_PATH", &path);
+        let vdb = temp_db("dt3_validator");
+        let validator = initialize_genesis(&vdb, &stdlib_path(), &vaddr, &vpub, &[1u8; 32]);
+        let follower_key = SigningKey::from_bytes(&[43u8; 32]);
+        let faddr = crypto::derive_address(follower_key.verifying_key().as_bytes()).unwrap();
+        let fpub = hex::encode(follower_key.verifying_key().as_bytes());
+        let fdb = temp_db("dt3_follower");
+        let follower = initialize_genesis(&fdb, &stdlib_path(), &faddr, &fpub, &[2u8; 32]);
+        std::env::remove_var("AINCORE_GENESIS_PATH");
+        validator.unwrap();
+        follower.unwrap();
+
+        let state_keys = |db: &StateDB| -> std::collections::BTreeMap<String, Vec<u8>> {
+            db.db
+                .iterator(storage::rocksdb::IteratorMode::Start)
+                .map(|r| r.unwrap())
+                .filter(|(k, _)| {
+                    storage::class::classify(k) == Some(storage::class::KeyClass::State)
+                })
+                .map(|(k, v)| (String::from_utf8(k.to_vec()).unwrap(), v.to_vec()))
+                .collect()
+        };
+        let (vs, fs) = (state_keys(&vdb), state_keys(&fdb));
+        let differing: Vec<_> = vs
+            .keys()
+            .chain(fs.keys())
+            .filter(|k| vs.get(*k) != fs.get(*k))
+            .collect();
+        assert!(differing.is_empty(), "genesis state differs: {differing:?}");
+        assert!(
+            fdb.get_object(&faddr).is_none(),
+            "no account for the node's own key"
+        );
+
+        let block_one_root = |db: &Arc<StateDB>| match Executor::new(Arc::clone(db))
+            .execute_block_checked_at(vec![], &vaddr, 1, &[], |_, _| Ok(()))
+            .unwrap()
+        {
+            executor::BlockExecOutcome::Executed(summary) => summary.state_root,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(block_one_root(&vdb), block_one_root(&fdb));
     }
 
     #[test]

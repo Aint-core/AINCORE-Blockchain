@@ -509,14 +509,35 @@ ran**. "0 tests ran", or an unapplied mutant, must never count as green.
 - RC-1 is done: `state_commit::boot_check` runs before the executor starts.
 - FX-4: the fee sweep is keyed by the executing height.
 - FX-5: `receipts_root` uses only the block's own staged receipts.
-- FX-9: one encoder, `vm_move::state_keys`. Golden tests pin every hand-written system key
-  in the executor and genesis, consensus uses the executor's key, and the paymaster
-  spelling is lowercased.
+- FX-9 (partial):
+  - `vm_move::state_keys` is the encoder for the VM resolver, overlay and changeset;
+  - golden tests pin the validator-set key and the genesis system-resource keys to it;
+  - consensus uses the executor's validator-set key;
+  - the paymaster spelling is lowercased.
+
+  Still hand-written, and producing identical strings today:
+  - executor `resource_…` builders (`lib.rs` near 83, 108, 337, 353, 369);
+  - the literal-hex Epoch key near 1342;
+  - the conflict tokens near 2706-2935;
+  - the RPC read helpers in `api_local.rs`.
+
+  The `obj:` account key has no canonical encoder, and it stores `tx.public_key` in whatever
+  case the client sent. The rest of FX-9 lands in S3.
 - FX-10: implicit accounts use the genesis constructor.
 - FX-15: empty roots are always refused; the switch and its env fallback are gone.
-- FX-12 is closed by the design: every block write is staged and committed in one atomic
-  batch, so the mempool can no longer read a half-committed block. Its chain-id half is FX-6.
+- FX-12 needs no change: S2 changed nothing in the mempool. The block commit was already
+  one atomic batch, and the mempool's one balance read is a single key, so it cannot see a
+  torn block. Its chain-id half is FX-6.
 - FX-16 is recorded above and still open.
+- FX-7, first bullet, moved up from S3: genesis no longer writes an account for the
+  booting node's own key. With a lazily seeded version 0, that account made every node
+  that is not a genesis validator compute a different block-1 root. Witness:
+  `a_follower_and_a_validator_agree_on_the_block_one_root`.
+- FX-15 remainder for S3: genesis still writes `sys:config:require_exec_roots`, which
+  nothing reads. It is in version 0 and in the genesis identity.
+- **No pruning yet.** With 20,000 state keys and 8 changed keys per block, the tree
+  grows by about 35 KB per block, which is roughly 1 GB a day at 3-second blocks. Do not
+  run S2 long-lived without S7.
 
 | S3 | Genesis as version 0; identity with `state_root(0)` in memory; **WG-1 enforcement on** | **Yes** |
 
