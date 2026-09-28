@@ -706,3 +706,86 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod seal_tests {
+    use crate::StateDB;
+
+    fn temp_db(name: &str) -> StateDB {
+        let path =
+            std::env::temp_dir().join(format!("aincore_seal_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        StateDB::open(path.to_str().unwrap()).unwrap()
+    }
+
+    /// G3 CM-2: once the root is sealed, a consensus-state write fails the
+    /// whole block transaction, and nothing it staged is published.
+    #[test]
+    fn a_state_write_after_the_seal_fails_the_block() {
+        let db = temp_db("after_seal");
+        let result = db.block_transaction(|view| {
+            view.put("obj:before", "ok").unwrap();
+            assert!(view.seal_state(), "positive control: sealing a block view");
+            view.put("latest_height", "1").unwrap(); // chain data after the seal: fine
+            view.put("obj:after", "escapes the root").unwrap();
+            Ok(())
+        });
+        let err = result.expect_err("a sealed block must refuse a state write");
+        assert!(err.to_string().contains("sealed"), "{err}");
+        assert_eq!(db.get("obj:before").unwrap(), None, "nothing was published");
+        assert_eq!(db.get("latest_height").unwrap(), None);
+
+        let ok = db.block_transaction(|view| {
+            view.put("obj:before", "ok").unwrap();
+            assert!(view.seal_state());
+            view.put("latest_height", "1").unwrap();
+            Ok(())
+        });
+        assert!(
+            ok.is_ok(),
+            "positive control: non-state writes after the seal pass"
+        );
+        assert_eq!(db.get("obj:before").unwrap().as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn sealing_outside_the_block_transaction_is_refused() {
+        let db = temp_db("seal_outside");
+        assert!(!db.seal_state(), "base database");
+        db.transaction(|view| {
+            assert!(!view.seal_state(), "plain transaction");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// CM-1: the change set is every staged consensus-state write, last write
+    /// per key, and nothing else.
+    #[test]
+    fn staged_state_changes_are_state_keys_last_write_wins() {
+        let db = temp_db("staged");
+        db.put("obj:old", "x").unwrap();
+        assert_eq!(
+            db.staged_state_changes(),
+            None,
+            "no stage on the base database"
+        );
+        let changes = db
+            .block_transaction(|view| {
+                view.put("obj:a", "1").unwrap();
+                view.put("obj:a", "2").unwrap();
+                view.delete("obj:old").unwrap();
+                view.put("latest_height", "5").unwrap();
+                view.put("consensus:qc:5", "q").unwrap();
+                Ok(view.staged_state_changes().unwrap())
+            })
+            .unwrap();
+        assert_eq!(
+            changes,
+            vec![
+                ("obj:a".to_string(), Some(b"2".to_vec())),
+                ("obj:old".to_string(), None),
+            ]
+        );
+    }
+}

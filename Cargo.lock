@@ -1338,6 +1338,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde_json",
+ "state_commit",
  "storage",
  "tokio",
 ]
@@ -2717,6 +2718,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "state_commit",
  "storage",
  "vm_move",
 ]

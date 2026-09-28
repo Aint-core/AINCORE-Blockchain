@@ -14,6 +14,7 @@ fn fixture(name: &str) -> (ChainSync, Block, String) {
     let key = crypto::SigningKey::from_bytes(&[77; 32]);
     let proposer = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
     set_validators(&sync, vec![(&proposer, 100)]);
+    seed_state_tree(&sync);
     let executor = executor::Executor::new(sync.storage.clone());
     let mut block = Block::new_with_roots_at(
         1,

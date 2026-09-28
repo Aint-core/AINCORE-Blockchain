@@ -44,6 +44,7 @@ fn fixture(name: &str, height: u64) -> (ChainSync, Vec<Block>, String) {
     )
     .unwrap();
     set_validators(&sync, vec![(&proposer, 100)]);
+    seed_state_tree(&sync);
     let mut blocks = vec![];
     let mut parent = "genesis".to_string();
     for h in 1..=height {

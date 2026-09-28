@@ -127,6 +127,10 @@ pub struct DagConsensus {
     pub placement_sleep: Arc<dyn Fn(std::time::Duration) + Send + Sync>,
     #[cfg(test)]
     pub(crate) local_acceptance_hook: Option<LocalAcceptanceHook>,
+    /// Tests only: runs inside the block transaction BEFORE execution, the
+    /// last point where consensus state may be staged (G3 CM-2).
+    #[cfg(test)]
+    pub(crate) pre_execution_hook: Option<LocalAcceptanceHook>,
 }
 
 impl DagConsensus {
@@ -544,6 +548,8 @@ impl DagConsensus {
             placement_sleep: Arc::new(std::thread::sleep),
             #[cfg(test)]
             local_acceptance_hook: None,
+            #[cfg(test)]
+            pre_execution_hook: None,
         }
     }
 
@@ -1712,12 +1718,25 @@ impl DagConsensus {
                         let parent_height = self.latest_block_height;
                         let parent_hash = self.latest_block_hash.clone();
                         let qc_chain_id = self.resolve_chain_id();
-                        let outcome = executor.execute_block_checked_at(
+                        #[cfg(test)]
+                        let pre_execution_hook = self.pre_execution_hook;
+                        let outcome = executor.execute_block_admitted_at(
                             block_txs.clone(),
                             &reward_recipient,
                             // The block being BUILT: one above the current tip.
                             self.latest_block_height + 1,
                             &slash_evidence,
+                            // Nothing to admit for a block this node built. Tests
+                            // may stage state here, BEFORE execution: after the
+                            // state root is sealed (G3 CM-2) a state write fails
+                            // the whole block.
+                            |_view| {
+                                #[cfg(test)]
+                                if let Some(hook) = pre_execution_hook {
+                                    hook(0, _view)?;
+                                }
+                                Ok(())
+                            },
                             |summary, view| {
                                 let stored_height = view.get("latest_height").map_err(|e| e.to_string())?
                                     .map(|h| h.parse::<u64>()).transpose().map_err(|e| e.to_string())?

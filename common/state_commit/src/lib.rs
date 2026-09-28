@@ -345,6 +345,21 @@ fn apply_checked(
     })
 }
 
+/// Version 0 of an EMPTY tree from every consensus-state key in the flat
+/// store, i.e. the genesis state. It must run before block 1 executes: its
+/// scan reads whatever is staged, so running it later would fold block 1's
+/// writes into genesis.
+pub fn seed_genesis(db: &Arc<StateDB>) -> Result<Applied> {
+    let mut changes = Vec::new();
+    for row in db.db.iterator(IteratorMode::Start) {
+        let (key, value) = row?;
+        if classify(&key) == Some(KeyClass::State) {
+            changes.push((String::from_utf8(key.to_vec())?, Some(value.to_vec())));
+        }
+    }
+    apply(db, 0, changes)
+}
+
 /// The root at `version`.
 pub fn root(db: &Arc<StateDB>, version: Version) -> Result<RootHash> {
     no_panic("root", || {

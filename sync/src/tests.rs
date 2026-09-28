@@ -58,6 +58,14 @@ mod tests {
         include!("admission_snapshot_tests.rs");
     }
 
+    /// G3: genesis ends with its state committed as tree version 0 (S3). A
+    /// fixture that builds headers from `current_state_root()` does the same
+    /// after writing its genesis state.
+    fn seed_state_tree(sync: &ChainSync) {
+        let seeded = state_commit::seed_genesis(&sync.storage).expect("seed state tree v0");
+        sync.storage.write_batch(seeded.batch).unwrap();
+    }
+
     fn set_validators(sync: &ChainSync, validators: Vec<(&str, u64)>) {
         let vals: Vec<(String, u64)> = validators
             .into_iter()
@@ -672,6 +680,7 @@ mod tests {
         let key = crypto::SigningKey::from_bytes(&[77; 32]);
         let proposer = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
         set_validators(&sync, vec![(&proposer, 100)]);
+        seed_state_tree(&sync);
         let executor = executor::Executor::new(sync.storage.clone());
         let mut valid = Block::new_with_roots(
             1, 1, "genesis".into(), vec![], proposer,

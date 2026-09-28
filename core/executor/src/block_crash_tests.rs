@@ -227,7 +227,10 @@ fn block_crash_child() {
             assert_eq!(coin_balance(&db, &recipient), 300);
             assert_eq!(
                 summary.state_root,
-                "0b19b72bb92f73df569edc7ac59a4ccf85dd8529184d007fdc3e51fc482a441a",
+                // G3: the Jellyfish Merkle root of this fixture after block 1.
+                // It replaced the old hash-chain value 0b19b72b...; what the
+                // crash tests prove is that every replay equals this clean root.
+                "40051153e5a2d64458f78de0492b7c416abb934522293152243373c5b0fc5a9e",
                 "clean execution must preserve the pre-staging fixture root"
             );
         }

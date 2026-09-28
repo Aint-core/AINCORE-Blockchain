@@ -15,3 +15,7 @@ executor = { path = "../core/executor" }
 tokio = { version = "1.0", features = ["full"] }
 rand = "0.8"
 hex = "0.4"
+
+[dev-dependencies]
+# G3: fixtures seed the state tree the way genesis will.
+state_commit = { path = "../common/state_commit" }

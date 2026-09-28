@@ -783,12 +783,6 @@ pub struct BlockExecutionSummary {
 
 pub struct Executor {
     db: Arc<StateDB>,
-    /// RE-AUDIT HIGH (state root): while a block is executing, every
-    /// post-transaction write (fee rewards, fee sweep, slashes, epoch advance)
-    /// is mirrored here so the block's state root covers them. It used to be
-    /// folded BEFORE these phases, so cross-node root comparison was blind to
-    /// exactly the writes most likely to diverge. `None` outside a block.
-    block_write_log: std::sync::Mutex<Option<std::collections::BTreeMap<String, Option<String>>>>,
     vm: AINCOREVM,
     #[cfg(test)]
     block_boundary_hook: Option<fn(u8, &StateDB)>,
@@ -806,7 +800,6 @@ impl Executor {
     pub fn new(db: Arc<StateDB>) -> Self {
         let vm = AINCOREVM::new(Arc::clone(&db));
         Self {
-            block_write_log: std::sync::Mutex::new(None),
             db,
             vm,
             #[cfg(test)]
@@ -1013,12 +1006,15 @@ impl Executor {
         Ok(())
     }
 
+    /// The Jellyfish Merkle root at the latest committed version (G3), or
+    /// all zeros before genesis seeded the tree.
     pub fn current_state_root(&self) -> String {
-        self.db
-            .get("sys:state_root")
-            .ok()
-            .flatten()
-            .unwrap_or_else(default_state_root)
+        match state_commit::latest_version(&self.db) {
+            Ok(Some(version)) => state_commit::root(&self.db, version)
+                .map(|root| hex::encode(root.0))
+                .unwrap_or_else(|_| default_state_root()),
+            _ => default_state_root(),
+        }
     }
 
     pub fn receipts_root_for_block(&self, txs_json: &[String]) -> String {
@@ -1091,24 +1087,15 @@ impl Executor {
         }
     }
 
-    /// Mirror a write into the block write log when a block is executing.
-    fn log_block_write(&self, key: &str, val: Option<&str>) {
-        if let Ok(mut guard) = self.block_write_log.lock() {
-            if let Some(log) = guard.as_mut() {
-                log.insert(key.to_string(), val.map(|v| v.to_string()));
-            }
-        }
-    }
-
-    /// `db.put` that also feeds the block state root (see `block_write_log`).
+    /// A plain staged write. Since G3 the state root covers every
+    /// consensus-state write staged in the block transaction, logged or not,
+    /// so there is no separate write log to feed.
     fn logged_put(&self, key: &str, val: &str) -> Result<(), String> {
-        self.log_block_write(key, Some(val));
         self.db.put(key, val).map_err(|e| e.to_string())
     }
 
-    /// `db.delete` that also feeds the block state root.
+    /// A plain staged delete (see `logged_put`).
     fn logged_delete(&self, key: &str) -> Result<(), String> {
-        self.log_block_write(key, None);
         self.db.delete(key).map_err(|e| e.to_string())
     }
 
@@ -1118,9 +1105,6 @@ impl Executor {
         context: &str,
     ) -> Result<(), String> {
         updates.sort_by(|left, right| left.0.cmp(&right.0));
-        for (key, val_opt) in &updates {
-            self.log_block_write(key, val_opt.as_deref());
-        }
         let mut write_batch = WriteBatch::default();
         for (key, val_opt) in updates {
             if let Some(value) = val_opt {
@@ -1808,34 +1792,24 @@ impl Executor {
         //    remove the offender and let the slash silently fail while the block
         //    still committed to the item.
         //
-        //    The write log MUST be armed before this: apply_slash_evidence
-        //    writes through logged_put/logged_delete, and those writes only
-        //    reach the state root if the log is open. Arming it after the hoist
-        //    silently excluded every slash write from the block state root.
-        if let Ok(mut g) = self.block_write_log.lock() {
-            *g = Some(std::collections::BTreeMap::new());
+        //    Every write it makes is staged in the block transaction, and the
+        //    state root at the end covers all of them (G3 CM-1).
+        //
+        // G3: version 0 of the state tree is the genesis state. It is built
+        // here, before block 1 changes anything, from the flat genesis keys.
+        if block_height == 1 && matches!(state_commit::latest_version(&self.db), Ok(None)) {
+            let seeded = state_commit::seed_genesis(&self.db).unwrap_or_else(|e| {
+                panic!("CRITICAL: cannot seed state tree version 0 from genesis: {e}")
+            });
+            if let Err(e) = self.db.write_batch(seeded.batch) {
+                panic!("CRITICAL: state tree genesis write failed: {e}");
+            }
         }
         #[cfg(test)]
         if let Some(hook) = self.block_boundary_hook {
             hook(0, &self.db);
         }
         self.apply_slash_evidence(slash_evidence);
-        // Drain the slash writes NOW and re-arm. They happened BEFORE the tx
-        // batches in RocksDB, so they must be the OLDEST entries in the
-        // effective-write map: the end-of-block merge is last-write-wins, and
-        // leaving them in the log until then let a slash value overwrite the tx
-        // value for a key both touched (e.g. the staking ValidatorSet resource),
-        // committing the root to a state the block never had.
-        let pre_tx_writes: std::collections::BTreeMap<String, Option<String>> = {
-            let mut taken = std::collections::BTreeMap::new();
-            if let Ok(mut g) = self.block_write_log.lock() {
-                if let Some(log) = g.take() {
-                    taken = log;
-                }
-                *g = Some(std::collections::BTreeMap::new());
-            }
-            taken
-        };
 
         // 1. Parse all transactions with N-2 FIX: cumulative object limit
         let mut parsed_txs = Vec::new();
@@ -1948,8 +1922,6 @@ impl Executor {
         // key — a pure function of the block's outcome, immune to partitioning.
         // Seeded with the step-0 slash writes so a later tx write to the same
         // key correctly wins (matching RocksDB's actual ordering).
-        let mut block_effective_writes: std::collections::BTreeMap<String, Option<String>> =
-            pre_tx_writes;
 
         for batch in batches.iter() {
             // Execute in parallel to get updates
@@ -1997,10 +1969,8 @@ impl Executor {
                         }
                         if let Some(val) = val_opt {
                             write_batch.put(key.as_bytes(), val.as_bytes());
-                            block_effective_writes.insert(key.clone(), Some(val));
                         } else {
                             write_batch.delete(key.as_bytes());
-                            block_effective_writes.insert(key.clone(), None);
                         }
                     }
                     total_fees = total_fees.saturating_add(gas_charged); // C-6 FIX: accumulate gas (saturating — defense-in-depth)
@@ -2123,46 +2093,27 @@ impl Executor {
         // being executed (see execute_block_parallel_at doc).
         self.maybe_advance_epoch(block_height);
 
-        // Fold the state root ONCE PER BLOCK, at the very END, over the sorted
-        // effective writes of the transactions PLUS every post-loop write (fee
-        // rewards, fee sweep, slashes, epoch advance) mirrored in the block write
-        // log. RE-AUDIT HIGH: folding before those phases left the root blind to
-        // exactly the writes most likely to diverge across nodes. Post-loop
-        // writes are applied in a deterministic order, so last-write-wins is
-        // deterministic too. Only blocks with NO effective state writes leave
-        // the root untouched; zero transactions do not imply zero post-loop writes.
-        if let Ok(mut g) = self.block_write_log.lock() {
-            if let Some(log) = g.take() {
-                for (k, v) in log {
-                    block_effective_writes.insert(k, v);
-                }
-            }
+        // G3 CM-1/CM-2: the state root is the Jellyfish Merkle root over EVERY
+        // consensus-state key. The change set is whatever this block staged,
+        // including writes that never went through a log (epoch rotation,
+        // governance, the burn path), diffed against version h-1. After the
+        // root is computed the stage is sealed: a later state write would
+        // escape the root, so it fails the whole block at commit.
+        let changes = self
+            .db
+            .staged_state_changes()
+            .expect("CRITICAL: a block must execute inside its block transaction");
+        let applied = state_commit::apply(&self.db, block_height, changes).unwrap_or_else(|e| {
+            panic!("CRITICAL: state tree apply failed at height {block_height}: {e}")
+        });
+        if let Err(e) = self.db.write_batch(applied.batch) {
+            panic!("CRITICAL: state tree write failed at height {block_height}: {e}");
         }
-        if !block_effective_writes.is_empty() {
-            use sha2::Digest;
-            let mut block_hasher = sha2::Sha256::new();
-            for (key, val_opt) in &block_effective_writes {
-                block_hasher.update(key.as_bytes());
-                match val_opt {
-                    Some(val) => block_hasher.update(val.as_bytes()),
-                    None => block_hasher.update(b"DELETE"),
-                }
-            }
-            let block_hash_digest = block_hasher.finalize();
-            let prev_root = self.db.get("sys:state_root").unwrap_or(None).unwrap_or(
-                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-            );
-            let mut global_hasher = sha2::Sha256::new();
-            global_hasher.update(hex::decode(&prev_root).unwrap_or(vec![0u8; 32]));
-            global_hasher.update(block_hash_digest);
-            let new_root = hex::encode(global_hasher.finalize());
-            if let Err(e) = self.db.put("sys:state_root", &new_root) {
-                eprintln!("❌ FATAL: state root persist failed: {}", e);
-                panic!(
-                    "CRITICAL: database write failure - stopping node to prevent state corruption."
-                );
-            }
-        }
+        assert!(
+            self.db.seal_state(),
+            "CRITICAL: state root computed outside the block transaction"
+        );
+        let state_root = hex::encode(applied.root.0);
         #[cfg(test)]
         if let Some(hook) = self.block_boundary_hook {
             hook(2, &self.db);
@@ -2181,7 +2132,7 @@ impl Executor {
         }
 
         let summary = BlockExecutionSummary {
-            state_root: self.current_state_root(),
+            state_root,
             receipts_root: self.receipts_root_for_block(&txs_json),
             gas_charged: total_fees,
             executed_raws,
@@ -5352,9 +5303,12 @@ mod tests {
             other => panic!("height 2 must execute after 1: {:?}", other),
         }
         assert_eq!(executor.last_executed_height(), 2);
-        // Empty blocks legitimately fold nothing, so the root is unchanged here;
-        // the height marker is what makes each height consumable exactly once.
-        assert_eq!(root0, executor.current_state_root());
+        // G3: block 1 seeds the tree with the genesis state, so the root moves
+        // from all-zeros to the genesis root there. Empty blocks after it
+        // change no state, so the root stays at the genesis root; the height
+        // marker is what makes each height consumable exactly once.
+        assert_ne!(root0, s1.state_root, "block 1 committed the genesis state");
+        assert_eq!(s1.state_root, executor.current_state_root());
     }
 
     /// Build a hex-encoded BCS `coin::transfer` payload from `from` to `to`.
@@ -5847,6 +5801,119 @@ mod tests {
         assert_eq!(total_burned, 10_000);
         assert_eq!(total_supply, 999_990_000);
         assert_eq!(validator_set(&db).total_supply, 999_990_000);
+    }
+
+    /// A funded sender, a recipient and one signed AIN transfer of 100, on a
+    /// chain that burns 10% of fees (the unlogged burn path).
+    fn g3_burning_transfer(name: &str) -> (Arc<StateDB>, String, String) {
+        let db = temp_db(name);
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[31u8; 32]);
+        let recipient_key = SigningKey::from_bytes(&[32u8; 32]);
+        let sender = create_account(&db, &sender_key);
+        let recipient = create_account(&db, &recipient_key);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        set_coin_store(&db, &sender, 1_000_000);
+        set_coin_store(&db, &recipient, 0);
+        set_validator_set(&db, &sender, 0, 1_000_000_000);
+        db.put("sys:total_supply", "1000000000").unwrap();
+        db.put("total_burned", "0").unwrap();
+        db.put("sys:config:burn_percentage", "10").unwrap();
+        let call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                move_core_types::account_address::AccountAddress::ONE,
+                move_core_types::identifier::Identifier::new("coin").unwrap(),
+            ),
+            function: "transfer".to_string(),
+            ty_args: vec![move_core_types::language_storage::TypeTag::Struct(
+                Box::new(move_core_types::language_storage::StructTag {
+                    address: move_core_types::account_address::AccountAddress::ONE,
+                    module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                    name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                    type_params: vec![],
+                }),
+            )],
+            args: vec![
+                bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_address(&recipient).unwrap()).unwrap(),
+                bcs::to_bytes(&100u128).unwrap(),
+            ],
+        };
+        let payload =
+            hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
+        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
+        (db, sender, tx_json)
+    }
+
+    /// G3: the burn path writes `sys:total_supply` with a plain put that never
+    /// reached the old hash-chain root. The Jellyfish root covers every staged
+    /// state write, so the new supply is provable against the block's root.
+    #[test]
+    fn an_unlogged_state_write_is_provable_against_the_block_root() {
+        let (db, sender, tx_json) = g3_burning_transfer("g3_unlogged_in_root");
+        let outcome = Executor::new(db.clone())
+            .execute_block_checked_at(vec![tx_json], &sender, 1, &[], |_, _| Ok(()))
+            .unwrap();
+        let BlockExecOutcome::Executed(summary) = outcome else {
+            panic!("block 1 must execute: {outcome:?}");
+        };
+        let supply = db.get("sys:total_supply").unwrap().unwrap();
+        assert_eq!(supply, "999990000", "positive control: the burn happened");
+        let root = state_commit::root(&db, 1).unwrap();
+        assert_eq!(
+            hex::encode(root.0),
+            summary.state_root,
+            "header root is the tree root"
+        );
+        let (value, proof) = state_commit::prove(&db, "sys:total_supply", 1).unwrap();
+        assert_eq!(value.as_deref(), Some(supply.as_bytes()));
+        state_commit::verify(root, "sys:total_supply", Some(supply.as_bytes()), &proof)
+            .expect("the unlogged burn write is in the root");
+        let (old, old_proof) = state_commit::prove(&db, "sys:total_supply", 0).unwrap();
+        assert_eq!(
+            old.as_deref(),
+            Some(b"1000000000".as_ref()),
+            "genesis value at version 0"
+        );
+        state_commit::verify(
+            state_commit::root(&db, 0).unwrap(),
+            "sys:total_supply",
+            old.as_deref(),
+            &old_proof,
+        )
+        .unwrap();
+    }
+
+    /// G3 CM-2: a consensus-state write in `accept`, after the root is sealed,
+    /// would escape the header's root. The whole block is refused and nothing
+    /// it staged is published.
+    #[test]
+    fn a_state_write_after_the_root_refuses_the_whole_block() {
+        let (db, sender, tx_json) = g3_burning_transfer("g3_sealed_block");
+        let executor = Executor::new(db.clone());
+        let refused =
+            executor.execute_block_checked_at(vec![tx_json.clone()], &sender, 1, &[], |_, view| {
+                view.put("obj:escapee", "x").map_err(|e| e.to_string())
+            });
+        let err = refused.expect_err("a post-seal state write must refuse the block");
+        assert!(err.contains("sealed"), "{err}");
+        assert_eq!(executor.last_executed_height(), 0, "nothing committed");
+        assert_eq!(db.get("obj:escapee").unwrap(), None);
+        assert_eq!(
+            state_commit::latest_version(&db).unwrap(),
+            None,
+            "no tree rows either"
+        );
+
+        let accepted =
+            executor.execute_block_checked_at(vec![tx_json], &sender, 1, &[], |_, view| {
+                view.put("latest_height", "1").map_err(|e| e.to_string())
+            });
+        assert!(
+            matches!(accepted, Ok(BlockExecOutcome::Executed(_))),
+            "positive control: chain data after the seal is fine"
+        );
     }
 
     /// G3 S0: a real block writes its consensus state inside the marked block

@@ -3,7 +3,7 @@
 //! The raw database is private: all writers share the same gate. A transaction
 //! holds that gate while its callback runs, so base reads and prefix scans cannot
 //! race a writer. Only staged writes are copied; the database is not materialized.
-use crate::class::{Observer, StateClassStats, WriteContext};
+use crate::class::{classify, KeyClass, Observer, StateClassStats, WriteContext};
 use crate::{StateDB, StorageError};
 use rocksdb::{Direction, IteratorMode, WriteBatch, WriteBatchIterator, DB};
 use std::collections::BTreeMap;
@@ -33,6 +33,11 @@ struct Stage {
     read_failed: AtomicBool,
     /// True only for the executor's block transaction (G3 WG-1).
     block: bool,
+    /// G3 CM-2: set once the block's state root is computed. From then on a
+    /// consensus-state write would escape the root, so it fails the whole
+    /// block at commit (`seal_violated`).
+    sealed: AtomicBool,
+    seal_violated: AtomicBool,
 }
 
 impl Stage {
@@ -159,6 +164,14 @@ impl ReadStore {
             for key in collected.changes.keys() {
                 self.shared.observer.observe(key, ctx);
             }
+            if stage.sealed.load(Ordering::Acquire)
+                && collected
+                    .changes
+                    .keys()
+                    .any(|key| classify(key) == Some(KeyClass::State))
+            {
+                stage.seal_violated.store(true, Ordering::Release);
+            }
             // The binding only visits default-column puts/deletes. Never silently
             // omit other operation kinds from a transaction's commit.
             assert_eq!(
@@ -185,6 +198,37 @@ impl ReadStore {
                 .lock()
                 .expect("storage writer gate poisoned");
             self.write_durable(batch)
+        }
+    }
+
+    /// G3 CM-1: the consensus-state writes staged so far in this block
+    /// transaction, last write per key (`None` = delete). `None` outside a
+    /// transaction view.
+    pub fn staged_state_changes(&self) -> Option<Vec<(String, Option<Vec<u8>>)>> {
+        let stage = self.stage.as_ref()?;
+        let changes = stage.changes.lock().expect("transaction changes poisoned");
+        stage.check_active();
+        Some(
+            changes
+                .iter()
+                .filter(|(key, _)| classify(key) == Some(KeyClass::State))
+                .filter_map(|(key, value)| {
+                    let key = String::from_utf8(key.clone()).ok()?;
+                    Some((key, value.as_ref().map(|v| v.to_vec())))
+                })
+                .collect(),
+        )
+    }
+
+    /// G3 CM-2: seal consensus state once the root is computed. Returns false
+    /// outside the block transaction, where sealing has no meaning.
+    pub fn seal_state(&self) -> bool {
+        match &self.stage {
+            Some(stage) if stage.block => {
+                stage.sealed.store(true, Ordering::Release);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -300,6 +344,16 @@ impl Iterator for StoreIterator<'_> {
 }
 
 impl StateDB {
+    /// G3 CM-1: consensus-state writes staged in this transaction view.
+    pub fn staged_state_changes(&self) -> Option<Vec<(String, Option<Vec<u8>>)>> {
+        self.db.staged_state_changes()
+    }
+
+    /// G3 CM-2: seal consensus state in the block transaction.
+    pub fn seal_state(&self) -> bool {
+        self.db.seal_state()
+    }
+
     /// Execute against a private write-behind view; publish one synced batch only
     /// on success. ALL callback DB access must use the supplied view. Re-entering
     /// a base writer from this callback would deadlock on the non-reentrant gate.
@@ -340,6 +394,8 @@ impl StateDB {
             active: AtomicBool::new(true),
             read_failed: AtomicBool::new(false),
             block,
+            sealed: AtomicBool::new(false),
+            seal_violated: AtomicBool::new(false),
         });
         let _close = CloseStage(stage.clone());
         let view = Arc::new(StateDB {
@@ -357,6 +413,11 @@ impl StateDB {
         if stage.read_failed.load(Ordering::Acquire) {
             return Err(StorageError::DatabaseOperation(
                 "transaction encountered a storage read error".into(),
+            ));
+        }
+        if stage.seal_violated.load(Ordering::Acquire) {
+            return Err(StorageError::DatabaseOperation(
+                "consensus state was written after the block's state root was sealed".into(),
             ));
         }
         let mut batch = WriteBatch::default();

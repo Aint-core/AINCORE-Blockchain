@@ -401,8 +401,14 @@ fn producer_and_lagged_adoption_use_block_epoch_after_rotation() {
     let set = seed_bls_identity(&node);
     // Model the executor's already-tested rotation metadata inside actual block
     // acceptance. This isolates caller timing; it does not execute Move reconfiguration.
-    node.local_acceptance_hook = Some(|boundary, view| {
-        if boundary == 0 && view.get("latest_height").unwrap().as_deref() == Some("1") {
+    // G3: the metadata is consensus state, so it is staged before execution,
+    // not in `accept` after the root is sealed (CM-2).
+    node.pre_execution_hook = Some(|_boundary, view| {
+        // Building block 1: no height stored yet (or "0").
+        if matches!(
+            view.get("latest_height").unwrap().as_deref(),
+            None | Some("0")
+        ) {
             let set = view.get("sys:validator_set:v1").unwrap().unwrap();
             view.put("sys:validator_set:epoch:1", &set).unwrap();
             view.put("consensus:epoch_start_height:1", "2").unwrap();
