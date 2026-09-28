@@ -2,7 +2,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-// Reserved for future rate limiting implementation
+// Default node-wide cap on concurrent inbound connections. Env-tunable via
+// AINCORE_MAX_CONNECTIONS. The transport opens one connection per message, so on
+// a validator host this cap is reached by honest traffic alone: measured on the
+// NAS, 100 refused ~1,200 connections per 10 minutes, ~90% of them from the
+// other validators.
 const MAX_CONNECTIONS: usize = 100;
 // Default per-IP concurrent inbound connection cap (SEC-#28). Env-tunable via
 // AINCORE_MAX_CONN_PER_IP — raise it for CGNAT/reverse-proxy deployments where
@@ -82,6 +86,11 @@ pub async fn start_server<F>(
     // Env-tunable for CGNAT/reverse-proxy where honest peers share a source IP.
     let per_ip_connections: Arc<Mutex<HashMap<std::net::IpAddr, usize>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    let max_connections = std::env::var("AINCORE_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(MAX_CONNECTIONS);
     let max_conn_per_ip = std::env::var("AINCORE_MAX_CONN_PER_IP")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -105,10 +114,10 @@ pub async fn start_server<F>(
             }
         };
 
-        if active_connections.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+        if active_connections.load(Ordering::Relaxed) >= max_connections {
             eprintln!(
                 "⚠️ Max TCP Connections reached ({}). Rejecting {}",
-                MAX_CONNECTIONS, addr
+                max_connections, addr
             );
             continue;
         }
