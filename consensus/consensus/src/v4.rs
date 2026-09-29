@@ -169,6 +169,10 @@ pub struct Engine {
     pull_seq_reserved: u64,
     /// RE-6 on the serving side.
     budget: pull::Budget,
+    /// The GC floor this engine last acted on (OR-3, GC-3).
+    last_floor: u64,
+    /// The highest round a gap fetch already covers (`want_gap`).
+    gap_high: u64,
 }
 
 fn storage_err(e: impl ToString) -> StorageError {
@@ -258,7 +262,10 @@ impl Engine {
             .map_err(|e| e.to_string())?;
         let guards_continuous = match held {
             Some(h) => h == origin,
-            None if genesis_init => {
+            // Only a database that has never signed or placed anything may
+            // take a first origin; the flag left set on a wiped or restored
+            // store must not re-arm signing (review LOW-3).
+            None if genesis_init && Self::never_signed(&storage) => {
                 storage
                     .put("consensus:guard_origin", &origin)
                     .map_err(|e| e.to_string())?;
@@ -298,10 +305,34 @@ impl Engine {
             pull_seq: seq,
             pull_seq_reserved: seq,
             budget: pull::Budget::default(),
+            last_floor: 0,
+            gap_high: 0,
             cfg,
         };
         engine.boot()?;
         Ok(engine)
+    }
+
+    fn never_signed(storage: &StateDB) -> bool {
+        let fresh_tip = storage
+            .get("latest_height")
+            .ok()
+            .flatten()
+            .is_none_or(|h| h == "0");
+        let no_rows = [
+            "consensus:vproposed:",
+            "consensus:vattest:",
+            "consensus:vslot:",
+        ]
+        .iter()
+        .all(|p| {
+            storage
+                .db
+                .prefix_iterator(p.as_bytes())
+                .next()
+                .is_none_or(|row| row.is_ok_and(|(k, _)| !k.starts_with(p.as_bytes())))
+        });
+        fresh_tip && no_rows
     }
 
     /// RC-1 steps 2 to 6.
@@ -419,7 +450,7 @@ impl Engine {
 
     /// g. Always 0 until GC lands (S7).
     fn gc_floor(&self) -> u64 {
-        0
+        lock(&self.ordering).gc_floor()
     }
 
     fn attest_body(&self, round: u64, author: &str, digest: &str) -> AttestBody {
@@ -468,6 +499,11 @@ impl Engine {
     // ----------------------------------------------------------------- ingress
 
     pub fn on_message(&mut self, raw_len: usize, msg: Msg, net: &dyn ConsensusNet) {
+        self.dispatch(raw_len, msg, net);
+        self.observe_floor(net);
+    }
+
+    fn dispatch(&mut self, raw_len: usize, msg: Msg, net: &dyn ConsensusNet) {
         match msg {
             Msg::Vertex(v) => self.on_vertex(raw_len, v, net),
             Msg::Attest(a) => self.on_attestation(a, net),
@@ -483,11 +519,12 @@ impl Engine {
 
     /// IN-1, then ST and AT for a vertex that stages.
     pub fn on_vertex(&mut self, raw_len: usize, v: Vertex, net: &dyn ConsensusNet) {
-        // A copy of a body already staged: nothing to verify or stage again.
-        // Its embedded certificates may still be news, and its author may be
-        // retrying for this node's attestation (AT-2 reuses the guard).
+        // A copy of a body already staged: nothing to verify or stage again,
+        // and nothing to harvest (every ref of a staged body had a verified
+        // certificate when it staged; a relay-padded copy is not verified, so
+        // its refs are never looked at). Its author may be retrying for this
+        // node's attestation (AT-2 reuses the guard).
         if self.is_staged(&v.hash) {
-            self.harvest_certs(&v, net);
             self.resend_attestation(&v, net);
             return;
         }
@@ -523,12 +560,14 @@ impl Engine {
                 self.stage_and_attest(v, net);
             }
             Verdict::PendingCert(missing) => {
-                // RE-1 (c): ask for the certificates it waits on.
+                // RE-1 (c): ask for the certificates it waits on, and for the
+                // whole gap below them when this node is far behind.
                 for i in missing {
                     if let Some(r) = v.parent_refs.get(i) {
                         self.want_cert(r.round, &r.author);
                     }
                 }
+                self.want_gap(v.round.saturating_sub(1));
                 self.pending.push(v);
             }
             Verdict::PendingEpoch => {
@@ -765,6 +804,7 @@ impl Engine {
     /// round or every parent is orderable. Inserting it wakes the children
     /// waiting on it, then runs the decision.
     fn try_orderable(&mut self, digest: String) {
+        let floor = self.gc_floor();
         let mut work = vec![digest];
         let mut inserted = false;
         while let Some(d) = work.pop() {
@@ -782,13 +822,16 @@ impl Engine {
             if !certified {
                 continue;
             }
+            // OR-1 with GC-2's settled arm: a parent whose ref declares a round
+            // at or below g is settled, as in the decision's walk (one
+            // predicate; Layer S aligns refs with parents and checks the round).
             let missing: Vec<String> = if v.round == FIRST_ROUND {
                 Vec::new()
             } else {
-                v.parents
+                v.parent_refs
                     .iter()
-                    .filter(|p| !self.orderable.contains(*p))
-                    .cloned()
+                    .filter(|r| r.round > floor && !self.orderable.contains(&r.digest))
+                    .map(|r| r.digest.clone())
                     .collect()
             };
             if !missing.is_empty() {
@@ -885,6 +928,7 @@ impl Engine {
                 net.broadcast(Msg::Vertex(v.clone()));
             }
         }
+        self.observe_floor(net);
         self.fetch(net);
         if !self.may_sign() {
             return None;
@@ -1075,6 +1119,11 @@ impl Engine {
         lock(&self.ordering).current_finality_digest().to_string()
     }
 
+    /// GC-1's g, as the ordering engine holds it.
+    pub fn floor(&self) -> u64 {
+        self.gc_floor()
+    }
+
     pub fn cursor(&self) -> u64 {
         lock(&self.ordering).next_anchor_round
     }
@@ -1097,6 +1146,7 @@ impl Engine {
     }
 }
 
+mod gc;
 pub mod pull;
 
 #[cfg(test)]

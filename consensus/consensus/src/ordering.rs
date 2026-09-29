@@ -42,10 +42,15 @@ pub struct OrderingEngine {
     /// committed it, LAP/PI/LP4 skipped it, and the block chains split.
     pub next_anchor_round: u64,
     pub committed_sequence: Vec<String>, // recent committed vertex hashes (bounded window)
-    /// O(1) membership mirror of `committed_sequence` for the commit-time de-dup
-    /// (`retain` / `contains`). Kept in lockstep with the Vec so the per-commit
-    /// de-dup no longer does a linear scan over an ever-growing list.
-    committed_set: std::collections::HashSet<String>,
+    /// GC-4: every digest committed by an anchor above the GC floor, with
+    /// that anchor's round. It is a function of the committed prefix alone
+    /// (rebuilt at boot from the `cseq` rows above g, pruned when g passes the
+    /// anchor), so it is the same on every node and across restarts: "settled"
+    /// can no longer depend on how long a node has been up (H9).
+    committed_set: HashMap<String, u64>,
+    /// GC-1: g, the floor below which every parent is settled. A function of
+    /// the committed prefix; persisted with each accepted anchor.
+    gc_floor: u64,
     /// Rolling cumulative finality digest: `H(prev_digest_hex || new_hashes…)`,
     /// chained on every commit and persisted as `consensus:finality_digest`. On
     /// restart it CONTINUES from that persisted value, so it is a pure function of
@@ -93,6 +98,16 @@ const COMMITTED_SEQ_WINDOW: usize = 8192;
 /// Per-round committed-hash key prefix (append-only; pruned with the round window).
 const COMMITTED_SEQ_KEY_PREFIX: &str = "consensus:cseq:";
 
+/// The error prefix of a DE-6 decision conflict: ordering halts on it.
+pub const DECISION_CONFLICT: &str = "DECISION_CONFLICT";
+/// DE-6 writes at most this many rows for one plan: a plan whose anchor is
+/// further past the cursor (a crafted synced block) is refused, not looped on.
+pub const MAX_DECISION_ROWS: u64 = 5_000;
+
+/// GC-1: g trails the last committed anchor by this many rounds.
+pub const GC_DEPTH: u64 = 50;
+const GC_FLOOR_KEY: &str = "consensus:gc_floor";
+
 /// DE-6: `consensus:anchor_decision:{E:020}:{r:020}` holds `C:{digest}` or
 /// `S`, written once in the acceptance transaction.
 pub fn anchor_decision_key(epoch: u64, round: u64) -> String {
@@ -119,6 +134,8 @@ pub(crate) struct PreparedAnchor {
     finalized_round: u64,
     next_anchor_round: u64,
     evicted_cseq_rounds: Vec<u64>,
+    /// GC-1: the floor after this anchor.
+    gc_floor: u64,
 }
 
 impl Default for OrderingEngine {
@@ -137,7 +154,8 @@ impl OrderingEngine {
             finalized_round: 0,
             next_anchor_round: 1,
             committed_sequence: Vec::new(),
-            committed_set: HashSet::new(),
+            committed_set: HashMap::new(),
+            gc_floor: 0,
             finality_digest: String::new(),
             vdf_engine: vdf,
             step1_beacon: vec![0u8; 32],
@@ -174,51 +192,48 @@ impl OrderingEngine {
             }
         }
 
-        // Rebuild the bounded committed-hash de-dup index from the recent per-round
-        // keys (consensus:cseq:{round}). Only rounds still inside committed_rounds
-        // are read, so this is O(window) — and it replaces the previous single giant
-        // key that was rewritten in full on every commit.
+        // GC-4: rebuild the committed set from every `cseq` row above g. Each
+        // row is one committed anchor's sequence; nothing above g was ever
+        // deleted, so this is exact, and the same on every node.
+        let gc_floor = storage
+            .get(GC_FLOOR_KEY)
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
         let mut committed_sequence: Vec<String> = Vec::new();
-        let mut committed_set: HashSet<String> = HashSet::new();
+        let mut committed_set: HashMap<String, u64> = HashMap::new();
         {
-            let mut recent: Vec<u64> = committed_rounds.iter().copied().collect();
-            recent.sort_unstable();
-            for r in recent {
-                if let Ok(Some(json)) =
-                    storage.get(&format!("{}{}", COMMITTED_SEQ_KEY_PREFIX, r))
-                {
-                    if let Ok(hashes) = serde_json::from_str::<Vec<String>>(&json) {
-                        for h in hashes {
-                            if committed_set.insert(h.clone()) {
-                                committed_sequence.push(h);
-                            }
-                        }
+            let mut rows: Vec<(u64, Vec<String>)> = Vec::new();
+            for row in storage.db.prefix_iterator(COMMITTED_SEQ_KEY_PREFIX.as_bytes()) {
+                let Ok((key, value)) = row else {
+                    break;
+                };
+                if !key.starts_with(COMMITTED_SEQ_KEY_PREFIX.as_bytes()) {
+                    break;
+                }
+                let round = std::str::from_utf8(&key[COMMITTED_SEQ_KEY_PREFIX.len()..])
+                    .ok()
+                    .and_then(|r| r.parse::<u64>().ok());
+                let hashes = serde_json::from_slice::<Vec<String>>(&value).ok();
+                if let (Some(round), Some(hashes)) = (round, hashes) {
+                    if round > gc_floor {
+                        rows.push((round, hashes));
                     }
                 }
             }
-            // Backward-compat: fold in the legacy single-key blob if present (older
-            // nodes wrote consensus:committed_sequence; ignored once cseq keys exist).
-            if committed_sequence.is_empty() {
-                if let Ok(Some(json)) = storage.get("consensus:committed_sequence") {
-                    if let Ok(seq) = serde_json::from_str::<Vec<String>>(&json) {
-                        for h in seq {
-                            if committed_set.insert(h.clone()) {
-                                committed_sequence.push(h);
-                            }
-                        }
+            rows.sort_by_key(|(r, _)| *r);
+            for (round, hashes) in rows {
+                for h in hashes {
+                    if committed_set.insert(h.clone(), round).is_none() {
+                        committed_sequence.push(h);
                     }
                 }
             }
-            if committed_sequence.len() > COMMITTED_SEQ_WINDOW {
-                let excess = committed_sequence.len() - COMMITTED_SEQ_WINDOW;
-                for h in committed_sequence.drain(0..excess) {
-                    committed_set.remove(&h);
-                }
-            }
-            if !committed_sequence.is_empty() {
+            if !committed_set.is_empty() {
                 println!(
-                    "🔄 Restored {} committed vertex hashes (de-dup index)",
-                    committed_sequence.len()
+                    "🔄 Restored {} committed vertex hashes above floor {gc_floor}",
+                    committed_set.len()
                 );
             }
         }
@@ -310,6 +325,7 @@ impl OrderingEngine {
             next_anchor_round,
             committed_sequence,
             committed_set,
+            gc_floor,
             finality_digest,
             vdf_engine: vdf,
             step1_beacon,
@@ -497,22 +513,35 @@ impl OrderingEngine {
         hex::encode(hasher.finalize())
     }
 
-    /// Record newly committed hashes into the bounded in-memory de-dup index
-    /// (Vec + HashSet mirror), evicting the oldest entries once the window is
-    /// exceeded. Front eviction is a single O(len) drain, done at most once per
-    /// commit — cheap relative to the removed per-round 700 KB re-serialisation.
-    fn record_committed(&mut self, new_hashes: &[String]) {
+    /// Record an anchor's newly committed hashes (GC-4), then drop what the
+    /// floor has passed. `committed_sequence` stays a bounded recent window for
+    /// display; it decides nothing.
+    fn record_committed(&mut self, anchor_round: u64, new_hashes: &[String]) {
         for h in new_hashes {
-            if self.committed_set.insert(h.clone()) {
+            if self.committed_set.insert(h.clone(), anchor_round).is_none() {
                 self.committed_sequence.push(h.clone());
             }
         }
+        let g = self.gc_floor;
+        self.committed_set.retain(|_, r| *r > g);
         if self.committed_sequence.len() > COMMITTED_SEQ_WINDOW {
             let excess = self.committed_sequence.len() - COMMITTED_SEQ_WINDOW;
-            for h in self.committed_sequence.drain(0..excess) {
-                self.committed_set.remove(&h);
-            }
+            self.committed_sequence.drain(0..excess);
         }
+    }
+
+    /// GC-1's g.
+    pub fn gc_floor(&self) -> u64 {
+        self.gc_floor
+    }
+
+    /// The committed digests above g (GC-4), sorted: what two nodes at one
+    /// cursor must agree on.
+    pub fn committed_digests(&self) -> Vec<(String, u64)> {
+        let mut out: Vec<(String, u64)> =
+            self.committed_set.iter().map(|(d, r)| (d.clone(), *r)).collect();
+        out.sort();
+        out
     }
 
     /// Mencoba melakukan commit pada ronde tertentu
@@ -623,7 +652,7 @@ impl OrderingEngine {
                     None => return None, // cannot happen, but never guess
                 };
                 let Some(visited) =
-                    Self::walk_history(&chain, j, chain_round, dag, &self.committed_set)
+                    Self::walk_history(&chain, j, chain_round, dag, &self.committed_set, self.gc_floor)
                 else {
                     // HOLE below the chain anchor: not decidable yet.
                     return None;
@@ -774,20 +803,23 @@ impl OrderingEngine {
 
     /// Walk the causal history of `from` down to rounds >= `floor`, returning
     /// the set of visited vertex hashes — or None if the walk hits a HOLE: a
-    /// referenced parent that is neither in the local DAG, nor already
-    /// committed, nor the genesis sentinel. A complete walk is what makes a
-    /// SKIP decision a proof instead of a guess.
+    /// referenced parent that is neither in the local DAG nor settled. A
+    /// complete walk is what makes a SKIP decision a proof instead of a guess.
     ///
-    /// There is no settled-by-floor arm yet. It lands with GC (S7) and only
-    /// together with a sequence builder that applies the same predicate
-    /// (DE-5): a parent this walk treats as settled while `find_causal_history`
-    /// still collects it where held gives two nodes different sequences.
+    /// "Settled" is ONE predicate, the same on every node (GC-2): the genesis
+    /// sentinel, a digest in `committed` (exact above g, GC-4), or a parent
+    /// whose child's authenticated ref declares a round at or below `gc_floor`
+    /// (refs at round >= 2 are checked to declare exactly `round - 1` at
+    /// ingress, V3 and V4 alike). The committed sequence is taken from this
+    /// same walk (DE-5), so the completeness gate and the collector can never
+    /// disagree on what is settled (review C-1, H9).
     fn walk_history(
         from: &str,
         floor: u64,
         from_round: u64,
         dag: &HashMap<String, Vertex>,
-        committed_set: &std::collections::HashSet<String>,
+        committed: &HashMap<String, u64>,
+        gc_floor: u64,
     ) -> Option<HashSet<String>> {
         let _ = from_round; // bounded implicitly: rounds strictly decrease
         let mut visited: HashSet<String> = HashSet::new();
@@ -797,7 +829,7 @@ impl OrderingEngine {
                 continue;
             }
             let Some(v) = dag.get(&h) else {
-                if h == "genesis" || committed_set.contains(&h) {
+                if h == "genesis" || committed.contains_key(&h) {
                     continue; // settled — not a hole
                 }
                 return None; // hole
@@ -806,8 +838,12 @@ impl OrderingEngine {
             if v.round <= floor {
                 continue; // do not descend below the floor
             }
-            for p in &v.parents {
-                if p != "genesis" && !committed_set.contains(p) {
+            for (i, p) in v.parents.iter().enumerate() {
+                let below_floor = v
+                    .parent_refs
+                    .get(i)
+                    .is_some_and(|r| r.digest == *p && r.round <= gc_floor);
+                if p != "genesis" && !committed.contains_key(p) && !below_floor {
                     stack.push(p.clone());
                 }
             }
@@ -824,21 +860,26 @@ impl OrderingEngine {
         leader: String,
         dag: &HashMap<String, Vertex>,
     ) -> Option<PreparedAnchor> {
-        // Completeness gate: an anchor with a hole in its history must WAIT,
-        // not commit a partial sequence (the old find_causal_history silently
-        // dropped missing vertices, which would diverge across nodes).
+        // Completeness gate and collector in one (DE-5): an anchor with a hole
+        // in its history must WAIT, not commit a partial sequence; the history
+        // above g, minus what is committed, IS the sequence.
         let anchor_round_in_dag = dag.get(anchor_vertex_hash).map(|v| v.round)?;
-        Self::walk_history(
+        let visited = Self::walk_history(
             anchor_vertex_hash,
             0,
             anchor_round_in_dag,
             dag,
             &self.committed_set,
+            self.gc_floor,
         )?;
-
-        let mut sequence = self.find_causal_history(anchor_vertex_hash, dag);
-        // Filter yang sudah committed (O(1) membership via the mirror set).
-        sequence.retain(|h| !self.committed_set.contains(h));
+        let mut sequence: Vec<(u64, String)> = visited
+            .into_iter()
+            .filter(|h| !self.committed_set.contains_key(h))
+            .filter_map(|h| dag.get(&h).map(|v| (v.round, h)))
+            .collect();
+        // The sort linearizes an agreed set; it chooses nothing.
+        sequence.sort();
+        let sequence: Vec<String> = sequence.into_iter().map(|(_, h)| h).collect();
 
         Some(self.prepare_anchor_bookkeeping(
             anchor_round,
@@ -883,17 +924,22 @@ impl OrderingEngine {
         // cutoff are still rejected by the high-water comparison in the guard.
         // The evicted rounds also get their per-round cseq keys deleted below.
         let cutoff = finalized_round.saturating_sub(COMMITTED_ROUNDS_WINDOW);
-        let evicted_cseq_rounds: Vec<u64> = if cutoff > 0 {
-            let ev: Vec<u64> = committed_rounds
-                .iter()
-                .copied()
-                .filter(|r| *r < cutoff)
-                .collect();
-            committed_rounds.retain(|r| *r >= cutoff);
-            ev
-        } else {
-            Vec::new()
-        };
+        committed_rounds.retain(|r| *r >= cutoff);
+        // GC-1: g trails this anchor by GC_DEPTH, and never falls. The cseq rows
+        // of anchors at or below it are deleted (GC-4 rebuilds only above g).
+        let gc_floor = self.gc_floor.max(anchor_round.saturating_sub(GC_DEPTH));
+        let mut evicted_cseq_rounds: Vec<u64> = self
+            .committed_set
+            .values()
+            .copied()
+            .filter(|r| *r <= gc_floor)
+            .collect::<HashSet<u64>>()
+            .into_iter()
+            .collect();
+        if anchor_round <= gc_floor {
+            evicted_cseq_rounds.push(anchor_round);
+        }
+        evicted_cseq_rounds.sort_unstable();
         // Fold this commit's newly-ordered vertex hashes into the rolling finality
         // digest, chained from the previous (persisted) value. Equal ordered
         // sequences produce equal digests; this does not establish agreement
@@ -908,6 +954,7 @@ impl OrderingEngine {
             previous_next_anchor_round: self.next_anchor_round,
             previous_digest: self.finality_digest.clone(),
             committed_rounds, finalized_round, next_anchor_round, evicted_cseq_rounds,
+            gc_floor,
         }
     }
 
@@ -938,6 +985,14 @@ impl OrderingEngine {
         // anchor round from the cursor up to it was skipped. A row that
         // already says otherwise refuses the whole acceptance.
         let first = Self::align_anchor(plan.previous_next_anchor_round.max(1)).max(2);
+        if !info.anchor_round.is_multiple_of(2)
+            || info.anchor_round.saturating_sub(first) / 2 >= MAX_DECISION_ROWS
+        {
+            return Err(format!(
+                "anchor round {} is not an anchor round within {MAX_DECISION_ROWS} of the cursor {first}",
+                info.anchor_round
+            ));
+        }
         for r in (first..=info.anchor_round).step_by(2) {
             let key = anchor_decision_key(0, r);
             let decision = if r == info.anchor_round {
@@ -948,7 +1003,7 @@ impl OrderingEngine {
             match storage.get(&key).map_err(|err| err.to_string())? {
                 Some(held) if held != decision => {
                     return Err(format!(
-                        "anchor round {r} was decided {held}, not {decision}"
+                        "{DECISION_CONFLICT}: anchor round {r} was decided {held}, not {decision}"
                     ))
                 }
                 Some(_) => {}
@@ -965,6 +1020,7 @@ impl OrderingEngine {
         for r in &plan.evicted_cseq_rounds {
             batch.delete(format!("{}{}", COMMITTED_SEQ_KEY_PREFIX, r).as_bytes());
         }
+        batch.put(GC_FLOOR_KEY.as_bytes(), plan.gc_floor.to_string().as_bytes());
         batch.put(b"consensus:finalized_round", plan.finalized_round.to_string().as_bytes());
         batch.put(b"consensus:next_anchor_round", plan.next_anchor_round.to_string().as_bytes());
         batch.put(b"consensus:last_anchor_round", info.anchor_round.to_string().as_bytes());
@@ -996,7 +1052,8 @@ impl OrderingEngine {
         self.committed_rounds = plan.committed_rounds.clone();
         self.finalized_round = plan.finalized_round;
         self.next_anchor_round = plan.next_anchor_round;
-        self.record_committed(&info.sequence);
+        self.gc_floor = plan.gc_floor;
+        self.record_committed(info.anchor_round, &info.sequence);
         self.finality_digest = info.finality_digest.clone();
 
         // 6. Update the VDF leader-election beacon from (anchor_round, finality
@@ -1162,52 +1219,6 @@ impl OrderingEngine {
         validators[validators.len() - 1].0.clone()
     }
 
-    fn find_causal_history(&self, anchor_hash: &str, dag: &HashMap<String, Vertex>) -> Vec<String> {
-        let mut history = Vec::new();
-        let mut stack = vec![anchor_hash.to_string()];
-        let mut visited = HashSet::new();
-
-        while let Some(hash) = stack.pop() {
-            if visited.contains(&hash) {
-                continue;
-            }
-            visited.insert(hash.clone());
-
-            if let Some(vertex) = dag.get(&hash) {
-                history.push(hash.clone());
-                for parent in &vertex.parents {
-                    if !self.committed_set.contains(parent) {
-                        // Optimization: Stop if already committed (O(1) via mirror set)
-                        stack.push(parent.clone());
-                    }
-                }
-            }
-        }
-
-        // Sort by Round (ASC) then Hash (ASC) for deterministic order
-        // CRITICAL FIX: Remove expect() panics, use safe error handling
-        history.sort_by(|a, b| {
-            // Safe retrieval with fallback
-            let va_opt = dag.get(a);
-            let vb_opt = dag.get(b);
-
-            match (va_opt, vb_opt) {
-                (Some(va), Some(vb)) => {
-                    if va.round != vb.round {
-                        va.round.cmp(&vb.round)
-                    } else {
-                        // FORK CHOICE RULE: Lowest hash wins (deterministic tie-breaking)
-                        a.cmp(b)
-                    }
-                }
-                (Some(_), None) => std::cmp::Ordering::Less, // A exists, B missing → A first
-                (None, Some(_)) => std::cmp::Ordering::Greater, // B exists, A missing → B first
-                (None, None) => std::cmp::Ordering::Equal,   // Both missing → equal
-            }
-        });
-
-        history
-    }
 }
 
 #[cfg(test)]
@@ -2915,26 +2926,23 @@ mod tests {
         );
     }
 
-    /// S3/S4 review C-1: a missing parent is a hole whatever round the child's
-    /// ref declares for it. The removed settled-by-floor arm skipped a parent
-    /// whose ref declared round 0, a round V3 ingress never checked.
+    /// GC-2: a missing parent is a hole unless it is settled: committed, or
+    /// declared by the child's ref at or below g.
     #[test]
-    fn a_missing_parent_is_a_hole_whatever_round_its_ref_declares() {
+    fn a_missing_parent_is_a_hole_unless_its_declared_round_is_at_or_below_g() {
         let validators = mk_validators(4);
         let a = &validators[0].0;
         let (h1, _) = mk_vertex(1, a, vec!["genesis".to_string()]);
-        let (h2, mut v2) = mk_vertex(2, a, vec![h1.clone()]);
-        v2.parent_refs = vec![blockchain::ParentRef {
-            cert: None,
-            round: 0,
-            author: a.clone(),
-            digest: h1.clone(),
-            proof: None,
-        }];
+        let (h2, v2) = mk_vertex(2, a, vec![h1.clone()]);
+        assert_eq!(v2.parent_refs[0].round, 1);
         let dag: std::collections::HashMap<String, blockchain::Vertex> =
             [(h2.clone(), v2)].into_iter().collect();
-        let none = std::collections::HashSet::new();
-        assert!(super::OrderingEngine::walk_history(&h2, 0, 2, &dag, &none).is_none());
+        let none = std::collections::HashMap::new();
+        let walk = |g| super::OrderingEngine::walk_history(&h2, 0, 2, &dag, &none, g);
+        assert!(walk(0).is_none(), "g = 0: the missing round-1 parent is a hole");
+        assert_eq!(walk(1).unwrap(), [h2.clone()].into_iter().collect());
+        let committed: std::collections::HashMap<String, u64> = [(h1.clone(), 2)].into_iter().collect();
+        assert!(super::OrderingEngine::walk_history(&h2, 0, 2, &dag, &committed, 0).is_some());
     }
 
     /// A Byzantine author's round-0 vertex Y, cited by its round-1 vertex
@@ -2994,20 +3002,12 @@ mod tests {
         );
         let f0 = commit_fingerprint(&c0);
         let f1 = commit_fingerprint(&c1);
-        assert!(
-            f0.iter().any(|c| c.2.contains(&hy)),
-            "vacuous: the view holding Y never committed it"
-        );
-        assert!(f1.is_empty(), "the view without Y committed past the hole");
-        for a in &f0 {
-            if let Some(b) = f1.iter().find(|b| b.0 == a.0) {
-                assert_eq!(
-                    a, b,
-                    "anchor round {} committed with different sequences",
-                    a.0
-                );
-            }
-        }
+        // One settled predicate for the gate and the collector: Y's declared
+        // round is at or below g, so both views settle it and commit the same
+        // sequences, Y in neither.
+        assert!(!f0.is_empty(), "vacuous: nothing committed");
+        assert_eq!(f0, f1, "the two views committed different sequences");
+        assert!(f0.iter().all(|c| !c.2.contains(&hy)), "Y was committed");
     }
 
     /// G1 S4, DE-2: an author with two vertices at r+1 votes for nothing, so a
@@ -3283,7 +3283,14 @@ mod tests {
         );
         //   (c) its causal history has a HOLE — this is the actual blocker
         assert!(
-            super::OrderingEngine::walk_history(&h2_leader, 0, 2, &dag, &wedged.committed_set)
+            super::OrderingEngine::walk_history(
+                &h2_leader,
+                0,
+                2,
+                &dag,
+                &wedged.committed_set,
+                wedged.gc_floor,
+            )
                 .is_none(),
             "walk_history must report a hole on the fabricated parent"
         );
@@ -3919,7 +3926,7 @@ mod tests {
         }
     }
 
-    /// H9 witness, an OPEN defect (second review of the C-1 fix): walk and
+    /// H9 witness, CLOSED at S7 (second review of the C-1 fix): walk and
     /// collector agree on each node, but "settled" (`committed_set`) is
     /// node-local. A restarted engine rebuilds it from the last
     /// COMMITTED_ROUNDS_WINDOW anchor rounds; a live one keeps the last
@@ -3931,7 +3938,6 @@ mod tests {
     /// chain (floor g on authenticated ref rounds, one predicate for the walk
     /// and the collector, DE-5).
     #[test]
-    #[ignore = "reproduces H9, an OPEN defect: RED by design until S7"]
     fn test_h9_restart_window_splits_one_anchor() {
         h9_withheld_chain_world(400, "restart");
     }
@@ -3940,7 +3946,6 @@ mod tests {
     /// three honest vertices) the walk reaches evicted, pruned parents on
     /// every node that builds blocks: a halt from one validator key.
     #[test]
-    #[ignore = "reproduces H9, an OPEN defect: RED by design until S7"]
     fn test_h9_long_withheld_chain_halts_every_node() {
         h9_withheld_chain_world(2800, "halt");
     }
@@ -3981,6 +3986,9 @@ mod tests {
         let mut restarted = super::OrderingEngine::new_with_storage(db2.clone());
         assert_eq!(restarted.next_anchor_round, live.next_anchor_round);
         assert_eq!(restarted.finality_digest, live.finality_digest);
+        // GC-4: the committed set is a function of the committed prefix.
+        assert_eq!(restarted.committed_set, live.committed_set);
+        assert_eq!(restarted.gc_floor, live.gc_floor);
         // D's withheld chain, released now.
         let mut dprev = "genesis".to_string();
         for r in 1..n {
@@ -4023,5 +4031,24 @@ mod tests {
             commit_fingerprint(&a_restarted),
             "one anchor, two sequences"
         );
+    }
+
+    /// Second review of S5, MEDIUM-2: DE-6 refuses an adopted anchor that is
+    /// not an anchor round, or lies absurdly far past the cursor, instead of
+    /// writing a row per skipped round.
+    #[test]
+    fn de6_refuses_an_absurd_adopted_anchor_quickly() {
+        let validators = mk_validators(4);
+        let db = temp_db("de6_absurd");
+        let mut eng = super::OrderingEngine::new_with_storage(db);
+        let t = std::time::Instant::now();
+        for round in [1u64 << 40, 7] {
+            let info = eng.adopt_synced_anchor(round, "a", &["x".to_string()], &validators);
+            assert!(info.is_none(), "anchor {round} was adopted");
+        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        assert!(eng
+            .adopt_synced_anchor(2, "b", &["y".to_string()], &validators)
+            .is_some());
     }
 }

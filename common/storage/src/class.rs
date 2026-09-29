@@ -320,6 +320,7 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         ["peer" | "peer_ip" | "peer_addr", id] if seg(id) => Node,
         ["alarm", "anchor_height_violation", h] if dec(h) => Node,
         ["alarm", "vcert_conflict", e, r, a] if dec20(e) && dec20(r) && seg(a) => Node,
+        ["alarm", "decision_conflict", h] if dec(h) => Node,
 
         // T and log
         ["jmt", "node", n] if hex(n) => Tree,
@@ -633,6 +634,7 @@ mod tests {
             ("consensus:anchor_decision:00000000000000000003:00000000000000153030".into(), Local),
             ("consensus:gc_floor".into(), Local),
             ("consensus:pull_seq".into(), Local),
+            ("alarm:decision_conflict:42".into(), Node),
             ("consensus:guard_origin".into(), Node),
             (format!("alarm:vcert_conflict:00000000000000000003:00000000000000153030:{H64}"), Node),
             ("da_shard_10000_0".into(), Local),

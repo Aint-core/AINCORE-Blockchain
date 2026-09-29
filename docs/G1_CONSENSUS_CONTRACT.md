@@ -709,6 +709,56 @@ node receiving no push at all keeping up by pull alone, a lost certificate row f
 restart, the flood witness (a Byzantine member, a spoofer of the honest fetcher and outsiders,
 20 requests each per server per tick), and a node-level catch-up through `DagConsensus`.
 
+**S5 second review (no CRITICAL), fixed.**
+- HIGH: in the node, the CE-3 halt stopped only signing, and the commit loop kept placing
+  blocks. Now `ordering_halted()` stops the commit loop, finality-vote signing and sync
+  adoption.
+- DE-6 conflicts halt the same way: they write `alarm:decision_conflict:{h}`, and the halt is
+  reloaded at boot.
+- MEDIUM: a copy of a staged body is neither verified nor harvested (it was a free BLS-cost
+  lever).
+- MEDIUM: DE-6 refuses an adopted anchor that is odd or more than `MAX_DECISION_ROWS` anchor
+  rounds past the cursor, instead of looping a row per round.
+- LOW: the guard origin is taken only by a database that never signed; the V4 mode is a
+  boot-fixed flag and fails closed; sync adoption on V4 decides with C_0.
+
+**S7 status: GC, and H9 closed.**
+- In `OrderingEngine`, "settled" is one predicate built from agreed data: the sentinel,
+  `committed_set`, or a declared ref round ≤ g.
+- `committed_set` maps each digest to the anchor round that committed it. It is pruned when
+  that anchor falls to g or below, and rebuilt at boot from the `cseq` rows above g (GC-4).
+  It is no longer a FIFO or 256-round window.
+- g = anchor − `GC_DEPTH` is persisted in the acceptance transaction (GC-1).
+- The committed sequence is the visited set of the completeness walk itself (DE-5), so the
+  gate and the collector cannot disagree.
+- Both H9 witnesses are green and now ordinary tests. The restart witness also asserts that
+  the committed set and g are identical.
+- The regressions from review C-1 now assert the right invariant: two views, one holding a
+  parent the other lacks, commit the same sequences.
+- In the engine:
+  - Ingress uses the real g.
+  - OR-1 has the same settled arm.
+  - OR-3: when g rises, every waiting child is re-evaluated, and wants and PENDING vertices
+    at or below g retire.
+  - GC-3: rows and memory at or below g − `RETAIN_SLACK` are deleted, and the plain-body
+    budget gets its bytes back (review LOW-6).
+- Catch-up, found by the 200-round witness: a node cut off for 40 rounds learned its gap one
+  level per round trip. That is slower than the chain grows, so its gap left the retention
+  window. Now new wants are sent as soon as an answer reveals them, a batch never drops a
+  want, and a vertex that goes PENDING far above O_E wants the certificates of the whole gap
+  at once.
+- Witnesses:
+  - 200 rounds with every node restarting at a different time and one cut off for 40 rounds:
+    all agree; the old rows are deleted; memory is bounded; the committed set is identical.
+  - The floor-rise witness (OR-3).
+  - Guards are deleted only where ingress refuses everything.
+  - GC gives a plain twin's bytes back.
+- Mutation: 13 mutants, including the contract's kill list (drop OR-3, guards deleted above
+  g, a FIFO committed set). 11 are killed. The two survivors are the gap fetch and the
+  immediate send: each is sufficient on its own under SimNet's instant delivery, so they are
+  redundant catch-up accelerators rather than untested rules. S10's delayed network is
+  where each one is timed.
+
 ### Imported decisions and finality votes (IM)
 
 **IM-1 (QC authority).**

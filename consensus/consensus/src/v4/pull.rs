@@ -120,6 +120,8 @@ pub(crate) struct Budget {
 /// One outstanding want: who to ask, in rotation, and when next.
 #[derive(Debug, Clone)]
 pub struct Want {
+    /// The round of what is wanted: at or below g, it retires (RE-4).
+    pub(super) round: u64,
     targets: Vec<String>,
     next: usize,
     due: u64,
@@ -127,8 +129,9 @@ pub struct Want {
 }
 
 impl Want {
-    fn new(targets: Vec<String>, now: u64) -> Self {
+    fn new(round: u64, targets: Vec<String>, now: u64) -> Self {
         Self {
+            round,
             targets,
             next: 0,
             due: now,
@@ -168,8 +171,10 @@ impl Engine {
             .map(|(_, m)| m.address.clone())
             .filter(|a| *a != self.cfg.address)
             .collect();
-        self.body_wants
-            .insert(cert.body.digest.clone(), Want::new(signers, self.tick));
+        self.body_wants.insert(
+            cert.body.digest.clone(),
+            Want::new(cert.body.round, signers, self.tick),
+        );
     }
 
     /// RE-2: a certificate is asked of every member.
@@ -185,7 +190,8 @@ impl Engine {
             .map(|m| m.address.clone())
             .filter(|a| *a != self.cfg.address)
             .collect();
-        self.cert_wants.insert(slot, Want::new(members, self.tick));
+        self.cert_wants
+            .insert(slot, Want::new(round, members, self.tick));
     }
 
     /// One fetch step: retire what is satisfied, then ask for what is due.
@@ -218,6 +224,13 @@ impl Engine {
         let certs = &self.certs;
         self.cert_wants.retain(|slot, _| !certs.contains_key(slot));
 
+        self.send_due(net);
+    }
+
+    /// Ask for every want that is due, in batches: never more than a batch
+    /// per request, and never a turn used without being sent.
+    pub(super) fn send_due(&mut self, net: &dyn ConsensusNet) {
+        let now = self.tick;
         let mut bodies: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (digest, want) in self.body_wants.iter_mut() {
             // A body already received and waiting on its parents' certificates
@@ -226,27 +239,52 @@ impl Engine {
                 continue;
             }
             if let Some(target) = want.take_turn(now) {
-                let batch = bodies.entry(target).or_default();
-                if batch.len() < MAX_REQ_DIGESTS {
-                    batch.push(digest.clone());
-                }
+                bodies.entry(target).or_default().push(digest.clone());
             }
         }
         for (target, digests) in bodies {
-            self.request(&target, Request::Vertices(digests), net);
+            for batch in digests.chunks(MAX_REQ_DIGESTS) {
+                self.request(&target, Request::Vertices(batch.to_vec()), net);
+            }
         }
         let mut slots: BTreeMap<String, Vec<(u64, String)>> = BTreeMap::new();
         for (slot, want) in self.cert_wants.iter_mut() {
             if let Some(target) = want.take_turn(now) {
-                let batch = slots.entry(target).or_default();
-                if batch.len() < MAX_REQ_SLOTS {
-                    batch.push(slot.clone());
-                }
+                slots.entry(target).or_default().push(slot.clone());
             }
         }
         for (target, slots) in slots {
-            self.request(&target, Request::Certs(slots), net);
+            for batch in slots.chunks(MAX_REQ_SLOTS) {
+                self.request(&target, Request::Certs(batch.to_vec()), net);
+            }
         }
+    }
+
+    /// A node far behind learns what it misses one level at a time through
+    /// PENDING, which can be slower than the chain grows. So when a vertex
+    /// waits on certificates at `upto` far above O_E, the certificates of
+    /// every author for the whole gap are wanted at once (bounded), and their
+    /// bodies follow through RE-1 (a).
+    pub(super) fn want_gap(&mut self, upto: u64) {
+        const MAX_GAP_ROUNDS: u64 = 256;
+        let top = lock(&self.round_index)
+            .keys()
+            .max()
+            .copied()
+            .unwrap_or(0)
+            .max(self.gc_floor());
+        let from = top + 1;
+        let upto = upto.min(from + MAX_GAP_ROUNDS);
+        if upto <= self.gap_high.max(from) {
+            return;
+        }
+        let authors: Vec<String> = self.stakes.iter().map(|(a, _)| a.clone()).collect();
+        for r in from.max(self.gap_high + 1)..=upto {
+            for a in &authors {
+                self.want_cert(r, a);
+            }
+        }
+        self.gap_high = upto;
     }
 
     /// A strictly increasing request number, across restarts: numbers are
@@ -399,6 +437,8 @@ impl Engine {
                 }
             }
         }
+        // What this answer revealed is asked for now, not a tick later.
+        self.send_due(net);
     }
 
     /// The digests this node is fetching (tests and diagnostics).

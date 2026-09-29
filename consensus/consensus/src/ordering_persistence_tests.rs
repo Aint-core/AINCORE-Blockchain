@@ -60,7 +60,7 @@ fn snapshot(engine: &OrderingEngine, db: &StateDB) -> Snapshot {
         finalized: engine.finalized_round,
         cursor: engine.next_anchor_round,
         sequence: engine.committed_sequence.clone(),
-        dedup: engine.committed_set.iter().cloned().collect(),
+        dedup: engine.committed_set.keys().cloned().collect(),
         digest: engine.finality_digest.clone(),
         beacon: engine.get_random_beacon().to_vec(),
         rows,

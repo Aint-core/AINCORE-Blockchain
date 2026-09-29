@@ -131,6 +131,15 @@ pub struct DagConsensus {
     /// (`genesis:vertex_format` = 4). It then owns ingress, staging, O_E and
     /// production; `dag` holds its staged bodies and `round_index` O_E.
     pub(crate) v4: Option<crate::v4::Engine>,
+    /// Fixed at boot: this chain runs V4. Every V3/V4 branch reads this, not
+    /// whether the engine happens to be present at that moment.
+    v4_chain: bool,
+    /// C_0 as (address, stake), fixed at boot on a V4 chain (DE-7).
+    v4_stakes: Vec<(String, u64)>,
+    /// A recorded conflict (a second certificate for a slot, CE-3; a decision
+    /// row that disagrees, DE-6) halts ordering: no block is placed, no
+    /// finality vote signed, no synced anchor adopted. Survives restarts.
+    ordering_halt: Option<String>,
     #[cfg(test)]
     pub(crate) local_acceptance_hook: Option<LocalAcceptanceHook>,
     /// Tests only: runs inside the block transaction BEFORE execution, the
@@ -221,7 +230,11 @@ impl DagConsensus {
 
         // G1 S5: a V4 chain boots through the certified-DAG engine (RC-1), never
         // through the V3 recovery below, which would read V4 bodies as V3.
-        let v4_format = crate::v4::is_v4_chain(&storage);
+        // Fail closed: a node that cannot read its format must not guess V3.
+        let v4_format = match storage.get(crate::v4::VERTEX_FORMAT_KEY) {
+            Ok(v) => v.as_deref() == Some("4"),
+            Err(e) => panic!("cannot read the chain's vertex format: {e}"),
+        };
         // OPTIMIZED RECOVERY: Use checkpoint instead of full scan (Aptos/Sui style)
         let checkpoint_round = if v4_format {
             0
@@ -624,6 +637,9 @@ impl DagConsensus {
             }),
             placement_sleep: Arc::new(std::thread::sleep),
             v4: None,
+            v4_chain: v4_format,
+            v4_stakes: Vec::new(),
+            ordering_halt: None,
             #[cfg(test)]
             local_acceptance_hook: None,
             #[cfg(test)]
@@ -633,10 +649,38 @@ impl DagConsensus {
             #[cfg(test)]
             v4_outbox: None,
         };
+        let alarms = "alarm:decision_conflict:";
+        if let Some(Ok((key, _))) = this.storage.db.prefix_iterator(alarms.as_bytes()).next() {
+            if key.starts_with(alarms.as_bytes()) {
+                this.ordering_halt = Some(format!(
+                    "a decision conflict was recorded ({})",
+                    String::from_utf8_lossy(&key)
+                ));
+            }
+        }
         if v4_format {
             this.start_v4();
         }
         this
+    }
+
+    /// Why ordering is halted, if it is: a conflict this node recorded, or
+    /// the V4 engine's certificate conflict (CE-3, OR-2).
+    pub fn ordering_halted(&self) -> Option<String> {
+        self.ordering_halt.clone().or_else(|| {
+            self.v4
+                .as_ref()
+                .and_then(|e| e.halted().map(str::to_string))
+        })
+    }
+
+    /// DE-6: a decision row disagreed. Recorded durably; ordering stops.
+    fn halt_on_decision_conflict(&mut self, height: u64, err: &str) {
+        let _ = self
+            .storage
+            .put(&format!("alarm:decision_conflict:{height}"), err);
+        eprintln!("🚨 [DE-6] {err}: ordering halted at height {height}");
+        self.ordering_halt = Some(err.to_string());
     }
 
     /// Boot the certified-DAG engine on a V4 chain (RC-1). A V4 chain without
@@ -675,6 +719,7 @@ impl DagConsensus {
         )
         .unwrap_or_else(|e| panic!("the V4 engine did not boot: {e}"));
         self.current_round = engine.current_round();
+        self.v4_stakes = engine.stakes().to_vec();
         self.v4 = Some(engine);
     }
 
@@ -903,7 +948,7 @@ impl DagConsensus {
     }
 
     pub fn try_create_vertex(&mut self) {
-        if self.v4.is_some() {
+        if self.v4_chain {
             self.v4_tick();
             return;
         }
@@ -1291,7 +1336,7 @@ impl DagConsensus {
     pub fn add_vertex(&mut self, vertex: Vertex) {
         // One DAG format per chain: a V4 chain takes vertices only through the
         // certified-DAG engine.
-        if self.v4.is_some() {
+        if self.v4_chain {
             return;
         }
         // G1 V4 fields have no place in a V3 vertex. Its hash binds neither the
@@ -1648,15 +1693,19 @@ impl DagConsensus {
     /// The committee a decision reads: the live set on the V3 path; on V4 the
     /// frozen C_0 (DE-7), for the leader, the votes, the reward and BFT time.
     fn decision_committee(&self) -> Vec<(String, u64)> {
-        match &self.v4 {
-            Some(engine) => engine.stakes().to_vec(),
-            None => self.get_validator_set_with_stake(),
+        if self.v4_chain {
+            self.v4_stakes.clone()
+        } else {
+            self.get_validator_set_with_stake()
         }
     }
 
     /// Decide and place every anchor that is ready: one anchor per decision,
     /// its block executed and accepted before the next is decided.
     fn commit_ready_anchors(&mut self, trigger_round: u64) {
+        if self.ordering_halted().is_some() {
+            return;
+        }
         // --- ORDERING LOGIC (Bullshark-lite) ---
         // Now we can take new locks without holding the previous ones.
 
@@ -1977,6 +2026,10 @@ impl DagConsensus {
                         }
                         Err(err) => {
                             eprintln!("[LOCAL_BLOCK_ACCEPTANCE_FAILED] anchor {}: {err}; ordering not advanced", commit.anchor_round);
+                            if err.contains(crate::ordering::DECISION_CONFLICT) {
+                                let height = self.latest_block_height + 1;
+                                self.halt_on_decision_conflict(height, &err);
+                            }
                             break;
                         }
                     }
@@ -2087,7 +2140,7 @@ impl DagConsensus {
             // Or re-acquire lock.
             // V4 has no V3 pruning or checkpoints: its GC is S7 (GC-1..GC-5)
             // and its boot never reads a checkpoint (RC-1).
-            if !commit.sequence.is_empty() && self.v4.is_none() {
+            if !commit.sequence.is_empty() && !self.v4_chain {
                 // H-5 FIX: Prune only FINALIZED rounds (check ordering engine)
                 // M3 FIX: Derive the prune watermark from the MONOTONIC finality
                 // high-water mark, not committed_rounds.iter().min(). The old
@@ -2257,6 +2310,10 @@ impl DagConsensus {
     }
 
     fn retry_qc_work(&mut self) {
+        // A halted node signs no finality vote.
+        if self.ordering_halted().is_some() {
+            return;
+        }
         let chain = self.resolve_chain_id();
         match crate::qc_producer::retry_pending_qcs(
             &self.storage, &self.node_key, &self.node_id, &chain, &mut self.qc_retry_cursor,
@@ -2975,7 +3032,7 @@ impl DagConsensus {
             // S1 before parsing. The JSON of a `Msg::Vertex` wraps the vertex
             // in `{"Vertex":…}`; the vertex's own length is what S1 bounds.
             const WRAP: usize = r#"{"Vertex":}"#.len();
-            if self.v4.is_none() || content.len() > MAX_VERTEX_BYTES + WRAP {
+            if !self.v4_chain || content.len() > MAX_VERTEX_BYTES + WRAP {
                 return;
             }
             if let Ok(m) = serde_json::from_str::<crate::v4::Msg>(content) {
@@ -3285,8 +3342,8 @@ impl DagConsensus {
             // local cursor moves past any gossip hole exactly as the producer's
             // did, then cast this node's finality vote for the block — a stalled
             // follower otherwise stops voting and the >2/3 QC quorum dies.
-            {
-                let validators = self.get_validator_set_with_stake();
+            if self.ordering_halted().is_none() {
+                let validators = self.decision_committee();
                 let start_h = self.last_adopted_height.saturating_add(1);
                 for h in start_h..=new_height {
                     let Some(block) = self

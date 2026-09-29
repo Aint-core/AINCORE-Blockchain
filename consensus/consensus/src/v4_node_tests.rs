@@ -456,3 +456,115 @@ fn a_v4_node_that_missed_rounds_catches_up_by_pull() {
     let common = c.assert_same_blocks(ahead);
     assert!(common >= ahead);
 }
+
+/// A certificate for (round, author, digest) signed by `signer_seeds`: what
+/// more than f colluding keys can produce.
+fn forge_cert(
+    c: &Cluster,
+    round: u64,
+    author: &str,
+    digest: &str,
+    signer_seeds: &[u8],
+) -> crate::vcert::VertexCertificate {
+    let body = crate::vcert::AttestBody {
+        chain_id: crate::qc::expected_chain_id(),
+        genesis_identity: GENESIS_IDENTITY.to_string(),
+        epoch: 0,
+        round,
+        author: author.to_string(),
+        digest: digest.to_string(),
+        committee_hash: crate::qc::validator_set_hash(&c.committee),
+    };
+    let mut collector = crate::vcert::CertCollector::new(body.clone(), &c.committee).unwrap();
+    let mut out = None;
+    for &s in signer_seeds {
+        let att = crate::vcert::VertexAttestation {
+            body: body.clone(),
+            signer: validator_info(s).address,
+            signature: BLSEngine::consensus()
+                .sign_raw(&body.signing_bytes(), &derive_validator_bls_seed(&[s; 32])),
+        };
+        if let Ok(crate::vcert::CollectOutcome::Certified(cert)) = collector.add(&att) {
+            out = Some(*cert);
+        }
+    }
+    out.expect("a quorum of signers")
+}
+
+/// CE-3 through the node (second review of S5, HIGH-1): a node that sees two
+/// certificates for one slot places no further block, signs no further
+/// finality vote, before and after a restart.
+#[test]
+fn a_ce3_halted_node_places_no_more_blocks() {
+    let mut c = Cluster::new("halt", &[111, 112, 113, 114], true);
+    c.run(6);
+    let author = c.known[1].0.clone();
+    let fake = "ab".repeat(32);
+    let cert = forge_cert(&c, 1, &author, &fake, &[111, 112, 113]);
+    let wire = format!(
+        "{}{}",
+        crate::v4::WIRE_PREFIX,
+        serde_json::to_string(&crate::v4::Msg::Cert(cert)).unwrap()
+    );
+    c.node_mut(0).handle_message(&wire);
+    assert!(c.node(0).ordering_halted().is_some(), "not halted");
+    let at_halt = c.node(0).latest_block_height;
+    c.run(10);
+    assert_eq!(
+        c.node(0).latest_block_height,
+        at_halt,
+        "a halted node placed blocks"
+    );
+    assert!(
+        c.node(1).latest_block_height > at_halt,
+        "vacuous: the others stopped too"
+    );
+    c.reopen(0);
+    assert!(
+        c.node(0).ordering_halted().is_some(),
+        "the halt was forgotten"
+    );
+    c.run(6);
+    assert_eq!(c.node(0).latest_block_height, at_halt);
+}
+
+static EXECUTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// DE-6 through the node (second review of S5, LOW-1): a decision row that
+/// disagrees refuses the acceptance, records an alarm and halts ordering; the
+/// refused block is executed once, not on every progress, and the halt
+/// survives a restart.
+#[test]
+fn a_decision_conflict_halts_the_node_with_an_alarm() {
+    let mut c = Cluster::new("de6-halt", &[119, 120, 121, 122], true);
+    c.node(0)
+        .storage
+        .put(&crate::ordering::anchor_decision_key(0, 2), "S")
+        .unwrap();
+    c.node_mut(0).pre_execution_hook = Some(|_, _| {
+        EXECUTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    });
+    c.run(20);
+    assert_eq!(c.node(0).latest_block_height, 0);
+    assert!(
+        c.node(1).latest_block_height > 2,
+        "vacuous: the others stopped too"
+    );
+    assert!(c.node(0).ordering_halted().is_some());
+    assert!(EXECUTIONS.load(std::sync::atomic::Ordering::SeqCst) <= 1);
+    let alarm = c
+        .node(0)
+        .storage
+        .db
+        .prefix_iterator(b"alarm:decision_conflict:")
+        .next()
+        .and_then(|r| r.ok())
+        .map(|(k, _)| k.starts_with(b"alarm:decision_conflict:"));
+    assert_eq!(alarm, Some(true), "no alarm row");
+    c.reopen(0);
+    assert!(
+        c.node(0).ordering_halted().is_some(),
+        "the halt was forgotten"
+    );
+}

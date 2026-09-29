@@ -1486,3 +1486,239 @@ fn a_replay_or_a_forged_identity_charges_no_ones_budget() {
         "the member's reservation was charged by others"
     );
 }
+
+/// Second review of S5, MEDIUM-1: a copy of a staged body is neither
+/// verified nor harvested, so a relay padding a public digest with refs (here
+/// carrying a valid but conflicting certificate) costs nothing and changes
+/// nothing.
+#[test]
+fn a_padded_copy_of_a_staged_body_is_not_harvested() {
+    let mut c = Cluster::new("no-harvest", 4, 0);
+    c.run(3);
+    let author = c.members[1].info.address.clone();
+    let staged = c.engine(0).certified(2, &author).unwrap().to_string();
+    let mut copy = lock(&c.engine(0).dag).get(&staged).cloned().unwrap();
+    let fake = "ab".repeat(32);
+    let conflicting = forged_cert(&c, 1, &author, &fake, &[0, 2, 3]);
+    copy.parent_refs.push(ParentRef {
+        round: 1,
+        author: author.clone(),
+        digest: fake,
+        proof: None,
+        cert: Some(conflicting.compact()),
+    });
+    c.receive(0, Msg::Vertex(copy));
+    assert!(
+        c.engine(0).halted().is_none(),
+        "the padded copy was harvested"
+    );
+}
+
+/// Second review of S5, LOW-3: the guard-origin flag left set does not re-arm
+/// signing on a database that has already signed.
+#[test]
+fn a_used_database_never_takes_a_new_guard_origin() {
+    let mut c = Cluster::new("origin-rearm", 4, 0);
+    c.run(3);
+    c.engine(0)
+        .storage
+        .delete("consensus:guard_origin")
+        .unwrap();
+    // `open` with genesis_init = true, as a node started with the flag set.
+    c.engines[0] = None;
+    c.open(0, true);
+    assert!(c
+        .engine(0)
+        .storage
+        .get("consensus:guard_origin")
+        .unwrap()
+        .is_none());
+    c.run(4);
+    assert!(
+        c.engine(0).own_proposal(5).is_none(),
+        "the node signed again"
+    );
+}
+
+/// S7: 200 rounds. Every node restarts at a different time, and one is cut
+/// off for 40 rounds (inside the retention window) and rejoins by fetch. All
+/// decide the same sequences; GC deleted the rows at or below g − slack;
+/// memory stays bounded; nodes at one cursor hold the same committed set.
+#[test]
+fn two_hundred_rounds_with_restarts_at_different_times_agree() {
+    let mut c = Cluster::new("s7-long", 4, 0);
+    let cut = c.members[3].info.address.clone();
+    for tick in 0..200usize {
+        if tick >= 40 && (tick - 40) % 35 == 0 && (tick - 40) / 35 < 4 {
+            c.reopen((tick - 40) / 35);
+        }
+        c.tick_all();
+        if (100..140).contains(&tick) {
+            let off = cut.clone();
+            c.deliver(&move |e, to| to == 3 || e.from == off);
+            c.held.clear();
+        } else {
+            c.deliver(&|_, _| false);
+        }
+    }
+    c.run(10);
+    c.assert_agree();
+    for i in c.validators() {
+        let e = c.engine(i);
+        let g = e.floor();
+        assert!(g > 100, "node {i}: g = {g}");
+        let cut_round = g - staging::RETAIN_SLACK;
+        let old = staging::vslot_key(EPOCH, cut_round, &c.members[0].info.address);
+        assert!(
+            e.storage.get(&old).unwrap().is_none(),
+            "node {i} kept row {old}"
+        );
+        let held = lock(&e.dag).len();
+        let bound = 4 * (crate::ordering::GC_DEPTH + staging::RETAIN_SLACK + 20) as usize;
+        assert!(held <= bound, "node {i} holds {held} bodies");
+        assert!(lock(&e.dag).values().all(|v| v.round > cut_round));
+    }
+    let cursors: Vec<u64> = c.validators().map(|i| c.engine(i).cursor()).collect();
+    for i in c.validators().skip(1) {
+        if cursors[i] == cursors[0] {
+            assert_eq!(
+                lock(&c.engine(i).ordering).committed_digests(),
+                lock(&c.engine(0).ordering).committed_digests(),
+                "node {i}"
+            );
+        }
+    }
+}
+
+/// OR-3, the floor-rise witness: node 0 can never obtain one round-3 body,
+/// so its children wait. When g passes that round (here node 0 adopts the
+/// others' decisions, as block sync would), the waiting children are
+/// released and node 0 orders and decides again.
+#[test]
+fn a_waiting_child_is_released_when_the_floor_passes_its_parent() {
+    let mut c = Cluster::new("s7-floor", 4, 0);
+    c.run(2);
+    c.tick_all();
+    let lost = c.engine(1).own_proposal(3).unwrap().hash.clone();
+    let gone = lost.clone();
+    let hide = move |e: &Envelope, to: usize| {
+        to == 0
+            && match &e.msg {
+                Msg::Vertex(v) => v.hash == gone,
+                Msg::Resp {
+                    resp: pull::Response::Vertices { bodies, .. },
+                    ..
+                } => bodies.iter().any(|v| v.hash == gone),
+                _ => false,
+            }
+    };
+    for _ in 0..70 {
+        c.deliver(&hide);
+        c.held.clear();
+        c.tick_all();
+    }
+    c.deliver(&hide);
+    c.held.clear();
+    assert!(!c.engine(0).is_staged(&lost));
+    let stuck = c.decisions[0].len();
+    let ahead: Vec<Decision> = c.decisions[1].clone();
+    assert!(ahead.iter().any(|d| d.0 > 3 + crate::ordering::GC_DEPTH));
+    // Adopt the others' decisions until g passes round 3.
+    let stakes = c.engine(0).stakes().to_vec();
+    for d in ahead.iter().skip(stuck) {
+        let mut ord = lock(&c.engine(0).ordering);
+        if ord.gc_floor() >= 3 {
+            break;
+        }
+        assert!(ord.adopt_synced_anchor(d.0, &d.1, &d.2, &stakes).is_some());
+    }
+    assert!(c.engine(0).floor() >= 3);
+    c.tick(0);
+    assert!(
+        !c.engine(0).wanted_bodies().contains(&lost),
+        "a want at or below g did not retire"
+    );
+    let adopted = lock(&c.engine(0).ordering).next_anchor_round;
+    c.run(8);
+    assert!(
+        c.engine(0).cursor() > adopted,
+        "node 0 decided nothing after the floor rose"
+    );
+}
+
+/// GC-3: deleting guards below g cannot enable a second signature. A twin of
+/// a vertex just above g is refused (its guard survives GC); an old vertex at
+/// or below g is STALE and never signed again.
+#[test]
+fn guards_are_deleted_only_where_ingress_refuses_everything() {
+    let mut c = Cluster::new("s7-guards", 4, 0);
+    c.run(2);
+    let old = c.engine(1).own_proposal(2).unwrap().clone();
+    c.run(130);
+    let g = c.engine(0).floor();
+    assert!(g > staging::RETAIN_SLACK + 2, "g = {g}");
+    let me = c.members[0].info.address.clone();
+    let signed = Cell::new(0);
+    let count = |e: &Envelope, _: usize| {
+        if e.from == me && matches!(e.msg, Msg::Attest(_)) {
+            signed.set(signed.get() + 1);
+        }
+        false
+    };
+    // Old: at or below g, its guard long deleted.
+    c.q.borrow_mut().push_back(Envelope {
+        from: c.members[1].info.address.clone(),
+        to: To::One(me.clone()),
+        msg: Msg::Vertex(old.clone()),
+    });
+    c.deliver(&count);
+    assert_eq!(signed.get(), 0, "an old vertex was signed again");
+    // Just above g: a twin of what node 0 already attested.
+    let author = c.members[1].info.address.clone();
+    let r = (g + 1..g + 20)
+        .find(|r| c.engine(1).own_proposal(*r).is_some())
+        .expect("a round above g");
+    let above = c.engine(1).own_proposal(r).unwrap().clone();
+    let twin = twin_of(&above, &c.members[1].node_key, "late-twin");
+    c.q.borrow_mut().push_back(Envelope {
+        from: author,
+        to: To::One(me.clone()),
+        msg: Msg::Vertex(twin),
+    });
+    c.deliver(&count);
+    assert_eq!(signed.get(), 0, "a twin above g was signed");
+}
+
+/// ST-3 after GC-3: a Byzantine leader's uncertified twin is staged as a
+/// plain body and counts against its author's budget; once g passes its
+/// round, GC deletes it and gives the bytes back.
+#[test]
+fn gc_gives_the_plain_body_budget_back() {
+    let mut c = Cluster::new("s7-vbytes", 4, 0);
+    c.run(1);
+    let byz = c.leader(2);
+    c.tick_all();
+    let a = c.engine(byz).own_proposal(2).unwrap().clone();
+    let b = twin_of(&a, &c.members[byz].node_key, "twin-b");
+    c.q.borrow_mut().push_back(Envelope {
+        from: c.members[byz].info.address.clone(),
+        to: To::All,
+        msg: Msg::Vertex(b.clone()),
+    });
+    c.deliver(&|_, _| false);
+    let h = c.validators().find(|&i| i != byz).unwrap();
+    let counted = |c: &Cluster| -> u64 {
+        c.engine(h)
+            .storage
+            .get(&staging::vbytes_key(EPOCH, &a.author))
+            .unwrap()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    assert!(c.engine(h).is_staged(&b.hash));
+    assert!(counted(&c) > 0, "vacuous: the twin is not a plain body");
+    c.run(130);
+    assert!(c.engine(h).floor() > 2 + staging::RETAIN_SLACK);
+    assert!(!c.engine(h).is_staged(&b.hash), "GC kept the twin");
+    assert_eq!(counted(&c), 0, "GC did not give the twin's bytes back");
+}
