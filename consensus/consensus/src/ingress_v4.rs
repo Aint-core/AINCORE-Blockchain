@@ -78,7 +78,20 @@ fn lower_hex(s: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// The parts of Layer S that need no epoch record (S1, S2 but the wire size).
+/// The body as it is stored and served: a ref's certificate and any V3
+/// identity proof stripped, so every copy of one vertex is one byte string.
+pub(crate) fn canonical_body(v: &Vertex) -> Result<String, String> {
+    let mut canonical = v.clone();
+    for r in &mut canonical.parent_refs {
+        r.cert = None;
+        r.proof = None;
+    }
+    serde_json::to_string(&canonical).map_err(|e| e.to_string())
+}
+
+/// The parts of Layer S that need no epoch record. The size bound is on the
+/// canonical body, not on the copy received, so boot, which re-runs Layer S
+/// on the stored body, measures the same bytes ingress did.
 fn intrinsic(v: &Vertex) -> Result<(), String> {
     if !v.is_live_form() {
         return Err("a compact proof, not a live vertex".into());
@@ -92,6 +105,10 @@ fn intrinsic(v: &Vertex) -> Result<(), String> {
     let mut seen = std::collections::HashSet::new();
     if !v.parents.iter().all(|p| seen.insert(p.as_str())) {
         return Err("a parent digest twice".into());
+    }
+    let bytes = canonical_body(v)?.len();
+    if bytes > MAX_VERTEX_BYTES {
+        return Err(format!("a {bytes}-byte body, over {MAX_VERTEX_BYTES}"));
     }
     Ok(())
 }

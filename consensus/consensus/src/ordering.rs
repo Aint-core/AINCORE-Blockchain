@@ -3885,4 +3885,110 @@ mod tests {
             );
         }
     }
+
+    /// H9 witness, an OPEN defect (second review of the C-1 fix): walk and
+    /// collector agree on each node, but "settled" (`committed_set`) is
+    /// node-local. A restarted engine rebuilds it from the last
+    /// COMMITTED_ROUNDS_WINDOW anchor rounds; a live one keeps the last
+    /// COMMITTED_SEQ_WINDOW hashes. Validator D withholds its own chain (each
+    /// vertex cites two honest parents and its previous one, a legal parent
+    /// quorum) and releases it; honest round `n` cites D's last vertex. The
+    /// live node and the restarted node commit one anchor with different
+    /// sequences. Closed at S7: "settled" becomes a function of the committed
+    /// chain (floor g on authenticated ref rounds, one predicate for the walk
+    /// and the collector, DE-5).
+    #[test]
+    #[ignore = "reproduces H9, an OPEN defect: RED by design until S7"]
+    fn test_h9_restart_window_splits_one_anchor() {
+        h9_withheld_chain_world(400, "restart");
+    }
+
+    /// H9 at length: past the live window (8192 hashes, about 2730 rounds of
+    /// three honest vertices) the walk reaches evicted, pruned parents on
+    /// every node that builds blocks: a halt from one validator key.
+    #[test]
+    #[ignore = "reproduces H9, an OPEN defect: RED by design until S7"]
+    fn test_h9_long_withheld_chain_halts_every_node() {
+        h9_withheld_chain_world(2800, "halt");
+    }
+
+    fn h9_withheld_chain_world(n: u64, tag: &str) {
+        use std::collections::HashMap;
+        let validators = mk_validators(4);
+        let honest: Vec<String> = validators[..3].iter().map(|(a, _)| a.clone()).collect();
+        let d = validators[3].0.clone();
+        let mut dag: HashMap<String, blockchain::Vertex> = HashMap::new();
+        let mut idx: HashMap<u64, Vec<String>> = HashMap::new();
+        let put = |dag: &mut HashMap<String, blockchain::Vertex>,
+                   idx: &mut HashMap<u64, Vec<String>>,
+                   h: String,
+                   v: blockchain::Vertex| {
+            idx.entry(v.round).or_default().push(h.clone());
+            dag.insert(h, v);
+        };
+        let mut prev = vec!["genesis".to_string()];
+        for r in 1..n {
+            let mut this = Vec::new();
+            for a in &honest {
+                let (h, v) = mk_vertex(r, a, prev.clone());
+                put(&mut dag, &mut idx, h.clone(), v);
+                this.push(h);
+            }
+            prev = this;
+        }
+        let db1 = temp_db(&format!("h9_live_{tag}"));
+        let db2 = temp_db(&format!("h9_restarted_{tag}"));
+        let mut live = super::OrderingEngine::new_with_storage(db1.clone());
+        let mut other = super::OrderingEngine::new_with_storage(db2.clone());
+        let c1 = drain(&mut live, &dag, &idx, &validators);
+        let c2 = drain(&mut other, &dag, &idx, &validators);
+        assert!(!c1.is_empty());
+        assert_eq!(commit_fingerprint(&c1), commit_fingerprint(&c2));
+        drop(other);
+        let mut restarted = super::OrderingEngine::new_with_storage(db2.clone());
+        assert_eq!(restarted.next_anchor_round, live.next_anchor_round);
+        assert_eq!(restarted.finality_digest, live.finality_digest);
+        // D's withheld chain, released now.
+        let mut dprev = "genesis".to_string();
+        for r in 1..n {
+            let parents = if r == 1 {
+                vec!["genesis".to_string()]
+            } else {
+                vec![
+                    format!("v{}_{}", r - 1, honest[0]),
+                    format!("v{}_{}", r - 1, honest[1]),
+                    dprev.clone(),
+                ]
+            };
+            let (h, v) = mk_vertex(r, &d, parents);
+            put(&mut dag, &mut idx, h.clone(), v);
+            dprev = h;
+        }
+        prev.push(dprev);
+        for r in n..n + 30 {
+            let mut this = Vec::new();
+            for a in &honest {
+                let (h, v) = mk_vertex(r, a, prev.clone());
+                put(&mut dag, &mut idx, h.clone(), v);
+                this.push(h);
+            }
+            prev = this;
+        }
+        // What a node that builds blocks holds: honest rounds below n - 10
+        // pruned, D's freshly admitted chain present.
+        let mut pdag = dag.clone();
+        pdag.retain(|_, v| v.round >= n - 10 || v.author == d);
+        let mut pidx = idx.clone();
+        for hs in pidx.values_mut() {
+            hs.retain(|h| pdag.contains_key(h));
+        }
+        let a_live = live.try_commit(0, &pdag, &pidx, &validators);
+        let a_restarted = restarted.try_commit(0, &dag, &idx, &validators);
+        assert!(!a_live.is_empty(), "the live node halted");
+        assert_eq!(
+            commit_fingerprint(&a_live),
+            commit_fingerprint(&a_restarted),
+            "one anchor, two sequences"
+        );
+    }
 }

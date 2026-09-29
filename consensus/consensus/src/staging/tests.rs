@@ -736,3 +736,89 @@ fn the_pending_buffer_breaks_a_top_round_tie_by_digest() {
         assert_eq!(buffer.push(order[1].clone()).unwrap().hash, greater);
     }
 }
+
+/// Second review, MEDIUM: ingress and boot bound the same bytes. A copy that
+/// omits the defaulted fields is shorter than the body stored for it; the
+/// bound is on the stored (canonical) body, so what ingress stages and this
+/// node attests, its own boot loads, and nothing larger is ever staged.
+#[test]
+fn ingress_and_boot_bound_the_same_bytes() {
+    use crate::ingress_v4::{v4_verdict, Context, Verdict};
+    let all = members();
+    let c = committee(&all);
+    let s = sentinel();
+    let base = serde_json::to_string(&twin(&all[0], FIRST, ""))
+        .unwrap()
+        .len();
+    let at = |canonical_len: usize| {
+        let v = twin(&all[0], FIRST, &"x".repeat(canonical_len - base));
+        let canonical = serde_json::to_string(&v).unwrap();
+        assert_eq!(canonical.len(), canonical_len);
+        let raw = canonical.replacen("\"parent_refs\":[],", "", 1).replacen(
+            ",\"aggregated_signature\":null",
+            "",
+            1,
+        );
+        assert!(raw.len() < canonical.len());
+        let w: Vertex = serde_json::from_str(&raw).unwrap();
+        (raw.len(), w)
+    };
+    let ctx = Context {
+        chain_id: CHAIN,
+        genesis_identity: GENESIS,
+        active: record(&c, &s),
+        previous: None,
+        next: None,
+        now_secs: 2_000,
+        gc_floor: 0,
+        cursor: FIRST,
+    };
+    let (raw_len, over) = at(crate::dag::MAX_VERTEX_BYTES + 1);
+    assert!(raw_len <= crate::dag::MAX_VERTEX_BYTES);
+    assert!(matches!(
+        v4_verdict(raw_len, &over, &ctx, |_| None),
+        Verdict::Invalid(_)
+    ));
+    let (raw_len, fits) = at(crate::dag::MAX_VERTEX_BYTES);
+    assert_eq!(v4_verdict(raw_len, &fits, &ctx, |_| None), Verdict::Stage);
+    let dir = TempDb::new("canon_size");
+    {
+        let db = dir.open();
+        assert_eq!(
+            stage(&db, &fits, Role::SelfAttested, None, B_AUTH),
+            Ok(StageOutcome::Staged)
+        );
+    }
+    let db = dir.open();
+    let got = load(&db, &record(&c, &s), CHAIN, GENESIS, 0).unwrap();
+    assert!(got.bodies.iter().any(|(_, b)| b.hash == fits.hash));
+}
+
+/// Second review, LOW: `stage` rolls back when `stage_in` fails after a
+/// write. The eviction's delete is undone, so the slot still names bodies
+/// that are all held.
+#[test]
+fn a_failed_stage_writes_nothing() {
+    let all = members();
+    let (a, b, c) = (
+        twin(&all[0], FIRST, "a"),
+        twin(&all[0], FIRST, "b"),
+        twin(&all[0], FIRST, "c"),
+    );
+    let dir = TempDb::new("rollback");
+    let db = dir.open();
+    stage(&db, &a, Role::Staged, None, B_AUTH).unwrap();
+    stage(&db, &b, Role::Staged, None, B_AUTH).unwrap();
+    FAULT_AFTER_EVICT.with(|f| f.set(true));
+    let failed = stage(&db, &c, Role::Staged, Some(&c.hash), B_AUTH);
+    FAULT_AFTER_EVICT.with(|f| f.set(false));
+    assert!(failed.is_err());
+    assert!(body_held(&db, &a) && body_held(&db, &b));
+    assert!(!body_held(&db, &c));
+    assert_eq!(digests(&db, &a).len(), 2);
+    // Without the fault the same call evicts a member.
+    assert!(matches!(
+        stage(&db, &c, Role::Staged, Some(&c.hash), B_AUTH),
+        Ok(StageOutcome::Evicted(_))
+    ));
+}

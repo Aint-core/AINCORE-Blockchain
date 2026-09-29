@@ -19,7 +19,9 @@
         "tests::tests::equivocation_liveness_tests::equivocated_parent_must_not_permanently_block_supported_anchor",
         "tests::tests::equivocation_liveness_tests::complete_signed_history_decides_after_retransmission_and_reopen",
         "tests::tests::test_h3_tier2_stateless_gate_prevents_the_ancestry_fork",
-        "tests::tests::test_h3_tier2_round_skipping_anchor_is_refused"
+        "tests::tests::test_h3_tier2_round_skipping_anchor_is_refused",
+        "ordering::tests::test_h9_restart_window_splits_one_anchor",
+        "ordering::tests::test_h9_long_withheld_chain_halts_every_node"
       ],
       "excluded_ignored": {
         "ordering::tests::probe_corpus_arm_distribution": "Measurement of scheduler corpus distribution, not a safety assertion.",

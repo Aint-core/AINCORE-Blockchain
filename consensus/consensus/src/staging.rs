@@ -119,12 +119,7 @@ pub fn stage_in(
     // The canonical body: transport fields stripped, so whichever copy
     // arrived first, the stored and served bytes are the same. Certificates
     // live in their own rows.
-    let mut canonical = v.clone();
-    for r in &mut canonical.parent_refs {
-        r.cert = None;
-        r.proof = None;
-    }
-    let body = serde_json::to_string(&canonical).map_err(|e| e.to_string())?;
+    let body = ingress_v4::canonical_body(v)?;
     let bytes = body.len() as u64;
     let mut outcome = StageOutcome::Staged;
     if slot.len() >= MAX_STAGED_PER_SLOT {
@@ -157,6 +152,10 @@ pub fn stage_in(
         let evicted = slot.remove(at);
         view.delete(&format!("vertex:{}", evicted.digest))
             .map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        if FAULT_AFTER_EVICT.with(|f| f.get()) {
+            return Err("an injected write fault".into());
+        }
         plain = plain.saturating_sub(evicted.bytes);
         outcome = StageOutcome::Evicted(evicted.digest);
     }
@@ -239,6 +238,7 @@ pub fn load(
             let body = storage
                 .get(&format!("vertex:{}", entry.digest))
                 .map_err(|e| e.to_string())?
+                // Bounds the parse; Layer S re-checks these same bytes.
                 .filter(|json| json.len() <= crate::dag::MAX_VERTEX_BYTES)
                 .and_then(|json| serde_json::from_str::<Vertex>(&json).ok());
             match body {
@@ -312,6 +312,12 @@ impl PendingBuffer {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fails `stage_in` after its first write, to show `stage` rolls back.
+    static FAULT_AFTER_EVICT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
