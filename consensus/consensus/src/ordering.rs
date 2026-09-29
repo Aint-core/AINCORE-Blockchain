@@ -587,12 +587,16 @@ impl OrderingEngine {
             let mut direct: Option<(u64, String)> = None;
             let mut r = start;
             while r < max_round && r - start < MAX_SCAN {
-                if let Some(h) = Self::leader_vertex_hash(r, dag, round_index, validators) {
-                    if Self::direct_quorum_met(r, &h, dag, round_index, validators, total_stake)
-                    {
-                        direct = Some((r, h));
-                        break;
-                    }
+                // DE-1/DE-2: at most one candidate can hold a quorum of votes,
+                // because every voter votes once (Lemma V).
+                if let Some(h) = Self::leader_candidates(r, dag, round_index, validators)
+                    .into_iter()
+                    .find(|h| {
+                        Self::direct_quorum_met(r, h, dag, round_index, validators, total_stake)
+                    })
+                {
+                    direct = Some((r, h));
+                    break;
                 }
                 r += 2;
             }
@@ -608,21 +612,29 @@ impl OrderingEngine {
                     None => return None, // cannot happen, but never guess
                 };
                 let Some(visited) =
-                    Self::walk_history(&chain, j, chain_round, dag, &self.committed_set)
+                    Self::walk_history(&chain, j, chain_round, dag, &self.committed_set, 0)
                 else {
                     // HOLE below the chain anchor: not decidable yet.
                     return None;
                 };
-                match Self::leader_vertex_hash(j, dag, round_index, validators) {
-                    Some(hj) if visited.contains(&hj) => {
+                // DE-4: the leader's vertices at j WITHIN the chain's history,
+                // not in this node's round index, so neither arrival order nor
+                // a twin the history does not contain can reach the decision.
+                let leader_j = Self::leader_for_round(j, validators, 0);
+                let mut in_history = visited.iter().filter(|h| {
+                    dag.get(*h)
+                        .is_some_and(|v| v.round == j && v.author == leader_j)
+                });
+                match (in_history.next(), in_history.next()) {
+                    (Some(hj), None) => {
                         to_commit.push((j, hj.clone()));
-                        chain = hj;
+                        chain = hj.clone();
                     }
-                    // Leader vertex known and provably NOT an ancestor, or no
-                    // leader vertex exists anywhere in the chain's complete
-                    // history: SKIP j. (The walk above was complete, so absence
-                    // is proof, not a guess.)
-                    _ => {}
+                    // No leader vertex in the chain's complete history: SKIP j.
+                    // The walk was complete, so absence is proof, not a guess.
+                    (None, _) => {}
+                    // Two: unreachable under Lemma U. Never guess.
+                    (Some(_), Some(_)) => return None,
                 }
             }
 
@@ -653,21 +665,51 @@ impl OrderingEngine {
         }
     }
 
-    /// The round-r leader's vertex hash, if present in the local DAG.
-    /// Leader = `leader_for_round(r, validators, 0)` — the PURE function; no
-    /// availability-driven fallback attempts (those were half the fork).
+    /// DE-1: every vertex the round-r leader authored in the local index, in
+    /// digest order, never arrival order. Leader = `leader_for_round(r,
+    /// validators, 0)`, the PURE function. Under V4 there is at most one
+    /// (Lemma U); the set form makes a violating input fail safe.
+    fn leader_candidates(
+        round: u64,
+        dag: &HashMap<String, Vertex>,
+        round_index: &HashMap<u64, Vec<String>>,
+        validators: &[(String, u64)],
+    ) -> Vec<String> {
+        let leader = Self::leader_for_round(round, validators, 0);
+        let mut candidates: Vec<String> = round_index
+            .get(&round)
+            .into_iter()
+            .flatten()
+            .filter(|h| dag.get(*h).is_some_and(|v| v.author == leader))
+            .cloned()
+            .collect();
+        candidates.sort();
+        candidates.dedup();
+        candidates
+    }
+
+    /// The round-r leader's vertex hash when there is exactly one candidate
+    /// (DE-1). No choice is ever made between two. The decision itself uses
+    /// the candidate set; this form serves the test harness.
+    #[cfg(test)]
     fn leader_vertex_hash(
         round: u64,
         dag: &HashMap<String, Vertex>,
         round_index: &HashMap<u64, Vec<String>>,
         validators: &[(String, u64)],
     ) -> Option<String> {
-        let leader = Self::leader_for_round(round, validators, 0);
-        round_index.get(&round)?.iter().find_map(|h| {
-            dag.get(h)
-                .filter(|v| v.author == leader)
-                .map(|_| h.clone())
-        })
+        let mut candidates = Self::leader_candidates(round, dag, round_index, validators);
+        (candidates.len() == 1).then(|| candidates.remove(0))
+    }
+
+    /// DE-2's vote of `u` for the round-r leader: the digest of the first ref,
+    /// in u's own signed order, whose author is the leader. Read from u's
+    /// bytes, never from a DAG lookup.
+    fn vote<'a>(u: &'a Vertex, leader: &str) -> Option<&'a str> {
+        u.parent_refs
+            .iter()
+            .find(|r| r.author == leader)
+            .map(|r| r.digest.as_str())
     }
 
     /// Stake-weighted direct-commit check: do round r+1 vertices from a strict
@@ -685,17 +727,29 @@ impl OrderingEngine {
         };
         let stakes: HashMap<&str, u64> =
             validators.iter().map(|(a, s)| (a.as_str(), *s)).collect();
-        let mut voted: HashSet<&str> = HashSet::new();
+        let leader = Self::leader_for_round(round, validators, 0);
+        // DE-2: an author counts only with exactly one vertex at r+1, and only
+        // for the candidate its own vote names, so no stake counts twice.
+        let mut by_author: HashMap<&str, HashSet<&str>> = HashMap::new();
         for vh in votes {
             if let Some(v) = dag.get(vh) {
-                if v.parents.iter().any(|p| p == anchor_hash) {
-                    voted.insert(v.author.as_str());
-                }
+                by_author
+                    .entry(v.author.as_str())
+                    .or_default()
+                    .insert(vh.as_str());
             }
         }
-        let signed: u128 = voted
+        let signed: u128 = by_author
             .iter()
-            .filter_map(|a| stakes.get(a).map(|s| *s as u128))
+            .filter(|(_, held)| held.len() == 1)
+            .filter(|(_, held)| {
+                held.iter()
+                    .next()
+                    .and_then(|h| dag.get(*h))
+                    .and_then(|u| Self::vote(u, &leader))
+                    == Some(anchor_hash)
+            })
+            .filter_map(|(a, _)| stakes.get(a).map(|s| *s as u128))
             .sum();
         crate::qc::stake_quorum_met(signed, total_stake)
     }
@@ -705,12 +759,16 @@ impl OrderingEngine {
     /// referenced parent that is neither in the local DAG, nor already
     /// committed, nor the genesis sentinel. A complete walk is what makes a
     /// SKIP decision a proof instead of a guess.
+    /// `gc_floor` is g: a parent whose round, as the child's authenticated ref
+    /// declares it, is at or below g is settled and not descended into (the
+    /// settled-by-floor arm; a no-op while g is 0).
     fn walk_history(
         from: &str,
         floor: u64,
         from_round: u64,
         dag: &HashMap<String, Vertex>,
         committed_set: &std::collections::HashSet<String>,
+        gc_floor: u64,
     ) -> Option<HashSet<String>> {
         let _ = from_round; // bounded implicitly: rounds strictly decrease
         let mut visited: HashSet<String> = HashSet::new();
@@ -729,8 +787,12 @@ impl OrderingEngine {
             if v.round <= floor {
                 continue; // do not descend below the floor
             }
-            for p in &v.parents {
-                if p != "genesis" && !committed_set.contains(p) {
+            for (i, p) in v.parents.iter().enumerate() {
+                let below_floor = v
+                    .parent_refs
+                    .get(i)
+                    .is_some_and(|r| r.digest == *p && r.round <= gc_floor);
+                if p != "genesis" && !committed_set.contains(p) && !below_floor {
                     stack.push(p.clone());
                 }
             }
@@ -757,6 +819,7 @@ impl OrderingEngine {
             anchor_round_in_dag,
             dag,
             &self.committed_set,
+            0,
         )?;
 
         let mut sequence = self.find_causal_history(anchor_vertex_hash, dag);
@@ -2087,8 +2150,10 @@ mod tests {
     /// The real fix is not a tie-break. Anchor identity has to be fixed by a
     /// 2f+1-weighted certificate over a specific hash, so that "which twin" is
     /// not a question any individual node answers from its own view.
+    ///
+    /// GREEN since G1 S4 (DE-1..DE-4): votes are read from each voter's own
+    /// refs, one per author, and candidates are a set, never arrival order.
     #[test]
-    #[ignore = "reproduces H2+H4, both OPEN: RED by design until anchor identity is certificate-bound"]
     fn test_h2_h4_twin_anchors_double_count_stake_and_break_subset_independence() {
         let (validators, vertices, twin_a, twin_b) = twin_scenario();
         let total: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
@@ -2149,6 +2214,22 @@ mod tests {
             full.decision(2),
             rev.decision(2)
         );
+
+        // ---- NON-VACUITY -------------------------------------------------------
+        // Agreement is cheap if nobody decides. At least 3 of the 4 views must
+        // COMMIT twin_a, the twin every round-3 voter names first.
+        let committed = [&full, &only_a, &only_b, &rev]
+            .iter()
+            .filter(|v| v.decision(2) == Decision::Commit(twin_a.clone()))
+            .count();
+        assert!(
+            committed >= 3,
+            "vacuous: only {committed} of 4 views committed twin_a ({:?} {:?} {:?} {:?})",
+            full.decision(2),
+            only_a.decision(2),
+            only_b.decision(2),
+            rev.decision(2)
+        );
     }
 
     // ===================================================================
@@ -2204,6 +2285,8 @@ mod tests {
     /// moved, something in the harness is reading process-dependent state — find
     /// it rather than updating the constant.**
     const H3_FIRST_BREACH_SEED: u64 = 77;
+    /// The Equivocate menu's first twin fork before G1 S4 (Commit vs Commit),
+    /// kept as the regression seed: it must stay breach-free now.
     const TWIN_FIRST_BREACH_SEED: u64 = 3;
     const SCHED_OMIT_P: f64 = 0.2;
     const SCHED_VIEWS: usize = 3;
@@ -2664,87 +2747,207 @@ mod tests {
         }
     }
 
-    /// GATE 4 — under equivocation, arrival order becomes DECISIVE, and the corpus
-    /// must find that unaided too.
+    /// GATE 4 — under equivocation, arrival order no longer decides, and no two
+    /// views commit different twins.
     ///
-    /// The sibling of gate 3. Same scheduler, same seeds, one difference: the
-    /// Byzantine validator emits TWINS and honest nodes cite both. Permutation goes
-    /// from inert to decisive, which proves gate 3's inertness is caused by the
-    /// absence of twins and not by a harness that cannot see reordering.
+    /// Before G1 S4 this gate asserted the opposite: permutation was DECISIVE
+    /// under equivocation (the corpus found the twin fork first at seed 3, and
+    /// 283 Commit-vs-Commit breaches in 3,000 schedules), because candidates
+    /// were chosen by arrival order and a voter citing both twins counted for
+    /// both. DE-1..DE-4 read votes from each voter's own refs, one per author,
+    /// and treat candidates as a set. Measured with `probe_corpus_fingerprint`
+    /// (3,000 schedules, release):
+    ///     Equivocate           Commit-vs-Commit 283 -> 0
+    ///     Equivocate, C1-legal all breaches     123 -> 0, decided rate 0.3967 -> 0.4167
+    ///     Honest, SparseAnchor fingerprints bit-identical
     ///
-    /// Measured over 20,000 schedules per menu:
-    ///     honest      0 AD-1 breaches
-    ///     sparse    175 breaches, first at seed 77   (H3: Commit vs Skip)
-    ///     equivocate 1,716 breaches, first at seed 7 (H2: Commit vs Commit)
-    ///
-    /// Note the shapes differ and so do the mechanisms: the sparse-anchor fork runs
-    /// through the ancestry arms (157 ancestry-commit, 184 ancestry-skip), while the
-    /// twin fork records ZERO in both and happens entirely on the direct-commit
-    /// path. Two distinct defects, not one seen twice.
-    ///
-    /// This gate PASSES at HEAD because H2 is open — it is a statement about the
-    /// corpus's power, not about the chain's safety. The safety assertion is
-    /// `test_h2_h4_twin_anchors_double_count_stake_and_break_subset_independence`,
-    /// which is RED by design.
+    /// Twins are still injected (the universe is unchanged); the proof that the
+    /// gate still sees them is that the pre-S4 code fails (a) and (b).
     #[test]
-    fn corpus_equivocation_makes_arrival_order_decisive() {
-        // (a) Permutation is LIVE here. Gate 3 asserts the exact opposite under
-        //     Menu::SparseAnchor; the contrast is the evidence.
-        let mut differed = 0u64;
+    fn corpus_equivocation_arrival_order_is_inert_and_twins_never_fork() {
+        let mut arms = ArmCounts::default();
         for seed in 0..SCHED_CORPUS {
-            if sched_run(seed, Menu::Equivocate, true) != sched_run(seed, Menu::Equivocate, false)
-            {
-                differed += 1;
-            }
-        }
-        assert!(
-            differed > 0,
-            "reordering changed nothing under equivocation across {} schedules. \
-             Either twins stopped being injected, or the corpus cannot see arrival \
-             order at all — in which case gate 3's inertness result is meaningless.",
-            SCHED_CORPUS
-        );
-
-        // (b) The corpus must find the twin fork unaided, and it must be the
-        //     Commit-vs-Commit shape: two honest nodes finalising DIFFERENT
-        //     vertices at the SAME round.
-        const BUDGET: u64 = 100_000;
-        let mut found: Option<(u64, ScheduleOutcome)> = None;
-        for seed in 0..BUDGET {
-            let o = sched_run(seed, Menu::Equivocate, true);
-            if o.violation.is_some() {
-                found = Some((seed, o));
-                break;
-            }
-        }
-        let (seed, outcome) = found.expect("no twin fork found within 100,000 schedules");
-        assert_eq!(
-            seed, TWIN_FIRST_BREACH_SEED,
-            "first breach moved to seed {} (pinned {}). See H3_FIRST_BREACH_SEED's              doc — this is the menu where permutation is LIVE, so it is the one that              detects process-dependent iteration.",
-            seed, TWIN_FIRST_BREACH_SEED
-        );
-        let (round, _i, di, _j, dj) = outcome.violation.clone().unwrap();
-        assert_eq!(round % 2, 0);
-        assert!(
-            di.starts_with("Commit") && dj.starts_with("Commit") && di != dj,
-            "seed {} breached AD-1 but not in the twin shape ({} vs {}). The twin \
-             fork is two nodes COMMITTING different hashes, not one committing and \
-             one skipping — that is H3, a different defect.",
-            seed,
-            di,
-            dj
-        );
-
-        for replay in 0..3 {
+            let permuted = sched_run(seed, Menu::Equivocate, true);
+            // (a) Arrival order reaches no decision.
             assert_eq!(
-                sched_run(seed, Menu::Equivocate, true),
-                outcome,
-                "replay {} of seed {} diverged — a non-reproducible counterexample \
-                 is worthless",
-                replay,
-                seed
+                permuted,
+                sched_run(seed, Menu::Equivocate, false),
+                "seed {seed}: reordering changed the outcome under equivocation"
             );
+            // (b) No two views commit different vertices at one round.
+            if let Some((round, _, di, _, dj)) = &permuted.violation {
+                assert!(
+                    !(di.starts_with("Commit") && dj.starts_with("Commit")),
+                    "seed {seed}: two views committed different twins at round {round}: {di} vs {dj}"
+                );
+            }
+            arms.add(&permuted.arms);
         }
+        assert!(arms.direct_commit > 0, "vacuous: no direct commit at all");
+        assert_eq!(
+            sched_run(TWIN_FIRST_BREACH_SEED, Menu::Equivocate, true).violation,
+            None,
+            "the pre-S4 first twin fork is back"
+        );
+    }
+
+    /// A DE-4 world: the round-2 leader has twins A < B (by digest). Round 3:
+    /// the voters named in `cite` cite `cite[i]` (their refs in that order,
+    /// then the other round-2 vertices); the rest cite only the non-leader
+    /// round-2 vertices. Rounds 4 and 5 are full meshes, so round 4 commits
+    /// directly and round 2 is decided by walking back from it.
+    fn de4_world(cite: &[Vec<usize>]) -> (Vec<(String, u64)>, View, [String; 2]) {
+        let validators = mk_validators(4);
+        let l2 = super::OrderingEngine::leader_for_round(2, &validators, 0);
+        let mut view = View::new();
+        let mut r1 = Vec::new();
+        for (a, _) in &validators {
+            let (h, v) = mk_vertex(1, a, vec!["genesis".to_string()]);
+            view.insert(&h, &v);
+            r1.push(h);
+        }
+        let (ha, va) = mk_twin(2, &l2, r1.clone(), 1);
+        let (hb, vb) = mk_twin(2, &l2, r1.clone(), 2);
+        assert!(ha < hb);
+        view.insert(&ha, &va);
+        view.insert(&hb, &vb);
+        let twins = [ha, hb];
+        let mut others = Vec::new();
+        for (a, _) in &validators {
+            if a != &l2 {
+                let (h, v) = mk_vertex(2, a, r1.clone());
+                view.insert(&h, &v);
+                others.push(h);
+            }
+        }
+        let mut prev = Vec::new();
+        for (i, (a, _)) in validators.iter().enumerate() {
+            let mut parents: Vec<String> = cite
+                .get(i)
+                .map(|c| c.iter().map(|&t| twins[t].clone()).collect())
+                .unwrap_or_default();
+            parents.extend(others.iter().cloned());
+            let (h, v) = mk_vertex(3, a, parents);
+            view.insert(&h, &v);
+            prev.push(h);
+        }
+        for r in 4..=5u64 {
+            let mut this = Vec::new();
+            for (a, _) in &validators {
+                let (h, v) = mk_vertex(r, a, prev.clone());
+                view.insert(&h, &v);
+                this.push(h);
+            }
+            prev = this;
+        }
+        view.evaluate(&validators);
+        (validators, view, twins)
+    }
+
+    /// G1 S4, DE-4: the walk-back decides by the leader vertices INSIDE the
+    /// chain's history. Here only twin B is in it, and A, the lower digest,
+    /// is the one an index lookup would pick.
+    #[test]
+    fn the_walk_back_commits_the_leader_inside_the_history() {
+        // Two voters cite B, too few for a direct commit at round 2.
+        let (validators, view, [_, b]) = de4_world(&[vec![1], vec![1]]);
+        assert_eq!(
+            view.decision(2),
+            Decision::Commit(b),
+            "committed through the walk-back"
+        );
+        assert!(matches!(view.decision(4), Decision::Commit(_)));
+        assert_eq!(
+            super::OrderingEngine::leader_vertex_hash(2, &view.dag, &view.idx, &validators),
+            None,
+            "no single candidate when the index holds twins"
+        );
+    }
+
+    /// G1 S4, DE-4: two leader vertices in the history at one round is
+    /// Undecided, never a guess (unreachable under Lemma U).
+    #[test]
+    fn two_leaders_in_the_history_leave_the_round_undecided() {
+        // Votes split 2/2 between the twins, so round 2 is not direct, and
+        // round 4's history holds both.
+        let (_, view, _) = de4_world(&[vec![0, 1], vec![0, 1], vec![1, 0], vec![1, 0]]);
+        assert_eq!(view.decision(2), Decision::Undecided);
+        assert_eq!(
+            view.decision(4),
+            Decision::Undecided,
+            "nothing past it either"
+        );
+    }
+
+    /// G1 S4, DE-4's settled-by-floor arm: a parent whose declared round is at
+    /// or below g is settled, so its missing body is no hole. A no-op at g = 0.
+    #[test]
+    fn a_parent_at_or_below_the_floor_is_settled() {
+        let validators = mk_validators(4);
+        let a = &validators[0].0;
+        let (h1, _) = mk_vertex(1, a, vec!["genesis".to_string()]);
+        let (h2, v2) = mk_vertex(2, a, vec![h1.clone()]);
+        let dag: std::collections::HashMap<String, blockchain::Vertex> =
+            [(h2.clone(), v2)].into_iter().collect();
+        let none = std::collections::HashSet::new();
+        let walk = |g| super::OrderingEngine::walk_history(&h2, 0, 2, &dag, &none, g);
+        assert!(
+            walk(0).is_none(),
+            "g = 0: the missing round-1 parent is a hole"
+        );
+        assert_eq!(walk(1).unwrap(), [h2.clone()].into_iter().collect());
+    }
+
+    /// G1 S4, DE-2: an author with two vertices at r+1 votes for nothing, so a
+    /// twin voter cannot back one anchor twice.
+    #[test]
+    fn a_voter_with_twins_counts_for_nothing() {
+        let validators = mk_validators(4);
+        let total: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
+        let leader = super::OrderingEngine::leader_for_round(2, &validators, 0);
+        let mut view = View::new();
+        let mut r1 = Vec::new();
+        for (v, _) in &validators {
+            let (h, x) = mk_vertex(1, v, vec!["genesis".to_string()]);
+            view.insert(&h, &x);
+            r1.push(h);
+        }
+        let mut anchor = String::new();
+        for (v, _) in &validators {
+            let (h, x) = mk_vertex(2, v, r1.clone());
+            if v == &leader {
+                anchor = h.clone();
+            }
+            view.insert(&h, &x);
+        }
+        let voters: Vec<&String> = validators
+            .iter()
+            .map(|(v, _)| v)
+            .filter(|v| **v != leader)
+            .collect();
+        // Three non-leader voters make the quorum (3 of 4).
+        for v in &voters {
+            let (h, x) = mk_vertex(3, v, vec![anchor.clone()]);
+            view.insert(&h, &x);
+        }
+        let met = |view: &View| {
+            super::OrderingEngine::direct_quorum_met(
+                2,
+                &anchor,
+                &view.dag,
+                &view.idx,
+                &validators,
+                total,
+            )
+        };
+        assert!(
+            met(&view),
+            "positive control: three single voters are a quorum"
+        );
+        // One voter adds a twin: it now counts for nothing, and 2 of 4 is not a quorum.
+        let (h, x) = mk_twin(3, voters[0], vec![anchor.clone()], 9);
+        view.insert(&h, &x);
+        assert!(!met(&view), "a twin voter still counted");
     }
 
     /// The honest LIVENESS floor. Measured range 0.4325..0.4407 across corpus
@@ -2968,14 +3171,8 @@ mod tests {
         );
         //   (c) its causal history has a HOLE — this is the actual blocker
         assert!(
-            super::OrderingEngine::walk_history(
-                &h2_leader,
-                0,
-                2,
-                &dag,
-                &wedged.committed_set
-            )
-            .is_none(),
+            super::OrderingEngine::walk_history(&h2_leader, 0, 2, &dag, &wedged.committed_set, 0)
+                .is_none(),
             "walk_history must report a hole on the fabricated parent"
         );
 
@@ -3532,6 +3729,49 @@ mod tests {
                     format!("{:?}", menu), c1, breaches, cc, cs, arms.decided_rate()
                 );
             }
+        }
+    }
+
+    /// G1 S4's bit-identity gate: a fingerprint of every corpus outcome.
+    /// Compare it before and after a decision edit: honest must not move.
+    ///
+    ///   cargo test -p consensus --release --lib probe_corpus_fingerprint -- --ignored --nocapture
+    #[test]
+    #[ignore = "the S4 bit-identity fingerprint"]
+    fn probe_corpus_fingerprint() {
+        const N: u64 = 3_000;
+        for (menu, c1) in [
+            (Menu::Honest, false),
+            (Menu::SparseAnchor, false),
+            (Menu::Equivocate, false),
+            (Menu::Equivocate, true),
+        ] {
+            let mut data = Vec::new();
+            let (mut cc, mut cs) = (0u64, 0u64);
+            let mut arms = ArmCounts::default();
+            for seed in 0..N {
+                let o = sched_run_full(seed, menu, true, 0, c1);
+                arms.add(&o.arms);
+                if let Some((_, _, di, _, dj)) = &o.violation {
+                    if di.starts_with("Commit") && dj.starts_with("Commit") {
+                        cc += 1;
+                    } else {
+                        cs += 1;
+                    }
+                }
+                data.extend_from_slice(
+                    format!("{:?}|{:?}|{:?}|", o.violation, o.breach_cursors, o.arms).as_bytes(),
+                );
+            }
+            println!(
+                "FP {:<11} c1={:<5} fingerprint={} C-vs-C={} C-vs-other={} rate={:.4}",
+                format!("{:?}", menu),
+                c1,
+                hex::encode(crypto::hash(&data)),
+                cc,
+                cs,
+                arms.decided_rate()
+            );
         }
     }
 

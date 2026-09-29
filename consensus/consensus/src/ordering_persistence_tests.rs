@@ -199,7 +199,16 @@ fn advance_local(engine: &mut OrderingEngine) -> Option<CommitInfo> {
     let mut dag = HashMap::new();
     let mut index = HashMap::new();
     for round in 3..=5 {
-        let mut vertex = Vertex::new(round, "validator".to_string(), vec![parent], vec![]);
+        let mut vertex = Vertex::new(round, "validator".to_string(), vec![parent.clone()], vec![]);
+        // Ingress-shaped: a round > 1 vertex carries a ref per parent (the
+        // decision reads its votes from them, G1 DE-2).
+        vertex.parent_refs = vec![blockchain::ParentRef {
+            round: round - 1,
+            author: "validator".to_string(),
+            digest: parent,
+            proof: None,
+            cert: None,
+        }];
         vertex.timestamp = round;
         vertex.hash = vertex.calculate_hash();
         parent = vertex.hash.clone();

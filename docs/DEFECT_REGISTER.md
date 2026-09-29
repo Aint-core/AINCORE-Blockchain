@@ -275,6 +275,16 @@ The FABRICATED-PARENT script (B3/B4) is deliberately excluded from the menu: it 
 known-open wedge that would fire on nearly every seed and drown the agreement signal. It has
 its own characterisation test.
 
+**UPDATE (G1 S4, branch `g1/certified-dag`): H2 + H4 are CLOSED in the decision function.**
+DE-1 makes the round's candidates a set in digest order (no arrival-order `find_map`). DE-2
+reads each voter's vote from its own signed refs, and counts an author only with exactly
+one vertex at r+1, so no stake counts twice. DE-4 decides the walk-back from the leaders
+inside the chain's own history. The A2 witness is un-ignored and green, and non-vacuous: 3
+of its 4 views commit twin_a. Over 3,000 corpus schedules the Equivocate menu's
+Commit-vs-Commit forks went from 283 to 0, and the C1-legal universe's breaches from 123 to
+0. The Honest and SparseAnchor fingerprints are bit-identical (`probe_corpus_fingerprint`),
+as the contract's extensional-identity claim predicts for V3-reachable inputs.
+
 **H2 + H4 ARE NOW EXPRESSED — written deliberately while H4 is UNREACHABLE end-to-end.**
 `ordering.rs`, `test_h2_h4_twin_anchors_double_count_stake_and_break_subset_independence`,
 RED by design:
@@ -429,7 +439,7 @@ as runnable statements rather than prose:
 | Test | Defect | Un-ignore when |
 |---|---|---|
 | `test_h3_sparse_anchor_forks_...` | H3 finality fork | ingress parent-quorum lands |
-| `test_h2_h4_twin_anchors_...` | H2 + H4 | anchor identity is certificate-bound |
+| `test_h2_h4_twin_anchors_...` | H2 + H4 | **GREEN since G1 S4** (branch `g1/certified-dag`): candidates are a set, votes come from each voter's own refs, one per author |
 | `test_h1_dropped_twin_...` | H1 (+ the restart defect the naive fix adds) | both twins persisted AND the choice made deterministic |
 | `probe_corpus_arm_distribution` | — | (measurement probe, never a gate) |
 

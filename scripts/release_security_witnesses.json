@@ -26,6 +26,7 @@
         "ordering::tests::probe_is_h3_masked_by_the_b3b4_halt": "Ordering experiment with synthetic inputs, not the production ingress path.",
         "ordering::tests::probe_c1_decision_experiment": "Experimental C1 decision model, not a production release witness.",
         "ordering::tests::probe_validate_c1_legal_universe": "Validation of the experimental C1 corpus, not production execution.",
+        "ordering::tests::probe_corpus_fingerprint": "G1 S4 measurement: a corpus fingerprint compared before and after a decision edit, not a safety assertion.",
         "ordering::tests::test_h3_sparse_anchor_forks_direct_committer_from_ancestry_skipper": "Direct ordering input bypasses the enforced thin-anchor ingress premise. Both test_h3_tier2 ingress controls are mandatory above. This exclusion does not establish that the decision function is sound in isolation."
       }
     },
