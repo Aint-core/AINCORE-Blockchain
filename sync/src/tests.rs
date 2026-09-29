@@ -55,6 +55,9 @@ mod tests {
         include!("reorg_acceptance_tests.rs");
     }
 
+    mod qc_import {
+        include!("qc_import_tests.rs");
+    }
     mod admission_snapshot {
         include!("admission_snapshot_tests.rs");
     }

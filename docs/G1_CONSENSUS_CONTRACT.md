@@ -759,6 +759,44 @@ restart, the flood witness (a Byzantine member, a spoofer of the honest fetcher 
   redundant catch-up accelerators rather than untested rules. S10's delayed network is
   where each one is timed.
 
+**S8 status: QC authority on the V4 path.**
+
+What landed:
+- **IM-1 at import.** `ChainSync::process_blocks_with_qcs` executes a synced block only
+  together with a QC (`qc_producer::verify_block_qc`). The QC must verify under the committee
+  of the block's epoch and bind the block's hash, anchor round, anchor hash, state root and
+  receipts root. The QC is then imported (`import_finality_qc`).
+  - A validly signed block with a substituted anchor is therefore refused on V4, even though
+    the header hash does not bind the anchor yet (G0).
+- **IM-1 at adoption.** `reload_chain_tip` adopts a synced block on V4 only with a stored QC
+  that verifies and binds it.
+- **IM-1's last clause and IM-3.** A mismatch between the QC's finality digest and this
+  node's fold of the same sequence is a decision conflict: an alarm is written and ordering
+  halts. The same holds for a DE-6 row conflict during adoption.
+  - `adopt_synced_anchor_with` now returns its error, so a conflict is no longer swallowed as
+    "retry later".
+- **IM-4.** `SyncResponse.qcs` carries the QC of every served block that has one.
+
+Deviations:
+- IM-2 is two steps, not one transaction: execution with its block, then adoption with its
+  QC work. Adoption retries from the persisted adoption cursor, and both steps apply IM-1, so
+  a crash between them only delays adoption.
+- FinalityVote V2 (`next_validator_set_hash`, IM-5) lands with epochs at S9.
+- The node-level outage witness (a node offline past the window catches up from per-height
+  QCs, and the survivors form new QCs) needs QC formation across nodes in the harness, so it
+  moves to S10's system suite.
+
+V3 behaves as before: no QC is required on a V3 chain.
+
+Witnesses:
+- a V4 block without its QC is not executed;
+- a substituted anchor is refused and the real block executes;
+- a QC below quorum, or for another block, is refused;
+- a sync response carries each block's QC.
+
+Mutation: 5 of 5 killed (the contract's list: no QC check, block hash only, dropped `qcs`),
+plus unverified signatures and a QC that is not imported.
+
 ### Imported decisions and finality votes (IM)
 
 **IM-1 (QC authority).**

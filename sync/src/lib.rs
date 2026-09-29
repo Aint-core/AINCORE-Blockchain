@@ -179,6 +179,10 @@ pub struct SyncResponse {
     /// empty responses. `None` from older peers (serde default).
     #[serde(default)]
     pub prune_horizon: Option<u64>,
+    /// G1 IM-4: the QC of each served block that has one. A V4 chain imports a
+    /// block only together with its QC (IM-1). Empty from older peers.
+    #[serde(default)]
+    pub qcs: Vec<consensus::qc::QuorumCertificate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -864,8 +868,9 @@ impl ChainSync {
                                                             }
                                                             break; // No more blocks
                                                         }
-                                                        let synced = self.process_blocks(
+                                                        let synced = self.process_blocks_with_qcs(
                                                             sync_resp.blocks,
+                                                            &sync_resp.qcs,
                                                             current,
                                                         );
                                                         if synced <= current {
@@ -1043,7 +1048,25 @@ impl ChainSync {
     }
 
     /// Process synced blocks — returns the final height reached
+    #[cfg(test)]
     fn process_blocks(&self, blocks: Vec<Block>, current_height: u64) -> u64 {
+        self.process_blocks_with_qcs(blocks, &[], current_height)
+    }
+
+    /// `process_blocks` with the peer's per-height QCs. On a V4 chain (G1
+    /// IM-1) a block is executed only together with a QC that verifies under
+    /// its epoch's committee and binds its hash, anchor and roots; the QC is
+    /// imported with it. A proposer signature alone is not enough.
+    fn process_blocks_with_qcs(
+        &self,
+        blocks: Vec<Block>,
+        qcs: &[consensus::qc::QuorumCertificate],
+        current_height: u64,
+    ) -> u64 {
+        let v4 = consensus::v4::is_v4_chain(&self.storage);
+        let qc_of = |b: &Block| -> Option<&consensus::qc::QuorumCertificate> {
+            qcs.iter().find(|q| q.block_height == b.header.height)
+        };
         let mut last_processed = current_height;
         let executor = executor::Executor::new(std::sync::Arc::clone(&self.storage));
         let total_blocks = blocks.len();
@@ -1152,6 +1175,30 @@ impl ChainSync {
                 );
                 break;
             }
+            let qc = if v4 {
+                let checked = qc_of(block).map(|q| {
+                    consensus::qc_producer::verify_block_qc(&self.storage, block, q).map(|()| q)
+                });
+                match checked {
+                    Some(Ok(q)) => Some(q.clone()),
+                    Some(Err(e)) => {
+                        eprintln!(
+                            "🚨 [SECURITY][SYNC_QC_REJECT] block #{}: {e}",
+                            block.header.height
+                        );
+                        break;
+                    }
+                    None => {
+                        eprintln!(
+                            "[ChainSync] block #{} came without its QC; not executed (V4)",
+                            block.header.height
+                        );
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
 
             // Validate roots and stage block/index storage in the SAME transaction
             // as execution. Rejection must not consume a nonce or execution height.
@@ -1178,6 +1225,9 @@ impl ChainSync {
                 Ok(executor::BlockExecOutcome::Executed(_)) => {
                     last_processed = block.header.height;
                     consensus::dag::prune_history(&self.storage, last_processed, self.retention);
+                    if let Some(q) = &qc {
+                        self.import_block_qc(q);
+                    }
                 }
                 Ok(executor::BlockExecOutcome::AlreadyExecuted { last_executed }) => {
                     // Execution completion alone does not identify the block.
@@ -1203,6 +1253,9 @@ impl ChainSync {
                         }
                         Some(_) => {
                             last_processed = last_processed.max(block.header.height);
+                            if let Some(q) = &qc {
+                                self.import_block_qc(q);
+                            }
                             continue;
                         }
                         None => {
@@ -1252,6 +1305,17 @@ impl ChainSync {
             );
         }
         last_processed
+    }
+
+    /// Store a verified block QC (IM-1/IM-4). Idempotent; a failure only
+    /// delays adoption, which waits for a stored QC.
+    fn import_block_qc(&self, q: &consensus::qc::QuorumCertificate) {
+        if let Err(e) = consensus::qc_producer::import_finality_qc(&self.storage, q) {
+            eprintln!(
+                "[ChainSync] QC of block #{} not stored ({e}); adoption waits",
+                q.block_height
+            );
+        }
     }
 
     /// The requests `handle_message` answers. The node's TCP handler routes
@@ -1447,10 +1511,15 @@ impl ChainSync {
         } else {
             None
         };
+        let qcs = blocks_to_send
+            .iter()
+            .filter_map(|b| consensus::qc_producer::stored_qc(&self.storage, b.header.height))
+            .collect();
         SyncResponse {
             blocks: blocks_to_send,
             finality: Some(self.collect_finality_artifact()),
             prune_horizon,
+            qcs,
         }
     }
 

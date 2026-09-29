@@ -1120,11 +1120,13 @@ impl OrderingEngine {
         sequence: &[String],
         validators: &[(String, u64)],
         stage: impl FnOnce(&StateDB, &CommitInfo) -> Result<(), String>,
-    ) -> Option<CommitInfo> {
+    ) -> Result<Option<CommitInfo>, String> {
         if anchor_round <= self.finalized_round || self.committed_rounds.contains(&anchor_round) {
-            return None;
+            return Ok(None);
         }
-        let storage = self.storage.as_ref()?.clone();
+        let Some(storage) = self.storage.as_ref().cloned() else {
+            return Ok(None);
+        };
         let leader = Self::leader_for_round(anchor_round, validators, 0);
         let plan = self.prepare_anchor_bookkeeping(anchor_round, anchor_hash, leader, sequence.to_vec());
         let result = storage.transaction(|view| {
@@ -1137,12 +1139,12 @@ impl OrderingEngine {
         });
         if let Err(error) = result {
             eprintln!("Cannot persist adopted anchor and QC work: {error}");
-            return None;
+            return Err(error.to_string());
         }
         #[cfg(test)]
         if let Some(hook) = self.anchor_persistence_hook { hook(1); }
         self.publish_prepared_anchor(&plan);
-        Some(plan.info)
+        Ok(Some(plan.info))
     }
 
     /// Elect the anchor leader for `round` as a PURE function of the round, the

@@ -156,6 +156,45 @@ pub fn epoch_for_block_height(storage: &StateDB, height: u64) -> Option<u64> {
     None
 }
 
+/// G1 IM-1 (V4): a block from another node is imported or adopted only with
+/// a QC that verifies under the committee of its height's epoch and binds
+/// every consensus field of it: hash, anchor round and digest, and both roots.
+/// The finality digest is checked where it is computed, at adoption.
+pub fn verify_block_qc(
+    storage: &StateDB,
+    block: &blockchain::Block,
+    qc: &QuorumCertificate,
+) -> Result<(), String> {
+    let h = block.header.height;
+    let epoch = epoch_for_block_height(storage, h).ok_or("no epoch for this height")?;
+    let validators =
+        load_validator_set_for_epoch(storage, epoch).ok_or("no committee for this epoch")?;
+    crate::qc::verify_qc(qc, &validators, &crate::qc::expected_chain_id())
+        .map_err(|e| format!("the QC does not verify: {e}"))?;
+    let checks = [
+        (qc.epoch == epoch, "epoch"),
+        (qc.block_height == h, "height"),
+        (qc.block_hash == block.header.hash, "block hash"),
+        (qc.anchor_round == block.header.round, "anchor round"),
+        (qc.anchor_hash == block.anchor_hash, "anchor hash"),
+        (qc.state_root == block.header.state_root, "state root"),
+        (qc.receipts_root == block.header.receipts_root, "receipts root"),
+    ];
+    match checks.iter().find(|(ok, _)| !ok) {
+        Some((_, field)) => Err(format!("the QC does not bind this block's {field}")),
+        None => Ok(()),
+    }
+}
+
+/// The stored QC of height `h`, if any.
+pub fn stored_qc(storage: &StateDB, h: u64) -> Option<QuorumCertificate> {
+    storage
+        .get(&format!("consensus:qc:{h}"))
+        .ok()
+        .flatten()
+        .and_then(|j| serde_json::from_str(&j).ok())
+}
+
 /// Commit context captured at the point a block is finalized + executed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitContext {

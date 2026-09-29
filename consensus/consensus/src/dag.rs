@@ -3369,17 +3369,46 @@ impl DagConsensus {
                     // unsigned/mis-signed blocks before execution; this is defense
                     // in depth for anything that reached storage another way.
                     if !block.committed_vertices.is_empty() && !block.proposer_signature.is_empty() {
+                        // G1 IM-1 (V4): a synced block is adopted only with a
+                        // stored QC that verifies and binds it; without one,
+                        // adoption waits (the QC is fetched with the block).
+                        let qc = if self.v4_chain {
+                            let verified = crate::qc_producer::stored_qc(&self.storage, h).filter(|q| {
+                                crate::qc_producer::verify_block_qc(&self.storage, &block, q).is_ok()
+                            });
+                            if verified.is_none() {
+                                eprintln!("V4: block {h} has no verified QC yet; adoption waits");
+                                break;
+                            }
+                            verified
+                        } else {
+                            None
+                        };
                         let qc_chain_id = self.resolve_chain_id();
+                        let mut conflict: Option<String> = None;
                         let adopted = match self.ordering_engine.lock() {
                             Ok(mut engine) => {
                                 let already_decided = block.header.round <= engine.finalized_round
                                     || engine.committed_rounds.contains(&block.header.round);
-                                let info = engine.adopt_synced_anchor_with(
+                                let result = engine.adopt_synced_anchor_with(
                                     block.header.round,
                                     &block.anchor_hash,
                                     &block.committed_vertices,
                                     &validators,
                                     |view, info| {
+                                        // IM-1's last clause, where the digest is
+                                        // computed: the QC's finality digest must be
+                                        // this node's fold of the same sequence.
+                                        if let Some(q) = &qc {
+                                            if q.finality_digest != info.finality_digest {
+                                                return Err(format!(
+                                                    "{}: block {h}'s QC finality digest {} is not this node's {}",
+                                                    crate::ordering::DECISION_CONFLICT,
+                                                    q.finality_digest,
+                                                    info.finality_digest
+                                                ));
+                                            }
+                                        }
                                         crate::qc_producer::stage_pending_qc(view, &block, info, qc_chain_id)?;
                                         view.put("consensus:last_adopted_height", &h.to_string())
                                             .map_err(|e| e.to_string())?;
@@ -3388,17 +3417,34 @@ impl DagConsensus {
                                         Ok(())
                                     },
                                 );
-                                if info.is_none() && !already_decided {
-                                    eprintln!("Anchor adoption at height {h} was not persisted; retry later");
-                                    break;
+                                match result {
+                                    Ok(info) => {
+                                        if info.is_none() && !already_decided {
+                                            eprintln!("Anchor adoption at height {h} was not persisted; retry later");
+                                            break;
+                                        }
+                                        info
+                                    }
+                                    Err(e) if e.contains(crate::ordering::DECISION_CONFLICT) => {
+                                        conflict = Some(e);
+                                        None
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Anchor adoption at height {h} was not persisted ({e}); retry later");
+                                        break;
+                                    }
                                 }
-                                info
                             }
                             Err(_) => {
                                 eprintln!("Ordering lock unavailable at height {h}; adoption deferred");
                                 break;
                             }
                         };
+                        // IM-3: a QC-bound decision this node disagrees with halts.
+                        if let Some(e) = conflict {
+                            self.halt_on_decision_conflict(h, &e);
+                            break;
+                        }
                         if adopted.is_some() {
                             #[cfg(test)]
                             if let Some(hook) = self.local_acceptance_hook {
