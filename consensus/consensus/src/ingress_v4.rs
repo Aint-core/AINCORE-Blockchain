@@ -22,10 +22,13 @@ pub const LEAD: u64 = 200;
 pub const MAX_FUTURE_DRIFT_SECS: u64 = 30;
 pub const ABSOLUTE_ROUND_CEILING: u64 = u64::MAX / 2;
 
-/// What this node holds about the active epoch.
+/// What this node holds about one epoch.
 pub struct EpochRecord<'a> {
     pub epoch: u64,
     pub first_round: u64,
+    /// r*: the round of the anchor that closed the epoch, once known. Above it
+    /// the epoch is over (EP-5).
+    pub closing_round: Option<u64>,
     /// `blockchain::epoch_genesis` of this epoch.
     pub sentinel: &'a str,
     /// C_E, frozen for the epoch.
@@ -37,6 +40,11 @@ pub struct Context<'a> {
     pub chain_id: &'a str,
     pub genesis_identity: &'a str,
     pub active: EpochRecord<'a>,
+    /// The epoch before the active one, when this node holds its record.
+    pub previous: Option<EpochRecord<'a>>,
+    /// The epoch after the active one, once its committee is recorded (with
+    /// the boundary block) and before it is activated.
+    pub next: Option<EpochRecord<'a>>,
     pub now_secs: u64,
     /// The GC floor g.
     pub gc_floor: u64,
@@ -44,25 +52,94 @@ pub struct Context<'a> {
     pub cursor: u64,
 }
 
+/// A verdict is about this copy of a vertex, never about its digest: a relay
+/// can alter the unhashed transport fields of an honest vertex.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// Drop this copy. Never feeds a ban, a score or a slash.
     Invalid(String),
     /// Timing only: the vertex can be had again.
     Drop(String),
-    /// Of the next epoch, not active yet: keep and re-evaluate on activation.
+    /// Of the next epoch, authenticated, not active yet: keep and re-evaluate
+    /// on activation.
     PendingEpoch,
     /// These parent refs (indices) have no verified certificate yet: keep,
     /// ask for them, re-evaluate when one arrives.
     PendingCert(Vec<usize>),
-    /// Evidence only.
+    /// Authenticated, of a closed epoch or below the floor: evidence only.
     Stale,
     Stage,
 }
 
-/// The IN-1 verdict on `vertex`, whose serialized form was `raw_len` bytes.
-/// `local_cert` returns this node's own copy of a parent's certificate, if
-/// it holds one; an embedded copy is tried first.
+fn lower_hex(s: &str, len: usize) -> bool {
+    s.len() == len
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Layer S under the record of the vertex's own epoch: every node holding
+/// that record reaches the same verdict.
+fn layer_s(
+    v: &Vertex,
+    record: &EpochRecord<'_>,
+    chain_id: &str,
+    genesis_identity: &str,
+) -> Result<(), String> {
+    if v.hash != v.hash_v4_with_domain(chain_id, genesis_identity) {
+        return Err("the hash is not the V4 hash of the body".into());
+    }
+    let Some(author) = record
+        .committee
+        .iter()
+        .find(|m| m.address == v.author && m.stake > 0)
+    else {
+        return Err(format!("author {} is not a staked member", v.author));
+    };
+    // Canonical hex only: `hex::decode` takes either case, which would let a
+    // relay make byte-different valid copies of one vertex.
+    if !lower_hex(&v.signature, 128) || !v.verify_ed25519_signature(&author.ed25519_public_key) {
+        return Err("the author's signature does not verify".into());
+    }
+    if v.round < record.first_round || v.round > ABSOLUTE_ROUND_CEILING {
+        return Err(format!(
+            "round {} outside {}..={ABSOLUTE_ROUND_CEILING}",
+            v.round, record.first_round
+        ));
+    }
+    if v.round == record.first_round {
+        if v.parents != [record.sentinel] || !v.parent_refs.is_empty() {
+            return Err("a first-round vertex must cite the epoch sentinel only".into());
+        }
+        return Ok(());
+    }
+    // A ref no certificate could ever satisfy is refused here rather than
+    // left to wait: its author is a staked member, its digest canonical.
+    for r in &v.parent_refs {
+        if !lower_hex(&r.digest, 64) {
+            return Err(format!(
+                "a parent digest that is not canonical hex: {}",
+                r.digest
+            ));
+        }
+        if !record
+            .committee
+            .iter()
+            .any(|m| m.address == r.author && m.stake > 0)
+        {
+            return Err(format!("a parent by {}, not a staked member", r.author));
+        }
+    }
+    let stakes: Vec<(String, u64)> = record
+        .committee
+        .iter()
+        .map(|m| (m.address.clone(), m.stake))
+        .collect();
+    qc::parent_refs_admissible_above(v, &stakes, record.first_round)
+}
+
+/// The IN-1 verdict on this copy of `v`, whose serialized form was `raw_len`
+/// bytes. `local_cert` returns this node's own copy of a parent's
+/// certificate, if it holds one; an embedded copy is tried first.
 pub fn v4_verdict(
     raw_len: usize,
     v: &Vertex,
@@ -87,52 +164,35 @@ pub fn v4_verdict(
     if !v.parents.iter().all(|p| seen.insert(p.as_str())) {
         return Verdict::Invalid("a parent digest twice".into());
     }
-    if v.hash != v.hash_v4_with_domain(ctx.chain_id, ctx.genesis_identity) {
-        return Verdict::Invalid("the hash is not the V4 hash of the body".into());
-    }
-    // E1 before anything round-relative: another epoch's rounds mean nothing
-    // against this one's record.
-    if v.epoch < active.epoch {
-        return Verdict::Stale;
-    }
-    if v.epoch == active.epoch + 1 {
-        return Verdict::PendingEpoch;
-    }
-    if v.epoch > active.epoch + 1 {
-        return Verdict::Drop(format!("epoch {} is ahead of the next", v.epoch));
-    }
-    // Layer S under the active epoch's record.
-    let Some(author) = active
-        .committee
-        .iter()
-        .find(|m| m.address == v.author && m.stake > 0)
-    else {
-        return Verdict::Invalid(format!("author {} is not a staked member", v.author));
-    };
-    if !v.verify_ed25519_signature(&author.ed25519_public_key) {
-        return Verdict::Invalid("the author's signature does not verify".into());
-    }
-    if v.round < active.first_round || v.round > ABSOLUTE_ROUND_CEILING {
-        return Verdict::Invalid(format!(
-            "round {} outside {}..={ABSOLUTE_ROUND_CEILING}",
-            v.round, active.first_round
-        ));
-    }
-    if v.round == active.first_round {
-        if v.parents != [active.sentinel] || !v.parent_refs.is_empty() {
-            return Verdict::Invalid(
-                "a first-round vertex must cite the epoch sentinel only".into(),
-            );
+    // E1 picks the record; Layer S runs under it before anything is kept.
+    // A vertex whose epoch record this node does not hold cannot be
+    // authenticated, so it is dropped (timing), never buffered.
+    let record = if v.epoch == active.epoch {
+        active
+    } else if Some(v.epoch) == active.epoch.checked_add(1) {
+        match &ctx.next {
+            Some(next) if next.epoch == v.epoch => next,
+            _ => return Verdict::Drop("the next epoch's committee is not known yet".into()),
+        }
+    } else if Some(v.epoch) == active.epoch.checked_sub(1) {
+        match &ctx.previous {
+            Some(previous) if previous.epoch == v.epoch => previous,
+            _ => return Verdict::Drop("the previous epoch's record is not held".into()),
         }
     } else {
-        let stakes: Vec<(String, u64)> = active
-            .committee
-            .iter()
-            .map(|m| (m.address.clone(), m.stake))
-            .collect();
-        if let Err(e) = qc::parent_refs_admissible_above(v, &stakes, active.first_round) {
-            return Verdict::Invalid(e);
-        }
+        return Verdict::Drop(format!(
+            "epoch {} is not adjacent to the active one",
+            v.epoch
+        ));
+    };
+    if let Err(e) = layer_s(v, record, ctx.chain_id, ctx.genesis_identity) {
+        return Verdict::Invalid(e);
+    }
+    if v.epoch > active.epoch {
+        return Verdict::PendingEpoch;
+    }
+    if v.epoch < active.epoch || active.closing_round.is_some_and(|r| v.round > r) {
+        return Verdict::Stale;
     }
     // Layer E.
     if v.timestamp > ctx.now_secs.saturating_add(MAX_FUTURE_DRIFT_SECS) {
@@ -141,7 +201,8 @@ pub fn v4_verdict(
     if v.round <= ctx.gc_floor {
         return Verdict::Stale;
     }
-    if v.round > ctx.cursor.saturating_add(LEAD) && !v.payload.is_empty() {
+    let beyond_lead = v.round > ctx.cursor.saturating_add(LEAD);
+    if beyond_lead && !v.payload.is_empty() {
         return Verdict::Drop(format!(
             "payload at round {}, beyond the cursor's lead",
             v.round
@@ -151,7 +212,12 @@ pub fn v4_verdict(
         return Verdict::Stage;
     }
     let committee_hash = qc::validator_set_hash(active.committee);
+    let n = active.committee.len();
     let certified = |r: &ParentRef, compact: &CompactCert| {
+        // A certificate of the wrong shape is noise a relay added: ignored.
+        if compact.signer_bitmap.len() != n.div_ceil(8) || compact.aggregate_signature.len() != 96 {
+            return false;
+        }
         let body = AttestBody {
             chain_id: ctx.chain_id.to_string(),
             genesis_identity: ctx.genesis_identity.to_string(),
@@ -186,6 +252,14 @@ pub fn v4_verdict(
         .collect();
     if missing.is_empty() {
         Verdict::Stage
+    } else if beyond_lead {
+        // Past the lead a vertex is staged only on parents already certified:
+        // it never makes this node wait or ask for certificates that may not
+        // exist.
+        Verdict::Drop(format!(
+            "round {} beyond the lead on uncertified parents",
+            v.round
+        ))
     } else {
         Verdict::PendingCert(missing)
     }

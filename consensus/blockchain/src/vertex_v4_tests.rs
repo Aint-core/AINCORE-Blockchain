@@ -162,3 +162,33 @@ fn every_epoch_sentinel_field_counts() {
         assert_ne!(v, &base(), "variant {i}");
     }
 }
+
+/// Review MEDIUM-2: a V4 compact proof hashes to the vertex's own digest.
+#[test]
+fn a_v4_compact_proof_keeps_the_v4_hash() {
+    let v = golden();
+    let proof = v.to_compact_proof_v4();
+    assert!(proof.payload.is_empty() && proof.parents.is_empty());
+    assert_eq!(
+        proof.hash_v4_with_domain(CHAIN, GENESIS),
+        v.hash_v4_with_domain(CHAIN, GENESIS)
+    );
+    // The V3 proof does not: it carries the V3 parents root.
+    assert_ne!(
+        v.to_compact_proof().hash_v4_with_domain(CHAIN, GENESIS),
+        v.hash_v4_with_domain(CHAIN, GENESIS)
+    );
+}
+
+#[test]
+fn the_v4_hash_wrapper_uses_the_installed_domain() {
+    let v = golden();
+    let (chain, genesis) = vertex_domain();
+    assert_eq!(v.hash_v4(), v.hash_v4_with_domain(&chain, &genesis));
+    assert_ne!(v.hash_v4(), v.calculate_hash());
+    // The epoch-1 sentinel is a real sentinel, pinned.
+    assert_eq!(
+        epoch_genesis(CHAIN, GENESIS, 1, 1, &"d".repeat(64), &"e".repeat(64)),
+        "3cb57215f561a26d68e1a7323a169873d8968110dc1f6f230f091c14039e095d"
+    );
+}

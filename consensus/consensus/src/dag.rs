@@ -1168,6 +1168,16 @@ impl DagConsensus {
     const MAX_ROUND_JUMP: u64 = 10_000;
 
     pub fn add_vertex(&mut self, vertex: Vertex) {
+        // G1 V4 fields have no place in a V3 vertex. Its hash binds neither the
+        // epoch nor a parent certificate, so a relay could pad them onto an
+        // honest vertex and have every node store and serve the padding.
+        if vertex.epoch != 0 || vertex.parent_refs.iter().any(|r| r.cert.is_some()) {
+            println!(
+                "🚨 REJECTED: a V3 vertex carrying V4 fields (epoch {} or a parent certificate)",
+                vertex.epoch
+            );
+            return;
+        }
 
         // Anti-overflow: any vertex above ABSOLUTE_ROUND_CEILING is malicious
         // — the chain cannot legitimately reach this magnitude.

@@ -283,6 +283,8 @@ taken by the implementer under the founder's delegation:
 | `T_LEADER` (local) | ≥ measured certification latency; default 2 ticks | Liveness only. |
 | `T_RETRY`, `T_FETCH` (local) | 1 tick; fetch backoff doubling to 8 ticks | Driven by the receiver's clock. |
 
+**The V3 path refuses V4 fields.** A V3 vertex with `epoch ≠ 0` or any `ParentRef.cert` is refused at V3 ingress (`dag.rs` `add_vertex`): the V3 hash binds neither, so a relay could otherwise pad an honest vertex for every node to store (S2 review HIGH-1). V4 equivocation evidence uses `Vertex::to_compact_proof_v4`, whose carried parents root is the V4 one (S2 review MEDIUM-2).
+
 **Signed-bytes domains.** Every new signed message is `DOMAIN ‖ BCS(struct)`, as for FinalityVote (`qc.rs:56-66`).
 
 | Domain | Use |
@@ -361,7 +363,7 @@ taken by the implementer under the founder's delegation:
 ### Ingress (IN)
 
 Verdicts:
-- **INVALID**: drop this copy. It never feeds a ban, a peer score or a slash (`DEFECT_REGISTER.md:80`).
+- **INVALID**: drop this copy. It never feeds a ban, a peer score or a slash (`DEFECT_REGISTER.md:80`). Every verdict is about the copy, never keyed by digest: a relay can alter the unhashed transport fields of an honest vertex.
 - **DROP**: timing only. The vertex can be obtained again.
 - **PENDING(epoch|cert)**: kept in a bounded buffer and re-evaluated on a trigger.
 - **STALE**: used as evidence only.
@@ -371,23 +373,29 @@ No rule concludes that a digest does not exist (`DEFECT_REGISTER.md:750`).
 
 **IN-1 (two layers).** Checks run cheapest first.
 
-- **Layer S (stateless given the epoch record of E).** Every node that knows epoch E reaches the same verdict.
+- **Layer S (stateless given the record of the vertex's own epoch E).** Every node that holds that record reaches the same verdict. E1 picks the record (E_active − 1, E_active or E_active + 1) before S3–S6 run under it, so no vertex is kept, pending or stale, before it is authenticated (S2 review MEDIUM-1).
   - S1: raw size ≤ `MAX_VERTEX_BYTES`, checked before parsing (`dag.rs:2681`).
   - S2: `is_live_form`; `aggregated_signature` is `None`; parents ≤ `MAX_PARENTS`; parent digests unique (`dag.rs:1185-1220`).
   - S3: `v.hash == hash_v4(v)`.
-  - S4: the author is in C_E with stake > 0, and the Ed25519 signature verifies under `C_E[author].ed25519_public_key`. This replaces the live account lookup (`dag.rs:1158`, `:2114-2161`) and live membership (`dag.rs:1262-1273`).
+  - S4: the author is in C_E with stake > 0, and the Ed25519 signature (canonical lowercase hex) verifies under `C_E[author].ed25519_public_key`. This replaces the live account lookup (`dag.rs:1158`, `:2114-2161`) and live membership (`dag.rs:1262-1273`).
+  - S4b: every `ParentRef` names a member of C_E with stake > 0 and a canonical 64-character lowercase-hex digest. A ref no certificate could ever satisfy is refused, not left pending (S2 review LOW-1).
   - S5: `first_round(E) ≤ v.round ≤ ABSOLUTE_ROUND_CEILING` (`dag.rs:1107`).
   - S6: if `v.round == first_round(E)`, then `parents == [EPOCH_GENESIS(E)]` and `parent_refs` is empty. Otherwise `qc::parent_refs_admissible(v, C_E)` applies, with its four clauses unchanged (`qc.rs:243-311`). The only edit is that its round-≤1 exemption (`qc.rs:247-249`) becomes `round == first_round(E)`.
   - Any failure → INVALID.
 - **Layer E (context).** Outcomes are only PENDING, STALE, DROP or STAGE. This layer never returns INVALID.
-  - E1 epoch: E = E_active → continue. E = E_active + 1, not yet activated → PENDING(epoch). E > E_active + 1 → DROP. E < E_active → STALE.
+  - E1 epoch (runs first, and selects the record Layer S uses):
+    - E = E_active → continue under C_E.
+    - E = E_active + 1 → Layer S under C_{E+1} (recorded with H_E), then PENDING(epoch). Before C_{E+1} is recorded → DROP.
+    - E = E_active − 1 → Layer S under C_{E−1}, then STALE. Without that record → DROP.
+    - Any other E → DROP.
+    - A vertex of E_active above its closing round r* (once known) → STALE (EP-5).
   - E2 clock: `timestamp > now + 30 s` → DROP. Today this is a hard reject (`dag.rs:1141-1151`); here it is timing only.
   - E3 floor: `v.round ≤ g` → STALE.
   - E4 parent certificates (for `round > first_round(E)`):
     - For each ref, take the embedded `CompactCert`, or else the local `vcert` for (E, ref.round, ref.author) with the ref's digest. Verify it with CE-2 (results are cached).
     - A missing or invalid certificate → PENDING(cert), and send `CERT_REQ`.
     - An invalid *embedded* certificate never makes the vertex INVALID. It is an unhashed transport field that any relay can corrupt.
-  - E5 back-pressure: `v.round > cursor + LEAD` **and the vertex carries payload** → DROP. A payload-free vertex is never dropped for its round (Correction C1).
+  - E5 back-pressure: `v.round > cursor + LEAD` **and the vertex carries payload** → DROP. A payload-free vertex is never dropped for its round (Correction C1), but past the lead it is staged only when every parent certificate already verifies; otherwise DROP, with no PENDING and no CERT_REQ (S2 review MEDIUM-3).
   - No parent **body** is ever required.
 - **Run order.** Epoch classification (E1) runs before any round-relative check. The single-vertex round-jump check (`dag.rs:1126`) is removed. Its role is taken by E4 (a vertex above the certified frontier stays PENDING) and E5.
 
@@ -722,7 +730,8 @@ No decision reads arrival order or a minimum hash.
 - This removes the undercounted window bound the recovery attack found.
 
 **GC-5 (bounds).**
-- At most 2 staged bodies per slot, over at most `LEAD + GC_DEPTH + RETAIN_SLACK` rounds per epoch.
+- At most 2 staged bodies per slot, over at most `LEAD + GC_DEPTH + RETAIN_SLACK` payload-bearing rounds per epoch.
+- Above `cursor + LEAD` only payload-free bodies on certified parents are staged (C1): at most one certified slot per author per round, about 1 KB each. Certified rounds advance at most once per tick, so while commits stall the growth is at most about n KB per tick, reclaimed by GC once commits resume.
 - Plus `B_AUTH` per author and 16 PENDING vertices per author.
 - Honest operation stages about one body per slot. The worst case at n=4 is dominated by a single Byzantine author's `B_AUTH`.
 

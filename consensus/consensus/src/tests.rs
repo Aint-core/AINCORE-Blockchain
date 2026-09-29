@@ -125,6 +125,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    /// G1 S2 review HIGH-1: a V3 vertex carrying V4 fields is refused, so a
+    /// relay cannot pad an honest vertex with an unhashed epoch or
+    /// certificates for every node to store and serve.
+    #[test]
+    fn a_v3_vertex_carrying_v4_fields_is_refused() {
+        let (mut consensus, path) = setup_dag("v3_refuses_v4_fields");
+        consensus.try_create_vertex();
+        let honest = consensus
+            .dag
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        consensus.dag.lock().unwrap().clear();
+        let mut epoch = honest.clone();
+        epoch.epoch = 77;
+        consensus.add_vertex(epoch);
+        let mut cert = honest.clone();
+        cert.parent_refs.push(blockchain::ParentRef {
+            round: 0,
+            author: honest.author.clone(),
+            digest: "0".repeat(64),
+            proof: None,
+            cert: Some(blockchain::CompactCert {
+                signer_bitmap: vec![0; 100_000],
+                aggregate_signature: vec![0; 96],
+            }),
+        });
+        consensus.add_vertex(cert);
+        assert!(
+            consensus.dag.lock().unwrap().is_empty(),
+            "padded copies refused"
+        );
+        consensus.add_vertex(honest.clone());
+        assert!(
+            consensus.dag.lock().unwrap().contains_key(&honest.hash),
+            "positive control: the honest copy is accepted"
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     #[test]
     fn test_dag_growth_and_ordering() {
         let (mut consensus, path) = setup_dag("growth");

@@ -481,13 +481,6 @@ pub fn chain_id() -> String {
 /// domain-separated. Unambiguous -- ["A","B"] and ["AB"] differ -- unlike the
 /// old bare concatenation, which let one validator ship two bodies with the
 /// same hash (one of them splitting a SLASH_EVIDENCE: item off a transaction).
-/// A self-describing reference to a parent vertex: who authored it, at which
-/// round, and its digest.
-///
-/// The child signature authenticates a CLAIM, not the truth of the parent's
-/// identity. A compact parent-signed header proof binds the declared metadata
-/// to the digest without relying on which full bodies the receiver holds.
-/// This does not certify availability, causal validity, or non-equivocation.
 fn is_zero(n: &u64) -> bool {
     *n == 0
 }
@@ -501,6 +494,13 @@ pub struct CompactCert {
     pub aggregate_signature: Vec<u8>,
 }
 
+/// A self-describing reference to a parent vertex: who authored it, at which
+/// round, and its digest.
+///
+/// The child signature authenticates a CLAIM, not the truth of the parent's
+/// identity. A compact parent-signed header proof binds the declared metadata
+/// to the digest without relying on which full bodies the receiver holds.
+/// This does not certify availability, causal validity, or non-equivocation.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ParentRef {
     /// The round the parent was authored at. An ingress rule requires this to be
@@ -743,6 +743,14 @@ impl Vertex {
         // `parent_refs` would still be unbounded in exactly the way the compact
         // form exists to prevent.
         c.parent_refs = Vec::new();
+        c
+    }
+
+    /// `to_compact_proof` for a V4 vertex: the carried parents root is the V4
+    /// one, so `hash_v4` of the proof is the vertex's own (EQ-1 evidence).
+    pub fn to_compact_proof_v4(&self) -> Vertex {
+        let mut c = self.to_compact_proof();
+        c.parents_root = Some(self.parents_root_v4());
         c
     }
 

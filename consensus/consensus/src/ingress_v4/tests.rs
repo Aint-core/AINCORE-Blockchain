@@ -150,16 +150,20 @@ fn verdict_with(
     committee: &[ValidatorInfo],
     local: impl Fn(&ParentRef) -> Option<CompactCert>,
 ) -> Verdict {
-    let sentinel = sentinel(EPOCH);
+    let sentinels = [sentinel(EPOCH - 1), sentinel(EPOCH), sentinel(EPOCH + 1)];
+    let record = |i: usize| EpochRecord {
+        epoch: EPOCH - 1 + i as u64,
+        first_round: FIRST,
+        closing_round: None,
+        sentinel: &sentinels[i],
+        committee,
+    };
     let ctx = Context {
         chain_id: CHAIN,
         genesis_identity: GENESIS,
-        active: EpochRecord {
-            epoch: EPOCH,
-            first_round: FIRST,
-            sentinel: &sentinel,
-            committee,
-        },
+        active: record(1),
+        previous: Some(record(0)),
+        next: Some(record(2)),
         now_secs: NOW,
         gc_floor: 0,
         cursor: FIRST,
@@ -336,9 +340,10 @@ fn first_round_vertices_across_the_boundary_are_classified_by_epoch() {
     assert_eq!(verdict(&at(EPOCH + 1), &c), Verdict::PendingEpoch);
     assert_eq!(verdict(&at(EPOCH - 1), &c), Verdict::Stale);
     assert!(matches!(verdict(&at(EPOCH + 2), &c), Verdict::Drop(_)));
-    // A later epoch's vertex is classified before its round is read.
+    // Another epoch's vertex is judged by that epoch's own record: round 1
+    // is below its first round.
     let next = vertex(&all[0], EPOCH + 1, 1, vec![sentinel(EPOCH + 1)], vec![]);
-    assert_eq!(verdict(&next, &c), Verdict::PendingEpoch);
+    assert!(invalid(verdict(&next, &c)));
 }
 
 #[test]
@@ -374,9 +379,6 @@ fn layer_s_refuses_what_every_node_refuses() {
             .collect();
         (refs.iter().map(|r| r.digest.clone()).collect(), refs)
     };
-    let (parents, refs) = claims(FIRST, MAX_PARENTS);
-    let at_limit = vertex(&all[3], EPOCH, FIRST + 1, parents, refs);
-    assert!(!refused(&at_limit), "{:?}", verdict(&at_limit, &c));
     let (parents, refs) = claims(FIRST, MAX_PARENTS + 1);
     assert!(
         refused(&vertex(&all[3], EPOCH, FIRST + 1, parents, refs)),
@@ -434,9 +436,12 @@ fn layer_s_refuses_what_every_node_refuses() {
         active: EpochRecord {
             epoch: EPOCH,
             first_round: FIRST,
+            closing_round: None,
             sentinel: &sentinel,
             committee: &c,
         },
+        previous: None,
+        next: None,
         now_secs: NOW,
         gc_floor: 0,
         cursor: FIRST,
@@ -464,9 +469,12 @@ fn layer_e_delays_but_never_refuses() {
             active: EpochRecord {
                 epoch: EPOCH,
                 first_round: FIRST,
+                closing_round: None,
                 sentinel: &sentinel,
                 committee: &c,
             },
+            previous: None,
+            next: None,
             now_secs: now,
             gc_floor: floor,
             cursor,
@@ -532,13 +540,267 @@ fn layer_s_verdicts_do_not_depend_on_the_context() {
             active: EpochRecord {
                 epoch: EPOCH,
                 first_round: FIRST,
+                closing_round: None,
                 sentinel: &sentinel,
                 committee: &c,
             },
+            previous: None,
+            next: None,
             now_secs: now,
             gc_floor: floor,
             cursor,
         };
         assert!(invalid(v4_verdict(1_000, &bad, &ctx, |_| None)));
     }
+}
+
+// ── review of S2 (733e0d8) ─────────────────────────────────────────────────
+
+fn context<'a>(
+    committee: &'a [ValidatorInfo],
+    sentinels: &'a [String; 3],
+    previous: bool,
+    next: bool,
+) -> Context<'a> {
+    let record = |i: usize| EpochRecord {
+        epoch: EPOCH - 1 + i as u64,
+        first_round: FIRST,
+        closing_round: None,
+        sentinel: &sentinels[i],
+        committee,
+    };
+    Context {
+        chain_id: CHAIN,
+        genesis_identity: GENESIS,
+        active: record(1),
+        previous: previous.then(|| record(0)),
+        next: next.then(|| record(2)),
+        now_secs: NOW,
+        gc_floor: 0,
+        cursor: FIRST,
+    }
+}
+
+/// MEDIUM-1: a vertex of an adjacent epoch is authenticated under that
+/// epoch's record before it is kept; without the record it is dropped.
+#[test]
+fn adjacent_epochs_are_authenticated_before_they_are_kept() {
+    let all = members();
+    let c = committee(&all);
+    let sentinels = [sentinel(EPOCH - 1), sentinel(EPOCH), sentinel(EPOCH + 1)];
+    let at = |epoch| vertex(&all[0], epoch, FIRST, vec![sentinel(epoch)], vec![]);
+    let forged = |epoch| {
+        let mut v = at(epoch);
+        v.sign_with_ed25519(&crypto::SigningKey::from_bytes(&all[1].node_key));
+        v
+    };
+    let judge = |v: &Vertex, previous, next| {
+        v4_verdict(1_000, v, &context(&c, &sentinels, previous, next), |_| None)
+    };
+    assert_eq!(judge(&at(EPOCH + 1), true, true), Verdict::PendingEpoch);
+    assert!(
+        invalid(judge(&forged(EPOCH + 1), true, true)),
+        "a forged next-epoch vertex"
+    );
+    assert!(
+        matches!(judge(&at(EPOCH + 1), true, false), Verdict::Drop(_)),
+        "no next record"
+    );
+    assert_eq!(judge(&at(EPOCH - 1), true, true), Verdict::Stale);
+    assert!(
+        invalid(judge(&forged(EPOCH - 1), true, true)),
+        "a forged old-epoch vertex"
+    );
+    assert!(
+        matches!(judge(&at(EPOCH - 1), false, true), Verdict::Drop(_)),
+        "no previous record"
+    );
+    assert!(matches!(
+        judge(&at(EPOCH + 2), true, true),
+        Verdict::Drop(_)
+    ));
+    assert!(matches!(
+        judge(&at(EPOCH - 2), true, true),
+        Verdict::Drop(_)
+    ));
+    // The active epoch at the edge of u64: no overflow, no panic.
+    let edge = [sentinel(EPOCH - 1), sentinel(EPOCH), sentinel(EPOCH + 1)];
+    let mut ctx = context(&c, &edge, false, false);
+    ctx.active.epoch = u64::MAX;
+    let mut v = at(EPOCH);
+    v.epoch = u64::MAX;
+    seal(&mut v, &all[0]);
+    assert!(!matches!(
+        v4_verdict(1_000, &v, &ctx, |_| None),
+        Verdict::Drop(_)
+    ));
+    v.epoch = 5;
+    seal(&mut v, &all[0]);
+    assert!(
+        matches!(v4_verdict(1_000, &v, &ctx, |_| None), Verdict::Drop(_)),
+        "not adjacent to u64::MAX"
+    );
+    v.epoch = 0;
+    seal(&mut v, &all[0]);
+    ctx.active.epoch = 0;
+    assert!(!matches!(
+        v4_verdict(1_000, &v, &ctx, |_| None),
+        Verdict::Stale
+    ));
+}
+
+/// Plausible LOW: above the epoch's closing round r*, a vertex of it is stale.
+#[test]
+fn a_vertex_above_the_closing_round_is_stale() {
+    let all = members();
+    let c = committee(&all);
+    let sentinels = [sentinel(EPOCH - 1), sentinel(EPOCH), sentinel(EPOCH + 1)];
+    let (v, _) = second_round(&all, 3, &[0, 1, 2]);
+    let mut ctx = context(&c, &sentinels, true, true);
+    ctx.active.closing_round = Some(FIRST + 1);
+    assert_eq!(
+        v4_verdict(1_000, &v, &ctx, |_| None),
+        Verdict::Stage,
+        "at r*"
+    );
+    ctx.active.closing_round = Some(FIRST);
+    assert_eq!(
+        v4_verdict(1_000, &v, &ctx, |_| None),
+        Verdict::Stale,
+        "above r*"
+    );
+}
+
+/// MEDIUM-3: past the lead, a payload-free vertex is staged only on parents
+/// already certified; otherwise it is dropped, and nothing is asked for.
+#[test]
+fn past_the_lead_only_certified_parents_are_staged() {
+    let all = members();
+    let c = committee(&all);
+    let sentinels = [sentinel(EPOCH - 1), sentinel(EPOCH), sentinel(EPOCH + 1)];
+    let (mut v, _) = second_round(&all, 3, &[0, 1, 2]);
+    v.payload.clear();
+    seal(&mut v, &all[3]);
+    let mut ctx = context(&c, &sentinels, true, true);
+    ctx.cursor = 0;
+    assert_eq!(v4_verdict(1_000, &v, &ctx, |_| None), Verdict::Stage);
+    v.parent_refs[1].cert = None;
+    assert!(matches!(
+        v4_verdict(1_000, &v, &ctx, |_| None),
+        Verdict::Drop(_)
+    ));
+    ctx.cursor = FIRST;
+    assert_eq!(
+        v4_verdict(1_000, &v, &ctx, |_| None),
+        Verdict::PendingCert(vec![1])
+    );
+}
+
+/// LOW-1: a ref no certificate could satisfy is refused, not left waiting.
+#[test]
+fn refs_must_name_staked_members_and_canonical_digests() {
+    let all = members();
+    let c = committee(&all);
+    let (v, parents) = second_round(&all, 3, &[0, 1, 2]);
+    assert_eq!(verdict(&v, &c), Verdict::Stage);
+    let with = |edit: &dyn Fn(&mut Vertex)| {
+        let mut w = v.clone();
+        edit(&mut w);
+        w.parents = w.parent_refs.iter().map(|r| r.digest.clone()).collect();
+        seal(&mut w, &all[3]);
+        w
+    };
+    // A fourth ref by a non-member: the other three still make a quorum, so
+    // only the membership rule refuses it.
+    let outsider = member(9);
+    let stray = first_round(&outsider);
+    let extra = with(&|w| w.parent_refs.push(reference(&stray, None)));
+    assert!(invalid(verdict(&extra, &c)), "{:?}", verdict(&extra, &c));
+    let upper = parents[0].hash.to_uppercase();
+    assert!(invalid(verdict(
+        &with(&|w| w.parent_refs[0].digest = upper.clone()),
+        &c
+    )));
+}
+
+/// LOW-3: the signature must be canonical (lowercase) hex.
+#[test]
+fn an_upper_case_signature_is_invalid() {
+    let all = members();
+    let c = committee(&all);
+    let mut v = first_round(&all[0]);
+    assert_eq!(verdict(&v, &c), Verdict::Stage);
+    v.signature = v.signature.to_uppercase();
+    assert!(invalid(verdict(&v, &c)));
+}
+
+/// Review mutants: clauses the first tests did not pin.
+#[test]
+fn clauses_the_first_tests_did_not_pin() {
+    let all = members();
+    let c = committee(&all);
+    // The sentinel is the ONLY parent of a first-round vertex.
+    let p = first_round(&all[1]);
+    let extra = vertex(
+        &all[0],
+        EPOCH,
+        FIRST,
+        vec![sentinel(EPOCH), p.hash.clone()],
+        vec![],
+    );
+    assert!(invalid(verdict(&extra, &c)), "a sentinel and more");
+    // A live vertex carries neither compact root.
+    let mut rooted = first_round(&all[0]);
+    rooted.parents_root = Some(rooted.parents_root_v4());
+    seal(&mut rooted, &all[0]);
+    assert!(
+        invalid(verdict(&rooted, &c)),
+        "a parents root on a live vertex"
+    );
+    // The author is matched exactly, not case-insensitively.
+    let mut upper = first_round(&all[0]);
+    upper.author = upper.author.to_uppercase();
+    seal(&mut upper, &all[0]);
+    assert!(invalid(verdict(&upper, &c)), "an upper-case author");
+    // Stake, not a count of authors (C9): 4000/3000/2000/1000.
+    let mut weighted = c.clone();
+    for (m, stake) in weighted.iter_mut().zip([4000, 3000, 2000, 1000]) {
+        m.stake = stake;
+    }
+    let claims = |authors: &[usize]| -> Vertex {
+        let refs: Vec<ParentRef> = authors
+            .iter()
+            .map(|&i| ParentRef {
+                round: FIRST,
+                author: all[i].info.address.clone(),
+                digest: format!("{:064x}", 5_000 + i),
+                proof: None,
+                cert: None,
+            })
+            .collect();
+        vertex(
+            &all[3],
+            EPOCH,
+            FIRST + 1,
+            refs.iter().map(|r| r.digest.clone()).collect(),
+            refs,
+        )
+    };
+    assert!(
+        invalid(verdict(&claims(&[1, 2, 3]), &weighted)),
+        "3 of 4 authors, 60% of stake"
+    );
+    assert_eq!(
+        verdict(&claims(&[0, 1]), &weighted),
+        Verdict::PendingCert(vec![0, 1]),
+        "2 of 4 authors, 70% of stake"
+    );
+    // V3 keeps its round-0 and round-1 exemptions.
+    let v3 = |round| Vertex {
+        round,
+        ..first_round(&all[0])
+    };
+    assert!(qc::parent_refs_admissible(&v3(0), &[]).is_ok());
+    assert!(qc::parent_refs_admissible(&v3(1), &[]).is_ok());
+    assert!(qc::parent_refs_admissible(&v3(2), &[]).is_err());
 }
