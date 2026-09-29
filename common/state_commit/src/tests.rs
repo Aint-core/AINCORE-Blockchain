@@ -582,16 +582,21 @@ fn chunk_refuses_a_corrupt_preimage_and_reports_the_end_as_none() {
     assert!(chunk(&clean, 0, None, MAX_CHUNK + 1).is_err(), "size cap");
 }
 
-/// `chunk_while` ends before the first refused leaf, having read at most
-/// that one past it, with a proof for what it took; refusing the first leaf
-/// takes nothing.
+/// `chunk_with` ends before the first refused leaf, having read at most that
+/// one past it, with a proof for what it took; refusing the first leaf takes
+/// nothing.
 #[test]
-fn chunk_while_ends_before_the_first_refused_leaf() {
+fn chunk_with_ends_before_the_first_refused_leaf() {
     let (srv, root) = server("while", 30);
+    let mut first = Vec::new();
     let mut seen = 0;
-    let (first, proof) = chunk_while(&srv, 0, None, 100, |_, _| {
+    let proof = chunk_with(&srv, 0, None, 100, |key, value| {
         seen += 1;
-        seen <= 5
+        if seen > 5 {
+            return false;
+        }
+        first.push((key, value));
+        true
     })
     .unwrap()
     .unwrap();
@@ -604,11 +609,19 @@ fn chunk_while_ends_before_the_first_refused_leaf() {
     restore.add_chunk(rest, proof).unwrap();
     restore.finish().unwrap();
     assert!(
-        chunk_while(&srv, 0, None, 100, |_, _| false)
+        chunk_with(&srv, 0, None, 100, |_, _| false)
             .unwrap()
             .is_none(),
         "nothing taken"
     );
+    let mut taken = 0;
+    chunk_with(&srv, 0, None, 7, |_, _| {
+        taken += 1;
+        true
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(taken, 7, "at most max");
 }
 
 /// Golden vector: the root of a fixed state must never drift. Any change to

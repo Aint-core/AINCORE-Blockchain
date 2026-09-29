@@ -191,7 +191,6 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         | "sys:block_prune_cursor_v1"
         | "sys:kept_pin_blocks_v1"
         | "sys:restored_by"
-        | "sys:restore_tip_height"
         | "sys:tx_index_backfill_v1_complete"
         | "genesis_initialized"
         | "sync:halt_reason"
@@ -617,7 +616,6 @@ mod tests {
             ("sys:restored_checkpoint".into(), Node),
             ("sys:kept_pin_blocks_v1".into(), Node),
             ("sys:restored_by".into(), Node),
-            ("sys:restore_tip_height".into(), Node),
             // K, T, log
             ("genesis_identity".into(), Constant),
             (format!("jmt:node:{H64}"), Tree),

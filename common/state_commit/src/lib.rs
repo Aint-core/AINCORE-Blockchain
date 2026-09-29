@@ -947,21 +947,27 @@ pub fn chunk(
     after: Option<KeyHash>,
     max: usize,
 ) -> Result<Option<(Entries, SparseMerkleRangeProof<Sha256>)>> {
-    chunk_while(db, version, after, max, |_, _| true)
+    let mut out = Vec::new();
+    let proof = chunk_with(db, version, after, max, |key, value| {
+        out.push((key, value));
+        true
+    })?;
+    Ok(proof.map(|proof| (out, proof)))
 }
 
-/// `chunk`, ending before the first leaf `admit` refuses: it sees each leaf's
-/// key and value in order, so a server can stop at a byte budget after
-/// reading at most one leaf past it. `Ok(None)` when no leaf was taken: the
-/// stream is complete, or `admit` refused the first leaf (its caller knows
-/// which).
-pub fn chunk_while(
+/// Walk up to `max` leaves after `after`, in order, handing each to `take`,
+/// which keeps it (true) or ends the chunk before it (false). So a server can
+/// stop at a byte budget, having read at most one leaf past it, and need not
+/// hold values it only measures. Returns the range proof up to the last leaf
+/// taken; `Ok(None)` when none was: the stream is complete, or `take` refused
+/// the first leaf (its caller knows which).
+pub fn chunk_with(
     db: &Arc<StateDB>,
     version: Version,
     after: Option<KeyHash>,
     max: usize,
-    mut admit: impl FnMut(&str, &[u8]) -> bool,
-) -> Result<Option<(Entries, SparseMerkleRangeProof<Sha256>)>> {
+    mut take: impl FnMut(String, Vec<u8>) -> bool,
+) -> Result<Option<SparseMerkleRangeProof<Sha256>>> {
     ensure!(
         (1..=MAX_CHUNK).contains(&max),
         "chunk size must be 1..={MAX_CHUNK}"
@@ -969,7 +975,7 @@ pub fn chunk_while(
     no_panic("chunk", || {
         let store = Arc::new(JmtStore::new(db.clone()));
         let start = after.unwrap_or(KeyHash([0u8; 32]));
-        let mut out = Vec::new();
+        let mut taken = 0;
         let mut last = None;
         for item in JellyfishMerkleIterator::new(store.clone(), version, start)? {
             let (kh, value) = item?;
@@ -986,20 +992,21 @@ pub fn chunk_while(
                 "corrupt preimage for {}",
                 hex::encode(kh.0)
             );
-            if !admit(&key, &value) {
+            if !take(key, value) {
                 break;
             }
-            out.push((key, value));
+            taken += 1;
             last = Some(kh);
-            if out.len() == max {
+            if taken == max {
                 break;
             }
         }
         let Some(last) = last else {
             return Ok(None);
         };
-        let proof = Sha256Jmt::new(store.as_ref()).get_range_proof(last, version)?;
-        Ok(Some((out, proof)))
+        Ok(Some(
+            Sha256Jmt::new(store.as_ref()).get_range_proof(last, version)?,
+        ))
     })
 }
 
@@ -1015,20 +1022,23 @@ pub fn wire_chunk(
     after: Option<[u8; 32]>,
     max: usize,
 ) -> Result<Option<(Entries, Vec<u8>)>> {
-    wire_chunk_while(db, version, after, max, |_, _| true)
+    match chunk(db, version, after.map(KeyHash), max)? {
+        None => Ok(None),
+        Some((entries, proof)) => Ok(Some((entries, borsh::to_vec(&proof)?))),
+    }
 }
 
-/// `chunk_while` for the wire.
-pub fn wire_chunk_while(
+/// `chunk_with` for the wire: the proof borsh-encoded.
+pub fn wire_chunk_with(
     db: &Arc<StateDB>,
     version: Version,
     after: Option<[u8; 32]>,
     max: usize,
-    admit: impl FnMut(&str, &[u8]) -> bool,
-) -> Result<Option<(Entries, Vec<u8>)>> {
-    match chunk_while(db, version, after.map(KeyHash), max, admit)? {
+    take: impl FnMut(String, Vec<u8>) -> bool,
+) -> Result<Option<Vec<u8>>> {
+    match chunk_with(db, version, after.map(KeyHash), max, take)? {
         None => Ok(None),
-        Some((entries, proof)) => Ok(Some((entries, borsh::to_vec(&proof)?))),
+        Some(proof) => Ok(Some(borsh::to_vec(&proof)?)),
     }
 }
 

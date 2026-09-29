@@ -514,8 +514,6 @@ fn assert_restored(client: &Arc<StateDB>, chain: &Chain) {
         Some("[]"),
         "the old chain's kept pins are forgotten"
     );
-    let tip: u64 = client.get(RESTORE_TIP).unwrap().unwrap().parse().unwrap();
-    assert!(tip >= H, "the network tip, at least the checkpoint: {tip}");
     let anchor_round = (2 * H).to_string();
     for (key, value) in [
         ("consensus:finality_digest", "ee".repeat(32)),
@@ -2716,81 +2714,120 @@ fn serve_from_budgets_by_the_clients_ip() {
     assert!(sync.serve_from("GET_HEIGHT", ip).is_some());
 }
 
-/// The restore records the network's height as the highest a peer reports,
-/// and at least the checkpoint's: SN-6 judges a key by it at every boot.
-#[tokio::test]
-async fn the_restore_records_the_network_tip() {
-    let g = genesis();
-    let a = chain("tip_a", MEMBER);
-    for (heights, expected) in [(["HEIGHT:50", "HEIGHT:x"], 50), (["HEIGHT:3", "?"], H)] {
-        let client = temp_db("tip_client");
-        let mut peers = [peer(&a, Behaviour::Honest), peer(&a, Behaviour::Honest)];
-        run_with(&client, &plan(&a.cp, &g, false), 2, |i, msg| {
-            if msg == "GET_HEIGHT" {
-                return Ok(heights[i].to_string());
-            }
-            serve(&mut peers[i], msg)
-        })
-        .await
-        .unwrap();
-        assert_eq!(client.get(RESTORE_TIP).unwrap(), Some(expected.to_string()));
-    }
-    // A recent checkpoint: a peer's absurd height is cut to what time allows.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let recent = chain_with(
-        "tip_recent",
+/// SN-6 on what the restored state records: a key in any retained epoch's
+/// committee, or in the active set, is a validator. The block's signer may
+/// be in the checkpoint epoch's committee or in the active set.
+#[test]
+fn validators_are_what_the_restored_state_records() {
+    let a = chain_with(
+        "recorded_a",
         Spec {
-            timestamp: now,
+            epoch_one: Some([8; 32]),
+            validators: vec!["ab".repeat(32)],
             ..Spec::default()
         },
     );
-    let client = temp_db("tip_recent_client");
-    let mut server = peer(&recent, Behaviour::Honest);
-    run_with(&client, &plan(&recent.cp, &g, false), 1, |_, msg| {
-        if msg == "GET_HEIGHT" {
-            return Ok(format!("HEIGHT:{}", u64::MAX));
+    let client = temp_db("recorded_client");
+    {
+        let _seed = client.seeding();
+        for (key, value) in &a.state {
+            client.put(key, &String::from_utf8_lossy(value)).unwrap();
         }
-        serve(&mut server, msg)
-    })
-    .await
-    .unwrap();
-    let tip: u64 = client.get(RESTORE_TIP).unwrap().unwrap().parse().unwrap();
-    let ceiling = H + TIP_CLOCK_SLACK_SECS * MAX_BLOCKS_PER_SEC;
-    assert!((ceiling..ceiling + 600).contains(&tip), "{tip}");
+    }
+    let genesis_member = committee()[0].address.clone();
+    let epoch_one = committee_of([8; 32], 2)[0].address.clone();
+    for key in [&genesis_member, &epoch_one, &"ab".repeat(32), &proposer().1] {
+        assert!(recorded_validator(&client, key), "{key}");
+    }
+    assert!(!recorded_validator(&client, &outsider().1));
+    let signing = committee_of([8; 32], 2);
+    assert!(
+        signed_by_a_validator(&client, &signing, &epoch_one),
+        "committee"
+    );
+    assert!(
+        signed_by_a_validator(&client, &signing, &proposer().1),
+        "active"
+    );
+    assert!(!signed_by_a_validator(&client, &signing, &genesis_member));
 }
 
-/// A peer cannot push the tip past what time allows since the checkpoint
-/// block, nor below the checkpoint.
-#[tokio::test]
-async fn a_peer_cannot_raise_the_tip_past_what_time_allows() {
-    let a = chain("ceiling_a", MEMBER);
-    let mut block = stored_block(&a);
-    let now = 1_000_000;
-    block.header.timestamp = now - 60;
-    let per_sec = MAX_BLOCKS_PER_SEC;
-    assert_eq!(
-        tip_ceiling(&block, now),
-        H + (60 + TIP_CLOCK_SLACK_SECS) * per_sec
+/// A cursor for `after`: the key hash of `key`, hex.
+fn cursor_before(key: &str) -> String {
+    hex::encode(state_commit::key_hash(key).0)
+}
+
+fn leaf_order(chain: &Chain) -> Vec<String> {
+    state_commit::chunk(&chain.db, H, None, state_commit::MAX_CHUNK)
+        .unwrap()
+        .unwrap()
+        .0
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// Review 4: the server keeps room for the proof. Eight 262,090-byte leaves
+/// with 68-byte keys fill 4,194,240 of the 4,194,304 inline bytes: they fit
+/// only without the proof, so the server sends seven, and the client, which
+/// counts the proof, accepts them.
+#[test]
+fn a_served_chunk_near_the_inline_limit_passes_the_client() {
+    let big = 262_090usize;
+    let extra = (2_000..2_300).map(|i| (obj(i), vec![b'n'; big])).collect();
+    let a = chain_with(
+        "nearlimit_a",
+        Spec {
+            extra,
+            ..Spec::default()
+        },
     );
-    assert_eq!(
-        tip_ceiling(&block, now - 1_000),
-        H + TIP_CLOCK_SLACK_SECS * per_sec,
-        "a clock behind the block"
-    );
-    let reply = |height: &'static str| {
-        move |_: usize, _: String| async move { Ok::<_, String>(height.to_string()) }
+    let order = leaf_order(&a);
+    let is_big = |k: &String| {
+        k.strip_prefix("obj:")
+            .and_then(|h| u64::from_str_radix(h, 16).ok())
+            .is_some_and(|i| (2_000..2_300).contains(&i))
     };
-    let mut huge = reply("HEIGHT:18446744073709551615");
-    assert_eq!(network_tip(H, 500, 2, &mut huge).await, 500);
-    let mut low = reply("HEIGHT:3");
-    assert_eq!(network_tip(H, 500, 2, &mut low).await, H);
-    let mut fair = reply("HEIGHT:70");
-    assert_eq!(network_tip(H, 500, 2, &mut fair).await, 70);
-    let mut low = reply("HEIGHT:3");
-    assert_eq!(network_tip(H, H - 5, 2, &mut low).await, H, "never below");
+    let start = (0..order.len().saturating_sub(8))
+        .find(|&j| order[j + 1..=j + 8].iter().all(is_big))
+        .expect("a run of eight big leaves");
+    let server = peer(&a, Behaviour::Honest).sync;
+    let resp = server.handle_state_chunk(ChunkRequest {
+        version: H,
+        after: Some(cursor_before(&order[start])),
+        max: MAX_CHUNK_ENTRIES,
+    });
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    assert!(chunk_fits(&resp.entries, resp.proof.len() / 2));
+    assert_eq!(resp.entries.len(), 7, "the byte limit bound the chunk");
+}
+
+/// Review 4: a first leaf past the protocol's limits is refused, never
+/// reported as the end of the stream. A 4.2 MB key is past the inline limit
+/// on its own.
+#[test]
+fn a_first_leaf_past_the_limits_is_not_the_end() {
+    let huge = format!("obj:{}", "k".repeat(4_200_000));
+    let a = chain_with(
+        "firstpast_a",
+        Spec {
+            extra: vec![(huge.clone(), b"v".to_vec())],
+            ..Spec::default()
+        },
+    );
+    let order = leaf_order(&a);
+    let at = order.iter().position(|k| *k == huge).unwrap();
+    let server = peer(&a, Behaviour::Honest).sync;
+    let resp = server.handle_state_chunk(ChunkRequest {
+        version: H,
+        after: (at > 0).then(|| cursor_before(&order[at - 1])),
+        max: MAX_CHUNK_ENTRIES,
+    });
+    assert!(!resp.done, "not the end");
+    assert_eq!(
+        resp.error.as_deref(),
+        Some("a leaf over the protocol's limit")
+    );
 }
 
 /// Review 3: a block re-signed with any account's key is not stored: the

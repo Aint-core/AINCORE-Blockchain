@@ -65,10 +65,6 @@ const PART_BUSY_WAIT: Duration = Duration::from_secs(1);
 /// sits out turns. An honest server delivers at its budget, several times
 /// this.
 const MIN_TURN_UNITS_PER_SEC: f64 = STATE_SERVE_UNITS_PER_SEC_PER_IP / 8.0;
-/// Where a restored node records the network's height when it was restored:
-/// a key that was a validator at or before it may have signed slots this
-/// datadir never saw (SN-6).
-pub const RESTORE_TIP: &str = "sys:restore_tip_height";
 /// Where a restored node records the checkpoint it restored, and the key it
 /// restored with (N).
 pub const RESTORED_CHECKPOINT: &str = "sys:restored_checkpoint";
@@ -510,20 +506,35 @@ impl ChainSync {
         blocking(|| {
             let mut budget = ChunkBudget::new(state_commit::MAX_RANGE_PROOF_BYTES);
             let (mut read, mut refused) = (0u64, false);
-            let chunk = state_commit::wire_chunk_while(
+            // A value too large to travel inline is only measured: its bytes
+            // are not held while the chunk is built.
+            let mut entries = Vec::new();
+            let chunk = state_commit::wire_chunk_with(
                 &self.storage,
                 req.version,
                 after,
                 admission.granted,
                 |key, value| {
-                    read += value.len() as u64;
-                    refused = !budget.take(key, value.len() as u64);
+                    let len = value.len() as u64;
+                    read += len;
+                    refused = !budget.take(&key, len);
+                    if !refused {
+                        entries.push(WireEntry {
+                            len,
+                            value: if value.len() > INLINE_VALUE_BYTES {
+                                String::new()
+                            } else {
+                                hex::encode(&value)
+                            },
+                            key,
+                        });
+                    }
                     !refused
                 },
             );
             admission.charge(read);
-            let (entries, proof) = match chunk {
-                Ok(Some(chunk)) => chunk,
+            let proof = match chunk {
+                Ok(Some(proof)) => proof,
                 Ok(None) if refused => return refuse("a leaf over the protocol's limit"),
                 Ok(None) => {
                     admission.refund(admission.granted);
@@ -535,18 +546,6 @@ impl ChainSync {
                 Err(_) => return refuse("version not whole here"),
             };
             admission.refund(admission.granted.saturating_sub(entries.len()));
-            let entries = entries
-                .into_iter()
-                .map(|(key, value)| WireEntry {
-                    len: value.len() as u64,
-                    value: if value.len() > INLINE_VALUE_BYTES {
-                        String::new()
-                    } else {
-                        hex::encode(&value)
-                    },
-                    key,
-                })
-                .collect();
             ChunkResponse {
                 entries,
                 proof: hex::encode(proof),
@@ -778,47 +777,6 @@ fn check_anchor(cp: &Checkpoint, block: &Block, qc: &QuorumCertificate) -> Resul
 
 type Pair = (Block, QuorumCertificate);
 
-/// The fastest the chain can grow: one round per consensus tick (100 ms at
-/// the least) and a block per two rounds is 5 a second.
-const MAX_BLOCKS_PER_SEC: u64 = 10;
-/// Clock slack when the tip is bounded by time.
-const TIP_CLOCK_SLACK_SECS: u64 = 3_600;
-
-/// The highest the network can be now, from the checkpoint block's BFT
-/// timestamp (seconds): a ceiling on the tip peers report.
-fn tip_ceiling(checkpoint: &Block, now_secs: u64) -> u64 {
-    let elapsed = now_secs
-        .saturating_sub(checkpoint.header.timestamp)
-        .saturating_add(TIP_CLOCK_SLACK_SECS);
-    checkpoint
-        .header
-        .height
-        .saturating_add(elapsed.saturating_mul(MAX_BLOCKS_PER_SEC))
-}
-
-/// The network's height as the peers report it: the highest answer, so one
-/// honest peer is enough (SN-6 then refuses more, never less); at least the
-/// checkpoint's, and at most `ceiling`, so a peer cannot push it past what
-/// time allows and refuse this node's key long after it joined.
-async fn network_tip<F, Fut>(checkpoint: u64, ceiling: u64, peers: usize, ask: &mut F) -> u64
-where
-    F: FnMut(usize, String) -> Fut,
-    Fut: Future<Output = Result<String, String>>,
-{
-    let mut tip = checkpoint;
-    for peer in 0..peers {
-        if let Ok(reply) = ask(peer, "GET_HEIGHT".to_string()).await {
-            if let Some(height) = reply
-                .strip_prefix("HEIGHT:")
-                .and_then(|h| h.trim().parse::<u64>().ok())
-            {
-                tip = tip.max(height);
-            }
-        }
-    }
-    tip.min(ceiling.max(checkpoint))
-}
-
 /// Every distinct (block, QC) pair the peers hold for the checkpoint, asked
 /// again, round after round, until one is found. A pair stays together: the
 /// block stored is the one whose own QC verifies.
@@ -908,11 +866,10 @@ fn sn6_refusal(me: &str) -> String {
 }
 
 /// The checkpoint epoch's committee, as the restored state records it; and
-/// SN-6: this node is neither in it nor in the active set.
+/// SN-6: this node's key is no validator the restored state records.
 fn restored_committee(
     storage: &StateDB,
     plan: &RestorePlan<'_>,
-    tip: u64,
 ) -> Result<(u64, Vec<consensus::qc::ValidatorInfo>), String> {
     let height = plan.checkpoint.height;
     let epoch = consensus::qc_producer::epoch_for_block_height(storage, height)
@@ -920,44 +877,45 @@ fn restored_committee(
     let committee = consensus::qc_producer::load_validator_set_for_epoch(storage, epoch)
         .ok_or("the restored state has no committee for the checkpoint's epoch")?;
     if let Some(me) = plan.local_signer {
-        if committee.iter().any(|v| v.address == me) || validator_at_or_before(storage, me, tip) {
+        if recorded_validator(storage, me) {
             return Err(sn6_refusal(me));
         }
     }
     Ok((epoch, committee))
 }
 
-/// SN-6: whether `key` was a validator in an epoch that began at or before
-/// `height`, as `storage` records the epochs (the recent ones it retains),
-/// or is in its active set since the current epoch began. An epoch whose
-/// start is not recorded counts as begun: the safe side.
-pub fn validator_at_or_before(storage: &StateDB, key: &str, height: u64) -> bool {
+/// SN-6: whether `storage` records `key` as a validator: in the committee of
+/// any epoch it retains, or in the active set. It cannot tell about a chain
+/// it has not seen: a key that joined after the checkpoint is not in a
+/// restored state (G1 RC-3 covers that case; see the contract).
+pub fn recorded_validator(storage: &StateDB, key: &str) -> bool {
     let current = storage
         .get("consensus:epoch")
         .ok()
         .flatten()
         .and_then(|e| e.parse::<u64>().ok())
         .unwrap_or(0);
-    let begun = |epoch: u64| {
-        epoch == 0
-            || storage
-                .get(&format!("consensus:epoch_start_height:{epoch}"))
-                .ok()
-                .flatten()
-                .and_then(|s| s.parse::<u64>().ok())
-                .is_none_or(|start| start <= height)
-    };
-    let in_epoch = (0..=current).rev().take(64).any(|epoch| {
+    (0..=current).rev().take(64).any(|epoch| {
         consensus::qc_producer::load_validator_set_for_epoch(storage, epoch)
             .is_some_and(|set| set.iter().any(|v| v.address == key))
-            && begun(epoch)
-    });
-    in_epoch
-        || (begun(current)
-            && storage
-                .get_active_validators()
-                .iter()
-                .any(|(address, _)| address == key))
+    }) || storage
+        .get_active_validators()
+        .iter()
+        .any(|(address, _)| address == key)
+}
+
+/// Whether `signer` may sign the checkpoint's block: a validator of the
+/// checkpoint epoch's committee, or of the restored active set.
+fn signed_by_a_validator(
+    storage: &StateDB,
+    committee: &[consensus::qc::ValidatorInfo],
+    signer: &str,
+) -> bool {
+    committee.iter().any(|v| v.address == signer)
+        || storage
+            .get_active_validators()
+            .iter()
+            .any(|(address, _)| address == signer)
 }
 
 /// The first pair whose QC the committee signed under this chain id, and
@@ -973,12 +931,7 @@ fn verified_pair(
     let mut last_error = String::from("no QC");
     for (block, qc) in pairs {
         let signer = &block.proposer_signer;
-        let validator = committee.iter().any(|v| &v.address == signer)
-            || storage
-                .get_active_validators()
-                .iter()
-                .any(|(address, _)| address == signer);
-        if !validator {
+        if !signed_by_a_validator(storage, committee, signer) {
             last_error = format!("block signer {signer} is not a validator");
             continue;
         }
@@ -1008,9 +961,7 @@ fn bootstrap_record(
     plan: &RestorePlan<'_>,
     block: &Block,
     qc: &QuorumCertificate,
-    tip: u64,
 ) -> Result<WriteBatch, String> {
-    let tip = tip.to_string();
     let h = block.header.height.to_string();
     let block_json = serde_json::to_string(block).map_err(|e| e.to_string())?;
     let qc_json = serde_json::to_string(qc).map_err(|e| e.to_string())?;
@@ -1040,7 +991,6 @@ fn bootstrap_record(
         (StateDB::BLOCK_PRUNE_CURSOR_KEY.into(), &h),
         (StateDB::KEPT_PIN_BLOCKS_KEY.into(), "[]"),
         (RESTORED_CHECKPOINT.into(), &checkpoint),
-        (RESTORE_TIP.into(), &tip),
     ];
     if let Some(me) = plan.local_signer {
         rows.push((RESTORED_BY.into(), me));
@@ -1084,7 +1034,7 @@ fn check_datadir(storage: &StateDB, plan: &RestorePlan<'_>) -> Result<(), String
         );
     }
     if let Some(me) = plan.local_signer {
-        if validator_at_or_before(storage, me, u64::MAX) {
+        if recorded_validator(storage, me) {
             return Err(sn6_refusal(me));
         }
     }
@@ -1356,11 +1306,6 @@ where
     let cp = plan.checkpoint;
     let root = hex32(&cp.state_root).ok_or("malformed checkpoint root")?;
     let pairs = fetch_anchor(cp, peers, &mut ask, patience).await?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let ceiling = tip_ceiling(&pairs[0].0, now);
-    let tip = network_tip(cp.height, ceiling, peers, &mut ask).await;
 
     let marker = serde_json::json!({"height": cp.height, "state_root": cp.state_root});
     storage
@@ -1470,7 +1415,7 @@ where
         // the checks read only flat state. On failure the marker stays.
         let inconsistent = |e: String| format!("the checkpoint is inconsistent: {e}");
         let chain_id = check_genesis(storage, plan).map_err(inconsistent)?;
-        let (epoch, committee) = restored_committee(storage, plan, tip).map_err(inconsistent)?;
+        let (epoch, committee) = restored_committee(storage, plan).map_err(inconsistent)?;
         let (block, qc) = match verified_pair(storage, &chain_id, epoch, &committee, &pairs) {
             Ok(pair) => pair,
             // The peer that held the good pair may have missed the first
@@ -1481,7 +1426,7 @@ where
                     .map_err(inconsistent)?
             }
         };
-        let record = bootstrap_record(tree, plan, &block, &qc, tip)?;
+        let record = bootstrap_record(tree, plan, &block, &qc)?;
         storage.write_batch(record).map_err(|e| e.to_string())?;
         return Ok(Restored {
             height: cp.height,

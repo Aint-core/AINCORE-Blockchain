@@ -756,7 +756,8 @@ counters, never values.
   with pins kept for two windows.
 
 **S6 status (branch `g3/activation`).** S6a is the library half, S6b the node wiring. There
-were three independent reviews; the findings of all three are fixed.
+were four independent reviews. The findings of the first three are fixed; review 4's
+HIGH is fixed and its MEDIUMs are listed under Open (the review work stopped there).
 - **Trust until TA (S5):** the anchor is a weak-subjectivity checkpoint
   `height:block_hash:state_root` (TA-0, TA-4), pinned by the operator together with the
   network's genesis identity (`AINCORE_EXPECTED_GENESIS_HASH`, required for a restore).
@@ -851,31 +852,23 @@ were three independent reviews; the findings of all three are fixed.
     It also:
     - resets the block prune cursor and the kept pin blocks;
     - removes a `sync:halt_reason` raised against the old state;
-    - records `sys:restored_checkpoint`, `sys:restored_by`, and
-      `sys:restore_tip_height`. That is the highest height a peer reported, at least the
-      checkpoint's, and at most what time allows since the checkpoint block's BFT
-      timestamp: 10 blocks a second (the chain makes at most 5, at the 100 ms minimum
-      tick) with an hour of clock slack. A peer that inflates the tip can refuse this
-      node's key only for as long as the real chain takes to reach that ceiling, not
-      forever.
+    - records `sys:restored_checkpoint` and `sys:restored_by`.
 - **SN-6:** a validator key on a new datadir could sign a slot its old instance signed,
-  and the abstention that prevents that (G1 RC-3) does not exist yet. S6 judges a key by
-  its history (`validator_at_or_before`). A key may not run on a restored datadir if it
-  was a validator at or before the height the restore recorded: in an epoch the state
-  records that had begun by then, or in the active set once the current epoch had begun.
-  A key that joined later signed nothing elsewhere. The rule is checked:
-  - before anything is cleared, when replacing a chain where this node's key was ever a
-    validator;
-  - after the restore, against the restored committee and active set, with the marker
-    kept;
-  - at every boot (`check_restored_signer`). This catches a key that joined between the
-    checkpoint and the recorded height, once the node has synced its joining. Review 3
-    (MEDIUM): the boot check compared keys, so such a key passed.
+  and the abstention that prevents that (G1 RC-3) does not exist yet. S6 refuses what
+  it can verify (`recorded_validator`: the committee of any epoch the state retains, or
+  the active set):
+  - before anything is cleared, when replacing a chain that records this node's key as
+    a validator;
+  - after the restore, when the restored state does, with the marker kept;
+  - at every boot, when the datadir was restored with another key and this node's key
+    is a validator (`check_restored_signer`). The restoring key itself may join later.
 
-  Only observers restore. **Gap, closed by G1 RC-3:** a running node does not check
-  again between syncing that epoch and its next boot. A key that joined between the
-  checkpoint and the recorded height could sign while the node catches up. So an
-  operator restores with a fresh key; the signing points are G1's.
+  Only observers restore. **Not covered, left to G1 RC-3:** a key that became a
+  validator after the checkpoint is not in the restored state, and the chain since then
+  cannot be verified before S5. Review 3 and 4 showed that a height taken from peers
+  can be forged or inflated (review 4 HIGH: the tip ceiling came from an unverified
+  anchor whose timestamp the header hash does not bind, FX-18). So the operator rule
+  stands: restore with a freshly generated key, never with a validator's.
 - **Pins keep their blocks:**
   - Block pruning skips the pinned heights and records each block kept
     (`sys:kept_pin_blocks_v1`).
@@ -942,7 +935,7 @@ were three independent reviews; the findings of all three are fixed.
       while one saying "busy" at once keeps them;
     - busy value parts waited out with no part fetched twice, and waits that do not grow;
     - a block re-signed by a non-validator not stored;
-    - the network tip recorded, and SN-6 at boot by history;
+    - SN-6 on what the restored state records, and at boot by key;
     - opt-in serving, `serve_from` budgeting by IP, and the transport passing the source
       IP (over the host's LAN address too);
     - a chunk read once and charged what it served and read;
@@ -958,6 +951,25 @@ were three independent reviews; the findings of all three are fixed.
   - Global resources have no size bound (`register_device` grows `DeviceRegistry`), so a
     leaf could outgrow the protocol's limit. Bounding it is an execution matter, filed as
     a separate task.
+  - **Review 4 MEDIUMs, not fixed (liveness and server load; no state safety):**
+    - A hostile peer that answers just under `slow_turn` (2 s), busy or with one leaf,
+      is never struck: about 2 s lost per round per such peer. Fix direction: judge a
+      turn against the best peer's measured rate, not an absolute threshold.
+    - The rate threshold counts raw bytes, not wire bytes (hex), so an honest server on a
+      link under about 16 Mbit/s is struck while such a hostile peer keeps its turns.
+    - `admit_all` starves value parts: clients looping chunk requests keep the global
+      bucket under a part's 257 units. Fix direction: admit a part partially and charge
+      the rest as debt.
+    - The one-second cap on read charges lets one client make the server read a large
+      leaf every second while paying for 8 MiB. Only leaves over 8 MiB matter; the chunk
+      path no longer holds parted values in memory, and the value path should refuse
+      leaves over `MAX_LEAF_BYTES`.
+    - Opt-in serving: nothing sets `AINCORE_SERVE_SNAPSHOTS=1` yet, and a REPLACE
+      restore clears the old chain before it learns that no peer serves. Fix direction:
+      probe one chunk before `clear()`, and shut out a peer that does not serve.
+  - FX-18 (branch `g3/canonical-header-hash`, not merged) makes the header hash
+    injective. `Block::anchor_hash` is still not bound by the block hash; binding it
+    changes `check_anchor`.
 | S8 | Activation in the shared fresh genesis with G1 S11 (AC) | Genesis |
 
 ## Open questions and founder decisions
