@@ -1024,12 +1024,14 @@ fn pruning_follows_the_value_rule() {
     commit(&db, 2, vec![(k(1), some("c")), (k(2), None)]);
     commit(&db, 3, vec![(k(1), some("d"))]);
     prune(&db, 2, &Default::default(), usize::MAX).unwrap();
-    // k1: the row at 2 (newest at or below the floor) and at 3. k2: its
-    // deletion row at 2.
+    // k1: the row at 2 (newest at or below the floor) and at 3. k2 was
+    // deleted at the floor and never re-created: no row at all, since an
+    // absent key reads the same as a deleted one.
     assert_eq!(count_rows(&db, &val_prefix(&key_hash(&k(1)))), 2);
-    assert_eq!(count_rows(&db, &val_prefix(&key_hash(&k(2)))), 1);
+    assert_eq!(count_rows(&db, &val_prefix(&key_hash(&k(2)))), 0);
     assert_eq!(prove(&db, &k(1), 2).unwrap().0, some("c"));
     assert_eq!(prove(&db, &k(1), 3).unwrap().0, some("d"));
+    assert_eq!(prove(&db, &k(2), 2).unwrap().0, None);
     assert_eq!(prove(&db, &k(2), 3).unwrap().0, None);
 }
 
@@ -1091,4 +1093,98 @@ fn rc3_refuses_a_root_that_is_not_the_networks() {
     let root = commit(&db, 0, vec![(k(1), some("a"))]);
     audit_root_against_qc(&db, 0, &hex::encode(root.0)).unwrap();
     assert!(audit_root_against_qc(&db, 0, &"00".repeat(32)).is_err());
+}
+
+/// SN-4 (S7 review): pins exist at production retention. Epoch boundaries
+/// spaced about a quarter window apart over two windows: a handful of
+/// versions below the floor, not zero and not every boundary.
+#[test]
+fn the_pin_schedule_pins_a_few_boundaries_below_the_floor() {
+    let pins = pin_schedule(600, 200, 20);
+    assert_eq!(
+        pins,
+        [200, 240, 280, 320, 360, 400, 440, 480, 520, 560, 600].into()
+    );
+    assert!(pins.iter().all(|v| v % 20 == 0), "epoch boundaries only");
+    let below_floor = pins.iter().filter(|v| **v < 400).count();
+    assert_eq!(below_floor, 5);
+    // Full-mode defaults: 100,000 blocks, 20-block epochs.
+    let full = pin_schedule(1_000_000, 100_000, 20);
+    assert!(full.len() <= 9, "{}", full.len());
+    assert!(
+        full.iter().any(|v| *v < 900_000),
+        "some pin below the floor"
+    );
+}
+
+/// GC-1 (S7 review): a deleted key leaves nothing behind once pruned past its
+/// deletion: no value rows, no preimage. A key deleted and re-created keeps
+/// exactly its live row.
+#[test]
+fn deleted_keys_leave_no_rows_after_pruning() {
+    let db = temp_db("prune_deleted");
+    commit(
+        &db,
+        0,
+        vec![(k(1), some("keep")), (k(2), some("a")), (k(4), some("p"))],
+    );
+    // k4 is deleted, then re-created and live at the tip: its deletion row
+    // goes, its preimage stays.
+    commit(&db, 1, vec![(k(4), None)]);
+    commit(&db, 2, vec![(k(4), some("q"))]);
+    let mut version = 3;
+    for round in 0..10 {
+        commit(&db, version, vec![(k(2), None)]);
+        commit(&db, version + 1, vec![(k(2), some(&format!("b{round}")))]);
+        version += 2;
+    }
+    commit(&db, version, vec![(k(2), None)]);
+    commit(&db, version + 1, vec![(k(3), some("x"))]);
+    commit(&db, version + 2, vec![(k(3), None)]);
+    let tip = version + 2;
+    prune(&db, tip, &Default::default(), usize::MAX).unwrap();
+    assert_eq!(
+        count_rows(&db, &val_prefix(&key_hash(&k(2)))),
+        0,
+        "deleted k2"
+    );
+    assert_eq!(
+        count_rows(&db, &val_prefix(&key_hash(&k(3)))),
+        0,
+        "deleted k3"
+    );
+    assert_eq!(count_rows(&db, &val_prefix(&key_hash(&k(1)))), 1, "live k1");
+    assert_eq!(
+        count_rows(&db, &val_prefix(&key_hash(&k(4)))),
+        1,
+        "re-created k4"
+    );
+    assert_eq!(count_rows(&db, PRE), 2, "only the live keys' preimages");
+    assert_eq!(prove(&db, &k(4), tip).unwrap().0, some("q"));
+    assert_eq!(count_rows(&db, VDEAD), 0);
+    assert_eq!(prove(&db, &k(2), tip).unwrap().0, None);
+    assert_eq!(prove(&db, &k(1), tip).unwrap().0, some("keep"));
+}
+
+/// A pin that still needs a deleted key's older value keeps its deletion row
+/// too, so versions at or above the deletion still read the key as absent.
+#[test]
+fn a_pinned_value_keeps_the_deletion_row_after_it() {
+    let db = temp_db("prune_deleted_pinned");
+    commit(&db, 0, vec![(k(1), some("a"))]);
+    commit(&db, 1, vec![(k(9), some("filler"))]);
+    commit(&db, 2, vec![(k(1), None)]);
+    commit(&db, 3, vec![(k(9), some("filler2"))]);
+    prune(&db, 3, &[1].into(), usize::MAX).unwrap();
+    assert_eq!(prove(&db, &k(1), 1).unwrap().0, some("a"), "the pin");
+    assert_eq!(prove(&db, &k(1), 3).unwrap().0, None, "still absent after");
+    // A snapshot served at the pin names k1, so its preimage stays, and so
+    // does the deletion row that bounds the pinned value's life.
+    assert_eq!(count_rows(&db, &pre_key(&key_hash(&k(1)))), 1, "preimage");
+    assert_eq!(count_rows(&db, VDEAD), 1, "deletion row");
+    // Once the pin goes, so does everything of k1.
+    prune(&db, 3, &Default::default(), usize::MAX).unwrap();
+    assert_eq!(count_rows(&db, &val_prefix(&key_hash(&k(1)))), 0);
+    assert_eq!(count_rows(&db, &pre_key(&key_hash(&k(1)))), 0);
+    assert_eq!(count_rows(&db, VDEAD), 0);
 }

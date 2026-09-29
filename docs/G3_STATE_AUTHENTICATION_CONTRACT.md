@@ -677,9 +677,15 @@ counters, never values.
   - QC under the trusted committee and chain;
   - expected epoch;
   - QC height equals the answer height;
-  - freshness;
+  - freshness, and when the client asked for a height, exactly that height
+    (`Trust::requested_height`);
   - proof against `qc.state_root`;
   - key hash derived locally.
+
+  The RPC refuses a height parameter that is present but not an unsigned integer
+  (-32602); it never reads one as "latest". The JS verifier refuses a key or value with a
+  lone surrogate, whose UTF-8 encoding would substitute U+FFFD and let two strings hash
+  alike.
 
   Until S5, the caller supplies the committee and epoch for the height. The JS SDK checks
   the Merkle proof only; its BLS QC check is not built yet, and the SDK says so.
@@ -693,6 +699,10 @@ counters, never values.
     before any row goes.
   - It removes nodes through `jmt`'s stale index, and value rows through a new
     value-stale index (`jmt:vstale:*`, written by `apply`) under the value rule.
+  - Deleted keys leave nothing behind. `apply` writes a deletion index
+    (`jmt:vdead:{since}:{keyhash}`). Once no older row of the key survives (a pin may
+    still hold one), prune drops the deletion row, and the preimage too when the key was
+    not re-created.
   - Every pinned version keeps what it needs.
   - A root that an empty block carries forward is marked stale, which `jmt` does not do.
   - It is bounded per call and converges; the floor never goes down.
@@ -700,15 +710,42 @@ counters, never values.
   state, and every version at or above the floor stays whole with an unchanged root.
 - **Wiring:** the consensus commit path prunes state next to block history, under the
   same `AINCORE_STORAGE_MODE` / `AINCORE_BLOCK_RETENTION` policy (`archive` never prunes).
-  Proofs are served exactly as long as blocks are. Epoch-boundary versions from the last
-  two windows are pinned (SN-4).
+  - It runs every 100 blocks (`STATE_PRUNE_EVERY`), bounded to a fixed number of rows
+    per call.
+  - Proofs are served exactly as long as blocks are.
+  - Pins come from `state_commit::pin_schedule(tip, keep, epoch_interval)` (SN-4). They
+    are epoch boundaries spaced about a quarter window apart over the last two windows.
+    The interval is the genesis pin `sys:config:epoch_block_interval`.
+  - For example, tip 600, keep 200 and interval 20 pin 200, 240, … 600. That is five
+    versions below the floor, not every boundary.
+  - It is pure arithmetic, so a joiner and every server agree on it without reading rows.
+- **Not pruned:** a node that only imports blocks through sync never reaches the commit
+  path, so it prunes neither blocks nor state. This was already true of blocks; S6 must
+  decide whether sync-only nodes prune.
 - **RC-2** (`audit_flat_vs_tree`): at boot, every leaf equals its flat key and every flat
   state key is a leaf. It walks `STATE_EXACT` and `STATE_PREFIXES`, which a test ties to
   the classifier. Divergent keys are listed and the node refuses to start.
-- **RC-3** (`audit_root_against_qc`): at boot, the tree root at the latest stored QC's
+- **RC-3 at boot** (`audit_root_against_qc`): the tree root at the latest stored QC's
   height (when retained) must be `qc.state_root`.
+  - The QC comes from the same database, so it must first verify (`qc_rpc::verify`):
+    - BLS under the committee this node records for its epoch;
+    - the epoch this node records for that height;
+    - the chain id;
+    - the height it is filed under.
+  - A QC that does not verify refuses the boot. One that cannot be checked (committee or
+    epoch history missing) skips RC-3 with a warning.
+- **RC-3 at runtime:** `store_certificate` is the one path every QC takes to be recorded
+  (produced, aggregated, imported, recovered). A QC whose root is not the local tree's
+  root at that height is refused there, so finality stops advancing, visibly, instead of
+  the node running on state the network did not sign.
+- **RC-3 trust limit:** the committee RC-3 checks against is itself a local record until
+  TA (S5) binds it to the network. A database forged whole, committee included, still
+  passes. That is why `scripts/testnet-join.sh`, which installed a downloaded database,
+  is disabled (SN-5): on a G3 chain a forged tarball passed every boot check. Joining is
+  by sync from genesis off an archive seed until S6.
 - **Witnesses C1′ and C2′, database halves:** an edited flat state key fails RC-2 and names
-  the key; a foreign root fails RC-3.
+  the key. A foreign root fails RC-3. So does a QC signed outside the committee, or filed
+  under another height. A produced QC over another root is never stored.
 - **Open parameters (founder decision):** the retention window and `T_restore_max`. The
   defaults follow block retention: 100,000 blocks in full mode and 1,000 in observer mode,
   with pins kept for two windows.
@@ -821,6 +858,9 @@ once (FX-8, SN-5).
 - `jmt:val:{keyhash64}:{version:020}`: value history, encoded as `v{hex}` for a value (so an
   empty value stays distinct) or `d` for a deletion
 - `jmt:stale:{stale_since:020}:{hex(NodeKey)}`
+- `jmt:vstale:{since:020}:{keyhash64}:{prev:020}`: the value row at `prev` was
+  superseded at `since` (GC-1)
+- `jmt:vdead:{since:020}:{keyhash64}`: the key was deleted at `since` (GC-1)
 - `jmt:pre:{keyhash64}`: key preimage
 - `jmt:latest`, `jmt:floor`, `jmt:pinned:{version:020}`
 

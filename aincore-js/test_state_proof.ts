@@ -34,4 +34,17 @@ assert.throws(() =>
     verifyStateProof(PLACEHOLDER.toString('hex'), 'anything', 'x', { leaf: null, siblings: [] }),
 );
 
+// A lone surrogate encodes as U+FFFD, so it would pass for a value (or key)
+// that really holds U+FFFD. Both are refused before hashing.
+const fffd = doc.vectors.find((v: any) => v.valid && typeof v.value === 'string');
+assert.ok(fffd, 'a vector with a value');
+assert.throws(
+    () => verifyStateProof(fffd.root, fffd.key, fffd.value + '\uD800', fffd.proof),
+    /well-formed/,
+);
+assert.throws(
+    () => verifyStateProof(PLACEHOLDER.toString('hex'), 'k\uDC00', null, { leaf: null, siblings: [] }),
+    /well-formed/,
+);
+
 console.log(`state proof vectors passed (${valid} valid, ${invalid} refused)`);

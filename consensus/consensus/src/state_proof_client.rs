@@ -12,7 +12,9 @@
 //! 5. The key hash is derived here from the requested key (inside
 //!    `state_proof::verify`).
 //! 6. Freshness: the height is at least `min_height`, the client's known
-//!    finalized height or the height it asked for.
+//!    finalized height. A client that asked for a height gets exactly that
+//!    height (`requested_height`), never an older or newer one the server
+//!    preferred.
 
 use crate::qc::{verify_qc, QuorumCertificate, ValidatorInfo};
 use serde::{Deserialize, Serialize};
@@ -35,6 +37,8 @@ pub struct Trust<'a> {
     pub expected_epoch: u64,
     /// The lowest height the client will accept (PF-2.6).
     pub min_height: u64,
+    /// The height the client asked for, when it asked for one (PF-2.6).
+    pub requested_height: Option<u64>,
 }
 
 /// Check an answer for `key`. `Ok(Some(value))` or `Ok(None)` (absent) only
@@ -63,6 +67,14 @@ pub fn verify_answer(
             "QC height {} is not the answer's height {}",
             qc.block_height, answer.height
         ));
+    }
+    if let Some(requested) = trust.requested_height {
+        if answer.height != requested {
+            return Err(format!(
+                "asked for height {requested}, the answer is for {}",
+                answer.height
+            ));
+        }
     }
     if answer.height < trust.min_height {
         return Err(format!(
@@ -178,6 +190,7 @@ mod tests {
             committee,
             expected_epoch: 0,
             min_height: 1,
+            requested_height: None,
         }
     }
 
@@ -231,6 +244,21 @@ mod tests {
             ..trust(&infos)
         };
         refuses("a stale height", key, &good, &stale);
+        let asked_for_other = Trust {
+            requested_height: Some(2),
+            ..trust(&infos)
+        };
+        refuses(
+            "not the height the client asked for",
+            key,
+            &good,
+            &asked_for_other,
+        );
+        let asked_for_this = Trust {
+            requested_height: Some(1),
+            ..trust(&infos)
+        };
+        assert!(verify_answer(key, &good, &asked_for_this).is_ok());
         let mut a = good.clone();
         let mut forged = a.quorum_certificate.clone().unwrap();
         forged.state_root = "00".repeat(32);

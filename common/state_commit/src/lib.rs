@@ -98,6 +98,10 @@ const PRE: &str = "jmt:pre:";
 /// value row of `kh` at `prev` was superseded at `v`. `jmt`'s own stale index
 /// covers nodes only.
 const VSTALE: &str = "jmt:vstale:";
+/// Deletion index (GC-1): `jmt:vdead:{v:020}:{kh}` says `kh` was deleted at
+/// `v`. Once nothing older survives, its deletion row (and, with nothing
+/// newer, its preimage) can go too: absence is the default.
+const VDEAD: &str = "jmt:vdead:";
 /// PF-3 / GC-1: versions below this are pruned and never served.
 pub const FLOOR: &str = "jmt:floor";
 /// The latest applied version.
@@ -154,6 +158,10 @@ fn latest_value_version(
     }
 }
 
+fn vdead_key(since: Version, kh: &KeyHash) -> String {
+    format!("{VDEAD}{:020}:{}", since, hex::encode(kh.0))
+}
+
 fn pre_key(kh: &KeyHash) -> String {
     format!("{PRE}{}", hex::encode(kh.0))
 }
@@ -188,12 +196,34 @@ impl JmtStore {
     }
 }
 
+fn read_node(db: &StateDB, key: &NodeKey) -> Result<Option<Node>> {
+    match db.get(&node_key(key)?)? {
+        None => Ok(None),
+        Some(raw) => Ok(Some(borsh::from_slice(&hex::decode(raw)?)?)),
+    }
+}
+
+/// Node reads over a borrowed `StateDB`, a transaction view included. A root
+/// lookup reads nothing else.
+struct RootReader<'a>(&'a StateDB);
+
+impl TreeReader for RootReader<'_> {
+    fn get_node_option(&self, key: &NodeKey) -> Result<Option<Node>> {
+        read_node(self.0, key)
+    }
+
+    fn get_value_option(&self, _: Version, _: KeyHash) -> Result<Option<OwnedValue>> {
+        bail!("a root lookup reads no values")
+    }
+
+    fn get_rightmost_leaf(&self) -> Result<Option<(NodeKey, LeafNode)>> {
+        bail!("a root lookup reads no leaves")
+    }
+}
+
 impl TreeReader for JmtStore {
     fn get_node_option(&self, key: &NodeKey) -> Result<Option<Node>> {
-        match self.db.get(&node_key(key)?)? {
-            None => Ok(None),
-            Some(raw) => Ok(Some(borsh::from_slice(&hex::decode(raw)?)?)),
-        }
+        read_node(&self.db, key)
     }
 
     /// Newest value at or below `max_version`: a reverse seek over the
@@ -364,6 +394,9 @@ fn apply_checked(
             }
         }
         batch.put(val_key(kh, *v), encode_value(value.as_deref()));
+        if value.is_none() {
+            batch.put(vdead_key(*v, kh), "");
+        }
     }
     let mut old_root_marked = false;
     for stale in &update.stale_node_index_batch {
@@ -610,8 +643,67 @@ pub fn prune(
         stats.values += 1;
         rows += 1;
     }
-    db.write_batch(batch)?;
+    if !batch.is_empty() {
+        db.write_batch(batch)?;
+    }
+    // Deleted keys: once no older row survives (a pin may still hold one),
+    // the deletion row goes, and with nothing newer, the preimage too.
+    let mut batch = WriteBatch::default();
+    for row in db.db.prefix_iterator(VDEAD.as_bytes()) {
+        let (k, _) = row?;
+        if !k.starts_with(VDEAD.as_bytes()) {
+            break;
+        }
+        let rest = std::str::from_utf8(&k[VDEAD.len()..])?;
+        let (since, kh_hex) = rest.split_once(':').context("malformed vdead row")?;
+        let since: Version = since.parse()?;
+        if since > floor {
+            break;
+        }
+        if rows >= max_rows {
+            stats.more = true;
+            break;
+        }
+        let kh = KeyHash(
+            hex::decode(kh_hex)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("malformed vdead key hash"))?,
+        );
+        if since > 0 && latest_value_version(db, &kh, since - 1)?.is_some() {
+            continue;
+        }
+        batch.delete(val_key(&kh, since));
+        batch.delete(&k);
+        if latest_value_version(db, &kh, Version::MAX)? == Some(since) {
+            batch.delete(pre_key(&kh));
+        }
+        stats.values += 1;
+        rows += 1;
+    }
+    if !batch.is_empty() {
+        db.write_batch(batch)?;
+    }
     Ok(stats)
+}
+
+/// SN-4: the pinned versions for a tip. They are epoch boundaries (multiples
+/// of `epoch_interval`), spaced about a quarter of the retention window
+/// apart, and kept for two windows. That is a handful of versions, not every
+/// boundary. Pure arithmetic, so a joiner and every server agree on it
+/// without reading any rows.
+pub fn pin_schedule(
+    tip: Version,
+    keep: Version,
+    epoch_interval: Version,
+) -> std::collections::BTreeSet<Version> {
+    let interval = epoch_interval.max(1);
+    let spacing = interval * (keep / 4 / interval).max(1);
+    let from = tip.saturating_sub(keep.saturating_mul(2));
+    let first = from.div_ceil(spacing) * spacing;
+    (first..=tip)
+        .step_by(spacing as usize)
+        .filter(|v| *v > 0)
+        .collect()
 }
 
 /// RC-2: at boot, the flat consensus-state keys and the tree's leaves at the
@@ -678,11 +770,7 @@ pub fn audit_flat_vs_tree(db: &Arc<StateDB>) -> Result<Vec<String>> {
 /// RC-3: the tree root at `version` must equal the network's
 /// `qc.state_root` for it. This catches a self-consistent but foreign
 /// database (a restored backup, a copied datadir) that RC-2 cannot see.
-pub fn audit_root_against_qc(
-    db: &Arc<StateDB>,
-    version: Version,
-    qc_state_root: &str,
-) -> Result<()> {
+pub fn audit_root_against_qc(db: &StateDB, version: Version, qc_state_root: &str) -> Result<()> {
     let root = hex::encode(root(db, version)?.0);
     ensure!(
         root.eq_ignore_ascii_case(qc_state_root),
@@ -691,10 +779,11 @@ pub fn audit_root_against_qc(
     Ok(())
 }
 
-/// The root at `version`.
-pub fn root(db: &Arc<StateDB>, version: Version) -> Result<RootHash> {
+/// The root at `version`. Takes any `StateDB`, so a transaction view can
+/// check a root inside the write that depends on it.
+pub fn root(db: &StateDB, version: Version) -> Result<RootHash> {
     no_panic("root", || {
-        Sha256Jmt::new(&JmtStore::new(db.clone())).get_root_hash(version)
+        Sha256Jmt::new(&RootReader(db)).get_root_hash(version)
     })
 }
 

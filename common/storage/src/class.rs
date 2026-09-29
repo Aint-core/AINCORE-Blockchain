@@ -297,6 +297,7 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         ["jmt", "val", kh, v] if hex64(kh) && dec20(v) => Tree,
         ["jmt", "stale", v, n] if dec20(v) && hex(n) => Tree,
         ["jmt", "vstale", v, kh, prev] if dec20(v) && hex64(kh) && dec20(prev) => Tree,
+        ["jmt", "vdead", v, kh] if dec20(v) && hex64(kh) => Tree,
         ["jmt", "pre", kh] if hex64(kh) => Tree,
         ["jmt", "pinned", v] if dec20(v) => Tree,
         ["ta", e] if dec20(e) => Log,

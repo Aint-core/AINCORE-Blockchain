@@ -494,3 +494,45 @@ fn native_aggregate_write_error_cannot_publish_completion() {
         QcOutcome::Complete(_)
     ));
 }
+
+/// G3 RC-3 at runtime: a QC whose root is not the local tree's root at its
+/// height is never recorded, on any path (they all store through
+/// `store_certificate`). The matching QC is.
+#[test]
+fn a_qc_over_another_state_root_is_never_stored() {
+    let dir = TestDir::new();
+    dir.seed(false);
+    let db = std::sync::Arc::new(dir.open());
+    for v in 0..=10u64 {
+        let a = state_commit::apply(
+            &db,
+            v,
+            vec![(format!("obj:{v:064x}"), Some(b"{}".to_vec()))],
+        )
+        .unwrap();
+        db.write_batch(a.batch).unwrap();
+    }
+    let root = hex::encode(state_commit::root(&db, 10).unwrap().0);
+    let foreign = ctx_for(10);
+    assert_ne!(foreign.state_root, root);
+    let before = rows(&db);
+    assert!(matches!(
+        produce_and_store_qc(&db, &[7; 32], "local", &foreign),
+        QcOutcome::Skipped
+    ));
+    assert_eq!(rows(&db), before, "nothing of the refused QC is recorded");
+    let ours = CommitContext {
+        state_root: root,
+        ..ctx_for(10)
+    };
+    assert!(matches!(
+        produce_and_store_qc(&db, &[7; 32], "local", &ours),
+        QcOutcome::Complete(_)
+    ));
+    assert!(db.get("consensus:qc:10").unwrap().is_some());
+    // Above the tree there is nothing to compare yet.
+    assert!(matches!(
+        produce_and_store_qc(&db, &[7; 32], "local", &ctx_for(11)),
+        QcOutcome::Complete(_)
+    ));
+}

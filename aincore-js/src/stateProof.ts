@@ -46,8 +46,21 @@ function sha256(...parts: Uint8Array[]): Buffer {
     return h.digest();
 }
 
+/**
+ * The exact UTF-8 bytes of `s`. A string with a lone surrogate has none: its
+ * encoding substitutes U+FFFD, so two different strings would hash alike and
+ * one could pass for the other. It is refused.
+ */
+function utf8(s: string, what: string): Buffer {
+    const bytes = Buffer.from(s, 'utf8');
+    if (bytes.toString('utf8') !== s) {
+        throw new Error(`the ${what} is not well-formed Unicode (a lone surrogate)`);
+    }
+    return bytes;
+}
+
 export function keyHash(key: string): Buffer {
-    return sha256(Buffer.from(key, 'utf8'));
+    return sha256(utf8(key, 'key'));
 }
 
 function parseHash(hex: string): Buffer {
@@ -88,7 +101,7 @@ export function verifyStateProof(
     if (value !== null) {
         if (!leaf) throw new Error('the proof shows the key absent');
         if (!leaf.key.equals(kh)) throw new Error('the proof is for another key');
-        if (!leaf.value.equals(sha256(Buffer.from(value, 'utf8')))) {
+        if (!leaf.value.equals(sha256(utf8(value, 'value')))) {
             throw new Error('the value does not match the proof');
         }
     } else if (leaf) {

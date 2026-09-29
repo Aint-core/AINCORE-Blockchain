@@ -864,9 +864,16 @@ fn handle_rpc_method(
                 .ok_or_else(|| JsonRpcError { code: -32000, message: "no state tree yet".into() })?;
             // PF-3: nothing below the retention floor (S7 prunes under it).
             let floor = stored_u64("jmt:floor").unwrap_or(0);
-            let height = match params.get(1).and_then(|v| v.as_u64()) {
-                Some(h) => h,
-                None => stored_u64("consensus:qc:latest_height").unwrap_or(latest),
+            // A height that is present but not a u64 is refused, never
+            // silently replaced by the latest one (PF-2.6).
+            let height = match params.get(1) {
+                None | Some(serde_json::Value::Null) => {
+                    stored_u64("consensus:qc:latest_height").unwrap_or(latest)
+                },
+                Some(v) => v.as_u64().ok_or_else(|| JsonRpcError {
+                    code: -32602,
+                    message: format!("Invalid height {v}: expected an unsigned integer"),
+                })?,
             };
             if height < floor || height > latest {
                 return Err(JsonRpcError {
@@ -2812,6 +2819,20 @@ mod tests {
         assert!(
             call(serde_json::json!(["sys:chain_id", 5])).is_err(),
             "above the tree"
+        );
+        // PF-2.6: a malformed height is refused, never read as "latest".
+        for bad in [
+            serde_json::json!("0"),
+            serde_json::json!(-1),
+            serde_json::json!(0.5),
+            serde_json::json!([0]),
+        ] {
+            let err = call(serde_json::json!(["sys:chain_id", bad])).unwrap_err();
+            assert_eq!(err.code, -32602, "{bad}");
+        }
+        assert_eq!(
+            call(serde_json::json!(["sys:chain_id", null])).unwrap()["height"],
+            0
         );
         db.put("jmt:floor", "1").unwrap();
         assert!(

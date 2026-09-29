@@ -1890,12 +1890,17 @@ impl DagConsensus {
                         }
                         // G3 GC-1: state versions follow the same window, so
                         // proofs are served exactly as long as blocks are.
-                        match prune_state_window(
-                            &self.storage,
-                            self.latest_block_height,
-                            keep_blocks,
-                            (max_delete as usize).saturating_mul(40),
-                        ) {
+                        let due = self.latest_block_height.is_multiple_of(STATE_PRUNE_EVERY);
+                        match if !due {
+                            Ok(state_commit::PruneStats::default())
+                        } else {
+                            prune_state_window(
+                                &self.storage,
+                                self.latest_block_height,
+                                keep_blocks,
+                                (max_delete as usize).saturating_mul(4_000),
+                            )
+                        } {
                             Ok(stats) if stats.nodes + stats.values > 0 => println!(
                                 "🧹 State tree pruning: removed {} nodes and {} values",
                                 stats.nodes, stats.values
@@ -3329,10 +3334,16 @@ impl std::fmt::Display for AccountAddress {
     }
 }
 
+/// How often state pruning runs, in blocks. Each run raises the floor with
+/// one synced write, so running every block would add that write to every
+/// commit under the consensus lock.
+pub(crate) const STATE_PRUNE_EVERY: u64 = 100;
+
 /// G3 GC-1 / SN-4: prune state versions older than `keep` blocks behind
-/// `tip`, keeping every epoch-boundary version (`H_E`) from the last two
-/// windows for snapshot restores. At most `max_rows` rows per call; the
-/// rest follows on later commits. Node-local and root-neutral.
+/// `tip`, keeping the pinned epoch-boundary versions of the last two windows
+/// (`state_commit::pin_schedule`) for snapshot restores. At most `max_rows`
+/// rows per call; the rest follows on later runs. Node-local and
+/// root-neutral.
 pub(crate) fn prune_state_window(
     storage: &Arc<StateDB>,
     tip: u64,
@@ -3342,15 +3353,13 @@ pub(crate) fn prune_state_window(
     if keep == 0 || tip <= keep {
         return Ok(state_commit::PruneStats::default());
     }
-    let pin_from = tip.saturating_sub(keep.saturating_mul(2));
-    // `consensus:epoch_start_height:{E}` holds H_{E-1} + 1.
-    let pinned: std::collections::BTreeSet<u64> = storage
-        .scan_prefix("consensus:epoch_start_height:")
-        .into_iter()
-        .filter_map(|(_, start)| start.parse::<u64>().ok())
-        .filter_map(|start| start.checked_sub(1))
-        .filter(|boundary| *boundary >= pin_from)
-        .collect();
+    let interval = storage
+        .get("sys:config:epoch_block_interval")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(20);
+    let pinned = state_commit::pin_schedule(tip, keep, interval);
     state_commit::prune(storage, tip - keep, &pinned, max_rows).map_err(|e| e.to_string())
 }
 
@@ -3360,15 +3369,28 @@ mod prune_window_tests {
     use std::sync::Arc;
     use storage::StateDB;
 
-    /// GC-1 / SN-4 wiring: the window follows block retention, and the
-    /// epoch-boundary versions of the last two windows stay whole.
+    /// GC-1 / SN-4 wiring: the window follows block retention, and the pinned
+    /// epoch-boundary versions below the floor stay whole. The pins come from
+    /// arithmetic, not from `consensus:epoch_start_height:*` rows, which the
+    /// executor deletes after 8 epochs (S7 review).
     #[test]
     fn the_state_window_prunes_old_versions_and_keeps_epoch_pins() {
         let path = std::env::temp_dir().join(format!("prune_window_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         let db = Arc::new(StateDB::open(path.to_str().unwrap()).unwrap());
         let key = |i: u64| format!("obj:{i:064x}");
-        for version in 0..=30u64 {
+        let mut v0 = vec![(
+            "sys:config:epoch_block_interval".to_string(),
+            Some(b"5".to_vec()),
+        )];
+        v0.push((key(99), Some(b"tick0".to_vec())));
+        {
+            let _seed = db.seeding();
+            db.put("sys:config:epoch_block_interval", "5").unwrap();
+        }
+        let applied = state_commit::apply(&db, 0, v0).unwrap();
+        db.write_batch(applied.batch).unwrap();
+        for version in 1..=30u64 {
             let changes = vec![
                 (key(version % 5), Some(format!("v{version}").into_bytes())),
                 (key(99), Some(format!("tick{version}").into_bytes())),
@@ -3376,18 +3398,14 @@ mod prune_window_tests {
             let applied = state_commit::apply(&db, version, changes).unwrap();
             db.write_batch(applied.batch).unwrap();
         }
-        {
-            let _seed = db.seeding();
-            db.put("consensus:epoch_start_height:1", "11").unwrap();
-            db.put("consensus:epoch_start_height:2", "21").unwrap();
-        }
         let roots: Vec<_> = (0..=30)
             .map(|v| state_commit::root(&db, v).unwrap())
             .collect();
         let stats = prune_state_window(&db, 30, 10, usize::MAX).unwrap();
         assert!(stats.nodes > 0, "positive control: {stats:?}");
         assert_eq!(state_commit::floor(&db).unwrap(), 20);
-        for version in [10u64, 20, 25, 30] {
+        // Pins: multiples of 5 from 10 (two windows back).
+        for version in [10u64, 15, 20, 25, 30] {
             let (value, proof) = state_commit::prove(&db, &key(99), version).unwrap();
             assert_eq!(
                 value,
@@ -3397,9 +3415,9 @@ mod prune_window_tests {
             state_commit::verify(roots[version as usize], &key(99), value.as_deref(), &proof)
                 .unwrap();
         }
+        let old = state_commit::prove(&db, &key(99), 7);
         assert!(
-            state_commit::prove(&db, &key(99), 5).is_err()
-                || state_commit::prove(&db, &key(99), 5).unwrap().0 != Some(b"tick5".to_vec()),
+            old.is_err() || old.unwrap().0 != Some(b"tick7".to_vec()),
             "an unpinned version below the floor lost its rows"
         );
         // A tip inside the window prunes nothing.

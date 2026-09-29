@@ -85,6 +85,24 @@ fn state_boot_audit(storage: &std::sync::Arc<StateDB>) -> Result<(), String> {
     };
     let qc: consensus::qc::QuorumCertificate = serde_json::from_str(&qc_json)
         .map_err(|e| format!("stored QC at {height} is unreadable: {e}"))?;
+    // The QC comes from this same database, so its root is evidence only once
+    // it verifies: a quorum of the committee this node records for its epoch
+    // signed it, under this chain id. That committee record is itself local;
+    // binding it to the network is TA (S5), until then this is the limit.
+    match node::qc_rpc::verify(storage, &qc, Some(height)) {
+        Ok(()) => {}
+        Err(node::qc_rpc::VerificationError::Unavailable(why)) => {
+            eprintln!(
+                "⚠️ G3 RC-3 skipped at boot: the stored QC at {height} cannot be verified ({why})"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(format!(
+                "the stored QC at {height} does not verify (RC-3): {e}"
+            ))
+        }
+    }
     state_commit::audit_root_against_qc(storage, height, &qc.state_root)
         .map_err(|e| format!("this database is not the network's (RC-3): {e}"))
 }
@@ -1083,36 +1101,85 @@ mod boot_identity_tests {
     /// G3 RC-2 / RC-3 at boot (witness C1′'s second half, C2′'s database half).
     #[test]
     fn the_boot_audit_refuses_a_tampered_or_foreign_database() {
+        use consensus::qc::{
+            build_qc, expected_chain_id, validator_set_hash, FinalityVote, ValidatorInfo,
+        };
         use std::sync::Arc;
         let path = std::env::temp_dir().join(format!("boot_audit_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         let db = Arc::new(storage::StateDB::open(path.to_str().unwrap()).unwrap());
+        let committee = vec![ValidatorInfo {
+            address: "local".into(),
+            stake: 100,
+            ed25519_public_key: "00".repeat(32),
+            bls_public_key: hex::encode(crypto::bls::BLSEngine::consensus().pubkey_raw(&[7; 32])),
+            bls_pop: hex::encode(
+                crypto::bls::BLSEngine::consensus().prove_possession_raw(&[7; 32]),
+            ),
+        }];
+        let second = format!("obj:{}", "cd".repeat(32));
         {
             let _seed = db.seeding();
             db.put("sys:chain_id", "AINCORE-TEST").unwrap();
             db.put(&format!("obj:{}", "ab".repeat(32)), "{}").unwrap();
+            db.put(
+                "genesis:validator_set:v1",
+                &serde_json::to_string(&committee).unwrap(),
+            )
+            .unwrap();
         }
         let v0 = state_commit::seed_genesis(&db).unwrap();
         db.write_batch(v0.batch).unwrap();
+        {
+            let _seed = db.seeding();
+            db.put(&second, "{}").unwrap();
+        }
+        let v1 = state_commit::apply(&db, 1, vec![(second, Some(b"{}".to_vec()))]).unwrap();
+        db.write_batch(v1.batch).unwrap();
         assert_eq!(super::state_boot_audit(&db), Ok(()), "consistent");
 
-        let qc = |root: String| {
-            serde_json::json!({
-                "version": 1, "chain_id": "AINCORE-TEST", "epoch": 0, "finalized_round": 0,
-                "anchor_round": 0, "anchor_hash": "", "block_height": 0, "block_hash": "",
-                "state_root": root, "receipts_root": "", "finality_digest": "",
-                "validator_set_hash": "", "signer_bitmap": [], "signed_stake": 0,
-                "total_stake": 0, "aggregate_signature": [],
-            })
-            .to_string()
+        let bls = crypto::bls::BLSEngine::consensus();
+        let member = [7u8; 32];
+        let quorum_cert = |state_root: String, signer: [u8; 32]| {
+            let vote = FinalityVote {
+                chain_id: expected_chain_id(),
+                epoch: 0,
+                finalized_round: 2,
+                anchor_round: 2,
+                anchor_hash: "01".repeat(32),
+                block_height: 1,
+                block_hash: "02".repeat(32),
+                state_root,
+                receipts_root: "04".repeat(32),
+                finality_digest: "05".repeat(32),
+                validator_set_hash: validator_set_hash(&committee),
+            };
+            let signature = bls.sign_raw(&vote.to_signing_bytes(), &signer);
+            serde_json::to_string(&build_qc(&vote, &committee, &[0], &[signature]).unwrap())
+                .unwrap()
         };
-        db.put("consensus:qc:latest_height", "0").unwrap();
-        db.put("consensus:qc:0", &qc("00".repeat(32))).unwrap();
+        let root = hex::encode(state_commit::root(&db, 1).unwrap().0);
+        db.put("consensus:qc:latest_height", "1").unwrap();
+        db.put("consensus:qc:1", &quorum_cert("00".repeat(32), member))
+            .unwrap();
         let err = super::state_boot_audit(&db).expect_err("a foreign root");
-        assert!(err.contains("RC-3"), "{err}");
-        let root = hex::encode(state_commit::root(&db, 0).unwrap().0);
-        db.put("consensus:qc:0", &qc(root)).unwrap();
+        assert!(
+            err.contains("RC-3") && err.contains("not the network"),
+            "{err}"
+        );
+        db.put("consensus:qc:1", &quorum_cert(root.clone(), [9; 32]))
+            .unwrap();
+        let err = super::state_boot_audit(&db).expect_err("signed outside the committee");
+        assert!(err.contains("does not verify"), "{err}");
+        db.put("consensus:qc:1", &quorum_cert(root.clone(), member))
+            .unwrap();
         assert_eq!(super::state_boot_audit(&db), Ok(()), "the network's root");
+        db.put("consensus:qc:latest_height", "0").unwrap();
+        db.put("consensus:qc:0", &quorum_cert(root, member))
+            .unwrap();
+        let err = super::state_boot_audit(&db).expect_err("filed under another height");
+        assert!(err.contains("does not verify"), "{err}");
+        db.put("consensus:qc:latest_height", "1").unwrap();
 
         {
             let _seed = db.seeding();

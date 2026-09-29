@@ -386,9 +386,34 @@ fn ensure_certificate_slot(storage: &StateDB, key: &str, vote: &FinalityVote) ->
     Ok(())
 }
 
+/// G3 RC-3 at runtime: a certificate this node records must certify the state
+/// it holds. Every path that stores one (produced, aggregated, imported,
+/// recovered) passes through `store_certificate`, so a QC whose root is not
+/// the local tree's root at that height is refused, never recorded as
+/// finality. Finality then stops advancing here, visibly, instead of the node
+/// carrying on over state the network did not sign. Heights outside the
+/// retained tree (pruned, or not executed yet) have nothing to compare.
+fn check_certified_root(storage: &StateDB, cert: &QuorumCertificate) -> Result<(), String> {
+    let Some(latest) = state_commit::latest_version(storage).map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    let floor = state_commit::floor(storage).map_err(|e| e.to_string())?;
+    if cert.block_height < floor || cert.block_height > latest {
+        return Ok(());
+    }
+    state_commit::audit_root_against_qc(storage, cert.block_height, &cert.state_root).map_err(|e| {
+        eprintln!(
+            "🚨 [QC] G3 RC-3: refusing QC for block #{}: {e}",
+            cert.block_height
+        );
+        format!("G3 RC-3: the certified state is not this node's: {e}")
+    })
+}
+
 // Caller supplies a transaction view. All indexes describe one accepted QC;
 // replay of an older height must not regress the latest pointer.
 fn store_certificate(storage: &StateDB, cert: &QuorumCertificate) -> Result<(), String> {
+    check_certified_root(storage, cert)?;
     let height_key = format!("consensus:qc:{}", cert.block_height);
     let round_key = format!("consensus:qc_by_round:{}", cert.anchor_round);
     ensure_certificate_slot(storage, &height_key, &cert.finality_vote())?;
