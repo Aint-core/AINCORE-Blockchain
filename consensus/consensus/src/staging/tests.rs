@@ -500,3 +500,29 @@ fn the_pending_buffer_evicts_the_highest_round() {
         .remove(&all[0].info.address, low.round, &low.hash)
         .is_some());
 }
+
+/// S2 review 2: the stored body is canonical, without transport fields, so
+/// the first copy to arrive cannot pad what is stored and served.
+#[test]
+fn the_stored_body_carries_no_transport_fields() {
+    let all = members();
+    let mut v = twin(&all[0], FIRST + 1, "a");
+    v.parent_refs = vec![blockchain::ParentRef {
+        round: FIRST,
+        author: all[1].info.address.clone(),
+        digest: "1".repeat(64),
+        proof: None,
+        cert: Some(blockchain::CompactCert {
+            signer_bitmap: vec![7],
+            aggregate_signature: vec![9; 96],
+        }),
+    }];
+    let dir = TempDb::new("canonical");
+    let db = dir.open();
+    stage(&db, &v, Role::Staged, None, B_AUTH).unwrap();
+    let stored: Vertex =
+        serde_json::from_str(&db.get(&format!("vertex:{}", v.hash)).unwrap().unwrap()).unwrap();
+    assert_eq!(stored.parent_refs.len(), 1);
+    assert_eq!(stored.parent_refs[0].cert, None);
+    assert_eq!(stored.parent_refs[0].digest, v.parent_refs[0].digest);
+}

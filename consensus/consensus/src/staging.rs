@@ -116,7 +116,15 @@ pub fn stage_in(
         }
         return Ok(StageOutcome::Held);
     }
-    let body = serde_json::to_string(v).map_err(|e| e.to_string())?;
+    // The canonical body: transport fields stripped, so whichever copy
+    // arrived first, the stored and served bytes are the same. Certificates
+    // live in their own rows.
+    let mut canonical = v.clone();
+    for r in &mut canonical.parent_refs {
+        r.cert = None;
+        r.proof = None;
+    }
+    let body = serde_json::to_string(&canonical).map_err(|e| e.to_string())?;
     let bytes = body.len() as u64;
     let mut outcome = StageOutcome::Staged;
     if slot.len() >= MAX_STAGED_PER_SLOT {

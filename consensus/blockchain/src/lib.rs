@@ -477,10 +477,6 @@ pub fn chain_id() -> String {
         .unwrap_or_else(|| DEFAULT_CHAIN_ID.to_string())
 }
 
-/// Root over the payload items: count-prefixed, each item length-prefixed,
-/// domain-separated. Unambiguous -- ["A","B"] and ["AB"] differ -- unlike the
-/// old bare concatenation, which let one validator ship two bodies with the
-/// same hash (one of them splitting a SLASH_EVIDENCE: item off a transaction).
 fn is_zero(n: &u64) -> bool {
     *n == 0
 }
@@ -655,6 +651,10 @@ pub fn epoch_genesis(
     hex::encode(hash(&data))
 }
 
+/// Root over the payload items: count-prefixed, each item length-prefixed,
+/// domain-separated. Unambiguous -- ["A","B"] and ["AB"] differ -- unlike the
+/// old bare concatenation, which let one validator ship two bodies with the
+/// same hash (one of them splitting a SLASH_EVIDENCE: item off a transaction).
 pub fn payload_root_of(items: &[String]) -> String {
     let mut data = Vec::new();
     data.extend_from_slice(b"AINCORE_PAYLOAD_V2");

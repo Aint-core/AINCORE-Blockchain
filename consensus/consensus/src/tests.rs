@@ -168,6 +168,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    /// G1 S2 review 2: a V3 equivocation proof carrying a relay-set epoch is
+    /// refused, so the padding never reaches `sys:equiv_seen`.
+    #[test]
+    fn a_v3_equivocation_proof_carrying_an_epoch_is_refused() {
+        for padded in [true, false] {
+            let (mut consensus, path) =
+                setup_dag(if padded { "equiv_epoch" } else { "equiv_plain" });
+            consensus.current_round = 1;
+            let offender = consensus.node_id.clone();
+            let mut a = signed_vertex(&consensus, 1, 1_000);
+            let b = signed_vertex(&consensus, 1, 2_000);
+            if padded {
+                a.epoch = u64::MAX;
+            }
+            consensus.handle_message(&equiv_proof_msg(&offender, &a, &b));
+            let seen = consensus
+                .storage
+                .get(&format!("sys:equiv_seen:{}:1", offender))
+                .unwrap();
+            assert_eq!(seen.is_some(), !padded, "padded {padded}");
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+
+    /// G1 S2 review 2: a certificate on an EXISTING ref of a V3 vertex (its
+    /// V3 hash unchanged) is refused too, not only one on a pushed ref.
+    #[test]
+    fn a_v3_vertex_with_a_cert_on_an_existing_ref_is_refused() {
+        let (mut consensus, path) = setup_dag("v3_cert_existing_ref");
+        let remote_key = crypto::SigningKey::from_bytes(&[99u8; 32]);
+        let remote_pub = hex::encode(remote_key.verifying_key().to_bytes());
+        let remote_id = crypto::derive_address(remote_key.verifying_key().as_bytes()).unwrap();
+        let remote_account = Object::new(
+            remote_id.clone(),
+            Owner::Address(remote_id.clone()),
+            serde_json::json!({ "public_key": remote_pub, "sequence_number": 0 })
+                .to_string()
+                .into_bytes(),
+            "0x1::account::AccountData".to_string(),
+        );
+        {
+            let _seed = consensus.storage.seeding();
+            consensus.storage.put_object(&remote_account).unwrap();
+            let validator_json =
+                format!(r#"[["{}",1000],["{}",1000]]"#, consensus.node_id, remote_id);
+            consensus
+                .storage
+                .put("sys:validators", &validator_json)
+                .unwrap();
+        }
+        consensus.invalidate_validators_cache();
+        let round = consensus.current_round + 2;
+        let local_parent = tier2_signed(&consensus.node_key, &consensus.node_id, round - 1, 999);
+        let remote_parent = tier2_signed(&[99u8; 32], &remote_id, round - 1, 999);
+        let local_pub = hex::encode(
+            crypto::SigningKey::from_bytes(&consensus.node_key)
+                .verifying_key()
+                .to_bytes(),
+        );
+        let parent_refs = vec![
+            blockchain::ParentRef::authenticated(&local_parent, local_pub),
+            blockchain::ParentRef::authenticated(&remote_parent, remote_pub),
+        ];
+        let mut v = blockchain::Vertex {
+            epoch: 0,
+            round,
+            author: remote_id.clone(),
+            timestamp: 1_000,
+            payload: vec![],
+            parents: parent_refs.iter().map(|p| p.digest.clone()).collect(),
+            parent_refs,
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
+        };
+        v.hash = v.calculate_hash();
+        v.sign_with_ed25519(&remote_key);
+        let mut padded = v.clone();
+        padded.parent_refs[0].cert = Some(blockchain::CompactCert {
+            signer_bitmap: vec![255],
+            aggregate_signature: vec![255u8; 90_000],
+        });
+        assert_eq!(padded.calculate_hash(), v.hash);
+        consensus.add_vertex(padded);
+        assert!(
+            consensus
+                .storage
+                .get(&format!("vertex:{}", v.hash))
+                .unwrap()
+                .is_none(),
+            "the cert-padded copy was admitted"
+        );
+        consensus.add_vertex(v.clone());
+        assert!(
+            consensus
+                .storage
+                .get(&format!("vertex:{}", v.hash))
+                .unwrap()
+                .is_some(),
+            "positive control: the honest copy is admitted"
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     #[test]
     fn test_dag_growth_and_ordering() {
         let (mut consensus, path) = setup_dag("growth");

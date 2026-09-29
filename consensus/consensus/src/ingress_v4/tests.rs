@@ -804,3 +804,177 @@ fn clauses_the_first_tests_did_not_pin() {
     assert!(qc::parent_refs_admissible(&v3(1), &[]).is_ok());
     assert!(qc::parent_refs_admissible(&v3(2), &[]).is_err());
 }
+
+// ── review 2 of S2 (fc8b6c0) ───────────────────────────────────────────────
+
+/// MEDIUM-A: a V3 identity proof on a V4 ref, or a certificate of the wrong
+/// shape, is refused for that copy.
+#[test]
+fn transport_padding_is_refused_per_copy() {
+    let all = members();
+    let c = committee(&all);
+    let (v, _) = second_round(&all, 3, &[0, 1, 2]);
+    assert_eq!(verdict(&v, &c), Verdict::Stage);
+    let mut proof = v.clone();
+    proof.parent_refs[0].proof = Some(blockchain::ParentIdentityProof {
+        timestamp: 1,
+        payload_root: "0".repeat(64),
+        parents_root: "0".repeat(64),
+        public_key: "0".repeat(64),
+        signature: "0".repeat(128),
+    });
+    assert_eq!(
+        proof.hash_v4_with_domain(CHAIN, GENESIS),
+        v.hash,
+        "unhashed"
+    );
+    assert!(invalid(verdict(&proof, &c)), "a V3 proof");
+    let mut wide = v.clone();
+    wide.parent_refs[0]
+        .cert
+        .as_mut()
+        .unwrap()
+        .aggregate_signature
+        .extend([0; 1000]);
+    assert!(invalid(verdict(&wide, &c)), "an oversized certificate");
+    let mut bitmap = v.clone();
+    bitmap.parent_refs[1]
+        .cert
+        .as_mut()
+        .unwrap()
+        .signer_bitmap
+        .push(0);
+    assert!(
+        invalid(verdict(&bitmap, &c)),
+        "a bitmap of the wrong length"
+    );
+}
+
+/// MEDIUM-1, pinned: an adjacent epoch is judged by ITS committee and ITS
+/// first round, not the active ones.
+#[test]
+fn an_adjacent_epoch_is_judged_by_its_own_committee_and_first_round() {
+    let all = members();
+    let active = committee(&all);
+    let newcomer = member(5);
+    // Epoch E+1: members 1..3 and the newcomer, from round FIRST + 7.
+    let mut next_committee: Vec<ValidatorInfo> = all[1..].iter().map(|m| m.info.clone()).collect();
+    next_committee.push(newcomer.info.clone());
+    next_committee.sort_by(|a, b| a.address.cmp(&b.address));
+    let sentinels = [sentinel(EPOCH - 1), sentinel(EPOCH), sentinel(EPOCH + 1)];
+    let mut ctx = context(&active, &sentinels, true, true);
+    if let Some(next) = ctx.next.as_mut() {
+        next.committee = &next_committee;
+        next.first_round = FIRST + 7;
+    }
+    let at = |m: &Member, round| vertex(m, EPOCH + 1, round, vec![sentinel(EPOCH + 1)], vec![]);
+    let judge = |v: &Vertex| v4_verdict(1_000, v, &ctx, |_| None);
+    assert_eq!(
+        judge(&at(&newcomer, FIRST + 7)),
+        Verdict::PendingEpoch,
+        "a next-epoch member"
+    );
+    assert!(
+        invalid(judge(&at(&all[0], FIRST + 7))),
+        "an active-only member"
+    );
+    assert!(
+        invalid(judge(&at(&newcomer, FIRST))),
+        "below the next epoch's first round"
+    );
+}
+
+/// S4b's clauses, each alone: a zero-stake ref author, a digest that is not
+/// hex, and one of the wrong length.
+#[test]
+fn every_ref_clause_refuses_on_its_own() {
+    let all = members();
+    let mut c = committee(&all);
+    let claims = |authors: &[usize], digest: &dyn Fn(usize) -> String| -> Vertex {
+        let refs: Vec<ParentRef> = authors
+            .iter()
+            .map(|&i| ParentRef {
+                round: FIRST,
+                author: all[i].info.address.clone(),
+                digest: digest(i),
+                proof: None,
+                cert: None,
+            })
+            .collect();
+        vertex(
+            &all[0],
+            EPOCH,
+            FIRST + 1,
+            refs.iter().map(|r| r.digest.clone()).collect(),
+            refs,
+        )
+    };
+    let hexed = |i: usize| format!("{:064x}", 7_000 + i);
+    // Member 3 holds no stake; members 0..2 alone are the whole quorum.
+    c.iter_mut().for_each(|m| {
+        if m.address == all[3].info.address {
+            m.stake = 0;
+        }
+    });
+    assert!(
+        !invalid(verdict(&claims(&[0, 1, 2], &hexed), &c)),
+        "positive control"
+    );
+    assert!(
+        invalid(verdict(&claims(&[0, 1, 2, 3], &hexed), &c)),
+        "a zero-stake ref author"
+    );
+    let letter = |i: usize| format!("{}g", &format!("{:064x}", 7_000 + i)[1..]);
+    assert!(
+        invalid(verdict(&claims(&[0, 1, 2], &letter), &c)),
+        "not hex"
+    );
+    let long = |i: usize| format!("{:065x}", 7_000 + i);
+    assert!(
+        invalid(verdict(&claims(&[0, 1, 2], &long), &c)),
+        "65 characters"
+    );
+}
+
+/// The parent count at the limit passes Layer S; one over is refused.
+#[test]
+fn exactly_max_parents_is_admissible() {
+    let all = members();
+    let with_members = |n: usize| -> (Vec<ValidatorInfo>, Vertex) {
+        let mut c = committee(&all);
+        for i in 0..n.saturating_sub(c.len()) {
+            let mut m = c[0].clone();
+            m.address = format!("{:064x}", 900_000 + i);
+            c.push(m);
+        }
+        c.sort_by(|a, b| a.address.cmp(&b.address));
+        let refs: Vec<ParentRef> = c
+            .iter()
+            .take(n)
+            .enumerate()
+            .map(|(i, m)| ParentRef {
+                round: FIRST,
+                author: m.address.clone(),
+                digest: format!("{:064x}", 1_000_000 + i),
+                proof: None,
+                cert: None,
+            })
+            .collect();
+        let v = vertex(
+            &all[0],
+            EPOCH,
+            FIRST + 1,
+            refs.iter().map(|r| r.digest.clone()).collect(),
+            refs,
+        );
+        (c, v)
+    };
+    let (c, v) = with_members(MAX_PARENTS);
+    assert!(
+        matches!(verdict(&v, &c), Verdict::PendingCert(_)),
+        "{:?}",
+        verdict(&v, &c)
+    );
+    let (c, v) = with_members(MAX_PARENTS + 1);
+    assert!(invalid(verdict(&v, &c)));
+}

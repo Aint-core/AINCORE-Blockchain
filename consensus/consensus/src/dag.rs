@@ -2434,6 +2434,11 @@ impl DagConsensus {
         if a.author != b.author || a.round != b.round || a.hash == b.hash {
             return None;
         }
+        // A V3 proof carries no epoch: the V3 hash does not bind one, so a
+        // relay could pad it into the durable evidence (G1 S2 review 2).
+        if a.epoch != 0 || b.epoch != 0 {
+            return None;
+        }
         // 2. each hash must bind its body (PWN-001) — stops pairing a real
         //    vertex with a body-tampered twin.
         if a.hash != a.calculate_hash() || b.hash != b.calculate_hash() {

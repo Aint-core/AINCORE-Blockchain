@@ -13,10 +13,11 @@ use crate::vcert::{self, AttestBody, VertexCertificate};
 use blockchain::{CompactCert, ParentRef, Vertex};
 
 /// Payload back-pressure (PR-1): a vertex carrying transactions more than this
-/// far above this node's cursor is dropped. A payload-free vertex never is:
-/// a hard cap on rounds deadlocks for good once every round up to it is
-/// proposed and no anchor in the window can gain votes (the G1 math review,
-/// b.6). Rounds keep advancing on empty vertices; only payload is bounded.
+/// far above this node's cursor is dropped. A payload-free vertex is not
+/// dropped for its round: a hard cap on rounds deadlocks for good once every
+/// round up to it is proposed and no anchor in the window can gain votes (the
+/// G1 math review, b.6). Past the lead it is staged only on parents already
+/// certified; otherwise it is dropped and nothing is asked for.
 pub const LEAD: u64 = 200;
 /// A timestamp this far ahead of this node's clock is dropped, not refused.
 pub const MAX_FUTURE_DRIFT_SECS: u64 = 30;
@@ -114,7 +115,19 @@ pub(crate) fn layer_s(
     }
     // A ref no certificate could ever satisfy is refused here rather than
     // left to wait: its author is a staked member, its digest canonical.
+    let n = record.committee.len();
     for r in &v.parent_refs {
+        // Transport fields bound nothing: a V3 identity proof is no V4
+        // evidence, and a certificate has one shape. Refusing a padded copy
+        // costs nothing: verdicts are per copy (S2 review 2, MEDIUM-A).
+        if r.proof.is_some() {
+            return Err("a V3 parent identity proof on a V4 ref".into());
+        }
+        if r.cert.as_ref().is_some_and(|c| {
+            c.signer_bitmap.len() != n.div_ceil(8) || c.aggregate_signature.len() != 96
+        }) {
+            return Err("a parent certificate of the wrong shape".into());
+        }
         if !lower_hex(&r.digest, 64) {
             return Err(format!(
                 "a parent digest that is not canonical hex: {}",

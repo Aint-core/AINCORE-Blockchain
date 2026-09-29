@@ -2324,15 +2324,36 @@ impl Executor {
         };
         match ev.get("kind").and_then(|v| v.as_str()) {
             Some("equivocation") => {
-                let round = ev.get("round").and_then(|v| v.as_u64()).ok_or("missing round")?;
-                let a: blockchain::Vertex = serde_json::from_value(ev.get("vertex_a").cloned().unwrap_or_default()).map_err(|e| format!("vertex_a: {e}"))?;
-                let b: blockchain::Vertex = serde_json::from_value(ev.get("vertex_b").cloned().unwrap_or_default()).map_err(|e| format!("vertex_b: {e}"))?;
-                if a.author != offender || b.author != offender { return Err("author != offender".into()); }
-                if a.round != round || b.round != round { return Err("round mismatch".into()); }
-                if a.hash == b.hash { return Err("identical vertices are not equivocation".into()); }
-                if a.calculate_hash() != a.hash || b.calculate_hash() != b.hash { return Err("vertex hash does not match body".into()); }
+                let round = ev
+                    .get("round")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("missing round")?;
+                let a: blockchain::Vertex =
+                    serde_json::from_value(ev.get("vertex_a").cloned().unwrap_or_default())
+                        .map_err(|e| format!("vertex_a: {e}"))?;
+                let b: blockchain::Vertex =
+                    serde_json::from_value(ev.get("vertex_b").cloned().unwrap_or_default())
+                        .map_err(|e| format!("vertex_b: {e}"))?;
+                if a.author != offender || b.author != offender {
+                    return Err("author != offender".into());
+                }
+                if a.round != round || b.round != round {
+                    return Err("round mismatch".into());
+                }
+                if a.hash == b.hash {
+                    return Err("identical vertices are not equivocation".into());
+                }
+                // A V3 proof carries no epoch: the V3 hash does not bind one.
+                if a.epoch != 0 || b.epoch != 0 {
+                    return Err("a V3 proof carrying an epoch".into());
+                }
+                if a.calculate_hash() != a.hash || b.calculate_hash() != b.hash {
+                    return Err("vertex hash does not match body".into());
+                }
                 let pk = pubkey_of(&offender).ok_or("offender pubkey unresolvable")?;
-                if !a.verify_ed25519_signature(&pk) || !b.verify_ed25519_signature(&pk) { return Err("vertex signature invalid".into()); }
+                if !a.verify_ed25519_signature(&pk) || !b.verify_ed25519_signature(&pk) {
+                    return Err("vertex signature invalid".into());
+                }
                 Ok((offender, "equivocation".into(), round))
             }
             Some("downtime") => {
@@ -5148,6 +5169,16 @@ mod tests {
         let mut f = b.clone();
         f.sign_with_ed25519(&SigningKey::from_bytes(&[52u8; 32]));
         assert!(executor.verify_slash_evidence(&item(&a, &f)).is_err());
+        // An epoch a relay set on a V3 proof (unhashed) is refused (G1 S2
+        // review 2): it would otherwise land in durable evidence.
+        let mut padded = b.clone();
+        padded.epoch = u64::MAX;
+        assert_eq!(
+            padded.calculate_hash(),
+            b.hash,
+            "the V3 hash ignores the epoch"
+        );
+        assert!(executor.verify_slash_evidence(&item(&a, &padded)).is_err());
 
         // COMPACT proofs (payload stripped, payload_root carried) must verify
         // identically -- this is what keeps DAG-carried evidence tiny.
