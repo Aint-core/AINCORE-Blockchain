@@ -1,14 +1,7 @@
 use super::*;
 
 fn fixture(name: &str) -> (ChainSync, Block) {
-    let sync = setup_sync(&format!(
-        "identity_{name}_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let sync = setup_sync(&unique_name(&format!("identity_{name}")));
     let key = crypto::SigningKey::from_bytes(&[77; 32]);
     let proposer = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
     set_validators(&sync, vec![(&proposer, 100)]);

@@ -18,6 +18,14 @@ mod tests {
         Arc::new(StateDB::open(&path).expect("Failed to open DB"))
     }
 
+    /// A DB name no other call in this process gets: pid + counter, not the
+    /// clock (macOS ticks in microseconds, so parallel tests could collide).
+    fn unique_name(prefix: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}_{}_{n}", std::process::id())
+    }
 
     /// RE-AUDIT CRITICAL fixture: register the proposer's Ed25519 key as its
     /// on-chain AccountData and sign the block, so validate_block's proposer
@@ -618,12 +626,7 @@ mod tests {
 
     #[test]
     fn test_process_blocks_unpersisted_execution_does_not_advance() {
-        let sync = setup_sync(&format!(
-            "unpersisted_execution_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
+        let sync = setup_sync(&unique_name("unpersisted_execution"));
         let key = crypto::SigningKey::from_bytes(&[77; 32]);
         let proposer = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
         set_validators(&sync, vec![(&proposer, 100)]);
