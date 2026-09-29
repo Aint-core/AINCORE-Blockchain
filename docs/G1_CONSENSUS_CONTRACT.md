@@ -31,6 +31,53 @@
 
 ## Status and scope
 
+**Corrections from the independent math review (2026-09-29).** The review
+(`docs/research/g1_math_review.md`, against Narwhal arXiv 2105.11827,
+Bullshark arXiv 2209.05633, Sui Lutris and Diem/Aptos reconfiguration) found
+the safety math sound and the liveness argument wrong in one place. Decisions,
+taken by the implementer under the founder's delegation:
+
+- **C1 (MAJOR, applied): `LEAD` bounds payload, not rounds.** PR-1, AT-1 and E5
+  now let payload-free vertices advance past `cursor + LEAD`. Before, every
+  round up to the cap could be proposed with no anchor supported, and the chain
+  then could never move again. S10 adds LIV-1: a scheduler skips `LEAD/2 + 1`
+  anchors before GST; after GST a direct commit follows within K rounds. GC-5's
+  byte bound is over payload-bearing rounds.
+- **C2 (MAJOR): epoch-boundary liveness assumptions**, added to the list:
+  LA-10, C_E stays live until QC(H_E) forms and is served; LA-11, more than
+  2/3 of T_{E+1} is synced at activation (a registration cutoff at H_E − K, as
+  in Sui Lutris, if not); LA-12, the committee list itself travels with
+  QC(H_E) for nodes that rejoin without executing (Diem's `next_epoch_state`).
+- **C3: DE-2 counts votes with Q_E (2f+1), where Bullshark commits with f+1.**
+  Kept as a deliberate strengthening: safe, and it keeps S4's bit-identity with
+  today's ordering. Its cost is liveness: with one node down every online honest
+  node must vote. Revisited only with S10's measurements.
+- **C4: no member may hold a liveness veto.** A committee where one member has
+  `3·s_i ≥ T` is refused at genesis and by EP-2 (the old committee carries over,
+  with an alarm). Such a member halts the chain alone by crashing. Precedent:
+  Sui caps a validator's voting power. LA-2 reads in stake terms.
+- **C5: round numbering.** Slots are epoch-scoped, and anchor rounds are
+  globally strictly increasing: every E+1 anchor round exceeds r*_E, because
+  `anchor_already_on_chain` and `consensus:cseq:{anchor_round}` are round-only.
+  S9's "first_round = r*+1 → overlap red" mutation is dropped (both values are
+  safe); S9 instead injects epoch-E vertices at rounds r*+1 … r*+LEAD after
+  activation and requires O_{E+1} unchanged. S9's replay mutation must run with
+  C_{E+1} = C_E, or `committee_hash` masks it.
+- **C6: Lemma U states its assumptions U1–U10**: the fault bound in floored
+  weight units, committee agreement via `committee_hash`, stake recomputed from
+  C_E, distinct signer entries (unique addresses: `canonical_order` is a stable
+  sort), one durable digest per slot per key, signed fields taken from the
+  validated body, BLS with verified PoPs and distinct domains, durable synced
+  writes, exact arithmetic, and verification only against the certificate's own
+  epoch committee.
+- **C7: GC-3 deletes a closed epoch's rows by epoch**, so rows above the new
+  floor do not leak (about LEAD × n per epoch).
+- **C8: weak subjectivity** for rejoin across many epochs is an assumption,
+  handed to G3 (checkpoints) and G5 (unbonding).
+- **C9: the quorum is `3·stake(S) > 2·T`** (`qc::stake_quorum_met`), not the
+  count formula `(n·2/3)+1` that CLAUDE.md stated: with unequal stake a count
+  quorum lets 30% Byzantine stake certify twins.
+
 **What this contract settles.** It answers the five items of required design work at `PRODUCTION_READINESS_GOAL.md:971-986` with one contract. The contract covers:
 
 - equivocation;
@@ -232,7 +279,7 @@
 | `MAX_STAGED_PER_SLOT` | 2 | Includes the certified reservation (ST-2). |
 | `PENDING_MAX_PER_AUTHOR` | 16 vertices | Evicts the highest round first. |
 | `B_AUTH` (local) | 64 MiB per author | Only for bodies that are neither certified nor self-attested. |
-| `LEAD` (local) | 200 rounds | Back-pressure above this node's cursor (PR-1). |
+| `LEAD` (local) | 200 rounds | Payload back-pressure above this node's cursor (PR-1). Rounds are not capped (Correction C1). |
 | `T_LEADER` (local) | ≥ measured certification latency; default 2 ticks | Liveness only. |
 | `T_RETRY`, `T_FETCH` (local) | 1 tick; fetch backoff doubling to 8 ticks | Driven by the receiver's clock. |
 
@@ -247,7 +294,8 @@
 | `AINCORE_EPOCH_GENESIS_V1` | Epoch sentinel. |
 
 **Types.**
-- `hash_v4(v) = hex(SHA256(AINCORE_VERTEX_V4 ‖ put(chain_id) ‖ put(genesis_identity) ‖ epoch_be8 ‖ round_be8 ‖ put(author) ‖ put(parents_root_v4) ‖ put(aggregated_signature or "") ‖ timestamp_be8 ‖ put(payload_root)))`.
+- `hash_v4(v) = hex(SHA256(AINCORE_VERTEX_V4 ‖ put(chain_id) ‖ put(genesis_identity) ‖ epoch_be8 ‖ round_be8 ‖ put(author) ‖ put(parents_root_v4) ‖ agg ‖ timestamp_be8 ‖ put(payload_root)))`, where `agg` is `0x00` when `aggregated_signature` is absent and `0x01 ‖ put(aggregated_signature)` when present.
+  - *(Corrected at S2: the first text, `put(aggregated_signature or "")`, hashed an absent aggregate and an empty one alike, the same non-injective class as FX-18. The S2 codec test caught it.)*
   - `put` means a u64 big-endian length prefix, as in `calculate_hash_with_domain` (`lib.rs:658-681`).
   - The Ed25519 signature is still over the hash hex (`lib.rs:602-606`).
 - `ParentRef` keeps its hashed fields `{round, author, digest}` (`lib.rs:404-423`). It gains a *transport* field `cert: Option<CompactCert>`, which is not hashed.
@@ -339,7 +387,7 @@ No rule concludes that a digest does not exist (`DEFECT_REGISTER.md:750`).
     - For each ref, take the embedded `CompactCert`, or else the local `vcert` for (E, ref.round, ref.author) with the ref's digest. Verify it with CE-2 (results are cached).
     - A missing or invalid certificate → PENDING(cert), and send `CERT_REQ`.
     - An invalid *embedded* certificate never makes the vertex INVALID. It is an unhashed transport field that any relay can corrupt.
-  - E5 back-pressure: `v.round > cursor + LEAD` → DROP.
+  - E5 back-pressure: `v.round > cursor + LEAD` **and the vertex carries payload** → DROP. A payload-free vertex is never dropped for its round (Correction C1).
   - No parent **body** is ever required.
 - **Run order.** Epoch classification (E1) runs before any round-relative check. The single-vertex round-jump check (`dag.rs:1126`) is removed. Its role is taken by E4 (a vertex above the certified frontier stays PENDING) and E5.
 
@@ -369,7 +417,7 @@ No rule concludes that a digest does not exist (`DEFECT_REGISTER.md:750`).
 **AT-1 (preconditions).**
 - self ∈ C_E with stake > 0.
 - E = E_active.
-- g < v.round ≤ cursor + LEAD.
+- g < v.round, and v.round ≤ cursor + LEAD unless v is payload-free (Correction C1).
 - IN-1 passed, including verification of every parent **certificate**.
 - The derived BLS key equals `C_E[self].bls_public_key`. Otherwise skip and log, as QC production does (`qc_producer.rs:286-296`).
 - Guard continuity holds (RC-3).
@@ -431,7 +479,7 @@ This is the core of `verify_qc` (`qc.rs:338-425`) refactored into one shared ver
 **PR-1 (round).**
 - The current round is `max(first_round(E), 1 + max{r : held certificates for (E, r) come from authors satisfying Q_E})`.
 - This replaces `quorum_round` over held bodies (`dag.rs:631-663`, `:1419-1428`).
-- A node does not propose above `cursor + LEAD`.
+- Above `cursor + LEAD` a node proposes only payload-free vertices: rounds keep advancing, payload waits (Correction C1).
 
 **PR-2 (when to propose).** At a tick, propose round r iff all of the following hold:
 - self ∈ C_E and E is active;
@@ -750,7 +798,7 @@ Let T = T_E and β < T/3.
 4. **Retrieval.** Every needed body has an honest retaining signer (Lemma A, GC-3), and RE-6 prevents starvation. A want succeeds within |signers| rotations.
 5. **Leader draw.** Each anchor round's leader is honest with probability at least the honest stake share, which exceeds 2/3. That gives at most 1.5 anchor rounds expected between direct commits.
    - There is **no deterministic bound**, because the stake-weighted draw is not round-robin (Mysticeti Lemma 11 assumes round-robin).
-   - PR-1's `LEAD` back-pressure could halt the chain after `LEAD/2` consecutive silent Byzantine leaders. With β < 1/3, the probability of that per window is at most 3^−100.
+   - `LEAD` bounds payload, not rounds (Correction C1). A hard round cap deadlocked for good once every round up to it was proposed with no anchor supported, which a pre-GST scheduler reaches with certainty; the 3^−100 figure that stood here covered silent Byzantine leaders only and is withdrawn.
 6. **Blocks and QCs.** There is one block per committed anchor. A QC per block follows from the durable retry worker.
 7. **Epochs.** QC(H_E) forms, and activation follows.
 8. **Rejoin.** Within the retention window, catch-up is by step 4. Beyond it, by IM-1 with per-height QCs.

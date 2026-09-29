@@ -85,13 +85,8 @@ pub struct VertexCertificate {
     pub aggregate_signature: Vec<u8>,
 }
 
-/// The transport form carried in a child's `ParentRef`. The body and both
-/// stakes are reconstructed from the child's epoch, the ref and C_E.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompactCert {
-    pub signer_bitmap: Vec<u8>,
-    pub aggregate_signature: Vec<u8>,
-}
+/// The transport form carried in a child's `ParentRef`, defined next to it.
+pub use blockchain::CompactCert;
 
 impl VertexCertificate {
     pub fn compact(&self) -> CompactCert {

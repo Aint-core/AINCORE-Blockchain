@@ -872,6 +872,7 @@ impl DagConsensus {
                 // cut re-serialised the whole remaining payload on every pop,
                 // which is quadratic in payload bytes under the consensus lock.
                 let empty_probe = Vertex {
+                    epoch: 0,
                     round: self.current_round,
                     author: self.node_id.clone(),
                     timestamp: u64::MAX,
@@ -924,6 +925,7 @@ impl DagConsensus {
 
             // 3. Create Vertex
             let mut vertex = Vertex {
+                epoch: 0,
                 round: self.current_round,
                 author: self.node_id.clone(),
                 timestamp: (self.now_secs)(),

@@ -1,0 +1,544 @@
+//! G1 S2 acceptance (`docs/G1_CONSENSUS_CONTRACT.md`, "Staged implementation
+//! plan", S2): one test per IN-1 clause. Each refusal is paired with the
+//! acceptance it departs from, so no test passes by refusing everything.
+
+use super::*;
+use crate::qc::derive_validator_bls_seed;
+use crate::vcert::{CertCollector, CollectOutcome, VertexAttestation};
+use crypto::bls::BLSEngine;
+
+const CHAIN: &str = "AINCORE-V4-TEST";
+const GENESIS: &str = "genesis-identity-v4-test";
+const EPOCH: u64 = 2;
+const FIRST: u64 = 1_000;
+const NOW: u64 = 1_000_000;
+
+struct Member {
+    node_key: [u8; 32],
+    info: ValidatorInfo,
+}
+
+fn member(seed: u8) -> Member {
+    let node_key = [seed; 32];
+    let ed = crypto::SigningKey::from_bytes(&node_key)
+        .verifying_key()
+        .to_bytes();
+    let bls = BLSEngine::consensus();
+    let bls_seed = derive_validator_bls_seed(&node_key);
+    Member {
+        node_key,
+        info: ValidatorInfo {
+            address: crypto::derive_address(&ed).unwrap(),
+            stake: 100,
+            ed25519_public_key: hex::encode(ed),
+            bls_public_key: hex::encode(bls.pubkey_raw(&bls_seed)),
+            bls_pop: hex::encode(bls.prove_possession_raw(&bls_seed)),
+        },
+    }
+}
+
+/// Four equal-stake members in canonical order: a quorum is any three.
+fn members() -> Vec<Member> {
+    let mut m: Vec<Member> = (1..=4u8).map(member).collect();
+    m.sort_by(|a, b| a.info.address.cmp(&b.info.address));
+    m
+}
+
+fn committee(m: &[Member]) -> Vec<ValidatorInfo> {
+    m.iter().map(|m| m.info.clone()).collect()
+}
+
+fn sentinel(epoch: u64) -> String {
+    blockchain::epoch_genesis(
+        CHAIN,
+        GENESIS,
+        epoch,
+        FIRST,
+        &"b".repeat(64),
+        &"a".repeat(64),
+    )
+}
+
+fn seal(v: &mut Vertex, m: &Member) {
+    v.hash = v.hash_v4_with_domain(CHAIN, GENESIS);
+    v.sign_with_ed25519(&crypto::SigningKey::from_bytes(&m.node_key));
+}
+
+fn vertex(
+    m: &Member,
+    epoch: u64,
+    round: u64,
+    parents: Vec<String>,
+    refs: Vec<ParentRef>,
+) -> Vertex {
+    let mut v = Vertex {
+        epoch,
+        round,
+        author: m.info.address.clone(),
+        parents,
+        parent_refs: refs,
+        payload: vec!["tx".into()],
+        timestamp: NOW - 5,
+        hash: String::new(),
+        signature: String::new(),
+        aggregated_signature: None,
+        payload_root: None,
+        parents_root: None,
+    };
+    seal(&mut v, m);
+    v
+}
+
+fn first_round(m: &Member) -> Vertex {
+    vertex(m, EPOCH, FIRST, vec![sentinel(EPOCH)], vec![])
+}
+
+/// A certificate for `parent` in `epoch`, from the signers given.
+fn certify(all: &[Member], parent: &Vertex, epoch: u64, signers: &[usize]) -> CompactCert {
+    let c = committee(all);
+    let body = AttestBody {
+        chain_id: CHAIN.into(),
+        genesis_identity: GENESIS.into(),
+        epoch,
+        round: parent.round,
+        author: parent.author.clone(),
+        digest: parent.hash.clone(),
+        committee_hash: qc::validator_set_hash(&c),
+    };
+    let mut collector = CertCollector::new(body.clone(), &c).unwrap();
+    let mut out = None;
+    for &i in signers {
+        let att = VertexAttestation {
+            body: body.clone(),
+            signer: all[i].info.address.clone(),
+            signature: BLSEngine::consensus().sign_raw(
+                &body.signing_bytes(),
+                &derive_validator_bls_seed(&all[i].node_key),
+            ),
+        };
+        if let CollectOutcome::Certified(cert) = collector.add(&att).unwrap() {
+            out = Some(cert.compact());
+        }
+    }
+    out.expect("a quorum")
+}
+
+fn reference(parent: &Vertex, cert: Option<CompactCert>) -> ParentRef {
+    ParentRef {
+        round: parent.round,
+        author: parent.author.clone(),
+        digest: parent.hash.clone(),
+        proof: None,
+        cert,
+    }
+}
+
+/// A round FIRST + 1 vertex by `all[by]`, citing the first-round vertices of
+/// `cited`, each with an embedded certificate.
+fn second_round(all: &[Member], by: usize, cited: &[usize]) -> (Vertex, Vec<Vertex>) {
+    let parents: Vec<Vertex> = cited.iter().map(|&i| first_round(&all[i])).collect();
+    let refs = parents
+        .iter()
+        .map(|p| reference(p, Some(certify(all, p, EPOCH, &[0, 1, 2]))))
+        .collect();
+    let digests = parents.iter().map(|p| p.hash.clone()).collect();
+    (vertex(&all[by], EPOCH, FIRST + 1, digests, refs), parents)
+}
+
+fn verdict_with(
+    v: &Vertex,
+    committee: &[ValidatorInfo],
+    local: impl Fn(&ParentRef) -> Option<CompactCert>,
+) -> Verdict {
+    let sentinel = sentinel(EPOCH);
+    let ctx = Context {
+        chain_id: CHAIN,
+        genesis_identity: GENESIS,
+        active: EpochRecord {
+            epoch: EPOCH,
+            first_round: FIRST,
+            sentinel: &sentinel,
+            committee,
+        },
+        now_secs: NOW,
+        gc_floor: 0,
+        cursor: FIRST,
+    };
+    v4_verdict(serde_json::to_vec(v).unwrap().len(), v, &ctx, local)
+}
+
+fn verdict(v: &Vertex, committee: &[ValidatorInfo]) -> Verdict {
+    verdict_with(v, committee, |_| None)
+}
+
+fn invalid(v: Verdict) -> bool {
+    matches!(v, Verdict::Invalid(_))
+}
+
+#[test]
+fn honest_vertices_stage() {
+    let all = members();
+    let c = committee(&all);
+    assert_eq!(verdict(&first_round(&all[0]), &c), Verdict::Stage);
+    let (v, _) = second_round(&all, 3, &[0, 1, 2]);
+    assert_eq!(verdict(&v, &c), Verdict::Stage);
+}
+
+#[test]
+fn a_tampered_epoch_is_invalid() {
+    let all = members();
+    let c = committee(&all);
+    let (mut v, _) = second_round(&all, 3, &[0, 1, 2]);
+    assert_eq!(verdict(&v, &c), Verdict::Stage);
+    v.epoch += 1;
+    let v_next = v.clone();
+    v.epoch -= 2;
+    // The hash binds the epoch: another epoch is not the signed vertex.
+    assert!(invalid(verdict(&v_next, &c)), "{:?}", verdict(&v_next, &c));
+    assert!(invalid(verdict(&v, &c)));
+}
+
+#[test]
+fn a_certificate_of_another_epoch_leaves_the_vertex_pending() {
+    let all = members();
+    let c = committee(&all);
+    let (mut v, parents) = second_round(&all, 3, &[0, 1, 2]);
+    // Genuine signatures, for the same slot in the previous epoch.
+    v.parent_refs[1].cert = Some(certify(&all, &parents[1], EPOCH - 1, &[0, 1, 2]));
+    assert_eq!(verdict(&v, &c), Verdict::PendingCert(vec![1]));
+}
+
+#[test]
+fn a_missing_certificate_leaves_the_vertex_pending() {
+    let all = members();
+    let c = committee(&all);
+    let (mut v, _) = second_round(&all, 3, &[0, 1, 2]);
+    v.parent_refs[0].cert = None;
+    v.parent_refs[2].cert = None;
+    assert_eq!(verdict(&v, &c), Verdict::PendingCert(vec![0, 2]));
+}
+
+#[test]
+fn a_stripped_certificate_with_a_local_copy_stages() {
+    let all = members();
+    let c = committee(&all);
+    let (mut v, parents) = second_round(&all, 3, &[0, 1, 2]);
+    let held = certify(&all, &parents[0], EPOCH, &[1, 2, 3]);
+    v.parent_refs[0].cert = None;
+    let local = |r: &ParentRef| (r.digest == parents[0].hash).then(|| held.clone());
+    assert_eq!(verdict_with(&v, &c, local), Verdict::Stage);
+    // The local copy is looked up by the ref's own digest.
+    let wrong = |_: &ParentRef| Some(certify(&all, &parents[1], EPOCH, &[0, 1, 2]));
+    assert_eq!(verdict_with(&v, &c, wrong), Verdict::PendingCert(vec![0]));
+}
+
+#[test]
+fn a_corrupted_embedded_certificate_is_never_invalid() {
+    let all = members();
+    let c = committee(&all);
+    let (mut v, parents) = second_round(&all, 3, &[0, 1, 2]);
+    let good = v.parent_refs[2].cert.clone().unwrap();
+    let mut bad = good.clone();
+    bad.aggregate_signature[5] ^= 1;
+    v.parent_refs[2].cert = Some(bad.clone());
+    // The hash does not cover the transport field: the vertex still verifies.
+    assert_eq!(verdict(&v, &c), Verdict::PendingCert(vec![2]));
+    let local = |r: &ParentRef| (r.digest == parents[2].hash).then(|| good.clone());
+    assert_eq!(verdict_with(&v, &c, local), Verdict::Stage);
+    // A bitmap below the quorum is corruption too, not invalidity.
+    let mut thin = good.clone();
+    thin.signer_bitmap = vec![0b0000_0001];
+    v.parent_refs[2].cert = Some(thin);
+    assert_eq!(verdict(&v, &c), Verdict::PendingCert(vec![2]));
+}
+
+#[test]
+fn a_round_skip_or_a_thin_anchor_is_invalid() {
+    let all = members();
+    let c = committee(&all);
+    // Citing round FIRST from round FIRST + 2 skips a round.
+    let (v, parents) = second_round(&all, 3, &[0, 1, 2]);
+    let refs = v.parent_refs.clone();
+    let skip = vertex(
+        &all[3],
+        EPOCH,
+        FIRST + 2,
+        parents.iter().map(|p| p.hash.clone()).collect(),
+        refs,
+    );
+    assert!(invalid(verdict(&skip, &c)), "{:?}", verdict(&skip, &c));
+    // Two of four authors is not a quorum.
+    let (thin, _) = second_round(&all, 3, &[0, 1]);
+    assert!(invalid(verdict(&thin, &c)), "{:?}", verdict(&thin, &c));
+    let (quorum, _) = second_round(&all, 3, &[0, 1, 3]);
+    assert_eq!(verdict(&quorum, &c), Verdict::Stage);
+}
+
+#[test]
+fn a_duplicate_parent_author_is_invalid() {
+    let all = members();
+    let c = committee(&all);
+    // Twins: two first-round vertices by member 0.
+    let a = first_round(&all[0]);
+    let mut b = vertex(&all[0], EPOCH, FIRST, vec![sentinel(EPOCH)], vec![]);
+    b.payload = vec!["other".into()];
+    seal(&mut b, &all[0]);
+    let p1 = first_round(&all[1]);
+    let cited = [&a, &b, &p1];
+    let v = vertex(
+        &all[3],
+        EPOCH,
+        FIRST + 1,
+        cited.iter().map(|p| p.hash.clone()).collect(),
+        cited
+            .iter()
+            .map(|p| reference(p, Some(certify(&all, p, EPOCH, &[0, 1, 2]))))
+            .collect(),
+    );
+    let verdict = verdict(&v, &c);
+    assert!(
+        matches!(&verdict, Verdict::Invalid(e) if e.contains("twice")),
+        "{verdict:?}"
+    );
+}
+
+#[test]
+fn a_wrong_sentinel_is_invalid() {
+    let all = members();
+    let c = committee(&all);
+    for wrong in [
+        "genesis".to_string(),
+        sentinel(EPOCH - 1),
+        sentinel(EPOCH + 1),
+    ] {
+        let v = vertex(&all[0], EPOCH, FIRST, vec![wrong.clone()], vec![]);
+        assert!(invalid(verdict(&v, &c)), "{wrong}");
+    }
+    // A first-round vertex with refs as well as the sentinel.
+    let p = first_round(&all[1]);
+    let v = vertex(
+        &all[0],
+        EPOCH,
+        FIRST,
+        vec![sentinel(EPOCH)],
+        vec![reference(&p, None)],
+    );
+    assert!(invalid(verdict(&v, &c)));
+    assert_eq!(verdict(&first_round(&all[0]), &c), Verdict::Stage);
+}
+
+#[test]
+fn first_round_vertices_across_the_boundary_are_classified_by_epoch() {
+    let all = members();
+    let c = committee(&all);
+    let at = |epoch| vertex(&all[0], epoch, FIRST, vec![sentinel(epoch)], vec![]);
+    assert_eq!(verdict(&at(EPOCH), &c), Verdict::Stage);
+    assert_eq!(verdict(&at(EPOCH + 1), &c), Verdict::PendingEpoch);
+    assert_eq!(verdict(&at(EPOCH - 1), &c), Verdict::Stale);
+    assert!(matches!(verdict(&at(EPOCH + 2), &c), Verdict::Drop(_)));
+    // A later epoch's vertex is classified before its round is read.
+    let next = vertex(&all[0], EPOCH + 1, 1, vec![sentinel(EPOCH + 1)], vec![]);
+    assert_eq!(verdict(&next, &c), Verdict::PendingEpoch);
+}
+
+#[test]
+fn layer_s_refuses_what_every_node_refuses() {
+    let all = members();
+    let c = committee(&all);
+    let ok = first_round(&all[0]);
+    assert_eq!(verdict(&ok, &c), Verdict::Stage);
+    let refused = |v: &Vertex| invalid(verdict(v, &c));
+    let mut v = ok.clone();
+    v.payload_root = Some(v.payload_root());
+    v.payload.clear();
+    assert!(refused(&v), "a compact proof");
+    let mut v = ok.clone();
+    v.aggregated_signature = Some("00".into());
+    seal(&mut v, &all[0]);
+    assert!(refused(&v), "an aggregate signature");
+    // Refs that pass every other rule: three members' claims make a quorum,
+    // the rest are distinct non-members, so only the parent count refuses.
+    let claims = |round: u64, n: usize| -> (Vec<String>, Vec<ParentRef>) {
+        let refs: Vec<ParentRef> = (0..n)
+            .map(|i| ParentRef {
+                round,
+                author: if i < 3 {
+                    all[i].info.address.clone()
+                } else {
+                    format!("{i:064x}")
+                },
+                digest: format!("{:064x}", i + 1_000),
+                proof: None,
+                cert: None,
+            })
+            .collect();
+        (refs.iter().map(|r| r.digest.clone()).collect(), refs)
+    };
+    let (parents, refs) = claims(FIRST, MAX_PARENTS);
+    let at_limit = vertex(&all[3], EPOCH, FIRST + 1, parents, refs);
+    assert!(!refused(&at_limit), "{:?}", verdict(&at_limit, &c));
+    let (parents, refs) = claims(FIRST, MAX_PARENTS + 1);
+    assert!(
+        refused(&vertex(&all[3], EPOCH, FIRST + 1, parents, refs)),
+        "too many parents"
+    );
+    // One digest cited twice, under two claimed authors: the refs alone
+    // would pass (three distinct authors), so only the digest rule refuses.
+    let p = first_round(&all[0]);
+    let q = first_round(&all[1]);
+    let r = |author: usize, parent: &Vertex| ParentRef {
+        round: FIRST,
+        author: all[author].info.address.clone(),
+        digest: parent.hash.clone(),
+        proof: None,
+        cert: None,
+    };
+    let twice = vertex(
+        &all[3],
+        EPOCH,
+        FIRST + 1,
+        vec![p.hash.clone(), p.hash.clone(), q.hash.clone()],
+        vec![r(0, &p), r(2, &p), r(1, &q)],
+    );
+    assert!(refused(&twice), "a parent twice: {:?}", verdict(&twice, &c));
+    let mut v = ok.clone();
+    v.timestamp += 1;
+    assert!(refused(&v), "a hash that is not the body's");
+    let v3 = {
+        let mut v = ok.clone();
+        v.hash = v.calculate_hash_with_domain(CHAIN, GENESIS);
+        v.sign_with_ed25519(&crypto::SigningKey::from_bytes(&all[0].node_key));
+        v
+    };
+    assert!(refused(&v3), "a V3 hash");
+    let outsider = member(9);
+    assert!(refused(&first_round(&outsider)), "not a member");
+    let mut v = ok.clone();
+    v.sign_with_ed25519(&crypto::SigningKey::from_bytes(&all[1].node_key));
+    assert!(refused(&v), "signed by another key");
+    let mut zero = c.clone();
+    zero[0].stake = 0;
+    assert!(invalid(verdict(&ok, &zero)), "no stake");
+    let v = vertex(&all[0], EPOCH, FIRST - 1, vec![sentinel(EPOCH)], vec![]);
+    assert!(refused(&v), "below the first round");
+    let (parents, refs) = claims(ABSOLUTE_ROUND_CEILING, 3);
+    let v = vertex(&all[0], EPOCH, ABSOLUTE_ROUND_CEILING + 1, parents, refs);
+    assert!(refused(&v), "over the ceiling: {:?}", verdict(&v, &c));
+    let (parents, refs) = claims(ABSOLUTE_ROUND_CEILING - 1, 3);
+    let v = vertex(&all[0], EPOCH, ABSOLUTE_ROUND_CEILING, parents, refs);
+    assert!(!refused(&v), "at the ceiling: {:?}", verdict(&v, &c));
+    let sentinel = sentinel(EPOCH);
+    let ctx = Context {
+        chain_id: CHAIN,
+        genesis_identity: GENESIS,
+        active: EpochRecord {
+            epoch: EPOCH,
+            first_round: FIRST,
+            sentinel: &sentinel,
+            committee: &c,
+        },
+        now_secs: NOW,
+        gc_floor: 0,
+        cursor: FIRST,
+    };
+    assert!(
+        invalid(v4_verdict(MAX_VERTEX_BYTES + 1, &ok, &ctx, |_| None)),
+        "size"
+    );
+    assert_eq!(
+        v4_verdict(MAX_VERTEX_BYTES, &ok, &ctx, |_| None),
+        Verdict::Stage
+    );
+}
+
+#[test]
+fn layer_e_delays_but_never_refuses() {
+    let all = members();
+    let c = committee(&all);
+    let sentinel = sentinel(EPOCH);
+    let (v, _) = second_round(&all, 3, &[0, 1, 2]);
+    let at = |now: u64, floor: u64, cursor: u64, v: &Vertex| {
+        let ctx = Context {
+            chain_id: CHAIN,
+            genesis_identity: GENESIS,
+            active: EpochRecord {
+                epoch: EPOCH,
+                first_round: FIRST,
+                sentinel: &sentinel,
+                committee: &c,
+            },
+            now_secs: now,
+            gc_floor: floor,
+            cursor,
+        };
+        v4_verdict(1_000, v, &ctx, |_| None)
+    };
+    assert_eq!(at(NOW, 0, FIRST, &v), Verdict::Stage);
+    assert!(
+        matches!(at(v.timestamp - 31, 0, FIRST, &v), Verdict::Drop(_)),
+        "the clock"
+    );
+    assert_eq!(
+        at(v.timestamp - 30, 0, FIRST, &v),
+        Verdict::Stage,
+        "within drift"
+    );
+    assert_eq!(
+        at(NOW, FIRST + 1, FIRST, &v),
+        Verdict::Stale,
+        "at the floor"
+    );
+    assert_eq!(at(NOW, FIRST, FIRST, &v), Verdict::Stage, "above the floor");
+    let far = FIRST + 1 - LEAD - 1;
+    assert!(
+        matches!(at(NOW, 0, far, &v), Verdict::Drop(_)),
+        "payload past the lead"
+    );
+    assert_eq!(at(NOW, 0, far + 1, &v), Verdict::Stage, "within the lead");
+    // Rounds keep advancing past the lead on payload-free vertices: a hard
+    // cap on rounds deadlocks once every round up to it is proposed.
+    let mut empty = v.clone();
+    empty.payload.clear();
+    seal(&mut empty, &all[3]);
+    assert_eq!(
+        at(NOW, 0, far, &empty),
+        Verdict::Stage,
+        "empty, past the lead"
+    );
+    // Whatever the context, a vertex that passes Layer S is never invalid.
+    for now in [0, NOW, u64::MAX] {
+        for floor in [0, FIRST + 5, u64::MAX] {
+            for cursor in [0, FIRST, u64::MAX] {
+                assert!(
+                    !invalid(at(now, floor, cursor, &v)),
+                    "{now} {floor} {cursor}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn layer_s_verdicts_do_not_depend_on_the_context() {
+    let all = members();
+    let c = committee(&all);
+    let sentinel = sentinel(EPOCH);
+    let mut bad = first_round(&all[0]);
+    bad.timestamp += 1;
+    for (now, floor, cursor) in [(0, 0, 0), (NOW, u64::MAX, u64::MAX), (u64::MAX, 5, FIRST)] {
+        let ctx = Context {
+            chain_id: CHAIN,
+            genesis_identity: GENESIS,
+            active: EpochRecord {
+                epoch: EPOCH,
+                first_round: FIRST,
+                sentinel: &sentinel,
+                committee: &c,
+            },
+            now_secs: now,
+            gc_floor: floor,
+            cursor,
+        };
+        assert!(invalid(v4_verdict(1_000, &bad, &ctx, |_| None)));
+    }
+}

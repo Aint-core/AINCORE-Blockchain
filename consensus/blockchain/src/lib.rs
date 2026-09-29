@@ -395,6 +395,11 @@ pub fn calculate_vertices_root(vertices: &[String]) -> String {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Vertex {
+    /// The consensus epoch the vertex belongs to (G1 V4). Bound by `hash_v4`
+    /// only: the V3 hash ignores it, and a V3 vertex leaves it 0, which is not
+    /// serialized, so V3 bytes are unchanged.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub epoch: u64,
     pub round: u64,
     pub author: String,
     pub parents: Vec<String>, // Hashes of parent vertices (from round r-1)
@@ -483,6 +488,19 @@ pub fn chain_id() -> String {
 /// identity. A compact parent-signed header proof binds the declared metadata
 /// to the digest without relying on which full bodies the receiver holds.
 /// This does not certify availability, causal validity, or non-equivocation.
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// The transport form of a vertex certificate (G1 V4), carried in a child's
+/// `ParentRef`. The attested body and both stakes are rebuilt from the child's
+/// epoch, the ref and the epoch committee, so none of them is taken on trust.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactCert {
+    pub signer_bitmap: Vec<u8>,
+    pub aggregate_signature: Vec<u8>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ParentRef {
     /// The round the parent was authored at. An ingress rule requires this to be
@@ -502,6 +520,11 @@ pub struct ParentRef {
     /// identity, and missing/invalid evidence is rejected before admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof: Option<ParentIdentityProof>,
+    /// V4 transport field: the parent's certificate. Not hashed, like `proof`:
+    /// any relay can strip or corrupt it, so a bad one never makes the child
+    /// invalid; the child waits for a good one instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert: Option<CompactCert>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -516,6 +539,7 @@ pub struct ParentIdentityProof {
 impl ParentRef {
     pub fn authenticated(vertex: &Vertex, public_key: String) -> Self {
         Self {
+            cert: None,
             round: vertex.round,
             author: vertex.author.clone(),
             digest: vertex.hash.clone(),
@@ -547,6 +571,7 @@ impl ParentRef {
             return false;
         }
         let header = Vertex {
+            epoch: 0,
             round: self.round,
             author: self.author.clone(),
             parents: Vec::new(),
@@ -572,8 +597,18 @@ impl ParentRef {
 /// domain tag is bumped from V2 so a pre-upgrade vertex can never collide with a
 /// post-upgrade one; this is a signed-preimage change and needs a fresh genesis.
 pub fn parents_root_of(parents: &[String], parent_refs: &[ParentRef]) -> String {
+    parents_root_in(b"AINCORE_PARENTS_V3", parents, parent_refs)
+}
+
+/// The V4 parents root: the V3 layout under its own domain (G1). Transport
+/// fields of a ref (`proof`, `cert`) are not part of it.
+pub fn parents_root_v4_of(parents: &[String], parent_refs: &[ParentRef]) -> String {
+    parents_root_in(b"AINCORE_PARENTS_V4", parents, parent_refs)
+}
+
+fn parents_root_in(domain: &[u8], parents: &[String], parent_refs: &[ParentRef]) -> String {
     let mut data = Vec::new();
-    data.extend_from_slice(b"AINCORE_PARENTS_V3");
+    data.extend_from_slice(domain);
     data.extend_from_slice(&(parents.len() as u32).to_be_bytes());
     for p in parents {
         data.extend_from_slice(&(p.len() as u64).to_be_bytes());
@@ -586,6 +621,36 @@ pub fn parents_root_of(parents: &[String], parent_refs: &[ParentRef]) -> String 
         data.extend_from_slice(r.author.as_bytes());
         data.extend_from_slice(&(r.digest.len() as u64).to_be_bytes());
         data.extend_from_slice(r.digest.as_bytes());
+    }
+    hex::encode(hash(&data))
+}
+
+/// The parent every first-round vertex of an epoch cites (G1 `EPOCH_GENESIS`).
+/// Epoch 0 keeps the legacy `"genesis"`. A later epoch's sentinel binds the
+/// chain, the genesis, the epoch, its first round, and the block and anchor
+/// that closed the previous epoch, so no two epochs, chains or histories share
+/// one.
+pub fn epoch_genesis(
+    chain_id: &str,
+    genesis_identity: &str,
+    epoch: u64,
+    first_round: u64,
+    prev_block_hash: &str,
+    prev_anchor_hash: &str,
+) -> String {
+    if epoch == 0 {
+        return "genesis".to_string();
+    }
+    let mut data = b"AINCORE_EPOCH_GENESIS_V1".to_vec();
+    for field in [chain_id, genesis_identity] {
+        data.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        data.extend_from_slice(field.as_bytes());
+    }
+    data.extend_from_slice(&epoch.to_be_bytes());
+    data.extend_from_slice(&first_round.to_be_bytes());
+    for field in [prev_block_hash, prev_anchor_hash] {
+        data.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        data.extend_from_slice(field.as_bytes());
     }
     hex::encode(hash(&data))
 }
@@ -623,6 +688,7 @@ impl Vertex {
             .as_secs();
 
         let mut v = Vertex {
+            epoch: 0,
             round,
             author,
             parents,
@@ -736,6 +802,50 @@ impl Vertex {
         self.calculate_hash_with_domain(&chain_id, &genesis_identity)
     }
 
+    /// The V4 parents root: the explicit compact root if present, else
+    /// computed from the parents.
+    pub fn parents_root_v4(&self) -> String {
+        match &self.parents_root {
+            Some(r) => r.clone(),
+            None => parents_root_v4_of(&self.parents, &self.parent_refs),
+        }
+    }
+
+    /// VERTEX HASH V4 (G1): the V2 layout under its own domain, with the
+    /// epoch bound after the genesis identity, the V4 parents root, and a
+    /// presence tag before the aggregate signature.
+    pub fn hash_v4(&self) -> String {
+        let (chain_id, genesis_identity) = vertex_domain();
+        self.hash_v4_with_domain(&chain_id, &genesis_identity)
+    }
+
+    pub fn hash_v4_with_domain(&self, chain_id: &str, genesis_identity: &str) -> String {
+        let mut data = Vec::new();
+        let put = |data: &mut Vec<u8>, bytes: &[u8]| {
+            data.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+            data.extend_from_slice(bytes);
+        };
+        data.extend_from_slice(b"AINCORE_VERTEX_V4");
+        put(&mut data, chain_id.as_bytes());
+        put(&mut data, genesis_identity.as_bytes());
+        data.extend_from_slice(&self.epoch.to_be_bytes());
+        data.extend_from_slice(&self.round.to_be_bytes());
+        put(&mut data, self.author.as_bytes());
+        put(&mut data, self.parents_root_v4().as_bytes());
+        // A presence tag, so an absent aggregate and an empty one differ: V2
+        // hashes both as "".
+        match &self.aggregated_signature {
+            None => data.push(0),
+            Some(aggregate) => {
+                data.push(1);
+                put(&mut data, aggregate.as_bytes());
+            }
+        }
+        data.extend_from_slice(&self.timestamp.to_be_bytes());
+        put(&mut data, self.payload_root().as_bytes());
+        hex::encode(hash(&data))
+    }
+
     /// Pure hashing core (testable with explicit domains).
     pub fn calculate_hash_with_domain(&self, chain_id: &str, genesis_identity: &str) -> String {
         let mut data = Vec::new();
@@ -767,11 +877,15 @@ impl Vertex {
 mod header_hash_tests;
 
 #[cfg(test)]
+mod vertex_v4_tests;
+
+#[cfg(test)]
 mod vertex_hash_v2_tests {
     use super::*;
 
     fn v(payload: Vec<String>) -> Vertex {
         let mut x = Vertex {
+            epoch: 0,
             round: 7,
             author: "a".into(),
             parents: vec!["genesis".into()],
@@ -989,6 +1103,7 @@ mod bft_time_tests {
     fn parent_refs_are_bound_by_the_vertex_hash() {
         let mk = |refs: Vec<ParentRef>| {
             let mut x = Vertex {
+                epoch: 0,
                 round: 4,
                 author: "author-a".into(),
                 parents: vec!["p1".into(), "p2".into()],
@@ -1005,6 +1120,7 @@ mod bft_time_tests {
             x
         };
         let r = |round, author: &str, digest: &str| ParentRef {
+            cert: None,
             round,
             author: author.into(),
             digest: digest.into(),
@@ -1065,12 +1181,25 @@ mod bft_time_tests {
     #[test]
     fn compact_proof_strips_parent_refs_and_still_verifies() {
         let mut v = Vertex {
+            epoch: 0,
             round: 4,
             author: "author-a".into(),
             parents: vec!["p1".into(), "p2".into()],
             parent_refs: vec![
-                ParentRef { round: 3, author: "A".into(), digest: "p1".into(), proof: None },
-                ParentRef { round: 3, author: "B".into(), digest: "p2".into(), proof: None },
+                ParentRef {
+                    cert: None,
+                    round: 3,
+                    author: "A".into(),
+                    digest: "p1".into(),
+                    proof: None,
+                },
+                ParentRef {
+                    cert: None,
+                    round: 3,
+                    author: "B".into(),
+                    digest: "p2".into(),
+                    proof: None,
+                },
             ],
             payload: vec!["tx1".into()],
             timestamp: 99,

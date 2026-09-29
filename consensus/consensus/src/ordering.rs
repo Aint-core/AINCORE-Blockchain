@@ -1679,6 +1679,7 @@ mod tests {
             .iter()
             .filter_map(|p| {
                 parse_fixture_hash(p).map(|(r, a)| blockchain::ParentRef {
+                    cert: None,
                     round: r,
                     author: a,
                     digest: p.clone(),
@@ -1689,6 +1690,7 @@ mod tests {
         (
             hash.clone(),
             blockchain::Vertex {
+                epoch: 0,
                 round,
                 author: author.to_string(),
                 timestamp: 1_000 + round,

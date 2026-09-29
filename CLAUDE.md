@@ -120,7 +120,7 @@ User TX
 ## ⛓️ Consensus Mechanics
 
 ### DagConsensus (dag.rs)
-- **BFT Quorum:** `(n * 2/3) + 1` — wajib untuk finality
+- **BFT Quorum:** `3·stake(S) > 2·total_stake` (`qc::stake_quorum_met`) — wajib untuk finality. Bukan hitungan node `(n * 2/3) + 1`: dengan stake tidak sama, rumus hitungan itu membolehkan 30% stake Byzantine mensertifikasi dua versi vertex (G1 math review, C9).
 - **Validator set:** dibaca dari `sys:validators` (storage) atau BCS `ValidatorSet` resource
 - **Observer mode:** node yang bukan validator tidak boleh mine
 - **Split-brain prevention:** validator terisolasi (no peers) berhenti mine

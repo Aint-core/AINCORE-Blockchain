@@ -244,7 +244,18 @@ pub fn parent_refs_admissible(
     vertex: &blockchain::Vertex,
     committee: &[(String, u64)],
 ) -> Result<(), String> {
-    if vertex.round <= 1 {
+    parent_refs_admissible_above(vertex, committee, 1)
+}
+
+/// `parent_refs_admissible` for a DAG whose rounds start at `first_round`
+/// (G1 V4, per epoch): a vertex at or below it cites the epoch sentinel and is
+/// exempt here.
+pub fn parent_refs_admissible_above(
+    vertex: &blockchain::Vertex,
+    committee: &[(String, u64)],
+    first_round: u64,
+) -> Result<(), String> {
+    if vertex.round <= first_round {
         return Ok(());
     }
     if vertex.parent_refs.len() != vertex.parents.len() {

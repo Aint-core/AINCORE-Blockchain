@@ -5111,6 +5111,7 @@ mod tests {
 
         let mk = |ts: u64| {
             let mut v = blockchain::Vertex {
+                epoch: 0,
                 round: 9,
                 author: offender.clone(),
                 parents: vec!["genesis".into()],
@@ -5152,6 +5153,7 @@ mod tests {
         // identically -- this is what keeps DAG-carried evidence tiny.
         let mk_big = |ts: u64| {
             let mut v = blockchain::Vertex {
+                epoch: 0,
                 round: 9,
                 author: offender.clone(),
                 parents: vec!["genesis".into()],

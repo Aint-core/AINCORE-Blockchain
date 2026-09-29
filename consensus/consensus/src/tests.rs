@@ -521,6 +521,7 @@ mod tests {
         let author = consensus.node_id.clone();
 
         let mut vertex_a = blockchain::Vertex {
+            epoch: 0,
             round: 1,
             author: author.clone(),
             timestamp: 1_000,
@@ -537,6 +538,7 @@ mod tests {
         vertex_a.sign_with_ed25519(&signing_key);
 
         let mut vertex_b = blockchain::Vertex {
+            epoch: 0,
             round: 1,
             author: author.clone(),
             timestamp: 2_000, // different content ⇒ different hash
@@ -822,6 +824,7 @@ mod tests {
         // check passes (this node is registered in setup_dag).
         let signing_key = SigningKey::from_bytes(&dag.node_key);
         let mut vertex = Vertex {
+            epoch: 0,
             round: 1,
             author: dag.node_id.clone(),
             parents: vec![],
@@ -862,6 +865,7 @@ mod tests {
         // Build a vertex with round = u64::MAX - 1 authored by this node.
         let signing_key = SigningKey::from_bytes(&dag.node_key);
         let mut vertex = Vertex {
+            epoch: 0,
             round: u64::MAX - 1,
             author: dag.node_id.clone(),
             parents: vec![],
@@ -1435,6 +1439,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let mut v = blockchain::Vertex {
+            epoch: 0,
             round,
             author: consensus.node_id.clone(),
             timestamp,
@@ -1455,6 +1460,7 @@ mod tests {
     fn signed_vertex(consensus: &DagConsensus, round: u64, timestamp: u64) -> blockchain::Vertex {
         let signing_key = crypto::SigningKey::from_bytes(&consensus.node_key);
         let mut v = blockchain::Vertex {
+            epoch: 0,
             round,
             author: consensus.node_id.clone(),
             timestamp,
@@ -1511,6 +1517,7 @@ mod tests {
         // offender's pubkey, so a forger cannot frame an honest validator.
         let attacker = crypto::SigningKey::from_bytes(&[7u8; 32]);
         let mut forged = blockchain::Vertex {
+            epoch: 0,
             round: 1,
             author: offender.clone(),
             timestamp: 3_000,
@@ -1729,6 +1736,7 @@ mod tests {
         let author = consensus.node_id.clone();
         let mk = move |parents: Vec<String>| {
             let mut v = blockchain::Vertex {
+                epoch: 0,
                 round: 1,
                 author: author.clone(),
                 timestamp: 7_000,
@@ -2042,6 +2050,7 @@ mod tests {
         // The remote validator emits a vertex FAR ahead of us.
         let far_round = round_before + 500;
         let mut far_vertex = blockchain::Vertex {
+            epoch: 0,
             round: far_round,
             author: remote_id.clone(),
             timestamp: 1_000,
@@ -2080,14 +2089,22 @@ mod tests {
         // design) — and it still must not drag the local proposal clock forward.
         // Without this leg the test would have been weakened into "we now reject
         // everything far ahead", which is a different and lesser claim.
-        let local_parent = tier2_signed(&consensus.node_key, &consensus.node_id, far_round - 1, 999);
+        let local_parent =
+            tier2_signed(&consensus.node_key, &consensus.node_id, far_round - 1, 999);
         let remote_parent = tier2_signed(&[99u8; 32], &remote_id, far_round - 1, 999);
         let parent_refs = vec![
-            blockchain::ParentRef::authenticated(&local_parent,
-                hex::encode(crypto::SigningKey::from_bytes(&consensus.node_key).verifying_key().to_bytes())),
+            blockchain::ParentRef::authenticated(
+                &local_parent,
+                hex::encode(
+                    crypto::SigningKey::from_bytes(&consensus.node_key)
+                        .verifying_key()
+                        .to_bytes(),
+                ),
+            ),
             blockchain::ParentRef::authenticated(&remote_parent, remote_pub),
         ];
         let mut far_ok = blockchain::Vertex {
+            epoch: 0,
             round: far_round,
             author: remote_id.clone(),
             timestamp: 1_000,
@@ -2295,6 +2312,7 @@ mod tests {
     fn tier2_signed(key: &[u8; 32], author: &str, round: u64, ts: u64) -> blockchain::Vertex {
         let sk = crypto::SigningKey::from_bytes(key);
         let mut v = blockchain::Vertex {
+            epoch: 0,
             round,
             author: author.to_string(),
             timestamp: ts,
@@ -2864,6 +2882,7 @@ mod tests {
     ) -> blockchain::Vertex {
         let sk = crypto::SigningKey::from_bytes(key);
         let mut v = blockchain::Vertex {
+            epoch: 0,
             round,
             author: author.to_string(),
             timestamp: ts,
@@ -2872,6 +2891,7 @@ mod tests {
             parent_refs: parents
                 .iter()
                 .map(|(d, r, a, proof)| blockchain::ParentRef {
+                    cert: None,
                     round: *r,
                     author: a.clone(),
                     digest: d.clone(),
