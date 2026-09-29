@@ -5,6 +5,7 @@ mod tests {
         object::{self, Object},
         StateDB,
     };
+    use std::collections::BTreeSet;
     use std::fs;
 
     fn temp_db(name: &str) -> StateDB {
@@ -390,7 +391,7 @@ mod tests {
         assert_eq!(db.get_tx_block_height(&hash2), Some(2));
         assert_eq!(db.get_tx_block_height(&hash3), Some(3));
 
-        let deleted = db.prune_old_blocks(4, 2, 10).unwrap();
+        let deleted = db.prune_old_blocks(4, 2, 10, &Default::default()).unwrap();
         assert_eq!(
             deleted, 1,
             "only block 1 is older than the retention window"
@@ -405,6 +406,48 @@ mod tests {
         assert_eq!(db.get_tx_block_height(&hash2), Some(2));
         assert_eq!(db.get_tx_block_height(&hash3), Some(3));
         assert_eq!(db.get_chain_height(), 3, "latest_height must not be pruned");
+    }
+
+    /// G3 SN-4: a pinned block survives the prune cursor, and goes once its
+    /// pin expires, with its tx index.
+    #[test]
+    fn pinned_blocks_survive_pruning_until_their_pin_expires() {
+        use sha2::{Digest, Sha256};
+        let db = temp_db("block_prune_pinned");
+        let tx = |h: u64| format!(r#"{{"sender":"s","sequence_number":{h}}}"#);
+        for h in 1..=6u64 {
+            let json = format!(
+                r#"{{"header":{{"hash":"h{h}","height":{h}}},"transactions":[{}]}}"#,
+                serde_json::to_string(&tx(h)).unwrap(),
+            );
+            db.save_block_json(h, &json).unwrap();
+        }
+        let pinned: BTreeSet<u64> = [2].into();
+        assert_eq!(
+            db.prune_old_blocks(6, 2, 10, &pinned).unwrap(),
+            2,
+            "blocks 1 and 3"
+        );
+        for h in [1u64, 3] {
+            assert_eq!(db.get(&format!("block_{h}")).unwrap(), None, "{h}");
+        }
+        assert!(
+            db.get("block_2").unwrap().is_some(),
+            "the pinned block stays"
+        );
+        let hash2 = hex::encode(Sha256::digest(tx(2).as_bytes()));
+        assert_eq!(db.get_tx_block_height(&hash2), Some(2));
+        assert_eq!(
+            db.prune_old_blocks(7, 2, 10, &pinned).unwrap(),
+            1,
+            "only block 4"
+        );
+        assert!(db.get("block_2").unwrap().is_some(), "the cursor passed it");
+        assert!(db.prune_block_at(2).unwrap());
+        assert_eq!(db.get("block_2").unwrap(), None);
+        assert_eq!(db.get("block_txs:2").unwrap(), None);
+        assert_eq!(db.get_tx_block_height(&hash2), None);
+        assert!(!db.prune_block_at(2).unwrap(), "already gone");
     }
 
     #[test]

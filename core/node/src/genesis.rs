@@ -754,9 +754,23 @@ pub fn stdlib_hash_of(stdlib_path: &str) -> Result<String, GenesisError> {
     Ok(stdlib_state_hash(&load_stdlib_modules(stdlib_path)?))
 }
 
+/// G3 SN-1b: genesis never runs on a datadir a snapshot restore marked; the
+/// restore must finish (or the datadir be wiped) first.
+fn refuse_unfinished_restore(storage: &StateDB) -> Result<(), GenesisError> {
+    if storage.get(storage::RESTORE_MARKER)?.is_some() {
+        return Err(GenesisError::InvalidData(
+            "a snapshot restore is unfinished in this datadir: run the restore again, or wipe \
+             the datadir"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Initialize genesis from the genesis.json `genesis_file_path` finds, or
 /// reopen a database that already holds one (which needs no genesis.json).
 pub fn initialize_genesis(storage: &Arc<StateDB>, stdlib_path: &str) -> Result<(), GenesisError> {
+    refuse_unfinished_restore(storage)?;
     if storage.get("genesis_initialized")?.is_some() {
         return reopen_genesis(storage);
     }
@@ -779,6 +793,7 @@ pub fn initialize_genesis_from(
     stdlib_path: &str,
     genesis_path: &std::path::Path,
 ) -> Result<(), GenesisError> {
+    refuse_unfinished_restore(storage)?;
     if storage.get("genesis_initialized")?.is_some() {
         return reopen_genesis(storage);
     }
@@ -3017,6 +3032,22 @@ mod tests {
             bad.tip_agreement_n = tip;
             assert!(build_genesis(&bad, &stdlib()).is_err(), "{burn:?} {tip:?}");
         }
+    }
+
+    /// G3 SN-1b (review L4): genesis never runs on a datadir that carries a
+    /// restore marker.
+    #[test]
+    fn genesis_refuses_a_datadir_with_an_unfinished_restore() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+        let db = temp_db("unfinished_restore");
+        db.put(storage::RESTORE_MARKER, "{\"height\":10}").unwrap();
+        let file = write_file("unfinished_restore", &s3_genesis_file());
+        let err = initialize_genesis_from(&db, &stdlib_path(), &file).unwrap_err();
+        assert!(err.to_string().contains("restore is unfinished"), "{err}");
+        assert!(db.get("genesis_initialized").unwrap().is_none());
+        db.delete(storage::RESTORE_MARKER).unwrap();
+        initialize_genesis_from(&db, &stdlib_path(), &file).expect("then genesis runs");
     }
 
     /// Review finding (S3a): a reopen must not depend on genesis.json, the

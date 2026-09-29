@@ -755,68 +755,117 @@ counters, never values.
   defaults follow block retention: 100,000 blocks in full mode and 1,000 in observer mode,
   with pins kept for two windows.
 
-**S6 status (branch `g3/activation`).** S6a is the library half, S6b the node wiring.
+**S6 status (branch `g3/activation`).** S6a is the library half, S6b the node wiring; one
+independent review, whose findings are fixed.
 - **Trust until TA (S5):** the anchor is a weak-subjectivity checkpoint
-  `height:block_hash:state_root` (TA-0, TA-4), pinned by the operator.
-  - Every chunk is proven against its root.
-  - The block and QC at the checkpoint come from peers and must match it, field by field
-    (`check_anchor`).
+  `height:block_hash:state_root` (TA-0, TA-4), pinned by the operator together with the
+  network's genesis identity (`AINCORE_EXPECTED_GENESIS_HASH`, required for a restore).
+  - Every chunk, and every part of a large value, is proven against the checkpoint root.
+  - The block and QC at the checkpoint come from peers as a pair. The pair must match
+    the checkpoint and each other (`check_anchor`), and the block stored is the one
+    whose own QC verifies.
   - After the restore, the QC must verify under the committee that the restored state
-    records for its epoch, and under this node's own chain id. That is a consistency
-    check, not trust, since the committee comes from the pinned state itself.
-  - `consensus:epoch`, `consensus:epoch_start_height:*`, `genesis:validator_set:v1`
-    and `sys:validator_set:epoch:*` are all S, so the restored state carries its
-    committee.
-- **Write gate:** `StateDB::restore_transaction`, a new `restore` write context, may
-  write consensus state. It opens only while `sys:restore_in_progress` exists (WG-1 now
-  reads: a block, genesis or a verified restore).
+    records for its epoch, and under this node's chain id. That is a consistency check,
+    not trust, since the committee comes from the pinned state itself.
+  - `consensus:epoch`, `consensus:epoch_start_height:*`, `genesis:validator_set:v1` and
+    `sys:validator_set:epoch:*` are all S, so the restored state carries its committee.
+- **Genesis binding:** the plan carries this node's own genesis, built in memory from its
+  genesis.json (`genesis::build_local_genesis`), checked against the required pin.
+  - The restored state must also hold the same `GENESIS_FIXED` values (`sys:chain_id`,
+    `genesis:validator_set:v1`, `sys:config:epoch_block_interval`).
+  - The identity itself (it binds `state_root(0)`) cannot be recomputed from a later
+    state. It is trusted through the pin, and written with the genesis rows outside the
+    state.
+- **Write gate:** `StateDB::restore_transaction`, a new `restore` write context, may write
+  consensus state and opens only while `sys:restore_in_progress` exists. The marker keeps
+  honest code honest; it is not a security boundary, since any base write may create it.
 - **Transport** (`sync::state_sync`, served from `chain_sync::handle_message`):
   - `STATE_ANCHOR_REQ` returns `block_{h}` and `consensus:qc:{h}`.
   - `STATE_CHUNK_REQ` returns up to 2,000 leaves and 6 MiB, with the range proof
     borsh-encoded (`state_commit::wire_chunk`).
-  - A server serves only versions it retains (`state_commit::servable`: the floor to
-    the latest, plus the pins), holding one of the shared serving slots.
+  - A value over 256 KiB travels in 2 MiB parts (`STATE_VALUE_REQ`), so no single leaf
+    can make the state unservable. The client accepts a leaf of at most 256 MiB, and at
+    most 512 MiB per chunk.
+  - A server serves only what its pruning keeps (`state_commit::servable`: the floor to
+    the latest, plus the pins), under the node's own retention.
+  - Its budget is apart from vertex serving: two requests at a time, 4,000 leaves or
+    parts a second. The reads run in `block_in_place`, off the workers consensus shares.
+- **Pins keep their blocks** (SN-4, review H1): block pruning skips the pinned heights,
+  and deletes a pin's block once the pin expires (`state_commit::expired_pin`). A
+  snapshot at a pin older than block retention keeps its anchor. QCs are never pruned.
 - **Driver** (`restore_state`):
   - It runs on a fresh datadir, on one an interrupted restore marked, or, when asked,
     over an existing chain (SN-4, a node offline past retention).
-  - Before starting it clears S, C, T and Dead rows, and L rows except the signing
-    guards and `latest_proposed_round` (SN-6).
-  - A refused chunk, a stream that ends early or a wrong root wipes the attempt and
-    restarts with the next peer.
-  - A peer that does not answer is skipped at the same cursor.
-  - The SN-1b record, the tree completion and the removal of the marker are one
-    batch.
-- **Witnesses** (all SN-4 horizons that do not need the node):
-  - honest peers;
-  - a forged chunk;
-  - a stream that ends early, and one that drops a leaf;
-  - a peer that prunes mid-restore;
-  - an interrupted restore, which refuses to boot (RC-1) and then completes;
-  - a long-offline datadir, replaced only when asked, with its guards kept;
-  - a checkpoint no peer backs, one from another chain, and one its own committee did
-    not sign;
-  - the server's retention refusals.
-- **Genesis binding:** the plan carries this node's own genesis, built in memory from its
-  genesis.json (`genesis::build_local_genesis`, with the operator's pin checked).
-  - The restored state must hold the same `GENESIS_FIXED` values (`sys:chain_id`,
-    `genesis:validator_set:v1`, `sys:config:epoch_block_interval`). That binds the
-    checkpoint to this node's genesis, not only to its chain id.
-  - The genesis rows outside the state (stdlib pins, version, identity) are written with
-    the bootstrap record.
-- **SN-3 witness:** a node restored at block 1 imports block 2 through `process_blocks`
-  and reaches the producer's root.
+  - It refuses a chain where this node's key is a validator (SN-6, see below).
+  - Before starting it clears S, C, T and Dead rows, and L rows except the signing guards
+    and `latest_proposed_round`.
+  - Requests go round robin, so no one peer, however slow, owns the restore.
+  - A peer that sends a refused chunk or ends the stream early is shut out, and the
+    attempt restarts with the others.
+  - An unanswered request (busy, down, pruned) is retried with the next peer, from the
+    same cursor, after a backoff. Over TCP a request times out after 30 s.
+  - Every failure keeps the restore marker, so a failed or interrupted restore refuses
+    to boot (RC-1) until a restore completes; genesis refuses such a datadir too.
+    Replacing a chain destroys it before the new state can be verified (the check needs
+    the restored state): move a datadir aside rather than replace it when in doubt.
+  - The SN-1b record, the tree completion and the removal of the marker are one batch.
+    It also:
+    - resets the block prune cursor to `h`;
+    - removes a `sync:halt_reason` raised against the old state;
+    - records `sys:restored_checkpoint`.
+- **SN-6, what S6 does and does not do:** a validator key restored onto a new datadir
+  could sign a slot its old instance signed, and the abstention that prevents that (G1
+  RC-3) does not exist yet. So a restore refuses a chain where this node's key is in the
+  checkpoint epoch's committee or the active validator set. Only observers restore. A
+  replace keeps the old datadir's signing guards and proposal round.
 - **Node wiring (S6b):**
-  - Settings: `AINCORE_STATE_SYNC_CHECKPOINT=height:block_hash:state_root` and
-    `AINCORE_STATE_SYNC_PEERS=ip:port,...` (the peers' TCP ports).
-    `AINCORE_STATE_SYNC_REPLACE=1` replaces an older chain in the datadir.
+  - Settings: `AINCORE_STATE_SYNC_CHECKPOINT=height:block_hash:state_root`,
+    `AINCORE_STATE_SYNC_PEERS=ip:port,...` (the peers' TCP ports), and
+    `AINCORE_EXPECTED_GENESIS_HASH`. `AINCORE_STATE_SYNC_REPLACE=1` replaces an older
+    chain.
   - The restore runs before genesis handling, and genesis then reopens the restored
     datadir.
-  - A datadir at or past the checkpoint is left alone, so the settings may stay set.
-  - Transport: `restore_over_tcp` over the node's encrypted TCP, one connection per peer,
-    reopened after a failure.
+  - Nothing is restored on a datadir already restored from the checkpoint, or past it on
+    the checkpoint's chain, so the settings may stay set.
+  - A datadir past it on another chain (its block at the checkpoint height differs) is
+    refused unless REPLACE is set. One whose block there is pruned cannot be compared
+    and is left alone unless REPLACE is set.
   - The node's TCP handler routes by `ChainSync::serves`, one list shared with
     `handle_message`. Before this the new requests would have reached no handler.
-- **Open:** a restore between real machines needs a G3 chain, so it comes with S8.
+- **Pruning on every path** (GC-1): a node that only imports blocks prunes like one that
+  builds them.
+- **Witnesses:**
+  - honest peers;
+  - a forged chunk, a forged value part, and a stream that ends early or drops a leaf,
+    each shutting its peer out;
+  - only lying peers;
+  - a forger next to a busy honest peer;
+  - busy answers waited out;
+  - a one-leaf-at-a-time peer;
+  - a peer that prunes mid-restore;
+  - a pinned version below block retention;
+  - an interrupted restore;
+  - a long-offline datadir (replaced only when asked; guards, attestations and proposal
+    round kept; old chain data, view and halt gone);
+  - a validator key refused;
+  - checkpoints that do not hold, including every `GENESIS_FIXED` mismatch and a
+    committee outside the state, all failing closed;
+  - a checkpoint in a later epoch;
+  - block and QC kept as a pair;
+  - a leaf larger than a chunk, in parts;
+  - the chunk byte budget and the load shedding;
+  - the server's retention refusals;
+  - a restore over real encrypted TCP;
+  - a dropped connection reopened;
+  - SN-3, a restored node importing the next block through `process_blocks`;
+  - the node's settings and its fork, restored-already and pruned-block decisions.
+- **Open:**
+  - A restore between real machines needs a G3 chain, so it comes with S8.
+  - Serving reads a whole large value once per request burst. A cache of one value
+    bounds that, not a hostile client asking for many.
+  - Global resources have no size bound (review H2: a permissionless `register_device`
+    grows `DeviceRegistry`). Parts make that servable; bounding it is an execution
+    matter.
 | S8 | Activation in the shared fresh genesis with G1 S11 (AC) | Genesis |
 
 ## Open questions and founder decisions

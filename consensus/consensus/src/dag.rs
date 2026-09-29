@@ -3321,13 +3321,22 @@ pub fn prune_history(storage: &Arc<StateDB>, height: u64, policy: Option<(u64, u
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return,
     };
-    match storage.prune_old_blocks(height, keep_blocks, max_delete) {
+    // The pinned versions keep their blocks too, so a snapshot at a pin has
+    // its anchor block (SN-4); a pin's block goes once the pin expires.
+    let interval = state_commit::epoch_interval(storage);
+    let pins = state_commit::pin_schedule(height, keep_blocks, interval);
+    match storage.prune_old_blocks(height, keep_blocks, max_delete, &pins) {
         Ok(deleted) if deleted > 0 => println!(
             "🧹 Block history pruning: removed {} old blocks (retain={}, batch={})",
             deleted, keep_blocks, max_delete
         ),
         Ok(_) => {}
         Err(e) => eprintln!("⚠️ Block history pruning failed: {}", e),
+    }
+    if let Some(expired) = state_commit::expired_pin(height, keep_blocks, interval) {
+        if let Err(e) = storage.prune_block_at(expired) {
+            eprintln!("⚠️ Pruning the expired pin block {expired} failed: {e}");
+        }
     }
     // State versions follow the same window, so proofs are served exactly as
     // long as blocks are.

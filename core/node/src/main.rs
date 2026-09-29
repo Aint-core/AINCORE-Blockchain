@@ -131,6 +131,10 @@ struct StateSyncSettings {
     replace_existing: bool,
 }
 
+/// A restore takes its trust from the checkpoint and from the network's
+/// genesis identity, which the operator pins alongside it (TA-1).
+const GENESIS_PIN: &str = "AINCORE_EXPECTED_GENESIS_HASH";
+
 impl StateSyncSettings {
     /// `AINCORE_STATE_SYNC_CHECKPOINT=height:block_hash:state_root`,
     /// `AINCORE_STATE_SYNC_PEERS=ip:port,...` and, to replace an older chain,
@@ -139,11 +143,18 @@ impl StateSyncSettings {
         checkpoint: Option<String>,
         peers: Option<String>,
         replace: Option<String>,
+        genesis_pin: Option<String>,
     ) -> Result<Option<Self>, String> {
         let Some(checkpoint) = checkpoint.filter(|c| !c.trim().is_empty()) else {
             return Ok(None);
         };
         let checkpoint = checkpoint.parse()?;
+        if genesis_pin.filter(|p| !p.trim().is_empty()).is_none() {
+            return Err(format!(
+                "a state restore needs {GENESIS_PIN}: the checkpoint pins the state, the genesis \
+                 hash pins which chain it belongs to"
+            ));
+        }
         let peers = peers
             .filter(|p| !p.trim().is_empty())
             .ok_or("AINCORE_STATE_SYNC_PEERS is required with a checkpoint")?;
@@ -179,6 +190,7 @@ impl StateSyncSettings {
             std::env::var("AINCORE_STATE_SYNC_CHECKPOINT").ok(),
             std::env::var("AINCORE_STATE_SYNC_PEERS").ok(),
             std::env::var("AINCORE_STATE_SYNC_REPLACE").ok(),
+            std::env::var(GENESIS_PIN).ok(),
         )
     }
 }
@@ -186,35 +198,65 @@ impl StateSyncSettings {
 /// G3 S6 (SN-1, SN-2): restore this node's state at an operator-pinned
 /// checkpoint from peers, before genesis handling; genesis then reopens the
 /// restored datadir. The checkpoint is the trust anchor, so it must come from
-/// a source the operator trusts (TA-0, TA-4). A datadir at or past it is left
-/// alone, so the settings may stay set.
+/// a source the operator trusts (TA-0, TA-4).
+///
+/// Nothing is restored on a datadir already restored from this checkpoint,
+/// or one past it on the checkpoint's own chain, so the settings may stay
+/// set. A datadir past it on another chain (its block at the checkpoint
+/// height differs) is refused unless `AINCORE_STATE_SYNC_REPLACE=1`.
 async fn restore_from_checkpoint(
     storage: &Arc<StateDB>,
     settings: &StateSyncSettings,
     genesis: impl FnOnce() -> Result<genesis::GenesisState, String>,
     my_port: u16,
+    local_signer: &str,
 ) -> Result<Option<chain_sync::state_sync::Restored>, String> {
-    let marked = storage
-        .get(storage::RESTORE_MARKER)
-        .map_err(|e| e.to_string())?
-        .is_some();
-    let height = storage
-        .get("latest_height")
-        .map_err(|e| e.to_string())?
-        .and_then(|h| h.parse::<u64>().ok());
-    if !marked && height.is_some_and(|h| h >= settings.checkpoint.height) {
-        println!(
-            "ℹ️ [STATE_SYNC] at height {} already, at or past the checkpoint; not restoring",
-            height.unwrap_or(0)
-        );
-        return Ok(None);
+    let cp = &settings.checkpoint;
+    let read = |key: &str| storage.get(key).map_err(|e| e.to_string());
+    if read(storage::RESTORE_MARKER)?.is_none() {
+        if read(chain_sync::state_sync::RESTORED_CHECKPOINT)? == Some(cp.to_string()) {
+            println!("ℹ️ [STATE_SYNC] restored from this checkpoint already; not restoring");
+            return Ok(None);
+        }
+        let height = read("latest_height")?.and_then(|h| h.parse::<u64>().ok());
+        if let Some(height) = height.filter(|h| *h >= cp.height) {
+            let ours = read(&format!("block_{}", cp.height))?
+                .and_then(|json| serde_json::from_str::<blockchain::Block>(&json).ok())
+                .map(|block| block.header.hash);
+            match ours {
+                Some(hash) if hash.eq_ignore_ascii_case(&cp.block_hash) => {
+                    println!(
+                        "ℹ️ [STATE_SYNC] at height {height}, past the checkpoint on its chain; \
+                         not restoring"
+                    );
+                    return Ok(None);
+                }
+                Some(hash) if !settings.replace_existing => {
+                    return Err(format!(
+                        "this datadir's block {} is {hash}, not the checkpoint's {}: it is on \
+                         another chain. Set AINCORE_STATE_SYNC_REPLACE=1 to replace it",
+                        cp.height, cp.block_hash
+                    ))
+                }
+                None if !settings.replace_existing => {
+                    println!(
+                        "ℹ️ [STATE_SYNC] at height {height}, past the checkpoint, whose block is \
+                         pruned here and cannot be compared; not restoring"
+                    );
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
     }
     let genesis = genesis()?;
     let plan = chain_sync::state_sync::RestorePlan {
-        checkpoint: &settings.checkpoint,
+        checkpoint: cp,
         genesis: &genesis.writes,
         genesis_identity: &genesis.identity,
         replace_existing: settings.replace_existing,
+        local_signer: Some(local_signer),
+        patience: chain_sync::state_sync::Patience::default(),
     };
     println!(
         "🔄 [STATE_SYNC] restoring height {} from {} peer(s)",
@@ -634,7 +676,8 @@ async fn main() {
         Ok(Some(settings)) => {
             let local_genesis =
                 || genesis::build_local_genesis(stdlib_path).map_err(|e| e.to_string());
-            if let Err(e) = restore_from_checkpoint(&storage, &settings, local_genesis, port).await
+            if let Err(e) =
+                restore_from_checkpoint(&storage, &settings, local_genesis, port, &node_id).await
             {
                 eprintln!("❌ FATAL: state restore failed: {e}; refusing to boot");
                 std::process::exit(1);
@@ -1315,22 +1358,27 @@ mod boot_identity_tests {
         );
     }
 
-    /// G3 S6: the restore settings parse strictly, and are off without a
-    /// checkpoint.
+    /// G3 S6: the restore settings parse strictly, are off without a
+    /// checkpoint, and need the genesis pin with one.
     #[test]
     fn state_sync_settings_parse_strictly() {
         use super::StateSyncSettings;
         let some = |s: &str| Some(s.to_string());
+        let pin = some(&"ee".repeat(32));
         let cp = format!("7:{}:{}", "ab".repeat(32), "cd".repeat(32));
         assert_eq!(
-            StateSyncSettings::parse(None, some("1.2.3.4:9"), None),
+            StateSyncSettings::parse(None, some("1.2.3.4:9"), None, None),
             Ok(None)
         );
-        assert_eq!(StateSyncSettings::parse(some(" "), None, None), Ok(None));
+        assert_eq!(
+            StateSyncSettings::parse(some(" "), None, None, None),
+            Ok(None)
+        );
         let parsed = StateSyncSettings::parse(
             some(&cp),
             some("192.168.18.202:9022, 192.168.18.66:9032"),
             some("1"),
+            pin.clone(),
         )
         .unwrap()
         .unwrap();
@@ -1343,52 +1391,146 @@ mod boot_identity_tests {
             ]
         );
         assert!(parsed.replace_existing);
-        for (peers, replace) in [
-            (None, None),
-            (some(""), None),
-            (some("192.168.18.202"), None),
-            (some(":9022"), None),
-            (some("host:99999"), None),
-            (some("host:9022"), some("yes")),
+        for (peers, replace, genesis_pin) in [
+            (None, None, pin.clone()),
+            (some(""), None, pin.clone()),
+            (some("192.168.18.202"), None, pin.clone()),
+            (some(":9022"), None, pin.clone()),
+            (some("host:99999"), None, pin.clone()),
+            (some("host:9022"), some("yes"), pin.clone()),
+            (some("host:9022"), None, None),
+            (some("host:9022"), None, some(" ")),
         ] {
             assert!(
-                StateSyncSettings::parse(some(&cp), peers.clone(), replace.clone()).is_err(),
-                "{peers:?} {replace:?}"
+                StateSyncSettings::parse(
+                    some(&cp),
+                    peers.clone(),
+                    replace.clone(),
+                    genesis_pin.clone()
+                )
+                .is_err(),
+                "{peers:?} {replace:?} {genesis_pin:?}"
             );
         }
-        assert!(StateSyncSettings::parse(some("7:x:y"), some("h:1"), None).is_err());
+        assert!(StateSyncSettings::parse(some("7:x:y"), some("h:1"), None, pin).is_err());
     }
 
-    /// G3 S6: a datadir at or past the checkpoint is left alone, so the
-    /// settings may stay set across restarts; no genesis is even built.
-    #[tokio::test]
-    async fn a_datadir_at_the_checkpoint_is_not_restored_again() {
-        use super::{restore_from_checkpoint, StateSyncSettings};
-        let path = std::env::temp_dir().join(format!("s6b_skip_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        let db = std::sync::Arc::new(storage::StateDB::open(path.to_str().unwrap()).unwrap());
-        db.put("latest_height", "7").unwrap();
-        let settings = StateSyncSettings::parse(
+    fn settings(replace: bool) -> super::StateSyncSettings {
+        super::StateSyncSettings::parse(
             Some(format!("7:{}:{}", "ab".repeat(32), "cd".repeat(32))),
             Some("127.0.0.1:1".into()),
-            None,
+            replace.then(|| "1".into()),
+            Some("ee".repeat(32)),
         )
         .unwrap()
-        .unwrap();
-        let untouched = || -> Result<node::genesis::GenesisState, String> {
-            panic!("no genesis is built when nothing is restored")
-        };
+        .unwrap()
+    }
+
+    fn skip_db(name: &str) -> std::sync::Arc<storage::StateDB> {
+        let path = std::env::temp_dir().join(format!(
+            "s6b_{name}_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::sync::Arc::new(storage::StateDB::open(path.to_str().unwrap()).unwrap())
+    }
+
+    fn block_at_7(hash: &str) -> String {
+        let mut block = blockchain::Block::new_with_roots(
+            7,
+            14,
+            "00".repeat(32),
+            vec![],
+            "p".into(),
+            String::new(),
+            String::new(),
+        );
+        block.header.hash = hash.to_string();
+        serde_json::to_string(&block).unwrap()
+    }
+
+    /// A restore must not run: no genesis is built.
+    fn untouched() -> Result<node::genesis::GenesisState, String> {
+        panic!("no genesis is built when nothing is restored")
+    }
+
+    /// A restore runs: it asks for the genesis, which here fails.
+    fn no_genesis() -> Result<node::genesis::GenesisState, String> {
+        Err("no genesis".into())
+    }
+
+    /// G3 S6: a datadir restored from this checkpoint, or past it on its
+    /// chain, is left alone, so the settings may stay set across restarts.
+    #[tokio::test]
+    async fn a_datadir_at_the_checkpoint_is_not_restored_again() {
+        use super::restore_from_checkpoint;
+        let me = "ff".repeat(32);
+        let on_chain = skip_db("on_chain");
+        on_chain.put("latest_height", "9").unwrap();
+        on_chain
+            .put("block_7", &block_at_7(&"ab".repeat(32)))
+            .unwrap();
+        for replace in [false, true] {
+            assert_eq!(
+                restore_from_checkpoint(&on_chain, &settings(replace), untouched, 0, &me).await,
+                Ok(None),
+                "on the checkpoint's chain (replace: {replace})"
+            );
+        }
+        let restored = skip_db("restored");
+        restored
+            .put(
+                chain_sync::state_sync::RESTORED_CHECKPOINT,
+                &settings(true).checkpoint.to_string(),
+            )
+            .unwrap();
         assert_eq!(
-            restore_from_checkpoint(&db, &settings, untouched, 0).await,
+            restore_from_checkpoint(&restored, &settings(true), untouched, 0, &me).await,
+            Ok(None),
+            "restored from it already"
+        );
+        // Mid-restore, it restores.
+        on_chain.put(storage::RESTORE_MARKER, "{}").unwrap();
+        assert_eq!(
+            restore_from_checkpoint(&on_chain, &settings(false), no_genesis, 0, &me).await,
+            Err("no genesis".into())
+        );
+    }
+
+    /// Review M2: a datadir past the checkpoint on another chain (its block at
+    /// the checkpoint height differs: a fork) is refused, or replaced when
+    /// asked. One whose block there is pruned cannot be compared, and is
+    /// left alone unless replacing is asked for.
+    #[tokio::test]
+    async fn a_forked_datadir_past_the_checkpoint_is_refused_or_replaced() {
+        use super::restore_from_checkpoint;
+        let me = "ff".repeat(32);
+        let forked = skip_db("forked");
+        forked.put("latest_height", "100").unwrap();
+        forked
+            .put("block_7", &block_at_7(&"99".repeat(32)))
+            .unwrap();
+        let err = restore_from_checkpoint(&forked, &settings(false), untouched, 0, &me)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("another chain") && err.contains("REPLACE"),
+            "{err}"
+        );
+        assert_eq!(
+            restore_from_checkpoint(&forked, &settings(true), no_genesis, 0, &me).await,
+            Err("no genesis".into()),
+            "replaced when asked"
+        );
+        let pruned = skip_db("pruned");
+        pruned.put("latest_height", "100").unwrap();
+        assert_eq!(
+            restore_from_checkpoint(&pruned, &settings(false), untouched, 0, &me).await,
             Ok(None)
         );
-        // Below the checkpoint, or mid-restore, it restores (and here fails:
-        // the genesis cannot be built).
-        db.put(storage::RESTORE_MARKER, "{}").unwrap();
-        let no_genesis =
-            || -> Result<node::genesis::GenesisState, String> { Err("no genesis".into()) };
         assert_eq!(
-            restore_from_checkpoint(&db, &settings, no_genesis, 0).await,
+            restore_from_checkpoint(&pruned, &settings(true), no_genesis, 0, &me).await,
             Err("no genesis".into())
         );
     }

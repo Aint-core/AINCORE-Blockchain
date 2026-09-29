@@ -735,6 +735,17 @@ pub fn pin_schedule(
         .collect()
 }
 
+/// The pin that most recently left `pin_schedule(tip, keep, interval)`: the
+/// largest pin spacing multiple below the schedule's start. Its block goes
+/// then (SN-4); `None` while nothing has expired.
+pub fn expired_pin(tip: Version, keep: Version, epoch_interval: Version) -> Option<Version> {
+    let interval = epoch_interval.max(1);
+    let spacing = interval * (keep / 4 / interval).max(1);
+    let from = tip.saturating_sub(keep.saturating_mul(2));
+    let expired = from.checked_sub(1)? / spacing * spacing;
+    (expired > 0).then_some(expired)
+}
+
 /// The epoch interval genesis pinned (FX-6); pins are its multiples. Boot
 /// refuses a database without the pin, so a running node never sees the
 /// default.
@@ -842,6 +853,14 @@ pub fn audit_root_against_qc(db: &StateDB, version: Version, qc_state_root: &str
 pub fn root(db: &StateDB, version: Version) -> Result<RootHash> {
     no_panic("root", || {
         Sha256Jmt::new(&RootReader(db)).get_root_hash(version)
+    })
+}
+
+/// The value of `key` at `version`, read through the tree: `None` when the
+/// key is absent there.
+pub fn value_at(db: &Arc<StateDB>, key: &str, version: Version) -> Result<Option<OwnedValue>> {
+    no_panic("value", || {
+        Sha256Jmt::new(&JmtStore::new(db.clone())).get(key_hash(key), version)
     })
 }
 

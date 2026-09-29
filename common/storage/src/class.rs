@@ -192,7 +192,8 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         | "sys:tx_index_backfill_v1_complete"
         | "genesis_initialized"
         | "sync:halt_reason"
-        | "sys:restore_in_progress" => Some(Node),
+        | "sys:restore_in_progress"
+        | "sys:restored_checkpoint" => Some(Node),
 
         "genesis_identity" => Some(Constant),
 
@@ -610,6 +611,7 @@ mod tests {
             ("alarm:anchor_height_violation:9".into(), Node),
             ("sync:halt_reason".into(), Node),
             ("sys:restore_in_progress".into(), Node),
+            ("sys:restored_checkpoint".into(), Node),
             // K, T, log
             ("genesis_identity".into(), Constant),
             (format!("jmt:node:{H64}"), Tree),

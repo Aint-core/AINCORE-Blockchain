@@ -517,6 +517,15 @@ impl StateDB {
         }
     }
 
+    /// One block's body, its tx list and the tx indexes that point into it.
+    fn delete_block(&self, height: u64, batch: &mut rocksdb::WriteBatch) {
+        for tx_hash in self.block_tx_hashes(height) {
+            batch.delete(format!("tx_index:{}", tx_hash).as_bytes());
+        }
+        batch.delete(format!("block_{}", height).as_bytes());
+        batch.delete(format!("block_txs:{}", height).as_bytes());
+    }
+
     /// Prune historical block bodies and their tx indexes while preserving
     /// live world-state resources. This is for validator/observer storage
     /// modes; archive nodes should not call it.
@@ -524,11 +533,16 @@ impl StateDB {
     /// The operation is cursor-based and bounded so a node that is already far
     /// past the retention window does not try to delete hundreds of thousands
     /// of keys in one block commit.
+    ///
+    /// G3 SN-4: the blocks at `pinned` heights stay, so a snapshot at a
+    /// pinned version keeps its anchor block. `prune_block_at` removes one
+    /// once its pin expires.
     pub fn prune_old_blocks(
         &self,
         current_height: u64,
         keep_blocks: u64,
         max_delete_per_call: u64,
+        pinned: &BTreeSet<u64>,
     ) -> Result<usize, StorageError> {
         if keep_blocks == 0 || max_delete_per_call == 0 || current_height <= keep_blocks {
             return Ok(0);
@@ -549,13 +563,11 @@ impl StateDB {
         let mut deleted = 0usize;
 
         while cursor < end_exclusive {
-            for tx_hash in self.block_tx_hashes(cursor) {
-                batch.delete(format!("tx_index:{}", tx_hash).as_bytes());
+            if !pinned.contains(&cursor) {
+                self.delete_block(cursor, &mut batch);
+                deleted += 1;
             }
-            batch.delete(format!("block_{}", cursor).as_bytes());
-            batch.delete(format!("block_txs:{}", cursor).as_bytes());
             cursor = cursor.saturating_add(1);
-            deleted += 1;
         }
 
         batch.put(
@@ -564,6 +576,18 @@ impl StateDB {
         );
         self.write_batch(batch)?;
         Ok(deleted)
+    }
+
+    /// G3 SN-4: delete the block at `height` (a pin that expired, which the
+    /// prune cursor already passed). Whether it was there.
+    pub fn prune_block_at(&self, height: u64) -> Result<bool, StorageError> {
+        if self.get(&format!("block_{}", height))?.is_none() {
+            return Ok(false);
+        }
+        let mut batch = rocksdb::WriteBatch::default();
+        self.delete_block(height, &mut batch);
+        self.write_batch(batch)?;
+        Ok(true)
     }
 
     /// Return block retention policy from environment.

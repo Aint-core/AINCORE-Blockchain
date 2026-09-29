@@ -92,6 +92,9 @@ pub const MAX_CONCURRENT_VERTEX_SERVES: usize = 4;
 #[derive(Debug)]
 pub struct VertexServeBudget {
     inner: Mutex<BudgetState>,
+    max_in_flight: usize,
+    per_sec: f64,
+    burst: f64,
 }
 
 #[derive(Debug)]
@@ -103,13 +106,11 @@ struct BudgetState {
 
 impl Default for VertexServeBudget {
     fn default() -> Self {
-        Self {
-            inner: Mutex::new(BudgetState {
-                tokens: VERTEX_SERVE_BURST,
-                last_refill: Instant::now(),
-                in_flight: 0,
-            }),
-        }
+        Self::with_limits(
+            MAX_CONCURRENT_VERTEX_SERVES,
+            VERTEX_SERVE_LOOKUPS_PER_SEC,
+            VERTEX_SERVE_BURST,
+        )
     }
 }
 
@@ -126,6 +127,21 @@ impl Drop for ServeSlot<'_> {
 }
 
 impl VertexServeBudget {
+    /// A budget with its own limits: at most `max_in_flight` concurrent
+    /// serves, and lookups refilled at `per_sec` up to `burst`.
+    pub fn with_limits(max_in_flight: usize, per_sec: f64, burst: f64) -> Self {
+        Self {
+            inner: Mutex::new(BudgetState {
+                tokens: burst,
+                last_refill: Instant::now(),
+                in_flight: 0,
+            }),
+            max_in_flight,
+            per_sec,
+            burst,
+        }
+    }
+
     /// The guarded state is three plain counters, so a panic while holding the
     /// lock leaves nothing inconsistent. Recovering from poisoning is therefore
     /// correct AND necessary: propagating it would either wedge the vertex server
@@ -138,7 +154,7 @@ impl VertexServeBudget {
     /// are already in flight. Callers shed load; they never queue.
     pub fn try_enter(&self) -> Option<ServeSlot<'_>> {
         let mut st = self.lock_recover();
-        if st.in_flight >= MAX_CONCURRENT_VERTEX_SERVES {
+        if st.in_flight >= self.max_in_flight {
             return None;
         }
         st.in_flight += 1;
@@ -153,7 +169,7 @@ impl VertexServeBudget {
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(st.last_refill).as_secs_f64();
         st.last_refill = now;
-        st.tokens = (st.tokens + elapsed * VERTEX_SERVE_LOOKUPS_PER_SEC).min(VERTEX_SERVE_BURST);
+        st.tokens = (st.tokens + elapsed * self.per_sec).min(self.burst);
         let granted = (want as f64).min(st.tokens.max(0.0)).floor();
         st.tokens -= granted;
         granted as usize
@@ -196,6 +212,9 @@ pub struct FinalityArtifact {
     pub qc: Option<consensus::qc::QuorumCertificate>,
 }
 
+/// A value served in parts: its version, key and bytes.
+type StateValue = (u64, String, Arc<Vec<u8>>);
+
 pub struct ChainSync {
     node_id: String,
     my_port: u16,
@@ -204,6 +223,11 @@ pub struct ChainSync {
     /// AUDIT H8: bounds what VERTEX_REQ can push through blocking RocksDB reads
     /// on the tokio workers shared with consensus. See `VertexServeBudget`.
     serve_budget: VertexServeBudget,
+    /// G3 S6: the same bound for snapshot serving, apart, so a restoring peer
+    /// never takes vertex serving's slots (`state_sync::STATE_SERVE_*`).
+    state_budget: VertexServeBudget,
+    /// The last value served in parts: (version, key, value).
+    state_value_cache: Mutex<Option<StateValue>>,
     /// Block retention (`StateDB::block_pruning_policy_from_env`), read once.
     /// Imported blocks prune under it like built ones (G3 GC-1).
     retention: Option<(u64, u64)>,
@@ -224,6 +248,12 @@ impl ChainSync {
             peers,
             storage,
             serve_budget: VertexServeBudget::default(),
+            state_budget: VertexServeBudget::with_limits(
+                state_sync::STATE_SERVE_IN_FLIGHT,
+                state_sync::STATE_SERVE_LEAVES_PER_SEC,
+                state_sync::STATE_SERVE_LEAVES_PER_SEC,
+            ),
+            state_value_cache: Mutex::new(None),
             retention: StateDB::block_pruning_policy_from_env(),
             #[cfg(test)]
             before_execution_hook: None,
@@ -1251,6 +1281,7 @@ impl ChainSync {
                 "VERTEX_REQ:",
                 state_sync::ANCHOR_REQ,
                 state_sync::CHUNK_REQ,
+                state_sync::VALUE_REQ,
             ]
             .iter()
             .any(|prefix| msg.starts_with(prefix))
@@ -1284,6 +1315,11 @@ impl ChainSync {
             let req = serde_json::from_str::<state_sync::ChunkRequest>(req_json).ok()?;
             let resp = serde_json::to_string(&self.handle_state_chunk(req)).ok()?;
             return Some(format!("{}{}", state_sync::CHUNK_RESP, resp));
+        }
+        if let Some(req_json) = msg.strip_prefix(state_sync::VALUE_REQ) {
+            let req = serde_json::from_str::<state_sync::ValueRequest>(req_json).ok()?;
+            let resp = serde_json::to_string(&self.handle_state_value(req)).ok()?;
+            return Some(format!("{}{}", state_sync::VALUE_RESP, resp));
         }
         if let Some(req_json) = msg.strip_prefix(state_sync::ANCHOR_REQ) {
             let req = serde_json::from_str::<state_sync::AnchorRequest>(req_json).ok()?;
