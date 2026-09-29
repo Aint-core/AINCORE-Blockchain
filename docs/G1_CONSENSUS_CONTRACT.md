@@ -927,6 +927,12 @@ Their witnesses:
 
 Both were verified killed. Total S9: 33 mutants, all killed.
 
+**G0 anchor binding (for S11).** The substituted-anchor witness (B2) is closed on V4 by a
+validation rule, with no format change: the anchor must be the last vertex of the committed
+sequence, which `vertices_root` binds (DE-5 makes the anchor the unique top-round vertex of its
+own walk). B1, the resegmented round and timestamp, was closed by FX-18. See the update in
+`BLOCK_IDENTITY_V2_PLAN.md`.
+
 **S10 status: the system suite (`sync/src/system_tests.rs`).**
 - Setup: real `DagConsensus` nodes on a V4 genesis, each with its own `ChainSync`, and real multi-node QCs.
 - The consensus crate has a `sim` feature that exposes only the outbox transport. chain_sync enables it for its tests only.

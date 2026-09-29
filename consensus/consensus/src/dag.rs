@@ -2161,6 +2161,10 @@ impl DagConsensus {
                                     block_timestamp, commit.sequence.clone(), commit.anchor_hash.clone(),
                                     slash_evidence.clone(),
                                 );
+                                if self.v4_chain && !block.anchor_is_bound() {
+                                    // G0: every peer would refuse this block.
+                                    return Err("the anchor is not the last committed vertex".to_string());
+                                }
                                 block.sign_proposer(&crypto::SigningKey::from_bytes(&self.node_key), &self.node_id);
                                 let json = serde_json::to_string(&block).map_err(|e| e.to_string())?;
                                 view.save_block_json(parent_height + 1, &json).map_err(|e| e.to_string())?;

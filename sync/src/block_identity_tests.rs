@@ -94,7 +94,7 @@ fn sync_must_reject_vertices_attached_to_a_block_without_them() {
 }
 
 #[test]
-#[ignore = "OPEN block identity: anchor_hash is not covered by the proposer header signature"]
+#[ignore = "V3 only: on V4 the anchor is bound through vertices_root (G0, Block::anchor_is_bound; witness v4_validation_refuses_an_anchor_that_is_not_the_last_committed_vertex). V3 is deleted at G1 S11"]
 fn sync_must_reject_substituted_anchor_with_reused_signature() {
     let (left, block) = fixture("anchor_left");
     let (right, _) = fixture("anchor_right");

@@ -101,7 +101,8 @@ fn block_at(sync: &ChainSync, height: u64, parent: &str, anchor: &str) -> Block 
         exec.current_state_root(),
         exec.receipts_root_for_block(&[]),
         23,
-        vec!["ab".repeat(32)],
+        // The anchor is the last committed vertex (G0).
+        vec!["aa".repeat(32), anchor.to_string()],
         anchor.into(),
         vec![],
     );
@@ -319,4 +320,22 @@ fn v4_sync_refuses_a_boundary_qc_binding_another_committee() {
         .get(&format!("alarm:committee_mismatch:{:020}", 1))
         .unwrap()
         .is_some());
+}
+
+/// G0 on V4: the anchor is bound through the header's vertices root. A
+/// validly signed block whose anchor is swapped for another hash (same header
+/// hash, same signature) is refused at validation, before any QC is looked
+/// at; the real block passes.
+#[test]
+fn v4_validation_refuses_an_anchor_that_is_not_the_last_committed_vertex() {
+    let (sync, _) = v4_sync("g0_anchor");
+    let real = block_at(&sync, 1, "genesis", &"ab".repeat(32));
+    assert!(real.anchor_is_bound(), "the fixture's anchor is its last vertex");
+    let mut swapped = real.clone();
+    swapped.anchor_hash = "ef".repeat(32);
+    assert_eq!(swapped.header.hash, real.header.hash);
+    assert_eq!(swapped.proposer_signature, real.proposer_signature);
+    let err = sync.validate_block(&swapped, 1, "genesis").unwrap_err();
+    assert!(err.contains("last committed vertex"), "{err}");
+    sync.validate_block(&real, 1, "genesis").unwrap();
 }

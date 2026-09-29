@@ -83,6 +83,19 @@ impl Block {
         self.proposer_signer = signer.to_string();
     }
 
+    /// G0 anchor binding. The committed sequence is the anchor's history
+    /// sorted by (round, hash), and the anchor is its only vertex at the
+    /// anchor round, so the anchor is the sequence's last element. The header
+    /// binds the sequence (`vertices_root`), so requiring this binds
+    /// `anchor_hash` to the signed block hash with no new field. A block with
+    /// no sequence carries no anchor.
+    pub fn anchor_is_bound(&self) -> bool {
+        match self.committed_vertices.last() {
+            Some(last) => *last == self.anchor_hash,
+            None => self.anchor_hash.is_empty(),
+        }
+    }
+
     /// Verify `proposer_signature` against the proposer's Ed25519 public key
     /// (hex). Empty or malformed signatures verify as FALSE.
     pub fn verify_proposer_signature(&self, public_key_hex: &str) -> bool {

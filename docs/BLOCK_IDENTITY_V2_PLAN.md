@@ -4,6 +4,17 @@ Status: a prototype canonical codec is implemented and isolated; production
 wiring, activation and migration are NOT implemented or approved. No live
 deployment, reset or genesis migration.
 
+> **Update (2026-09-30, branch `g1/certified-dag`, G0 anchor binding):** on a V4 chain the
+> anchor is now bound to the signed block hash without a new field. The committed sequence is
+> the anchor's history sorted by (round, hash) (G1 DE-5), and the anchor is its only vertex at
+> the anchor round, so it is the sequence's last element. `Block::anchor_is_bound` requires
+> exactly that; the header's `vertices_root` already binds the sequence. Sync validation
+> refuses a block that breaks it, and local acceptance refuses to build one. Witness:
+> `v4_validation_refuses_an_anchor_that_is_not_the_last_committed_vertex`. Independently, V4's
+> IM-1 refuses such a block because its QC binds the anchor. Still open in this plan: binding
+> the chain and genesis identity and the finality digest into the block hash itself. On V4 the
+> QC binds the chain id, and the QC's finality digest is checked at adoption.
+
 ## Reproduced evidence
 
 > **Update (2026-09-29, branch `g3/canonical-header-hash`, G3 FX-18):** the legacy header

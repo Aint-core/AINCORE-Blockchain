@@ -479,6 +479,14 @@ impl ChainSync {
                 block.header.vertices_root, computed
             ));
         }
+        // G0 (V4): the anchor is the sequence's last vertex, which the header
+        // binds; a substituted anchor under a reused signature stops here.
+        if consensus::v4::is_v4_chain(storage) && !block.anchor_is_bound() {
+            return Err(format!(
+                "block {}'s anchor {} is not its last committed vertex",
+                block.header.height, block.anchor_hash
+            ));
+        }
         // Consumer-side invariant: only equivocation evidence is ordered
         // through the DAG. Reject a block carrying any other kind outright.
         if let Some(bad) = block
