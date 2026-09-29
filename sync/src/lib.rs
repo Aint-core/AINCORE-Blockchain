@@ -1219,7 +1219,24 @@ impl ChainSync {
                 |summary, view| {
                     Self::verify_execution_roots_in(block, summary)?;
                     let json = serde_json::to_string(block).map_err(|e| e.to_string())?;
-                    view.save_block_json(block.header.height, &json).map_err(|e| e.to_string())
+                    view.save_block_json(block.header.height, &json).map_err(|e| e.to_string())?;
+                    // G1 EP-2/EP-3: an imported boundary block closes its epoch
+                    // in its own transaction, so H_E + 1's QC verifies under
+                    // C_{E+1}. EP-4: QC(H_E) must bind the committee derived.
+                    if let Some(start) = consensus::v4::epoch::stage_boundary(view, block)? {
+                        let derived = consensus::qc::validator_set_hash(&start.committee);
+                        if let Some(q) = &qc {
+                            if q.next_validator_set_hash != derived {
+                                return Err(format!(
+                                    "{}: QC(H_{}) binds next committee {:?}, this node derived {derived}",
+                                    consensus::v4::epoch::COMMITTEE_MISMATCH,
+                                    start.epoch - 1,
+                                    q.next_validator_set_hash
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
                 },
             ) {
                 Ok(executor::BlockExecOutcome::Executed(_)) => {
@@ -1284,6 +1301,21 @@ impl ChainSync {
                         "[ChainSync][BLOCK_ACCEPTANCE_FAILED] block #{} was not accepted: {}",
                         block.header.height, error
                     );
+                    // Except EP-4's: a verified QC(H_E) (>2/3 of C_E) certifies
+                    // a next committee this node did not derive from the same
+                    // post-state. That is not a peer's fault: the node halts.
+                    if error.contains(consensus::v4::epoch::COMMITTEE_MISMATCH) {
+                        if let Some(interval) = consensus::v4::epoch::epoch_interval(&self.storage) {
+                            let next = consensus::v4::epoch::epoch_of_height(
+                                block.header.height,
+                                interval,
+                            ) + 1;
+                            let _ = self.storage.put(
+                                &format!("alarm:committee_mismatch:{next:020}"),
+                                &error,
+                            );
+                        }
+                    }
                     break;
                 }
             }

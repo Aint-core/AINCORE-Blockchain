@@ -102,6 +102,11 @@ pub fn load_validator_set_v1(storage: &StateDB) -> Option<Vec<ValidatorInfo>> {
 /// No epoch can borrow the mutable live set. This lookup trusts locally validated
 /// genesis/history; it does not replace a pinned genesis or transition proof.
 pub fn load_validator_set_for_epoch(storage: &StateDB, epoch: u64) -> Option<Vec<ValidatorInfo>> {
+    // G1 EP-1/EP-2: on a V4 chain C_E is E's epoch record (C_0 genesis's),
+    // derived at H_{E−1} whether or not Move's epoch advance succeeded.
+    if crate::v4::is_v4_chain(storage) {
+        return crate::v4::epoch::committee_of(storage, epoch);
+    }
     if epoch == 0 {
         let raw = storage.get("genesis:validator_set:v1").ok()??;
         let set: Vec<ValidatorInfo> = serde_json::from_str(&raw).ok()?;
@@ -130,6 +135,11 @@ pub fn load_validator_set_for_epoch(storage: &StateDB, epoch: u64) -> Option<Vec
 pub fn epoch_for_block_height(storage: &StateDB, height: u64) -> Option<u64> {
     if height == 0 {
         return None;
+    }
+    // G1 EP-1: on a V4 chain E(h) = ⌊(h−1)/I⌋, from the pinned I alone.
+    if crate::v4::is_v4_chain(storage) {
+        let interval = crate::v4::epoch::epoch_interval(storage)?;
+        return Some(crate::v4::epoch::epoch_of_height(height, interval));
     }
     let mut epoch = match storage.get("consensus:epoch").ok()? {
         Some(raw) => raw.parse::<u64>().ok()?,
@@ -186,6 +196,23 @@ pub fn verify_block_qc(
     }
 }
 
+/// G1 EP-4: store a QC for a block this node holds, after IM-1 (it verifies
+/// under the committee of the block's epoch and binds the block). Unlike
+/// `import_finality_qc` it need not advance finality: a node that built H_E
+/// itself is already past its round, yet needs QC(H_E) to activate E+1.
+pub fn store_block_qc(
+    storage: &StateDB,
+    block: &blockchain::Block,
+    qc: &QuorumCertificate,
+) -> Result<(), String> {
+    verify_block_qc(storage, block, qc)?;
+    storage
+        .transaction(|view| {
+            store_certificate(&view, qc).map_err(storage::StorageError::DatabaseOperation)
+        })
+        .map_err(|e| e.to_string())
+}
+
 /// The stored QC of height `h`, if any.
 pub fn stored_qc(storage: &StateDB, h: u64) -> Option<QuorumCertificate> {
     storage
@@ -211,6 +238,10 @@ pub struct CommitContext {
     /// committed anchor (reused so the QC binds to the exact digest consensus
     /// finalized over, not a separately-recomputed one).
     pub finality_digest: String,
+    /// G1 EP-4: on a V4 boundary block H_E, `validator_set_hash(C_{E+1})` as
+    /// this node derived it in H_E's transaction; empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub next_validator_set_hash: String,
 }
 
 /// Outcome of contributing THIS node's signature to a committed block.
@@ -317,6 +348,7 @@ fn produce_qc_staged(
         receipts_root: ctx.receipts_root.clone(),
         finality_digest: ctx.finality_digest.clone(),
         validator_set_hash: qc::validator_set_hash(&validators),
+        next_validator_set_hash: ctx.next_validator_set_hash.clone(),
     };
 
     let seed = derive_validator_bls_seed(node_key);
@@ -841,6 +873,7 @@ mod tests {
             state_root: "ef".repeat(32),
             receipts_root: "12".repeat(32),
             finality_digest: "34".repeat(32),
+            next_validator_set_hash: String::new(),
         }
     }
 
@@ -989,6 +1022,7 @@ mod tests {
             receipts_root: ctx.receipts_root.clone(),
             finality_digest: ctx.finality_digest.clone(),
             validator_set_hash: qc::validator_set_hash(validators),
+            next_validator_set_hash: ctx.next_validator_set_hash.clone(),
         }
     }
 

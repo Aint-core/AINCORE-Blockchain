@@ -51,6 +51,9 @@ pub struct OrderingEngine {
     /// GC-1: g, the floor below which every parent is settled. A function of
     /// the committed prefix; persisted with each accepted anchor.
     gc_floor: u64,
+    /// EP-3: the closing round r* of the active epoch, once its boundary block
+    /// is accepted. No anchor above it is decided until the next epoch begins.
+    epoch_closing: Option<u64>,
     /// Rolling cumulative finality digest: `H(prev_digest_hex || new_hashes…)`,
     /// chained on every commit and persisted as `consensus:finality_digest`. On
     /// restart it CONTINUES from that persisted value, so it is a pure function of
@@ -156,6 +159,7 @@ impl OrderingEngine {
             committed_sequence: Vec::new(),
             committed_set: HashMap::new(),
             gc_floor: 0,
+            epoch_closing: None,
             finality_digest: String::new(),
             vdf_engine: vdf,
             step1_beacon: vec![0u8; 32],
@@ -326,6 +330,7 @@ impl OrderingEngine {
             committed_sequence,
             committed_set,
             gc_floor,
+            epoch_closing: None,
             finality_digest,
             vdf_engine: vdf,
             step1_beacon,
@@ -535,6 +540,38 @@ impl OrderingEngine {
         self.gc_floor
     }
 
+    /// Whether `digest` is in the committed set (above g).
+    pub fn is_committed(&self, digest: &str) -> bool {
+        self.committed_set.contains_key(digest)
+    }
+
+    /// EP-3: the active epoch closed at `closing_round` (r*): nothing above it
+    /// is decided until the next epoch begins.
+    pub fn close_epoch_at(&mut self, closing_round: u64) {
+        self.epoch_closing = Some(closing_round);
+    }
+
+    /// EP-4: the next epoch begins at `first_round`. The cursor and g move up
+    /// to it (g = first_round − 1), and its sentinel is settled, as "genesis"
+    /// is for epoch 0: a first-round vertex cites only the sentinel. The
+    /// sentinel stays settled until g passes the epoch's first rounds, by which
+    /// time no walk reaches them. Idempotent; boot calls it again.
+    pub fn begin_epoch(&mut self, first_round: u64, sentinel: &str) -> Result<(), String> {
+        self.epoch_closing = None;
+        self.next_anchor_round = self.next_anchor_round.max(Self::align_anchor(first_round));
+        self.gc_floor = self.gc_floor.max(first_round.saturating_sub(1));
+        self.committed_set.insert(sentinel.to_string(), first_round + GC_DEPTH + 1);
+        if let Some(storage) = &self.storage {
+            storage
+                .put(GC_FLOOR_KEY, &self.gc_floor.to_string())
+                .map_err(|e| e.to_string())?;
+            storage
+                .put("consensus:next_anchor_round", &self.next_anchor_round.to_string())
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     /// The committed digests above g (GC-4), sorted: what two nodes at one
     /// cursor must agree on.
     pub fn committed_digests(&self) -> Vec<(String, u64)> {
@@ -626,7 +663,8 @@ impl OrderingEngine {
             // 1. Find the SMALLEST directly-committable anchor round >= cursor.
             let mut direct: Option<(u64, String)> = None;
             let mut r = start;
-            while r < max_round && r - start < MAX_SCAN {
+            let closing = self.epoch_closing.unwrap_or(u64::MAX);
+            while r < max_round && r - start < MAX_SCAN && r <= closing {
                 // DE-1/DE-2: at most one candidate can hold a quorum of votes,
                 // because every voter votes once (Lemma V).
                 if let Some(h) = Self::leader_candidates(r, dag, round_index, validators)
@@ -1491,6 +1529,7 @@ mod tests {
             receipts_root: "12".repeat(32),
             finality_digest: "34".repeat(32),
             validator_set_hash: "ff".repeat(32),
+            next_validator_set_hash: String::new(),
             signer_bitmap: vec![0xff],
             signed_stake: 100,
             total_stake: 100,

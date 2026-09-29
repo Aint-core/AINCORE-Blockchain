@@ -567,6 +567,7 @@ mod qc_gate_tests {
             receipts_root: "dd".repeat(32),
             finality_digest: "ee".repeat(32),
             validator_set_hash: set_hash.to_string(),
+            next_validator_set_hash: String::new(),
         }
     }
 

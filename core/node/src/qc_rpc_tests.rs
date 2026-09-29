@@ -61,6 +61,7 @@ fn cert(db: &StateDB, epoch: u64, height: u64) -> QuorumCertificate {
         receipts_root: "04".repeat(32),
         finality_digest: "05".repeat(32),
         validator_set_hash: validator_set_hash(&target),
+        next_validator_set_hash: String::new(),
     };
     let signature = bls.sign_raw(&vote.to_signing_bytes(), &[7 + epoch as u8; 32]);
     let qc = build_qc(&vote, &target, &[0], &[signature]).unwrap();

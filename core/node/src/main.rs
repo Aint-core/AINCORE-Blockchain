@@ -930,6 +930,8 @@ async fn main() {
                     || msg.starts_with("DOWNTIME_ATTEST:")
                     || msg.starts_with("EQUIV_PROOF:")
                     || msg.starts_with("QC_VOTE:")
+                    || msg.starts_with(consensus::dag::QC_WANT_PREFIX)
+                    || msg.starts_with(consensus::dag::QC_CERT_PREFIX)
                 {
                     // WRITE LOCK required to update DAG / store remote attestation /
                     // slash equivocator / collect+aggregate QC finality votes
@@ -979,6 +981,8 @@ async fn main() {
                         || msg.starts_with("DOWNTIME_ATTEST:")
                         || msg.starts_with("EQUIV_PROOF:")
                         || msg.starts_with("QC_VOTE:")
+                        || msg.starts_with(consensus::dag::QC_WANT_PREFIX)
+                        || msg.starts_with(consensus::dag::QC_CERT_PREFIX)
                     {
                         if let Ok(mut guard) = node_consensus.write() {
                             guard.handle_message(&msg);
@@ -1356,6 +1360,7 @@ mod boot_identity_tests {
                 receipts_root: "04".repeat(32),
                 finality_digest: "05".repeat(32),
                 validator_set_hash: validator_set_hash(&committee),
+                next_validator_set_hash: String::new(),
             };
             let signature = bls.sign_raw(&vote.to_signing_bytes(), &signer);
             serde_json::to_string(&build_qc(&vote, &committee, &[0], &[signature]).unwrap())

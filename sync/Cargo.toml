@@ -20,5 +20,8 @@ hex = "0.4"
 [dev-dependencies]
 # G3 WG-1: test fixtures seed their own genesis state (StateDB::seeding).
 storage = { path = "../common/storage", features = ["test-seeding"] }
+# G1 S10: the system suite runs real consensus nodes with their sync.
+consensus = { path = "../consensus/consensus", features = ["sim"] }
+mempool = { path = "../core/mempool" }
 # G3: fixtures seed the state tree the way genesis will.
 state_commit = { path = "../common/state_commit" }

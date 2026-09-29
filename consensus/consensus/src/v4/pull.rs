@@ -37,8 +37,12 @@ pub const STALL_TICKS: u64 = 4;
 pub enum Request {
     /// `VERTEX_REQ`: staged bodies by digest.
     Vertices(Vec<String>),
-    /// `CERT_REQ`: certificates by (round, author) of the active epoch.
-    Certs(Vec<(u64, String)>),
+    /// `CERT_REQ`: certificates by (round, author) of one epoch (the active
+    /// one, or the one just closed while a lagging node finishes it).
+    Certs {
+        epoch: u64,
+        slots: Vec<(u64, String)>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,7 +207,7 @@ impl Engine {
             let round = self.current_round();
             let authors: Vec<String> = self.stakes.iter().map(|(a, _)| a.clone()).collect();
             for r in [round.saturating_sub(1), round] {
-                if r >= FIRST_ROUND {
+                if r >= self.first_round {
                     for a in &authors {
                         self.want_cert(r, a);
                     }
@@ -255,7 +259,11 @@ impl Engine {
         }
         for (target, slots) in slots {
             for batch in slots.chunks(MAX_REQ_SLOTS) {
-                self.request(&target, Request::Certs(batch.to_vec()), net);
+                let req = Request::Certs {
+                    epoch: self.epoch,
+                    slots: batch.to_vec(),
+                };
+                self.request(&target, req, net);
             }
         }
     }
@@ -388,13 +396,14 @@ impl Engine {
         match req {
             Request::Vertices(digests) => {
                 let dag = lock(&self.dag);
+                let closed = self.closed.as_ref().map(|c| &c.bodies);
                 let (mut bodies, mut unknown, mut bytes) = (Vec::new(), Vec::new(), 0usize);
                 for d in digests.iter().take(MAX_REQ_DIGESTS) {
-                    let size = dag
-                        .get(d)
+                    let held = dag.get(d).or_else(|| closed.and_then(|c| c.get(d)));
+                    let size = held
                         .and_then(|v| serde_json::to_string(v).ok())
                         .map(|j| j.len());
-                    match (dag.get(d), size) {
+                    match (held, size) {
                         (Some(v), Some(n)) if bytes + n <= MAX_RESP_BYTES => {
                             bytes += n;
                             bodies.push(v.clone());
@@ -404,10 +413,20 @@ impl Engine {
                 }
                 Response::Vertices { bodies, unknown }
             }
-            Request::Certs(slots) => {
+            Request::Certs { epoch, slots } => {
+                // The closed epoch's tail stays servable until the next
+                // activation, so a node behind the boundary can finish it.
+                let index = if *epoch == self.epoch {
+                    Some(&self.certs)
+                } else {
+                    self.closed
+                        .as_ref()
+                        .filter(|c| c.epoch == *epoch)
+                        .map(|c| &c.certs)
+                };
                 let (mut certs, mut unknown) = (Vec::new(), Vec::new());
                 for slot in slots.iter().take(MAX_REQ_SLOTS) {
-                    match self.certs.get(slot) {
+                    match index.and_then(|i| i.get(slot)) {
                         Some(c) => certs.push(c.clone()),
                         None => unknown.push(slot.clone()),
                     }

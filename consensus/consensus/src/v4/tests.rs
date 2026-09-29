@@ -110,11 +110,19 @@ struct Cluster {
     q: Queue,
     /// Envelopes held back by a delivery rule, released later.
     held: Vec<Envelope>,
+    /// Blocks per epoch (0: one epoch forever).
+    epoch_interval: u64,
 }
 
 impl Cluster {
     /// `n` validators, plus `observers` nodes outside the committee.
     fn new(tag: &str, n: u8, observers: u8) -> Self {
+        Self::with_epochs(tag, n, observers, 0)
+    }
+
+    /// Standalone epochs: every node closes and activates an epoch every
+    /// `interval` blocks (decided anchors).
+    fn with_epochs(tag: &str, n: u8, observers: u8, interval: u64) -> Self {
         let mut members: Vec<Member> = (1..=n).map(member).collect();
         members.sort_by(|a, b| a.info.address.cmp(&b.info.address));
         let committee: Vec<ValidatorInfo> = members.iter().map(|m| m.info.clone()).collect();
@@ -132,6 +140,7 @@ impl Cluster {
             dirs,
             q: Rc::new(RefCell::new(VecDeque::new())),
             held: Vec::new(),
+            epoch_interval: interval,
         };
         for i in 0..cluster.members.len() {
             cluster.open(i, true);
@@ -148,6 +157,7 @@ impl Cluster {
             node_key: self.members[i].node_key,
             address: self.members[i].info.address.clone(),
             b_auth: staging::B_AUTH,
+            epoch_interval: self.epoch_interval,
         };
         self.engines[i] = Some(Engine::open(storage, cfg, genesis_init, Arc::new(|| NOW)).unwrap());
     }
@@ -260,6 +270,17 @@ impl Cluster {
 
     fn run(&mut self, ticks: usize) {
         for _ in 0..ticks {
+            self.tick_all();
+            self.deliver(&|_, _| false);
+        }
+    }
+
+    /// Run until `done` holds, at most `ticks` ticks.
+    fn run_until(&mut self, ticks: usize, done: impl Fn(&Cluster) -> bool) {
+        for _ in 0..ticks {
+            if done(self) {
+                return;
+            }
             self.tick_all();
             self.deliver(&|_, _| false);
         }
@@ -1461,7 +1482,10 @@ fn a_replay_or_a_forged_identity_charges_no_ones_budget() {
             &from,
             &to,
             seq,
-            pull::Request::Certs(vec![(1, from.clone())]),
+            pull::Request::Certs {
+                epoch: 0,
+                slots: vec![(1, from.clone())],
+            },
         ))
     };
     let answers = |c: &Cluster| {
@@ -1721,4 +1745,538 @@ fn gc_gives_the_plain_body_budget_back() {
     assert!(c.engine(h).floor() > 2 + staging::RETAIN_SLACK);
     assert!(!c.engine(h).is_staged(&b.hash), "GC kept the twin");
     assert_eq!(counted(&c), 0, "GC did not give the twin's bytes back");
+}
+
+// ------------------------------------------------------------ S9: epochs
+
+/// The epoch a node is in, and its first round.
+fn epoch_of(c: &Cluster, i: usize) -> (u64, u64) {
+    let e = c.engine(i);
+    (e.epoch, e.first_round)
+}
+
+/// EP-1..EP-4: every 3 blocks an epoch closes at its last anchor r* and the
+/// next begins at r* + 2 with its own sentinel. Nodes agree across several
+/// boundaries, and each boundary's first round follows its closing anchor.
+#[test]
+fn epochs_rotate_and_every_node_agrees_across_boundaries() {
+    let mut c = Cluster::with_epochs("s9-rotate", 4, 0, 3);
+    c.run(40);
+    c.assert_agree();
+    for i in c.validators() {
+        let (epoch, first) = epoch_of(&c, i);
+        assert!(epoch >= 3, "node {i} is in epoch {epoch}");
+        let start: epoch::EpochStart = serde_json::from_str(
+            &c.engine(i)
+                .storage
+                .get(&epoch::epoch_start_key(epoch))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first, start.prev_closing_round + 2);
+        assert_ne!(start.sentinel, SENTINEL);
+        // The boundary anchor is the epoch's last decision (EP-3).
+        let boundary = c.decisions[i]
+            .iter()
+            .find(|d| d.1 == start.prev_anchor)
+            .expect("the boundary anchor was decided");
+        assert_eq!(boundary.0, start.prev_closing_round);
+        // EP-5 (i): the in-memory index holds the active epoch only; an entry
+        // of E surviving activation would sit at E+1's round numbers.
+        {
+            let e = c.engine(i);
+            let dag = lock(&e.dag);
+            for (round, digests) in lock(&e.round_index).iter() {
+                for d in digests {
+                    assert!(
+                        dag.get(d)
+                            .is_some_and(|v| v.epoch == epoch && v.round == *round),
+                        "node {i}: round {round} indexes {d}, not an epoch-{epoch} body"
+                    );
+                }
+            }
+        }
+        // GC-3 by epoch: two epochs back, nothing of epoch 0 is left.
+        let old = format!("consensus:vslot:v1:{:020}:", 0);
+        let e = c.engine(i);
+        assert!(
+            e.storage
+                .db
+                .prefix_iterator(old.as_bytes())
+                .next()
+                .is_none_or(|r| !r.unwrap().0.starts_with(old.as_bytes())),
+            "node {i} kept epoch 0's slots"
+        );
+    }
+}
+
+/// EP-2, (e): epoch 1's committee drops one member, adds a newcomer with its
+/// own keys, and weights stake unequally. In epoch 1 the newcomer's vertices
+/// are ordered and the leaver's are not, the leaver follows as an observer,
+/// and every node agrees throughout.
+#[test]
+fn a_committee_change_with_a_new_key_and_unequal_stake_rotates_cleanly() {
+    let mut c = Cluster::with_epochs("s9-change", 4, 1, 6);
+    let newcomer = c.members.len() - 1;
+    let leaver = 3;
+    let mut next: Vec<ValidatorInfo> = c.committee[..3].to_vec();
+    next[0].stake = 300;
+    next.push(c.members[newcomer].info.clone());
+    for i in 0..c.members.len() {
+        c.engines[i]
+            .as_mut()
+            .unwrap()
+            .schedule_committee(1, next.clone());
+    }
+    let e1_decisions = |c: &Cluster| {
+        let first = c.engine(0).first_round;
+        c.decisions[0].iter().filter(|d| d.0 >= first).count()
+    };
+    c.run_until(80, |c| {
+        (0..c.members.len()).all(|i| epoch_of(c, i).0 == 1) && e1_decisions(c) >= 3
+    });
+    assert!(e1_decisions(&c) >= 3, "vacuous: epoch 1 decided too little");
+    c.assert_agree();
+    let e1: epoch::EpochStart = serde_json::from_str(
+        &c.engine(0)
+            .storage
+            .get(&epoch::epoch_start_key(1))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(e1.committee, qc::canonical_order(&next));
+    let authors: Vec<String> = {
+        let dag = lock(&c.engine(0).dag);
+        c.decisions[0]
+            .iter()
+            .filter(|d| d.0 >= e1.first_round)
+            .flat_map(|d| d.2.clone())
+            .map(|h| dag.get(&h).expect("an epoch-1 body is held").author.clone())
+            .collect()
+    };
+    assert!(authors.contains(&c.members[newcomer].info.address));
+    assert!(!authors.contains(&c.members[leaver].info.address));
+    assert!(c.engine(leaver).own.is_empty(), "the leaver proposed");
+}
+
+/// EP-2, (j): a proposed member whose BLS proof of possession fails makes the
+/// whole proposal invalid: epoch 1 carries epoch 0's committee over, with an
+/// alarm, on every node alike.
+#[test]
+fn an_invalid_pop_carries_the_committee_over_with_an_alarm() {
+    let mut c = Cluster::with_epochs("s9-pop", 4, 0, 3);
+    let mut next = c.committee.clone();
+    next[1].bls_pop = hex::encode([7u8; 96]);
+    for i in c.validators() {
+        c.engines[i]
+            .as_mut()
+            .unwrap()
+            .schedule_committee(1, next.clone());
+    }
+    c.run(20);
+    c.assert_agree();
+    for i in c.validators() {
+        let e = c.engine(i);
+        let e1: epoch::EpochStart =
+            serde_json::from_str(&e.storage.get(&epoch::epoch_start_key(1)).unwrap().unwrap())
+                .unwrap();
+        assert_eq!(e1.committee, qc::canonical_order(&c.committee), "node {i}");
+        assert!(e
+            .storage
+            .get(&format!("alarm:committee_invalid:{:020}", 1))
+            .unwrap()
+            .is_some());
+    }
+}
+
+/// EP-5 (a), (d), (i): after a boundary, an epoch-E vertex at the new
+/// epoch's round numbers is inert, and an epoch-(E+1) first-round vertex
+/// citing a wrong sentinel is invalid; neither is staged, and O_{E+1} does
+/// not change.
+#[test]
+fn stale_and_wrong_sentinel_vertices_change_nothing_after_a_boundary() {
+    let mut c = Cluster::with_epochs("s9-stale", 4, 0, 3);
+    c.run(14);
+    let (epoch, first) = epoch_of(&c, 0);
+    assert!(epoch >= 1);
+    let m = &c.members[1];
+    let mk = |epoch: u64, round: u64, parents: Vec<String>| {
+        let mut v = Vertex {
+            epoch,
+            round,
+            author: m.info.address.clone(),
+            parents,
+            parent_refs: vec![],
+            payload: vec!["x".into()],
+            timestamp: NOW,
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
+        };
+        v.hash = v.hash_v4_with_domain(CHAIN, GENESIS);
+        v.sign_with_ed25519(&crypto::SigningKey::from_bytes(&m.node_key));
+        v
+    };
+    let stale = mk(epoch - 1, first, vec!["genesis".into()]);
+    let wrong = mk(epoch, first, vec!["f".repeat(64)]);
+    let before = lock(&c.engine(0).round_index).clone();
+    c.receive(0, Msg::Vertex(stale.clone()));
+    c.receive(0, Msg::Vertex(wrong.clone()));
+    assert!(!c.engine(0).is_staged(&stale.hash));
+    assert!(!c.engine(0).is_staged(&wrong.hash));
+    assert_eq!(*lock(&c.engine(0).round_index), before);
+}
+
+/// LA-6 across a boundary: a node cut off just before the others close
+/// epoch 0 (it is behind by less than the retention window) finishes epoch 0
+/// from the others' closed tail, activates epoch 1 and agrees. Without the
+/// closed tail, or without the Ahead trigger, it stays in epoch 0 forever.
+#[test]
+fn a_node_behind_at_a_boundary_catches_up_into_the_next_epoch() {
+    let mut c = Cluster::with_epochs("s9-behind", 4, 0, 6);
+    c.run_until(40, |c| c.decisions[1].len() >= 4);
+    let cut = c.members[0].info.address.clone();
+    let quiet = move |e: &Envelope, to: usize| to == 0 || e.from == cut;
+    for _ in 0..40 {
+        if epoch_of(&c, 1).0 == 1 && c.engine(1).current_round() > c.engine(1).first_round + 2 {
+            break;
+        }
+        c.tick_all();
+        c.deliver(&quiet);
+        c.held.clear();
+    }
+    assert_eq!(epoch_of(&c, 0).0, 0, "vacuous: node 0 kept up");
+    assert_eq!(epoch_of(&c, 1).0, 1, "vacuous: the others never closed");
+    c.run_until(80, |c| {
+        epoch_of(c, 0).0 == 1 && c.decisions[0].len() >= c.decisions[1].len()
+    });
+    assert_eq!(epoch_of(&c, 0).0, 1, "node 0 never finished epoch 0");
+    c.run(6);
+    c.assert_agree();
+    assert!(c.decisions[0].len() > 6);
+}
+
+/// RC-3, (k): a node whose guard database was wiped abstains for the rest of
+/// the epoch and resumes at the next activation.
+#[test]
+fn a_wiped_guard_database_abstains_until_the_next_epoch() {
+    let mut c = Cluster::with_epochs("s9-wiped", 4, 0, 4);
+    c.run(2);
+    c.engine(0)
+        .storage
+        .delete("consensus:guard_origin")
+        .unwrap();
+    c.reopen(0);
+    let e0 = epoch_of(&c, 0).0;
+    c.run(3);
+    assert!(
+        c.engine(0).own.keys().all(|r| *r < 3),
+        "node 0 proposed while abstaining"
+    );
+    c.run(30);
+    let (e, first) = epoch_of(&c, 0);
+    assert!(e > e0, "no activation happened");
+    assert!(
+        c.engine(0).own.keys().any(|r| *r >= first),
+        "node 0 did not resume at activation"
+    );
+    c.assert_agree();
+}
+
+/// RC-3: a guard database whose origin is another key's (a copied or
+/// swapped store) is not continuous either: the node abstains until the next
+/// activation, exactly as with a wiped one.
+#[test]
+fn a_guard_database_of_another_key_abstains_until_the_next_epoch() {
+    let mut c = Cluster::with_epochs("s9-foreign", 4, 0, 4);
+    c.run(2);
+    let foreign = guard_origin(CHAIN, GENESIS, &c.members[1].node_key);
+    c.engine(0)
+        .storage
+        .put("consensus:guard_origin", &foreign)
+        .unwrap();
+    c.reopen(0);
+    let e0 = epoch_of(&c, 0).0;
+    c.run(3);
+    assert!(
+        c.engine(0).own.keys().all(|r| *r < 3),
+        "node 0 proposed under another key's guards"
+    );
+    c.run(30);
+    let (e, first) = epoch_of(&c, 0);
+    assert!(e > e0, "no activation happened");
+    assert!(
+        c.engine(0).own.keys().any(|r| *r >= first),
+        "node 0 did not resume at activation"
+    );
+    c.assert_agree();
+}
+
+/// EP-4, (f): a node cut off across a boundary carried a payload in a
+/// proposal that never got certified. At activation that payload is handed
+/// back for the mempool.
+#[test]
+fn an_orphaned_payload_is_handed_back_at_activation() {
+    let mut c = Cluster::with_epochs("s9-orphan", 4, 0, 6);
+    c.run_until(40, |c| c.decisions[1].len() >= 3);
+    // A payload that does get committed in epoch 0, above its floor: it must
+    // not come back.
+    let net = c.net(0);
+    c.engines[0]
+        .as_mut()
+        .unwrap()
+        .on_tick(vec!["kept-tx".into()], &net);
+    let kept = c
+        .engine(0)
+        .own
+        .values()
+        .find(|v| v.payload == ["kept-tx"])
+        .map(|v| v.hash.clone());
+    let kept = kept.expect("node 0 proposed kept-tx");
+    c.deliver(&|_, _| false);
+    c.run_until(20, |c| lock(&c.engine(0).ordering).is_committed(&kept));
+    assert!(
+        lock(&c.engine(0).ordering).is_committed(&kept),
+        "kept-tx never committed"
+    );
+    assert_eq!(
+        epoch_of(&c, 0).0,
+        0,
+        "vacuous: the boundary came before the cut"
+    );
+    let net = c.net(0);
+    c.engines[0]
+        .as_mut()
+        .unwrap()
+        .on_tick(vec!["orphan-tx".into()], &net);
+    let lost = c.members[0].info.address.clone();
+    let quiet = move |e: &Envelope, to: usize| e.from == lost || to == 0;
+    for _ in 0..40 {
+        if epoch_of(&c, 1).0 == 1 {
+            break;
+        }
+        c.tick_all();
+        c.deliver(&quiet);
+        c.held.clear();
+    }
+    assert_eq!(epoch_of(&c, 0).0, 0, "vacuous: node 0 kept up");
+    c.run_until(80, |c| epoch_of(c, 0).0 == 1);
+    c.assert_agree();
+    assert_eq!(epoch_of(&c, 0).0, 1);
+    let back = c.engines[0].as_mut().unwrap().take_orphaned_payloads();
+    assert!(back.contains(&"orphan-tx".to_string()), "{back:?}");
+    assert!(
+        !back.contains(&"kept-tx".to_string()),
+        "a committed payload came back"
+    );
+}
+
+/// RC-1 across a boundary: the servers restart after activating epoch 1 and
+/// still serve epoch 0's tail (rebuilt from their rows) to a node that was
+/// cut off before the boundary.
+#[test]
+fn restarted_servers_still_serve_the_closed_tail() {
+    let mut c = Cluster::with_epochs("s9-reopen-tail", 4, 0, 6);
+    c.run_until(40, |c| c.decisions[1].len() >= 4);
+    let cut = c.members[0].info.address.clone();
+    let quiet = move |e: &Envelope, to: usize| to == 0 || e.from == cut;
+    for _ in 0..40 {
+        if epoch_of(&c, 1).0 == 1 && c.engine(1).current_round() > c.engine(1).first_round + 2 {
+            break;
+        }
+        c.tick_all();
+        c.deliver(&quiet);
+        c.held.clear();
+    }
+    assert_eq!(epoch_of(&c, 0).0, 0, "vacuous: node 0 kept up");
+    for i in 1..4 {
+        c.reopen(i);
+        assert_eq!(epoch_of(&c, i).0, 1);
+        assert!(c
+            .engine(i)
+            .closed
+            .as_ref()
+            .is_some_and(|t| t.epoch == 0 && !t.certs.is_empty()));
+    }
+    c.run_until(80, |c| {
+        epoch_of(c, 0).0 == 1 && c.decisions[0].len() >= c.decisions[1].len()
+    });
+    assert_eq!(epoch_of(&c, 0).0, 1, "node 0 never finished epoch 0");
+    c.run(4);
+    c.assert_agree();
+}
+
+/// RC-1 between close and activation: a node whose activation write was lost
+/// (it holds E+1's record but not `epoch_active`) activates on its first call
+/// and keeps agreeing; it never stays in a closed epoch.
+#[test]
+fn a_crash_between_close_and_activation_still_activates() {
+    let mut c = Cluster::with_epochs("s9-crash-close", 4, 0, 4);
+    for _ in 0..60 {
+        if epoch_of(&c, 0).0 == 1 {
+            break;
+        }
+        c.tick_all();
+        c.deliver(&|_, _| false);
+    }
+    assert_eq!(epoch_of(&c, 0).0, 1);
+    c.engine(0).storage.delete(epoch::EPOCH_ACTIVE_KEY).unwrap();
+    c.reopen(0);
+    assert_eq!(epoch_of(&c, 0).0, 0, "the lost write was not simulated");
+    assert!(c.engine(0).closing_round.is_some());
+    // EP-5 (c): an E+1 certificate that arrives before activation is kept
+    // and ingested at activation (the end of this very call), not dropped to
+    // be fetched again.
+    for _ in 0..10 {
+        if c.engine(1).certs.values().any(|cert| cert.body.epoch == 1) {
+            break;
+        }
+        for i in 1..4 {
+            c.tick(i);
+        }
+        c.deliver(&|_, to| to == 0);
+        c.held.clear();
+    }
+    let early = c
+        .engine(1)
+        .certs
+        .values()
+        .find(|cert| cert.body.epoch == 1)
+        .cloned()
+        .expect("node 1 holds an epoch-1 certificate");
+    let slot = (early.body.round, early.body.author.clone());
+    c.receive(0, Msg::Cert(early.clone()));
+    assert_eq!(epoch_of(&c, 0).0, 1, "the first call did not activate");
+    assert_eq!(
+        c.engine(0).certs.get(&slot).map(|k| k.body.digest.clone()),
+        Some(early.body.digest.clone()),
+        "the early certificate was not ingested at activation"
+    );
+    c.run(20);
+    assert!(epoch_of(&c, 0).0 >= 1, "node 0 stayed in the closed epoch");
+    c.assert_agree();
+}
+
+// ------------------------------------------------------------ S10: rates
+
+/// Decided anchors over the anchor rounds they span, on node `i`.
+fn decided_rate(c: &Cluster, i: usize) -> f64 {
+    let d = &c.decisions[i];
+    let (Some(first), Some(last)) = (d.first(), d.last()) else {
+        return 0.0;
+    };
+    let span = (last.0 - first.0) / 2 + 1;
+    d.len() as f64 / span as f64
+}
+
+/// S10's liveness floor: the V4 decided-rate stays at or above 0.42 with
+/// four honest validators, and with one Byzantine member that proposes but
+/// never attests (its certificates must come from the three honest ones).
+#[test]
+fn the_decided_rate_stays_above_the_floor_with_a_non_attesting_member() {
+    let mut honest = Cluster::new("rate-honest", 4, 0);
+    honest.run(120);
+    honest.assert_agree();
+    let r_honest = decided_rate(&honest, 0);
+
+    let mut c = Cluster::new("rate-silent", 4, 0);
+    let byz = c.members[3].info.address.clone();
+    for _ in 0..120 {
+        c.tick_all();
+        let b = byz.clone();
+        c.deliver(&move |e, _| e.from == b && matches!(e.msg, Msg::Attest(_)));
+        c.held.clear();
+    }
+    c.assert_agree();
+    let r_byz = decided_rate(&c, 0);
+    eprintln!("S10 decided-rate: honest {r_honest:.3}, one non-attesting member {r_byz:.3}");
+    assert!(
+        c.decisions[0].len() >= 20,
+        "vacuous: {} decisions",
+        c.decisions[0].len()
+    );
+    assert!(r_honest >= 0.42, "honest decided-rate {r_honest:.3}");
+    assert!(
+        r_byz >= 0.42,
+        "decided-rate {r_byz:.3} with a non-attesting member"
+    );
+}
+
+/// The same floor under delay and a harder adversary: a quarter of all
+/// messages arrive a tick late, and the Byzantine member never attests and
+/// shows each of its vertices to one honest node only (the others must pull
+/// it or decide without it).
+#[test]
+fn the_decided_rate_stays_above_the_floor_under_delay_and_a_withholding_member() {
+    use rand::{Rng, SeedableRng};
+    let mut c = Cluster::new("rate-delay", 4, 0);
+    let byz = c.members[3].info.address.clone();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x42);
+    let late: Vec<bool> = (0..20_000).map(|_| rng.gen_range(0..100) < 25).collect();
+    let counter = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    for _ in 0..160 {
+        c.release();
+        c.tick_all();
+        let (b, late, n) = (byz.clone(), late.clone(), std::rc::Rc::clone(&counter));
+        c.deliver(&move |e, to| {
+            if e.from == b {
+                if matches!(e.msg, Msg::Attest(_)) {
+                    return true;
+                }
+                if matches!(e.msg, Msg::Vertex(_)) && to != 0 {
+                    return true;
+                }
+            }
+            let k = n.get();
+            n.set(k + 1);
+            late[k % late.len()]
+        });
+        // The Byzantine member's withheld copies are dropped for good; the
+        // late honest ones are released at the next tick.
+        let b = byz.clone();
+        c.held
+            .retain(|e| !(e.from == b && matches!(e.msg, Msg::Attest(_) | Msg::Vertex(_))));
+    }
+    c.run(10);
+    c.assert_agree_except(Some(3));
+    let r = decided_rate(&c, 0);
+    eprintln!(
+        "S10 decided-rate under delay and withholding: {r:.3} ({} decisions)",
+        c.decisions[0].len()
+    );
+    assert!(
+        c.decisions[0].len() >= 20,
+        "vacuous: {} decisions",
+        c.decisions[0].len()
+    );
+    assert!(r >= 0.42, "decided-rate {r:.3}");
+}
+
+/// EP-3: E+1's record is written once. Writing the same record again is a
+/// no-op; a different one is a decision conflict and changes nothing.
+#[test]
+fn an_epoch_record_is_written_once() {
+    let c = Cluster::new("s9-write-once", 4, 0);
+    let db = &c.engine(0).storage;
+    let boundary = epoch::Boundary {
+        epoch: 0,
+        current: &c.committee,
+        closing_round: 10,
+        anchor: "aa",
+        block_hash: "bb",
+        height: 4,
+    };
+    let (start, invalid) = epoch::next_start(CHAIN, GENESIS, &boundary, &c.committee);
+    assert!(invalid.is_none());
+    epoch::write_next(db, &start, None).unwrap();
+    epoch::write_next(db, &start, None).unwrap();
+    let mut other = start.clone();
+    other.first_round += 2;
+    let err = epoch::write_next(db, &other, None).unwrap_err();
+    assert!(err.contains(crate::ordering::DECISION_CONFLICT), "{err}");
+    assert_eq!(epoch::read_start_from(db, 1).unwrap(), Some(start));
 }

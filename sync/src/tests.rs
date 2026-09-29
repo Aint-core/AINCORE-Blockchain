@@ -58,6 +58,9 @@ mod tests {
     mod qc_import {
         include!("qc_import_tests.rs");
     }
+    mod system {
+        include!("system_tests.rs");
+    }
     mod admission_snapshot {
         include!("admission_snapshot_tests.rs");
     }
@@ -276,6 +279,7 @@ mod tests {
             receipts_root: "12".repeat(32),
             finality_digest: "34".repeat(32),
             validator_set_hash: validator_set_hash(&validators),
+            next_validator_set_hash: String::new(),
         };
         let sig = bls.sign_raw(&vote.to_signing_bytes(), &seed);
         build_qc(&vote, &validators, &[0], &[sig]).unwrap()

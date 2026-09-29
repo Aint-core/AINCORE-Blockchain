@@ -143,6 +143,7 @@ fn attestation_bytes_never_cross_verify_with_a_finality_vote() {
         receipts_root: digest('a'),
         finality_digest: digest('a'),
         validator_set_hash: qc::validator_set_hash(&committee),
+        next_validator_set_hash: String::new(),
     };
     let attest_bytes = b.signing_bytes();
     let vote_bytes = vote.to_signing_bytes();

@@ -23,6 +23,10 @@ use sha2::{Digest, Sha256};
 /// never collide with a DAG vertex signature (which uses the same consensus DST
 /// at the BLS layer). Bump the suffix on any breaking change to the vote shape.
 const FINALITY_VOTE_DOMAIN: &[u8] = b"AINCORE_FINALITY_VOTE_V1";
+/// FinalityVote V2 (G1 IM-5): a vote that also binds the next epoch's
+/// committee. Only votes that carry `next_validator_set_hash` use it, so
+/// every other vote keeps its V1 bytes.
+const FINALITY_VOTE_DOMAIN_V2: &[u8] = b"AINCORE_FINALITY_VOTE_V2";
 const VALIDATOR_BLS_DOMAIN: &[u8] = b"AINCORE_VALIDATOR_BLS_V1";
 
 /// Per-validator finality identity. `bls_public_key` / `bls_pop` are hex.
@@ -51,15 +55,27 @@ pub struct FinalityVote {
     pub receipts_root: String,
     pub finality_digest: String,
     pub validator_set_hash: String,
+    /// G1 EP-4: on the boundary block H_E of a V4 chain,
+    /// `validator_set_hash(C_{E+1})` as the voter derived it; empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub next_validator_set_hash: String,
 }
 
 impl FinalityVote {
     /// Deterministic signing bytes: domain tag || BCS(self). BCS is canonical
     /// (no map ordering ambiguity), and the domain prefix separates finality
     /// votes from vertex signatures. NEVER sign JSON.
+    ///
+    /// Without a next committee the bytes are V1's exactly (the serde skip
+    /// drops the empty field from BCS too); with one, the V2 domain.
     pub fn to_signing_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(FINALITY_VOTE_DOMAIN.len() + 256);
-        out.extend_from_slice(FINALITY_VOTE_DOMAIN);
+        let domain = if self.next_validator_set_hash.is_empty() {
+            FINALITY_VOTE_DOMAIN
+        } else {
+            FINALITY_VOTE_DOMAIN_V2
+        };
+        let mut out = Vec::with_capacity(domain.len() + 320);
+        out.extend_from_slice(domain);
         let body = bcs::to_bytes(self).expect("FinalityVote is BCS-serializable");
         out.extend_from_slice(&body);
         out
@@ -81,6 +97,9 @@ pub struct QuorumCertificate {
     pub receipts_root: String,
     pub finality_digest: String,
     pub validator_set_hash: String,
+    /// FinalityVote V2's field (see there); empty unless the vote carried it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub next_validator_set_hash: String,
     /// Positional bitmap over validators in canonical (address-sorted) order.
     pub signer_bitmap: Vec<u8>,
     pub signed_stake: u128,
@@ -104,6 +123,7 @@ impl QuorumCertificate {
             receipts_root: self.receipts_root.clone(),
             finality_digest: self.finality_digest.clone(),
             validator_set_hash: self.validator_set_hash.clone(),
+            next_validator_set_hash: self.next_validator_set_hash.clone(),
         }
     }
 }
@@ -512,6 +532,7 @@ pub fn build_qc(
         receipts_root: vote.receipts_root.clone(),
         finality_digest: vote.finality_digest.clone(),
         validator_set_hash: vote.validator_set_hash.clone(),
+        next_validator_set_hash: vote.next_validator_set_hash.clone(),
         signer_bitmap: encode_bitmap(signer_indices, n),
         signed_stake,
         total_stake,
@@ -552,6 +573,7 @@ mod tests {
             receipts_root: "dd".repeat(32),
             finality_digest: "ee".repeat(32),
             validator_set_hash: "ff".repeat(32),
+            next_validator_set_hash: String::new(),
         }
     }
 

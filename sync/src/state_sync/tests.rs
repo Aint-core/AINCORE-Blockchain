@@ -253,6 +253,7 @@ fn chain_with(name: &str, spec: Spec) -> Chain {
         receipts_root: block.header.receipts_root.clone(),
         finality_digest: "ee".repeat(32),
         validator_set_hash: validator_set_hash(&signing),
+        next_validator_set_hash: String::new(),
     };
     let signature =
         crypto::bls::BLSEngine::consensus().sign_raw(&vote.to_signing_bytes(), &spec.signer);
@@ -1793,6 +1794,7 @@ fn a_restored_node_follows_the_chain() {
         receipts_root: one.header.receipts_root.clone(),
         finality_digest: "ee".repeat(32),
         validator_set_hash: validator_set_hash(&committee()),
+        next_validator_set_hash: String::new(),
     };
     let signature = crypto::bls::BLSEngine::consensus().sign_raw(&vote.to_signing_bytes(), &MEMBER);
     let qc = build_qc(&vote, &committee(), &[0], &[signature]).unwrap();

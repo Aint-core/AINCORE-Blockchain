@@ -69,6 +69,10 @@ pub enum Verdict {
     PendingCert(Vec<usize>),
     /// Authenticated, of a closed epoch or below the floor: evidence only.
     Stale,
+    /// Of the next epoch while this node does not hold its record, signed by
+    /// a member of the active committee: dropped, but proof that the network
+    /// passed a boundary this node has not reached (it fetches the gap).
+    Ahead,
     Stage,
 }
 
@@ -116,6 +120,23 @@ fn intrinsic(v: &Vertex) -> Result<(), String> {
 /// Layer S under the record of the vertex's own epoch: every node holding
 /// that record reaches the same verdict. Boot re-runs it on staged bodies, so
 /// it carries every check but the wire size.
+/// The hash is the V4 hash of the body and a staked member of `record`
+/// signed it (no other Layer S check: the vertex is of another epoch).
+fn signed_by_member(
+    v: &Vertex,
+    record: &EpochRecord<'_>,
+    chain_id: &str,
+    genesis_identity: &str,
+) -> bool {
+    v.hash == v.hash_v4_with_domain(chain_id, genesis_identity)
+        && lower_hex(&v.signature, 128)
+        && record
+            .committee
+            .iter()
+            .find(|m| m.address == v.author && m.stake > 0)
+            .is_some_and(|m| v.verify_ed25519_signature(&m.ed25519_public_key))
+}
+
 pub(crate) fn layer_s(
     v: &Vertex,
     record: &EpochRecord<'_>,
@@ -225,6 +246,9 @@ pub fn v4_verdict_cached(
     } else if Some(v.epoch) == active.epoch.checked_add(1) {
         match &ctx.next {
             Some(next) if next.epoch == v.epoch => next,
+            _ if signed_by_member(v, active, ctx.chain_id, ctx.genesis_identity) => {
+                return Verdict::Ahead
+            }
             _ => return Verdict::Drop("the next epoch's committee is not known yet".into()),
         }
     } else if Some(v.epoch) == active.epoch.checked_sub(1) {

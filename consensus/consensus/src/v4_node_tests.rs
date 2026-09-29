@@ -27,6 +27,8 @@ struct Cluster {
     nodes: Vec<Node>,
     committee: Vec<ValidatorInfo>,
     known: Vec<(String, String)>,
+    /// I, pinned in the seeded genesis (EP-1).
+    epoch_interval: u64,
 }
 
 fn validator_info(seed: u8) -> ValidatorInfo {
@@ -44,6 +46,10 @@ fn validator_info(seed: u8) -> ValidatorInfo {
 
 impl Cluster {
     fn new(tag: &str, seeds: &[u8], v4: bool) -> Self {
+        Self::with_interval(tag, seeds, v4, 1000)
+    }
+
+    fn with_interval(tag: &str, seeds: &[u8], v4: bool, epoch_interval: u64) -> Self {
         let committee: Vec<ValidatorInfo> = seeds.iter().map(|s| validator_info(*s)).collect();
         let known: Vec<(String, String)> = committee
             .iter()
@@ -53,6 +59,7 @@ impl Cluster {
             nodes: Vec::new(),
             committee,
             known,
+            epoch_interval,
         };
         for (i, seed) in seeds.iter().enumerate() {
             let path = std::env::temp_dir()
@@ -98,8 +105,19 @@ impl Cluster {
         )
         .unwrap();
         db.put("genesis_identity", GENESIS_IDENTITY).unwrap();
+        db.put(
+            crate::v4::epoch::EPOCH_INTERVAL_KEY,
+            &self.epoch_interval.to_string(),
+        )
+        .unwrap();
         if v4 {
             db.put(crate::v4::VERTEX_FORMAT_KEY, "4").unwrap();
+            // The live set genesis writes: C_{E+1} derives from it (EP-2).
+            db.put(
+                "sys:validator_set:v1",
+                &serde_json::to_string(&self.committee).unwrap(),
+            )
+            .unwrap();
             db.put(
                 "consensus:guard_origin",
                 &crate::v4::guard_origin(
@@ -189,6 +207,44 @@ impl Cluster {
                 }
             }
         }
+    }
+
+    /// `deliver`, except that `lost(from, to, wire)` messages never arrive.
+    fn deliver_filtered(&mut self, lost: &dyn Fn(usize, usize, &str) -> bool) {
+        loop {
+            let mut batch: Vec<(usize, String)> = Vec::new();
+            for i in 0..self.nodes.len() {
+                let outbox = self.node(i).v4_outbox.clone().unwrap();
+                batch.extend(outbox.lock().unwrap().drain(..).map(|w| (i, w)));
+            }
+            if batch.is_empty() {
+                break;
+            }
+            for (from, wire) in batch {
+                for j in (0..self.nodes.len()).filter(|&j| j != from && !lost(from, j, &wire)) {
+                    self.node_mut(j).handle_message(&wire);
+                }
+            }
+        }
+    }
+
+    /// Run until `done` holds, at most `ticks` ticks.
+    fn run_until(&mut self, ticks: usize, done: impl Fn(&Cluster) -> bool) {
+        for _ in 0..ticks {
+            if done(self) {
+                return;
+            }
+            self.run(1);
+        }
+    }
+
+    /// The active epoch of node `i`'s engine.
+    fn epoch(&self, i: usize) -> u64 {
+        self.node(i).v4.as_ref().unwrap().epoch()
+    }
+
+    fn qc(&self, i: usize, h: u64) -> Option<crate::qc::QuorumCertificate> {
+        crate::qc_producer::stored_qc(&self.node(i).storage, h)
     }
 
     fn run(&mut self, ticks: usize) {
@@ -567,4 +623,366 @@ fn a_decision_conflict_halts_the_node_with_an_alarm() {
         c.node(0).ordering_halted().is_some(),
         "the halt was forgotten"
     );
+}
+
+// ------------------------------------------------------------ S9b: epochs
+
+/// EP-1..EP-4 on real nodes (I = 4 blocks): every boundary block H_E writes
+/// E+1's record in its own transaction, the nodes form QC(H_E) binding
+/// `next_validator_set_hash` (FinalityVote V2), activate E+1 on it, and keep
+/// placing the same blocks, whose QCs verify under the epoch's committee.
+/// (g): this harness has no Move stdlib, so `advance_epoch` fails at every
+/// boundary; the epochs advance regardless.
+#[test]
+fn v4_nodes_rotate_epochs_on_the_qc_of_each_boundary_block() {
+    let mut c = Cluster::with_interval("epochs", &[91, 92, 93, 94], true, 4);
+    c.run_until(200, |c| {
+        (0..4).all(|i| c.epoch(i) >= 3 && c.node(i).latest_block_height >= 14)
+    });
+    let placed = c.assert_same_blocks(14);
+    for i in 0..4 {
+        assert!(c.epoch(i) >= 3, "node {i} is in epoch {}", c.epoch(i));
+        let db = &c.node(i).storage;
+        assert!(
+            db.get("sys:last_epoch_boundary").unwrap().is_none(),
+            "(g) is vacuous: Move's advance_epoch ran here"
+        );
+        for e in 1..=3u64 {
+            let start = crate::v4::epoch::read_start_from(db, e).unwrap().unwrap();
+            let boundary = 4 * e;
+            let (round, hash) = c.block(i, boundary).unwrap();
+            assert_eq!(start.prev_height, boundary);
+            assert_eq!(start.prev_block_hash, hash);
+            assert_eq!(start.prev_closing_round, round);
+            assert_eq!(start.first_round, round + 2);
+            assert_eq!(start.committee, crate::qc::canonical_order(&c.committee));
+            // FinalityVote V2 on the boundary block only.
+            let q = c.qc(i, boundary).expect("QC(H_E) is held");
+            assert_eq!(
+                q.next_validator_set_hash,
+                crate::qc::validator_set_hash(&start.committee)
+            );
+            assert_eq!(q.epoch, e - 1);
+            // The first block of E+1 is certified by C_{E+1} in epoch E+1,
+            // with an anchor at or above E+1's first round.
+            let (first, _) = c.block(i, boundary + 1).unwrap();
+            assert!(
+                first >= start.first_round,
+                "block {} at round {first}",
+                boundary + 1
+            );
+            let q = c
+                .qc(i, boundary + 1)
+                .expect("the first block of E+1 has its QC");
+            assert_eq!(q.epoch, e);
+            assert!(q.next_validator_set_hash.is_empty());
+            crate::qc::verify_qc(&q, &start.committee, &crate::qc::expected_chain_id()).unwrap();
+        }
+    }
+    assert!(placed >= 14);
+}
+
+/// EP-2 (e) on real nodes: the live set in H_0's post-state weights one
+/// member ten times (staged by every node's executor alike). Epoch 1's
+/// committee is that set, the boundary QC binds its hash, and the nodes keep
+/// agreeing under the new stake.
+#[test]
+fn a_stake_change_in_the_boundary_post_state_becomes_the_next_committee() {
+    let mut c = Cluster::with_interval("epoch-stake", &[95, 96, 97, 98], true, 4);
+    fn reweigh(_: u8, view: &StateDB) -> Result<(), String> {
+        let raw = view
+            .get("genesis:validator_set:v1")
+            .map_err(|e| e.to_string())?
+            .unwrap();
+        let mut set: Vec<ValidatorInfo> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        set = crate::qc::canonical_order(&set);
+        set[0].stake = 10_000;
+        view.put(
+            "sys:validator_set:v1",
+            &serde_json::to_string(&set).unwrap(),
+        )
+        .map_err(|e| e.to_string())
+    }
+    for i in 0..4 {
+        c.node_mut(i).pre_execution_hook = Some(reweigh);
+    }
+    c.run_until(200, |c| {
+        (0..4).all(|i| c.epoch(i) >= 1 && c.node(i).latest_block_height >= 9)
+    });
+    c.assert_same_blocks(9);
+    for i in 0..4 {
+        assert!(c.epoch(i) >= 1);
+        let start = crate::v4::epoch::read_start_from(&c.node(i).storage, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(start.committee.iter().map(|m| m.stake).max(), Some(10_000));
+        assert_eq!(
+            c.qc(i, 4).unwrap().next_validator_set_hash,
+            crate::qc::validator_set_hash(&start.committee)
+        );
+        let engine = c.node(i).v4.as_ref().unwrap();
+        assert!(
+            engine.stakes().iter().any(|(_, s)| *s == 10_000),
+            "node {i}"
+        );
+    }
+}
+
+/// EP-3/EP-4 (h): a node restarted right after accepting H_E (E+1's record
+/// written, E+1 not active) closes on boot and activates once it holds the
+/// QC, like the others.
+#[test]
+fn a_node_restarted_at_the_boundary_block_activates_like_the_others() {
+    let mut c = Cluster::with_interval("epoch-crash", &[71, 72, 73, 74], true, 4);
+    c.run_until(80, |c| c.node(0).latest_block_height >= 4);
+    assert!(c.node(0).latest_block_height >= 4, "no boundary block");
+    c.reopen(0);
+    let engine = c.node(0).v4.as_ref().unwrap();
+    assert!(
+        engine.next_start().is_some() || engine.epoch() >= 1,
+        "the boundary record was lost across the restart"
+    );
+    c.run_until(200, |c| {
+        (0..4).all(|i| c.epoch(i) >= 2 && c.node(i).latest_block_height >= 10)
+    });
+    c.assert_same_blocks(10);
+    assert!(c.epoch(0) >= 2);
+}
+
+/// EP-4 and EP-5 (c): a node that closed E but never saw the votes for
+/// QC(H_E) asks for the QC (QC_WANT), gets it (QC_CERT), activates, and
+/// catches up with the others' E+1 blocks; its E+1 messages held before
+/// activation change nothing.
+#[test]
+fn a_node_that_missed_the_boundary_votes_fetches_the_qc_and_activates() {
+    let mut c = Cluster::with_interval("epoch-qcwant", &[61, 62, 63, 64], true, 4);
+    c.run_until(80, |c| (0..4).all(|i| c.node(i).latest_block_height >= 3));
+    // Node 0 hears no finality vote and no QC answer for a while.
+    for _ in 0..40 {
+        for i in 0..4 {
+            c.node_mut(i).try_create_vertex();
+        }
+        c.deliver_filtered(&|_, to, wire| {
+            to == 0
+                && (wire.starts_with("QC_VOTE:") || wire.starts_with(crate::dag::QC_CERT_PREFIX))
+        });
+        if (1..4).all(|i| c.epoch(i) >= 1) && c.node(1).latest_block_height >= 6 {
+            break;
+        }
+    }
+    assert_eq!(c.epoch(0), 0, "vacuous: node 0 activated without the QC");
+    assert!(
+        c.node(0).v4.as_ref().unwrap().next_start().is_some(),
+        "node 0 did not close"
+    );
+    assert!(c.qc(0, 4).is_none());
+    // A forged QC(H_0) (one flipped signature byte) is never stored.
+    let mut forged = c.qc(1, 4).expect("node 1 holds QC(H_0)");
+    forged.aggregate_signature[10] ^= 1;
+    let wire = format!(
+        "{}{}",
+        crate::dag::QC_CERT_PREFIX,
+        serde_json::to_string(&forged).unwrap()
+    );
+    c.node_mut(0).handle_message(&wire);
+    assert!(c.qc(0, 4).is_none(), "a forged QC was stored");
+    assert_eq!(c.epoch(0), 0);
+    // QC_WANT is answered only for a boundary height, once per throttle
+    // window however often it is asked.
+    let answers = |c: &mut Cluster, ask: &str| {
+        let outbox = c.node(1).v4_outbox.clone().unwrap();
+        outbox.lock().unwrap().clear();
+        for _ in 0..5 {
+            c.node_mut(1).handle_message(ask);
+        }
+        let sent = outbox
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|w| w.starts_with(crate::dag::QC_CERT_PREFIX))
+            .count();
+        sent
+    };
+    assert_eq!(
+        answers(&mut c, "QC_WANT:3"),
+        0,
+        "a non-boundary height was answered"
+    );
+    assert!(
+        answers(&mut c, "QC_WANT:4") <= 1,
+        "the answer is not throttled"
+    );
+    c.run_until(200, |c| {
+        c.epoch(0) >= 1 && c.node(0).latest_block_height >= c.node(1).latest_block_height
+    });
+    assert!(
+        c.epoch(0) >= 1,
+        "node 0 never activated: height {}, closed {:?}, qc4 {}, halted {:?}",
+        c.node(0).latest_block_height,
+        c.node(0)
+            .v4
+            .as_ref()
+            .unwrap()
+            .next_start()
+            .map(|n| (n.epoch, n.prev_height)),
+        c.qc(0, 4).is_some(),
+        c.node(0).ordering_halted()
+    );
+    assert!(c.qc(0, 4).is_some());
+    c.run(8);
+    c.assert_same_blocks(8);
+}
+
+/// EP-4: a QC(H_E) whose next committee differs from the one this node
+/// derived halts ordering with `alarm:committee_mismatch`, durably. (Node 0's
+/// record is rewritten as a divergent derivation would have left it.)
+#[test]
+fn a_boundary_qc_binding_another_committee_halts_the_node() {
+    let mut c = Cluster::with_interval("epoch-mismatch", &[51, 52, 53, 54], true, 4);
+    c.run_until(80, |c| (0..4).all(|i| c.node(i).latest_block_height >= 3));
+    for _ in 0..40 {
+        for i in 0..4 {
+            c.node_mut(i).try_create_vertex();
+        }
+        c.deliver_filtered(&|_, to, wire| {
+            to == 0
+                && (wire.starts_with("QC_VOTE:") || wire.starts_with(crate::dag::QC_CERT_PREFIX))
+        });
+        if c.node(0).latest_block_height >= 4 && (1..4).all(|i| c.qc(i, 4).is_some()) {
+            break;
+        }
+    }
+    assert_eq!(c.epoch(0), 0, "vacuous: node 0 activated");
+    assert!(c.qc(0, 4).is_none(), "vacuous: node 0 holds the QC");
+    {
+        let db = &c.node(0).storage;
+        let mut start = crate::v4::epoch::read_start_from(db, 1).unwrap().unwrap();
+        start.committee.pop();
+        db.put(
+            &crate::v4::epoch::epoch_start_key(1),
+            &serde_json::to_string(&start).unwrap(),
+        )
+        .unwrap();
+    }
+    c.reopen(0);
+    c.run(20);
+    assert_eq!(
+        c.epoch(0),
+        0,
+        "node 0 activated a committee it did not derive"
+    );
+    assert!(c.node(0).ordering_halted().is_some(), "node 0 did not halt");
+    assert!(
+        c.node(0)
+            .storage
+            .get(&format!("alarm:committee_mismatch:{:020}", 1))
+            .unwrap()
+            .is_some(),
+        "no alarm row"
+    );
+    c.reopen(0);
+    assert!(
+        c.node(0).ordering_halted().is_some(),
+        "the halt was forgotten"
+    );
+}
+
+/// EP-3 in one commit loop: a node cut off across H_0 learns several
+/// anchors at once when it heals, so a single commit loop crosses the
+/// boundary. E closes right after H_0 is placed, so no epoch-0 anchor above
+/// r* becomes a block: every node places the same blocks.
+#[test]
+fn a_node_deciding_a_batch_across_the_boundary_places_the_same_blocks() {
+    let mut c = Cluster::with_interval("epoch-batch", &[41, 42, 43, 44], true, 4);
+    c.run_until(80, |c| (0..4).all(|i| c.node(i).latest_block_height >= 2));
+    let cut_at = c.node(0).latest_block_height;
+    for _ in 0..60 {
+        for i in 0..4 {
+            c.node_mut(i).try_create_vertex();
+        }
+        c.deliver_lossy(&|from, to| from == 0 || to == 0);
+        if (1..4).all(|i| c.epoch(i) >= 1 && c.node(i).latest_block_height >= 7) {
+            break;
+        }
+    }
+    assert!(
+        c.node(0).latest_block_height <= cut_at + 1,
+        "vacuous: node 0 kept up"
+    );
+    assert!(
+        (1..4).all(|i| c.epoch(i) >= 1),
+        "vacuous: no boundary passed"
+    );
+    c.run_until(300, |c| {
+        c.epoch(0) >= 1 && c.node(0).latest_block_height >= c.node(1).latest_block_height
+    });
+    c.run(4);
+    let placed = c.assert_same_blocks(8);
+    for h in 1..=placed {
+        let start = crate::v4::epoch::read_start_from(&c.node(0).storage, 1)
+            .unwrap()
+            .unwrap();
+        let (round, _) = c.block(0, h).unwrap();
+        if h <= 4 {
+            assert!(
+                round <= start.prev_closing_round,
+                "block {h} at round {round}"
+            );
+        } else {
+            assert!(round >= start.first_round, "block {h} at round {round}");
+        }
+    }
+}
+
+/// EP-3 against lagging placement: every node's block placement stalls
+/// (execution fails) while rounds go on past H_0's anchor, so epoch-0 anchors
+/// above r* become decidable before anyone closes. When placement resumes,
+/// one commit loop places H_0 and must stop there: every block after it
+/// anchors an epoch-1 vertex, never an epoch-0 one above r*.
+#[test]
+fn a_commit_loop_stops_at_the_boundary_even_when_later_anchors_are_ready() {
+    static BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    fn gate(_: u8, _: &StateDB) -> Result<(), String> {
+        if BLOCKED.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("placement stalled (test)".into());
+        }
+        Ok(())
+    }
+    let mut c = Cluster::with_interval("epoch-stall", &[35, 36, 37, 38], true, 4);
+    for i in 0..4 {
+        c.node_mut(i).pre_execution_hook = Some(gate);
+    }
+    c.run_until(80, |c| (0..4).all(|i| c.node(i).latest_block_height >= 3));
+    BLOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let stalled_at = c.node(0).latest_block_height;
+    c.run(14);
+    assert_eq!(
+        c.node(0).latest_block_height,
+        stalled_at,
+        "placement was not stalled"
+    );
+    BLOCKED.store(false, std::sync::atomic::Ordering::SeqCst);
+    c.run_until(300, |c| {
+        (0..4).all(|i| c.epoch(i) >= 1 && c.node(i).latest_block_height >= 8)
+    });
+    let placed = c.assert_same_blocks(8);
+    let db = &c.node(0).storage;
+    let start = crate::v4::epoch::read_start_from(db, 1).unwrap().unwrap();
+    for h in 5..=placed {
+        let block: blockchain::Block =
+            serde_json::from_str(&db.get(&format!("block_{h}")).unwrap().unwrap()).unwrap();
+        let anchor: blockchain::Vertex = serde_json::from_str(
+            &db.get(&format!("vertex:{}", block.anchor_hash))
+                .unwrap()
+                .expect("the anchor body is held"),
+        )
+        .unwrap();
+        assert!(
+            anchor.epoch >= 1,
+            "block {h} anchors an epoch-{} vertex at round {} (r* = {})",
+            anchor.epoch,
+            anchor.round,
+            start.prev_closing_round
+        );
+    }
 }

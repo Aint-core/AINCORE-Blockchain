@@ -602,9 +602,13 @@ fn adjacent_epochs_are_authenticated_before_they_are_kept() {
         invalid(judge(&forged(EPOCH + 1), true, true)),
         "a forged next-epoch vertex"
     );
+    // Without the next record the vertex cannot be kept, but a member's
+    // signature on it proves the network is past the boundary (Ahead); a
+    // forged one proves nothing.
+    assert_eq!(judge(&at(EPOCH + 1), true, false), Verdict::Ahead);
     assert!(
-        matches!(judge(&at(EPOCH + 1), true, false), Verdict::Drop(_)),
-        "no next record"
+        matches!(judge(&forged(EPOCH + 1), true, false), Verdict::Drop(_)),
+        "a forged next-epoch vertex without the next record"
     );
     assert_eq!(judge(&at(EPOCH - 1), true, true), Verdict::Stale);
     assert!(

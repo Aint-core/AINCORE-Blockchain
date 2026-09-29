@@ -1996,6 +1996,7 @@ mod tests {
             // Must equal validator_set_hash(set): verify_qc binds the QC to the
             // exact validator set (the #7 binding). A dummy hash would be rejected.
             validator_set_hash: consensus::qc::validator_set_hash(&set),
+            next_validator_set_hash: String::new(),
         };
         let sig = bls.sign_raw(&vote.to_signing_bytes(), &bls_seed);
         let qc = consensus::qc::build_qc(&vote, &set, &[0], &[sig]).expect("build qc");

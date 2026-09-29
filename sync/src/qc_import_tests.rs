@@ -25,10 +25,24 @@ fn member(seed: u8) -> ValidatorInfo {
 }
 
 const SEEDS: [u8; 4] = [11, 12, 13, 14];
+/// Replaces seed 14 in the epoch-1 committee of the boundary tests.
+const NEWCOMER: u8 = 15;
+/// The test blocks' proposer, a member of the live set (block validation).
+const PROPOSER: u8 = 77;
 
 /// A V4 chain whose genesis committee is `SEEDS`; the proposer of the test
 /// blocks is the fixture key 77 (registered by `authenticate_block`).
 fn v4_sync(name: &str) -> (ChainSync, Vec<ValidatorInfo>) {
+    v4_sync_with(name, 1000, None)
+}
+
+/// `v4_sync` with epoch length `interval` and, if given, the live validator
+/// set every block's post-state carries (C_{E+1} derives from it).
+fn v4_sync_with(
+    name: &str,
+    interval: u64,
+    live: Option<&[ValidatorInfo]>,
+) -> (ChainSync, Vec<ValidatorInfo>) {
     let name = format!("s8_{name}_{}_{}", std::process::id(), rand::random::<u64>());
     let sync = setup_sync(&name);
     let committee: Vec<ValidatorInfo> =
@@ -51,6 +65,24 @@ fn v4_sync(name: &str) -> (ChainSync, Vec<ValidatorInfo>) {
         sync.storage
             .put(consensus::v4::VERTEX_FORMAT_KEY, "4")
             .unwrap();
+        // A V4 genesis pins its epoch length (EP-1).
+        sync.storage
+            .put(
+                consensus::v4::epoch::EPOCH_INTERVAL_KEY,
+                &interval.to_string(),
+            )
+            .unwrap();
+        sync.storage
+            .put("genesis_identity", "s9b-sync-genesis")
+            .unwrap();
+        if let Some(live) = live {
+            sync.storage
+                .put(
+                    "sys:validator_set:v1",
+                    &serde_json::to_string(live).unwrap(),
+                )
+                .unwrap();
+        }
     }
     seed_state_tree(&sync);
     (sync, committee)
@@ -79,9 +111,20 @@ fn block_at(sync: &ChainSync, height: u64, parent: &str, anchor: &str) -> Block 
 
 /// A QC for `block` signed by the committee members at `signers`.
 fn qc_for(block: &Block, committee: &[ValidatorInfo], signers: &[usize]) -> QuorumCertificate {
+    qc_in(block, committee, signers, 0, String::new())
+}
+
+/// `qc_for` in epoch `epoch`, binding `next` (FinalityVote V2) if non-empty.
+fn qc_in(
+    block: &Block,
+    committee: &[ValidatorInfo],
+    signers: &[usize],
+    epoch: u64,
+    next: String,
+) -> QuorumCertificate {
     let vote = FinalityVote {
         chain_id: consensus::qc::expected_chain_id(),
-        epoch: 0,
+        epoch,
         finalized_round: block.header.round,
         anchor_round: block.header.round,
         anchor_hash: block.anchor_hash.clone(),
@@ -91,10 +134,12 @@ fn qc_for(block: &Block, committee: &[ValidatorInfo], signers: &[usize]) -> Quor
         receipts_root: block.header.receipts_root.clone(),
         finality_digest: "cd".repeat(32),
         validator_set_hash: consensus::qc::validator_set_hash(committee),
+        next_validator_set_hash: next,
     };
     let by_address = |a: &str| {
         SEEDS
             .iter()
+            .chain(&[NEWCOMER, PROPOSER])
             .find(|s| member(**s).address == a)
             .copied()
             .unwrap()
@@ -190,4 +235,88 @@ fn v4_sync_responses_carry_each_blocks_qc() {
         resp.qcs.iter().map(|q| q.block_height).collect::<Vec<_>>(),
         vec![1]
     );
+}
+
+// ------------------------------------------------------------ S9b: epochs
+
+/// C_1 of the boundary tests: 14 leaves, 15 and the proposer join (real
+/// key changes).
+fn next_committee() -> Vec<ValidatorInfo> {
+    consensus::qc::canonical_order(
+        &[11, 12, 13, NEWCOMER, PROPOSER]
+            .iter()
+            .map(|s| member(*s))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// EP-2/EP-3/EP-4 on import (I = 2): H_0 = block 2 writes epoch 1's record
+/// (C_1 from its post-state) in its own transaction; QC(H_0) binds hash(C_1);
+/// block 3 is then accepted with a QC of C_1 in epoch 1, and refused with a
+/// QC of C_0.
+#[test]
+fn v4_sync_imports_across_a_boundary_under_the_next_committee() {
+    let c1 = next_committee();
+    let (sync, c0) = v4_sync_with("boundary", 2, Some(&c1));
+    let next = consensus::qc::validator_set_hash(&c1);
+    let b1 = block_at(&sync, 1, "genesis", &"a1".repeat(32));
+    assert_eq!(
+        sync.process_blocks_with_qcs(vec![b1.clone()], &[qc_for(&b1, &c0, &[0, 1, 2])], 0),
+        1
+    );
+    let b2 = block_at(&sync, 2, &b1.header.hash, &"a2".repeat(32));
+    let q2 = qc_in(&b2, &c0, &[0, 1, 2], 0, next.clone());
+    assert_eq!(sync.process_blocks_with_qcs(vec![b2.clone()], &[q2], 1), 2);
+    let start = consensus::v4::epoch::read_start_from(&sync.storage, 1)
+        .unwrap()
+        .expect("H_0's transaction wrote epoch 1's record");
+    assert_eq!(start.committee, c1);
+    assert_eq!(start.first_round, b2.header.round + 2);
+    assert_eq!(start.prev_height, 2);
+    let b3 = block_at(&sync, 3, &b2.header.hash, &"a3".repeat(32));
+    let stale = qc_in(&b3, &c0, &[0, 1, 2], 0, String::new());
+    assert_eq!(
+        sync.process_blocks_with_qcs(vec![b3.clone()], &[stale], 2),
+        2,
+        "a QC of the old committee certified an epoch-1 block"
+    );
+    let q3 = qc_in(&b3, &c1, &[0, 1, 2, 3], 1, String::new());
+    assert_eq!(sync.process_blocks_with_qcs(vec![b3], &[q3], 2), 3);
+}
+
+/// EP-4 on import: QC(H_0) binding a next committee other than the one this
+/// node derives from the same post-state is refused, and the node records
+/// `alarm:committee_mismatch` (its consensus halts on it).
+#[test]
+fn v4_sync_refuses_a_boundary_qc_binding_another_committee() {
+    let c1 = next_committee();
+    let (sync, c0) = v4_sync_with("mismatch", 2, Some(&c1));
+    let b1 = block_at(&sync, 1, "genesis", &"a1".repeat(32));
+    assert_eq!(
+        sync.process_blocks_with_qcs(vec![b1.clone()], &[qc_for(&b1, &c0, &[0, 1, 2])], 0),
+        1
+    );
+    let b2 = block_at(&sync, 2, &b1.header.hash, &"a2".repeat(32));
+    let wrong = qc_in(
+        &b2,
+        &c0,
+        &[0, 1, 2],
+        0,
+        consensus::qc::validator_set_hash(&c0),
+    );
+    assert_eq!(
+        sync.process_blocks_with_qcs(vec![b2.clone()], &[wrong], 1),
+        1
+    );
+    assert!(
+        consensus::v4::epoch::read_start_from(&sync.storage, 1)
+            .unwrap()
+            .is_none(),
+        "the refused block's record was written"
+    );
+    assert!(sync
+        .storage
+        .get(&format!("alarm:committee_mismatch:{:020}", 1))
+        .unwrap()
+        .is_some());
 }

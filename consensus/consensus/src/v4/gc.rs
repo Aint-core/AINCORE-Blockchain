@@ -48,14 +48,24 @@ impl Engine {
         if cut == 0 {
             return;
         }
+        if !self.delete_epoch_rows(self.epoch, cut) {
+            return; // retried at the next rise of the floor
+        }
+        self.forget_below(cut);
+    }
+
+    /// Delete `epoch`'s staged bodies, slot rows, certificates, this node's
+    /// guards and producer guards at rounds at or below `cut`, and give the
+    /// plain-body budget back, in one transaction. True when committed.
+    pub(super) fn delete_epoch_rows(&self, epoch: u64, cut: u64) -> bool {
         let cg = vcert::chain_genesis_tag(&self.cfg.chain_id, &self.cfg.genesis_identity);
         let bls_pk = hex::encode(
             BLSEngine::consensus().pubkey_raw(&qc::derive_validator_bls_seed(&self.cfg.node_key)),
         );
-        let slots = format!("consensus:vslot:v1:{EPOCH:020}:");
-        let certs = format!("consensus:vcert:v1:{EPOCH:020}:");
-        let guards = format!("consensus:vattest:v1:{cg}:{bls_pk}:{EPOCH}:");
-        let proposed = self.proposed_prefix();
+        let slots = format!("consensus:vslot:v1:{epoch:020}:");
+        let certs = format!("consensus:vcert:v1:{epoch:020}:");
+        let guards = format!("consensus:vattest:v1:{cg}:{bls_pk}:{epoch}:");
+        let proposed = format!("consensus:vproposed:v1:{cg}:{}:{epoch}:", self.ed25519_pk);
         let round_of = |key: &[u8], prefix: &str, at_end: bool| -> Option<u64> {
             let rest = std::str::from_utf8(key.get(prefix.len()..)?).ok()?;
             let field = if at_end {
@@ -112,7 +122,7 @@ impl Engine {
             }
             // The plain-body budget gives back what GC removed (ST-3).
             for (author, bytes) in &freed {
-                let key = staging::vbytes_key(EPOCH, author);
+                let key = staging::vbytes_key(epoch, author);
                 let held = view
                     .get(&key)
                     .map_err(storage_err)?
@@ -123,10 +133,11 @@ impl Engine {
             }
             Ok(())
         });
-        if result.is_err() {
-            return; // retried at the next rise of the floor
-        }
-        // Memory follows the rows.
+        result.is_ok()
+    }
+
+    /// Forget in memory what GC deleted at or below `cut`.
+    fn forget_below(&mut self, cut: u64) {
         {
             let mut dag = lock(&self.dag);
             dag.retain(|_, v| v.round > cut);

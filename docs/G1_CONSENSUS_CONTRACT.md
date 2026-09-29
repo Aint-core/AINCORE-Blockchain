@@ -797,6 +797,174 @@ Witnesses:
 Mutation: 5 of 5 killed (the contract's list: no QC check, block hash only, dropped `qcs`),
 plus unverified signatures and a QC that is not imported.
 
+**S9 status, part 1: epochs in the engine (`consensus::v4::epoch`).** The node wiring
+(closing at H_E's acceptance from the post-state validator set, activation on QC(H_E),
+FinalityVote V2) is S9b.
+
+What landed:
+- **EP-2/EP-3 close.** `close_epoch(r*, anchor, block_hash, proposed)` writes E+1's record
+  (`consensus:epoch_start:{E+1}`): the proposed committee if `validate_committee` accepts it
+  (non-empty, ≤ 256, unique, positive stake, the ed25519 key derives the address, the BLS
+  PoP verifies), else C_E again with `alarm:committee_invalid:{E+1}`; first round r* + 2; the
+  sentinel `epoch_genesis(chain, genesis, E+1, first_round, block_hash, anchor)`. Ordering
+  scans no anchor above r* (`close_epoch_at`), and production stops.
+- **EP-4 activate.** `epoch_active` is written first; `begin_epoch` moves the cursor and g to
+  the new first round and marks the sentinel settled; derived state resets. RC-3: a node that
+  abstained under a wiped guard database resumes. Rows two epochs back are deleted (GC-3 by
+  epoch). Early E+1 certificates and pending E+1 vertices are evaluated.
+- **EP-4 orphans.** Payloads of this node's uncommitted epoch-E proposals above g_E are handed
+  back (`take_orphaned_payloads`). They are judged against E's floor and committed set
+  *before* `begin_epoch` replaces both. (The first version judged after, and returned nothing:
+  witness (f) caught it.) The mempool's loan timeout remains the backstop after a crash.
+- **RC-1 for epochs.** Boot reads `epoch_active`, E's and E−1's records and E+1's if E closed.
+  A standalone engine that crashed between closing and activating activates on its first call.
+- **LA-6 across a boundary (found by the catch-up witness).** A node cut off just before a
+  boundary could never finish E, for two reasons. Its peers had cleared E's bodies and
+  certificates at activation. And the only authenticated evidence that it was behind, E+1
+  vertices, were dropped before any fetch (it holds no C_{E+1}). Fixed:
+  - the tail of the closed epoch is kept and served until the next activation, and rebuilt
+    from its rows at boot;
+  - `CERT_REQ` names its epoch;
+  - an E+1 vertex signed by a member of C_E, arriving while this node holds no E+1 record, is a
+    new verdict, `Ahead`. It is not kept, but its gap is fetched (bounded, as RE-1 (c)).
+  A node further behind than the closed tail catches up by IM-1 block sync, as LA-6 says.
+
+Deviation: the standalone engine (tests) counts decisions as blocks and closes every
+`epoch_interval` of them; that count is not atomic with the decision rows. The node (S9b)
+closes at H_E inside the block's transaction, so this does not ship.
+
+Witnesses (engine, 4 validators, real RocksDB guards): rotation and agreement across ≥ 3
+boundaries with r* + 2 and the epoch-0 rows gone; (e) a committee change dropping a member,
+adding a newcomer with new keys and unequal stake (the newcomer's vertices are ordered in
+epoch 1, the leaver's are not, the leaver follows); (j) an invalid PoP → carry-over with the
+alarm on every node; (a)(d)(i) a stale epoch-E vertex at E+1's first round and an E+1
+first-round vertex citing a wrong sentinel change nothing; (k) a wiped guard database abstains
+until the next activation and then proposes; (f) an orphaned payload is handed back; a node
+behind at the boundary catches up into E+1; restarted servers still serve the closed tail; a
+crash between close and activation still activates. `(b)`, `(c)`, `(g)` and `(h)` need the
+node (S9b).
+
+Mutation: 18 mutants. 13 were killed on the first run; K5 (round index kept), K6 (no continuity
+check), N5 (committed orphans returned) and N12 (early certificates dropped) survived and got
+witnesses: the index-epoch invariant in the rotation test, a foreign guard origin, a committed
+payload that must not come back, and an E+1 certificate delivered between close and activation.
+Their re-run is in part 2's result.
+
+**S9 status, part 2 (S9b): epochs in the node.**
+
+What landed:
+- **EP-1.** On a V4 chain `epoch_for_block_height` is ⌊(h−1)/I⌋ from the pinned
+  `sys:config:epoch_block_interval`, and `load_validator_set_for_epoch` is the epoch record's
+  committee (genesis's for 0). The executor's `consensus:epoch*` and
+  `sys:validator_set:epoch:*` rows are no longer read on V4, so rotation does not depend on
+  Move's `advance_epoch` succeeding.
+- **EP-2/EP-3.** `epoch::stage_boundary` runs inside the transaction that accepts a boundary
+  block H_E. That covers both the local build (`commit_ready_anchors`) and the sync import
+  (`process_blocks_with_qcs`). It derives C_{E+1} from `sys:validator_set:v1` in H_E's
+  post-state, validates it (else C_E and `alarm:committee_invalid`), and writes E+1's record
+  write-once. A different existing record is a decision conflict. Right after placement the node
+  closes E in memory, before anything else is decided.
+- **IM-5, FinalityVote V2.** A vote and a QC carry `next_validator_set_hash`. It is non-empty only
+  on a V4 boundary block, where it is signed under `AINCORE_FINALITY_VOTE_V2`. Every other vote
+  keeps its V1 bytes exactly (the empty field is skipped in BCS and JSON), so V3 is unchanged.
+- **EP-4.** The node activates E+1 when it holds QC(H_E), and only if that QC:
+  - verifies under C_E;
+  - binds H_E's height, hash, anchor round and anchor;
+  - carries a next hash equal to the hash of the committee this node derived.
+  A mismatch writes `alarm:committee_mismatch:{E+1}` and halts. The alarm survives restarts, and
+  the sync import path writes the same alarm. Orphaned payloads go back to the mempool.
+- **QC(H_E) transport (found by the witnesses).** Activation makes one QC liveness-critical on
+  every node. A node that missed the boundary votes had no way to get it:
+  - sync asks only for blocks above its tip;
+  - `GET_FINALITY` returns only the latest QC;
+  - `import_finality_qc` stores only a QC that advances finality, and a node that built H_E itself
+    is already past that round.
+  With unequal stake this stalled three of four nodes at H_1.
+  Fix, part 1: `QC_WANT:{h}` / `QC_CERT:{qc}`. A node closed and missing QC(H_E) asks, throttled.
+  Peers answer only for a boundary height they hold a QC for, at most once per throttle window
+  per height.
+  Fix, part 2: `store_block_qc` stores a QC for a held block after IM-1, without the finality
+  rule.
+
+Deviations and open items:
+- The adoption loop closes and activates between adopted heights, but the node harness has no
+  sync. The sync-level witnesses cover the import half, and S10's system suite covers adoption
+  across a boundary.
+- **Snapshot restore across epochs is open.** Epoch records are Local, so a state snapshot does
+  not carry them, and a node restored in epoch E > 0 cannot verify QCs. The fix is an epoch
+  change proof: the chain of QC(H_E) with its next hashes, from C_0. It is needed before any
+  restore on a multi-epoch chain (G6 / before S11's launch).
+- (b) is covered by construction (DE scans no anchor above r*) and by the engine's stale
+  witness. It has no separate node witness.
+
+Witnesses:
+- Node level, 4 real nodes with real multi-node QCs (the harness now routes QC votes), I = 4:
+  - rotation through 3 boundaries: each record matches H_E; QC(H_E) binds hash(C_{E+1}) and is
+    V2; the first block of E+1 has a QC of epoch E+1 under C_{E+1}. With (g) non-vacuous: Move's
+    `advance_epoch` never ran.
+  - (e) a stake change in H_0's post-state becomes C_1 and its stakes decide.
+  - (h) a node restarted right after H_E activates like the others.
+  - (c) a node that missed the boundary votes: it closes, stays inactive, refuses a forged
+    `QC_CERT`, fetches QC(H_E), activates and agrees. `QC_WANT` for a non-boundary height is not
+    answered, and repeated asks get one answer.
+  - A QC(H_E) binding another committee halts with the alarm, across a restart.
+- Sync level, I = 2, with C_1 ≠ C_0 by a real key change:
+  - H_0's import writes epoch 1's record, and block 3 is accepted with a C_1 QC and refused with a
+    C_0 QC;
+  - a boundary QC binding another committee is refused and raises the alarm.
+
+Mutation (S9b): the four part-1 survivors re-ran and were all killed. Then 15 new mutants ran:
+- 13 were killed on the first run;
+- B10 survived: dropping the in-memory close right after placement.
+- B14 survived: the record not written once.
+
+Their witnesses:
+- B10: in normal runs production stops at the close, so an epoch-E anchor above r* never
+  becomes decidable. The new witness stalls placement on every node while rounds continue.
+  Without the close, block 5 anchors an epoch-0 vertex at round 10 above r* = 8; with it, every
+  block after H_0 anchors an epoch-1 vertex.
+- B14: a direct unit witness of write-once.
+
+Both were verified killed. Total S9: 33 mutants, all killed.
+
+**S10 status: the system suite (`sync/src/system_tests.rs`).**
+- Setup: real `DagConsensus` nodes on a V4 genesis, each with its own `ChainSync`, and real multi-node QCs.
+- The consensus crate has a `sim` feature that exposes only the outbox transport. chain_sync enables it for its tests only.
+- Every agreement check compares every block hash and allows at most one QC per height across nodes. The block hash binds the state and receipts roots.
+
+Witnesses:
+- **Outage (from S8):** Y is offline past GC_DEPTH + RETAIN_SLACK rounds and syncs back by
+  IM-1, with every imported block carrying its QC. W then crashes for good, and every new QC
+  carries Y's signature.
+- **Adoption across boundaries:** Y syncs back through two boundaries (I = 4), ends in the
+  others' epoch, and votes there.
+- **Partitions:**
+  - 2|2: nothing is placed on either side; after healing, the nodes agree.
+  - 1|3: the three keep deciding; the one catches up.
+- **Faults:**
+  - 10% loss, 15% delay of up to 3 ticks, and every batch reordered, across epoch boundaries;
+  - a restart every 5 ticks, rotating through the nodes;
+  - a slow node that ticks 1 step in 4.
+- **Stake profiles:** 4×1000, 4000/3000/2000/1000, 3300/2300/2200/2200 and
+  2000/1000/1000/1000 all decide and agree.
+- **IM-3 on adoption:** a synced block conflicting with a local decision row halts the node with
+  the alarm, and the block is not adopted.
+- **Decided-rate (engine SimNet), floor 0.42:**
+  - honest nodes: 1.000;
+  - one member that never attests: 1.000;
+  - 25% of messages a tick late plus a member that never attests and shows each vertex to one
+    honest node only: 0.656.
+
+Open in S10:
+- the V3 baseline on the same SimNet;
+- R(P) for P ∈ {5, 50, 99, 150};
+- per-round BLS and fsync cost on the Pi (a hardware measurement);
+- exit-77 crashes at every durable boundary (the suite restarts between calls; the block
+  transaction makes each acceptance atomic);
+- the equivocating-leader and withheld-body cases at system level (they are witnessed at engine
+  level by A2c, A3c and the twin flood);
+- re-running every earlier mutation at system level.
+
 ### Imported decisions and finality votes (IM)
 
 **IM-1 (QC authority).**

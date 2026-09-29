@@ -24,6 +24,10 @@ type BroadcastHook = Arc<dyn Fn(&Vertex) + Send + Sync>;
 /// the IDENTICAL evidence set at block-build time. Never send it to the mempool
 /// or the executor as a tx.
 pub const SLASH_EVIDENCE_PREFIX: &str = "SLASH_EVIDENCE:";
+/// G1 EP-4: ask peers for QC(H_E) / answer with it (`answer_qc_want`).
+pub const QC_WANT_PREFIX: &str = "QC_WANT:";
+pub const QC_CERT_PREFIX: &str = "QC_CERT:";
+const QC_WANT_EVERY_TICKS: u64 = 4;
 /// Upper bound on evidence items carried per vertex and applied per block
 /// (matches executor::apply_slash_evidence's `.take(5)`).
 const MAX_EVIDENCE_PER_VERTEX: usize = 5;
@@ -140,6 +144,10 @@ pub struct DagConsensus {
     /// row that disagrees, DE-6) halts ordering: no block is placed, no
     /// finality vote signed, no synced anchor adopted. Survives restarts.
     ordering_halt: Option<String>,
+    /// V4 ticks so far, and the QC(H_E) ask/answer throttles (EP-4).
+    v4_ticks: u64,
+    qc_want_next: u64,
+    qc_answered: HashMap<u64, u64>,
     #[cfg(test)]
     pub(crate) local_acceptance_hook: Option<LocalAcceptanceHook>,
     /// Tests only: runs inside the block transaction BEFORE execution, the
@@ -150,12 +158,12 @@ pub struct DagConsensus {
     #[cfg(test)]
     pub(crate) broadcast_hook: Option<BroadcastHook>,
     /// Tests only: V4 wire messages this node sent, instead of the network.
-    #[cfg(test)]
-    pub(crate) v4_outbox: Option<V4Outbox>,
+    #[cfg(any(test, feature = "sim"))]
+    pub v4_outbox: Option<V4Outbox>,
 }
 
-#[cfg(test)]
-pub(crate) type V4Outbox = Arc<Mutex<Vec<String>>>;
+#[cfg(any(test, feature = "sim"))]
+pub type V4Outbox = Arc<Mutex<Vec<String>>>;
 
 /// The production `ConsensusNet`: V4 messages go out as `DAG_V4:{json}` over
 /// gossip and the TCP fan-out, like `DAG_VERTEX`. An attestation, addressed to
@@ -165,17 +173,14 @@ struct V4Net {
     p2p_tx: Option<tokio::sync::mpsc::Sender<String>>,
     peers: PeerList,
     storage: Arc<StateDB>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "sim"))]
     outbox: Option<V4Outbox>,
 }
 
-impl crate::v4::ConsensusNet for V4Net {
-    fn broadcast(&self, msg: crate::v4::Msg) {
-        let Ok(json) = serde_json::to_string(&msg) else {
-            return;
-        };
-        let wire = format!("{}{json}", crate::v4::WIRE_PREFIX);
-        #[cfg(test)]
+impl V4Net {
+    /// Gossip plus the TCP fallback (in tests, the node's outbox).
+    fn broadcast_wire(&self, wire: String) {
+        #[cfg(any(test, feature = "sim"))]
         if let Some(outbox) = &self.outbox {
             outbox.lock().unwrap_or_else(|e| e.into_inner()).push(wire);
             return;
@@ -205,6 +210,15 @@ impl crate::v4::ConsensusNet for V4Net {
                 let _ = network::send_message(&format!("{ip}:{port}"), &wire);
             }
         }
+    }
+}
+
+impl crate::v4::ConsensusNet for V4Net {
+    fn broadcast(&self, msg: crate::v4::Msg) {
+        let Ok(json) = serde_json::to_string(&msg) else {
+            return;
+        };
+        self.broadcast_wire(format!("{}{json}", crate::v4::WIRE_PREFIX));
     }
 
     fn send(&self, _to: &str, msg: crate::v4::Msg) {
@@ -640,22 +654,26 @@ impl DagConsensus {
             v4_chain: v4_format,
             v4_stakes: Vec::new(),
             ordering_halt: None,
+            v4_ticks: 0,
+            qc_want_next: 0,
+            qc_answered: HashMap::new(),
             #[cfg(test)]
             local_acceptance_hook: None,
             #[cfg(test)]
             pre_execution_hook: None,
             #[cfg(test)]
             broadcast_hook: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "sim"))]
             v4_outbox: None,
         };
-        let alarms = "alarm:decision_conflict:";
-        if let Some(Ok((key, _))) = this.storage.db.prefix_iterator(alarms.as_bytes()).next() {
-            if key.starts_with(alarms.as_bytes()) {
-                this.ordering_halt = Some(format!(
-                    "a decision conflict was recorded ({})",
-                    String::from_utf8_lossy(&key)
-                ));
+        for alarms in ["alarm:decision_conflict:", "alarm:committee_mismatch:"] {
+            if let Some(Ok((key, _))) = this.storage.db.prefix_iterator(alarms.as_bytes()).next() {
+                if key.starts_with(alarms.as_bytes()) {
+                    this.ordering_halt = Some(format!(
+                        "a consensus conflict was recorded ({})",
+                        String::from_utf8_lossy(&key)
+                    ));
+                }
             }
         }
         if v4_format {
@@ -674,6 +692,11 @@ impl DagConsensus {
         })
     }
 
+    /// The V4 engine's active epoch (None on a V3 chain).
+    pub fn v4_epoch(&self) -> Option<u64> {
+        self.v4.as_ref().map(|e| e.epoch())
+    }
+
     /// DE-6: a decision row disagreed. Recorded durably; ordering stops.
     fn halt_on_decision_conflict(&mut self, height: u64, err: &str) {
         let _ = self
@@ -681,6 +704,169 @@ impl DagConsensus {
             .put(&format!("alarm:decision_conflict:{height}"), err);
         eprintln!("🚨 [DE-6] {err}: ordering halted at height {height}");
         self.ordering_halt = Some(err.to_string());
+    }
+
+    /// G1 EP-3 and EP-4 on the node. E closes in memory once H_E is accepted
+    /// or adopted (its record was written in H_E's transaction). E+1 activates
+    /// once this node holds QC(H_E), verified under C_E and binding H_E; the
+    /// QC's `next_validator_set_hash` must be the hash of the committee this
+    /// node derived, or ordering halts with `alarm:committee_mismatch`.
+    fn v4_epoch_step(&mut self) {
+        if self.ordering_halted().is_some() {
+            return;
+        }
+        let Some(mut engine) = self.v4.take() else {
+            return;
+        };
+        self.v4_epoch_step_with(&mut engine);
+        self.v4_stakes = engine.stakes().to_vec();
+        self.v4 = Some(engine);
+    }
+
+    fn v4_epoch_step_with(&mut self, engine: &mut crate::v4::Engine) {
+        match engine.observe_close() {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                eprintln!("[EP-3] the next epoch's record is unreadable: {e}");
+                return;
+            }
+        }
+        let Some(next) = engine.next_start().cloned() else {
+            return;
+        };
+        let mismatch_key = format!("alarm:committee_mismatch:{:020}", next.epoch);
+        if let Ok(Some(why)) = self.storage.get(&mismatch_key) {
+            // Sync refused QC(H_E) for this reason (see chain_sync).
+            self.ordering_halt = Some(why);
+            return;
+        }
+        let Some(qc) = crate::qc_producer::stored_qc(&self.storage, next.prev_height) else {
+            // A node that missed the votes has no other way to this one QC
+            // (sync asks for blocks above its tip, GET_FINALITY for the latest
+            // QC): ask peers for it, throttled.
+            if self.v4_ticks >= self.qc_want_next {
+                self.qc_want_next = self.v4_ticks + QC_WANT_EVERY_TICKS;
+                self.v4_net()
+                    .broadcast_wire(format!("{QC_WANT_PREFIX}{}", next.prev_height));
+            }
+            return;
+        };
+        let binds = qc.block_height == next.prev_height
+            && qc.block_hash == next.prev_block_hash
+            && qc.anchor_round == next.prev_closing_round
+            && qc.anchor_hash == next.prev_anchor
+            && qc.epoch == engine.epoch()
+            && crate::qc::verify_qc(&qc, engine.committee(), &self.resolve_chain_id()).is_ok();
+        if !binds {
+            eprintln!(
+                "[EP-4] the stored QC of height {} does not bind H_{}; activation waits",
+                next.prev_height,
+                engine.epoch()
+            );
+            return;
+        }
+        let derived = crate::qc::validator_set_hash(&next.committee);
+        if qc.next_validator_set_hash != derived {
+            let why = format!(
+                "{}: QC(H_{}) binds next committee {:?}, this node derived {derived}",
+                crate::v4::epoch::COMMITTEE_MISMATCH,
+                engine.epoch(),
+                qc.next_validator_set_hash
+            );
+            let _ = self.storage.put(&mismatch_key, &why);
+            eprintln!("🚨 [EP-4] {why}: ordering halted");
+            self.ordering_halt = Some(why);
+            return;
+        }
+        let net = self.v4_net();
+        if let Err(e) = engine.activate_next(&net) {
+            eprintln!("[EP-4] activation of epoch {} failed: {e}", next.epoch);
+            return;
+        }
+        println!(
+            "⏭️  [EP-4] epoch {} active from round {}",
+            next.epoch, next.first_round
+        );
+        self.current_round = engine.current_round();
+        let orphans: Vec<String> = engine
+            .take_orphaned_payloads()
+            .into_iter()
+            .filter(|p| !p.starts_with(SLASH_EVIDENCE_PREFIX))
+            .collect();
+        if !orphans.is_empty() {
+            if let Ok(mut mp) = self.mempool.lock() {
+                mp.return_unshipped(&orphans);
+            }
+        }
+    }
+
+    /// `QC_WANT:{h}`: a peer waiting to activate asks for QC(H_E). Answered
+    /// only for a boundary height this node holds a QC for, at most once per
+    /// `QC_WANT_EVERY_TICKS` per height, so a flood of asks costs one answer.
+    fn answer_qc_want(&mut self, raw: &str) {
+        if !self.v4_chain || raw.len() > 20 {
+            return;
+        }
+        let Ok(h) = raw.parse::<u64>() else {
+            return;
+        };
+        let Some(interval) = crate::v4::epoch::epoch_interval(&self.storage) else {
+            return;
+        };
+        if h == 0 || !h.is_multiple_of(interval) {
+            return;
+        }
+        if self
+            .qc_answered
+            .get(&h)
+            .is_some_and(|t| self.v4_ticks < t + QC_WANT_EVERY_TICKS)
+        {
+            return;
+        }
+        let Some(raw_qc) = self
+            .storage
+            .get(&format!("consensus:qc:{h}"))
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        if self.qc_answered.len() >= 16 {
+            self.qc_answered.clear();
+        }
+        self.qc_answered.insert(h, self.v4_ticks);
+        self.v4_net()
+            .broadcast_wire(format!("{QC_CERT_PREFIX}{raw_qc}"));
+    }
+
+    /// `QC_CERT:{qc}`: a QC for a block this node holds. Stored only if it
+    /// verifies under that block's committee and binds the block (IM-1), then
+    /// the epoch step runs (it may activate).
+    fn on_boundary_qc(&mut self, json: &str) {
+        if !self.v4_chain || json.len() > 64 * 1024 {
+            return;
+        }
+        let Ok(qc) = serde_json::from_str::<crate::qc::QuorumCertificate>(json) else {
+            return;
+        };
+        if crate::qc_producer::stored_qc(&self.storage, qc.block_height).is_some() {
+            return;
+        }
+        let Some(block) = self
+            .storage
+            .get(&format!("block_{}", qc.block_height))
+            .ok()
+            .flatten()
+            .and_then(|j| serde_json::from_str::<blockchain::Block>(&j).ok())
+        else {
+            return;
+        };
+        if let Err(e) = crate::qc_producer::store_block_qc(&self.storage, &block, &qc) {
+            eprintln!("[EP-4] QC of block {} not stored: {e}", qc.block_height);
+            return;
+        }
+        self.v4_epoch_step();
     }
 
     /// Boot the certified-DAG engine on a V4 chain (RC-1). A V4 chain without
@@ -702,6 +888,8 @@ impl DagConsensus {
             node_key: self.node_key,
             address: self.node_id.clone(),
             b_auth: crate::staging::B_AUTH,
+            // The node closes epochs on its own blocks (S9b), not by count.
+            epoch_interval: 0,
         };
         let shared = crate::v4::Shared {
             dag: Arc::clone(&self.dag),
@@ -737,7 +925,7 @@ impl DagConsensus {
             p2p_tx: self.p2p_tx.clone(),
             peers: self.peers.clone(),
             storage: Arc::clone(&self.storage),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "sim"))]
             outbox: self.v4_outbox.clone(),
         }
     }
@@ -760,7 +948,9 @@ impl DagConsensus {
     /// The V4 tick: PR-1..PR-4 through the engine, with this node's payload
     /// gathered only when a proposal is due, then the commit loop if O_E grew.
     fn v4_tick(&mut self) {
+        self.v4_ticks += 1;
         self.retry_qc_work();
+        self.v4_epoch_step();
         let Some(mut engine) = self.v4.take() else {
             return;
         };
@@ -1975,6 +2165,10 @@ impl DagConsensus {
                                 let json = serde_json::to_string(&block).map_err(|e| e.to_string())?;
                                 view.save_block_json(parent_height + 1, &json).map_err(|e| e.to_string())?;
                                 engine.stage_prepared_anchor(&plan, view)?;
+                                // G1 EP-2/EP-3: a boundary block closes its epoch
+                                // in its own transaction (before the QC work,
+                                // whose vote binds the next committee).
+                                crate::v4::epoch::stage_boundary(view, &block)?;
                                 crate::qc_producer::stage_pending_qc(
                                     view, &block, &plan.info, qc_chain_id.clone(),
                                 )?;
@@ -2071,6 +2265,9 @@ impl DagConsensus {
                     );
                     break;
                 };
+                // G1 EP-3: if that was H_E, E closes before anything else is
+                // decided (no epoch-E anchor above r*).
+                self.v4_epoch_step();
                 // Orphan-loss fix: settle the mempool's loan ledger — only the
                 // transactions that actually EXECUTED leave it; the rest stay
                 // inflight and requeue_stale() returns them to pending later.
@@ -2941,31 +3138,10 @@ impl DagConsensus {
                 return;
             }
         };
-        let msg = format!("QC_VOTE:{}", serialized);
-
-        // 1. Gossipsub.
-        if let Some(tx) = &self.p2p_tx {
-            let tx_clone = tx.clone();
-            let msg_clone = msg.clone();
-            tokio::spawn(async move {
-                let _ = tx_clone.send(msg_clone).await;
-            });
-        }
-
-        // 2. TCP fallback.
-        use network::send_message;
-        if let Ok(peers) = self.peers.lock() {
-            for (peer_id, port) in peers.iter() {
-                if *peer_id != self.node_id {
-                    let ip = self
-                        .storage
-                        .get_peer_ip(peer_id)
-                        .unwrap_or_else(|| "127.0.0.1".to_string());
-                    let addr = format!("{}:{}", ip, port);
-                    let _ = send_message(&addr, &msg);
-                }
-            }
-        }
+        // Gossipsub plus the TCP fallback (one transport for every
+        // consensus message; tests route it through the outbox).
+        self.v4_net()
+            .broadcast_wire(format!("QC_VOTE:{}", serialized));
     }
 
     /// QC Phase 3: handle an inbound peer finality vote. Verify the single BLS
@@ -3028,6 +3204,14 @@ impl DagConsensus {
     }
 
     pub fn handle_message(&mut self, msg: &str) {
+        if let Some(h) = msg.strip_prefix(QC_WANT_PREFIX) {
+            self.answer_qc_want(h);
+            return;
+        }
+        if let Some(json) = msg.strip_prefix(QC_CERT_PREFIX) {
+            self.on_boundary_qc(json);
+            return;
+        }
         if let Some(content) = msg.strip_prefix(crate::v4::WIRE_PREFIX) {
             // S1 before parsing. The JSON of a `Msg::Vertex` wraps the vertex
             // in `{"Vertex":…}`; the vertex's own length is what S1 bounds.
@@ -3343,7 +3527,7 @@ impl DagConsensus {
             // did, then cast this node's finality vote for the block — a stalled
             // follower otherwise stops voting and the >2/3 QC quorum dies.
             if self.ordering_halted().is_none() {
-                let validators = self.decision_committee();
+                let mut validators = self.decision_committee();
                 let start_h = self.last_adopted_height.saturating_add(1);
                 for h in start_h..=new_height {
                     let Some(block) = self
@@ -3457,6 +3641,15 @@ impl DagConsensus {
                     let _ = self
                         .storage
                         .put("consensus:last_adopted_height", &h.to_string());
+                    // G1 EP-3/EP-4: an adopted H_E closes E, and its QC (held,
+                    // since adoption needs it) activates E+1 before H_E + 1.
+                    if self.v4_chain {
+                        self.v4_epoch_step();
+                        if self.ordering_halted().is_some() {
+                            break;
+                        }
+                        validators = self.decision_committee();
+                    }
                 }
             }
 

@@ -93,6 +93,9 @@ pub struct Config {
     pub address: String,
     /// ST-3's plain-body budget per author (`staging::B_AUTH`).
     pub b_auth: u64,
+    /// Standalone engines (tests) close an epoch every this many blocks
+    /// (decided anchors); 0 for none. A node closes epochs on its blocks.
+    pub epoch_interval: u64,
 }
 
 /// What the engine shares with its host node (the contract's derived state):
@@ -171,8 +174,32 @@ pub struct Engine {
     budget: pull::Budget,
     /// The GC floor this engine last acted on (OR-3, GC-3).
     last_floor: u64,
+    /// The active epoch E (EP-1): its number, first round and sentinel, and
+    /// r* once it has closed (EP-3). `cfg.committee` is C_E.
+    epoch: u64,
+    first_round: u64,
+    sentinel: String,
+    closing_round: Option<u64>,
+    /// E+1's record once E has closed and until activation (EP-2, EP-4).
+    next: Option<epoch::EpochStart>,
+    /// E−1 and its closing round, for classifying its late messages (EP-5).
+    previous: Option<epoch::EpochStart>,
+    previous_closing: u64,
+    /// Epoch 0's record (the genesis committee).
+    genesis: epoch::EpochStart,
+    /// Verified certificates of E+1 that arrived before activation.
+    early_certs: Vec<VertexCertificate>,
+    /// Payloads of this node's proposals that an epoch boundary orphaned.
+    orphaned: Vec<String>,
+    /// Standalone only: blocks decided, scheduled committees, and an
+    /// activation waiting for the end of the call.
+    blocks: u64,
+    scheduled: BTreeMap<u64, Vec<ValidatorInfo>>,
+    activation_due: bool,
     /// The highest round a gap fetch already covers (`want_gap`).
     gap_high: u64,
+    /// The tail of the epoch just closed, served to nodes still finishing it.
+    closed: Option<epoch::ClosedEpoch>,
 }
 
 fn storage_err(e: impl ToString) -> StorageError {
@@ -273,6 +300,16 @@ impl Engine {
             }
             None => false,
         };
+        let genesis = epoch::EpochStart {
+            epoch: EPOCH,
+            first_round: FIRST_ROUND,
+            sentinel: SENTINEL.to_string(),
+            committee: committee.clone(),
+            prev_closing_round: 0,
+            prev_anchor: String::new(),
+            prev_block_hash: String::new(),
+            prev_height: 0,
+        };
         let cfg = Config { committee, ..cfg };
         let seq = Self::load_seq(&storage);
         let mut engine = Self {
@@ -307,6 +344,20 @@ impl Engine {
             budget: pull::Budget::default(),
             last_floor: 0,
             gap_high: 0,
+            closed: None,
+            epoch: EPOCH,
+            first_round: FIRST_ROUND,
+            sentinel: SENTINEL.to_string(),
+            closing_round: None,
+            next: None,
+            previous: None,
+            previous_closing: 0,
+            genesis,
+            early_certs: Vec::new(),
+            orphaned: Vec::new(),
+            blocks: 0,
+            scheduled: BTreeMap::new(),
+            activation_due: false,
             cfg,
         };
         engine.boot()?;
@@ -337,6 +388,8 @@ impl Engine {
 
     /// RC-1 steps 2 to 6.
     fn boot(&mut self) -> Result<(), String> {
+        self.load_epoch_state()?;
+        self.load_closed()?;
         let loaded = {
             let record = self.record();
             staging::load(
@@ -355,7 +408,7 @@ impl Engine {
         }
         // CE-3's halt survives a restart: a recorded certificate conflict is
         // never forgotten, and the node orders and signs nothing more.
-        let alarms = format!("alarm:vcert_conflict:{EPOCH:020}:");
+        let alarms = format!("alarm:vcert_conflict:{:020}:", self.epoch);
         if let Some(row) = self.storage.db.prefix_iterator(alarms.as_bytes()).next() {
             let (key, _) = row.map_err(|e| e.to_string())?;
             if key.starts_with(alarms.as_bytes()) {
@@ -440,10 +493,10 @@ impl Engine {
 
     fn record(&self) -> EpochRecord<'_> {
         EpochRecord {
-            epoch: EPOCH,
-            first_round: FIRST_ROUND,
-            closing_round: None,
-            sentinel: SENTINEL,
+            epoch: self.epoch,
+            first_round: self.first_round,
+            closing_round: self.closing_round,
+            sentinel: &self.sentinel,
             committee: &self.cfg.committee,
         }
     }
@@ -457,7 +510,7 @@ impl Engine {
         AttestBody {
             chain_id: self.cfg.chain_id.clone(),
             genesis_identity: self.cfg.genesis_identity.clone(),
-            epoch: EPOCH,
+            epoch: self.epoch,
             round,
             author: author.to_string(),
             digest: digest.to_string(),
@@ -470,7 +523,7 @@ impl Engine {
             "consensus:vproposed:v1:{}:{}:{}:",
             vcert::chain_genesis_tag(&self.cfg.chain_id, &self.cfg.genesis_identity),
             self.ed25519_pk,
-            EPOCH
+            self.epoch
         )
     }
 
@@ -501,6 +554,7 @@ impl Engine {
     pub fn on_message(&mut self, raw_len: usize, msg: Msg, net: &dyn ConsensusNet) {
         self.dispatch(raw_len, msg, net);
         self.observe_floor(net);
+        self.finish_call(net);
     }
 
     fn dispatch(&mut self, raw_len: usize, msg: Msg, net: &dyn ConsensusNet) {
@@ -533,8 +587,8 @@ impl Engine {
                 chain_id: &self.cfg.chain_id,
                 genesis_identity: &self.cfg.genesis_identity,
                 active: self.record(),
-                previous: None,
-                next: None,
+                previous: self.previous_record(),
+                next: self.next_record(),
                 now_secs: (self.now_secs)(),
                 gc_floor: self.gc_floor(),
                 cursor: lock(&self.ordering).next_anchor_round,
@@ -572,6 +626,11 @@ impl Engine {
             }
             Verdict::PendingEpoch => {
                 self.pending.push(v);
+            }
+            Verdict::Ahead => {
+                // The network activated E+1 and this node has not closed E:
+                // the rest of E is fetched (served from peers' closed tail).
+                self.want_gap(v.round.saturating_sub(1));
             }
             Verdict::Invalid(_) | Verdict::Drop(_) | Verdict::Stale => {}
         }
@@ -681,7 +740,7 @@ impl Engine {
 
     /// CE-1 on the author's side.
     pub fn on_attestation(&mut self, att: VertexAttestation, net: &dyn ConsensusNet) {
-        if att.body.author != self.cfg.address || att.body.epoch != EPOCH {
+        if att.body.author != self.cfg.address || att.body.epoch != self.epoch {
             return;
         }
         let Some(collector) = self.collectors.get_mut(&att.body.round) else {
@@ -696,12 +755,33 @@ impl Engine {
 
     /// CE-2 then CE-3.
     pub fn on_cert(&mut self, cert: VertexCertificate, net: &dyn ConsensusNet) {
+        if cert.body.epoch != self.epoch {
+            // EP-5: a certificate of E+1 before activation is kept, verified
+            // under C_{E+1}, and ingested at activation. Any other epoch's is
+            // inert.
+            const EARLY_CERT_CAP: usize = 4096;
+            let keep = self.next.as_ref().is_some_and(|next| {
+                cert.body.epoch == next.epoch
+                    && vcert::verify_vertex_cert(
+                        &cert,
+                        &next.committee,
+                        &self.cfg.chain_id,
+                        &self.cfg.genesis_identity,
+                        next.epoch,
+                    )
+                    .is_ok()
+            });
+            if keep && self.early_certs.len() < EARLY_CERT_CAP {
+                self.early_certs.push(cert);
+            }
+            return;
+        }
         if vcert::verify_vertex_cert(
             &cert,
             &self.cfg.committee,
             &self.cfg.chain_id,
             &self.cfg.genesis_identity,
-            EPOCH,
+            self.epoch,
         )
         .is_err()
         {
@@ -743,8 +823,8 @@ impl Engine {
         if let Some(held) = self.certs.get(&key) {
             if held.body.digest != cert.body.digest {
                 let alarm = format!(
-                    "alarm:vcert_conflict:{EPOCH:020}:{:020}:{}",
-                    cert.body.round, cert.body.author
+                    "alarm:vcert_conflict:{:020}:{:020}:{}",
+                    cert.body.epoch, cert.body.round, cert.body.author
                 );
                 let evidence = serde_json::json!({ "held": held, "other": cert }).to_string();
                 let _ = self.storage.put(&alarm, &evidence);
@@ -756,8 +836,8 @@ impl Engine {
             return;
         }
         let row = format!(
-            "consensus:vcert:v1:{EPOCH:020}:{:020}:{}",
-            cert.body.round, cert.body.author
+            "consensus:vcert:v1:{:020}:{:020}:{}",
+            cert.body.epoch, cert.body.round, cert.body.author
         );
         if let Ok(json) = serde_json::to_string(&cert) {
             // May be unsynced: a certificate can be obtained again (RC-2).
@@ -825,7 +905,7 @@ impl Engine {
             // OR-1 with GC-2's settled arm: a parent whose ref declares a round
             // at or below g is settled, as in the decision's walk (one
             // predicate; Layer S aligns refs with parents and checks the round).
-            let missing: Vec<String> = if v.round == FIRST_ROUND {
+            let missing: Vec<String> = if v.round == self.first_round {
                 Vec::new()
             } else {
                 v.parent_refs
@@ -895,7 +975,22 @@ impl Engine {
             if out.is_empty() {
                 break;
             }
+            for info in &out {
+                self.standalone_block(info);
+            }
             self.decided.extend(out);
+            if self.activation_due {
+                break;
+            }
+        }
+    }
+
+    /// The end of every call: a standalone epoch boundary activates here,
+    /// where a network is at hand (EP-4).
+    fn finish_call(&mut self, net: &dyn ConsensusNet) {
+        while self.activation_due {
+            self.activation_due = false;
+            let _ = self.activate_next(net);
         }
     }
 
@@ -911,7 +1006,7 @@ impl Engine {
             .rev()
             .find(|(_, s)| qc::stake_quorum_met(**s, total))
             .map(|(r, _)| *r);
-        top.map_or(FIRST_ROUND, |r| (r + 1).max(FIRST_ROUND))
+        top.map_or(self.first_round, |r| (r + 1).max(self.first_round))
     }
 
     /// One tick: rebroadcast this node's uncertified proposals (T_RETRY is one
@@ -929,8 +1024,10 @@ impl Engine {
             }
         }
         self.observe_floor(net);
+        self.finish_call(net);
         self.fetch(net);
-        if !self.may_sign() {
+        // EP-3: after its boundary block, epoch E proposes nothing more.
+        if !self.may_sign() || self.closing_round.is_some() {
             return None;
         }
         let round = self.current_round();
@@ -942,7 +1039,7 @@ impl Engine {
             _ => return None,
         }
         let prev = round - 1;
-        if round > FIRST_ROUND && prev >= 2 && prev.is_multiple_of(2) {
+        if round > self.first_round && prev >= 2 && prev.is_multiple_of(2) {
             let leader = OrderingEngine::leader_for_round(prev, &self.stakes, 0);
             let since = self.quorum_since.get(&prev).copied().unwrap_or(self.tick);
             if !self.certs.contains_key(&(prev, leader)) && self.tick < since + T_LEADER_TICKS {
@@ -972,8 +1069,8 @@ impl Engine {
     /// round, one per author, sorted by author, each carried with its
     /// certificate. The first round cites the sentinel.
     fn parents_for(&self, round: u64) -> (Vec<String>, Vec<ParentRef>) {
-        if round == FIRST_ROUND {
-            return (vec![SENTINEL.to_string()], Vec::new());
+        if round == self.first_round {
+            return (vec![self.sentinel.clone()], Vec::new());
         }
         let mut held: Vec<&VertexCertificate> = self
             .certs
@@ -1000,7 +1097,7 @@ impl Engine {
     pub fn proposal_overhead(&self, round: u64) -> usize {
         let (parents, parent_refs) = self.parents_for(round);
         let probe = Vertex {
-            epoch: EPOCH,
+            epoch: self.epoch,
             round,
             author: self.cfg.address.clone(),
             parents,
@@ -1023,7 +1120,7 @@ impl Engine {
     pub fn propose(&mut self, round: u64, payload: Vec<String>, net: &dyn ConsensusNet) -> bool {
         let (parents, parent_refs) = self.parents_for(round);
         let mut v = Vertex {
-            epoch: EPOCH,
+            epoch: self.epoch,
             round,
             author: self.cfg.address.clone(),
             parents,
@@ -1146,6 +1243,7 @@ impl Engine {
     }
 }
 
+pub mod epoch;
 mod gc;
 pub mod pull;
 

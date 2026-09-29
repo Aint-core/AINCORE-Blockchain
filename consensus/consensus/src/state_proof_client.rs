@@ -139,6 +139,7 @@ mod tests {
             receipts_root: "dd".repeat(32),
             finality_digest: "ee".repeat(32),
             validator_set_hash: validator_set_hash(infos),
+            next_validator_set_hash: String::new(),
         };
         let bls = BLSEngine::consensus();
         let order = crate::qc::canonical_order(infos);

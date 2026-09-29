@@ -187,7 +187,9 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         | "consensus:qc:latest_height"
         | "consensus:qc:latest_round"
         | "consensus:gc_floor"
-        | "consensus:pull_seq" => Some(Local),
+        | "consensus:pull_seq"
+        | "consensus:epoch_active"
+        | "consensus:standalone_height" => Some(Local),
 
         "sys:da:signing_key_enc_v1"
         | "sys:da:signing_key"
@@ -315,12 +317,15 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
             Local
         }
         ["consensus", "anchor_decision", e, r] if dec20(e) && dec20(r) => Local,
+        ["consensus", "epoch_start", e] if dec20(e) => Local,
 
         // N
         ["peer" | "peer_ip" | "peer_addr", id] if seg(id) => Node,
         ["alarm", "anchor_height_violation", h] if dec(h) => Node,
         ["alarm", "vcert_conflict", e, r, a] if dec20(e) && dec20(r) && seg(a) => Node,
         ["alarm", "decision_conflict", h] if dec(h) => Node,
+        ["alarm", "committee_invalid", e] if dec20(e) => Node,
+        ["alarm", "committee_mismatch", e] if dec20(e) => Node,
 
         // T and log
         ["jmt", "node", n] if hex(n) => Tree,
@@ -634,6 +639,11 @@ mod tests {
             ("consensus:anchor_decision:00000000000000000003:00000000000000153030".into(), Local),
             ("consensus:gc_floor".into(), Local),
             ("consensus:pull_seq".into(), Local),
+            ("consensus:epoch_active".into(), Local),
+            ("consensus:standalone_height".into(), Local),
+            ("consensus:epoch_start:00000000000000000004".into(), Local),
+            ("alarm:committee_invalid:00000000000000000004".into(), Node),
+            ("alarm:committee_mismatch:00000000000000000004".into(), Node),
             ("alarm:decision_conflict:42".into(), Node),
             ("consensus:guard_origin".into(), Node),
             (format!("alarm:vcert_conflict:00000000000000000003:00000000000000153030:{H64}"), Node),

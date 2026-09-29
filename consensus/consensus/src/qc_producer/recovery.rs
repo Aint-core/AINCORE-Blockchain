@@ -39,6 +39,9 @@ pub(crate) fn stage_pending_qc(
         state_root: block.header.state_root.clone(),
         receipts_root: block.header.receipts_root.clone(),
         finality_digest: info.finality_digest.clone(),
+        // EP-4: the boundary block's vote binds the next committee, as this
+        // node derived it earlier in this same transaction.
+        next_validator_set_hash: next_committee_hash(view, block.header.height)?,
     };
     validate_held(view, &ctx, &ctx.chain_id)?;
     let encoded = serde_json::to_string(&ctx).map_err(|e| e.to_string())?;
@@ -52,6 +55,22 @@ pub(crate) fn stage_pending_qc(
         }
     }
     view.put(&key, &encoded).map_err(|e| e.to_string())
+}
+
+/// `validator_set_hash(C_{E+1})` if `height` is a V4 boundary block H_E.
+pub(crate) fn next_committee_hash(view: &StateDB, height: u64) -> Result<String, String> {
+    if !crate::v4::is_v4_chain(view) {
+        return Ok(String::new());
+    }
+    let interval =
+        crate::v4::epoch::epoch_interval(view).ok_or("a V4 chain needs its epoch interval")?;
+    if !height.is_multiple_of(interval) {
+        return Ok(String::new());
+    }
+    let next = crate::v4::epoch::epoch_of_height(height, interval) + 1;
+    let start = crate::v4::epoch::read_start_from(view, next)?
+        .ok_or("a boundary block without the next epoch's record")?;
+    Ok(qc::validator_set_hash(&start.committee))
 }
 
 fn validate_held(view: &StateDB, ctx: &CommitContext, chain_id: &str) -> Result<(), String> {
@@ -135,6 +154,7 @@ fn retry_one(
                 receipts_root: ctx.receipts_root.clone(),
                 finality_digest: ctx.finality_digest.clone(),
                 validator_set_hash: qc::validator_set_hash(&validators),
+                next_validator_set_hash: ctx.next_validator_set_hash.clone(),
             })
         {
             return Err("stored QC conflicts with pending work".into());

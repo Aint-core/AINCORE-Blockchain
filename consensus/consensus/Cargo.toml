@@ -28,6 +28,11 @@ state_proof = { path = "../../common/state_proof" }
 # ed25519-dalek removed - use crypto crate
 # sha256 removed - use crypto crate
 
+[features]
+# G1 S10: multi-node system tests in other crates (chain_sync) route this
+# node's consensus messages through an in-memory outbox. Never in a build.
+sim = []
+
 [dev-dependencies]
 # G3 WG-1: test fixtures seed their own genesis state (StateDB::seeding).
 storage = { path = "../../common/storage", features = ["test-seeding"] }
