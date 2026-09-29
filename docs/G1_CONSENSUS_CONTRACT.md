@@ -617,6 +617,32 @@ history raise an alarm.
 - On any input where each author has at most one vertex per round in the index and at most one ref per author, DE-1..DE-4 compute exactly what `ordering.rs:586-627` computes today.
 - That covers every V3-reachable input (twins are dropped at `dag.rs:1356`; C1 is at `qc.rs:293-298`; round ≤ 1 carries no ref since the C-1 fix) and every V4 input.
 
+**S5 status (branch `g1/certified-dag`), part 1: the engine.** `consensus::v4::Engine`
+implements IN-1 → ST → AT (one transaction, RC-2) → CE-1/2/3 → OR-1/OR-2 → DE over O_E
+with the frozen C_0 → PR-1..PR-4 → RC-1 boot and RC-3 guard continuity, behind the
+`ConsensusNet` seam; tests drive four validators on real RocksDB over a simulated network.
+Green: A2c (all 8 delivery orders, a Byzantine leader that signs and aggregates both twins:
+exactly one certificate every time, every honest node commits it at round 2), A3c-push
+(before and after every node reopens; B stays staged, never orderable; A takes the certified
+role on h0), the twin flood (next vertices pass C1), `v4_cert_conflict_halts_ordering` (the
+2-Byzantine negative control), the slow-leader and absent-leader witnesses, reopen, RC-3
+abstention, an observer, votes counted from O_E only, PENDING on stripped certificates, OR-1
+down-closure, and ST-2 eviction through the engine. The contract's S5 kill list is observed
+red (OR-1 without a certificate, DE over staged bodies, producer over staged bodies, PR-3
+removed), with 10 more mutants, 14 of 14 killed. Deliberate gaps, each owned by a later
+part or stage:
+- **S5e (part 2):** wiring into `DagConsensus` behind the V4 flag and re-pointing every
+  reader; DE-6's `anchor_decision` rows and `gc_floor`, which belong to the block-acceptance
+  transaction; EQ-1 twin evidence; `v4_leader_uses_frozen_committee` against a mutated live
+  set (the engine has no live set to read).
+- **S6:** pull (fetch, CERT_REQ, ATTEST_REQ). Push retries are a rebroadcast every tick.
+- **S7:** g > 0. OR-1 has no settled-by-floor arm (review C-1), and H9 applies to the engine
+  too: `committed_set` is rebuilt from a window at boot.
+- `vcollect` is not persisted: attestations are obtained again after a restart (RC-2 allows
+  unsynced), because the rebroadcast makes attesters answer `Reused`.
+- RC-3's origin is written only when the engine opens with `genesis_init`; the look-back and
+  listen rules of `docs/research/validator_signing_safety.md` are S9.
+
 ### Imported decisions and finality votes (IM)
 
 **IM-1 (QC authority).**

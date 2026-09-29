@@ -5,6 +5,7 @@ pub mod qc;
 pub mod qc_producer;
 pub mod staging;
 pub mod state_proof_client;
+pub mod v4;
 pub mod vcert;
 
 #[cfg(test)]

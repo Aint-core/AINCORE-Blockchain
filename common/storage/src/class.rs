@@ -184,7 +184,8 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         | "consensus:beacon_folded_anchor_round"
         | "consensus:qc:latest"
         | "consensus:qc:latest_height"
-        | "consensus:qc:latest_round" => Some(Local),
+        | "consensus:qc:latest_round"
+        | "consensus:gc_floor" => Some(Local),
 
         "sys:da:signing_key_enc_v1"
         | "sys:da:signing_key"
@@ -195,7 +196,8 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         | "genesis_initialized"
         | "sync:halt_reason"
         | "sys:restore_in_progress"
-        | "sys:restored_checkpoint" => Some(Node),
+        | "sys:restored_checkpoint"
+        | "consensus:guard_origin" => Some(Node),
 
         "genesis_identity" => Some(Constant),
 
@@ -298,10 +300,24 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
             Local
         }
         ["consensus", "vbytes", "v1", e, author] if dec20(e) && seg(author) => Local,
+        // G1 S5: the producer guard, the author's collected attestations and
+        // the write-once anchor decisions.
+        ["consensus", "vproposed", "v1", cg, pk, e, r]
+            if hex64(cg) && hex(pk) && dec(e) && dec20(r) =>
+        {
+            Local
+        }
+        ["consensus", "vcollect", "v1", e, r, author, digest, signer]
+            if dec20(e) && dec20(r) && seg(author) && hex64(digest) && seg(signer) =>
+        {
+            Local
+        }
+        ["consensus", "anchor_decision", e, r] if dec20(e) && dec20(r) => Local,
 
         // N
         ["peer" | "peer_ip" | "peer_addr", id] if seg(id) => Node,
         ["alarm", "anchor_height_violation", h] if dec(h) => Node,
+        ["alarm", "vcert_conflict", e, r, a] if dec20(e) && dec20(r) && seg(a) => Node,
 
         // T and log
         ["jmt", "node", n] if hex(n) => Tree,
@@ -606,6 +622,15 @@ mod tests {
             (format!("consensus:vslot:v1:00000000000000000003:00000000000000153030:{H64}"), Local),
             (format!("consensus:vcert:v1:00000000000000000003:00000000000000153030:{H64}"), Local),
             (format!("consensus:vbytes:v1:00000000000000000003:{H64}"), Local),
+            (format!("consensus:vproposed:v1:{H64}:{H64}:3:00000000000000153030"), Local),
+            (
+                format!("consensus:vcollect:v1:00000000000000000003:00000000000000153030:{H64}:{H64}:{H64}"),
+                Local,
+            ),
+            ("consensus:anchor_decision:00000000000000000003:00000000000000153030".into(), Local),
+            ("consensus:gc_floor".into(), Local),
+            ("consensus:guard_origin".into(), Node),
+            (format!("alarm:vcert_conflict:00000000000000000003:00000000000000153030:{H64}"), Node),
             ("da_shard_10000_0".into(), Local),
             ("da_commitment_1".into(), Local),
             ("da_data_1".into(), Local),

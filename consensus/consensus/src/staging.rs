@@ -305,6 +305,18 @@ impl PendingBuffer {
             .remove(&(round, digest.to_string()))
     }
 
+    /// Every held vertex, lowest round first per author, leaving the buffer
+    /// empty: what a trigger re-evaluates (a new certificate or epoch).
+    pub fn take_all(&mut self) -> Vec<Vertex> {
+        let mut out: Vec<Vertex> = self
+            .per_author
+            .drain()
+            .flat_map(|(_, held)| held.into_values())
+            .collect();
+        out.sort_by(|a, b| (a.round, &a.author, &a.hash).cmp(&(b.round, &b.author, &b.hash)));
+        out
+    }
+
     pub fn len(&self) -> usize {
         self.per_author.values().map(|m| m.len()).sum()
     }

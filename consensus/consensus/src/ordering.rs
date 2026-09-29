@@ -355,6 +355,11 @@ impl OrderingEngine {
     }
 
     /// Get random bytes from beacon for leader selection
+    /// The rolling finality digest of everything committed so far.
+    pub(crate) fn current_finality_digest(&self) -> &str {
+        &self.finality_digest
+    }
+
     pub fn get_random_beacon(&self) -> &[u8] {
         &self.last_vdf_output
     }
