@@ -2,14 +2,7 @@ use super::*;
 use std::collections::BTreeMap;
 
 fn fixture(name: &str) -> (ChainSync, Block, String) {
-    let name = format!(
-        "admission_{name}_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let name = unique_name(&format!("admission_{name}"));
     let sync = setup_sync(&name);
     let key = crypto::SigningKey::from_bytes(&[77; 32]);
     let proposer = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();

@@ -807,16 +807,16 @@ impl GovernanceManager {
 mod tests {
     use super::{GovernanceManager, ProposalStatus};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use storage::StateDB;
 
     fn temp_db_path(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!("aincore-governance-{name}-{unique}"))
+        // pid + counter, not the clock: macOS clocks tick in microseconds.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("aincore-governance-{name}-{pid}-{n}"))
     }
 
     fn put_coin_store(db: &StateDB, address: &str, amount: u128) {
