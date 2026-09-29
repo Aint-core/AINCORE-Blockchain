@@ -534,14 +534,7 @@ mod tests {
         block.header.timestamp = now + 60;
 
         // Recompute hash after manipulation to ensure it only fails due to timestamp
-        let mut data = Vec::new();
-        data.extend_from_slice(block.header.height.to_string().as_bytes());
-        data.extend_from_slice(block.header.prev_hash.as_bytes());
-        data.extend_from_slice(block.header.tx_hash.as_bytes());
-        data.extend_from_slice(block.header.proposer_id.as_bytes());
-        data.extend_from_slice(block.header.round.to_string().as_bytes());
-        data.extend_from_slice(block.header.timestamp.to_string().as_bytes());
-        block.header.hash = hex::encode(crypto::hash(&data));
+        block.header.hash = blockchain::calculate_header_hash(&block.header);
 
         let result = sync.validate_block(&block, 2, "prev_hash_1");
         assert!(result.is_err());

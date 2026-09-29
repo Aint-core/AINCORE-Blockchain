@@ -269,64 +269,128 @@ impl Block {
     }
 }
 
-// Fungsi bantu untuk menghitung hash dari daftar transaksi
-pub fn calculate_tx_hash(transactions: &[String]) -> String {
-    let mut data = Vec::new();
-    for tx in transactions {
-        data.extend_from_slice(tx.as_bytes());
+// Canonical block commitments (G3 FX-18). The legacy preimages concatenated
+// fields with no boundaries, so different headers shared a hash: round 20 at
+// time 1790667886 hashed like round 201 at time 790667886. Every preimage now
+// starts with its own domain tag, and its fields cannot be re-segmented.
+// Consensus-breaking: it activates only with the fresh genesis (G3 S8).
+const HEADER_DOMAIN: &[u8] = b"AINCORE_BLOCK_HEADER_V1\0";
+const TXS_DOMAIN: &[u8] = b"AINCORE_BLOCK_TXS_V1\0";
+const VERTICES_DOMAIN: &[u8] = b"AINCORE_BLOCK_VERTICES_V1\0";
+const EVIDENCE_DOMAIN: &[u8] = b"AINCORE_BLOCK_EVIDENCE_V1\0";
+
+/// Preimage writer: integers are u64 little-endian, a string is its byte length
+/// (u64 LE) then its bytes, a list is its count (u64 LE) then its strings, and
+/// an optional root is a tag byte (0 absent, 1 present) then the string.
+///
+/// Hand-written rather than BCS so that it is total: a hash check on peer input
+/// has no error or panic path (BCS refuses sequences over 2^31 - 1).
+struct Preimage(Vec<u8>);
+
+impl Preimage {
+    fn new(domain: &[u8]) -> Self {
+        Self(domain.to_vec())
     }
-    hex::encode(hash(&data))
+
+    fn u64(&mut self, n: u64) {
+        self.0.extend_from_slice(&n.to_le_bytes());
+    }
+
+    fn str(&mut self, s: &str) {
+        self.u64(s.len() as u64);
+        self.0.extend_from_slice(s.as_bytes());
+    }
+
+    /// An empty root means absent, and is only the tag.
+    fn opt_root(&mut self, root: &str) {
+        if root.is_empty() {
+            self.0.push(0);
+        } else {
+            self.0.push(1);
+            self.str(root);
+        }
+    }
+
+    fn list(&mut self, items: &[String]) {
+        self.u64(items.len() as u64);
+        for item in items {
+            self.str(item);
+        }
+    }
+
+    fn digest(&self) -> String {
+        hex::encode(hash(&self.0))
+    }
 }
 
-// Fungsi bantu untuk menghitung hash dari header blok
+/// Root binding a block's transaction list (order-sensitive). An empty list
+/// still has a root.
+pub fn calculate_tx_hash(transactions: &[String]) -> String {
+    let mut p = Preimage::new(TXS_DOMAIN);
+    p.list(transactions);
+    p.digest()
+}
+
+/// The exact bytes `calculate_header_hash` hashes: every field except `hash`,
+/// in declaration order.
+fn header_preimage(header: &BlockHeader) -> Vec<u8> {
+    // Exhaustive on purpose: a new header field fails to compile here until it
+    // is encoded or explicitly excluded, so it cannot be left out of the hash.
+    let BlockHeader {
+        height,
+        prev_hash,
+        tx_hash,
+        state_root,
+        receipts_root,
+        vertices_root,
+        evidence_root,
+        proposer_id,
+        round,
+        timestamp,
+        hash: _,
+    } = header;
+    let mut p = Preimage::new(HEADER_DOMAIN);
+    p.u64(*height);
+    p.str(prev_hash);
+    p.str(tx_hash);
+    p.opt_root(state_root);
+    p.opt_root(receipts_root);
+    p.opt_root(vertices_root);
+    p.opt_root(evidence_root);
+    p.str(proposer_id);
+    p.u64(*round);
+    p.u64(*timestamp);
+    p.0
+}
+
+/// The block hash: what the proposer signs, the QC certifies and sync checks.
+/// It binds the header fields only. `Block::anchor_hash` is outside it; that
+/// gap is still open (G0 block identity v2, witness in sync's
+/// `block_identity_tests.rs`).
 pub fn calculate_header_hash(header: &BlockHeader) -> String {
-    let mut data = Vec::new();
-    data.extend_from_slice(header.height.to_string().as_bytes());
-    data.extend_from_slice(header.prev_hash.as_bytes());
-    data.extend_from_slice(header.tx_hash.as_bytes());
-    if !header.state_root.is_empty() || !header.receipts_root.is_empty() {
-        data.extend_from_slice(header.state_root.as_bytes());
-        data.extend_from_slice(header.receipts_root.as_bytes());
-    }
-    data.extend_from_slice(header.proposer_id.as_bytes());
-    data.extend_from_slice(header.round.to_string().as_bytes());
-    data.extend_from_slice(header.timestamp.to_string().as_bytes());
-    if !header.vertices_root.is_empty() {
-        data.extend_from_slice(header.vertices_root.as_bytes());
-    }
-    if !header.evidence_root.is_empty() {
-        data.extend_from_slice(header.evidence_root.as_bytes());
-    }
-    hex::encode(hash(&data))
+    hex::encode(hash(&header_preimage(header)))
 }
 
 /// Root binding a block's slash evidence list (order-sensitive). Empty list
-/// => empty root, so blocks without evidence keep their old header hash.
+/// => empty root, which the header hash encodes as absent.
 pub fn calculate_evidence_root(items: &[String]) -> String {
     if items.is_empty() {
         return String::new();
     }
-    let mut data = Vec::new();
-    data.extend_from_slice((items.len() as u64).to_be_bytes().as_slice());
-    for it in items {
-        data.extend_from_slice((it.len() as u64).to_be_bytes().as_slice());
-        data.extend_from_slice(it.as_bytes());
-    }
-    hex::encode(hash(&data))
+    let mut p = Preimage::new(EVIDENCE_DOMAIN);
+    p.list(items);
+    p.digest()
 }
 
 /// Root binding a block's committed vertex sequence (order-sensitive). Empty
-/// sequence => empty root, so legacy/empty blocks keep their old header hash.
+/// sequence => empty root, which the header hash encodes as absent.
 pub fn calculate_vertices_root(vertices: &[String]) -> String {
     if vertices.is_empty() {
         return String::new();
     }
-    let mut data = Vec::new();
-    data.extend_from_slice((vertices.len() as u64).to_be_bytes().as_slice());
-    for v in vertices {
-        data.extend_from_slice(v.as_bytes());
-    }
-    hex::encode(hash(&data))
+    let mut p = Preimage::new(VERTICES_DOMAIN);
+    p.list(vertices);
+    p.digest()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -698,6 +762,9 @@ impl Vertex {
         hex::encode(hash(&data))
     }
 }
+
+#[cfg(test)]
+mod header_hash_tests;
 
 #[cfg(test)]
 mod vertex_hash_v2_tests {

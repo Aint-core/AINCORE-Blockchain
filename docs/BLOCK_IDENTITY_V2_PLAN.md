@@ -6,6 +6,13 @@ deployment, reset or genesis migration.
 
 ## Reproduced evidence
 
+> **Update (2026-09-29, branch `g3/canonical-header-hash`, G3 FX-18):** the legacy header
+> hash and transaction hash are now length-framed and domain-tagged for the fresh genesis,
+> and the sync copy of the transaction hash is gone. The round/timestamp witness is a
+> passing, non-ignored rejection test there. The anchor witness below is still open and
+> still ignored: the block hash does not bind `Block::anchor_hash`, the chain or the
+> genesis. The text below describes the code before that change.
+
 `sync/src/block_identity_tests.rs` drives the real `process_blocks` path with
 authenticated proposer records, real Ed25519 signatures, matching empty-execution
 roots and independent RocksDB stores. The two stores accept and persist:

@@ -75,8 +75,10 @@ As a result, there is:
   - TA builds on G1 EP-1/2/4 and FinalityVote V2. **TA-2 requires a joint amendment to G1
     EP-2** (open question 5).
   - The local-view leaks listed in FX-13 are G1's to fix.
-- **G0:** the legacy header hash is not injective (`consensus/blockchain/src/lib.rs:282-301`).
-  Until G0 block identity v2 lands, PF-2 binds to the QC, never to the header hash.
+- **G0:** the legacy header hash is not injective over the header fields. FX-18 fixes that
+  for the fresh genesis. The block hash still does not bind `Block::anchor_hash`, the chain
+  or the genesis; that is G0 block identity v2. Until it lands, PF-2 binds to the QC, never
+  to the header hash.
 - **G2:** atomic block commit is shared ground. CM-3 restates the part G3 needs.
 - **Crypto agility / ML-DSA:** only the activation is shared (AC-1).
 
@@ -440,10 +442,69 @@ Each item was found by the inventory or a review, and re-checked at `b7ab25a`.
 | FX-14 | **Live halt path.** If Move `advance_epoch` aborts or errors, `maybe_advance_epoch` returns before rotating (`lib.rs:1263-1270`, `1289-1291`). That leaves a gap in `consensus:epoch_start_height:*`. At the next boundary `epoch_for_block_height` returns None (`qc_producer.rs:130-157`) and `stage_pending_qc` fails (`recovery.rs:32-33`) on every retry, so every validator halts. Rotate at every boundary whatever the Move outcome, with carry-over. The fix is tracked as its own task because today's chain runs this code. | executor | neutral on the success path |
 | FX-16 | **Found in S2:** the paymaster field is the payer's PUBLIC KEY, and it is used directly as the payer's object and CoinStore key (`obj:{pubkey}`, `resource_{pubkey}_…`), not the address `SHA-256(pubkey)` that every other account uses. S2 only canonicalizes its spelling (FX-9). Making the payer an address changes paymaster semantics and needs its own decision. | executor | changing (open) |
 | FX-15 | Make root binding unconditional. Remove the `sys:config:require_exec_roots` knob and its env fallback, and the empty-root bypass in sync (`sync/src/lib.rs:215-222`, `275-294`). | sync, genesis | changing |
+| FX-18 | **Canonical block commitments** (found by an adversarial review, with a PoC). See the "FX-18" entry below the table. | blockchain, sync, consensus | changing (fresh genesis) |
+
+**FX-18 — the block hash was not injective.** `calculate_header_hash` concatenated the
+header fields with no boundaries, so different headers shared one hash. The review's PoC
+pair is round 20 at timestamp 1790667886 and round 201 at timestamp 790667886. The same
+re-segmentation worked at every adjacent pair:
+- `height|prev_hash` and `proposer_id|round` (signer "abc1" at round 23 equals "abc" at
+  round 123);
+- `state_root|receipts_root`;
+- the optional roots, which were omitted when empty.
+
+A QC over `block_hash`, sync's hash check, the bridge's finality check and the S6
+checkpoint anchor all trust that hash to bind those fields. The class had three more
+instances, all fixed:
+- `calculate_tx_hash` concatenated transactions: `["A","B"]` hashed like `["AB"]`, and a
+  second copy lived in sync;
+- `calculate_vertices_root` did not delimit items: `["ab","c"]` hashed like `["a","bc"]`;
+- sync compared `vertices_root` only when the header's was non-empty, so a peer could
+  attach a committed sequence to a signed block that had none.
+
+A dead fourth copy, `SimpleConsensus`'s `format!("{parent}{height}{round}{proposer}")`
+block hash, is deleted.
+
+The new preimages start with a domain tag: `AINCORE_BLOCK_HEADER_V1\0`,
+`AINCORE_BLOCK_TXS_V1\0`, `AINCORE_BLOCK_VERTICES_V1\0` or `AINCORE_BLOCK_EVIDENCE_V1\0`.
+The encoding rules are:
+- integers are u64 little-endian;
+- a string is its byte length (u64 LE) then its bytes;
+- a list is its count (u64 LE) then its strings;
+- an optional root is a tag byte (0 absent, 1 present) then its string.
+
+The header preimage covers every field except `hash`, in declaration order, through an
+exhaustive destructure, so a new field cannot be left out silently. An empty vertices or
+evidence list keeps the empty root, which the header encodes as absent.
+
+Witnesses (`consensus/blockchain/src/header_hash_tests.rs`, `sync/src/block_identity_tests.rs`):
+- a golden preimage and hashes, produced by an independent Python encoder;
+- the PoC pair;
+- one test per adjacent boundary, each also proving the pair collided under the legacy
+  code;
+- every field bound;
+- a test-side decoder parsing every preimage back into its header, hostile inputs included
+  (control bytes, fake length prefixes, extreme integers);
+- crafted pairs showing that each length prefix is load-bearing;
+- body-root boundaries and domain separation;
+- sync rejecting the re-segmented signed block and an attached sequence.
+
+Mutation, 41 mutants (drop each field, each length prefix, each tag, and more): all are
+killed. Without the golden vectors, 40 are still killed. The survivor, the list count, is
+equivalent: every list is trailing and its items are length-prefixed.
+
+Still open: `Block::anchor_hash`, chain and genesis binding are outside the block hash
+(G0 identity v2). The anchor witness stays ignored in sync.
+
+**Fresh-genesis prerequisite:** every block hash, `tx_hash`, vertices root and evidence
+root changes. It activates only in the S8 fresh genesis, with G1 S11. The S8
+`GENESIS_VERSION` bump must include it, so a binary with the old encoding cannot join. It
+is never deployed to today's chain.
 
 ### Activation (AC)
 - **AC-1:** BREAKING. `state_root` changes meaning, the vote becomes FinalityVote V2, the
-  genesis identity gains `state_root(0)`, and FX-4/5/7/9/10/15 change execution results.
+  genesis identity gains `state_root(0)`, FX-4/5/7/9/10/15 change execution results, and
+  FX-18 changes every block hash and body root.
   Activation needs a new `GENESIS_VERSION` and one fresh genesis, shared with G1 S11 and
   crypto agility.
 - **AC-2:** No dual mode. The hash-chain root and its write log are deleted.
@@ -958,7 +1019,7 @@ were three independent reviews; the findings of all three are fixed.
   - Global resources have no size bound (`register_device` grows `DeviceRegistry`), so a
     leaf could outgrow the protocol's limit. Bounding it is an execution matter, filed as
     a separate task.
-| S8 | Activation in the shared fresh genesis with G1 S11 (AC) | Genesis |
+| S8 | Activation in the shared fresh genesis with G1 S11 (AC). Prerequisite: FX-18, the canonical block hash, is in the activated build. | Genesis |
 
 ## Open questions and founder decisions
 

@@ -871,6 +871,39 @@ later `vattest`, no longer remember what that key signed.
   should cover `qc_signing` too.
 - *Owner:* G1 (RC-3), shared with whoever owns the QC producer.
 
+### HDR-1 — the block hash was not injective. FIXED at the fresh genesis (G3 FX-18).
+
+**Severity: HIGH.** Confirmed by an adversarial review with a PoC. Fixed on branch
+`g3/canonical-header-hash`, which is based on `g3/activation`.
+
+`blockchain::calculate_header_hash` concatenated the header fields with no boundaries, and
+omitted empty roots. So two different headers could share one hash, and therefore one
+proposer signature, one QC and one checkpoint anchor. The review's pair: round 20 at
+timestamp 1790667886, and round 201 at timestamp 790667886. Every adjacent field pair
+re-segmented the same way. The class had three more instances:
+- `calculate_tx_hash`, where `["A","B"]` hashed like `["AB"]` (plus its copy in sync);
+- `calculate_vertices_root`, where `["ab","c"]` hashed like `["a","bc"]`;
+- sync checked `vertices_root` only when the header's was non-empty.
+
+A dead copy in `SimpleConsensus` is deleted.
+
+- *Fix:* one tagged, length-framed encoder for the header hash and all three body roots.
+  Integers are u64 LE, strings are length-prefixed, and absent roots carry an explicit tag.
+  The header preimage destructures the header exhaustively, and sync compares the vertices
+  root unconditionally. The encoding is specified in `docs/G3_STATE_AUTHENTICATION_CONTRACT.md`
+  FX-18.
+- *Witnesses:*
+  - a golden vector from an independent encoder;
+  - the PoC;
+  - one test per boundary, each also proving the legacy collision;
+  - the sync witness `sync_must_reject_resegmented_round_timestamp_with_reused_signature`,
+    no longer ignored, and a new witness for an attached vertex sequence.
+- *Activation:* consensus-breaking. It lands only with the S8 fresh genesis (with G1 S11)
+  and is never deployed to today's chain.
+- *Still open:* the block hash does not bind `Block::anchor_hash` (the witness
+  `sync_must_reject_substituted_anchor_with_reused_signature` stays ignored), the chain or the
+  genesis. That is G0 block identity v2 (`docs/BLOCK_IDENTITY_V2_PLAN.md`).
+
 ## 4. Known UNWORKABLE — do not repeat
 
 1. **v3's E2 rule (design `:154-172`).** Unsound as written (P2-A). Its skip arm — "if the walked round-(r+1) set held ≥ 2/3 stake and `Σ_t votes(t) ≤ 1/3`: skip" — and its commit arm both quantify over **bodies the deciding node happens to hold**, so two honest nodes with different holdings decide differently. It violates AD-3 directly. E2 also depends on two mechanisms that do not exist: shadow rows "as compact form **plus parents**", which `to_compact_proof()` cannot produce (P2-B, `blockchain/src/lib.rs:454-461`), and a one-shadow-per-`(author,round)` cap that assumes k=2 twins when nothing bounds k (P2-C). **E2 must be discarded, not patched.**

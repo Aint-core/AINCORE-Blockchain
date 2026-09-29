@@ -310,14 +310,6 @@ impl ChainSync {
         Ok(())
     }
 
-    fn calculate_tx_hash(transactions: &[String]) -> String {
-        let mut data = Vec::new();
-        for tx in transactions {
-            data.extend_from_slice(tx.as_bytes());
-        }
-        hex::encode(crypto::hash(&data))
-    }
-
     fn active_validator_addresses(&self) -> Vec<String> {
         self.storage
             .get_active_validators()
@@ -463,7 +455,7 @@ impl ChainSync {
             ));
         }
 
-        let computed_tx_hash = Self::calculate_tx_hash(&block.transactions);
+        let computed_tx_hash = blockchain::calculate_tx_hash(&block.transactions);
         if block.header.tx_hash != computed_tx_hash {
             return Err(format!(
                 "Transaction hash mismatch: expected {}, computed {}",
@@ -474,14 +466,14 @@ impl ChainSync {
         // LIVENESS/INTEGRITY: the block's committed vertex sequence is what a
         // follower adopts into its ordering engine; bind it to the header so a
         // peer cannot hand us a sequence that does not belong to this block.
-        if !block.header.vertices_root.is_empty() {
-            let computed = blockchain::calculate_vertices_root(&block.committed_vertices);
-            if computed != block.header.vertices_root {
-                return Err(format!(
-                    "Vertices root mismatch: expected {}, computed {}",
-                    block.header.vertices_root, computed
-                ));
-            }
+        // Unconditional (G3 FX-18): an empty header root must mean an empty
+        // sequence, or a peer could attach vertices to a block that has none.
+        let computed = blockchain::calculate_vertices_root(&block.committed_vertices);
+        if computed != block.header.vertices_root {
+            return Err(format!(
+                "Vertices root mismatch: expected {}, computed {}",
+                block.header.vertices_root, computed
+            ));
         }
         // Consumer-side invariant: only equivocation evidence is ordered
         // through the DAG. Reject a block carrying any other kind outright.
