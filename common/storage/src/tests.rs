@@ -408,46 +408,47 @@ mod tests {
         assert_eq!(db.get_chain_height(), 3, "latest_height must not be pruned");
     }
 
-    /// G3 SN-4: a pinned block survives the prune cursor, and goes once its
-    /// pin expires, with its tx index.
+    /// G3 SN-4: a pinned block survives the prune cursor, is recorded as
+    /// kept, and goes once no longer pinned, with its tx index, however the
+    /// pins moved (a retention change included).
     #[test]
     fn pinned_blocks_survive_pruning_until_their_pin_expires() {
         use sha2::{Digest, Sha256};
         let db = temp_db("block_prune_pinned");
         let tx = |h: u64| format!(r#"{{"sender":"s","sequence_number":{h}}}"#);
-        for h in 1..=6u64 {
+        for h in 1..=8u64 {
             let json = format!(
                 r#"{{"header":{{"hash":"h{h}","height":{h}}},"transactions":[{}]}}"#,
                 serde_json::to_string(&tx(h)).unwrap(),
             );
             db.save_block_json(h, &json).unwrap();
         }
-        let pinned: BTreeSet<u64> = [2].into();
+        let pinned: BTreeSet<u64> = [2, 3].into();
         assert_eq!(
             db.prune_old_blocks(6, 2, 10, &pinned).unwrap(),
-            2,
-            "blocks 1 and 3"
+            1,
+            "only block 1"
         );
-        for h in [1u64, 3] {
-            assert_eq!(db.get(&format!("block_{h}")).unwrap(), None, "{h}");
-        }
-        assert!(
-            db.get("block_2").unwrap().is_some(),
-            "the pinned block stays"
-        );
+        assert!(db.get("block_2").unwrap().is_some() && db.get("block_3").unwrap().is_some());
+        assert_eq!(db.kept_pin_blocks().unwrap(), pinned);
         let hash2 = hex::encode(Sha256::digest(tx(2).as_bytes()));
         assert_eq!(db.get_tx_block_height(&hash2), Some(2));
-        assert_eq!(
-            db.prune_old_blocks(7, 2, 10, &pinned).unwrap(),
-            1,
-            "only block 4"
-        );
-        assert!(db.get("block_2").unwrap().is_some(), "the cursor passed it");
-        assert!(db.prune_block_at(2).unwrap());
+        // Still pinned: nothing goes.
+        assert_eq!(db.prune_expired_pins(6, 2, &pinned).unwrap(), 0);
+        // The pins moved (say, retention changed): 2 is no longer one.
+        let moved: BTreeSet<u64> = [3, 6].into();
+        assert_eq!(db.prune_old_blocks(8, 2, 10, &moved).unwrap(), 2, "4 and 5");
+        assert_eq!(db.prune_expired_pins(8, 2, &moved).unwrap(), 1);
         assert_eq!(db.get("block_2").unwrap(), None);
         assert_eq!(db.get("block_txs:2").unwrap(), None);
         assert_eq!(db.get_tx_block_height(&hash2), None);
-        assert!(!db.prune_block_at(2).unwrap(), "already gone");
+        assert!(db.get("block_3").unwrap().is_some(), "3 is still pinned");
+        assert_eq!(db.kept_pin_blocks().unwrap(), [3].into());
+        // A later call with nothing expired changes nothing.
+        assert_eq!(db.prune_expired_pins(8, 2, &moved).unwrap(), 0);
+        // No longer pinned but inside the retention window: kept.
+        assert_eq!(db.prune_expired_pins(8, 10, &BTreeSet::new()).unwrap(), 0);
+        assert!(db.get("block_3").unwrap().is_some(), "inside the window");
     }
 
     #[test]

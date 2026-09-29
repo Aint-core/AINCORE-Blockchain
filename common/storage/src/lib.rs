@@ -133,6 +133,8 @@ struct ValidatorSetV1Entry {
 
 impl StateDB {
     pub const BLOCK_PRUNE_CURSOR_KEY: &'static str = "sys:block_prune_cursor_v1";
+    /// G3 SN-4: the blocks kept for a pin, below the prune cursor.
+    pub const KEPT_PIN_BLOCKS_KEY: &'static str = "sys:kept_pin_blocks_v1";
 
     /// Open database with production-grade durability settings
     ///
@@ -535,8 +537,9 @@ impl StateDB {
     /// of keys in one block commit.
     ///
     /// G3 SN-4: the blocks at `pinned` heights stay, so a snapshot at a
-    /// pinned version keeps its anchor block. `prune_block_at` removes one
-    /// once its pin expires.
+    /// pinned version keeps its anchor block. Each one kept is recorded
+    /// (`KEPT_PIN_BLOCKS_KEY`), so `prune_expired_pins` can remove it once
+    /// it is no longer pinned, however the pins moved.
     pub fn prune_old_blocks(
         &self,
         current_height: u64,
@@ -561,9 +564,13 @@ impl StateDB {
         let end_exclusive = oldest_to_keep.min(cursor.saturating_add(max_delete_per_call));
         let mut batch = rocksdb::WriteBatch::default();
         let mut deleted = 0usize;
+        let mut kept = self.kept_pin_blocks()?;
+        let kept_before = kept.len();
 
         while cursor < end_exclusive {
-            if !pinned.contains(&cursor) {
+            if pinned.contains(&cursor) {
+                kept.insert(cursor);
+            } else {
                 self.delete_block(cursor, &mut batch);
                 deleted += 1;
             }
@@ -574,20 +581,59 @@ impl StateDB {
             Self::BLOCK_PRUNE_CURSOR_KEY.as_bytes(),
             cursor.to_string().as_bytes(),
         );
+        if kept.len() != kept_before {
+            Self::put_kept_pin_blocks(&kept, &mut batch)?;
+        }
         self.write_batch(batch)?;
         Ok(deleted)
     }
 
-    /// G3 SN-4: delete the block at `height` (a pin that expired, which the
-    /// prune cursor already passed). Whether it was there.
-    pub fn prune_block_at(&self, height: u64) -> Result<bool, StorageError> {
-        if self.get(&format!("block_{}", height))?.is_none() {
-            return Ok(false);
+    /// G3 SN-4: the pinned blocks that are no longer pinned and lie below
+    /// the retention window go. Returns how many.
+    pub fn prune_expired_pins(
+        &self,
+        current_height: u64,
+        keep_blocks: u64,
+        pinned: &BTreeSet<u64>,
+    ) -> Result<usize, StorageError> {
+        let oldest_to_keep = current_height.saturating_sub(keep_blocks);
+        let mut kept = self.kept_pin_blocks()?;
+        let expired: Vec<u64> = kept
+            .iter()
+            .copied()
+            .filter(|h| !pinned.contains(h) && *h < oldest_to_keep)
+            .collect();
+        if expired.is_empty() {
+            return Ok(0);
         }
         let mut batch = rocksdb::WriteBatch::default();
-        self.delete_block(height, &mut batch);
+        for height in &expired {
+            self.delete_block(*height, &mut batch);
+            kept.remove(height);
+        }
+        Self::put_kept_pin_blocks(&kept, &mut batch)?;
         self.write_batch(batch)?;
-        Ok(true)
+        Ok(expired.len())
+    }
+
+    /// The heights of the blocks block pruning kept for a pin.
+    pub fn kept_pin_blocks(&self) -> Result<BTreeSet<u64>, StorageError> {
+        match self.get(Self::KEPT_PIN_BLOCKS_KEY)? {
+            None => Ok(BTreeSet::new()),
+            Some(json) => serde_json::from_str(&json).map_err(|e| {
+                StorageError::SerializationError(format!("malformed kept pin blocks: {e}"))
+            }),
+        }
+    }
+
+    fn put_kept_pin_blocks(
+        kept: &BTreeSet<u64>,
+        batch: &mut rocksdb::WriteBatch,
+    ) -> Result<(), StorageError> {
+        let json = serde_json::to_string(kept)
+            .map_err(|e| StorageError::SerializationError(e.to_string()))?;
+        batch.put(Self::KEPT_PIN_BLOCKS_KEY.as_bytes(), json.as_bytes());
+        Ok(())
     }
 
     /// Return block retention policy from environment.

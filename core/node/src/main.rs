@@ -220,9 +220,16 @@ async fn restore_from_checkpoint(
         }
         let height = read("latest_height")?.and_then(|h| h.parse::<u64>().ok());
         if let Some(height) = height.filter(|h| *h >= cp.height) {
+            // The block at the checkpoint height, or its QC, which is never
+            // pruned.
             let ours = read(&format!("block_{}", cp.height))?
                 .and_then(|json| serde_json::from_str::<blockchain::Block>(&json).ok())
-                .map(|block| block.header.hash);
+                .map(|block| block.header.hash)
+                .or(read(&format!("consensus:qc:{}", cp.height))?
+                    .and_then(|json| {
+                        serde_json::from_str::<consensus::qc::QuorumCertificate>(&json).ok()
+                    })
+                    .map(|qc| qc.block_hash));
             match ours {
                 Some(hash) if hash.eq_ignore_ascii_case(&cp.block_hash) => {
                     println!(
@@ -239,11 +246,13 @@ async fn restore_from_checkpoint(
                     ))
                 }
                 None if !settings.replace_existing => {
-                    println!(
-                        "ℹ️ [STATE_SYNC] at height {height}, past the checkpoint, whose block is \
-                         pruned here and cannot be compared; not restoring"
-                    );
-                    return Ok(None);
+                    return Err(format!(
+                        "at height {height}, past the checkpoint, this datadir holds neither \
+                         the block nor the QC at {}, so whether it is on the checkpoint's chain \
+                         cannot be told. Set AINCORE_STATE_SYNC_REPLACE=1 to replace it, or \
+                         unset the checkpoint",
+                        cp.height
+                    ))
                 }
                 _ => {}
             }
@@ -270,6 +279,42 @@ async fn restore_from_checkpoint(
         restored.height, restored.leaves, restored.restarts
     );
     Ok(Some(restored))
+}
+
+/// G3 SN-6 at every boot: a datadir restored with one key may not be run as
+/// a validator with another. A validator key moved onto a restored datadir
+/// can sign a slot its old instance already signed, and the abstention that
+/// prevents that (G1 RC-3) does not exist yet.
+fn check_restored_signer(storage: &StateDB, my_address: &str) -> Result<(), String> {
+    let Some(restored_by) = storage
+        .get(chain_sync::state_sync::RESTORED_BY)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    if restored_by == my_address {
+        return Ok(());
+    }
+    let height = storage
+        .get("latest_height")
+        .map_err(|e| e.to_string())?
+        .and_then(|h| h.parse::<u64>().ok())
+        .unwrap_or(0);
+    let in_committee = consensus::qc_producer::epoch_for_block_height(storage, height.max(1))
+        .and_then(|epoch| consensus::qc_producer::load_validator_set_for_epoch(storage, epoch))
+        .is_some_and(|committee| committee.iter().any(|v| v.address == my_address));
+    let active = storage
+        .get_active_validators()
+        .iter()
+        .any(|(address, _)| address == my_address);
+    if in_committee || active {
+        return Err(format!(
+            "this datadir was restored with key {restored_by}, and this node's key \
+             {my_address} is a validator: a validator key moved onto a restored datadir can \
+             sign a slot its old instance already signed (SN-6)"
+        ));
+    }
+    Ok(())
 }
 
 /// G3 FX-6: the chain id comes only from `sys:chain_id`, which genesis
@@ -752,6 +797,10 @@ async fn main() {
         eprintln!("❌ FATAL: {e}; refusing to boot");
         std::process::exit(1);
     }
+    if let Err(e) = check_restored_signer(&storage, &node_id) {
+        eprintln!("❌ FATAL: {e}; refusing to boot");
+        std::process::exit(1);
+    }
 
     let executor = Arc::new(Executor::new(Arc::clone(&storage)));
     // Phase 2.1 (H-01): use with_storage so PQC (Dilithium5) submissions
@@ -919,13 +968,13 @@ async fn main() {
         let node_signing_key_server = Arc::clone(&node_signing_key);
 
         tokio::spawn(async move {
-            network::start_server(
+            network::start_server_with_peer(
                 port,
                 server_node_id,
                 node_peers,
                 Arc::clone(&node_storage),
                 node_signing_key_server,
-                move |msg: String| -> Option<String> {
+                move |msg: String, peer: std::net::IpAddr| -> Option<String> {
                     println!("📨 [Server] Received msg: {:.50}...", msg);
                     if msg.starts_with("TX:") {
                         if let Ok(guard) = node_consensus.read() {
@@ -967,11 +1016,12 @@ async fn main() {
                         // GET_FINALITY (with the quorum certificate), SYNC_REQ (blocks +
                         // finality QC + prune_horizon), VERTEX_REQ (DAG vertex bodies by
                         // hash) and the G3 S6 snapshot restore (STATE_ANCHOR_REQ,
-                        // STATE_CHUNK_REQ). The returned response is sent back
+                        // STATE_CHUNK_REQ, STATE_VALUE_REQ), which budgets per
+                        // client IP. The returned response is sent back
                         // over the same encrypted socket by network::start_server. Keeping
                         // this here — instead of reimplementing it inline in the transport —
                         // is what stops serving-side fixes from silently landing on dead code.
-                        node_chain_sync.handle_message(&msg)
+                        node_chain_sync.handle_message_from(&msg, Some(peer))
                     } else {
                         None
                     }
@@ -1500,8 +1550,8 @@ mod boot_identity_tests {
 
     /// Review M2: a datadir past the checkpoint on another chain (its block at
     /// the checkpoint height differs: a fork) is refused, or replaced when
-    /// asked. One whose block there is pruned cannot be compared, and is
-    /// left alone unless replacing is asked for.
+    /// asked. With the block pruned the QC at that height, never pruned,
+    /// decides; with neither, it is refused (post-fix review MEDIUM 4).
     #[tokio::test]
     async fn a_forked_datadir_past_the_checkpoint_is_refused_or_replaced() {
         use super::restore_from_checkpoint;
@@ -1523,16 +1573,125 @@ mod boot_identity_tests {
             Err("no genesis".into()),
             "replaced when asked"
         );
-        let pruned = skip_db("pruned");
-        pruned.put("latest_height", "100").unwrap();
+        // Block pruned: the QC at the checkpoint height decides.
+        let qc_at_7 = |hash: &str| {
+            let mut qc: consensus::qc::QuorumCertificate =
+                serde_json::from_value(serde_json::json!({
+                    "version": 1, "chain_id": "C", "epoch": 0, "finalized_round": 16,
+                    "anchor_round": 14, "anchor_hash": "", "block_height": 7, "block_hash": "",
+                    "state_root": "", "receipts_root": "", "finality_digest": "",
+                    "validator_set_hash": "", "signer_bitmap": [], "signed_stake": 0,
+                    "total_stake": 0, "aggregate_signature": [],
+                }))
+                .unwrap();
+            qc.block_hash = hash.to_string();
+            serde_json::to_string(&qc).unwrap()
+        };
+        let pruned_on_chain = skip_db("pruned_on_chain");
+        pruned_on_chain.put("latest_height", "100").unwrap();
+        pruned_on_chain
+            .put("consensus:qc:7", &qc_at_7(&"ab".repeat(32)))
+            .unwrap();
         assert_eq!(
-            restore_from_checkpoint(&pruned, &settings(false), untouched, 0, &me).await,
-            Ok(None)
+            restore_from_checkpoint(&pruned_on_chain, &settings(false), untouched, 0, &me).await,
+            Ok(None),
+            "the QC says: the checkpoint's chain"
         );
+        let pruned_forked = skip_db("pruned_forked");
+        pruned_forked.put("latest_height", "100").unwrap();
+        pruned_forked
+            .put("consensus:qc:7", &qc_at_7(&"99".repeat(32)))
+            .unwrap();
+        let err = restore_from_checkpoint(&pruned_forked, &settings(false), untouched, 0, &me)
+            .await
+            .unwrap_err();
+        assert!(err.contains("another chain"), "{err}");
+        // Neither block nor QC: cannot tell, so refused unless replacing.
+        let unknown = skip_db("unknown");
+        unknown.put("latest_height", "100").unwrap();
+        let err = restore_from_checkpoint(&unknown, &settings(false), untouched, 0, &me)
+            .await
+            .unwrap_err();
+        assert!(err.contains("cannot be told"), "{err}");
         assert_eq!(
-            restore_from_checkpoint(&pruned, &settings(true), no_genesis, 0, &me).await,
+            restore_from_checkpoint(&unknown, &settings(true), no_genesis, 0, &me).await,
             Err("no genesis".into())
         );
+        // Exactly at the checkpoint height counts as past it; one below
+        // restores.
+        let at = skip_db("at_height");
+        at.put("latest_height", "7").unwrap();
+        at.put("block_7", &block_at_7(&"ab".repeat(32))).unwrap();
+        assert_eq!(
+            restore_from_checkpoint(&at, &settings(false), untouched, 0, &me).await,
+            Ok(None)
+        );
+        at.put("latest_height", "6").unwrap();
+        assert_eq!(
+            restore_from_checkpoint(&at, &settings(true), no_genesis, 0, &me).await,
+            Err("no genesis".into())
+        );
+    }
+
+    /// Post-fix review MEDIUM 5 (SN-6 at every boot): a datadir restored
+    /// with one key refuses to run with another that is a validator.
+    #[test]
+    fn a_restored_datadir_refuses_a_different_validator_key() {
+        use super::check_restored_signer;
+        let db = skip_db("restored_signer");
+        let observer = "aa".repeat(32);
+        let validator = "bb".repeat(32);
+        assert_eq!(
+            check_restored_signer(&db, &validator),
+            Ok(()),
+            "not restored"
+        );
+        {
+            let _seed = db.seeding();
+            db.put(
+                "sys:validators",
+                &serde_json::to_string(&vec![(validator.clone(), 100u64)]).unwrap(),
+            )
+            .unwrap();
+        }
+        db.put(chain_sync::state_sync::RESTORED_BY, &observer)
+            .unwrap();
+        assert_eq!(check_restored_signer(&db, &observer), Ok(()), "its own key");
+        assert_eq!(
+            check_restored_signer(&db, &"cc".repeat(32)),
+            Ok(()),
+            "another observer key"
+        );
+        let err = check_restored_signer(&db, &validator).unwrap_err();
+        assert!(err.contains("SN-6") && err.contains(&observer), "{err}");
+        // Its own restoring key, a validator now (it joined): fine.
+        db.put(chain_sync::state_sync::RESTORED_BY, &validator)
+            .unwrap();
+        assert_eq!(check_restored_signer(&db, &validator), Ok(()));
+        // A member of the current epoch's committee, not in the active set.
+        let committee_only = skip_db("restored_committee");
+        let member = consensus::qc::ValidatorInfo {
+            address: validator.clone(),
+            stake: 100,
+            ed25519_public_key: "00".repeat(32),
+            bls_public_key: "00".repeat(48),
+            bls_pop: "00".repeat(96),
+        };
+        {
+            let _seed = committee_only.seeding();
+            committee_only
+                .put(
+                    "genesis:validator_set:v1",
+                    &serde_json::to_string(&vec![member]).unwrap(),
+                )
+                .unwrap();
+        }
+        committee_only
+            .put(chain_sync::state_sync::RESTORED_BY, &observer)
+            .unwrap();
+        committee_only.put("latest_height", "5").unwrap();
+        let err = check_restored_signer(&committee_only, &validator).unwrap_err();
+        assert!(err.contains("SN-6"), "{err}");
     }
 
     #[test]

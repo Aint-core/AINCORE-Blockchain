@@ -1262,26 +1262,3 @@ fn a_key_recreated_during_pruning_keeps_its_preimage() {
     assert_eq!(count_rows(&db, VDEAD), 0, "the old deletion row went");
 }
 
-/// SN-4: the pin that just left the schedule, and only that one.
-#[test]
-fn the_expired_pin_is_the_one_that_just_left_the_schedule() {
-    // Schedule at tip 600, keep 200, interval 20: 200, 240, ... 600.
-    assert_eq!(expired_pin(600, 200, 20), Some(160));
-    assert!(!pin_schedule(600, 200, 20).contains(&160));
-    assert!(
-        pin_schedule(560, 200, 20).contains(&160),
-        "pinned until tip 560"
-    );
-    assert_eq!(expired_pin(561, 200, 20), Some(160), "expired at 561");
-    assert_eq!(expired_pin(400, 200, 20), None, "nothing expired yet");
-    assert_eq!(expired_pin(441, 200, 20), Some(40));
-    for tip in 400..2_000u64 {
-        if let Some(v) = expired_pin(tip, 200, 20) {
-            assert!(!pin_schedule(tip, 200, 20).contains(&v), "{tip}");
-            assert!(
-                pin_schedule(v + 400, 200, 20).contains(&v),
-                "{tip}: was a pin"
-            );
-        }
-    }
-}

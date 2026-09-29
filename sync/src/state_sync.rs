@@ -15,10 +15,11 @@ use crate::ChainSync;
 use blockchain::Block;
 use consensus::qc::QuorumCertificate;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::sync::Arc;
-use std::time::Duration;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use storage::class::{classify, KeyClass};
 use storage::rocksdb::{Direction, IteratorMode, WriteBatch};
 use storage::{StateDB, RESTORE_MARKER};
@@ -33,24 +34,36 @@ pub const VALUE_RESP: &str = "STATE_VALUE_RESP:";
 /// The most leaves a server sends in one chunk.
 pub const MAX_CHUNK_ENTRIES: usize = 2_000;
 /// Encoded chunk budget, well under the transport's 10 MiB frame.
-const MAX_CHUNK_BYTES: usize = 6 * 1024 * 1024;
+const MAX_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// A value longer than this travels in parts (`STATE_VALUE_REQ`), so no
 /// single leaf can make a chunk unservable.
 pub const INLINE_VALUE_BYTES: usize = 256 * 1024;
-/// The bytes of one value part (twice that as hex, under the frame).
-pub const VALUE_PART_BYTES: usize = 2 * 1024 * 1024;
-/// The largest leaf a client accepts, and the most bytes one chunk may
-/// assemble to: what a hostile peer can make a restoring node allocate.
+/// The bytes of one value part. Every part but a value's last is exactly
+/// this long, so a peer that sends less is caught at once.
+pub const VALUE_PART_BYTES: usize = 1024 * 1024;
+/// The largest leaf the protocol carries, and the most bytes one chunk may
+/// add up to. A server never sends past them; a client that is sent past
+/// them has met a liar.
 pub const MAX_LEAF_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_CHUNK_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
-/// Snapshot serving: concurrent requests, and leaves (or value parts) per
-/// second. Apart from vertex serving's budget.
-pub const STATE_SERVE_IN_FLIGHT: usize = 2;
-pub const STATE_SERVE_LEAVES_PER_SEC: f64 = 4_000.0;
+/// Snapshot serving, apart from vertex serving: requests in flight and cost
+/// units per second (a leaf, or `UNIT_BYTES` read), globally and per client
+/// IP, so no one client takes more than its share.
+pub const STATE_SERVE_IN_FLIGHT: usize = 4;
+pub const STATE_SERVE_IN_FLIGHT_PER_IP: usize = 1;
+pub const STATE_SERVE_UNITS_PER_SEC: f64 = 8_000.0;
+pub const STATE_SERVE_UNITS_PER_SEC_PER_IP: f64 = 2_000.0;
+pub const UNIT_BYTES: u64 = 4 * 1024;
+/// Client IPs remembered at once; idle ones are forgotten first.
+const MAX_TRACKED_IPS: usize = 1_024;
 /// Rows deleted per batch while clearing a datadir.
 const CLEAR_BATCH: usize = 10_000;
-/// Where a restored node records the checkpoint it restored (N).
+/// "busy" answers to one value part before its chunk is given up on.
+const PART_BUSY_RETRIES: u32 = 3;
+/// Where a restored node records the checkpoint it restored, and the key it
+/// restored with (N).
 pub const RESTORED_CHECKPOINT: &str = "sys:restored_checkpoint";
+pub const RESTORED_BY: &str = "sys:restored_by";
 
 /// Genesis state keys no transaction changes. The restored state must hold
 /// this node's own genesis values for them. With the genesis identity pinned
@@ -159,7 +172,7 @@ pub struct ValueRequest {
     pub offset: u64,
 }
 
-/// Up to `VALUE_PART_BYTES` of a value, from `offset`.
+/// `VALUE_PART_BYTES` of a value from `offset`, or what is left of it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ValueResponse {
     /// Hex of the part.
@@ -168,6 +181,8 @@ pub struct ValueResponse {
     pub len: u64,
     pub error: Option<String>,
 }
+
+const BUSY: &str = "busy";
 
 /// Run `f`, which reads RocksDB synchronously, without holding a tokio worker
 /// that consensus tasks wait on: on a multi-thread runtime the worker first
@@ -178,6 +193,151 @@ fn blocking<T>(f: impl FnOnce() -> T) -> T {
             tokio::task::block_in_place(f)
         }
         _ => f(),
+    }
+}
+
+struct Bucket {
+    tokens: f64,
+    last: Instant,
+    in_flight: usize,
+}
+
+impl Bucket {
+    fn full(burst: f64) -> Self {
+        Self {
+            tokens: burst,
+            last: Instant::now(),
+            in_flight: 0,
+        }
+    }
+
+    fn refill(&mut self, rate: f64, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * rate).min(rate);
+    }
+}
+
+struct Buckets {
+    global: Bucket,
+    per_ip: HashMap<IpAddr, Bucket>,
+}
+
+/// Snapshot serving's budget: slots in flight and cost units, globally and
+/// per client IP. A burst is one second's worth. Bytes read are charged
+/// after the fact and may leave a bucket in debt, which later requests wait
+/// out.
+pub struct StateBudget {
+    buckets: Mutex<Buckets>,
+}
+
+impl Default for StateBudget {
+    fn default() -> Self {
+        Self {
+            buckets: Mutex::new(Buckets {
+                global: Bucket::full(STATE_SERVE_UNITS_PER_SEC),
+                per_ip: HashMap::new(),
+            }),
+        }
+    }
+}
+
+/// A request let in: `granted` units, and a slot released on drop.
+pub struct Admission<'a> {
+    budget: &'a StateBudget,
+    ip: Option<IpAddr>,
+    pub granted: usize,
+}
+
+impl StateBudget {
+    /// Plain counters: recovering from a poisoned lock is safe.
+    fn lock(&self) -> MutexGuard<'_, Buckets> {
+        self.buckets.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Let a request from `ip` in (`None`: in process, global limits only),
+    /// with up to `want` units both buckets hold. `None` when busy.
+    pub fn admit(&self, ip: Option<IpAddr>, want: usize) -> Option<Admission<'_>> {
+        let mut st = self.lock();
+        let now = Instant::now();
+        st.global.refill(STATE_SERVE_UNITS_PER_SEC, now);
+        if st.global.in_flight >= STATE_SERVE_IN_FLIGHT {
+            return None;
+        }
+        let mut cap = st.global.tokens;
+        if let Some(ip) = ip {
+            if !st.per_ip.contains_key(&ip) && st.per_ip.len() >= MAX_TRACKED_IPS {
+                // A bucket that has refilled and is idle is the same as a
+                // new one.
+                st.per_ip.retain(|_, b| {
+                    let refilled = b.tokens
+                        + now.saturating_duration_since(b.last).as_secs_f64()
+                            * STATE_SERVE_UNITS_PER_SEC_PER_IP;
+                    b.in_flight > 0 || refilled < STATE_SERVE_UNITS_PER_SEC_PER_IP
+                });
+                if st.per_ip.len() >= MAX_TRACKED_IPS {
+                    return None;
+                }
+            }
+            let bucket = st
+                .per_ip
+                .entry(ip)
+                .or_insert_with(|| Bucket::full(STATE_SERVE_UNITS_PER_SEC_PER_IP));
+            bucket.refill(STATE_SERVE_UNITS_PER_SEC_PER_IP, now);
+            if bucket.in_flight >= STATE_SERVE_IN_FLIGHT_PER_IP {
+                return None;
+            }
+            cap = cap.min(bucket.tokens);
+        }
+        let granted = (want as f64).min(cap).floor();
+        if granted < 1.0 {
+            return None;
+        }
+        st.global.tokens -= granted;
+        st.global.in_flight += 1;
+        if let Some(bucket) = ip.and_then(|ip| st.per_ip.get_mut(&ip)) {
+            bucket.tokens -= granted;
+            bucket.in_flight += 1;
+        }
+        Some(Admission {
+            budget: self,
+            ip,
+            granted: granted as usize,
+        })
+    }
+}
+
+impl StateBudget {
+    /// Tests only: the units a bucket holds now, before any refill.
+    #[cfg(test)]
+    fn balance(&self, ip: Option<IpAddr>) -> f64 {
+        let st = self.lock();
+        match ip {
+            None => st.global.tokens,
+            Some(ip) => st.per_ip.get(&ip).map_or(f64::NAN, |b| b.tokens),
+        }
+    }
+}
+
+impl Admission<'_> {
+    /// Charge `bytes` read, on top of what was granted.
+    fn charge_read(&self, bytes: u64) {
+        let units = bytes.div_ceil(UNIT_BYTES) as f64;
+        let mut st = self.budget.lock();
+        st.global.tokens -= units;
+        if let Some(bucket) = self.ip.and_then(|ip| st.per_ip.get_mut(&ip)) {
+            bucket.tokens -= units;
+        }
+    }
+}
+
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        let mut st = self.budget.lock();
+        st.global.in_flight = st.global.in_flight.saturating_sub(1);
+        if let Some(bucket) = self.ip.and_then(|ip| st.per_ip.get_mut(&ip)) {
+            bucket.in_flight = bucket.in_flight.saturating_sub(1);
+        }
     }
 }
 
@@ -204,18 +364,19 @@ impl ChainSync {
         }
     }
 
-    /// Serve one restore chunk (SN-2) of a version this node retains
-    /// (`state_commit::servable`). Bounded apart from vertex serving: a slot of
-    /// `STATE_SERVE_IN_FLIGHT`, leaves from a `STATE_SERVE_LEAVES_PER_SEC`
-    /// bucket, `MAX_CHUNK_BYTES` per answer, and the reads off the shared
-    /// tokio workers.
+    /// `serve_state_chunk` for an in-process caller.
     pub fn handle_state_chunk(&self, req: ChunkRequest) -> ChunkResponse {
+        self.serve_state_chunk(req, None)
+    }
+
+    /// Serve one restore chunk (SN-2) of a version this node retains, to
+    /// `peer`. Charged a unit per leaf and per `UNIT_BYTES` read, under the
+    /// global and the per-IP budget; at most `MAX_CHUNK_BYTES` inline and
+    /// `MAX_CHUNK_TOTAL_BYTES` in parts; the reads off the shared workers.
+    pub fn serve_state_chunk(&self, req: ChunkRequest, peer: Option<IpAddr>) -> ChunkResponse {
         let refuse = |why: &str| ChunkResponse {
             error: Some(why.to_string()),
             ..Default::default()
-        };
-        let Some(_slot) = self.state_budget.try_enter() else {
-            return refuse("busy");
         };
         let after = match req.after.as_deref() {
             None => None,
@@ -224,18 +385,18 @@ impl ChainSync {
                 None => return refuse("malformed cursor"),
             },
         };
-        // A few point reads: before any leaves are charged.
+        // A few point reads: before anything is charged.
         if let Err(why) = self.state_servable(req.version) {
             return refuse(why);
         }
-        let granted = self
+        let Some(admission) = self
             .state_budget
-            .take_lookups(req.max.clamp(1, MAX_CHUNK_ENTRIES));
-        if granted == 0 {
-            return refuse("busy");
-        }
+            .admit(peer, req.max.clamp(1, MAX_CHUNK_ENTRIES))
+        else {
+            return refuse(BUSY);
+        };
         blocking(|| {
-            let mut max = granted;
+            let mut max = admission.granted;
             loop {
                 let (entries, proof) =
                     match state_commit::wire_chunk(&self.storage, req.version, after, max) {
@@ -248,6 +409,8 @@ impl ChainSync {
                         Ok(Some(chunk)) => chunk,
                         Err(_) => return refuse("version not whole here"),
                     };
+                admission.charge_read(entries.iter().map(|(_, v)| v.len() as u64).sum());
+                let over_limit = entries.iter().any(|(_, v)| v.len() as u64 > MAX_LEAF_BYTES);
                 let entries: Vec<WireEntry> = entries
                     .into_iter()
                     .map(|(key, value)| WireEntry {
@@ -260,11 +423,19 @@ impl ChainSync {
                         key,
                     })
                     .collect();
-                let size: usize = entries
+                let inline: usize = entries
                     .iter()
                     .map(|e| e.key.len() + e.value.len() + 32)
                     .sum();
-                if size + 2 * proof.len() <= MAX_CHUNK_BYTES {
+                let parted: u64 = entries
+                    .iter()
+                    .filter(|e| e.value.is_empty())
+                    .map(|e| e.len)
+                    .sum();
+                if !over_limit
+                    && inline + 2 * proof.len() <= MAX_CHUNK_BYTES
+                    && parted <= MAX_CHUNK_TOTAL_BYTES
+                {
                     return ChunkResponse {
                         entries,
                         proof: hex::encode(proof),
@@ -273,30 +444,32 @@ impl ChainSync {
                     };
                 }
                 if max == 1 {
-                    return refuse("one leaf exceeds the chunk budget");
+                    return refuse("a leaf over the protocol's limit");
                 }
                 max /= 2;
             }
         })
     }
 
-    /// Serve up to `VALUE_PART_BYTES` of one leaf's value, for a value too
-    /// large to travel inline. Bounded like chunks; the last value read is
-    /// cached, so the parts of one value cost one read.
+    /// `serve_state_value` for an in-process caller.
     pub fn handle_state_value(&self, req: ValueRequest) -> ValueResponse {
+        self.serve_state_value(req, None)
+    }
+
+    /// Serve `VALUE_PART_BYTES` of one leaf's value from `offset` to
+    /// `peer`, for a value too large to travel inline. Charged like chunks,
+    /// by the bytes read: a whole value when it is not the cached one.
+    pub fn serve_state_value(&self, req: ValueRequest, peer: Option<IpAddr>) -> ValueResponse {
         let refuse = |why: &str| ValueResponse {
             error: Some(why.to_string()),
             ..Default::default()
         };
-        let Some(_slot) = self.state_budget.try_enter() else {
-            return refuse("busy");
-        };
         if let Err(why) = self.state_servable(req.version) {
             return refuse(why);
         }
-        if self.state_budget.take_lookups(1) == 0 {
-            return refuse("busy");
-        }
+        let Some(admission) = self.state_budget.admit(peer, 1) else {
+            return refuse(BUSY);
+        };
         blocking(|| {
             let cached = {
                 let cache = self
@@ -312,6 +485,7 @@ impl ChainSync {
                 Some(value) => value,
                 None => match state_commit::value_at(&self.storage, &req.key, req.version) {
                     Ok(Some(value)) => {
+                        admission.charge_read(value.len() as u64);
                         let value = Arc::new(value);
                         *self
                             .state_value_cache
@@ -330,6 +504,7 @@ impl ChainSync {
             }
             let start = req.offset as usize;
             let end = value.len().min(start + VALUE_PART_BYTES);
+            admission.charge_read((end - start) as u64);
             ValueResponse {
                 data: hex::encode(&value[start..end]),
                 len,
@@ -342,12 +517,21 @@ impl ChainSync {
 /// How hard a restore tries before it gives up.
 #[derive(Debug, Clone)]
 pub struct Patience {
-    /// Unanswered requests in a row, across all peers, before giving up.
+    /// Requests in a row, across all peers, that got no usable answer (a
+    /// dead or silent peer, a refusal other than busy) before giving up.
+    /// Busy answers wait instead, within `deadline`.
     pub max_failures: usize,
-    /// The wait after an unanswered request, doubling each round of the
-    /// peers up to `backoff_max`.
+    /// The wait after a request that got no usable answer, doubling each
+    /// round of the peers up to `backoff_max`.
     pub backoff_start: Duration,
     pub backoff_max: Duration,
+    /// One request's limit over TCP.
+    pub request_timeout: Duration,
+    /// The slowest a peer may send a value's parts before it counts as not
+    /// answering: this many bytes a second, after `request_timeout`.
+    pub min_bytes_per_sec: u64,
+    /// The whole restore's limit.
+    pub deadline: Duration,
 }
 
 impl Default for Patience {
@@ -356,6 +540,9 @@ impl Default for Patience {
             max_failures: 60,
             backoff_start: Duration::from_millis(50),
             backoff_max: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(60),
+            min_bytes_per_sec: 256 * 1024,
+            deadline: Duration::from_secs(24 * 60 * 60),
         }
     }
 }
@@ -384,7 +571,7 @@ pub struct RestorePlan<'a> {
     /// datadir, or one an interrupted restore left marked.
     pub replace_existing: bool,
     /// This node's own address. A restore refuses a chain where it is a
-    /// validator (SN-6).
+    /// validator (SN-6), and records it.
     pub local_signer: Option<&'a str>,
     pub patience: Patience,
 }
@@ -453,7 +640,8 @@ fn clear(storage: &Arc<StateDB>) -> Result<(), String> {
 }
 
 /// The block and QC match the checkpoint, and each other, and the block is
-/// internally whole. The QC's signature is checked after the restore.
+/// internally whole. The QC's signature and the block's proposer signature
+/// are checked after the restore.
 fn check_anchor(cp: &Checkpoint, block: &Block, qc: &QuorumCertificate) -> Result<(), String> {
     let h = &block.header;
     if h.height != cp.height
@@ -481,48 +669,58 @@ fn check_anchor(cp: &Checkpoint, block: &Block, qc: &QuorumCertificate) -> Resul
     Ok(())
 }
 
-/// Every (block, QC) pair the peers hold for the checkpoint. A pair stays
-/// together: the block stored is the one whose own QC verifies.
+type Pair = (Block, QuorumCertificate);
+
+/// Every distinct (block, QC) pair the peers hold for the checkpoint, asked
+/// again, round after round, until one is found. A pair stays together: the
+/// block stored is the one whose own QC verifies.
 async fn fetch_anchor<F, Fut>(
     cp: &Checkpoint,
     peers: usize,
     ask: &mut F,
-) -> Result<Vec<(Block, QuorumCertificate)>, String>
+    patience: &Patience,
+) -> Result<Vec<Pair>, String>
 where
     F: FnMut(usize, String) -> Fut,
     Fut: Future<Output = Result<String, String>>,
 {
     let request =
         serde_json::to_string(&AnchorRequest { height: cp.height }).map_err(|e| e.to_string())?;
-    let mut pairs: Vec<(Block, QuorumCertificate)> = Vec::new();
-    for peer in 0..peers {
-        let Ok(reply) = ask(peer, format!("{ANCHOR_REQ}{request}")).await else {
-            continue;
-        };
-        let Some(anchor) = reply
-            .strip_prefix(ANCHOR_RESP)
-            .and_then(|json| serde_json::from_str::<AnchorResponse>(json).ok())
-        else {
-            continue;
-        };
-        let (Some(block), Some(qc)) = (anchor.block, anchor.quorum_certificate) else {
-            continue;
-        };
-        if let Err(e) = check_anchor(cp, &block, &qc) {
-            eprintln!("⚠️ [STATE_SYNC] peer {peer}: {e}");
-            continue;
+    for round in 0..patience.max_failures.max(1) {
+        let mut pairs: Vec<Pair> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        for peer in 0..peers {
+            let Ok(reply) = ask(peer, format!("{ANCHOR_REQ}{request}")).await else {
+                continue;
+            };
+            let Some(anchor) = reply
+                .strip_prefix(ANCHOR_RESP)
+                .and_then(|json| serde_json::from_str::<AnchorResponse>(json).ok())
+            else {
+                continue;
+            };
+            let (Some(block), Some(qc)) = (anchor.block, anchor.quorum_certificate) else {
+                continue;
+            };
+            if let Err(e) = check_anchor(cp, &block, &qc) {
+                eprintln!("⚠️ [STATE_SYNC] peer {peer}: {e}");
+                continue;
+            }
+            let id = serde_json::to_string(&(&block, &qc)).map_err(|e| e.to_string())?;
+            if !seen.contains(&id) {
+                seen.push(id);
+                pairs.push((block, qc));
+            }
         }
-        if !pairs.iter().any(|(_, known)| *known == qc) {
-            pairs.push((block, qc));
+        if !pairs.is_empty() {
+            return Ok(pairs);
         }
+        tokio::time::sleep(patience.backoff(round + 1, 1)).await;
     }
-    if pairs.is_empty() {
-        return Err(format!(
-            "no peer holds block {} and its QC as the checkpoint names them",
-            cp.height
-        ));
-    }
-    Ok(pairs)
+    Err(format!(
+        "no peer holds block {} and its QC as the checkpoint names them",
+        cp.height
+    ))
 }
 
 fn short(value: &str) -> &str {
@@ -552,15 +750,21 @@ fn check_genesis(storage: &StateDB, plan: &RestorePlan<'_>) -> Result<String, St
     Ok(plan.genesis["sys:chain_id"].clone())
 }
 
-/// The restored state is of this node's genesis, its own committee signed
-/// one of the QCs under this node's chain id, and this node is not one of
-/// its validators. Returns the verified pair.
-fn verify_restored(
+fn sn6_refusal(me: &str) -> String {
+    format!(
+        "this node's key {me} is a validator of the chain. A validator key restored onto a \
+         new datadir can sign a slot its old instance already signed, and the abstention that \
+         prevents that (G1 RC-3) does not exist yet (SN-6). Restore with a new node key, as an \
+         observer"
+    )
+}
+
+/// The checkpoint epoch's committee, as the restored state records it; and
+/// SN-6: this node is neither in it nor in the active set.
+fn restored_committee(
     storage: &StateDB,
     plan: &RestorePlan<'_>,
-    pairs: &[(Block, QuorumCertificate)],
-) -> Result<(Block, QuorumCertificate), String> {
-    let chain_id = check_genesis(storage, plan)?;
+) -> Result<(u64, Vec<consensus::qc::ValidatorInfo>), String> {
     let height = plan.checkpoint.height;
     let epoch = consensus::qc_producer::epoch_for_block_height(storage, height)
         .ok_or("the restored state has no epoch for the checkpoint height")?;
@@ -573,23 +777,35 @@ fn verify_restored(
                 .iter()
                 .any(|(address, _)| address == me);
         if signs {
-            return Err(format!(
-                "this node's key {me} is a validator of the restored chain. A validator key \
-                 restored onto a new datadir can sign a slot its old instance already signed, \
-                 and the abstention that prevents that (G1 RC-3) does not exist yet (SN-6). \
-                 Restore with a new node key, as an observer"
-            ));
+            return Err(sn6_refusal(me));
         }
     }
+    Ok((epoch, committee))
+}
+
+/// The first pair whose QC the committee signed under this chain id, and
+/// whose block its proposer signed, as the restored state records the
+/// proposer's key.
+fn verified_pair(
+    storage: &StateDB,
+    chain_id: &str,
+    epoch: u64,
+    committee: &[consensus::qc::ValidatorInfo],
+    pairs: &[Pair],
+) -> Result<Pair, String> {
     let mut last_error = String::from("no QC");
     for (block, qc) in pairs {
         if qc.epoch != epoch {
             last_error = format!("QC epoch {} is not the restored epoch {epoch}", qc.epoch);
             continue;
         }
-        match consensus::qc::verify_qc(qc, &committee, &chain_id) {
+        if let Err(e) = consensus::qc::verify_qc(qc, committee, chain_id) {
+            last_error = format!("{e:?}");
+            continue;
+        }
+        match ChainSync::verify_proposer_signature_in(storage, block) {
             Ok(()) => return Ok((block.clone(), qc.clone())),
-            Err(e) => last_error = format!("{e:?}"),
+            Err(e) => last_error = e,
         }
     }
     Err(format!(
@@ -612,7 +828,7 @@ fn bootstrap_record(
     let anchor_round = qc.anchor_round.to_string();
     let finalized_round = qc.finalized_round.to_string();
     let checkpoint = plan.checkpoint.to_string();
-    let rows: Vec<(String, &str)> = vec![
+    let mut rows: Vec<(String, &str)> = vec![
         ("jmt:floor".into(), &h),
         (format!("block_{h}"), &block_json),
         ("latest_height".into(), &h),
@@ -633,8 +849,12 @@ fn bootstrap_record(
         // Node-local rows that described the replaced chain: nothing below
         // `h` exists now, and a sync halt was about the old state.
         (StateDB::BLOCK_PRUNE_CURSOR_KEY.into(), &h),
+        (StateDB::KEPT_PIN_BLOCKS_KEY.into(), "[]"),
         (RESTORED_CHECKPOINT.into(), &checkpoint),
     ];
+    if let Some(me) = plan.local_signer {
+        rows.push((RESTORED_BY.into(), me));
+    }
     for (key, value) in rows {
         batch.put(key.as_bytes(), value.as_bytes());
     }
@@ -650,9 +870,11 @@ fn bootstrap_record(
     Ok(batch)
 }
 
-/// Refuse to overwrite a chain unless asked (`replace_existing`). A fresh
-/// datadir, or one an interrupted restore marked, is always fine.
-fn check_datadir(storage: &StateDB, replace_existing: bool) -> Result<(), String> {
+/// Refuse to overwrite a chain unless asked (`replace_existing`), and a
+/// replace of a chain where this node is a validator (SN-6), before anything
+/// is cleared. A fresh datadir, or one an interrupted restore marked, is
+/// always fine.
+fn check_datadir(storage: &StateDB, plan: &RestorePlan<'_>) -> Result<(), String> {
     let marked = storage
         .get(RESTORE_MARKER)
         .map_err(|e| e.to_string())?
@@ -665,18 +887,36 @@ fn check_datadir(storage: &StateDB, replace_existing: bool) -> Result<(), String
             .get("latest_height")
             .map_err(|e| e.to_string())?
             .is_some();
-    if holds_chain && !marked && !replace_existing {
+    if holds_chain && !marked && !plan.replace_existing {
         return Err(
             "this datadir already holds a chain; restoring replaces it, so it must be asked for"
                 .into(),
         );
     }
+    if let Some(me) = plan.local_signer {
+        if storage
+            .get_active_validators()
+            .iter()
+            .any(|(address, _)| address == me)
+        {
+            return Err(sn6_refusal(me));
+        }
+    }
     Ok(())
 }
 
-/// Round robin over the peers, less the ones caught sending a bad stream.
+/// The longest a struck peer sits out, in turns.
+const MAX_SIT_OUT: u32 = 256;
+
+/// Picks peers for the next request, round robin. A peer that fails to
+/// deliver sits out turns, twice as many at each failure in a row, so a
+/// slow, silent or stalling peer loses its turns to the ones that deliver
+/// while one that stumbled once is soon back. A peer caught lying is shut
+/// out for good.
 struct PeerSet {
     excluded: Vec<bool>,
+    penalty: Vec<u32>,
+    sit_out: Vec<u32>,
     next: usize,
 }
 
@@ -684,6 +924,8 @@ impl PeerSet {
     fn new(peers: usize) -> Self {
         Self {
             excluded: vec![false; peers],
+            penalty: vec![0; peers],
+            sit_out: vec![0; peers],
             next: 0,
         }
     }
@@ -693,11 +935,31 @@ impl PeerSet {
         for _ in 0..n {
             let peer = self.next % n;
             self.next = self.next.wrapping_add(1);
-            if !self.excluded[peer] {
-                return Some(peer);
+            if self.excluded[peer] {
+                continue;
             }
+            if self.sit_out[peer] > 0 {
+                self.sit_out[peer] -= 1;
+                continue;
+            }
+            return Some(peer);
         }
-        None
+        // Every live peer is sitting out: the one closest to its turn.
+        let peer = (0..n)
+            .filter(|p| !self.excluded[*p])
+            .min_by_key(|p| self.sit_out[*p])?;
+        self.sit_out[peer] = 0;
+        Some(peer)
+    }
+
+    fn delivered(&mut self, peer: usize) {
+        self.penalty[peer] = 0;
+        self.sit_out[peer] = 0;
+    }
+
+    fn strike(&mut self, peer: usize) {
+        self.penalty[peer] = self.penalty[peer].saturating_mul(2).clamp(1, MAX_SIT_OUT);
+        self.sit_out[peer] = self.penalty[peer];
     }
 
     fn exclude(&mut self, peer: usize) {
@@ -712,14 +974,93 @@ impl PeerSet {
 enum Reply {
     Chunk(state_commit::Entries, Vec<u8>),
     Done,
-    /// No usable answer. Not proof of lying: a busy or pruning peer, a dead
-    /// connection, or a leaf too large to take.
+    /// The peer is up but loaded: wait, it is no failure.
+    Busy,
+    /// No usable answer, which proves nothing: a dead connection, a pruned
+    /// version, a peer too slow.
     Unanswered(String),
+    /// An answer no honest server gives.
+    Lied(String),
+}
+
+/// One value, in parts, from `peer`. Every part but the last must be exactly
+/// `VALUE_PART_BYTES`, and all of it must arrive at `min_bytes_per_sec`.
+async fn ask_parts<F, Fut>(
+    ask: &mut F,
+    peer: usize,
+    version: u64,
+    key: &str,
+    len: u64,
+    patience: &Patience,
+) -> Result<Vec<u8>, Reply>
+where
+    F: FnMut(usize, String) -> Fut,
+    Fut: Future<Output = Result<String, String>>,
+{
+    let deadline = Instant::now()
+        + patience.request_timeout
+        + Duration::from_secs(len / patience.min_bytes_per_sec.max(1));
+    let mut value = Vec::with_capacity(len as usize);
+    let mut busy = 0u32;
+    while (value.len() as u64) < len {
+        if Instant::now() > deadline {
+            return Err(Reply::Unanswered("value parts too slow".into()));
+        }
+        let request = ValueRequest {
+            version,
+            key: key.to_string(),
+            offset: value.len() as u64,
+        };
+        let message =
+            serde_json::to_string(&request).map_err(|e| Reply::Unanswered(e.to_string()))?;
+        let part = match ask(peer, format!("{VALUE_REQ}{message}")).await {
+            Ok(reply) => reply
+                .strip_prefix(VALUE_RESP)
+                .and_then(|json| serde_json::from_str::<ValueResponse>(json).ok()),
+            Err(e) => return Err(Reply::Unanswered(e)),
+        };
+        let Some(part) = part else {
+            return Err(Reply::Unanswered("a garbled value part".into()));
+        };
+        match part.error.as_deref() {
+            Some(BUSY) if busy < PART_BUSY_RETRIES => {
+                busy += 1;
+                tokio::time::sleep(patience.backoff(busy as usize, 1)).await;
+                continue;
+            }
+            Some(BUSY) => return Err(Reply::Busy),
+            Some(error) => return Err(Reply::Unanswered(error.to_string())),
+            None => {}
+        }
+        busy = 0;
+        let expected = (len - value.len() as u64).min(VALUE_PART_BYTES as u64);
+        match hex::decode(&part.data) {
+            Ok(data) if part.len == len && data.len() as u64 == expected => {
+                value.extend_from_slice(&data)
+            }
+            Ok(data) => {
+                return Err(Reply::Lied(format!(
+                    "a value part of {} bytes of {}, where {expected} of {len} were due",
+                    data.len(),
+                    part.len
+                )))
+            }
+            Err(_) => return Err(Reply::Lied("a value part that is not hex".into())),
+        }
+    }
+    Ok(value)
 }
 
 /// One chunk from `peer`, with every value too large to travel inline
-/// fetched in parts from the same peer. Nothing here is verified yet.
-async fn ask_chunk<F, Fut>(ask: &mut F, peer: usize, version: u64, after: Option<[u8; 32]>) -> Reply
+/// fetched in parts from the same peer. Nothing here is verified against the
+/// root yet; what is checked are the protocol's own limits.
+async fn ask_chunk<F, Fut>(
+    ask: &mut F,
+    peer: usize,
+    version: u64,
+    after: Option<[u8; 32]>,
+    patience: &Patience,
+) -> Reply
 where
     F: FnMut(usize, String) -> Fut,
     Fut: Future<Output = Result<String, String>>,
@@ -741,59 +1082,40 @@ where
     let Some(response) = response else {
         return Reply::Unanswered("a garbled answer".into());
     };
-    if let Some(error) = response.error {
-        return Reply::Unanswered(error);
+    match response.error.as_deref() {
+        Some(BUSY) => return Reply::Busy,
+        Some(error) => return Reply::Unanswered(error.to_string()),
+        None => {}
     }
     if response.done {
         return Reply::Done;
     }
     let Ok(proof) = hex::decode(&response.proof) else {
-        return Reply::Unanswered("a garbled proof".into());
+        return Reply::Lied("a proof that is not hex".into());
     };
     let mut total = 0u64;
     let mut entries = Vec::with_capacity(response.entries.len());
     for entry in response.entries {
-        let Ok(mut value) = hex::decode(&entry.value) else {
-            return Reply::Unanswered("a garbled value".into());
+        let Ok(value) = hex::decode(&entry.value) else {
+            return Reply::Lied("a value that is not hex".into());
         };
         total = total.saturating_add(entry.len);
         if entry.len > MAX_LEAF_BYTES || total > MAX_CHUNK_TOTAL_BYTES {
-            return Reply::Unanswered(format!(
-                "a leaf of {} bytes is too large to take",
-                entry.len
+            return Reply::Lied(format!(
+                "a chunk past the protocol's limits ({total} bytes)"
             ));
         }
-        if (value.len() as u64) > entry.len {
-            return Reply::Unanswered("a value longer than its length".into());
+        if value.len() as u64 == entry.len {
+            entries.push((entry.key, value));
+            continue;
         }
-        while (value.len() as u64) < entry.len {
-            let part = ValueRequest {
-                version,
-                key: entry.key.clone(),
-                offset: value.len() as u64,
-            };
-            let Ok(message) = serde_json::to_string(&part) else {
-                return Reply::Unanswered("cannot encode the request".into());
-            };
-            let part = match ask(peer, format!("{VALUE_REQ}{message}")).await {
-                Ok(reply) => reply
-                    .strip_prefix(VALUE_RESP)
-                    .and_then(|json| serde_json::from_str::<ValueResponse>(json).ok()),
-                Err(e) => return Reply::Unanswered(e),
-            };
-            let Some(part) = part.filter(|p| p.error.is_none() && p.len == entry.len) else {
-                return Reply::Unanswered("a value part was refused".into());
-            };
-            match hex::decode(&part.data) {
-                Ok(data)
-                    if !data.is_empty() && value.len() as u64 + data.len() as u64 <= entry.len =>
-                {
-                    value.extend_from_slice(&data)
-                }
-                _ => return Reply::Unanswered("a garbled value part".into()),
-            }
+        if !value.is_empty() || entry.len <= INLINE_VALUE_BYTES as u64 {
+            return Reply::Lied("a value neither whole nor in parts".into());
         }
-        entries.push((entry.key, value));
+        match ask_parts(ask, peer, version, &entry.key, entry.len, patience).await {
+            Ok(value) => entries.push((entry.key, value)),
+            Err(reply) => return reply,
+        }
     }
     Reply::Chunk(entries, proof)
 }
@@ -801,13 +1123,14 @@ where
 /// SN-2: restore the state at `plan.checkpoint` from `peers` peers, asking
 /// peer `i` with `ask(i, message)`, then write the bootstrap record (SN-1b).
 ///
-/// Requests go round robin, so no one peer holds the restore. A peer that
-/// sends a refused chunk, or ends the stream early, is shut out and the
-/// partial restore starts over with the others. An unanswered request is
-/// retried with the next peer, from the same cursor, after a backoff. The
-/// datadir carries the restore marker from the first write to the last, and
-/// keeps it when the restore fails: a failed or interrupted restore refuses
-/// to boot (RC-1) until a restore completes.
+/// Requests go round robin, a failing peer sitting out turns (`PeerSet`). A peer
+/// that sends a refused chunk, or ends the stream early, is shut out and the
+/// partial restore starts over with the others; one that breaks the protocol
+/// is shut out with no restart. A busy peer is waited for, within the
+/// deadline; a peer that does not answer is retried after a backoff, from
+/// the same cursor. The datadir carries the restore marker from the first
+/// write to the last, and keeps it when the restore fails: a failed or
+/// interrupted restore refuses to boot (RC-1) until a restore completes.
 pub async fn restore_state<F, Fut>(
     storage: &Arc<StateDB>,
     plan: &RestorePlan<'_>,
@@ -821,10 +1144,12 @@ where
     if peers == 0 {
         return Err("no peers to restore from".into());
     }
-    check_datadir(storage, plan.replace_existing)?;
+    let started = Instant::now();
+    let patience = &plan.patience;
+    check_datadir(storage, plan)?;
     let cp = plan.checkpoint;
     let root = hex32(&cp.state_root).ok_or("malformed checkpoint root")?;
-    let pairs = fetch_anchor(cp, peers, &mut ask).await?;
+    let pairs = fetch_anchor(cp, peers, &mut ask, patience).await?;
 
     let marker = serde_json::json!({"height": cp.height, "state_root": cp.state_root});
     storage
@@ -834,6 +1159,7 @@ where
     let mut set = PeerSet::new(peers);
     let mut restarts = 0usize;
     let mut failures = 0usize;
+    let mut busy = 0usize;
     'restore: loop {
         clear(storage)?;
         let mut restore = state_commit::Restore::begin(
@@ -844,49 +1170,67 @@ where
         .map_err(|e| e.to_string())?;
         let mut leaves = 0usize;
         let ended_by = loop {
+            if started.elapsed() > patience.deadline {
+                return Err(format!(
+                    "the restore ran out of time ({:?})",
+                    patience.deadline
+                ));
+            }
             let Some(peer) = set.pick() else {
                 return Err(format!(
                     "every peer sent a bad state stream ({restarts} restarts)"
                 ));
             };
-            match ask_chunk(&mut ask, peer, cp.height, restore.cursor()).await {
+            let asked = Instant::now();
+            match ask_chunk(&mut ask, peer, cp.height, restore.cursor(), patience).await {
+                Reply::Chunk(entries, proof) => match restore.add_wire_chunk(entries, &proof) {
+                    Ok(verified) => {
+                        set.delivered(peer);
+                        failures = 0;
+                        busy = 0;
+                        leaves += verified.len();
+                        storage
+                            .restore_transaction(|view| {
+                                let mut batch = WriteBatch::default();
+                                for (key, value) in &verified {
+                                    batch.put(key.as_bytes(), value);
+                                }
+                                view.write_batch(batch)
+                            })
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "⚠️ [STATE_SYNC] peer {peer} sent a refused chunk, shut out: {e}"
+                        );
+                        set.exclude(peer);
+                        restarts += 1;
+                        continue 'restore;
+                    }
+                },
+                Reply::Done => break peer,
+                Reply::Busy => {
+                    // An honest server says busy at once; one that takes its
+                    // time to say it is stalling.
+                    if asked.elapsed() >= patience.request_timeout / 4 {
+                        set.strike(peer);
+                    }
+                    busy += 1;
+                    tokio::time::sleep(patience.backoff(busy, set.live())).await;
+                }
                 Reply::Unanswered(why) => {
+                    set.strike(peer);
                     failures += 1;
-                    if failures >= plan.patience.max_failures {
+                    if failures >= patience.max_failures {
                         return Err(format!(
                             "no peer serves the checkpoint's state (last: {why})"
                         ));
                     }
-                    tokio::time::sleep(plan.patience.backoff(failures, set.live())).await;
+                    tokio::time::sleep(patience.backoff(failures, set.live())).await;
                 }
-                Reply::Done => {
-                    failures = 0;
-                    break peer;
-                }
-                Reply::Chunk(entries, proof) => {
-                    failures = 0;
-                    match restore.add_wire_chunk(entries, &proof) {
-                        Ok(verified) => {
-                            leaves += verified.len();
-                            storage
-                                .restore_transaction(|view| {
-                                    let mut batch = WriteBatch::default();
-                                    for (key, value) in &verified {
-                                        batch.put(key.as_bytes(), value);
-                                    }
-                                    view.write_batch(batch)
-                                })
-                                .map_err(|e| e.to_string())?;
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "⚠️ [STATE_SYNC] peer {peer} sent a refused chunk, shut out: {e}"
-                            );
-                            set.exclude(peer);
-                            restarts += 1;
-                            continue 'restore;
-                        }
-                    }
+                Reply::Lied(why) => {
+                    eprintln!("⚠️ [STATE_SYNC] peer {peer} broke the protocol, shut out: {why}");
+                    set.exclude(peer);
                 }
             }
         };
@@ -901,8 +1245,19 @@ where
         };
         // The tree is whole at `root` but `jmt:latest` is not written yet;
         // the checks read only flat state. On failure the marker stays.
-        let (block, qc) = verify_restored(storage, plan, &pairs)
-            .map_err(|e| format!("the checkpoint is inconsistent: {e}"))?;
+        let inconsistent = |e: String| format!("the checkpoint is inconsistent: {e}");
+        let chain_id = check_genesis(storage, plan).map_err(inconsistent)?;
+        let (epoch, committee) = restored_committee(storage, plan).map_err(inconsistent)?;
+        let (block, qc) = match verified_pair(storage, &chain_id, epoch, &committee, &pairs) {
+            Ok(pair) => pair,
+            // The peer that held the good pair may have missed the first
+            // round: ask once more.
+            Err(_) => {
+                let fresh = fetch_anchor(cp, peers, &mut ask, patience).await?;
+                verified_pair(storage, &chain_id, epoch, &committee, &fresh)
+                    .map_err(inconsistent)?
+            }
+        };
         let record = bootstrap_record(tree, plan, &block, &qc)?;
         storage.write_batch(record).map_err(|e| e.to_string())?;
         return Ok(Restored {
@@ -916,12 +1271,9 @@ where
 type Connections =
     tokio::sync::Mutex<std::collections::HashMap<usize, (tokio::net::TcpStream, [u8; 32])>>;
 
-/// How long one request over TCP may take before it counts as unanswered.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// `restore_state` over the node's encrypted TCP transport, to the peers'
 /// sync ports. One connection per peer, kept across requests and reopened
-/// after a failure or a timeout.
+/// after a failure or a timeout (`Patience::request_timeout`).
 pub async fn restore_over_tcp(
     storage: &Arc<StateDB>,
     plan: &RestorePlan<'_>,
@@ -930,18 +1282,19 @@ pub async fn restore_over_tcp(
 ) -> Result<Restored, String> {
     let key = crypto::SigningKey::generate(&mut rand::rngs::OsRng);
     let connections: Arc<Connections> = Arc::default();
+    let timeout = plan.patience.request_timeout;
     restore_state(storage, plan, peers.len(), |peer, msg| {
         let connections = Arc::clone(&connections);
         let (ip, port) = peers[peer].clone();
         let key = key.clone();
         async move {
             let asked = ask_over_tcp(&connections, peer, &ip, port, my_port, &key, &msg);
-            match tokio::time::timeout(REQUEST_TIMEOUT, asked).await {
+            match tokio::time::timeout(timeout, asked).await {
                 Ok(reply) => reply,
                 Err(_) => {
                     // The connection may be mid-frame: never reuse it.
                     connections.lock().await.remove(&peer);
-                    Err(format!("{ip}:{port}: no answer in {REQUEST_TIMEOUT:?}"))
+                    Err(format!("{ip}:{port}: no answer in {timeout:?}"))
                 }
             }
         }

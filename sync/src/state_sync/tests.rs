@@ -4,6 +4,7 @@
 use super::*;
 use consensus::qc::{build_qc, validator_set_hash, FinalityVote, ValidatorInfo};
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::sync::Mutex;
 
 const CHAIN: &str = "AINCORE-TEST-S6";
@@ -14,6 +15,32 @@ const H: u64 = 10;
 const SMALL_CHUNK: usize = 7;
 const MEMBER: [u8; 32] = [7; 32];
 const IDENTITY: &str = "1d";
+/// The anchor block's proposer.
+const PROPOSER: [u8; 32] = [77; 32];
+
+fn proposer() -> (crypto::SigningKey, String) {
+    let key = crypto::SigningKey::from_bytes(&PROPOSER);
+    let address = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+    (key, address)
+}
+
+/// The proposer's account, as the state stores it.
+fn proposer_account() -> (String, Vec<u8>) {
+    let (key, address) = proposer();
+    let pk = hex::encode(key.verifying_key().to_bytes());
+    let account = storage::object::Object::new(
+        address.clone(),
+        storage::object::Owner::Address(address.clone()),
+        serde_json::json!({ "public_key": pk, "sequence_number": 0 })
+            .to_string()
+            .into_bytes(),
+        "0x1::account::AccountData".to_string(),
+    );
+    (
+        format!("obj:{address}"),
+        serde_json::to_vec(&account).unwrap(),
+    )
+}
 
 fn temp_db(name: &str) -> Arc<StateDB> {
     let path = std::env::temp_dir().join(format!(
@@ -150,6 +177,8 @@ fn chain_with(name: &str, spec: Spec) -> Chain {
                 ));
             }
             v0.extend((0..40).map(|i| (obj(i), Some(format!("v{i}").into_bytes()))));
+            let (account_key, account) = proposer_account();
+            v0.push((account_key, Some(account)));
             v0.extend(spec.extra.iter().map(|(k, v)| (k.clone(), Some(v.clone()))));
             v0
         } else if version == 4 {
@@ -171,12 +200,13 @@ fn chain_with(name: &str, spec: Spec) -> Chain {
         }
     }
     let root = root_h.unwrap();
-    let block = Block::new_with_roots_at(
+    let (proposer_key, proposer_address) = proposer();
+    let mut block = Block::new_with_roots_at(
         H,
         2 * H,
         "00".repeat(32),
         vec![],
-        "proposer".into(),
+        proposer_address.clone(),
         root.clone(),
         "dd".repeat(32),
         1_000,
@@ -184,6 +214,7 @@ fn chain_with(name: &str, spec: Spec) -> Chain {
         "aa".repeat(32),
         vec![],
     );
+    block.sign_proposer(&proposer_key, &proposer_address);
     let vote = FinalityVote {
         chain_id: CHAIN.into(),
         epoch,
@@ -324,6 +355,9 @@ fn fast() -> Patience {
         max_failures: 6,
         backoff_start: Duration::ZERO,
         backoff_max: Duration::ZERO,
+        request_timeout: Duration::from_secs(10),
+        min_bytes_per_sec: 1,
+        deadline: Duration::from_secs(120),
     }
 }
 
@@ -519,12 +553,20 @@ async fn a_node_restores_from_honest_peers() {
     vote.epoch = 1;
     let signature = crypto::bls::BLSEngine::consensus().sign_raw(&vote.to_signing_bytes(), &MEMBER);
     let other_epoch = build_qc(&vote, &committee(), &[0], &[signature]).unwrap();
-    let plan = plan(&a.cp, &g, false);
-    let err = verify_restored(&client, &plan, &[(block.clone(), other_epoch.clone())]).unwrap_err();
-    assert!(err.contains("epoch"), "{err}");
-    let (_, verified) = verify_restored(
+    let err = verified_pair(
         &client,
-        &plan,
+        CHAIN,
+        0,
+        &committee(),
+        &[(block.clone(), other_epoch.clone())],
+    )
+    .unwrap_err();
+    assert!(err.contains("epoch"), "{err}");
+    let (_, verified) = verified_pair(
+        &client,
+        CHAIN,
+        0,
+        &committee(),
         &[(block.clone(), other_epoch), (block, good.clone())],
     )
     .unwrap();
@@ -986,6 +1028,37 @@ async fn a_validator_key_is_not_restored_onto_a_new_datadir() {
     };
     run(&client, &as_observer, &mut peers).await.unwrap();
     assert_restored(&client, &a);
+    assert_eq!(client.get(RESTORED_BY).unwrap(), Some(observer.clone()));
+
+    // Post-fix review LOW 6: replacing a chain where this node signs is
+    // refused before anything is cleared.
+    let signing = temp_db("signer_replace");
+    {
+        let _seed = signing.seeding();
+        signing.put("genesis_initialized", "true").unwrap();
+        signing.put("latest_height", "3").unwrap();
+        signing
+            .put(
+                "sys:validators",
+                &serde_json::to_string(&vec![(observer.clone(), 100u64)]).unwrap(),
+            )
+            .unwrap();
+        signing.put(&obj(999), "old").unwrap();
+    }
+    let replace_as_validator = RestorePlan {
+        local_signer: Some(&observer),
+        ..plan(&a.cp, &g, true)
+    };
+    let err = run(&signing, &replace_as_validator, &mut peers)
+        .await
+        .unwrap_err();
+    assert!(err.contains("SN-6"), "{err}");
+    assert_eq!(
+        signing.get(&obj(999)).unwrap().as_deref(),
+        Some("old"),
+        "untouched"
+    );
+    assert_eq!(signing.get(RESTORE_MARKER).unwrap(), None);
 }
 
 /// A checkpoint no peer can back restores nothing. One whose state its own
@@ -1083,23 +1156,48 @@ fn the_server_serves_only_what_it_retains() {
     let last = state_commit::key_hash(&first.entries.last().unwrap().key);
     let end = ask(H, Some(hex::encode(last.0)));
     assert!(end.done && end.entries.is_empty() && end.error.is_none());
+    // Value parts: the same retention, and the same slots.
+    let value = |version: u64| {
+        sync.handle_state_value(ValueRequest {
+            version,
+            key: obj(3),
+            offset: 0,
+        })
+    };
+    assert_eq!(
+        value(TIP + 1).error.as_deref(),
+        Some("version not retained")
+    );
+    let held: Vec<_> = (0..STATE_SERVE_IN_FLIGHT)
+        .map(|_| sync.state_budget.admit(None, 1).expect("a slot"))
+        .collect();
+    assert_eq!(value(H).error.as_deref(), Some("busy"));
+    drop(held);
     state_commit::prune(&a.db, TIP, &Default::default(), usize::MAX).unwrap();
     assert_eq!(ask(H, None).error.as_deref(), Some("version not retained"));
+    assert_eq!(value(H).error.as_deref(), Some("version not retained"));
     assert!(ask(TIP, None).error.is_none(), "the floor is still served");
+    // Refusals are not charged: many of them leave the budget whole.
+    let fresh = peer(&a, Behaviour::Honest).sync;
+    for _ in 0..50 {
+        let refused = fresh.handle_state_chunk(ChunkRequest {
+            version: TIP + 1,
+            after: None,
+            max: MAX_CHUNK_ENTRIES,
+        });
+        assert!(refused.error.is_some());
+    }
+    assert!(fresh
+        .state_budget
+        .admit(None, 8_000)
+        .is_some_and(|a| a.granted > 7_000));
 }
 
-/// Review H3: snapshot serving has its own bounded budget: two requests at
-/// a time, and leaves from a bucket, so a flood of chunk requests is shed.
+/// Review H3: snapshot serving has its own bounded budget: slots and units
+/// in flight globally, so a flood is shed.
 #[test]
 fn the_state_server_sheds_load() {
-    let extra = (100..3_100).map(|i| (obj(i), b"x".to_vec())).collect();
-    let a = chain_with(
-        "shed_a",
-        Spec {
-            extra,
-            ..Spec::default()
-        },
-    );
+    let a = chain("shed_a", MEMBER);
     let sync = peer(&a, Behaviour::Honest).sync;
     let ask = || {
         sync.handle_state_chunk(ChunkRequest {
@@ -1108,20 +1206,221 @@ fn the_state_server_sheds_load() {
             max: MAX_CHUNK_ENTRIES,
         })
     };
-    let slots = (sync.state_budget.try_enter(), sync.state_budget.try_enter());
-    assert!(slots.0.is_some() && slots.1.is_some());
+    let held: Vec<_> = (0..STATE_SERVE_IN_FLIGHT)
+        .map(|_| sync.state_budget.admit(None, 1).expect("a slot"))
+        .collect();
     assert_eq!(ask().error.as_deref(), Some("busy"), "no free slot");
-    drop(slots);
-    // The bucket starts full (two chunks' worth), then refills at its rate.
-    let start = std::time::Instant::now();
-    assert_eq!(ask().entries.len(), MAX_CHUNK_ENTRIES);
-    assert_eq!(ask().entries.len(), MAX_CHUNK_ENTRIES);
-    let third = ask();
-    let refilled = start.elapsed().as_secs_f64() * STATE_SERVE_LEAVES_PER_SEC;
+    drop(held);
+    assert!(ask().error.is_none());
+}
+
+/// Post-fix review HIGH 2: one client cannot starve the others. Its own
+/// bucket runs dry long before the global one, and a second client is
+/// still served.
+#[test]
+fn one_client_cannot_starve_the_others() {
+    let extra = (100..4_100).map(|i| (obj(i), b"x".to_vec())).collect();
+    let a = chain_with(
+        "fair_a",
+        Spec {
+            extra,
+            ..Spec::default()
+        },
+    );
+    let sync = peer(&a, Behaviour::Honest).sync;
+    let ask = |ip: [u8; 4]| {
+        sync.serve_state_chunk(
+            ChunkRequest {
+                version: H,
+                after: None,
+                max: MAX_CHUNK_ENTRIES,
+            },
+            Some(IpAddr::from(ip)),
+        )
+    };
+    let hog = [10, 0, 0, 1];
+    let start = Instant::now();
+    let mut leaves = 0usize;
+    for _ in 0..20 {
+        leaves += ask(hog).entries.len();
+    }
+    // At most a burst, then the per-IP rate, however fast it asks.
+    let allowed = STATE_SERVE_UNITS_PER_SEC_PER_IP * (1.0 + start.elapsed().as_secs_f64());
     assert!(
-        third.entries.len() as f64 <= refilled + 1.0,
-        "{} leaves, but only {refilled} refilled",
-        third.entries.len()
+        (leaves as f64) <= allowed,
+        "the hog got {leaves} leaves, its share is {allowed}"
+    );
+    assert!(
+        leaves < 20 * MAX_CHUNK_ENTRIES,
+        "positive control: it was held back"
+    );
+    let other = ask([10, 0, 0, 2]);
+    assert_eq!(
+        other.entries.len(),
+        MAX_CHUNK_ENTRIES,
+        "another client is served in full: {:?}",
+        other.error
+    );
+    // One request in flight per client.
+    let third = IpAddr::from([10, 0, 0, 5]);
+    let held = sync.state_budget.admit(Some(third), 1);
+    assert!(held.is_some());
+    assert_eq!(ask([10, 0, 0, 5]).error.as_deref(), Some("busy"));
+    drop(held);
+    assert!(ask([10, 0, 0, 5]).error.is_none());
+}
+
+/// The per-IP table forgets idle clients when full, and refuses new ones
+/// while every client it holds is busy or in debt.
+#[test]
+fn the_client_table_forgets_idle_clients_only() {
+    let budget = StateBudget::default();
+    let ip = |i: u32| Some(IpAddr::from(i.to_be_bytes()));
+    for i in 0..MAX_TRACKED_IPS as u32 {
+        drop(budget.admit(ip(i), 1).expect("room"));
+    }
+    std::thread::sleep(Duration::from_millis(5));
+    assert!(
+        budget.admit(ip(1 << 20), 1).is_some(),
+        "an idle client forgotten"
+    );
+    // A client with a request in flight is never forgotten, so it cannot
+    // dodge its one-slot limit by being evicted.
+    let pinned = StateBudget::default();
+    let held = pinned.admit(ip(0), 1).expect("in flight");
+    for i in 1..MAX_TRACKED_IPS as u32 {
+        drop(pinned.admit(ip(i), 1).expect("room"));
+    }
+    std::thread::sleep(Duration::from_millis(5));
+    assert!(
+        pinned.admit(ip(1 << 22), 1).is_some(),
+        "the table makes room"
+    );
+    assert!(pinned.admit(ip(0), 1).is_none(), "still one in flight");
+    drop(held);
+    let busy = StateBudget::default();
+    let held: Vec<_> = (0..MAX_TRACKED_IPS as u32)
+        .filter_map(|i| busy.admit(ip(i), 1))
+        .collect();
+    // Only STATE_SERVE_IN_FLIGHT fit at once globally; the rest are in the
+    // table, spent.
+    drop(held);
+    for i in 0..MAX_TRACKED_IPS as u32 {
+        if let Some(a) = busy.admit(ip(i), 1) {
+            a.charge_read(1 << 30);
+        }
+    }
+    assert!(busy.admit(ip(1 << 21), 1).is_none(), "every client in debt");
+}
+
+/// Post-fix review MEDIUM 3: serving is charged by the bytes it reads, so a
+/// client that makes the server re-read a large value (alternating keys to
+/// miss the cache) runs out of budget.
+#[test]
+fn value_reads_are_charged_by_their_bytes() {
+    let extra = vec![
+        (obj(500), vec![b'p'; 3 << 20]),
+        (obj(501), vec![b'q'; 3 << 20]),
+        (obj(502), vec![b'r'; 8 << 20]),
+    ];
+    let a = chain_with(
+        "bytes_a",
+        Spec {
+            extra,
+            ..Spec::default()
+        },
+    );
+    let sync = peer(&a, Behaviour::Honest).sync;
+    let client = Some(IpAddr::from([10, 0, 0, 3]));
+    let start = Instant::now();
+    let mut served = 0u64;
+    for i in 0..10u64 {
+        let part = sync.serve_state_value(
+            ValueRequest {
+                version: H,
+                key: obj(500 + i % 2),
+                offset: 0,
+            },
+            client,
+        );
+        if part.error.is_none() {
+            served += 1;
+        }
+    }
+    // Each miss reads 3 MiB and sends 1 MiB: over 1,000 units, of 2,000 a
+    // second (plus one burst) for this client.
+    let per_read = ((3 << 20) + (1 << 20)) / UNIT_BYTES;
+    let allowed = STATE_SERVE_UNITS_PER_SEC_PER_IP * (1.0 + start.elapsed().as_secs_f64());
+    assert!(
+        (served * per_read) as f64 <= allowed + per_read as f64,
+        "{served} whole-value reads served in {:?}",
+        start.elapsed()
+    );
+    // One read of an 8 MiB value costs more than a client's whole bucket
+    // (2,048 units read, 256 sent): it leaves the bucket in debt.
+    let heavy = Some(IpAddr::from([10, 0, 0, 4]));
+    let read = sync.serve_state_value(
+        ValueRequest {
+            version: H,
+            key: obj(502),
+            offset: 0,
+        },
+        heavy,
+    );
+    assert!(read.error.is_none(), "{:?}", read.error);
+    let balance = sync.state_budget.balance(heavy);
+    assert!(balance < -300.0, "in debt: {balance}");
+}
+
+/// Post-fix review test gap: the one-value cache answers only for its own
+/// version and key.
+#[test]
+fn the_value_cache_answers_only_for_its_key_and_version() {
+    let (p, q) = (vec![b'p'; 2 << 20], vec![b'q'; 2 << 20]);
+    let a = chain_with(
+        "cache_a",
+        Spec {
+            extra: vec![(obj(500), p.clone()), (obj(501), q.clone())],
+            ..Spec::default()
+        },
+    );
+    // Version TIP rewrites obj(500).
+    let sync = peer(&a, Behaviour::Honest).sync;
+    let first = |key: u64, version: u64| {
+        let part = sync.handle_state_value(ValueRequest {
+            version,
+            key: obj(key),
+            offset: 0,
+        });
+        assert!(part.error.is_none(), "{:?}", part.error);
+        hex::decode(part.data).unwrap()[0]
+    };
+    for _ in 0..2 {
+        assert_eq!(first(500, H), b'p');
+        assert_eq!(first(501, H), b'q');
+    }
+    // obj(5) is "r5" at H and "r12" at TIP: the cache is per version.
+    let value = |version: u64| {
+        let part = sync.handle_state_value(ValueRequest {
+            version,
+            key: obj(5),
+            offset: 0,
+        });
+        String::from_utf8(hex::decode(part.data).unwrap()).unwrap()
+    };
+    for _ in 0..2 {
+        assert_eq!(value(H), "r5");
+        assert_eq!(value(TIP), "r12");
+    }
+    assert!(
+        sync.handle_state_value(ValueRequest {
+            version: H,
+            key: obj(502),
+            offset: 0
+        })
+        .error
+        .is_some(),
+        "an absent key after a cached one"
     );
 }
 
@@ -1156,6 +1455,22 @@ fn a_chunk_stays_within_its_byte_budget() {
         .sum::<usize>()
         + chunk.proof.len();
     assert!(size <= MAX_CHUNK_BYTES, "{size}");
+    // Reading those values is charged by their bytes.
+    let reader = Some(IpAddr::from([10, 0, 0, 9]));
+    let charged = sync.serve_state_chunk(
+        ChunkRequest {
+            version: H,
+            after: None,
+            max: 100,
+        },
+        reader,
+    );
+    assert!(charged.error.is_none());
+    let balance = sync.state_budget.balance(reader);
+    assert!(
+        balance < 0.0,
+        "8 MiB read costs more than a bucket: {balance}"
+    );
     // The big value's parts, from the server alone.
     let mut value = Vec::new();
     while value.len() < big.len() {
@@ -1559,6 +1874,484 @@ async fn a_claimed_leaf_over_the_limit_is_not_fetched() {
     })
     .await
     .unwrap_err();
-    assert!(err.contains("too large"), "{err}");
+    assert!(err.contains("every peer sent a bad state stream"), "{err}");
     assert_eq!(value_asks, 0, "no part was asked for");
+}
+
+/// Post-fix review HIGH 1: a peer that sends value parts shorter than the
+/// protocol's part size is caught at once and shut out, without a restart.
+#[tokio::test]
+async fn a_peer_that_trickles_value_parts_is_shut_out() {
+    let g = genesis();
+    let spec = Spec {
+        extra: vec![(obj(500), vec![b't'; 3 << 20])],
+        ..Spec::default()
+    };
+    let slow = chain_with("trickle_s", spec.clone());
+    let honest_chain = chain_with("trickle_h", spec);
+    let client = temp_db("trickle_client");
+    let mut trickler = peer(&slow, Behaviour::Honest);
+    let mut honest = peer(&honest_chain, Behaviour::Honest);
+    let mut trickled = 0usize;
+    let done = run_with(&client, &plan(&slow.cp, &g, false), 2, |i, msg| {
+        if i == 1 {
+            // Busy until the trickler had its turn at the big value.
+            if trickled == 0 && msg.starts_with(CHUNK_REQ) {
+                return busy();
+            }
+            return serve(&mut honest, msg);
+        }
+        let reply = serve(&mut trickler, msg)?;
+        let Some(json) = reply.strip_prefix(VALUE_RESP) else {
+            return Ok(reply);
+        };
+        trickled += 1;
+        let mut part: ValueResponse = serde_json::from_str(json).unwrap();
+        part.data.truncate(2);
+        Ok(format!(
+            "{VALUE_RESP}{}",
+            serde_json::to_string(&part).unwrap()
+        ))
+    })
+    .await
+    .unwrap();
+    assert_eq!(done.restarts, 0, "a protocol lie needs no restart");
+    assert_eq!(trickled, 1, "shut out after its one short part");
+    assert_restored(&client, &slow);
+}
+
+/// Post-fix review HIGH 2: busy answers are waited out, however many, and
+/// never end the restore as failures do.
+#[tokio::test]
+async fn many_busy_answers_do_not_end_the_restore() {
+    let g = genesis();
+    let h = chain("manybusy_h", MEMBER);
+    let client = temp_db("manybusy_client");
+    let mut honest = peer(&h, Behaviour::Honest);
+    let mut asks = 0usize;
+    run_with(&client, &plan(&h.cp, &g, false), 1, |_, msg| {
+        if msg.starts_with(CHUNK_REQ) {
+            asks += 1;
+            if !asks.is_multiple_of(5) {
+                return busy();
+            }
+        }
+        serve(&mut honest, msg)
+    })
+    .await
+    .unwrap();
+    assert!(asks > 20, "{asks} asks, most of them busy");
+    assert_restored(&client, &h);
+}
+
+/// Failures are counted in a row: a peer that fails now and then, but
+/// delivers in between, never exhausts the restore.
+#[tokio::test]
+async fn failures_count_only_in_a_row() {
+    let g = genesis();
+    let h = chain("gaps_h", MEMBER);
+    let client = temp_db("gaps_client");
+    let mut honest = peer(&h, Behaviour::Honest);
+    let mut asks = 0usize;
+    let mut failed = 0usize;
+    run_with(&client, &plan(&h.cp, &g, false), 1, |_, msg| {
+        if msg.starts_with(CHUNK_REQ) {
+            asks += 1;
+            if asks.is_multiple_of(2) {
+                failed += 1;
+                return Err("connection reset".into());
+            }
+        }
+        serve(&mut honest, msg)
+    })
+    .await
+    .unwrap();
+    assert!(failed > fast().max_failures, "{failed} failures in all");
+    assert_restored(&client, &h);
+}
+
+/// The anchor is asked for again when no peer had it the first time (a
+/// blip), before the restore gives up.
+#[tokio::test]
+async fn the_anchor_is_asked_for_again() {
+    let g = genesis();
+    let h = chain("anchor_retry_h", MEMBER);
+    let client = temp_db("anchor_retry_client");
+    let mut honest = peer(&h, Behaviour::Honest);
+    let mut anchor_asks = 0usize;
+    run_with(&client, &plan(&h.cp, &g, false), 1, |_, msg| {
+        if msg.starts_with(ANCHOR_REQ) {
+            anchor_asks += 1;
+            if anchor_asks < 3 {
+                return Err("down".into());
+            }
+        }
+        serve(&mut honest, msg)
+    })
+    .await
+    .unwrap();
+    assert_eq!(anchor_asks, 3);
+    assert_restored(&client, &h);
+}
+
+/// Post-fix review LOW 7: the honest QC with a block whose proposer
+/// signature was forged (outside the header hash) is not the pair stored.
+#[tokio::test]
+async fn a_block_with_a_forged_proposer_signature_is_not_stored() {
+    let g = genesis();
+    let a = chain("sig_a", MEMBER);
+    let b = chain("sig_b", MEMBER);
+    let client = temp_db("sig_client");
+    let mut byz = peer(&a, Behaviour::Honest);
+    let mut honest = peer(&b, Behaviour::Honest);
+    let mut block = stored_block(&a);
+    block.proposer_signer = "attacker".into();
+    let byz_anchor = format!(
+        "{ANCHOR_RESP}{}",
+        serde_json::to_string(&AnchorResponse {
+            block: Some(block),
+            quorum_certificate: Some(stored_qc(&a)),
+        })
+        .unwrap()
+    );
+    run_with(&client, &plan(&a.cp, &g, false), 2, |i, msg| {
+        if i == 0 && msg.starts_with(ANCHOR_REQ) {
+            Ok(byz_anchor.clone())
+        } else if i == 0 {
+            serve(&mut byz, msg)
+        } else {
+            serve(&mut honest, msg)
+        }
+    })
+    .await
+    .unwrap();
+    let stored: Block =
+        serde_json::from_str(&client.get(&format!("block_{H}")).unwrap().unwrap()).unwrap();
+    assert_eq!(stored.proposer_signer, proposer().1);
+    assert_restored(&client, &a);
+}
+
+/// A server that never answers is left after the request timeout, and the
+/// restore completes from another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_server_times_out() {
+    let g = genesis();
+    let a = chain("silent_a", MEMBER);
+    let port = spawn_server(&a).await;
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent_port = silent.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = silent.accept().await {
+            held.push(socket);
+        }
+    });
+    let client = temp_db("silent_client");
+    let patient = RestorePlan {
+        patience: Patience {
+            request_timeout: Duration::from_millis(300),
+            ..fast()
+        },
+        ..plan(&a.cp, &g, false)
+    };
+    let start = Instant::now();
+    restore_over_tcp(
+        &client,
+        &patient,
+        &[
+            ("127.0.0.1".to_string(), silent_port),
+            ("127.0.0.1".to_string(), port),
+        ],
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        start.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_restored(&client, &a);
+}
+
+#[test]
+fn the_backoff_doubles_per_round_of_the_peers_up_to_its_cap() {
+    let patience = Patience {
+        backoff_start: Duration::from_millis(50),
+        backoff_max: Duration::from_secs(5),
+        ..Patience::default()
+    };
+    let ms = |failures, peers| patience.backoff(failures, peers).as_millis();
+    assert_eq!(ms(0, 1), 50);
+    assert_eq!(ms(1, 1), 100);
+    assert_eq!(ms(3, 1), 400);
+    assert_eq!(ms(3, 2), 100, "a round is one ask of every live peer");
+    assert_eq!(ms(3, 0), 400, "no live peer counts as one");
+    assert_eq!(ms(20, 1), 5_000, "capped");
+    assert_eq!(ms(usize::MAX, 1), 5_000, "no overflow");
+}
+
+/// A value part whose stated length differs from its leaf's is a lie.
+#[tokio::test]
+async fn a_value_part_with_another_length_is_a_lie() {
+    let g = genesis();
+    let a = chain_with(
+        "partlen_a",
+        Spec {
+            extra: vec![(obj(500), vec![b'l'; 3 << 20])],
+            ..Spec::default()
+        },
+    );
+    let client = temp_db("partlen_client");
+    let mut liar = peer(&a, Behaviour::Honest);
+    let err = run_with(&client, &plan(&a.cp, &g, false), 1, |_, msg| {
+        let reply = serve(&mut liar, msg)?;
+        let Some(json) = reply.strip_prefix(VALUE_RESP) else {
+            return Ok(reply);
+        };
+        let mut part: ValueResponse = serde_json::from_str(json).unwrap();
+        part.len += 1;
+        Ok(format!(
+            "{VALUE_RESP}{}",
+            serde_json::to_string(&part).unwrap()
+        ))
+    })
+    .await
+    .unwrap_err();
+    assert!(err.contains("every peer sent a bad state stream"), "{err}");
+}
+
+/// A peer that was busy once gets its turns back once it delivers.
+#[tokio::test]
+async fn a_peer_busy_once_gets_its_turns_back() {
+    let g = genesis();
+    let a = chain("turns_a", MEMBER);
+    let b = chain("turns_b", MEMBER);
+    let client = temp_db("turns_client");
+    let mut first = peer(&a, Behaviour::Honest);
+    let mut second = peer(&b, Behaviour::Honest);
+    let mut first_asks = 0usize;
+    run_with(&client, &plan(&a.cp, &g, false), 2, |i, msg| {
+        if i == 1 {
+            return serve(&mut second, msg);
+        }
+        if msg.starts_with(CHUNK_REQ) {
+            first_asks += 1;
+            if first_asks == 1 {
+                return busy();
+            }
+        }
+        serve(&mut first, msg)
+    })
+    .await
+    .unwrap();
+    assert!(first.chunks >= 2, "it served again: {}", first.chunks);
+    assert_restored(&client, &a);
+}
+
+/// A peer that does not answer loses its turns to one that delivers.
+#[tokio::test]
+async fn a_silent_peer_loses_its_turns() {
+    let g = genesis();
+    let a = chain("mute_a", MEMBER);
+    let client = temp_db("mute_client");
+    let mut honest = peer(&a, Behaviour::Honest);
+    let mut silent_asks = 0usize;
+    run_with(&client, &plan(&a.cp, &g, false), 2, |i, msg| {
+        if i == 0 {
+            if msg.starts_with(CHUNK_REQ) {
+                silent_asks += 1;
+            }
+            return Err("no answer".into());
+        }
+        serve(&mut honest, msg)
+    })
+    .await
+    .unwrap();
+    assert!(
+        silent_asks <= 3,
+        "passed over more each time: {silent_asks}"
+    );
+    assert_restored(&client, &a);
+}
+
+/// Busy answers are waited out only until the restore's deadline.
+#[tokio::test]
+async fn a_restore_that_is_only_ever_busy_runs_out_of_time() {
+    let g = genesis();
+    let a = chain("forever_busy", MEMBER);
+    let client = temp_db("forever_busy_client");
+    let mut honest = peer(&a, Behaviour::Honest);
+    let hurried = RestorePlan {
+        patience: Patience {
+            deadline: Duration::from_millis(200),
+            ..fast()
+        },
+        ..plan(&a.cp, &g, false)
+    };
+    let err = run_with(&client, &hurried, 1, |_, msg| {
+        if msg.starts_with(CHUNK_REQ) {
+            std::thread::sleep(Duration::from_millis(5));
+            return busy();
+        }
+        serve(&mut honest, msg)
+    })
+    .await
+    .unwrap_err();
+    assert!(err.contains("ran out of time"), "{err}");
+}
+
+/// A peer that sends a value's parts slower than the minimum rate is left
+/// for another, before it finishes.
+#[tokio::test]
+async fn value_parts_sent_too_slowly_are_given_up_on() {
+    let g = genesis();
+    let spec = Spec {
+        extra: vec![(obj(500), vec![b's'; 3 << 20])],
+        ..Spec::default()
+    };
+    let slow_chain = chain_with("sluggish_s", spec.clone());
+    let honest_chain = chain_with("sluggish_h", spec);
+    let client = temp_db("sluggish_client");
+    let mut slow = peer(&slow_chain, Behaviour::Honest);
+    let mut honest = peer(&honest_chain, Behaviour::Honest);
+    // Parts the slow peer sent in its current turn, and the most in any.
+    let (mut slow_parts, mut most) = (0usize, 0usize);
+    let hurried = RestorePlan {
+        patience: Patience {
+            request_timeout: Duration::from_secs(3),
+            min_bytes_per_sec: u64::MAX,
+            ..fast()
+        },
+        ..plan(&slow_chain.cp, &g, false)
+    };
+    run_with(&client, &hurried, 2, |i, msg| {
+        if i == 1 {
+            if most == 0 && msg.starts_with(CHUNK_REQ) {
+                return busy();
+            }
+            return serve(&mut honest, msg);
+        }
+        if msg.starts_with(CHUNK_REQ) {
+            slow_parts = 0;
+        }
+        if msg.starts_with(VALUE_REQ) {
+            slow_parts += 1;
+            most = most.max(slow_parts);
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        serve(&mut slow, msg)
+    })
+    .await
+    .unwrap();
+    assert!(
+        (1..3).contains(&most),
+        "never let finish the value's three parts: {most}"
+    );
+    assert_restored(&client, &slow_chain);
+}
+
+/// When no pair of the first round verifies, the anchor is asked for again:
+/// the peer with the good pair may have missed that round.
+#[tokio::test]
+async fn the_anchor_is_fetched_again_when_no_qc_verifies() {
+    let g = genesis();
+    let a = chain("refetch_a", MEMBER);
+    let bad = chain("refetch_bad", [9; 32]);
+    let client = temp_db("refetch_client");
+    let mut honest = peer(&a, Behaviour::Honest);
+    let mut outsider = peer(&bad, Behaviour::Honest);
+    let mut honest_anchor_asks = 0usize;
+    run_with(&client, &plan(&a.cp, &g, false), 2, |i, msg| {
+        if i == 0 {
+            if msg.starts_with(ANCHOR_REQ) {
+                honest_anchor_asks += 1;
+                if honest_anchor_asks == 1 {
+                    return Err("blip".into());
+                }
+            }
+            return serve(&mut honest, msg);
+        }
+        if msg.starts_with(ANCHOR_REQ) {
+            // A pair signed outside the committee, for the same checkpoint.
+            return serve(&mut outsider, msg);
+        }
+        serve(&mut honest, msg)
+    })
+    .await
+    .unwrap();
+    assert_eq!(honest_anchor_asks, 2, "asked again after the bad QC");
+    assert_restored(&client, &a);
+}
+
+/// A peer that takes its time to say busy is stalling: it sits out turns
+/// like a silent one. An honest server says busy at once.
+#[tokio::test]
+async fn a_peer_that_stalls_before_saying_busy_loses_its_turns() {
+    let g = genesis();
+    let a = chain("stall_a", MEMBER);
+    let client = temp_db("stall_client");
+    let mut honest = peer(&a, Behaviour::Honest);
+    let mut stalls = 0usize;
+    let hurried = RestorePlan {
+        patience: Patience {
+            request_timeout: Duration::from_millis(200),
+            ..fast()
+        },
+        ..plan(&a.cp, &g, false)
+    };
+    run_with(&client, &hurried, 2, |i, msg| {
+        if i == 0 && msg.starts_with(CHUNK_REQ) {
+            stalls += 1;
+            std::thread::sleep(Duration::from_millis(60));
+            return busy();
+        }
+        serve(&mut honest, msg)
+    })
+    .await
+    .unwrap();
+    assert!(stalls <= 3, "passed over more each time: {stalls}");
+    assert_restored(&client, &a);
+}
+
+/// A peer that delivers is forgiven: its next failure costs one turn again,
+/// not twice its last.
+#[tokio::test]
+async fn a_peer_that_delivers_is_forgiven() {
+    let g = genesis();
+    let a = chain("forgive_a", MEMBER);
+    let client = temp_db("forgive_client");
+    let mut first = peer(&a, Behaviour::Honest);
+    let mut second = peer(&a, Behaviour::Honest);
+    let mut order: Vec<usize> = Vec::new();
+    let mut first_asks = 0usize;
+    run_with(&client, &plan(&a.cp, &g, false), 2, |i, msg| {
+        if msg.starts_with(CHUNK_REQ) {
+            order.push(i);
+        }
+        if i == 1 {
+            return serve(&mut second, msg);
+        }
+        if msg.starts_with(CHUNK_REQ) {
+            first_asks += 1;
+            if first_asks == 1 || first_asks == 3 {
+                return Err("dropped".into());
+            }
+        }
+        serve(&mut first, msg)
+    })
+    .await
+    .unwrap();
+    // After its second failure (its third ask), the other peer is asked
+    // twice before it is back: one sit-out turn, as after its first.
+    let third = order
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| **p == 0)
+        .nth(2)
+        .map(|(at, _)| at)
+        .unwrap();
+    let before_back = order[third + 1..].iter().take_while(|p| **p == 1).count();
+    assert_eq!(before_back, 2, "order: {order:?}");
+    assert_restored(&client, &a);
 }

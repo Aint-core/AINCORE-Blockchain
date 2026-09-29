@@ -3046,6 +3046,9 @@ mod tests {
         let err = initialize_genesis_from(&db, &stdlib_path(), &file).unwrap_err();
         assert!(err.to_string().contains("restore is unfinished"), "{err}");
         assert!(db.get("genesis_initialized").unwrap().is_none());
+        // The production entry point refuses before looking for any file.
+        let err = initialize_genesis(&db, &stdlib_path()).unwrap_err();
+        assert!(err.to_string().contains("restore is unfinished"), "{err}");
         db.delete(storage::RESTORE_MARKER).unwrap();
         initialize_genesis_from(&db, &stdlib_path(), &file).expect("then genesis runs");
     }

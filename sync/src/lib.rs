@@ -92,9 +92,6 @@ pub const MAX_CONCURRENT_VERTEX_SERVES: usize = 4;
 #[derive(Debug)]
 pub struct VertexServeBudget {
     inner: Mutex<BudgetState>,
-    max_in_flight: usize,
-    per_sec: f64,
-    burst: f64,
 }
 
 #[derive(Debug)]
@@ -106,11 +103,13 @@ struct BudgetState {
 
 impl Default for VertexServeBudget {
     fn default() -> Self {
-        Self::with_limits(
-            MAX_CONCURRENT_VERTEX_SERVES,
-            VERTEX_SERVE_LOOKUPS_PER_SEC,
-            VERTEX_SERVE_BURST,
-        )
+        Self {
+            inner: Mutex::new(BudgetState {
+                tokens: VERTEX_SERVE_BURST,
+                last_refill: Instant::now(),
+                in_flight: 0,
+            }),
+        }
     }
 }
 
@@ -127,21 +126,6 @@ impl Drop for ServeSlot<'_> {
 }
 
 impl VertexServeBudget {
-    /// A budget with its own limits: at most `max_in_flight` concurrent
-    /// serves, and lookups refilled at `per_sec` up to `burst`.
-    pub fn with_limits(max_in_flight: usize, per_sec: f64, burst: f64) -> Self {
-        Self {
-            inner: Mutex::new(BudgetState {
-                tokens: burst,
-                last_refill: Instant::now(),
-                in_flight: 0,
-            }),
-            max_in_flight,
-            per_sec,
-            burst,
-        }
-    }
-
     /// The guarded state is three plain counters, so a panic while holding the
     /// lock leaves nothing inconsistent. Recovering from poisoning is therefore
     /// correct AND necessary: propagating it would either wedge the vertex server
@@ -154,7 +138,7 @@ impl VertexServeBudget {
     /// are already in flight. Callers shed load; they never queue.
     pub fn try_enter(&self) -> Option<ServeSlot<'_>> {
         let mut st = self.lock_recover();
-        if st.in_flight >= self.max_in_flight {
+        if st.in_flight >= MAX_CONCURRENT_VERTEX_SERVES {
             return None;
         }
         st.in_flight += 1;
@@ -169,7 +153,7 @@ impl VertexServeBudget {
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(st.last_refill).as_secs_f64();
         st.last_refill = now;
-        st.tokens = (st.tokens + elapsed * self.per_sec).min(self.burst);
+        st.tokens = (st.tokens + elapsed * VERTEX_SERVE_LOOKUPS_PER_SEC).min(VERTEX_SERVE_BURST);
         let granted = (want as f64).min(st.tokens.max(0.0)).floor();
         st.tokens -= granted;
         granted as usize
@@ -223,9 +207,8 @@ pub struct ChainSync {
     /// AUDIT H8: bounds what VERTEX_REQ can push through blocking RocksDB reads
     /// on the tokio workers shared with consensus. See `VertexServeBudget`.
     serve_budget: VertexServeBudget,
-    /// G3 S6: the same bound for snapshot serving, apart, so a restoring peer
-    /// never takes vertex serving's slots (`state_sync::STATE_SERVE_*`).
-    state_budget: VertexServeBudget,
+    /// G3 S6: snapshot serving's own budget, global and per client IP.
+    state_budget: state_sync::StateBudget,
     /// The last value served in parts: (version, key, value).
     state_value_cache: Mutex<Option<StateValue>>,
     /// Block retention (`StateDB::block_pruning_policy_from_env`), read once.
@@ -248,11 +231,7 @@ impl ChainSync {
             peers,
             storage,
             serve_budget: VertexServeBudget::default(),
-            state_budget: VertexServeBudget::with_limits(
-                state_sync::STATE_SERVE_IN_FLIGHT,
-                state_sync::STATE_SERVE_LEAVES_PER_SEC,
-                state_sync::STATE_SERVE_LEAVES_PER_SEC,
-            ),
+            state_budget: state_sync::StateBudget::default(),
             state_value_cache: Mutex::new(None),
             retention: StateDB::block_pruning_policy_from_env(),
             #[cfg(test)]
@@ -557,27 +536,31 @@ impl ChainSync {
                 block.header.height, signer
             ));
         }
+        Self::verify_proposer_signature_in(storage, block)
+    }
+
+    /// The block's proposer signature, under the public key its signer's
+    /// account records in `storage`.
+    pub(crate) fn verify_proposer_signature_in(
+        storage: &StateDB,
+        block: &Block,
+    ) -> Result<(), String> {
+        let signer = &block.proposer_signer;
         let signer_pk = storage
-            .get_object(&signer)
+            .get_object(signer)
             .and_then(|obj| serde_json::from_slice::<serde_json::Value>(&obj.data).ok())
             .and_then(|v| v.get("public_key").and_then(|k| k.as_str()).map(String::from));
         match signer_pk {
-            Some(pk) if block.verify_proposer_signature(&pk) => {}
-            Some(_) => {
-                return Err(format!(
-                    "Proposer signature invalid or missing on block #{} (signer {})",
-                    block.header.height, signer
-                ));
-            }
-            None => {
-                return Err(format!(
-                    "Cannot resolve signer {} public key to authenticate block #{}",
-                    signer, block.header.height
-                ));
-            }
+            Some(pk) if block.verify_proposer_signature(&pk) => Ok(()),
+            Some(_) => Err(format!(
+                "Proposer signature invalid or missing on block #{} (signer {})",
+                block.header.height, signer
+            )),
+            None => Err(format!(
+                "Cannot resolve signer {} public key to authenticate block #{}",
+                signer, block.header.height
+            )),
         }
-
-        Ok(())
     }
 
     // Run before execution while holding the storage writer gate. In particular,
@@ -1289,6 +1272,12 @@ impl ChainSync {
 
     /// Handle incoming encrypted message (called by Network Server Handler)
     pub fn handle_message(&self, msg: &str) -> Option<String> {
+        self.handle_message_from(msg, None)
+    }
+
+    /// `handle_message` for a request from `peer`, whose IP snapshot serving
+    /// budgets by. `None` is an in-process caller.
+    pub fn handle_message_from(&self, msg: &str, peer: Option<std::net::IpAddr>) -> Option<String> {
         // Handle Request Logic
         if msg == "GET_HEIGHT" {
             let h = self.get_local_height();
@@ -1313,12 +1302,12 @@ impl ChainSync {
         }
         if let Some(req_json) = msg.strip_prefix(state_sync::CHUNK_REQ) {
             let req = serde_json::from_str::<state_sync::ChunkRequest>(req_json).ok()?;
-            let resp = serde_json::to_string(&self.handle_state_chunk(req)).ok()?;
+            let resp = serde_json::to_string(&self.serve_state_chunk(req, peer)).ok()?;
             return Some(format!("{}{}", state_sync::CHUNK_RESP, resp));
         }
         if let Some(req_json) = msg.strip_prefix(state_sync::VALUE_REQ) {
             let req = serde_json::from_str::<state_sync::ValueRequest>(req_json).ok()?;
-            let resp = serde_json::to_string(&self.handle_state_value(req)).ok()?;
+            let resp = serde_json::to_string(&self.serve_state_value(req, peer)).ok()?;
             return Some(format!("{}{}", state_sync::VALUE_RESP, resp));
         }
         if let Some(req_json) = msg.strip_prefix(state_sync::ANCHOR_REQ) {

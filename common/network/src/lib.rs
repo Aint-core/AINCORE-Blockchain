@@ -69,6 +69,24 @@ pub async fn start_server<F>(
 ) where
     F: Fn(String) -> Option<String> + Send + Sync + 'static,
 {
+    start_server_with_peer(port, node_id, peers, db, my_signing_key, move |msg, _| {
+        handler(msg)
+    })
+    .await
+}
+
+/// `start_server`, handing the handler each request's source IP too, so a
+/// handler can budget per client.
+pub async fn start_server_with_peer<F>(
+    port: u16,
+    node_id: String,
+    peers: PeerList,
+    db: Arc<StateDB>,
+    my_signing_key: Arc<ed25519_dalek::SigningKey>,
+    handler: F,
+) where
+    F: Fn(String, std::net::IpAddr) -> Option<String> + Send + Sync + 'static,
+{
     use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 
     let listener = match TcpListener::bind(("0.0.0.0", port)).await {
@@ -381,7 +399,7 @@ pub async fn start_server<F>(
                             // GET_HEIGHT/GET_FINALITY/SYNC_REQ were previously reimplemented
                             // inline here, silently shadowing chain_sync's handlers and
                             // letting serving-side fixes (QC, prune-horizon) land on dead code.
-                            if let Some(response) = handler_clone(msg) {
+                            if let Some(response) = handler_clone(msg, peer_ip) {
                                 let _ = send_encrypted(&mut socket, &shared_key, &response).await;
                             }
                         }
