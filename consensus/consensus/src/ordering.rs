@@ -612,7 +612,7 @@ impl OrderingEngine {
                     None => return None, // cannot happen, but never guess
                 };
                 let Some(visited) =
-                    Self::walk_history(&chain, j, chain_round, dag, &self.committed_set, 0)
+                    Self::walk_history(&chain, j, chain_round, dag, &self.committed_set)
                 else {
                     // HOLE below the chain anchor: not decidable yet.
                     return None;
@@ -633,8 +633,15 @@ impl OrderingEngine {
                     // No leader vertex in the chain's complete history: SKIP j.
                     // The walk was complete, so absence is proof, not a guess.
                     (None, _) => {}
-                    // Two: unreachable under Lemma U. Never guess.
-                    (Some(_), Some(_)) => return None,
+                    // Two: unreachable under Lemma U. Never guess, and say so:
+                    // the round stays undecided until an operator looks.
+                    (Some(a), Some(b)) => {
+                        eprintln!(
+                            "🚨 [DE-4] leader {leader_j} has two vertices at round {j} in one \
+                             history ({a}, {b}): Lemma U does not hold; round left undecided"
+                        );
+                        return None;
+                    }
                 }
             }
 
@@ -759,16 +766,17 @@ impl OrderingEngine {
     /// referenced parent that is neither in the local DAG, nor already
     /// committed, nor the genesis sentinel. A complete walk is what makes a
     /// SKIP decision a proof instead of a guess.
-    /// `gc_floor` is g: a parent whose round, as the child's authenticated ref
-    /// declares it, is at or below g is settled and not descended into (the
-    /// settled-by-floor arm; a no-op while g is 0).
+    ///
+    /// There is no settled-by-floor arm yet. It lands with GC (S7) and only
+    /// together with a sequence builder that applies the same predicate
+    /// (DE-5): a parent this walk treats as settled while `find_causal_history`
+    /// still collects it where held gives two nodes different sequences.
     fn walk_history(
         from: &str,
         floor: u64,
         from_round: u64,
         dag: &HashMap<String, Vertex>,
         committed_set: &std::collections::HashSet<String>,
-        gc_floor: u64,
     ) -> Option<HashSet<String>> {
         let _ = from_round; // bounded implicitly: rounds strictly decrease
         let mut visited: HashSet<String> = HashSet::new();
@@ -787,12 +795,8 @@ impl OrderingEngine {
             if v.round <= floor {
                 continue; // do not descend below the floor
             }
-            for (i, p) in v.parents.iter().enumerate() {
-                let below_floor = v
-                    .parent_refs
-                    .get(i)
-                    .is_some_and(|r| r.digest == *p && r.round <= gc_floor);
-                if p != "genesis" && !committed_set.contains(p) && !below_floor {
+            for p in &v.parents {
+                if p != "genesis" && !committed_set.contains(p) {
                     stack.push(p.clone());
                 }
             }
@@ -819,7 +823,6 @@ impl OrderingEngine {
             anchor_round_in_dag,
             dag,
             &self.committed_set,
-            0,
         )?;
 
         let mut sequence = self.find_causal_history(anchor_vertex_hash, dag);
@@ -2879,23 +2882,99 @@ mod tests {
         );
     }
 
-    /// G1 S4, DE-4's settled-by-floor arm: a parent whose declared round is at
-    /// or below g is settled, so its missing body is no hole. A no-op at g = 0.
+    /// S3/S4 review C-1: a missing parent is a hole whatever round the child's
+    /// ref declares for it. The removed settled-by-floor arm skipped a parent
+    /// whose ref declared round 0, a round V3 ingress never checked.
     #[test]
-    fn a_parent_at_or_below_the_floor_is_settled() {
+    fn a_missing_parent_is_a_hole_whatever_round_its_ref_declares() {
         let validators = mk_validators(4);
         let a = &validators[0].0;
         let (h1, _) = mk_vertex(1, a, vec!["genesis".to_string()]);
-        let (h2, v2) = mk_vertex(2, a, vec![h1.clone()]);
+        let (h2, mut v2) = mk_vertex(2, a, vec![h1.clone()]);
+        v2.parent_refs = vec![blockchain::ParentRef {
+            cert: None,
+            round: 0,
+            author: a.clone(),
+            digest: h1.clone(),
+            proof: None,
+        }];
         let dag: std::collections::HashMap<String, blockchain::Vertex> =
             [(h2.clone(), v2)].into_iter().collect();
         let none = std::collections::HashSet::new();
-        let walk = |g| super::OrderingEngine::walk_history(&h2, 0, 2, &dag, &none, g);
-        assert!(
-            walk(0).is_none(),
-            "g = 0: the missing round-1 parent is a hole"
+        assert!(super::OrderingEngine::walk_history(&h2, 0, 2, &dag, &none).is_none());
+    }
+
+    /// A Byzantine author's round-0 vertex Y, cited by its round-1 vertex
+    /// through a ref declaring round 0, held by one view and not the other.
+    /// Ingress refuses both shapes now; this is the ordering-level guard.
+    fn round0_parent_world(hold_y: bool) -> (Vec<(String, u64)>, View, String) {
+        let validators = mk_validators(4);
+        let byz = validators[3].0.clone();
+        let (hy, vy) = mk_vertex(0, &byz, vec![]);
+        let (hb1, mut vb1) = mk_vertex(1, &byz, vec![hy.clone()]);
+        vb1.parent_refs = vec![blockchain::ParentRef {
+            cert: None,
+            round: 0,
+            author: byz.clone(),
+            digest: hy.clone(),
+            proof: None,
+        }];
+        let mut view = View::new();
+        if hold_y {
+            view.insert(&hy, &vy);
+        }
+        let mut prev = Vec::new();
+        for (a, _) in &validators {
+            let (h, v) = if *a == byz {
+                (hb1.clone(), vb1.clone())
+            } else {
+                mk_vertex(1, a, vec!["genesis".to_string()])
+            };
+            view.insert(&h, &v);
+            prev.push(h);
+        }
+        for r in 2..=5u64 {
+            let mut this = Vec::new();
+            for (a, _) in &validators {
+                let (h, v) = mk_vertex(r, a, prev.clone());
+                view.insert(&h, &v);
+                this.push(h);
+            }
+            prev = this;
+        }
+        (validators, view, hy)
+    }
+
+    /// S3/S4 review C-1 (the reviewer's PoC): two views that differ only in
+    /// holding Y never commit one anchor with different sequences. The view
+    /// without Y waits on the hole.
+    #[test]
+    fn a_round0_parent_one_view_lacks_never_forks_the_sequence() {
+        let (validators, mut with_y, hy) = round0_parent_world(true);
+        let (_, mut without_y, _) = round0_parent_world(false);
+        let c0 = drain(&mut with_y.eng, &with_y.dag, &with_y.idx, &validators);
+        let c1 = drain(
+            &mut without_y.eng,
+            &without_y.dag,
+            &without_y.idx,
+            &validators,
         );
-        assert_eq!(walk(1).unwrap(), [h2.clone()].into_iter().collect());
+        let f0 = commit_fingerprint(&c0);
+        let f1 = commit_fingerprint(&c1);
+        assert!(
+            f0.iter().any(|c| c.2.contains(&hy)),
+            "vacuous: the view holding Y never committed it"
+        );
+        assert!(f1.is_empty(), "the view without Y committed past the hole");
+        for a in &f0 {
+            if let Some(b) = f1.iter().find(|b| b.0 == a.0) {
+                assert_eq!(
+                    a, b,
+                    "anchor round {} committed with different sequences",
+                    a.0
+                );
+            }
+        }
     }
 
     /// G1 S4, DE-2: an author with two vertices at r+1 votes for nothing, so a
@@ -3171,7 +3250,7 @@ mod tests {
         );
         //   (c) its causal history has a HOLE — this is the actual blocker
         assert!(
-            super::OrderingEngine::walk_history(&h2_leader, 0, 2, &dag, &wedged.committed_set, 0)
+            super::OrderingEngine::walk_history(&h2_leader, 0, 2, &dag, &wedged.committed_set)
                 .is_none(),
             "walk_history must report a hole on the fabricated parent"
         );

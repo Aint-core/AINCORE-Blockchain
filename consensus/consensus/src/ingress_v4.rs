@@ -78,14 +78,34 @@ fn lower_hex(s: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// The parts of Layer S that need no epoch record (S1, S2 but the wire size).
+fn intrinsic(v: &Vertex) -> Result<(), String> {
+    if !v.is_live_form() {
+        return Err("a compact proof, not a live vertex".into());
+    }
+    if v.aggregated_signature.is_some() {
+        return Err("an aggregated signature on a live vertex".into());
+    }
+    if v.parents.len() > MAX_PARENTS {
+        return Err(format!("{} parents, over {MAX_PARENTS}", v.parents.len()));
+    }
+    let mut seen = std::collections::HashSet::new();
+    if !v.parents.iter().all(|p| seen.insert(p.as_str())) {
+        return Err("a parent digest twice".into());
+    }
+    Ok(())
+}
+
 /// Layer S under the record of the vertex's own epoch: every node holding
-/// that record reaches the same verdict.
+/// that record reaches the same verdict. Boot re-runs it on staged bodies, so
+/// it carries every check but the wire size.
 pub(crate) fn layer_s(
     v: &Vertex,
     record: &EpochRecord<'_>,
     chain_id: &str,
     genesis_identity: &str,
 ) -> Result<(), String> {
+    intrinsic(v)?;
     if v.hash != v.hash_v4_with_domain(chain_id, genesis_identity) {
         return Err("the hash is not the V4 hash of the body".into());
     }
@@ -164,18 +184,8 @@ pub fn v4_verdict(
     if raw_len > MAX_VERTEX_BYTES {
         return Verdict::Invalid(format!("{raw_len} bytes, over {MAX_VERTEX_BYTES}"));
     }
-    if !v.is_live_form() {
-        return Verdict::Invalid("a compact proof, not a live vertex".into());
-    }
-    if v.aggregated_signature.is_some() {
-        return Verdict::Invalid("an aggregated signature on a live vertex".into());
-    }
-    if v.parents.len() > MAX_PARENTS {
-        return Verdict::Invalid(format!("{} parents, over {MAX_PARENTS}", v.parents.len()));
-    }
-    let mut seen = std::collections::HashSet::new();
-    if !v.parents.iter().all(|p| seen.insert(p.as_str())) {
-        return Verdict::Invalid("a parent digest twice".into());
+    if let Err(e) = intrinsic(v) {
+        return Verdict::Invalid(e);
     }
     // E1 picks the record; Layer S runs under it before anything is kept.
     // A vertex whose epoch record this node does not hold cannot be

@@ -17,7 +17,7 @@ pub const MAX_STAGED_PER_SLOT: usize = 2;
 /// The bytes of plain bodies (neither certified nor self-attested) staged per
 /// author and epoch (ST-3). Callers pass it; tests use smaller budgets.
 pub const B_AUTH: u64 = 64 * 1024 * 1024;
-/// Rounds below `g − RETAIN_SLACK` are not loaded at boot (GC-3).
+/// Boot loads only rounds above `g − RETAIN_SLACK` (GC-3).
 pub const RETAIN_SLACK: u64 = 50;
 pub const PENDING_MAX_PER_AUTHOR: usize = 16;
 
@@ -128,7 +128,12 @@ pub fn stage_in(
     let bytes = body.len() as u64;
     let mut outcome = StageOutcome::Staged;
     if slot.len() >= MAX_STAGED_PER_SLOT {
-        // ST-2: only the slot's certified digest may displace a member.
+        // ST-2: only the slot's certified digest may displace a member. A
+        // body this node attests must be held (AT-3), so attesting one that
+        // cannot be is an error that aborts the caller's transaction.
+        if role == Role::SelfAttested {
+            return Err("attesting a third digest for a full slot".into());
+        }
         if role != Role::Certified {
             return Ok(StageOutcome::EvidenceOnly("a third digest for a full slot"));
         }
@@ -176,7 +181,7 @@ pub fn stage_in(
     Ok(outcome)
 }
 
-/// `stage_in` in a transaction of its own.
+/// `stage_in` in a transaction of its own; an error writes nothing.
 pub fn stage(
     storage: &StateDB,
     v: &Vertex,
@@ -185,8 +190,11 @@ pub fn stage(
     budget: u64,
 ) -> Result<StageOutcome, String> {
     storage
-        .transaction(|view| Ok(stage_in(&view, v, role, certified, budget)))
-        .map_err(|e| e.to_string())?
+        .transaction(|view| {
+            stage_in(&view, v, role, certified, budget)
+                .map_err(storage::StorageError::DatabaseOperation)
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// What boot reloads for the active epoch (RC-1 steps 2 and 3).
@@ -202,8 +210,9 @@ pub struct Loaded {
 }
 
 /// RC-1 steps 2 and 3 for `record`'s epoch: the staged bodies of rounds above
-/// `gc_floor − RETAIN_SLACK`, each re-checked with Layer S, and the epoch's
-/// certificates, each verified. Step 4 (O_E through OR-1) is S5.
+/// `gc_floor − RETAIN_SLACK`, each re-checked with Layer S and the size bound,
+/// and the epoch's certificates, each verified. Step 4 (O_E through OR-1) is
+/// S5.
 pub fn load(
     storage: &StateDB,
     record: &EpochRecord<'_>,
@@ -212,7 +221,8 @@ pub fn load(
     gc_floor: u64,
 ) -> Result<Loaded, String> {
     let mut out = Loaded::default();
-    let from = gc_floor.saturating_sub(RETAIN_SLACK);
+    // Rounds above g − RETAIN_SLACK: all of them while that is negative.
+    let from = gc_floor.checked_sub(RETAIN_SLACK).map_or(0, |r| r + 1);
     let prefix = format!("consensus:vslot:v1:{:020}:", record.epoch);
     let start = format!("{prefix}{from:020}:");
     for row in storage.db.iterator(storage::rocksdb::IteratorMode::From(
@@ -229,6 +239,7 @@ pub fn load(
             let body = storage
                 .get(&format!("vertex:{}", entry.digest))
                 .map_err(|e| e.to_string())?
+                .filter(|json| json.len() <= crate::dag::MAX_VERTEX_BYTES)
                 .and_then(|json| serde_json::from_str::<Vertex>(&json).ok());
             match body {
                 Some(v)

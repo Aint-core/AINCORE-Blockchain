@@ -511,7 +511,11 @@ fn the_stored_body_carries_no_transport_fields() {
         round: FIRST,
         author: all[1].info.address.clone(),
         digest: "1".repeat(64),
-        proof: None,
+        proof: blockchain::ParentRef::authenticated(
+            &twin(&all[1], FIRST, "p"),
+            all[1].info.ed25519_public_key.clone(),
+        )
+        .proof,
         cert: Some(blockchain::CompactCert {
             signer_bitmap: vec![7],
             aggregate_signature: vec![9; 96],
@@ -524,5 +528,211 @@ fn the_stored_body_carries_no_transport_fields() {
         serde_json::from_str(&db.get(&format!("vertex:{}", v.hash)).unwrap().unwrap()).unwrap();
     assert_eq!(stored.parent_refs.len(), 1);
     assert_eq!(stored.parent_refs[0].cert, None);
+    assert!(stored.parent_refs[0].proof.is_none());
     assert_eq!(stored.parent_refs[0].digest, v.parent_refs[0].digest);
+}
+
+/// Writes `v`'s body and a slot row naming `digest` under `epoch`, bypassing
+/// `stage`: what a corrupted or tampered store could hold.
+fn plant(db: &StateDB, epoch: u64, digest: &str, v: &Vertex) {
+    let row = vec![SlotEntry {
+        digest: digest.to_string(),
+        role: Role::Staged,
+        bytes: 1,
+    }];
+    db.put(
+        &vslot_key(epoch, v.round, &v.author),
+        &serde_json::to_string(&row).unwrap(),
+    )
+    .unwrap();
+    db.put(
+        &format!("vertex:{digest}"),
+        &serde_json::to_string(v).unwrap(),
+    )
+    .unwrap();
+}
+
+/// S3/S4 review L-1: boot loads rounds strictly above g − RETAIN_SLACK, and
+/// every round while that is negative.
+#[test]
+fn boot_loads_exactly_the_rounds_above_g_minus_slack() {
+    let all = members();
+    let c = committee(&all);
+    let s = sentinel();
+    let dir = TempDb::new("boundary");
+    let v = twin(&all[0], FIRST, "edge");
+    {
+        let db = dir.open();
+        stage(&db, &v, Role::Staged, None, B_AUTH).unwrap();
+    }
+    let db = dir.open();
+    let loaded = |g| {
+        load(&db, &record(&c, &s), CHAIN, GENESIS, g)
+            .unwrap()
+            .bodies
+            .iter()
+            .any(|(_, b)| b.hash == v.hash)
+    };
+    assert!(loaded(0));
+    assert!(loaded(RETAIN_SLACK - 1));
+    assert!(
+        loaded(FIRST - 1 + RETAIN_SLACK),
+        "round g − RETAIN_SLACK + 1"
+    );
+    assert!(!loaded(FIRST + RETAIN_SLACK), "round g − RETAIN_SLACK");
+}
+
+/// S3/S4 review L-2: boot re-runs S1 and S2 too. A compact-form body under a
+/// real digest hashes, but its payload is not the one signed for.
+#[test]
+fn boot_refuses_a_proof_form_body() {
+    let all = members();
+    let c = committee(&all);
+    let s = sentinel();
+    let dir = TempDb::new("proofform");
+    let v = twin(&all[0], FIRST, "real");
+    let mut w = v.clone();
+    w.payload_root = Some(v.payload_root());
+    w.payload = vec!["FOREIGN".to_string()];
+    assert_eq!(w.hash_v4_with_domain(CHAIN, GENESIS), v.hash);
+    let db = dir.open();
+    plant(&db, EPOCH, &v.hash, &w);
+    let got = load(&db, &record(&c, &s), CHAIN, GENESIS, 0).unwrap();
+    assert!(got.bodies.is_empty());
+    assert_eq!(got.refused, vec![v.hash.clone()]);
+}
+
+#[test]
+fn boot_refuses_an_oversized_body() {
+    let all = members();
+    let c = committee(&all);
+    let s = sentinel();
+    let dir = TempDb::new("oversize");
+    let big = twin(&all[0], FIRST, &"x".repeat(crate::dag::MAX_VERTEX_BYTES));
+    let db = dir.open();
+    plant(&db, EPOCH, &big.hash, &big);
+    let got = load(&db, &record(&c, &s), CHAIN, GENESIS, 0).unwrap();
+    assert!(got.bodies.is_empty());
+    assert_eq!(got.refused, vec![big.hash.clone()]);
+}
+
+/// A slot entry is loaded only with the body its digest names, of the
+/// record's epoch, even when the body under that key is itself valid.
+#[test]
+fn boot_refuses_a_body_under_another_digest_or_epoch() {
+    let all = members();
+    let c = committee(&all);
+    let s = sentinel();
+    let dir = TempDb::new("foreign");
+    let db = dir.open();
+    let v = twin(&all[0], FIRST, "named");
+    let w = twin(&all[0], FIRST, "other");
+    plant(&db, EPOCH, &v.hash, &w);
+    let got = load(&db, &record(&c, &s), CHAIN, GENESIS, 0).unwrap();
+    assert!(got.bodies.is_empty(), "the body of another digest");
+    // An epoch-2 vertex that cites epoch 1's sentinel passes Layer S under
+    // epoch 1's record; only the epoch check keeps it out of that epoch.
+    let mut e2 = twin(&all[1], FIRST, "e2");
+    e2.epoch = EPOCH + 1;
+    e2.hash = e2.hash_v4_with_domain(CHAIN, GENESIS);
+    e2.sign_with_ed25519(&crypto::SigningKey::from_bytes(&all[1].node_key));
+    assert!(crate::ingress_v4::layer_s(&e2, &record(&c, &s), CHAIN, GENESIS).is_ok());
+    plant(&db, EPOCH, &e2.hash, &e2);
+    let got = load(&db, &record(&c, &s), CHAIN, GENESIS, 0).unwrap();
+    assert!(got.bodies.is_empty(), "a body of another epoch");
+    assert_eq!(got.refused.len(), 2);
+}
+
+/// A held body is never demoted: re-staging a certified body as plain leaves
+/// it certified, so it stays unevictable and off the budget.
+#[test]
+fn a_held_body_is_never_demoted() {
+    let all = members();
+    let v = twin(&all[0], FIRST, "a");
+    let dir = TempDb::new("demote");
+    let db = dir.open();
+    stage(&db, &v, Role::Staged, Some(&v.hash), B_AUTH).unwrap();
+    assert_eq!(
+        stage(&db, &v, Role::Staged, None, B_AUTH),
+        Ok(StageOutcome::Held)
+    );
+    assert_eq!(slot(&db, &v)[0].role, Role::Certified);
+    assert_eq!(plain(&db, &v), 0);
+}
+
+#[test]
+fn a_body_that_exactly_fits_the_budget_is_staged() {
+    let all = members();
+    let v = twin(&all[0], FIRST, "a");
+    let size = serde_json::to_string(&v).unwrap().len() as u64;
+    let dir = TempDb::new("exact");
+    let db = dir.open();
+    assert_eq!(
+        stage(&db, &v, Role::Staged, None, size),
+        Ok(StageOutcome::Staged)
+    );
+    assert_eq!(plain(&db, &v), size);
+}
+
+/// ST-3: the plain-body budget is per author AND epoch.
+#[test]
+fn each_epoch_has_its_own_plain_body_budget() {
+    let all = members();
+    let m = &all[0];
+    let v1 = twin(m, FIRST, "a");
+    let size = serde_json::to_string(&v1).unwrap().len() as u64;
+    let budget = size + size / 2;
+    let dir = TempDb::new("epoch_budget");
+    let db = dir.open();
+    stage(&db, &v1, Role::Staged, None, budget).unwrap();
+    assert!(matches!(
+        stage(&db, &twin(m, FIRST + 1, "a"), Role::Staged, None, budget),
+        Ok(StageOutcome::EvidenceOnly(_))
+    ));
+    let mut e2 = twin(m, FIRST + 1, "a");
+    e2.epoch = EPOCH + 1;
+    e2.hash = e2.hash_v4_with_domain(CHAIN, GENESIS);
+    assert_eq!(
+        stage(&db, &e2, Role::Staged, None, budget),
+        Ok(StageOutcome::Staged)
+    );
+}
+
+/// S3/S4 review L-5: a body this node attests must be held (AT-3), so
+/// attesting a third digest for a full slot is an error, and writes nothing.
+#[test]
+fn attesting_a_third_digest_for_a_full_slot_is_an_error() {
+    let all = members();
+    let (a, b, c) = (
+        twin(&all[0], FIRST, "a"),
+        twin(&all[0], FIRST, "b"),
+        twin(&all[0], FIRST, "c"),
+    );
+    let dir = TempDb::new("self_third");
+    let db = dir.open();
+    stage(&db, &a, Role::Staged, None, B_AUTH).unwrap();
+    stage(&db, &b, Role::Staged, None, B_AUTH).unwrap();
+    let before = plain(&db, &a);
+    assert!(stage(&db, &c, Role::SelfAttested, None, B_AUTH).is_err());
+    assert!(!body_held(&db, &c));
+    assert_eq!(digests(&db, &a).len(), 2);
+    assert_eq!(plain(&db, &a), before);
+}
+
+/// Of two pending vertices at the top round, the greater digest goes: the
+/// same choice whatever order they arrived in.
+#[test]
+fn the_pending_buffer_breaks_a_top_round_tie_by_digest() {
+    let all = members();
+    let top = FIRST + 500;
+    let (x, y) = (twin(&all[0], top, "x"), twin(&all[0], top, "y"));
+    let greater = x.hash.clone().max(y.hash.clone());
+    for order in [[&x, &y], [&y, &x]] {
+        let mut buffer = PendingBuffer::default();
+        for r in 0..PENDING_MAX_PER_AUTHOR as u64 - 1 {
+            assert!(buffer.push(twin(&all[0], FIRST + r, "p")).is_none());
+        }
+        assert!(buffer.push(order[0].clone()).is_none());
+        assert_eq!(buffer.push(order[1].clone()).unwrap().hash, greater);
+    }
 }

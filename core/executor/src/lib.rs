@@ -5179,6 +5179,7 @@ mod tests {
             "the V3 hash ignores the epoch"
         );
         assert!(executor.verify_slash_evidence(&item(&a, &padded)).is_err());
+        assert!(executor.verify_slash_evidence(&item(&padded, &a)).is_err());
 
         // COMPACT proofs (payload stripped, payload_root carried) must verify
         // identically -- this is what keeps DAG-carried evidence tiny.

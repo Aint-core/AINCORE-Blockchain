@@ -978,3 +978,32 @@ fn exactly_max_parents_is_admissible() {
     let (c, v) = with_members(MAX_PARENTS + 1);
     assert!(invalid(verdict(&v, &c)));
 }
+
+/// The certificate bitmap holds one bit per member, rounded up to whole
+/// bytes: at eight members that is one byte, not two.
+#[test]
+fn the_bitmap_length_is_members_rounded_up_to_bytes() {
+    let mut all: Vec<Member> = (1..=8u8).map(member).collect();
+    all.sort_by(|a, b| a.info.address.cmp(&b.info.address));
+    let c = committee(&all);
+    let s = sentinel(EPOCH);
+    let record = EpochRecord {
+        epoch: EPOCH,
+        first_round: FIRST,
+        closing_round: None,
+        sentinel: &s,
+        committee: &c,
+    };
+    let parents: Vec<Vertex> = all[..7].iter().map(first_round).collect();
+    let with_bitmap = |bytes: usize| {
+        let mut refs: Vec<ParentRef> = parents.iter().map(|p| reference(p, None)).collect();
+        refs[0].cert = Some(CompactCert {
+            signer_bitmap: vec![0; bytes],
+            aggregate_signature: vec![0; 96],
+        });
+        let digests = parents.iter().map(|p| p.hash.clone()).collect();
+        vertex(&all[0], EPOCH, FIRST + 1, digests, refs)
+    };
+    assert_eq!(layer_s(&with_bitmap(1), &record, CHAIN, GENESIS), Ok(()));
+    assert!(layer_s(&with_bitmap(2), &record, CHAIN, GENESIS).is_err());
+}

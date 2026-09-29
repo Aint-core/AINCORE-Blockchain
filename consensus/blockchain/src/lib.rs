@@ -669,9 +669,16 @@ pub fn payload_root_of(items: &[String]) -> String {
 impl Vertex {
     /// Authenticates parent identities, not their availability or causal validity.
     /// The committee/quorum check remains a separate consensus rule.
+    ///
+    /// Round 1 opens the DAG: it cites only the genesis sentinel and carries no
+    /// refs, and nothing sits at round 0. A ref there has no round to be checked
+    /// against, and a round-0 parent is one some nodes hold and others never see
+    /// (the V4 rule for an epoch's first round is the same).
     pub fn verify_parent_identities(&self) -> bool {
-        if self.round <= 1 {
-            return true;
+        match self.round {
+            0 => return false,
+            1 => return self.parents == ["genesis"] && self.parent_refs.is_empty(),
+            _ => {}
         }
         self.parents.len() == self.parent_refs.len()
             && !self.parents.is_empty()

@@ -172,22 +172,24 @@ mod tests {
     /// refused, so the padding never reaches `sys:equiv_seen`.
     #[test]
     fn a_v3_equivocation_proof_carrying_an_epoch_is_refused() {
-        for padded in [true, false] {
-            let (mut consensus, path) =
-                setup_dag(if padded { "equiv_epoch" } else { "equiv_plain" });
+        // Either side of the proof may carry the epoch.
+        for padded in ["none", "a", "b"] {
+            let (mut consensus, path) = setup_dag(&format!("equiv_epoch_{padded}"));
             consensus.current_round = 1;
             let offender = consensus.node_id.clone();
             let mut a = signed_vertex(&consensus, 1, 1_000);
-            let b = signed_vertex(&consensus, 1, 2_000);
-            if padded {
-                a.epoch = u64::MAX;
+            let mut b = signed_vertex(&consensus, 1, 2_000);
+            match padded {
+                "a" => a.epoch = u64::MAX,
+                "b" => b.epoch = u64::MAX,
+                _ => {}
             }
             consensus.handle_message(&equiv_proof_msg(&offender, &a, &b));
             let seen = consensus
                 .storage
                 .get(&format!("sys:equiv_seen:{}:1", offender))
                 .unwrap();
-            assert_eq!(seen.is_some(), !padded, "padded {padded}");
+            assert_eq!(seen.is_some(), padded == "none", "padded {padded}");
             let _ = std::fs::remove_dir_all(&path);
         }
     }
@@ -1111,12 +1113,12 @@ mod tests {
         // validator carries the whole stake, so the parent gate is satisfied.
         let mut parents: Vec<blockchain::ParentRef> = Vec::new();
         for round in 1..=4 {
-            let mut vertex = Vertex::new(
-                round,
-                remote_addr.clone(),
-                parents.iter().map(|r| r.digest.clone()).collect(),
-                vec![],
-            );
+            let digests = if round == 1 {
+                vec!["genesis".to_string()]
+            } else {
+                parents.iter().map(|r| r.digest.clone()).collect()
+            };
+            let mut vertex = Vertex::new(round, remote_addr.clone(), digests, vec![]);
             vertex.parent_refs = parents.clone();
             vertex.hash = vertex.calculate_hash();
             vertex.sign_with_ed25519(&remote_sk);
@@ -3058,6 +3060,15 @@ mod tests {
         parents: &[TestParent],
     ) -> blockchain::Vertex {
         let sk = crypto::SigningKey::from_bytes(key);
+        // Round 1 cites the genesis sentinel with no refs, as the producer
+        // builds it; `&[]` or the sentinel alone asks for that shape.
+        let sentinel = [("genesis".to_string(), 0, String::new(), None)];
+        let parents: &[TestParent] =
+            if round == 1 && parents.iter().all(|(d, _, _, _)| d == "genesis") {
+                &sentinel
+            } else {
+                parents
+            };
         let mut v = blockchain::Vertex {
             epoch: 0,
             round,
@@ -3067,6 +3078,7 @@ mod tests {
             parents: parents.iter().map(|(d, _, _, _)| d.clone()).collect(),
             parent_refs: parents
                 .iter()
+                .filter(|(d, _, _, _)| d != "genesis")
                 .map(|(d, r, a, proof)| blockchain::ParentRef {
                     cert: None,
                     round: *r,
@@ -3803,5 +3815,129 @@ mod tests {
             "boot refused to advance past a round that HAS a quorum — the rule is \
              not discriminating, it is just clamping"
         );
+    }
+
+    /// The V3 opening rule, exactly: nothing at round 0, and round 1 cites the
+    /// genesis sentinel alone, with no refs, as the producer builds it.
+    #[test]
+    fn round_one_cites_the_genesis_sentinel_alone() {
+        let (addr, _, key) = tier2_keypair(70);
+        let shaped = |round: u64, parents: &[&str], refs: usize| {
+            let mut v = tier2_vertex(&key, &addr, round, 1_000, &[]);
+            v.parents = parents.iter().map(|p| p.to_string()).collect();
+            v.parent_refs = (0..refs)
+                .map(|_| blockchain::ParentRef {
+                    cert: None,
+                    round: 0,
+                    author: String::new(),
+                    digest: "genesis".to_string(),
+                    proof: None,
+                })
+                .collect();
+            v
+        };
+        let other = "a".repeat(64);
+        assert!(shaped(1, &["genesis"], 0).verify_parent_identities());
+        assert!(!shaped(1, &["genesis"], 1).verify_parent_identities());
+        assert!(!shaped(1, &[&other], 0).verify_parent_identities());
+        assert!(!shaped(1, &["genesis", &other], 0).verify_parent_identities());
+        assert!(!shaped(1, &[], 0).verify_parent_identities());
+        assert!(!shaped(0, &[], 0).verify_parent_identities());
+        assert!(!shaped(0, &["genesis"], 0).verify_parent_identities());
+    }
+
+    /// S3/S4 review C-1, through the real `add_vertex`: a Byzantine validator's
+    /// round-0 vertex Y and its round-1 vertex citing Y (with a ref declaring
+    /// round 0) are refused, as is a round-1 vertex carrying a ref, so node X
+    /// that was handed Y and node Z that was not place the same block 1.
+    #[test]
+    fn a_round0_parent_is_refused_and_two_nodes_place_one_block() {
+        const PINNED: u64 = 1_700_000_000;
+        let keys: Vec<(String, String, [u8; 32])> =
+            (1..=4u8).map(|i| tier2_keypair(i + 60)).collect();
+        let known: Vec<(String, String)> = keys
+            .iter()
+            .map(|(a, p, _)| (a.clone(), p.clone()))
+            .collect();
+        let px = get_test_db_path("r0_refused_x");
+        let pz = get_test_db_path("r0_refused_z");
+        let mut x = tier2_open(61, &px, &known);
+        let mut z = tier2_open(62, &pz, &known);
+        x.now_secs = Arc::new(|| PINNED);
+        z.now_secs = Arc::new(|| PINNED);
+        let (b_addr, _, b_key) = keys[3].clone();
+        let y = tier2_vertex(&b_key, &b_addr, 0, PINNED, &[]);
+        let b1 = tier2_vertex(
+            &b_key,
+            &b_addr,
+            1,
+            PINNED,
+            &[(y.hash.clone(), 0, b_addr.clone(), None)],
+        );
+        let mut genesis_ref = tier2_vertex(&b_key, &b_addr, 1, PINNED, &[]);
+        genesis_ref.parent_refs = vec![blockchain::ParentRef {
+            cert: None,
+            round: 0,
+            author: String::new(),
+            digest: "genesis".to_string(),
+            proof: None,
+        }];
+        genesis_ref.hash = genesis_ref.calculate_hash();
+        genesis_ref.sign_with_ed25519(&crypto::SigningKey::from_bytes(&b_key));
+        x.current_round = 1;
+        z.current_round = 1;
+        x.add_vertex(y.clone());
+        x.add_vertex(b1.clone());
+        z.add_vertex(b1.clone());
+        x.add_vertex(genesis_ref.clone());
+        for node in [&x, &z] {
+            let held = tier2_accepted(node);
+            assert!(!held.contains(&y.hash), "a round-0 vertex was admitted");
+            assert!(
+                !held.contains(&b1.hash),
+                "a round-1 vertex citing round 0 was admitted"
+            );
+            assert!(
+                !held.contains(&genesis_ref.hash),
+                "a round-1 vertex with a ref was admitted"
+            );
+        }
+        let mut round: Vec<(blockchain::Vertex, [u8; 32])> = keys[..3]
+            .iter()
+            .map(|(a, _, k)| (tier2_vertex(k, a, 1, PINNED, &[]), *k))
+            .collect();
+        for r in 1..=5u64 {
+            if r > 1 {
+                let prev: Vec<TestParent> = round.iter().map(|(v, k)| test_parent(v, k)).collect();
+                round = keys
+                    .iter()
+                    .map(|(a, _, k)| (tier2_vertex(k, a, r, PINNED, &prev), *k))
+                    .collect();
+            }
+            for node in [&mut x, &mut z] {
+                node.current_round = r;
+                for (v, _) in &round {
+                    node.add_vertex(v.clone());
+                }
+                assert!(
+                    round
+                        .iter()
+                        .all(|(v, _)| tier2_accepted(node).contains(&v.hash)),
+                    "round {r} not fully admitted"
+                );
+            }
+        }
+        let header = |n: &DagConsensus, h: u64| {
+            n.storage
+                .get(&format!("block_{h}"))
+                .unwrap()
+                .and_then(|j| serde_json::from_str::<blockchain::Block>(&j).ok())
+                .map(|b| (b.header.round, b.header.hash))
+        };
+        let (hx, hz) = (header(&x, 1), header(&z, 1));
+        let _ = std::fs::remove_dir_all(&px);
+        let _ = std::fs::remove_dir_all(&pz);
+        assert!(hx.is_some(), "vacuous: X placed no block");
+        assert_eq!(hx, hz, "X and Z placed different blocks at height 1");
     }
 }
