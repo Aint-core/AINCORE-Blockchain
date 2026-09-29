@@ -93,6 +93,12 @@ const COMMITTED_SEQ_WINDOW: usize = 8192;
 /// Per-round committed-hash key prefix (append-only; pruned with the round window).
 const COMMITTED_SEQ_KEY_PREFIX: &str = "consensus:cseq:";
 
+/// DE-6: `consensus:anchor_decision:{E:020}:{r:020}` holds `C:{digest}` or
+/// `S`, written once in the acceptance transaction.
+pub fn anchor_decision_key(epoch: u64, round: u64) -> String {
+    format!("consensus:anchor_decision:{epoch:020}:{round:020}")
+}
+
 #[derive(Debug, Clone)]
 pub struct CommitInfo {
     pub sequence: Vec<String>,
@@ -354,12 +360,12 @@ impl OrderingEngine {
         }
     }
 
-    /// Get random bytes from beacon for leader selection
     /// The rolling finality digest of everything committed so far.
     pub(crate) fn current_finality_digest(&self) -> &str {
         &self.finality_digest
     }
 
+    /// Get random bytes from beacon for leader selection
     pub fn get_random_beacon(&self) -> &[u8] {
         &self.last_vdf_output
     }
@@ -927,6 +933,28 @@ impl OrderingEngine {
         let rounds_json = serde_json::to_string(&rounds).map_err(|err| err.to_string())?;
         let sequence_json = serde_json::to_string(&info.sequence).map_err(|err| err.to_string())?;
         let mut batch = storage::rocksdb::WriteBatch::default();
+        // DE-6: a write-once decision for every anchor round this plan
+        // settles. One anchor is emitted per call, the lowest decided, so every
+        // anchor round from the cursor up to it was skipped. A row that
+        // already says otherwise refuses the whole acceptance.
+        let first = Self::align_anchor(plan.previous_next_anchor_round.max(1)).max(2);
+        for r in (first..=info.anchor_round).step_by(2) {
+            let key = anchor_decision_key(0, r);
+            let decision = if r == info.anchor_round {
+                format!("C:{}", info.anchor_hash)
+            } else {
+                "S".to_string()
+            };
+            match storage.get(&key).map_err(|err| err.to_string())? {
+                Some(held) if held != decision => {
+                    return Err(format!(
+                        "anchor round {r} was decided {held}, not {decision}"
+                    ))
+                }
+                Some(_) => {}
+                None => batch.put(key.as_bytes(), decision.as_bytes()),
+            }
+        }
         batch.put(b"consensus:committed_rounds", rounds_json.as_bytes());
         if !info.sequence.is_empty() {
             batch.put(

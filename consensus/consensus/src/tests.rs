@@ -7,6 +7,9 @@ mod tests {
     mod equivocation_liveness_tests {
         include!("equivocation_liveness_tests.rs");
     }
+    mod v4_node_tests {
+        include!("v4_node_tests.rs");
+    }
     // use super::*; // Unused
     use crate::dag::DagConsensus;
     use executor::Executor;

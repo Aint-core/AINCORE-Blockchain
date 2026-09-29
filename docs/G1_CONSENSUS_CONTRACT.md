@@ -631,10 +631,8 @@ down-closure, and ST-2 eviction through the engine. The contract's S5 kill list 
 red (OR-1 without a certificate, DE over staged bodies, producer over staged bodies, PR-3
 removed), with 10 more mutants, 14 of 14 killed. Deliberate gaps, each owned by a later
 part or stage:
-- **S5e (part 2):** wiring into `DagConsensus` behind the V4 flag and re-pointing every
-  reader; DE-6's `anchor_decision` rows and `gc_floor`, which belong to the block-acceptance
-  transaction; EQ-1 twin evidence; `v4_leader_uses_frozen_committee` against a mutated live
-  set (the engine has no live set to read).
+- EQ-1 twin evidence (the V3 equivocation path does not run on a V4 chain; V4 proposer
+  twins are staged and never orderable, but not yet carried as slashing evidence: G5).
 - **S6:** pull (fetch, CERT_REQ, ATTEST_REQ). Push retries are a rebroadcast every tick.
 - **S7:** g > 0. OR-1 has no settled-by-floor arm (review C-1), and H9 applies to the engine
   too: `committed_set` is rebuilt from a window at boot.
@@ -642,6 +640,43 @@ part or stage:
   unsynced), because the rebroadcast makes attesters answer `Reused`.
 - RC-3's origin is written only when the engine opens with `genesis_init`; the look-back and
   listen rules of `docs/research/validator_signing_safety.md` are S9.
+
+**S5 status, part 2: the engine in the node.** A chain whose genesis pins
+`genesis:vertex_format` = 4 runs `DagConsensus` through the engine (`open_shared`): `dag`
+holds the staged bodies and `round_index` O_E (OR-1 its only writer), the V3 recovery,
+`add_vertex`, pruning and checkpoints are off, and `DAG_V4:{json}` messages go through
+`handle_message` (routed in `main.rs`). The V3 commit loop is extracted as
+`commit_ready_anchors` and runs unchanged over O_E with C_0 (`decision_committee`, DE-7):
+block building, execution, the acceptance transaction and QC work are the same code. The
+producer gathers its payload (mempool, evidence, byte budget, now `gather_payload`, shared
+with V3) only when PR-2/PR-3 open a slot, and returns it if the proposal fails. DE-6 is in
+the acceptance transaction (`stage_prepared_anchor`, V3 and V4 alike): write-once
+`anchor_decision` rows, `C:{digest}` for the emitted anchor and `S` for every anchor round it
+skips; a conflicting row refuses the acceptance, so ordering stops. RC-3's origin is written
+only with `AINCORE_GUARD_ORIGIN_INIT=1` on the first start. Node-level witnesses (four real
+nodes, real execution): identical blocks, one per even anchor round; a transaction through a
+V4 vertex into the same block everywhere; every node restarting mid-run; a 70-tick run
+restarted past the V3 prune point; a node that never mixes formats; `v4_leader_uses_frozen_committee`
+(the live set changed on one node mid-run).
+
+The review of part 1 found no CRITICAL; all of it is fixed with regressions:
+- HIGH-1: embedded parent certificates were verified but never ingested, so one lost
+  `DAG_CERT` stalled every node that did not receive it. Every verified embedded certificate
+  of a staging (or already staged) vertex now goes through CE-3, conflict check included.
+- HIGH-2: the standalone engine persists a decision before anything is built from it. It is
+  now test-only; the node decides through `prepare_commit` → acceptance transaction →
+  publish, as V3 does.
+- MEDIUM-1: the CE-3 halt is reloaded at boot from `alarm:vcert_conflict`.
+- MEDIUM-2: E4 results are cached (`v4_verdict_cached`: a ref already in the certificate index
+  is not verified again) and a new certificate wakes only the pending vertices waiting on its
+  slot.
+- LOW: no signature for a digest its slot is certified against; a copy of a staged body
+  skips the verdict and the transaction (certificates harvested, the attestation re-sent from
+  its guard); boot re-promotes a certified body's role; test gaps (RC-3 and halted nodes
+  attest nothing, a collector survives a restart, a lost proposal is rebroadcast) closed.
+
+Mutation, part 2 and the fixes: 21 mutants, 19 killed. The two survivors are the cache and
+the duplicate fast path (M2, L2), which change cost, not outcomes.
 
 ### Imported decisions and finality votes (IM)
 

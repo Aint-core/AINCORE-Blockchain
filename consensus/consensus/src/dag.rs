@@ -127,6 +127,10 @@ pub struct DagConsensus {
     /// The pause between anchor-placement attempts. Separate from `now_secs`
     /// because a simulation wants to skip the wait, not fake the clock.
     pub placement_sleep: Arc<dyn Fn(std::time::Duration) + Send + Sync>,
+    /// G1 S5: the certified-DAG engine, when this chain's vertex format is V4
+    /// (`genesis:vertex_format` = 4). It then owns ingress, staging, O_E and
+    /// production; `dag` holds its staged bodies and `round_index` O_E.
+    pub(crate) v4: Option<crate::v4::Engine>,
     #[cfg(test)]
     pub(crate) local_acceptance_hook: Option<LocalAcceptanceHook>,
     /// Tests only: runs inside the block transaction BEFORE execution, the
@@ -136,6 +140,67 @@ pub struct DagConsensus {
     /// Tests only: runs as a vertex is broadcast, before it leaves the process.
     #[cfg(test)]
     pub(crate) broadcast_hook: Option<BroadcastHook>,
+    /// Tests only: V4 wire messages this node sent, instead of the network.
+    #[cfg(test)]
+    pub(crate) v4_outbox: Option<V4Outbox>,
+}
+
+#[cfg(test)]
+pub(crate) type V4Outbox = Arc<Mutex<Vec<String>>>;
+
+/// The production `ConsensusNet`: V4 messages go out as `DAG_V4:{json}` over
+/// gossip and the TCP fan-out, like `DAG_VERTEX`. An attestation, addressed to
+/// its author, travels the same way; every other node ignores it.
+struct V4Net {
+    node_id: String,
+    p2p_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    peers: PeerList,
+    storage: Arc<StateDB>,
+    #[cfg(test)]
+    outbox: Option<V4Outbox>,
+}
+
+impl crate::v4::ConsensusNet for V4Net {
+    fn broadcast(&self, msg: crate::v4::Msg) {
+        let Ok(json) = serde_json::to_string(&msg) else {
+            return;
+        };
+        let wire = format!("{}{json}", crate::v4::WIRE_PREFIX);
+        #[cfg(test)]
+        if let Some(outbox) = &self.outbox {
+            outbox.lock().unwrap_or_else(|e| e.into_inner()).push(wire);
+            return;
+        }
+        if let Some(tx) = &self.p2p_tx {
+            let (tx, wire) = (tx.clone(), wire.clone());
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        let _ = tx.send(wire).await;
+                    });
+                }
+                Err(_) => {
+                    let _ = tx.try_send(wire);
+                }
+            }
+        }
+        if let Ok(peers) = self.peers.lock() {
+            for (peer_id, port) in peers.iter() {
+                if *peer_id == self.node_id {
+                    continue;
+                }
+                let ip = self
+                    .storage
+                    .get_peer_ip(peer_id)
+                    .unwrap_or_else(|| "127.0.0.1".to_string());
+                let _ = network::send_message(&format!("{ip}:{port}"), &wire);
+            }
+        }
+    }
+
+    fn send(&self, _to: &str, msg: crate::v4::Msg) {
+        self.broadcast(msg);
+    }
 }
 
 impl DagConsensus {
@@ -154,8 +219,15 @@ impl DagConsensus {
         let mut round_idx_map: HashMap<u64, Vec<String>> = HashMap::new();
         let mut max_round = 0;
 
+        // G1 S5: a V4 chain boots through the certified-DAG engine (RC-1), never
+        // through the V3 recovery below, which would read V4 bodies as V3.
+        let v4_format = crate::v4::is_v4_chain(&storage);
         // OPTIMIZED RECOVERY: Use checkpoint instead of full scan (Aptos/Sui style)
-        let checkpoint_round = storage.get_latest_checkpoint_round();
+        let checkpoint_round = if v4_format {
+            0
+        } else {
+            storage.get_latest_checkpoint_round()
+        };
         // An unusable checkpoint cannot justify skipping retained disk rows.
         let mut recovered_checkpoint_round = 0;
 
@@ -373,7 +445,7 @@ impl DagConsensus {
                     replayed_tail, recovered_checkpoint_round, tail_rejected
                 );
             }
-        } else {
+        } else if !v4_format {
             // Fallback: Scan for legacy data (only on first run or migration)
             let vertices_json = storage.scan_vertices();
             let mut legacy_rejected = 0usize;
@@ -512,7 +584,7 @@ impl DagConsensus {
 
         let storage_for_ordering = Arc::clone(&storage);
 
-        Self {
+        let mut this = Self {
             node_id,
             peers,
             current_round: final_start_round,
@@ -551,12 +623,130 @@ impl DagConsensus {
                     .unwrap_or(0)
             }),
             placement_sleep: Arc::new(std::thread::sleep),
+            v4: None,
             #[cfg(test)]
             local_acceptance_hook: None,
             #[cfg(test)]
             pre_execution_hook: None,
             #[cfg(test)]
             broadcast_hook: None,
+            #[cfg(test)]
+            v4_outbox: None,
+        };
+        if v4_format {
+            this.start_v4();
+        }
+        this
+    }
+
+    /// Boot the certified-DAG engine on a V4 chain (RC-1). A V4 chain without
+    /// its genesis committee or identity cannot run, and must never fall back
+    /// to V3: boot stops.
+    fn start_v4(&mut self) {
+        let committee = crate::qc_producer::load_validator_set_for_epoch(&self.storage, 0)
+            .expect("a V4 chain needs its genesis committee (genesis:validator_set:v1)");
+        let genesis_identity = self
+            .storage
+            .get("genesis_identity")
+            .ok()
+            .flatten()
+            .expect("a V4 chain needs its genesis identity");
+        let cfg = crate::v4::Config {
+            chain_id: self.resolve_chain_id(),
+            genesis_identity,
+            committee,
+            node_key: self.node_key,
+            address: self.node_id.clone(),
+            b_auth: crate::staging::B_AUTH,
+        };
+        let shared = crate::v4::Shared {
+            dag: Arc::clone(&self.dag),
+            round_index: Arc::clone(&self.round_index),
+            ordering: Arc::clone(&self.ordering_engine),
+        };
+        // RC-3: the guard origin is written only on an explicit first start.
+        let genesis_init = std::env::var("AINCORE_GUARD_ORIGIN_INIT").ok().as_deref() == Some("1");
+        let engine = crate::v4::Engine::open_shared(
+            Arc::clone(&self.storage),
+            cfg,
+            shared,
+            genesis_init,
+            Arc::clone(&self.now_secs),
+        )
+        .unwrap_or_else(|e| panic!("the V4 engine did not boot: {e}"));
+        self.current_round = engine.current_round();
+        self.v4 = Some(engine);
+    }
+
+    /// Replace the wall clock, the V4 engine's included.
+    pub fn set_now_secs(&mut self, now_secs: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        if let Some(engine) = self.v4.as_mut() {
+            engine.set_now_secs(Arc::clone(&now_secs));
+        }
+        self.now_secs = now_secs;
+    }
+
+    fn v4_net(&self) -> V4Net {
+        V4Net {
+            node_id: self.node_id.clone(),
+            p2p_tx: self.p2p_tx.clone(),
+            peers: self.peers.clone(),
+            storage: Arc::clone(&self.storage),
+            #[cfg(test)]
+            outbox: self.v4_outbox.clone(),
+        }
+    }
+
+    /// One V4 message through the engine, then the commit loop if O_E grew.
+    fn on_v4_message(&mut self, raw_len: usize, msg: crate::v4::Msg) {
+        let Some(mut engine) = self.v4.take() else {
+            return;
+        };
+        let net = self.v4_net();
+        engine.on_message(raw_len, msg, &net);
+        let progressed = engine.take_progress();
+        self.current_round = self.current_round.max(engine.current_round());
+        self.v4 = Some(engine);
+        if progressed {
+            self.commit_ready_anchors(0);
+        }
+    }
+
+    /// The V4 tick: PR-1..PR-4 through the engine, with this node's payload
+    /// gathered only when a proposal is due, then the commit loop if O_E grew.
+    fn v4_tick(&mut self) {
+        self.retry_qc_work();
+        let Some(mut engine) = self.v4.take() else {
+            return;
+        };
+        let net = self.v4_net();
+        if let Some(slot) = engine.tick(&net) {
+            let payload = if slot.carry_payload {
+                let overhead = engine
+                    .proposal_overhead(slot.round)
+                    .saturating_add(crate::v4::WIRE_PREFIX.len());
+                self.gather_payload(slot.round, overhead)
+            } else {
+                Vec::new()
+            };
+            if engine.propose(slot.round, payload.clone(), &net) {
+                self.current_round = self.current_round.max(slot.round);
+            } else {
+                let txs: Vec<String> = payload
+                    .into_iter()
+                    .filter(|p| !p.starts_with(SLASH_EVIDENCE_PREFIX))
+                    .collect();
+                if !txs.is_empty() {
+                    if let Ok(mut mp) = self.mempool.lock() {
+                        mp.return_unshipped(&txs);
+                    }
+                }
+            }
+        }
+        let progressed = engine.take_progress();
+        self.v4 = Some(engine);
+        if progressed {
+            self.commit_ready_anchors(0);
         }
     }
 
@@ -713,6 +903,10 @@ impl DagConsensus {
     }
 
     pub fn try_create_vertex(&mut self) {
+        if self.v4.is_some() {
+            self.v4_tick();
+            return;
+        }
         self.retry_qc_work();
         // 1. Check if we have enough parents from previous round
         let prev_round = self.current_round - 1;
@@ -833,51 +1027,9 @@ impl DagConsensus {
         // Standard logic for Genesis or Connected Nodes
         if parent_quorum_met {
             // 2. Create Payload (Fetch from Mempool)
-            let mut payload = Vec::new();
-            if let Ok(mut mp) = self.mempool.lock() {
-                // Orphan-loss fix: before pulling, reclaim loaned transactions
-                // that never executed (orphaned vertex payloads and
-                // nonce-deferred txs). 30s ≈ well past commit latency, well
-                // short of user-visible loss.
-                let _ = mp.requeue_stale(std::time::Duration::from_secs(30));
-                // Throughput tuning: pull size per vertex. Narwhal is designed for
-                // large batches; 50 was a conservative bring-up cap and became the
-                // de-facto per-round throughput ceiling. Env-tunable so the burn-in
-                // and benchmark runs measure the config that will actually ship.
-                let pull = std::env::var("AINCORE_MEMPOOL_PULL")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .filter(|v| (1..=10_000).contains(v))
-                    .unwrap_or(500);
-                payload = mp.get_pending_transactions(pull);
-                if !payload.is_empty() {
-                    println!("🚀 DAG PULLED {} TXS FROM MEMPOOL", payload.len());
-                }
-            }
-
-            // PROTOCOL: carry queued equivocation evidence in this vertex so it
-            // is ordered by consensus and extracted identically on every node.
-            let carried = self.drain_evidence_for_vertex(self.current_round);
-            if !carried.is_empty() {
-                println!(
-                    "⚖️  DAG carrying {} slash evidence item(s) in this vertex",
-                    carried.len()
-                );
-                let mut with_evidence = carried;
-                with_evidence.extend(payload);
-                payload = with_evidence;
-            }
-            // BYTE BUDGET: never build a vertex the transport cannot deliver.
-            // Measure what is actually shipped -- the serialized JSON of the
-            // whole DAG_VERTEX message -- not an estimate: JSON escaping and the
-            // fixed fields made an estimate under-count, so a "trimmed" vertex
-            // was still rejected on the wire. Drop from the END (txs first,
-            // evidence last) until it fits.
-            {
-                // Fixed overhead measured ONCE with an empty payload, then a
-                // running total of each item's escaped contribution. The first
-                // cut re-serialised the whole remaining payload on every pop,
-                // which is quadratic in payload bytes under the consensus lock.
+            // BYTE BUDGET: the payload-free wire size of this vertex, measured
+            // once; the payload is trimmed to fit (see gather_payload).
+            let overhead = {
                 let empty_probe = Vertex {
                     epoch: 0,
                     round: self.current_round,
@@ -892,43 +1044,12 @@ impl DagConsensus {
                     parents_root: None,
                     parent_refs: Vec::new(),
                 };
-                let overhead = serde_json::to_string(&empty_probe)
+                serde_json::to_string(&empty_probe)
                     .map(|s| s.len())
                     .unwrap_or(usize::MAX)
-                    + "DAG_VERTEX:".len();
-                let item_cost = |it: &String| -> usize {
-                    // escaped JSON string + the separating comma
-                    serde_json::to_string(it).map(|s| s.len()).unwrap_or(usize::MAX) + 1
-                };
-                let mut total: usize = overhead.saturating_add(
-                    payload.iter().map(item_cost).sum::<usize>(),
-                );
-                let mut trimmed_txs: Vec<String> = Vec::new();
-                while total > MAX_VERTEX_BYTES && !payload.is_empty() {
-                    if let Some(d) = payload.pop() {
-                        total = total.saturating_sub(item_cost(&d));
-                        if d.starts_with(SLASH_EVIDENCE_PREFIX) {
-                            eprintln!("⚠️  evidence item deferred: vertex byte budget");
-                        } else {
-                            // A trimmed tx was LOANED by the mempool
-                            // (get_pending_transactions moved it to inflight).
-                            // Dropping it here would strand it until
-                            // requeue_stale, and after MAX_REQUEUE_ATTEMPTS a
-                            // valid accepted transaction is deleted outright.
-                            trimmed_txs.push(d);
-                        }
-                    }
-                }
-                if !trimmed_txs.is_empty() {
-                    if let Ok(mut mp) = self.mempool.lock() {
-                        mp.return_unshipped(&trimmed_txs);
-                    }
-                    println!(
-                        "↩️  returned {} tx(s) to the mempool: vertex byte budget",
-                        trimmed_txs.len()
-                    );
-                }
-            }
+                    + "DAG_VERTEX:".len()
+            };
+            let payload = self.gather_payload(self.current_round, overhead);
 
             // 3. Create Vertex
             let mut vertex = Vertex {
@@ -1168,6 +1289,11 @@ impl DagConsensus {
     const MAX_ROUND_JUMP: u64 = 10_000;
 
     pub fn add_vertex(&mut self, vertex: Vertex) {
+        // One DAG format per chain: a V4 chain takes vertices only through the
+        // certified-DAG engine.
+        if self.v4.is_some() {
+            return;
+        }
         // G1 V4 fields have no place in a V3 vertex. Its hash binds neither the
         // epoch nor a parent certificate, so a relay could pad them onto an
         // honest vertex and have every node store and serve the padding.
@@ -1516,6 +1642,21 @@ impl DagConsensus {
             return;
         }
 
+        self.commit_ready_anchors(vertex.round);
+    }
+
+    /// The committee a decision reads: the live set on the V3 path; on V4 the
+    /// frozen C_0 (DE-7), for the leader, the votes, the reward and BFT time.
+    fn decision_committee(&self) -> Vec<(String, u64)> {
+        match &self.v4 {
+            Some(engine) => engine.stakes().to_vec(),
+            None => self.get_validator_set_with_stake(),
+        }
+    }
+
+    /// Decide and place every anchor that is ready: one anchor per decision,
+    /// its block executed and accepted before the next is decided.
+    fn commit_ready_anchors(&mut self, trigger_round: u64) {
         // --- ORDERING LOGIC (Bullshark-lite) ---
         // Now we can take new locks without holding the previous ones.
 
@@ -1545,9 +1686,9 @@ impl DagConsensus {
             // Re-sampled on EVERY iteration: the previous anchor's block may have
             // just changed it.
             self.invalidate_validators_cache();
-            let validators = self.get_validator_set_with_stake();
+            let validators = self.decision_committee();
 
-            let Some(plan) = engine.prepare_commit(vertex.round, &dag, &round_idx, &validators) else {
+            let Some(plan) = engine.prepare_commit(trigger_round, &dag, &round_idx, &validators) else {
                 break;
             };
             plan
@@ -1672,7 +1813,7 @@ impl DagConsensus {
                     .collect()
             };
             let stakes_now: std::collections::HashMap<String, u64> =
-                self.get_validator_set_with_stake().into_iter().collect();
+                self.decision_committee().into_iter().collect();
             let block_timestamp =
                 blockchain::bft_block_timestamp(weigh(&ts_raw, &stakes_now), parent_ts);
 
@@ -1944,7 +2085,9 @@ impl DagConsensus {
             // We can't look up round without DAG lock.
             // Let's Skip intricate pruning update for this hotfix.
             // Or re-acquire lock.
-            if !commit.sequence.is_empty() {
+            // V4 has no V3 pruning or checkpoints: its GC is S7 (GC-1..GC-5)
+            // and its boot never reads a checkpoint (RC-1).
+            if !commit.sequence.is_empty() && self.v4.is_none() {
                 // H-5 FIX: Prune only FINALIZED rounds (check ordering engine)
                 // M3 FIX: Derive the prune watermark from the MONOTONIC finality
                 // high-water mark, not committed_rounds.iter().min(). The old
@@ -2023,6 +2166,94 @@ impl DagConsensus {
             }
         }
 
+    }
+
+    /// A vertex payload for `round`: queued equivocation evidence first, then
+    /// mempool transactions, trimmed from the end until a vertex whose
+    /// payload-free wire size is `overhead` fits `MAX_VERTEX_BYTES`. Trimmed
+    /// transactions go back to the mempool.
+    fn gather_payload(&mut self, round: u64, overhead: usize) -> Vec<String> {
+        let mut payload = Vec::new();
+        if let Ok(mut mp) = self.mempool.lock() {
+            // Orphan-loss fix: before pulling, reclaim loaned transactions
+            // that never executed (orphaned vertex payloads and
+            // nonce-deferred txs). 30s ≈ well past commit latency, well
+            // short of user-visible loss.
+            let _ = mp.requeue_stale(std::time::Duration::from_secs(30));
+            // Throughput tuning: pull size per vertex. Narwhal is designed for
+            // large batches; 50 was a conservative bring-up cap and became the
+            // de-facto per-round throughput ceiling. Env-tunable so the burn-in
+            // and benchmark runs measure the config that will actually ship.
+            let pull = std::env::var("AINCORE_MEMPOOL_PULL")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| (1..=10_000).contains(v))
+                .unwrap_or(500);
+            payload = mp.get_pending_transactions(pull);
+            if !payload.is_empty() {
+                println!("🚀 DAG PULLED {} TXS FROM MEMPOOL", payload.len());
+            }
+        }
+
+        // PROTOCOL: carry queued equivocation evidence in this vertex so it
+        // is ordered by consensus and extracted identically on every node.
+        let carried = self.drain_evidence_for_vertex(round);
+        if !carried.is_empty() {
+            println!(
+                "⚖️  DAG carrying {} slash evidence item(s) in this vertex",
+                carried.len()
+            );
+            let mut with_evidence = carried;
+            with_evidence.extend(payload);
+            payload = with_evidence;
+        }
+        // BYTE BUDGET: never build a vertex the transport cannot deliver.
+        // Measure what is actually shipped -- the serialized JSON of the
+        // whole DAG_VERTEX message -- not an estimate: JSON escaping and the
+        // fixed fields made an estimate under-count, so a "trimmed" vertex
+        // was still rejected on the wire. Drop from the END (txs first,
+        // evidence last) until it fits.
+        {
+            // Fixed overhead measured ONCE with an empty payload, then a
+            // running total of each item's escaped contribution. The first
+            // cut re-serialised the whole remaining payload on every pop,
+            // which is quadratic in payload bytes under the consensus lock.
+            let item_cost = |it: &String| -> usize {
+                // escaped JSON string + the separating comma
+                serde_json::to_string(it)
+                    .map(|s| s.len())
+                    .unwrap_or(usize::MAX)
+                    + 1
+            };
+            let mut total: usize =
+                overhead.saturating_add(payload.iter().map(item_cost).sum::<usize>());
+            let mut trimmed_txs: Vec<String> = Vec::new();
+            while total > MAX_VERTEX_BYTES && !payload.is_empty() {
+                if let Some(d) = payload.pop() {
+                    total = total.saturating_sub(item_cost(&d));
+                    if d.starts_with(SLASH_EVIDENCE_PREFIX) {
+                        eprintln!("⚠️  evidence item deferred: vertex byte budget");
+                    } else {
+                        // A trimmed tx was LOANED by the mempool
+                        // (get_pending_transactions moved it to inflight).
+                        // Dropping it here would strand it until
+                        // requeue_stale, and after MAX_REQUEUE_ATTEMPTS a
+                        // valid accepted transaction is deleted outright.
+                        trimmed_txs.push(d);
+                    }
+                }
+            }
+            if !trimmed_txs.is_empty() {
+                if let Ok(mut mp) = self.mempool.lock() {
+                    mp.return_unshipped(&trimmed_txs);
+                }
+                println!(
+                    "↩️  returned {} tx(s) to the mempool: vertex byte budget",
+                    trimmed_txs.len()
+                );
+            }
+        }
+        payload
     }
 
     fn retry_qc_work(&mut self) {
@@ -2740,6 +2971,22 @@ impl DagConsensus {
     }
 
     pub fn handle_message(&mut self, msg: &str) {
+        if let Some(content) = msg.strip_prefix(crate::v4::WIRE_PREFIX) {
+            // S1 before parsing. The JSON of a `Msg::Vertex` wraps the vertex
+            // in `{"Vertex":…}`; the vertex's own length is what S1 bounds.
+            const WRAP: usize = r#"{"Vertex":}"#.len();
+            if self.v4.is_none() || content.len() > MAX_VERTEX_BYTES + WRAP {
+                return;
+            }
+            if let Ok(m) = serde_json::from_str::<crate::v4::Msg>(content) {
+                let raw_len = match &m {
+                    crate::v4::Msg::Vertex(_) => content.len().saturating_sub(WRAP),
+                    _ => content.len(),
+                };
+                self.on_v4_message(raw_len, m);
+            }
+            return;
+        }
         if let Some(content) = msg.strip_prefix("DAG_VERTEX:") {
             // Byte budget BEFORE parsing: an oversize vertex could never have
             // been delivered by an honest transport anyway, and parsing it is

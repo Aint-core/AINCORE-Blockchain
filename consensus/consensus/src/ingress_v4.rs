@@ -196,6 +196,19 @@ pub fn v4_verdict(
     ctx: &Context<'_>,
     local_cert: impl Fn(&ParentRef) -> Option<CompactCert>,
 ) -> Verdict {
+    v4_verdict_cached(raw_len, v, ctx, local_cert, |_| false)
+}
+
+/// `v4_verdict` with E4's cache (IN-1: "results are cached"): `verified(r)`
+/// says this node already holds a verified certificate for exactly `r`'s
+/// (round, author, digest), so no signature is checked again for it.
+pub fn v4_verdict_cached(
+    raw_len: usize,
+    v: &Vertex,
+    ctx: &Context<'_>,
+    local_cert: impl Fn(&ParentRef) -> Option<CompactCert>,
+    verified: impl Fn(&ParentRef) -> bool,
+) -> Verdict {
     let active = &ctx.active;
     // Layer S, the parts that need no epoch record.
     if raw_len > MAX_VERTEX_BYTES {
@@ -285,7 +298,8 @@ pub fn v4_verdict(
             // An embedded certificate is a transport field any relay can
             // corrupt: a bad one falls back to the local copy, and neither
             // being good only makes the vertex wait.
-            !(r.cert.as_ref().is_some_and(|c| certified(r, c))
+            !(verified(r)
+                || r.cert.as_ref().is_some_and(|c| certified(r, c))
                 || local_cert(r).is_some_and(|c| certified(r, &c)))
         })
         .map(|(i, _)| i)

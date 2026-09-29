@@ -147,6 +147,7 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         "sys:validators"
         | "sys:validator_set:v1"
         | "genesis:validator_set:v1"
+        | "genesis:vertex_format"
         | "consensus:epoch"
         | "sys:last_epoch_boundary"
         | "sys:chain_id"
@@ -345,6 +346,7 @@ pub const STATE_EXACT: &[&str] = &[
     "sys:validators",
     "sys:validator_set:v1",
     "genesis:validator_set:v1",
+    "genesis:vertex_format",
     "consensus:epoch",
     "sys:last_epoch_boundary",
     "sys:chain_id",

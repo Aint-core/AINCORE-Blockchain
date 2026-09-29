@@ -926,6 +926,7 @@ async fn main() {
                         }
                     }
                 } else if msg.starts_with("DAG_VERTEX:")
+                    || msg.starts_with("DAG_V4:")
                     || msg.starts_with("DOWNTIME_ATTEST:")
                     || msg.starts_with("EQUIV_PROOF:")
                     || msg.starts_with("QC_VOTE:")
@@ -974,6 +975,7 @@ async fn main() {
                         }
                         None
                     } else if msg.starts_with("DAG_VERTEX:")
+                        || msg.starts_with("DAG_V4:")
                         || msg.starts_with("DOWNTIME_ATTEST:")
                         || msg.starts_with("EQUIV_PROOF:")
                         || msg.starts_with("QC_VOTE:")

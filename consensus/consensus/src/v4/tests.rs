@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::qc::derive_validator_bls_seed;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -505,8 +505,22 @@ fn v4_cert_conflict_halts_ordering() {
             msg: Msg::Cert(cert),
         });
     }
-    c.deliver(&|_, _| false);
-    c.run(6);
+    // The certificates arrive first: from then on a halted node signs
+    // nothing, not even the round-2 vertices still in flight.
+    let byz_addr = c.members[byz].info.address.clone();
+    let attested = Cell::new(0);
+    let count = |e: &Envelope, _: usize| {
+        if e.from != byz_addr && matches!(e.msg, Msg::Attest(_)) {
+            attested.set(attested.get() + 1);
+        }
+        false
+    };
+    c.deliver(&count);
+    for _ in 0..6 {
+        c.tick_all();
+        c.deliver(&count);
+    }
+    assert_eq!(attested.get(), 0, "a halted node attested");
     for i in c.validators().filter(|&i| i != byz) {
         assert!(c.engine(i).halted().is_some(), "node {i} did not halt");
         let alarm = format!("alarm:vcert_conflict:{EPOCH:020}:{:020}:{}", 2, a.author);
@@ -650,11 +664,20 @@ fn a_node_without_guard_origin_abstains_from_signing() {
         .delete("consensus:guard_origin")
         .unwrap();
     c.reopen(i);
-    let before = c.engine(i).own_proposal(3).is_some();
-    c.run(6);
-    assert!(!before);
+    let me = c.members[i].info.address.clone();
+    let signed = Cell::new(0);
+    for _ in 0..6 {
+        c.tick_all();
+        c.deliver(&|e, _| {
+            if e.from == me && matches!(e.msg, Msg::Attest(_)) {
+                signed.set(signed.get() + 1);
+            }
+            false
+        });
+    }
+    assert_eq!(signed.get(), 0, "an abstaining node attested");
     assert!(
-        c.engine(i).own_proposal(4).is_none(),
+        c.engine(i).own_proposal(3).is_none() && c.engine(i).own_proposal(4).is_none(),
         "an abstaining node proposed"
     );
     c.assert_agree();
@@ -853,4 +876,259 @@ fn a_certified_third_twin_evicts_the_plain_one_on_a_node_that_attested_another()
     c.run(6);
     c.assert_agree_except(Some(byz));
     assert_eq!(c.anchor(h0, 2).map(|d| &d.1), Some(&cc.hash));
+}
+
+/// Review of S5 part 1, HIGH-1: an author's `DAG_CERT` for round 1 reaches
+/// only h1. The others see that certificate embedded in h1's round-2 vertex;
+/// they ingest it from there (CE-3) and keep ordering and deciding.
+#[test]
+fn a_lost_dag_cert_is_recovered_from_the_children_that_embed_it() {
+    let mut c = Cluster::new("harvest", 4, 0);
+    let (byz, h1) = (0usize, 1usize);
+    let byz_addr = c.members[byz].info.address.clone();
+    let withhold = move |e: &Envelope, to: usize| {
+        e.from == byz_addr && to != h1 && matches!(&e.msg, Msg::Cert(x) if x.body.round == 1)
+    };
+    for _ in 0..20 {
+        c.tick_all();
+        c.deliver(&withhold);
+        c.held.clear(); // never delivered
+    }
+    let b1 = c.engine(byz).own_proposal(1).unwrap().hash.clone();
+    for v in [2usize, 3] {
+        assert_eq!(
+            c.engine(v).certified(1, c.engine(byz).address()),
+            Some(b1.as_str()),
+            "node {v} ingested the embedded certificate"
+        );
+        assert!(c.engine(v).is_orderable(&b1));
+        assert!(
+            c.decisions[v].iter().any(|d| d.0 >= 14),
+            "node {v} kept deciding"
+        );
+    }
+    c.assert_agree();
+}
+
+/// Review of S5 part 1, MEDIUM-1: CE-3's halt is persisted. After a restart
+/// the node is still halted: it orders nothing and signs nothing.
+#[test]
+fn the_cert_conflict_halt_survives_a_restart() {
+    let mut c = Cluster::new("halt-restart", 4, 0);
+    c.run(1);
+    let byz = c.leader(2);
+    let byz2 = c.validators().find(|&i| i != byz).unwrap();
+    let honest: Vec<usize> = c.validators().filter(|&i| i != byz && i != byz2).collect();
+    c.tick_all();
+    let a = c.engine(byz).own_proposal(2).unwrap().clone();
+    let b = twin_of(&a, &c.members[byz].node_key, "twin-b");
+    let cert_a = forged_cert(&c, 2, &a.author, &a.hash, &[byz, byz2, honest[0]]);
+    let cert_b = forged_cert(&c, 2, &a.author, &b.hash, &[byz, byz2, honest[1]]);
+    for cert in [cert_a, cert_b] {
+        c.q.borrow_mut().push_front(Envelope {
+            from: c.members[byz].info.address.clone(),
+            to: To::All,
+            msg: Msg::Cert(cert),
+        });
+    }
+    c.q.borrow_mut().push_back(Envelope {
+        from: c.members[byz].info.address.clone(),
+        to: To::All,
+        msg: Msg::Vertex(b.clone()),
+    });
+    c.deliver(&|_, _| false);
+    for &h in &honest {
+        assert!(c.engine(h).halted().is_some());
+        c.reopen(h);
+        assert!(
+            c.engine(h).halted().is_some(),
+            "node {h}: the halt was forgotten"
+        );
+    }
+    let gone = c.members[byz].info.address.clone();
+    let signed = Cell::new(0);
+    let honest_addrs: Vec<String> = honest
+        .iter()
+        .map(|&h| c.members[h].info.address.clone())
+        .collect();
+    for _ in 0..10 {
+        c.tick_all();
+        c.deliver(&|e, _| {
+            if honest_addrs.contains(&e.from) && matches!(e.msg, Msg::Attest(_)) {
+                signed.set(signed.get() + 1);
+            }
+            e.from == gone
+        });
+        c.held.clear();
+    }
+    assert_eq!(signed.get(), 0, "a halted node attested");
+    for &h in &honest {
+        assert!(
+            c.anchor(h, 2).is_none(),
+            "node {h} ordered past the conflict"
+        );
+    }
+}
+
+/// Review of S5 part 1, LOW-1: a node that holds the slot's certificate for
+/// twin B never signs twin A, even when A is the first body it stages.
+#[test]
+fn a_node_holding_one_twins_certificate_never_signs_the_other() {
+    let mut c = Cluster::new("no-attest-twin", 4, 0);
+    c.run(1);
+    let byz = c.leader(2);
+    let honest: Vec<usize> = c.validators().filter(|&i| i != byz).collect();
+    let h0 = honest[0];
+    c.tick_all();
+    let a = c.engine(byz).own_proposal(2).unwrap().clone();
+    let b = twin_of(&a, &c.members[byz].node_key, "twin-b");
+    c.q.borrow_mut()
+        .retain(|e| !matches!(&e.msg, Msg::Vertex(v) if v.hash == a.hash));
+    let cert_b = forged_cert(&c, 2, &a.author, &b.hash, &[byz, honest[1], honest[2]]);
+    c.receive(h0, Msg::Cert(cert_b));
+    c.receive(h0, Msg::Vertex(a.clone()));
+    assert!(c.engine(h0).is_staged(&a.hash), "A is still staged");
+    let e = c.engine(h0);
+    let body = e.attest_body(2, &a.author, &a.hash);
+    assert!(
+        e.read_own_attestation(&body).unwrap().is_none(),
+        "h0 signed A"
+    );
+}
+
+/// RC-1 step 6 and CE-1 across a restart: a node restarts while its own
+/// proposal is still collecting attestations; the collector is rebuilt, the
+/// attestations answering its rebroadcast are counted, and it is certified.
+#[test]
+fn a_proposal_collecting_attestations_across_a_restart_is_certified() {
+    let mut c = Cluster::new("collector-restart", 4, 0);
+    c.run(1);
+    let me = c.members[0].info.address.clone();
+    let to_me = move |e: &Envelope, to: usize| to == 0 && matches!(e.msg, Msg::Attest(_));
+    c.tick_all();
+    c.deliver(&to_me);
+    c.held.clear(); // the attestations are lost with the crash
+    let mine = c.engine(0).own_proposal(2).unwrap().hash.clone();
+    assert!(c.engine(0).certified(2, &me).is_none());
+    c.reopen(0);
+    c.run(2);
+    for i in c.validators() {
+        assert_eq!(
+            c.engine(i).certified(2, &me),
+            Some(mine.as_str()),
+            "node {i}"
+        );
+    }
+}
+
+/// T_RETRY: a proposal whose broadcast is lost is sent again at the next
+/// tick and certified.
+#[test]
+fn a_lost_proposal_is_rebroadcast_and_certified() {
+    let mut c = Cluster::new("retry", 4, 0);
+    c.run(1);
+    let me = c.members[0].info.address.clone();
+    let from_me = me.clone();
+    let lose = move |e: &Envelope, _: usize| {
+        e.from == from_me && matches!(&e.msg, Msg::Vertex(v) if v.round == 2)
+    };
+    c.tick_all();
+    c.deliver(&lose);
+    c.held.clear();
+    let mine = c.engine(0).own_proposal(2).unwrap().hash.clone();
+    for i in 1..4 {
+        assert!(!c.engine(i).is_staged(&mine));
+    }
+    c.run(1);
+    for i in c.validators() {
+        assert_eq!(
+            c.engine(i).certified(2, &me),
+            Some(mine.as_str()),
+            "node {i}"
+        );
+    }
+}
+
+fn decision_row(c: &Cluster, i: usize, round: u64) -> Option<String> {
+    c.engine(i)
+        .storage
+        .get(&crate::ordering::anchor_decision_key(EPOCH, round))
+        .unwrap()
+}
+
+/// DE-6: every anchor round the cursor passes gets exactly one written
+/// decision, a skip included, and it matches what was committed.
+#[test]
+fn every_anchor_round_gets_one_written_decision() {
+    let mut c = Cluster::new("decision-rows", 4, 0);
+    c.run(1);
+    let leader = c.leader(2);
+    let gone = c.members[leader].info.address.clone();
+    let mute = move |e: &Envelope, _: usize| e.from == gone;
+    for _ in 0..12 {
+        c.tick_all();
+        c.deliver(&mute);
+        c.held.clear();
+    }
+    for i in c.validators().filter(|&i| i != leader) {
+        assert_eq!(decision_row(&c, i, 2).as_deref(), Some("S"), "node {i}");
+        let top = c.decisions[i].last().expect("decided").0;
+        for r in (4..=top).step_by(2) {
+            let row = decision_row(&c, i, r).unwrap_or_else(|| panic!("node {i}: no row {r}"));
+            match c.anchor(i, r) {
+                Some(d) => assert_eq!(row, format!("C:{}", d.1)),
+                None => assert_eq!(row, "S"),
+            }
+        }
+        assert!(decision_row(&c, i, top + 2).is_none());
+    }
+}
+
+/// DE-6: a decision row that already says otherwise refuses the decision,
+/// and the node orders nothing past it.
+#[test]
+fn a_conflicting_decision_row_refuses_the_decision() {
+    let mut c = Cluster::new("decision-conflict", 4, 0);
+    c.engine(0)
+        .storage
+        .put(&crate::ordering::anchor_decision_key(EPOCH, 2), "S")
+        .unwrap();
+    c.run(8);
+    assert!(
+        c.decisions[0].is_empty(),
+        "node 0 decided past a conflicting row"
+    );
+    for i in 1..4 {
+        let d = c.anchor(i, 2).expect("the others commit anchor 2");
+        assert_eq!(decision_row(&c, i, 2), Some(format!("C:{}", d.1)));
+    }
+}
+
+/// Review of S5 part 1, LOW-3: a crash between a certificate's row and the
+/// promotion of its body leaves the body in a plain role. Boot promotes it
+/// again.
+#[test]
+fn boot_restores_the_certified_role_of_a_held_body() {
+    let mut c = Cluster::new("repromote", 4, 0);
+    c.run(3);
+    let author = c.members[1].info.address.clone();
+    let digest = c.engine(0).certified(2, &author).unwrap().to_string();
+    let key = staging::vslot_key(EPOCH, 2, &author);
+    let db = &c.engine(0).storage;
+    let mut slot: Vec<staging::SlotEntry> =
+        serde_json::from_str(&db.get(&key).unwrap().unwrap()).unwrap();
+    for e in &mut slot {
+        if e.digest == digest {
+            e.role = Role::Staged;
+        }
+    }
+    db.put(&key, &serde_json::to_string(&slot).unwrap())
+        .unwrap();
+    c.reopen(0);
+    let slot: Vec<staging::SlotEntry> =
+        serde_json::from_str(&c.engine(0).storage.get(&key).unwrap().unwrap()).unwrap();
+    assert_eq!(
+        slot.iter().find(|e| e.digest == digest).map(|e| e.role),
+        Some(Role::Certified)
+    );
 }

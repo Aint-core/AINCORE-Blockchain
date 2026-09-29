@@ -21,7 +21,7 @@ use blockchain::{ParentRef, Vertex};
 use crypto::bls::BLSEngine;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use storage::{StateDB, StorageError};
 
 /// The single epoch of S5, its first round and its sentinel (EP-1).
@@ -30,6 +30,35 @@ pub const FIRST_ROUND: u64 = 1;
 pub const SENTINEL: &str = "genesis";
 /// PR-3: how many ticks a round waits for the previous anchor's leader.
 pub const T_LEADER_TICKS: u64 = 2;
+/// The genesis-pinned vertex format (`VERTEX_FORMAT`): "4" selects V4.
+pub const VERTEX_FORMAT_KEY: &str = "genesis:vertex_format";
+/// The node-side wire prefix of a V4 message.
+pub const WIRE_PREFIX: &str = "DAG_V4:";
+
+/// The `consensus:guard_origin` row of RC-3: the chain, the genesis and this
+/// node's two keys. A database whose row differs (or is missing) did not sign
+/// under these keys from genesis on.
+pub fn guard_origin(chain_id: &str, genesis_identity: &str, node_key: &[u8; 32]) -> String {
+    let ed25519 = hex::encode(
+        crypto::SigningKey::from_bytes(node_key)
+            .verifying_key()
+            .to_bytes(),
+    );
+    let bls =
+        hex::encode(BLSEngine::consensus().pubkey_raw(&qc::derive_validator_bls_seed(node_key)));
+    serde_json::json!({
+        "cg": vcert::chain_genesis_tag(chain_id, genesis_identity),
+        "ed25519": ed25519,
+        "bls": bls,
+    })
+    .to_string()
+}
+
+/// Whether this chain's genesis pins the V4 vertex format. One DAG format per
+/// chain: a node never runs both.
+pub fn is_v4_chain(storage: &StateDB) -> bool {
+    storage.get(VERTEX_FORMAT_KEY).ok().flatten().as_deref() == Some("4")
+}
 
 /// The V4 wire messages the engine exchanges (the push half of the contract's
 /// message table).
@@ -61,6 +90,28 @@ pub struct Config {
     pub b_auth: u64,
 }
 
+/// What the engine shares with its host node (the contract's derived state):
+/// `dag` holds the staged bodies, `round_index` holds O_E (OR-1 is its only
+/// writer), and the ordering engine the host decides with.
+#[derive(Clone)]
+pub struct Shared {
+    pub dag: Arc<Mutex<HashMap<String, Vertex>>>,
+    pub round_index: Arc<Mutex<HashMap<u64, Vec<String>>>>,
+    pub ordering: Arc<Mutex<OrderingEngine>>,
+}
+
+/// A proposal PR-2 and PR-3 allow at this tick. Above the cursor's lead the
+/// vertex carries no payload (PR-1, Correction C1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slot {
+    pub round: u64,
+    pub carry_payload: bool,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The V4 engine of one node.
 pub struct Engine {
     cfg: Config,
@@ -73,17 +124,18 @@ pub struct Engine {
     can_sign: bool,
     /// RC-3: guard continuity held at boot.
     guards_continuous: bool,
-    /// The staged bodies (canonical form).
-    bodies: HashMap<String, Vertex>,
+    /// The staged bodies (canonical form), shared with the host as `dag`.
+    dag: Arc<Mutex<HashMap<String, Vertex>>>,
     /// The certificate index: (round, author) → certificate.
     certs: HashMap<(u64, String), VertexCertificate>,
     /// Signed stake of the certificates held per round (PR-1).
     cert_stake: BTreeMap<u64, u128>,
     /// PR-3: the tick at which a quorum of certificates at a round was first held.
     quorum_since: HashMap<u64, u64>,
-    /// O_E: round → orderable digests (one per author, OR-2), and their bodies.
-    orderable_index: HashMap<u64, Vec<String>>,
-    orderable: HashMap<String, Vertex>,
+    /// O_E: round → orderable digests (one per author, OR-2), shared with the
+    /// host as `round_index`, and its membership.
+    round_index: Arc<Mutex<HashMap<u64, Vec<String>>>>,
+    orderable: HashSet<String>,
     /// OR-1: a parent digest → the certified children waiting on it.
     waiting: HashMap<String, HashSet<String>>,
     pending: PendingBuffer,
@@ -91,7 +143,12 @@ pub struct Engine {
     own: BTreeMap<u64, Vertex>,
     /// CE-1 for this node's proposals not yet certified.
     collectors: BTreeMap<u64, CertCollector>,
-    ordering: OrderingEngine,
+    ordering: Arc<Mutex<OrderingEngine>>,
+    /// Standalone (tests): decide on every O_E insertion. Hosted: the host's
+    /// commit loop decides, told by `take_progress`.
+    self_decide: bool,
+    /// O_E grew since the last `take_progress`.
+    progressed: bool,
     decided: Vec<CommitInfo>,
     halted: Option<String>,
     tick: u64,
@@ -118,9 +175,46 @@ impl Engine {
     /// moment the guard origin may be written (RC-3). Otherwise a missing or
     /// mismatched origin under a committee key means a fresh, wiped or resynced
     /// database, and the node abstains from signing for the epoch.
+    ///
+    /// Standalone: the engine decides by itself on every O_E insertion, and a
+    /// decision is persisted before anything is built from it. That is not
+    /// atomic with a block (RC-2), so this form exists for tests only; a node
+    /// uses `open_shared`, whose decisions its block-acceptance transaction
+    /// stages (review of S5 part 1, HIGH-2).
+    #[cfg(test)]
     pub fn open(
         storage: Arc<StateDB>,
         cfg: Config,
+        genesis_init: bool,
+        now_secs: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Result<Self, String> {
+        let shared = Shared {
+            dag: Arc::new(Mutex::new(HashMap::new())),
+            round_index: Arc::new(Mutex::new(HashMap::new())),
+            ordering: Arc::new(Mutex::new(OrderingEngine::new_with_storage(Arc::clone(
+                &storage,
+            )))),
+        };
+        Self::open_with(storage, cfg, shared, true, genesis_init, now_secs)
+    }
+
+    /// The engine inside a node: it fills the node's `dag` and `round_index`
+    /// and leaves deciding to the node's commit loop (`take_progress`).
+    pub fn open_shared(
+        storage: Arc<StateDB>,
+        cfg: Config,
+        shared: Shared,
+        genesis_init: bool,
+        now_secs: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Result<Self, String> {
+        Self::open_with(storage, cfg, shared, false, genesis_init, now_secs)
+    }
+
+    fn open_with(
+        storage: Arc<StateDB>,
+        cfg: Config,
+        shared: Shared,
+        self_decide: bool,
         genesis_init: bool,
         now_secs: Arc<dyn Fn() -> u64 + Send + Sync>,
     ) -> Result<Self, String> {
@@ -142,12 +236,7 @@ impl Engine {
             .iter()
             .find(|m| m.address == cfg.address && m.stake > 0);
         let can_sign = me.is_some_and(|m| m.bls_public_key == bls_pk);
-        let origin = serde_json::json!({
-            "cg": vcert::chain_genesis_tag(&cfg.chain_id, &cfg.genesis_identity),
-            "ed25519": ed25519_pk,
-            "bls": bls_pk,
-        })
-        .to_string();
+        let origin = guard_origin(&cfg.chain_id, &cfg.genesis_identity, &cfg.node_key);
         let held = storage
             .get("consensus:guard_origin")
             .map_err(|e| e.to_string())?;
@@ -163,19 +252,21 @@ impl Engine {
         };
         let cfg = Config { committee, ..cfg };
         let mut engine = Self {
-            ordering: OrderingEngine::new_with_storage(Arc::clone(&storage)),
+            ordering: shared.ordering,
+            self_decide,
+            progressed: false,
             storage,
             stakes,
             committee_hash,
             ed25519_pk,
             can_sign,
             guards_continuous,
-            bodies: HashMap::new(),
+            dag: shared.dag,
             certs: HashMap::new(),
             cert_stake: BTreeMap::new(),
             quorum_since: HashMap::new(),
-            orderable_index: HashMap::new(),
-            orderable: HashMap::new(),
+            round_index: shared.round_index,
+            orderable: HashSet::new(),
             waiting: HashMap::new(),
             pending: PendingBuffer::default(),
             own: BTreeMap::new(),
@@ -202,12 +293,39 @@ impl Engine {
                 self.gc_floor(),
             )?
         };
-        for (_, v) in loaded.bodies {
-            self.bodies.insert(v.hash.clone(), v);
+        {
+            let mut dag = lock(&self.dag);
+            for (_, v) in loaded.bodies {
+                dag.insert(v.hash.clone(), v);
+            }
+        }
+        // CE-3's halt survives a restart: a recorded certificate conflict is
+        // never forgotten, and the node orders and signs nothing more.
+        let alarms = format!("alarm:vcert_conflict:{EPOCH:020}:");
+        if let Some(row) = self.storage.db.prefix_iterator(alarms.as_bytes()).next() {
+            let (key, _) = row.map_err(|e| e.to_string())?;
+            if key.starts_with(alarms.as_bytes()) {
+                self.halted = Some(format!(
+                    "a certificate conflict was recorded ({})",
+                    String::from_utf8_lossy(&key)
+                ));
+            }
         }
         let mut certs = loaded.certs;
         certs.sort_by_key(|c| c.body.round);
         for cert in certs {
+            // A crash between the certificate row and the promotion leaves
+            // the body in a plain role: promote it again (idempotent).
+            let held = lock(&self.dag).get(&cert.body.digest).cloned();
+            if let Some(v) = held {
+                staging::stage(
+                    &self.storage,
+                    &v,
+                    Role::Staged,
+                    Some(&cert.body.digest),
+                    self.cfg.b_auth,
+                )?;
+            }
             self.index_cert(cert);
         }
         // Step 4: O_E through OR-1, in increasing round.
@@ -236,7 +354,8 @@ impl Engine {
             proposed.push((round, String::from_utf8_lossy(&value).into_owned()));
         }
         for (round, digest) in proposed {
-            let Some(body) = self.bodies.get(&digest).cloned() else {
+            let held = lock(&self.dag).get(&digest).cloned();
+            let Some(body) = held else {
                 continue;
             };
             let mut full = body;
@@ -258,7 +377,10 @@ impl Engine {
             }
             self.own.insert(round, full);
         }
-        self.decide();
+        self.progressed = !self.orderable.is_empty();
+        if self.self_decide {
+            self.decide();
+        }
         Ok(())
     }
 
@@ -332,6 +454,14 @@ impl Engine {
 
     /// IN-1, then ST and AT for a vertex that stages.
     pub fn on_vertex(&mut self, raw_len: usize, v: Vertex, net: &dyn ConsensusNet) {
+        // A copy of a body already staged: nothing to verify or stage again.
+        // Its embedded certificates may still be news, and its author may be
+        // retrying for this node's attestation (AT-2 reuses the guard).
+        if self.is_staged(&v.hash) {
+            self.harvest_certs(&v, net);
+            self.resend_attestation(&v, net);
+            return;
+        }
         let verdict = {
             let ctx = Context {
                 chain_id: &self.cfg.chain_id,
@@ -341,22 +471,71 @@ impl Engine {
                 next: None,
                 now_secs: (self.now_secs)(),
                 gc_floor: self.gc_floor(),
-                cursor: self.ordering.next_anchor_round,
+                cursor: lock(&self.ordering).next_anchor_round,
             };
             let certs = &self.certs;
-            ingress_v4::v4_verdict(raw_len, &v, &ctx, |r: &ParentRef| {
-                certs
-                    .get(&(r.round, r.author.clone()))
-                    .filter(|c| c.body.digest == r.digest)
-                    .map(|c| c.compact())
-            })
+            // E4's cache: a ref whose certificate is already in the index was
+            // verified when it got there (CE-3 ingests only verified ones).
+            ingress_v4::v4_verdict_cached(
+                raw_len,
+                &v,
+                &ctx,
+                |_| None,
+                |r: &ParentRef| {
+                    certs
+                        .get(&(r.round, r.author.clone()))
+                        .is_some_and(|c| c.body.digest == r.digest)
+                },
+            )
         };
         match verdict {
-            Verdict::Stage => self.stage_and_attest(v, net),
+            Verdict::Stage => {
+                self.harvest_certs(&v, net);
+                self.stage_and_attest(v, net);
+            }
             Verdict::PendingCert(_) | Verdict::PendingEpoch => {
                 self.pending.push(v);
             }
             Verdict::Invalid(_) | Verdict::Drop(_) | Verdict::Stale => {}
+        }
+    }
+
+    /// CE-3 for the parent certificates a vertex carries: each one that
+    /// verifies and is not yet in the index is ingested (with the conflict
+    /// check), so a lost `DAG_CERT` never leaves this node unable to order a
+    /// parent it can see certified in its children.
+    fn harvest_certs(&mut self, v: &Vertex, net: &dyn ConsensusNet) {
+        for r in &v.parent_refs {
+            let Some(compact) = &r.cert else {
+                continue;
+            };
+            let known = self
+                .certs
+                .get(&(r.round, r.author.clone()))
+                .is_some_and(|c| c.body.digest == r.digest);
+            if known {
+                continue;
+            }
+            let body = self.attest_body(r.round, &r.author, &r.digest);
+            let cert = VertexCertificate::from_compact(body, compact, &self.cfg.committee);
+            self.on_cert(cert, net);
+        }
+    }
+
+    /// Answer a retried vertex with this node's existing attestation, if it
+    /// signed one: AT-2's reuse, without a transaction.
+    fn resend_attestation(&mut self, v: &Vertex, net: &dyn ConsensusNet) {
+        if !self.may_sign() {
+            return;
+        }
+        let body = self.attest_body(v.round, &v.author, &v.hash);
+        let Ok(Some(a)) = self.read_own_attestation(&body) else {
+            return;
+        };
+        if v.author == self.cfg.address {
+            self.on_attestation(a, net);
+        } else {
+            net.send(&v.author, Msg::Attest(a));
         }
     }
 
@@ -369,7 +548,9 @@ impl Engine {
             .get(&(v.round, v.author.clone()))
             .map(|c| c.body.digest.clone());
         let body = self.attest_body(v.round, &v.author, &v.hash);
-        let sign = self.may_sign();
+        // Never sign a digest the slot is certified against: under Lemma U
+        // it cannot be certified, and beyond f it would help a second one.
+        let sign = self.may_sign() && certified.as_deref().is_none_or(|d| d == v.hash);
         let (committee, key, address, budget) = (
             &self.cfg.committee,
             &self.cfg.node_key,
@@ -400,14 +581,17 @@ impl Engine {
         let Ok((attestation, staged)) = result else {
             return;
         };
-        match staged {
-            StageOutcome::EvidenceOnly(_) => return,
-            StageOutcome::Evicted(gone) => {
-                self.bodies.remove(&gone);
+        {
+            let mut dag = lock(&self.dag);
+            match staged {
+                StageOutcome::EvidenceOnly(_) => return,
+                StageOutcome::Evicted(gone) => {
+                    dag.remove(&gone);
+                }
+                StageOutcome::Staged | StageOutcome::Held => {}
             }
-            StageOutcome::Staged | StageOutcome::Held => {}
+            dag.insert(v.hash.clone(), canonical(&v));
         }
-        self.bodies.insert(v.hash.clone(), canonical(&v));
         if let Some(AttestOutcome::Signed(a) | AttestOutcome::Reused(a)) = attestation {
             if v.author == self.cfg.address {
                 self.on_attestation(a, net);
@@ -500,7 +684,8 @@ impl Engine {
         let digest = cert.body.digest.clone();
         self.index_cert(cert);
         // A held body of the certified digest takes the certified role.
-        if let Some(v) = self.bodies.get(&digest).cloned() {
+        let held = lock(&self.dag).get(&digest).cloned();
+        if let Some(v) = held {
             let _ = staging::stage(
                 &self.storage,
                 &v,
@@ -509,10 +694,21 @@ impl Engine {
                 self.cfg.b_auth,
             );
         }
-        self.try_orderable(digest);
-        // Vertices waiting on a parent certificate are re-evaluated.
+        self.try_orderable(digest.clone());
+        // Vertices waiting on this slot's certificate are re-evaluated; the
+        // others keep waiting.
         if !self.pending.is_empty() {
-            for v in self.pending.take_all() {
+            let (round, author) = key;
+            let (wake, wait): (Vec<Vertex>, Vec<Vertex>) =
+                self.pending.take_all().into_iter().partition(|p| {
+                    p.parent_refs
+                        .iter()
+                        .any(|r| r.round == round && r.author == author && r.digest == digest)
+                });
+            for v in wait {
+                self.pending.push(v);
+            }
+            for v in wake {
                 let len = ingress_v4::canonical_body(&v).map_or(usize::MAX, |b| b.len());
                 self.on_vertex(len, v, net);
             }
@@ -529,10 +725,11 @@ impl Engine {
         let mut work = vec![digest];
         let mut inserted = false;
         while let Some(d) = work.pop() {
-            if self.orderable.contains_key(&d) {
+            if self.orderable.contains(&d) {
                 continue;
             }
-            let Some(v) = self.bodies.get(&d) else {
+            let held = lock(&self.dag).get(&d).cloned();
+            let Some(v) = held else {
                 continue;
             };
             let certified = self
@@ -547,7 +744,7 @@ impl Engine {
             } else {
                 v.parents
                     .iter()
-                    .filter(|p| !self.orderable.contains_key(*p))
+                    .filter(|p| !self.orderable.contains(*p))
                     .cloned()
                     .collect()
             };
@@ -557,29 +754,35 @@ impl Engine {
                 }
                 continue;
             }
-            let v = v.clone();
             // OR-2: one digest per author per round. CE-3 keeps one
             // certificate per slot, so this cannot fire; it is checked anyway.
-            let row = self.orderable_index.entry(v.round).or_default();
-            if row
-                .iter()
-                .any(|h| self.orderable.get(h).is_some_and(|u| u.author == v.author))
             {
-                self.halted = Some(format!(
-                    "OR-2: author {} twice at round {}",
-                    v.author, v.round
-                ));
-                return;
+                let dag = lock(&self.dag);
+                let mut index = lock(&self.round_index);
+                let row = index.entry(v.round).or_default();
+                if row
+                    .iter()
+                    .any(|h| dag.get(h).is_some_and(|u| u.author == v.author))
+                {
+                    self.halted = Some(format!(
+                        "OR-2: author {} twice at round {}",
+                        v.author, v.round
+                    ));
+                    return;
+                }
+                row.push(d.clone());
             }
-            row.push(d.clone());
-            self.orderable.insert(d.clone(), v);
+            self.orderable.insert(d.clone());
             inserted = true;
             if let Some(children) = self.waiting.remove(&d) {
                 work.extend(children);
             }
         }
         if inserted {
-            self.decide();
+            self.progressed = true;
+            if self.self_decide {
+                self.decide();
+            }
         }
     }
 
@@ -589,9 +792,12 @@ impl Engine {
     /// is decidable. Halted ordering decides nothing.
     fn decide(&mut self) {
         while self.halted.is_none() {
-            let out =
-                self.ordering
-                    .try_commit(0, &self.orderable, &self.orderable_index, &self.stakes);
+            let out = {
+                let mut ordering = lock(&self.ordering);
+                let dag = lock(&self.dag);
+                let index = lock(&self.round_index);
+                ordering.try_commit(0, &dag, &index, &self.stakes)
+            };
             if out.is_empty() {
                 break;
             }
@@ -615,12 +821,13 @@ impl Engine {
     }
 
     /// One tick: rebroadcast this node's uncertified proposals (T_RETRY is one
-    /// tick), then propose the current round if PR-2 and PR-3 allow. `payload`
-    /// is what this node would carry; above the lead it proposes without it.
-    pub fn on_tick(&mut self, payload: Vec<String>, net: &dyn ConsensusNet) {
+    /// tick), then return the round PR-2 and PR-3 allow this node to propose
+    /// now, if any. The caller gathers a payload only then, and calls
+    /// `propose`.
+    pub fn tick(&mut self, net: &dyn ConsensusNet) -> Option<Slot> {
         self.tick += 1;
         if self.halted.is_some() {
-            return;
+            return None;
         }
         for round in self.collectors.keys() {
             if let Some(v) = self.own.get(round) {
@@ -628,60 +835,97 @@ impl Engine {
             }
         }
         if !self.may_sign() {
-            return;
+            return None;
         }
         let round = self.current_round();
         if self.own.contains_key(&round) {
-            return;
+            return None;
         }
         match self.storage.get(&self.proposed_key(round)) {
             Ok(None) => {}
-            _ => return,
+            _ => return None,
         }
         let prev = round - 1;
         if round > FIRST_ROUND && prev >= 2 && prev.is_multiple_of(2) {
             let leader = OrderingEngine::leader_for_round(prev, &self.stakes, 0);
             let since = self.quorum_since.get(&prev).copied().unwrap_or(self.tick);
             if !self.certs.contains_key(&(prev, leader)) && self.tick < since + T_LEADER_TICKS {
-                return;
+                return None;
             }
         }
-        let beyond_lead = round
-            > self
-                .ordering
-                .next_anchor_round
-                .saturating_add(ingress_v4::LEAD);
-        let payload = if beyond_lead { Vec::new() } else { payload };
-        self.propose(round, payload, net);
+        let cursor = lock(&self.ordering).next_anchor_round;
+        Some(Slot {
+            round,
+            carry_payload: round <= cursor.saturating_add(ingress_v4::LEAD),
+        })
     }
 
-    /// PR-4: parents are all certificates held for the previous round, one per
-    /// author, sorted by author, each carried with its certificate. One
-    /// transaction stages the body, writes the producer guard and the node's
-    /// own attestation guard; only then is the vertex broadcast.
-    fn propose(&mut self, round: u64, payload: Vec<String>, net: &dyn ConsensusNet) {
-        let (parents, parent_refs) = if round == FIRST_ROUND {
-            (vec![SENTINEL.to_string()], Vec::new())
-        } else {
-            let mut held: Vec<&VertexCertificate> = self
-                .certs
-                .iter()
-                .filter(|((r, _), _)| *r == round - 1)
-                .map(|(_, c)| c)
-                .collect();
-            held.sort_by(|a, b| a.body.author.cmp(&b.body.author));
-            let refs: Vec<ParentRef> = held
-                .iter()
-                .map(|c| ParentRef {
-                    round: c.body.round,
-                    author: c.body.author.clone(),
-                    digest: c.body.digest.clone(),
-                    proof: None,
-                    cert: Some(c.compact()),
-                })
-                .collect();
-            (refs.iter().map(|r| r.digest.clone()).collect(), refs)
+    /// `tick`, then `propose` with `payload` when a slot is open.
+    pub fn on_tick(&mut self, payload: Vec<String>, net: &dyn ConsensusNet) {
+        if let Some(slot) = self.tick(net) {
+            let payload = if slot.carry_payload {
+                payload
+            } else {
+                Vec::new()
+            };
+            self.propose(slot.round, payload, net);
+        }
+    }
+
+    /// PR-4's parents for `round`: every certificate held for the previous
+    /// round, one per author, sorted by author, each carried with its
+    /// certificate. The first round cites the sentinel.
+    fn parents_for(&self, round: u64) -> (Vec<String>, Vec<ParentRef>) {
+        if round == FIRST_ROUND {
+            return (vec![SENTINEL.to_string()], Vec::new());
+        }
+        let mut held: Vec<&VertexCertificate> = self
+            .certs
+            .iter()
+            .filter(|((r, _), _)| *r == round - 1)
+            .map(|(_, c)| c)
+            .collect();
+        held.sort_by(|a, b| a.body.author.cmp(&b.body.author));
+        let refs: Vec<ParentRef> = held
+            .iter()
+            .map(|c| ParentRef {
+                round: c.body.round,
+                author: c.body.author.clone(),
+                digest: c.body.digest.clone(),
+                proof: None,
+                cert: Some(c.compact()),
+            })
+            .collect();
+        (refs.iter().map(|r| r.digest.clone()).collect(), refs)
+    }
+
+    /// The wire size of this node's round-`round` proposal with no payload,
+    /// so the caller can fit its payload under `MAX_VERTEX_BYTES`.
+    pub fn proposal_overhead(&self, round: u64) -> usize {
+        let (parents, parent_refs) = self.parents_for(round);
+        let probe = Vertex {
+            epoch: EPOCH,
+            round,
+            author: self.cfg.address.clone(),
+            parents,
+            parent_refs,
+            payload: Vec::new(),
+            timestamp: u64::MAX,
+            hash: "0".repeat(64),
+            signature: "0".repeat(128),
+            aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
         };
+        serde_json::to_string(&Msg::Vertex(probe)).map_or(usize::MAX, |s| s.len())
+    }
+
+    /// PR-4: one transaction stages the body, writes the producer guard and
+    /// the node's own attestation guard; only then is the vertex broadcast.
+    /// Returns false when nothing was proposed, so the caller keeps its
+    /// payload.
+    pub fn propose(&mut self, round: u64, payload: Vec<String>, net: &dyn ConsensusNet) -> bool {
+        let (parents, parent_refs) = self.parents_for(round);
         let mut v = Vertex {
             epoch: EPOCH,
             round,
@@ -698,6 +942,11 @@ impl Engine {
         };
         v.hash = v.hash_v4_with_domain(&self.cfg.chain_id, &self.cfg.genesis_identity);
         v.sign_with_ed25519(&crypto::SigningKey::from_bytes(&self.cfg.node_key));
+        // S1 bounds the copy received, certificates included, and Layer S the
+        // canonical body; a proposal over either could never be staged.
+        if serde_json::to_string(&v).map_or(true, |b| b.len() > crate::dag::MAX_VERTEX_BYTES) {
+            return false;
+        }
         let body = self.attest_body(round, &self.cfg.address, &v.hash);
         let guard = self.proposed_key(round);
         let (committee, key, address, budget) = (
@@ -724,15 +973,16 @@ impl Engine {
             }
         });
         let Ok(own_attestation) = result else {
-            return;
+            return false;
         };
-        self.bodies.insert(v.hash.clone(), canonical(&v));
+        lock(&self.dag).insert(v.hash.clone(), canonical(&v));
         if let Ok(collector) = CertCollector::new(body, &self.cfg.committee) {
             self.collectors.insert(round, collector);
         }
         self.own.insert(round, v.clone());
         net.broadcast(Msg::Vertex(v));
         self.on_attestation(own_attestation, net);
+        true
     }
 
     // ----------------------------------------------------------------- reads
@@ -747,11 +997,11 @@ impl Engine {
     }
 
     pub fn is_staged(&self, digest: &str) -> bool {
-        self.bodies.contains_key(digest)
+        lock(&self.dag).contains_key(digest)
     }
 
     pub fn is_orderable(&self, digest: &str) -> bool {
-        self.orderable.contains_key(digest)
+        self.orderable.contains(digest)
     }
 
     /// The certified digest of a slot, if this node holds its certificate.
@@ -769,12 +1019,29 @@ impl Engine {
         &self.cfg.address
     }
 
-    pub fn finality_digest(&self) -> &str {
-        self.ordering.current_finality_digest()
+    pub fn finality_digest(&self) -> String {
+        lock(&self.ordering).current_finality_digest().to_string()
     }
 
     pub fn cursor(&self) -> u64 {
-        self.ordering.next_anchor_round
+        lock(&self.ordering).next_anchor_round
+    }
+
+    /// Replace the wall clock (a deterministic harness pins it).
+    pub fn set_now_secs(&mut self, now_secs: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        self.now_secs = now_secs;
+    }
+
+    /// C_0 as (address, stake), canonical order: what the host decides with
+    /// (DE-7), never the live set.
+    pub fn stakes(&self) -> &[(String, u64)] {
+        &self.stakes
+    }
+
+    /// Whether O_E grew since the last call: the host's cue to run its
+    /// commit loop.
+    pub fn take_progress(&mut self) -> bool {
+        std::mem::take(&mut self.progressed)
     }
 }
 
