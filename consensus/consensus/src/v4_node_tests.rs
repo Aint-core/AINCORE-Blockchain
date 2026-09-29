@@ -172,6 +172,25 @@ impl Cluster {
         }
     }
 
+    /// `deliver`, except that `lost(from, to)` messages never arrive.
+    fn deliver_lossy(&mut self, lost: &dyn Fn(usize, usize) -> bool) {
+        loop {
+            let mut batch: Vec<(usize, String)> = Vec::new();
+            for i in 0..self.nodes.len() {
+                let outbox = self.node(i).v4_outbox.clone().unwrap();
+                batch.extend(outbox.lock().unwrap().drain(..).map(|w| (i, w)));
+            }
+            if batch.is_empty() {
+                break;
+            }
+            for (from, wire) in batch {
+                for j in (0..self.nodes.len()).filter(|&j| j != from && !lost(from, j)) {
+                    self.node_mut(j).handle_message(&wire);
+                }
+            }
+        }
+    }
+
     fn run(&mut self, ticks: usize) {
         for _ in 0..ticks {
             for i in 0..self.nodes.len() {
@@ -415,4 +434,25 @@ fn a_long_v4_run_survives_a_restart_past_the_v3_prune_point() {
     c.run(10);
     let after = c.assert_same_blocks(before + 3);
     assert!(after > before);
+}
+
+/// S6 through the node: node 0 hears nothing for six ticks, then pulls what
+/// it missed (requests and answers travel as `DAG_V4:` messages) and places
+/// the same blocks as everyone.
+#[test]
+fn a_v4_node_that_missed_rounds_catches_up_by_pull() {
+    let mut c = Cluster::new("pull", &[105, 106, 107, 108], true);
+    c.run(3);
+    for _ in 0..6 {
+        for i in 0..4 {
+            c.node_mut(i).try_create_vertex();
+        }
+        c.deliver_lossy(&|_, to| to == 0);
+    }
+    let behind = c.node(0).latest_block_height;
+    let ahead = c.node(1).latest_block_height;
+    assert!(ahead > behind, "the others moved on ({behind} vs {ahead})");
+    c.run(12);
+    let common = c.assert_same_blocks(ahead);
+    assert!(common >= ahead);
 }

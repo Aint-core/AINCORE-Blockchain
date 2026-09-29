@@ -232,6 +232,27 @@ impl Cluster {
         }
     }
 
+    /// Deliver until quiet, letting `map` drop (None) or rewrite each
+    /// envelope for each receiver: a Byzantine relay or server.
+    fn deliver_map(&mut self, map: &dyn Fn(&Envelope, usize) -> Option<Msg>) {
+        loop {
+            let Some(env) = self.q.borrow_mut().pop_front() else {
+                break;
+            };
+            let receivers: Vec<usize> = match &env.to {
+                To::All => (0..self.members.len())
+                    .filter(|&i| self.members[i].info.address != env.from)
+                    .collect(),
+                To::One(a) => vec![self.index_of(a)],
+            };
+            for i in receivers {
+                if let Some(msg) = map(&env, i) {
+                    self.receive(i, msg);
+                }
+            }
+        }
+    }
+
     fn release(&mut self) {
         let held = std::mem::take(&mut self.held);
         self.q.borrow_mut().extend(held);
@@ -798,8 +819,11 @@ fn a_vertex_ahead_of_its_parent_certificates_is_staged_when_they_arrive() {
 fn a_certified_vertex_waits_for_its_parents_to_be_orderable() {
     let mut c = Cluster::new("down-closed", 4, 0);
     let absent = c.members[1].info.address.clone();
+    // The parent's body is hidden from node 0, pushed or pulled.
     let hide = move |e: &Envelope, to: usize| {
-        to == 0 && e.from == absent && matches!(&e.msg, Msg::Vertex(v) if v.round == 1)
+        to == 0
+            && ((e.from == absent && matches!(&e.msg, Msg::Vertex(v) if v.round == 1))
+                || matches!(e.msg, Msg::Resp { .. }))
     };
     c.tick_all();
     c.deliver(&hide);
@@ -1130,5 +1154,335 @@ fn boot_restores_the_certified_role_of_a_held_body() {
     assert_eq!(
         slot.iter().find(|e| e.digest == digest).map(|e| e.role),
         Some(Role::Certified)
+    );
+}
+
+/// The fixture of the pull witnesses: round 2's leader never shows its
+/// vertex A to h0 and never answers a request. Returns (leader, h0, A).
+fn withheld_from(c: &mut Cluster) -> (usize, usize, Vertex) {
+    c.run(1);
+    let byz = c.leader(2);
+    let h0 = c.validators().find(|&i| i != byz).unwrap();
+    c.tick_all();
+    let a = c.engine(byz).own_proposal(2).unwrap().clone();
+    (byz, h0, a)
+}
+
+fn withholding(c: &Cluster, byz: usize, h0: usize) -> impl Fn(&Envelope, usize) -> bool {
+    let byz_addr = c.members[byz].info.address.clone();
+    move |e: &Envelope, to: usize| {
+        e.from == byz_addr
+            && ((to == h0 && matches!(&e.msg, Msg::Vertex(v) if v.round == 2))
+                || matches!(e.msg, Msg::Resp { .. }))
+    }
+}
+
+/// A3c-pull: A's body is withheld from h0 and its author refuses to serve.
+/// h0 holds A's certificate, fetches the body from A's other signers, and
+/// commits 2/A with everyone, a restart mid-fetch included.
+#[test]
+fn a3c_pull_a_withheld_body_is_fetched_from_its_signers() {
+    let mut c = Cluster::new("pull-a3c", 4, 0);
+    let (byz, h0, a) = withheld_from(&mut c);
+    let rule = withholding(&c, byz, h0);
+    // First delivery: h0 gets A's certificate, not A.
+    c.deliver(&|e, to| rule(e, to) || (to == h0 && matches!(e.msg, Msg::Resp { .. })));
+    c.held.clear();
+    assert_eq!(c.engine(h0).certified(2, &a.author), Some(a.hash.as_str()));
+    assert!(!c.engine(h0).is_staged(&a.hash));
+    // A restart before the fetch completes: the want is rebuilt at boot.
+    c.reopen(h0);
+    assert!(c.engine(h0).wanted_bodies().contains(&a.hash));
+    for _ in 0..8 {
+        c.tick_all();
+        c.deliver(&rule);
+        c.held.clear();
+    }
+    assert!(c.engine(h0).is_staged(&a.hash), "h0 fetched A");
+    c.assert_agree();
+    assert_eq!(c.anchor(h0, 2).map(|d| &d.1), Some(&a.hash));
+}
+
+/// RE-4: a signer that answers with a body under another digest (here A's
+/// twin) is ignored, the body is not staged, and the next signer is asked.
+#[test]
+fn a_wrong_body_is_refused_and_the_next_signer_is_asked() {
+    let mut c = Cluster::new("pull-wrong", 4, 0);
+    let (byz, h0, a) = withheld_from(&mut c);
+    let b = twin_of(&a, &c.members[byz].node_key, "twin-b");
+    let rule = withholding(&c, byz, h0);
+    let liar = c.validators().find(|&i| i != byz && i != h0).unwrap();
+    let liar_addr = c.members[liar].info.address.clone();
+    let forged = b.clone();
+    let map = move |e: &Envelope, to: usize| -> Option<Msg> {
+        if rule(e, to) {
+            return None;
+        }
+        match &e.msg {
+            Msg::Resp {
+                to: requester,
+                resp: pull::Response::Vertices { .. },
+            } if e.from == liar_addr => Some(Msg::Resp {
+                to: requester.clone(),
+                resp: pull::Response::Vertices {
+                    bodies: vec![forged.clone()],
+                    unknown: vec![],
+                },
+            }),
+            _ => Some(e.msg.clone()),
+        }
+    };
+    for _ in 0..10 {
+        c.tick_all();
+        c.deliver_map(&map);
+    }
+    assert!(
+        c.engine(h0).is_staged(&a.hash),
+        "h0 fetched A from an honest signer"
+    );
+    assert!(
+        !c.engine(h0).is_staged(&b.hash),
+        "h0 staged the liar's body"
+    );
+    c.assert_agree();
+    assert_eq!(c.anchor(h0, 2).map(|d| &d.1), Some(&a.hash));
+}
+
+/// RE-4: `unknown` never retires a want. Every signer answers `unknown` for
+/// a while; h0 keeps asking and fetches A once one of them serves it.
+#[test]
+fn an_unknown_answer_never_ends_the_search() {
+    let mut c = Cluster::new("pull-unknown", 4, 0);
+    let (byz, h0, a) = withheld_from(&mut c);
+    let rule = withholding(&c, byz, h0);
+    let silent = Cell::new(true);
+    let map = |e: &Envelope, to: usize| -> Option<Msg> {
+        if rule(e, to) {
+            return None;
+        }
+        match &e.msg {
+            Msg::Resp {
+                to: requester,
+                resp: pull::Response::Vertices { bodies, unknown },
+            } if silent.get() => Some(Msg::Resp {
+                to: requester.clone(),
+                resp: pull::Response::Vertices {
+                    bodies: vec![],
+                    unknown: unknown
+                        .iter()
+                        .cloned()
+                        .chain(bodies.iter().map(|v| v.hash.clone()))
+                        .collect(),
+                },
+            }),
+            _ => Some(e.msg.clone()),
+        }
+    };
+    for _ in 0..8 {
+        c.tick_all();
+        c.deliver_map(&map);
+    }
+    assert!(!c.engine(h0).is_staged(&a.hash));
+    assert!(
+        c.engine(h0).wanted_bodies().contains(&a.hash),
+        "the want retired"
+    );
+    silent.set(false);
+    for _ in 0..12 {
+        c.tick_all();
+        c.deliver_map(&map);
+    }
+    assert!(c.engine(h0).is_staged(&a.hash));
+    c.assert_agree();
+}
+
+/// RE-1 end to end: a node cut off for several rounds catches up by pull
+/// alone (no push is replayed to it) and decides the same anchors.
+#[test]
+fn a_node_cut_off_for_several_rounds_catches_up_by_pull() {
+    let mut c = Cluster::new("pull-catchup", 4, 0);
+    c.run(2);
+    let cut = c.members[0].info.address.clone();
+    let isolate = move |e: &Envelope, to: usize| to == 0 || e.from == cut;
+    for _ in 0..6 {
+        c.tick_all();
+        c.deliver(&isolate);
+        c.held.clear();
+    }
+    let behind = c.decisions[0].len();
+    let ahead = c.decisions[1].len();
+    assert!(
+        ahead > behind + 1,
+        "the others moved on ({behind} vs {ahead})"
+    );
+    c.run(16);
+    c.assert_agree();
+    assert!(c.decisions[0].len() > ahead, "node 0 caught up and went on");
+}
+
+/// RE-1 (d): a node that receives no push at all (no vertex, attestation or
+/// certificate reaches it) learns everything by pull: stalled, it asks for
+/// the certificates of its rounds, then for their bodies, and decides the
+/// same anchors.
+#[test]
+fn a_node_without_any_push_keeps_up_by_pull_alone() {
+    let mut c = Cluster::new("pull-only", 4, 0);
+    let no_push = |e: &Envelope, to: usize| {
+        to == 0 && matches!(e.msg, Msg::Vertex(_) | Msg::Attest(_) | Msg::Cert(_))
+    };
+    for _ in 0..40 {
+        c.tick_all();
+        c.deliver(&no_push);
+        c.held.clear();
+    }
+    assert!(!c.decisions[0].is_empty(), "node 0 decided nothing");
+    c.assert_agree();
+}
+
+/// RE-1 (b): a crash lost an (unsynced) certificate row of an old round.
+/// After the restart that parent is not orderable, so its children wait;
+/// the node asks for the certificate and orders again.
+#[test]
+fn a_lost_certificate_row_is_fetched_after_a_restart() {
+    let mut c = Cluster::new("pull-lost-cert", 4, 0);
+    c.run(4);
+    let author = c.members[1].info.address.clone();
+    let row = format!("consensus:vcert:v1:{EPOCH:020}:{:020}:{author}", 1);
+    c.engine(0).storage.delete(&row).unwrap();
+    c.reopen(0);
+    assert!(c.engine(0).certified(1, &author).is_none());
+    let before = c.decisions[0].len();
+    c.run(6);
+    assert!(
+        c.engine(0).certified(1, &author).is_some(),
+        "the certificate was fetched"
+    );
+    assert!(c.decisions[0].len() > before, "node 0 orders again");
+    c.assert_agree();
+}
+
+/// RE-6, the flood witness. Every tick, ahead of the honest requests, each
+/// server receives 20 validly signed requests from a Byzantine member, 20
+/// requests claiming the honest fetcher's identity under the wrong key, 20
+/// from a node outside the committee, and 20 replays of every request the
+/// honest fetcher has sent so far. The honest fetch still completes: its
+/// reservation is its own, a forged identity or a replay charges no one, and
+/// outsiders share only the residual. The flood asks for an unknown digest,
+/// so no answer to it can help the victim.
+#[test]
+fn a_flood_cannot_starve_an_honest_members_fetch() {
+    let mut c = Cluster::new("pull-flood", 4, 1);
+    let (byz, h0, a) = withheld_from(&mut c);
+    let rule = withholding(&c, byz, h0);
+    let outsider = c.members.len() - 1;
+    let addr = |i: usize| c.members[i].info.address.clone();
+    let (byz_addr, h0_addr, out_addr) = (addr(byz), addr(h0), addr(outsider));
+    let (byz_key, out_key) = (c.members[byz].node_key, c.members[outsider].node_key);
+    let servers: Vec<String> = c
+        .validators()
+        .filter(|&i| i != byz && i != h0)
+        .map(addr)
+        .collect();
+    let addrs: Vec<String> = c.members.iter().map(|m| m.info.address.clone()).collect();
+    let captured: RefCell<Vec<(String, pull::SignedRequest)>> = RefCell::new(Vec::new());
+    let mut seq = 1_000_000u64;
+    for _ in 0..12 {
+        c.tick_all();
+        // Every request the victim ever sent is replayed, every tick.
+        let replays: Vec<(String, pull::SignedRequest)> = captured.borrow().clone();
+        for to in &servers {
+            for _ in 0..20 {
+                seq += 1;
+                let req = pull::Request::Vertices(vec!["f".repeat(64)]);
+                let flood = [
+                    (byz_addr.clone(), &byz_key, byz_addr.clone()),
+                    (byz_addr.clone(), &byz_key, h0_addr.clone()),
+                    (out_addr.clone(), &out_key, out_addr.clone()),
+                ];
+                for (sender, key, claimed) in flood {
+                    let signed = pull::SignedRequest::sign(
+                        CHAIN,
+                        GENESIS,
+                        key,
+                        &claimed,
+                        to,
+                        seq,
+                        req.clone(),
+                    );
+                    c.q.borrow_mut().push_front(Envelope {
+                        from: sender,
+                        to: To::One(to.clone()),
+                        msg: Msg::Req(signed),
+                    });
+                }
+                for (target, old) in replays.iter().filter(|(t, _)| t == to) {
+                    c.q.borrow_mut().push_front(Envelope {
+                        from: byz_addr.clone(),
+                        to: To::One(target.clone()),
+                        msg: Msg::Req(old.clone()),
+                    });
+                }
+            }
+        }
+        c.deliver(&|e, to| {
+            if let Msg::Req(r) = &e.msg {
+                if r.from == h0_addr && e.from == h0_addr {
+                    captured.borrow_mut().push((addrs[to].clone(), r.clone()));
+                }
+            }
+            rule(e, to)
+        });
+        c.held.clear();
+    }
+    assert!(
+        c.engine(h0).is_staged(&a.hash),
+        "the honest fetch was starved"
+    );
+    c.assert_agree();
+}
+
+/// RE-6: a replayed request is not answered and charges nothing, so the
+/// member it came from still gets its whole reservation in that tick; a
+/// request claiming a member under another key is not answered either.
+#[test]
+fn a_replay_or_a_forged_identity_charges_no_ones_budget() {
+    let mut c = Cluster::new("replay", 4, 0);
+    c.run(2);
+    let (me, server) = (0usize, 1usize);
+    let from = c.members[me].info.address.clone();
+    let to = c.members[server].info.address.clone();
+    let key = c.members[me].node_key;
+    let other_key = c.members[2].node_key;
+    let req = |seq: u64, key: &[u8; 32]| {
+        Msg::Req(pull::SignedRequest::sign(
+            CHAIN,
+            GENESIS,
+            key,
+            &from,
+            &to,
+            seq,
+            pull::Request::Certs(vec![(1, from.clone())]),
+        ))
+    };
+    let answers = |c: &Cluster| {
+        c.q.borrow()
+            .iter()
+            .filter(|e| matches!(&e.msg, Msg::Resp { to: t, .. } if *t == from))
+            .count()
+    };
+    c.receive(server, req(10, &key));
+    assert_eq!(answers(&c), 1);
+    for _ in 0..10 {
+        c.receive(server, req(10, &key)); // replays
+        c.receive(server, req(11 + 100, &other_key)); // forged identity
+    }
+    assert_eq!(answers(&c), 1, "a replay or a forgery was answered");
+    for seq in 11..20 {
+        c.receive(server, req(seq, &key));
+    }
+    assert_eq!(
+        answers(&c),
+        pull::MEMBER_REQS_PER_TICK as usize,
+        "the member's reservation was charged by others"
     );
 }

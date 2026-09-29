@@ -299,6 +299,14 @@ impl PendingBuffer {
         None
     }
 
+    /// Whether a vertex with this digest is held (bounded: at most
+    /// `PENDING_MAX_PER_AUTHOR` per author).
+    pub fn contains(&self, digest: &str) -> bool {
+        self.per_author
+            .values()
+            .any(|held| held.keys().any(|(_, d)| d == digest))
+    }
+
     pub fn remove(&mut self, author: &str, round: u64, digest: &str) -> Option<Vertex> {
         self.per_author
             .get_mut(author)?

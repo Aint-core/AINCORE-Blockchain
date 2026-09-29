@@ -70,6 +70,11 @@ pub enum Msg {
     Attest(VertexAttestation),
     /// `DAG_CERT`: author to all.
     Cert(VertexCertificate),
+    /// RE-3: a signed pull request for one target, answered to its sender.
+    /// Only `to` answers, whatever the transport delivers it to.
+    Req(pull::SignedRequest),
+    /// RE-5: the answer, addressed to the requester.
+    Resp { to: String, resp: pull::Response },
 }
 
 /// The transport seam. Production sends over gossip and TCP; tests use a
@@ -153,6 +158,17 @@ pub struct Engine {
     halted: Option<String>,
     tick: u64,
     now_secs: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// RE-1 (a, b): certified bodies this node lacks, and who to ask.
+    body_wants: BTreeMap<String, pull::Want>,
+    /// RE-1 (b, c, d): certificates this node lacks, by slot.
+    cert_wants: BTreeMap<(u64, String), pull::Want>,
+    /// The tick at which a certificate last arrived (RE-1 d).
+    last_cert_tick: u64,
+    /// This node's last request number and the durable reservation above it.
+    pull_seq: u64,
+    pull_seq_reserved: u64,
+    /// RE-6 on the serving side.
+    budget: pull::Budget,
 }
 
 fn storage_err(e: impl ToString) -> StorageError {
@@ -251,6 +267,7 @@ impl Engine {
             None => false,
         };
         let cfg = Config { committee, ..cfg };
+        let seq = Self::load_seq(&storage);
         let mut engine = Self {
             ordering: shared.ordering,
             self_decide,
@@ -275,6 +292,12 @@ impl Engine {
             halted: None,
             tick: 0,
             now_secs,
+            body_wants: BTreeMap::new(),
+            cert_wants: BTreeMap::new(),
+            last_cert_tick: 0,
+            pull_seq: seq,
+            pull_seq_reserved: seq,
+            budget: pull::Budget::default(),
             cfg,
         };
         engine.boot()?;
@@ -449,6 +472,12 @@ impl Engine {
             Msg::Vertex(v) => self.on_vertex(raw_len, v, net),
             Msg::Attest(a) => self.on_attestation(a, net),
             Msg::Cert(c) => self.on_cert(c, net),
+            Msg::Req(signed) => self.on_request(signed, net),
+            Msg::Resp { to, resp } => {
+                if to == self.cfg.address {
+                    self.on_response(resp, net);
+                }
+            }
         }
     }
 
@@ -493,7 +522,16 @@ impl Engine {
                 self.harvest_certs(&v, net);
                 self.stage_and_attest(v, net);
             }
-            Verdict::PendingCert(_) | Verdict::PendingEpoch => {
+            Verdict::PendingCert(missing) => {
+                // RE-1 (c): ask for the certificates it waits on.
+                for i in missing {
+                    if let Some(r) = v.parent_refs.get(i) {
+                        self.want_cert(r.round, &r.author);
+                    }
+                }
+                self.pending.push(v);
+            }
+            Verdict::PendingEpoch => {
                 self.pending.push(v);
             }
             Verdict::Invalid(_) | Verdict::Drop(_) | Verdict::Stale => {}
@@ -645,7 +683,12 @@ impl Engine {
             .iter()
             .find(|(a, _)| *a == cert.body.author)
             .map_or(0, |(_, s)| *s as u128);
+        // RE-1 (a): a certificate whose body is not held.
+        if !self.is_staged(&cert.body.digest) {
+            self.want_body(&cert);
+        }
         self.certs.insert(key, cert);
+        self.last_cert_tick = self.tick;
         let total: u128 = self.stakes.iter().map(|(_, s)| *s as u128).sum();
         let held = self.cert_stake.entry(round).or_insert(0);
         *held += signer_stake;
@@ -750,6 +793,14 @@ impl Engine {
             };
             if !missing.is_empty() {
                 for p in missing {
+                    // RE-1 (b): a waiting child's parent. Its body is wanted
+                    // once its certificate is held; the certificate first.
+                    if let Some(r) = v.parent_refs.iter().find(|r| r.digest == p) {
+                        if !self.certs.contains_key(&(r.round, r.author.clone())) {
+                            let (round, author) = (r.round, r.author.clone());
+                            self.want_cert(round, &author);
+                        }
+                    }
                     self.waiting.entry(p).or_default().insert(d.clone());
                 }
                 continue;
@@ -834,6 +885,7 @@ impl Engine {
                 net.broadcast(Msg::Vertex(v.clone()));
             }
         }
+        self.fetch(net);
         if !self.may_sign() {
             return None;
         }
@@ -1044,6 +1096,8 @@ impl Engine {
         std::mem::take(&mut self.progressed)
     }
 }
+
+pub mod pull;
 
 #[cfg(test)]
 mod tests;

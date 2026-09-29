@@ -186,7 +186,8 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         | "consensus:qc:latest"
         | "consensus:qc:latest_height"
         | "consensus:qc:latest_round"
-        | "consensus:gc_floor" => Some(Local),
+        | "consensus:gc_floor"
+        | "consensus:pull_seq" => Some(Local),
 
         "sys:da:signing_key_enc_v1"
         | "sys:da:signing_key"
@@ -631,6 +632,7 @@ mod tests {
             ),
             ("consensus:anchor_decision:00000000000000000003:00000000000000153030".into(), Local),
             ("consensus:gc_floor".into(), Local),
+            ("consensus:pull_seq".into(), Local),
             ("consensus:guard_origin".into(), Node),
             (format!("alarm:vcert_conflict:00000000000000000003:00000000000000153030:{H64}"), Node),
             ("da_shard_10000_0".into(), Local),

@@ -678,6 +678,37 @@ The review of part 1 found no CRITICAL; all of it is fixed with regressions:
 Mutation, part 2 and the fixes: 21 mutants, 19 killed. The two survivors are the cache and
 the duplicate fast path (M2, L2), which change cost, not outcomes.
 
+**S6 status (branch `g1/certified-dag`): pull.** `consensus::v4::pull`. Every RE-1 trigger makes
+a want:
+- (a) a certificate whose body is not held → a body want, asked of the certificate's signers
+  in rotation (RE-2);
+- (b) a waiting child's parent without a certificate → a certificate want;
+- (c) PENDING(cert) → the refs' certificates;
+- (d) no certificate for `STALL_TICKS` → the current and previous rounds' certificates from
+  every member.
+
+Wants retry with `T_FETCH` doubling to 8 ticks and retire only when satisfied (RE-4: an
+`unknown` answer never retires one). A returned body is taken only if wanted and goes through
+IN-1 (its hash is the digest). The server (`serve`, RE-5) reads only: staged bodies (≤ 32,
+900 KiB) and indexed certificates (≤ 64). Wants are rebuilt at boot from the certificates
+whose bodies are missing (reopen mid-fetch). ATTEST_REQ is the per-tick rebroadcast of the
+node's own uncertified proposal (answered from the attestation guard).
+
+RE-6, the contract's interim until G4's session identity: a request is signed by its sender's
+committee key with a strictly increasing number (reserved durably in blocks, so it survives a
+restart). A member gets `MEMBER_REQS_PER_TICK` of its own; a request claiming a member without
+its signature, or replaying a number, is dropped without charging anyone; outsiders share
+`RESIDUAL_REQS_PER_TICK`. The transport is `send`: in the node, requests and answers travel as
+`DAG_V4:` gossip and only the addressee acts (a direct authenticated channel is an ops
+optimization for S10).
+
+Witnesses: A3c-pull (A withheld from h0, its author refuses to serve, restart mid-fetch: h0
+fetches A from the other signers and commits 2/A), a wrong body refused and the next signer
+asked, `unknown` never ending the search, a node cut off for several rounds catching up, a
+node receiving no push at all keeping up by pull alone, a lost certificate row fetched after a
+restart, the flood witness (a Byzantine member, a spoofer of the honest fetcher and outsiders,
+20 requests each per server per tick), and a node-level catch-up through `DagConsensus`.
+
 ### Imported decisions and finality votes (IM)
 
 **IM-1 (QC authority).**
