@@ -812,6 +812,65 @@ mod tests {
         );
     }
 
+    /// G3 S6: the handler is told each request's source IP, which snapshot
+    /// serving budgets per client. Asked over loopback, and over this host's
+    /// own LAN address when it has one, so a fixed address cannot pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_handler_sees_each_requests_source_ip() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let path = std::env::temp_dir().join(format!(
+            "network_ip_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Arc::new(StateDB::open(path.to_str().unwrap()).unwrap());
+        let server_key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        let server_id = crypto::derive_address(server_key.verifying_key().as_bytes()).unwrap();
+        tokio::spawn(start_server_with_peer(
+            port,
+            server_id,
+            Arc::new(Mutex::new(HashMap::new())),
+            db,
+            Arc::new(server_key),
+            |msg: String, ip: std::net::IpAddr| (msg == "WHO").then(|| ip.to_string()),
+        ));
+        // This host's LAN address, if it has one: a UDP connect sends nothing.
+        let lan = std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|s| s.connect("192.0.2.1:9").map(|_| s))
+            .and_then(|s| s.local_addr())
+            .ok()
+            .map(|a| a.ip())
+            .filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
+        let key = ed25519_dalek::SigningKey::from_bytes(&[6; 32]);
+        let mut asked = vec!["127.0.0.1".to_string()];
+        asked.extend(lan.map(|ip| ip.to_string()));
+        for ip in asked {
+            let mut connected = None;
+            for _ in 0..100 {
+                if let Ok(c) = secure_connect(&ip, port, "__test__", 0, None, &key).await {
+                    connected = Some(c);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let Some((mut stream, shared, _)) = connected else {
+                let e = secure_connect(&ip, port, "__test__", 0, None, &key)
+                    .await
+                    .err();
+                panic!("the server accepts on {ip}: {e:?}");
+            };
+            send_encrypted_msg(&mut stream, &shared, "WHO")
+                .await
+                .unwrap();
+            let seen = read_encrypted_msg(&mut stream, &shared).await.unwrap();
+            assert_eq!(seen, ip);
+        }
+    }
+
     /// A connect to a port with no listener must fail fast (bounded by connect
     /// timeout), never hang.
     #[tokio::test]

@@ -24,9 +24,21 @@ fn proposer() -> (crypto::SigningKey, String) {
     (key, address)
 }
 
+/// An account that is no validator.
+const OUTSIDER: [u8; 32] = [78; 32];
+
+fn outsider() -> (crypto::SigningKey, String) {
+    let key = crypto::SigningKey::from_bytes(&OUTSIDER);
+    let address = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+    (key, address)
+}
+
 /// The proposer's account, as the state stores it.
 fn proposer_account() -> (String, Vec<u8>) {
-    let (key, address) = proposer();
+    account(proposer())
+}
+
+fn account((key, address): (crypto::SigningKey, String)) -> (String, Vec<u8>) {
     let pk = hex::encode(key.verifying_key().to_bytes());
     let account = storage::object::Object::new(
         address.clone(),
@@ -107,6 +119,10 @@ struct Spec {
     extra: Vec<(String, Vec<u8>)>,
     /// A second epoch from height 5, whose committee is this seed's.
     epoch_one: Option<[u8; 32]>,
+    /// The active set (`sys:validators`) besides the proposer.
+    validators: Vec<String>,
+    /// The checkpoint block's BFT timestamp, in seconds.
+    timestamp: u64,
 }
 
 impl Default for Spec {
@@ -116,6 +132,8 @@ impl Default for Spec {
             state_chain: CHAIN,
             extra: Vec::new(),
             epoch_one: None,
+            validators: Vec::new(),
+            timestamp: 1_000,
         }
     }
 }
@@ -177,8 +195,16 @@ fn chain_with(name: &str, spec: Spec) -> Chain {
                 ));
             }
             v0.extend((0..40).map(|i| (obj(i), Some(format!("v{i}").into_bytes()))));
-            let (account_key, account) = proposer_account();
-            v0.push((account_key, Some(account)));
+            let (account_key, proposer) = proposer_account();
+            v0.push((account_key, Some(proposer)));
+            let (outsider_key, outsider) = account(outsider());
+            v0.push((outsider_key, Some(outsider)));
+            let mut active: Vec<(String, u64)> = vec![(self::proposer().1, 100)];
+            active.extend(spec.validators.iter().map(|v| (v.clone(), 100)));
+            v0.push((
+                "sys:validators".into(),
+                Some(serde_json::to_vec(&active).unwrap()),
+            ));
             v0.extend(spec.extra.iter().map(|(k, v)| (k.clone(), Some(v.clone()))));
             v0
         } else if version == 4 {
@@ -209,7 +235,7 @@ fn chain_with(name: &str, spec: Spec) -> Chain {
         proposer_address.clone(),
         root.clone(),
         "dd".repeat(32),
-        1_000,
+        spec.timestamp,
         vec![],
         "aa".repeat(32),
         vec![],
@@ -283,7 +309,8 @@ fn peer(chain: &Chain, behaviour: Behaviour) -> Peer {
             0,
             Arc::new(Mutex::new(HashMap::new())),
             Arc::clone(&chain.db),
-        ),
+        )
+        .with_snapshot_serving(true),
         db: Arc::clone(&chain.db),
         behaviour,
         chunks: 0,
@@ -357,6 +384,7 @@ fn fast() -> Patience {
         backoff_max: Duration::ZERO,
         request_timeout: Duration::from_secs(10),
         min_bytes_per_sec: 1,
+        slow_turn: Duration::from_secs(2),
         deadline: Duration::from_secs(120),
     }
 }
@@ -481,6 +509,13 @@ fn assert_restored(client: &Arc<StateDB>, chain: &Chain) {
         Some(chain.cp.to_string())
     );
     assert_eq!(client.get("sync:halt_reason").unwrap(), None);
+    assert_eq!(
+        client.get(StateDB::KEPT_PIN_BLOCKS_KEY).unwrap().as_deref(),
+        Some("[]"),
+        "the old chain's kept pins are forgotten"
+    );
+    let tip: u64 = client.get(RESTORE_TIP).unwrap().unwrap().parse().unwrap();
+    assert!(tip >= H, "the network tip, at least the checkpoint: {tip}");
     let anchor_round = (2 * H).to_string();
     for (key, value) in [
         ("consensus:finality_digest", "ee".repeat(32)),
@@ -887,7 +922,8 @@ async fn a_pinned_version_below_block_retention_restores() {
         Arc::new(Mutex::new(HashMap::new())),
         Arc::clone(&a.db),
     )
-    .with_retention(Some((keep, 1_000)));
+    .with_retention(Some((keep, 1_000)))
+    .with_snapshot_serving(true);
     let mut peers = [server];
     run(&client, &plan(&a.cp, &g, false), &mut peers)
         .await
@@ -1001,26 +1037,30 @@ async fn a_validator_key_is_not_restored_onto_a_new_datadir() {
     let a = chain_with(
         "signer_a",
         Spec {
-            extra: vec![(
-                "sys:validators".into(),
-                serde_json::to_vec(&vec![(joined.clone(), 100u64)]).unwrap(),
-            )],
+            validators: vec![joined.clone()],
             ..Spec::default()
         },
     );
-    let client = temp_db("signer_client");
     let mut peers = [peer(&a, Behaviour::Honest)];
     let member = committee()[0].address.clone();
+    let mut last = None;
     for signer in [&member, &joined] {
+        // A fresh datadir each time, so the restored state is what refuses.
+        let client = temp_db("signer_client");
         let as_validator = RestorePlan {
             local_signer: Some(signer),
             ..plan(&a.cp, &g, false)
         };
         let err = run(&client, &as_validator, &mut peers).await.unwrap_err();
         assert!(err.contains("validator") && err.contains("SN-6"), "{err}");
-        assert!(client.get(RESTORE_MARKER).unwrap().is_some());
+        assert!(
+            client.get(RESTORE_MARKER).unwrap().is_some(),
+            "refused after the restore, the marker kept"
+        );
         assert!(state_commit::boot_check(&client).is_err(), "it cannot boot");
+        last = Some(client);
     }
+    let client = last.unwrap();
     let observer = "ff".repeat(32);
     let as_observer = RestorePlan {
         local_signer: Some(&observer),
@@ -1156,6 +1196,21 @@ fn the_server_serves_only_what_it_retains() {
     let last = state_commit::key_hash(&first.entries.last().unwrap().key);
     let end = ask(H, Some(hex::encode(last.0)));
     assert!(end.done && end.entries.is_empty() && end.error.is_none());
+    // The end of the stream costs nothing: its grant is given back.
+    let client = Some(IpAddr::from([10, 0, 0, 12]));
+    let end = sync.serve_state_chunk(
+        ChunkRequest {
+            version: H,
+            after: Some(hex::encode(last.0)),
+            max: 100,
+        },
+        client,
+    );
+    assert!(end.done);
+    assert_eq!(
+        sync.state_budget.balance(client),
+        STATE_SERVE_UNITS_PER_SEC_PER_IP
+    );
     // Value parts: the same retention, and the same slots.
     let value = |version: u64| {
         sync.handle_state_value(ValueRequest {
@@ -1298,31 +1353,57 @@ fn the_client_table_forgets_idle_clients_only() {
     );
     assert!(pinned.admit(ip(0), 1).is_none(), "still one in flight");
     drop(held);
-    let busy = StateBudget::default();
-    let held: Vec<_> = (0..MAX_TRACKED_IPS as u32)
-        .filter_map(|i| busy.admit(ip(i), 1))
-        .collect();
-    // Only STATE_SERVE_IN_FLIGHT fit at once globally; the rest are in the
-    // table, spent.
-    drop(held);
-    for i in 0..MAX_TRACKED_IPS as u32 {
-        if let Some(a) = busy.admit(ip(i), 1) {
-            a.charge_read(1 << 30);
+    // A table of clients all still refilling has no room, whatever the
+    // global bucket holds.
+    let debt = StateBudget::default();
+    {
+        let mut st = debt.lock();
+        let now = Instant::now();
+        for i in 0..MAX_TRACKED_IPS as u32 {
+            st.per_ip.insert(
+                IpAddr::from(i.to_be_bytes()),
+                Bucket {
+                    tokens: -1.0,
+                    last: now,
+                    in_flight: 0,
+                },
+            );
         }
     }
-    assert!(busy.admit(ip(1 << 21), 1).is_none(), "every client in debt");
+    assert!(debt.admit(ip(1 << 21), 1).is_none(), "every client in debt");
+    assert_eq!(debt.lock().per_ip.len(), MAX_TRACKED_IPS, "none forgotten");
+    assert_eq!(debt.balance(None), STATE_SERVE_UNITS_PER_SEC, "not global");
 }
 
-/// Post-fix review MEDIUM 3: serving is charged by the bytes it reads, so a
-/// client that makes the server re-read a large value (alternating keys to
-/// miss the cache) runs out of budget.
+/// A bucket holds one second's worth at most, however long it was idle.
+#[test]
+fn a_bucket_holds_one_seconds_worth() {
+    let budget = StateBudget::default();
+    let ip = IpAddr::from([10, 0, 0, 1]);
+    drop(budget.admit(Some(ip), 1));
+    {
+        let mut st = budget.lock();
+        let long_ago = Instant::now() - Duration::from_secs(60);
+        st.global.last = long_ago;
+        st.per_ip.get_mut(&ip).unwrap().last = long_ago;
+    }
+    let client = budget.admit(Some(ip), usize::MAX).unwrap();
+    assert_eq!(client.granted, STATE_SERVE_UNITS_PER_SEC_PER_IP as usize);
+    drop(client);
+    budget.lock().global.last = Instant::now() - Duration::from_secs(60);
+    let global = budget.admit(None, usize::MAX).unwrap();
+    assert_eq!(global.granted, STATE_SERVE_UNITS_PER_SEC as usize);
+}
+
+/// Post-fix review MEDIUM 3, as charged since review 3: a part costs its
+/// bytes, and reading a value the cache does not hold costs its bytes too,
+/// up to one second's worth. A client that makes the server re-read large
+/// values (more of them than the cache holds) runs out of budget.
 #[test]
 fn value_reads_are_charged_by_their_bytes() {
-    let extra = vec![
-        (obj(500), vec![b'p'; 3 << 20]),
-        (obj(501), vec![b'q'; 3 << 20]),
-        (obj(502), vec![b'r'; 8 << 20]),
-    ];
+    let mut extra: Vec<(String, Vec<u8>)> =
+        (500..506).map(|i| (obj(i), vec![b'p'; 3 << 20])).collect();
+    extra.push((obj(510), vec![b'r'; 8 << 20]));
     let a = chain_with(
         "bytes_a",
         Spec {
@@ -1334,11 +1415,12 @@ fn value_reads_are_charged_by_their_bytes() {
     let client = Some(IpAddr::from([10, 0, 0, 3]));
     let start = Instant::now();
     let mut served = 0u64;
-    for i in 0..10u64 {
+    for i in 0..12u64 {
+        // Six values in turn, more than the cache holds: every read misses.
         let part = sync.serve_state_value(
             ValueRequest {
                 version: H,
-                key: obj(500 + i % 2),
+                key: obj(500 + i % 6),
                 offset: 0,
             },
             client,
@@ -1347,29 +1429,54 @@ fn value_reads_are_charged_by_their_bytes() {
             served += 1;
         }
     }
-    // Each miss reads 3 MiB and sends 1 MiB: over 1,000 units, of 2,000 a
-    // second (plus one burst) for this client.
-    let per_read = ((3 << 20) + (1 << 20)) / UNIT_BYTES;
+    // Each miss costs its part and the 3 MiB read, of 2,000 units a second
+    // (plus one burst) for this client.
+    let per_read = PART_UNITS as f64 + ((3 << 20) / UNIT_BYTES) as f64;
     let allowed = STATE_SERVE_UNITS_PER_SEC_PER_IP * (1.0 + start.elapsed().as_secs_f64());
     assert!(
-        (served * per_read) as f64 <= allowed + per_read as f64,
+        served as f64 * per_read <= allowed + per_read,
         "{served} whole-value reads served in {:?}",
         start.elapsed()
     );
-    // One read of an 8 MiB value costs more than a client's whole bucket
-    // (2,048 units read, 256 sent): it leaves the bucket in debt.
+    assert!(served >= 1, "positive control");
+    // Reading an 8 MiB value costs one second's worth on top of its part,
+    // for the client and globally: in debt by the part, at most.
+    let fresh = peer(&a, Behaviour::Honest).sync;
     let heavy = Some(IpAddr::from([10, 0, 0, 4]));
-    let read = sync.serve_state_value(
-        ValueRequest {
-            version: H,
-            key: obj(502),
-            offset: 0,
-        },
-        heavy,
+    let ask = |offset: u64, ip: Option<IpAddr>| {
+        fresh.serve_state_value(
+            ValueRequest {
+                version: H,
+                key: obj(510),
+                offset,
+            },
+            ip,
+        )
+    };
+    let first = ask(0, heavy);
+    assert!(first.error.is_none(), "{:?}", first.error);
+    let cost = PART_UNITS as f64 + STATE_SERVE_UNITS_PER_SEC_PER_IP;
+    let client_balance = fresh.state_budget.balance(heavy);
+    assert_eq!(client_balance, STATE_SERVE_UNITS_PER_SEC_PER_IP - cost);
+    let global_balance = fresh.state_budget.balance(None);
+    assert_eq!(global_balance, STATE_SERVE_UNITS_PER_SEC - cost, "global");
+    // Its next part is cached: the part alone, for any client.
+    let reader_ip = IpAddr::from([10, 0, 0, 5]);
+    let reader = Some(reader_ip);
+    let next = ask(VALUE_PART_BYTES as u64, reader);
+    assert!(next.error.is_none(), "{:?}", next.error);
+    assert_eq!(
+        fresh.state_budget.balance(reader),
+        STATE_SERVE_UNITS_PER_SEC_PER_IP - PART_UNITS as f64
     );
-    assert!(read.error.is_none(), "{:?}", read.error);
-    let balance = sync.state_budget.balance(heavy);
-    assert!(balance < -300.0, "in debt: {balance}");
+    // A part is let in only when its whole cost fits.
+    {
+        let mut st = fresh.state_budget.lock();
+        let bucket = st.per_ip.get_mut(&reader_ip).unwrap();
+        bucket.tokens = 100.0;
+        bucket.last = Instant::now();
+    }
+    assert_eq!(ask(0, reader).error.as_deref(), Some(BUSY));
 }
 
 /// Post-fix review test gap: the one-value cache answers only for its own
@@ -1466,11 +1573,20 @@ fn a_chunk_stays_within_its_byte_budget() {
         reader,
     );
     assert!(charged.error.is_none());
-    let balance = sync.state_budget.balance(reader);
-    assert!(
-        balance < 0.0,
-        "8 MiB read costs more than a bucket: {balance}"
-    );
+    // Charged a unit per leaf served (the rest of the grant given back) and
+    // the bytes read: the leaves served and the one read past the budget.
+    let served = charged.entries.len();
+    let (read, _) = state_commit::chunk(&a.db, H, None, served + 1)
+        .unwrap()
+        .unwrap();
+    let read: u64 = read.iter().map(|(_, v)| v.len() as u64).sum();
+    let expected = STATE_SERVE_UNITS_PER_SEC_PER_IP
+        - served as f64
+        - (read.div_ceil(UNIT_BYTES) as f64).min(STATE_SERVE_UNITS_PER_SEC_PER_IP);
+    // Exactly: a server that read more (every leaf granted, or the same
+    // leaves again) would be charged more.
+    assert!(read < 8 << 20, "under the charge's cap: {read}");
+    assert_eq!(sync.state_budget.balance(reader), expected);
     // The big value's parts, from the server alone.
     let mut value = Vec::new();
     while value.len() < big.len() {
@@ -1561,7 +1677,8 @@ impl Producer {
             Arc::new(Mutex::new(HashMap::new())),
             temp_db(name),
         )
-        .with_retention(retention);
+        .with_retention(retention)
+        .with_snapshot_serving(true);
         {
             let _seed = sync.storage.seeding();
             for (k, v) in &genesis() {
@@ -1756,26 +1873,20 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// A node's TCP server for `chain`, routing by `ChainSync::serves` as the
-/// node does. Returns its port once it accepts connections.
+/// A node's TCP server for `chain`, routing by `ChainSync::serve_from` as
+/// the node does. Returns its port once it accepts connections.
 async fn spawn_server(chain: &Chain) -> u16 {
     let server = Arc::new(peer(chain, Behaviour::Honest).sync);
     let port = free_port();
     let server_key = crypto::SigningKey::from_bytes(&[5; 32]);
     let server_id = crypto::derive_address(server_key.verifying_key().as_bytes()).unwrap();
-    tokio::spawn(network::start_server(
+    tokio::spawn(network::start_server_with_peer(
         port,
         server_id,
         Arc::new(Mutex::new(HashMap::new())),
         Arc::clone(&chain.db),
         Arc::new(server_key),
-        move |msg: String| {
-            if ChainSync::serves(&msg) {
-                server.handle_message(&msg)
-            } else {
-                None
-            }
-        },
+        move |msg: String, peer: IpAddr| server.serve_from(&msg, peer),
     ));
     for _ in 0..100 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -1817,7 +1928,9 @@ async fn a_node_restores_over_the_encrypted_transport() {
 }
 
 /// S6b: a connection the server dropped is reopened on the next request,
-/// never reused. Here the server drops it for exceeding its message rate.
+/// never reused, and the request is retried on it once (review 3: a kept
+/// connection the server closed while idle failed its next request). Here
+/// the server drops it for exceeding its message rate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dropped_connection_is_reopened() {
     let a = chain("tcp_drop", MEMBER);
@@ -1825,26 +1938,15 @@ async fn a_dropped_connection_is_reopened() {
     let connections = Connections::default();
     let key = crypto::SigningKey::from_bytes(&[6; 32]);
     let ask = |msg: &'static str| ask_over_tcp(&connections, 0, "127.0.0.1", port, 0, &key, msg);
-    assert_eq!(ask("GET_HEIGHT").await.unwrap(), "HEIGHT:0");
-    let mut dropped = false;
-    for _ in 0..200 {
-        if ask("GET_HEIGHT").await.is_err() {
-            dropped = true;
-            break;
-        }
+    let mut secrets = std::collections::HashSet::new();
+    for i in 0..250 {
+        let reply = ask("GET_HEIGHT").await;
+        assert_eq!(reply.as_deref(), Ok("HEIGHT:0"), "request {i}");
+        secrets.insert(connections.lock().await[&0].1);
     }
     assert!(
-        dropped,
-        "positive control: the server drops a flooding connection"
-    );
-    assert!(
-        connections.lock().await.is_empty(),
-        "the dead connection is gone"
-    );
-    assert_eq!(
-        ask("GET_HEIGHT").await.unwrap(),
-        "HEIGHT:0",
-        "a new one works"
+        secrets.len() > 1,
+        "positive control: the server dropped the flooding connection"
     );
 }
 
@@ -2295,7 +2397,7 @@ async fn a_peer_that_stalls_before_saying_busy_loses_its_turns() {
     let mut stalls = 0usize;
     let hurried = RestorePlan {
         patience: Patience {
-            request_timeout: Duration::from_millis(200),
+            slow_turn: Duration::from_millis(100),
             ..fast()
         },
         ..plan(&a.cp, &g, false)
@@ -2303,7 +2405,7 @@ async fn a_peer_that_stalls_before_saying_busy_loses_its_turns() {
     run_with(&client, &hurried, 2, |i, msg| {
         if i == 0 && msg.starts_with(CHUNK_REQ) {
             stalls += 1;
-            std::thread::sleep(Duration::from_millis(60));
+            std::thread::sleep(Duration::from_millis(150));
             return busy();
         }
         serve(&mut honest, msg)
@@ -2353,5 +2455,691 @@ async fn a_peer_that_delivers_is_forgiven() {
         .unwrap();
     let before_back = order[third + 1..].iter().take_while(|p| **p == 1).count();
     assert_eq!(before_back, 2, "order: {order:?}");
+    assert_restored(&client, &a);
+}
+
+// ===================== Review 3 witnesses =====================
+
+fn chunk_fits(entries: &[WireEntry], proof: usize) -> bool {
+    let mut budget = ChunkBudget::new(proof);
+    entries.iter().all(|e| budget.take(&e.key, e.len))
+}
+
+/// The protocol's chunk limits (`ChunkBudget`), at and just over each.
+#[test]
+fn a_chunk_fits_the_protocol_only_within_every_limit() {
+    let leaf = |len: u64| WireEntry {
+        key: obj(1),
+        value: String::new(),
+        len,
+    };
+    assert!(chunk_fits(&[leaf(MAX_LEAF_BYTES)], 0));
+    assert!(!chunk_fits(&[leaf(MAX_LEAF_BYTES + 1)], 0), "a leaf");
+    let at_total = [leaf(MAX_LEAF_BYTES), leaf(MAX_LEAF_BYTES)];
+    assert!(chunk_fits(&at_total, 0), "the parted total");
+    let over_total = [
+        leaf(MAX_LEAF_BYTES),
+        leaf(MAX_LEAF_BYTES),
+        leaf(INLINE_VALUE_BYTES as u64 + 1),
+    ];
+    assert!(!chunk_fits(&over_total, 0), "over the parted total");
+    // Inline: the key, 32 bytes of framing and the hex per leaf, and the
+    // proof twice. Fill to the limit with the largest inline leaves.
+    let cost = |len: u64| obj(1).len() + 32 + 2 * len as usize;
+    let big = INLINE_VALUE_BYTES as u64;
+    let (mut entries, mut used) = (Vec::new(), 0);
+    while used + cost(big) <= MAX_CHUNK_BYTES {
+        entries.push(leaf(big));
+        used += cost(big);
+    }
+    let last = ((MAX_CHUNK_BYTES - used - cost(0)) / 2) as u64;
+    entries.push(leaf(last));
+    assert!(chunk_fits(&entries, 0), "at the inline limit");
+    entries.last_mut().unwrap().len = last + 1;
+    assert!(!chunk_fits(&entries, 0), "inline bytes");
+    entries.last_mut().unwrap().len = last;
+    assert!(!chunk_fits(&entries, 1), "the proof counts");
+    entries.last_mut().unwrap().len = last - 1;
+    assert!(chunk_fits(&entries, 1));
+    // A leaf over the inline size counts toward the parts, not inline.
+    let parts = [leaf(big + 1), leaf(big + 1)];
+    let mut budget = ChunkBudget::new(0);
+    assert!(parts.iter().all(|e| budget.take(&e.key, e.len)));
+    assert_eq!(budget.inline, 2 * cost(0));
+    assert_eq!(budget.parted, 2 * (big + 1));
+}
+
+/// The client checks a chunk's entries before it fetches any part: a value
+/// neither whole nor in parts is a lie, and only the values in parts count
+/// toward a chunk's total.
+#[tokio::test]
+async fn a_chunks_entries_are_checked_before_any_part_is_fetched() {
+    let whole = |key: u64, value: &[u8], len: u64| WireEntry {
+        key: obj(key),
+        value: hex::encode(value),
+        len,
+    };
+    let parted = |key: u64, len: u64| WireEntry {
+        key: obj(key),
+        value: String::new(),
+        len,
+    };
+    let cases = [
+        // A small value sent empty.
+        (vec![parted(1, 10)], false),
+        // A whole value over the inline size.
+        (
+            vec![whole(
+                1,
+                &vec![7; INLINE_VALUE_BYTES + 1],
+                INLINE_VALUE_BYTES as u64 + 1,
+            )],
+            false,
+        ),
+        // A value that is not its stated length.
+        (vec![whole(1, b"abc", 4)], false),
+        // The parted total exactly, inline bytes besides: parts are asked
+        // for (and the ask fails here).
+        (
+            vec![
+                whole(1, &[7; 1000], 1000),
+                parted(2, MAX_LEAF_BYTES),
+                parted(3, MAX_LEAF_BYTES),
+            ],
+            true,
+        ),
+        (
+            vec![
+                parted(2, MAX_LEAF_BYTES),
+                parted(3, MAX_LEAF_BYTES),
+                parted(4, INLINE_VALUE_BYTES as u64 + 1),
+            ],
+            false,
+        ),
+    ];
+    for (entries, fetched) in cases {
+        let reply = chunk_reply(&ChunkResponse {
+            entries,
+            ..Default::default()
+        });
+        let value_asks = std::cell::Cell::new(0usize);
+        let mut ask = |_: usize, msg: String| {
+            let r = if msg.starts_with(VALUE_REQ) {
+                value_asks.set(value_asks.get() + 1);
+                Err("down".to_string())
+            } else {
+                reply.clone()
+            };
+            async move { r }
+        };
+        let got = ask_chunk(&mut ask, 0, H, None, &fast()).await;
+        if fetched {
+            assert!(matches!(got, Reply::Unanswered(_)));
+            assert_eq!(value_asks.get(), 1);
+        } else {
+            assert!(matches!(got, Reply::Lied(_)));
+            assert_eq!(value_asks.get(), 0);
+        }
+    }
+}
+
+/// A turn is too slow only past `slow_turn` and under the minimum rate.
+#[test]
+fn a_turn_is_judged_by_its_rate_past_the_slow_turn() {
+    let slow_turn = Duration::from_secs(2);
+    let secs = Duration::from_secs;
+    assert!(!too_slow(secs(1), 1.0, slow_turn), "a short turn");
+    assert!(too_slow(secs(3), 1.0, slow_turn), "a leaf in 3 s");
+    let enough = 3.0 * MIN_TURN_UNITS_PER_SEC;
+    assert!(!too_slow(secs(3), enough, slow_turn), "enough for its time");
+    assert!(too_slow(secs(3), enough - 1.0, slow_turn), "just under");
+}
+
+/// A struck peer sits out twice as many turns at each failure in a row, up
+/// to `MAX_SIT_OUT`; a delivery forgives it; when every live peer sits out,
+/// the closest is asked and its sit-out ends.
+#[test]
+fn a_struck_peer_sits_out_twice_as_long_up_to_a_cap() {
+    let mut set = PeerSet::new(3);
+    let mut expected = 1;
+    for _ in 0..12 {
+        set.strike(0);
+        assert_eq!(set.sit_out[0], expected);
+        expected = (expected * 2).min(MAX_SIT_OUT);
+    }
+    assert_eq!(set.sit_out[0], MAX_SIT_OUT);
+    set.delivered(0);
+    assert_eq!((set.penalty[0], set.sit_out[0]), (0, 0));
+    set.exclude(2);
+    let turns: Vec<_> = (0..4).map(|_| set.pick().unwrap()).collect();
+    assert_eq!(turns, [0, 1, 0, 1], "round robin, the excluded skipped");
+    for _ in 0..3 {
+        set.strike(0);
+    }
+    for _ in 0..2 {
+        set.strike(1);
+    }
+    assert_eq!(set.pick(), Some(1), "the closest to its turn");
+    assert_eq!(set.sit_out[1], 0, "its sit-out ended");
+    set.exclude(0);
+    set.exclude(1);
+    assert_eq!((set.pick(), set.live()), (None, 0));
+}
+
+/// The value cache keeps the most recently used values, as many and as
+/// large as its limits allow, and always the last one put.
+#[test]
+fn the_value_cache_keeps_the_most_recently_used() {
+    let mut cache = ValueCache::default();
+    let value = |b: u8| Arc::new(vec![b; 16]);
+    for v in 0..VALUE_CACHE_ENTRIES as u64 {
+        cache.put(v, "k", value(v as u8));
+    }
+    assert!(cache.get(0, "k").is_some(), "the oldest, now the newest");
+    cache.put(99, "k", value(9));
+    assert!(cache.get(1, "k").is_none(), "the least recently used went");
+    for v in [0, 2, 3, 99] {
+        assert!(cache.get(v, "k").is_some(), "{v}");
+    }
+    assert!(cache.get(0, "other").is_none(), "per key");
+    cache.put(7, "big", Arc::new(vec![0; VALUE_CACHE_BYTES + 1]));
+    assert_eq!(cache.entries.len(), 1, "the byte limit");
+    assert!(cache.get(7, "big").is_some(), "the last one stays");
+    cache.put(8, "small", value(1));
+    assert_eq!(cache.entries.len(), 1);
+    assert!(cache.get(8, "small").is_some());
+}
+
+/// Snapshot serving is off unless asked for (`AINCORE_SERVE_SNAPSHOTS=1`):
+/// a validator's disk serves consensus first. Anchors are always served.
+#[test]
+fn a_node_serves_snapshots_only_when_asked_to() {
+    let a = chain("optin_a", MEMBER);
+    let chunk = || ChunkRequest {
+        version: H,
+        after: None,
+        max: 10,
+    };
+    let value = || ValueRequest {
+        version: H,
+        key: obj(3),
+        offset: 0,
+    };
+    let default = ChainSync::new(
+        "server".into(),
+        0,
+        Arc::new(Mutex::new(HashMap::new())),
+        Arc::clone(&a.db),
+    );
+    let off = if std::env::var("AINCORE_SERVE_SNAPSHOTS").is_err() {
+        default
+    } else {
+        default.with_snapshot_serving(false)
+    };
+    assert_eq!(
+        off.handle_state_chunk(chunk()).error.as_deref(),
+        Some(NOT_SERVED)
+    );
+    assert_eq!(
+        off.handle_state_value(value()).error.as_deref(),
+        Some(NOT_SERVED)
+    );
+    assert!(off
+        .handle_state_anchor(AnchorRequest { height: H })
+        .block
+        .is_some());
+    let on = off.with_snapshot_serving(true);
+    assert!(on.handle_state_chunk(chunk()).error.is_none());
+    assert!(on.handle_state_value(value()).error.is_none());
+}
+
+/// The node's server routes by `serve_from`: chain sync's requests are
+/// answered and budgeted by the client's IP; anything else is not answered.
+#[test]
+fn serve_from_budgets_by_the_clients_ip() {
+    let a = chain("route_a", MEMBER);
+    let sync = peer(&a, Behaviour::Honest).sync;
+    let ip = IpAddr::from([10, 0, 0, 8]);
+    let request = ChunkRequest {
+        version: H,
+        after: None,
+        max: 10,
+    };
+    let msg = format!("{CHUNK_REQ}{}", serde_json::to_string(&request).unwrap());
+    let reply = sync.serve_from(&msg, ip).unwrap();
+    assert!(reply.starts_with(CHUNK_RESP), "{reply}");
+    assert!(
+        sync.state_budget.balance(Some(ip)) < STATE_SERVE_UNITS_PER_SEC_PER_IP,
+        "charged to the client"
+    );
+    assert_eq!(sync.serve_from("TX:{}", ip), None);
+    assert!(sync.serve_from("GET_HEIGHT", ip).is_some());
+}
+
+/// The restore records the network's height as the highest a peer reports,
+/// and at least the checkpoint's: SN-6 judges a key by it at every boot.
+#[tokio::test]
+async fn the_restore_records_the_network_tip() {
+    let g = genesis();
+    let a = chain("tip_a", MEMBER);
+    for (heights, expected) in [(["HEIGHT:50", "HEIGHT:x"], 50), (["HEIGHT:3", "?"], H)] {
+        let client = temp_db("tip_client");
+        let mut peers = [peer(&a, Behaviour::Honest), peer(&a, Behaviour::Honest)];
+        run_with(&client, &plan(&a.cp, &g, false), 2, |i, msg| {
+            if msg == "GET_HEIGHT" {
+                return Ok(heights[i].to_string());
+            }
+            serve(&mut peers[i], msg)
+        })
+        .await
+        .unwrap();
+        assert_eq!(client.get(RESTORE_TIP).unwrap(), Some(expected.to_string()));
+    }
+    // A recent checkpoint: a peer's absurd height is cut to what time allows.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let recent = chain_with(
+        "tip_recent",
+        Spec {
+            timestamp: now,
+            ..Spec::default()
+        },
+    );
+    let client = temp_db("tip_recent_client");
+    let mut server = peer(&recent, Behaviour::Honest);
+    run_with(&client, &plan(&recent.cp, &g, false), 1, |_, msg| {
+        if msg == "GET_HEIGHT" {
+            return Ok(format!("HEIGHT:{}", u64::MAX));
+        }
+        serve(&mut server, msg)
+    })
+    .await
+    .unwrap();
+    let tip: u64 = client.get(RESTORE_TIP).unwrap().unwrap().parse().unwrap();
+    let ceiling = H + TIP_CLOCK_SLACK_SECS * MAX_BLOCKS_PER_SEC;
+    assert!((ceiling..ceiling + 600).contains(&tip), "{tip}");
+}
+
+/// A peer cannot push the tip past what time allows since the checkpoint
+/// block, nor below the checkpoint.
+#[tokio::test]
+async fn a_peer_cannot_raise_the_tip_past_what_time_allows() {
+    let a = chain("ceiling_a", MEMBER);
+    let mut block = stored_block(&a);
+    let now = 1_000_000;
+    block.header.timestamp = now - 60;
+    let per_sec = MAX_BLOCKS_PER_SEC;
+    assert_eq!(
+        tip_ceiling(&block, now),
+        H + (60 + TIP_CLOCK_SLACK_SECS) * per_sec
+    );
+    assert_eq!(
+        tip_ceiling(&block, now - 1_000),
+        H + TIP_CLOCK_SLACK_SECS * per_sec,
+        "a clock behind the block"
+    );
+    let reply = |height: &'static str| {
+        move |_: usize, _: String| async move { Ok::<_, String>(height.to_string()) }
+    };
+    let mut huge = reply("HEIGHT:18446744073709551615");
+    assert_eq!(network_tip(H, 500, 2, &mut huge).await, 500);
+    let mut low = reply("HEIGHT:3");
+    assert_eq!(network_tip(H, 500, 2, &mut low).await, H);
+    let mut fair = reply("HEIGHT:70");
+    assert_eq!(network_tip(H, 500, 2, &mut fair).await, 70);
+    let mut low = reply("HEIGHT:3");
+    assert_eq!(network_tip(H, H - 5, 2, &mut low).await, H, "never below");
+}
+
+/// Review 3: a block re-signed with any account's key is not stored: the
+/// signer must be a validator. The pair a validator signed is the one kept.
+#[tokio::test]
+async fn a_block_signed_by_a_non_validator_is_not_stored() {
+    let g = genesis();
+    let a = chain("resign_a", MEMBER);
+    let client = temp_db("resign_client");
+    let mut byz = peer(&a, Behaviour::Honest);
+    let mut honest = peer(&a, Behaviour::Honest);
+    let (key, address) = outsider();
+    let mut block = stored_block(&a);
+    block.sign_proposer(&key, &address);
+    let byz_anchor = format!(
+        "{ANCHOR_RESP}{}",
+        serde_json::to_string(&AnchorResponse {
+            block: Some(block.clone()),
+            quorum_certificate: Some(stored_qc(&a)),
+        })
+        .unwrap()
+    );
+    run_with(&client, &plan(&a.cp, &g, false), 2, |i, msg| {
+        if i == 0 && msg.starts_with(ANCHOR_REQ) {
+            Ok(byz_anchor.clone())
+        } else if i == 0 {
+            serve(&mut byz, msg)
+        } else {
+            serve(&mut honest, msg)
+        }
+    })
+    .await
+    .unwrap();
+    let stored: Block =
+        serde_json::from_str(&client.get(&format!("block_{H}")).unwrap().unwrap()).unwrap();
+    assert_eq!(stored.proposer_signer, proposer().1);
+    assert!(
+        ChainSync::verify_proposer_signature_in(&client, &block).is_ok(),
+        "positive control: the outsider's signature itself verifies"
+    );
+    assert_restored(&client, &a);
+}
+
+/// Peers that hold the same pair give one candidate, not one each.
+#[tokio::test]
+async fn the_same_anchor_from_many_peers_is_one_candidate() {
+    let a = chain("dedup_a", MEMBER);
+    let mut peers = [
+        peer(&a, Behaviour::Honest),
+        peer(&a, Behaviour::Honest),
+        peer(&a, Behaviour::Honest),
+    ];
+    let mut ask = |i: usize, msg: String| {
+        let r = serve(&mut peers[i], &msg);
+        async move { r }
+    };
+    let pairs = fetch_anchor(&a.cp, 3, &mut ask, &fast()).await.unwrap();
+    assert_eq!(pairs.len(), 1);
+}
+
+/// Review 3 HIGH 1: a large leaf restores on the per-IP path from one
+/// server, with production patience, even when every part misses the cache
+/// (other clients read as many other values in between): a miss costs at
+/// most one second's worth, and a busy part is waited for.
+#[tokio::test]
+async fn a_large_leaf_restores_on_the_per_ip_path_when_every_part_misses() {
+    let g = genesis();
+    let a = chain_with(
+        "perip_big_a",
+        Spec {
+            extra: vec![(obj(500), vec![b'z'; 8 << 20])],
+            ..Spec::default()
+        },
+    );
+    let client = temp_db("perip_big_client");
+    let server = peer(&a, Behaviour::Honest).sync;
+    let ip = IpAddr::from([10, 0, 0, 7]);
+    let patient = RestorePlan {
+        patience: Patience {
+            deadline: Duration::from_secs(120),
+            ..Patience::default()
+        },
+        ..plan(&a.cp, &g, false)
+    };
+    let (mut thrashed, mut parts, mut lowest) = (None, 0usize, f64::MAX);
+    run_with(&client, &patient, 1, |_, msg| {
+        if let Some(json) = msg.strip_prefix(VALUE_REQ) {
+            let offset = serde_json::from_str::<ValueRequest>(json).unwrap().offset;
+            if thrashed != Some(offset) {
+                thrashed = Some(offset);
+                for i in 0..VALUE_CACHE_ENTRIES as u8 {
+                    let read = server.serve_state_value(
+                        ValueRequest {
+                            version: H,
+                            key: obj(u64::from(i)),
+                            offset: 0,
+                        },
+                        Some(IpAddr::from([10, 1, 0, i])),
+                    );
+                    assert!(read.error.is_none(), "{:?}", read.error);
+                }
+            }
+        }
+        let reply = server.serve_from(msg, ip).ok_or("no answer")?;
+        if let Some(json) = reply.strip_prefix(VALUE_RESP) {
+            let part: ValueResponse = serde_json::from_str(json).unwrap();
+            parts += usize::from(part.error.is_none());
+            lowest = lowest.min(server.state_budget.balance(Some(ip)));
+        }
+        Ok(reply)
+    })
+    .await
+    .unwrap();
+    assert_eq!(parts, 8, "each part once");
+    assert!(
+        lowest < 0.0,
+        "positive control: misses were charged: {lowest}"
+    );
+    assert_restored(&client, &a);
+}
+
+/// Review 3 HIGH 2: a peer that sends valid chunks too slowly for what they
+/// hold (a leaf at a time) sits out turns like a failing one.
+#[tokio::test]
+async fn a_peer_that_trickles_valid_chunks_loses_its_turns() {
+    let g = genesis();
+    let a = chain("slowvalid_a", MEMBER);
+    let client = temp_db("slowvalid_client");
+    let hostile = peer(&a, Behaviour::Honest).sync;
+    let honest = peer(&a, Behaviour::Honest).sync;
+    let judged = RestorePlan {
+        patience: Patience {
+            slow_turn: Duration::from_millis(300),
+            ..fast()
+        },
+        ..plan(&a.cp, &g, false)
+    };
+    let (mut hostile_turns, mut honest_turns) = (0usize, 0usize);
+    run_with(&client, &judged, 2, |i, msg| {
+        let Some(json) = msg.strip_prefix(CHUNK_REQ) else {
+            return honest.handle_message(msg).ok_or("no answer".into());
+        };
+        let mut request: ChunkRequest = serde_json::from_str(json).unwrap();
+        if i == 0 {
+            hostile_turns += 1;
+            std::thread::sleep(Duration::from_millis(400));
+            request.max = 1;
+            return chunk_reply(&hostile.handle_state_chunk(request));
+        }
+        honest_turns += 1;
+        request.max = SMALL_CHUNK;
+        chunk_reply(&honest.handle_state_chunk(request))
+    })
+    .await
+    .unwrap();
+    assert!(
+        hostile_turns <= 3,
+        "passed over more each time: {hostile_turns} turns, honest {honest_turns}"
+    );
+    assert_restored(&client, &a);
+}
+
+/// A slow turn that delivers enough for its time keeps the peer's turns:
+/// only the rate counts, not the time alone.
+#[tokio::test]
+async fn a_slow_turn_that_delivers_enough_keeps_its_turns() {
+    let g = genesis();
+    let extra = (100..160)
+        .map(|i| (obj(i), vec![b'd'; INLINE_VALUE_BYTES]))
+        .collect();
+    let a = chain_with(
+        "slowbig_a",
+        Spec {
+            extra,
+            ..Spec::default()
+        },
+    );
+    let client = temp_db("slowbig_client");
+    let server = peer(&a, Behaviour::Honest).sync;
+    let judged = RestorePlan {
+        patience: Patience {
+            slow_turn: Duration::from_millis(500),
+            ..fast()
+        },
+        ..plan(&a.cp, &g, false)
+    };
+    let (mut slow_turns, mut fast_turns) = (0usize, 0usize);
+    run_with(&client, &judged, 2, |i, msg| {
+        let Some(json) = msg.strip_prefix(CHUNK_REQ) else {
+            return server.handle_message(msg).ok_or("no answer".into());
+        };
+        // Whole chunks, bound by bytes: about seven 256 KiB leaves each,
+        // over 450 units, so over 250 a second unless a turn takes 1.8 s.
+        let reply = chunk_reply(&server.handle_state_chunk(serde_json::from_str(json).unwrap()));
+        if i == 0 {
+            slow_turns += 1;
+            std::thread::sleep(Duration::from_millis(600));
+        } else {
+            fast_turns += 1;
+        }
+        reply
+    })
+    .await
+    .unwrap();
+    assert!(
+        fast_turns <= slow_turns + 1,
+        "slow {slow_turns}, fast {fast_turns}"
+    );
+    assert!(slow_turns >= 4, "positive control: {slow_turns}");
+    assert_restored(&client, &a);
+}
+
+/// A busy answer given at once is no fault: the peer keeps its turns. Only a
+/// slow "busy" costs turns (`a_peer_that_stalls_before_saying_busy..`).
+#[tokio::test]
+async fn a_peer_that_says_busy_at_once_keeps_its_turns() {
+    let g = genesis();
+    let extra = (100..400).map(|i| (obj(i), b"x".to_vec())).collect();
+    let a = chain_with(
+        "fairbusy_a",
+        Spec {
+            extra,
+            ..Spec::default()
+        },
+    );
+    let client = temp_db("fairbusy_client");
+    let mut first = peer(&a, Behaviour::Honest);
+    let mut second = peer(&a, Behaviour::Honest);
+    let (mut first_turns, mut second_turns) = (0usize, 0usize);
+    run_with(&client, &plan(&a.cp, &g, false), 2, |i, msg| {
+        if i == 1 || !msg.starts_with(CHUNK_REQ) {
+            second_turns += usize::from(msg.starts_with(CHUNK_REQ));
+            return serve(&mut second, msg);
+        }
+        first_turns += 1;
+        if !first_turns.is_multiple_of(2) {
+            return busy();
+        }
+        serve(&mut first, msg)
+    })
+    .await
+    .unwrap();
+    assert!(
+        second_turns <= first_turns + 1,
+        "first {first_turns}, second {second_turns}"
+    );
+    assert!(first_turns > 10, "positive control: {first_turns}");
+    assert_restored(&client, &a);
+}
+
+fn polling() -> Patience {
+    Patience {
+        backoff_start: Duration::from_millis(50),
+        backoff_max: Duration::from_secs(5),
+        ..fast()
+    }
+}
+
+/// A value part answered "busy" is asked for again from where the value
+/// stands: no part is fetched twice, the wait does not grow from one part to
+/// the next, and the request timeout runs from the last part, not the first.
+#[tokio::test]
+async fn value_parts_wait_out_busy_answers_without_starting_over() {
+    let g = genesis();
+    let a = chain_with(
+        "partbusy_a",
+        Spec {
+            extra: vec![(obj(500), vec![b'w'; 8 << 20])],
+            ..Spec::default()
+        },
+    );
+    let client = temp_db("partbusy_client");
+    let mut server = peer(&a, Behaviour::Honest);
+    // Eight parts, each after a 200 ms wait: longer than the timeout in all.
+    let polled = RestorePlan {
+        patience: Patience {
+            backoff_start: Duration::from_millis(100),
+            request_timeout: Duration::from_secs(1),
+            ..polling()
+        },
+        ..plan(&a.cp, &g, false)
+    };
+    let (mut asked, mut served, mut waits) = (Vec::new(), Vec::new(), Vec::new());
+    let mut said_busy = Instant::now();
+    run_with(&client, &polled, 1, |_, msg| {
+        if let Some(json) = msg.strip_prefix(VALUE_REQ) {
+            let offset = serde_json::from_str::<ValueRequest>(json).unwrap().offset;
+            if !asked.contains(&offset) {
+                asked.push(offset);
+                said_busy = Instant::now();
+                let busy = ValueResponse {
+                    error: Some("busy".into()),
+                    ..Default::default()
+                };
+                return Ok(format!(
+                    "{VALUE_RESP}{}",
+                    serde_json::to_string(&busy).unwrap()
+                ));
+            }
+            served.push(offset);
+            waits.push(said_busy.elapsed());
+        }
+        serve(&mut server, msg)
+    })
+    .await
+    .unwrap();
+    let parts: Vec<u64> = (0..8).map(|i| i * VALUE_PART_BYTES as u64).collect();
+    assert_eq!(served, parts, "each part once, in order");
+    // One step each (200 ms). Growing, the third would wait 800 ms.
+    assert!(
+        waits.iter().all(|w| *w < Duration::from_millis(600)),
+        "{waits:?}"
+    );
+    assert_restored(&client, &a);
+}
+
+/// The restore's wait for a busy peer starts over once it delivers: the
+/// waits do not grow across a restore.
+#[tokio::test]
+async fn the_busy_wait_starts_over_after_a_delivery() {
+    let g = genesis();
+    let a = chain("busyreset_a", MEMBER);
+    let client = temp_db("busyreset_client");
+    let mut server = peer(&a, Behaviour::Honest);
+    let polled = RestorePlan {
+        patience: polling(),
+        ..plan(&a.cp, &g, false)
+    };
+    let (mut chunk_asks, mut waits) = (0usize, Vec::new());
+    let mut said_busy = Instant::now();
+    run_with(&client, &polled, 1, |_, msg| {
+        if msg.starts_with(CHUNK_REQ) {
+            chunk_asks += 1;
+            if !chunk_asks.is_multiple_of(2) {
+                said_busy = Instant::now();
+                return busy();
+            }
+            waits.push(said_busy.elapsed());
+        }
+        serve(&mut server, msg)
+    })
+    .await
+    .unwrap();
+    // Busy before each chunk answer: one step each (100 ms). Growing, the
+    // fifth would wait 1.6 s.
+    assert!(waits.len() >= 7, "positive control: {waits:?}");
+    assert!(
+        waits.iter().all(|w| *w < Duration::from_millis(600)),
+        "{waits:?}"
+    );
     assert_restored(&client, &a);
 }

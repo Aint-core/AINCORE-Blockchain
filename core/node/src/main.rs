@@ -281,37 +281,28 @@ async fn restore_from_checkpoint(
     Ok(Some(restored))
 }
 
-/// G3 SN-6 at every boot: a datadir restored with one key may not be run as
-/// a validator with another. A validator key moved onto a restored datadir
-/// can sign a slot its old instance already signed, and the abstention that
-/// prevents that (G1 RC-3) does not exist yet.
+/// G3 SN-6 at every boot: on a restored datadir, a key that was a validator
+/// at or before the network height the restore recorded may have signed
+/// slots this datadir never saw, so it may not run here. A key that became a
+/// validator after that (a fresh key that joined) signed nothing elsewhere.
 fn check_restored_signer(storage: &StateDB, my_address: &str) -> Result<(), String> {
-    let Some(restored_by) = storage
-        .get(chain_sync::state_sync::RESTORED_BY)
+    let Some(tip) = storage
+        .get(chain_sync::state_sync::RESTORE_TIP)
         .map_err(|e| e.to_string())?
     else {
         return Ok(());
     };
-    if restored_by == my_address {
-        return Ok(());
-    }
-    let height = storage
-        .get("latest_height")
-        .map_err(|e| e.to_string())?
-        .and_then(|h| h.parse::<u64>().ok())
-        .unwrap_or(0);
-    let in_committee = consensus::qc_producer::epoch_for_block_height(storage, height.max(1))
-        .and_then(|epoch| consensus::qc_producer::load_validator_set_for_epoch(storage, epoch))
-        .is_some_and(|committee| committee.iter().any(|v| v.address == my_address));
-    let active = storage
-        .get_active_validators()
-        .iter()
-        .any(|(address, _)| address == my_address);
-    if in_committee || active {
+    let tip: u64 = tip.parse().map_err(|_| {
+        format!(
+            "unreadable {}: {tip:?}",
+            chain_sync::state_sync::RESTORE_TIP
+        )
+    })?;
+    if chain_sync::state_sync::validator_at_or_before(storage, my_address, tip) {
         return Err(format!(
-            "this datadir was restored with key {restored_by}, and this node's key \
-             {my_address} is a validator: a validator key moved onto a restored datadir can \
-             sign a slot its old instance already signed (SN-6)"
+            "this datadir was restored when the network was at height {tip}, and this \
+             node's key {my_address} was a validator by then: it may have signed slots this \
+             datadir never saw (SN-6)"
         ));
     }
     Ok(())
@@ -1011,7 +1002,7 @@ async fn main() {
                         } else {
                             None
                         }
-                    } else if ChainSync::serves(&msg) {
+                    } else {
                         // Single serving implementation: chain_sync owns GET_HEIGHT,
                         // GET_FINALITY (with the quorum certificate), SYNC_REQ (blocks +
                         // finality QC + prune_horizon), VERTEX_REQ (DAG vertex bodies by
@@ -1021,9 +1012,7 @@ async fn main() {
                         // over the same encrypted socket by network::start_server. Keeping
                         // this here — instead of reimplementing it inline in the transport —
                         // is what stops serving-side fixes from silently landing on dead code.
-                        node_chain_sync.handle_message_from(&msg, Some(peer))
-                    } else {
-                        None
+                        node_chain_sync.serve_from(&msg, peer)
                     }
                 },
             )
@@ -1633,65 +1622,72 @@ mod boot_identity_tests {
         );
     }
 
-    /// Post-fix review MEDIUM 5 (SN-6 at every boot): a datadir restored
-    /// with one key refuses to run with another that is a validator.
+    /// SN-6 at every boot (review 3 MEDIUM): on a restored datadir, a key
+    /// that was a validator at or before the network height the restore
+    /// recorded may not run; one that became a validator later may.
     #[test]
-    fn a_restored_datadir_refuses_a_different_validator_key() {
+    fn a_restored_datadir_refuses_a_key_that_was_a_validator_by_its_tip() {
         use super::check_restored_signer;
-        let db = skip_db("restored_signer");
-        let observer = "aa".repeat(32);
-        let validator = "bb".repeat(32);
-        assert_eq!(
-            check_restored_signer(&db, &validator),
-            Ok(()),
-            "not restored"
-        );
-        {
-            let _seed = db.seeding();
-            db.put(
-                "sys:validators",
-                &serde_json::to_string(&vec![(validator.clone(), 100u64)]).unwrap(),
-            )
-            .unwrap();
-        }
-        db.put(chain_sync::state_sync::RESTORED_BY, &observer)
-            .unwrap();
-        assert_eq!(check_restored_signer(&db, &observer), Ok(()), "its own key");
-        assert_eq!(
-            check_restored_signer(&db, &"cc".repeat(32)),
-            Ok(()),
-            "another observer key"
-        );
-        let err = check_restored_signer(&db, &validator).unwrap_err();
-        assert!(err.contains("SN-6") && err.contains(&observer), "{err}");
-        // Its own restoring key, a validator now (it joined): fine.
-        db.put(chain_sync::state_sync::RESTORED_BY, &validator)
-            .unwrap();
-        assert_eq!(check_restored_signer(&db, &validator), Ok(()));
-        // A member of the current epoch's committee, not in the active set.
-        let committee_only = skip_db("restored_committee");
-        let member = consensus::qc::ValidatorInfo {
-            address: validator.clone(),
+        let early = "aa".repeat(32);
+        let late = "bb".repeat(32);
+        let pending = "cc".repeat(32);
+        let observer = "dd".repeat(32);
+        let member = |address: &str| consensus::qc::ValidatorInfo {
+            address: address.to_string(),
             stake: 100,
             ed25519_public_key: "00".repeat(32),
             bls_public_key: "00".repeat(48),
             bls_pop: "00".repeat(96),
         };
+        // Genesis: `early`. Epoch 1 from height 15: `early`. Epoch 2 from 30:
+        // `late`. The active set (for the next epoch): `pending`.
+        let db = skip_db("restored_signer");
         {
-            let _seed = committee_only.seeding();
-            committee_only
-                .put(
-                    "genesis:validator_set:v1",
-                    &serde_json::to_string(&vec![member]).unwrap(),
-                )
+            let _seed = db.seeding();
+            let set = |who: &[&str]| {
+                serde_json::to_string(&who.iter().map(|a| member(a)).collect::<Vec<_>>()).unwrap()
+            };
+            db.put("genesis:validator_set:v1", &set(&[&early])).unwrap();
+            db.put("sys:validator_set:epoch:1", &set(&[&early]))
                 .unwrap();
-        }
-        committee_only
-            .put(chain_sync::state_sync::RESTORED_BY, &observer)
+            db.put("sys:validator_set:epoch:2", &set(&[&late])).unwrap();
+            db.put(
+                "sys:validators",
+                &serde_json::to_string(&vec![(pending.clone(), 100u64)]).unwrap(),
+            )
             .unwrap();
-        committee_only.put("latest_height", "5").unwrap();
-        let err = check_restored_signer(&committee_only, &validator).unwrap_err();
-        assert!(err.contains("SN-6"), "{err}");
+            db.put("consensus:epoch_start_height:1", "15").unwrap();
+            db.put("consensus:epoch_start_height:2", "30").unwrap();
+            db.put("consensus:epoch", "2").unwrap();
+        }
+        db.put("latest_height", "40").unwrap();
+        // Not restored: no rule.
+        for key in [&early, &late, &pending, &observer] {
+            assert_eq!(check_restored_signer(&db, key), Ok(()), "not restored");
+        }
+        let at = |tip: &str| {
+            db.put(chain_sync::state_sync::RESTORE_TIP, tip).unwrap();
+            [&early, &late, &pending, &observer].map(|key| check_restored_signer(&db, key).is_ok())
+        };
+        // Restored at 20: `early` was a validator by then; `late` joined at
+        // 30, after it; `pending` is active only from the epoch that began
+        // at 30.
+        assert_eq!(at("20"), [false, true, true, true]);
+        // Restored at 30: both epochs had begun, and the active set with them.
+        assert_eq!(at("30"), [false, false, false, true]);
+        // Restored at 10: before epoch 1, `early` was a genesis validator.
+        assert_eq!(at("10"), [false, true, true, true]);
+        let err = check_restored_signer(&db, &early).unwrap_err();
+        assert!(err.contains("SN-6") && err.contains("10"), "{err}");
+        // An epoch whose start is not recorded counts as begun.
+        {
+            let _seed = db.seeding();
+            db.delete("consensus:epoch_start_height:2").unwrap();
+        }
+        assert_eq!(at("20"), [false, false, false, true]);
+        // A record it cannot read refuses: never read as "not restored".
+        db.put(chain_sync::state_sync::RESTORE_TIP, "x").unwrap();
+        assert!(check_restored_signer(&db, &observer).is_err());
     }
 
     #[test]

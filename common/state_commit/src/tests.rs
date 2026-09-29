@@ -582,6 +582,35 @@ fn chunk_refuses_a_corrupt_preimage_and_reports_the_end_as_none() {
     assert!(chunk(&clean, 0, None, MAX_CHUNK + 1).is_err(), "size cap");
 }
 
+/// `chunk_while` ends before the first refused leaf, having read at most
+/// that one past it, with a proof for what it took; refusing the first leaf
+/// takes nothing.
+#[test]
+fn chunk_while_ends_before_the_first_refused_leaf() {
+    let (srv, root) = server("while", 30);
+    let mut seen = 0;
+    let (first, proof) = chunk_while(&srv, 0, None, 100, |_, _| {
+        seen += 1;
+        seen <= 5
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!((first.len(), seen), (5, 6), "one leaf read past the budget");
+    assert_eq!(first, chunk(&srv, 0, None, 5).unwrap().unwrap().0);
+    let mut restore = Restore::begin(temp_db("client_while"), 0, root).unwrap();
+    let last = key_hash(&first.last().unwrap().0);
+    restore.add_chunk(first, proof).unwrap();
+    let (rest, proof) = chunk(&srv, 0, Some(last), 100).unwrap().unwrap();
+    restore.add_chunk(rest, proof).unwrap();
+    restore.finish().unwrap();
+    assert!(
+        chunk_while(&srv, 0, None, 100, |_, _| false)
+            .unwrap()
+            .is_none(),
+        "nothing taken"
+    );
+}
+
 /// Golden vector: the root of a fixed state must never drift. Any change to
 /// key hashing, leaf or value encoding breaks proofs clients already verify
 /// (the same vector will pin the JS verifier, PF-4).

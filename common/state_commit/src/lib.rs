@@ -947,6 +947,21 @@ pub fn chunk(
     after: Option<KeyHash>,
     max: usize,
 ) -> Result<Option<(Entries, SparseMerkleRangeProof<Sha256>)>> {
+    chunk_while(db, version, after, max, |_, _| true)
+}
+
+/// `chunk`, ending before the first leaf `admit` refuses: it sees each leaf's
+/// key and value in order, so a server can stop at a byte budget after
+/// reading at most one leaf past it. `Ok(None)` when no leaf was taken: the
+/// stream is complete, or `admit` refused the first leaf (its caller knows
+/// which).
+pub fn chunk_while(
+    db: &Arc<StateDB>,
+    version: Version,
+    after: Option<KeyHash>,
+    max: usize,
+    mut admit: impl FnMut(&str, &[u8]) -> bool,
+) -> Result<Option<(Entries, SparseMerkleRangeProof<Sha256>)>> {
     ensure!(
         (1..=MAX_CHUNK).contains(&max),
         "chunk size must be 1..={MAX_CHUNK}"
@@ -971,6 +986,9 @@ pub fn chunk(
                 "corrupt preimage for {}",
                 hex::encode(kh.0)
             );
+            if !admit(&key, &value) {
+                break;
+            }
             out.push((key, value));
             last = Some(kh);
             if out.len() == max {
@@ -987,7 +1005,7 @@ pub fn chunk(
 
 /// Largest wire range proof: a count, then at most 256 tagged siblings of
 /// up to 64 bytes each.
-const MAX_RANGE_PROOF_BYTES: usize = 4 + 256 * 65;
+pub const MAX_RANGE_PROOF_BYTES: usize = 4 + 256 * 65;
 
 /// `chunk` for the wire: the range proof borsh-encoded, so peers never
 /// handle `jmt` types. `after` is the key hash the previous chunk ended on.
@@ -997,7 +1015,18 @@ pub fn wire_chunk(
     after: Option<[u8; 32]>,
     max: usize,
 ) -> Result<Option<(Entries, Vec<u8>)>> {
-    match chunk(db, version, after.map(KeyHash), max)? {
+    wire_chunk_while(db, version, after, max, |_, _| true)
+}
+
+/// `chunk_while` for the wire.
+pub fn wire_chunk_while(
+    db: &Arc<StateDB>,
+    version: Version,
+    after: Option<[u8; 32]>,
+    max: usize,
+    admit: impl FnMut(&str, &[u8]) -> bool,
+) -> Result<Option<(Entries, Vec<u8>)>> {
+    match chunk_while(db, version, after.map(KeyHash), max, admit)? {
         None => Ok(None),
         Some((entries, proof)) => Ok(Some((entries, borsh::to_vec(&proof)?))),
     }

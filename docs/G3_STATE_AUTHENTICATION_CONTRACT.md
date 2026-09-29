@@ -756,15 +756,16 @@ counters, never values.
   with pins kept for two windows.
 
 **S6 status (branch `g3/activation`).** S6a is the library half, S6b the node wiring. There
-were two independent reviews; the findings of both are fixed.
+were three independent reviews; the findings of all three are fixed.
 - **Trust until TA (S5):** the anchor is a weak-subjectivity checkpoint
   `height:block_hash:state_root` (TA-0, TA-4), pinned by the operator together with the
   network's genesis identity (`AINCORE_EXPECTED_GENESIS_HASH`, required for a restore).
   - Every chunk, and every part of a large value, is proven against the checkpoint root.
   - The block and QC at the checkpoint come from peers as pairs, deduplicated as pairs,
     that must match the checkpoint and each other (`check_anchor`).
-  - The block stored is the one whose own QC verifies and whose proposer signature
-    verifies under the key the restored state records.
+  - The block stored is the one whose own QC verifies, whose proposer is a validator (the
+    checkpoint epoch's committee or the restored active set), and whose proposer
+    signature verifies under the key the restored state records for it.
   - The QC must verify under the committee that the restored state records for its epoch,
     and under this node's chain id. That is a consistency check, not trust.
 - **Genesis binding:** the plan carries this node's own genesis, built in memory
@@ -774,7 +775,8 @@ were two independent reviews; the findings of both are fixed.
 - **Write gate:** `StateDB::restore_transaction` may write consensus state and opens only
   while `sys:restore_in_progress` exists. The marker keeps honest code honest; it is not a
   security boundary.
-- **Protocol** (`sync::state_sync`, served from `chain_sync::handle_message_from`):
+- **Protocol** (`sync::state_sync`; the node's TCP server routes through
+  `ChainSync::serve_from`, with the request's source IP):
   - `STATE_ANCHOR_REQ` returns `block_{h}` and `consensus:qc:{h}`.
   - `STATE_CHUNK_REQ` returns up to 2,000 leaves: at most 4 MiB inline, and values over
     256 KiB as parts, at most 512 MiB per chunk.
@@ -784,11 +786,29 @@ were two independent reviews; the findings of both are fixed.
     cannot be restored; bounding resources is an execution matter (see Open).
   - A server serves only what its own pruning keeps (`state_commit::servable` under the
     node's retention).
+  - Chunks and value parts are served only when the operator asks
+    (`AINCORE_SERVE_SNAPSHOTS=1`); anchors always. Off by default, a validator's disk
+    serves consensus first. Snapshot reads are random reads: on a spinning disk (the NAS)
+    they compete with consensus fsyncs, so serve from an SSD or a node that does not
+    validate.
 - **Serving budget** (`StateBudget`), apart from vertex serving:
-  - Cost units are a leaf or 4 KiB read. It allows 8,000 a second and 4 requests in
-    flight globally, and 2,000 a second and 1 in flight per client IP.
-  - Bytes read are charged after the fact, whole values on a cache miss, so a bucket can
-    go into debt. Refusals are free. Idle clients are forgotten.
+  - Cost units are a leaf or 4 KiB sent. It allows 8,000 a second and 4 requests in
+    flight globally, and 2,000 a second and 1 in flight per client IP. A bucket holds one
+    second's worth at most.
+  - A chunk is read once, leaf by leaf, up to the first leaf that would break the
+    protocol's limits (`ChunkBudget`, which the client checks too). It is charged a
+    unit per leaf served, with the rest of its grant given back, and the bytes it read,
+    at most one second's worth. Before, a chunk over its byte budget was read again at
+    half the size until it fit: all the leaves granted, each time.
+  - A value part is let in only when its whole cost (the request and 1 MiB) fits.
+  - Reading a value the cache does not hold is charged its bytes, but never more than one
+    second's worth. A bucket in debt then waits a second at most, and a large leaf always
+    makes progress. Review 3 (HIGH): charged whole, reading one large value cost more
+    than a client's bucket could hold, and the restore never finished.
+  - Values served in parts are cached: the four most recently used, up to 256 MiB. The
+    parts of one value cost one read even while other clients read other values.
+  - Refusals are free. Idle clients are forgotten; a table full of clients still
+    refilling admits no new one.
   - The reads run in `block_in_place`, off the workers consensus shares.
   - The node's TCP handler passes each request's source IP
     (`network::start_server_with_peer`).
@@ -800,16 +820,26 @@ were two independent reviews; the findings of both are fixed.
   - Requests go round robin. A peer that fails to deliver sits out turns, twice as many
     each time in a row (up to 256), so a slow, silent or stalling peer loses its turns to
     the ones that deliver.
+  - A turn is judged by the peer's time. A turn longer than 2 s (`slow_turn`) that
+    delivered under 250 units a second, or ended in "busy", costs turns like a failure.
+    A busy answer given at once costs nothing. So a hostile peer costs at most about 2 s
+    per turn it gets, and it gets fewer each time. Review 3 (HIGH): valid chunks trickled
+    a leaf at a time, or "busy" said just under a timeout, kept a peer's turns.
   - Shutting peers out:
     - An answer no honest server gives shuts the peer out, with no restart. Examples: a
       part of the wrong size or length, or a claim past the protocol's limits.
     - A refused chunk, or a stream that ends early, shuts the peer out and restarts from
       zero, so each lying peer in the operator's list costs at most one restart.
   - Waiting and giving up:
-    - A busy answer is waited out and never counts as a failure. A busy answer that took a
-      quarter of the request timeout counts as a stall.
+    - A busy answer is waited out and never counts as a failure.
+    - A busy value part is asked for again from where the value stands, after a wait of
+      at most a second, as long as some part arrives within the request timeout.
     - Unanswered requests end the restore only after 60 in a row.
     - A value's parts must arrive at 256 KiB/s after the request timeout (60 s over TCP).
+      At the budget above, a value whose every part misses the cache arrives at about
+      900 KiB/s.
+    - Over TCP, a kept connection the server closed while idle is retried once on a new
+      connection, not counted as a failure.
     - The whole restore has a deadline (24 h).
   - The anchor is asked for round after round until a pair is found, and asked for again
     if no pair verifies.
@@ -821,17 +851,31 @@ were two independent reviews; the findings of both are fixed.
     It also:
     - resets the block prune cursor and the kept pin blocks;
     - removes a `sync:halt_reason` raised against the old state;
-    - records `sys:restored_checkpoint` and `sys:restored_by`.
+    - records `sys:restored_checkpoint`, `sys:restored_by`, and
+      `sys:restore_tip_height`. That is the highest height a peer reported, at least the
+      checkpoint's, and at most what time allows since the checkpoint block's BFT
+      timestamp: 10 blocks a second (the chain makes at most 5, at the 100 ms minimum
+      tick) with an hour of clock slack. A peer that inflates the tip can refuse this
+      node's key only for as long as the real chain takes to reach that ceiling, not
+      forever.
 - **SN-6:** a validator key on a new datadir could sign a slot its old instance signed,
-  and the abstention that prevents that (G1 RC-3) does not exist yet. So S6 refuses it
-  three times:
-  - before anything is cleared, when replacing a chain where this node's key is active;
-  - after the restore, when this node's key is in the checkpoint epoch's committee or the
-    restored active set, with the marker kept;
-  - at every boot, when the datadir was restored with another key and this node's key is
-    a validator now (`check_restored_signer`).
+  and the abstention that prevents that (G1 RC-3) does not exist yet. S6 judges a key by
+  its history (`validator_at_or_before`). A key may not run on a restored datadir if it
+  was a validator at or before the height the restore recorded: in an epoch the state
+  records that had begun by then, or in the active set once the current epoch had begun.
+  A key that joined later signed nothing elsewhere. The rule is checked:
+  - before anything is cleared, when replacing a chain where this node's key was ever a
+    validator;
+  - after the restore, against the restored committee and active set, with the marker
+    kept;
+  - at every boot (`check_restored_signer`). This catches a key that joined between the
+    checkpoint and the recorded height, once the node has synced its joining. Review 3
+    (MEDIUM): the boot check compared keys, so such a key passed.
 
-  Only observers restore.
+  Only observers restore. **Gap, closed by G1 RC-3:** a running node does not check
+  again between syncing that epoch and its next boot. A key that joined between the
+  checkpoint and the recorded height could sign while the node catches up. So an
+  operator restores with a fresh key; the signing points are G1's.
 - **Pins keep their blocks:**
   - Block pruning skips the pinned heights and records each block kept
     (`sys:kept_pin_blocks_v1`).
@@ -844,8 +888,8 @@ were two independent reviews; the findings of both are fixed.
     chain.
   - The restore runs before genesis handling.
   - Nothing is restored on a datadir already restored from the checkpoint, or past it on
-    the checkpoint's chain. The block at the checkpoint height decides, or, once that
-    block is pruned, its QC.
+    the checkpoint's chain, so on a restored node the settings may stay set. The block at
+    the checkpoint height decides, or, once that block is pruned, its QC.
   - A datadir past it on another chain, or where neither block nor QC is left to tell,
     is refused unless REPLACE is set.
 - **Pruning on every path** (GC-1): a node that only imports blocks prunes like one that
@@ -892,10 +936,25 @@ were two independent reviews; the findings of both are fixed.
     - a dropped connection reopened.
   - **The node:** its settings and its fork, restored-already, at-height and
     pruned-block decisions.
+  - **Review 3:**
+    - a large leaf restored on the per-IP path, every part missing the cache;
+    - a peer trickling valid chunks, and one saying "busy" slowly, losing their turns,
+      while one saying "busy" at once keeps them;
+    - busy value parts waited out with no part fetched twice, and waits that do not grow;
+    - a block re-signed by a non-validator not stored;
+    - the network tip recorded, and SN-6 at boot by history;
+    - opt-in serving, `serve_from` budgeting by IP, and the transport passing the source
+      IP (over the host's LAN address too);
+    - a chunk read once and charged what it served and read;
+    - the chunk limits at and over each, the client's entry checks before any part, sit-out
+      doubling and its cap, the cache's LRU, a bucket's one-second cap, and one candidate
+      per distinct anchor;
+    - a kept connection the server dropped, retried.
 - **Open:**
   - A restore between real machines needs a G3 chain, so it comes with S8.
   - Per-IP fairness is only as good as IP diversity: many attacker IPs share the global
-    budget with honest clients, and a Docker bridge makes its peers one IP.
+    budget with honest clients, and a Docker bridge makes its peers one IP. Opt-in
+    serving limits who carries that load.
   - Global resources have no size bound (`register_device` grows `DeviceRegistry`), so a
     leaf could outgrow the protocol's limit. Bounding it is an execution matter, filed as
     a separate task.

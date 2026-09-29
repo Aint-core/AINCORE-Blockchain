@@ -196,9 +196,6 @@ pub struct FinalityArtifact {
     pub qc: Option<consensus::qc::QuorumCertificate>,
 }
 
-/// A value served in parts: its version, key and bytes.
-type StateValue = (u64, String, Arc<Vec<u8>>);
-
 pub struct ChainSync {
     node_id: String,
     my_port: u16,
@@ -209,8 +206,12 @@ pub struct ChainSync {
     serve_budget: VertexServeBudget,
     /// G3 S6: snapshot serving's own budget, global and per client IP.
     state_budget: state_sync::StateBudget,
-    /// The last value served in parts: (version, key, value).
-    state_value_cache: Mutex<Option<StateValue>>,
+    /// The values last served in parts.
+    state_value_cache: Mutex<state_sync::ValueCache>,
+    /// G3 S6: whether this node serves state snapshots at all
+    /// (`AINCORE_SERVE_SNAPSHOTS=1`). Off by default: a snapshot read load
+    /// on a validator's disk competes with consensus.
+    serves_snapshots: bool,
     /// Block retention (`StateDB::block_pruning_policy_from_env`), read once.
     /// Imported blocks prune under it like built ones (G3 GC-1).
     retention: Option<(u64, u64)>,
@@ -232,7 +233,8 @@ impl ChainSync {
             storage,
             serve_budget: VertexServeBudget::default(),
             state_budget: state_sync::StateBudget::default(),
-            state_value_cache: Mutex::new(None),
+            state_value_cache: Mutex::new(state_sync::ValueCache::default()),
+            serves_snapshots: std::env::var("AINCORE_SERVE_SNAPSHOTS").as_deref() == Ok("1"),
             retention: StateDB::block_pruning_policy_from_env(),
             #[cfg(test)]
             before_execution_hook: None,
@@ -243,6 +245,12 @@ impl ChainSync {
     #[cfg(test)]
     pub(crate) fn with_retention(mut self, retention: Option<(u64, u64)>) -> Self {
         self.retention = retention;
+        self
+    }
+
+    /// Serve state snapshots (G3 S6), whatever `AINCORE_SERVE_SNAPSHOTS` says.
+    pub fn with_snapshot_serving(mut self, serve: bool) -> Self {
+        self.serves_snapshots = serve;
         self
     }
 
@@ -1268,6 +1276,17 @@ impl ChainSync {
             ]
             .iter()
             .any(|prefix| msg.starts_with(prefix))
+    }
+
+    /// A request the node's TCP server received from `peer`: answered when
+    /// chain sync serves it (`serves`), snapshot serving budgeted by the
+    /// peer's IP.
+    pub fn serve_from(&self, msg: &str, peer: std::net::IpAddr) -> Option<String> {
+        if Self::serves(msg) {
+            self.handle_message_from(msg, Some(peer))
+        } else {
+            None
+        }
     }
 
     /// Handle incoming encrypted message (called by Network Server Handler)
