@@ -363,6 +363,9 @@ pub enum WriteContext {
     Transaction,
     /// Inside the executor's block transaction.
     Block,
+    /// Inside a snapshot restore's transaction (G3 SN-2), which opens only
+    /// while the database carries `sys:restore_in_progress`.
+    Restore,
 }
 
 impl WriteContext {
@@ -371,7 +374,14 @@ impl WriteContext {
             WriteContext::Base => "base",
             WriteContext::Transaction => "transaction",
             WriteContext::Block => "block",
+            WriteContext::Restore => "restore",
         }
+    }
+
+    /// G3 WG-1: consensus state is written by a block (genesis is block 0's
+    /// state) or by a verified snapshot restore, and nowhere else.
+    pub fn may_write_state(self) -> bool {
+        matches!(self, WriteContext::Block | WriteContext::Restore)
     }
 }
 
@@ -413,7 +423,7 @@ impl Observer {
                 self.unclassified.fetch_add(1, Ordering::Relaxed);
                 "unclassified"
             }
-            Some(KeyClass::State) if ctx != WriteContext::Block => {
+            Some(KeyClass::State) if !ctx.may_write_state() => {
                 self.state_outside_block.fetch_add(1, Ordering::Relaxed);
                 "state_outside_block"
             }
@@ -721,6 +731,45 @@ mod tests {
     /// is refused, whole batch included, and counted. The block transaction
     /// and every other key class still write. The test-only seeding guard
     /// allows state writes only while it lives.
+    /// G3 SN-2 / WG-1: a restore transaction writes state only while the
+    /// restore marker exists, and its writes are not violations.
+    #[test]
+    fn a_restore_transaction_writes_state_only_under_its_marker() {
+        let db = temp_db("restore_ctx");
+        let state_key = format!("obj:{H64}");
+        let refused = |r: Result<(), crate::StorageError>| {
+            matches!(r, Err(crate::StorageError::WriteGate(_)))
+        };
+        assert!(
+            refused(db.restore_transaction(|v| v.put(&state_key, "x"))),
+            "no marker"
+        );
+        db.put(crate::RESTORE_MARKER, "{}")
+            .expect("the marker is node-local");
+        db.restore_transaction(|v| {
+            v.put(&state_key, "restored")?;
+            v.put("latest_height", "7")
+        })
+        .expect("state under the marker");
+        assert_eq!(db.get(&state_key).unwrap().as_deref(), Some("restored"));
+        assert!(refused(db.put(&state_key, "base")), "base is still refused");
+        assert!(
+            refused(db.restore_transaction(|v| v.put("no:such:template", "x"))),
+            "CL-1 still holds"
+        );
+        let s = db.db.state_class_stats();
+        assert_eq!(
+            s.state_outside_block, 1,
+            "only the base put counts; the restore's state write is no violation"
+        );
+        db.delete(crate::RESTORE_MARKER).unwrap();
+        assert!(
+            refused(db.restore_transaction(|v| v.delete(&state_key))),
+            "closed again once the marker goes"
+        );
+        assert_eq!(db.get(&state_key).unwrap().as_deref(), Some("restored"));
+    }
+
     #[test]
     fn the_write_gate_refuses_state_outside_the_block_transaction() {
         let db = temp_db("observer");

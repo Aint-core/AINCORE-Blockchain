@@ -6,6 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use storage::StateDB;
 
+/// G3 S6: snapshot restore from peers (SN-2).
+pub mod state_sync;
+
 /// Request for specific DAG vertices by hash.
 ///
 /// AUDIT B3/B4: AINCORE has no way to ASK for a vertex. The only redelivery is a
@@ -1226,6 +1229,21 @@ impl ChainSync {
         last_processed
     }
 
+    /// The requests `handle_message` answers. The node's TCP handler routes
+    /// exactly these here, so a request type is added in one place.
+    pub fn serves(msg: &str) -> bool {
+        msg == "GET_HEIGHT"
+            || msg == "GET_FINALITY"
+            || [
+                "SYNC_REQ:",
+                "VERTEX_REQ:",
+                state_sync::ANCHOR_REQ,
+                state_sync::CHUNK_REQ,
+            ]
+            .iter()
+            .any(|prefix| msg.starts_with(prefix))
+    }
+
     /// Handle incoming encrypted message (called by Network Server Handler)
     pub fn handle_message(&self, msg: &str) -> Option<String> {
         // Handle Request Logic
@@ -1249,6 +1267,16 @@ impl ChainSync {
                 }
             }
             return None;
+        }
+        if let Some(req_json) = msg.strip_prefix(state_sync::CHUNK_REQ) {
+            let req = serde_json::from_str::<state_sync::ChunkRequest>(req_json).ok()?;
+            let resp = serde_json::to_string(&self.handle_state_chunk(req)).ok()?;
+            return Some(format!("{}{}", state_sync::CHUNK_RESP, resp));
+        }
+        if let Some(req_json) = msg.strip_prefix(state_sync::ANCHOR_REQ) {
+            let req = serde_json::from_str::<state_sync::AnchorRequest>(req_json).ok()?;
+            let resp = serde_json::to_string(&self.handle_state_anchor(req)).ok()?;
+            return Some(format!("{}{}", state_sync::ANCHOR_RESP, resp));
         }
         if let Some(req_json) = msg.strip_prefix("SYNC_REQ:") {
             if let Ok(req) = serde_json::from_str::<SyncRequest>(req_json) {

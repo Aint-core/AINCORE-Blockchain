@@ -12,6 +12,7 @@ blockchain = { path = "../consensus/blockchain" }
 consensus = { path = "../consensus/consensus" }
 crypto = { path = "../common/crypto" }
 executor = { path = "../core/executor" }
+state_commit = { path = "../common/state_commit" }
 tokio = { version = "1.0", features = ["full"] }
 rand = "0.8"
 hex = "0.4"

@@ -737,6 +737,17 @@ pub fn load_genesis_file(path: &std::path::Path) -> Result<GenesisFile, GenesisE
     })
 }
 
+/// G3 S6: this node's own genesis, built from its genesis.json and stdlib the
+/// way `initialize_genesis` builds it, and checked against the operator's
+/// pin. A snapshot restore binds the restored state to it (TA-1) and writes
+/// its rows outside the state.
+pub fn build_local_genesis(stdlib_path: &str) -> Result<GenesisState, GenesisError> {
+    let file = load_genesis_file(&genesis_file_path()?)?;
+    let genesis = build_genesis(&file, &load_stdlib_modules(stdlib_path)?)?;
+    check_genesis_pin(&genesis.identity)?;
+    Ok(genesis)
+}
+
 /// `stdlib_state_hash` of a stdlib directory: the value genesis.json pins as
 /// `stdlib_hash`.
 pub fn stdlib_hash_of(stdlib_path: &str) -> Result<String, GenesisError> {

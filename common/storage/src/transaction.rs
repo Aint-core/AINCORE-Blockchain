@@ -4,7 +4,7 @@
 //! holds that gate while its callback runs, so base reads and prefix scans cannot
 //! race a writer. Only staged writes are copied; the database is not materialized.
 use crate::class::{classify, KeyClass, Observer, StateClassStats, WriteContext};
-use crate::{StateDB, StorageError};
+use crate::{StateDB, StorageError, RESTORE_MARKER};
 use rocksdb::{Direction, IteratorMode, WriteBatch, WriteBatchIterator, DB};
 use std::collections::BTreeMap;
 use std::iter::Peekable;
@@ -36,6 +36,8 @@ struct Stage {
     read_failed: AtomicBool,
     /// True only for the executor's block transaction (G3 WG-1).
     block: bool,
+    /// True only for a snapshot restore's transaction (G3 SN-2).
+    restore: bool,
     /// G3 CM-2: set once the block's state root is computed. From then on a
     /// consensus-state write would escape the root, so it fails the whole
     /// block at commit (`seal_violated`).
@@ -189,7 +191,7 @@ impl ReadStore {
                         crate::class::mask(key)
                     )))
                 }
-                Some(KeyClass::State) if ctx != WriteContext::Block => {
+                Some(KeyClass::State) if !ctx.may_write_state() => {
                     return Err(StorageError::WriteGate(format!(
                         "state key {} written outside the block transaction ({} context)",
                         crate::class::mask(key),
@@ -206,6 +208,7 @@ impl ReadStore {
         let ctx = match &self.stage {
             None => WriteContext::Base,
             Some(stage) if stage.block => WriteContext::Block,
+            Some(stage) if stage.restore => WriteContext::Restore,
             Some(_) => WriteContext::Transaction,
         };
         if let Some(stage) = &self.stage {
@@ -444,7 +447,7 @@ impl StateDB {
         &self,
         work: impl FnOnce(Arc<StateDB>) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
-        self.transaction_with(false, work)
+        self.transaction_with(false, false, work)
     }
 
     /// The executor's block transaction, and genesis's: the only place
@@ -455,12 +458,29 @@ impl StateDB {
         &self,
         work: impl FnOnce(Arc<StateDB>) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
-        self.transaction_with(true, work)
+        self.transaction_with(true, false, work)
+    }
+
+    /// A snapshot restore's transaction (G3 SN-2): it may write consensus
+    /// state, like the block transaction, and opens only while the database
+    /// carries the restore marker `sys:restore_in_progress`. Everything it
+    /// writes came out of a chunk verified against the trusted root.
+    pub fn restore_transaction<T>(
+        &self,
+        work: impl FnOnce(Arc<StateDB>) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        if self.get(RESTORE_MARKER)?.is_none() {
+            return Err(StorageError::WriteGate(
+                "a restore transaction needs the restore marker".into(),
+            ));
+        }
+        self.transaction_with(false, true, work)
     }
 
     fn transaction_with<T>(
         &self,
         block: bool,
+        restore: bool,
         work: impl FnOnce(Arc<StateDB>) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
         if self.db.stage.is_some() {
@@ -477,6 +497,7 @@ impl StateDB {
             active: AtomicBool::new(true),
             read_failed: AtomicBool::new(false),
             block,
+            restore,
             sealed: AtomicBool::new(false),
             seal_violated: AtomicBool::new(false),
         });

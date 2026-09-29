@@ -3353,13 +3353,7 @@ pub(crate) fn prune_state_window(
     if keep == 0 || tip <= keep {
         return Ok(state_commit::PruneStats::default());
     }
-    let interval = storage
-        .get("sys:config:epoch_block_interval")
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(20);
-    let pinned = state_commit::pin_schedule(tip, keep, interval);
+    let pinned = state_commit::pin_schedule(tip, keep, state_commit::epoch_interval(storage));
     state_commit::prune(storage, tip - keep, &pinned, max_rows).map_err(|e| e.to_string())
 }
 

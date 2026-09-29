@@ -17,7 +17,8 @@
 use anyhow::{bail, ensure, Context, Result};
 use jmt::restore::{JellyfishMerkleRestore, StateSnapshotReceiver};
 use jmt::storage::{LeafNode, Node, NodeBatch, NodeKey, TreeReader, TreeWriter};
-use jmt::{JellyfishMerkleIterator, KeyHash, OwnedValue, RootHash, Sha256Jmt, Version};
+pub use jmt::RootHash;
+use jmt::{JellyfishMerkleIterator, KeyHash, OwnedValue, Sha256Jmt, Version};
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -499,7 +500,7 @@ pub fn seed_genesis(db: &Arc<StateDB>) -> Result<Applied> {
 /// never guess.
 pub fn boot_check(db: &Arc<StateDB>) -> Result<()> {
     ensure!(
-        db.get("sys:restore_in_progress")?.is_none(),
+        db.get(storage::RESTORE_MARKER)?.is_none(),
         "a snapshot restore is incomplete; wipe the tree and restore again"
     );
     let executed: Version = db
@@ -704,6 +705,35 @@ pub fn pin_schedule(
         .step_by(spacing as usize)
         .filter(|v| *v > 0)
         .collect()
+}
+
+/// The epoch interval genesis pinned (FX-6); pins are its multiples. Boot
+/// refuses a database without the pin, so a running node never sees the
+/// default.
+pub fn epoch_interval(db: &StateDB) -> Version {
+    db.get("sys:config:epoch_block_interval")
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<Version>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(20)
+}
+
+/// SN-4: whether this node may serve `version` to a restoring peer: every
+/// version from the floor to the latest, plus the pins of the current
+/// window. `keep` is this node's retention window; `None` is an archive
+/// node, which never prunes. Pruning keeps exactly this set.
+pub fn servable(db: &StateDB, version: Version, keep: Option<Version>) -> Result<bool> {
+    let Some(latest) = latest_version(db)? else {
+        return Ok(false);
+    };
+    if version > latest {
+        return Ok(false);
+    }
+    if version >= floor(db)? {
+        return Ok(true);
+    }
+    Ok(keep.is_some_and(|keep| pin_schedule(latest, keep, epoch_interval(db)).contains(&version)))
 }
 
 /// RC-2: at boot, the flat consensus-state keys and the tree's leaves at the
@@ -919,6 +949,24 @@ pub fn chunk(
     })
 }
 
+/// Largest wire range proof: a count, then at most 256 tagged siblings of
+/// up to 64 bytes each.
+const MAX_RANGE_PROOF_BYTES: usize = 4 + 256 * 65;
+
+/// `chunk` for the wire: the range proof borsh-encoded, so peers never
+/// handle `jmt` types. `after` is the key hash the previous chunk ended on.
+pub fn wire_chunk(
+    db: &Arc<StateDB>,
+    version: Version,
+    after: Option<[u8; 32]>,
+    max: usize,
+) -> Result<Option<(Entries, Vec<u8>)>> {
+    match chunk(db, version, after.map(KeyHash), max)? {
+        None => Ok(None),
+        Some((entries, proof)) => Ok(Some((entries, borsh::to_vec(&proof)?))),
+    }
+}
+
 /// Delete every tree row (`jmt:*`), so a failed restore can start over
 /// (SN-2 "wipe and restart"). The caller commits the batch, together with
 /// the deletion of the flat state keys the restore installed.
@@ -1029,6 +1077,29 @@ impl Restore {
         }
         self.db.write_batch(batch)?;
         Ok(entries)
+    }
+
+    /// The key hash of the last accepted leaf, where the next chunk starts.
+    pub fn cursor(&self) -> Option<[u8; 32]> {
+        self.last.map(|k| k.0)
+    }
+
+    /// `add_chunk` with the proof in its wire encoding (`wire_chunk`). A
+    /// proof that does not decode is a refused chunk like any other.
+    pub fn add_wire_chunk(&mut self, entries: Entries, proof: &[u8]) -> Result<Entries> {
+        let decoded = if proof.len() > MAX_RANGE_PROOF_BYTES {
+            Err(anyhow::anyhow!("a range proof of {} bytes", proof.len()))
+        } else {
+            borsh::from_slice::<SparseMerkleRangeProof<Sha256>>(proof)
+                .map_err(|e| anyhow::anyhow!("malformed range proof: {e}"))
+        };
+        match decoded {
+            Ok(proof) => self.add_chunk(entries, proof),
+            Err(e) => {
+                self.poisoned = true;
+                Err(e)
+            }
+        }
     }
 
     /// Finish, then require the restored root to equal the expected one.

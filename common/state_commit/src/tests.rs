@@ -1188,3 +1188,36 @@ fn a_pinned_value_keeps_the_deletion_row_after_it() {
     assert_eq!(count_rows(&db, &pre_key(&key_hash(&k(1)))), 0);
     assert_eq!(count_rows(&db, VDEAD), 0);
 }
+
+/// SN-4: a server offers exactly what pruning keeps: the floor to the tip,
+/// and the pins below the floor.
+#[test]
+fn servable_versions_are_what_pruning_keeps() {
+    let db = temp_db("servable");
+    assert!(!servable(&db, 0, Some(10)).unwrap(), "no tree yet");
+    for v in 0..=40 {
+        commit(&db, v, vec![(k((v % 3) as usize), some(&format!("x{v}")))]);
+    }
+    // Interval 20 is the default; keep 10 pins multiples of 20 from 20.
+    let pins = pin_schedule(40, 10, epoch_interval(&db));
+    assert_eq!(pins, [20, 40].into());
+    prune(&db, 30, &pins, usize::MAX).unwrap();
+    for (version, keep, expected) in [
+        (30, Some(10), true),
+        (40, Some(10), true),
+        (41, Some(10), false),
+        (20, Some(10), true),
+        (25, Some(10), false),
+        (29, Some(10), false),
+        (20, None, false),
+    ] {
+        assert_eq!(
+            servable(&db, version, keep).unwrap(),
+            expected,
+            "{version} {keep:?}"
+        );
+    }
+    for version in [20u64, 30, 40] {
+        prove(&db, &k(1), version).expect("a servable version is whole");
+    }
+}

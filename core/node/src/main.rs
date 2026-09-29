@@ -121,6 +121,115 @@ fn refuse_removed_snapshot_install(env: Option<String>) -> Result<(), String> {
     }
 }
 
+/// G3 S6: where and from whom to restore state before booting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StateSyncSettings {
+    checkpoint: chain_sync::state_sync::Checkpoint,
+    /// The peers' TCP ports (the port they serve sync on).
+    peers: Vec<(String, u16)>,
+    /// Replace an older chain this datadir holds.
+    replace_existing: bool,
+}
+
+impl StateSyncSettings {
+    /// `AINCORE_STATE_SYNC_CHECKPOINT=height:block_hash:state_root`,
+    /// `AINCORE_STATE_SYNC_PEERS=ip:port,...` and, to replace an older chain,
+    /// `AINCORE_STATE_SYNC_REPLACE=1`. `None` without a checkpoint.
+    fn parse(
+        checkpoint: Option<String>,
+        peers: Option<String>,
+        replace: Option<String>,
+    ) -> Result<Option<Self>, String> {
+        let Some(checkpoint) = checkpoint.filter(|c| !c.trim().is_empty()) else {
+            return Ok(None);
+        };
+        let checkpoint = checkpoint.parse()?;
+        let peers = peers
+            .filter(|p| !p.trim().is_empty())
+            .ok_or("AINCORE_STATE_SYNC_PEERS is required with a checkpoint")?;
+        let peers = peers
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                let (ip, port) = p
+                    .rsplit_once(':')
+                    .filter(|(ip, _)| !ip.is_empty())
+                    .ok_or_else(|| format!("state sync peer {p:?} is not ip:port"))?;
+                let port = port
+                    .parse::<u16>()
+                    .map_err(|_| format!("state sync peer {p:?} has no valid port"))?;
+                Ok((ip.to_string(), port))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let replace_existing = match replace.as_deref().map(str::trim) {
+            None | Some("") | Some("0") => false,
+            Some("1") => true,
+            Some(other) => return Err(format!("AINCORE_STATE_SYNC_REPLACE={other}: use 1 or 0")),
+        };
+        Ok(Some(Self {
+            checkpoint,
+            peers,
+            replace_existing,
+        }))
+    }
+
+    fn from_env() -> Result<Option<Self>, String> {
+        Self::parse(
+            std::env::var("AINCORE_STATE_SYNC_CHECKPOINT").ok(),
+            std::env::var("AINCORE_STATE_SYNC_PEERS").ok(),
+            std::env::var("AINCORE_STATE_SYNC_REPLACE").ok(),
+        )
+    }
+}
+
+/// G3 S6 (SN-1, SN-2): restore this node's state at an operator-pinned
+/// checkpoint from peers, before genesis handling; genesis then reopens the
+/// restored datadir. The checkpoint is the trust anchor, so it must come from
+/// a source the operator trusts (TA-0, TA-4). A datadir at or past it is left
+/// alone, so the settings may stay set.
+async fn restore_from_checkpoint(
+    storage: &Arc<StateDB>,
+    settings: &StateSyncSettings,
+    genesis: impl FnOnce() -> Result<genesis::GenesisState, String>,
+    my_port: u16,
+) -> Result<Option<chain_sync::state_sync::Restored>, String> {
+    let marked = storage
+        .get(storage::RESTORE_MARKER)
+        .map_err(|e| e.to_string())?
+        .is_some();
+    let height = storage
+        .get("latest_height")
+        .map_err(|e| e.to_string())?
+        .and_then(|h| h.parse::<u64>().ok());
+    if !marked && height.is_some_and(|h| h >= settings.checkpoint.height) {
+        println!(
+            "ℹ️ [STATE_SYNC] at height {} already, at or past the checkpoint; not restoring",
+            height.unwrap_or(0)
+        );
+        return Ok(None);
+    }
+    let genesis = genesis()?;
+    let plan = chain_sync::state_sync::RestorePlan {
+        checkpoint: &settings.checkpoint,
+        genesis: &genesis.writes,
+        genesis_identity: &genesis.identity,
+        replace_existing: settings.replace_existing,
+    };
+    println!(
+        "🔄 [STATE_SYNC] restoring height {} from {} peer(s)",
+        settings.checkpoint.height,
+        settings.peers.len()
+    );
+    let restored =
+        chain_sync::state_sync::restore_over_tcp(storage, &plan, &settings.peers, my_port).await?;
+    println!(
+        "✅ [STATE_SYNC] restored height {} ({} leaves, {} restarts)",
+        restored.height, restored.leaves, restored.restarts
+    );
+    Ok(Some(restored))
+}
+
 /// G3 FX-6: the chain id comes only from `sys:chain_id`, which genesis
 /// writes. The `AINCORE_CHAIN_ID` env may repeat it, for tools that still
 /// read it, but it may not name another chain.
@@ -519,6 +628,23 @@ async fn main() {
     } else {
         "core/vm_move/stdlib/bytecode" // Default, will error with clear message if missing
     };
+    // G3 S6: restore from a checkpoint first, when one is configured.
+    match StateSyncSettings::from_env() {
+        Ok(None) => {}
+        Ok(Some(settings)) => {
+            let local_genesis =
+                || genesis::build_local_genesis(stdlib_path).map_err(|e| e.to_string());
+            if let Err(e) = restore_from_checkpoint(&storage, &settings, local_genesis, port).await
+            {
+                eprintln!("❌ FATAL: state restore failed: {e}; refusing to boot");
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("❌ FATAL: {e}; refusing to boot");
+            std::process::exit(1);
+        }
+    }
     // G3 FX-7: genesis depends on genesis.json and the stdlib only, never on
     // this node's key, so every node builds the same state and identity.
     if let Err(e) = genesis::initialize_genesis(&storage, stdlib_path) {
@@ -793,15 +919,12 @@ async fn main() {
                         } else {
                             None
                         }
-                    } else if msg == "GET_HEIGHT"
-                        || msg == "GET_FINALITY"
-                        || msg.starts_with("SYNC_REQ:")
-                        || msg.starts_with("VERTEX_REQ:")
-                    {
+                    } else if ChainSync::serves(&msg) {
                         // Single serving implementation: chain_sync owns GET_HEIGHT,
                         // GET_FINALITY (with the quorum certificate), SYNC_REQ (blocks +
-                        // finality QC + prune_horizon) and VERTEX_REQ (DAG vertex bodies by
-                        // hash). The returned response is sent back
+                        // finality QC + prune_horizon), VERTEX_REQ (DAG vertex bodies by
+                        // hash) and the G3 S6 snapshot restore (STATE_ANCHOR_REQ,
+                        // STATE_CHUNK_REQ). The returned response is sent back
                         // over the same encrypted socket by network::start_server. Keeping
                         // this here — instead of reimplementing it inline in the transport —
                         // is what stops serving-side fixes from silently landing on dead code.
@@ -1189,6 +1312,84 @@ mod boot_identity_tests {
         assert!(
             err.contains("RC-2") && err.contains("sys:chain_id"),
             "{err}"
+        );
+    }
+
+    /// G3 S6: the restore settings parse strictly, and are off without a
+    /// checkpoint.
+    #[test]
+    fn state_sync_settings_parse_strictly() {
+        use super::StateSyncSettings;
+        let some = |s: &str| Some(s.to_string());
+        let cp = format!("7:{}:{}", "ab".repeat(32), "cd".repeat(32));
+        assert_eq!(
+            StateSyncSettings::parse(None, some("1.2.3.4:9"), None),
+            Ok(None)
+        );
+        assert_eq!(StateSyncSettings::parse(some(" "), None, None), Ok(None));
+        let parsed = StateSyncSettings::parse(
+            some(&cp),
+            some("192.168.18.202:9022, 192.168.18.66:9032"),
+            some("1"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.checkpoint.height, 7);
+        assert_eq!(
+            parsed.peers,
+            vec![
+                ("192.168.18.202".to_string(), 9022),
+                ("192.168.18.66".to_string(), 9032)
+            ]
+        );
+        assert!(parsed.replace_existing);
+        for (peers, replace) in [
+            (None, None),
+            (some(""), None),
+            (some("192.168.18.202"), None),
+            (some(":9022"), None),
+            (some("host:99999"), None),
+            (some("host:9022"), some("yes")),
+        ] {
+            assert!(
+                StateSyncSettings::parse(some(&cp), peers.clone(), replace.clone()).is_err(),
+                "{peers:?} {replace:?}"
+            );
+        }
+        assert!(StateSyncSettings::parse(some("7:x:y"), some("h:1"), None).is_err());
+    }
+
+    /// G3 S6: a datadir at or past the checkpoint is left alone, so the
+    /// settings may stay set across restarts; no genesis is even built.
+    #[tokio::test]
+    async fn a_datadir_at_the_checkpoint_is_not_restored_again() {
+        use super::{restore_from_checkpoint, StateSyncSettings};
+        let path = std::env::temp_dir().join(format!("s6b_skip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let db = std::sync::Arc::new(storage::StateDB::open(path.to_str().unwrap()).unwrap());
+        db.put("latest_height", "7").unwrap();
+        let settings = StateSyncSettings::parse(
+            Some(format!("7:{}:{}", "ab".repeat(32), "cd".repeat(32))),
+            Some("127.0.0.1:1".into()),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let untouched = || -> Result<node::genesis::GenesisState, String> {
+            panic!("no genesis is built when nothing is restored")
+        };
+        assert_eq!(
+            restore_from_checkpoint(&db, &settings, untouched, 0).await,
+            Ok(None)
+        );
+        // Below the checkpoint, or mid-restore, it restores (and here fails:
+        // the genesis cannot be built).
+        db.put(storage::RESTORE_MARKER, "{}").unwrap();
+        let no_genesis =
+            || -> Result<node::genesis::GenesisState, String> { Err("no genesis".into()) };
+        assert_eq!(
+            restore_from_checkpoint(&db, &settings, no_genesis, 0).await,
+            Err("no genesis".into())
         );
     }
 

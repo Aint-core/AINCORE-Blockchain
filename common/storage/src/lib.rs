@@ -13,6 +13,11 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Mutex;
 
+/// G3 SN-2: present while a snapshot restore is incomplete. RC-1 refuses to
+/// boot a database that carries it, and only while it is present may a
+/// restore transaction write consensus state.
+pub const RESTORE_MARKER: &str = "sys:restore_in_progress";
+
 /// Every database directory this process currently has open, keyed by the
 /// directory's own identity rather than by the spelling of its path.
 ///
