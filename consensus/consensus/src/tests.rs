@@ -97,6 +97,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    /// Validator signing safety (docs/research/validator_signing_safety.md):
+    /// the proposed round is durable before the vertex leaves the process, so
+    /// a crash in between cannot let the restarted node sign the round again.
+    #[test]
+    fn the_proposed_round_is_saved_before_the_vertex_is_broadcast() {
+        let (mut consensus, path) = setup_dag("round_before_broadcast");
+        let storage = Arc::clone(&consensus.storage);
+        let seen: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
+        let record = Arc::clone(&seen);
+        consensus.broadcast_hook = Some(Arc::new(move |v: &blockchain::Vertex| {
+            let saved = storage
+                .get("latest_proposed_round")
+                .unwrap()
+                .and_then(|r| r.parse::<u64>().ok())
+                .unwrap_or(0);
+            record.lock().unwrap().push((v.round, saved));
+        }));
+        for _ in 0..3 {
+            consensus.try_create_vertex();
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3, "three vertices broadcast: {seen:?}");
+        for (round, saved) in seen {
+            assert!(saved >= round, "round {round} broadcast with {saved} saved");
+        }
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     #[test]
     fn test_dag_growth_and_ordering() {
         let (mut consensus, path) = setup_dag("growth");

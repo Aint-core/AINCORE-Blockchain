@@ -15,6 +15,8 @@ type ValidatorStakeCache = Arc<Mutex<Option<Vec<(String, u64)>>>>;
 
 #[cfg(test)]
 type LocalAcceptanceHook = fn(u8, &StateDB) -> Result<(), String>;
+#[cfg(test)]
+type BroadcastHook = Arc<dyn Fn(&Vertex) + Send + Sync>;
 
 /// PROTOCOL (deterministic slashing): a vertex payload item carrying this
 /// prefix is equivocation evidence, not a transaction. It rides through the DAG
@@ -131,6 +133,9 @@ pub struct DagConsensus {
     /// last point where consensus state may be staged (G3 CM-2).
     #[cfg(test)]
     pub(crate) pre_execution_hook: Option<LocalAcceptanceHook>,
+    /// Tests only: runs as a vertex is broadcast, before it leaves the process.
+    #[cfg(test)]
+    pub(crate) broadcast_hook: Option<BroadcastHook>,
 }
 
 impl DagConsensus {
@@ -550,6 +555,8 @@ impl DagConsensus {
             local_acceptance_hook: None,
             #[cfg(test)]
             pre_execution_hook: None,
+            #[cfg(test)]
+            broadcast_hook: None,
         }
     }
 
@@ -952,14 +959,23 @@ impl DagConsensus {
                 return;
             }
 
-            // 4. Add & Broadcast
+            // 4. Persist the round, then add and broadcast. The round is saved
+            // (a synced write) BEFORE the signature leaves the process: a crash
+            // between a broadcast and the save let the restarted node propose
+            // this round again, a double-sign (slashed 100%). A failed save
+            // publishes nothing.
+            if let Err(e) = self
+                .storage
+                .put("latest_proposed_round", &self.current_round.to_string())
+            {
+                eprintln!(
+                    "🚫 not broadcasting vertex at round {}: the proposed round was not saved: {e}",
+                    vertex.round
+                );
+                return;
+            }
             self.add_vertex(vertex.clone());
             self.broadcast_vertex(&vertex);
-
-            // Explicitly save the round we just proposed to prevent Double-Sign on restart
-            let _ = self
-                .storage
-                .put("latest_proposed_round", &self.current_round.to_string());
 
             // === DOWNTIME DETECTION (Jail System Trigger) ===
             // Track which validators participated in this round.
@@ -2028,6 +2044,10 @@ impl DagConsensus {
     }
 
     fn broadcast_vertex(&self, vertex: &Vertex) {
+        #[cfg(test)]
+        if let Some(hook) = &self.broadcast_hook {
+            hook(vertex);
+        }
         let serialized = match serde_json::to_string(vertex) {
             Ok(s) => s,
             Err(e) => {

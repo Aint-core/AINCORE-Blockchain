@@ -8,7 +8,7 @@
 #      or an explicit --sha256 value (same hash you'd use for
 #      AINCORE_BOOTSTRAP_SHA256).
 #   2. extracts validator_*.db -> {datadir}/validator_{port}.db
-#   3. restores node.key into {datadir}/node.key (unless --new-identity).
+#   3. restores node.key into {datadir}/node.key only with --restore-validator-key.
 #   4. restores genesis.json next to the datadir if --genesis-out is given.
 #
 # SAFETY: it NEVER overwrites a non-empty existing chain DB. If
@@ -17,16 +17,23 @@
 # it does not delete it).
 #
 # NODE IDENTITY:
-#   default        restore node.key from the backup → node resumes its OWN
-#                  identity (correct for restoring the SAME validator).
-#   --new-identity drop node.key → the node generates a fresh keypair on first
-#                  boot. Use this to spin up an OBSERVER from a validator's state
-#                  without impersonating the validator's consensus identity.
+#   default        node.key is NOT restored: the node generates a fresh keypair
+#                  on first boot and runs as an OBSERVER.
+#   --restore-validator-key
+#                  restore the backup's node.key. DANGEROUS: the backup's signing
+#                  records are older than what the validator signed after the
+#                  backup was taken, so the restored node can sign the same
+#                  rounds again: a double-sign, slashed 100%. Use it only if the
+#                  validator provably never ran after the backup, and never while
+#                  any other copy of the key can run. The boot check that makes
+#                  this safe (look back at peers, then listen) is G1 RC-3, not
+#                  built yet. See docs/research/validator_signing_safety.md.
+#   --new-identity accepted for compatibility; it is the default now.
 #
 # Usage:
 #   restore_node.sh --backup <archive.tar.gz> --datadir <dir> --port <p> \
 #                   [--sha256 <hex> | --no-verify] \
-#                   [--new-identity] [--force] [--genesis-out <path>]
+#                   [--restore-validator-key] [--force] [--genesis-out <path>]
 #
 # Exit codes: 0 ok, 2 usage error, 3 precondition failed, 4 integrity failed.
 set -euo pipefail
@@ -36,7 +43,7 @@ DATADIR=""
 PORT=""
 EXPECT_SHA=""
 VERIFY=1
-NEW_IDENTITY=0
+NEW_IDENTITY=1
 FORCE=0
 GENESIS_OUT=""
 
@@ -53,6 +60,7 @@ while [[ $# -gt 0 ]]; do
     --sha256)        EXPECT_SHA="${2:-}"; shift 2 ;;
     --no-verify)     VERIFY=0; shift ;;
     --new-identity)  NEW_IDENTITY=1; shift ;;
+    --restore-validator-key) NEW_IDENTITY=0; shift ;;
     --force)         FORCE=1; shift ;;
     --genesis-out)   GENESIS_OUT="${2:-}"; shift 2 ;;
     -h|--help)       usage 0 ;;
@@ -144,7 +152,7 @@ mv "$SRC_DB" "$DEST_DB"
 
 # --- node.key handling ------------------------------------------------------
 if [[ "$NEW_IDENTITY" == 1 ]]; then
-  echo "==> --new-identity: NOT restoring node.key (node will generate a fresh keypair on boot)."
+  echo "==> NOT restoring node.key: the node generates a fresh keypair on boot (observer)."
   # If a key happens to pre-exist in the target datadir, leave it untouched;
   # the operator chose new-identity so we simply don't import the backup's key.
 else
@@ -153,6 +161,9 @@ else
       echo "WARNING: $DEST_KEY already exists — keeping the EXISTING key, not the backup's." >&2
       echo "         (Pass --new-identity to keep existing, or remove it first to import.)" >&2
     else
+      echo "WARNING: restoring a validator key with an older database can double-sign" >&2
+      echo "         (slashed 100%). Only safe if the validator never ran after the" >&2
+      echo "         backup and no other copy of the key can run." >&2
       echo "==> Restoring node.key -> $DEST_KEY"
       cp "$STAGING/node.key" "$DEST_KEY"
       chmod 600 "$DEST_KEY" 2>/dev/null || true

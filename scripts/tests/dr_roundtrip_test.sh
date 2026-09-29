@@ -61,9 +61,9 @@ SHA_VERIFY "$WORK/backups" "$(basename "$ARCHIVE").sha256" >/dev/null \
   || fail "sha256 sidecar did not verify against archive"
 ok "sha256 sidecar verifies"
 
-# --- 3. restore into a fresh datadir ----------------------------------------
+# --- 3. restore into a fresh datadir, with the validator key asked for ----
 "$RESTORE_SH" --backup "$ARCHIVE" --datadir "$WORK/restored" --port "$PORT" \
-  --genesis-out "$WORK/genesis-restored.json" >/dev/null
+  --genesis-out "$WORK/genesis-restored.json" --restore-validator-key >/dev/null 2>&1
 ok "restore completed"
 
 # --- 4. byte-for-byte round-trip --------------------------------------------
@@ -89,12 +89,15 @@ if "$RESTORE_SH" --backup "$ARCHIVE" --datadir "$WORK/restored" --port "$PORT" \
 fi
 ok "restore refuses to clobber existing non-empty DB"
 
-# --- 6. --new-identity drops the key ----------------------------------------
-"$RESTORE_SH" --backup "$ARCHIVE" --datadir "$WORK/observer" --port 9101 \
+# --- 6. by default the key is NOT restored: a validator key with an older
+#        database can double-sign (docs/research/validator_signing_safety.md)
+"$RESTORE_SH" --backup "$ARCHIVE" --datadir "$WORK/observer" --port 9101 >/dev/null
+[[ -d "$WORK/observer/validator_9101.db" ]] || fail "the default restore did not install DB"
+[[ ! -f "$WORK/observer/node.key" ]] || fail "the default restore must NOT restore node.key"
+"$RESTORE_SH" --backup "$ARCHIVE" --datadir "$WORK/observer2" --port 9102 \
   --new-identity >/dev/null
-[[ -d "$WORK/observer/validator_9101.db" ]] || fail "--new-identity did not install DB"
-[[ ! -f "$WORK/observer/node.key" ]] || fail "--new-identity should NOT restore node.key"
-ok "--new-identity installs DB without node.key"
+[[ ! -f "$WORK/observer2/node.key" ]] || fail "--new-identity should NOT restore node.key"
+ok "the default restore, and --new-identity, install DB without node.key"
 
 # --- 7. integrity tampering is caught ---------------------------------------
 TAMPERED="$WORK/tampered.tar.gz"

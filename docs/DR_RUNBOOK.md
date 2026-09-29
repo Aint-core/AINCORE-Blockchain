@@ -94,7 +94,7 @@ Restore into a **fresh** datadir. The script refuses to clobber a non-empty
 existing DB unless `--force` (which moves the old DB aside, never deletes it).
 
 ```bash
-# Restore the SAME validator (keeps its identity from the backup's node.key):
+# Restore as an OBSERVER (the default: a fresh keypair, no validator key):
 scripts/restore_node.sh \
   --backup ./backups/aincore-backup-port9001-<UTC>.tar.gz \
   --datadir ./data-restored \
@@ -107,9 +107,21 @@ scripts/restore_node.sh \
 ```
 
 The node boots, reads its restored height, and ChainSyncs only the small delta
-that elapsed since the backup. Do **not** run two nodes with the same `node.key`
-simultaneously — that is equivocation and will get the validator slashed. Ensure
-the failed node is truly down before bringing the restored one online.
+that elapsed since the backup.
+
+**A validator key is never restored together with an old database by default.**
+The backup's signing records (`latest_proposed_round`, the QC signing guards)
+are older than what the validator signed after the backup was taken, so a
+restored validator can sign those rounds again: a double-sign, slashed 100%.
+Production chains treat this the same way (Ethereum slashing-protection
+databases, CometBFT `priv_validator_state.json`, Aptos SafetyRules): the
+signing state is never rolled back. `--restore-validator-key` exists for the
+one safe case, a validator that provably never ran after the backup, with the
+old machine powered off and its key moved (`mv`, never `cp`). The boot check
+that makes validator recovery safe in general (ask peers what this key signed,
+then listen before signing) is G1 RC-3; see
+`docs/research/validator_signing_safety.md`. Never run two nodes with the same
+`node.key`.
 
 ### Restoring as a fresh OBSERVER (no identity)
 
