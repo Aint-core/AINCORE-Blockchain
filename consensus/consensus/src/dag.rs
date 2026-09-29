@@ -1871,44 +1871,11 @@ impl DagConsensus {
                 }
 
                 {
-                    if let Some((keep_blocks, max_delete)) =
-                        storage::StateDB::block_pruning_policy_from_env()
-                    {
-                        match self.storage.prune_old_blocks(
-                            self.latest_block_height,
-                            keep_blocks,
-                            max_delete,
-                        ) {
-                            Ok(deleted) if deleted > 0 => {
-                                println!(
-                                    "🧹 Block history pruning: removed {} old blocks (retain={}, batch={})",
-                                    deleted, keep_blocks, max_delete
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(e) => eprintln!("⚠️ Block history pruning failed: {}", e),
-                        }
-                        // G3 GC-1: state versions follow the same window, so
-                        // proofs are served exactly as long as blocks are.
-                        let due = self.latest_block_height.is_multiple_of(STATE_PRUNE_EVERY);
-                        match if !due {
-                            Ok(state_commit::PruneStats::default())
-                        } else {
-                            prune_state_window(
-                                &self.storage,
-                                self.latest_block_height,
-                                keep_blocks,
-                                (max_delete as usize).saturating_mul(4_000),
-                            )
-                        } {
-                            Ok(stats) if stats.nodes + stats.values > 0 => println!(
-                                "🧹 State tree pruning: removed {} nodes and {} values",
-                                stats.nodes, stats.values
-                            ),
-                            Ok(_) => {}
-                            Err(e) => eprintln!("⚠️ State tree pruning failed: {}", e),
-                        }
-                    }
+                    prune_history(
+                        &self.storage,
+                        self.latest_block_height,
+                        storage::StateDB::block_pruning_policy_from_env(),
+                    );
                     // Phase 2.8 (M-08): block commit is the only moment
                     // where a slash could have changed the validator set
                     // during normal operation, so refresh the cache here.
@@ -3331,6 +3298,54 @@ struct AccountAddress([u8; 32]);
 impl std::fmt::Display for AccountAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", hex::encode(self.0))
+    }
+}
+
+/// Serializes pruning. A node prunes from the path that builds blocks and
+/// from the one that imports them; a run that finds another in progress
+/// skips, and a later tip catches up.
+static PRUNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// G3 GC-1: prune block history and state versions behind `height`, the new
+/// tip, under `policy` (`StateDB::block_pruning_policy_from_env`: the blocks
+/// to keep and a batch size, `None` for an archive node). Every path that
+/// advances the tip calls it, a block this node built and one it imported
+/// through sync, so a node that only follows prunes too. Node-local and
+/// root-neutral.
+pub fn prune_history(storage: &Arc<StateDB>, height: u64, policy: Option<(u64, u64)>) {
+    let Some((keep_blocks, max_delete)) = policy else {
+        return;
+    };
+    let _running = match PRUNING.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    match storage.prune_old_blocks(height, keep_blocks, max_delete) {
+        Ok(deleted) if deleted > 0 => println!(
+            "🧹 Block history pruning: removed {} old blocks (retain={}, batch={})",
+            deleted, keep_blocks, max_delete
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("⚠️ Block history pruning failed: {}", e),
+    }
+    // State versions follow the same window, so proofs are served exactly as
+    // long as blocks are.
+    if !height.is_multiple_of(STATE_PRUNE_EVERY) {
+        return;
+    }
+    match prune_state_window(
+        storage,
+        height,
+        keep_blocks,
+        (max_delete as usize).saturating_mul(4_000),
+    ) {
+        Ok(stats) if stats.nodes + stats.values > 0 => println!(
+            "🧹 State tree pruning: removed {} nodes and {} values",
+            stats.nodes, stats.values
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("⚠️ State tree pruning failed: {}", e),
     }
 }
 

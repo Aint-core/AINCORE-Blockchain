@@ -648,9 +648,34 @@ pub fn prune(
         db.write_batch(batch)?;
     }
     // Deleted keys: once no older row survives (a pin may still hold one),
-    // the deletion row goes, and with nothing newer, the preimage too.
+    // the deletion row goes, and with nothing newer, the preimage too. The
+    // checks and the deletes are one transaction, which holds the writer gate
+    // block execution takes: a key re-created in between cannot lose its
+    // preimage to a check that no longer holds.
+    let budget = max_rows.saturating_sub(rows);
+    let dead = db
+        .transaction(|view| {
+            prune_deleted(&view, floor, budget)
+                .map_err(|e| storage::StorageError::DatabaseOperation(e.to_string()))
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    stats.values += dead.values;
+    stats.more |= dead.more;
+    Ok(stats)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: runs in `prune_deleted` after its checks, before its writes.
+    pub(crate) static BEFORE_DEAD_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The deletion pass of `prune`, over a transaction view.
+fn prune_deleted(view: &StateDB, floor: Version, budget: usize) -> Result<PruneStats> {
+    let mut stats = PruneStats::default();
     let mut batch = WriteBatch::default();
-    for row in db.db.prefix_iterator(VDEAD.as_bytes()) {
+    for row in view.db.prefix_iterator(VDEAD.as_bytes()) {
         let (k, _) = row?;
         if !k.starts_with(VDEAD.as_bytes()) {
             break;
@@ -661,7 +686,7 @@ pub fn prune(
         if since > floor {
             break;
         }
-        if rows >= max_rows {
+        if stats.values >= budget {
             stats.more = true;
             break;
         }
@@ -670,19 +695,22 @@ pub fn prune(
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("malformed vdead key hash"))?,
         );
-        if since > 0 && latest_value_version(db, &kh, since - 1)?.is_some() {
+        if since > 0 && latest_value_version(view, &kh, since - 1)?.is_some() {
             continue;
         }
         batch.delete(val_key(&kh, since));
         batch.delete(&k);
-        if latest_value_version(db, &kh, Version::MAX)? == Some(since) {
+        if latest_value_version(view, &kh, Version::MAX)? == Some(since) {
             batch.delete(pre_key(&kh));
         }
         stats.values += 1;
-        rows += 1;
+    }
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_DEAD_WRITE.with(|h| h.borrow_mut().take()) {
+        hook();
     }
     if !batch.is_empty() {
-        db.write_batch(batch)?;
+        view.write_batch(batch)?;
     }
     Ok(stats)
 }

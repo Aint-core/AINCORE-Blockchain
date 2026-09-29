@@ -1221,3 +1221,43 @@ fn servable_versions_are_what_pruning_keeps() {
         prove(&db, &k(1), version).expect("a servable version is whole");
     }
 }
+
+/// GC-1 race: a key re-created while prune decides to drop its preimage
+/// keeps the preimage. The re-creation runs on another thread between
+/// prune's checks and its writes, as the executor writes: `apply` and its
+/// batch in one transaction. The deletion pass is one transaction too, so
+/// the two serialize on the writer gate.
+#[test]
+fn a_key_recreated_during_pruning_keeps_its_preimage() {
+    let db = temp_db("prune_race");
+    commit(&db, 0, vec![(k(1), some("a")), (k(9), some("x"))]);
+    commit(&db, 1, vec![(k(1), None)]);
+    commit(&db, 2, vec![(k(9), some("y"))]);
+    let writer: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
+        Default::default();
+    let handle = std::sync::Arc::clone(&writer);
+    let for_thread = std::sync::Arc::clone(&db);
+    BEFORE_DEAD_WRITE.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move || {
+            let db = for_thread;
+            *handle.lock().unwrap() = Some(std::thread::spawn(move || {
+                db.transaction(|view| {
+                    let applied = apply(&view, 3, vec![(k(1), some("back"))])
+                        .map_err(|e| storage::StorageError::DatabaseOperation(e.to_string()))?;
+                    view.write_batch(applied.batch)
+                })
+                .unwrap();
+            }));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }));
+    });
+    prune(&db, 2, &Default::default(), usize::MAX).unwrap();
+    writer.lock().unwrap().take().unwrap().join().unwrap();
+    assert_eq!(prove(&db, &k(1), 3).unwrap().0, some("back"));
+    assert_eq!(
+        count_rows(&db, &pre_key(&key_hash(&k(1)))),
+        1,
+        "the re-created key keeps its preimage"
+    );
+    assert_eq!(count_rows(&db, VDEAD), 0, "the old deletion row went");
+}

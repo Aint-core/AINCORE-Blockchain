@@ -719,9 +719,14 @@ counters, never values.
   - For example, tip 600, keep 200 and interval 20 pin 200, 240, … 600. That is five
     versions below the floor, not every boundary.
   - It is pure arithmetic, so a joiner and every server agree on it without reading rows.
-- **Not pruned:** a node that only imports blocks through sync never reaches the commit
-  path, so it prunes neither blocks nor state. This was already true of blocks; S6 must
-  decide whether sync-only nodes prune.
+- **Both paths prune** (`consensus::dag::prune_history`): a block this node built and a
+  block it imported through sync. Before S6 a node that only followed pruned neither blocks
+  nor state, and a restored node is exactly such a node. One process-wide lock keeps the
+  two paths from pruning at once.
+- **The deletion pass is one transaction.** It holds the writer gate that block execution
+  takes. Otherwise a key re-created between prune's check and its write could lose its
+  preimage (`apply` writes a preimage only when none exists). Witnessed with a concurrent
+  writer.
 - **RC-2** (`audit_flat_vs_tree`): at boot, every leaf equals its flat key and every flat
   state key is a leaf. It walks `STATE_EXACT` and `STATE_PREFIXES`, which a test ties to
   the classifier. Divergent keys are listed and the node refuses to start.
@@ -811,10 +816,7 @@ counters, never values.
     reopened after a failure.
   - The node's TCP handler routes by `ChainSync::serves`, one list shared with
     `handle_message`. Before this the new requests would have reached no handler.
-- **Open:**
-  - a restore between real machines, which needs a G3 chain, so it comes with S8;
-  - no witness for the chunk byte budget;
-  - sync-only nodes do not prune.
+- **Open:** a restore between real machines needs a G3 chain, so it comes with S8.
 | S8 | Activation in the shared fresh genesis with G1 S11 (AC) | Genesis |
 
 ## Open questions and founder decisions

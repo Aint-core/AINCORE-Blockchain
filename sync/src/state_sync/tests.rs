@@ -672,67 +672,119 @@ fn checkpoints_parse_strictly() {
     }
 }
 
+/// A node that builds its chain by importing it, as a follower does: empty
+/// blocks from one proposer, over the genesis rows of `genesis()`.
+struct Producer {
+    sync: ChainSync,
+    key: crypto::SigningKey,
+    proposer: String,
+}
+
+impl Producer {
+    fn new(name: &str, retention: Option<(u64, u64)>) -> Self {
+        let key = crypto::SigningKey::from_bytes(&[77; 32]);
+        let proposer = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let pk = hex::encode(key.verifying_key().to_bytes());
+        let sync = ChainSync::new(
+            "producer".into(),
+            0,
+            Arc::new(Mutex::new(HashMap::new())),
+            temp_db(name),
+        )
+        .with_retention(retention);
+        {
+            let _seed = sync.storage.seeding();
+            for (k, v) in &genesis() {
+                if classify(k.as_bytes()) == Some(KeyClass::State) {
+                    sync.storage.put(k, v).unwrap();
+                }
+            }
+            sync.storage
+                .put(
+                    "sys:validators",
+                    &serde_json::to_string(&vec![(proposer.clone(), 100u64)]).unwrap(),
+                )
+                .unwrap();
+            let account = storage::object::Object::new(
+                proposer.clone(),
+                storage::object::Owner::Address(proposer.clone()),
+                serde_json::json!({ "public_key": pk, "sequence_number": 0 })
+                    .to_string()
+                    .into_bytes(),
+                "0x1::account::AccountData".to_string(),
+            );
+            sync.storage.put_object(&account).unwrap();
+        }
+        let v0 = state_commit::seed_genesis(&sync.storage).unwrap();
+        sync.storage.write_batch(v0.batch).unwrap();
+        Self {
+            sync,
+            key,
+            proposer,
+        }
+    }
+
+    /// Build and import blocks `1..=n`; returns them.
+    fn import(&self, n: u64) -> Vec<Block> {
+        let executor = executor::Executor::new(Arc::clone(&self.sync.storage));
+        let mut prev = "genesis".to_string();
+        let mut blocks = Vec::new();
+        for height in 1..=n {
+            let root = hex::encode(
+                state_commit::root(&self.sync.storage, height - 1)
+                    .unwrap()
+                    .0,
+            );
+            let mut block = Block::new_with_roots(
+                height,
+                height,
+                prev.clone(),
+                vec![],
+                self.proposer.clone(),
+                root,
+                executor.receipts_root_for_block(&[]),
+            );
+            block.header.hash = blockchain::calculate_header_hash(&block.header);
+            block.sign_proposer(&self.key, &self.proposer);
+            assert_eq!(
+                self.sync.process_blocks(vec![block.clone()], height - 1),
+                height
+            );
+            prev = block.header.hash.clone();
+            blocks.push(block);
+        }
+        blocks
+    }
+}
+
+/// G3 GC-1: a node that only imports blocks prunes blocks and state like one
+/// that builds them (it used to prune neither).
+#[test]
+fn a_node_that_only_follows_prunes() {
+    let producer = Producer::new("follow_prunes", Some((10, 250)));
+    producer.import(100);
+    let db = &producer.sync.storage;
+    assert_eq!(state_commit::floor(db).unwrap(), 90);
+    assert!(db.get("block_1").unwrap().is_none(), "old blocks pruned");
+    assert!(db.get("block_95").unwrap().is_some());
+    assert!(state_commit::root(db, 50).is_err(), "an old version pruned");
+    // Pins: multiples of 5 (the genesis interval) over two windows.
+    for version in [80, 85, 90, 95, 100] {
+        state_commit::prove(db, "sys:chain_id", version).expect("kept");
+    }
+    assert!(state_commit::audit_flat_vs_tree(db).unwrap().is_empty());
+}
+
 /// SN-3: a restored node imports the next block through the normal path
 /// (`process_blocks`), onto the restored tree, and reaches the producer's
 /// root. The producer is itself a node that imported blocks 1 and 2.
 #[test]
 fn a_restored_node_follows_the_chain() {
     let g = genesis();
-    let key = crypto::SigningKey::from_bytes(&[77; 32]);
-    let proposer = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
-    let pk = hex::encode(key.verifying_key().to_bytes());
-    let producer = ChainSync::new(
-        "producer".into(),
-        0,
-        Arc::new(Mutex::new(HashMap::new())),
-        temp_db("follow_producer"),
-    );
-    {
-        let _seed = producer.storage.seeding();
-        for (k, v) in &g {
-            if classify(k.as_bytes()) == Some(KeyClass::State) {
-                producer.storage.put(k, v).unwrap();
-            }
-        }
-        producer
-            .storage
-            .put(
-                "sys:validators",
-                &serde_json::to_string(&vec![(proposer.clone(), 100u64)]).unwrap(),
-            )
-            .unwrap();
-        let account = storage::object::Object::new(
-            proposer.clone(),
-            storage::object::Owner::Address(proposer.clone()),
-            serde_json::json!({ "public_key": pk, "sequence_number": 0 })
-                .to_string()
-                .into_bytes(),
-            "0x1::account::AccountData".to_string(),
-        );
-        producer.storage.put_object(&account).unwrap();
-    }
-    let v0 = state_commit::seed_genesis(&producer.storage).unwrap();
-    producer.storage.write_batch(v0.batch).unwrap();
-    let executor = executor::Executor::new(Arc::clone(&producer.storage));
-    let empty_block = |height: u64, prev: String| {
-        let root = hex::encode(state_commit::root(&producer.storage, height - 1).unwrap().0);
-        let mut block = Block::new_with_roots(
-            height,
-            height,
-            prev,
-            vec![],
-            proposer.clone(),
-            root,
-            executor.receipts_root_for_block(&[]),
-        );
-        block.header.hash = blockchain::calculate_header_hash(&block.header);
-        block.sign_proposer(&key, &proposer);
-        block
-    };
-    let one = empty_block(1, "genesis".into());
-    assert_eq!(producer.process_blocks(vec![one.clone()], 0), 1);
-    let two = empty_block(2, one.header.hash.clone());
-    assert_eq!(producer.process_blocks(vec![two.clone()], 1), 2);
+    let producer = Producer::new("follow_producer", None);
+    let blocks = producer.import(2);
+    let (one, two) = (blocks[0].clone(), blocks[1].clone());
+    let producer = producer.sync;
 
     // The checkpoint is block 1, with a QC from the genesis committee.
     let vote = FinalityVote {
@@ -906,5 +958,49 @@ async fn a_dropped_connection_is_reopened() {
         ask("GET_HEIGHT").await.unwrap(),
         "HEIGHT:0",
         "a new one works"
+    );
+}
+
+/// The server keeps every chunk within its byte budget, shrinking it as
+/// needed, and refuses a single leaf that cannot fit.
+#[test]
+fn a_chunk_stays_within_its_byte_budget() {
+    let serve = |name: &str, values: Vec<Vec<u8>>| {
+        let db = temp_db(name);
+        let changes: Vec<(String, Option<Vec<u8>>)> = values
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (obj(i as u64), Some(v)))
+            .collect();
+        let applied = state_commit::apply(&db, 0, changes).unwrap();
+        db.write_batch(applied.batch).unwrap();
+        ChainSync::new("s".into(), 0, Arc::new(Mutex::new(HashMap::new())), db).handle_state_chunk(
+            ChunkRequest {
+                version: 0,
+                after: None,
+                max: 100,
+            },
+        )
+    };
+    // Six 1 MiB values: 12 MiB as hex, twice the budget.
+    let chunk = serve("budget", vec![vec![b'x'; 1 << 20]; 6]);
+    assert!(chunk.error.is_none(), "{:?}", chunk.error);
+    assert!(
+        (1..6).contains(&chunk.entries.len()),
+        "shrunk: {}",
+        chunk.entries.len()
+    );
+    let size: usize = chunk
+        .entries
+        .iter()
+        .map(|(k, v)| k.len() + v.len())
+        .sum::<usize>()
+        + chunk.proof.len();
+    assert!(size <= MAX_CHUNK_BYTES, "{size}");
+    // One 4 MiB value is 8 MiB as hex.
+    let chunk = serve("budget_one", vec![vec![b'y'; 4 << 20]]);
+    assert_eq!(
+        chunk.error.as_deref(),
+        Some("one leaf exceeds the chunk budget")
     );
 }

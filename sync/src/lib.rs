@@ -204,6 +204,9 @@ pub struct ChainSync {
     /// AUDIT H8: bounds what VERTEX_REQ can push through blocking RocksDB reads
     /// on the tokio workers shared with consensus. See `VertexServeBudget`.
     serve_budget: VertexServeBudget,
+    /// Block retention (`StateDB::block_pruning_policy_from_env`), read once.
+    /// Imported blocks prune under it like built ones (G3 GC-1).
+    retention: Option<(u64, u64)>,
     #[cfg(test)]
     before_execution_hook: Option<fn(&StateDB)>,
 }
@@ -221,9 +224,17 @@ impl ChainSync {
             peers,
             storage,
             serve_budget: VertexServeBudget::default(),
+            retention: StateDB::block_pruning_policy_from_env(),
             #[cfg(test)]
             before_execution_hook: None,
         }
+    }
+
+    /// Tests only: a retention policy other than the environment's.
+    #[cfg(test)]
+    pub(crate) fn with_retention(mut self, retention: Option<(u64, u64)>) -> Self {
+        self.retention = retention;
+        self
     }
 
     fn verify_block_hash(block: &Block) -> Result<bool, String> {
@@ -1153,6 +1164,7 @@ impl ChainSync {
             ) {
                 Ok(executor::BlockExecOutcome::Executed(_)) => {
                     last_processed = block.header.height;
+                    consensus::dag::prune_history(&self.storage, last_processed, self.retention);
                 }
                 Ok(executor::BlockExecOutcome::AlreadyExecuted { last_executed }) => {
                     // Execution completion alone does not identify the block.
