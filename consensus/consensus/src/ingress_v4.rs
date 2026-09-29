@@ -79,7 +79,7 @@ fn lower_hex(s: &str, len: usize) -> bool {
 
 /// Layer S under the record of the vertex's own epoch: every node holding
 /// that record reaches the same verdict.
-fn layer_s(
+pub(crate) fn layer_s(
     v: &Vertex,
     record: &EpochRecord<'_>,
     chain_id: &str,

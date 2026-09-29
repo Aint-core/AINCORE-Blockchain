@@ -290,6 +290,14 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         {
             Local
         }
+        // G1 S3 staging: up to two bodies per slot, the plain-body budget per
+        // author, and the slot's certificate.
+        ["consensus", "vslot" | "vcert", "v1", e, r, author]
+            if dec20(e) && dec20(r) && seg(author) =>
+        {
+            Local
+        }
+        ["consensus", "vbytes", "v1", e, author] if dec20(e) && seg(author) => Local,
 
         // N
         ["peer" | "peer_ip" | "peer_addr", id] if seg(id) => Node,
@@ -595,6 +603,9 @@ mod tests {
             (format!("consensus:qc_signing:v1:{H64}:{bls}:height:70016"), Local),
             (format!("consensus:qc_signing:v1:{H64}:{bls}:round:153030"), Local),
             (format!("consensus:vattest:v1:{H64}:{bls}:3:{H64}:00000000000000153030"), Local),
+            (format!("consensus:vslot:v1:00000000000000000003:00000000000000153030:{H64}"), Local),
+            (format!("consensus:vcert:v1:00000000000000000003:00000000000000153030:{H64}"), Local),
+            (format!("consensus:vbytes:v1:00000000000000000003:{H64}"), Local),
             ("da_shard_10000_0".into(), Local),
             ("da_commitment_1".into(), Local),
             ("da_data_1".into(), Local),

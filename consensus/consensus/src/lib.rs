@@ -3,6 +3,7 @@ pub mod ingress_v4;
 pub mod ordering;
 pub mod qc;
 pub mod qc_producer;
+pub mod staging;
 pub mod state_proof_client;
 pub mod vcert;
 

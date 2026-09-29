@@ -420,6 +420,13 @@ No rule concludes that a digest does not exist (`DEFECT_REGISTER.md:750`).
 
 **ST-4.** Staging never writes to O_E. Only OR-1 does.
 
+**S3 implementation notes** (`consensus::staging`, unwired until S5):
+- `stage_in` runs inside the caller's transaction, so staging, the node's own attestation guard (RC-2) and the plain-body counter commit or abort together. `stage` is the stand-alone form.
+- Slot rows: `consensus:vslot:v1:{E:020}:{r:020}:{author}` hold up to two `{digest, role, bytes}`. The plain-body counter per author and epoch is `consensus:vbytes:v1:{E:020}:{author}`. All are Local keys.
+- ST-2 eviction: of two plain members the greater digest is evicted, so the choice is the same after every restart. The evicted body is deleted and its bytes released. A second certified digest for a slot is evidence only (and an alarm at S5, `alarm:vcert_conflict`).
+- A body certified or self-attested after it was staged is promoted in place, and its bytes leave `B_AUTH`.
+- Boot (`load`) is RC-1 steps 2 and 3: every slot entry of the epoch above `g − RETAIN_SLACK`, each re-checked with Layer S (both twins, no load-order dedup), plus the epoch's `vcert` rows that verify. Step 4, O_E through OR-1, is S5.
+
 ### Attestation (AT)
 
 **AT-1 (preconditions).**
