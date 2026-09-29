@@ -1212,18 +1212,18 @@ pub fn build_genesis(
     storage.put(&gov_key, &hex::encode(gov_bytes))?;
 
     // === Initialize Universal Mining (Oracle & DeviceRegistry) ===
+    // Mirrors 0x1::universal_mining::VerifiedDevice in BCS field order. The
+    // registry holds verified bindings only; registrations live under each
+    // owner's address (DeviceClaims), so genesis writes none.
     #[derive(serde::Serialize)]
-    struct DeviceInfo {
+    struct VerifiedDevice {
         device_pubkey: Vec<u8>,
         owner_addr: move_core_types::account_address::AccountAddress,
-        // H3: must mirror 0x1::universal_mining::DeviceInfo BCS field order
-        // (verified before device_type).
-        verified: bool,
-        device_type: u8,
+        last_reward_epoch: u64,
     }
     #[derive(serde::Serialize)]
     struct DeviceRegistry {
-        devices: Vec<DeviceInfo>,
+        devices: Vec<VerifiedDevice>,
     }
 
     #[derive(serde::Serialize)]

@@ -9,17 +9,48 @@ module 0x1::universal_mining {
     const ENOT_AUTHORIZED: u64 = 1;
     const EDEVICE_ALREADY_REGISTERED: u64 = 2;
     const EDEVICE_NOT_REGISTERED: u64 = 3;
+    // 4 = ALREADY_VOTED, raised inline by submit_vote.
+    const EINVALID_DEVICE_PUBKEY: u64 = 5;
+    const EOWNER_DEVICE_LIMIT: u64 = 6;
+    const EREGISTRY_FULL: u64 = 7;
 
     /// The address of the authorized Oracle who can submit proofs
     const ORACLE_ADDRESS: address = @0x1; // For prototype, system account is oracle
 
-    /// Represents a registered IoT device
-    struct DeviceInfo has store, drop {
+    /// BOUNDS (G3 S6 open item: global resources had no size bound).
+    ///
+    /// register_device used to append to ONE vector at @0x1, for anyone, with
+    /// no limit on the key length or the count, and it scanned the whole
+    /// vector on every call. Measured before this change: gas = 125 + 180*N
+    /// for N registered devices, and the key bytes were free (a 16 MiB key
+    /// cost the same 125 gas as a 32-byte one). At N ~ 55,500 (about 4.2 MB)
+    /// the load alone exceeded MAX_GAS_LIMIT, so every registration,
+    /// verification and reward aborted for good.
+    ///
+    /// Now nothing a caller can grow is shared: a registration lands in the
+    /// caller's own DeviceClaims, capped per owner. Only feeders write the
+    /// global DeviceRegistry, and it is capped too. A global cap on
+    /// permissionless registrations was not an option: one attacker could
+    /// fill it and lock every honest owner out.
+    ///
+    /// A device key is an Ed25519 public key: the only scheme the feeders
+    /// verify off-chain (see add_verified_device) and the one the IoT SDK
+    /// generates.
+    const DEVICE_PUBKEY_BYTES: u64 = 32;
+    /// Devices one address may register. Bounds the caller's DeviceClaims
+    /// resource and the scan in each of its registrations.
+    const MAX_DEVICES_PER_OWNER: u64 = 32;
+    /// Verified bindings the global DeviceRegistry may hold. At 73 bytes an
+    /// entry the full registry stays under 1 MiB (one state-sync part), and a
+    /// feeder call that loads and scans all of it costs about 1.64M gas
+    /// (measured), under a fifth of MAX_GAS_LIMIT. Growing past this needs
+    /// keyed storage (Move tables), which this VM does not have.
+    const MAX_VERIFIED_DEVICES: u64 = 10000;
+
+    /// A device an owner registered. Unverified: it earns nothing until a
+    /// feeder verifies the binding (add_verified_device).
+    struct DeviceClaim has store, drop {
         device_pubkey: vector<u8>,
-        owner_addr: address,
-        // SECURITY (H3): only a feeder-verified (owner_addr, device_pubkey)
-        // binding may receive rewards. Defaults to false at registration.
-        verified: bool,
         device_type: u8,
         // 0=Unknown
         // 1=Wearable (Watch/Band)
@@ -27,6 +58,18 @@ module 0x1::universal_mining {
         // 3=Mobile (Phone App)
         // 4=Desktop (Laptop/PC)
         // 5=Browser (Web Extension)
+    }
+
+    /// The devices one owner registered, stored at the owner's address.
+    struct DeviceClaims has key {
+        devices: vector<DeviceClaim>,
+    }
+
+    /// A feeder-verified (owner_addr, device_pubkey) binding.
+    /// SECURITY (H3): only these receive rewards.
+    struct VerifiedDevice has store, drop {
+        device_pubkey: vector<u8>,
+        owner_addr: address,
         // AUDIT-#10: per-device per-epoch reward rate limit. The last staking
         // epoch this device was PAID in; distribute_reward pays at most once per
         // device per epoch (feeders could otherwise re-finalize the same device
@@ -42,9 +85,10 @@ module 0x1::universal_mining {
     const DEVICE_DESKTOP: u8 = 4;
     const DEVICE_BROWSER: u8 = 5;
 
-    /// Global registry of devices
+    /// Global registry of VERIFIED devices, at most one entry per pubkey.
+    /// Only feeders add to it, up to MAX_VERIFIED_DEVICES.
     struct DeviceRegistry has key {
-        devices: vector<DeviceInfo>,
+        devices: vector<VerifiedDevice>,
     }
 
     /// Initialize the module (called at genesis)
@@ -67,35 +111,67 @@ module 0x1::universal_mining {
     ///   2. Trust the FEEDER SET to bind a physical device to an owner: only a
     ///      feeder-verified binding earns rewards (see add_verified_device +
     ///      distribute_reward).
+    ///
+    /// The registration is stored under the caller's own address, so it can
+    /// neither grow a shared resource nor collide with anyone else's (see
+    /// BOUNDS above).
     public entry fun register_device(
         account: &signer,
         device_pubkey: vector<u8>,
         device_type: u8
-    ) acquires DeviceRegistry {
+    ) acquires DeviceClaims {
+        assert!(
+            vector::length(&device_pubkey) == DEVICE_PUBKEY_BYTES,
+            error::invalid_argument(EINVALID_DEVICE_PUBKEY)
+        );
         let owner_addr = signer::address_of(account);
-        let registry = borrow_global_mut<DeviceRegistry>(@0x1);
+        if (!exists<DeviceClaims>(owner_addr)) {
+            move_to(account, DeviceClaims { devices: vector::empty() });
+        };
+        let claims = borrow_global_mut<DeviceClaims>(owner_addr);
 
         // Duplicate guard scoped to (owner_addr, device_pubkey): an attacker
         // registering a victim's pubkey under the attacker address can NOT prevent
         // the victim from registering the same pubkey under the victim address.
-        let len = vector::length(&registry.devices);
+        assert!(
+            !claims_device(&claims.devices, &device_pubkey),
+            error::already_exists(EDEVICE_ALREADY_REGISTERED)
+        );
+        assert!(
+            vector::length(&claims.devices) < MAX_DEVICES_PER_OWNER,
+            error::resource_exhausted(EOWNER_DEVICE_LIMIT)
+        );
+
+        vector::push_back(&mut claims.devices, DeviceClaim {
+            device_pubkey,
+            device_type,
+        });
+    }
+
+    /// True when `devices` holds `device_pubkey`.
+    fun claims_device(devices: &vector<DeviceClaim>, device_pubkey: &vector<u8>): bool {
+        let len = vector::length(devices);
         let i = 0;
         while (i < len) {
-            let dev = vector::borrow(&registry.devices, i);
-            assert!(
-                !(dev.device_pubkey == device_pubkey && dev.owner_addr == owner_addr),
-                error::already_exists(EDEVICE_ALREADY_REGISTERED)
-            );
+            if (&vector::borrow(devices, i).device_pubkey == device_pubkey) {
+                return true
+            };
             i = i + 1;
         };
+        false
+    }
 
-        vector::push_back(&mut registry.devices, DeviceInfo {
-            device_pubkey,
-            owner_addr,
-            verified: false,
-            device_type,
-            last_reward_epoch: 0,
-        });
+    /// The index of `device_pubkey` in the verified registry, if it is there.
+    fun find_verified(devices: &vector<VerifiedDevice>, device_pubkey: &vector<u8>): (bool, u64) {
+        let len = vector::length(devices);
+        let i = 0;
+        while (i < len) {
+            if (&vector::borrow(devices, i).device_pubkey == device_pubkey) {
+                return (true, i)
+            };
+            i = i + 1;
+        };
+        (false, 0)
     }
 
     /// FEEDER-GATED key-ownership binding.
@@ -108,36 +184,47 @@ module 0x1::universal_mining {
     /// the real ed25519 verifier in Rust) and then marks exactly one
     /// (owner_addr, device_pubkey) registration verified. Only verified devices
     /// receive rewards.
+    ///
+    /// The owner must have registered the device. That is also what bounds a
+    /// registry entry: every key in it passed register_device's length check.
     public entry fun add_verified_device(
         feeder: &signer,
         owner_addr: address,
         device_pubkey: vector<u8>
-    ) acquires OracleConfig, DeviceRegistry {
+    ) acquires OracleConfig, DeviceClaims, DeviceRegistry {
         let feeder_addr = signer::address_of(feeder);
         let config = borrow_global<OracleConfig>(@0x1);
         assert!(
             vector::contains(&config.feeders, &feeder_addr),
             error::permission_denied(ENOT_AUTHORIZED)
         );
+        assert!(
+            exists<DeviceClaims>(owner_addr)
+                && claims_device(&borrow_global<DeviceClaims>(owner_addr).devices, &device_pubkey),
+            error::not_found(EDEVICE_NOT_REGISTERED)
+        );
 
         let registry = borrow_global_mut<DeviceRegistry>(@0x1);
-        let len = vector::length(&registry.devices);
-        let i = 0;
-        while (i < len) {
-            let dev = vector::borrow_mut(&mut registry.devices, i);
-            if (dev.device_pubkey == device_pubkey) {
-                // Single verified owner per pubkey: a pubkey already verified for
-                // a different owner cannot be re-bound here.
-                assert!(
-                    !(dev.verified && dev.owner_addr != owner_addr),
-                    error::permission_denied(ENOT_AUTHORIZED)
-                );
-                if (dev.owner_addr == owner_addr) {
-                    dev.verified = true;
-                };
-            };
-            i = i + 1;
+        let (found, idx) = find_verified(&registry.devices, &device_pubkey);
+        if (found) {
+            // Single verified owner per pubkey: a pubkey already verified for a
+            // different owner cannot be re-bound here. Verifying the same owner
+            // again changes nothing, so last_reward_epoch is kept.
+            assert!(
+                vector::borrow(&registry.devices, idx).owner_addr == owner_addr,
+                error::permission_denied(ENOT_AUTHORIZED)
+            );
+            return
         };
+        assert!(
+            vector::length(&registry.devices) < MAX_VERIFIED_DEVICES,
+            error::resource_exhausted(EREGISTRY_FULL)
+        );
+        vector::push_back(&mut registry.devices, VerifiedDevice {
+            device_pubkey,
+            owner_addr,
+            last_reward_epoch: 0,
+        });
     }
 
     /// Decentralization: Voting Logic
@@ -276,26 +363,13 @@ module 0x1::universal_mining {
         let epoch = 0x1::staking::get_current_epoch();
 
         // Find device owner. SECURITY (H3): only a feeder-VERIFIED binding may be
-        // paid. An unverified (e.g. front-run) registration is skipped, so a
-        // pubkey squatted by an attacker who never passed feeder key-ownership
+        // paid, and the registry holds nothing else. An unverified (e.g.
+        // front-run) registration lives only in its registrant's DeviceClaims, so
+        // a pubkey squatted by an attacker who never passed feeder key-ownership
         // verification receives nothing.
         let registry = borrow_global_mut<DeviceRegistry>(@0x1);
-        let len = vector::length(&registry.devices);
-        let i = 0;
-        let found = false;
-        let idx = 0;
+        let (found, idx) = find_verified(&registry.devices, &device_pubkey);
         let owner = @0x0;
-
-        while (i < len) {
-            let dev = vector::borrow(&registry.devices, i);
-            if (dev.device_pubkey == device_pubkey && dev.verified) {
-                owner = dev.owner_addr;
-                found = true;
-                idx = i;
-                break
-            };
-            i = i + 1;
-        };
 
         // AUDIT-#10: pay a verified device AT MOST ONCE per epoch. Feeders can
         // re-finalize the same device arbitrarily often (each proof is fresh), so
@@ -308,6 +382,7 @@ module 0x1::universal_mining {
                 return
             };
             dev.last_reward_epoch = epoch;
+            owner = dev.owner_addr;
         };
 
         if (found) {

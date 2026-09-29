@@ -7346,54 +7346,89 @@ mod tests {
         );
     }
 
-    /// FIX H3: device registration front-run lockout + reward theft.
-    /// (1) Owner A registers pubkey P; attacker B registers the SAME pubkey P
-    ///     under B -- this must NOT abort (scoped duplicate guard closes the
-    ///     lockout). (2) A feeder verifies only (A, P). (3) Only the verified
-    ///     binding is eligible for rewards (B stays unverified, earns nothing).
-    #[test]
-    fn test_h3_no_lockout_and_only_verified_owner_is_bound() {
-        use serde::{Deserialize, Serialize};
-        #[derive(Serialize, Deserialize)]
-        struct TDevice {
-            device_pubkey: Vec<u8>,
-            owner_addr: move_core_types::account_address::AccountAddress,
-            verified: bool,
-            device_type: u8,
-            // AUDIT-#10: DeviceInfo gained a per-device per-epoch reward-limit field.
-            last_reward_epoch: u64,
-        }
-        #[derive(Serialize, Deserialize)]
-        struct TRegistry {
-            devices: Vec<TDevice>,
-        }
-        #[derive(Serialize)]
-        struct TOracle {
-            feeders: Vec<move_core_types::account_address::AccountAddress>,
-            threshold: u64,
-            active_proofs: Vec<u8>, // empty -> BCS [0], same as empty Vec<PendingProof>
-        }
+    // ---- 0x1::universal_mining device registration -------------------------
+    //
+    // Mirrors of the Move layouts. Registrations live in DeviceClaims at each
+    // owner's address; the global DeviceRegistry at @0x1 holds only
+    // feeder-verified bindings.
 
-        let db = temp_db("h3_device");
-        load_stdlib(&db);
+    /// universal_mining::MAX_DEVICES_PER_OWNER.
+    const MAX_DEVICES_PER_OWNER: usize = 32;
+    /// universal_mining::MAX_VERIFIED_DEVICES.
+    const MAX_VERIFIED_DEVICES: usize = 10_000;
 
-        let um = |s: &str| {
-            format!(
-                "resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::universal_mining::{}",
-                s
-            )
-        };
-        // Seed empty DeviceRegistry + OracleConfig with @0x1 as the trusted feeder.
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+    struct TestDeviceClaim {
+        device_pubkey: Vec<u8>,
+        device_type: u8,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct TestDeviceClaims {
+        devices: Vec<TestDeviceClaim>,
+    }
+
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+    struct TestVerifiedDevice {
+        device_pubkey: Vec<u8>,
+        owner_addr: move_core_types::account_address::AccountAddress,
+        last_reward_epoch: u64,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct TestDeviceRegistry {
+        devices: Vec<TestVerifiedDevice>,
+    }
+
+    #[derive(Serialize)]
+    struct TestOracleConfig {
+        feeders: Vec<move_core_types::account_address::AccountAddress>,
+        threshold: u64,
+        active_proofs: Vec<u8>, // empty -> BCS [0], same as empty Vec<PendingProof>
+    }
+
+    #[derive(Serialize)]
+    struct TestEmissionPools {
+        delegation_budget: u128,
+        depin_budget: u128,
+    }
+
+    fn um_key(addr: &move_core_types::account_address::AccountAddress, name: &str) -> String {
+        vm_move::state_keys::resource_key_str(addr, &format!("0x1::universal_mining::{}", name))
+    }
+
+    fn registry_key() -> String {
+        um_key(&system_address(), "DeviceRegistry")
+    }
+
+    /// An address whose last 8 bytes are `n`, for seeding many owners.
+    fn nth_addr(n: u64) -> move_core_types::account_address::AccountAddress {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0xd0;
+        bytes[24..].copy_from_slice(&n.to_be_bytes());
+        move_core_types::account_address::AccountAddress::new(bytes)
+    }
+
+    /// A 32-byte device key whose first 8 bytes are `n`.
+    fn nth_key(n: u64) -> Vec<u8> {
+        let mut key = vec![0x5a; 32];
+        key[..8].copy_from_slice(&n.to_be_bytes());
+        key
+    }
+
+    /// The universal_mining state genesis creates (registry plus an oracle
+    /// whose only feeder is @0x1), with `verified` already in the registry.
+    fn seed_device_state(db: &StateDB, verified: Vec<TestVerifiedDevice>) {
         let _seed = db.seeding();
         db.put(
-            &um("DeviceRegistry"),
-            &hex::encode(bcs::to_bytes(&TRegistry { devices: vec![] }).unwrap()),
+            &registry_key(),
+            &hex::encode(bcs::to_bytes(&TestDeviceRegistry { devices: verified }).unwrap()),
         )
         .unwrap();
         db.put(
-            &um("OracleConfig"),
+            &um_key(&system_address(), "OracleConfig"),
             &hex::encode(
-                bcs::to_bytes(&TOracle {
+                bcs::to_bytes(&TestOracleConfig {
                     feeders: vec![system_address()],
                     threshold: 1,
                     active_proofs: vec![],
@@ -7402,90 +7437,495 @@ mod tests {
             ),
         )
         .unwrap();
+    }
 
-        let owner_a = "12121212121212121212121212121212";
-        let owner_b = "34343434343434343434343434343434";
-        let pubkey: Vec<u8> = vec![9u8; 32];
-        let module = move_core_types::language_storage::ModuleId::new(
+    fn device_registry(db: &StateDB) -> TestDeviceRegistry {
+        bcs::from_bytes(&hex::decode(db.get(&registry_key()).unwrap().unwrap()).unwrap()).unwrap()
+    }
+
+    fn device_claims(
+        db: &StateDB,
+        owner: &move_core_types::account_address::AccountAddress,
+    ) -> Option<TestDeviceClaims> {
+        db.get(&um_key(owner, "DeviceClaims"))
+            .unwrap()
+            .map(|v| bcs::from_bytes(&hex::decode(v).unwrap()).unwrap())
+    }
+
+    /// Calls `0x1::universal_mining::{function}` as `auth`, with `args` after
+    /// the signer slot, at the per-transaction gas ceiling.
+    fn device_call(
+        executor: &Executor,
+        function: &str,
+        auth: move_core_types::account_address::AccountAddress,
+        args: Vec<Vec<u8>>,
+    ) -> (u64, Vec<(String, Option<String>)>, vm_move::ExecutionStatus) {
+        let mut all = vec![bcs::to_bytes(&auth).unwrap()];
+        all.extend(args);
+        executor
+            .vm
+            .execute_public_entry_function(
+                vec![],
+                move_core_types::language_storage::ModuleId::new(
+                    system_address(),
+                    move_core_types::identifier::Identifier::new("universal_mining").unwrap(),
+                ),
+                function,
+                vec![],
+                all,
+                MAX_GAS_LIMIT,
+                auth,
+            )
+            .expect("universal_mining call executes")
+    }
+
+    fn register(
+        executor: &Executor,
+        owner: move_core_types::account_address::AccountAddress,
+        key: &[u8],
+    ) -> (u64, Vec<(String, Option<String>)>, vm_move::ExecutionStatus) {
+        device_call(
+            executor,
+            "register_device",
+            owner,
+            vec![bcs::to_bytes(key).unwrap(), bcs::to_bytes(&1u8).unwrap()],
+        )
+    }
+
+    fn verify(
+        executor: &Executor,
+        owner: move_core_types::account_address::AccountAddress,
+        key: &[u8],
+    ) -> (u64, Vec<(String, Option<String>)>, vm_move::ExecutionStatus) {
+        device_call(
+            executor,
+            "add_verified_device",
             system_address(),
-            move_core_types::identifier::Identifier::new("universal_mining").unwrap(),
-        );
-        let executor = Executor::new(db.clone());
+            vec![bcs::to_bytes(&owner).unwrap(), bcs::to_bytes(key).unwrap()],
+        )
+    }
 
-        let register = |auth: &str| {
-            let (_g, updates, status) = executor
-                .vm
-                .execute_public_entry_function(
-                    vec![],
-                    module.clone(),
-                    "register_device",
-                    vec![],
-                    vec![
-                        bcs::to_bytes(&parse_move_address(auth).unwrap()).unwrap(), // signer slot (rebound)
-                        bcs::to_bytes(&pubkey).unwrap(),
-                        bcs::to_bytes(&1u8).unwrap(),
-                    ],
-                    1_000_000,
-                    parse_move_address(auth).unwrap(),
-                )
-                .expect("register_device executes");
+    /// True when the call aborted in universal_mining with `code`.
+    fn aborted_with(status: &vm_move::ExecutionStatus, code: u64) -> bool {
+        !status.success
+            && status.error.as_deref().is_some_and(|e| {
+                e.contains(&format!("ABORTED with sub status {} at", code))
+                    && e.contains("universal_mining")
+            })
+    }
+
+    /// FIX H3: device registration front-run lockout + reward theft.
+    /// (1) Owner A registers pubkey P; attacker B registers the SAME pubkey P
+    ///     under B -- this must NOT abort (scoped duplicate guard closes the
+    ///     lockout). (2) A feeder verifies only (A, P). (3) Only the verified
+    ///     binding is eligible for rewards (B stays unverified, earns nothing).
+    #[test]
+    fn test_h3_no_lockout_and_only_verified_owner_is_bound() {
+        let db = temp_db("h3_device");
+        load_stdlib(&db);
+        // Tests apply execution results outside a block (G3 WG-1).
+        let _seed = db.seeding();
+        seed_device_state(&db, vec![]);
+        let executor = Executor::new(db.clone());
+        let owner_a = parse_move_address("12121212121212121212121212121212").unwrap();
+        let owner_b = parse_move_address("34343434343434343434343434343434").unwrap();
+        let pubkey: Vec<u8> = vec![9u8; 32];
+
+        // A registers P, then B registers the SAME P -- the second MUST succeed.
+        for owner in [owner_a, owner_b] {
+            let (_gas, updates, status) = register(&executor, owner, &pubkey);
             assert!(
                 status.success,
                 "register_device must not abort: {:?}",
                 status
             );
             apply_updates(&db, updates);
-        };
-
-        // A registers P, then B registers the SAME P -- the second MUST succeed.
-        register(owner_a);
-        register(owner_b);
-
-        let reg: TRegistry =
-            bcs::from_bytes(&hex::decode(db.get(&um("DeviceRegistry")).unwrap().unwrap()).unwrap())
-                .unwrap();
-        assert_eq!(
-            reg.devices.len(),
-            2,
-            "no lockout: both owners registered the same pubkey"
-        );
+        }
+        for owner in [owner_a, owner_b] {
+            assert_eq!(
+                device_claims(&db, &owner).expect("each owner holds its own registration"),
+                TestDeviceClaims {
+                    devices: vec![TestDeviceClaim {
+                        device_pubkey: pubkey.clone(),
+                        device_type: 1
+                    }]
+                },
+                "no lockout: both owners registered the same pubkey"
+            );
+        }
         assert!(
-            reg.devices.iter().all(|d| !d.verified),
-            "fresh registrations are unverified"
+            device_registry(&db).devices.is_empty(),
+            "registrations are unverified and stay out of the registry"
         );
 
         // Feeder @0x1 verifies ONLY (A, P).
-        let (_g, updates, status) = executor
-            .vm
-            .execute_public_entry_function(
-                vec![],
-                module.clone(),
-                "add_verified_device",
-                vec![],
-                vec![
-                    bcs::to_bytes(&system_address()).unwrap(), // feeder signer slot (rebound to @0x1)
-                    bcs::to_bytes(&parse_move_address(owner_a).unwrap()).unwrap(),
-                    bcs::to_bytes(&pubkey).unwrap(),
-                ],
-                1_000_000,
-                system_address(),
-            )
-            .expect("add_verified_device executes");
+        let (_gas, updates, status) = verify(&executor, owner_a, &pubkey);
         assert!(status.success, "feeder verify must succeed: {:?}", status);
         apply_updates(&db, updates);
-
-        let reg: TRegistry =
-            bcs::from_bytes(&hex::decode(db.get(&um("DeviceRegistry")).unwrap().unwrap()).unwrap())
-                .unwrap();
-        let a_addr = parse_move_address(owner_a).unwrap();
-        let b_addr = parse_move_address(owner_b).unwrap();
-        let a = reg.devices.iter().find(|d| d.owner_addr == a_addr).unwrap();
-        let b = reg.devices.iter().find(|d| d.owner_addr == b_addr).unwrap();
-        assert!(a.verified, "owner A's binding must be feeder-verified");
-        assert!(
-            !b.verified,
-            "attacker B's front-run binding must remain unverified (earns no reward)"
+        assert_eq!(
+            device_registry(&db).devices,
+            vec![TestVerifiedDevice {
+                device_pubkey: pubkey.clone(),
+                owner_addr: owner_a,
+                last_reward_epoch: 0
+            }],
+            "only owner A's binding is verified; B's front-run binding earns nothing"
         );
+
+        // And B cannot be verified for P afterwards: one verified owner per key.
+        let (_gas, _updates, status) = verify(&executor, owner_b, &pubkey);
+        assert!(aborted_with(&status, 0x50001), "{:?}", status);
+    }
+
+    /// G3 S6 open item: `register_device` appended to one global vector for
+    /// anyone and scanned it every call. Before this fix the measured cost was
+    /// 125 + 180*N gas for N registered devices, key bytes were free, and the
+    /// call ran out of gas for everyone at N ~ 55,500.
+    ///
+    /// Now a registration touches only the caller's own DeviceClaims: its gas
+    /// does not depend on how many devices anyone else registered or how full
+    /// the verified registry is, and it never writes the registry.
+    #[test]
+    fn register_device_cost_does_not_grow_with_other_registrations() {
+        let fresh_owner_gas = |registry_len: usize, other_owners: u64| {
+            let db = temp_db(&format!("device_cost_{}_{}", registry_len, other_owners));
+            load_stdlib(&db);
+            // Tests apply execution results outside a block (G3 WG-1).
+            let _seed = db.seeding();
+            seed_device_state(
+                &db,
+                (0..registry_len as u64)
+                    .map(|i| TestVerifiedDevice {
+                        device_pubkey: nth_key(i),
+                        owner_addr: nth_addr(i),
+                        last_reward_epoch: 0,
+                    })
+                    .collect(),
+            );
+            let executor = Executor::new(db.clone());
+            for i in 0..other_owners {
+                let (_gas, updates, status) =
+                    register(&executor, nth_addr(1_000_000 + i), &nth_key(i));
+                assert!(status.success, "{:?}", status);
+                apply_updates(&db, updates);
+            }
+            let owner = nth_addr(u64::MAX);
+            let (gas, updates, status) = register(&executor, owner, &nth_key(7));
+            assert!(status.success, "{:?}", status);
+            let keys: Vec<&str> = updates.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(
+                keys,
+                vec![um_key(&owner, "DeviceClaims").as_str()],
+                "a registration writes only the caller's own DeviceClaims"
+            );
+            gas
+        };
+        let empty = fresh_owner_gas(0, 0);
+        let crowded = fresh_owner_gas(MAX_VERIFIED_DEVICES, 200);
+        println!("register_device, first device: {empty} gas (empty chain), {crowded} gas (full registry, 200 other owners)");
+        assert_eq!(
+            empty, crowded,
+            "a registration's gas must not depend on anyone else's"
+        );
+
+        // One owner's k-th registration: bounded by MAX_DEVICES_PER_OWNER.
+        let db = temp_db("device_cost_one_owner");
+        load_stdlib(&db);
+        // Tests apply execution results outside a block (G3 WG-1).
+        let _seed = db.seeding();
+        seed_device_state(&db, vec![]);
+        let executor = Executor::new(db.clone());
+        let owner = nth_addr(1);
+        let mut last = 0;
+        for k in 0..MAX_DEVICES_PER_OWNER as u64 {
+            let (gas, updates, status) = register(&executor, owner, &nth_key(k));
+            assert!(status.success, "{:?}", status);
+            apply_updates(&db, updates);
+            last = gas;
+        }
+        println!("register_device, device {MAX_DEVICES_PER_OWNER} of one owner: {last} gas");
+        assert!(last < 50_000, "the most a registration can cost: {last}");
+    }
+
+    /// The pubkey is the only caller-sized part of a registration. It must be
+    /// exactly 32 bytes (Ed25519); before this fix a 16 MiB key cost 125 gas.
+    #[test]
+    fn register_device_refuses_a_pubkey_that_is_not_32_bytes() {
+        let db = temp_db("device_key_len");
+        load_stdlib(&db);
+        // Tests apply execution results outside a block (G3 WG-1).
+        let _seed = db.seeding();
+        seed_device_state(&db, vec![]);
+        let executor = Executor::new(db.clone());
+        let owner = nth_addr(1);
+        for len in [0usize, 1, 31, 33, 64, 51_200, 1024 * 1024] {
+            let (_gas, updates, status) = register(&executor, owner, &vec![7u8; len]);
+            assert!(aborted_with(&status, 0x10005), "len {len}: {:?}", status);
+            assert!(
+                updates.is_empty(),
+                "len {len}: an aborted registration writes nothing"
+            );
+        }
+        let (_gas, updates, status) = register(&executor, owner, &[7u8; 32]);
+        assert!(status.success, "{:?}", status);
+        apply_updates(&db, updates);
+        assert_eq!(device_claims(&db, &owner).unwrap().devices.len(), 1);
+    }
+
+    #[test]
+    fn register_device_caps_devices_per_owner() {
+        let db = temp_db("device_owner_cap");
+        load_stdlib(&db);
+        // Tests apply execution results outside a block (G3 WG-1).
+        let _seed = db.seeding();
+        seed_device_state(&db, vec![]);
+        let executor = Executor::new(db.clone());
+        let owner = nth_addr(1);
+        for k in 0..MAX_DEVICES_PER_OWNER as u64 {
+            let (_gas, updates, status) = register(&executor, owner, &nth_key(k));
+            assert!(status.success, "device {k}: {:?}", status);
+            apply_updates(&db, updates);
+        }
+        let (_gas, updates, status) = register(&executor, owner, &nth_key(999));
+        assert!(aborted_with(&status, 0x90006), "{:?}", status);
+        assert!(updates.is_empty());
+        assert_eq!(
+            device_claims(&db, &owner).unwrap().devices.len(),
+            MAX_DEVICES_PER_OWNER
+        );
+
+        // Another owner is unaffected by the first owner's cap.
+        let (_gas, _updates, status) = register(&executor, nth_addr(2), &nth_key(999));
+        assert!(status.success, "{:?}", status);
+    }
+
+    /// Only feeders add to the registry, and only up to MAX_VERIFIED_DEVICES.
+    /// A full registry refuses new bindings but still accepts re-verifying one
+    /// it holds, and the feeder's worst call stays under a fifth of the
+    /// per-transaction ceiling.
+    #[test]
+    fn add_verified_device_stops_at_the_registry_cap() {
+        let db = temp_db("device_registry_cap");
+        load_stdlib(&db);
+        // Tests apply execution results outside a block (G3 WG-1).
+        let _seed = db.seeding();
+        seed_device_state(
+            &db,
+            (0..MAX_VERIFIED_DEVICES as u64 - 1)
+                .map(|i| TestVerifiedDevice {
+                    device_pubkey: nth_key(i),
+                    owner_addr: nth_addr(i),
+                    last_reward_epoch: 0,
+                })
+                .collect(),
+        );
+        let executor = Executor::new(db.clone());
+        let (a, b) = (nth_addr(u64::MAX), nth_addr(u64::MAX - 1));
+        let (key_a, key_b) = (vec![0xaa; 32], vec![0xbb; 32]);
+        for (owner, key) in [(a, &key_a), (b, &key_b)] {
+            let (_gas, updates, status) = register(&executor, owner, key);
+            assert!(status.success, "{:?}", status);
+            apply_updates(&db, updates);
+        }
+
+        let (gas, updates, status) = verify(&executor, a, &key_a);
+        assert!(status.success, "the last free slot is usable: {:?}", status);
+        apply_updates(&db, updates);
+        assert_eq!(device_registry(&db).devices.len(), MAX_VERIFIED_DEVICES);
+        println!(
+            "add_verified_device into a registry of {} devices: {gas} gas",
+            MAX_VERIFIED_DEVICES - 1
+        );
+        assert!(gas < MAX_GAS_LIMIT / 5, "feeder call at the cap: {gas}");
+        let registry_bytes = db.get(&registry_key()).unwrap().unwrap().len() / 2;
+        assert!(
+            registry_bytes < 1024 * 1024,
+            "full registry: {registry_bytes} bytes"
+        );
+
+        let (_gas, updates, status) = verify(&executor, b, &key_b);
+        assert!(aborted_with(&status, 0x90007), "{:?}", status);
+        assert!(updates.is_empty());
+
+        let (_gas, _updates, status) = verify(&executor, a, &key_a);
+        assert!(
+            status.success,
+            "re-verifying a held binding is a no-op: {:?}",
+            status
+        );
+
+        // The reward lookup's worst case: the last entry of a full registry.
+        let (gas, _updates, status) = device_call(
+            &executor,
+            "submit_mining_proof",
+            system_address(),
+            vec![
+                bcs::to_bytes(&key_a).unwrap(),
+                bcs::to_bytes(&100u64).unwrap(),
+            ],
+        );
+        assert!(status.success, "{:?}", status);
+        println!("submit_mining_proof for the last of {MAX_VERIFIED_DEVICES} devices: {gas} gas");
+        assert!(gas < MAX_GAS_LIMIT / 5, "reward lookup at the cap: {gas}");
+    }
+
+    /// The honest reward path through the new registry: register, verify, and
+    /// a finalized proof pays the owner once per epoch.
+    #[test]
+    fn a_verified_device_is_paid_once_per_epoch() {
+        let db = temp_db("device_reward");
+        load_stdlib(&db);
+        // Tests apply execution results outside a block (G3 WG-1).
+        let _seed = db.seeding();
+        seed_device_state(&db, vec![]);
+        let owner_hex = "5656565656565656565656565656565656565656565656565656565656565656";
+        let owner = parse_move_address(owner_hex).unwrap();
+        set_coin_store(&db, owner_hex, 0);
+        let set_epoch = |epoch: u64| {
+            let _seed = db.seeding();
+            let set = TestValidatorSet {
+                validators: vec![],
+                unbonding_queue: vec![],
+                total_supply: 0,
+                current_epoch: epoch,
+            };
+            db.put(
+                &validator_set_key(),
+                &hex::encode(bcs::to_bytes(&set).unwrap()),
+            )
+            .unwrap();
+        };
+        set_epoch(1);
+        {
+            let _seed = db.seeding();
+            db.put(
+                &vm_move::state_keys::resource_key_str(
+                    &system_address(),
+                    "0x1::staking::EmissionPools",
+                ),
+                &hex::encode(
+                    bcs::to_bytes(&TestEmissionPools {
+                        delegation_budget: 0,
+                        depin_budget: 10_000_000_000_000_000_000,
+                    })
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        }
+        let executor = Executor::new(db.clone());
+        let key = vec![0x42; 32];
+        let (_gas, updates, status) = register(&executor, owner, &key);
+        assert!(status.success, "{:?}", status);
+        apply_updates(&db, updates);
+        let (_gas, updates, status) = verify(&executor, owner, &key);
+        assert!(status.success, "{:?}", status);
+        apply_updates(&db, updates);
+
+        let prove = || {
+            let (_gas, updates, status) = device_call(
+                &executor,
+                "submit_mining_proof",
+                system_address(),
+                vec![
+                    bcs::to_bytes(&key).unwrap(),
+                    bcs::to_bytes(&100u64).unwrap(),
+                ],
+            );
+            assert!(status.success, "{:?}", status);
+            apply_updates(&db, updates);
+        };
+        const REWARD: u128 = 360_000_000_000_000_000; // 0.36 AIN at bqi 100
+        prove();
+        assert_eq!(coin_balance(&db, owner_hex), REWARD, "paid in epoch 1");
+        prove();
+        assert_eq!(
+            coin_balance(&db, owner_hex),
+            REWARD,
+            "not paid twice in one epoch"
+        );
+        assert_eq!(device_registry(&db).devices[0].last_reward_epoch, 1);
+        set_epoch(2);
+        prove();
+        assert_eq!(
+            coin_balance(&db, owner_hex),
+            2 * REWARD,
+            "paid again in epoch 2"
+        );
+    }
+
+    /// Honest registration through a real signed transaction (gas prologue,
+    /// signer binding, commit), and an over-long key through the same path:
+    /// charged gas, no registration.
+    #[test]
+    fn register_device_through_a_signed_transaction() {
+        let db = temp_db("device_signed_tx");
+        load_stdlib(&db);
+        // Tests apply execution results outside a block (G3 WG-1).
+        let _seed = db.seeding();
+        seed_device_state(&db, vec![]);
+        let signing_key = SigningKey::from_bytes(&[31u8; 32]);
+        let sender = create_account(&db, &signing_key);
+        {
+            let _seed = db.seeding();
+            db.set_federation_key("00000000000000000000000000000000")
+                .unwrap();
+        }
+        set_coin_store(&db, &sender, 1_000_000);
+        let executor = Executor::new(db.clone());
+        let owner = parse_move_address(&sender).unwrap();
+        let payload = |key: Vec<u8>| {
+            entry_payload(
+                "universal_mining",
+                "register_device",
+                vec![],
+                vec![
+                    bcs::to_bytes(&owner).unwrap(),
+                    bcs::to_bytes(&key).unwrap(),
+                    bcs::to_bytes(&3u8).unwrap(),
+                ],
+            )
+        };
+
+        let (updates, gas) = executor
+            .execute_transaction(&signed_tx(
+                &signing_key,
+                &sender,
+                &payload(vec![1; 32]),
+                0,
+                100_000,
+                1,
+            ))
+            .expect("registration accepted");
+        assert_eq!(gas, 100_000);
+        apply_updates(&db, updates);
+        assert_eq!(
+            device_claims(&db, &owner).unwrap().devices,
+            vec![TestDeviceClaim {
+                device_pubkey: vec![1; 32],
+                device_type: 3
+            }]
+        );
+        assert_eq!(coin_balance(&db, &sender), 900_000);
+
+        let (updates, gas) = executor
+            .execute_transaction(&signed_tx(
+                &signing_key,
+                &sender,
+                &payload(vec![2; 4096]),
+                1,
+                100_000,
+                1,
+            ))
+            .expect("the transaction is kept: gas is charged even though it aborts");
+        assert_eq!(gas, 100_000);
+        apply_updates(&db, updates);
+        assert_eq!(
+            device_claims(&db, &owner).unwrap().devices.len(),
+            1,
+            "the over-long key was not registered"
+        );
+        assert_eq!(coin_balance(&db, &sender), 800_000);
     }
 
     // ========================================================================
