@@ -263,8 +263,10 @@ fn block_crash_child() {
                 // S2 executor reproduces 3208d836... exactly. G5 S3 moved it
                 // through the stdlib alone (delegation pools, the emission
                 // hot potato, math): with S2's bytecode the S3 executor
-                // reproduces e8953244... exactly.
-                "726ce81de53f3a51edd3c6c77a99cf9c2464f6ba216970ec82f3298b93794f97",
+                // reproduces e8953244... exactly. G5 S4a moved it through the
+                // stdlib alone (the offense ledger, W and D): with S3's
+                // bytecode the S4a executor reproduces 726ce81d... exactly.
+                "c5038a3d757c3c7afdde5cd2444af673096d2ba6a56bccbc688e3f294e03033e",
                 "clean execution must preserve the pre-staging fixture root"
             );
         }

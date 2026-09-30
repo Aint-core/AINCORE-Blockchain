@@ -100,7 +100,8 @@ software upgrade.
 | Name | Value | Derivation |
 |---|---|---|
 | U, unbonding | 21 d | U ≥ T_trust + T_mis (clock research §3.2). T_trust = 14 d: the longest halt so far was 10 days, checkpoints are weekly, and bridge light clients trust for 2/3·U (IBC ADR-026). T_mis = 7 d to detect misbehaviour and land evidence |
-| W, evidence max age | U | research b.5: W ≤ U is the slashability condition |
+| W, evidence max age | 7 d | Amendment A2. W = T_mis, the misbehaviour budget U's derivation already reserves; W ≤ U is the slashability condition (research b.5). W bounds how long committee records are kept, and W + D + I·C_τ < U lets every slash settle before any stake it reaches can unlock (SL-5) |
+| D, correlation window | 1 d | Amendment A2. Offenses within D of each other count together (SL-4). Every recorded operator-error incident clustered within hours (Ethereum 2022–2025); Ethereum and Polkadot both raise the fraction with concurrent offenses (docs/research/slash_policy.md) |
 | N, commission notice | 7 d | the delegator's reaction time. Precedents: Solana ≥ 1 epoch (~2 d), Cardano 5 d, Aptos 3.5–14 d. AINCORE has no redelegation and serves app users, so it sits at the protective end (commission research §4.1) |
 | Δc, commission increase per notice | 500 bps | Aptos +10 pp per lockup, Cosmos `max_change_rate`, Polkadot pools. A delegator locked in by U tolerates about (1−c)·U/T before leaving (Farrell–Klemperer switching cost): 5.5 pp for a one-year delegator |
 | λ, emission | −ln(1 − 0.019) per year | emission decision: 1.90 %/yr of the remaining reserve |
@@ -225,17 +226,17 @@ delegators', stay slashable until they are paid. A slash for an infraction in ep
 reduces the bonded stake and every entry created in epoch E_i or later and before the slash
 was applied. Stake that left during E_i still weighed C_{E_i}, since committees are frozen
 per epoch (DL-1). Tickets created after the slash are not cut twice.
-- **Pool side.** The active principal is cut at once, rounded up, and the pool closes for
-  good. The pool records the slash as an event: E_i, its sequence number, the fraction, and
-  how many unpaid tickets it may reach.
+- **Pool side.** The pool closes for good when the evidence is accepted (SL-5). At
+  settlement the active principal is cut, rounded up, and the pool records the slash as an
+  event: E_i, its sequence number, the fraction, and how many unpaid tickets it may reach.
   - A ticket records the pool's slash count when it is made, so it is cut only by later
     events, and only once.
   - Each ticket is cut when withdrawn. The cut is burned.
   - An event is dropped once every ticket it may reach is paid. A pool keeps at most 8
     events; past that, the two oldest merge into one that cuts at least as much for every
     ticket.
-- **Infraction epoch.** In S3 it is the epoch of the block that applies the slash. S4
-  passes the evidence's epoch.
+- **Infraction epoch.** E_i is the epoch of the equivocated slot, taken from the evidence
+  (SL-3).
 - **Atomicity.** The validator's own stake and its pool are slashed in one Move call,
   `delegation::slash`, so a slash cannot be half applied.
 
@@ -246,11 +247,69 @@ least U after the last block it could sign, and the queue stays sorted. The extr
 most I·C_τ (3.9 h at I = 1,000 and 14 s, 0.8 % of U). The same rule holds for a validator
 that leaves, the remainder of a partial slash, and a delegator that undelegates.
 
-**SL-3 (evidence).** Equivocation evidence is V4 (G1 EQ-1): two V4-hashed vertices, or two
-attestations, of one slot, signed by a member of C_{E(slot)}. It is carried through the DAG
-(`SLASH_EVIDENCE:`), verified against C_{E(slot)} rather than the live set, refused when
-older than W in τ, and applied 100 %. Evidence rows are kept for W, keyed by epoch. The V3
-evidence path and the V3 DAG code are deleted with it (G1 S11b part 2).
+**SL-3 (evidence).** Evidence is V4 and names a slot (E, round, author).
+- **Kinds.**
+  - Proposer twins (G1 EQ-1): two V4 vertices of one slot with different `hash_v4`, both
+    signed with the author's key in C_E.
+  - A certificate conflict (G1 CE-3): two certificates of one slot on different digests.
+    Every signer in both is an offender: both BLS aggregates verify, so each of them signed
+    both digests. Two quorums of C_E intersect in more than a third of its weight, so this
+    evidence always reaches SL-4's 100 %.
+- **Verification.** Evidence is carried through the DAG (`SLASH_EVIDENCE:`) and verified
+  against C_E (keys and membership), never the live set.
+- **Age.** It is refused once τ > τ_start(E+1) + W. That is never before W has passed since
+  the latest moment the offense could have happened. It is also refused once C_E's record
+  is gone. Committee records, their splits and τ_start(E) are kept while τ ≤ τ_start(E+1) + W
+  and for at least 8 epochs.
+- **Tombstone.** A validator's first accepted offense is its only one:
+  - it is jailed for good and never re-enters a committee;
+  - its `join_validator_set` is refused;
+  - later evidence against it is ignored.
+- **Keys.** Evidence rows are keyed by epoch.
+- **V3.** The V3 evidence path and the V3 DAG code are deleted (G1 S11b part 2).
+
+**SL-4 (fraction).** Offender v's fraction is
+
+  `f = 10⁴ bps if 3·Q ≥ T, else max(100, ⌈9·10⁴·Q²/T²⌉) bps`.
+
+- T is the total weight of C_{e_v}.
+- Q is the sum of w_u over the distinct offenders u (v included) with |τ_u − τ_v| ≤ D.
+  - τ_e = τ_start(e_u) is the start of the offense epoch.
+  - w_u is u's weight in C_{e_u}.
+- Isolated faults cost from 1 % up. The fraction rises with the square of the share that
+  equivocated together, and is 100 % from a third, the least any safety attack needs. It is
+  Polkadot's (3k/n)² by stake instead of by count, with Ethereum's 1 % realized floor.
+- The fraction is stake-weighted: splitting stake across validators does not lower Q.
+- Integer form: Q, T ≤ 1.5·10⁸, so 9·10⁴·Q² < 2.1·10²¹, far inside u128.
+
+**SL-5 (acceptance and settlement).**
+- **Acceptance.** In the block that carries the evidence:
+  - the offender is jailed and leaves the live set;
+  - its own stake moves to unbonding, which is in scope, and none of it is burned yet;
+  - its pool closes: no deposits, no reward, no weight;
+  - the offense is recorded with e_v, τ_v, w_v, T and the frozen split (s_v, d_v) of
+    C_{e_v}.
+- **Settlement.** The fraction is final once τ ≥ τ_v + D + I·C_τ + W. By then every
+  correlated offense's evidence has landed or been refused. It settles at the first reward
+  period after that, or at once when 3·Q ≥ T, since 100 % cannot rise. The settlement is
+  one Move call.
+- **No freeze is needed.** In-scope stake unlocks at τ_v + U or later (SL-2). Settlement
+  happens by τ_v + D + I·C_τ + W + R·C_τ < τ_v + U, since 1 d + 3.9 h + 7 d is far below
+  21 d. `chain::valid` requires I·C_τ ≤ U − W − D − R·C_τ.
+- **No cancel, and burned.** There is no discretionary cancel: the founder would be
+  cancelling his own slashes. Slashed coins are burned.
+
+**SL-6 (who pays).** The operator's own stake takes the loss first. With the frozen split
+(s, d) of C_{e_v} and b = s + d:
+
+  `A = f·b` (bps × weight), `self = min(10⁴, ⌈A/s⌉)`, `pool = min(10⁴, ⌈max(0, A − 10⁴·s)/d⌉)`
+  (bps), so an operator without a pool pays exactly f.
+
+- Every unbonding entry of the validator made in epoch e_v or later is cut by `self`. Earlier
+  entries are out of scope.
+- The pool is cut by `pool` (SL-1).
+- At f = 100 % both are 100 %, so the cost of an attack is unchanged.
+- An isolated fault reaches delegators only when f·b > s.
 
 **DOC-1 (honest claims).** The RPC and every public document describe the draw on the
 remaining reserve by consensus time, report `last_reward_height`, the realized rate and the
@@ -267,7 +326,9 @@ end of G5, as with G1.
 | **S1b** | Amendment A1: CL-1 τ, BT-1's quorum guard, CL-2 writing τ from the block timestamp, P-1's new split (C_τ pinned; U, N, Δc, K constants; G removed), SL-2 unlock by τ, UB-1, CM-1 | with 1 s blocks unbonding completes at 21 d of block time, not at a block count; a 10-day timestamp jump advances τ by C_τ; a corrupted timestamp stream cannot unlock before U / C_τ blocks; a below-quorum sample does not advance T; one author at +30 s cannot move T out of the honest range; a matured entry is paid once, at the first boundary at or after its unlock, in queue order; a commission increase applies exactly at N and never earlier, above Δc it is refused, a decrease applies at once | τ uncapped; cap ignored after a halt; quorum guard removed; unlock from h without I·C_τ; burn restored; payout not bounded by K; manual apply restored; increase cap removed |
 | **S2** | EM-1..EM-3: payouts every R blocks by Δτ, committee recipients from a state record shared with consensus, fees to the committee, boundary order, rotation independent of Move, I = 1,000 written by genesis-tool | a payout mints exactly the EM-1 integer form and a day's draw compounds to 1.90 %/yr; the emission over the same τ matches (within 10⁻⁶) for 1 s or 7 s blocks and R ∈ {1, 20}; a payout after a long gap covers one day; a joiner is paid from its first committee epoch and a leaver until its last; fees pay C_{E(h)}, not the live set; a jailed member gets nothing; an invalid live set keeps the committee; the executor's record equals consensus's committee on real nodes | Δτ ignored; the cap removed; the live set paid; payout after derivation at H_E; jailed paid; fees to the live set; rotation skipped when Move aborts; consensus cross-check removed |
 | **S3** | DL-1..DL-3, CM-1 in the payout, the atomic slash: pools of aggregates with per-account positions and tickets; the reward split from the frozen record; bonded weight at boundaries; `math` u256 mul_div; the RPC reads the Move state | conservation: principal escrow = C + unbonding, Σ points = P, reward escrow covers every claim within dust; ρ·P + κ = S·Σπ exactly; each payout's two parts match the frozen split to the unit, and a mid-epoch joiner does not move it; a delegator is paid ⌊p·Δρ/S⌋ to the unit and a joiner nothing from before; weight changes at the next epoch only; commission uses the rate at the period start; the active and ticket slash follow SL-1 in one call; a closed pool refuses deposits; a pool's stored size does not grow with its delegators; a full account cannot block another's undelegation; exits and deposits round the pool's way; a claim past u128 works and a 1-unit shortfall does not abort | the carry dropped; points rounded up on deposit; coins rounded up on exit; deposits into a dead pool; tickets of an earlier epoch slashed; the applied-height guard dropped; live stake used in the split; a vector of delegators in the pool; the escrow clamp removed; u128 intermediates |
-| **S4** | SL-1..SL-3: unbonding slashable, V4 evidence (EQ-1) through the DAG, W in τ, V3 deletion | a leaver that equivocates before its unlock loses its unbonding stake; an undelegation after the infraction is slashed and one before it is not; evidence older than W is refused; a V4 node never records V3 evidence (kept from S11b) | only active stake slashed; live-set membership check; no age bound |
+| **S4a** | Amendment A2 policy: SL-4..SL-6, acceptance and settlement in Move, the offense ledger, the tombstone, W = 7 d and D = 1 d pinned | SL-4 to the basis point (isolated 1/4, 1/10, 1/100 of weight; a third); offenses within D count together, beyond D they do not; 3Q ≥ T settles at once at 100 %; otherwise nothing settles before τ_v + D + I·C_τ + W; the waterfall leaves delegators whole when the operator covers A; in-scope own unbonding is cut, earlier entries are not; a leaver that equivocates before its unlock loses its unbonding stake; every in-scope entry is still unpaid at settlement; a tombstoned join is refused | floor dropped; linear instead of square; threshold at half; D unbounded or zero; settlement before the deadline; waterfall reversed; pool left open at acceptance; out-of-scope entries cut |
+| **S4b** | SL-3: V4 proposer twins and certificate conflicts detected, kept in durable epoch-keyed rows before GC, carried and verified against C_E with the age bound; committee records kept for W | a twin pair from real V4 engines is carried and accepted; a pair signed by a non-member of C_E, or checked against the live set, is refused; evidence younger than W is accepted and older is refused; a certificate conflict slashes its intersection at 100 %; the same slot in two epochs does not collide | live-set membership; no age bound; a round-only key; the V3 hash |
+| **S4c** | G1 S11b part 2: V3 ingress, producer, recovery and evidence deleted; the V3-fixture witnesses re-expressed on V4 | the release gate's V3-fixture witnesses pass on V4 fixtures; a V4 node never records V3 evidence (kept from S11b) | — |
 | **S5** | DOC-1: RPC fields, README, WHITEPAPER, CLAUDE.md | the RPC reports the Move state; no document names a halving (a grep witness) | — |
 | **S6** | The fresh genesis file from genesis-tool with the measured t_b, shown to the founder before it is used | the genesis identity changes with each pinned parameter | — |
 

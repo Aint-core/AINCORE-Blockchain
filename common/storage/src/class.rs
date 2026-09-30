@@ -146,6 +146,7 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
     let fixed = match key {
         "sys:validators"
         | "sys:validator_set:v1"
+        | "sys:validator_set:retained_from"
         | "genesis:validator_set:v1"
         | "genesis:vertex_format"
         | "sys:genesis_time"
@@ -263,6 +264,7 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         // S
         ["sys", "validator_set", "epoch", e] if dec(e) => State,
         ["sys", "validator_set", "epoch_delegated", e] if dec(e) => State,
+        ["sys", "validator_set", "epoch_time", e] if dec(e) => State,
         ["consensus", "epoch_start_height", e] if dec(e) => State,
         ["sys", "fee_sweep_queue", h, miner] if dec(h) && seg(miner) => State,
         ["sys", "slashed", a, r] if seg(a) && dec(r) => State,
@@ -355,6 +357,7 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
 pub const STATE_EXACT: &[&str] = &[
     "sys:validators",
     "sys:validator_set:v1",
+    "sys:validator_set:retained_from",
     "genesis:validator_set:v1",
     "genesis:vertex_format",
     "sys:genesis_time",
@@ -384,6 +387,7 @@ pub const STATE_PREFIXES: &[&str] = &[
     "obj:",
     "sys:validator_set:epoch:",
     "sys:validator_set:epoch_delegated:",
+    "sys:validator_set:epoch_time:",
     "consensus:epoch_start_height:",
     "sys:fee_sweep_queue:",
     "sys:slashed:",
@@ -578,6 +582,8 @@ mod tests {
             ("genesis:validator_set:v1".into(), State),
             ("sys:validator_set:epoch:12".into(), State),
             ("sys:validator_set:epoch_delegated:12".into(), State),
+            ("sys:validator_set:epoch_time:12".into(), State),
+            ("sys:validator_set:retained_from".into(), State),
             ("consensus:epoch".into(), State),
             ("consensus:epoch_start_height:12".into(), State),
             ("sys:last_epoch_boundary".into(), State),
@@ -749,6 +755,8 @@ mod tests {
             "sys:validator_set:epoch:x",
             "sys:validator_set:epoch_delegated:",
             "sys:validator_set:epoch_delegated:07",
+            "sys:validator_set:epoch_time:",
+            "sys:validator_set:epoch_time:x",
             &format!("tx_index:{}", &H64[..63]),
             &format!("vertex:{}", H64.to_uppercase()),
             "sys:config:unknown",

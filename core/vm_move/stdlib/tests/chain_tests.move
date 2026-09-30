@@ -62,12 +62,14 @@ module 0xcafe::chain_tests {
         assert!(!chain::valid(20, 0, 14), 3);
         assert!(!chain::valid(20, 7, 14), 4);
         assert!(!chain::valid(20, 20, 0), 5);
-        // U / 14 = 129,600 epochs of blocks at most.
-        assert!(chain::valid(129600, 20, 14), 6);
-        assert!(!chain::valid(129620, 20, 14), 7);
-        // U / 1,814 = 1,000 (rounded down): 1,000 fits, 1,001 does not.
-        assert!(chain::valid(1000, 1, 1814), 8);
-        assert!(!chain::valid(1001, 1, 1814), 9);
+        // (I + R) x C_tau <= U - W - D = 1,123,200 s (G5 SL-5): at 14 s,
+        // I + R <= 80,228, so I = 80,200 fits and 80,220 does not.
+        assert!(chain::valid(80200, 20, 14), 6);
+        assert!(!chain::valid(80220, 20, 14), 7);
+        // 1,123,200 / 1,123 = 1,000 (rounded down): I + R = 1,000 fits,
+        // 1,001 does not.
+        assert!(chain::valid(999, 1, 1123), 8);
+        assert!(!chain::valid(1000, 1, 1123), 9);
     }
 
     /// G5 SL-2: stake leaving now unlocks U after the end of this committee

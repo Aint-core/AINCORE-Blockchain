@@ -674,6 +674,10 @@ pub struct ChainParams {
 /// U, 21 days in seconds: the Move constant `0x1::chain::UNBONDING_SECS`,
 /// which bounds I x C_tau (P-1).
 const UNBONDING_SECS: u64 = 1_814_400;
+/// W and D (G5 SL-3, SL-4): `0x1::chain::EVIDENCE_MAX_AGE_SECS` and
+/// `CORRELATION_WINDOW_SECS`.
+const EVIDENCE_MAX_AGE_SECS: u64 = 604_800;
+const CORRELATION_WINDOW_SECS: u64 = 86_400;
 
 impl ChainParams {
     /// The 6,650 ms values (C_tau = 14 s), with the pinned interval's default
@@ -684,13 +688,18 @@ impl ChainParams {
         max_block_interval_secs: 14,
     };
 
-    /// P-1's constraints (the same as Move `chain::valid`).
+    /// P-1's constraints (the same as Move `chain::valid`): the sum
+    /// (I + R) x C_tau + W + D is at most U, so every slash settles before
+    /// the stake it reaches can unlock (G5 SL-5).
     pub fn validate(&self) -> Result<(), GenesisError> {
+        let budget = UNBONDING_SECS - EVIDENCE_MAX_AGE_SECS - CORRELATION_WINDOW_SECS;
         let ok = self.epoch_blocks > 0
             && self.reward_period > 0
             && self.epoch_blocks.is_multiple_of(self.reward_period)
             && self.max_block_interval_secs > 0
-            && self.epoch_blocks <= UNBONDING_SECS / self.max_block_interval_secs;
+            && self.epoch_blocks <= budget
+            && self.reward_period <= budget
+            && self.epoch_blocks + self.reward_period <= budget / self.max_block_interval_secs;
         if ok {
             Ok(())
         } else {
@@ -3160,17 +3169,18 @@ mod tests {
             (0, 0, 1_790_000_000)
         );
 
-        // P-1's constraints hold at genesis, not only in Move. One epoch at the
-        // cap may not exceed U: 20 x 90,720 s = U exactly is allowed.
+        // P-1's constraints hold at genesis, not only in Move. (I + R) x
+        // C_tau + W + D may not exceed U (G5 SL-5): (20 + 20) x 28,080 s =
+        // U - W - D exactly is allowed.
         let mut edge = base.clone();
-        edge.max_block_interval_secs = Some(90_720);
-        build_genesis(&edge, &stdlib()).expect("I x C_tau = U is allowed");
+        edge.max_block_interval_secs = Some(28_080);
+        build_genesis(&edge, &stdlib()).expect("(I + R) x C_tau = U - W - D is allowed");
         let refused: [(&str, Edit); 4] = [
             ("R does not divide I", |f| f.reward_period_blocks = Some(7)),
             ("a zero reward period", |f| f.reward_period_blocks = Some(0)),
             ("a zero clock cap", |f| f.max_block_interval_secs = Some(0)),
-            ("one epoch at the cap past U", |f| {
-                f.max_block_interval_secs = Some(90_721)
+            ("a slash that could settle after its stake unlocks", |f| {
+                f.max_block_interval_secs = Some(28_081)
             }),
         ];
         for (name, edit) in refused {
@@ -3198,6 +3208,17 @@ mod tests {
             .and_then(|v| v.strip_suffix(';'))
             .expect("chain.move declares UNBONDING_SECS");
         assert_eq!(declared.parse::<u64>().unwrap(), UNBONDING_SECS);
+        for (name, mirror) in [
+            ("EVIDENCE_MAX_AGE_SECS", EVIDENCE_MAX_AGE_SECS),
+            ("CORRELATION_WINDOW_SECS", CORRELATION_WINDOW_SECS),
+        ] {
+            let declared = source
+                .lines()
+                .find_map(|l| l.trim().strip_prefix(&format!("const {name}: u64 = ")))
+                .and_then(|v| v.strip_suffix(';'))
+                .unwrap_or_else(|| panic!("chain.move declares {name}"));
+            assert_eq!(declared.parse::<u64>().unwrap(), mirror, "{name}");
+        }
     }
 
     /// G5 P-1: genesis-tool's one input, the measured block time, gives
@@ -3217,10 +3238,11 @@ mod tests {
             4
         );
         assert_eq!(derive_chain_params(1).unwrap().max_block_interval_secs, 1);
-        // Blocks so slow that one epoch at the cap exceeds U are refused:
-        // 1,000 x 1,815 s > 21 days, 1,000 x 1,814 s is not.
-        assert!(derive_chain_params(907_000).is_ok());
-        assert!(derive_chain_params(907_001).is_err());
+        // Blocks so slow that a slash could settle after its stake unlocks
+        // are refused (G5 SL-5): (1,000 + 20) x C_tau <= U - W - D =
+        // 1,123,200 s holds for C_tau = 1,101 s, not 1,102 s.
+        assert!(derive_chain_params(550_500).is_ok());
+        assert!(derive_chain_params(550_501).is_err());
         assert!(derive_chain_params(0).is_err());
     }
 

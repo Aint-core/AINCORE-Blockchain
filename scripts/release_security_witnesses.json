@@ -73,13 +73,14 @@
         "tests::g5_an_oversized_committee_weight_cannot_stop_emission",
         "tests::g5_delegators_are_paid_by_points_from_the_frozen_split",
         "tests::g5_commission_is_charged_at_the_rate_in_force_when_the_period_began",
-        "tests::g5_slash_cuts_stake_pool_and_reached_tickets_in_one_call",
+        "tests::g5_a_slash_settles_by_the_weight_that_equivocated_together",
+        "tests::g5_the_operator_pays_first_and_only_in_scope_stake",
+        "tests::g5_a_tombstoned_validator_is_slashed_once_and_never_rejoins",
         "tests::g5_a_full_account_blocks_only_its_own_undelegation",
         "tests::g5_a_pool_does_not_grow_with_its_delegators",
         "tests::g5_pool_arithmetic_rounds_for_the_pool_and_never_aborts_on_dust",
         "tests::g5_only_open_pools_of_a_full_point_take_reward_or_weight",
-        "tests::test_pending_downtime_slash_also_slashes_delegated_stake",
-        "tests::test_h1_slash_also_slashes_unbonding_queue",
+        "tests::test_accepted_equivocation_unbonds_all_stake_and_removes_validator",
         "tests::rotate_validator_epoch_snapshots_advances_and_prunes"
       ],
       "excluded_ignored": {

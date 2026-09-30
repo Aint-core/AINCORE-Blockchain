@@ -559,6 +559,27 @@ fn delegated_split_key(epoch: u64) -> String {
     format!("sys:validator_set:epoch_delegated:{epoch}")
 }
 
+/// G5 SL-3: the consensus time committee epoch `epoch` began, written at its
+/// boundary with the committee record.
+fn epoch_time_key(epoch: u64) -> String {
+    format!("sys:validator_set:epoch_time:{epoch}")
+}
+
+/// G5 SL-3: the oldest epoch whose committee records are still kept.
+const RETAINED_FROM_KEY: &str = "sys:validator_set:retained_from";
+
+/// W, `0x1::chain::EVIDENCE_MAX_AGE_SECS` (G5 SL-3): an epoch's records are
+/// kept while evidence of it can still be accepted.
+const EVIDENCE_MAX_AGE_SECS: u64 = 604_800;
+
+/// G5 SL-5: an offense's weights from the records of its epoch.
+struct OffenseRecord {
+    began: u64,
+    weight: u64,
+    committee_weight: u64,
+    delegated: u64,
+}
+
 fn dex_registry_key() -> String {
     vm_move::state_keys::resource_key_str(&system_address(), "0x1::dex::PoolRegistry")
 }
@@ -1575,6 +1596,42 @@ impl Executor {
             ),
             Err(err) => eprintln!("⚠️ Reward payout failed at block {}: {}", height, err),
         }
+        self.settle_offenses(height);
+    }
+
+    /// G5 SL-5: every reward period, settle the offenses whose slash fraction
+    /// is final (Move `delegation::settle_offenses`).
+    fn settle_offenses(&self, height: u64) {
+        let action = MoveAction::CallEntryFunction(EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                system_address(),
+                move_core_types::identifier::Identifier::new("delegation")
+                    .expect("delegation identifier"),
+            ),
+            function: "settle_offenses".to_string(),
+            ty_args: vec![],
+            args: vec![bcs::to_bytes(&system_address()).expect("an address is BCS")],
+        });
+        match self.vm.execute_transaction_actions(
+            vec![(action, true, system_address())],
+            system_address(),
+            // Linear in the offense ledger, which holds each offender once.
+            20_000_000,
+        ) {
+            Ok((_gas_used, mut updates, status)) if status.success => {
+                self.append_supply_tracker_updates(&mut updates);
+                if let Err(err) = self.commit_kv_updates(updates, "offense settlement") {
+                    eprintln!("🚨 [OFFENSE_SETTLEMENT_COMMIT_FAIL] {}", err);
+                } else {
+                    self.sync_supply_trackers_from_validator_set();
+                }
+            }
+            Ok((_gas_used, _updates, status)) => eprintln!(
+                "⚠️ Offense settlement aborted at block {}: {:?}",
+                height, status.error
+            ),
+            Err(err) => eprintln!("⚠️ Offense settlement failed at block {}: {}", height, err),
+        }
     }
 
     /// The committee of epoch E (G1 EP-2): the genesis committee for epoch 0,
@@ -1591,6 +1648,47 @@ impl Executor {
             .expect("CRITICAL: the committee record could not be read")
             .map(|raw| serde_json::from_str(&raw).expect("CRITICAL: a committee record is corrupt"))
             .unwrap_or_default()
+    }
+
+    /// G5 SL-5: what an offense by `validator` in `epoch` weighs, from the
+    /// records of that epoch: its weight and delegated part in C_{epoch}, the
+    /// committee's total weight and the consensus time the epoch began. None
+    /// when the records are gone (older than W, SL-3) or do not hold it.
+    fn offense_record(&self, validator: &str, epoch: u64) -> Option<OffenseRecord> {
+        let committee = self.committee_of_epoch(epoch);
+        let weight = committee.iter().find(|m| m.address == validator)?.stake;
+        let committee_weight = committee
+            .iter()
+            .map(|m| m.stake)
+            .fold(0u64, u64::saturating_add);
+        let delegated = self
+            .delegated_split_of_epoch(epoch)
+            .get(validator)
+            .copied()
+            .unwrap_or(0)
+            .min(weight);
+        Some(OffenseRecord {
+            began: self.epoch_began(epoch)?,
+            weight,
+            committee_weight,
+            delegated,
+        })
+    }
+
+    /// The consensus time committee epoch `epoch` began: 0 for the genesis
+    /// epoch, the tau of its boundary block H_{E-1} after (recorded at
+    /// rotation). None once pruned.
+    fn epoch_began(&self, epoch: u64) -> Option<u64> {
+        if epoch == 0 {
+            return Some(0);
+        }
+        self.db
+            .get(&epoch_time_key(epoch))
+            .expect("CRITICAL: the epoch time record could not be read")
+            .map(|raw| {
+                raw.parse()
+                    .expect("CRITICAL: an epoch time record is corrupt")
+            })
     }
 
     /// The committee epoch of the executing block, E(h) = (h - 1) / I, from
@@ -1785,20 +1883,47 @@ impl Executor {
             &format!("consensus:epoch_start_height:{}", new_epoch),
             &boundary_height.saturating_add(1).to_string(),
         );
+        let now = committed_chain_clock(&self.db).time;
+        self.db
+            .put(&epoch_time_key(new_epoch), &now.to_string())
+            .expect("CRITICAL: the epoch time record write failed");
 
-        // Retain a bounded window of historical snapshots so slightly-behind
-        // nodes can still verify QCs from recent past epochs, without unbounded
-        // growth. Older snapshots are safe to drop (a QC that old no longer
-        // advances finality).
+        // G5 SL-3: keep an epoch's committee, split and start time while
+        // evidence of it can still be accepted (tau <= tau_start(E+1) + W), and
+        // at least the last 8 epochs, so slightly-behind nodes can still verify
+        // QCs from recent epochs. The walk is bounded per boundary.
         const EPOCH_SNAPSHOT_RETENTION: u64 = 8;
-        if let Some(stale) = new_epoch.checked_sub(EPOCH_SNAPSHOT_RETENTION + 1) {
+        const MAX_PRUNED_PER_BOUNDARY: u64 = 64;
+        let mut oldest = self
+            .db
+            .get(RETAINED_FROM_KEY)
+            .expect("CRITICAL: the retention record could not be read")
+            .map(|raw| {
+                raw.parse::<u64>()
+                    .expect("CRITICAL: the retention record is corrupt")
+            })
+            .unwrap_or(0);
+        let from = oldest;
+        while oldest + EPOCH_SNAPSHOT_RETENTION < new_epoch
+            && oldest - from < MAX_PRUNED_PER_BOUNDARY
+            && self
+                .epoch_began(oldest + 1)
+                .is_some_and(|next| next.saturating_add(EVIDENCE_MAX_AGE_SECS) < now)
+        {
             let _ = self
                 .db
-                .delete(&format!("sys:validator_set:epoch:{}", stale));
-            let _ = self.db.delete(&delegated_split_key(stale));
+                .delete(&format!("sys:validator_set:epoch:{}", oldest));
+            let _ = self.db.delete(&delegated_split_key(oldest));
+            let _ = self.db.delete(&epoch_time_key(oldest));
             let _ = self
                 .db
-                .delete(&format!("consensus:epoch_start_height:{}", stale));
+                .delete(&format!("consensus:epoch_start_height:{}", oldest));
+            oldest += 1;
+        }
+        if oldest != from {
+            self.db
+                .put(RETAINED_FROM_KEY, &oldest.to_string())
+                .expect("CRITICAL: the retention record write failed");
         }
     }
 
@@ -2892,8 +3017,8 @@ impl Executor {
             }
             match self.verify_slash_evidence(item) {
                 Ok((offender, reason, round)) => {
-                    let _ = self.logged_put(&format!("validator:jailed:{}", offender), &round.to_string());
-                    self.execute_one_slash(&offender, &reason, round);
+                    // G5 S4b replaces this with the evidence's own epoch.
+                    self.execute_one_slash(&offender, self.executing_epoch(), round);
                     if reason == "downtime" {
                         // These attestation rows are NODE-LOCAL bookkeeping (written
                         // with plain put by the local detector and by whatever gossip
@@ -2922,22 +3047,24 @@ impl Executor {
         for (key, event_json) in &slash_keys {
             let Some(addr) = key.strip_prefix("sys:pending_slash:") else { continue };
             let ev: serde_json::Value = serde_json::from_str(event_json).unwrap_or_default();
-            let reason = ev.get("reason").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
             let round = ev.get("round").and_then(|v| v.as_u64()).unwrap_or(0);
-            self.execute_one_slash(addr, &reason, round);
+            let epoch = ev
+                .get("epoch")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_else(|| self.executing_epoch());
+            self.execute_one_slash(addr, epoch, round);
         }
     }
 
     /// Execute ONE verified slash (the body of the former pending-slash scan,
     /// now driven exclusively by block-carried evidence). `round` is the
     /// evidence round (equivocation) or epoch (downtime) used for the tombstone.
-    fn execute_one_slash(&self, validator_addr: &str, reason: &str, round: u64) {
+    fn execute_one_slash(&self, validator_addr: &str, epoch: u64, round: u64) {
         use move_core_types::account_address::AccountAddress;
         use move_core_types::identifier::Identifier;
         use move_core_types::language_storage::ModuleId;
 
         let validator_addr = validator_addr.to_string();
-        let reason = reason.to_string();
         let key = &format!("sys:pending_slash:{}", validator_addr);
         {
             // H-4 FIX: Tombstone check for replay protection
@@ -2953,24 +3080,22 @@ impl Executor {
             }
 
             println!(
-                "⚖️  EXECUTING ON-CHAIN SLASH for validator: {}",
-                &validator_addr
-            );
-            println!("   Reason: {}, Round: {}", reason, round);
-
-            // === C-5 FIX: ROUTE ECONOMIC SLASH THROUGH MOVE VM ===
-            // G5 SL-1: `delegation::slash` burns the validator's own stake and
-            // its pool's in ONE call, so neither half can land alone (the old
-            // second call for the pool could fail and was only logged). Its
-            // work is constant whatever the pool's size. The infraction epoch
-            // is this block's; S4 passes the evidence's.
-            let slash_pct: u64 = if reason == "equivocation" { 100 } else { 5 };
-
-            let module_id = ModuleId::new(
-                AccountAddress::ONE,
-                Identifier::new("delegation").expect("delegation identifier is valid"),
+                "⚖️  ACCEPTING EQUIVOCATION by {} in epoch {} (round {})",
+                &validator_addr, epoch, round
             );
 
+            // G5 SL-5: Move records the offense with its weight, its
+            // committee's weight and its frozen split, all from C_{epoch}, and
+            // takes the offender's stake into unbonding; the fraction settles
+            // later (SL-4..SL-6), at `delegation::settle_offenses`.
+            let Some(record) = self.offense_record(&validator_addr, epoch) else {
+                println!(
+                    "   ❌ No committee record places {} in epoch {}: refused",
+                    validator_addr, epoch
+                );
+                let _ = self.logged_delete(key);
+                return;
+            };
             let vm_addr = match AccountAddress::from_hex_literal(&format!("0x{}", validator_addr)) {
                 Ok(addr) => addr,
                 Err(_) => {
@@ -2982,25 +3107,31 @@ impl Executor {
                     return;
                 }
             };
-
             let args = vec![
-                bcs::to_bytes(&AccountAddress::ONE).unwrap_or_default(),
-                bcs::to_bytes(&vm_addr).unwrap_or_default(),
-                bcs::to_bytes(&(slash_pct * 100)).unwrap_or_default(),
-                bcs::to_bytes(&self.executing_epoch()).unwrap_or_default(),
+                bcs::to_bytes(&AccountAddress::ONE).expect("an address is BCS"),
+                bcs::to_bytes(&vm_addr).expect("an address is BCS"),
+                bcs::to_bytes(&epoch).expect("a u64 is BCS"),
+                bcs::to_bytes(&record.began).expect("a u64 is BCS"),
+                bcs::to_bytes(&record.weight).expect("a u64 is BCS"),
+                bcs::to_bytes(&record.committee_weight).expect("a u64 is BCS"),
+                bcs::to_bytes(&(record.weight - record.delegated)).expect("a u64 is BCS"),
+                bcs::to_bytes(&record.delegated).expect("a u64 is BCS"),
             ];
-
             match self.vm.execute_public_entry_function(
                 vec![],
-                module_id,
-                "slash",
+                ModuleId::new(
+                    AccountAddress::ONE,
+                    Identifier::new("delegation").expect("delegation identifier is valid"),
+                ),
+                "report_equivocation",
                 vec![],
                 args,
-                // Constant work (G5 SL-1): no loop over delegators or tickets.
+                // Bounded: the offense ledger holds each offender once, and the
+                // settlement it runs is linear in it.
                 10_000_000,
-                // auth_signer: slash asserts signer==@0x1. With FIX #1 binding
-                // the signer slot to auth_signer, this MUST be system_address()
-                // (the validator target is carried separately, not the signer).
+                // auth_signer: report_equivocation asserts signer==@0x1. With
+                // FIX #1 binding the signer slot to auth_signer, this MUST be
+                // system_address() (the offender is carried separately).
                 system_address(),
             ) {
                 Ok((_gas_used, vm_changes, status)) if status.success => {
@@ -3011,29 +3142,25 @@ impl Executor {
                         };
                     }
                     self.sync_supply_trackers_from_validator_set();
-                    println!(
-                        "   ⚡ Move VM slash executed: {}% of bonded and delegated stake for {}",
-                        slash_pct, validator_addr
-                    );
+                    println!("   ⚡ Offense recorded; the fraction settles by G5 SL-5");
                 }
                 Ok((_gas_used, _changes, status)) => {
                     println!(
-                        "   ⚠️  Move VM slash aborted ({:?}), falling back to consensus-only removal",
+                        "   ⚠️  Move VM offense record aborted ({:?}), falling back to consensus-only removal",
                         status.error
                     );
                 }
                 Err(e) => {
                     println!(
-                        "   ⚠️  Move VM slash failed ({}), falling back to consensus-only removal",
+                        "   ⚠️  Move VM offense record failed ({}), falling back to consensus-only removal",
                         e
                     );
                 }
             }
 
             // CONSENSUS SET UPDATE: mirror Move staking's active-set semantics.
-            // staking::slash_validator_bps removes the validator from the Move active set
-            // and queues any remaining stake for unbonding/jail, so the native cache must
-            // not keep the validator active with reduced weight.
+            // staking::remove_offender takes the validator out of the Move active
+            // set, so the native cache must not keep it with any weight.
             if let Ok(Some(json)) = self.db.get("sys:validators") {
                 if let Ok(mut vals) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
                     let before_len = vals.len();
@@ -3041,15 +3168,9 @@ impl Executor {
 
                     for (addr, weight) in vals.iter_mut() {
                         if addr == &validator_addr {
-                            if reason == "equivocation" {
-                                println!(
-                                    "   💥 EQUIVOCATION: Validator permanently removed from consensus set!"
-                                );
-                            } else {
-                                println!(
-                                    "   ⏳ DOWNTIME: Validator jailed and removed from active consensus set."
-                                );
-                            }
+                            println!(
+                                "   💥 EQUIVOCATION: Validator permanently removed from consensus set!"
+                            );
                             *weight = 0;
                             slashed = true;
                         }
@@ -3093,7 +3214,12 @@ impl Executor {
                 }
             }
 
-            // H-4 FIX: Write tombstone
+            // G5 SL-3: the offender is jailed for good (no payouts, no
+            // committee, no rejoin). H-4 FIX: the tombstone stops a replay.
+            let _ = self.logged_put(
+                &format!("validator:jailed:{}", validator_addr),
+                &round.to_string(),
+            );
             let _ = self.logged_put(&tombstone_key, "1");
 
             // Delete the pending slash entry (processed)
@@ -3904,6 +4030,21 @@ impl Executor {
                         );
                         return None;
                     }
+                    // G5 SL-3 (tombstone): a validator with an accepted
+                    // offense never re-enters a committee.
+                    if extract_join_validator_v1(&call, &tx.sender).is_some()
+                        && self
+                            .db
+                            .get(&format!("validator:jailed:{}", tx.sender))
+                            .expect("CRITICAL: the jail record could not be read")
+                            .is_some()
+                    {
+                        println!(
+                            "❌ REJECTED join_validator_set from {}: tombstoned for equivocation",
+                            tx.sender
+                        );
+                        return None;
+                    }
                     // B1: capture join_validator_set identity BEFORE the call is
                     // moved into the action, so we can append it to the live
                     // sys:validator_set:v1 after a successful execution.
@@ -4544,13 +4685,49 @@ mod tests {
             "an invalid proposal keeps the committee"
         );
 
-        // Retention: rotating to epoch 9 prunes epoch (9 - 8 - 1) = 0.
+        // G5 SL-3 retention: an epoch's records stay while evidence of it can
+        // still be accepted, tau <= tau_start(E+1) + W, and for at least the
+        // last 8 epochs. Epoch 1 began at tau 0 (no clock yet).
+        let set_time = |time: u64| {
+            db.put(
+                &vm_move::state_keys::resource_key_str(&system_address(), "0x1::chain::Clock"),
+                &hex::encode(
+                    bcs::to_bytes(&ChainClock {
+                        height: 0,
+                        time,
+                        block_timestamp: time,
+                    })
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        };
         db.put("sys:validator_set:epoch:0", "[]").unwrap();
+        set_time(EVIDENCE_MAX_AGE_SECS);
         exec.rotate_validator_epoch(180); // epoch 9
         assert!(
-            db.get("sys:validator_set:epoch:0").unwrap().is_none(),
-            "snapshot beyond the retention window must be pruned"
+            db.get("sys:validator_set:epoch:0").unwrap().is_some(),
+            "evidence of epoch 0 is accepted until exactly W after epoch 1 began"
         );
+        set_time(EVIDENCE_MAX_AGE_SECS + 1);
+        exec.rotate_validator_epoch(200); // epoch 10
+                                          // Epochs 0 and 1 are past W and older than the last 9 (2..=10).
+        for gone in [0, 1] {
+            assert!(
+                db.get(&format!("sys:validator_set:epoch:{gone}"))
+                    .unwrap()
+                    .is_none(),
+                "a snapshot past W and past 8 epochs is pruned"
+            );
+        }
+        assert!(db.get(&epoch_time_key(1)).unwrap().is_none());
+        assert_eq!(db.get(RETAINED_FROM_KEY).unwrap().as_deref(), Some("2"));
+        assert_eq!(
+            db.get(&epoch_time_key(10)).unwrap().as_deref(),
+            Some((EVIDENCE_MAX_AGE_SECS + 1).to_string().as_str())
+        );
+        // Epoch 2 is past W too, but kept: it is one of the last 9.
+        assert!(db.get("sys:validator_set:epoch:2").unwrap().is_some());
     }
 
     /// A committee member with real keys: its Ed25519 key derives its address
@@ -6574,146 +6751,412 @@ mod tests {
         g5_paid_block(&mut chain, validator, DAY, 1_000, 3_000, 1_200);
     }
 
-    /// G5 SL-1 through real blocks: one call cuts the validator's own stake
-    /// and its pool (active principal at once, rounded up) and closes the
-    /// pool. Tickets are cut when withdrawn: one made in an earlier epoch
-    /// than the infraction's is not; one made in its epoch before the slash
-    /// is; one made after the slash is not cut twice. A closed pool takes no
-    /// delegation even with its validator active again. The spent event is
-    /// dropped once its tickets are paid.
+    /// Mirror of the Move `0x1::delegation::Offense` (G5 SL-5).
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    struct TestOffense {
+        validator: move_core_types::account_address::AccountAddress,
+        epoch: u64,
+        epoch_began: u64,
+        weight: u64,
+        committee_weight: u64,
+        self_weight: u64,
+        delegated_weight: u64,
+        settled: bool,
+    }
+
+    /// The offense ledger (`0x1::delegation::Offenses`), empty when absent.
+    fn g5_offenses(db: &StateDB) -> Vec<TestOffense> {
+        db.get(&vm_move::state_keys::resource_key_str(
+            &system_address(),
+            "0x1::delegation::Offenses",
+        ))
+        .unwrap()
+        .map(|raw| bcs::from_bytes(&hex::decode(raw).unwrap()).unwrap())
+        .unwrap_or_default()
+    }
+
+    fn g5_offense(db: &StateDB, validator: &str) -> TestOffense {
+        let want = parse_move_address(validator).unwrap();
+        g5_offenses(db)
+            .into_iter()
+            .find(|o| o.validator == want)
+            .expect("the offense is recorded")
+    }
+
+    /// Accepts equivocation evidence against `validator` in committee epoch
+    /// `epoch` between blocks, through the executor's acceptance path.
+    fn g5_report(chain: &G5Chain, validator: &str, epoch: u64, round: u64) {
+        let _seed = chain.db.seeding();
+        chain
+            .db
+            .put(
+                &format!("sys:pending_slash:{validator}"),
+                &serde_json::json!({ "round": round, "epoch": epoch }).to_string(),
+            )
+            .unwrap();
+        chain.executor.execute_pending_slashes();
+    }
+
+    /// A validator's own unbonding entries: (start height, stake).
+    fn g5_own_unbonding(db: &StateDB, validator: &str) -> Vec<(u64, u128)> {
+        let want = parse_move_address(validator).unwrap();
+        validator_set(db)
+            .unbonding_queue
+            .iter()
+            .filter(|r| r.validator_addr == want)
+            .map(|r| (r.start_height, r.stake))
+            .collect()
+    }
+
+    fn g5_burned(db: &StateDB) -> u128 {
+        db.get(&supply_stats_key())
+            .unwrap()
+            .and_then(|raw| decode_supply_stats_hex(&raw))
+            .map(|stats| stats.cumulative_burned)
+            .unwrap_or(0)
+    }
+
+    /// G5 SL-4, SL-5 through real blocks (R = 1, one-day blocks, 7 equal
+    /// validators). Offenses count together when their epochs began within
+    /// D. Two in epoch 0 cost (6/7)^2 = 73.47 % each, but only once
+    /// D + I x C_tau + W = 28 d has passed since epoch 0 began, when every
+    /// correlated offense's evidence has landed. A lone offense in epoch 1,
+    /// 20 days later, is not raised by them (36 %, still pending); a second
+    /// one in its epoch makes a third of that committee, 100 % at once for
+    /// both. A leaver that equivocates before its unlock loses its unbonding
+    /// stake.
     #[test]
-    fn g5_slash_cuts_stake_pool_and_reached_tickets_in_one_call() {
-        use move_core_types::u256::U256;
+    fn g5_a_slash_settles_by_the_weight_that_equivocated_together() {
         let ain = G5_AIN;
-        let (mut chain, validators, delegators) = delegation_chain(
-            "g5_dl_slash",
-            20,
-            DAY,
-            &[(126, 1_000)],
-            &[(127, 1_000 * ain), (128, 1_000 * ain)],
-        );
-        let (validator_key, validator) = &validators[0];
-        let [(a_key, a), (b_key, b)] = <[_; 2]>::try_from(delegators).ok().unwrap();
+        let seeds: Vec<(u8, u64)> = (160..167).map(|seed| (seed, 1_000)).collect();
+        let (mut chain, validators, _) = delegation_chain("g5_sl_correlated", 1, DAY, &seeds, &[]);
         let db = chain.db.clone();
-        let call = |chain: &mut G5Chain, key: &SigningKey, function: &str, amount: Option<u128>| {
-            let mut args = vec![move_addr_arg(validator)];
+        let v = |i: usize| validators[i].1.clone();
+
+        // V0 leaves at height 3, in epoch 0, which it could still sign.
+        let leave = chain.tx(&validators[0].0, "staking", "leave_validator_set", vec![]);
+        chain.run_to(3, vec![leave]);
+        chain.run_to(5, vec![]);
+        let burned = g5_burned(&db);
+        g5_report(&chain, &v(0), 0, 1);
+        g5_report(&chain, &v(1), 0, 1);
+        // 2,000 of 7,000 is below a third: recorded, not settled, nothing
+        // burned. V1's whole stake is unbonding.
+        assert!(!g5_offense(&db, &v(0)).settled && !g5_offense(&db, &v(1)).settled);
+        assert_eq!(g5_own_unbonding(&db, &v(0)), vec![(3, 1_000 * ain)]);
+        assert_eq!(g5_own_unbonding(&db, &v(1)), vec![(5, 1_000 * ain)]);
+        assert_eq!(g5_burned(&db), burned);
+
+        chain.run_to(21, vec![]);
+        assert_eq!(g5_committee(&db, 1).len(), 5, "the offenders left C_1");
+        g5_report(&chain, &v(2), 1, 21);
+        // Alone within D: 1,000 of 5,000 is 36 %, not final yet.
+        assert!(!g5_offense(&db, &v(2)).settled);
+        assert_eq!(g5_own_unbonding(&db, &v(2)), vec![(21, 1_000 * ain)]);
+        chain.run_to(22, vec![]);
+        g5_report(&chain, &v(3), 1, 22);
+        // 2,000 of 5,000 within D: a third, so 100 % at once for both.
+        assert!(g5_offense(&db, &v(2)).settled && g5_offense(&db, &v(3)).settled);
+        assert_eq!(g5_own_unbonding(&db, &v(2)), vec![(21, 0)]);
+        assert_eq!(g5_own_unbonding(&db, &v(3)), vec![(22, 0)]);
+        assert_eq!(g5_burned(&db), burned + 2_000 * ain);
+
+        // Epoch 0's pair settles at 28 d exactly, not a block earlier.
+        chain.run_to(27, vec![]);
+        assert_eq!(chain.clock().time, 27 * DAY);
+        assert!(!g5_offense(&db, &v(0)).settled);
+        assert_eq!(g5_own_unbonding(&db, &v(0)), vec![(3, 1_000 * ain)]);
+        chain.run_to(28, vec![]);
+        let kept = 1_000 * ain - 1_000 * ain * 7_347 / 10_000;
+        assert_eq!(g5_own_unbonding(&db, &v(0)), vec![(3, kept)]);
+        assert_eq!(g5_own_unbonding(&db, &v(1)), vec![(5, kept)]);
+        assert_eq!(
+            g5_burned(&db),
+            burned + 2_000 * ain + 2 * (1_000 * ain - kept)
+        );
+        // Every in-scope entry was still unpaid at settlement: the earliest
+        // unlocks at 3 d + I x C_tau + U = 44 d.
+        let unlocks: Vec<u64> = validator_set(&db)
+            .unbonding_queue
+            .iter()
+            .map(|r| r.unlock_time)
+            .collect();
+        assert!(unlocks.iter().all(|u| *u >= 44 * DAY));
+    }
+
+    /// G5 SL-6 and SL-1 through real blocks (R = 1, one-day blocks). Five
+    /// validators of 3,000, V6 (own 1,000, pool 3,100) and V7 (own 1,000,
+    /// pool 500) weigh 20,600 in epoch 1. V6 and V7 equivocate in epoch 1:
+    /// Q = 5,600, f = ceil(9e4 x 5,600^2 / 20,600^2) = 6,651 bps.
+    /// - V7: A = 0.6651 x 1,500 AIN is below its own 1,000, so the operator
+    ///   pays 99.77 % and its delegators nothing.
+    /// - V6: A = 0.6651 x 4,100 exceeds its own 1,000: own 100 %, pool
+    ///   ceil((27,269,100 - 10,000,000) / 3,100) = 5,571 bps.
+    /// - An own entry from before the offense epoch is out of scope.
+    /// - Tickets: one from epoch 0 is not cut; ones from epoch 1, before or
+    ///   after acceptance, are; one made after settlement is not cut twice,
+    ///   even while the event still waits for the others.
+    #[test]
+    fn g5_the_operator_pays_first_and_only_in_scope_stake() {
+        let ain = G5_AIN;
+        let mut seeds: Vec<(u8, u64)> = (170..175).map(|seed| (seed, 3_000)).collect();
+        seeds.extend([(175u8, 1_000u64), (176, 1_000)]);
+        let (mut chain, validators, delegators) = delegation_chain(
+            "g5_sl_waterfall",
+            1,
+            DAY,
+            &seeds,
+            &[(177, 1_000 * ain), (178, 4_000 * ain), (179, 1_000 * ain)],
+        );
+        let db = chain.db.clone();
+        let (v6_key, v6) = &validators[5];
+        let (v7_key, v7) = &validators[6];
+        let [(a_key, _), (b_key, b), (c_key, c)] = <[_; 3]>::try_from(delegators).ok().unwrap();
+        let call = |chain: &mut G5Chain,
+                    key: &SigningKey,
+                    pool: &str,
+                    function: &str,
+                    amount: Option<u128>| {
+            let mut args = vec![move_addr_arg(pool)];
             args.extend(amount.map(|a| bcs::to_bytes(&a).unwrap()));
             chain.tx(key, "delegation", function, args)
         };
+        let enable = |chain: &mut G5Chain, key: &SigningKey| {
+            chain.tx(
+                key,
+                "delegation",
+                "enable_delegation",
+                vec![bcs::to_bytes(&0u64).unwrap()],
+            )
+        };
 
+        let opens = vec![enable(&mut chain, v6_key), enable(&mut chain, v7_key)];
+        chain.run_to(1, opens);
+        let joins = vec![
+            call(&mut chain, &a_key, v7, "delegate", Some(500 * ain)),
+            call(&mut chain, &b_key, v6, "delegate", Some(3_100 * ain)),
+            call(&mut chain, &c_key, v6, "delegate", Some(100 * ain)),
+        ];
+        chain.run_to(2, joins);
+        let t0 = call(&mut chain, &b_key, v6, "undelegate", Some(100 * ain));
+        chain.run_to(3, vec![t0]);
+        // An own entry of V7 from epoch 0 (a fixture): out of scope.
+        {
+            let _seed = db.seeding();
+            let mut set = validator_set(&db);
+            set.unbonding_queue.push(TestUnbondingRequest {
+                validator_addr: parse_move_address(v7).unwrap(),
+                stake: 50 * ain,
+                start_height: 1,
+                unlock_time: u64::MAX / 2,
+            });
+            db.put(
+                &validator_set_key(),
+                &hex::encode(bcs::to_bytes(&set).unwrap()),
+            )
+            .unwrap();
+        }
+        chain.run_to(20, vec![]);
+        let weight = |a: &str| {
+            g5_committee(&db, 1)
+                .into_iter()
+                .find(|m| m.0 == a)
+                .unwrap()
+                .1
+        };
+        assert_eq!((weight(v6), weight(v7)), (4_100, 1_500));
+
+        let t1 = call(&mut chain, &b_key, v6, "undelegate", Some(100 * ain));
+        chain.run_to(21, vec![t1]);
+        g5_report(&chain, v7, 1, 21);
+        g5_report(&chain, v6, 1, 21);
+        assert!(
+            !g5_offense(&db, v6).settled,
+            "5,600 of 20,600 is below a third"
+        );
+        let t2 = call(&mut chain, &b_key, v6, "undelegate", Some(100 * ain));
+        chain.run_to(23, vec![t2]);
+
+        // Epoch 1 began at 20 d: settlement at 48 d.
+        chain.run_to(47, vec![]);
+        assert!(!g5_offense(&db, v6).settled);
+        chain.run_to(48, vec![]);
+        assert!(g5_offense(&db, v6).settled && g5_offense(&db, v7).settled);
+        let mut v7_entries = g5_own_unbonding(&db, v7);
+        v7_entries.sort();
+        assert_eq!(
+            v7_entries,
+            vec![
+                (1, 50 * ain),
+                (21, 1_000 * ain - 1_000 * ain * 9_977 / 10_000)
+            ],
+            "own pays 99.77 %; the epoch-0 entry is out of scope"
+        );
+        let v7_pool = pool_of(&db, v7);
+        assert_eq!(
+            v7_pool.active_coins,
+            500 * ain,
+            "V7's delegators pay nothing"
+        );
+        assert!(v7_pool.closed);
+        assert_eq!(g5_own_unbonding(&db, v6), vec![(21, 0)]);
+        let v6_pool = pool_of(&db, v6);
+        let active = 2_900 * ain - 2_900 * ain * 5_571 / 10_000;
+        assert_eq!(v6_pool.active_coins, active);
+        assert_eq!(
+            v6_pool.slash_events,
+            vec![DelegationSlashEvent {
+                seq: 0,
+                infraction_epoch: 1,
+                bps: 5_571,
+                pending_tickets: 3,
+            }]
+        );
+
+        // C leaves in full after settlement, at the slashed price.
+        let t3 = call(&mut chain, &c_key, v6, "undelegate", Some(1_000 * ain));
+        chain.run_to(49, vec![t3]);
+        let x3 = g5_mul_div(100 * ain, active, 2_900 * ain);
+        assert_eq!(book_of(&db, &c).tickets[0].amount, x3);
+        // All unlock by 49 d + I x C_tau + U = 90 d. C is paid first, while
+        // the event still waits for B's three tickets: in full.
+        chain.run_until(90 * DAY, vec![]);
+        let c_before = coin_balance(&db, &c);
+        let withdraw_c = call(&mut chain, &c_key, v6, "withdraw_unbonded", None);
+        chain.run_to(chain.height + 1, vec![withdraw_c]);
+        let gained_c = coin_balance(&db, &c) - c_before;
+        assert!(
+            (x3 - 100_000..=x3).contains(&gained_c),
+            "{gained_c} vs {x3}"
+        );
+        assert_eq!(pool_of(&db, v6).slash_events[0].pending_tickets, 3);
+        // B: t0 (epoch 0) in full; t1 and t2 (epoch 1) cut 55.71 %.
+        let b_before = coin_balance(&db, &b);
+        let withdraw_b = call(&mut chain, &b_key, v6, "withdraw_unbonded", None);
+        chain.run_to(chain.height + 1, vec![withdraw_b]);
+        let paid_b = 100 * ain + 2 * (100 * ain * 4_429 / 10_000);
+        let gained_b = coin_balance(&db, &b) - b_before;
+        assert!(
+            (paid_b - 100_000..=paid_b).contains(&gained_b),
+            "{gained_b} vs {paid_b}"
+        );
+        let v6_pool = pool_of(&db, v6);
+        assert!(
+            v6_pool.slash_events.is_empty(),
+            "no ticket can meet it any more"
+        );
+        assert_eq!(
+            v6_pool.principal,
+            v6_pool.active_coins + v6_pool.unbonding_coins
+        );
+    }
+
+    /// G5 SL-3 and SL-5 (tombstone and refusals): a second offense by the
+    /// same validator is ignored; evidence for an epoch whose committee does
+    /// not hold the validator is refused and changes nothing; a closed pool
+    /// takes no delegation even with its validator active again; and a
+    /// tombstoned validator's join is refused, while the same join from a
+    /// fresh key is accepted.
+    #[test]
+    fn g5_a_tombstoned_validator_is_slashed_once_and_never_rejoins() {
+        let ain = G5_AIN;
+        let seeds: Vec<(u8, u64)> = (180..184).map(|seed| (seed, 1_000)).collect();
+        let (mut chain, validators, delegators) = delegation_chain(
+            "g5_sl_tombstone",
+            20,
+            14,
+            &seeds,
+            &[(184, 3_000 * ain), (185, 100 * ain)],
+        );
+        let db = chain.db.clone();
+        let (v0_key, v0) = &validators[0];
+        let v1 = &validators[1].1;
+        let (fresh_key, _) = &delegators[0];
+        let (d_key, _) = &delegators[1];
+        {
+            let _seed = db.seeding();
+            set_coin_store(&db, v0, 3_000 * ain);
+        }
         let enable = chain.tx(
-            validator_key,
+            v0_key,
             "delegation",
             "enable_delegation",
             vec![bcs::to_bytes(&0u64).unwrap()],
         );
         chain.run_to(1, vec![enable]);
-        let join = call(&mut chain, &a_key, "delegate", Some(100 * ain));
-        chain.run_to(2, vec![join]);
-        // t0 in epoch 0, t1 in epoch 1.
-        let t0 = call(&mut chain, &a_key, "undelegate", Some(10 * ain));
-        chain.run_to(3, vec![t0]);
-        let t1 = call(&mut chain, &a_key, "undelegate", Some(10 * ain));
-        chain.run_to(21, vec![t1]);
-        let join_b = call(&mut chain, &b_key, "delegate", Some(50 * ain));
-        chain.run_to(22, vec![join_b]);
-        let tickets = book_of(&db, &a).tickets;
+        g5_report(&chain, v0, 0, 7);
+        g5_report(&chain, v0, 0, 8);
+        assert_eq!(g5_offenses(&db).len(), 1, "one offense per validator");
         assert_eq!(
-            tickets
-                .iter()
-                .map(|t| (t.created_epoch, t.slash_seq))
-                .collect::<Vec<_>>(),
-            vec![(0, 0), (1, 0)]
+            g5_own_unbonding(&db, v0),
+            vec![(1, 1_000 * ain)],
+            "one removal"
         );
+        // V1 is in no committee of epoch 3 (no such record): refused.
+        g5_report(&chain, v1, 3, 9);
+        assert_eq!(g5_offenses(&db).len(), 1);
+        assert!(db.get(&format!("validator:jailed:{v1}")).unwrap().is_none());
+        assert!(validator_set(&db)
+            .validators
+            .iter()
+            .any(|c| c.validator_addr == parse_move_address(v1).unwrap()));
 
-        // A downtime slash (5 %) lands at height 22, in epoch 1.
-        let supply = validator_set(&db).total_supply;
-        {
-            let _seed = db.seeding();
-            db.put(
-                &format!("sys:pending_slash:{validator}"),
-                &serde_json::json!({"reason":"downtime","round":79}).to_string(),
+        let join = |chain: &mut G5Chain, key: &SigningKey, seed: u8| {
+            let (bls_public_key, bls_pop) = test_bls_identity(seed);
+            chain.tx(
+                key,
+                "staking",
+                "join_validator_set",
+                vec![
+                    bcs::to_bytes(&(1_000 * ain)).unwrap(),
+                    bcs::to_bytes(&key.verifying_key().to_bytes().to_vec()).unwrap(),
+                    bcs::to_bytes(&bls_public_key).unwrap(),
+                    bcs::to_bytes(&bls_pop).unwrap(),
+                ],
             )
-            .unwrap();
-            chain.executor.execute_pending_slashes();
+        };
+        // A fresh key joins; the tombstoned one is refused before execution.
+        let fresh = join(&mut chain, fresh_key, 184);
+        chain.run_to(2, vec![fresh]);
+        let refused = join(&mut chain, v0_key, 180);
+        chain.height += 1;
+        chain.timestamp += 14;
+        let outcome = chain.executor.execute_block_parallel_at(
+            vec![refused],
+            &chain.proposer.clone(),
+            chain.height,
+            chain.timestamp,
+            &[],
+        );
+        match outcome {
+            BlockExecOutcome::Executed(s) => assert!(s.executed_raws.is_empty(), "the join ran"),
+            other => panic!("the block must execute: {other:?}"),
         }
-        let move_set = validator_set(&db);
-        assert!(move_set.validators.is_empty(), "the validator is removed");
-        assert_eq!(move_set.unbonding_queue[0].stake, 950 * ain);
-        let pool = pool_of(&db, validator);
-        // Active 130 AIN -> 123.5 AIN; tickets wait; both burns in one call.
-        assert_eq!(
-            (pool.active_coins, pool.active_points, pool.unbonding_coins),
-            (1_235 * ain / 10, 130 * ain, 20 * ain)
-        );
-        assert_eq!(pool.principal, pool.active_coins + pool.unbonding_coins);
-        assert!(pool.closed);
-        assert_eq!(
-            pool.slash_events,
-            vec![DelegationSlashEvent {
-                seq: 0,
-                infraction_epoch: 1,
-                bps: 500,
-                pending_tickets: 2,
-            }]
-        );
-        assert_eq!(move_set.total_supply, supply - 50 * ain - 65 * ain / 10);
-
-        // The validator is active again (a fixture), but its pool is closed.
+        let active: Vec<_> = validator_set(&db)
+            .validators
+            .iter()
+            .map(|c| c.validator_addr)
+            .collect();
+        assert!(!active.contains(&parse_move_address(v0).unwrap()));
+        assert_eq!(active.len(), 4, "V1, V2, V3 and the fresh joiner");
+        // V0 is back in the Move set only as a fixture: its pool stays closed.
         set_active_validators(
             &db,
-            &[(validator.as_str(), 950 * ain)],
-            move_set.total_supply,
+            &[(v0.as_str(), 1_000 * ain)],
+            validator_set(&db).total_supply,
         );
-        let refused = call(&mut chain, &b_key, "delegate", Some(10 * ain));
-        // t2 after the slash, at the slashed price; B leaves in full (t3).
-        let t2 = call(&mut chain, &a_key, "undelegate", Some(10 * ain));
-        let t3 = call(&mut chain, &b_key, "undelegate", Some(1_000 * ain));
-        chain.run_to(23, vec![refused, t2, t3]);
-        let (c, p) = (pool.active_coins, pool.active_points);
-        let q = (U256::from(10 * ain) * U256::from(p) + U256::from(c) - U256::from(1u8))
-            / U256::from(c);
-        let x2 = (q * U256::from(c) / U256::from(p)).unchecked_as_u128();
-        let x3 = g5_mul_div(50 * ain, c - x2, p - q.unchecked_as_u128());
-        let tickets_a = book_of(&db, &a).tickets;
-        assert_eq!((tickets_a[2].amount, tickets_a[2].slash_seq), (x2, 1));
-        assert_eq!(book_of(&db, &b).tickets[0].amount, x3);
+        let refused = chain.tx(
+            d_key,
+            "delegation",
+            "delegate",
+            vec![move_addr_arg(v0), bcs::to_bytes(&(10 * ain)).unwrap()],
+        );
+        chain.run_to(chain.height + 1, vec![refused]);
         assert_eq!(
-            book_of(&db, &b).positions.len(),
+            pool_of(&db, v0).active_coins,
             0,
-            "the refused delegation added nothing"
+            "a closed pool takes no delegation"
         );
-        assert_eq!(pool_of(&db, validator).position_count, 1);
-
-        // All unlock by 23 d + 20 d + 21 d = 64 d. B's ticket, made after the
-        // slash, is paid first, while the event is live: in full, and the
-        // event still waits for A's two.
-        chain.run_until(64 * DAY, vec![]);
-        let b_before = coin_balance(&db, &b);
-        let withdraw_b = call(&mut chain, &b_key, "withdraw_unbonded", None);
-        chain.run_to(chain.height + 1, vec![withdraw_b]);
-        let gained_b = coin_balance(&db, &b) - b_before;
-        assert!(
-            (x3 - 100_000..=x3).contains(&gained_b),
-            "{gained_b} vs {x3}"
-        );
-        assert_eq!(pool_of(&db, validator).slash_events[0].pending_tickets, 2);
-        let a_before = coin_balance(&db, &a);
-        let withdraw_a = call(&mut chain, &a_key, "withdraw_unbonded", None);
-        chain.run_to(chain.height + 1, vec![withdraw_a]);
-        let paid_a = 10 * ain + 95 * ain / 10 + x2;
-        let gained_a = coin_balance(&db, &a) - a_before;
-        assert!(
-            (paid_a - 100_000..=paid_a).contains(&gained_a),
-            "{gained_a} vs {paid_a}"
-        );
-        let pool = pool_of(&db, validator);
-        assert!(
-            pool.slash_events.is_empty(),
-            "no ticket can meet it any more"
-        );
-        assert_eq!((pool.unbonding_coins, pool.ticket_count), (0, 0));
-        assert_eq!(pool.principal, pool.active_coins);
     }
 
     /// G5 DL-3: tickets are capped per account, so a full account blocks only
@@ -9195,18 +9638,36 @@ mod tests {
         assert_eq!(coin_balance(&db, &miner), amount);
     }
 
+    /// G5 SL-5 (acceptance): verified evidence takes the offender out of the
+    /// Move active set, the native mirror and the QC trust root; jails and
+    /// tombstones it; and moves its whole stake into unbonding, unlocking U
+    /// after the epoch bound (SL-2). Nothing is burned while the fraction is
+    /// not final: here one tenth of the committee equivocated, 9 %.
     #[test]
-    fn test_pending_equivocation_slash_burns_all_stake_and_removes_validator() {
-        let db = temp_db("slash_equivocation");
+    fn test_accepted_equivocation_unbonds_all_stake_and_removes_validator() {
+        let db = temp_db("slash_acceptance");
         load_stdlib(&db);
-        let validator_key = SigningKey::from_bytes(&[21u8; 32]);
-        let validator = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
+        let offender = committee_member(21, 100);
+        let validator = offender.address.clone();
+        let others: Vec<_> = (24u8..27).map(|seed| committee_member(seed, 300)).collect();
         let _seed = db.seeding();
+        let mut committee = others.clone();
+        committee.push(offender.clone());
+        db.put(
+            "genesis:validator_set:v1",
+            &serde_json::to_string(&committee).unwrap(),
+        )
+        .unwrap();
+        db.put(
+            "sys:validator_set:v1",
+            &serde_json::to_string(&committee).unwrap(),
+        )
+        .unwrap();
         db.put(
             "sys:validators",
             &serde_json::to_string(&vec![
                 (validator.clone(), 100u64),
-                ("33333333333333333333333333333333".to_string(), 100u64),
+                (others[0].address.clone(), 300u64),
             ])
             .unwrap(),
         )
@@ -9214,52 +9675,10 @@ mod tests {
         set_validator_set(&db, &validator, 1_000_000, 1_000_000);
         db.put(
             &format!("sys:pending_slash:{}", validator),
-            &serde_json::json!({"reason":"equivocation","round":77}).to_string(),
+            &serde_json::json!({"round": 78, "epoch": 0}).to_string(),
         )
         .unwrap();
-
-        let executor = Executor::new(db.clone());
-        executor.execute_pending_slashes();
-
-        assert!(db
-            .get(&format!("sys:pending_slash:{}", validator))
-            .unwrap()
-            .is_none());
-        assert_eq!(
-            db.get(&format!("sys:slashed:{}:77", validator))
-                .unwrap()
-                .as_deref(),
-            Some("1")
-        );
-        let native_validators: Vec<(String, u64)> =
-            serde_json::from_str(&db.get("sys:validators").unwrap().unwrap()).unwrap();
-        assert!(!native_validators.iter().any(|(addr, _)| addr == &validator));
-
-        let move_validators = validator_set(&db);
-        assert!(move_validators.validators.is_empty());
-        assert!(move_validators.unbonding_queue.is_empty());
-        assert_eq!(move_validators.total_supply, 0);
-    }
-
-    #[test]
-    fn test_pending_downtime_slash_jails_validator_and_unbonds_remaining_stake() {
-        let db = temp_db("slash_downtime");
-        load_stdlib(&db);
-        let validator_key = SigningKey::from_bytes(&[22u8; 32]);
-        let validator = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
-        let _seed = db.seeding();
-        db.put(
-            "sys:validators",
-            &serde_json::to_string(&vec![(validator.clone(), 100u64)]).unwrap(),
-        )
-        .unwrap();
-        set_validator_set(&db, &validator, 1_000_000, 1_000_000);
-        db.put(
-            &format!("sys:pending_slash:{}", validator),
-            &serde_json::json!({"reason":"downtime","round":78}).to_string(),
-        )
-        .unwrap();
-        // Height 25 at consensus time 1,000 s: G5 SL-2 unlocks the remainder U
+        // Height 25 at consensus time 1,000 s: G5 SL-2 unlocks the stake U
         // after the epoch bound, 1,000 + I x C_tau (20 x 14 s).
         let clock = ChainClock {
             height: 25,
@@ -9285,196 +9704,41 @@ mod tests {
                 .as_deref(),
             Some("1")
         );
+        assert_eq!(
+            db.get(&format!("validator:jailed:{}", validator))
+                .unwrap()
+                .as_deref(),
+            Some("78")
+        );
         let native_validators: Vec<(String, u64)> =
             serde_json::from_str(&db.get("sys:validators").unwrap().unwrap()).unwrap();
-        assert!(native_validators.is_empty());
+        assert_eq!(native_validators, vec![(others[0].address.clone(), 300)]);
+        let live: Vec<blockchain::committee::ValidatorInfo> =
+            serde_json::from_str(&db.get("sys:validator_set:v1").unwrap().unwrap()).unwrap();
+        assert!(!live.iter().any(|m| m.address == validator));
 
         let move_validators = validator_set(&db);
         assert!(move_validators.validators.is_empty());
         assert_eq!(move_validators.unbonding_queue.len(), 1);
-        assert_eq!(move_validators.unbonding_queue[0].stake, 950_000);
-        let remainder = &move_validators.unbonding_queue[0];
+        let entry = &move_validators.unbonding_queue[0];
         assert_eq!(
-            (remainder.start_height, remainder.unlock_time),
-            (25, 1_000 + 280 + 21 * 86_400)
-        );
-        assert_eq!(move_validators.total_supply, 950_000);
-    }
-
-    /// G5 SL-1 (FIX H1): a downtime slash (500 bps) cuts the validator's own
-    /// stake AND its pool's active principal, in one Move call. The pool's
-    /// price falls 5 %, so every position loses 5 % without the pool touching
-    /// a single delegator, and the pool closes.
-    #[test]
-    fn test_pending_downtime_slash_also_slashes_delegated_stake() {
-        let db = temp_db("slash_delegated");
-        load_stdlib(&db);
-        let validator_key = SigningKey::from_bytes(&[23u8; 32]);
-        let validator = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
-        let _seed = db.seeding();
-        db.put(
-            "sys:validators",
-            &serde_json::to_string(&vec![(validator.clone(), 100u64)]).unwrap(),
-        )
-        .unwrap();
-        // Self-stake = 1,000,000. Delegated = 800,001 from two delegators.
-        set_validator_set(&db, &validator, 1_000_000, 1_800_001);
-        let (a, b) = (format!("{:064x}", 0x44), format!("{:064x}", 0x55));
-        let mut pool = open_pool(800_001);
-        pool.position_count = 2;
-        set_pool(&db, &validator, &pool);
-        for (delegator, points) in [(&a, 500_000), (&b, 300_001)] {
-            set_book(
-                &db,
-                delegator,
-                &DelegationBook {
-                    positions: vec![position(&validator, points)],
-                    tickets: vec![],
-                },
-            );
-        }
-
-        db.put(
-            &format!("sys:pending_slash:{}", validator),
-            &serde_json::json!({"reason":"downtime","round":79}).to_string(),
-        )
-        .unwrap();
-
-        let executor = Executor::new(db.clone());
-        executor.execute_pending_slashes();
-
-        // Self-stake slashed 5% => 50,000 burned, 950,000 unbonded.
-        let move_validators = validator_set(&db);
-        assert!(move_validators.validators.is_empty());
-        assert_eq!(move_validators.unbonding_queue.len(), 1);
-        assert_eq!(move_validators.unbonding_queue[0].stake, 950_000);
-
-        // The pool's active principal loses ceil(800,001 x 5 %) = 40,001,
-        // rounded against the delegators; its points stay.
-        let pool = pool_of(&db, &validator);
-        assert_eq!(
-            (pool.active_coins, pool.principal, pool.active_points),
-            (760_000, 760_000, 800_001)
-        );
-        assert!(pool.closed, "a slashed pool closes");
-        assert_eq!(pool.slash_count, 1);
-        assert!(pool.slash_events.is_empty(), "no ticket for it to reach");
-        // Each position loses 5 % through the price, rounded down.
-        for (delegator, value) in [(&a, 474_999), (&b, 285_000)] {
-            let book = book_of(&db, delegator);
-            assert_eq!(pool.position_value(&book.positions[0]).0, value);
-        }
-
-        // Supply: 1,800,001 - 50,000 (self) - 40,001 (delegated) = 1,710,000.
-        assert_eq!(move_validators.total_supply, 1_710_000);
-    }
-
-    /// G5 SL-1 (FIX H1-followup): stake already unbonding stays slashable.
-    /// The slash cuts the active principal at once and records an event; a
-    /// ticket made before it, in the infraction's epoch, is cut by it when
-    /// paid, the cut burned, and the spent event is dropped.
-    #[test]
-    fn test_h1_slash_also_slashes_unbonding_queue() {
-        let ain = G5_AIN;
-        let mut keys = vec![];
-        let mut chain = G5Chain::new("slash_unbonding", DAY, |db| {
-            keys.push(G5Chain::account(db, 31, ain));
-            keys.push(G5Chain::account(db, 32, ain));
-            keys.push(G5Chain::account(db, 33, ain));
-            let (validator, active, unbonding) = (&keys[0].1, &keys[1].1, &keys[2].1);
-            // Self-stake 1,000,000 AIN; supply = self + active 400k + unbonding 200k.
-            set_active_validators(
-                db,
-                &[(validator.as_str(), 1_000_000 * ain)],
-                1_600_000 * ain,
-            );
-            let mut pool = open_pool(400_000 * ain);
-            pool.unbonding_coins = 200_000 * ain;
-            pool.principal = 600_000 * ain;
-            pool.ticket_count = 1;
-            pool.position_count = 1;
-            set_pool(db, validator, &pool);
-            set_book(
-                db,
-                active,
-                &DelegationBook {
-                    positions: vec![position(validator, 400_000 * ain)],
-                    tickets: vec![],
-                },
-            );
-            set_book(
-                db,
-                unbonding,
-                &DelegationBook {
-                    positions: vec![],
-                    tickets: vec![DelegationTicket {
-                        validator: parse_move_address(validator).unwrap(),
-                        amount: 200_000 * ain,
-                        created_epoch: 0,
-                        slash_seq: 0,
-                        unlock_time: 0,
-                    }],
-                },
-            );
-        });
-        let [(_, validator), _, (unbonding_key, unbonding)] =
-            <[_; 3]>::try_from(keys).ok().unwrap();
-        let db = chain.db.clone();
-        chain.run_to(1, vec![]);
-        {
-            let _seed = db.seeding();
-            db.put(
-                &format!("sys:pending_slash:{}", validator),
-                &serde_json::json!({"reason":"downtime","round":79}).to_string(),
-            )
-            .unwrap();
-            chain.executor.execute_pending_slashes();
-        }
-
-        let pool = pool_of(&db, &validator);
-        // Active 400k -> 380k at once; the ticket's 200k waits for its payout.
-        assert_eq!(
-            (pool.active_coins, pool.unbonding_coins, pool.principal),
-            (380_000 * ain, 200_000 * ain, 580_000 * ain)
+            (entry.stake, entry.start_height, entry.unlock_time),
+            (1_000_000, 25, 1_000 + 280 + 21 * 86_400)
         );
         assert_eq!(
-            pool.slash_events,
-            vec![DelegationSlashEvent {
-                seq: 0,
-                infraction_epoch: 0,
-                bps: 500,
-                pending_tickets: 1,
-            }]
+            move_validators.total_supply, 1_000_000,
+            "nothing burned yet"
         );
-        // Supply: 1,600,000 - 50,000 (self) - 20,000 (active) = 1,530,000.
-        assert_eq!(validator_set(&db).total_supply, 1_530_000 * ain);
-
-        // The ticket pays 190k; 10k is burned; the spent event is dropped.
-        let before = coin_balance(&db, &unbonding);
-        let withdraw = chain.tx(
-            &unbonding_key,
-            "delegation",
-            "withdraw_unbonded",
-            vec![move_addr_arg(&validator)],
-        );
-        chain.run_to(2, vec![withdraw]);
-        let gained = coin_balance(&db, &unbonding) - before;
-        assert!(
-            (190_000 * ain - 100_000..190_000 * ain).contains(&gained),
-            "the unbonding entry MUST be slashed 5% (the bypass this fix closes): {gained}"
-        );
-        let pool = pool_of(&db, &validator);
+        let offenses = g5_offenses(&db);
+        assert_eq!(offenses.len(), 1);
         assert_eq!(
-            (pool.unbonding_coins, pool.principal, pool.ticket_count),
-            (0, 380_000 * ain, 0)
+            (
+                offenses[0].weight,
+                offenses[0].committee_weight,
+                offenses[0].settled
+            ),
+            (100, 1_000, false)
         );
-        assert!(
-            pool.slash_events.is_empty(),
-            "no ticket can meet it any more"
-        );
-        // 10k burned (and at most the gas fee, if fees burn).
-        assert!((1_520_000 * ain - 100_000..=1_520_000 * ain)
-            .contains(&validator_set(&db).total_supply));
     }
 
     // ---- 0x1::universal_mining device registration -------------------------

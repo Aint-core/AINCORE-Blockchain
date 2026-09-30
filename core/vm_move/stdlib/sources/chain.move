@@ -23,6 +23,12 @@ module 0x1::chain {
     const UNBONDING_SECS: u64 = 1814400;
     /// N: 7 days of notice before a commission increase applies.
     const COMMISSION_NOTICE_SECS: u64 = 604800;
+    /// W: 7 days (G5 SL-3, amendment A2). Evidence of an offense is accepted
+    /// until W after the end of its epoch: T_mis, U's misbehaviour budget.
+    const EVIDENCE_MAX_AGE_SECS: u64 = 604800;
+    /// D: 1 day (G5 SL-4). Offenses this close in consensus time count
+    /// together in the slash fraction.
+    const CORRELATION_WINDOW_SECS: u64 = 86400;
 
     /// The block being executed: its height, tau and its BFT timestamp.
     struct Clock has key {
@@ -57,19 +63,25 @@ module 0x1::chain {
         move_to(sys, Clock { height: 0, time: 0, block_timestamp: 0 });
     }
 
-    /// P-1's constraints: every value positive, the reward period divides the
-    /// epoch, and one epoch at the cap (the extra wait SL-2 adds) is at most U,
-    /// which also keeps `unbonding_unlock_time` from overflowing.
+    /// P-1's constraints: every value positive, and the reward period divides
+    /// the epoch. And (I + R) x C_tau + W + D <= U, so a slash settles before
+    /// any stake it reaches can unlock (G5 SL-5): settlement comes at most
+    /// D + I x C_tau + W after the offense epoch starts, plus one reward
+    /// period, and in-scope stake unlocks U after it at the earliest. This
+    /// also keeps `unbonding_unlock_time` from overflowing.
     public fun valid(
         epoch_blocks: u64,
         reward_period: u64,
         max_block_interval_secs: u64,
     ): bool {
+        let budget = UNBONDING_SECS - EVIDENCE_MAX_AGE_SECS - CORRELATION_WINDOW_SECS;
         epoch_blocks > 0
             && reward_period > 0
             && epoch_blocks % reward_period == 0
             && max_block_interval_secs > 0
-            && epoch_blocks <= UNBONDING_SECS / max_block_interval_secs
+            && epoch_blocks <= budget
+            && reward_period <= budget
+            && epoch_blocks + reward_period <= budget / max_block_interval_secs
     }
 
     public fun height(): u64 acquires Clock {
@@ -99,6 +111,14 @@ module 0x1::chain {
 
     public fun commission_notice_secs(): u64 {
         COMMISSION_NOTICE_SECS
+    }
+
+    public fun evidence_max_age_secs(): u64 {
+        EVIDENCE_MAX_AGE_SECS
+    }
+
+    public fun correlation_window_secs(): u64 {
+        CORRELATION_WINDOW_SECS
     }
 
     /// G5 SL-2: when stake that stops weighting the committee in this block

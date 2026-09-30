@@ -20,7 +20,6 @@ module 0x1::staking {
     const EINSUFFICIENT_STAKE: u64 = 3;
     const EUNBONDING_NOT_READY: u64 = 4;
     const ENO_UNBONDING_REQUEST: u64 = 5;
-    const EINVALID_SLASH_BPS: u64 = 6;
     const EINVALID_BLS_KEY: u64 = 7;
     const EINVALID_BLS_POP: u64 = 8;
     /// AUDIT-#2: active validator set is full
@@ -493,71 +492,73 @@ module 0x1::staking {
         coin::burn(coin_to_burn);
     }
 
-    /// Slash a validator (burn stake and remove)
-    public fun slash_validator(account: &signer, validator_addr: address) acquires ValidatorSet, SupplyStats {
-        slash_validator_bps(account, validator_addr, 500)
-    }
-
-    /// Slash a validator by basis points. Only system may call this.
-    /// Downtime uses 500 bps (5%). Equivocation can use 10000 bps (100%).
-    public entry fun slash_validator_bps(account: &signer, validator_addr: address, slash_bps: u64) acquires ValidatorSet, SupplyStats {
-        let addr = signer::address_of(account);
-        // Only 0x1 can call this (system)
-        assert!(addr == @0x1, error::permission_denied(ENOT_VALIDATOR));
-        assert!(slash_bps <= MAX_BPS, error::invalid_argument(EINVALID_SLASH_BPS));
-
+    /// G5 SL-5: an accepted offender leaves the active set. Its whole stake
+    /// starts unbonding like a leaver's, and all of it stays slashable
+    /// (SL-1); none is burned before settlement. A no-op for an address that
+    /// is not in the set (it left earlier; its entries are already queued).
+    public(friend) fun remove_offender(validator_addr: address) acquires ValidatorSet {
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
         let len = vector::length(&validator_set.validators);
         let i = 0;
-        let found = false;
-        let index = 0;
-
         while (i < len) {
-            let v = vector::borrow(&validator_set.validators, i);
-            if (v.validator_addr == validator_addr) {
-                found = true;
-                index = i;
-                break
-            };
-            i = i + 1;
-        };
-
-        if (found) {
-            let config = vector::remove(&mut validator_set.validators, index);
-            let ValidatorConfig { validator_addr, stake, public_key: _, bls_public_key: _, bls_pop: _ } = config;
-            
-            let total_val = coin::value(&stake);
-            let slash_amount = (total_val * (slash_bps as u128)) / (MAX_BPS as u128);
-            let remaining_amount = total_val - slash_amount;
-            
-            // Extract and burn the slash amount as a deflationary penalty.
-            let slash_coins = coin::extract(&mut stake, slash_amount);
-            coin::burn(slash_coins);
-            // AUDIT-#8: reduce net total_supply AND credit the burn ledger by the
-            // SAME clamped delta so cumulative MINTED (net + burned) is invariant.
-            let removed = if (validator_set.total_supply >= slash_amount) {
-                slash_amount
-            } else {
-                validator_set.total_supply
-            };
-            validator_set.total_supply = validator_set.total_supply - removed;
-            if (!exists<SupplyStats>(@0x1)) {
-                move_to(account, SupplyStats { cumulative_burned: 0 });
-            };
-            let stats = borrow_global_mut<SupplyStats>(@0x1);
-            stats.cumulative_burned = stats.cumulative_burned + removed;
-            
-            // Burn the rest to re-mint on withdrawal (same as leave_validator_set).
-            coin::burn(stake);
-
-            if (remaining_amount > 0) {
+            if (vector::borrow(&validator_set.validators, i).validator_addr == validator_addr) {
+                let ValidatorConfig { validator_addr: _, stake, public_key: _, bls_public_key: _, bls_pop: _ } =
+                    vector::remove(&mut validator_set.validators, i);
+                let amount = coin::value(&stake);
+                // Destroyed here and minted again when paid, as for a leaver;
+                // it stays counted in total_supply until then.
+                coin::burn(stake);
                 vector::push_back(&mut validator_set.unbonding_queue, UnbondingRequest {
                     validator_addr,
-                    stake: remaining_amount,
+                    stake: amount,
                     start_height: chain::height(),
                     unlock_time: chain::unbonding_unlock_time(),
                 });
+                return
             };
+            i = i + 1;
+        };
+    }
+
+    /// G5 SL-6: cut every unbonding entry of `validator_addr` that started in
+    /// committee epoch `from_epoch` or later by `bps`, rounded up against the
+    /// offender. Earlier entries left before the offense and are out of scope.
+    /// The cut is never paid, so it leaves total_supply and is counted as
+    /// burned (AUDIT-#8: cumulative minted is unchanged).
+    public(friend) fun slash_unbonding(
+        validator_addr: address,
+        from_epoch: u64,
+        bps: u64,
+    ) acquires ValidatorSet, SupplyStats {
+        if (bps == 0) {
+            return
+        };
+        let interval = chain::epoch_blocks();
+        let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
+        let burned = 0u128;
+        let len = vector::length(&validator_set.unbonding_queue);
+        let i = 0;
+        while (i < len) {
+            let request = vector::borrow_mut(&mut validator_set.unbonding_queue, i);
+            let epoch = if (request.start_height == 0) { 0 } else { (request.start_height - 1) / interval };
+            if (request.validator_addr == validator_addr && epoch >= from_epoch) {
+                let cut = (request.stake * (bps as u128) + (MAX_BPS as u128) - 1) / (MAX_BPS as u128);
+                if (cut > request.stake) {
+                    cut = request.stake;
+                };
+                request.stake = request.stake - cut;
+                burned = burned + cut;
+            };
+            i = i + 1;
+        };
+        if (burned == 0) {
+            return
+        };
+        let removed = if (validator_set.total_supply >= burned) { burned } else { validator_set.total_supply };
+        validator_set.total_supply = validator_set.total_supply - removed;
+        if (exists<SupplyStats>(@0x1)) {
+            let stats = borrow_global_mut<SupplyStats>(@0x1);
+            stats.cumulative_burned = stats.cumulative_burned + removed;
         };
     }
 }
