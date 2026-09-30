@@ -68,9 +68,12 @@ pub struct GenMultiArgs {
     #[arg(long, default_value_t = 50_000)]
     pub treasury_reserve_ain: u128,
 
-    /// Epoch duration (seconds). Must be > 0.
-    #[arg(long, default_value_t = 10)]
-    pub epoch_duration: u64,
+    /// The block time measured on the release candidate, in milliseconds
+    /// (G5 P-1). Every deadline and the emission draw are derived from it and
+    /// written into genesis.json as block counts. The default is the time
+    /// measured on the running chain; measure the release before mainnet.
+    #[arg(long, default_value_t = 6_650)]
+    pub block_time_ms: u64,
 
     /// The stdlib bytecode the chain starts from; its hash is pinned into
     /// genesis.json (G3 FX-7).
@@ -104,14 +107,18 @@ pub struct GenesisValidatorConfig {
 }
 
 /// Top-level genesis file. Field names + types match
-/// `node::genesis::GenesisFile`: `chain_id`, `validators`, `treasury_reserve`
-/// (String), `epoch_duration` (u64).
+/// `node::genesis::GenesisFile`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct GenesisFile {
     pub chain_id: String,
     pub validators: Vec<GenesisValidatorConfig>,
     pub treasury_reserve: String,
-    pub epoch_duration: u64,
+    /// G5 P-1: every parameter in blocks, derived from the block time.
+    pub reward_period_blocks: u64,
+    pub unbonding_blocks: u64,
+    pub claim_grace_blocks: u64,
+    pub commission_delay_blocks: u64,
+    pub emission_draw_num: u128,
     /// G3 FX-7: the stdlib this chain starts from, by
     /// `node::genesis::stdlib_hash_of`. A node whose stdlib differs refuses
     /// the genesis.
@@ -187,7 +194,7 @@ pub fn build_genesis_file(
     specs: &[ValidatorSpec],
     chain_id: &str,
     treasury_reserve_ain: u128,
-    epoch_duration: u64,
+    block_time_ms: u64,
     stdlib_hash: &str,
 ) -> Result<GenesisFile, Box<dyn std::error::Error>> {
     if specs.is_empty() {
@@ -196,9 +203,8 @@ pub fn build_genesis_file(
     if chain_id.trim().is_empty() {
         return Err("chain_id must not be empty".into());
     }
-    if epoch_duration == 0 {
-        return Err("epoch_duration must be > 0".into());
-    }
+    let params = node::genesis::derive_chain_params(block_time_ms)
+        .map_err(|e| format!("cannot derive the chain parameters: {e}"))?;
     if stdlib_hash.trim().is_empty() {
         return Err("stdlib_hash must not be empty".into());
     }
@@ -240,7 +246,11 @@ pub fn build_genesis_file(
         chain_id: chain_id.to_string(),
         validators,
         treasury_reserve: treasury_reserve.to_string(),
-        epoch_duration,
+        reward_period_blocks: params.reward_period,
+        unbonding_blocks: params.unbonding_blocks,
+        claim_grace_blocks: params.claim_grace_blocks,
+        commission_delay_blocks: params.commission_delay_blocks,
+        emission_draw_num: params.draw_num,
         stdlib_hash: stdlib_hash.to_string(),
         genesis_time: None,
     })
@@ -274,7 +284,7 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
         &specs,
         &args.chain_id,
         args.treasury_reserve_ain,
-        args.epoch_duration,
+        args.block_time_ms,
         &stdlib_hash,
     )?;
     genesis.genesis_time = Some(args.genesis_time.unwrap_or_else(|| {
@@ -307,7 +317,10 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     println!("🏦 Treasury reserve: {} quanta", genesis.treasury_reserve);
-    println!("⏳ Epoch duration: {}s", genesis.epoch_duration);
+    println!(
+        "⏳ From {} ms blocks: unbonding {} blocks, reward period {}, emission draw {} per 10^12 per block",
+        args.block_time_ms, genesis.unbonding_blocks, genesis.reward_period_blocks, genesis.emission_draw_num
+    );
     println!("📚 Stdlib hash: {}", genesis.stdlib_hash);
     println!("✅ Wrote {}", args.out.display());
     println!(
@@ -412,7 +425,7 @@ mod tests {
                 stake_ain: 2000,
             },
         ];
-        let err = build_genesis_file(&specs, "AINCORE-MAINNET-1", 50_000, 10, "stdlib-hash")
+        let err = build_genesis_file(&specs, "AINCORE-MAINNET-1", 50_000, 6_650, "stdlib-hash")
             .expect_err("duplicate must fail");
         assert!(err.to_string().contains("duplicate validator address"));
     }
@@ -434,7 +447,7 @@ mod tests {
             },
         ];
         let genesis =
-            build_genesis_file(&specs, "AINCORE-MAINNET-1", 50_000, 10, "stdlib-hash").unwrap();
+            build_genesis_file(&specs, "AINCORE-MAINNET-1", 50_000, 6_650, "stdlib-hash").unwrap();
 
         // Reconstruct consensus::qc::ValidatorInfo from the emitted file (this is
         // the same shape genesis.rs writes to sys:validator_set:v1, with stake
@@ -484,7 +497,7 @@ mod tests {
             &specs,
             "AINCORE-MAINNET-1",
             50_000,
-            7,
+            6_650,
             &node::genesis::stdlib_hash_of(&stdlib_path()).unwrap(),
         )
         .unwrap();
@@ -531,6 +544,23 @@ mod tests {
             consensus::qc::validator_set_hash(&loaded),
             consensus::qc::validator_set_hash(&expected),
             "persisted validator set hash must match the generated genesis"
+        );
+
+        // G5 P-1: the node stores exactly what the tool derived from the block
+        // time; the epoch is the pinned interval (the tool writes I = 1,000
+        // from G5 S2, when rewards stop being paid per epoch).
+        let derived = node::genesis::derive_chain_params(6_650).unwrap();
+        let stored = node::genesis::stored_chain_params(&db).unwrap();
+        assert_eq!(
+            db.get("sys:config:epoch_block_interval").unwrap(),
+            Some(stored.epoch_blocks.to_string())
+        );
+        assert_eq!(
+            stored,
+            node::genesis::ChainParams {
+                epoch_blocks: stored.epoch_blocks,
+                ..derived
+            }
         );
 
         let _ = std::fs::remove_dir_all(&dir);

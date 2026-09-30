@@ -1716,10 +1716,17 @@ impl Producer {
         let mut prev = "genesis".to_string();
         let mut blocks = Vec::new();
         for height in 1..=n {
+            // G5 CL-2: an empty block's one state change is the clock.
+            let (key, value) = executor::chain_clock_write(height);
             let root = hex::encode(
-                state_commit::root(&self.sync.storage, height - 1)
-                    .unwrap()
-                    .0,
+                state_commit::apply(
+                    &self.sync.storage,
+                    height,
+                    [(key, Some(value.into_bytes()))],
+                )
+                .unwrap()
+                .root
+                .0,
             );
             let mut block = Block::new_with_roots(
                 height,

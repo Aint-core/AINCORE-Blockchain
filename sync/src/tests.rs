@@ -81,6 +81,24 @@ mod tests {
         sync.storage.write_batch(seeded.batch).unwrap();
     }
 
+    /// G5 CL-2: the state root of an empty block at `height` on top of the
+    /// executed chain. An empty block changes one state key, the chain clock,
+    /// so this is the parent's tree plus that write; nothing is written. A
+    /// conflicting empty block at a height the fixture already executed (with
+    /// an empty block) has that version's root.
+    fn empty_block_root(sync: &ChainSync, height: u64) -> String {
+        let latest = state_commit::latest_version(&sync.storage)
+            .unwrap()
+            .unwrap();
+        if height <= latest {
+            return hex::encode(state_commit::root(&sync.storage, height).unwrap().0);
+        }
+        let (key, value) = executor::chain_clock_write(height);
+        let applied = state_commit::apply(&sync.storage, height, [(key, Some(value.into_bytes()))])
+            .expect("the parent version is executed");
+        hex::encode(applied.root.0)
+    }
+
     fn set_validators(sync: &ChainSync, validators: Vec<(&str, u64)>) {
         let _seed = sync.storage.seeding();
         let vals: Vec<(String, u64)> = validators
@@ -690,8 +708,13 @@ mod tests {
         seed_state_tree(&sync);
         let executor = executor::Executor::new(sync.storage.clone());
         let mut valid = Block::new_with_roots(
-            1, 1, "genesis".into(), vec![], proposer,
-            executor.current_state_root(), executor.receipts_root_for_block(&[]),
+            1,
+            1,
+            "genesis".into(),
+            vec![],
+            proposer,
+            empty_block_root(&sync, 1),
+            executor.receipts_root_for_block(&[]),
         );
         authenticate_block(&sync, &mut valid);
         for bad_state in [true, false] {
@@ -718,7 +741,8 @@ mod tests {
     /// G3 S3: a follower's genesis commits version 0 like the producer's
     /// (here the fixture's `seed_state_tree`), so block 1 imports onto it and
     /// reaches the producer's root. The producer's root is computed apart,
-    /// in memory, from the same genesis state (TA-1).
+    /// in memory, from the same genesis state (TA-1) plus block 1's one state
+    /// change, the chain clock (G5 CL-2).
     #[test]
     fn a_follower_imports_block_one_onto_its_genesis_tree() {
         let sync = setup_sync("block_one_genesis_tree");
@@ -745,9 +769,13 @@ mod tests {
             .filter(|(k, _)| storage::class::classify(k) == Some(storage::class::KeyClass::State))
             .map(|(k, v)| (String::from_utf8(k.to_vec()).unwrap(), v.to_vec()))
             .collect();
-        let producer_root = state_commit::genesis_root(&genesis_state).unwrap();
+        let genesis_root = state_commit::genesis_root(&genesis_state).unwrap();
         seed_state_tree(&sync);
-        assert_eq!(state_commit::root(&sync.storage, 0).unwrap(), producer_root);
+        assert_eq!(state_commit::root(&sync.storage, 0).unwrap(), genesis_root);
+        let mut block_one_state = genesis_state;
+        let (clock_key, clock_value) = executor::chain_clock_write(1);
+        block_one_state.insert(clock_key, clock_value.into_bytes());
+        let producer_root = state_commit::genesis_root(&block_one_state).unwrap();
         block.header.state_root = hex::encode(producer_root.0);
         block.header.receipts_root = executor.receipts_root_for_block(&[]);
         rehash_block(&mut block);

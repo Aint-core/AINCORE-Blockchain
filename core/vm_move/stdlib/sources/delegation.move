@@ -7,7 +7,7 @@ module 0x1::delegation {
     use std::error;
     use 0x1::coin::{Self, Coin};
     use 0x1::staking::AincoreCoin;
-    use 0x1::epoch;
+    use 0x1::chain;
 
     /// Error codes
     const EVALIDATOR_NOT_FOUND: u64 = 1;
@@ -42,11 +42,9 @@ module 0x1::delegation {
     /// Maximum commission: 30%
     const MAX_COMMISSION: u64 = 3000; // Basis points (3000 = 30%)
     
-    /// Commission change notice period: 7 days
-    const COMMISSION_CHANGE_DELAY: u64 = 604800;
-    
-    /// Unbonding period: 21 days (same as validators)
-    const UNBONDING_PERIOD: u64 = 1814400;
+    // G5 CL-1: the commission notice and the unbonding period are genesis
+    // parameters in blocks (`chain::commission_delay_blocks`,
+    // `chain::unlock_height`), not seconds on a virtual clock.
 
     /// Individual delegation record
     struct Delegation has store, drop {
@@ -55,11 +53,14 @@ module 0x1::delegation {
         reward_debt: u128, // For reward tracking (accumulated rewards already claimed)
     }
 
-    /// Unbonding delegation (locked for 21 days)
+    /// Unbonding delegation (G5 SL-1, SL-2): the stake stopped weighting the
+    /// committee at `start_height`; it unlocks U blocks after the end of that
+    /// committee epoch and stays slashable until withdrawn.
     struct UnbondingDelegation has store, drop {
         delegator: address,
         amount: u128,
-        unlock_time: u64,
+        start_height: u64,
+        unlock_height: u64,
     }
 
     /// Validator pool that accepts delegations
@@ -67,7 +68,7 @@ module 0x1::delegation {
         validator_addr: address,
         commission_rate: u64,         // Basis points (100 = 1%)
         pending_commission: u64,      // New commission rate (pending)
-        commission_change_time: u64,  // When commission change takes effect
+        commission_change_height: u64, // When the pending rate may apply
         total_delegated: u128,
         delegations: vector<Delegation>,
         unbonding_queue: vector<UnbondingDelegation>,
@@ -103,7 +104,7 @@ module 0x1::delegation {
             validator_addr: addr,
             commission_rate,
             pending_commission: commission_rate,
-            commission_change_time: 0,
+            commission_change_height: 0,
             total_delegated: 0,
             delegations: vector::empty(),
             unbonding_queue: vector::empty(),
@@ -246,11 +247,12 @@ module 0x1::delegation {
         pool.total_delegated = pool.total_delegated - amount;
         
         // Add to unbonding queue
-        let current_time = epoch::now_seconds();
+        let h = chain::height();
         vector::push_back(&mut pool.unbonding_queue, UnbondingDelegation {
             delegator: delegator_addr,
             amount,
-            unlock_time: current_time + UNBONDING_PERIOD,
+            start_height: h,
+            unlock_height: chain::unlock_height(h),
         });
     }
 
@@ -260,8 +262,8 @@ module 0x1::delegation {
         validator_addr: address
     ) acquires ValidatorPool {
         let delegator_addr = signer::address_of(delegator);
-        let current_time = epoch::now_seconds();
-        
+        let now = chain::height();
+
         assert!(exists<ValidatorPool>(validator_addr), error::not_found(EVALIDATOR_NOT_FOUND));
         let pool = borrow_global_mut<ValidatorPool>(validator_addr);
         
@@ -273,7 +275,7 @@ module 0x1::delegation {
         
         while (i < len) {
             let ud = vector::borrow(&pool.unbonding_queue, i);
-            if (ud.delegator == delegator_addr && current_time >= ud.unlock_time) {
+            if (ud.delegator == delegator_addr && now >= ud.unlock_height) {
                 total_withdraw = total_withdraw + ud.amount;
                 vector::push_back(&mut to_remove, i);
             };
@@ -341,11 +343,9 @@ module 0x1::delegation {
         assert!(exists<ValidatorPool>(addr), error::not_found(EVALIDATOR_NOT_FOUND));
         
         let pool = borrow_global_mut<ValidatorPool>(addr);
-        let current_time = epoch::now_seconds();
-        
-        // Set pending commission change
+        // Set pending commission change (G5 P-1 notice, in blocks)
         pool.pending_commission = new_commission;
-        pool.commission_change_time = current_time + COMMISSION_CHANGE_DELAY;
+        pool.commission_change_height = chain::height() + chain::commission_delay_blocks();
     }
 
     /// Apply pending commission change (after 7 days)
@@ -353,12 +353,10 @@ module 0x1::delegation {
         validator: &signer
     ) acquires ValidatorPool {
         let addr = signer::address_of(validator);
-        let current_time = epoch::now_seconds();
-        
         assert!(exists<ValidatorPool>(addr), error::not_found(EVALIDATOR_NOT_FOUND));
         let pool = borrow_global_mut<ValidatorPool>(addr);
-        
-        assert!(current_time >= pool.commission_change_time, error::invalid_state(ECOMMISSION_CHANGE_TOO_SOON));
+
+        assert!(chain::height() >= pool.commission_change_height, error::invalid_state(ECOMMISSION_CHANGE_TOO_SOON));
         
         pool.commission_rate = pool.pending_commission;
     }

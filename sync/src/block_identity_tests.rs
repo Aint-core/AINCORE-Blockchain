@@ -18,7 +18,7 @@ fn fixture_with(name: &str, committed_vertices: Vec<String>) -> (ChainSync, Bloc
         "genesis".into(),
         vec![],
         proposer,
-        executor.current_state_root(),
+        empty_block_root(&sync, 1),
         executor.receipts_root_for_block(&[]),
         23,
         committed_vertices,

@@ -19,7 +19,7 @@ fn signed_empty(sync: &ChainSync, height: u64, parent: &str, timestamp: u64) -> 
         parent.into(),
         vec![],
         proposer,
-        exec.current_state_root(),
+        empty_block_root(sync, height),
         exec.receipts_root_for_block(&[]),
         timestamp,
         vec!["ab".repeat(32)],

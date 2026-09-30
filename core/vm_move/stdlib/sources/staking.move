@@ -3,6 +3,7 @@ module 0x1::staking {
     use std::vector;
     use std::error;
     use 0x1::coin::{Self, Coin};
+    use 0x1::chain;
 
     // FIX #2: the pool mints (mint_delegation_reward / mint_depin_reward)
     // create AIN and must only be reachable from other system (0x1) modules.
@@ -79,11 +80,6 @@ module 0x1::staking {
     const SATURATION_DIVISOR: u128 = 50;
 
     const COIN_SCALE: u128 = 1000000000000000000;
-    const EPOCH_SECONDS: u64 = 60;
-    
-    /// Unbonding Period: 21 days (1,814,400 seconds)
-    /// This prevents Nothing-at-Stake attacks by locking stake after leaving
-    const UNBONDING_PERIOD: u64 = 1814400; 
     const MAX_BPS: u64 = 10000;
     
     /// Marker struct for AINCORE Coin
@@ -102,11 +98,14 @@ module 0x1::staking {
         bls_pop: vector<u8>,
     }
     
-    /// Unbonding request (stake locked for 21 days)
+    /// Unbonding request. G5 CL-1 and SL-2: heights, not seconds. The stake
+    /// stopped weighting the committee at `start_height` and unlocks U blocks
+    /// after the end of that committee epoch (`chain::unlock_height`).
     struct UnbondingRequest has store, drop {
         validator_addr: address,
         stake: u128,
-        unlock_time: u64, // Timestamp when stake can be withdrawn
+        start_height: u64,
+        unlock_height: u64,
     }
 
     /// Global set of active validators
@@ -234,18 +233,17 @@ module 0x1::staking {
         let config = vector::remove(&mut validator_set.validators, index);
         let ValidatorConfig { validator_addr: _, stake, public_key: _, bls_public_key: _, bls_pop: _ } = config;
         
-        // CRITICAL: Do NOT return stake immediately!
-        // Lock it for 21 days to prevent Nothing-at-Stake attacks
-        let current_time = validator_set.current_epoch * EPOCH_SECONDS;
-        let unlock_time = current_time + UNBONDING_PERIOD;
-        
+        // CRITICAL: Do NOT return stake immediately! It stays locked (and,
+        // G5 SL-1, slashable) for U blocks after its last committee epoch.
+        let h = chain::height();
         let stake_amount = coin::value(&stake);
         coin::burn(stake); // Burn the coin (will re-mint on withdrawal)
-        
+
         let unbonding_req = UnbondingRequest {
             validator_addr: addr,
             stake: stake_amount,
-            unlock_time,
+            start_height: h,
+            unlock_height: chain::unlock_height(h),
         };
         
         vector::push_back(&mut validator_set.unbonding_queue, unbonding_req);
@@ -264,11 +262,10 @@ module 0x1::staking {
         };
 
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
-        let current_time = validator_set.current_epoch * EPOCH_SECONDS;
-        
-        // Grace period: 21 days (unbonding) + 10 days (claim buffer) = 31 days
-        let grace_period: u64 = 2678400; // 31 days in seconds
-        
+        let now = chain::height();
+        // Claim grace after the unlock (G5 P-1, in blocks).
+        let grace = chain::claim_grace_blocks();
+
         let queue_len = vector::length(&validator_set.unbonding_queue);
         let i = 0;
         
@@ -276,9 +273,9 @@ module 0x1::staking {
             let req = vector::borrow(&validator_set.unbonding_queue, i);
             
             // If request is older than grace period, auto-burn
-            if (current_time >= req.unlock_time + grace_period) {
+            if (now >= req.unlock_height + grace) {
                 let old_req = vector::remove(&mut validator_set.unbonding_queue, i);
-                let UnbondingRequest { validator_addr: _, stake: amount, unlock_time: _ } = old_req;
+                let UnbondingRequest { validator_addr: _, stake: amount, start_height: _, unlock_height: _ } = old_req;
                 
                 // Auto-burn unclaimed stake (deflationary penalty for not withdrawing).
                 // AUDIT-#8: reduce net total_supply AND credit the burn ledger by the
@@ -304,8 +301,8 @@ module 0x1::staking {
     public entry fun withdraw_unbonded(account: &signer) acquires ValidatorSet {
         let addr = signer::address_of(account);
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
-        let current_time = validator_set.current_epoch * EPOCH_SECONDS;
-        
+        let now = chain::height();
+
         let len = vector::length(&validator_set.unbonding_queue);
         let i = 0;
         let found = false;
@@ -314,7 +311,7 @@ module 0x1::staking {
         while (i < len) {
             let req = vector::borrow(&validator_set.unbonding_queue, i);
             if (req.validator_addr == addr) {
-                assert!(current_time >= req.unlock_time, error::invalid_state(EUNBONDING_NOT_READY));
+                assert!(now >= req.unlock_height, error::invalid_state(EUNBONDING_NOT_READY));
                 found = true;
                 index = i;
                 break
@@ -325,7 +322,7 @@ module 0x1::staking {
         assert!(found, error::not_found(ENO_UNBONDING_REQUEST));
         
         let unbonding_req = vector::remove(&mut validator_set.unbonding_queue, index);
-        let UnbondingRequest { validator_addr: _, stake: amount, unlock_time: _ } = unbonding_req;
+        let UnbondingRequest { validator_addr: _, stake: amount, start_height: _, unlock_height: _ } = unbonding_req;
         
         // Re-mint and return stake
         let coins = coin::mint<AincoreCoin>(amount);
@@ -604,12 +601,12 @@ module 0x1::staking {
             coin::burn(stake);
 
             if (remaining_amount > 0) {
-                let current_time = validator_set.current_epoch * EPOCH_SECONDS;
-                let unlock_time = current_time + UNBONDING_PERIOD;
+                let h = chain::height();
                 vector::push_back(&mut validator_set.unbonding_queue, UnbondingRequest {
                     validator_addr,
                     stake: remaining_amount,
-                    unlock_time,
+                    start_height: h,
+                    unlock_height: chain::unlock_height(h),
                 });
             };
         };

@@ -49,16 +49,23 @@
     },
     "executor": {
       "required": [
-        "tests::block_execution_writes_state_only_inside_the_block_transaction"
+        "tests::block_execution_writes_state_only_inside_the_block_transaction",
+        "tests::test_height_executes_exactly_once_and_only_in_order",
+        "tests::g5_deadlines_expire_exactly_at_their_heights",
+        "tests::g5_unclaimed_stake_burns_at_unlock_plus_grace",
+        "tests::test_g5_governance_refuses_every_action_but_signalling"
       ],
       "excluded_ignored": {
         "tests::test_h6_state_root_is_blind_to_out_of_band_writes": "Superseded by G3 C1′/C2′ (the root is the JMT root of the state map): storage class::tests::the_write_gate_refuses_state_outside_the_block_transaction, state_commit tests::rc2_lists_every_flat_key_the_tree_disagrees_with and tests::forged_or_foreign_chunks_are_refused, chain_sync a_forged_chunk_is_refused_and_the_restore_completes_elsewhere, consensus a_qc_over_another_state_root_is_never_stored, executor block_execution_writes_state_only_inside_the_block_transaction. WG-1 refuses this test's own setup write, so it cannot run as written.",
         "tests::test_h6_a_corrupted_state_snapshot_is_undetectable": "Superseded by G3 C1′/C2′ (the root is the JMT root of the state map): storage class::tests::the_write_gate_refuses_state_outside_the_block_transaction, state_commit tests::rc2_lists_every_flat_key_the_tree_disagrees_with and tests::forged_or_foreign_chunks_are_refused, chain_sync a_forged_chunk_is_refused_and_the_restore_completes_elsewhere, consensus a_qc_over_another_state_root_is_never_stored, executor block_execution_writes_state_only_inside_the_block_transaction. WG-1 refuses this test's own setup write, so it cannot run as written."
       }
     },
-    "storage": {
+    "node": {
       "required": [
-        "class::tests::the_write_gate_refuses_state_outside_the_block_transaction"
+        "genesis::tests::genesis_is_v4_and_binds_its_launch_time",
+        "genesis::tests::every_chain_parameter_is_stored_and_bound_by_the_identity",
+        "genesis::tests::the_chain_parameters_derive_from_the_block_time",
+        "genesis::tests::test_genesis_reopen_rejects_an_epoch_that_disagrees_with_the_interval"
       ],
       "excluded_ignored": {}
     },
@@ -66,6 +73,22 @@
       "required": [
         "tests::rc2_lists_every_flat_key_the_tree_disagrees_with",
         "tests::forged_or_foreign_chunks_are_refused"
+      ],
+      "excluded_ignored": {}
+    },
+    "storage": {
+      "required": [
+        "class::tests::the_write_gate_refuses_state_outside_the_block_transaction"
+      ],
+      "excluded_ignored": {}
+    },
+    "vm_move": {
+      "required": [
+        "move_unit_tests::stdlib_move_unit_tests_pass_on_the_production_vm",
+        "move_unit_tests::the_move_test_runner_reports_wrong_outcomes",
+        "move_unit_tests::committed_stdlib_bytecode_matches_its_sources",
+        "move_unit_tests::the_chain_parameters_and_clock_have_no_move_writer_but_initialize",
+        "move_unit_tests::no_stdlib_module_has_a_wall_clock"
       ],
       "excluded_ignored": {}
     }

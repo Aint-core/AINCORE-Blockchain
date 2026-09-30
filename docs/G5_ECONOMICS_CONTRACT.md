@@ -25,13 +25,23 @@ Today:
 ## Rules
 
 **CL-1 (one clock).** Every protocol deadline counts **block heights**: unbonding, the claim
-grace, the commission delay, governance voting and timelock, the evidence window and
-emission. The Move virtual-seconds clocks (`epoch.move` `epoch_duration`, staking
+grace, the commission delay, the evidence window and emission. The Move virtual-seconds clocks (`epoch.move` `epoch_duration`, staking
 `EPOCH_SECONDS`) are retired. A halted chain ages nothing (research b.5, Cosmos SDK #6478).
 
 **CL-2 (the executor passes the height).** Every system entry that needs time (reward
 payout, epoch boundary, governance driver) takes the block height as an argument, bound by
 the block being executed.
+
+**GV-1 (one governance path).** Governance is Move transactions only. The Rust
+`governance` crate's proposal path is removed from the executor (`drive_governance`) and
+from the RPC. It created proposals from one node's RPC with that node's wall clock
+(`SystemTime::now()`), so deadlines differed per node, and executing such a proposal would
+change state on only some nodes. G3's write gate already refuses those RPC writes on the
+new chain, so the path is dead there; it is deleted, not converted. Move governance loses
+`update_epoch_duration` (see P-1) and keeps signalling proposals. It has no voting period and
+no timelock (the 24-hour timelock was the Rust crate's), so it has no parameter: a pinned
+value nothing reads is dead state. At the permissioned launch, parameters change by
+software upgrade.
 
 **P-1 (parameters).** Genesis pins, and the genesis identity binds:
 
@@ -43,7 +53,6 @@ the block being executed.
 | W, evidence max age | U | research b.5: W ≤ U is the slashability condition |
 | G, claim grace | ⌈31 d / t_b⌉ | today's 31 days, in blocks |
 | C, commission notice | ⌈7 d / t_b⌉ | today's 7 days, in blocks |
-| T, governance timelock | ⌈24 h / t_b⌉ | today's 24 hours, in blocks |
 | d_b, emission draw per block | −ln(1 − 0.019) / (365.25 d / t_b) | emission decision: 1.90 %/yr of the remaining reserve |
 
 t_b is the block time measured at genesis (6.65 s today). `genesis-tool` derives the
@@ -108,7 +117,7 @@ end of G5, as with G1.
 
 | Stage | Content | Witnesses | Kill list |
 |---|---|---|---|
-| **S1** | CL-1, CL-2, P-1: heights everywhere in Move (`epoch`, `staking`, `delegation`, `governance`, `universal_mining`), the governance crate, genesis pins and genesis-tool derivation, the executor passes h | every deadline expires exactly at its height; a halt ages nothing; the pins are bound by the identity; genesis-tool reproduces the table from `block_time_ms` | a deadline in seconds; an unpinned parameter; governance able to change I, R or d_b |
+| **S1** | CL-1, CL-2, P-1, GV-1: a `0x1::chain` clock and parameter resource written by the executor per block; heights everywhere in Move (`epoch`, `staking`, `delegation`, `governance`); genesis pins and genesis-tool derivation; the Rust governance path removed | every deadline expires exactly at its height; a halt ages nothing; the pins are bound by the identity; genesis-tool reproduces the table from `block_time_ms` | a deadline in seconds; an unpinned parameter; governance able to change I, R or d_b |
 | **S2** | EM-1..EM-3: payouts every R blocks by Δh, abort catch-up, committee recipients, fees to the committee, boundary order, I = 1,000 | the emission curve is identical for R ∈ {1, 20} and I ∈ {20, 1,000}; an aborted payout is paid at the next; a joiner is paid from its first committee epoch and a leaver until its last; a jailed member gets nothing | Δh ignored; the live set paid; the clamp removed; payout after derivation at H_E |
 | **S3** | DL-1, DL-2: bonded stake in the committee weight; delegator rewards through the pool; commission by height | a delegator earns its share of the pool's reward minus commission, to the unit; delegating shifts committee weight at the next epoch only; the sum paid never exceeds e; total supply stays within MAX_SUPPLY | delegated stake ignored in weight; commission not taken; `reward_debt` not updated |
 | **S4** | SL-1..SL-3: unbonding slashable, unlock from H_{E(h)}, V4 evidence (EQ-1) through the DAG, W, V3 deletion | a leaver that equivocates before its unlock loses its unbonding stake; an undelegation after the infraction is slashed and one before it is not; evidence older than W is refused; a V4 node never records V3 evidence (kept from S11b) | only active stake slashed; live-set membership check; no age bound |

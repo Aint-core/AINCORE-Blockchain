@@ -410,6 +410,34 @@ fn decode_stored_stdlib_modules(
     Ok(modules)
 }
 
+/// A system resource of a stored genesis, BCS-decoded.
+fn decode_resource<T: DeserializeOwned>(
+    storage: &Arc<StateDB>,
+    key: &str,
+) -> Result<T, GenesisError> {
+    let value = storage.get(key)?.ok_or_else(|| {
+        GenesisError::InvalidData(format!(
+            "Genesis marker exists but required Move resource is missing: {}",
+            key
+        ))
+    })?;
+    let bytes = hex::decode(value)?;
+    bcs::from_bytes::<T>(&bytes).map_err(|err| {
+        GenesisError::InvalidData(format!(
+            "Genesis marker exists but required Move resource failed BCS decode: {} ({})",
+            key, err
+        ))
+    })
+}
+
+/// G5 P-1: the chain parameters genesis stored (`0x1::chain::Params`),
+/// checked against P-1's constraints.
+pub fn stored_chain_params(storage: &Arc<StateDB>) -> Result<ChainParams, GenesisError> {
+    let params: ChainParams = decode_resource(storage, &system_resource_key("0x1::chain::Params"))?;
+    params.validate()?;
+    Ok(params)
+}
+
 /// Structural checks on a stored genesis: the stdlib modules and markers are
 /// intact and every system resource still decodes. The chain identity is
 /// checked separately, against the in-memory genesis (TA-1).
@@ -432,7 +460,8 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
     struct UnbondingRequest {
         validator_addr: AccountAddress,
         stake: u128,
-        unlock_time: u64,
+        start_height: u64,
+        unlock_height: u64,
     }
     #[derive(serde::Deserialize)]
     struct ValidatorSet {
@@ -444,8 +473,6 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
     #[derive(serde::Deserialize)]
     struct Epoch {
         epoch_number: u64,
-        epoch_start_time: u64,
-        epoch_duration: u64,
     }
     #[derive(serde::Deserialize)]
     struct Proposal {
@@ -499,25 +526,6 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
         tokens: Vec<Vec<u8>>,
     }
 
-    fn decode_resource<T: DeserializeOwned>(
-        storage: &Arc<StateDB>,
-        key: &str,
-    ) -> Result<T, GenesisError> {
-        let value = storage.get(key)?.ok_or_else(|| {
-            GenesisError::InvalidData(format!(
-                "Genesis marker exists but required Move resource is missing: {}",
-                key
-            ))
-        })?;
-        let bytes = hex::decode(value)?;
-        bcs::from_bytes::<T>(&bytes).map_err(|err| {
-            GenesisError::InvalidData(format!(
-                "Genesis marker exists but required Move resource failed BCS decode: {} ({})",
-                key, err
-            ))
-        })
-    }
-
     let stored_modules = decode_stored_stdlib_modules(storage)?;
     let expected_hash = storage.get("genesis_stdlib_hash")?.ok_or_else(|| {
         GenesisError::InvalidData(
@@ -568,6 +576,17 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
         decode_resource(storage, &system_resource_key("0x1::staking::ValidatorSet"))?;
     let _validator_count = validator_set.validators.len();
     let _epoch: Epoch = decode_resource(storage, &system_resource_key("0x1::epoch::Epoch"))?;
+    let params = stored_chain_params(storage)?;
+    // G5 P-1: Move's epoch (unlock heights) and the Rust epoch (committee
+    // rotation) are one number, written once by genesis.
+    let interval = storage.get(GENESIS_EPOCH_BLOCK_INTERVAL_KEY)?;
+    if interval.as_deref() != Some(params.epoch_blocks.to_string().as_str()) {
+        return Err(GenesisError::InvalidData(format!(
+            "chain Params epoch_blocks {} disagrees with the pinned epoch interval {:?}",
+            params.epoch_blocks, interval
+        )));
+    }
+    let _clock: u64 = decode_resource(storage, &system_resource_key("0x1::chain::Clock"))?;
     let _governance: GovernanceState = decode_resource(
         storage,
         &system_resource_key("0x1::governance::GovernanceState"),
@@ -607,10 +626,10 @@ pub struct GenesisFile {
     pub chain_id: String,
     pub validators: Vec<GenesisValidatorConfig>,
     pub treasury_reserve: String,
-    pub epoch_duration: u64,
-    /// SEC-#13: the canonical epoch-BLOCK interval (in blocks). Distinct from
-    /// `epoch_duration`, a wall-clock seconds value used by the Move epoch
-    /// resource. When omitted, DEFAULT_EPOCH_BLOCK_INTERVAL is used. Pinned
+    /// SEC-#13: the canonical epoch-BLOCK interval (in blocks). (G5 CL-1: the
+    /// old `epoch_duration`, seconds on a virtual clock, is gone; a file that
+    /// still carries it parses, and the value is ignored.) When omitted,
+    /// DEFAULT_EPOCH_BLOCK_INTERVAL is used. Pinned
     /// into state and the genesis identity so every node advances epochs at
     /// identical heights.
     #[serde(default)]
@@ -623,12 +642,108 @@ pub struct GenesisFile {
     /// FX-7: seeded into `sys:config:tip_agreement_n`. Default 1.
     #[serde(default)]
     pub tip_agreement_n: Option<u64>,
+    /// G5 P-1: the chain parameters in blocks. The real genesis carries them
+    /// all, derived by genesis-tool from the measured block time
+    /// (`derive_chain_params`); an omitted one takes `ChainParams::DEFAULT`.
+    #[serde(default)]
+    pub reward_period_blocks: Option<u64>,
+    #[serde(default)]
+    pub unbonding_blocks: Option<u64>,
+    #[serde(default)]
+    pub claim_grace_blocks: Option<u64>,
+    #[serde(default)]
+    pub commission_delay_blocks: Option<u64>,
+    #[serde(default)]
+    pub emission_draw_num: Option<u128>,
     /// G1 S11 / RC-3: the launch time, unix seconds. A validator takes its
     /// first guard origin (`AINCORE_GUARD_ORIGIN_INIT=1`) only within the
     /// launch window after it, so the flag left set on a wiped database
     /// later cannot re-arm signing. Without it the flag is never honored.
     #[serde(default)]
     pub genesis_time: Option<u64>,
+}
+
+/// G5 P-1: the parameters every deadline and the emission count in, in
+/// blocks (the Move `0x1::chain::Params` resource). `epoch_blocks` is the
+/// pinned epoch interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChainParams {
+    pub epoch_blocks: u64,
+    pub reward_period: u64,
+    pub unbonding_blocks: u64,
+    pub claim_grace_blocks: u64,
+    pub commission_delay_blocks: u64,
+    pub draw_num: u128,
+}
+
+/// 21 days, 31 days and 7 days, in milliseconds (G5 P-1).
+const UNBONDING_MS: u64 = 21 * 86_400_000;
+const CLAIM_GRACE_MS: u64 = 31 * 86_400_000;
+const COMMISSION_DELAY_MS: u64 = 7 * 86_400_000;
+/// The Julian year, milliseconds.
+const YEAR_MS: f64 = 31_557_600_000.0;
+/// The emission decision: 1.90 % a year of the remaining reserve.
+const EMISSION_RATE_PER_YEAR: f64 = 0.019;
+
+impl ChainParams {
+    /// Every value `derive_chain_params` gives for the 6,650 ms block time
+    /// measured on the running chain, except the epoch, which is the pinned
+    /// interval's default until G5 S2 moves the reward cadence off it.
+    pub const DEFAULT: ChainParams = ChainParams {
+        epoch_blocks: DEFAULT_EPOCH_BLOCK_INTERVAL,
+        reward_period: 20,
+        unbonding_blocks: 273_000,
+        claim_grace_blocks: 402_767,
+        commission_delay_blocks: 90_948,
+        draw_num: 4_042,
+    };
+
+    /// P-1's constraints (the same as Move `chain::valid`).
+    pub fn validate(&self) -> Result<(), GenesisError> {
+        let ok = self.epoch_blocks > 0
+            && self.reward_period > 0
+            && self.epoch_blocks.is_multiple_of(self.reward_period)
+            && self.unbonding_blocks > 0
+            && self.unbonding_blocks.is_multiple_of(self.epoch_blocks)
+            && self.claim_grace_blocks > 0
+            && self.commission_delay_blocks > 0
+            && self.draw_num > 0
+            && self.draw_num < 10_000;
+        if ok {
+            Ok(())
+        } else {
+            Err(GenesisError::InvalidData(format!(
+                "genesis chain parameters violate G5 P-1: {self:?}"
+            )))
+        }
+    }
+}
+
+/// G5 P-1 from the measured block time: I = 1,000 and R = 20 (research b.2,
+/// b.6), U = 21 days rounded up to whole epochs, the claim grace and the
+/// commission notice rounded up to whole blocks, and the draw per block that takes
+/// 1.90 % of the remaining reserve a year. genesis-tool runs this once and
+/// writes integers into genesis.json; no node derives anything at run time.
+pub fn derive_chain_params(block_time_ms: u64) -> Result<ChainParams, GenesisError> {
+    if block_time_ms == 0 {
+        return Err(GenesisError::InvalidData(
+            "block_time_ms must be positive".into(),
+        ));
+    }
+    let blocks = |ms: u64| ms.div_ceil(block_time_ms);
+    let epoch_blocks = 1_000u64;
+    let blocks_per_year = YEAR_MS / block_time_ms as f64;
+    let draw = -(1.0 - EMISSION_RATE_PER_YEAR).ln() / blocks_per_year;
+    let params = ChainParams {
+        epoch_blocks,
+        reward_period: 20,
+        unbonding_blocks: blocks(UNBONDING_MS).div_ceil(epoch_blocks) * epoch_blocks,
+        claim_grace_blocks: blocks(CLAIM_GRACE_MS),
+        commission_delay_blocks: blocks(COMMISSION_DELAY_MS),
+        draw_num: (draw * 1e12).round() as u128,
+    };
+    params.validate()?;
+    Ok(params)
 }
 
 /// The genesis state, built in memory by `build_genesis`.
@@ -968,7 +1083,8 @@ pub fn build_genesis(
     struct UnbondingRequest {
         validator_addr: move_core_types::account_address::AccountAddress,
         stake: u128,
-        unlock_time: u64,
+        start_height: u64,
+        unlock_height: u64,
     }
 
     let mut genesis_validators = Vec::new();
@@ -976,7 +1092,7 @@ pub fn build_genesis(
     let mut v1_validators: Vec<consensus::qc::ValidatorInfo> = Vec::new();
     let mut total_bootstrap_stake: u128 = 0;
     let treasury_reserve_amount: u128;
-    let genesis_epoch_duration: u64;
+    let chain_params: ChainParams;
     // SEC-#13: canonical epoch-block interval to pin into storage + identity hash.
     let genesis_epoch_block_interval: u64;
     let genesis_chain_id: String;
@@ -998,12 +1114,6 @@ pub fn build_genesis(
         }
         treasury_reserve_amount =
             parse_genesis_amount(&config.treasury_reserve, "treasury_reserve")?;
-        genesis_epoch_duration = config.epoch_duration;
-        if genesis_epoch_duration == 0 {
-            return Err(GenesisError::InvalidData(
-                "genesis.json epoch_duration must be greater than 0".to_string(),
-            ));
-        }
         // SEC-#13: an explicit 0 is invalid (it would disable epoch advancement);
         // omission falls back to the canonical default.
         genesis_epoch_block_interval = match config.epoch_block_interval {
@@ -1015,6 +1125,20 @@ pub fn build_genesis(
             Some(v) => v,
             None => DEFAULT_EPOCH_BLOCK_INTERVAL,
         };
+        // G5 P-1: one epoch everywhere (the Move parameter is the pinned
+        // interval), the rest from genesis.json or the measured defaults.
+        let d = ChainParams::DEFAULT;
+        chain_params = ChainParams {
+            epoch_blocks: genesis_epoch_block_interval,
+            reward_period: config.reward_period_blocks.unwrap_or(d.reward_period),
+            unbonding_blocks: config.unbonding_blocks.unwrap_or(d.unbonding_blocks),
+            claim_grace_blocks: config.claim_grace_blocks.unwrap_or(d.claim_grace_blocks),
+            commission_delay_blocks: config
+                .commission_delay_blocks
+                .unwrap_or(d.commission_delay_blocks),
+            draw_num: config.emission_draw_num.unwrap_or(d.draw_num),
+        };
+        chain_params.validate()?;
         // FX-7: the defaults these keys' readers used when the keys were absent.
         genesis_burn_percentage = match config.burn_percentage {
             Some(p) if p > 100 => {
@@ -1184,21 +1308,24 @@ pub fn build_genesis(
         )?;
     }
 
-    // === Initialize Epoch ===
+    // === Initialize Epoch (the reward-period counter) ===
     #[derive(serde::Serialize)]
     struct Epoch {
         epoch_number: u64,
-        epoch_start_time: u64,
-        epoch_duration: u64,
     }
-    let epoch = Epoch {
-        epoch_number: 0,
-        epoch_start_time: 0,
-        epoch_duration: genesis_epoch_duration,
-    };
     let epoch_key = system_resource_key("0x1::epoch::Epoch");
-    let epoch_bytes = bcs::to_bytes(&epoch)?;
+    let epoch_bytes = bcs::to_bytes(&Epoch { epoch_number: 0 })?;
     storage.put(&epoch_key, &hex::encode(epoch_bytes))?;
+
+    // === G5 P-1, CL-2: the chain parameters and the clock at height 0 ===
+    storage.put(
+        &system_resource_key("0x1::chain::Params"),
+        &hex::encode(bcs::to_bytes(&chain_params)?),
+    )?;
+    storage.put(
+        &system_resource_key("0x1::chain::Clock"),
+        &hex::encode(bcs::to_bytes(&0u64)?),
+    )?;
 
     // === Initialize Governance ===
     #[derive(serde::Serialize)]
@@ -1679,6 +1806,36 @@ mod tests {
         );
     }
 
+    /// G5 P-1: a database whose Move epoch disagrees with the pinned epoch
+    /// interval (so unlock heights would not match committee epochs) is
+    /// refused at boot.
+    #[test]
+    fn test_genesis_reopen_rejects_an_epoch_that_disagrees_with_the_interval() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let db = temp_db("params_epoch_mismatch");
+        let key = SigningKey::from_bytes(&[26u8; 32]);
+        let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let pubkey = hex::encode(key.verifying_key().as_bytes());
+        init_genesis(&db, &addr, &pubkey).expect("fresh genesis initializes");
+        init_genesis(&db, &addr, &pubkey).expect("an intact database reopens");
+
+        let params_key = system_resource_key("0x1::chain::Params");
+        let mut params: ChainParams =
+            bcs::from_bytes(&hex::decode(db.get(&params_key).unwrap().unwrap()).unwrap()).unwrap();
+        params.epoch_blocks *= 2;
+        params.unbonding_blocks = params.epoch_blocks * 1_000;
+        params.validate().expect("still a valid set on its own");
+        let _seed = db.seeding();
+        db.put(&params_key, &hex::encode(bcs::to_bytes(&params).unwrap()))
+            .unwrap();
+        let err = init_genesis(&db, &addr, &pubkey).expect_err("a mismatched epoch must fail");
+        assert!(
+            err.to_string()
+                .contains("disagrees with the pinned epoch interval"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn test_genesis_reopen_rejects_corrupt_module_bytes() {
         let _guard = GENESIS_ENV_LOCK.lock().unwrap();
@@ -1785,7 +1942,9 @@ mod tests {
         #[allow(dead_code)]
         stake: u128,
         #[allow(dead_code)]
-        unlock_time: u64,
+        start_height: u64,
+        #[allow(dead_code)]
+        unlock_height: u64,
     }
     #[derive(serde::Deserialize)]
     struct TestValidatorSet {
@@ -2976,6 +3135,111 @@ mod tests {
 
     fn stdlib() -> Vec<(String, Vec<u8>)> {
         load_stdlib_modules(&stdlib_path()).unwrap()
+    }
+
+    /// G5 P-1: genesis stores every chain parameter as `0x1::chain::Params`,
+    /// the identity binds each one (so two chains that differ in any deadline
+    /// or in the emission draw cannot share an identity), the clock starts at
+    /// height 0, and a set that breaks P-1's constraints is refused.
+    #[test]
+    fn every_chain_parameter_is_stored_and_bound_by_the_identity() {
+        let base = s3_genesis_file();
+        let built = build_genesis(&base, &stdlib()).unwrap();
+        let stored = |g: &GenesisState| -> ChainParams {
+            let hex = &g.writes[&system_resource_key("0x1::chain::Params")];
+            bcs::from_bytes(&hex::decode(hex).unwrap()).unwrap()
+        };
+        assert_eq!(stored(&built), ChainParams::DEFAULT);
+        let clock = &built.writes[&system_resource_key("0x1::chain::Clock")];
+        assert_eq!(
+            bcs::from_bytes::<u64>(&hex::decode(clock).unwrap()).unwrap(),
+            0
+        );
+
+        // One valid change per field; each is stored and moves the identity.
+        type Edit = fn(&mut GenesisFile);
+        let edits: [(&str, Edit); 6] = [
+            ("epoch_blocks", |f| f.epoch_block_interval = Some(40)),
+            ("reward_period", |f| f.reward_period_blocks = Some(10)),
+            ("unbonding_blocks", |f| f.unbonding_blocks = Some(273_020)),
+            ("claim_grace_blocks", |f| {
+                f.claim_grace_blocks = Some(402_768)
+            }),
+            ("commission_delay_blocks", |f| {
+                f.commission_delay_blocks = Some(90_949)
+            }),
+            ("draw_num", |f| f.emission_draw_num = Some(4_043)),
+        ];
+        let mut identities = std::collections::BTreeSet::from([built.identity.clone()]);
+        for (name, edit) in edits {
+            let mut file = base.clone();
+            edit(&mut file);
+            let other = build_genesis(&file, &stdlib()).unwrap();
+            assert_ne!(stored(&other), ChainParams::DEFAULT, "{name} not stored");
+            assert!(
+                identities.insert(other.identity),
+                "{name} is not bound by the identity"
+            );
+        }
+
+        // P-1's constraints hold at genesis, not only in Move.
+        let refused: [(&str, Edit); 8] = [
+            ("R does not divide I", |f| f.reward_period_blocks = Some(7)),
+            ("U not whole epochs", |f| f.unbonding_blocks = Some(273_001)),
+            ("a zero grace", |f| f.claim_grace_blocks = Some(0)),
+            ("a zero notice", |f| f.commission_delay_blocks = Some(0)),
+            ("a draw of 1e-8", |f| f.emission_draw_num = Some(10_000)),
+            ("a zero reward period", |f| f.reward_period_blocks = Some(0)),
+            ("a zero unbonding", |f| f.unbonding_blocks = Some(0)),
+            ("a zero draw", |f| f.emission_draw_num = Some(0)),
+        ];
+        for (name, edit) in refused {
+            let mut file = base.clone();
+            edit(&mut file);
+            let err = build_genesis(&file, &stdlib()).expect_err(name);
+            assert!(err.to_string().contains("G5 P-1"), "{name}: {err}");
+        }
+    }
+
+    /// G5 P-1: genesis-tool's one input, the block time, reproduces the
+    /// contract's table at 6,650 ms, and the draw realizes 1.90 %/yr.
+    #[test]
+    fn the_chain_parameters_derive_from_the_block_time() {
+        let p = derive_chain_params(6_650).unwrap();
+        assert_eq!(
+            p,
+            ChainParams {
+                epoch_blocks: 1_000,
+                reward_period: 20,
+                unbonding_blocks: 273_000,
+                claim_grace_blocks: 402_767,
+                commission_delay_blocks: 90_948,
+                draw_num: 4_042,
+            }
+        );
+        // Every deadline is at least its duration in real time, and less than
+        // one block (U: one epoch) longer.
+        let t = 6_650u64;
+        assert!(p.unbonding_blocks * t >= UNBONDING_MS);
+        assert!((p.unbonding_blocks - p.epoch_blocks) * t < UNBONDING_MS);
+        for (blocks, ms) in [
+            (p.claim_grace_blocks, CLAIM_GRACE_MS),
+            (p.commission_delay_blocks, COMMISSION_DELAY_MS),
+        ] {
+            assert!(blocks * t >= ms && (blocks - 1) * t < ms);
+        }
+        let per_year = YEAR_MS / t as f64;
+        let realized = 1.0 - (1.0 - p.draw_num as f64 / 1e12).powf(per_year);
+        assert!(
+            (realized - EMISSION_RATE_PER_YEAR).abs() < 1e-5,
+            "{realized}"
+        );
+        // The derivation follows the block time; a zero block time is refused.
+        assert_eq!(
+            derive_chain_params(2_000).unwrap().unbonding_blocks,
+            908_000
+        );
+        assert!(derive_chain_params(0).is_err());
     }
 
     /// TA-1: the identity binds `state_root(0)`, so two genesis files that

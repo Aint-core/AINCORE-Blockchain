@@ -2,7 +2,6 @@ module 0x1::governance {
     use std::signer;
     use std::vector;
     use std::error;
-    use 0x1::epoch;
     use 0x1::coin;
     use 0x1::staking::{Self, AincoreCoin};
 
@@ -11,6 +10,8 @@ module 0x1::governance {
     const EALREADY_VOTED: u64 = 2;
     const EPROPOSAL_EXECUTED: u64 = 3;
     const EINSUFFICIENT_VOTES: u64 = 4;
+    /// G5 GV-1: proposals signal; they execute no protocol change.
+    const EUNSUPPORTED_ACTION: u64 = 5;
     const VOTE_GAS_RESERVE: u128 = 1000000000000000000; // 1 AIN stays liquid for claim/ops gas
 
     struct Proposal has store, drop {
@@ -20,8 +21,8 @@ module 0x1::governance {
         votes_for: u128, // CRITICAL FIX: Upgrade to u128 (u64 maxes out at 18.4 AIN!)
         votes_against: u128,
         executed: bool,
-        action_type: u8, // 1 = Change Epoch Duration
-        action_value: u64, // New duration
+        action_type: u8, // 0 only: a signalling proposal (G5 GV-1)
+        action_value: u64, // unused
         voters: vector<address>,
     }
 
@@ -44,7 +45,10 @@ module 0x1::governance {
         action_value: u64
     ) acquires GovernanceState {
         let addr = signer::address_of(account);
-        
+        // G5 GV-1: no action changes the protocol (the epoch-duration action,
+        // which could stretch every deadline, is gone).
+        assert!(action_type == 0, error::invalid_argument(EUNSUPPORTED_ACTION));
+
         // --- PHASE 8 SECURITY: BURN 10,000 AIN PROPOSAL FEE ---
         // 10,000 AIN represented in 18 decimals
         let fee_amount: u128 = 10000000000000000000000; 
@@ -179,11 +183,6 @@ module 0x1::governance {
                 
                 // Ensure Majority
                 assert!(p.votes_for > p.votes_against, error::invalid_state(EINSUFFICIENT_VOTES));
-
-                if (p.action_type == 1) {
-                    // Change Epoch Duration
-                    epoch::update_epoch_duration(account, p.action_value);
-                };
 
                 p.executed = true;
                 return

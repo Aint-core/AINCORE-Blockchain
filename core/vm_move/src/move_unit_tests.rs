@@ -239,7 +239,7 @@ fn stdlib_move_unit_tests_pass_on_the_production_vm() {
     let (ran, failures) = run_plans(&modules, &plans);
     // The count is pinned so a test that stops being discovered (a broken
     // attribute, a file that no longer loads) fails here instead of vanishing.
-    assert_eq!(ran, 14, "Move unit tests discovered");
+    assert_eq!(ran, 21, "Move unit tests discovered");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -301,6 +301,69 @@ fn the_move_test_runner_reports_wrong_outcomes() {
         ],
         "{failures:#?}"
     );
+}
+
+/// G5 P-1 and CL-2: in the committed bytecode, the genesis-pinned `Params`
+/// and the executor-written `Clock` have one Move writer, `chain::initialize`,
+/// which refuses a second call (the chain_tests above). Move lets only the
+/// declaring module write its resources, so no other module, governance
+/// included, can change a parameter or move the clock.
+#[test]
+fn the_chain_parameters_and_clock_have_no_move_writer_but_initialize() {
+    use move_binary_format::{access::ModuleAccess, file_format::Bytecode, CompiledModule};
+    let bytes = fs::read(stdlib_dir("bytecode").join("chain.mv")).expect("chain.mv committed");
+    let module = CompiledModule::deserialize(&bytes).expect("chain.mv deserializes");
+    let mut writes = std::collections::BTreeSet::new();
+    for def in module.function_defs() {
+        let function = module
+            .identifier_at(module.function_handle_at(def.function).name)
+            .to_string();
+        for instruction in def.code.iter().flat_map(|unit| unit.code.iter()) {
+            let target = match instruction {
+                Bytecode::MoveTo(i) | Bytecode::MoveFrom(i) | Bytecode::MutBorrowGlobal(i) => *i,
+                Bytecode::MoveToGeneric(_)
+                | Bytecode::MoveFromGeneric(_)
+                | Bytecode::MutBorrowGlobalGeneric(_) => panic!("chain has no generic resource"),
+                _ => continue,
+            };
+            let handle = module.struct_handle_at(module.struct_def_at(target).struct_handle);
+            writes.insert((
+                function.clone(),
+                module.identifier_at(handle.name).to_string(),
+            ));
+        }
+    }
+    let expected = [("initialize", "Clock"), ("initialize", "Params")]
+        .map(|(f, r)| (f.to_string(), r.to_string()));
+    assert_eq!(writes, expected.into_iter().collect());
+}
+
+/// G5 CL-1: no stdlib module has a wall clock. Every deadline reads
+/// `chain::height`, so a halted chain ages nothing; a `timestamp` module, or
+/// a field or function named for seconds, time or a duration, is how a
+/// second clock would come back. Identifiers, not source text, so comments
+/// that explain the old clock do not count.
+#[test]
+fn no_stdlib_module_has_a_wall_clock() {
+    use move_binary_format::{access::ModuleAccess, CompiledModule};
+    let mut found = Vec::new();
+    for entry in fs::read_dir(stdlib_dir("bytecode"))
+        .expect("stdlib bytecode exists")
+        .flatten()
+    {
+        let bytes = fs::read(entry.path()).expect("module readable");
+        let module = CompiledModule::deserialize(&bytes).expect("module deserializes");
+        for ident in module.identifiers() {
+            let ident = ident.as_str().to_ascii_lowercase();
+            if ["time", "second", "duration", "clock_secs"]
+                .iter()
+                .any(|w| ident.contains(w))
+            {
+                found.push(format!("{}: {}", module.self_id().name(), ident));
+            }
+        }
+    }
+    assert!(found.is_empty(), "wall-clock identifiers: {found:?}");
 }
 
 /// The committed bytecode is what genesis installs and what the tests above

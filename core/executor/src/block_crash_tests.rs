@@ -247,9 +247,12 @@ fn block_crash_child() {
                 // It replaced the old hash-chain value 0b19b72b...; what the
                 // crash tests prove is that every replay equals this clean root.
                 // The fixture state holds the stdlib bytecode, so the root
-                // moves with it: 40051153... became this when universal_mining
-                // bounded device registration.
-                "bfd42aa627f13bae185a6cb9ceb583d0f4bcebcac589615f1eb9c9bd5d8aaf49",
+                // moves with it: 40051153... became bfd42aa6... when
+                // universal_mining bounded device registration, and G5 S1 moved
+                // it in three proven steps (each alone, from bfd42aa6...): the
+                // height-clock stdlib 1ea8e128..., the genesis chain Params and
+                // Clock 94c32abd..., the per-block clock write this value.
+                "af45a2f325b8b3304e051dd994987b43122abd22dcb0e700bbec6dbdb9ecd2a5",
                 "clean execution must preserve the pre-staging fixture root"
             );
         }
