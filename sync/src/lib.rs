@@ -449,9 +449,7 @@ impl ChainSync {
             ));
         }
 
-        let validators: Vec<String> = storage.get_active_validators_checked()
-            .map_err(|e| format!("cannot resolve validator eligibility: {e}"))?
-            .into_iter().map(|(address, _)| address).collect();
+        let validators = Self::eligible_proposers(storage, block.header.height)?;
         if !validators.contains(&block.header.proposer_id) {
             return Err(format!(
                 "Proposer {} is not in active validator set",
@@ -549,6 +547,27 @@ impl ChainSync {
             ));
         }
         Self::verify_proposer_signature_in(storage, block)
+    }
+
+    /// Who may lead or sign block `height`. On V4 (G1 DE-7) the frozen
+    /// committee of the height's epoch, C_E(h): a member that leaves or is
+    /// slashed mid-epoch still leads its anchors, and the QC is the authority
+    /// anyway (final review HIGH: gating on the live set made its blocks
+    /// unsyncable). On V3 the live set, as before.
+    fn eligible_proposers(storage: &StateDB, height: u64) -> Result<Vec<String>, String> {
+        if consensus::v4::is_v4_chain(storage) {
+            let epoch = consensus::qc_producer::epoch_for_block_height(storage, height)
+                .ok_or("no epoch for this height")?;
+            let committee = consensus::v4::epoch::committee_of(storage, epoch)
+                .ok_or_else(|| format!("no committee for epoch {epoch}"))?;
+            return Ok(committee.into_iter().map(|m| m.address).collect());
+        }
+        Ok(storage
+            .get_active_validators_checked()
+            .map_err(|e| format!("cannot resolve validator eligibility: {e}"))?
+            .into_iter()
+            .map(|(address, _)| address)
+            .collect())
     }
 
     /// The block's proposer signature, under the public key its signer's
@@ -1097,6 +1116,27 @@ impl ChainSync {
             if let Ok(qc) = serde_json::from_str::<consensus::qc::QuorumCertificate>(&qc_json) {
                 if let Some(b) = blocks.iter().find(|b| b.header.height == qc.block_height) {
                     if b.header.hash != qc.block_hash {
+                        // G1 IM-3 (V4): the peer's block has its own verified
+                        // QC. Two certified blocks at one height is a conflict.
+                        if v4 {
+                            if let Some(q) = qc_of(b) {
+                                if consensus::qc_producer::verify_block_qc(&self.storage, b, q)
+                                    .is_ok()
+                                {
+                                    consensus::qc_producer::record_decision_conflict(
+                                        &self.storage,
+                                        b.header.height,
+                                        &format!(
+                                            "{}: two QCs at height {}: {} and {}",
+                                            consensus::ordering::DECISION_CONFLICT,
+                                            b.header.height,
+                                            qc.block_hash,
+                                            b.header.hash
+                                        ),
+                                    );
+                                }
+                            }
+                        }
                         eprintln!(
                             "🚨 [SECURITY][SYNC_QC_PIN_REJECT] peer's block #{} hash {} does not \
                              match the QC-certified hash {} — rejecting the whole batch before \
@@ -1115,6 +1155,19 @@ impl ChainSync {
                 if let Ok(Some(existing_json)) = self.storage.get(&key) {
                     if let Ok(existing) = serde_json::from_str::<Block>(&existing_json) {
                         if existing.header.hash == block.header.hash {
+                            // A held block's missing QC (a crash lost it, or it
+                            // never formed here) is imported from the peer's.
+                            if v4
+                                && consensus::qc_producer::stored_qc(
+                                    &self.storage,
+                                    block.header.height,
+                                )
+                                .is_none()
+                            {
+                                if let Some(q) = qc_of(block) {
+                                    self.import_block_qc(q);
+                                }
+                            }
                             continue;
                         }
                         if existing.header.round <= finalized_round
@@ -1128,6 +1181,30 @@ impl ChainSync {
                                 finalized_round
                             );
                             break;
+                        }
+                        // G1 IM-3 (V4): a verified QC for this other block
+                        // proves the local chain is not the certified one.
+                        // Halt with the alarm; never serve or build on it.
+                        if v4 {
+                            if let Some(q) = qc_of(block) {
+                                if consensus::qc_producer::verify_block_qc(&self.storage, block, q)
+                                    .is_ok()
+                                {
+                                    let why = format!(
+                                        "{}: a QC certifies block {} at height {}, this node holds {}",
+                                        consensus::ordering::DECISION_CONFLICT,
+                                        block.header.hash,
+                                        block.header.height,
+                                        existing.header.hash
+                                    );
+                                    consensus::qc_producer::record_decision_conflict(
+                                        &self.storage,
+                                        block.header.height,
+                                        &why,
+                                    );
+                                    break;
+                                }
+                            }
                         }
                         // A proposer signature or a longer peer chain is not a
                         // fork-choice proof. Even zero-TX blocks advance execution
@@ -1231,6 +1308,12 @@ impl ChainSync {
                     // G1 EP-2/EP-3: an imported boundary block closes its epoch
                     // in its own transaction, so H_E + 1's QC verifies under
                     // C_{E+1}. EP-4: QC(H_E) must bind the committee derived.
+                    // G1 IM-2 (V4): the block's QC is stored in the block's own
+                    // transaction; a crash between them used to leave the
+                    // block without its QC, and adoption waiting forever.
+                    if let Some(q) = &qc {
+                        consensus::qc_producer::stage_block_qc(view, q)?;
+                    }
                     if let Some(start) = consensus::v4::epoch::stage_boundary(view, block)? {
                         let derived = consensus::qc::validator_set_hash(&start.committee);
                         if let Some(q) = &qc {
@@ -1248,11 +1331,9 @@ impl ChainSync {
                 },
             ) {
                 Ok(executor::BlockExecOutcome::Executed(_)) => {
+                    // (its QC was stored in the same transaction)
                     last_processed = block.header.height;
                     consensus::dag::prune_history(&self.storage, last_processed, self.retention);
-                    if let Some(q) = &qc {
-                        self.import_block_qc(q);
-                    }
                 }
                 Ok(executor::BlockExecOutcome::AlreadyExecuted { last_executed }) => {
                     // Execution completion alone does not identify the block.

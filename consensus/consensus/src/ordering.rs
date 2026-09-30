@@ -54,6 +54,15 @@ pub struct OrderingEngine {
     /// EP-3: the closing round r* of the active epoch, once its boundary block
     /// is accepted. No anchor above it is decided until the next epoch begins.
     epoch_closing: Option<u64>,
+    /// DE-1's scan memo: anchor rounds below this had no direct quorum when
+    /// last scanned, and the scan resumes here. Safe to skip: a round that
+    /// gains a direct quorum later is in every later anchor's history (its
+    /// voters, over two thirds of the stake, intersect every later parent
+    /// set), so the walk back from the next direct anchor commits it all the
+    /// same. Replaces a fixed scan window that wedged the chain after a dry
+    /// spell longer than it (final review MEDIUM). In memory only; a restart
+    /// rescans once.
+    scan_from: std::cell::Cell<u64>,
     /// Rolling cumulative finality digest: `H(prev_digest_hex || new_hashes…)`,
     /// chained on every commit and persisted as `consensus:finality_digest`. On
     /// restart it CONTINUES from that persisted value, so it is a pure function of
@@ -147,6 +156,97 @@ impl Default for OrderingEngine {
     }
 }
 
+/// `OrderingEngine::walk_history(from, floor)` for a descending floor. After
+/// `lower_to(f)` it holds exactly what `walk_history(from, f)` returns (the
+/// same visits, the same hole verdict), but every vertex is expanded once:
+/// vertices at or below the floor are parked and expanded when it drops.
+struct DescendingWalk {
+    from: String,
+    started: bool,
+    visited: HashSet<String>,
+    by_round: HashMap<u64, Vec<String>>,
+    parked: Vec<(u64, String)>,
+}
+
+impl DescendingWalk {
+    fn new(from: &str) -> Self {
+        Self {
+            from: from.to_string(),
+            started: false,
+            visited: HashSet::new(),
+            by_round: HashMap::new(),
+            parked: Vec::new(),
+        }
+    }
+
+    /// The visited vertices at round `r`.
+    fn at_round(&self, r: u64) -> impl Iterator<Item = &String> {
+        self.by_round.get(&r).into_iter().flatten()
+    }
+
+    /// Lower the floor to `floor`; false on a hole (a missing, unsettled
+    /// parent of an expanded vertex), as `walk_history` returns None.
+    fn lower_to(
+        &mut self,
+        floor: u64,
+        dag: &HashMap<String, Vertex>,
+        committed: &HashMap<String, u64>,
+        gc_floor: u64,
+    ) -> bool {
+        let mut stack: Vec<String> = Vec::new();
+        let mut expand: Vec<String> = Vec::new();
+        if !self.started {
+            self.started = true;
+            stack.push(self.from.clone());
+        }
+        let parked = std::mem::take(&mut self.parked);
+        for (round, h) in parked {
+            if round > floor {
+                expand.push(h);
+            } else {
+                self.parked.push((round, h));
+            }
+        }
+        loop {
+            if let Some(h) = expand.pop() {
+                let Some(v) = dag.get(&h) else {
+                    continue;
+                };
+                for (i, p) in v.parents.iter().enumerate() {
+                    let below_floor = v
+                        .parent_refs
+                        .get(i)
+                        .is_some_and(|r| r.digest == *p && r.round <= gc_floor);
+                    if p != "genesis" && !committed.contains_key(p) && !below_floor {
+                        stack.push(p.clone());
+                    }
+                }
+                continue;
+            }
+            let Some(h) = stack.pop() else {
+                break;
+            };
+            if self.visited.contains(&h) {
+                continue;
+            }
+            let Some(v) = dag.get(&h) else {
+                if h == "genesis" || committed.contains_key(&h) {
+                    continue; // settled — not a hole
+                }
+                return false; // hole
+            };
+            self.visited.insert(h.clone());
+            self.by_round.entry(v.round).or_default().push(h.clone());
+            if v.round <= floor {
+                self.parked.push((v.round, h));
+            } else {
+                expand.push(h);
+            }
+        }
+        true
+    }
+}
+
 impl OrderingEngine {
     pub fn new() -> Self {
         // Initialize VDF with moderate difficulty (adjustable for faster/slower)
@@ -160,6 +260,7 @@ impl OrderingEngine {
             committed_set: HashMap::new(),
             gc_floor: 0,
             epoch_closing: None,
+            scan_from: std::cell::Cell::new(0),
             finality_digest: String::new(),
             vdf_engine: vdf,
             step1_beacon: vec![0u8; 32],
@@ -331,6 +432,7 @@ impl OrderingEngine {
             committed_set,
             gc_floor,
             epoch_closing: None,
+            scan_from: std::cell::Cell::new(0),
             finality_digest,
             vdf_engine: vdf,
             step1_beacon,
@@ -558,6 +660,7 @@ impl OrderingEngine {
     /// time no walk reaches them. Idempotent; boot calls it again.
     pub fn begin_epoch(&mut self, first_round: u64, sentinel: &str) -> Result<(), String> {
         self.epoch_closing = None;
+        self.scan_from.set(0);
         self.next_anchor_round = self.next_anchor_round.max(Self::align_anchor(first_round));
         self.gc_floor = self.gc_floor.max(first_round.saturating_sub(1));
         self.committed_set.insert(sentinel.to_string(), first_round + GC_DEPTH + 1);
@@ -651,9 +754,6 @@ impl OrderingEngine {
             return None;
         }
         let max_round = round_index.keys().copied().max().unwrap_or(0);
-        // Backstop against pathological cursor-to-tip gaps; the cursor normally
-        // trails the tip by a handful of rounds.
-        const MAX_SCAN: u64 = 10_000;
 
         // ONE anchor per call (see step 3): no outer loop -- the caller executes
         // the returned anchor, re-samples the validator set, and calls again.
@@ -662,9 +762,9 @@ impl OrderingEngine {
             let start = Self::align_anchor(self.next_anchor_round.max(1));
             // 1. Find the SMALLEST directly-committable anchor round >= cursor.
             let mut direct: Option<(u64, String)> = None;
-            let mut r = start;
+            let mut r = start.max(Self::align_anchor(self.scan_from.get()));
             let closing = self.epoch_closing.unwrap_or(u64::MAX);
-            while r < max_round && r - start < MAX_SCAN && r <= closing {
+            while r < max_round && r <= closing {
                 // DE-1/DE-2: at most one candidate can hold a quorum of votes,
                 // because every voter votes once (Lemma V).
                 if let Some(h) = Self::leader_candidates(r, dag, round_index, validators)
@@ -678,35 +778,51 @@ impl OrderingEngine {
                 }
                 r += 2;
             }
-            let (r_direct, direct_hash) = direct?;
+            let Some((r_direct, direct_hash)) = direct else {
+                // Remember how far nothing was directly supported, short of
+                // the newest rounds (their votes may still arrive).
+                let settled = max_round.saturating_sub(4);
+                if settled > self.scan_from.get() {
+                    self.scan_from.set(settled);
+                }
+                return None;
+            };
 
             // 2. Walk BACK from the direct anchor, deciding every round in
             //    [cursor, r_direct) by ancestry along the committed-anchor chain.
             let mut to_commit: Vec<(u64, String)> = vec![(r_direct, direct_hash.clone())];
             let mut chain = direct_hash;
+            // `walk_history(chain, j)` for each descending j, each vertex
+            // expanded once per chain (re-walking per j was quadratic in the
+            // gap after a long dry spell).
+            let mut walk = DescendingWalk::new(&chain);
             for j in (start..r_direct).rev().filter(|j| j.is_multiple_of(2)) {
-                let chain_round = match dag.get(&chain) {
-                    Some(v) => v.round,
-                    None => return None, // cannot happen, but never guess
-                };
-                let Some(visited) =
-                    Self::walk_history(&chain, j, chain_round, dag, &self.committed_set, self.gc_floor)
-                else {
+                if !dag.contains_key(&chain) {
+                    return None; // cannot happen, but never guess
+                }
+                if !walk.lower_to(j, dag, &self.committed_set, self.gc_floor) {
                     // HOLE below the chain anchor: not decidable yet.
                     return None;
-                };
+                }
                 // DE-4: the leader's vertices at j WITHIN the chain's history,
                 // not in this node's round index, so neither arrival order nor
                 // a twin the history does not contain can reach the decision.
                 let leader_j = Self::leader_for_round(j, validators, 0);
-                let mut in_history = visited.iter().filter(|h| {
-                    dag.get(*h)
-                        .is_some_and(|v| v.round == j && v.author == leader_j)
-                });
-                match (in_history.next(), in_history.next()) {
+                let in_history: Vec<String> = walk
+                    .at_round(j)
+                    .filter(|h| {
+                        dag.get(*h)
+                            .is_some_and(|v| v.round == j && v.author == leader_j)
+                    })
+                    .take(2)
+                    .cloned()
+                    .collect();
+                match (in_history.first(), in_history.get(1)) {
                     (Some(hj), None) => {
+                        let hj = hj.clone();
                         to_commit.push((j, hj.clone()));
-                        chain = hj.clone();
+                        walk = DescendingWalk::new(&hj);
+                        chain = hj;
                     }
                     // No leader vertex in the chain's complete history: SKIP j.
                     // The walk was complete, so absence is proof, not a guess.
@@ -851,6 +967,17 @@ impl OrderingEngine {
     /// ingress, V3 and V4 alike). The committed sequence is taken from this
     /// same walk (DE-5), so the completeness gate and the collector can never
     /// disagree on what is settled (review C-1, H9).
+    #[allow(dead_code)]
+    fn walk_history_reference(
+        from: &str,
+        floor: u64,
+        dag: &HashMap<String, Vertex>,
+        committed: &HashMap<String, u64>,
+        gc_floor: u64,
+    ) -> Option<HashSet<String>> {
+        Self::walk_history(from, floor, 0, dag, committed, gc_floor)
+    }
+
     fn walk_history(
         from: &str,
         floor: u64,
@@ -1023,15 +1150,25 @@ impl OrderingEngine {
         // anchor round from the cursor up to it was skipped. A row that
         // already says otherwise refuses the whole acceptance.
         let first = Self::align_anchor(plan.previous_next_anchor_round.max(1)).max(2);
+        // On V4 an anchor far past the cursor is legitimate after a long dry
+        // spell (and adoption needs its QC): the skip rows are written for
+        // the last MAX_DECISION_ROWS rounds only, a bounded batch, instead of
+        // refusing the anchor forever (final review MEDIUM). V3 keeps the
+        // refusal: its adoption is authenticated by one signature.
+        let v4 = crate::v4::is_v4_chain(storage);
         if !info.anchor_round.is_multiple_of(2)
-            || info.anchor_round.saturating_sub(first) / 2 >= MAX_DECISION_ROWS
+            || (!v4 && info.anchor_round.saturating_sub(first) / 2 >= MAX_DECISION_ROWS)
         {
             return Err(format!(
                 "anchor round {} is not an anchor round within {MAX_DECISION_ROWS} of the cursor {first}",
                 info.anchor_round
             ));
         }
-        for r in (first..=info.anchor_round).step_by(2) {
+        let first_row = first.max(
+            info.anchor_round
+                .saturating_sub(2 * (MAX_DECISION_ROWS - 1)),
+        );
+        for r in (first_row..=info.anchor_round).step_by(2) {
             let key = anchor_decision_key(0, r);
             let decision = if r == info.anchor_round {
                 format!("C:{}", info.anchor_hash)
@@ -1883,6 +2020,122 @@ mod tests {
             prev = this;
         }
         (dag, idx)
+    }
+
+    /// Review (safety dimension): rounds keep advancing (C1) while no anchor
+    /// has direct support for `dry` rounds; above that every leader is
+    /// supported. `dry` = 200 decides; `dry` = 10_002 (past MAX_SCAN) decides
+    /// nothing, and adding rounds cannot change that.
+    fn rs_dry_dag(
+        validators: &[(String, u64)],
+        dry: u64,
+        rounds: u64,
+    ) -> (
+        std::collections::HashMap<String, blockchain::Vertex>,
+        std::collections::HashMap<u64, Vec<String>>,
+    ) {
+        let mut dag = std::collections::HashMap::new();
+        let mut idx: std::collections::HashMap<u64, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut prev: Vec<String> = vec!["genesis".to_string()];
+        for r in 1..=rounds {
+            let prev_round = r - 1;
+            let mut cite = prev.clone();
+            if prev_round >= 2 && prev_round % 2 == 0 && prev_round < dry {
+                let leader = super::OrderingEngine::leader_for_round(prev_round, validators, 0);
+                cite.retain(|h| !h.ends_with(&format!("_{leader}")));
+            }
+            let mut this = Vec::new();
+            for (a, _) in validators {
+                let (h, v) = mk_vertex(r, a, cite.clone());
+                this.push(h.clone());
+                idx.entry(r).or_default().push(h.clone());
+                dag.insert(h, v);
+            }
+            prev = this;
+        }
+        (dag, idx)
+    }
+
+    #[test]
+    fn rs_a_dry_spell_shorter_than_max_scan_is_decided() {
+        let validators = mk_validators(4);
+        let (dag, idx) = rs_dry_dag(&validators, 200, 212);
+        let mut e = super::OrderingEngine::new();
+        let out = drain(&mut e, &dag, &idx, &validators);
+        assert!(!out.is_empty(), "control: the anchors after the dry spell commit");
+    }
+
+    #[test]
+    fn a_dry_spell_longer_than_the_old_scan_window_is_decided() {
+        let validators = mk_validators(4);
+        let (dag, idx) = rs_dry_dag(&validators, 10_002, 10_040);
+        let mut e = super::OrderingEngine::new();
+        let out = drain(&mut e, &dag, &idx, &validators);
+        assert!(
+            !out.is_empty(),
+            "anchors 10_002..10_038 have direct support, yet nothing is decided"
+        );
+    }
+
+    /// The incremental walk behind DE's walk-back is `walk_history` at every
+    /// floor: the same visited set, the same hole verdict. Checked on a full
+    /// mesh, on a DAG with a hole, and on the dry-spell DAG, from the top
+    /// vertices down to round 0, with and without committed vertices.
+    #[test]
+    fn the_descending_walk_is_walk_history_at_every_floor() {
+        let validators = mk_validators(4);
+        let (mesh, _) = full_mesh(&validators, 10);
+        let mut holed = mesh.clone();
+        let victim = holed
+            .iter()
+            .find(|(_, v)| v.round == 5)
+            .map(|(h, _)| h.clone())
+            .unwrap();
+        holed.remove(&victim);
+        let (dry, _) = rs_dry_dag(&validators, 8, 14);
+        let committed_some: std::collections::HashMap<String, u64> = mesh
+            .iter()
+            .filter(|(_, v)| v.round == 3)
+            .take(2)
+            .map(|(h, v)| (h.clone(), v.round))
+            .collect();
+        let empty = std::collections::HashMap::new();
+        let mut checked = 0;
+        for (dag, committed, gc_floor) in [
+            (&mesh, &empty, 0u64),
+            (&holed, &empty, 0),
+            (&dry, &empty, 0),
+            (&mesh, &committed_some, 2),
+        ] {
+            let top = dag.values().map(|v| v.round).max().unwrap();
+            for (from, _) in dag.iter().filter(|(_, v)| v.round == top) {
+                let mut walk = super::DescendingWalk::new(from);
+                for floor in (0..top).rev() {
+                    let reference = super::OrderingEngine::walk_history(
+                        from, floor, top, dag, committed, gc_floor,
+                    );
+                    let ok = walk.lower_to(floor, dag, committed, gc_floor);
+                    assert_eq!(ok, reference.is_some(), "hole verdict at floor {floor}");
+                    let Some(reference) = reference else {
+                        break;
+                    };
+                    assert_eq!(walk.visited, reference, "visited set at floor {floor}");
+                    for r in floor..=top {
+                        let mut at: Vec<&String> = walk.at_round(r).collect();
+                        let mut want: Vec<&String> = reference
+                            .iter()
+                            .filter(|h| dag.get(*h).is_some_and(|v| v.round == r))
+                            .collect();
+                        at.sort();
+                        want.sort();
+                        assert_eq!(at, want, "round {r} at floor {floor}");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 100, "vacuous: {checked} checks");
     }
 
     fn commit_fingerprint(commits: &[super::CommitInfo]) -> Vec<(u64, String, Vec<String>)> {
@@ -2950,6 +3203,80 @@ mod tests {
             None,
             "no single candidate when the index holds twins"
         );
+    }
+
+    /// KILL(M89), DE-4: each walk-back step descends from the leader just
+    /// committed, not from the direct anchor. X holds every round-5 vote and
+    /// commits 4 directly (L2 is outside L4's history, so 2 is skipped). Y
+    /// lacks one round-5 voter, so it commits 6 directly and walks back; L2 is
+    /// in L6's history but not in L4's, and Y must still skip 2.
+    #[test]
+    fn kill_m89_walk_back_descends_from_the_last_committed_leader() {
+        let validators = mk_validators(4);
+        let names: Vec<String> = validators.iter().map(|(a, _)| a.clone()).collect();
+        let leader = |r| super::OrderingEngine::leader_for_round(r, &validators, 0);
+        let (l2, l4) = (leader(2), leader(4));
+        let d = names.iter().find(|a| **a != l4).unwrap().clone();
+        let c = names.iter().find(|a| **a != d).unwrap().clone();
+        let p = names[0].clone();
+        let mut all: Vec<(String, blockchain::Vertex)> = Vec::new();
+        let mut round = |r: u64, parents_of: &dyn Fn(&str) -> Vec<String>| -> Vec<String> {
+            let mut hs = Vec::new();
+            for a in &names {
+                let (h, v) = mk_vertex(r, a, parents_of(a));
+                all.push((h.clone(), v));
+                hs.push(h);
+            }
+            hs
+        };
+        let r1 = round(1, &|_| vec!["genesis".to_string()]);
+        let r2 = round(2, &|_| r1.clone());
+        let at = |hs: &[String], a: &str| hs.iter().find(|h| h.ends_with(&format!("_{a}"))).unwrap().clone();
+        let v2_l2 = at(&r2, &l2);
+        let r2_other: Vec<String> = r2.iter().filter(|h| **h != v2_l2).cloned().collect();
+        let r3 = round(3, &|a| {
+            if a == p {
+                vec![v2_l2.clone(), r2_other[0].clone(), r2_other[1].clone()]
+            } else {
+                r2_other.clone()
+            }
+        });
+        let v3_p = at(&r3, &p);
+        let r4 = round(4, &|a| {
+            if a == l4 {
+                r3.iter().filter(|h| **h != v3_p).cloned().collect()
+            } else {
+                r3.clone()
+            }
+        });
+        let v4_l4 = at(&r4, &l4);
+        let r5 = round(5, &|a| {
+            if a == d {
+                r4.iter().filter(|h| **h != v4_l4).cloned().collect()
+            } else {
+                r4.clone()
+            }
+        });
+        let c5 = at(&r5, &c);
+        let r5_y: Vec<String> = r5.iter().filter(|h| **h != c5).cloned().collect();
+        let r6 = round(6, &|_| r5_y.clone());
+        let _r7 = round(7, &|_| r6.clone());
+        let mut x = View::new();
+        let mut y = View::new();
+        for (h, v) in &all {
+            x.insert(h, v);
+            if *h != c5 {
+                y.insert(h, v);
+            }
+        }
+        x.evaluate(&validators);
+        y.evaluate(&validators);
+        assert_eq!(x.decision(4), Decision::Commit(v4_l4.clone()), "vacuous: X did not commit 4");
+        assert_eq!(x.decision(2), Decision::Skip, "vacuous: X did not skip 2");
+        assert!(matches!(y.decision(6), Decision::Commit(_)), "vacuous: Y did not commit 6");
+        for r in [2u64, 4, 6] {
+            assert!(agree(&x.decision(r), &y.decision(r)), "round {r}: X {:?}, Y {:?}", x.decision(r), y.decision(r));
+        }
     }
 
     /// G1 S4, DE-4: two leader vertices in the history at one round is

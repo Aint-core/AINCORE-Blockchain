@@ -778,9 +778,11 @@ What landed:
 - **IM-4.** `SyncResponse.qcs` carries the QC of every served block that has one.
 
 Deviations:
-- IM-2 is two steps, not one transaction: execution with its block, then adoption with its
-  QC work. Adoption retries from the persisted adoption cursor, and both steps apply IM-1, so
-  a crash between them only delays adoption.
+- IM-2 is two steps, not one transaction: execution with its block (and, since the final
+  review, its QC), then adoption with its QC work. **Corrected by the final review:** the claim
+  that "a crash between them only delays adoption" was false while the import wrote the ordering
+  keys (a restarted node forked). On V4 the import no longer writes them, and no local decision
+  is made while a held block is unadopted.
 - FinalityVote V2 (`next_validator_set_hash`, IM-5) lands with epochs at S9.
 - The node-level outage witness (a node offline past the window catches up from per-height
   QCs, and the survivors form new QCs) needs QC formation across nodes in the harness, so it
@@ -970,6 +972,98 @@ Open in S10:
 - the equivocating-leader and withheld-body cases at system level (they are witnessed at engine
   level by A2c, A3c and the twin flood);
 - re-running every earlier mutation at system level.
+
+**G1 final review (2026-09-30, at df26933).** Five independent reviewers covered decision
+safety, ingress and certificates, node integration and sync, resource exhaustion, and test
+quality. Every finding came with a PoC test; each PoC is now a regression test.
+
+CRITICAL, fixed:
+- **A crash between sync import and adoption forked the node.** Three reviewers found it
+  independently. S8's note ("a crash between them only delays adoption") was wrong.
+- **The mechanism:**
+  - the QC import wrote the ordering engine's own keys (`consensus:finalized_round`, the last
+    anchor, the finality digest);
+  - a restart then moved the cursor past the imported blocks;
+  - adoption skipped them as already decided, so their sequences never reached the committed
+    set;
+  - the node's next local anchor re-committed them.
+- **The fix, as a class:**
+  - on V4 an import only records the certificate. The ordering keys are written only by
+    acceptance and adoption, with the sequence they commit;
+  - no local decision is made while any held block is unadopted.
+
+HIGH, all fixed:
+- **A diverged node was never detected.** A verified QC for another block at a held height is
+  now a decision conflict. It raises the alarm on every path: storing a certificate, sync's
+  conflict branch, and its QC-pin branch. A running node halts on an alarm at its next tick.
+- **RC-3: a wiped or resynced validator re-armed signing at the first activation it performed**,
+  even inside an epoch it had already signed in. It resigned slots, so one Byzantine node got
+  two certificates for one slot.
+  - It now re-arms only at the activation of an epoch whose boundary block's BFT time is later
+    than its first guard-less boot plus a clock-skew margin (`consensus:guard_resume_after`,
+    `EpochStart.prev_timestamp`).
+- **Pull answers could exceed the node's own pre-parse cap**, so a near-maximal body could never
+  be fetched. `v4::MAX_WIRE_BYTES` is now the one bound: answers are packed to fit it, and one
+  maximal body always fits.
+- **RE-6's single sequence high-water mark dropped every reordered request**, so a node behind
+  never caught up. Each member's numbers are now accepted once each, in any order, within a
+  window (`SeqWindow`).
+- **A crash between a synced block's execution and its QC import left adoption waiting
+  forever.** The QC is now stored in the block's own transaction. A held block's missing QC is
+  imported from a re-sent block. `QC_WANT` asks for any held height the node is stuck on
+  (adoption, or its own pending vote), not only boundaries.
+- **A frozen-committee leader that leaves the live set made its blocks unsyncable.** On V4,
+  sync checks leader and signer against C_E(h).
+
+MEDIUM and LOW, fixed:
+- **A dry spell of more than 10,000 rounds wedged decisions forever.**
+  - The scan now has a memo instead of a cap. This is safe by the indirect rule: an anchor that
+    gains a direct quorum late lies in every later anchor's history.
+  - The walk-back is incremental (`DescendingWalk`, proven equal to `walk_history` at every
+    floor, holes included). The 10,002-round case went from 296 s to under a second.
+  - On V4 the DE-6 rows cover only the last `MAX_DECISION_ROWS` anchor rounds, instead of the
+    anchor being refused.
+- **Pull:**
+  - certificate answers are taken only for wanted, unheld slots, and capped;
+  - wants share one peer list, and their rotation start is spread;
+  - the client sends at most `CLIENT_REQS_PER_TICK` requests per tick.
+- **Throttles and dedup:**
+  - an attestation is re-sent at most once per slot per tick;
+  - early E+1 certificates are deduplicated;
+  - QC answers are throttled per height with oldest-entry eviction, under a global per-tick
+    budget.
+- **Epoch handling:**
+  - nothing of E is attested after E closes (EP-3);
+  - an unreadable epoch record halts instead of being ignored.
+
+Test quality:
+- 22 kill tests from the review were added. They cover among others:
+  - the E4 cache digest;
+  - each EP-2 committee clause;
+  - IM-1's finality-digest clause at adoption;
+  - adoption without a QC;
+  - the decision committee after activation;
+  - guard deletion above the cut;
+  - the DE-4 walk-back chain;
+  - PR-1 by stake.
+- Vacuous witnesses were rewritten:
+  - the twin flood now really certifies a twin;
+  - the stale leg now reaches EP-5 (it is asserted to pass Layer S);
+  - the system suite now requires QCs.
+
+Mutation of the fixes: 17 mutants, each reverting one fix, run against both crates. All are
+killed except F3 (no local decision while a held block is unadopted), which is equivalent in
+effect. The commit loop decides the smallest ready anchor first, and an anchor at or below the
+tip round is "already on chain", so the guard is defense in depth. A timing-based review test
+that failed under load (and so "killed" six mutants spuriously) was made deterministic. Two
+survivors got witnesses: attestation after the close (white-box) and pacing of body fetches.
+
+Deferred:
+- **The RC-3 init flag left set on a wiped database** still re-arms at once. The fix belongs
+  with S11's genesis: a launch window, or f+1 peers reporting height 0.
+- **Snapshot restore across epochs** needs an epoch-change proof.
+- **A stored QC that conflicts with this node's own pending vote** (retry path) only errors.
+  Storing one is already refused on V4.
 
 ### Imported decisions and finality votes (IM)
 

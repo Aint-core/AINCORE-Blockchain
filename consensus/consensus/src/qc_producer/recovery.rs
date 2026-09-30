@@ -15,6 +15,13 @@ fn key(height: u64) -> String {
 
 /// Caller MUST supply the same transaction view as block/order acceptance.
 /// Do not infer a lost historical digest from the current tip on restart.
+/// The lowest height with pending QC work, if any.
+pub(crate) fn lowest_pending_qc_height(storage: &StateDB) -> Option<u64> {
+    let (key, _) = storage.db.prefix_iterator(PREFIX.as_bytes()).next()?.ok()?;
+    let key = String::from_utf8_lossy(&key).into_owned();
+    key.strip_prefix(PREFIX)?.parse::<u64>().ok()
+}
+
 pub(crate) fn stage_pending_qc(
     view: &StateDB,
     block: &blockchain::Block,

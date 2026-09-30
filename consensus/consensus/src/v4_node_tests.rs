@@ -803,11 +803,10 @@ fn a_node_that_missed_the_boundary_votes_fetches_the_qc_and_activates() {
             .count();
         sent
     };
-    assert_eq!(
-        answers(&mut c, "QC_WANT:3"),
-        0,
-        "a non-boundary height was answered"
-    );
+    // Any held height is answered (adoption and lost votes need them too),
+    // never one above the tip.
+    let above = format!("QC_WANT:{}", c.node(1).latest_block_height + 1);
+    assert_eq!(answers(&mut c, &above), 0, "a height above the tip was answered");
     assert!(
         answers(&mut c, "QC_WANT:4") <= 1,
         "the answer is not throttled"
@@ -985,4 +984,251 @@ fn a_commit_loop_stops_at_the_boundary_even_when_later_anchors_are_ready() {
             start.prev_closing_round
         );
     }
+}
+
+// ------------------------------------------------ final review (dos) regressions
+
+/// DOS-3: `QC_WANT` is "answered at most once per throttle window per
+/// height", but the window map is cleared whenever it holds 16 heights. With
+/// 17 boundary heights holding a QC (17 epochs), asking them in rotation gets
+/// every ask answered, each answer a broadcast (gossip plus one fresh TCP
+/// connection per peer).
+#[test]
+fn dos_qc_want_throttle_is_bypassed_by_rotating_17_heights() {
+    let mut c = Cluster::with_interval("dos-qcwant", &[71, 72, 73, 74], true, 4);
+    c.run_until(200, |c| c.node(1).latest_block_height >= 17);
+    assert!(c.node(1).latest_block_height >= 17, "vacuous: too few blocks");
+    let heights: Vec<u64> = (1..=17).collect();
+    for h in &heights {
+        c.node(1)
+            .storage
+            .put(&format!("consensus:qc:{h}"), &format!("{{\"stand_in_for_qc\":{h}}}"))
+            .unwrap();
+    }
+    let outbox = c.node(1).v4_outbox.clone().unwrap();
+    outbox.lock().unwrap().clear();
+    let rounds = 3;
+    for _ in 0..rounds {
+        for h in &heights {
+            c.node_mut(1).handle_message(&format!("{}{h}", crate::dag::QC_WANT_PREFIX));
+        }
+    }
+    let answers = outbox
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|w| w.starts_with(crate::dag::QC_CERT_PREFIX))
+        .count();
+    // However the asks are spread over heights, one tick answers at most
+    // QC_ANSWERS_PER_TICK of them (and does answer).
+    assert!(answers > 0, "vacuous: nothing was answered");
+    assert!(
+        answers <= 4,
+        "{answers} answers to {} asks in one tick",
+        rounds * heights.len()
+    );
+}
+
+/// DOS-4: every copy of a staged body makes the node re-send its attestation
+/// (`resend_attestation`), and `V4Net::send` is a broadcast (gossip plus one
+/// fresh TCP connection per peer). No throttle: N copies from anyone, N
+/// broadcasts.
+#[test]
+fn dos_each_replayed_vertex_copy_triggers_an_attestation_broadcast() {
+    let mut c = Cluster::new("dos-reattest", &[91, 92, 93, 94], true);
+    c.run(6);
+    let author = c.node(1).v4.as_ref().unwrap();
+    let v = (1..40)
+        .filter_map(|r| author.own_proposal(r).cloned())
+        .find(|v| c.node(0).v4.as_ref().unwrap().is_staged(&v.hash))
+        .expect("a proposal of node 1 staged at node 0");
+    let wire = format!(
+        "{}{}",
+        crate::v4::WIRE_PREFIX,
+        serde_json::to_string(&crate::v4::Msg::Vertex(v)).unwrap()
+    );
+    let outbox = c.node(0).v4_outbox.clone().unwrap();
+    outbox.lock().unwrap().clear();
+    let copies = 50;
+    for _ in 0..copies {
+        c.node_mut(0).handle_message(&wire);
+    }
+    let attests = outbox
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|w| w.starts_with(&format!("{}{{\"Attest\"", crate::v4::WIRE_PREFIX)))
+        .count();
+    eprintln!("{copies} replayed copies of one staged body: {attests} attestation broadcasts");
+    assert!(attests <= 1, "{attests} attestation broadcasts for {copies} copies of one body");
+}
+
+// ------------------------------------------------ final review (ingress) regressions
+
+/// Byzantine node 3 (offline otherwise) signs a round-r vertex whose
+/// canonical body is `MAX_VERTEX_BYTES - margin` bytes, shows it to nodes 1
+/// and 2 only, and certifies it with them. Node 0 must pull it. Returns
+/// (node 0 height before, after; node 1 height before, after; still wanted).
+fn rev_withheld_body(tag: &str, seeds: [u8; 4], margin: usize) -> (u64, u64, u64, u64, bool) {
+    let mut c = Cluster::new(tag, &seeds, true);
+    c.run(4);
+    let offline = |from: usize, to: usize, _w: &str| from == 3 || to == 3;
+    let run3 = |c: &mut Cluster, ticks: usize| {
+        for _ in 0..ticks {
+            for i in 0..3 {
+                c.node_mut(i).try_create_vertex();
+            }
+            c.deliver_filtered(&offline);
+        }
+    };
+    run3(&mut c, 3);
+    let byz_addr = c.known[3].0.clone();
+    let r = c.node(1).v4.as_ref().unwrap().current_round();
+    let mut refs: Vec<blockchain::ParentRef> = Vec::new();
+    for (a, _) in &c.known {
+        if let Some(d) = c.node(1).v4.as_ref().unwrap().certified(r - 1, a) {
+            refs.push(blockchain::ParentRef {
+                round: r - 1,
+                author: a.clone(),
+                digest: d.to_string(),
+                proof: None,
+                cert: None,
+            });
+        }
+    }
+    refs.sort_by(|a, b| a.author.cmp(&b.author));
+    assert!(refs.len() >= 3, "no quorum at r-1");
+    let chain = crate::qc::expected_chain_id();
+    let key = crypto::SigningKey::from_bytes(&[seeds[3]; 32]);
+    let build = |pad: usize| {
+        let mut v = blockchain::Vertex {
+            epoch: 0,
+            round: r,
+            author: byz_addr.clone(),
+            parents: refs.iter().map(|x| x.digest.clone()).collect(),
+            parent_refs: refs.clone(),
+            payload: vec!["x".repeat(pad)],
+            timestamp: PINNED,
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
+        };
+        v.hash = v.hash_v4_with_domain(&chain, GENESIS_IDENTITY);
+        v.sign_with_ed25519(&key);
+        v
+    };
+    let base = serde_json::to_string(&build(0)).unwrap().len();
+    let v = build(crate::dag::MAX_VERTEX_BYTES - margin - base);
+    let canonical = serde_json::to_string(&v).unwrap().len();
+    assert_eq!(canonical, crate::dag::MAX_VERTEX_BYTES - margin);
+    let wire = format!(
+        "{}{}",
+        crate::v4::WIRE_PREFIX,
+        serde_json::to_string(&crate::v4::Msg::Vertex(v.clone())).unwrap()
+    );
+    c.node_mut(1).handle_message(&wire);
+    c.node_mut(2).handle_message(&wire);
+    assert!(c.node(1).v4.as_ref().unwrap().is_staged(&v.hash), "1 did not stage");
+    assert!(c.node(2).v4.as_ref().unwrap().is_staged(&v.hash), "2 did not stage");
+    // Nodes 1 and 2 attested it (deterministic BLS: forge_cert's signatures
+    // are the ones they produced); the Byzantine author aggregates.
+    let cert = forge_cert(&c, r, &byz_addr, &v.hash, &[seeds[1], seeds[2], seeds[3]]);
+    let cwire = format!(
+        "{}{}",
+        crate::v4::WIRE_PREFIX,
+        serde_json::to_string(&crate::v4::Msg::Cert(cert)).unwrap()
+    );
+    for i in 0..3 {
+        c.node_mut(i).handle_message(&cwire);
+    }
+    c.deliver_filtered(&offline);
+    let (h0, h1) = (c.node(0).latest_block_height, c.node(1).latest_block_height);
+    run3(&mut c, 30);
+    let wanted = c
+        .node(0)
+        .v4
+        .as_ref()
+        .unwrap()
+        .wanted_bodies()
+        .contains(&v.hash);
+    let top_qc = (1..=c.node(1).latest_block_height)
+        .filter(|h| c.qc(1, *h).is_some())
+        .max()
+        .unwrap_or(0);
+    eprintln!("REV-QC {tag}: node 1 highest QC'd height {top_qc} of {}", c.node(1).latest_block_height);
+    (
+        h0,
+        c.node(0).latest_block_height,
+        h1,
+        c.node(1).latest_block_height,
+        wanted,
+    )
+}
+
+/// Control: a large withheld body (MAX - 2000) is pulled and node 0 keeps up.
+#[test]
+fn rev_control_a_large_withheld_body_is_pulled() {
+    let (h0, h0b, h1, h1b, wanted) = rev_withheld_body("rev-body-ctl", [211, 212, 213, 214], 2000);
+    assert!(h1b > h1, "vacuous: nodes 1/2 placed nothing ({h1} -> {h1b})");
+    assert!(!wanted, "control: body still wanted");
+    assert!(h0b > h0 + 3, "control: node 0 stalled ({h0} -> {h0b})");
+}
+
+/// REVIEW PoC: a withheld body within ~90 bytes of MAX_VERTEX_BYTES is
+/// served (MAX_RESP_BYTES = 900 KiB) but every RESP carrying it exceeds the
+/// node's pre-parse cap (MAX_VERTEX_BYTES + 11), so node 0 can never pull it
+/// and stops ordering for good.
+#[test]
+fn rev_a_near_max_withheld_body_can_never_be_pulled() {
+    let (h0, h0b, h1, h1b, wanted) = rev_withheld_body("rev-body-max", [221, 222, 223, 224], 20);
+    assert!(h1b > h1, "vacuous: nodes 1/2 placed nothing ({h1} -> {h1b})");
+    assert!(
+        h0b + 1 >= h1b && !wanted,
+        "node0 height {h0} -> {h0b}; node1 {h1} -> {h1b}; body still wanted by node 0: {wanted}"
+    );
+}
+
+// ---------------------------------------- final review (test quality): kill tests
+
+/// KILL(M55), DE-7 after an epoch change: the node's own decisions in E+1
+/// (leader and reward recipient) use C_{E+1}'s stakes, not C_E's. The
+/// existing stake-change witness checks only the engine's stake table.
+#[test]
+fn kill_m55_blocks_of_the_next_epoch_are_led_by_its_committee() {
+    let mut c = Cluster::with_interval("kill-m55", &[95, 96, 97, 98], true, 4);
+    fn reweigh(_: u8, view: &StateDB) -> Result<(), String> {
+        let raw = view
+            .get("genesis:validator_set:v1")
+            .map_err(|e| e.to_string())?
+            .unwrap();
+        let mut set: Vec<ValidatorInfo> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        set = crate::qc::canonical_order(&set);
+        set[0].stake = 10_000;
+        view.put("sys:validator_set:v1", &serde_json::to_string(&set).unwrap())
+            .map_err(|e| e.to_string())
+    }
+    for i in 0..4 {
+        c.node_mut(i).pre_execution_hook = Some(reweigh);
+    }
+    c.run_until(300, |c| (0..4).all(|i| c.epoch(i) >= 1 && c.node(i).latest_block_height >= 12));
+    let top = c.assert_same_blocks(12);
+    let start = crate::v4::epoch::read_start_from(&c.node(0).storage, 1).unwrap().unwrap();
+    let c1: Vec<(String, u64)> = start.committee.iter().map(|m| (m.address.clone(), m.stake)).collect();
+    let c0: Vec<(String, u64)> = crate::qc::canonical_order(&c.committee)
+        .iter()
+        .map(|m| (m.address.clone(), m.stake))
+        .collect();
+    let mut differs = 0;
+    for h in 5..=top.min(8) {
+        let b: blockchain::Block =
+            serde_json::from_str(&c.node(0).storage.get(&format!("block_{h}")).unwrap().unwrap()).unwrap();
+        let want = crate::ordering::OrderingEngine::leader_for_round(b.header.round, &c1, 0);
+        if want != crate::ordering::OrderingEngine::leader_for_round(b.header.round, &c0, 0) {
+            differs += 1;
+        }
+        assert_eq!(b.header.proposer_id, want, "block {h} (round {}) led by the wrong committee", b.header.round);
+    }
+    assert!(differs > 0, "vacuous: C_0 and C_1 elect the same leaders here");
 }

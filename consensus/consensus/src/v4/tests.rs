@@ -112,6 +112,8 @@ struct Cluster {
     held: Vec<Envelope>,
     /// Blocks per epoch (0: one epoch forever).
     epoch_interval: u64,
+    /// Every engine's wall clock (seconds); NOW unless a test moves it.
+    clock: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Cluster {
@@ -141,6 +143,7 @@ impl Cluster {
             q: Rc::new(RefCell::new(VecDeque::new())),
             held: Vec::new(),
             epoch_interval: interval,
+            clock: Arc::new(std::sync::atomic::AtomicU64::new(NOW)),
         };
         for i in 0..cluster.members.len() {
             cluster.open(i, true);
@@ -159,7 +162,9 @@ impl Cluster {
             b_auth: staging::B_AUTH,
             epoch_interval: self.epoch_interval,
         };
-        self.engines[i] = Some(Engine::open(storage, cfg, genesis_init, Arc::new(|| NOW)).unwrap());
+        let clock = Arc::clone(&self.clock);
+        let now = Arc::new(move || clock.load(AtomicOrdering::SeqCst));
+        self.engines[i] = Some(Engine::open(storage, cfg, genesis_init, now).unwrap());
     }
 
     /// Close and reopen node `i` on its database (a crash between messages).
@@ -572,10 +577,12 @@ fn v4_cert_conflict_halts_ordering() {
     }
 }
 
-/// Twin flood: an equivocating leader sends both twins to everyone. The
-/// honest producers' next vertices cite one certified digest per author, so
-/// they pass the stateless parent gate (C1) and no plan commits the other
-/// twin.
+/// Twin flood: an equivocating leader sends both twins to everyone, B first,
+/// and (being Byzantine) aggregates the honest attestations of B into a
+/// certificate. The honest producers' next vertices cite exactly one digest
+/// for the leader's slot, the certified one, so they pass the stateless
+/// parent gate (C1); no node ever cites or commits A. (Final review: the old
+/// version certified neither twin, so its checks held trivially.)
 #[test]
 fn a_twin_flood_leaves_every_next_vertex_citing_one_digest_per_author() {
     let mut c = Cluster::new("flood", 4, 0);
@@ -590,22 +597,39 @@ fn a_twin_flood_leaves_every_next_vertex_citing_one_digest_per_author() {
         msg: Msg::Vertex(b.clone()),
     });
     c.deliver(&|_, _| false);
+    let honest: Vec<usize> = c.validators().filter(|&i| i != byz).collect();
+    let mut signers = vec![byz];
+    signers.extend(&honest);
+    let cert_b = forged_cert(&c, 2, &a.author, &b.hash, &signers);
+    c.q.borrow_mut().push_back(Envelope {
+        from: c.members[byz].info.address.clone(),
+        to: To::All,
+        msg: Msg::Cert(cert_b),
+    });
+    c.deliver(&|_, _| false);
+    for &i in &honest {
+        assert_eq!(
+            c.engine(i).certified(2, &a.author),
+            Some(b.hash.as_str()),
+            "vacuous: node {i} does not hold B's certificate"
+        );
+    }
     c.run(8);
     let stakes: Vec<(String, u64)> = c
         .committee
         .iter()
         .map(|m| (m.address.clone(), m.stake))
         .collect();
-    for i in c.validators().filter(|&i| i != byz) {
+    for &i in &honest {
         let v = c.engine(i).own_proposal(3).expect("round 3 proposed");
         qc::parent_refs_admissible(v, &stakes).unwrap();
-        assert!(!v.parents.contains(&b.hash) || !v.parents.contains(&a.hash));
+        assert!(v.parents.contains(&b.hash), "node {i} does not cite the certified twin");
+        assert!(!v.parents.contains(&a.hash), "node {i} cites the uncertified twin");
     }
     c.assert_agree_except(Some(byz));
-    for i in c.validators().filter(|&i| i != byz) {
+    for &i in &honest {
         let d = c.anchor(i, 2).map(|x| x.1.clone());
-        let certified = c.engine(i).certified(2, &a.author).map(str::to_string);
-        assert_eq!(d, certified, "node {i}: the decision is the certified twin");
+        assert_eq!(d.as_deref(), Some(b.hash.as_str()), "node {i}: anchor 2 is B");
         assert!(
             c.decisions[i].iter().any(|d| d.0 > 2),
             "node {i} made no progress"
@@ -1902,13 +1926,13 @@ fn stale_and_wrong_sentinel_vertices_change_nothing_after_a_boundary() {
     let (epoch, first) = epoch_of(&c, 0);
     assert!(epoch >= 1);
     let m = &c.members[1];
-    let mk = |epoch: u64, round: u64, parents: Vec<String>| {
+    let mk = |epoch: u64, round: u64, parents: Vec<String>, refs: Vec<ParentRef>| {
         let mut v = Vertex {
             epoch,
             round,
             author: m.info.address.clone(),
             parents,
-            parent_refs: vec![],
+            parent_refs: refs,
             payload: vec!["x".into()],
             timestamp: NOW,
             hash: String::new(),
@@ -1921,8 +1945,28 @@ fn stale_and_wrong_sentinel_vertices_change_nothing_after_a_boundary() {
         v.sign_with_ed25519(&crypto::SigningKey::from_bytes(&m.node_key));
         v
     };
-    let stale = mk(epoch - 1, first, vec!["genesis".into()]);
-    let wrong = mk(epoch, first, vec!["f".repeat(64)]);
+    // An epoch-(E−1) vertex at E's first round, well formed: it cites a
+    // quorum of round r−1 parents, so Layer S under E−1's record accepts it
+    // and only EP-5's STALE rule can refuse it (final review: the old copy
+    // was malformed and refused by Layer S instead).
+    let refs: Vec<ParentRef> = (0..3)
+        .map(|k| ParentRef {
+            round: first - 1,
+            author: c.members[k].info.address.clone(),
+            digest: format!("{:064x}", k + 1),
+            proof: None,
+            cert: None,
+        })
+        .collect();
+    let parents: Vec<String> = refs.iter().map(|r| r.digest.clone()).collect();
+    let stale = mk(epoch - 1, first, parents, refs);
+    {
+        let e = c.engine(0);
+        let previous = e.previous_record().expect("E−1's record is held");
+        ingress_v4::layer_s(&stale, &previous, CHAIN, GENESIS)
+            .expect("vacuous: the stale vertex fails Layer S");
+    }
+    let wrong = mk(epoch, first, vec!["f".repeat(64)], vec![]);
     let before = lock(&c.engine(0).round_index).clone();
     c.receive(0, Msg::Vertex(stale.clone()));
     c.receive(0, Msg::Vertex(wrong.clone()));
@@ -1977,6 +2021,12 @@ fn a_wiped_guard_database_abstains_until_the_next_epoch() {
         c.engine(0).own.keys().all(|r| *r < 3),
         "node 0 proposed while abstaining"
     );
+    // Time passes beyond the resume point (boot + the skew margin): the
+    // next boundary opens an epoch that began after the guards were lost.
+    c.clock.store(
+        NOW + 3 * ingress_v4::MAX_FUTURE_DRIFT_SECS,
+        AtomicOrdering::SeqCst,
+    );
     c.run(30);
     let (e, first) = epoch_of(&c, 0);
     assert!(e > e0, "no activation happened");
@@ -2005,6 +2055,12 @@ fn a_guard_database_of_another_key_abstains_until_the_next_epoch() {
     assert!(
         c.engine(0).own.keys().all(|r| *r < 3),
         "node 0 proposed under another key's guards"
+    );
+    // Time passes beyond the resume point (boot + the skew margin): the
+    // next boundary opens an epoch that began after the guards were lost.
+    c.clock.store(
+        NOW + 3 * ingress_v4::MAX_FUTURE_DRIFT_SECS,
+        AtomicOrdering::SeqCst,
     );
     c.run(30);
     let (e, first) = epoch_of(&c, 0);
@@ -2269,6 +2325,7 @@ fn an_epoch_record_is_written_once() {
         anchor: "aa",
         block_hash: "bb",
         height: 4,
+        timestamp: NOW,
     };
     let (start, invalid) = epoch::next_start(CHAIN, GENESIS, &boundary, &c.committee);
     assert!(invalid.is_none());
@@ -2279,4 +2336,887 @@ fn an_epoch_record_is_written_once() {
     let err = epoch::write_next(db, &other, None).unwrap_err();
     assert!(err.contains(crate::ordering::DECISION_CONFLICT), "{err}");
     assert_eq!(epoch::read_start_from(db, 1).unwrap(), Some(start));
+}
+
+// ------------------------------------------------ final review (ingress)
+
+/// Node 0's own attestation row for (epoch, round, author, digest), if any.
+fn rev_own_attestation(
+    c: &Cluster,
+    i: usize,
+    epoch: u64,
+    round: u64,
+    author: &str,
+    digest: &str,
+) -> Option<VertexAttestation> {
+    let body = AttestBody {
+        chain_id: CHAIN.into(),
+        genesis_identity: GENESIS.into(),
+        epoch,
+        round,
+        author: author.to_string(),
+        digest: digest.to_string(),
+        committee_hash: qc::validator_set_hash(&c.engine(i).cfg.committee),
+    };
+    c.engine(i).read_own_attestation(&body).unwrap()
+}
+
+/// RC-3 (final review, HIGH): a validator whose database is wiped in epoch 1
+/// and that re-syncs from genesis must NOT be re-armed by the activations it
+/// performs while catching up: epoch 1 began before the wipe, and the key
+/// already signed in it. (It was, and a Byzantine author then got a second
+/// attestation from the honest key for a slot it had attested.)
+#[test]
+fn a_resyncing_wiped_validator_is_not_rearmed_in_an_epoch_it_signed_in() {
+    let mut c = Cluster::with_epochs("rev-wipe-resync", 4, 0, 10);
+    // Everyone in epoch 1, a few rounds in.
+    c.run_until(120, |c| {
+        c.validators().all(|i| epoch_of(c, i).0 == 1)
+            && c.engine(1).current_round() > c.engine(1).first_round + 2
+    });
+    assert!(c.validators().all(|i| epoch_of(&c, i).0 == 1), "no epoch 1");
+    let byz = 3usize;
+    let byz_addr = c.members[byz].info.address.clone();
+    let byz_key = c.members[byz].node_key;
+    // Byzantine node 3 shows its next vertex V to node 0 only.
+    c.tick_all();
+    let (r, v) = {
+        let e = c.engine(byz);
+        let (r, v) = e
+            .own
+            .iter()
+            .next_back()
+            .map(|(r, v)| (*r, v.clone()))
+            .unwrap();
+        (r, v)
+    };
+    assert_eq!(v.epoch, 1);
+    let vh = v.hash.clone();
+    let hide_v =
+        move |e: &Envelope, to: usize| matches!(&e.msg, Msg::Vertex(x) if x.hash == vh) && to != 0;
+    c.deliver(&hide_v);
+    c.held.clear();
+    for _ in 0..3 {
+        c.tick_all();
+        c.deliver(&hide_v);
+        c.held.clear();
+    }
+    let before = rev_own_attestation(&c, 0, 1, r, &byz_addr, &v.hash)
+        .expect("node 0 attested V before the wipe");
+    assert!(c.engine(1).certified(r, &byz_addr).is_none());
+
+    // Wipe node 0's database; restart without the init flag (correct ops).
+    c.engines[0] = None;
+    c.dirs[0] = TempDb::new("rev-wiped-0");
+    c.open(0, false);
+    assert!(!c.engine(0).guards_continuous, "RC-3 should abstain");
+    assert_eq!(epoch_of(&c, 0).0, 0);
+
+    // Node 0 catches up epoch 0 from the others' closed tail (only node 0
+    // ticks, so the others stay in epoch 1). An epoch-1 vertex is its cue.
+    let cue = c.engine(1).own.values().next_back().cloned().unwrap();
+    c.receive(0, Msg::Vertex(cue));
+    let vh2 = v.hash.clone();
+    let hide_all =
+        move |e: &Envelope, _to: usize| matches!(&e.msg, Msg::Vertex(x) if x.hash == vh2);
+    for _ in 0..200 {
+        if epoch_of(&c, 0).0 == 1 {
+            break;
+        }
+        c.tick(0);
+        c.deliver(&hide_all);
+        c.held.clear();
+    }
+    assert_eq!(epoch_of(&c, 0).0, 1, "node 0 never activated epoch 1");
+    assert!(
+        !c.engine(0).guards_continuous,
+        "re-armed inside an epoch that began before the wipe"
+    );
+    // The Byzantine author shows node 0 a twin of V for the same slot.
+    let twin = twin_of(&v, &byz_key, "rev-twin");
+    c.receive(0, Msg::Vertex(twin.clone()));
+    assert!(
+        rev_own_attestation(&c, 0, 1, r, &byz_addr, &twin.hash).is_none(),
+        "the honest key attested a second digest for slot (1, {r})"
+    );
+    let _ = before;
+}
+
+// ------------------------------------------------ final review (dos) regressions
+
+/// The node transport's size check (dag.rs handle_message): a `DAG_V4:`
+/// message whose JSON exceeds MAX_VERTEX_BYTES + WRAP is dropped before
+/// parsing, whatever its kind.
+fn dos_node_wire_accepts(msg: &Msg) -> bool {
+    const WRAP: usize = r#"{"Vertex":}"#.len();
+    serde_json::to_string(msg).is_ok_and(|c| c.len() <= crate::dag::MAX_VERTEX_BYTES + WRAP)
+}
+
+/// One tick where every validator proposes `payload_bytes` of payload, then a
+/// delivery that (optionally) applies the node's wire bound and isolates
+/// `cut`.
+fn dos_tick(c: &mut Cluster, payload_bytes: usize, wire: bool, cut: Option<usize>) {
+    for i in c.validators() {
+        let net = c.net(i);
+        let payload = if payload_bytes == 0 {
+            vec![]
+        } else {
+            vec![format!("{i}{}", "x".repeat(payload_bytes))]
+        };
+        c.engines[i].as_mut().unwrap().on_tick(payload, &net);
+        c.collect(i);
+    }
+    let cut_addr = cut.map(|k| c.members[k].info.address.clone());
+    let dropped = Cell::new(0usize);
+    c.deliver_map(&|e, to| {
+        if let (Some(k), Some(a)) = (cut, cut_addr.as_ref()) {
+            if to == k || e.from == *a {
+                return None;
+            }
+        }
+        if wire && !dos_node_wire_accepts(&e.msg) {
+            dropped.set(dropped.get() + 1);
+            return None;
+        }
+        Some(e.msg.clone())
+    });
+}
+
+/// DOS-1: `serve` packs up to MAX_RESP_BYTES (900 KiB) of bodies, but every
+/// node drops a `DAG_V4:` message over MAX_VERTEX_BYTES + 11 (768 KiB) before
+/// parsing it. A lagging node whose wanted bodies of one batch exceed 768 KiB
+/// never receives them; its wants retry in lockstep (same due tick, same
+/// rotation), so the same oversize answer is produced forever.
+#[test]
+fn dos_a_pull_answer_over_the_node_wire_bound_never_arrives() {
+    const PAYLOAD: usize = 60 * 1024;
+    let run = |wire: bool| -> (usize, usize, usize) {
+        let mut c = Cluster::new(if wire { "dos-wire-f" } else { "dos-wire-c" }, 4, 0);
+        for _ in 0..2 {
+            dos_tick(&mut c, PAYLOAD, wire, None);
+        }
+        for _ in 0..8 {
+            dos_tick(&mut c, PAYLOAD, wire, Some(0));
+        }
+        let ahead = c.decisions[1].len();
+        for _ in 0..40 {
+            dos_tick(&mut c, PAYLOAD, wire, None);
+        }
+        (c.decisions[0].len(), ahead, c.engine(0).wanted_bodies().len())
+    };
+    let (d0, ahead, _) = run(false);
+    assert!(d0 > ahead, "control: without the wire bound node 0 catches up ({d0} vs {ahead})");
+    let (d0, ahead, wants) = run(true);
+    assert!(
+        d0 > ahead,
+        "with the node's wire bound node 0 never catches up: {d0} decisions vs {ahead} before \
+         the rejoin, {wants} bodies still wanted after 40 ticks"
+    );
+}
+
+/// DOS-1 at the byte level: one ordinary answer to one request is over the
+/// node's bound.
+#[test]
+fn dos_one_serve_answer_exceeds_the_node_wire_bound() {
+    let mut c = Cluster::new("dos-wire-unit", 4, 0);
+    for _ in 0..6 {
+        dos_tick(&mut c, 60 * 1024, false, None);
+    }
+    let digests: Vec<String> = lock(&c.engine(1).dag).keys().take(32).cloned().collect();
+    let resp = c.engine(1).serve(&pull::Request::Vertices(digests.clone()));
+    let n = match &resp {
+        pull::Response::Vertices { bodies, .. } => bodies.len(),
+        _ => 0,
+    };
+    let msg = Msg::Resp {
+        to: c.members[0].info.address.clone(),
+        resp,
+    };
+    let len = serde_json::to_string(&msg).unwrap().len();
+    eprintln!("answer with {n} bodies of {} asked: {len} bytes, bound {}", digests.len(), crate::dag::MAX_VERTEX_BYTES + 11);
+    assert!(dos_node_wire_accepts(&msg), "serve built a {len}-byte answer the node transport drops");
+}
+
+/// Deliver until quiet, pass by pass. In each pass the requests of one sender
+/// to one target are delivered highest `seq` first: what the node transport
+/// (one spawned TCP connection per message plus gossip) does at random, and
+/// what any gossip peer can force by racing a sender's last request of a tick
+/// to its target. `cut` isolates a node.
+fn dos_deliver_reordered(c: &mut Cluster, reorder: bool, cut: Option<usize>) -> (usize, usize) {
+    let (mut sent, mut answered) = (0usize, 0usize);
+    let cut_addr = cut.map(|k| c.members[k].info.address.clone());
+    loop {
+        let mut pass: Vec<Envelope> = c.q.borrow_mut().drain(..).collect();
+        if pass.is_empty() {
+            break;
+        }
+        if reorder {
+            pass.sort_by_key(|e| match &e.msg {
+                Msg::Req(r) => (1u8, r.from.clone(), r.to.clone(), u64::MAX - r.seq),
+                _ => (0u8, String::new(), String::new(), 0),
+            });
+        }
+        for env in pass {
+            let receivers: Vec<usize> = match &env.to {
+                To::All => (0..c.members.len())
+                    .filter(|&i| c.members[i].info.address != env.from)
+                    .collect(),
+                To::One(a) => vec![c.index_of(a)],
+            };
+            for i in receivers {
+                if let (Some(k), Some(a)) = (cut, cut_addr.as_ref()) {
+                    if i == k || env.from == *a {
+                        continue;
+                    }
+                }
+                if let Msg::Req(r) = &env.msg {
+                    if r.from == c.members[0].info.address {
+                        sent += 1;
+                    }
+                }
+                let before = c.q.borrow().len();
+                c.receive(i, env.msg.clone());
+                if let Msg::Req(r) = &env.msg {
+                    if r.from == c.members[0].info.address {
+                        answered += c.q.borrow().iter().skip(before).filter(|e| matches!(e.msg, Msg::Resp { .. })).count();
+                    }
+                }
+            }
+        }
+    }
+    (sent, answered)
+}
+
+/// DOS-2: RE-6's strictly increasing `seq` drops every request of a sender
+/// that arrives after a later one. A lagging node sends its whole gap in one
+/// tick, many requests per target; delivered out of order, all but the last
+/// are dropped as replays (the budget charged nothing, but nothing is
+/// answered), the dropped wants back off in lockstep, and the catch-up falls
+/// behind the chain.
+#[test]
+fn dos_reordered_requests_are_dropped_as_replays() {
+    let run = |reorder: bool| -> (usize, usize, usize, usize) {
+        let mut c = Cluster::new(if reorder { "dos-seq-r" } else { "dos-seq-f" }, 4, 0);
+        c.run(2);
+        for _ in 0..40 {
+            c.tick_all();
+            dos_deliver_reordered(&mut c, false, Some(0));
+        }
+        let ahead = c.decisions[1].len();
+        let (mut sent, mut answered) = (0, 0);
+        for _ in 0..30 {
+            c.tick_all();
+            let (s, a) = dos_deliver_reordered(&mut c, reorder, None);
+            sent += s;
+            answered += a;
+        }
+        (c.decisions[0].len(), ahead, sent, answered)
+    };
+    let (d0, ahead, sent, answered) = run(false);
+    eprintln!("in order: node 0 {d0} decisions (others had {ahead}), {answered}/{sent} requests answered");
+    assert!(d0 > ahead, "control: in order node 0 catches up");
+    let (d0, ahead, sent, answered) = run(true);
+    eprintln!("reordered: node 0 {d0} decisions (others had {ahead}), {answered}/{sent} requests answered");
+    assert!(d0 > ahead, "reordered: node 0 never caught up ({d0} vs {ahead}); {answered}/{sent} answered");
+}
+
+
+/// DOS-5: an unsolicited `Resp` (anyone can send one: it is not signed and
+/// not matched to a request) carrying certificates this node ALREADY holds
+/// costs one full BLS aggregate verification per certificate: `on_response`
+/// takes every certificate (no cap, no want check) and `on_cert` verifies
+/// before looking at the index. One message under the node's 768 KiB bound
+/// carries ~1,000 of them.
+#[test]
+fn dos_an_unsolicited_answer_of_held_certificates_costs_a_pairing_each() {
+    // (Deterministic since the fix: a timing assertion failed under load.)
+    let mut c = Cluster::new("dos-cert-replay", 4, 0);
+    c.run(30);
+    let cert = c.engine(0).certs.values().next().cloned().unwrap();
+    let slot = (cert.body.round, cert.body.author.clone());
+    // Unheld and unwanted: an unsolicited answer carrying it is ignored.
+    c.engines[0].as_mut().unwrap().certs.remove(&slot);
+    let me = c.members[0].info.address.clone();
+    let answer = |cert: &VertexCertificate| Msg::Resp {
+        to: me.clone(),
+        resp: pull::Response::Certs {
+            certs: vec![cert.clone()],
+            unknown: vec![],
+        },
+    };
+    let msg = answer(&cert);
+    c.receive(0, msg);
+    assert!(
+        !c.engine(0).certs.contains_key(&slot),
+        "an unsolicited certificate was taken"
+    );
+    // Wanted: the same answer is taken (the control).
+    c.engines[0]
+        .as_mut()
+        .unwrap()
+        .want_cert(slot.0, &slot.1);
+    let msg = answer(&cert);
+    c.receive(0, msg);
+    assert!(
+        c.engine(0).certs.contains_key(&slot),
+        "vacuous: a wanted certificate was not taken"
+    );
+}
+
+/// DOS-6: one Byzantine member's signed E+1 vertex (verdict `Ahead`) makes
+/// every honest node want every author's certificate for 257 rounds, each
+/// want holding its own copy of the n−1 member addresses; all of them are
+/// due at once, to the same first target. Measured at n = 64.
+#[test]
+fn dos_one_ahead_vertex_creates_n_squared_want_state_and_a_request_burst() {
+    let n: u8 = 64;
+    let mut members: Vec<Member> = (1..=n).map(member).collect();
+    members.sort_by(|a, b| a.info.address.cmp(&b.info.address));
+    let committee: Vec<ValidatorInfo> = members.iter().map(|m| m.info.clone()).collect();
+    let db = TempDb::new("dos-ahead");
+    let storage = Arc::new(StateDB::open(db.0.to_str().unwrap()).unwrap());
+    let cfg = Config {
+        chain_id: CHAIN.into(),
+        genesis_identity: GENESIS.into(),
+        committee: committee.clone(),
+        node_key: members[0].node_key,
+        address: members[0].info.address.clone(),
+        b_auth: staging::B_AUTH,
+        epoch_interval: 0,
+    };
+    let mut engine = Engine::open(storage, cfg, true, Arc::new(|| NOW)).unwrap();
+    let byz = &members[1];
+    let mut v = Vertex {
+        epoch: 1,
+        round: 1_000_000,
+        author: byz.info.address.clone(),
+        parents: vec!["a".repeat(64)],
+        parent_refs: vec![],
+        payload: vec![],
+        timestamp: NOW,
+        hash: String::new(),
+        signature: String::new(),
+        aggregated_signature: None,
+        payload_root: None,
+        parents_root: None,
+    };
+    v.hash = v.hash_v4_with_domain(CHAIN, GENESIS);
+    v.sign_with_ed25519(&crypto::SigningKey::from_bytes(&byz.node_key));
+    let q: Queue = Rc::new(RefCell::new(VecDeque::new()));
+    let net = Net {
+        from: members[0].info.address.clone(),
+        q: Rc::clone(&q),
+    };
+    let len = serde_json::to_string(&v).unwrap().len();
+    engine.on_message(len, Msg::Vertex(v), &net);
+    let wants = engine.cert_wants.len();
+    let target_strings = wants * (n as usize - 1);
+    let t = std::time::Instant::now();
+    engine.tick(&net);
+    let tick_time = t.elapsed();
+    let reqs: Vec<String> = q
+        .borrow()
+        .iter()
+        .filter_map(|e| match (&e.msg, &e.to) {
+            (Msg::Req(_), To::One(to)) => Some(to.clone()),
+            _ => None,
+        })
+        .collect();
+    let distinct: HashSet<&String> = reqs.iter().collect();
+    eprintln!(
+        "n={n}: one Ahead vertex -> {wants} certificate wants holding {target_strings} address strings \
+         (~{} MiB), first tick {tick_time:?}: {} signed requests to {} target(s); each request is a \
+         broadcast to n-1 peers in the node",
+        target_strings * 88 / (1 << 20),
+        reqs.len(),
+        distinct.len()
+    );
+    // The wants share one peer list (memory is per want, not per want and
+    // peer), the first tick sends a paced batch, not a burst, and the
+    // rotation spreads it over several peers.
+    assert!(wants > 0, "vacuous: the Ahead vertex made no wants");
+    assert!(
+        reqs.len() <= pull::CLIENT_REQS_PER_TICK,
+        "{} requests in one tick",
+        reqs.len()
+    );
+    assert!(distinct.len() > 1, "every request went to one peer");
+}
+
+/// DOS-7: `early_certs` (EP-5) has no dedup. Replays of ONE valid E+1
+/// certificate (public: it was gossiped) fill the 4096 cap, every copy costing
+/// a pairing now and again at activation, and every genuine early certificate
+/// after that is dropped.
+#[test]
+fn dos_replays_of_one_early_certificate_fill_the_cap_and_drop_the_rest() {
+    let mut c = Cluster::with_epochs("dos-early", 4, 0, 4);
+    c.run_until(80, |c| {
+        (0..4).all(|i| epoch_of(c, i).0 == 1)
+            && c.engine(1).certs.values().filter(|k| k.body.epoch == 1).count() >= 2
+    });
+    let mut e1: Vec<VertexCertificate> = c
+        .engine(1)
+        .certs
+        .values()
+        .filter(|k| k.body.epoch == 1)
+        .cloned()
+        .collect();
+    e1.sort_by_key(|k| (k.body.round, k.body.author.clone()));
+    assert!(e1.len() >= 2, "vacuous: no epoch-1 certificates");
+    // Node 0 closed epoch 0 but has not activated epoch 1 (a host waiting for QC(H_0)).
+    c.engine(0).storage.delete(epoch::EPOCH_ACTIVE_KEY).unwrap();
+    c.epoch_interval = 0;
+    c.reopen(0);
+    assert_eq!(epoch_of(&c, 0).0, 0);
+    assert!(c.engine(0).next_start().is_some());
+    for _ in 0..5000 {
+        c.receive(0, Msg::Cert(e1[0].clone()));
+    }
+    c.receive(0, Msg::Cert(e1[1].clone()));
+    let kept = c.engine(0).early_certs.len();
+    let distinct: HashSet<(u64, String)> = c
+        .engine(0)
+        .early_certs
+        .iter()
+        .map(|k| (k.body.round, k.body.author.clone()))
+        .collect();
+    eprintln!("{kept} early certificates kept, {} distinct", distinct.len());
+    assert!(
+        distinct.contains(&(e1[1].body.round, e1[1].body.author.clone())),
+        "a genuine early certificate was dropped: {kept} kept, {} distinct",
+        distinct.len()
+    );
+}
+
+// ---------------------------------------- final review (test quality): kill tests
+
+// ------------------------------------------------ review probes (rev_tests)
+
+
+
+
+
+// ------------------------------------------- review kill tests (rev_tests)
+
+/// KILL(M01), AT-1/IN-1 E4: an honest node never stages or attests a vertex
+/// whose parent ref names a digest other than the slot's certified one, even
+/// though it holds a certificate for that slot. A Byzantine author's round-3
+/// vertex cites its own uncertified round-2 twin B while A is certified.
+#[test]
+fn kill_m01_a_ref_to_an_uncertified_twin_is_never_attested() {
+    let mut c = Cluster::new("kill-m01", 4, 0);
+    c.run(1);
+    let byz = c.leader(2);
+    c.tick_all();
+    c.deliver(&|_, _| false);
+    let a = c.engine(byz).own_proposal(2).unwrap().clone();
+    let b = twin_of(&a, &c.members[byz].node_key, "twin-b");
+    let honest: Vec<usize> = c.validators().filter(|&i| i != byz).collect();
+    let h = honest[0];
+    assert_eq!(
+        c.engine(h).certified(2, &a.author),
+        Some(a.hash.as_str()),
+        "vacuous: A is not certified at h"
+    );
+    let mut refs: Vec<ParentRef> = Vec::new();
+    for m in &c.committee {
+        let cert = c
+            .engine(h)
+            .certs
+            .get(&(2, m.address.clone()))
+            .expect("vacuous: round 2 is not certified")
+            .clone();
+        let twin = m.address == a.author;
+        refs.push(ParentRef {
+            round: 2,
+            author: m.address.clone(),
+            digest: if twin { b.hash.clone() } else { cert.body.digest.clone() },
+            proof: None,
+            cert: if twin { None } else { Some(cert.compact()) },
+        });
+    }
+    let mut w = Vertex {
+        epoch: EPOCH,
+        round: 3,
+        author: a.author.clone(),
+        parents: refs.iter().map(|r| r.digest.clone()).collect(),
+        parent_refs: refs,
+        payload: vec![],
+        timestamp: NOW,
+        hash: String::new(),
+        signature: String::new(),
+        aggregated_signature: None,
+        payload_root: None,
+        parents_root: None,
+    };
+    w.hash = w.hash_v4_with_domain(CHAIN, GENESIS);
+    w.sign_with_ed25519(&crypto::SigningKey::from_bytes(&c.members[byz].node_key));
+    for &i in &honest {
+        c.receive(i, Msg::Vertex(w.clone()));
+    }
+    let attested = c
+        .q
+        .borrow()
+        .iter()
+        .filter(|e| matches!(&e.msg, Msg::Attest(att) if att.body.digest == w.hash))
+        .count();
+    assert_eq!(attested, 0, "an honest node attested a vertex citing an uncertified twin");
+    for &i in &honest {
+        assert!(!c.engine(i).is_staged(&w.hash), "node {i} staged it");
+    }
+}
+
+/// KILL(M60), GC-3: GC deletes a node's attestation guards only at or below
+/// g − RETAIN_SLACK; every guard above the cut survives (the existing guard
+/// witness is masked by the slot's certificate, which also refuses a twin).
+#[test]
+fn kill_m60_guards_above_the_cut_survive_gc() {
+    let mut c = Cluster::new("kill-m60", 4, 0);
+    c.run(130);
+    let e0 = c.engine(0);
+    let g = e0.floor();
+    assert!(g > staging::RETAIN_SLACK + 2, "vacuous: g = {g}");
+    let cut = g - staging::RETAIN_SLACK;
+    let author = c.members[1].info.address.clone();
+    let mut checked = 0;
+    for r in (cut + 1)..=g {
+        if let Some(v) = c.engine(1).own_proposal(r) {
+            let body = e0.attest_body(r, &author, &v.hash);
+            assert!(
+                e0.read_own_attestation(&body).unwrap().is_some(),
+                "node 0's guard for round {r} (cut {cut}) is gone"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 10, "vacuous: {checked} guards checked");
+}
+
+/// KILL(M60), the unmasked guard witness: node 0 attested X at a round above
+/// g (so ingress does not refuse it as STALE) before the last GC, and does not
+/// hold X's certificate. A twin of X must still be refused by the guard alone.
+#[test]
+fn kill_m60_a_twin_above_the_cut_is_refused_by_the_guard_alone() {
+    let mut c = Cluster::new("kill-m60b", 4, 0);
+    c.run(130);
+    let g = c.engine(0).floor();
+    let author = c.members[1].info.address.clone();
+    let r = (g + 1..=g + 10)
+        .find(|r| c.engine(1).own_proposal(*r).is_some())
+        .expect("a round above g");
+    let x = c.engine(1).own_proposal(r).unwrap().clone();
+    // Simulate "the certificate never reached node 0": drop it from node 0's
+    // index (as a node that attested X and then lost every copy of the
+    // certificate would be); the guard row must still refuse the twin.
+    c.engines[0].as_mut().unwrap().certs.remove(&(r, author.clone()));
+    let twin = twin_of(&x, &c.members[1].node_key, "late-twin");
+    c.receive(0, Msg::Vertex(twin.clone()));
+    let signed = c
+        .q
+        .borrow()
+        .iter()
+        .filter(|e| matches!(&e.msg, Msg::Attest(att) if att.body.digest == twin.hash))
+        .count();
+    assert_eq!(signed, 0, "a twin above the cut was attested after GC");
+}
+
+
+/// KILL(M12..M15), EP-2 clause by clause: each malformed proposal alone is
+/// refused (so it carries C_E over), and zero-stake entries are dropped.
+#[test]
+fn kill_ep2_each_committee_clause_is_enforced() {
+    let good: Vec<ValidatorInfo> = (1..=4).map(|s| member(s).info).collect();
+    assert!(epoch::validate_committee(&good).is_ok(), "vacuous: the base set fails");
+    // M12: one address twice.
+    let mut dup = good.clone();
+    dup.push(good[0].clone());
+    assert!(epoch::validate_committee(&dup).is_err(), "a duplicated member was admitted");
+    // M13: an Ed25519 key that does not derive its address (the BLS key and
+    // PoP are the member's own, so only the derivation clause can refuse it).
+    let mut swapped = good.clone();
+    swapped[1].ed25519_public_key = good[2].ed25519_public_key.clone();
+    assert!(epoch::validate_committee(&swapped).is_err(), "a non-deriving key was admitted");
+    // M14: more than 256 members.
+    let mut over: Vec<ValidatorInfo> = (0..=255u8).map(|s| member(s).info).collect();
+    // 256 distinct seeds exist (0..=255); a 257th entry needs a new key.
+    let k257: [u8; 32] = {
+        let mut k = [9u8; 32];
+        k[0] = 1;
+        k[1] = 2;
+        k
+    };
+    let ed = crypto::SigningKey::from_bytes(&k257).verifying_key().to_bytes();
+    let bls = BLSEngine::consensus();
+    let bls_seed = derive_validator_bls_seed(&k257);
+    over.push(ValidatorInfo {
+        address: crypto::derive_address(&ed).unwrap(),
+        stake: 100,
+        ed25519_public_key: hex::encode(ed),
+        bls_public_key: hex::encode(bls.pubkey_raw(&bls_seed)),
+        bls_pop: hex::encode(bls.prove_possession_raw(&bls_seed)),
+    });
+    assert_eq!(over.len(), 257);
+    assert!(epoch::validate_committee(&over[..256]).is_ok(), "vacuous: 256 is refused");
+    assert!(epoch::validate_committee(&over).is_err(), "257 members were admitted");
+    // M15: a zero-stake entry is dropped, not kept.
+    let mut zero = good.clone();
+    let mut z = member(9).info;
+    z.stake = 0;
+    zero.push(z.clone());
+    let out = epoch::validate_committee(&zero).unwrap();
+    assert!(out.iter().all(|m| m.address != z.address), "a zero-stake member was kept");
+}
+
+/// KILL(M05), PR-1 with unequal stake: a node holding round-1 certificates
+/// from three authors that carry less than 2/3 of the stake has no round
+/// quorum and proposes no round-2 vertex (which every peer would refuse at
+/// Layer S, burning the slot).
+#[test]
+fn kill_m05_the_round_quorum_is_by_stake_not_by_count() {
+    let mut c = Cluster::new("kill-m05", 4, 0);
+    let stakes = [4000u64, 3000, 2000, 1000];
+    for (m, s) in c.committee.iter_mut().zip(stakes) {
+        m.stake = s;
+    }
+    for i in c.validators() {
+        c.reopen(i);
+    }
+    let heavy = c.members[0].info.address.clone();
+    let x = 3; // stake 1000
+    c.tick_all();
+    let h = heavy.clone();
+    c.deliver(&move |e, to| to == x && e.from == h && matches!(&e.msg, Msg::Cert(_)));
+    assert!(c.engine(x).certified(1, &heavy).is_none(), "vacuous: x holds the heavy cert");
+    let light: usize = (1..4)
+        .filter(|&i| c.engine(x).certified(1, &c.members[i].info.address).is_some())
+        .count();
+    assert_eq!(light, 3, "vacuous: x lacks a light certificate");
+    c.tick(x);
+    assert!(
+        c.engine(x).own_proposal(2).is_none(),
+        "x proposed round 2 on 6000 of 10000 stake"
+    );
+}
+
+/// KILL(M07), EP-3: once E has closed (H_E accepted) and before E+1 is
+/// active, the node proposes no epoch-E vertex.
+#[test]
+fn kill_m07_no_proposal_between_close_and_activation() {
+    let mut c = Cluster::new("kill-m07", 4, 0);
+    c.run(6);
+    let d = c.decisions[0].last().expect("vacuous: nothing decided").clone();
+    let committee = c.committee.clone();
+    c.engines[0]
+        .as_mut()
+        .unwrap()
+        .close_epoch(d.0, &d.1, "boundary-block", &committee)
+        .unwrap();
+    let next = c.engine(0).current_round();
+    assert!(c.engine(0).own_proposal(next).is_none(), "vacuous: already proposed");
+    c.tick(0);
+    assert!(
+        c.engine(0).own.keys().all(|r| *r < next),
+        "an epoch-E vertex was proposed after the close"
+    );
+}
+
+/// KILL(M79), RC-3: a guard database whose origin row was written for another
+/// chain (same keys) is not continuous for this one: the node abstains.
+#[test]
+fn kill_m79_a_guard_origin_of_another_chain_abstains() {
+    let mut c = Cluster::new("kill-m79", 4, 0);
+    let other = guard_origin("ANOTHER-CHAIN", GENESIS, &c.members[0].node_key);
+    c.engine(0).storage.put("consensus:guard_origin", &other).unwrap();
+    c.reopen(0);
+    let me = c.members[0].info.address.clone();
+    let signed = Cell::new(0);
+    for _ in 0..4 {
+        c.tick_all();
+        c.deliver(&|e, _| {
+            if e.from == me && matches!(e.msg, Msg::Attest(_)) {
+                signed.set(signed.get() + 1);
+            }
+            false
+        });
+    }
+    assert_eq!(signed.get(), 0, "a node under another chain's guard origin attested");
+    assert!(c.engine(0).own.is_empty(), "it proposed");
+}
+
+/// KILL(M80), RC-3: a database that holds blocks (a resynced store) but no
+/// guard rows never takes a first origin, even with the init flag set.
+#[test]
+fn kill_m80_a_synced_database_never_takes_a_guard_origin() {
+    let mut c = Cluster::new("kill-m80", 4, 0);
+    c.engine(0).storage.delete("consensus:guard_origin").unwrap();
+    c.engine(0).storage.put("latest_height", "5").unwrap();
+    c.engines[0] = None;
+    c.open(0, true);
+    assert!(
+        c.engine(0).storage.get("consensus:guard_origin").unwrap().is_none(),
+        "a store with 5 blocks took a first guard origin"
+    );
+}
+
+/// KILL(M19), EP-3: E+1's sentinel is EPOCH_GENESIS over the chain, E+1, its
+/// first round, H_E's hash and A*, exactly.
+#[test]
+fn kill_m19_the_sentinel_binds_the_boundary_block_and_anchor() {
+    let mut c = Cluster::with_epochs("kill-m19", 4, 0, 3);
+    c.run_until(40, |c| c.engine(0).epoch >= 1);
+    let start: epoch::EpochStart = serde_json::from_str(
+        &c.engine(0).storage.get(&epoch::epoch_start_key(1)).unwrap().unwrap(),
+    )
+    .unwrap();
+    assert!(!start.prev_block_hash.is_empty() && !start.prev_anchor.is_empty());
+    assert_eq!(
+        start.sentinel,
+        blockchain::epoch_genesis(
+            CHAIN,
+            GENESIS,
+            1,
+            start.first_round,
+            &start.prev_block_hash,
+            &start.prev_anchor
+        )
+    );
+}
+
+/// KILL(M25), RE-5: only the addressee answers a request (in the node every
+/// request is gossiped to everyone).
+#[test]
+fn kill_m25_only_the_addressee_answers() {
+    let mut c = Cluster::new("kill-m25", 4, 0);
+    c.run(2);
+    let from = c.members[0].info.address.clone();
+    let to = c.members[1].info.address.clone();
+    let req = pull::SignedRequest::sign(
+        CHAIN,
+        GENESIS,
+        &c.members[0].node_key,
+        &from,
+        &to,
+        1,
+        pull::Request::Certs { epoch: 0, slots: vec![(1, to.clone())] },
+    );
+    c.receive(2, Msg::Req(req));
+    let answers = c
+        .q
+        .borrow()
+        .iter()
+        .filter(|e| matches!(&e.msg, Msg::Resp { .. }))
+        .count();
+    assert_eq!(answers, 0, "a node answered a request addressed to another");
+}
+
+/// KILL(M27), RE-5: a VERTEX_RESP carries at most MAX_RESP_BYTES of bodies;
+/// the rest is `unknown` (asked again).
+#[test]
+fn kill_m27_a_vertex_answer_respects_the_byte_cap() {
+    let c = Cluster::new("kill-m27", 4, 0);
+    let e = c.engine(0);
+    let mut digests = Vec::new();
+    for k in 0..32u64 {
+        let mut v = Vertex {
+            epoch: EPOCH,
+            round: 1,
+            author: c.members[1].info.address.clone(),
+            parents: vec![SENTINEL.into()],
+            parent_refs: vec![],
+            payload: vec!["x".repeat(100 * 1024)],
+            timestamp: NOW + k,
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
+        };
+        v.hash = v.hash_v4_with_domain(CHAIN, GENESIS);
+        digests.push(v.hash.clone());
+        lock(&e.dag).insert(v.hash.clone(), v);
+    }
+    let pull::Response::Vertices { bodies, unknown } = e.serve(&pull::Request::Vertices(digests))
+    else {
+        panic!("wrong answer kind")
+    };
+    let bytes: usize = bodies.iter().map(|v| serde_json::to_string(v).unwrap().len()).sum();
+    assert!(bytes <= pull::MAX_RESP_BYTES, "{bytes} bytes answered");
+    assert!(!unknown.is_empty(), "vacuous: everything fit");
+}
+
+// ---------------------------------------- final review: remaining witnesses
+
+/// EP-3: once E has closed, this node signs nothing of E. White-box: the
+/// slot's attestation guard row is removed, so only the close can stop it.
+#[test]
+fn a_closed_epoch_is_never_attested() {
+    let mut c = Cluster::with_epochs("s9-closed-attest", 4, 0, 4);
+    for _ in 0..60 {
+        if epoch_of(&c, 0).0 == 1 {
+            break;
+        }
+        c.tick_all();
+        c.deliver(&|_, _| false);
+    }
+    assert_eq!(epoch_of(&c, 0).0, 1);
+    // Back to "epoch 0 closed, epoch 1 not active" (the lost activation write).
+    c.engine(0).storage.delete(epoch::EPOCH_ACTIVE_KEY).unwrap();
+    c.reopen(0);
+    let me = c.members[0].info.address.clone();
+    let (v, body) = {
+        let e = c.engine(0);
+        let closing = e.closing_round.expect("epoch 0 is closed");
+        let v = lock(&e.dag)
+            .values()
+            .filter(|v| v.epoch == 0 && v.round <= closing && v.author != me)
+            .max_by_key(|v| v.round)
+            .cloned()
+            .expect("an epoch-0 body is held");
+        let body = e.attest_body(v.round, &v.author, &v.hash);
+        (v, body)
+    };
+    let bls_pk = hex::encode(
+        BLSEngine::consensus().pubkey_raw(&derive_validator_bls_seed(&c.members[0].node_key)),
+    );
+    c.engine(0)
+        .storage
+        .delete(&vcert::attest_guard_key(&body, &bls_pk))
+        .unwrap();
+    assert!(c.engine(0).read_own_attestation(&body).unwrap().is_none());
+    let net = c.net(0);
+    c.engines[0].as_mut().unwrap().stage_and_attest(v, &net);
+    assert!(
+        c.engine(0).read_own_attestation(&body).unwrap().is_none(),
+        "a slot of the closed epoch was attested"
+    );
+}
+
+/// Client pacing covers body fetches too: however many bodies are due, one
+/// tick sends at most `CLIENT_REQS_PER_TICK` requests.
+#[test]
+fn body_fetches_are_paced_per_tick() {
+    let mut c = Cluster::new("pace-bodies", 4, 0);
+    c.run(6);
+    let cert = c.engine(0).certs.values().next().cloned().unwrap();
+    {
+        let e = c.engines[0].as_mut().unwrap();
+        for k in 0..(pull::CLIENT_REQS_PER_TICK * pull::MAX_REQ_DIGESTS * 3) {
+            let mut fake = cert.clone();
+            fake.body.digest = format!("{:064x}", 0xabc000 + k);
+            e.want_body(&fake);
+        }
+    }
+    c.q.borrow_mut().clear();
+    let net = c.net(0);
+    c.engines[0].as_mut().unwrap().send_due(&net);
+    let reqs = c
+        .q
+        .borrow()
+        .iter()
+        .filter(|x| matches!(x.msg, Msg::Req(_)))
+        .count();
+    assert!(
+        reqs > 0 && reqs <= pull::CLIENT_REQS_PER_TICK,
+        "{reqs} requests in one tick"
+    );
 }

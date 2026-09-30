@@ -41,7 +41,7 @@
 use crate::qc::{self, build_qc, verify_qc, FinalityVote, QuorumCertificate, ValidatorInfo};
 
 mod recovery;
-pub(crate) use recovery::{retry_pending_qcs, stage_pending_qc};
+pub(crate) use recovery::{lowest_pending_qc_height, retry_pending_qcs, stage_pending_qc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage::StateDB;
@@ -194,23 +194,6 @@ pub fn verify_block_qc(
         Some((_, field)) => Err(format!("the QC does not bind this block's {field}")),
         None => Ok(()),
     }
-}
-
-/// G1 EP-4: store a QC for a block this node holds, after IM-1 (it verifies
-/// under the committee of the block's epoch and binds the block). Unlike
-/// `import_finality_qc` it need not advance finality: a node that built H_E
-/// itself is already past its round, yet needs QC(H_E) to activate E+1.
-pub fn store_block_qc(
-    storage: &StateDB,
-    block: &blockchain::Block,
-    qc: &QuorumCertificate,
-) -> Result<(), String> {
-    verify_block_qc(storage, block, qc)?;
-    storage
-        .transaction(|view| {
-            store_certificate(&view, qc).map_err(storage::StorageError::DatabaseOperation)
-        })
-        .map_err(|e| e.to_string())
 }
 
 /// The stored QC of height `h`, if any.
@@ -481,9 +464,47 @@ fn check_certified_root(storage: &StateDB, cert: &QuorumCertificate) -> Result<(
     })
 }
 
+/// G1 IM-3 (V4): a QC for a height this node holds must certify that block.
+/// A verified QC (>2/3 of C_E) for another block at a held height means this
+/// node's chain is not the certified one: a decision conflict, never stored.
+fn check_held_block(storage: &StateDB, cert: &QuorumCertificate) -> Result<(), String> {
+    if !crate::v4::is_v4_chain(storage) {
+        return Ok(());
+    }
+    let Some(raw) = storage
+        .get(&format!("block_{}", cert.block_height))
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    let held: blockchain::Block = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    if held.header.hash != cert.block_hash {
+        return Err(format!(
+            "{}: the QC of height {} certifies block {}, this node holds {}",
+            crate::ordering::DECISION_CONFLICT,
+            cert.block_height,
+            cert.block_hash,
+            held.header.hash
+        ));
+    }
+    Ok(())
+}
+
+/// Record a decision conflict found while handling a QC: the alarm row halts
+/// ordering (the node reads it at boot and on every tick). Only for an error
+/// that is one (a verified certificate for another block), never for a
+/// malformed or unverifiable input a peer can send at will.
+pub fn record_decision_conflict(storage: &StateDB, height: u64, err: &str) {
+    if err.contains(crate::ordering::DECISION_CONFLICT) {
+        eprintln!("🚨 [IM-3] {err}: ordering halts");
+        let _ = storage.put(&format!("alarm:decision_conflict:{height}"), err);
+    }
+}
+
 // Caller supplies a transaction view. All indexes describe one accepted QC;
 // replay of an older height must not regress the latest pointer.
 fn store_certificate(storage: &StateDB, cert: &QuorumCertificate) -> Result<(), String> {
+    check_held_block(storage, cert)?;
     check_certified_root(storage, cert)?;
     let height_key = format!("consensus:qc:{}", cert.block_height);
     let round_key = format!("consensus:qc_by_round:{}", cert.anchor_round);
@@ -522,7 +543,11 @@ fn store_certificate(storage: &StateDB, cert: &QuorumCertificate) -> Result<(), 
 pub fn import_finality_qc(storage: &StateDB, cert: &QuorumCertificate) -> Result<bool, String> {
     let advanced = storage.transaction(|view| {
         stage_imported_finality(&view, cert).map_err(storage::StorageError::DatabaseOperation)
-    }).map_err(|e| e.to_string())?;
+    }).map_err(|e| {
+        let e = e.to_string();
+        record_decision_conflict(storage, cert.block_height, &e);
+        e
+    })?;
     #[cfg(test)]
     if advanced {
         qc_import_crash_boundary(2);
@@ -531,6 +556,9 @@ pub fn import_finality_qc(storage: &StateDB, cert: &QuorumCertificate) -> Result
 }
 
 fn stage_imported_finality(storage: &StateDB, cert: &QuorumCertificate) -> Result<bool, String> {
+    if crate::v4::is_v4_chain(storage) {
+        return stage_imported_certificate(storage, cert);
+    }
     match epoch_for_block_height(storage, cert.block_height) {
         None => return Ok(false),
         Some(epoch) if epoch != cert.epoch => {
@@ -586,6 +614,48 @@ fn stage_imported_finality(storage: &StateDB, cert: &QuorumCertificate) -> Resul
     store_certificate(storage, cert)?;
     #[cfg(test)]
     qc_import_crash_boundary(1);
+    Ok(true)
+}
+
+/// G1 (V4): the ordering keys (`consensus:finalized_round`, the last anchor,
+/// the finality digest) belong to the ordering engine; only acceptance and
+/// adoption write them, with the sequence they commit. An import writing them
+/// ahead of adoption made a restarted node skip the imported blocks' sequences
+/// and fork (review, CRITICAL). An import only records the certificate, once
+/// it verifies and binds a held block, and never needs to advance anything.
+/// The V4 import of a verified QC for a held block, inside the caller's
+/// transaction (sync stores it with the block it certifies, so a crash cannot
+/// leave the block without its QC; final review HIGH).
+pub fn stage_block_qc(view: &StateDB, cert: &QuorumCertificate) -> Result<bool, String> {
+    stage_imported_certificate(view, cert)
+}
+
+fn stage_imported_certificate(storage: &StateDB, cert: &QuorumCertificate) -> Result<bool, String> {
+    let Some(epoch) = epoch_for_block_height(storage, cert.block_height) else {
+        return Ok(false);
+    };
+    let Some(validators) = load_validator_set_for_epoch(storage, epoch) else {
+        return Ok(false);
+    };
+    if cert.epoch != epoch {
+        return Err("finality QC epoch is not its height's epoch".into());
+    }
+    verify_qc(cert, &validators, &qc::expected_chain_id())
+        .map_err(|e| format!("finality QC verification failed: {e:?}"))?;
+    // Verified: a QC for another block at a held height is now a conflict.
+    check_held_block(storage, cert)?;
+    let Some(raw) = storage
+        .get(&format!("block_{}", cert.block_height))
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(false);
+    };
+    let block: blockchain::Block = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    verify_block_qc(storage, &block, cert)?;
+    if stored_qc(storage, cert.block_height).as_ref() == Some(cert) {
+        return Ok(false);
+    }
+    store_certificate(storage, cert)?;
     Ok(true)
 }
 

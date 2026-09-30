@@ -201,7 +201,8 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         | "sync:halt_reason"
         | "sys:restore_in_progress"
         | "sys:restored_checkpoint"
-        | "consensus:guard_origin" => Some(Node),
+        | "consensus:guard_origin"
+        | "consensus:guard_resume_after" => Some(Node),
 
         "genesis_identity" => Some(Constant),
 
@@ -646,6 +647,7 @@ mod tests {
             ("alarm:committee_mismatch:00000000000000000004".into(), Node),
             ("alarm:decision_conflict:42".into(), Node),
             ("consensus:guard_origin".into(), Node),
+            ("consensus:guard_resume_after".into(), Node),
             (format!("alarm:vcert_conflict:00000000000000000003:00000000000000153030:{H64}"), Node),
             ("da_shard_10000_0".into(), Local),
             ("da_commitment_1".into(), Local),

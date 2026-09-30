@@ -89,7 +89,9 @@ fn v4_sync_with(
 }
 
 fn block_at(sync: &ChainSync, height: u64, parent: &str, anchor: &str) -> Block {
-    let key = crypto::SigningKey::from_bytes(&[77; 32]);
+    // On V4 the leader and the signer are members of C_E (DE-7); the fixture
+    // uses committee member 11 for both.
+    let key = crypto::SigningKey::from_bytes(&[SEEDS[0]; 32]);
     let proposer = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
     let exec = executor::Executor::new(sync.storage.clone());
     let mut block = Block::new_with_roots_at(
@@ -97,7 +99,7 @@ fn block_at(sync: &ChainSync, height: u64, parent: &str, anchor: &str) -> Block 
         2 * height,
         parent.into(),
         vec![],
-        proposer,
+        proposer.clone(),
         exec.current_state_root(),
         exec.receipts_root_for_block(&[]),
         23,
@@ -106,7 +108,23 @@ fn block_at(sync: &ChainSync, height: u64, parent: &str, anchor: &str) -> Block 
         anchor.into(),
         vec![],
     );
-    authenticate_block(sync, &mut block);
+    {
+        let _seed = sync.storage.seeding();
+        use storage::object::{Object, Owner};
+        let account = Object::new(
+            proposer.clone(),
+            Owner::Address(proposer.clone()),
+            serde_json::json!({
+                "public_key": hex::encode(key.verifying_key().to_bytes()),
+                "sequence_number": 0
+            })
+            .to_string()
+            .into_bytes(),
+            "0x1::account::AccountData".to_string(),
+        );
+        sync.storage.put_object(&account).unwrap();
+    }
+    block.sign_proposer(&key, &proposer);
     block
 }
 
@@ -186,7 +204,7 @@ fn v4_a_substituted_anchor_is_refused_and_the_real_block_is_executed() {
     let qc = qc_for(&real, &committee, &[0, 1, 2]);
     let mut forged = real.clone();
     forged.anchor_hash = "ef".repeat(32);
-    authenticate_block(&sync, &mut forged);
+    // (the reused signature: the header hash does not change)
     assert_eq!(
         forged.header.hash, real.header.hash,
         "same header, other anchor"
@@ -338,4 +356,62 @@ fn v4_validation_refuses_an_anchor_that_is_not_the_last_committed_vertex() {
     let err = sync.validate_block(&swapped, 1, "genesis").unwrap_err();
     assert!(err.contains("last committed vertex"), "{err}");
     sync.validate_block(&real, 1, "genesis").unwrap();
+}
+
+/// G1 IM-3 (final review, HIGH): a verified QC for another block at a height
+/// this node already holds proves the local chain is not the certified one.
+/// Both import paths record `alarm:decision_conflict` (the node halts on it)
+/// and store nothing; an unverifiable QC for another block records nothing.
+#[test]
+fn v4_a_verified_qc_for_another_block_at_a_held_height_raises_the_alarm() {
+    let (sync, c0) = v4_sync("im3_held");
+    let b1 = block_at(&sync, 1, "genesis", &"a1".repeat(32));
+    assert_eq!(
+        sync.process_blocks_with_qcs(vec![b1.clone()], &[qc_for(&b1, &c0, &[0, 1, 2])], 0),
+        1
+    );
+    let alarm = |s: &ChainSync| s.storage.get("alarm:decision_conflict:1").unwrap();
+    let other = block_at(&sync, 1, "genesis", &"b2".repeat(32));
+    assert_ne!(other.header.hash, b1.header.hash);
+    // Below quorum: proves nothing, changes nothing.
+    let weak = qc_for(&other, &c0, &[0, 1]);
+    assert!(consensus::qc_producer::import_finality_qc(&sync.storage, &weak).is_err());
+    assert_eq!(sync.process_blocks_with_qcs(vec![other.clone()], &[weak], 1), 1);
+    assert!(alarm(&sync).is_none(), "an unverifiable QC raised the alarm");
+    // A verified QC for the other block while ours is certified too: the
+    // QC-pin branch.
+    let certified = qc_for(&other, &c0, &[1, 2, 3]);
+    assert_eq!(sync.process_blocks_with_qcs(vec![other.clone()], std::slice::from_ref(&certified), 1), 1);
+    assert!(alarm(&sync).is_some(), "the pin branch did not raise the alarm");
+    sync.storage.delete("alarm:decision_conflict:1").unwrap();
+    // Ours uncertified (a node that forked locally): the conflict branch.
+    let saved: Vec<(String, Option<String>)> = [
+        "consensus:qc:1",
+        "consensus:qc:latest",
+        "consensus:qc:latest_height",
+        "consensus:qc:latest_round",
+    ]
+    .iter()
+    .map(|k| (k.to_string(), sync.storage.get(k).unwrap()))
+    .collect();
+    for (k, _) in &saved {
+        sync.storage.delete(k).unwrap();
+    }
+    assert_eq!(sync.process_blocks_with_qcs(vec![other], std::slice::from_ref(&certified), 1), 1);
+    assert!(alarm(&sync).is_some(), "the conflict branch did not raise the alarm");
+    sync.storage.delete("alarm:decision_conflict:1").unwrap();
+    for (k, v) in saved {
+        if let Some(v) = v {
+            sync.storage.put(&k, &v).unwrap();
+        }
+    }
+    // The same QC through the certificate import path (QC_CERT, finality).
+    let err = consensus::qc_producer::import_finality_qc(&sync.storage, &certified).unwrap_err();
+    assert!(err.contains(consensus::ordering::DECISION_CONFLICT), "{err}");
+    assert!(alarm(&sync).is_some(), "the import did not raise the alarm");
+    assert_eq!(
+        consensus::qc_producer::stored_qc(&sync.storage, 1).map(|q| q.block_hash),
+        Some(b1.header.hash),
+        "the conflicting QC was stored"
+    );
 }

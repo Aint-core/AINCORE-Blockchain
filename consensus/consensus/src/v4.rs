@@ -34,6 +34,9 @@ pub const T_LEADER_TICKS: u64 = 2;
 pub const VERTEX_FORMAT_KEY: &str = "genesis:vertex_format";
 /// The node-side wire prefix of a V4 message.
 pub const WIRE_PREFIX: &str = "DAG_V4:";
+/// The largest `DAG_V4:` message content a node parses: one maximal vertex
+/// body plus an envelope. Pull answers are packed to fit it (`pull.rs`).
+pub const MAX_WIRE_BYTES: usize = crate::dag::MAX_VERTEX_BYTES + 8 * 1024;
 
 /// The `consensus:guard_origin` row of RC-3: the chain, the genesis and this
 /// node's two keys. A database whose row differs (or is missing) did not sign
@@ -132,6 +135,11 @@ pub struct Engine {
     can_sign: bool,
     /// RC-3: guard continuity held at boot.
     guards_continuous: bool,
+    /// RC-3: a node that booted without continuous guards re-arms only at the
+    /// activation of an epoch whose boundary block is later than this (its
+    /// boot time plus the clock-skew margin), i.e. an epoch that began after
+    /// its guards were lost. Persisted in `consensus:guard_resume_after`.
+    resume_after: Option<u64>,
     /// The staged bodies (canonical form), shared with the host as `dag`.
     dag: Arc<Mutex<HashMap<String, Vertex>>>,
     /// The certificate index: (round, author) → certificate.
@@ -200,6 +208,15 @@ pub struct Engine {
     gap_high: u64,
     /// The tail of the epoch just closed, served to nodes still finishing it.
     closed: Option<epoch::ClosedEpoch>,
+    /// Requests sent this tick (client pacing), by tick.
+    sent: (u64, usize),
+    /// The committee's peers, shared by every certificate want.
+    peer_list: Option<(String, Arc<[String]>)>,
+    /// Slots whose attestation was re-sent this tick (one re-send per slot
+    /// per tick, however often a copy is replayed).
+    resent: (u64, HashSet<(u64, String)>),
+    /// The early E+1 certificates held, by (round, author, digest).
+    early_keys: HashSet<(u64, String, String)>,
 }
 
 fn storage_err(e: impl ToString) -> StorageError {
@@ -300,6 +317,11 @@ impl Engine {
             }
             None => false,
         };
+        let resume_after = if guards_continuous {
+            None
+        } else {
+            Some(epoch::resume_point(&storage, (now_secs)())?)
+        };
         let genesis = epoch::EpochStart {
             epoch: EPOCH,
             first_round: FIRST_ROUND,
@@ -309,6 +331,7 @@ impl Engine {
             prev_anchor: String::new(),
             prev_block_hash: String::new(),
             prev_height: 0,
+            prev_timestamp: 0,
         };
         let cfg = Config { committee, ..cfg };
         let seq = Self::load_seq(&storage);
@@ -322,6 +345,7 @@ impl Engine {
             ed25519_pk,
             can_sign,
             guards_continuous,
+            resume_after,
             dag: shared.dag,
             certs: HashMap::new(),
             cert_stake: BTreeMap::new(),
@@ -345,6 +369,10 @@ impl Engine {
             last_floor: 0,
             gap_high: 0,
             closed: None,
+            sent: (0, 0),
+            peer_list: None,
+            resent: (0, HashSet::new()),
+            early_keys: HashSet::new(),
             epoch: EPOCH,
             first_round: FIRST_ROUND,
             sentinel: SENTINEL.to_string(),
@@ -664,6 +692,14 @@ impl Engine {
         if !self.may_sign() {
             return;
         }
+        // Once per slot per tick: each replayed copy used to trigger a
+        // broadcast (final review MEDIUM).
+        if self.resent.0 != self.tick {
+            self.resent = (self.tick, HashSet::new());
+        }
+        if !self.resent.1.insert((v.round, v.author.clone())) {
+            return;
+        }
         let body = self.attest_body(v.round, &v.author, &v.hash);
         let Ok(Some(a)) = self.read_own_attestation(&body) else {
             return;
@@ -686,7 +722,11 @@ impl Engine {
         let body = self.attest_body(v.round, &v.author, &v.hash);
         // Never sign a digest the slot is certified against: under Lemma U
         // it cannot be certified, and beyond f it would help a second one.
-        let sign = self.may_sign() && certified.as_deref().is_none_or(|d| d == v.hash);
+        // EP-3: nothing of E is attested once E has closed (its anchors are
+        // decided; what is still staged is kept for serving only).
+        let sign = self.may_sign()
+            && self.closing_round.is_none()
+            && certified.as_deref().is_none_or(|d| d == v.hash);
         let (committee, key, address, budget) = (
             &self.cfg.committee,
             &self.cfg.node_key,
@@ -760,6 +800,16 @@ impl Engine {
             // under C_{E+1}, and ingested at activation. Any other epoch's is
             // inert.
             const EARLY_CERT_CAP: usize = 4096;
+            // Replays of one certificate cost one verification and one slot
+            // (they used to fill the cap and crowd out the rest).
+            let key = (
+                cert.body.round,
+                cert.body.author.clone(),
+                cert.body.digest.clone(),
+            );
+            if self.early_keys.contains(&key) || self.early_certs.len() >= EARLY_CERT_CAP {
+                return;
+            }
             let keep = self.next.as_ref().is_some_and(|next| {
                 cert.body.epoch == next.epoch
                     && vcert::verify_vertex_cert(
@@ -771,7 +821,8 @@ impl Engine {
                     )
                     .is_ok()
             });
-            if keep && self.early_certs.len() < EARLY_CERT_CAP {
+            if keep {
+                self.early_keys.insert(key);
                 self.early_certs.push(cert);
             }
             return;

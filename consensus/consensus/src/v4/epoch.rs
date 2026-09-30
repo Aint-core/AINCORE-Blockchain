@@ -26,6 +26,10 @@ pub struct EpochStart {
     /// H_{E−1}'s height: activation waits for its QC (EP-4).
     #[serde(default)]
     pub prev_height: u64,
+    /// H_{E−1}'s BFT timestamp: RC-3 re-arms a node whose guards were lost
+    /// only in an epoch that began after it booted (`resume_point`).
+    #[serde(default)]
+    pub prev_timestamp: u64,
 }
 
 impl EpochStart {
@@ -111,6 +115,8 @@ pub struct Boundary<'a> {
     pub anchor: &'a str,
     pub block_hash: &'a str,
     pub height: u64,
+    /// H_E's timestamp (BFT time on the node).
+    pub timestamp: u64,
 }
 
 /// EP-2 and EP-3: E+1's record. The proposed committee if it validates, C_E
@@ -145,6 +151,7 @@ pub fn next_start(
         prev_anchor: b.anchor.to_string(),
         prev_block_hash: b.block_hash.to_string(),
         prev_height: b.height,
+        prev_timestamp: b.timestamp,
     };
     (start, invalid)
 }
@@ -210,6 +217,7 @@ pub fn stage_boundary(
         anchor: &block.anchor_hash,
         block_hash: &block.header.hash,
         height,
+        timestamp: block.header.timestamp,
     };
     let (start, invalid) = next_start(
         &blockchain::chain_id(),
@@ -224,6 +232,30 @@ pub fn stage_boundary(
 /// EP-4: QC(H_E) binds a next committee other than the one this node
 /// derived. Written as `alarm:committee_mismatch:{E+1:020}`; ordering halts.
 pub const COMMITTEE_MISMATCH: &str = "COMMITTEE_MISMATCH";
+
+/// RC-3: where a node that lost its guards may resume signing.
+pub const GUARD_RESUME_KEY: &str = "consensus:guard_resume_after";
+
+/// RC-3: the resume point of a node whose guards are not continuous, written
+/// once at its first such boot (a later boot keeps it). The margin covers
+/// clock skew both ways (this node's clock and the BFT time of honest
+/// vertices, each within `MAX_FUTURE_DRIFT_SECS`): a boundary block whose BFT
+/// time is later than the point was made after the boot, so the epoch it
+/// opens began after the guards were lost and holds no earlier signature.
+pub fn resume_point(storage: &StateDB, now: u64) -> Result<u64, String> {
+    if let Some(held) = storage
+        .get(GUARD_RESUME_KEY)
+        .map_err(|e| e.to_string())?
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return Ok(held);
+    }
+    let point = now.saturating_add(2 * crate::ingress_v4::MAX_FUTURE_DRIFT_SECS);
+    storage
+        .put(GUARD_RESUME_KEY, &point.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(point)
+}
 
 /// `consensus:epoch_active`: the active epoch, written at activation.
 pub const EPOCH_ACTIVE_KEY: &str = "consensus:epoch_active";
@@ -280,6 +312,7 @@ impl Engine {
             prev_anchor: String::new(),
             prev_block_hash: String::new(),
             prev_height: 0,
+            prev_timestamp: 0,
         }
     }
 
@@ -376,6 +409,7 @@ impl Engine {
             anchor,
             block_hash,
             height: self.blocks,
+            timestamp: (self.now_secs)(),
         };
         let (start, invalid) = next_start(
             &self.cfg.chain_id,
@@ -483,9 +517,14 @@ impl Engine {
         self.last_floor = self.gc_floor();
         self.own.clear();
         self.collectors.clear();
+        let began_at = next.prev_timestamp;
         self.set_active(next);
-        // RC-3: a node that abstained for the epoch resumes at activation.
-        if !self.guards_continuous {
+        // RC-3: a node that abstained resumes at the activation of an epoch
+        // that began after its guards were lost (review HIGH: "the next
+        // activation it performs" re-armed a re-syncing node inside an epoch
+        // it had already signed in).
+        let began_after_loss = self.resume_after.is_some_and(|point| began_at > point);
+        if !self.guards_continuous && began_after_loss {
             let origin = guard_origin(
                 &self.cfg.chain_id,
                 &self.cfg.genesis_identity,
@@ -493,6 +532,8 @@ impl Engine {
             );
             if self.storage.put("consensus:guard_origin", &origin).is_ok() {
                 self.guards_continuous = true;
+                self.resume_after = None;
+                let _ = self.storage.delete(GUARD_RESUME_KEY);
             }
         }
         // GC-3 by epoch (Correction C7): the epoch before the one just closed
@@ -500,6 +541,7 @@ impl Engine {
         if let Some(old) = two_back {
             self.delete_epoch_rows(old, u64::MAX);
         }
+        self.early_keys.clear();
         for cert in std::mem::take(&mut self.early_certs) {
             self.on_cert(cert, net);
         }

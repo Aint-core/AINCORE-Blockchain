@@ -16,8 +16,20 @@ use super::*;
 pub const MAX_REQ_DIGESTS: usize = 32;
 /// Slots per `CERT_REQ`.
 pub const MAX_REQ_SLOTS: usize = 64;
-/// RE-5: bytes of bodies per answer.
-pub const MAX_RESP_BYTES: usize = 900 * 1024;
+/// RE-5: bytes of bodies per answer. The whole answer (bodies, `unknown`
+/// and the `Msg::Resp` envelope, at most `RESP_ENVELOPE_BYTES`) fits the
+/// node's pre-parse bound `v4::MAX_WIRE_BYTES`, and one maximal body always
+/// fits (final review HIGH: answers of 900 KiB were dropped unparsed by
+/// every node, so a near-maximal body could never be pulled).
+pub const MAX_RESP_BYTES: usize = MAX_WIRE_BYTES - RESP_ENVELOPE_BYTES;
+/// The `Msg::Resp` envelope and a full `unknown` list.
+pub const RESP_ENVELOPE_BYTES: usize = 4 * 1024;
+/// Requests this node sends per tick in all (client side): a far-behind node
+/// paces its fetch instead of bursting every due want at once.
+pub const CLIENT_REQS_PER_TICK: usize = 8;
+/// RE-6: a member's request numbers are accepted once each, in any order,
+/// within this distance of the highest seen (transports reorder).
+pub const SEQ_WINDOW: u64 = 1024;
 /// RE-3: `T_FETCH` doubles up to this many ticks.
 pub const T_FETCH_MAX: u64 = 8;
 /// RE-6: requests served per committee member per tick (its reservation).
@@ -116,9 +128,33 @@ impl SignedRequest {
 #[derive(Debug, Default)]
 pub(crate) struct Budget {
     tick: u64,
-    /// Per member: the highest `seq` seen, and requests served this tick.
-    members: HashMap<String, (u64, u32)>,
+    /// Per member: the request numbers seen, and requests served this tick.
+    members: HashMap<String, (SeqWindow, u32)>,
     residual: u32,
+}
+
+/// Anti-replay for one member's signed requests: each `seq` is accepted once,
+/// in any order, if it is within `SEQ_WINDOW` of the highest seen (a single
+/// high-water mark dropped every request a transport reordered, and a node
+/// behind never caught up; final review HIGH).
+#[derive(Debug, Default)]
+pub(crate) struct SeqWindow {
+    high: u64,
+    seen: std::collections::BTreeSet<u64>,
+}
+
+impl SeqWindow {
+    fn admit(&mut self, seq: u64) -> bool {
+        if seq == 0 || seq.saturating_add(SEQ_WINDOW) <= self.high || !self.seen.insert(seq) {
+            return false;
+        }
+        self.high = self.high.max(seq);
+        let floor = self.high.saturating_sub(SEQ_WINDOW);
+        while self.seen.first().is_some_and(|s| *s <= floor) {
+            self.seen.pop_first();
+        }
+        true
+    }
 }
 
 /// One outstanding want: who to ask, in rotation, and when next.
@@ -126,21 +162,31 @@ pub(crate) struct Budget {
 pub struct Want {
     /// The round of what is wanted: at or below g, it retires (RE-4).
     pub(super) round: u64,
-    targets: Vec<String>,
+    targets: Arc<[String]>,
     next: usize,
     due: u64,
     backoff: u64,
 }
 
 impl Want {
-    fn new(round: u64, targets: Vec<String>, now: u64) -> Self {
+    /// `start` spreads the rotation: wants made in one tick do not all ask
+    /// the same peer first.
+    fn new(round: u64, targets: Arc<[String]>, start: usize, now: u64) -> Self {
         Self {
             round,
             targets,
-            next: 0,
+            next: start,
             due: now,
             backoff: 1,
         }
+    }
+
+    /// The target `take_turn` would ask now, without taking the turn.
+    fn peek(&self, now: u64) -> Option<&str> {
+        if self.due > now || self.targets.is_empty() {
+            return None;
+        }
+        Some(&self.targets[self.next % self.targets.len()])
     }
 
     /// The target to ask now, advancing the rotation and the backoff.
@@ -154,6 +200,12 @@ impl Want {
         self.backoff = (self.backoff * 2).min(T_FETCH_MAX);
         Some(target)
     }
+}
+
+/// A rotation start derived from what is wanted.
+fn spread(key: &str) -> usize {
+    let digest = crypto::hash(key.as_bytes());
+    usize::from(digest[0]) | (usize::from(digest[1]) << 8)
 }
 
 impl Engine {
@@ -175,9 +227,10 @@ impl Engine {
             .map(|(_, m)| m.address.clone())
             .filter(|a| *a != self.cfg.address)
             .collect();
+        let start = spread(&cert.body.digest);
         self.body_wants.insert(
             cert.body.digest.clone(),
-            Want::new(cert.body.round, signers, self.tick),
+            Want::new(cert.body.round, signers.into(), start, self.tick),
         );
     }
 
@@ -187,15 +240,22 @@ impl Engine {
         if self.certs.contains_key(&slot) || self.cert_wants.contains_key(&slot) {
             return;
         }
-        let members: Vec<String> = self
-            .cfg
-            .committee
-            .iter()
-            .map(|m| m.address.clone())
-            .filter(|a| *a != self.cfg.address)
-            .collect();
+        // One shared peer list per committee (a per-want copy made one Ahead
+        // vertex cost 257·n·(n−1) strings; final review MEDIUM).
+        if self.peer_list.as_ref().is_none_or(|(hash, _)| *hash != self.committee_hash) {
+            let peers: Vec<String> = self
+                .cfg
+                .committee
+                .iter()
+                .map(|m| m.address.clone())
+                .filter(|a| *a != self.cfg.address)
+                .collect();
+            self.peer_list = Some((self.committee_hash.clone(), peers.into()));
+        }
+        let peers = Arc::clone(&self.peer_list.as_ref().expect("just set").1);
+        let start = spread(&format!("{round}:{author}"));
         self.cert_wants
-            .insert(slot, Want::new(round, members, self.tick));
+            .insert(slot, Want::new(round, peers, start, self.tick));
     }
 
     /// One fetch step: retire what is satisfied, then ask for what is due.
@@ -235,6 +295,13 @@ impl Engine {
     /// per request, and never a turn used without being sent.
     pub(super) fn send_due(&mut self, net: &dyn ConsensusNet) {
         let now = self.tick;
+        if self.sent.0 != now {
+            self.sent = (now, 0);
+        }
+        // At most `CLIENT_REQS_PER_TICK` requests this tick. A want is taken
+        // only if it joins a batch already open for its target, or a new
+        // request is still allowed; otherwise it stays due for the next tick.
+        let mut requests_left = CLIENT_REQS_PER_TICK.saturating_sub(self.sent.1);
         let mut bodies: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (digest, want) in self.body_wants.iter_mut() {
             // A body already received and waiting on its parents' certificates
@@ -242,19 +309,37 @@ impl Engine {
             if self.pending.contains(digest) {
                 continue;
             }
-            if let Some(target) = want.take_turn(now) {
-                bodies.entry(target).or_default().push(digest.clone());
+            let Some(target) = want.peek(now) else {
+                continue;
+            };
+            let open = bodies.get(target).map_or(0, Vec::len);
+            if open.is_multiple_of(MAX_REQ_DIGESTS) {
+                if requests_left == 0 {
+                    continue;
+                }
+                requests_left -= 1;
             }
+            let target = want.take_turn(now).expect("peeked");
+            bodies.entry(target).or_default().push(digest.clone());
+        }
+        let mut slots: BTreeMap<String, Vec<(u64, String)>> = BTreeMap::new();
+        for (slot, want) in self.cert_wants.iter_mut() {
+            let Some(target) = want.peek(now) else {
+                continue;
+            };
+            let open = slots.get(target).map_or(0, Vec::len);
+            if open.is_multiple_of(MAX_REQ_SLOTS) {
+                if requests_left == 0 {
+                    continue;
+                }
+                requests_left -= 1;
+            }
+            let target = want.take_turn(now).expect("peeked");
+            slots.entry(target).or_default().push(slot.clone());
         }
         for (target, digests) in bodies {
             for batch in digests.chunks(MAX_REQ_DIGESTS) {
                 self.request(&target, Request::Vertices(batch.to_vec()), net);
-            }
-        }
-        let mut slots: BTreeMap<String, Vec<(u64, String)>> = BTreeMap::new();
-        for (slot, want) in self.cert_wants.iter_mut() {
-            if let Some(target) = want.take_turn(now) {
-                slots.entry(target).or_default().push(slot.clone());
             }
         }
         for (target, slots) in slots {
@@ -320,6 +405,10 @@ impl Engine {
     }
 
     fn request(&mut self, target: &str, req: Request, net: &dyn ConsensusNet) {
+        if self.sent.0 != self.tick {
+            self.sent = (self.tick, 0);
+        }
+        self.sent.1 += 1;
         let seq = self.next_seq();
         let signed = SignedRequest::sign(
             &self.cfg.chain_id,
@@ -359,15 +448,14 @@ impl Engine {
                 if !signed.verifies(&self.cfg.chain_id, &self.cfg.genesis_identity, &pk) {
                     return;
                 }
-                let (last, used) = self
+                let (window, used) = self
                     .budget
                     .members
                     .entry(signed.from.clone())
-                    .or_insert((0, 0));
-                if signed.seq <= *last {
+                    .or_default();
+                if !window.admit(signed.seq) {
                     return;
                 }
-                *last = signed.seq;
                 if *used >= MEMBER_REQS_PER_TICK {
                     return;
                 }
@@ -451,7 +539,14 @@ impl Engine {
                 }
             }
             Response::Certs { certs, .. } => {
-                for c in certs {
+                // Only what this node asked for and does not hold, at most a
+                // request's worth: an answer is unauthenticated, and each
+                // certificate costs a pairing (final review MEDIUM).
+                for c in certs.into_iter().take(MAX_REQ_SLOTS) {
+                    let slot = (c.body.round, c.body.author.clone());
+                    if !self.cert_wants.contains_key(&slot) || self.certs.contains_key(&slot) {
+                        continue;
+                    }
                     self.on_cert(c, net);
                 }
             }

@@ -28,6 +28,8 @@ pub const SLASH_EVIDENCE_PREFIX: &str = "SLASH_EVIDENCE:";
 pub const QC_WANT_PREFIX: &str = "QC_WANT:";
 pub const QC_CERT_PREFIX: &str = "QC_CERT:";
 const QC_WANT_EVERY_TICKS: u64 = 4;
+const QC_ANSWERS_PER_TICK: u32 = 4;
+const QC_ANSWERED_CAP: usize = 256;
 /// Upper bound on evidence items carried per vertex and applied per block
 /// (matches executor::apply_slash_evidence's `.take(5)`).
 const MAX_EVIDENCE_PER_VERTEX: usize = 5;
@@ -148,6 +150,7 @@ pub struct DagConsensus {
     v4_ticks: u64,
     qc_want_next: u64,
     qc_answered: HashMap<u64, u64>,
+    qc_answer_budget: (u64, u32),
     #[cfg(test)]
     pub(crate) local_acceptance_hook: Option<LocalAcceptanceHook>,
     /// Tests only: runs inside the block transaction BEFORE execution, the
@@ -657,6 +660,7 @@ impl DagConsensus {
             v4_ticks: 0,
             qc_want_next: 0,
             qc_answered: HashMap::new(),
+            qc_answer_budget: (0, 0),
             #[cfg(test)]
             local_acceptance_hook: None,
             #[cfg(test)]
@@ -728,7 +732,11 @@ impl DagConsensus {
             Ok(true) => {}
             Ok(false) => return,
             Err(e) => {
-                eprintln!("[EP-3] the next epoch's record is unreadable: {e}");
+                // Fail closed: E cannot be known closed, so nothing more of E
+                // may be decided (the peers have closed it).
+                let why = format!("the next epoch's record is unreadable: {e}");
+                eprintln!("🚨 [EP-3] {why}: ordering halted");
+                self.ordering_halt = Some(why);
                 return;
             }
         }
@@ -744,12 +752,8 @@ impl DagConsensus {
         let Some(qc) = crate::qc_producer::stored_qc(&self.storage, next.prev_height) else {
             // A node that missed the votes has no other way to this one QC
             // (sync asks for blocks above its tip, GET_FINALITY for the latest
-            // QC): ask peers for it, throttled.
-            if self.v4_ticks >= self.qc_want_next {
-                self.qc_want_next = self.v4_ticks + QC_WANT_EVERY_TICKS;
-                self.v4_net()
-                    .broadcast_wire(format!("{QC_WANT_PREFIX}{}", next.prev_height));
-            }
+            // QC): ask peers for it.
+            self.want_qc(next.prev_height);
             return;
         };
         let binds = qc.block_height == next.prev_height
@@ -801,9 +805,41 @@ impl DagConsensus {
         }
     }
 
-    /// `QC_WANT:{h}`: a peer waiting to activate asks for QC(H_E). Answered
-    /// only for a boundary height this node holds a QC for, at most once per
-    /// `QC_WANT_EVERY_TICKS` per height, so a flood of asks costs one answer.
+    /// A conflict another component recorded (sync's IM-3 / EP-4 checks write
+    /// `alarm:decision_conflict:*` or `alarm:committee_mismatch:*`) halts
+    /// ordering here too, not only at the next boot.
+    fn refresh_alarm_halt(&mut self) {
+        if self.ordering_halt.is_some() {
+            return;
+        }
+        for alarms in ["alarm:decision_conflict:", "alarm:committee_mismatch:"] {
+            if let Some(Ok((key, _))) = self.storage.db.prefix_iterator(alarms.as_bytes()).next() {
+                if key.starts_with(alarms.as_bytes()) {
+                    self.ordering_halt = Some(format!(
+                        "a consensus conflict was recorded ({})",
+                        String::from_utf8_lossy(&key)
+                    ));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Ask peers for the QC of a held height (`QC_WANT:{h}`), at most once
+    /// per `QC_WANT_EVERY_TICKS`.
+    fn want_qc(&mut self, h: u64) {
+        if self.v4_ticks >= self.qc_want_next {
+            self.qc_want_next = self.v4_ticks + QC_WANT_EVERY_TICKS;
+            self.v4_net().broadcast_wire(format!("{QC_WANT_PREFIX}{h}"));
+        }
+    }
+
+    /// `QC_WANT:{h}`: a peer asks for the QC of a height (its boundary block,
+    /// a block it cannot adopt without one, or one it voted on). Answered with
+    /// the stored QC, at most once per `QC_WANT_EVERY_TICKS` per height (the
+    /// oldest throttle entry is evicted, never the whole table) and at most
+    /// `QC_ANSWERS_PER_TICK` answers per tick in all, so however asks are
+    /// spread over heights they cost a bounded number of answers.
     fn answer_qc_want(&mut self, raw: &str) {
         if !self.v4_chain || raw.len() > 20 {
             return;
@@ -811,10 +847,13 @@ impl DagConsensus {
         let Ok(h) = raw.parse::<u64>() else {
             return;
         };
-        let Some(interval) = crate::v4::epoch::epoch_interval(&self.storage) else {
+        if h == 0 || h > self.latest_block_height {
             return;
-        };
-        if h == 0 || !h.is_multiple_of(interval) {
+        }
+        if self.qc_answer_budget.0 != self.v4_ticks {
+            self.qc_answer_budget = (self.v4_ticks, 0);
+        }
+        if self.qc_answer_budget.1 >= QC_ANSWERS_PER_TICK {
             return;
         }
         if self
@@ -824,20 +863,22 @@ impl DagConsensus {
         {
             return;
         }
-        let Some(raw_qc) = self
-            .storage
-            .get(&format!("consensus:qc:{h}"))
-            .ok()
-            .flatten()
-        else {
+        let Some(raw_qc) = self.storage.get(&format!("consensus:qc:{h}")).ok().flatten() else {
             return;
         };
-        if self.qc_answered.len() >= 16 {
-            self.qc_answered.clear();
+        if self.qc_answered.len() >= QC_ANSWERED_CAP {
+            if let Some(oldest) = self
+                .qc_answered
+                .iter()
+                .min_by_key(|(height, tick)| (**tick, **height))
+                .map(|(height, _)| *height)
+            {
+                self.qc_answered.remove(&oldest);
+            }
         }
         self.qc_answered.insert(h, self.v4_ticks);
-        self.v4_net()
-            .broadcast_wire(format!("{QC_CERT_PREFIX}{raw_qc}"));
+        self.qc_answer_budget.1 += 1;
+        self.v4_net().broadcast_wire(format!("{QC_CERT_PREFIX}{raw_qc}"));
     }
 
     /// `QC_CERT:{qc}`: a QC for a block this node holds. Stored only if it
@@ -853,17 +894,12 @@ impl DagConsensus {
         if crate::qc_producer::stored_qc(&self.storage, qc.block_height).is_some() {
             return;
         }
-        let Some(block) = self
-            .storage
-            .get(&format!("block_{}", qc.block_height))
-            .ok()
-            .flatten()
-            .and_then(|j| serde_json::from_str::<blockchain::Block>(&j).ok())
-        else {
-            return;
-        };
-        if let Err(e) = crate::qc_producer::store_block_qc(&self.storage, &block, &qc) {
+        // Verified under the height's committee and bound to the held block
+        // before it is stored (a verified QC for another block is IM-3's
+        // conflict); on V4 an import never touches the ordering keys.
+        if let Err(e) = crate::qc_producer::import_finality_qc(&self.storage, &qc) {
             eprintln!("[EP-4] QC of block {} not stored: {e}", qc.block_height);
+            self.refresh_alarm_halt();
             return;
         }
         self.v4_epoch_step();
@@ -949,6 +985,14 @@ impl DagConsensus {
     /// gathered only when a proposal is due, then the commit loop if O_E grew.
     fn v4_tick(&mut self) {
         self.v4_ticks += 1;
+        self.refresh_alarm_halt();
+        // A height this node voted on whose QC never reached it (lost votes)
+        // is fetched instead of being retried forever (final review MEDIUM).
+        if let Some(h) = crate::qc_producer::lowest_pending_qc_height(&self.storage) {
+            if crate::qc_producer::stored_qc(&self.storage, h).is_none() {
+                self.want_qc(h);
+            }
+        }
         self.retry_qc_work();
         self.v4_epoch_step();
         let Some(mut engine) = self.v4.take() else {
@@ -1911,6 +1955,13 @@ impl DagConsensus {
         // Every `continue` below re-enters this loop and re-decides.
         'anchors: loop {
         self.reload_chain_tip();
+        // G1 (V4): the ordering state is valid only once it has absorbed
+        // every block on the chain. While a held block is not adopted (no
+        // QC yet, a crash between import and adoption), nothing is decided
+        // locally: a decision would re-collect that block's sequence.
+        if self.v4_chain && self.last_adopted_height < self.latest_block_height {
+            break;
+        }
         let plan = {
             let engine = self
                 .ordering_engine
@@ -3220,7 +3271,9 @@ impl DagConsensus {
             // S1 before parsing. The JSON of a `Msg::Vertex` wraps the vertex
             // in `{"Vertex":…}`; the vertex's own length is what S1 bounds.
             const WRAP: usize = r#"{"Vertex":}"#.len();
-            if !self.v4_chain || content.len() > MAX_VERTEX_BYTES + WRAP {
+            // One bound for every message kind: a pull answer carrying one
+            // maximal body must pass (the vertex copy is still bounded by S1).
+            if !self.v4_chain || content.len() > crate::v4::MAX_WIRE_BYTES {
                 return;
             }
             if let Ok(m) = serde_json::from_str::<crate::v4::Msg>(content) {
@@ -3566,6 +3619,7 @@ impl DagConsensus {
                             });
                             if verified.is_none() {
                                 eprintln!("V4: block {h} has no verified QC yet; adoption waits");
+                                self.want_qc(h);
                                 break;
                             }
                             verified
