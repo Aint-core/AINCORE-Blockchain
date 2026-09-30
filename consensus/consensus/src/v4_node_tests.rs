@@ -1306,3 +1306,70 @@ fn a_v4_node_takes_no_v3_evidence() {
     c.node_mut(0).handle_message(&format!("DOWNTIME_ATTEST:{attest}"));
     assert_eq!(rows(&c), before, "a V4 node recorded V3 evidence");
 }
+
+/// G1 EQ-1, G5 SL-3 on real V4 nodes: an author that sends a second body
+/// for its slot to one node is caught there. That node keeps the pair in an
+/// epoch-keyed row, carries it through the DAG, and every node's block holds
+/// it and jails the author, checked against C_0 rather than the live set.
+#[test]
+fn a_v4_twin_is_recorded_carried_and_jails_its_author() {
+    let mut c = Cluster::new("twin-evidence", &[51, 52, 53, 54], true);
+    c.run(3);
+    let (author, _, key) = tier2_keypair(52);
+    // Node 1 (seed 52) proposes; hold its messages to find the vertex.
+    c.node_mut(1).try_create_vertex();
+    let outbox = c.node(1).v4_outbox.clone().unwrap();
+    let original = outbox
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w.strip_prefix(crate::v4::WIRE_PREFIX))
+        .filter_map(|json| serde_json::from_str::<crate::v4::Msg>(json).ok())
+        .find_map(|m| match m {
+            crate::v4::Msg::Vertex(v) if v.author == author => Some(v),
+            _ => None,
+        })
+        .expect("node 1 proposed a vertex");
+    let mut twin = original.clone();
+    twin.payload.push("a second body for the same slot".into());
+    twin.payload_root = None;
+    twin.hash = twin.hash_v4_with_domain(&crate::qc::expected_chain_id(), GENESIS_IDENTITY);
+    twin.sign_with_ed25519(&crypto::SigningKey::from_bytes(&key));
+    assert_ne!(twin.hash, original.hash);
+    c.deliver();
+    let wire = format!(
+        "{}{}",
+        crate::v4::WIRE_PREFIX,
+        serde_json::to_string(&crate::v4::Msg::Vertex(twin.clone())).unwrap()
+    );
+    c.node_mut(0).handle_message(&wire);
+    let row = crate::v4::evidence::seen_key(&author, original.epoch, original.round);
+    assert!(
+        c.node(0).storage.get(&row).unwrap().is_some(),
+        "the node that saw both bodies keeps the pair"
+    );
+    let jailed = format!("validator:jailed:{author}");
+    c.run_until(60, |c| {
+        (0..4).all(|i| c.node(i).storage.get(&jailed).unwrap().is_some())
+    });
+    for i in 0..4 {
+        assert!(
+            c.node(i).storage.get(&jailed).unwrap().is_some(),
+            "node {i} applied the evidence"
+        );
+    }
+    let common = c.assert_same_blocks(1);
+    let carried = (1..=common).any(|h| {
+        c.node(2)
+            .storage
+            .get(&format!("block_{h}"))
+            .unwrap()
+            .and_then(|j| serde_json::from_str::<blockchain::Block>(&j).ok())
+            .is_some_and(|b| {
+                b.slash_evidence
+                    .iter()
+                    .any(|e| e.contains("equivocation_v4"))
+            })
+    });
+    assert!(carried, "a block carries the V4 evidence");
+}

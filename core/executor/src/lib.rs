@@ -572,6 +572,18 @@ const RETAINED_FROM_KEY: &str = "sys:validator_set:retained_from";
 /// kept while evidence of it can still be accepted.
 const EVIDENCE_MAX_AGE_SECS: u64 = 604_800;
 
+/// G5 SL-3: a verified evidence item: the offender and the slot it
+/// equivocated in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedEvidence {
+    pub offender: String,
+    pub kind: String,
+    /// The committee epoch of the slot. A V3 proof binds none: the executing
+    /// block's stands in (the V3 path is deleted in G5 S4c).
+    pub epoch: u64,
+    pub round: u64,
+}
+
 /// G5 SL-5: an offense's weights from the records of its epoch.
 struct OffenseRecord {
     began: u64,
@@ -2908,9 +2920,13 @@ impl Executor {
 
     /// Verify ONE evidence item against on-chain data only. Returns
     /// (offender, reason, round_or_epoch) on success. Pure.
-    pub fn verify_slash_evidence(&self, item: &str) -> Result<(String, String, u64), String> {
+    pub fn verify_slash_evidence(&self, item: &str) -> Result<VerifiedEvidence, String> {
         use std::collections::{BTreeMap, BTreeSet};
-        let ev: serde_json::Value = serde_json::from_str(item).map_err(|e| format!("bad json: {e}"))?;
+        let ev: serde_json::Value =
+            serde_json::from_str(item).map_err(|e| format!("bad json: {e}"))?;
+        if ev.get("kind").and_then(|k| k.as_str()) == Some("equivocation_v4") {
+            return self.verify_v4_twins(&ev);
+        }
         let validators: Vec<(String, u64)> = self
             .db
             .get("sys:validators")
@@ -2961,7 +2977,12 @@ impl Executor {
                 if !a.verify_ed25519_signature(&pk) || !b.verify_ed25519_signature(&pk) {
                     return Err("vertex signature invalid".into());
                 }
-                Ok((offender, "equivocation".into(), round))
+                Ok(VerifiedEvidence {
+                    offender,
+                    kind: "equivocation".into(),
+                    epoch: self.executing_epoch(),
+                    round,
+                })
             }
             Some("downtime") => {
                 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -2993,10 +3014,81 @@ impl Executor {
                 if rs.saturating_mul(3) <= total.saturating_mul(2) {
                     return Err(format!("downtime quorum not met: {rs}/{total}"));
                 }
-                Ok((offender, "downtime".into(), epoch))
+                Ok(VerifiedEvidence {
+                    offender,
+                    kind: "downtime".into(),
+                    epoch,
+                    round: epoch,
+                })
             }
             _ => Err("unknown evidence kind".into()),
         }
+    }
+
+    /// G1 EQ-1, G5 SL-3: a V4 proposer-twin pair. Two vertices of one slot
+    /// (E, round, author) with different hashes, each hash its own `hash_v4`
+    /// under this chain's domain, each signed with the author's key in C_E
+    /// (never the live set). Refused once tau > tau_start(E+1) + W, or once
+    /// C_E's record is gone.
+    fn verify_v4_twins(&self, ev: &serde_json::Value) -> Result<VerifiedEvidence, String> {
+        let offender = ev
+            .get("offender")
+            .and_then(|v| v.as_str())
+            .ok_or("missing offender")?
+            .to_string();
+        let epoch = ev
+            .get("epoch")
+            .and_then(|v| v.as_u64())
+            .ok_or("missing epoch")?;
+        let round = ev
+            .get("round")
+            .and_then(|v| v.as_u64())
+            .ok_or("missing round")?;
+        let vertex = |field: &str| -> Result<blockchain::Vertex, String> {
+            serde_json::from_value(ev.get(field).cloned().unwrap_or_default())
+                .map_err(|e| format!("{field}: {e}"))
+        };
+        let (a, b) = (vertex("vertex_a")?, vertex("vertex_b")?);
+        for v in [&a, &b] {
+            if v.author != offender || v.epoch != epoch || v.round != round {
+                return Err("the pair is not one slot of the offender".into());
+            }
+        }
+        if a.hash == b.hash {
+            return Err("identical vertices are not equivocation".into());
+        }
+        let genesis_identity = self
+            .db
+            .get("genesis_identity")
+            .map_err(|e| e.to_string())?
+            .ok_or("no genesis identity")?;
+        let chain_id = blockchain::chain_id();
+        for v in [&a, &b] {
+            if v.hash_v4_with_domain(&chain_id, &genesis_identity) != v.hash {
+                return Err("a vertex hash is not its V4 hash".into());
+            }
+        }
+        let member = self
+            .committee_of_epoch(epoch)
+            .into_iter()
+            .find(|m| m.address == offender)
+            .ok_or_else(|| format!("{offender} is not in the committee of epoch {epoch}"))?;
+        if !a.verify_ed25519_signature(&member.ed25519_public_key)
+            || !b.verify_ed25519_signature(&member.ed25519_public_key)
+        {
+            return Err("vertex signature invalid".into());
+        }
+        if let Some(next) = self.epoch_began(epoch + 1) {
+            if committed_chain_clock(&self.db).time > next.saturating_add(EVIDENCE_MAX_AGE_SECS) {
+                return Err(format!("evidence of epoch {epoch} is older than W"));
+            }
+        }
+        Ok(VerifiedEvidence {
+            offender,
+            kind: "equivocation_v4".into(),
+            epoch,
+            round,
+        })
     }
 
     /// Apply the block's slash evidence: verify each item independently, then
@@ -3009,17 +3101,25 @@ impl Executor {
             // "downtime" item's apply path touched node-local rows.
             let is_equiv = serde_json::from_str::<serde_json::Value>(item)
                 .ok()
-                .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(|k| k == "equivocation"))
+                .and_then(|v| {
+                    v.get("kind")
+                        .and_then(|k| k.as_str())
+                        .map(|k| k == "equivocation" || k == "equivocation_v4")
+                })
                 .unwrap_or(false);
             if !is_equiv {
                 eprintln!("⚠️  [SLASH] rejecting non-equivocation evidence kind in block");
                 continue;
             }
             match self.verify_slash_evidence(item) {
-                Ok((offender, reason, round)) => {
-                    // G5 S4b replaces this with the evidence's own epoch.
-                    self.execute_one_slash(&offender, self.executing_epoch(), round);
-                    if reason == "downtime" {
+                Ok(VerifiedEvidence {
+                    offender,
+                    kind,
+                    epoch,
+                    round,
+                }) => {
+                    self.execute_one_slash(&offender, epoch, round);
+                    if kind == "downtime" {
                         // These attestation rows are NODE-LOCAL bookkeeping (written
                         // with plain put by the local detector and by whatever gossip
                         // this node happened to receive). They were never state-root
@@ -3067,10 +3167,17 @@ impl Executor {
         let validator_addr = validator_addr.to_string();
         let key = &format!("sys:pending_slash:{}", validator_addr);
         {
-            // H-4 FIX: Tombstone check for replay protection
+            // H-4 FIX: Tombstone check for replay protection. G5 SL-3: a
+            // jailed validator's first offense is its only one.
             let event_id = format!("{}:{}", validator_addr, round);
             let tombstone_key = format!("sys:slashed:{}", event_id);
-            if let Ok(Some(_)) = self.db.get(&tombstone_key) {
+            let jailed = self
+                .db
+                .get(&format!("validator:jailed:{}", validator_addr))
+                .ok()
+                .flatten()
+                .is_some();
+            if jailed || matches!(self.db.get(&tombstone_key), Ok(Some(_))) {
                 println!(
                     "   ⏭️  Skipping already processed slash event: {}",
                     event_id
@@ -5760,8 +5867,13 @@ mod tests {
                 .to_string()
         };
 
-        let ok = executor.verify_slash_evidence(&item(&a, &b)).expect("valid proof");
-        assert_eq!(ok, (offender.clone(), "equivocation".to_string(), 9));
+        let ok = executor
+            .verify_slash_evidence(&item(&a, &b))
+            .expect("valid proof");
+        assert_eq!(
+            (ok.offender, ok.kind, ok.round),
+            (offender.clone(), "equivocation".to_string(), 9)
+        );
 
         // Same vertex twice is not equivocation.
         assert!(executor.verify_slash_evidence(&item(&a, &a)).is_err());
@@ -5809,9 +5921,16 @@ mod tests {
         let (ba, bb) = (mk_big(3), mk_big(4));
         let (ca, cb) = (ba.to_compact_proof(), bb.to_compact_proof());
         let compact_item = item(&ca, &cb);
-        assert!(compact_item.len() < 2_000, "compact proof must be small: {}", compact_item.len());
+        assert!(
+            compact_item.len() < 2_000,
+            "compact proof must be small: {}",
+            compact_item.len()
+        );
+        let compact = executor
+            .verify_slash_evidence(&compact_item)
+            .expect("compact proof verifies");
         assert_eq!(
-            executor.verify_slash_evidence(&compact_item).expect("compact proof verifies"),
+            (compact.offender, compact.kind, compact.round),
             (offender.clone(), "equivocation".to_string(), 9)
         );
         // A compact proof whose root was tampered fails hash binding.
@@ -5861,7 +5980,10 @@ mod tests {
         let ok = executor
             .verify_slash_evidence(&item(vec![att(&k1, &r1, true), att(&k2, &r2, true), att(&k3, &off, true)]))
             .expect("3/3 stake meets quorum");
-        assert_eq!(ok, (off.clone(), "downtime".to_string(), 4));
+        assert_eq!(
+            (ok.offender, ok.kind, ok.round),
+            (off.clone(), "downtime".to_string(), 4)
+        );
         // A bad signature invalidates the whole item (proposer cannot pad quorum).
         assert!(executor
             .verify_slash_evidence(&item(vec![att(&k1, &r1, true), att(&k2, &r2, true), att(&k3, &off, false)]))
@@ -7157,6 +7279,159 @@ mod tests {
             0,
             "a closed pool takes no delegation"
         );
+    }
+
+    /// A V4 vertex of `key`'s account at (epoch, round), hashed under this
+    /// chain's domain and `genesis_identity`, and signed.
+    fn g5_v4_vertex(
+        key: &SigningKey,
+        epoch: u64,
+        round: u64,
+        payload: &str,
+        genesis_identity: &str,
+    ) -> blockchain::Vertex {
+        let author = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let mut v =
+            blockchain::Vertex::new(round, author, vec!["genesis".into()], vec![payload.into()]);
+        v.epoch = epoch;
+        v.hash = v.hash_v4_with_domain(&blockchain::chain_id(), genesis_identity);
+        v.sign_with_ed25519(key);
+        v
+    }
+
+    /// G5 SL-3, G1 EQ-1: a V4 proposer-twin pair is checked against the
+    /// committee of its epoch, never the live set, and is refused once
+    /// older than W: tau > tau_start(E+1) + W. Accepted, it records the
+    /// offense in the evidence's own epoch.
+    #[test]
+    fn g5_v4_twin_evidence_is_checked_against_its_committee_and_age() {
+        let ain = G5_AIN;
+        let seeds: Vec<(u8, u64)> = (190..194).map(|seed| (seed, 1_000)).collect();
+        let (mut chain, validators, _) =
+            delegation_chain("g5_sl_v4_evidence", 20, DAY, &seeds, &[]);
+        let db = chain.db.clone();
+        let gi = "g5-v4-evidence-genesis";
+        {
+            let _seed = db.seeding();
+            db.put("genesis_identity", gi).unwrap();
+        }
+        let (key, offender) = (&validators[1].0, validators[1].1.clone());
+        let item = |a: &blockchain::Vertex, b: &blockchain::Vertex| consensus_evidence_item(a, b);
+        let (a, b) = (
+            g5_v4_vertex(key, 0, 5, "a", gi),
+            g5_v4_vertex(key, 0, 5, "b", gi),
+        );
+        let ok = chain
+            .executor
+            .verify_slash_evidence(&item(&a, &b))
+            .expect("valid twins");
+        assert_eq!(
+            ok,
+            VerifiedEvidence {
+                offender: offender.clone(),
+                kind: "equivocation_v4".into(),
+                epoch: 0,
+                round: 5,
+            }
+        );
+        // Not twins: one vertex twice, or two slots.
+        assert!(chain.executor.verify_slash_evidence(&item(&a, &a)).is_err());
+        let other_round = g5_v4_vertex(key, 0, 6, "b", gi);
+        assert!(chain
+            .executor
+            .verify_slash_evidence(&item(&a, &other_round))
+            .is_err());
+        // A key outside C_0 signs nothing that counts, even as a live validator.
+        let outsider = SigningKey::from_bytes(&[199; 32]);
+        let (x, y) = (
+            g5_v4_vertex(&outsider, 0, 5, "a", gi),
+            g5_v4_vertex(&outsider, 0, 5, "b", gi),
+        );
+        {
+            let outsider_addr =
+                crypto::derive_address(outsider.verifying_key().as_bytes()).unwrap();
+            let _seed = db.seeding();
+            db.put(
+                "sys:validators",
+                &serde_json::to_string(&vec![(outsider_addr, 1_000u64)]).unwrap(),
+            )
+            .unwrap();
+        }
+        assert!(chain.executor.verify_slash_evidence(&item(&x, &y)).is_err());
+        // Another domain, or a pair whose epoch C_0 does not cover.
+        let foreign = g5_v4_vertex(key, 0, 5, "b", "another-genesis");
+        assert!(chain
+            .executor
+            .verify_slash_evidence(&item(&a, &foreign))
+            .is_err());
+        let (a3, b3) = (
+            g5_v4_vertex(key, 3, 5, "a", gi),
+            g5_v4_vertex(key, 3, 5, "b", gi),
+        );
+        assert!(chain
+            .executor
+            .verify_slash_evidence(&item(&a3, &b3))
+            .is_err());
+
+        // Age: epoch 1 begins at 20 d, so evidence of epoch 0 is good until
+        // 27 d exactly (one-day blocks).
+        chain.run_to(27, vec![]);
+        assert_eq!(chain.clock().time, 27 * DAY);
+        assert!(chain.executor.verify_slash_evidence(&item(&a, &b)).is_ok());
+        chain.run_until(27 * DAY + 1, vec![]);
+        let refused = chain
+            .executor
+            .verify_slash_evidence(&item(&a, &b))
+            .unwrap_err();
+        assert!(refused.contains("older than W"), "{refused}");
+
+        // Carried in a block (epoch 1 evidence, fresh), it records the offense
+        // in its own epoch and jails the offender.
+        let (a1, b1) = (
+            g5_v4_vertex(key, 1, 25, "a", gi),
+            g5_v4_vertex(key, 1, 25, "b", gi),
+        );
+        let height = chain.height + 1;
+        chain.height = height;
+        chain.timestamp += DAY;
+        let proposer = chain.proposer.clone();
+        match chain.executor.execute_block_parallel_at(
+            vec![],
+            &proposer,
+            height,
+            chain.timestamp,
+            &[item(&a1, &b1)],
+        ) {
+            BlockExecOutcome::Executed(_) => {}
+            other => panic!("the block must execute: {other:?}"),
+        }
+        let offense = g5_offense(&db, &offender);
+        assert_eq!(
+            (offense.epoch, offense.weight, offense.committee_weight),
+            (1, 1_000, 4_000)
+        );
+        assert!(db
+            .get(&format!("validator:jailed:{offender}"))
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            g5_own_unbonding(&db, &offender),
+            vec![(height, 1_000 * ain)]
+        );
+    }
+
+    /// The item a V4 node carries for twins (consensus `v4::evidence`).
+    fn consensus_evidence_item(a: &blockchain::Vertex, b: &blockchain::Vertex) -> String {
+        let (first, second) = if a.hash < b.hash { (a, b) } else { (b, a) };
+        serde_json::json!({
+            "kind": "equivocation_v4",
+            "offender": first.author,
+            "epoch": first.epoch,
+            "round": first.round,
+            "vertex_a": first.to_compact_proof_v4(),
+            "vertex_b": second.to_compact_proof_v4(),
+        })
+        .to_string()
     }
 
     /// G5 DL-3: tickets are capped per account, so a full account blocks only

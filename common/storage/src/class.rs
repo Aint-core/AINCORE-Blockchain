@@ -284,6 +284,9 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         ["sys", "equiv_seen" | "equiv_carried" | "equiv_gossiped", o, r] if seg(o) && dec(r) => {
             Local
         }
+        ["sys", "equiv_seen_v4" | "equiv_carried_v4", o, e, r] if seg(o) && dec(e) && dec(r) => {
+            Local
+        }
         ["sys", "equiv_local_jail", o] if seg(o) => Local,
         ["dag", "checkpoint" | "checkpoint_sig", r] if dec(r) => Local,
         ["consensus", "cseq", r] if dec(r) => Local,
@@ -624,6 +627,8 @@ mod tests {
             (format!("sys:equiv_seen:{H64}:42"), Local),
             (format!("sys:equiv_carried:{H64}:42"), Local),
             (format!("sys:equiv_gossiped:{H64}:42"), Local),
+            (format!("sys:equiv_seen_v4:{H64}:3:42"), Local),
+            (format!("sys:equiv_carried_v4:{H64}:3:42"), Local),
             (format!("sys:equiv_local_jail:{H64}"), Local),
             ("dag:checkpoint:213600".into(), Local),
             ("dag:checkpoint_sig:213600".into(), Local),

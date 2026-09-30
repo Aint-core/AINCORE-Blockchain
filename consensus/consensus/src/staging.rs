@@ -43,6 +43,14 @@ pub fn vslot_key(epoch: u64, round: u64, author: &str) -> String {
     format!("consensus:vslot:v1:{epoch:020}:{round:020}:{author}")
 }
 
+/// The digests staged for a slot (at most `MAX_STAGED_PER_SLOT`); empty when
+/// the slot row is absent or unreadable.
+pub fn slot_digests(storage: &StateDB, epoch: u64, round: u64, author: &str) -> Vec<String> {
+    read_slot(storage, &vslot_key(epoch, round, author))
+        .map(|slot| slot.into_iter().map(|e| e.digest).collect())
+        .unwrap_or_default()
+}
+
 pub fn vcert_key(epoch: u64, round: u64, author: &str) -> String {
     format!("consensus:vcert:v1:{epoch:020}:{round:020}:{author}")
 }

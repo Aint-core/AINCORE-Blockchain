@@ -727,6 +727,9 @@ impl Engine {
         let sign = self.may_sign()
             && self.closing_round.is_none()
             && certified.as_deref().is_none_or(|d| d == v.hash);
+        // G1 EQ-1 / G5 SL-3: a second digest for the slot is proposer-twin
+        // evidence. Read the slot's other bodies first: staging may evict one.
+        let twins = evidence::other_bodies(&self.storage, &v);
         let (committee, key, address, budget) = (
             &self.cfg.committee,
             &self.cfg.node_key,
@@ -757,6 +760,9 @@ impl Engine {
         let Ok((attestation, staged)) = result else {
             return;
         };
+        for other in &twins {
+            evidence::record_twin(&self.storage, other, &v);
+        }
         {
             let mut dag = lock(&self.dag);
             match staged {
@@ -1295,6 +1301,7 @@ impl Engine {
 }
 
 pub mod epoch;
+pub mod evidence;
 mod gc;
 pub mod pull;
 

@@ -1874,9 +1874,18 @@ mod tests {
     /// would make apply_slash_evidence touch node-local attestation rows.
     #[test]
     fn test_only_equivocation_items_pass_kind_filter() {
-        assert!(DagConsensus::is_equivocation_item(r#"{"kind":"equivocation","offender":"x","round":1}"#));
-        assert!(!DagConsensus::is_equivocation_item(r#"{"kind":"downtime","offender":"x","epoch":1,"round":1}"#));
-        assert!(!DagConsensus::is_equivocation_item(r#"{"offender":"x","round":1}"#));
+        assert!(DagConsensus::is_equivocation_item(
+            r#"{"kind":"equivocation","offender":"x","round":1}"#
+        ));
+        assert!(DagConsensus::is_equivocation_item(
+            r#"{"kind":"equivocation_v4","offender":"x","epoch":2,"round":1}"#
+        ));
+        assert!(!DagConsensus::is_equivocation_item(
+            r#"{"kind":"downtime","offender":"x","epoch":1,"round":1}"#
+        ));
+        assert!(!DagConsensus::is_equivocation_item(
+            r#"{"offender":"x","round":1}"#
+        ));
         assert!(!DagConsensus::is_equivocation_item("not json"));
     }
 

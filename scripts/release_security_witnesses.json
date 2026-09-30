@@ -44,6 +44,7 @@
         "ordering::tests::the_descending_walk_is_walk_history_at_every_floor",
         "qc_producer::tests::persistence::a_qc_over_another_state_root_is_never_stored",
         "tests::tests::v4_node_tests::v4_nodes_rotate_epochs_on_the_qc_of_each_boundary_block",
+        "tests::tests::v4_node_tests::a_v4_twin_is_recorded_carried_and_jails_its_author",
         "tests::tests::a_block_timestamp_needs_a_quorum_of_the_committee"
       ],
       "excluded_ignored": {
@@ -76,6 +77,7 @@
         "tests::g5_a_slash_settles_by_the_weight_that_equivocated_together",
         "tests::g5_the_operator_pays_first_and_only_in_scope_stake",
         "tests::g5_a_tombstoned_validator_is_slashed_once_and_never_rejoins",
+        "tests::g5_v4_twin_evidence_is_checked_against_its_committee_and_age",
         "tests::g5_a_full_account_blocks_only_its_own_undelegation",
         "tests::g5_a_pool_does_not_grow_with_its_delegators",
         "tests::g5_pool_arithmetic_rounds_for_the_pool_and_never_aborts_on_dust",
