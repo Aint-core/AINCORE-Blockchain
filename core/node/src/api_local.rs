@@ -389,6 +389,43 @@ fn move_balance(storage: &Arc<StateDB>, addr: &str) -> String {
     coin_store_balance(storage, move_coin_store_key(move_addr))
 }
 
+/// G5 DL-2: a pool as the RPC reports it. `active`: its validator is in the
+/// live set, so the pool takes delegations (unless a slash closed it).
+fn validator_pool_json(
+    pool: &executor::DelegationPool,
+    now: u64,
+    active: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "total_delegated": pool.active_coins.to_string(),
+        "commission_rate": pool.commission_at(now),
+        "pending_commission": pool.pending_commission,
+        "commission_effective_time": pool.commission_effective_time,
+        "delegator_count": pool.position_count,
+        "unbonding": pool.unbonding_coins.to_string(),
+        "rewards_held": pool.rewards.to_string(),
+        "slashed": pool.closed,
+        "is_accepting": active && !pool.closed
+    })
+}
+
+/// The live validator set's addresses (`sys:validator_set:v1`).
+fn live_validator_addresses(storage: &Arc<StateDB>) -> std::collections::BTreeSet<String> {
+    storage
+        .get("sys:validator_set:v1")
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(&raw).ok())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|v| {
+            v.get("address")
+                .and_then(|a| a.as_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 fn coin_store_balance(storage: &Arc<StateDB>, key: String) -> String {
     storage
         .get(&key)
@@ -1190,58 +1227,59 @@ fn handle_rpc_method(
 
         // ============ DELEGATION QUERY METHODS ============
 
+        // G5 DL-2, DL-3: delegation lives in Move state (`0x1::delegation::Pool`
+        // at the validator, `0x1::delegation::Book` at the delegator). Amounts
+        // are base-unit strings; a ticket's amount is nominal (a slash of its
+        // pool is applied when it is withdrawn).
         "aincore_getDelegation" => {
             // params: [delegator_address, validator_address]
             if let (Some(delegator), Some(validator)) = (
                 params.get(0).and_then(|v| v.as_str()),
                 params.get(1).and_then(|v| v.as_str())
             ) {
-                // Query delegation from storage
-                // Delegation data stored as: delegation:{delegator}:{validator}
-                let key = format!("delegation:{}:{}", delegator, validator);
-                match data.storage.get(&key) {
-                    Ok(Some(data_str)) => {
-                        if let Ok(del_data) = serde_json::from_str::<serde_json::Value>(&data_str) {
-                            Ok(del_data)
-                        } else {
-                            Ok(serde_json::json!({ "amount": "0", "pending_rewards": "0" }))
-                        }
-                    },
-                    _ => Ok(serde_json::json!({ "amount": "0", "pending_rewards": "0" }))
-                }
+                let position = executor::delegation_book(&data.storage, delegator).and_then(|book| {
+                    book.positions
+                        .into_iter()
+                        .find(|p| p.validator.to_string() == validator)
+                });
+                let pool = executor::delegation_pool(&data.storage, validator);
+                let (amount, pending, points) = match (pool, position) {
+                    (Some(pool), Some(position)) => {
+                        let (value, owed) = pool.position_value(&position);
+                        (value, owed, position.points)
+                    }
+                    _ => (0, 0, 0),
+                };
+                Ok(serde_json::json!({
+                    "amount": amount.to_string(),
+                    "pending_rewards": pending.to_string(),
+                    "points": points.to_string()
+                }))
             } else {
                 Err(JsonRpcError { code: -32602, message: "Invalid params: [delegator, validator]".into() })
             }
         },
 
         "aincore_getDelegations" => {
-            // params: [delegator_address]
-            //
-            // Phase 2.11 (scope creep): bounded scan to prevent
-            // unbounded-iterator DoS through the API. Cap of 1000
-            // mirrors MAX_LIMIT used elsewhere in the API and is
-            // comfortably above realistic per-delegator delegation
-            // counts.
+            // params: [delegator_address]; at most 8 positions (DL-3).
             if let Some(delegator) = params.get(0).and_then(|v| v.as_str()) {
-                let prefix = format!("delegation:{}:", delegator);
-                let mut delegations = Vec::new();
-                const API_PREFIX_CAP: usize = 1000;
-
-                for (key_str, raw_value) in
-                    data.storage.scan_prefix_limited(&prefix, API_PREFIX_CAP)
-                {
-                    let validator = key_str.strip_prefix(&prefix).unwrap_or("");
-                    if let Ok(del_data) =
-                        serde_json::from_str::<serde_json::Value>(&raw_value)
-                    {
-                        delegations.push(serde_json::json!({
+                let positions = executor::delegation_book(&data.storage, delegator)
+                    .map(|book| book.positions)
+                    .unwrap_or_default();
+                let delegations: Vec<serde_json::Value> = positions
+                    .iter()
+                    .map(|position| {
+                        let validator = position.validator.to_string();
+                        let (amount, pending) = executor::delegation_pool(&data.storage, &validator)
+                            .map(|pool| pool.position_value(position))
+                            .unwrap_or((0, 0));
+                        serde_json::json!({
                             "validator": validator,
-                            "amount": del_data.get("amount").unwrap_or(&serde_json::json!("0")),
-                            "pending_rewards": del_data.get("pending_rewards").unwrap_or(&serde_json::json!("0"))
-                        }));
-                    }
-                }
-
+                            "amount": amount.to_string(),
+                            "pending_rewards": pending.to_string()
+                        })
+                    })
+                    .collect();
                 Ok(serde_json::json!(delegations))
             } else {
                 Err(JsonRpcError { code: -32602, message: "Invalid params: [delegator_address]".into() })
@@ -1249,29 +1287,27 @@ fn handle_rpc_method(
         },
 
         "aincore_getUnbondingDelegations" => {
-            // params: [delegator_address]
-            //
-            // Phase 2.11: bounded scan, see aincore_getDelegations.
+            // params: [delegator_address]; at most 16 tickets (DL-3).
             if let Some(delegator) = params.get(0).and_then(|v| v.as_str()) {
-                let prefix = format!("unbonding:{}:", delegator);
-                let mut unbondings = Vec::new();
-                const API_PREFIX_CAP: usize = 1000;
-
-                for (key_str, raw_value) in
-                    data.storage.scan_prefix_limited(&prefix, API_PREFIX_CAP)
-                {
-                    let validator = key_str.strip_prefix(&prefix).unwrap_or("");
-                    if let Ok(data) =
-                        serde_json::from_str::<serde_json::Value>(&raw_value)
-                    {
-                        unbondings.push(serde_json::json!({
+                let tickets = executor::delegation_book(&data.storage, delegator)
+                    .map(|book| book.tickets)
+                    .unwrap_or_default();
+                let unbondings: Vec<serde_json::Value> = tickets
+                    .iter()
+                    .map(|ticket| {
+                        let validator = ticket.validator.to_string();
+                        let pool_slashed = executor::delegation_pool(&data.storage, &validator)
+                            .map(|pool| pool.closed)
+                            .unwrap_or(false);
+                        serde_json::json!({
                             "validator": validator,
-                            "amount": data.get("amount").unwrap_or(&serde_json::json!("0")),
-                            "unlock_time": data.get("unlock_time").unwrap_or(&serde_json::json!(0))
-                        }));
-                    }
-                }
-
+                            "amount": ticket.amount.to_string(),
+                            "unlock_time": ticket.unlock_time,
+                            "created_epoch": ticket.created_epoch,
+                            "pool_slashed": pool_slashed
+                        })
+                    })
+                    .collect();
                 Ok(serde_json::json!(unbondings))
             } else {
                 Err(JsonRpcError { code: -32602, message: "Invalid params: [delegator_address]".into() })
@@ -1281,60 +1317,34 @@ fn handle_rpc_method(
         "aincore_getValidatorPool" => {
             // params: [validator_address]
             if let Some(validator) = params.get(0).and_then(|v| v.as_str()) {
-                let key = format!("validator_pool:{}", validator);
-                match data.storage.get(&key) {
-                    Ok(Some(pool_str)) => {
-                        if let Ok(pool_data) = serde_json::from_str::<serde_json::Value>(&pool_str) {
-                            Ok(serde_json::json!({
-                                "total_delegated": pool_data.get("total_delegated").unwrap_or(&serde_json::json!("0")),
-                                "commission_rate": pool_data.get("commission_rate").unwrap_or(&serde_json::json!(0)),
-                                "delegator_count": pool_data.get("delegator_count").unwrap_or(&serde_json::json!(0)),
-                                "is_accepting": true
-                            }))
-                        } else {
-                            Ok(serde_json::json!({
-                                "total_delegated": "0",
-                                "commission_rate": 0,
-                                "delegator_count": 0,
-                                "is_accepting": false
-                            }))
-                        }
-                    },
-                    _ => Ok(serde_json::json!({
+                let now = executor::committed_chain_clock(&data.storage).time;
+                let active = live_validator_addresses(&data.storage).contains(validator);
+                Ok(match executor::delegation_pool(&data.storage, validator) {
+                    Some(pool) => validator_pool_json(&pool, now, active),
+                    None => serde_json::json!({
                         "total_delegated": "0",
                         "commission_rate": 0,
                         "delegator_count": 0,
                         "is_accepting": false
-                    }))
-                }
+                    }),
+                })
             } else {
                 Err(JsonRpcError { code: -32602, message: "Invalid params: [validator_address]".into() })
             }
         },
 
         "aincore_getValidatorsWithDelegation" => {
-            // No params, returns all validators accepting delegations
-            let mut validators = Vec::new();
-
-            // Phase 2.11: bounded scan, see aincore_getDelegations.
-            let prefix = "validator_pool:";
-            const API_PREFIX_CAP: usize = 1000;
-            for (key_str, raw_value) in
-                data.storage.scan_prefix_limited(prefix, API_PREFIX_CAP)
-            {
-                let validator = key_str.strip_prefix(prefix).unwrap_or("");
-                if let Ok(pool_data) =
-                    serde_json::from_str::<serde_json::Value>(&raw_value)
-                {
-                    validators.push(serde_json::json!({
-                        "address": validator,
-                        "total_delegated": pool_data.get("total_delegated").unwrap_or(&serde_json::json!("0")),
-                        "commission_rate": pool_data.get("commission_rate").unwrap_or(&serde_json::json!(0)),
-                        "delegator_count": pool_data.get("delegator_count").unwrap_or(&serde_json::json!(0))
-                    }));
-                }
-            }
-
+            // No params: the live validators with an open pool.
+            let now = executor::committed_chain_clock(&data.storage).time;
+            let validators: Vec<serde_json::Value> = live_validator_addresses(&data.storage)
+                .into_iter()
+                .filter_map(|address| {
+                    let pool = executor::delegation_pool(&data.storage, &address)?;
+                    let mut entry = validator_pool_json(&pool, now, true);
+                    entry["address"] = serde_json::json!(address);
+                    Some(entry)
+                })
+                .collect();
             Ok(serde_json::json!(validators))
         },
 
@@ -2620,6 +2630,120 @@ mod tests {
         assert_eq!(key(move_coin_store_key(move_address(&address))), None);
         assert_eq!(key(wbtc_coin_store_key(move_address(&address))), None);
         assert!(db.get_object(&address).is_none(), "no account was created");
+    }
+
+    /// G5 DL-2, DL-3: the delegation RPCs read the Move state, the pool at
+    /// the validator and the book at the delegator. They used to read keys
+    /// nothing wrote, and always answered zero.
+    #[test]
+    fn the_delegation_rpcs_read_the_move_pool_and_book() {
+        let db = temp_db("s3_delegation_rpc");
+        let (validator, delegator) = (format!("{:064x}", 0xa1), format!("{:064x}", 0xd1));
+        let ain: u128 = 1_000_000_000_000_000_000;
+        let pool = executor::DelegationPool {
+            active_coins: 2 * ain,
+            active_points: 2 * ain,
+            reward_counter: ain / 2,
+            reward_carry: 0,
+            unbonding_coins: 3 * ain,
+            principal: 5 * ain,
+            rewards: ain,
+            commission_rate: 1_000,
+            pending_commission: 1_500,
+            commission_effective_time: 100,
+            closed: false,
+            slash_count: 0,
+            ticket_count: 1,
+            position_count: 1,
+            slash_events: vec![],
+        };
+        let book = executor::DelegationBook {
+            positions: vec![executor::DelegationPosition {
+                validator: move_address(&validator),
+                points: 2 * ain,
+                reward_snapshot: 0,
+            }],
+            tickets: vec![executor::DelegationTicket {
+                validator: move_address(&validator),
+                amount: 3 * ain,
+                created_epoch: 4,
+                slash_seq: 0,
+                unlock_time: 9_000,
+            }],
+        };
+        let clock = executor::ChainClock {
+            height: 10,
+            time: 200,
+            block_timestamp: 1_000,
+        };
+        {
+            let _seed = db.seeding();
+            let put = |address: &str, tag: &str, bytes: Vec<u8>| {
+                db.put(
+                    &vm_move::state_keys::resource_key_str(&move_address(address), tag),
+                    &hex::encode(bytes),
+                )
+                .unwrap();
+            };
+            put(
+                &validator,
+                "0x1::delegation::Pool",
+                bcs::to_bytes(&pool).unwrap(),
+            );
+            put(
+                &delegator,
+                "0x1::delegation::Book",
+                bcs::to_bytes(&book).unwrap(),
+            );
+            put(
+                &format!("{:064x}", 1),
+                "0x1::chain::Clock",
+                bcs::to_bytes(&clock).unwrap(),
+            );
+            db.put(
+                "sys:validator_set:v1",
+                &serde_json::json!([{ "address": validator, "stake": 1_002 }]).to_string(),
+            )
+            .unwrap();
+        }
+        let state = test_state(Arc::clone(&db));
+        let rpc = |method: &str, params: serde_json::Value| {
+            handle_rpc_method(method, params, &state).expect(method)
+        };
+
+        // The pending raise took effect at 100; the clock reads 200.
+        let pool_json = rpc("aincore_getValidatorPool", serde_json::json!([validator]));
+        assert_eq!(pool_json["total_delegated"], "2000000000000000000");
+        assert_eq!(pool_json["commission_rate"], 1_500);
+        assert_eq!(pool_json["delegator_count"], 1);
+        assert_eq!(pool_json["unbonding"], "3000000000000000000");
+        assert_eq!(pool_json["rewards_held"], "1000000000000000000");
+        assert_eq!(pool_json["is_accepting"], true);
+        // Owed: 2e18 points x 0.5e18 / 1e18 = 1e18.
+        let one = rpc(
+            "aincore_getDelegation",
+            serde_json::json!([delegator, validator]),
+        );
+        assert_eq!(one["amount"], "2000000000000000000");
+        assert_eq!(one["pending_rewards"], "1000000000000000000");
+        let all = rpc("aincore_getDelegations", serde_json::json!([delegator]));
+        assert_eq!(all[0]["validator"], validator);
+        assert_eq!(all[0]["amount"], "2000000000000000000");
+        let unbonding = rpc(
+            "aincore_getUnbondingDelegations",
+            serde_json::json!([delegator]),
+        );
+        assert_eq!(unbonding[0]["amount"], "3000000000000000000");
+        assert_eq!(unbonding[0]["unlock_time"], 9_000);
+        assert_eq!(unbonding[0]["pool_slashed"], false);
+        let listed = rpc("aincore_getValidatorsWithDelegation", serde_json::json!([]));
+        assert_eq!(listed[0]["address"], validator);
+        // A stranger has nothing.
+        let none = rpc(
+            "aincore_getDelegation",
+            serde_json::json!([format!("{:064x}", 0xee), validator]),
+        );
+        assert_eq!(none["amount"], "0");
     }
 
     /// Every address form reads the same account; a mistyped `A1n` is refused

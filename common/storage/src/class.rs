@@ -262,6 +262,7 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
     let class = match p.as_slice() {
         // S
         ["sys", "validator_set", "epoch", e] if dec(e) => State,
+        ["sys", "validator_set", "epoch_delegated", e] if dec(e) => State,
         ["consensus", "epoch_start_height", e] if dec(e) => State,
         ["sys", "fee_sweep_queue", h, miner] if dec(h) && seg(miner) => State,
         ["sys", "slashed", a, r] if seg(a) && dec(r) => State,
@@ -382,6 +383,7 @@ pub const STATE_PREFIXES: &[&str] = &[
     "pqc_pubkey_",
     "obj:",
     "sys:validator_set:epoch:",
+    "sys:validator_set:epoch_delegated:",
     "consensus:epoch_start_height:",
     "sys:fee_sweep_queue:",
     "sys:slashed:",
@@ -575,6 +577,7 @@ mod tests {
             ("sys:validator_set:v1".into(), State),
             ("genesis:validator_set:v1".into(), State),
             ("sys:validator_set:epoch:12".into(), State),
+            ("sys:validator_set:epoch_delegated:12".into(), State),
             ("consensus:epoch".into(), State),
             ("consensus:epoch_start_height:12".into(), State),
             ("sys:last_epoch_boundary".into(), State),
@@ -744,6 +747,8 @@ mod tests {
             "obj:",
             "sys:validator_set:epoch:",
             "sys:validator_set:epoch:x",
+            "sys:validator_set:epoch_delegated:",
+            "sys:validator_set:epoch_delegated:07",
             &format!("tx_index:{}", &H64[..63]),
             &format!("vertex:{}", H64.to_uppercase()),
             "sys:config:unknown",

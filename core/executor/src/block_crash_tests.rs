@@ -260,8 +260,11 @@ fn block_crash_child() {
                 // Params and Clock layout 35d1e242..., the tau clock write (the
                 // block at timestamp 7) 3208d836.... G5 S2 moved it through
                 // the stdlib alone (per-period emission): with A1's bytecode the
-                // S2 executor reproduces 3208d836... exactly.
-                "e8953244fae2148eddfed110d1716230b3f6e785dd0f9ca4cf8d63410e23c694",
+                // S2 executor reproduces 3208d836... exactly. G5 S3 moved it
+                // through the stdlib alone (delegation pools, the emission
+                // hot potato, math): with S2's bytecode the S3 executor
+                // reproduces e8953244... exactly.
+                "726ce81de53f3a51edd3c6c77a99cf9c2464f6ba216970ec82f3298b93794f97",
                 "clean execution must preserve the pre-staging fixture root"
             );
         }

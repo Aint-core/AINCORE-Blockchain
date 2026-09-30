@@ -27,7 +27,7 @@ module 0x1::epoch {
 
         staking::advance_committee_epoch(account);
         // G5 UB-1: pay matured unbonding (never burn it). Rewards are paid
-        // every reward period by `staking::pay_rewards` (G5 EM-1), not here.
+        // every reward period by `delegation::pay_rewards` (G5 EM-1), not here.
         staking::pay_matured_unbonding(account);
     }
 }

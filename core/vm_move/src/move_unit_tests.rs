@@ -239,7 +239,7 @@ fn stdlib_move_unit_tests_pass_on_the_production_vm() {
     let (ran, failures) = run_plans(&modules, &plans);
     // The count is pinned so a test that stops being discovered (a broken
     // attribute, a file that no longer loads) fails here instead of vanishing.
-    assert_eq!(ran, 21, "Move unit tests discovered");
+    assert_eq!(ran, 26, "Move unit tests discovered");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 

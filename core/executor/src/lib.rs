@@ -1,5 +1,6 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use storage::rocksdb::WriteBatch;
 use storage::StateDB;
@@ -299,6 +300,155 @@ struct MoveSupplyStats {
     cumulative_burned: u128,
 }
 
+/// Mirror of the Move `0x1::delegation::SlashEvent` (G5 SL-1), BCS field order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationSlashEvent {
+    pub seq: u64,
+    pub infraction_epoch: u64,
+    pub bps: u64,
+    pub pending_tickets: u64,
+}
+
+/// Mirror of the Move `0x1::delegation::Pool` (G5 DL-2), BCS field order. A
+/// `Coin` is a struct of one u128, so its BCS bytes are that u128's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationPool {
+    pub active_coins: u128,
+    pub active_points: u128,
+    pub reward_counter: u128,
+    pub reward_carry: u128,
+    pub unbonding_coins: u128,
+    pub principal: u128,
+    pub rewards: u128,
+    pub commission_rate: u64,
+    pub pending_commission: u64,
+    pub commission_effective_time: u64,
+    pub closed: bool,
+    pub slash_count: u64,
+    pub ticket_count: u64,
+    pub position_count: u64,
+    pub slash_events: Vec<DelegationSlashEvent>,
+}
+
+/// Mirror of the Move `0x1::delegation::Position`, BCS field order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationPosition {
+    pub validator: move_core_types::account_address::AccountAddress,
+    pub points: u128,
+    pub reward_snapshot: u128,
+}
+
+/// Mirror of the Move `0x1::delegation::Ticket` (G5 DL-3), BCS field order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationTicket {
+    pub validator: move_core_types::account_address::AccountAddress,
+    pub amount: u128,
+    pub created_epoch: u64,
+    pub slash_seq: u64,
+    pub unlock_time: u64,
+}
+
+/// Mirror of the Move `0x1::delegation::Book` (G5 DL-3), BCS field order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationBook {
+    pub positions: Vec<DelegationPosition>,
+    pub tickets: Vec<DelegationTicket>,
+}
+
+/// A committed `0x1::delegation` resource at `address`: `Ok(None)` when the
+/// address is unparseable or holds none, `Err` when the stored value does not
+/// decode (corrupt state).
+fn delegation_resource<T: serde::de::DeserializeOwned>(
+    db: &StateDB,
+    address: &str,
+    tag: &str,
+) -> Result<Option<T>, String> {
+    let Some(address) = parse_move_address(address) else {
+        return Ok(None);
+    };
+    let Some(stored) = db
+        .get(&vm_move::state_keys::resource_key_str(&address, tag))
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let bytes = hex::decode(stored).map_err(|e| format!("{tag} is not hex: {e}"))?;
+    bcs::from_bytes(&bytes)
+        .map(Some)
+        .map_err(|e| format!("{tag} is corrupt: {e}"))
+}
+
+/// The delegation pool of `validator` (G5 DL-2), if it opened one. For
+/// readers (the RPC): unreadable state reads as none.
+pub fn delegation_pool(db: &StateDB, validator: &str) -> Option<DelegationPool> {
+    delegation_resource(db, validator, "0x1::delegation::Pool")
+        .ok()
+        .flatten()
+}
+
+/// The positions and unbonding tickets of `delegator` (G5 DL-3). For
+/// readers (the RPC): unreadable state reads as none.
+pub fn delegation_book(db: &StateDB, delegator: &str) -> Option<DelegationBook> {
+    delegation_resource(db, delegator, "0x1::delegation::Book")
+        .ok()
+        .flatten()
+}
+
+impl DelegationPool {
+    /// G5 CM-1: the commission in force at consensus time `time`, in basis
+    /// points (Move's `commission_at`).
+    pub fn commission_at(&self, time: u64) -> u64 {
+        if self.pending_commission != self.commission_rate && time >= self.commission_effective_time
+        {
+            self.pending_commission
+        } else {
+            self.commission_rate
+        }
+    }
+
+    /// G5 DL-2, DL-3: what `position` is worth, floor(p x C / P), and what it
+    /// can claim, floor(p x (rho - snapshot) / S) clamped to the reward
+    /// escrow (Move's `get_delegation`).
+    pub fn position_value(&self, position: &DelegationPosition) -> (u128, u128) {
+        use move_core_types::u256::U256;
+        // Move's `math::mul_div_floor`, in u256; a quotient past u128 (not
+        // reachable from valid state) saturates.
+        let mul_div = |a: u128, b: u128, c: u128| -> u128 {
+            if c == 0 {
+                return 0;
+            }
+            let quotient = U256::from(a) * U256::from(b) / U256::from(c);
+            if quotient > U256::from(u128::MAX) {
+                u128::MAX
+            } else {
+                quotient.unchecked_as_u128()
+            }
+        };
+        let value = mul_div(position.points, self.active_coins, self.active_points);
+        let owed = mul_div(
+            position.points,
+            self.reward_counter.saturating_sub(position.reward_snapshot),
+            COIN_SCALE,
+        );
+        (value, owed.min(self.rewards))
+    }
+}
+
+/// G5 DL-1: the committee weight `validator`'s pool adds, in whole AIN: its
+/// bonded delegated principal, or 0 without an open pool (a slashed pool
+/// weighs nothing). Corrupt pool state stops the node: this feeds the
+/// committee.
+pub fn delegated_weight(db: &StateDB, validator: &str) -> u64 {
+    delegation_resource::<DelegationPool>(db, validator, "0x1::delegation::Pool")
+        .unwrap_or_else(|e| panic!("CRITICAL: {e}"))
+        .filter(|pool| !pool.closed)
+        .map(|pool| u64::try_from(pool.active_coins / COIN_SCALE).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// 1 AIN in base units.
+const COIN_SCALE: u128 = 1_000_000_000_000_000_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FeeSweepEntry {
     miner: String,
@@ -370,6 +520,20 @@ pub fn next_chain_clock(db: &StateDB, height: u64, block_timestamp: u64) -> Chai
     }
 }
 
+/// The committed `0x1::chain::Clock` (G5 CL-2), for readers (the RPC):
+/// before the first block, or unreadable, it reads as zero.
+pub fn committed_chain_clock(db: &StateDB) -> ChainClock {
+    db.get(&vm_move::state_keys::resource_key_str(
+        &system_address(),
+        "0x1::chain::Clock",
+    ))
+    .ok()
+    .flatten()
+    .and_then(|raw| hex::decode(raw).ok())
+    .and_then(|bytes| bcs::from_bytes(&bytes).ok())
+    .unwrap_or_default()
+}
+
 /// G5 CL-2: the state write every block makes before its transactions,
 /// `0x1::chain::Clock` (see [`next_chain_clock`]), as (key, stored value). It
 /// is the only state change an empty block makes.
@@ -387,6 +551,12 @@ pub fn validator_set_key() -> String {
 
 fn validator_set_v1_key() -> &'static str {
     "sys:validator_set:v1"
+}
+
+/// G5 DL-1: the delegated part of each member's weight in the committee of
+/// `epoch`, written with the committee record.
+fn delegated_split_key(epoch: u64) -> String {
+    format!("sys:validator_set:epoch_delegated:{epoch}")
 }
 
 fn dex_registry_key() -> String {
@@ -1019,9 +1189,9 @@ impl Executor {
         else {
             return Ok(()); // not an active validator — nothing to resync
         };
-        const COIN_SCALE: u128 = 1_000_000_000_000_000_000;
+        // G5 DL-1: the bonded weight, its own stake plus its open pool's.
         let new_stake = match u64::try_from(cfg.stake.value / COIN_SCALE) {
-            Ok(s) => s,
+            Ok(s) => s.saturating_add(delegated_weight(&self.db, addr)),
             Err(_) => return Ok(()),
         };
 
@@ -1343,10 +1513,12 @@ impl Executor {
         println!("⏳ Epoch advanced at block {}", next_height);
     }
 
-    /// G5 EM-1, EM-2: at every reward-period height (h mod R = 0) pay the
-    /// emission for the consensus time since the last payout to the committee
-    /// of h's epoch, jailed members excluded. A payout that aborts is caught up
-    /// by the next one (Move keeps the time of the last payout).
+    /// G5 EM-1, EM-2, DL-2: at every reward-period height (h mod R = 0) pay
+    /// the emission for the consensus time since the last payout to the
+    /// committee of h's epoch, jailed members excluded, each member's weight
+    /// split into its own and its pool's part as recorded with the committee.
+    /// A payout that aborts is caught up by the next one (Move keeps the time
+    /// of the last payout).
     fn maybe_pay_rewards(&self, height: u64) {
         let Some(params) = chain_params(&self.db) else {
             return;
@@ -1354,26 +1526,33 @@ impl Executor {
         if height == 0 || !height.is_multiple_of(params.reward_period) {
             return;
         }
-        let (members, weights): (
-            Vec<move_core_types::account_address::AccountAddress>,
-            Vec<u64>,
-        ) = self
-            .paid_committee(height)
-            .into_iter()
-            .filter_map(|(address, stake)| parse_move_address(&address).map(|a| (a, stake)))
-            .unzip();
+        let split =
+            self.delegated_split_of_epoch(height.saturating_sub(1) / self.epoch_block_interval());
+        let mut members = Vec::new();
+        let mut self_weights = Vec::new();
+        let mut delegated_weights = Vec::new();
+        for (address, stake) in self.paid_committee(height) {
+            let Some(member) = parse_move_address(&address) else {
+                continue;
+            };
+            let delegated = split.get(&address).copied().unwrap_or(0).min(stake);
+            members.push(member);
+            self_weights.push(stake - delegated);
+            delegated_weights.push(delegated);
+        }
         let action = MoveAction::CallEntryFunction(EntryFunctionCall {
             module: move_core_types::language_storage::ModuleId::new(
                 system_address(),
-                move_core_types::identifier::Identifier::new("staking")
-                    .expect("staking identifier"),
+                move_core_types::identifier::Identifier::new("delegation")
+                    .expect("delegation identifier"),
             ),
             function: "pay_rewards".to_string(),
             ty_args: vec![],
             args: vec![
                 bcs::to_bytes(&system_address()).expect("an address is BCS"),
                 bcs::to_bytes(&members).expect("addresses are BCS"),
-                bcs::to_bytes(&weights).expect("weights are BCS"),
+                bcs::to_bytes(&self_weights).expect("weights are BCS"),
+                bcs::to_bytes(&delegated_weights).expect("weights are BCS"),
             ],
         });
         match self.vm.execute_transaction_actions(
@@ -1414,6 +1593,120 @@ impl Executor {
             .unwrap_or_default()
     }
 
+    /// The committee epoch of the executing block, E(h) = (h - 1) / I, from
+    /// the clock written before its slashes and transactions (G5 CL-2).
+    fn executing_epoch(&self) -> u64 {
+        let key = vm_move::state_keys::resource_key_str(&system_address(), "0x1::chain::Clock");
+        let height = self
+            .db
+            .get(&key)
+            .expect("CRITICAL: the chain clock could not be read")
+            .map(|raw| {
+                bcs::from_bytes::<ChainClock>(
+                    &hex::decode(raw).expect("CRITICAL: chain state is not hex"),
+                )
+                .expect("CRITICAL: 0x1::chain::Clock is corrupt")
+                .height
+            })
+            .unwrap_or(0);
+        height.saturating_sub(1) / self.epoch_block_interval()
+    }
+
+    /// G5 DL-1: the delegated part of each member's weight in the committee
+    /// of `epoch`, recorded with it (`sys:validator_set:epoch_delegated:{E}`).
+    /// Absent (epoch 0, or no member had an open pool): none.
+    fn delegated_split_of_epoch(&self, epoch: u64) -> BTreeMap<String, u64> {
+        self.db
+            .get(&delegated_split_key(epoch))
+            .expect("CRITICAL: the delegated-weight record could not be read")
+            .map(|raw| {
+                serde_json::from_str(&raw).expect("CRITICAL: a delegated-weight record is corrupt")
+            })
+            .unwrap_or_default()
+    }
+
+    /// G5 DL-1: at the boundary, before the next committee is derived, set
+    /// every live member's weight in `sys:validator_set:v1` (and the
+    /// `sys:validators` mirror) to its bonded stake: its own stake in the
+    /// Move ValidatorSet plus its open pool's active principal, in whole AIN.
+    /// A delegation therefore weighs the committee from the next epoch, never
+    /// inside one. Returns the delegated part per member. A member the Move
+    /// set does not hold (only a test fixture) keeps its weight and adds no
+    /// delegation.
+    fn refresh_bonded_weights(&self) -> BTreeMap<String, u64> {
+        let mut delegated = BTreeMap::new();
+        let Some(mut live) = self
+            .db
+            .get(validator_set_v1_key())
+            .expect("CRITICAL: the live validator set could not be read")
+            .and_then(|raw| serde_json::from_str::<Vec<ValidatorSetV1Entry>>(&raw).ok())
+        else {
+            return delegated;
+        };
+        let own: BTreeMap<move_core_types::account_address::AccountAddress, u128> = self
+            .db
+            .get(&validator_set_key())
+            .expect("CRITICAL: the Move validator set could not be read")
+            .and_then(|raw| decode_validator_set_hex(&raw))
+            .map(|set| {
+                set.validators
+                    .into_iter()
+                    .map(|v| (v.validator_addr, v.stake.value))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut bonded = BTreeMap::new();
+        for entry in live.iter_mut() {
+            let Some(own_stake) = parse_move_address(&entry.address).and_then(|a| own.get(&a))
+            else {
+                continue;
+            };
+            let pool = delegated_weight(&self.db, &entry.address);
+            if pool > 0 {
+                delegated.insert(entry.address.clone(), pool);
+            }
+            let weight = u64::try_from(own_stake / COIN_SCALE)
+                .unwrap_or(u64::MAX)
+                .saturating_add(pool);
+            if entry.stake != weight {
+                entry.stake = weight;
+                bonded.insert(entry.address.clone(), weight);
+            }
+        }
+        if bonded.is_empty() {
+            return delegated;
+        }
+        self.db
+            .put(
+                validator_set_v1_key(),
+                &serde_json::to_string(&live).expect("the live set is JSON"),
+            )
+            .expect("CRITICAL: the live validator set write failed");
+        if let Some(mut mirror) = self
+            .db
+            .get("sys:validators")
+            .expect("CRITICAL: the validator mirror could not be read")
+            .and_then(|raw| serde_json::from_str::<Vec<(String, u64)>>(&raw).ok())
+        {
+            let mut changed = false;
+            for (address, stake) in mirror.iter_mut() {
+                if let Some(weight) = bonded.get(address) {
+                    *stake = *weight;
+                    changed = true;
+                }
+            }
+            if changed {
+                self.db
+                    .put(
+                        "sys:validators",
+                        &serde_json::to_string(&mirror).expect("the mirror is JSON"),
+                    )
+                    .expect("CRITICAL: the validator mirror write failed");
+            }
+        }
+        delegated
+    }
+
     /// G5 EM-2: who is paid for block `height`: the members of the committee
     /// C_{E(height)} with their committee stake, never the live set; jailed
     /// members and zero stake excluded.
@@ -1446,6 +1739,7 @@ impl Executor {
         }
         let new_epoch = boundary_height / interval;
 
+        let delegated = self.refresh_bonded_weights();
         let current = self.committee_of_epoch(new_epoch.saturating_sub(1));
         let proposed: Vec<blockchain::committee::ValidatorInfo> = self
             .db
@@ -1454,7 +1748,7 @@ impl Executor {
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
         let (next, invalid) = blockchain::committee::next_committee(&current, &proposed);
-        if let Some(why) = invalid {
+        if let Some(why) = &invalid {
             eprintln!(
                 "🚨 [COMMITTEE_INVALID] epoch {new_epoch} keeps the previous committee: {why}"
             );
@@ -1465,6 +1759,27 @@ impl Executor {
                 &serde_json::to_string(&next).expect("a committee is JSON"),
             )
             .expect("CRITICAL: the committee record write failed");
+        // G5 DL-1: the delegated part of each member's weight, recorded with
+        // the committee for its payouts. A kept committee keeps its split.
+        let split: BTreeMap<String, u64> = if invalid.is_some() {
+            self.delegated_split_of_epoch(new_epoch.saturating_sub(1))
+        } else {
+            next.iter()
+                .filter_map(|m| {
+                    delegated
+                        .get(&m.address)
+                        .map(|d| (m.address.clone(), (*d).min(m.stake)))
+                })
+                .collect()
+        };
+        if !split.is_empty() {
+            self.db
+                .put(
+                    &delegated_split_key(new_epoch),
+                    &serde_json::to_string(&split).expect("a split is JSON"),
+                )
+                .expect("CRITICAL: the delegated-weight record write failed");
+        }
         let _ = self.db.put("consensus:epoch", &new_epoch.to_string());
         let _ = self.db.put(
             &format!("consensus:epoch_start_height:{}", new_epoch),
@@ -1480,6 +1795,7 @@ impl Executor {
             let _ = self
                 .db
                 .delete(&format!("sys:validator_set:epoch:{}", stale));
+            let _ = self.db.delete(&delegated_split_key(stale));
             let _ = self
                 .db
                 .delete(&format!("consensus:epoch_start_height:{}", stale));
@@ -2643,13 +2959,16 @@ impl Executor {
             println!("   Reason: {}, Round: {}", reason, round);
 
             // === C-5 FIX: ROUTE ECONOMIC SLASH THROUGH MOVE VM ===
-            // The Move VM staking::slash_validator handles bonded stake deduction atomically.
-            // This replaces the old native-only weight manipulation.
+            // G5 SL-1: `delegation::slash` burns the validator's own stake and
+            // its pool's in ONE call, so neither half can land alone (the old
+            // second call for the pool could fail and was only logged). Its
+            // work is constant whatever the pool's size. The infraction epoch
+            // is this block's; S4 passes the evidence's.
             let slash_pct: u64 = if reason == "equivocation" { 100 } else { 5 };
 
             let module_id = ModuleId::new(
                 AccountAddress::ONE,
-                Identifier::new("staking").expect("staking identifier is valid"),
+                Identifier::new("delegation").expect("delegation identifier is valid"),
             );
 
             let vm_addr = match AccountAddress::from_hex_literal(&format!("0x{}", validator_addr)) {
@@ -2664,24 +2983,27 @@ impl Executor {
                 }
             };
 
-            let arg_sys = bcs::to_bytes(&AccountAddress::ONE)
-            .unwrap_or_default();
-            let arg_val = bcs::to_bytes(&vm_addr).unwrap_or_default();
-            let arg_bps = bcs::to_bytes(&(slash_pct * 100)).unwrap_or_default();
+            let args = vec![
+                bcs::to_bytes(&AccountAddress::ONE).unwrap_or_default(),
+                bcs::to_bytes(&vm_addr).unwrap_or_default(),
+                bcs::to_bytes(&(slash_pct * 100)).unwrap_or_default(),
+                bcs::to_bytes(&self.executing_epoch()).unwrap_or_default(),
+            ];
 
             match self.vm.execute_public_entry_function(
                 vec![],
                 module_id,
-                "slash_validator_bps",
+                "slash",
                 vec![],
-                vec![arg_sys.clone(), arg_val.clone(), arg_bps.clone()],
-                10_000_000, // AUDIT-#3: raised from 500k for margin over bounded loops
-                // auth_signer: slash_validator_bps asserts signer==@0x1. With FIX #1
-                // binding the signer slot to auth_signer, this MUST be system_address()
-                // (the validator target is carried separately in arg_val, not the signer).
+                args,
+                // Constant work (G5 SL-1): no loop over delegators or tickets.
+                10_000_000,
+                // auth_signer: slash asserts signer==@0x1. With FIX #1 binding
+                // the signer slot to auth_signer, this MUST be system_address()
+                // (the validator target is carried separately, not the signer).
                 system_address(),
             ) {
-                Ok((_gas_used, vm_changes, _)) => {
+                Ok((_gas_used, vm_changes, status)) if status.success => {
                     for (k, v) in vm_changes {
                         let _ = match v {
                             Some(val) => self.logged_put(&k, &val),
@@ -2690,57 +3012,15 @@ impl Executor {
                     }
                     self.sync_supply_trackers_from_validator_set();
                     println!(
-                        "   ⚡ Move VM slash executed: {}% of bonded stake for {}",
+                        "   ⚡ Move VM slash executed: {}% of bonded and delegated stake for {}",
                         slash_pct, validator_addr
                     );
-
-                    // === FIX H1: ALSO SLASH DELEGATED STAKE ===
-                    // staking::slash_validator_bps only burns the validator's
-                    // self-stake. Delegated funds live in
-                    // delegation::ValidatorPool.escrowed_coins, which Move's
-                    // acyclic-module rule forbids staking from touching. Invoke
-                    // delegation::slash_pool with the same @0x1 system signer so
-                    // delegators share the penalty by the same bps. No-op if the
-                    // validator never enabled delegation.
-                    let deleg_module_id = ModuleId::new(
-                        AccountAddress::ONE,
-                        Identifier::new("delegation").expect("delegation identifier is valid"),
+                }
+                Ok((_gas_used, _changes, status)) => {
+                    println!(
+                        "   ⚠️  Move VM slash aborted ({:?}), falling back to consensus-only removal",
+                        status.error
                     );
-                    match self.vm.execute_public_entry_function(
-                        vec![],
-                        deleg_module_id,
-                        "slash_pool",
-                        vec![],
-                        vec![arg_sys.clone(), arg_val.clone(), arg_bps.clone()],
-                        // AUDIT-#3 FIX: raised from 500k. Paired with the Move-side
-                        // MAX_UNBONDING_QUEUE=100 + MIN_UNDELEGATE floor, the slash
-                        // loop is bounded and can no longer be OOG-reverted to evade
-                        // delegated-stake slashing.
-                        10_000_000,
-                        // slash_pool asserts signer==@0x1; FIX #1 binds the
-                        // signer slot to this auth_signer.
-                        system_address(),
-                    ) {
-                        Ok((_g, deleg_changes, _)) => {
-                            for (k, v) in deleg_changes {
-                                let _ = match v {
-                                    Some(val) => self.logged_put(&k, &val),
-                                    None => self.logged_delete(&k),
-                                };
-                            }
-                            self.sync_supply_trackers_from_validator_set();
-                            println!(
-                                "   ⚡ Move VM delegation slash executed: {}% of delegated stake for {}",
-                                slash_pct, validator_addr
-                            );
-                        }
-                        Err(e) => {
-                            println!(
-                                "   ⚠️  Move VM delegation slash failed ({}); self-stake slash already applied",
-                                e
-                            );
-                        }
-                    }
                 }
                 Err(e) => {
                     println!(
@@ -2849,8 +3129,8 @@ impl Executor {
     /// `borrow_global_mut` the staking singletons:
     ///
     /// * `staking::burn_ain` (governance::create_proposal, token_factory::create_token,
-    ///   delegation's slash path) writes `ValidatorSet` AND `SupplyStats`.
-    /// * `staking::mint_delegation_reward` / `mint_depin_reward` write `EmissionPools`.
+    ///   delegation's ticket payout) writes `ValidatorSet` AND `SupplyStats`.
+    /// * `staking::mint_depin_reward` and the emission draw write `EmissionPools`.
     ///
     /// Any branch that can reach those MUST declare these keys, or the scheduler
     /// puts it in the same parallel batch as a `staking` tx; both execute against
@@ -3017,17 +3297,16 @@ impl Executor {
                 deps.extend(Self::staking_global_keys());
                 deps.push(validator_set_v1_key().to_string());
             } else if *module_addr == system_address() && module_name == "delegation" {
-                // AUDIT-B2: delegation reaches staking::mint_delegation_reward
-                // (EmissionPools) and staking::burn_ain (ValidatorSet + SupplyStats).
+                // AUDIT-B2: delegation reads the active set (staking::is_validator)
+                // and burns slashed tickets (staking::burn_ain: ValidatorSet +
+                // SupplyStats). G5 DL-3: a user call writes only the named pool
+                // and the sender's own Book and coin store.
                 deps.extend(Self::staking_global_keys());
+                deps.push(sender_resource("0x1::delegation::Book"));
                 match function {
-                    "enable_delegation" => {
+                    "enable_delegation" | "update_commission" => {
                         recognized = true;
-                        deps.push(sender_resource("0x1::delegation::ValidatorPool"));
-                        deps.push(vm_move::state_keys::resource_key_str(
-                            &system_address(),
-                            "0x1::delegation::DelegationRegistry",
-                        ));
+                        deps.push(sender_resource("0x1::delegation::Pool"));
                     }
                     "delegate" | "undelegate" | "claim_rewards" | "withdraw_unbonded" => {
                         recognized = true;
@@ -3039,7 +3318,7 @@ impl Executor {
                             {
                                 deps.push(vm_move::state_keys::resource_key_str(
                                     &addr,
-                                    "0x1::delegation::ValidatorPool",
+                                    "0x1::delegation::Pool",
                                 ));
                             }
                         }
@@ -4016,83 +4295,60 @@ mod tests {
         current_epoch: u64,
     }
 
-    // FIX H1: mirror 0x1::delegation::Delegation / ValidatorPool BCS layout so
-    // tests can seed a delegation pool with escrow and read it back after a slash.
-    #[derive(Serialize, Deserialize, Clone)]
-    struct TestDelegation {
-        delegator: move_core_types::account_address::AccountAddress,
-        amount: u128,
-        reward_debt: u128,
+    /// A validator's `0x1::delegation::Pool` (G5 DL-2); it must exist.
+    fn pool_of(db: &StateDB, validator: &str) -> DelegationPool {
+        delegation_pool(db, validator).expect("the validator has a pool")
     }
 
-    #[derive(Serialize, Deserialize)]
-    struct TestUnbondingDelegation {
-        delegator: move_core_types::account_address::AccountAddress,
-        amount: u128,
-        start_height: u64,
-        unlock_time: u64,
+    /// A delegator's `0x1::delegation::Book` (G5 DL-3); it must exist.
+    fn book_of(db: &StateDB, delegator: &str) -> DelegationBook {
+        delegation_book(db, delegator).expect("the delegator has a book")
     }
 
-    #[derive(Serialize, Deserialize)]
-    struct TestValidatorPool {
-        validator_addr: move_core_types::account_address::AccountAddress,
-        commission_rate: u64,
-        pending_commission: u64,
-        commission_effective_time: u64,
-        total_delegated: u128,
-        delegations: Vec<TestDelegation>,
-        unbonding_queue: Vec<TestUnbondingDelegation>,
-        accumulated_rewards_per_share: u128,
-        pending_rewards: u128,
-        escrowed_coins: TestCoin,
-    }
-
-    fn delegation_pool_key(validator: &str) -> String {
-        vm_move::state_keys::resource_key_str(
-            &parse_move_address(validator).unwrap(),
-            "0x1::delegation::ValidatorPool",
+    fn put_delegation_resource<T: Serialize>(db: &StateDB, address: &str, tag: &str, value: &T) {
+        let _seed = db.seeding();
+        db.put(
+            &vm_move::state_keys::resource_key_str(&parse_move_address(address).unwrap(), tag),
+            &hex::encode(bcs::to_bytes(value).unwrap()),
         )
+        .unwrap();
     }
 
-    fn set_delegation_pool(db: &StateDB, validator: &str, delegators: &[(&str, u128)]) {
-        let validator_addr = parse_move_address(validator).expect("validator move address");
-        let mut total: u128 = 0;
-        let delegations: Vec<TestDelegation> = delegators
-            .iter()
-            .map(|(addr, amt)| {
-                total += *amt;
-                TestDelegation {
-                    delegator: parse_move_address(addr).expect("delegator move address"),
-                    amount: *amt,
-                    reward_debt: 0,
-                }
-            })
-            .collect();
-        let pool = TestValidatorPool {
-            validator_addr,
+    fn set_pool(db: &StateDB, validator: &str, pool: &DelegationPool) {
+        put_delegation_resource(db, validator, "0x1::delegation::Pool", pool);
+    }
+
+    fn set_book(db: &StateDB, delegator: &str, book: &DelegationBook) {
+        put_delegation_resource(db, delegator, "0x1::delegation::Book", book);
+    }
+
+    /// An open pool holding `coins` of active principal as as many points.
+    fn open_pool(coins: u128) -> DelegationPool {
+        DelegationPool {
+            active_coins: coins,
+            active_points: coins,
+            reward_counter: 0,
+            reward_carry: 0,
+            unbonding_coins: 0,
+            principal: coins,
+            rewards: 0,
             commission_rate: 0,
             pending_commission: 0,
             commission_effective_time: 0,
-            total_delegated: total,
-            delegations,
-            unbonding_queue: vec![],
-            accumulated_rewards_per_share: 0,
-            pending_rewards: 0,
-            // Escrow invariant: escrowed_coins.value == total_delegated.
-            escrowed_coins: TestCoin { value: total },
-        };
-        let bytes = bcs::to_bytes(&pool).expect("validator pool BCS");
-        db.put(&delegation_pool_key(validator), &hex::encode(bytes))
-            .expect("validator pool stored");
+            closed: false,
+            slash_count: 0,
+            ticket_count: 0,
+            position_count: 0,
+            slash_events: vec![],
+        }
     }
 
-    fn delegation_pool(db: &StateDB, validator: &str) -> TestValidatorPool {
-        let value = db
-            .get(&delegation_pool_key(validator))
-            .expect("validator pool read")
-            .expect("validator pool exists");
-        let bytes = hex::decode(value).expect("validator pool hex");
-        bcs::from_bytes::<TestValidatorPool>(&bytes).expect("validator pool BCS")
+    fn position(validator: &str, points: u128) -> DelegationPosition {
+        DelegationPosition {
+            validator: parse_move_address(validator).unwrap(),
+            points,
+            reward_snapshot: 0,
+        }
     }
 
     #[derive(Serialize, Deserialize)]
@@ -4710,7 +4966,7 @@ mod tests {
             assert!(
                 deps.contains(&vs),
                 "{} must declare staking::ValidatorSet — it can reach it via staking::burn_ain / \
-                 mint_delegation_reward",
+                 staking::is_validator",
                 name
             );
             assert!(
@@ -5539,9 +5795,9 @@ mod tests {
 
     /// A chain for the G5 deadline tests: the stdlib, `0x1::chain::Params`
     /// with I = 20 (the executor's default epoch interval), R = 20 and the
-    /// given clock cap, the empty DelegationRegistry genesis creates, a
-    /// proposer with a coin store and whatever `seed` adds; then blocks run in
-    /// order through the real executor, at timestamps the test controls.
+    /// given clock cap, a proposer with a coin store and whatever `seed`
+    /// adds; then blocks run in order through the real executor, at
+    /// timestamps the test controls.
     struct G5Chain {
         db: Arc<StateDB>,
         executor: Executor,
@@ -5571,15 +5827,6 @@ mod tests {
                 db.set_federation_key("00000000000000000000000000000000")
                     .unwrap();
                 seed_chain_params_with(&db, (Executor::DEFAULT_EPOCH_BLOCK_INTERVAL, period, cap));
-                let no_pools: Vec<move_core_types::account_address::AccountAddress> = vec![];
-                db.put(
-                    &vm_move::state_keys::resource_key_str(
-                        &system_address(),
-                        "0x1::delegation::DelegationRegistry",
-                    ),
-                    &hex::encode(bcs::to_bytes(&no_pools).unwrap()),
-                )
-                .unwrap();
             }
             let proposer = Self::account(&db, 64, 0).1;
             seed(&db);
@@ -5743,6 +5990,35 @@ mod tests {
         assert_eq!((frozen.time, frozen.block_timestamp), (0, 5_000));
     }
 
+    /// The Move active set: `validators` with their own stake (base units).
+    fn set_active_validators(db: &StateDB, validators: &[(&str, u128)], total_supply: u128) {
+        let _seed = db.seeding();
+        let set = TestValidatorSet {
+            validators: validators
+                .iter()
+                .zip(1u8..)
+                .map(|((address, stake), bls_seed)| {
+                    let (bls_public_key, bls_pop) = test_bls_identity(bls_seed);
+                    TestValidatorConfig {
+                        validator_addr: parse_move_address(address).unwrap(),
+                        stake: TestCoin { value: *stake },
+                        public_key: vec![1, 2, 3],
+                        bls_public_key,
+                        bls_pop,
+                    }
+                })
+                .collect(),
+            unbonding_queue: vec![],
+            total_supply,
+            current_epoch: 0,
+        };
+        db.put(
+            &validator_set_key(),
+            &hex::encode(bcs::to_bytes(&set).unwrap()),
+        )
+        .unwrap();
+    }
+
     /// G5 CL-1, CL-2 and SL-2 through real blocks: a transaction reads the
     /// consensus time of the block that executes it, and an unbonding unlocks
     /// exactly U after its epoch bound (tau at leave + I x C_tau), refused one
@@ -5755,7 +6031,14 @@ mod tests {
             keys.push(G5Chain::account(db, 61, ain));
             keys.push(G5Chain::account(db, 62, 10 * ain));
             keys.push(G5Chain::account(db, 63, ain));
-            set_validator_set(db, &keys[2].1, 1_000 * ain, 1_000 * ain);
+            set_active_validators(
+                db,
+                &[
+                    (keys[0].1.as_str(), 1_000 * ain),
+                    (keys[2].1.as_str(), 1_000 * ain),
+                ],
+                2_000 * ain,
+            );
         });
         let [(validator_key, validator), (delegator_key, delegator), (leaver_key, leaver)] =
             <[_; 3]>::try_from(keys).ok().unwrap();
@@ -5794,11 +6077,10 @@ mod tests {
         chain.run_to(3, vec![undelegate, leave]);
         assert_eq!(chain.clock().time, 3 * DAY);
         let unlock = 3 * DAY + 20 * DAY + UNBONDING;
-        let pool = delegation_pool(&db, &validator);
-        let entry = &pool.unbonding_queue[0];
+        let ticket = &book_of(&db, &delegator).tickets[0];
         assert_eq!(
-            (entry.start_height, entry.unlock_time, entry.amount),
-            (3, unlock, 2 * ain)
+            (ticket.created_epoch, ticket.unlock_time, ticket.amount),
+            (0, unlock, 2 * ain)
         );
         let request = &validator_set(&db).unbonding_queue[0];
         assert_eq!((request.start_height, request.unlock_time), (3, unlock));
@@ -5812,11 +6094,7 @@ mod tests {
         );
         let exit = chain.tx(&leaver_key, "staking", "withdraw_unbonded", vec![]);
         chain.run_until(unlock - 1, vec![withdraw, exit]);
-        assert_eq!(
-            delegation_pool(&db, &validator).unbonding_queue.len(),
-            1,
-            "unlocked early"
-        );
+        assert_eq!(book_of(&db, &delegator).tickets.len(), 1, "unlocked early");
         assert_eq!(
             validator_set(&db).unbonding_queue.len(),
             1,
@@ -5838,9 +6116,12 @@ mod tests {
             chain.height < 60,
             "paid by the withdrawals, not by a boundary"
         );
-        let pool = delegation_pool(&db, &validator);
-        assert!(pool.unbonding_queue.is_empty());
-        assert_eq!(pool.escrowed_coins.value, 3 * ain);
+        assert!(book_of(&db, &delegator).tickets.is_empty());
+        let pool = pool_of(&db, &validator);
+        assert_eq!(
+            (pool.principal, pool.active_coins, pool.unbonding_coins),
+            (3 * ain, 3 * ain, 0)
+        );
         assert!(validator_set(&db).unbonding_queue.is_empty());
         // Each got its stake back less a gas fee below the 100,000 limit.
         let gained = |before: u128, a: &str| coin_balance(&db, a) - before;
@@ -5850,18 +6131,23 @@ mod tests {
 
     /// G5 CM-1: an increase takes effect exactly N after its announcement,
     /// never earlier; it may raise the rate in force by at most 500 bps; a
-    /// decrease applies at once and cancels a pending increase.
+    /// matured increase no payout has charged yet cannot be raised on (that
+    /// would charge the unpaid period at the new rate), one period later it
+    /// can; a decrease applies at once and cancels a pending increase.
+    /// Payouts run every block (R = 1).
     #[test]
     fn g5_commission_increase_waits_its_notice_and_is_capped() {
         let ain = G5_AIN;
         let mut keys = vec![];
-        let mut chain = G5Chain::new("g5_commission", DAY, |db| {
+        let mut chain = G5Chain::with_period("g5_commission", 1, DAY, |db| {
             keys.push(G5Chain::account(db, 81, ain));
+            // Payouts (which the settlement waits on) need the Move supply.
+            set_active_validators(db, &[], 1_000_000 * ain);
         });
         let (validator_key, validator) = keys.pop().unwrap();
         let db = chain.db.clone();
         let pool = || {
-            let p = delegation_pool(&db, &validator);
+            let p = pool_of(&db, &validator);
             (
                 p.commission_rate,
                 p.pending_commission,
@@ -5902,14 +6188,834 @@ mod tests {
             (500, 1_000, effective),
             "the increase applied early"
         );
-        // At the effective time the rate in force is 1,000, so 1,500 is +500.
-        let on_time = announce(&mut chain, 1_500);
-        chain.run_until(effective, vec![on_time]);
-        assert_eq!(pool(), (1_000, 1_500, effective + NOTICE));
+        // At the effective time the rate in force is 1,000, but the last
+        // payout (effective - 1) has not charged it: a raise to 1,500 would
+        // charge the unpaid period at 1,000 as the base. Refused.
+        let unsettled = announce(&mut chain, 1_500);
+        chain.run_until(effective, vec![unsettled]);
+        assert_eq!(
+            pool(),
+            (500, 1_000, effective),
+            "a raise on an uncharged increase"
+        );
+        // One block later the payout at `effective` has charged it: +500 on
+        // 1,000 is accepted.
+        let settled = announce(&mut chain, 1_500);
+        chain.run_to(chain.height + 1, vec![settled]);
+        let now = chain.clock().time;
+        assert_eq!(pool(), (1_000, 1_500, now + NOTICE));
         // A decrease applies at once and cancels the pending increase.
         let cut = announce(&mut chain, 300);
         chain.run_to(chain.height + 1, vec![cut]);
         assert_eq!(pool(), (300, 300, 0));
+    }
+
+    /// A G5 chain for delegation (DL-1..DL-3): validators from key seeds with
+    /// their own stake in whole AIN, each in the genesis committee, the live
+    /// set and the Move active set, with 10 AIN for gas; funded delegators;
+    /// the Epoch resource, so boundaries run the real Move epoch advance.
+    /// Reward period `period`, clock cap `cap`. The Move supply starts at
+    /// 1,000,000 AIN.
+    #[allow(clippy::type_complexity)]
+    fn delegation_chain(
+        name: &str,
+        period: u64,
+        cap: u64,
+        validators: &[(u8, u64)],
+        delegators: &[(u8, u128)],
+    ) -> (
+        G5Chain,
+        Vec<(SigningKey, String)>,
+        Vec<(SigningKey, String)>,
+    ) {
+        let mut vals = vec![];
+        let mut dels = vec![];
+        let chain = G5Chain::with_period(name, period, cap, |db| {
+            let mut members = vec![];
+            for (seed, own) in validators {
+                let account = G5Chain::account(db, *seed, 10 * G5_AIN);
+                let member = committee_member(*seed, *own);
+                assert_eq!(member.address, account.1);
+                members.push(member);
+                vals.push(account);
+            }
+            for (seed, balance) in delegators {
+                dels.push(G5Chain::account(db, *seed, *balance));
+            }
+            let own: Vec<(&str, u128)> = validators
+                .iter()
+                .zip(&vals)
+                .map(|((_, stake), (_, address))| (address.as_str(), *stake as u128 * G5_AIN))
+                .collect();
+            set_active_validators(db, &own, 1_000_000 * G5_AIN);
+            let _seed = db.seeding();
+            let members = blockchain::committee::canonical_order(&members);
+            for key in ["genesis:validator_set:v1", "sys:validator_set:v1"] {
+                db.put(key, &serde_json::to_string(&members).unwrap())
+                    .unwrap();
+            }
+            db.put(
+                &vm_move::state_keys::resource_key_str(&system_address(), "0x1::epoch::Epoch"),
+                &hex::encode(bcs::to_bytes(&0u64).unwrap()),
+            )
+            .unwrap();
+        });
+        (chain, vals, dels)
+    }
+
+    /// Cumulative minted AIN, the emission's anchor (net supply plus burned).
+    fn g5_minted(db: &StateDB) -> u128 {
+        let burned = db
+            .get(&supply_stats_key())
+            .unwrap()
+            .and_then(|raw| decode_supply_stats_hex(&raw))
+            .map(|stats| stats.cumulative_burned)
+            .unwrap_or(0);
+        validator_set(db).total_supply + burned
+    }
+
+    /// G5 DL-2: what a member's share `r` splits into, for own weight `s`,
+    /// delegated weight `d` and commission `bps`: (own part + commission,
+    /// the pool's part).
+    fn g5_split(r: u128, s: u128, d: u128, bps: u128) -> (u128, u128) {
+        let own = r * s / (s + d);
+        let delegated = r * d / (s + d);
+        let commission = delegated * bps / 10_000;
+        (own + commission, delegated - commission)
+    }
+
+    /// Runs one empty block `step` seconds after the last, whose payout
+    /// (R = 1) pays `validator`, the only committee member, with the split
+    /// `(s, d)` at `bps`; checks both parts to the unit and returns the pool's.
+    fn g5_paid_block(
+        chain: &mut G5Chain,
+        validator: &str,
+        step: u64,
+        s: u128,
+        d: u128,
+        bps: u128,
+    ) -> u128 {
+        let db = chain.db.clone();
+        let e = g5_expected_emission(g5_minted(&db), step);
+        let (own, to_pool) = g5_split(e, s, d, bps);
+        let (balance, rewards) = (
+            coin_balance(&db, validator),
+            pool_of(&db, validator).rewards,
+        );
+        chain.run_blocks(1, step);
+        assert_eq!(
+            coin_balance(&db, validator) - balance,
+            own,
+            "own part and commission at height {}",
+            chain.height
+        );
+        assert_eq!(
+            pool_of(&db, validator).rewards - rewards,
+            to_pool,
+            "the pool's part at height {}",
+            chain.height
+        );
+        to_pool
+    }
+
+    /// floor(a x b / c) in u256, as Move's `math::mul_div_floor`.
+    fn g5_mul_div(a: u128, b: u128, c: u128) -> u128 {
+        use move_core_types::u256::U256;
+        (U256::from(a) * U256::from(b) / U256::from(c)).unchecked_as_u128()
+    }
+
+    fn g5_committee(db: &StateDB, epoch: u64) -> Vec<(String, u64)> {
+        let raw = db
+            .get(&format!("sys:validator_set:epoch:{epoch}"))
+            .unwrap()
+            .unwrap();
+        serde_json::from_str::<Vec<blockchain::committee::ValidatorInfo>>(&raw)
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.address, m.stake))
+            .collect()
+    }
+
+    fn g5_split_record(db: &StateDB, epoch: u64) -> Option<BTreeMap<String, u64>> {
+        db.get(&delegated_split_key(epoch))
+            .unwrap()
+            .map(|raw| serde_json::from_str(&raw).unwrap())
+    }
+
+    /// G5 DL-1, DL-2 through real blocks (R = 1, 7 s blocks). A delegation
+    /// weighs the committee from the next epoch only, recorded with its
+    /// split. Each payout splits the member's share by that frozen split: own
+    /// part and commission to the validator, the rest to the pool's counter
+    /// with its remainder carried, so rho x P + kappa = S x (rewards minted)
+    /// exactly. A joiner mid-epoch starts at the current counter, so it is
+    /// paid nothing from before, and the split does not follow the live pool.
+    /// A claim takes exactly floor(p x (rho - snapshot) / S) from the escrow.
+    /// Principal = C + B, and the points add up.
+    #[test]
+    fn g5_delegators_are_paid_by_points_from_the_frozen_split() {
+        use move_core_types::u256::U256;
+        let ain = G5_AIN;
+        let (mut chain, validators, delegators) = delegation_chain(
+            "g5_dl_payout",
+            1,
+            14,
+            &[(121, 1_000)],
+            &[(122, 10_000 * ain), (123, 10_000 * ain)],
+        );
+        let (validator_key, validator) = &validators[0];
+        let [(a_key, a), (b_key, b)] = <[_; 2]>::try_from(delegators).ok().unwrap();
+        let db = chain.db.clone();
+        let delegate = |chain: &mut G5Chain, key: &SigningKey, amount: u128| {
+            chain.tx(
+                key,
+                "delegation",
+                "delegate",
+                vec![move_addr_arg(validator), bcs::to_bytes(&amount).unwrap()],
+            )
+        };
+
+        let enable = chain.tx(
+            validator_key,
+            "delegation",
+            "enable_delegation",
+            vec![bcs::to_bytes(&1_000u64).unwrap()],
+        );
+        chain.block(7, vec![enable]);
+        let join_a = delegate(&mut chain, &a_key, 3_000 * ain);
+        chain.block(14, vec![join_a]);
+        chain.run_blocks(18, 7);
+        assert_eq!(chain.height, 20);
+        // DL-1: epoch 0 paid the validator's own stake alone.
+        assert_eq!(
+            pool_of(&db, validator).rewards,
+            0,
+            "the pool weighs from epoch 1"
+        );
+        assert!(g5_split_record(&db, 0).is_none());
+        // At H_0 the committee of epoch 1 is recorded with the bonded weight
+        // and the delegated part.
+        assert_eq!(g5_committee(&db, 1), vec![(validator.clone(), 4_000)]);
+        assert_eq!(
+            g5_split_record(&db, 1),
+            Some(BTreeMap::from([(validator.clone(), 3_000)]))
+        );
+
+        // 21..29: every payout splits 1,000 : 3,000 at 10 %, and the counter
+        // carries its remainder exactly.
+        let scale = U256::from(COIN_SCALE);
+        for _ in 21..30 {
+            g5_paid_block(&mut chain, validator, 7, 1_000, 3_000, 1_000);
+            let pool = pool_of(&db, validator);
+            assert_eq!(
+                U256::from(pool.reward_counter) * U256::from(pool.active_points)
+                    + U256::from(pool.reward_carry),
+                U256::from(pool.rewards) * scale,
+                "rho x P + kappa = S x minted at height {}",
+                chain.height
+            );
+        }
+
+        // 30: B joins mid-epoch at the current counter.
+        let rho_before = pool_of(&db, validator).reward_counter;
+        let join_b = delegate(&mut chain, &b_key, 1_000 * ain);
+        chain.block(chain.timestamp + 7, vec![join_b]);
+        assert_eq!(
+            book_of(&db, &b).positions[0].reward_snapshot,
+            rho_before,
+            "a joiner is paid nothing from before it joined"
+        );
+        assert_eq!(
+            g5_committee(&db, 1),
+            vec![(validator.clone(), 4_000)],
+            "weight changes at the next epoch only"
+        );
+        // 31: the split is still epoch 1's 1,000 : 3,000, not the live 1,000 : 4,000.
+        g5_paid_block(&mut chain, validator, 7, 1_000, 3_000, 1_000);
+
+        // Each owes floor(p x (rho - snapshot) / S); A claims exactly that.
+        let pool = pool_of(&db, validator);
+        let (position_a, position_b) = (
+            book_of(&db, &a).positions[0].clone(),
+            book_of(&db, &b).positions[0].clone(),
+        );
+        let owed_a = g5_mul_div(position_a.points, pool.reward_counter, COIN_SCALE);
+        let owed_b = g5_mul_div(
+            position_b.points,
+            pool.reward_counter - rho_before,
+            COIN_SCALE,
+        );
+        assert_eq!(pool.position_value(&position_a), (3_000 * ain, owed_a));
+        assert_eq!(pool.position_value(&position_b), (1_000 * ain, owed_b));
+        assert!(
+            owed_b > 0 && owed_b < owed_a / 3,
+            "B earned two payouts, A twelve"
+        );
+        let e = g5_expected_emission(g5_minted(&db), 7);
+        let (_, to_pool) = g5_split(e, 1_000, 3_000, 1_000);
+        let claim = chain.tx(
+            &a_key,
+            "delegation",
+            "claim_rewards",
+            vec![move_addr_arg(validator)],
+        );
+        chain.block(chain.timestamp + 7, vec![claim]);
+        let after = pool_of(&db, validator);
+        assert_eq!(
+            after.rewards,
+            pool.rewards - owed_a + to_pool,
+            "the claim took exactly its due"
+        );
+        assert_eq!(
+            book_of(&db, &a).positions[0].reward_snapshot,
+            pool.reward_counter
+        );
+
+        // Conservation.
+        let points = book_of(&db, &a).positions[0].points + book_of(&db, &b).positions[0].points;
+        assert_eq!(points, after.active_points);
+        assert_eq!(after.principal, after.active_coins + after.unbonding_coins);
+        assert_eq!(after.position_count, 2);
+        let owed: u128 = [&a, &b]
+            .iter()
+            .map(|d| after.position_value(&book_of(&db, d).positions[0]).1)
+            .sum();
+        // The escrow also holds the carry kappa / S < P / S base units not yet
+        // on the counter, and the flooring of each claim and position.
+        assert!(owed <= after.rewards, "the escrow covers every claim");
+        assert!(
+            after.rewards - owed <= after.active_points / COIN_SCALE + 3,
+            "within dust: {} over",
+            after.rewards - owed
+        );
+
+        // H_1: epoch 2 weighs B too.
+        chain.run_blocks(40 - chain.height, 7);
+        assert_eq!(g5_committee(&db, 2), vec![(validator.clone(), 5_000)]);
+        assert_eq!(
+            g5_split_record(&db, 2),
+            Some(BTreeMap::from([(validator.clone(), 4_000)]))
+        );
+    }
+
+    /// G5 CM-1 in the payout (R = 1, one-day blocks, so each payout covers
+    /// one day): a raise announced at 21 d takes effect at 28 d; the payout
+    /// at 28 d covers (27 d, 28 d] and charges the old rate, the one at 29 d
+    /// the new one. While a matured raise is uncharged, a change above the
+    /// base rate is refused and one down to it is taken; a decrease applies
+    /// to the very next payout.
+    #[test]
+    fn g5_commission_is_charged_at_the_rate_in_force_when_the_period_began() {
+        let ain = G5_AIN;
+        let (mut chain, validators, delegators) = delegation_chain(
+            "g5_dl_commission",
+            1,
+            DAY,
+            &[(124, 1_000)],
+            &[(125, 10_000 * ain)],
+        );
+        let (validator_key, validator) = &validators[0];
+        let (a_key, _) = &delegators[0];
+        let db = chain.db.clone();
+        let announce = |chain: &mut G5Chain, bps: u64| {
+            chain.tx(
+                validator_key,
+                "delegation",
+                "update_commission",
+                vec![bcs::to_bytes(&bps).unwrap()],
+            )
+        };
+        let rates = || {
+            let p = pool_of(&db, validator);
+            (
+                p.commission_rate,
+                p.pending_commission,
+                p.commission_effective_time,
+            )
+        };
+
+        let enable = chain.tx(
+            validator_key,
+            "delegation",
+            "enable_delegation",
+            vec![bcs::to_bytes(&1_000u64).unwrap()],
+        );
+        chain.run_to(1, vec![enable]);
+        let join = chain.tx(
+            a_key,
+            "delegation",
+            "delegate",
+            vec![
+                move_addr_arg(validator),
+                bcs::to_bytes(&(3_000 * ain)).unwrap(),
+            ],
+        );
+        chain.run_to(2, vec![join]);
+        chain.run_to(20, vec![]);
+        let raise = announce(&mut chain, 1_500);
+        chain.run_to(21, vec![raise]);
+        assert_eq!(chain.clock().time, 21 * DAY);
+        assert_eq!(rates(), (1_000, 1_500, 28 * DAY));
+        chain.run_to(27, vec![]);
+        // 28: the period began at 27 d, before the raise: 10 %.
+        g5_paid_block(&mut chain, validator, DAY, 1_000, 3_000, 1_000);
+        // 29: the period began at 28 d: 15 %.
+        g5_paid_block(&mut chain, validator, DAY, 1_000, 3_000, 1_500);
+        // 30: the raise has been charged, so +500 on it is taken.
+        let again = announce(&mut chain, 2_000);
+        chain.run_to(30, vec![again]);
+        assert_eq!(rates(), (1_500, 2_000, 37 * DAY));
+        chain.run_to(36, vec![]);
+        // 37: 2,000 is in force but uncharged. 1,800 (above the 1,500 base)
+        // is refused; 1,200 (below it) is taken, at once.
+        let between = announce(&mut chain, 1_800);
+        let down = announce(&mut chain, 1_200);
+        chain.run_to(37, vec![between, down]);
+        assert_eq!(rates(), (1_200, 1_200, 0));
+        g5_paid_block(&mut chain, validator, DAY, 1_000, 3_000, 1_200);
+    }
+
+    /// G5 SL-1 through real blocks: one call cuts the validator's own stake
+    /// and its pool (active principal at once, rounded up) and closes the
+    /// pool. Tickets are cut when withdrawn: one made in an earlier epoch
+    /// than the infraction's is not; one made in its epoch before the slash
+    /// is; one made after the slash is not cut twice. A closed pool takes no
+    /// delegation even with its validator active again. The spent event is
+    /// dropped once its tickets are paid.
+    #[test]
+    fn g5_slash_cuts_stake_pool_and_reached_tickets_in_one_call() {
+        use move_core_types::u256::U256;
+        let ain = G5_AIN;
+        let (mut chain, validators, delegators) = delegation_chain(
+            "g5_dl_slash",
+            20,
+            DAY,
+            &[(126, 1_000)],
+            &[(127, 1_000 * ain), (128, 1_000 * ain)],
+        );
+        let (validator_key, validator) = &validators[0];
+        let [(a_key, a), (b_key, b)] = <[_; 2]>::try_from(delegators).ok().unwrap();
+        let db = chain.db.clone();
+        let call = |chain: &mut G5Chain, key: &SigningKey, function: &str, amount: Option<u128>| {
+            let mut args = vec![move_addr_arg(validator)];
+            args.extend(amount.map(|a| bcs::to_bytes(&a).unwrap()));
+            chain.tx(key, "delegation", function, args)
+        };
+
+        let enable = chain.tx(
+            validator_key,
+            "delegation",
+            "enable_delegation",
+            vec![bcs::to_bytes(&0u64).unwrap()],
+        );
+        chain.run_to(1, vec![enable]);
+        let join = call(&mut chain, &a_key, "delegate", Some(100 * ain));
+        chain.run_to(2, vec![join]);
+        // t0 in epoch 0, t1 in epoch 1.
+        let t0 = call(&mut chain, &a_key, "undelegate", Some(10 * ain));
+        chain.run_to(3, vec![t0]);
+        let t1 = call(&mut chain, &a_key, "undelegate", Some(10 * ain));
+        chain.run_to(21, vec![t1]);
+        let join_b = call(&mut chain, &b_key, "delegate", Some(50 * ain));
+        chain.run_to(22, vec![join_b]);
+        let tickets = book_of(&db, &a).tickets;
+        assert_eq!(
+            tickets
+                .iter()
+                .map(|t| (t.created_epoch, t.slash_seq))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (1, 0)]
+        );
+
+        // A downtime slash (5 %) lands at height 22, in epoch 1.
+        let supply = validator_set(&db).total_supply;
+        {
+            let _seed = db.seeding();
+            db.put(
+                &format!("sys:pending_slash:{validator}"),
+                &serde_json::json!({"reason":"downtime","round":79}).to_string(),
+            )
+            .unwrap();
+            chain.executor.execute_pending_slashes();
+        }
+        let move_set = validator_set(&db);
+        assert!(move_set.validators.is_empty(), "the validator is removed");
+        assert_eq!(move_set.unbonding_queue[0].stake, 950 * ain);
+        let pool = pool_of(&db, validator);
+        // Active 130 AIN -> 123.5 AIN; tickets wait; both burns in one call.
+        assert_eq!(
+            (pool.active_coins, pool.active_points, pool.unbonding_coins),
+            (1_235 * ain / 10, 130 * ain, 20 * ain)
+        );
+        assert_eq!(pool.principal, pool.active_coins + pool.unbonding_coins);
+        assert!(pool.closed);
+        assert_eq!(
+            pool.slash_events,
+            vec![DelegationSlashEvent {
+                seq: 0,
+                infraction_epoch: 1,
+                bps: 500,
+                pending_tickets: 2,
+            }]
+        );
+        assert_eq!(move_set.total_supply, supply - 50 * ain - 65 * ain / 10);
+
+        // The validator is active again (a fixture), but its pool is closed.
+        set_active_validators(
+            &db,
+            &[(validator.as_str(), 950 * ain)],
+            move_set.total_supply,
+        );
+        let refused = call(&mut chain, &b_key, "delegate", Some(10 * ain));
+        // t2 after the slash, at the slashed price; B leaves in full (t3).
+        let t2 = call(&mut chain, &a_key, "undelegate", Some(10 * ain));
+        let t3 = call(&mut chain, &b_key, "undelegate", Some(1_000 * ain));
+        chain.run_to(23, vec![refused, t2, t3]);
+        let (c, p) = (pool.active_coins, pool.active_points);
+        let q = (U256::from(10 * ain) * U256::from(p) + U256::from(c) - U256::from(1u8))
+            / U256::from(c);
+        let x2 = (q * U256::from(c) / U256::from(p)).unchecked_as_u128();
+        let x3 = g5_mul_div(50 * ain, c - x2, p - q.unchecked_as_u128());
+        let tickets_a = book_of(&db, &a).tickets;
+        assert_eq!((tickets_a[2].amount, tickets_a[2].slash_seq), (x2, 1));
+        assert_eq!(book_of(&db, &b).tickets[0].amount, x3);
+        assert_eq!(
+            book_of(&db, &b).positions.len(),
+            0,
+            "the refused delegation added nothing"
+        );
+        assert_eq!(pool_of(&db, validator).position_count, 1);
+
+        // All unlock by 23 d + 20 d + 21 d = 64 d. B's ticket, made after the
+        // slash, is paid first, while the event is live: in full, and the
+        // event still waits for A's two.
+        chain.run_until(64 * DAY, vec![]);
+        let b_before = coin_balance(&db, &b);
+        let withdraw_b = call(&mut chain, &b_key, "withdraw_unbonded", None);
+        chain.run_to(chain.height + 1, vec![withdraw_b]);
+        let gained_b = coin_balance(&db, &b) - b_before;
+        assert!(
+            (x3 - 100_000..=x3).contains(&gained_b),
+            "{gained_b} vs {x3}"
+        );
+        assert_eq!(pool_of(&db, validator).slash_events[0].pending_tickets, 2);
+        let a_before = coin_balance(&db, &a);
+        let withdraw_a = call(&mut chain, &a_key, "withdraw_unbonded", None);
+        chain.run_to(chain.height + 1, vec![withdraw_a]);
+        let paid_a = 10 * ain + 95 * ain / 10 + x2;
+        let gained_a = coin_balance(&db, &a) - a_before;
+        assert!(
+            (paid_a - 100_000..=paid_a).contains(&gained_a),
+            "{gained_a} vs {paid_a}"
+        );
+        let pool = pool_of(&db, validator);
+        assert!(
+            pool.slash_events.is_empty(),
+            "no ticket can meet it any more"
+        );
+        assert_eq!((pool.unbonding_coins, pool.ticket_count), (0, 0));
+        assert_eq!(pool.principal, pool.active_coins);
+    }
+
+    /// G5 DL-3: tickets are capped per account, so a full account blocks only
+    /// itself: A's 17th undelegation aborts and changes nothing, while B's
+    /// goes through. Matured tickets are all paid by one withdrawal.
+    #[test]
+    fn g5_a_full_account_blocks_only_its_own_undelegation() {
+        let ain = G5_AIN;
+        let (mut chain, validators, delegators) = delegation_chain(
+            "g5_dl_tickets",
+            20,
+            DAY,
+            &[(129, 1_000)],
+            &[(130, 100 * ain), (131, 100 * ain)],
+        );
+        let (validator_key, validator) = &validators[0];
+        let [(a_key, a), (b_key, b)] = <[_; 2]>::try_from(delegators).ok().unwrap();
+        let db = chain.db.clone();
+        let call = |chain: &mut G5Chain, key: &SigningKey, function: &str, amount: Option<u128>| {
+            let mut args = vec![move_addr_arg(validator)];
+            args.extend(amount.map(|a| bcs::to_bytes(&a).unwrap()));
+            chain.tx(key, "delegation", function, args)
+        };
+        let enable = chain.tx(
+            validator_key,
+            "delegation",
+            "enable_delegation",
+            vec![bcs::to_bytes(&0u64).unwrap()],
+        );
+        chain.run_to(1, vec![enable]);
+        // B opens a pool but is no validator: it takes no delegation.
+        let b_pool = chain.tx(
+            &b_key,
+            "delegation",
+            "enable_delegation",
+            vec![bcs::to_bytes(&0u64).unwrap()],
+        );
+        let to_b = chain.tx(
+            &a_key,
+            "delegation",
+            "delegate",
+            vec![move_addr_arg(&b), bcs::to_bytes(&(5 * ain)).unwrap()],
+        );
+        let joins = vec![
+            b_pool,
+            to_b,
+            call(&mut chain, &a_key, "delegate", Some(20 * ain)),
+            call(&mut chain, &b_key, "delegate", Some(5 * ain)),
+        ];
+        chain.run_to(2, joins);
+        assert_eq!(
+            pool_of(&db, &b).active_coins,
+            0,
+            "a non-validator's pool is refused"
+        );
+        assert_eq!(book_of(&db, &a).positions.len(), 1);
+        let mut txs: Vec<String> = (0..17)
+            .map(|_| call(&mut chain, &a_key, "undelegate", Some(ain)))
+            .collect();
+        // 4.5 of 5 would leave 0.5 AIN: B exits in full.
+        txs.push(call(&mut chain, &b_key, "undelegate", Some(45 * ain / 10)));
+        chain.run_to(3, txs);
+        let pool = pool_of(&db, validator);
+        let book_a = book_of(&db, &a);
+        assert_eq!(book_a.tickets.len(), 16, "the 17th is refused");
+        assert_eq!(pool.position_value(&book_a.positions[0]).0, 4 * ain);
+        let book_b = book_of(&db, &b);
+        assert_eq!(book_b.tickets.len(), 1, "B is not blocked");
+        assert_eq!(
+            book_b.tickets[0].amount,
+            5 * ain,
+            "a remainder below 1 AIN exits in full"
+        );
+        assert!(book_b.positions.is_empty());
+        assert_eq!((pool.ticket_count, pool.unbonding_coins), (17, 21 * ain));
+
+        chain.run_until(44 * DAY, vec![]);
+        let before = coin_balance(&db, &a);
+        let withdraw = call(&mut chain, &a_key, "withdraw_unbonded", None);
+        chain.run_to(chain.height + 1, vec![withdraw]);
+        let gained = coin_balance(&db, &a) - before;
+        assert!((16 * ain - 100_000..=16 * ain).contains(&gained));
+        assert!(book_of(&db, &a).tickets.is_empty());
+        let pool = pool_of(&db, validator);
+        assert_eq!((pool.ticket_count, pool.unbonding_coins), (1, 5 * ain));
+        assert_eq!(pool.principal, pool.active_coins + pool.unbonding_coins);
+    }
+
+    /// G5 DL-1, DL-2 at the edges. A pool with fewer than 10^18 points, or a
+    /// closed one, takes no reward: neither its part nor the commission on it
+    /// is minted, and the validator gets its own part only. A closed pool
+    /// weighs nothing in the next committee. A committee kept because the
+    /// live set is invalid keeps its split. A stake top-up keeps the pool's
+    /// weight in the live set.
+    #[test]
+    fn g5_only_open_pools_of_a_full_point_take_reward_or_weight() {
+        let ain = G5_AIN;
+        let (mut chain, validators, _) =
+            delegation_chain("g5_dl_edges", 20, 14, &[(156, 1_000), (157, 1_000)], &[]);
+        let (small_key, small) = &validators[0];
+        let closed = validators[1].1.clone();
+        let db = chain.db.clone();
+        // `small`: 1 AIN at a price of 2, so 0.5e18 points. `closed`: 10 AIN,
+        // slashed. The split of epoch 0 counts 1 and 10 AIN of delegation.
+        let mut pool = open_pool(ain);
+        pool.active_points = ain / 2;
+        pool.commission_rate = 1_000;
+        pool.pending_commission = 1_000;
+        set_pool(&db, small, &pool);
+        let mut pool = open_pool(10 * ain);
+        pool.closed = true;
+        pool.commission_rate = 1_000;
+        pool.pending_commission = 1_000;
+        set_pool(&db, &closed, &pool);
+        {
+            let _seed = db.seeding();
+            let split = BTreeMap::from([(small.clone(), 1u64), (closed.clone(), 10u64)]);
+            db.put(
+                &delegated_split_key(0),
+                &serde_json::to_string(&split).unwrap(),
+            )
+            .unwrap();
+        }
+        let e = g5_expected_emission(g5_minted(&db), 140);
+        let share = e * 40 / 80;
+        let (small_before, closed_before) = (coin_balance(&db, small), coin_balance(&db, &closed));
+        let supply_before = validator_set(&db).total_supply;
+        chain.run_blocks(20, 7);
+        let (paid_small, paid_closed) = (share * 999 / 1_000, share * 990 / 1_000);
+        assert_eq!(coin_balance(&db, small) - small_before, paid_small);
+        assert_eq!(coin_balance(&db, &closed) - closed_before, paid_closed);
+        assert_eq!(
+            validator_set(&db).total_supply - supply_before,
+            paid_small + paid_closed,
+            "what the payout did not pay stays in the reserve"
+        );
+        assert_eq!(pool_of(&db, small).rewards, 0);
+        assert_eq!(pool_of(&db, &closed).rewards, 0);
+        // Epoch 1 weighs the small pool, not the closed one.
+        let mut expected = vec![(small.clone(), 1_001), (closed.clone(), 1_000)];
+        expected.sort();
+        assert_eq!(g5_committee(&db, 1), expected);
+        assert_eq!(
+            g5_split_record(&db, 1),
+            Some(BTreeMap::from([(small.clone(), 1)]))
+        );
+
+        // A top-up of 5 AIN: own 1,005 plus the pool's 1.
+        let top_up = chain.tx(
+            small_key,
+            "staking",
+            "add_stake",
+            vec![bcs::to_bytes(&(5 * ain)).unwrap()],
+        );
+        chain.run_to(21, vec![top_up]);
+        let live: Vec<blockchain::committee::ValidatorInfo> =
+            serde_json::from_str(&db.get("sys:validator_set:v1").unwrap().unwrap()).unwrap();
+        assert_eq!(
+            live.iter().find(|m| &m.address == small).unwrap().stake,
+            1_006
+        );
+
+        // An empty live set is invalid: epoch 2 keeps epoch 1's committee
+        // and its split.
+        {
+            let _seed = db.seeding();
+            db.put("sys:validator_set:v1", "[]").unwrap();
+        }
+        chain.run_blocks(40 - chain.height, 7);
+        assert_eq!(g5_committee(&db, 2), expected);
+        assert_eq!(g5_split_record(&db, 2), g5_split_record(&db, 1));
+    }
+
+    /// G5 DL-3, SL-1 (bounded work): the pool is aggregates only. Its stored
+    /// size is the same with one delegator or twelve, so no operation on it,
+    /// a payout or a slash included, can cost more as delegators join; each
+    /// delegator's state is its own Book.
+    #[test]
+    fn g5_a_pool_does_not_grow_with_its_delegators() {
+        let ain = G5_AIN;
+        let seeds: Vec<(u8, u128)> = (140..152).map(|seed| (seed, 2 * ain)).collect();
+        let (mut chain, validators, delegators) =
+            delegation_chain("g5_dl_size", 20, 14, &[(139, 1_000)], &seeds);
+        let (validator_key, validator) = &validators[0];
+        let db = chain.db.clone();
+        let size = || {
+            let key = vm_move::state_keys::resource_key_str(
+                &parse_move_address(validator).unwrap(),
+                "0x1::delegation::Pool",
+            );
+            db.get(&key).unwrap().unwrap().len()
+        };
+        let enable = chain.tx(
+            validator_key,
+            "delegation",
+            "enable_delegation",
+            vec![bcs::to_bytes(&0u64).unwrap()],
+        );
+        chain.run_to(1, vec![enable]);
+        let delegate = |chain: &mut G5Chain, key: &SigningKey| {
+            chain.tx(
+                key,
+                "delegation",
+                "delegate",
+                vec![move_addr_arg(validator), bcs::to_bytes(&ain).unwrap()],
+            )
+        };
+        let first = delegate(&mut chain, &delegators[0].0);
+        chain.run_to(2, vec![first]);
+        let one = size();
+        let rest: Vec<String> = delegators[1..]
+            .iter()
+            .map(|(key, _)| delegate(&mut chain, key))
+            .collect();
+        chain.run_to(3, rest);
+        assert_eq!(size(), one, "the pool holds no per-delegator state");
+        assert_eq!(pool_of(&db, validator).position_count, 12);
+        for (_, delegator) in &delegators {
+            assert_eq!(book_of(&db, delegator).positions.len(), 1);
+        }
+    }
+
+    /// G5 DL-2, DL-3 rounding (EIP-4626: always the pool's way) at a price
+    /// C / P = (3e18 + 1) / 2e18, seeded: an undelegation burns
+    /// ceil(a x P / C) points and tickets floor(q x C / P) coins; a delegation
+    /// gets floor(a x P / C) points. A claim of p x (rho - snapshot) = 4e38,
+    /// past u128, is formed in u256, and an escrow one unit short pays what it
+    /// holds instead of aborting.
+    #[test]
+    fn g5_pool_arithmetic_rounds_for_the_pool_and_never_aborts_on_dust() {
+        use move_core_types::u256::U256;
+        let ain = G5_AIN;
+        let (mut chain, validators, delegators) = delegation_chain(
+            "g5_dl_rounding",
+            20,
+            14,
+            &[(153, 1_000)],
+            &[(154, 10 * ain), (155, 10 * ain)],
+        );
+        let (_, validator) = &validators[0];
+        let [(a_key, a), (b_key, b)] = <[_; 2]>::try_from(delegators).ok().unwrap();
+        let db = chain.db.clone();
+        let (c, p) = (3 * ain + 1, 2 * ain);
+        let rho = 200 * ain;
+        let owed = 400 * ain; // floor(2e18 x 2e20 / 1e18)
+        let mut pool = open_pool(c);
+        pool.active_points = p;
+        pool.reward_counter = rho;
+        pool.rewards = owed - 1;
+        pool.position_count = 1;
+        set_pool(&db, validator, &pool);
+        set_book(
+            &db,
+            &a,
+            &DelegationBook {
+                positions: vec![position(validator, p)],
+                tickets: vec![],
+            },
+        );
+
+        let before = coin_balance(&db, &a);
+        let claim = chain.tx(
+            &a_key,
+            "delegation",
+            "claim_rewards",
+            vec![move_addr_arg(validator)],
+        );
+        chain.run_to(1, vec![claim]);
+        let gained = coin_balance(&db, &a) - before;
+        assert!(
+            (owed - 1 - 100_000..=owed - 1).contains(&gained),
+            "{gained}"
+        );
+        assert_eq!(pool_of(&db, validator).rewards, 0);
+
+        let undelegate = chain.tx(
+            &a_key,
+            "delegation",
+            "undelegate",
+            vec![move_addr_arg(validator), bcs::to_bytes(&ain).unwrap()],
+        );
+        chain.run_to(2, vec![undelegate]);
+        let q = ((U256::from(ain) * U256::from(p) + U256::from(c) - U256::from(1u8))
+            / U256::from(c))
+        .unchecked_as_u128();
+        let x = g5_mul_div(q, c, p);
+        assert_eq!(q, 666_666_666_666_666_667);
+        assert_eq!(book_of(&db, &a).tickets[0].amount, x);
+        let pool = pool_of(&db, validator);
+        assert_eq!((pool.active_coins, pool.active_points), (c - x, p - q));
+
+        let join = chain.tx(
+            &b_key,
+            "delegation",
+            "delegate",
+            vec![move_addr_arg(validator), bcs::to_bytes(&ain).unwrap()],
+        );
+        chain.run_to(3, vec![join]);
+        assert_eq!(
+            book_of(&db, &b).positions[0].points,
+            g5_mul_div(ain, p - q, c - x)
+        );
     }
 
     /// Validators A, B and C with coin stores, `stake` each, and the Epoch
@@ -8195,12 +9301,10 @@ mod tests {
         assert_eq!(move_validators.total_supply, 950_000);
     }
 
-    /// FIX H1: a downtime slash (500 bps = 5%) must shrink BOTH the validator's
-    /// self-stake AND the delegated stake. Previously delegation::ValidatorPool
-    /// (total_delegated + escrowed_coins) was untouched, letting delegators
-    /// recover 100% and collapsing PoS security. Assert total_delegated and
-    /// escrowed_coins each shrink by exactly slash_bps, and the escrow invariant
-    /// (escrowed_coins.value == total_delegated) is preserved.
+    /// G5 SL-1 (FIX H1): a downtime slash (500 bps) cuts the validator's own
+    /// stake AND its pool's active principal, in one Move call. The pool's
+    /// price falls 5 %, so every position loses 5 % without the pool touching
+    /// a single delegator, and the pool closes.
     #[test]
     fn test_pending_downtime_slash_also_slashes_delegated_stake() {
         let db = temp_db("slash_delegated");
@@ -8213,15 +9317,22 @@ mod tests {
             &serde_json::to_string(&vec![(validator.clone(), 100u64)]).unwrap(),
         )
         .unwrap();
-        // Self-stake = 1,000,000. Delegated = 800,000 from two delegators.
-        set_validator_set(&db, &validator, 1_000_000, 1_800_000);
-        let delegator_a = "44444444444444444444444444444444";
-        let delegator_b = "55555555555555555555555555555555";
-        set_delegation_pool(
-            &db,
-            &validator,
-            &[(delegator_a, 500_000u128), (delegator_b, 300_000u128)],
-        );
+        // Self-stake = 1,000,000. Delegated = 800,001 from two delegators.
+        set_validator_set(&db, &validator, 1_000_000, 1_800_001);
+        let (a, b) = (format!("{:064x}", 0x44), format!("{:064x}", 0x55));
+        let mut pool = open_pool(800_001);
+        pool.position_count = 2;
+        set_pool(&db, &validator, &pool);
+        for (delegator, points) in [(&a, 500_000), (&b, 300_001)] {
+            set_book(
+                &db,
+                delegator,
+                &DelegationBook {
+                    positions: vec![position(&validator, points)],
+                    tickets: vec![],
+                },
+            );
+        }
 
         db.put(
             &format!("sys:pending_slash:{}", validator),
@@ -8238,120 +9349,132 @@ mod tests {
         assert_eq!(move_validators.unbonding_queue.len(), 1);
         assert_eq!(move_validators.unbonding_queue[0].stake, 950_000);
 
-        // Delegated stake slashed 5% proportionally:
-        //   A: 500_000 -> 475_000 (cut 25_000)
-        //   B: 300_000 -> 285_000 (cut 15_000)
-        // total_delegated: 800_000 -> 760_000; escrow burns 40_000.
-        let pool = delegation_pool(&db, &validator);
+        // The pool's active principal loses ceil(800,001 x 5 %) = 40,001,
+        // rounded against the delegators; its points stay.
+        let pool = pool_of(&db, &validator);
         assert_eq!(
-            pool.total_delegated, 760_000,
-            "delegated total must shrink 5%"
+            (pool.active_coins, pool.principal, pool.active_points),
+            (760_000, 760_000, 800_001)
         );
-        assert_eq!(
-            pool.escrowed_coins.value, 760_000,
-            "escrow must shrink 5% and stay == total_delegated"
-        );
-        let a = pool
-            .delegations
-            .iter()
-            .find(|d| d.delegator == parse_move_address(delegator_a).unwrap())
-            .expect("delegator A present");
-        let b = pool
-            .delegations
-            .iter()
-            .find(|d| d.delegator == parse_move_address(delegator_b).unwrap())
-            .expect("delegator B present");
-        assert_eq!(a.amount, 475_000);
-        assert_eq!(b.amount, 285_000);
+        assert!(pool.closed, "a slashed pool closes");
+        assert_eq!(pool.slash_count, 1);
+        assert!(pool.slash_events.is_empty(), "no ticket for it to reach");
+        // Each position loses 5 % through the price, rounded down.
+        for (delegator, value) in [(&a, 474_999), (&b, 285_000)] {
+            let book = book_of(&db, delegator);
+            assert_eq!(pool.position_value(&book.positions[0]).0, value);
+        }
 
-        // Supply must reflect the 50_000 self-stake burn + 40_000 escrow burn.
-        // Starting total_supply 1_800_000 - 50_000 (self) - 40_000 (delegated)
-        // = 1_710_000.
+        // Supply: 1,800,001 - 50,000 (self) - 40,001 (delegated) = 1,710,000.
         assert_eq!(move_validators.total_supply, 1_710_000);
     }
 
-    /// FIX H1-followup: stake already in the unbonding queue MUST also be slashed
-    /// (standard PoS keeps it slashable for the unbonding window). Otherwise an
-    /// attacker undelegates just before double-signing and recovers 100%. This
-    /// test seeds a pool with one BONDED delegation and one UNBONDING entry, then
-    /// asserts BOTH are cut, that `total_delegated` shrinks by ONLY the bonded
-    /// cut, and that escrow burns the bonded + unbonding cuts.
+    /// G5 SL-1 (FIX H1-followup): stake already unbonding stays slashable.
+    /// The slash cuts the active principal at once and records an event; a
+    /// ticket made before it, in the infraction's epoch, is cut by it when
+    /// paid, the cut burned, and the spent event is dropped.
     #[test]
     fn test_h1_slash_also_slashes_unbonding_queue() {
-        let db = temp_db("slash_unbonding");
-        load_stdlib(&db);
-        let validator_key = SigningKey::from_bytes(&[31u8; 32]);
-        let validator = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
-        let _seed = db.seeding();
-        db.put(
-            "sys:validators",
-            &serde_json::to_string(&vec![(validator.clone(), 100u64)]).unwrap(),
-        )
-        .unwrap();
-        // Self-stake 1,000,000. Supply = self + active(400k) + unbonding(200k).
-        set_validator_set(&db, &validator, 1_000_000, 1_600_000);
+        let ain = G5_AIN;
+        let mut keys = vec![];
+        let mut chain = G5Chain::new("slash_unbonding", DAY, |db| {
+            keys.push(G5Chain::account(db, 31, ain));
+            keys.push(G5Chain::account(db, 32, ain));
+            keys.push(G5Chain::account(db, 33, ain));
+            let (validator, active, unbonding) = (&keys[0].1, &keys[1].1, &keys[2].1);
+            // Self-stake 1,000,000 AIN; supply = self + active 400k + unbonding 200k.
+            set_active_validators(
+                db,
+                &[(validator.as_str(), 1_000_000 * ain)],
+                1_600_000 * ain,
+            );
+            let mut pool = open_pool(400_000 * ain);
+            pool.unbonding_coins = 200_000 * ain;
+            pool.principal = 600_000 * ain;
+            pool.ticket_count = 1;
+            pool.position_count = 1;
+            set_pool(db, validator, &pool);
+            set_book(
+                db,
+                active,
+                &DelegationBook {
+                    positions: vec![position(validator, 400_000 * ain)],
+                    tickets: vec![],
+                },
+            );
+            set_book(
+                db,
+                unbonding,
+                &DelegationBook {
+                    positions: vec![],
+                    tickets: vec![DelegationTicket {
+                        validator: parse_move_address(validator).unwrap(),
+                        amount: 200_000 * ain,
+                        created_epoch: 0,
+                        slash_seq: 0,
+                        unlock_time: 0,
+                    }],
+                },
+            );
+        });
+        let [(_, validator), _, (unbonding_key, unbonding)] =
+            <[_; 3]>::try_from(keys).ok().unwrap();
+        let db = chain.db.clone();
+        chain.run_to(1, vec![]);
+        {
+            let _seed = db.seeding();
+            db.put(
+                &format!("sys:pending_slash:{}", validator),
+                &serde_json::json!({"reason":"downtime","round":79}).to_string(),
+            )
+            .unwrap();
+            chain.executor.execute_pending_slashes();
+        }
 
-        let active = "66666666666666666666666666666666";
-        let unbonding = "77777777777777777777777777777777";
-        // total_delegated counts ONLY the bonded (active) delegation (400k).
-        // escrowed_coins backs active + unbonding (600k).
-        let pool = TestValidatorPool {
-            validator_addr: parse_move_address(&validator).unwrap(),
-            commission_rate: 0,
-            pending_commission: 0,
-            commission_effective_time: 0,
-            total_delegated: 400_000,
-            delegations: vec![TestDelegation {
-                delegator: parse_move_address(active).unwrap(),
-                amount: 400_000,
-                reward_debt: 0,
-            }],
-            unbonding_queue: vec![TestUnbondingDelegation {
-                delegator: parse_move_address(unbonding).unwrap(),
-                amount: 200_000,
-                start_height: 0,
-                unlock_time: 999_999_999,
-            }],
-            accumulated_rewards_per_share: 0,
-            pending_rewards: 0,
-            escrowed_coins: TestCoin { value: 600_000 },
-        };
-        db.put(
-            &delegation_pool_key(&validator),
-            &hex::encode(bcs::to_bytes(&pool).unwrap()),
-        )
-        .unwrap();
-
-        db.put(
-            &format!("sys:pending_slash:{}", validator),
-            &serde_json::json!({"reason":"downtime","round":79}).to_string(),
-        )
-        .unwrap();
-
-        Executor::new(db.clone()).execute_pending_slashes();
-
-        let pool = delegation_pool(&db, &validator);
-        // Active 400k -> 380k (cut 20k); unbonding 200k -> 190k (cut 10k).
+        let pool = pool_of(&db, &validator);
+        // Active 400k -> 380k at once; the ticket's 200k waits for its payout.
         assert_eq!(
-            pool.delegations[0].amount, 380_000,
-            "active delegation slashed 5%"
+            (pool.active_coins, pool.unbonding_coins, pool.principal),
+            (380_000 * ain, 200_000 * ain, 580_000 * ain)
         );
         assert_eq!(
-            pool.unbonding_queue[0].amount, 190_000,
-            "unbonding entry MUST be slashed 5% (the bypass this fix closes)"
+            pool.slash_events,
+            vec![DelegationSlashEvent {
+                seq: 0,
+                infraction_epoch: 0,
+                bps: 500,
+                pending_tickets: 1,
+            }]
         );
-        // total_delegated shrinks by ONLY the bonded cut (20k), not the unbonding cut.
+        // Supply: 1,600,000 - 50,000 (self) - 20,000 (active) = 1,530,000.
+        assert_eq!(validator_set(&db).total_supply, 1_530_000 * ain);
+
+        // The ticket pays 190k; 10k is burned; the spent event is dropped.
+        let before = coin_balance(&db, &unbonding);
+        let withdraw = chain.tx(
+            &unbonding_key,
+            "delegation",
+            "withdraw_unbonded",
+            vec![move_addr_arg(&validator)],
+        );
+        chain.run_to(2, vec![withdraw]);
+        let gained = coin_balance(&db, &unbonding) - before;
+        assert!(
+            (190_000 * ain - 100_000..190_000 * ain).contains(&gained),
+            "the unbonding entry MUST be slashed 5% (the bypass this fix closes): {gained}"
+        );
+        let pool = pool_of(&db, &validator);
         assert_eq!(
-            pool.total_delegated, 380_000,
-            "total_delegated must drop by the bonded cut only"
+            (pool.unbonding_coins, pool.principal, pool.ticket_count),
+            (0, 380_000 * ain, 0)
         );
-        // Escrow burns bonded(20k) + unbonding(10k) = 30k.
-        assert_eq!(
-            pool.escrowed_coins.value, 570_000,
-            "escrow must burn both the bonded and unbonding cuts"
+        assert!(
+            pool.slash_events.is_empty(),
+            "no ticket can meet it any more"
         );
-        // Supply: 1_600_000 - 50_000 (self) - 30_000 (delegated+unbonding) = 1_520_000.
-        assert_eq!(validator_set(&db).total_supply, 1_520_000);
+        // 10k burned (and at most the gas fee, if fees burn).
+        assert!((1_520_000 * ain - 100_000..=1_520_000 * ain)
+            .contains(&validator_set(&db).total_supply));
     }
 
     // ---- 0x1::universal_mining device registration -------------------------
@@ -8397,7 +9520,6 @@ mod tests {
 
     #[derive(Serialize)]
     struct TestEmissionPools {
-        delegation_budget: u128,
         depin_budget: u128,
     }
 
@@ -8813,7 +9935,6 @@ mod tests {
                 ),
                 &hex::encode(
                     bcs::to_bytes(&TestEmissionPools {
-                        delegation_budget: 0,
                         depin_budget: 10_000_000_000_000_000_000,
                     })
                     .unwrap(),

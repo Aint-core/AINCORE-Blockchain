@@ -145,33 +145,73 @@ succeeding (FX-14): an aborted epoch advance still records the next committee. T
 epoch counter (`staking.current_epoch`, which `universal_mining` uses to limit DePIN
 payouts) advances at committee boundaries.
 
-**DL-1 (bonded stake).** A validator's bonded stake is its own stake plus its pool's
-delegated stake. `sys:validator_set:v1` carries it, so the committee weight (G1 EP-2) is
-the bonded stake. It changes when a delegation or undelegation executes and takes effect at
-the next epoch.
+**DL-1 (bonded stake).** A validator's bonded stake is its own stake plus its pool's active
+delegated principal. At each boundary H_E, after the payout, the executor recomputes every
+live member's bonded stake from Move state into `sys:validator_set:v1`, so C_{E+1} is weighted
+by bonded stake. It records the split next to the committee
+(`sys:validator_set:epoch_delegated:{E+1}`). A delegation therefore changes committee weight
+at the next epoch, never inside one.
 
-**DL-2 (delegator rewards, F1 lazy accounting).** A validator's reward r (EM-2, computed on
-bonded stake) splits into:
-- the self share, r · self / bonded, to the validator;
-- the delegated share, r · delegated / bonded, from which the pool's commission goes to
-  the validator and the rest raises `accumulated_rewards_per_share`.
+**DL-2 (delegator rewards).** A pool keeps aggregates only (docs/research/delegation_pools.md
+§4): active principal C, points P, a reward counter ρ scaled by S = 10¹⁸ with a carried
+remainder κ, a principal escrow (C plus unbonding) and a reward escrow.
+- **Split.** A payout gives member v its clipped share r_v (EM-2), split with the frozen
+  record (s_v, d_v) of its epoch, b_v = s_v + d_v:
+  - r_s = ⌊r_v·s_v/b_v⌋ and r_d = ⌊r_v·d_v/b_v⌋;
+  - the commission m = ⌊r_d·c*/10⁴⌋, with c* the rate in force at the start of the reward
+    period (CM-1);
+  - π = r_d − m.
+- **Minting.** r_s + m is minted to the validator. π is minted into the pool's reward escrow
+  with ρ += ⌊(π·S + κ)/P⌋ and κ ← remainder. If the pool is not open or holds fewer than
+  10¹⁸ points, neither π nor m is minted; that part stays in the reserve.
+- **Nothing beyond e.** The payout draws e as one `staking::Emission`, a value with no
+  abilities: Move forces every unit either to a recipient or back to the reserve within
+  the same transaction, and nothing but drawn coins can go back. Nothing else mints for
+  delegation: the `DELEGATION_BPS` stream, its budget and `mint_delegation_reward` are
+  removed.
+- **Fees.** Per-block fees go to the validators alone, by committee weight (EM-2), as
+  block-author fees do on Polkadot and Ethereum. Delegators are paid from emission.
+- **Positions.** A position of p points with snapshot σ is owed ⌊p·(ρ − σ)/S⌋, paid (clamped to
+  the escrow) whenever it changes or on claim.
+- **Joiners.** A new position starts at σ = ρ, so it earns nothing from before it joined. It
+  earns from the next payout; its weight counts from the next epoch.
+- **Escrow.** The reward escrow covers every position's claim. It exceeds their sum by at
+  most P/S + (positions) + 1 base units: the carry κ, plus the flooring. A claim is clamped
+  to the escrow, so this dust never makes a claim abort.
 
-A delegator's pending reward is `amount · acc / 10¹⁸ − reward_debt`, as the pool already
-computes. The delegation reward is minted inside the same cap as all emission; the separate
-`DELEGATION_BPS` stream and its unpaid budget are removed.
-
-**DL-3 (delegator unbonding queue, S3).** A pool's unbonding is kept in buckets by unlock
-time, with pooled balances (Polkadot nomination pools' era buckets), and a per-delegator cap
-(Cosmos `MaxEntries` = 7). Matured buckets are paid automatically as in UB-1. Today one
-global cap of 100 entries per pool, emptied only by each delegator's own withdrawal, lets
-anyone with 100 AIN stop every undelegation from that pool.
+**DL-3 (delegator state per account, unbonding tickets).** Each delegator's state lives at its
+own address: at most 8 positions and 16 unbonding tickets. No operation touches another
+account or iterates a pool's delegators, so every operation costs the same whatever a pool's
+size.
+- **Points.** Points are issued ⌊a·P/C⌋ on delegate and burned ⌈a·P/C⌉ on undelegate;
+  coins paid are ⌊q·C/P⌋. Rounding always favours the pool (EIP-4626).
+- **Minimums.** A remainder below 1 AIN makes the exit full.
+- **Who takes deposits.** Only an open pool of a validator in the active set takes
+  deposits. A slashed pool is closed for good (SL-1).
+- **Price.** An open pool's price C/P never falls, since only a slash lowers it. So P ≤ C,
+  and an empty pool (P = 0) holds C = 0.
+  - A first depositor inherits nothing.
+  - No donation path exists: coins enter the principal only through `delegate`, which
+    issues points.
+  - The share-inflation attack (ERC-4626) has nothing to act on.
+- **Tickets.** A ticket unlocks at τ + I·C_τ + U (SL-2). The owner withdraws it once matured,
+  with the pool's slash events applied (SL-1). Nothing burns it.
+- **Why no automatic payout for delegators.** An automatic sweep of delegator tickets needs a
+  global queue linked through other accounts' records. Polkadot, Aptos, Solana and NEAR keep
+  unbonded stake until the owner withdraws, and the per-account cap already removes the
+  pool-wide freeze (100 entries of 1 AIN blocking a pool). Validator unbonding stays
+  automatic (UB-1).
 
 **CM-1 (commission).** A pool has at most one pending change. An increase may raise the rate
 by at most Δc over the rate in force, to at most 30 %, and takes effect at τ ≥ announce + N,
-fixed when announced; it applies to reward periods that start at or after that time. It is
-applied on the pool's next use; there is no manual apply, so a matured change cannot be held
-back and fired later. A new announcement replaces the pending one. A decrease takes effect
-at once and cancels a pending increase (Cosmos, Polkadot pools, Solana SIMD-0079).
+fixed when announced. A payout applies the rate in force at the start of its reward period,
+so no change is retroactive. There is no manual apply, so a matured change cannot be held
+back and fired later. A new announcement replaces the pending one. A decrease takes effect at
+once and cancels a pending increase (Cosmos, Polkadot pools, Solana SIMD-0079).
+- **An increase no payout has charged yet.** A matured increase becomes the base rate
+  once a payout has charged it. Until then, at most one reward period, a change above the
+  base rate is refused, so a period that began before the increase is never charged at
+  it.
 
 **UB-1 (unbonded stake is paid, never burned).** At each committee-epoch boundary the system
 pays up to K matured entries from the head of the validator unbonding queue, which is sorted
@@ -181,9 +221,23 @@ Ethereum pay automatically; Polkadot, Aptos, Solana and NEAR keep it), and the b
 security role once the stake unlocked.
 
 **SL-1 (slashable while unbonding).** Unbonding entries, the validator's and its pool's
-delegators', stay slashable until they are paid. A slash for an infraction at height h_i
-reduces every entry whose unbonding began at or after h_i, and the bonded stake (the Cosmos
-rule, research b.5 and (c)).
+delegators', stay slashable until they are paid. A slash for an infraction in epoch E_i
+reduces the bonded stake and every entry created in epoch E_i or later and before the slash
+was applied. Stake that left during E_i still weighed C_{E_i}, since committees are frozen
+per epoch (DL-1). Tickets created after the slash are not cut twice.
+- **Pool side.** The active principal is cut at once, rounded up, and the pool closes for
+  good. The pool records the slash as an event: E_i, its sequence number, the fraction, and
+  how many unpaid tickets it may reach.
+  - A ticket records the pool's slash count when it is made, so it is cut only by later
+    events, and only once.
+  - Each ticket is cut when withdrawn. The cut is burned.
+  - An event is dropped once every ticket it may reach is paid. A pool keeps at most 8
+    events; past that, the two oldest merge into one that cuts at least as much for every
+    ticket.
+- **Infraction epoch.** In S3 it is the epoch of the block that applies the slash. S4
+  passes the evidence's epoch.
+- **Atomicity.** The validator's own stake and its pool are slashed in one Move call,
+  `delegation::slash`, so a slash cannot be half applied.
 
 **SL-2 (unbonding counts from the end of the last committee epoch).** Stake that leaves at
 height h unlocks at `τ(h) + I·C_τ + U`. Its key can sign until H_{E(h)}, and
@@ -212,7 +266,7 @@ end of G5, as with G1.
 | **S1** (done, `65cc92a`) | CL-1, CL-2, P-1, GV-1 counted in heights: the `0x1::chain` clock and parameters, heights in Move, genesis pins and derivation, the Rust governance path removed | every deadline expires exactly at its height; a halt ages nothing; the pins are bound by the identity; genesis-tool reproduces the table | a deadline in seconds; an unpinned parameter; governance able to change a parameter |
 | **S1b** | Amendment A1: CL-1 τ, BT-1's quorum guard, CL-2 writing τ from the block timestamp, P-1's new split (C_τ pinned; U, N, Δc, K constants; G removed), SL-2 unlock by τ, UB-1, CM-1 | with 1 s blocks unbonding completes at 21 d of block time, not at a block count; a 10-day timestamp jump advances τ by C_τ; a corrupted timestamp stream cannot unlock before U / C_τ blocks; a below-quorum sample does not advance T; one author at +30 s cannot move T out of the honest range; a matured entry is paid once, at the first boundary at or after its unlock, in queue order; a commission increase applies exactly at N and never earlier, above Δc it is refused, a decrease applies at once | τ uncapped; cap ignored after a halt; quorum guard removed; unlock from h without I·C_τ; burn restored; payout not bounded by K; manual apply restored; increase cap removed |
 | **S2** | EM-1..EM-3: payouts every R blocks by Δτ, committee recipients from a state record shared with consensus, fees to the committee, boundary order, rotation independent of Move, I = 1,000 written by genesis-tool | a payout mints exactly the EM-1 integer form and a day's draw compounds to 1.90 %/yr; the emission over the same τ matches (within 10⁻⁶) for 1 s or 7 s blocks and R ∈ {1, 20}; a payout after a long gap covers one day; a joiner is paid from its first committee epoch and a leaver until its last; fees pay C_{E(h)}, not the live set; a jailed member gets nothing; an invalid live set keeps the committee; the executor's record equals consensus's committee on real nodes | Δτ ignored; the cap removed; the live set paid; payout after derivation at H_E; jailed paid; fees to the live set; rotation skipped when Move aborts; consensus cross-check removed |
-| **S3** | DL-1..DL-3, CM-1 in the payout: bonded stake in the committee weight; delegator rewards through the pool; bucketed delegator unbonding with automatic payout | a delegator earns its share of the pool's reward minus commission, to the unit; delegating shifts committee weight at the next epoch only; the sum paid never exceeds e; total supply stays within MAX_SUPPLY; 100 tiny undelegations cannot stop another delegator's | delegated stake ignored in weight; commission not taken; `reward_debt` not updated; the pool-wide cap restored |
+| **S3** | DL-1..DL-3, CM-1 in the payout, the atomic slash: pools of aggregates with per-account positions and tickets; the reward split from the frozen record; bonded weight at boundaries; `math` u256 mul_div; the RPC reads the Move state | conservation: principal escrow = C + unbonding, Σ points = P, reward escrow covers every claim within dust; ρ·P + κ = S·Σπ exactly; each payout's two parts match the frozen split to the unit, and a mid-epoch joiner does not move it; a delegator is paid ⌊p·Δρ/S⌋ to the unit and a joiner nothing from before; weight changes at the next epoch only; commission uses the rate at the period start; the active and ticket slash follow SL-1 in one call; a closed pool refuses deposits; a pool's stored size does not grow with its delegators; a full account cannot block another's undelegation; exits and deposits round the pool's way; a claim past u128 works and a 1-unit shortfall does not abort | the carry dropped; points rounded up on deposit; coins rounded up on exit; deposits into a dead pool; tickets of an earlier epoch slashed; the applied-height guard dropped; live stake used in the split; a vector of delegators in the pool; the escrow clamp removed; u128 intermediates |
 | **S4** | SL-1..SL-3: unbonding slashable, V4 evidence (EQ-1) through the DAG, W in τ, V3 deletion | a leaver that equivocates before its unlock loses its unbonding stake; an undelegation after the infraction is slashed and one before it is not; evidence older than W is refused; a V4 node never records V3 evidence (kept from S11b) | only active stake slashed; live-set membership check; no age bound |
 | **S5** | DOC-1: RPC fields, README, WHITEPAPER, CLAUDE.md | the RPC reports the Move state; no document names a halving (a grep witness) | — |
 | **S6** | The fresh genesis file from genesis-tool with the measured t_b, shown to the founder before it is used | the genesis identity changes with each pinned parameter | — |
