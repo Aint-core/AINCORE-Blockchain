@@ -1716,18 +1716,10 @@ impl Producer {
         let mut prev = "genesis".to_string();
         let mut blocks = Vec::new();
         for height in 1..=n {
-            // G5 CL-2: an empty block's one state change is the clock.
-            let (key, value) = executor::chain_clock_write(&self.sync.storage, height, height);
-            let root = hex::encode(
-                state_commit::apply(
-                    &self.sync.storage,
-                    height,
-                    [(key, Some(value.into_bytes()))],
-                )
-                .unwrap()
-                .root
-                .0,
-            );
+            // G5 CL-2: the executor's own root for this empty block (the
+            // clock, and at a boundary the committee record), found in a
+            // discarded transaction.
+            let root = crate::dry_run_empty_block_root(&self.sync.storage, height, height);
             let mut block = Block::new_with_roots_at(
                 height,
                 height,

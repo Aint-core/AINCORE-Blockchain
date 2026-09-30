@@ -82,11 +82,12 @@ mod tests {
     }
 
     /// G5 CL-2: the state root of an empty block at `height` with BFT
-    /// timestamp `timestamp`, on top of the executed chain. An empty block
-    /// changes one state key, the chain clock, so this is the parent's tree
-    /// plus that write; nothing is written. A block at a height the fixture
-    /// already executed (with an empty block) gets that version's root: it is
-    /// either the same block or a refused conflict.
+    /// timestamp `timestamp`, on top of the executed chain: the executor runs
+    /// it in a discarded transaction (`dry_run_empty_block_root`), so the
+    /// clock write and, at a boundary, the committee record are exact. A
+    /// block at a height the fixture already executed (with an empty block)
+    /// gets that version's root: it is either the same block or a refused
+    /// conflict.
     fn empty_block_root(sync: &ChainSync, height: u64, timestamp: u64) -> String {
         let latest = state_commit::latest_version(&sync.storage)
             .unwrap()
@@ -94,10 +95,7 @@ mod tests {
         if height <= latest {
             return hex::encode(state_commit::root(&sync.storage, height).unwrap().0);
         }
-        let (key, value) = executor::chain_clock_write(&sync.storage, height, timestamp);
-        let applied = state_commit::apply(&sync.storage, height, [(key, Some(value.into_bytes()))])
-            .expect("the parent version is executed");
-        hex::encode(applied.root.0)
+        crate::dry_run_empty_block_root(&sync.storage, height, timestamp)
     }
 
     fn set_validators(sync: &ChainSync, validators: Vec<(&str, u64)>) {

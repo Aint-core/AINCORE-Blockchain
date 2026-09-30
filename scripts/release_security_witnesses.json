@@ -17,7 +17,8 @@
         "tests::tests::qc_import::v4_a_substituted_anchor_is_refused_and_the_real_block_is_executed",
         "tests::tests::qc_import::v4_a_verified_qc_for_another_block_at_a_held_height_raises_the_alarm",
         "tests::tests::system::rs_import_then_crash_before_adoption_keeps_agreement",
-        "state_sync::tests::a_forged_chunk_is_refused_and_the_restore_completes_elsewhere"
+        "state_sync::tests::a_forged_chunk_is_refused_and_the_restore_completes_elsewhere",
+        "tests::tests::qc_import::v4_a_boundary_whose_committee_record_differs_is_refused"
       ],
       "excluded_ignored": {
         "tests::tests::block_identity::sync_must_reject_substituted_anchor_with_reused_signature": "V3 fixture (V3 is deleted at G1 S11b). On V4 the anchor is bound to the signed hash (G0, Block::anchor_is_bound): witnesses qc_import::v4_validation_refuses_an_anchor_that_is_not_the_last_committed_vertex and v4_a_substituted_anchor_is_refused_and_the_real_block_is_executed."
@@ -65,7 +66,12 @@
         "tests::g5_unbonding_unlocks_exactly_at_its_time",
         "tests::g5_commission_increase_waits_its_notice_and_is_capped",
         "tests::g5_matured_unbonding_is_paid_at_the_first_boundary",
-        "tests::g5_boundary_payouts_are_bounded_and_ordered"
+        "tests::g5_boundary_payouts_are_bounded_and_ordered",
+        "tests::g5_emission_counts_consensus_time_and_caps_one_payout_at_a_day",
+        "tests::g5_emission_does_not_depend_on_block_speed_or_period",
+        "tests::g5_rewards_and_fees_pay_the_committee_of_the_block_epoch",
+        "tests::g5_an_oversized_committee_weight_cannot_stop_emission",
+        "tests::rotate_validator_epoch_snapshots_advances_and_prunes"
       ],
       "excluded_ignored": {
         "tests::test_h6_state_root_is_blind_to_out_of_band_writes": "Superseded by G3 C1′/C2′ (the root is the JMT root of the state map): storage class::tests::the_write_gate_refuses_state_outside_the_block_transaction, state_commit tests::rc2_lists_every_flat_key_the_tree_disagrees_with and tests::forged_or_foreign_chunks_are_refused, chain_sync a_forged_chunk_is_refused_and_the_restore_completes_elsewhere, consensus a_qc_over_another_state_root_is_never_stored, executor block_execution_writes_state_only_inside_the_block_transaction. WG-1 refuses this test's own setup write, so it cannot run as written.",

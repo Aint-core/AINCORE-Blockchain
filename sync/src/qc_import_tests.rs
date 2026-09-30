@@ -303,6 +303,60 @@ fn v4_sync_imports_across_a_boundary_under_the_next_committee() {
     assert_eq!(sync.process_blocks_with_qcs(vec![b3], &[q3], 2), 3);
 }
 
+/// G5 EM-2: rewards and fees pay the executor's committee record, so
+/// consensus refuses a boundary block whose record differs from the
+/// committee it derives. Here the executor's record of C_1 is corrupted after
+/// H_0 and the live set is emptied, so at H_1 the executor falls back to the
+/// corrupted record while consensus falls back to its own C_1. The control
+/// chain, uncorrupted, imports the same boundary.
+#[test]
+fn v4_a_boundary_whose_committee_record_differs_is_refused() {
+    let c1 = next_committee();
+    let next = consensus::qc::validator_set_hash(&c1);
+    let run = |name: &str, corrupt: bool| -> (u64, bool) {
+        let (sync, c0) = v4_sync_with(name, 2, Some(&c1));
+        let b1 = block_at(&sync, 1, "genesis", &"a1".repeat(32));
+        let q1 = qc_for(&b1, &c0, &[0, 1, 2]);
+        assert_eq!(sync.process_blocks_with_qcs(vec![b1.clone()], &[q1], 0), 1);
+        let b2 = block_at(&sync, 2, &b1.header.hash, &"a2".repeat(32));
+        let q2 = qc_in(&b2, &c0, &[0, 1, 2], 0, next.clone());
+        assert_eq!(sync.process_blocks_with_qcs(vec![b2.clone()], &[q2], 1), 2);
+        {
+            let _seed = sync.storage.seeding();
+            if corrupt {
+                sync.storage
+                    .put(
+                        "sys:validator_set:epoch:1",
+                        &serde_json::to_string(&c0).unwrap(),
+                    )
+                    .unwrap();
+            }
+            sync.storage.put("sys:validator_set:v1", "[]").unwrap();
+        }
+        let b3 = block_at(&sync, 3, &b2.header.hash, &"a3".repeat(32));
+        let q3 = qc_in(&b3, &c1, &[0, 1, 2, 3], 1, String::new());
+        assert_eq!(sync.process_blocks_with_qcs(vec![b3.clone()], &[q3], 2), 3);
+        // H_1 = block 4: an empty live set keeps C_1 (EP-2's fallback).
+        let b4 = block_at(&sync, 4, &b3.header.hash, &"a4".repeat(32));
+        let q4 = qc_in(&b4, &c1, &[0, 1, 2, 3], 1, next.clone());
+        let height = sync.process_blocks_with_qcs(vec![b4], &[q4], 3);
+        let recorded = consensus::v4::epoch::read_start_from(&sync.storage, 2)
+            .unwrap()
+            .is_some();
+        (height, recorded)
+    };
+    assert_eq!(
+        run("record_control", false),
+        (4, true),
+        "control: the boundary imports"
+    );
+    assert_eq!(
+        run("record_corrupt", true),
+        (3, false),
+        "a boundary with another committee record was accepted"
+    );
+}
+
 /// EP-4 on import: QC(H_0) binding a next committee other than the one this
 /// node derives from the same post-state is refused, and the node records
 /// `alarm:committee_mismatch` (its consensus halts on it).

@@ -258,8 +258,10 @@ fn block_crash_child() {
                 // G5 amendment A1 moved it the same way, each step proven from
                 // af45a2f3...: the consensus-time stdlib 405a1f99..., the new
                 // Params and Clock layout 35d1e242..., the tau clock write (the
-                // block at timestamp 7) this value.
-                "3208d836fe9d403e746d281e54dd7efe15eedec6356e5a263a80ece2c6627af8",
+                // block at timestamp 7) 3208d836.... G5 S2 moved it through
+                // the stdlib alone (per-period emission): with A1's bytecode the
+                // S2 executor reproduces 3208d836... exactly.
+                "e8953244fae2148eddfed110d1716230b3f6e785dd0f9ca4cf8d63410e23c694",
                 "clean execution must preserve the pre-staging fixture root"
             );
         }

@@ -1680,3 +1680,28 @@ impl ChainSync {
 
 #[cfg(test)]
 mod tests;
+
+/// Test helper: the state root an empty block at `height` with BFT timestamp
+/// `timestamp` would have on top of the executed chain, found by executing it
+/// in a block transaction that is then discarded (nothing is written). It is
+/// exact at any height, including boundary blocks, whose committee record and
+/// epoch writes a fixture would otherwise have to predict.
+#[cfg(test)]
+pub(crate) fn dry_run_empty_block_root(storage: &Arc<StateDB>, height: u64, timestamp: u64) -> String {
+    let executor = executor::Executor::new(Arc::clone(storage));
+    let mut root = None;
+    let outcome = executor.execute_block_admitted_at(
+        vec![],
+        "dry-run",
+        height,
+        timestamp,
+        &[],
+        |_| Ok(()),
+        |summary, _| {
+            root = Some(summary.state_root.clone());
+            Err("dry run".into())
+        },
+    );
+    assert!(outcome.is_err(), "the dry run must not commit");
+    root.expect("the parent height is executed")
+}

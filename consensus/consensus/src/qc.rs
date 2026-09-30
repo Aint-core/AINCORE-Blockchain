@@ -29,16 +29,9 @@ const FINALITY_VOTE_DOMAIN: &[u8] = b"AINCORE_FINALITY_VOTE_V1";
 const FINALITY_VOTE_DOMAIN_V2: &[u8] = b"AINCORE_FINALITY_VOTE_V2";
 const VALIDATOR_BLS_DOMAIN: &[u8] = b"AINCORE_VALIDATOR_BLS_V1";
 
-/// Per-validator finality identity. `bls_public_key` / `bls_pop` are hex.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ValidatorInfo {
-    pub address: String,
-    pub stake: u64,
-    pub ed25519_public_key: String,
-    pub bls_public_key: String,
-    /// Proof-of-possession over `bls_public_key` (MANDATORY at registration).
-    pub bls_pop: String,
-}
+/// Per-validator finality identity, and the committee order (G5: defined in
+/// `blockchain::committee` so the executor pays exactly this committee).
+pub use blockchain::committee::{canonical_order, ValidatorInfo};
 
 /// The canonical message every validator signs for a finalized anchor. All
 /// validators MUST sign byte-identical bytes for `fast_aggregate_verify`.
@@ -153,15 +146,6 @@ impl std::fmt::Display for QcError {
     }
 }
 impl std::error::Error for QcError {}
-
-/// Canonicalize a validator set into the deterministic order the signer bitmap
-/// indexes against (sorted by address bytes). Returns a clone so callers cannot
-/// accidentally pass an unsorted slice and corrupt bitmap indexing.
-pub fn canonical_order(validators: &[ValidatorInfo]) -> Vec<ValidatorInfo> {
-    let mut v = validators.to_vec();
-    v.sort_by(|a, b| a.address.cmp(&b.address));
-    v
-}
 
 /// Deterministically derive the validator BLS signing seed from the persistent
 /// node identity. This mirrors genesis B1 derivation exactly:

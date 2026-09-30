@@ -327,6 +327,18 @@ struct ChainParamsResource {
     max_block_interval_secs: u64,
 }
 
+/// The genesis-pinned `0x1::chain::Params`, if the chain has them (a test
+/// fixture may not; boot refuses such a database).
+fn chain_params(db: &StateDB) -> Option<ChainParamsResource> {
+    let key = vm_move::state_keys::resource_key_str(&system_address(), "0x1::chain::Params");
+    db.get(&key)
+        .expect("CRITICAL: the chain parameters could not be read")
+        .map(|hex_value| {
+            bcs::from_bytes(&hex::decode(hex_value).expect("CRITICAL: chain state is not hex"))
+                .expect("CRITICAL: 0x1::chain::Params is corrupt")
+        })
+}
+
 /// G5 CL-1/CL-2 (amendment A1): the `0x1::chain::Clock` for block `height`
 /// whose BFT timestamp is `block_timestamp`, given the chain's state before
 /// it. tau grows by the timestamp's growth since the previous block, capped
@@ -347,12 +359,8 @@ pub fn next_chain_clock(db: &StateDB, height: u64, block_timestamp: u64) -> Chai
     let previous: ChainClock = read("0x1::chain::Clock")
         .map(|bytes| bcs::from_bytes(&bytes).expect("CRITICAL: 0x1::chain::Clock is corrupt"))
         .unwrap_or_default();
-    let cap = read("0x1::chain::Params")
-        .map(|bytes| {
-            bcs::from_bytes::<ChainParamsResource>(&bytes)
-                .expect("CRITICAL: 0x1::chain::Params is corrupt")
-                .max_block_interval_secs
-        })
+    let cap = chain_params(db)
+        .map(|p| p.max_block_interval_secs)
         .unwrap_or(0);
     let growth = block_timestamp.saturating_sub(previous.block_timestamp);
     ChainClock {
@@ -1273,15 +1281,18 @@ impl Executor {
             .expect("CRITICAL: the chain clock write failed inside the block transaction");
     }
 
+    /// The committee epoch boundary H_E (G1 EP-1): Move's `advance_epoch`
+    /// (the epoch counter, matured unbonding payouts), then the committee
+    /// record for E+1. The record does not depend on Move succeeding: consensus
+    /// derives the same committee at the same block whatever Move did (FX-14).
     fn maybe_advance_epoch(&self, next_height: u64) {
         let interval = self.epoch_block_interval();
         if next_height == 0 || !next_height.is_multiple_of(interval) {
             return;
         }
         // Exactly-once guard: a sync import and a local build racing on the same
-        // height must not BOTH fire the boundary (double-minted rewards diverge
-        // state). The marker is written in the same atomic batch as the epoch
-        // state below.
+        // height must not BOTH fire the boundary. The marker is written in the
+        // same block transaction as the epoch state below.
         let already = self
             .db
             .get("sys:last_epoch_boundary")
@@ -1307,51 +1318,127 @@ impl Executor {
         match self.vm.execute_transaction_actions(
             vec![(action, true, system_address())],
             system_address(),
-            // AUDIT-#2 FIX: raised from 1M. advance_epoch runs O(N) reward loops;
-            // paired with the Move-side MAX_VALIDATORS=1000 cap this leaves a wide
-            // margin (≈1000 validators worst-case ≪ this budget) so the epoch tx
-            // cannot OOG-abort and permanently halt emission + governance.
+            // AUDIT-#2: bounded loops (matured payouts, MAX_PAYOUTS_PER_BOUNDARY)
+            // fit well inside this budget.
             20_000_000,
         ) {
-            Ok((_gas_used, mut updates, status)) => {
-                if !status.success {
-                    eprintln!(
-                        "⚠️ Epoch advance aborted at block {}: {:?}",
-                        next_height, status.error
-                    );
-                    return;
-                }
+            Ok((_gas_used, mut updates, status)) if status.success => {
                 self.append_supply_tracker_updates(&mut updates);
-                updates.push((
-                    "sys:last_epoch_boundary".to_string(),
-                    Some(next_height.to_string()),
-                ));
                 if let Err(err) = self.commit_kv_updates(updates, "epoch advance") {
                     eprintln!("🚨 [EPOCH_ADVANCE_COMMIT_FAIL] {}", err);
-                    return;
+                } else {
+                    self.sync_supply_trackers_from_validator_set();
                 }
-                self.sync_supply_trackers_from_validator_set();
-                self.rotate_validator_epoch(next_height);
-                // G5 GV-1: governance is Move transactions only; the Rust
-                // proposal driver (RPC-created, wall-clock deadlines) is gone.
-                println!("⏳ Epoch advanced at block {}", next_height);
             }
-            Err(err) => {
-                eprintln!("⚠️ Epoch advance failed at block {}: {}", next_height, err);
+            Ok((_gas_used, _updates, status)) => eprintln!(
+                "⚠️ Epoch advance aborted at block {}: {:?}",
+                next_height, status.error
+            ),
+            Err(err) => eprintln!("⚠️ Epoch advance failed at block {}: {}", next_height, err),
+        }
+        self.db
+            .put("sys:last_epoch_boundary", &next_height.to_string())
+            .expect("CRITICAL: the epoch boundary marker write failed");
+        self.rotate_validator_epoch(next_height);
+        println!("⏳ Epoch advanced at block {}", next_height);
+    }
+
+    /// G5 EM-1, EM-2: at every reward-period height (h mod R = 0) pay the
+    /// emission for the consensus time since the last payout to the committee
+    /// of h's epoch, jailed members excluded. A payout that aborts is caught up
+    /// by the next one (Move keeps the time of the last payout).
+    fn maybe_pay_rewards(&self, height: u64) {
+        let Some(params) = chain_params(&self.db) else {
+            return;
+        };
+        if height == 0 || !height.is_multiple_of(params.reward_period) {
+            return;
+        }
+        let (members, weights): (
+            Vec<move_core_types::account_address::AccountAddress>,
+            Vec<u64>,
+        ) = self
+            .paid_committee(height)
+            .into_iter()
+            .filter_map(|(address, stake)| parse_move_address(&address).map(|a| (a, stake)))
+            .unzip();
+        let action = MoveAction::CallEntryFunction(EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                system_address(),
+                move_core_types::identifier::Identifier::new("staking")
+                    .expect("staking identifier"),
+            ),
+            function: "pay_rewards".to_string(),
+            ty_args: vec![],
+            args: vec![
+                bcs::to_bytes(&system_address()).expect("an address is BCS"),
+                bcs::to_bytes(&members).expect("addresses are BCS"),
+                bcs::to_bytes(&weights).expect("weights are BCS"),
+            ],
+        });
+        match self.vm.execute_transaction_actions(
+            vec![(action, true, system_address())],
+            system_address(),
+            // At most 256 members (G1 EP-2): a bounded loop.
+            20_000_000,
+        ) {
+            Ok((_gas_used, mut updates, status)) if status.success => {
+                self.append_supply_tracker_updates(&mut updates);
+                if let Err(err) = self.commit_kv_updates(updates, "reward payout") {
+                    eprintln!("🚨 [REWARD_PAYOUT_COMMIT_FAIL] {}", err);
+                } else {
+                    self.sync_supply_trackers_from_validator_set();
+                }
             }
+            Ok((_gas_used, _updates, status)) => eprintln!(
+                "⚠️ Reward payout aborted at block {}: {:?}",
+                height, status.error
+            ),
+            Err(err) => eprintln!("⚠️ Reward payout failed at block {}: {}", height, err),
         }
     }
 
-    /// SEC-#16: at each epoch boundary, snapshot the active validator set for the
-    /// NEW epoch and advance the consensus epoch counter. Runs from
-    /// `maybe_advance_epoch`, which fires on BOTH the consensus (dag) and sync
-    /// (chain_sync) block-apply paths — so every node rotates identically and
-    /// deterministically (epoch = boundary_height / interval, set from on-chain
-    /// state only). QC production/verification bind to `sys:validator_set:epoch:{E}`,
-    /// so a validator that joins during epoch E becomes active in E+1 when the
-    /// next boundary captures the updated live set. These are consensus-metadata
-    /// keys (like consensus:committed_rounds) — not Move state, not in the state
-    /// root.
+    /// The committee of epoch E (G1 EP-2): the genesis committee for epoch 0,
+    /// the record written at H_{E-1} after. Empty when the chain has none (a
+    /// test fixture).
+    fn committee_of_epoch(&self, epoch: u64) -> Vec<blockchain::committee::ValidatorInfo> {
+        let key = if epoch == 0 {
+            "genesis:validator_set:v1".to_string()
+        } else {
+            format!("sys:validator_set:epoch:{epoch}")
+        };
+        self.db
+            .get(&key)
+            .expect("CRITICAL: the committee record could not be read")
+            .map(|raw| serde_json::from_str(&raw).expect("CRITICAL: a committee record is corrupt"))
+            .unwrap_or_default()
+    }
+
+    /// G5 EM-2: who is paid for block `height`: the members of the committee
+    /// C_{E(height)} with their committee stake, never the live set; jailed
+    /// members and zero stake excluded.
+    fn paid_committee(&self, height: u64) -> Vec<(String, u64)> {
+        let epoch = height.saturating_sub(1) / self.epoch_block_interval();
+        self.committee_of_epoch(epoch)
+            .into_iter()
+            .filter(|m| m.stake > 0)
+            .filter(|m| {
+                self.db
+                    .get(&format!("validator:jailed:{}", m.address))
+                    .expect("CRITICAL: the jail record could not be read")
+                    .is_none()
+            })
+            .map(|m| (m.address, m.stake))
+            .collect()
+    }
+
+    /// G1 EP-2 / G5 EM-2: at the boundary H_E, record the committee of E+1 as
+    /// `sys:validator_set:epoch:{E+1}`: the live set (`sys:validator_set:v1`,
+    /// this block's post-state) if it is a valid committee, C_E otherwise.
+    /// Consensus derives its committee with the same function from the same
+    /// inputs and refuses a boundary block whose record differs; rewards and
+    /// fees pay this record. Runs on both the consensus and the sync
+    /// block-apply paths, inside the block transaction.
     fn rotate_validator_epoch(&self, boundary_height: u64) {
         let interval = self.epoch_block_interval();
         if interval == 0 {
@@ -1359,12 +1446,25 @@ impl Executor {
         }
         let new_epoch = boundary_height / interval;
 
-        // Freeze the current live set for the new epoch.
-        if let Ok(Some(active)) = self.db.get("sys:validator_set:v1") {
-            let _ = self
-                .db
-                .put(&format!("sys:validator_set:epoch:{}", new_epoch), &active);
+        let current = self.committee_of_epoch(new_epoch.saturating_sub(1));
+        let proposed: Vec<blockchain::committee::ValidatorInfo> = self
+            .db
+            .get("sys:validator_set:v1")
+            .expect("CRITICAL: the live validator set could not be read")
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        let (next, invalid) = blockchain::committee::next_committee(&current, &proposed);
+        if let Some(why) = invalid {
+            eprintln!(
+                "🚨 [COMMITTEE_INVALID] epoch {new_epoch} keeps the previous committee: {why}"
+            );
         }
+        self.db
+            .put(
+                &format!("sys:validator_set:epoch:{}", new_epoch),
+                &serde_json::to_string(&next).expect("a committee is JSON"),
+            )
+            .expect("CRITICAL: the committee record write failed");
         let _ = self.db.put("consensus:epoch", &new_epoch.to_string());
         let _ = self.db.put(
             &format!("consensus:epoch_start_height:{}", new_epoch),
@@ -1454,7 +1554,9 @@ impl Executor {
     ///
     /// Splits `total_reward` between:
     ///   - 20% anchor-leader bonus → `anchor_leader`
-    ///   - 80% stake-weighted pool → every validator in sys:validators
+    ///   - 80% stake-weighted pool → every member of `committee`, the block's
+    ///     paid committee (G5 EM-2: C_{E(h)} without jailed members, never
+    ///     the live set)
     ///
     /// The leader still receives any pool share they're entitled to from
     /// their own stake (so a high-stake leader gets bonus + pool share).
@@ -1462,22 +1564,12 @@ impl Executor {
     /// Rounding remainder (from integer division) is given to anchor_leader
     /// so the reward is fully consumed and never lost.
     ///
-    /// Fallback: if validator set is empty/unreadable, ALL goes to leader
-    /// (legacy behaviour preserved for genesis bootstrap and edge cases).
+    /// Fallback: if the committee is empty, ALL goes to the leader.
     fn compute_block_payouts(
-        &self,
         anchor_leader: &str,
         total_reward: u128,
+        validators: &[(String, u64)],
     ) -> Vec<(String, u128)> {
-        // Step 1: read validator set with stakes.
-        let validators: Vec<(String, u64)> = self
-            .db
-            .get("sys:validators")
-            .ok()
-            .flatten()
-            .and_then(|json| serde_json::from_str::<Vec<(String, u64)>>(&json).ok())
-            .unwrap_or_default();
-
         // Fallback: no validator set → legacy single-miner path.
         if validators.is_empty() {
             return vec![(anchor_leader.to_string(), total_reward)];
@@ -1508,7 +1600,7 @@ impl Executor {
         let mut payouts: BTreeMap<String, u128> = BTreeMap::new();
         let mut distributed_pool: u128 = 0;
 
-        for (addr, stake) in &validators {
+        for (addr, stake) in validators {
             let share = pool.saturating_mul(*stake as u128) / total_stake;
             distributed_pool = distributed_pool.saturating_add(share);
             *payouts.entry(addr.clone()).or_insert(0) = payouts
@@ -2097,7 +2189,11 @@ impl Executor {
         };
 
         if reward_amount > 0 {
-            let payouts = self.compute_block_payouts(miner_addr, reward_amount);
+            let payouts = Self::compute_block_payouts(
+                miner_addr,
+                reward_amount,
+                &self.paid_committee(block_height),
+            );
 
             println!(
                 "💰 Distributing Block Fees ({} AIN total) across {} recipient(s)",
@@ -2146,6 +2242,9 @@ impl Executor {
 
         // 8. Advance Move epoch on a deterministic block interval, AS the block
         // being executed (see execute_block_parallel_at doc).
+        // G5 EM-3: the reward payout for (h - R, h] pays C_{E(h)} before a
+        // boundary block records C_{E+1}.
+        self.maybe_pay_rewards(block_height);
         self.maybe_advance_epoch(block_height);
 
         // G3 CM-1/CM-2: the state root is the Jellyfish Merkle root over EVERY
@@ -4135,29 +4234,81 @@ mod tests {
         let db = temp_db("rotate_epoch");
         let exec = Executor::new(Arc::clone(&db));
         let _seed = db.seeding();
-        db.put("sys:validator_set:v1", "[\"set-at-boundary\"]").unwrap();
         // SEC-#13: pin the interval, as genesis does.
         db.put("sys:config:epoch_block_interval", "20").unwrap();
-
-        // interval 20 → boundary 40 = epoch 2.
-        exec.rotate_validator_epoch(40);
-        assert_eq!(db.get("consensus:epoch").unwrap().unwrap(), "2");
-        assert_eq!(
-            db.get("sys:validator_set:epoch:2").unwrap().unwrap(),
-            "[\"set-at-boundary\"]"
+        let (a, b, c) = (
+            committee_member(91, 5),
+            committee_member(92, 7),
+            committee_member(93, 9),
         );
+        let record = |epoch: u64| -> Vec<blockchain::committee::ValidatorInfo> {
+            serde_json::from_str(
+                &db.get(&format!("sys:validator_set:epoch:{epoch}"))
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        db.put(
+            "genesis:validator_set:v1",
+            &serde_json::to_string(&vec![a.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        // G5 EM-2 / G1 EP-2: a valid live set becomes the next committee, in
+        // canonical order. Interval 20: boundary 20 opens epoch 1.
+        db.put(
+            "sys:validator_set:v1",
+            &serde_json::to_string(&vec![c.clone(), b.clone()]).unwrap(),
+        )
+        .unwrap();
+        exec.rotate_validator_epoch(20);
         assert_eq!(
-            db.get("consensus:epoch_start_height:2").unwrap().unwrap(),
-            "41"
+            record(1),
+            blockchain::committee::canonical_order(&[b.clone(), c.clone()])
+        );
+        assert_eq!(db.get("consensus:epoch").unwrap().unwrap(), "1");
+        assert_eq!(
+            db.get("consensus:epoch_start_height:1").unwrap().unwrap(),
+            "21"
+        );
+
+        // An invalid live set (a forged proof of possession) keeps C_1.
+        let mut forged = a.clone();
+        forged.bls_pop = b.bls_pop.clone();
+        db.put(
+            "sys:validator_set:v1",
+            &serde_json::to_string(&vec![forged]).unwrap(),
+        )
+        .unwrap();
+        exec.rotate_validator_epoch(40);
+        assert_eq!(
+            record(2),
+            record(1),
+            "an invalid proposal keeps the committee"
         );
 
         // Retention: rotating to epoch 9 prunes epoch (9 - 8 - 1) = 0.
-        db.put("sys:validator_set:epoch:0", "[\"old\"]").unwrap();
+        db.put("sys:validator_set:epoch:0", "[]").unwrap();
         exec.rotate_validator_epoch(180); // epoch 9
         assert!(
             db.get("sys:validator_set:epoch:0").unwrap().is_none(),
             "snapshot beyond the retention window must be pruned"
         );
+    }
+
+    /// A committee member with real keys: its Ed25519 key derives its address
+    /// and its BLS proof of possession verifies.
+    fn committee_member(seed: u8, stake: u64) -> blockchain::committee::ValidatorInfo {
+        let key = SigningKey::from_bytes(&[seed; 32]);
+        let (bls_public_key, bls_pop) = test_bls_identity(seed);
+        blockchain::committee::ValidatorInfo {
+            address: crypto::derive_address(key.verifying_key().as_bytes()).unwrap(),
+            stake,
+            ed25519_public_key: hex::encode(key.verifying_key().as_bytes()),
+            bls_public_key: hex::encode(bls_public_key),
+            bls_pop: hex::encode(bls_pop),
+        }
     }
 
     fn load_stdlib(db: &StateDB) {
@@ -5403,13 +5554,23 @@ mod tests {
 
     impl G5Chain {
         fn new(name: &str, cap: u64, seed: impl FnOnce(&Arc<StateDB>)) -> Self {
+            Self::with_period(name, 20, cap, seed)
+        }
+
+        /// `new` with reward period `period` (it must divide I = 20).
+        fn with_period(
+            name: &str,
+            period: u64,
+            cap: u64,
+            seed: impl FnOnce(&Arc<StateDB>),
+        ) -> Self {
             let db = temp_db(name);
             load_stdlib(&db);
             {
                 let _seed = db.seeding();
                 db.set_federation_key("00000000000000000000000000000000")
                     .unwrap();
-                seed_chain_params_with(&db, (Executor::DEFAULT_EPOCH_BLOCK_INTERVAL, 20, cap));
+                seed_chain_params_with(&db, (Executor::DEFAULT_EPOCH_BLOCK_INTERVAL, period, cap));
                 let no_pools: Vec<move_core_types::account_address::AccountAddress> = vec![];
                 db.put(
                     &vm_move::state_keys::resource_key_str(
@@ -5476,6 +5637,13 @@ mod tests {
                 self.block(self.timestamp + self.cap, vec![]);
             }
             self.block(self.timestamp + self.cap, txs);
+        }
+
+        /// Runs `count` empty blocks, each `step` seconds after the last.
+        fn run_blocks(&mut self, count: u64, step: u64) {
+            for _ in 0..count {
+                self.block(self.timestamp + step, vec![]);
+            }
         }
 
         /// Runs blocks, each advancing consensus time by at most the cap,
@@ -5839,6 +6007,11 @@ mod tests {
             5,
             "the boundaries at 20, 40, 60, 80 and 100 ran"
         );
+        assert_eq!(
+            validator_set(&db).current_epoch,
+            5,
+            "the committee-epoch counter (DePIN's limit) advances at boundaries"
+        );
     }
 
     /// G5 UB-1: a boundary pays at most K = 256 matured entries, in queue
@@ -5896,6 +6069,218 @@ mod tests {
         assert_eq!(queued(), vec![1], "the rest paid; owner 1 still kept");
         assert_eq!(coin_balance(&db, &owners[299]), 1_299);
         assert_eq!(move_epoch(&db), 2);
+    }
+
+    /// The Move emission rule (G5 EM-1), for `elapsed` consensus seconds on
+    /// `minted` supply: remaining x lambda x dt, dt capped at one day.
+    fn g5_expected_emission(minted: u128, elapsed: u64) -> u128 {
+        let remaining = MAX_SUPPLY - minted;
+        let e = (remaining / 1_000_000_000) * 607_866_866 * (elapsed.min(86_400) as u128)
+            / 1_000_000_000;
+        e.min(remaining)
+    }
+
+    /// A Move ValidatorSet holding only `total_supply` (payouts read it for
+    /// the remaining reserve), and `members` as the genesis committee, each
+    /// with an empty coin store.
+    fn seed_committee_chain(
+        db: &StateDB,
+        members: &[blockchain::committee::ValidatorInfo],
+        total_supply: u128,
+    ) {
+        for m in members {
+            set_coin_store(db, &m.address, 0);
+        }
+        let _seed = db.seeding();
+        let set = TestValidatorSet {
+            validators: vec![],
+            unbonding_queue: vec![],
+            total_supply,
+            current_epoch: 0,
+        };
+        db.put(
+            &validator_set_key(),
+            &hex::encode(bcs::to_bytes(&set).unwrap()),
+        )
+        .unwrap();
+        db.put(
+            "genesis:validator_set:v1",
+            &serde_json::to_string(members).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// G5 EM-1: a payout mints remaining x lambda x (consensus time since the
+    /// last payout), split by committee weight; one payout covers at most a
+    /// day. lambda realizes 1.90 %/yr of the remaining reserve.
+    #[test]
+    fn g5_emission_counts_consensus_time_and_caps_one_payout_at_a_day() {
+        let ain = G5_AIN;
+        let supply = 1_000_000 * ain;
+        let (a, b) = (committee_member(101, 100), committee_member(102, 100));
+        let members = [a.clone(), b.clone()];
+        // 7 s blocks: the payout at height 20 covers 140 s.
+        let mut chain = G5Chain::new("g5_emission", 14, |db| {
+            seed_committee_chain(db, &members, supply)
+        });
+        chain.run_blocks(20, 7);
+        let e = g5_expected_emission(supply, 140);
+        assert!(e > 0);
+        // Equal weights (each clipped to 1/50 of the total): half each.
+        let each = e * 4 / 8;
+        assert_eq!(coin_balance(&chain.db, &a.address), each);
+        assert_eq!(coin_balance(&chain.db, &b.address), each);
+        assert_eq!(validator_set(&chain.db).total_supply, supply + 2 * each);
+
+        // A payout 20 days after the last covers one day only.
+        let mut slow = G5Chain::new("g5_emission_cap", DAY, |db| {
+            seed_committee_chain(db, &members, supply)
+        });
+        slow.run_blocks(20, DAY);
+        let capped = g5_expected_emission(supply, 20 * DAY);
+        assert_eq!(capped, g5_expected_emission(supply, DAY));
+        assert_eq!(
+            validator_set(&slow.db).total_supply,
+            supply + 2 * (capped * 4 / 8)
+        );
+
+        // The rate: a day's draw, compounded over a Julian year, is 1.90 %.
+        let remaining = (MAX_SUPPLY - supply) as f64;
+        let per_day = g5_expected_emission(supply, DAY) as f64 / remaining;
+        let per_year = 1.0 - (1.0 - per_day).powf(365.25);
+        assert!((per_year - 0.019).abs() < 1e-5, "{per_year}");
+    }
+
+    /// G5 EM-1: the emission depends on consensus time only. 1 s or 7 s blocks,
+    /// and a reward period of 1 or 20 blocks, mint the same over the same time
+    /// (to the linear form's bound, far below one part in a million).
+    #[test]
+    fn g5_emission_does_not_depend_on_block_speed_or_period() {
+        let ain = G5_AIN;
+        let supply = 1_000_000 * ain;
+        let members = [committee_member(103, 100), committee_member(104, 300)];
+        let minted = |name: &str, period: u64, step: u64, blocks: u64| -> u128 {
+            let mut chain = G5Chain::with_period(name, period, 14, |db| {
+                seed_committee_chain(db, &members, supply)
+            });
+            chain.run_blocks(blocks, step);
+            assert_eq!(chain.clock().time, 280);
+            // Stakes 100 and 300 both exceed the saturation point (1/50 of
+            // the total), so the two are paid alike.
+            assert_eq!(
+                coin_balance(&chain.db, &members[0].address),
+                coin_balance(&chain.db, &members[1].address)
+            );
+            validator_set(&chain.db).total_supply - supply
+        };
+        let slow = minted("g5_speed_slow", 20, 7, 40);
+        let fast = minted("g5_speed_fast", 20, 1, 280);
+        let every_block = minted("g5_speed_period1", 1, 7, 40);
+        assert!(slow > 0);
+        for other in [fast, every_block] {
+            let diff = slow.abs_diff(other) as f64 / slow as f64;
+            assert!(diff < 1e-6, "slow {slow}, other {other}");
+        }
+    }
+
+    /// G5 EM-1: a committee weight far beyond any real stake (u64::MAX whole
+    /// AIN) is bounded before the pot arithmetic. Unbounded, a day's pot
+    /// (about 8e21) times its clipped weight (about 3.7e17) overflows u128 and
+    /// aborts every payout, which would stop emission.
+    #[test]
+    fn g5_an_oversized_committee_weight_cannot_stop_emission() {
+        let supply = 1_000_000 * G5_AIN;
+        let members = [committee_member(105, u64::MAX), committee_member(106, 100)];
+        // Day-long blocks: the payout at 20 covers the capped one day.
+        let mut chain = G5Chain::new("g5_weight_bound", DAY, |db| {
+            seed_committee_chain(db, &members, supply)
+        });
+        chain.run_blocks(20, DAY);
+        assert!(
+            validator_set(&chain.db).total_supply > supply,
+            "the payout ran"
+        );
+        assert!(coin_balance(&chain.db, &members[1].address) > 0);
+    }
+
+    /// G5 EM-2, EM-3: rewards and fees pay the committee of the block's
+    /// epoch, never the live set. At the boundary H_E the payout pays C_E
+    /// before C_{E+1} is recorded: a joiner is paid from its first committee
+    /// epoch and a leaver until its last. A jailed member gets nothing.
+    #[test]
+    fn g5_rewards_and_fees_pay_the_committee_of_the_block_epoch() {
+        let ain = G5_AIN;
+        let supply = 1_000_000 * ain;
+        let (a, b, c) = (
+            committee_member(111, 100),
+            committee_member(112, 100),
+            committee_member(113, 100),
+        );
+        let bystander = committee_member(114, 100);
+        let mut keys = vec![];
+        let mut chain = G5Chain::new("g5_recipients", 14, |db| {
+            seed_committee_chain(db, &[a.clone(), b.clone()], supply);
+            set_coin_store(db, &c.address, 0);
+            set_coin_store(db, &bystander.address, 0);
+            keys.push(G5Chain::account(db, 115, 10 * ain));
+            let _seed = db.seeding();
+            // The live set: B left, C joined. A bystander is in the old
+            // reward mirror but in no committee.
+            db.put(
+                "sys:validator_set:v1",
+                &serde_json::to_string(&vec![a.clone(), c.clone()]).unwrap(),
+            )
+            .unwrap();
+            db.put(
+                "sys:validators",
+                &serde_json::to_string(&vec![(bystander.address.clone(), 100u64)]).unwrap(),
+            )
+            .unwrap();
+        });
+        let (payer_key, payer) = keys.pop().unwrap();
+        let db = chain.db.clone();
+        let balance = |m: &blockchain::committee::ValidatorInfo| coin_balance(&db, &m.address);
+
+        // H_0 = 20 pays C_0 = {A, B}, then records C_1 = {A, C}.
+        chain.run_blocks(20, 7);
+        assert!(
+            balance(&a) > 0 && balance(&b) > 0,
+            "C_0 is paid at its boundary"
+        );
+        assert_eq!(balance(&c), 0, "C joins from epoch 1 only");
+        let recorded: Vec<blockchain::committee::ValidatorInfo> =
+            serde_json::from_str(&db.get("sys:validator_set:epoch:1").unwrap().unwrap()).unwrap();
+        assert_eq!(
+            recorded,
+            blockchain::committee::canonical_order(&[a.clone(), c.clone()])
+        );
+
+        // Block 21's fees pay C_1: C and A, not B, not the bystander.
+        let (b_before, c_before) = (balance(&b), balance(&c));
+        let pay = signed_tx(
+            &payer_key,
+            &payer,
+            &coin_transfer_payload(&payer, &a.address, 1),
+            0,
+            100_000,
+            1,
+        );
+        chain.block(chain.timestamp + 7, vec![pay]);
+        assert!(balance(&c) > c_before, "a C_1 member earns block 21's fees");
+        assert_eq!(balance(&b), b_before, "B left the committee");
+        assert_eq!(balance(&bystander), 0, "the live reward mirror is not paid");
+
+        // A is jailed before the payout at 40: only C is paid.
+        {
+            let _seed = db.seeding();
+            db.put(&format!("validator:jailed:{}", a.address), "1")
+                .unwrap();
+        }
+        let (a_before, c_before) = (balance(&a), balance(&c));
+        chain.run_blocks(19, 7);
+        assert_eq!(chain.height, 40);
+        assert_eq!(balance(&a), a_before, "a jailed member gets nothing");
+        assert!(balance(&c) > c_before, "C is paid for epoch 1");
     }
 
     /// Build a hex-encoded BCS `coin::transfer` payload from `from` to `to`.
@@ -6629,11 +7014,15 @@ mod tests {
     #[test]
     fn a_queued_fee_is_keyed_by_the_executing_height() {
         let (db, sender, tx_json) = g3_burning_transfer("g3_sweep_height");
-        let bad = "not_a_hex_validator";
+        // G5 EM-2: fees pay the block's committee (epoch 0: the genesis one).
+        let mut good = committee_member(94, 1000);
+        good.address = sender.clone();
+        let mut bad = committee_member(95, 1000);
+        bad.address = "not_a_hex_validator".to_string();
         let _seed = db.seeding();
         db.put(
-            "sys:validators",
-            &serde_json::to_string(&vec![(sender.as_str(), 1000u64), (bad, 1000u64)]).unwrap(),
+            "genesis:validator_set:v1",
+            &serde_json::to_string(&vec![good, bad]).unwrap(),
         )
         .unwrap();
         let outcome = Executor::new(db.clone())
@@ -8805,25 +9194,13 @@ mod tests {
 
     // ── Phase 4.A1: stake-proportional reward distribution ────────────────
 
-    fn temp_db_a1(suffix: &str) -> Arc<StateDB> {
-        let mut p = std::env::temp_dir();
-        p.push(format!("aincore_a1_{}_{}", std::process::id(), suffix));
-        let _ = std::fs::remove_dir_all(&p);
-        Arc::new(StateDB::open(p.to_str().unwrap()).unwrap())
-    }
-
-    fn set_validator_set_a1(db: &StateDB, vs: &[(&str, u64)]) {
-        let _seed = db.seeding();
-        let owned: Vec<(String, u64)> = vs.iter().map(|(a, s)| (a.to_string(), *s)).collect();
-        db.put("sys:validators", &serde_json::to_string(&owned).unwrap())
-            .unwrap();
+    fn committee_a1(vs: &[(&str, u64)]) -> Vec<(String, u64)> {
+        vs.iter().map(|(a, s)| (a.to_string(), *s)).collect()
     }
 
     #[test]
     fn a1_empty_validator_set_falls_back_to_leader() {
-        let db = temp_db_a1("empty_vset");
-        let executor = Executor::new(Arc::clone(&db));
-        let payouts = executor.compute_block_payouts("leader", 1_000);
+        let payouts = Executor::compute_block_payouts("leader", 1_000, &[]);
 
         assert_eq!(payouts.len(), 1);
         assert_eq!(payouts[0], ("leader".to_string(), 1_000));
@@ -8831,10 +9208,8 @@ mod tests {
 
     #[test]
     fn a1_single_validator_gets_everything() {
-        let db = temp_db_a1("single");
-        set_validator_set_a1(&db, &[("alice", 100)]);
-        let executor = Executor::new(Arc::clone(&db));
-        let payouts = executor.compute_block_payouts("alice", 1_000);
+        let payouts =
+            Executor::compute_block_payouts("alice", 1_000, &committee_a1(&[("alice", 100)]));
 
         // alice = anchor leader, also sole pool member
         // total must == 1_000, no funds lost
@@ -8846,7 +9221,6 @@ mod tests {
 
     #[test]
     fn a1_stake_proportional_distribution() {
-        let db = temp_db_a1("proportional");
         // 3 validators with stakes 100, 200, 700 (total 1000)
         // Leader bonus: 20% of 1000 = 200 → leader (alice)
         // Pool: 80% of 1000 = 800
@@ -8855,9 +9229,11 @@ mod tests {
         //   carol (700/1000): 560
         //   sum: 800 (no remainder)
         // Final: alice = 200 + 80 = 280, bob = 160, carol = 560
-        set_validator_set_a1(&db, &[("alice", 100), ("bob", 200), ("carol", 700)]);
-        let executor = Executor::new(Arc::clone(&db));
-        let payouts = executor.compute_block_payouts("alice", 1_000);
+        let payouts = Executor::compute_block_payouts(
+            "alice",
+            1_000,
+            &committee_a1(&[("alice", 100), ("bob", 200), ("carol", 700)]),
+        );
 
         let map: std::collections::HashMap<String, u128> = payouts.into_iter().collect();
         assert_eq!(map.get("alice").copied().unwrap_or(0), 280);
@@ -8871,7 +9247,6 @@ mod tests {
 
     #[test]
     fn a1_rounding_remainder_goes_to_leader() {
-        let db = temp_db_a1("rounding");
         // 3 validators, equal stake 1 each (total 3).
         // total_reward = 100
         // leader_bonus = 20% = 20
@@ -8883,9 +9258,11 @@ mod tests {
         // bob   = 26
         // carol = 26
         // total: 100 ✓
-        set_validator_set_a1(&db, &[("alice", 1), ("bob", 1), ("carol", 1)]);
-        let executor = Executor::new(Arc::clone(&db));
-        let payouts = executor.compute_block_payouts("alice", 100);
+        let payouts = Executor::compute_block_payouts(
+            "alice",
+            100,
+            &committee_a1(&[("alice", 1), ("bob", 1), ("carol", 1)]),
+        );
 
         let map: std::collections::HashMap<String, u128> = payouts.into_iter().collect();
         let total: u128 = map.values().sum();
@@ -8898,10 +9275,11 @@ mod tests {
     fn a1_non_validator_leader_still_gets_bonus() {
         // Edge case: anchor_leader is NOT in validator set (e.g. transient state).
         // Leader bonus still flows to leader; pool split among validators.
-        let db = temp_db_a1("non_validator_leader");
-        set_validator_set_a1(&db, &[("bob", 100), ("carol", 100)]);
-        let executor = Executor::new(Arc::clone(&db));
-        let payouts = executor.compute_block_payouts("ghost_leader", 1_000);
+        let payouts = Executor::compute_block_payouts(
+            "ghost_leader",
+            1_000,
+            &committee_a1(&[("bob", 100), ("carol", 100)]),
+        );
 
         let map: std::collections::HashMap<String, u128> = payouts.into_iter().collect();
         // ghost_leader gets 20% bonus = 200

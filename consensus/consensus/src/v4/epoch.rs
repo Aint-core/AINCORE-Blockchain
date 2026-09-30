@@ -129,10 +129,7 @@ pub fn next_start(
     b: &Boundary<'_>,
     proposed: &[ValidatorInfo],
 ) -> (EpochStart, Option<String>) {
-    let (committee, invalid) = match validate_committee(proposed) {
-        Ok(c) => (c, None),
-        Err(why) => (qc::canonical_order(b.current), Some(why)),
-    };
+    let (committee, invalid) = blockchain::committee::next_committee(b.current, proposed);
     let epoch = b.epoch + 1;
     let first_round = b.closing_round + 2;
     let start = EpochStart {
@@ -225,6 +222,20 @@ pub fn stage_boundary(
         &boundary,
         &proposed,
     );
+    // G5 EM-2: the executor recorded C_{E+1} in this block's state with the
+    // same rule, and pays rewards and fees to that record. A different record
+    // is a determinism fault: refuse the block rather than pay another set.
+    let recorded: Option<Vec<ValidatorInfo>> = view
+        .get(&format!("sys:validator_set:epoch:{}", start.epoch))
+        .map_err(|e| e.to_string())?
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    if recorded.as_ref() != Some(&start.committee) {
+        return Err(format!(
+            "{}: the executor recorded another committee for epoch {}",
+            crate::ordering::DECISION_CONFLICT,
+            start.epoch
+        ));
+    }
     write_next(view, &start, invalid.as_deref())?;
     Ok(Some(start))
 }
@@ -264,41 +275,9 @@ const STANDALONE_HEIGHT_KEY: &str = "consensus:standalone_height";
 
 /// EP-2: a committee is non-empty, has unique addresses and at most 256
 /// members, keeps only positive stake, and every member's Ed25519 key derives
-/// its address and its BLS proof of possession verifies.
-pub fn validate_committee(proposed: &[ValidatorInfo]) -> Result<Vec<ValidatorInfo>, String> {
-    let members: Vec<ValidatorInfo> = proposed.iter().filter(|m| m.stake > 0).cloned().collect();
-    if members.is_empty() {
-        return Err("an empty committee".into());
-    }
-    if members.len() > 256 {
-        return Err(format!("{} members, over 256", members.len()));
-    }
-    let mut seen = HashSet::new();
-    let bls = BLSEngine::consensus();
-    for m in &members {
-        if !seen.insert(m.address.as_str()) {
-            return Err(format!("member {} twice", m.address));
-        }
-        let derives = hex::decode(&m.ed25519_public_key)
-            .ok()
-            .and_then(|pk| crypto::derive_address(&pk).ok())
-            .is_some_and(|a| a == m.address);
-        if !derives {
-            return Err(format!("member {}: its key does not derive it", m.address));
-        }
-        let pop_ok = match (hex::decode(&m.bls_public_key), hex::decode(&m.bls_pop)) {
-            (Ok(pk), Ok(pop)) => bls.verify_possession(&pk, &pop).unwrap_or(false),
-            _ => false,
-        };
-        if !pop_ok {
-            return Err(format!(
-                "member {}: its BLS proof of possession fails",
-                m.address
-            ));
-        }
-    }
-    Ok(qc::canonical_order(&members))
-}
+/// its address and its BLS proof of possession verifies. One definition,
+/// shared with the executor, which pays exactly this committee (G5 EM-2).
+pub use blockchain::committee::validate_committee;
 
 impl Engine {
     /// E's record as the engine holds it.

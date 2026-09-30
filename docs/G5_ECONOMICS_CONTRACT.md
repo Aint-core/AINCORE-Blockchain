@@ -110,20 +110,40 @@ The claim grace G is removed (UB-1). Nothing governable touches any of these: th
 action `update_epoch_duration` is removed. Clients offline for more than 14 days must boot
 from a checkpoint; checkpoints are published at least weekly.
 
-**EM-1 (emission by consensus time).** At a payout height h (h mod R = 0) the executor mints
-`e = remaining · (1 − e^(−λ·Δτ))`, with `Δτ = τ(h) − τ(last_reward_height)`; S2 fixes its
-overflow-safe integer form and its error bound. `last_reward_height` is state. Payouts
-telescope, so cumulative emission depends on τ only, not on R or I; a payout skipped by a
-Move abort is caught up at the next one (research b.7). A halt mints at most C_τ of emission.
+**EM-1 (emission by consensus time).** At a payout height h (h mod R = 0) Move mints
+`e = remaining · λ · Δτ` (`staking::pay_rewards`), with `Δτ` the consensus time since the
+last payout (state: `EmissionState.last_reward_time`). Integer form:
+`e = (remaining / 10⁹) · Λ · Δτ / 10⁹`, with `Λ = 607,866,866` (λ in 10⁻¹⁸ per second,
+realizing 1.9000 %/yr) and `Δτ` capped at one day per payout; the excess of a longer gap
+stays in the reserve. Bounds:
+- the product stays below 8·10³⁰, far inside u128;
+- the linear form's error is under λ·Δτ/2 (4·10⁻⁸ at a 133 s payout, 2.7·10⁻⁵ at the cap);
+- truncating `remaining` to 10⁹ base units loses under 10⁻⁹ AIN.
+
+Payouts telescope, so cumulative emission depends on τ only, not on R, I or the block time.
+A payout that aborts writes nothing, so the next one covers its time (research b.7). A halt
+mints at most C_τ of emission.
 
 **EM-2 (recipients).** A payout at h pays the members of the frozen committee C_{E(h)}
-(G1 EP-2), not the live set. Jailed members are excluded. Weights are the committee stake
-with today's saturation clip (1/50 of the total). Per-block fees go to the same committee
-(research b.6).
+(G1 EP-2), not the live set.
+- **Weights and exclusions.** Jailed members are excluded. Weights are the committee stake,
+  in whole AIN, with today's saturation clip (1/50 of the total).
+- **Fees.** Per-block fees go to the same committee, split as today: 20 % to the anchor
+  leader, 80 % by committee stake (research b.6).
+- **The committee record.** The executor records each committee in state as
+  `sys:validator_set:epoch:{E}` at H_{E−1}; epoch 0 uses the genesis committee.
+- **One rule for both sides.** The executor applies the same rule consensus uses (EP-2's
+  `validate_committee` and its fallback to C_E, one definition in
+  `blockchain::committee`). Consensus refuses a boundary block whose derived committee
+  differs from the recorded one, so economics and consensus cannot disagree on who the
+  committee is.
 
 **EM-3 (order inside a boundary block H_E).** First the reward payout for (H_E − R, H_E] to
 C_E, then EP-2's derivation of C_{E+1} from the post-state, then the start of unbonding for
-members that leave at H_E.
+members that leave at H_E. The derivation does not depend on Move's `advance_epoch`
+succeeding (FX-14): an aborted epoch advance still records the next committee. The Move
+epoch counter (`staking.current_epoch`, which `universal_mining` uses to limit DePIN
+payouts) advances at committee boundaries.
 
 **DL-1 (bonded stake).** A validator's bonded stake is its own stake plus its pool's
 delegated stake. `sys:validator_set:v1` carries it, so the committee weight (G1 EP-2) is
@@ -191,7 +211,7 @@ end of G5, as with G1.
 |---|---|---|---|
 | **S1** (done, `65cc92a`) | CL-1, CL-2, P-1, GV-1 counted in heights: the `0x1::chain` clock and parameters, heights in Move, genesis pins and derivation, the Rust governance path removed | every deadline expires exactly at its height; a halt ages nothing; the pins are bound by the identity; genesis-tool reproduces the table | a deadline in seconds; an unpinned parameter; governance able to change a parameter |
 | **S1b** | Amendment A1: CL-1 τ, BT-1's quorum guard, CL-2 writing τ from the block timestamp, P-1's new split (C_τ pinned; U, N, Δc, K constants; G removed), SL-2 unlock by τ, UB-1, CM-1 | with 1 s blocks unbonding completes at 21 d of block time, not at a block count; a 10-day timestamp jump advances τ by C_τ; a corrupted timestamp stream cannot unlock before U / C_τ blocks; a below-quorum sample does not advance T; one author at +30 s cannot move T out of the honest range; a matured entry is paid once, at the first boundary at or after its unlock, in queue order; a commission increase applies exactly at N and never earlier, above Δc it is refused, a decrease applies at once | τ uncapped; cap ignored after a halt; quorum guard removed; unlock from h without I·C_τ; burn restored; payout not bounded by K; manual apply restored; increase cap removed |
-| **S2** | EM-1..EM-3: payouts every R blocks by Δτ, abort catch-up, committee recipients, fees to the committee, boundary order, I = 1,000 | the emission curve depends on τ only: identical for R ∈ {1, 20}, I ∈ {20, 1,000} and 1 s or 6.65 s blocks; an aborted payout is paid at the next; a joiner is paid from its first committee epoch and a leaver until its last; a jailed member gets nothing | Δτ ignored; the live set paid; payout after derivation at H_E |
+| **S2** | EM-1..EM-3: payouts every R blocks by Δτ, committee recipients from a state record shared with consensus, fees to the committee, boundary order, rotation independent of Move, I = 1,000 written by genesis-tool | a payout mints exactly the EM-1 integer form and a day's draw compounds to 1.90 %/yr; the emission over the same τ matches (within 10⁻⁶) for 1 s or 7 s blocks and R ∈ {1, 20}; a payout after a long gap covers one day; a joiner is paid from its first committee epoch and a leaver until its last; fees pay C_{E(h)}, not the live set; a jailed member gets nothing; an invalid live set keeps the committee; the executor's record equals consensus's committee on real nodes | Δτ ignored; the cap removed; the live set paid; payout after derivation at H_E; jailed paid; fees to the live set; rotation skipped when Move aborts; consensus cross-check removed |
 | **S3** | DL-1..DL-3, CM-1 in the payout: bonded stake in the committee weight; delegator rewards through the pool; bucketed delegator unbonding with automatic payout | a delegator earns its share of the pool's reward minus commission, to the unit; delegating shifts committee weight at the next epoch only; the sum paid never exceeds e; total supply stays within MAX_SUPPLY; 100 tiny undelegations cannot stop another delegator's | delegated stake ignored in weight; commission not taken; `reward_debt` not updated; the pool-wide cap restored |
 | **S4** | SL-1..SL-3: unbonding slashable, V4 evidence (EQ-1) through the DAG, W in τ, V3 deletion | a leaver that equivocates before its unlock loses its unbonding stake; an undelegation after the infraction is slashed and one before it is not; evidence older than W is refused; a V4 node never records V3 evidence (kept from S11b) | only active stake slashed; live-set membership check; no age bound |
 | **S5** | DOC-1: RPC fields, README, WHITEPAPER, CLAUDE.md | the RPC reports the Move state; no document names a halving (a grep witness) | — |

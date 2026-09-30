@@ -114,7 +114,9 @@ pub struct GenesisFile {
     pub validators: Vec<GenesisValidatorConfig>,
     pub treasury_reserve: String,
     /// G5 P-1: derived from the measured block time (`derive_chain_params`):
-    /// the reward period in blocks and C_tau, the consensus-time cap per block.
+    /// the committee epoch I and the reward period R in blocks, and C_tau,
+    /// the consensus-time cap per block.
+    pub epoch_block_interval: u64,
     pub reward_period_blocks: u64,
     pub max_block_interval_secs: u64,
     /// G3 FX-7: the stdlib this chain starts from, by
@@ -244,6 +246,7 @@ pub fn build_genesis_file(
         chain_id: chain_id.to_string(),
         validators,
         treasury_reserve: treasury_reserve.to_string(),
+        epoch_block_interval: params.epoch_blocks,
         reward_period_blocks: params.reward_period,
         max_block_interval_secs: params.max_block_interval_secs,
         stdlib_hash: stdlib_hash.to_string(),
@@ -542,20 +545,13 @@ mod tests {
         );
 
         // G5 P-1: the node stores exactly what the tool derived from the block
-        // time; the epoch is the pinned interval (the tool writes I = 1,000
-        // from G5 S2, when rewards stop being paid per epoch).
+        // time, and pins the same epoch (I = 1,000) for consensus.
         let derived = node::genesis::derive_chain_params(6_650).unwrap();
-        let stored = node::genesis::stored_chain_params(&db).unwrap();
+        assert_eq!(derived.epoch_blocks, 1_000);
+        assert_eq!(node::genesis::stored_chain_params(&db).unwrap(), derived);
         assert_eq!(
             db.get("sys:config:epoch_block_interval").unwrap(),
-            Some(stored.epoch_blocks.to_string())
-        );
-        assert_eq!(
-            stored,
-            node::genesis::ChainParams {
-                epoch_blocks: stored.epoch_blocks,
-                ..derived
-            }
+            Some("1000".to_string())
         );
 
         let _ = std::fs::remove_dir_all(&dir);

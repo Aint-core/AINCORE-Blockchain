@@ -632,7 +632,8 @@ fn a_decision_conflict_halts_the_node_with_an_alarm() {
 /// `next_validator_set_hash` (FinalityVote V2), activate E+1 on it, and keep
 /// placing the same blocks, whose QCs verify under the epoch's committee.
 /// (g): this harness has no Move stdlib, so `advance_epoch` fails at every
-/// boundary; the epochs advance regardless.
+/// boundary; the epochs advance regardless, and the executor still records
+/// each committee (G5 EM-2), equal to the one consensus derived.
 #[test]
 fn v4_nodes_rotate_epochs_on_the_qc_of_each_boundary_block() {
     let mut c = Cluster::with_interval("epochs", &[91, 92, 93, 94], true, 4);
@@ -644,8 +645,10 @@ fn v4_nodes_rotate_epochs_on_the_qc_of_each_boundary_block() {
         assert!(c.epoch(i) >= 3, "node {i} is in epoch {}", c.epoch(i));
         let db = &c.node(i).storage;
         assert!(
-            db.get("sys:last_epoch_boundary").unwrap().is_none(),
-            "(g) is vacuous: Move's advance_epoch ran here"
+            db.get("resource_0000000000000000000000000000000000000000000000000000000000000001_0x1::epoch::Epoch")
+                .unwrap()
+                .is_none(),
+            "(g) is vacuous: Move's advance_epoch could run here"
         );
         for e in 1..=3u64 {
             let start = crate::v4::epoch::read_start_from(db, e).unwrap().unwrap();
@@ -656,6 +659,13 @@ fn v4_nodes_rotate_epochs_on_the_qc_of_each_boundary_block() {
             assert_eq!(start.prev_closing_round, round);
             assert_eq!(start.first_round, round + 2);
             assert_eq!(start.committee, crate::qc::canonical_order(&c.committee));
+            let recorded: Vec<crate::qc::ValidatorInfo> = serde_json::from_str(
+                &db.get(&format!("sys:validator_set:epoch:{e}"))
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(recorded, start.committee, "the executor's record");
             // FinalityVote V2 on the boundary block only.
             let q = c.qc(i, boundary).expect("QC(H_E) is held");
             assert_eq!(
