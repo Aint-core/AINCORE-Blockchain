@@ -572,16 +572,34 @@ const RETAINED_FROM_KEY: &str = "sys:validator_set:retained_from";
 /// kept while evidence of it can still be accepted.
 const EVIDENCE_MAX_AGE_SECS: u64 = 604_800;
 
-/// G5 SL-3: a verified evidence item: the offender and the slot it
-/// equivocated in.
+/// G5 SL-3: a verified evidence item: its slot and who equivocated in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedEvidence {
+    /// The slot's author (for twins, the offender).
     pub offender: String,
+    /// Everyone the evidence convicts: the twin author, or every attester in
+    /// both conflicting certificates.
+    pub offenders: Vec<String>,
     pub kind: String,
     /// The committee epoch of the slot. A V3 proof binds none: the executing
     /// block's stands in (the V3 path is deleted in G5 S4c).
     pub epoch: u64,
     pub round: u64,
+}
+
+impl VerifiedEvidence {
+    /// The dedup key of a block's evidence: one item per kind and slot.
+    pub fn key(&self) -> (String, u64) {
+        let scope = if self.kind == "certificate_conflict" {
+            "cert:"
+        } else {
+            ""
+        };
+        (
+            format!("{scope}{}:{}", self.offender, self.epoch),
+            self.round,
+        )
+    }
 }
 
 /// G5 SL-5: an offense's weights from the records of its epoch.
@@ -2924,8 +2942,10 @@ impl Executor {
         use std::collections::{BTreeMap, BTreeSet};
         let ev: serde_json::Value =
             serde_json::from_str(item).map_err(|e| format!("bad json: {e}"))?;
-        if ev.get("kind").and_then(|k| k.as_str()) == Some("equivocation_v4") {
-            return self.verify_v4_twins(&ev);
+        match ev.get("kind").and_then(|k| k.as_str()) {
+            Some("equivocation_v4") => return self.verify_v4_twins(&ev),
+            Some("certificate_conflict") => return self.verify_certificate_conflict(&ev),
+            _ => {}
         }
         let validators: Vec<(String, u64)> = self
             .db
@@ -2978,6 +2998,7 @@ impl Executor {
                     return Err("vertex signature invalid".into());
                 }
                 Ok(VerifiedEvidence {
+                    offenders: vec![offender.clone()],
                     offender,
                     kind: "equivocation".into(),
                     epoch: self.executing_epoch(),
@@ -3015,6 +3036,7 @@ impl Executor {
                     return Err(format!("downtime quorum not met: {rs}/{total}"));
                 }
                 Ok(VerifiedEvidence {
+                    offenders: vec![offender.clone()],
                     offender,
                     kind: "downtime".into(),
                     epoch,
@@ -3078,14 +3100,116 @@ impl Executor {
         {
             return Err("vertex signature invalid".into());
         }
+        self.check_evidence_age(epoch)?;
+        Ok(VerifiedEvidence {
+            offenders: vec![offender.clone()],
+            offender,
+            kind: "equivocation_v4".into(),
+            epoch,
+            round,
+        })
+    }
+
+    /// G5 SL-3: evidence of `epoch` is refused once tau > tau_start(E+1) + W.
+    fn check_evidence_age(&self, epoch: u64) -> Result<(), String> {
         if let Some(next) = self.epoch_began(epoch + 1) {
             if committed_chain_clock(&self.db).time > next.saturating_add(EVIDENCE_MAX_AGE_SECS) {
                 return Err(format!("evidence of epoch {epoch} is older than W"));
             }
         }
+        Ok(())
+    }
+
+    /// G1 CE-3, G5 SL-3: two certificates of one slot (E, round, author) on
+    /// different digests. Each must be bound to this chain, this genesis and
+    /// C_E (its committee hash), carry a canonical bitmap over C_E, and its
+    /// aggregate must verify against the keys its bits name. A member whose
+    /// bit is set in both signed both digests. C_E's keys are unique (SL-3,
+    /// `validate_committee`), so a bit names exactly one member.
+    fn verify_certificate_conflict(
+        &self,
+        ev: &serde_json::Value,
+    ) -> Result<VerifiedEvidence, String> {
+        use blockchain::attest::{bit_set, VertexCertificate, CERT_VERSION};
+        let author = ev
+            .get("offender")
+            .and_then(|v| v.as_str())
+            .ok_or("missing slot author")?
+            .to_string();
+        let epoch = ev
+            .get("epoch")
+            .and_then(|v| v.as_u64())
+            .ok_or("missing epoch")?;
+        let round = ev
+            .get("round")
+            .and_then(|v| v.as_u64())
+            .ok_or("missing round")?;
+        let cert = |field: &str| -> Result<VertexCertificate, String> {
+            serde_json::from_value(ev.get(field).cloned().unwrap_or_default())
+                .map_err(|e| format!("{field}: {e}"))
+        };
+        let (a, b) = (cert("cert_a")?, cert("cert_b")?);
+        let committee = self.committee_of_epoch(epoch);
+        if committee.is_empty() {
+            return Err(format!("no committee record for epoch {epoch}"));
+        }
+        let ordered = blockchain::committee::canonical_order(&committee);
+        let genesis_identity = self
+            .db
+            .get("genesis_identity")
+            .map_err(|e| e.to_string())?
+            .ok_or("no genesis identity")?;
+        let committee_hash = blockchain::committee::validator_set_hash(&committee);
+        let bitmap_len = ordered.len().div_ceil(8);
+        let bls = crypto::bls::BLSEngine::consensus();
+        for c in [&a, &b] {
+            let body = &c.body;
+            if c.version != CERT_VERSION
+                || body.chain_id != blockchain::chain_id()
+                || body.genesis_identity != genesis_identity
+                || body.epoch != epoch
+                || body.round != round
+                || body.author != author
+                || body.committee_hash != committee_hash
+            {
+                return Err("a certificate is not of this slot, chain and committee".into());
+            }
+            if c.signer_bitmap.len() != bitmap_len
+                || (ordered.len()..bitmap_len * 8).any(|i| bit_set(&c.signer_bitmap, i))
+            {
+                return Err("a non-canonical signer bitmap".into());
+            }
+            let keys: Vec<Vec<u8>> = ordered
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| bit_set(&c.signer_bitmap, *i))
+                .map(|(_, m)| hex::decode(&m.bls_public_key).map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?;
+            if keys.is_empty()
+                || !bls
+                    .fast_aggregate_verify(&body.signing_bytes(), &keys, &c.aggregate_signature)
+                    .unwrap_or(false)
+            {
+                return Err("a certificate's aggregate signature does not verify".into());
+            }
+        }
+        if a.body.digest == b.body.digest {
+            return Err("one digest is no conflict".into());
+        }
+        let offenders: Vec<String> = ordered
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| bit_set(&a.signer_bitmap, *i) && bit_set(&b.signer_bitmap, *i))
+            .map(|(_, m)| m.address.clone())
+            .collect();
+        if offenders.is_empty() {
+            return Err("no member signed both".into());
+        }
+        self.check_evidence_age(epoch)?;
         Ok(VerifiedEvidence {
-            offender,
-            kind: "equivocation_v4".into(),
+            offender: author,
+            offenders,
+            kind: "certificate_conflict".into(),
             epoch,
             round,
         })
@@ -3102,9 +3226,9 @@ impl Executor {
             let is_equiv = serde_json::from_str::<serde_json::Value>(item)
                 .ok()
                 .and_then(|v| {
-                    v.get("kind")
-                        .and_then(|k| k.as_str())
-                        .map(|k| k == "equivocation" || k == "equivocation_v4")
+                    v.get("kind").and_then(|k| k.as_str()).map(|k| {
+                        k == "equivocation" || k == "equivocation_v4" || k == "certificate_conflict"
+                    })
                 })
                 .unwrap_or(false);
             if !is_equiv {
@@ -3114,11 +3238,14 @@ impl Executor {
             match self.verify_slash_evidence(item) {
                 Ok(VerifiedEvidence {
                     offender,
+                    offenders,
                     kind,
                     epoch,
                     round,
                 }) => {
-                    self.execute_one_slash(&offender, epoch, round);
+                    for convicted in &offenders {
+                        self.execute_one_slash(convicted, epoch, round);
+                    }
                     if kind == "downtime" {
                         // These attestation rows are NODE-LOCAL bookkeeping (written
                         // with plain put by the local detector and by whatever gossip
@@ -7329,6 +7456,7 @@ mod tests {
             ok,
             VerifiedEvidence {
                 offender: offender.clone(),
+                offenders: vec![offender.clone()],
                 kind: "equivocation_v4".into(),
                 epoch: 0,
                 round: 5,
@@ -7418,6 +7546,196 @@ mod tests {
             g5_own_unbonding(&db, &offender),
             vec![(height, 1_000 * ain)]
         );
+    }
+
+    /// A certificate of slot (epoch 0, round, author) on `digest`, signed by
+    /// the committee members at `signers` (positions in canonical order).
+    fn g5_cert(
+        committee: &[blockchain::committee::ValidatorInfo],
+        seeds: &BTreeMap<String, u8>,
+        genesis_identity: &str,
+        round: u64,
+        author: &str,
+        digest: &str,
+        signers: &[usize],
+    ) -> blockchain::attest::VertexCertificate {
+        let ordered = blockchain::committee::canonical_order(committee);
+        let body = blockchain::attest::AttestBody {
+            chain_id: blockchain::chain_id(),
+            genesis_identity: genesis_identity.into(),
+            epoch: 0,
+            round,
+            author: author.into(),
+            digest: digest.into(),
+            committee_hash: blockchain::committee::validator_set_hash(committee),
+        };
+        let bls = crypto::bls::BLSEngine::consensus();
+        let mut bitmap = vec![0u8; ordered.len().div_ceil(8)];
+        let mut signatures = Vec::new();
+        for &i in signers {
+            bitmap[i / 8] |= 1 << (i % 8);
+            let seed = seeds[&ordered[i].address];
+            let mut ikm = [0u8; 32];
+            ikm[0] = seed;
+            ikm[31] = seed.wrapping_add(3);
+            signatures.push(bls.sign_raw(&body.signing_bytes(), &ikm));
+        }
+        let stake = |bits: &[usize]| bits.iter().map(|&i| ordered[i].stake as u128).sum();
+        blockchain::attest::VertexCertificate {
+            version: blockchain::attest::CERT_VERSION,
+            body,
+            signer_bitmap: bitmap,
+            signed_stake: stake(signers),
+            total_stake: ordered.iter().map(|m| m.stake as u128).sum(),
+            aggregate_signature: bls.aggregate_signatures(&signatures).unwrap(),
+        }
+    }
+
+    /// G1 CE-3, G5 SL-3: two certificates of one slot on different digests
+    /// convict every member whose bit is set in both, checked against C_E.
+    /// Refused: one digest, no member in both, another committee, a bit past
+    /// the committee, or an aggregate that does not verify. Carried in a
+    /// block, the two convicts are half of C_0: 100 % at once. A shared BLS
+    /// key is refused in a committee and at join.
+    #[test]
+    fn g5_a_certificate_conflict_convicts_every_attester_in_both() {
+        let ain = G5_AIN;
+        let seeds: Vec<(u8, u64)> = (200..204).map(|seed| (seed, 1_000)).collect();
+        let (mut chain, validators, delegators) =
+            delegation_chain("g5_sl_cert_conflict", 20, 14, &seeds, &[(205, 2_000 * ain)]);
+        let db = chain.db.clone();
+        let gi = "g5-cert-conflict-genesis";
+        {
+            let _seed = db.seeding();
+            db.put("genesis_identity", gi).unwrap();
+        }
+        let committee: Vec<_> = seeds
+            .iter()
+            .map(|(s, w)| committee_member(*s, *w))
+            .collect();
+        let by_address: BTreeMap<String, u8> = committee
+            .iter()
+            .zip(&seeds)
+            .map(|(m, (s, _))| (m.address.clone(), *s))
+            .collect();
+        let ordered = blockchain::committee::canonical_order(&committee);
+        let author = ordered[0].address.clone();
+        let cert = |digest: &str, signers: &[usize]| {
+            g5_cert(&committee, &by_address, gi, 3, &author, digest, signers)
+        };
+        let item = |a: &blockchain::attest::VertexCertificate,
+                    b: &blockchain::attest::VertexCertificate| {
+            serde_json::json!({
+                "kind": "certificate_conflict",
+                "offender": author,
+                "epoch": 0,
+                "round": 3,
+                "cert_a": a,
+                "cert_b": b,
+            })
+            .to_string()
+        };
+        let (x, y) = ("aa".repeat(32), "bb".repeat(32));
+        let (a, b) = (cert(&x, &[0, 1, 2]), cert(&y, &[1, 2, 3]));
+        let ok = chain
+            .executor
+            .verify_slash_evidence(&item(&a, &b))
+            .expect("a conflict");
+        assert_eq!(
+            ok.offenders,
+            vec![ordered[1].address.clone(), ordered[2].address.clone()],
+            "exactly the members in both"
+        );
+        assert!(chain
+            .executor
+            .verify_slash_evidence(&item(&a, &cert(&x, &[1, 2, 3])))
+            .is_err());
+        assert!(chain
+            .executor
+            .verify_slash_evidence(&item(&cert(&x, &[0]), &cert(&y, &[3])))
+            .is_err());
+        let mut foreign = b.clone();
+        foreign.body.committee_hash = "00".repeat(32);
+        assert!(chain
+            .executor
+            .verify_slash_evidence(&item(&a, &foreign))
+            .is_err());
+        let mut past = b.clone();
+        past.signer_bitmap[0] |= 1 << 5;
+        assert!(chain
+            .executor
+            .verify_slash_evidence(&item(&a, &past))
+            .is_err());
+        let mut forged = b.clone();
+        forged.aggregate_signature = a.aggregate_signature.clone();
+        assert!(chain
+            .executor
+            .verify_slash_evidence(&item(&a, &forged))
+            .is_err());
+
+        // Carried in a block: both convicts are recorded, and together they
+        // are half of C_0, so both settle at 100 % at once.
+        let height = chain.height + 1;
+        chain.height = height;
+        chain.timestamp += 14;
+        let proposer = chain.proposer.clone();
+        match chain.executor.execute_block_parallel_at(
+            vec![],
+            &proposer,
+            height,
+            chain.timestamp,
+            &[item(&a, &b)],
+        ) {
+            BlockExecOutcome::Executed(_) => {}
+            other => panic!("the block must execute: {other:?}"),
+        }
+        for convict in [&ordered[1].address, &ordered[2].address] {
+            assert!(g5_offense(&db, convict).settled, "{convict}");
+            assert_eq!(g5_own_unbonding(&db, convict), vec![(height, 0)]);
+            assert!(db
+                .get(&format!("validator:jailed:{convict}"))
+                .unwrap()
+                .is_some());
+        }
+        assert!(db
+            .get(&format!("validator:jailed:{}", ordered[3].address))
+            .unwrap()
+            .is_none());
+
+        // A shared BLS key: refused in a committee, and at join.
+        let mut twin_key = committee[1].clone();
+        twin_key.address = committee[2].address.clone();
+        twin_key.ed25519_public_key = committee[2].ed25519_public_key.clone();
+        let err = blockchain::committee::validate_committee(&[
+            committee[0].clone(),
+            committee[1].clone(),
+            twin_key,
+        ])
+        .unwrap_err();
+        assert!(err.contains("BLS key"), "{err}");
+        let (joiner_key, joiner) = &delegators[0];
+        let active_key = validator_set(&db).validators[0].bls_public_key.clone();
+        let (_, pop) = test_bls_identity(1);
+        let join = chain.tx(
+            joiner_key,
+            "staking",
+            "join_validator_set",
+            vec![
+                bcs::to_bytes(&(1_000 * ain)).unwrap(),
+                bcs::to_bytes(&joiner_key.verifying_key().to_bytes().to_vec()).unwrap(),
+                bcs::to_bytes(&active_key).unwrap(),
+                bcs::to_bytes(&pop).unwrap(),
+            ],
+        );
+        chain.run_to(chain.height + 1, vec![join]);
+        assert!(
+            !validator_set(&db)
+                .validators
+                .iter()
+                .any(|v| v.validator_addr == parse_move_address(joiner).unwrap()),
+            "a key another validator holds is refused"
+        );
+        let _ = validators;
     }
 
     /// The item a V4 node carries for twins (consensus `v4::evidence`).

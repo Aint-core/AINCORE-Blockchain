@@ -24,6 +24,8 @@ module 0x1::staking {
     const EINVALID_BLS_POP: u64 = 8;
     /// AUDIT-#2: active validator set is full
     const EMAX_VALIDATORS: u64 = 9;
+    /// G5 SL-3: another active validator holds this BLS key.
+    const EDUPLICATE_BLS_KEY: u64 = 10;
 
     /// Minimum stake required to join validator set (1000 AIN)
     const MIN_STAKE: u128 = 1000000000000000000000;
@@ -175,11 +177,17 @@ module 0x1::staking {
         let len = vector::length(&validator_set.validators);
         assert!((len as u64) < MAX_VALIDATORS, error::invalid_state(EMAX_VALIDATORS));
 
-        // Check if already a validator
+        // Check if already a validator. G5 SL-3: and that no active
+        // validator holds this BLS key, since a certificate bit names a key,
+        // and evidence must name one member.
         let i = 0;
         while (i < len) {
             let v = vector::borrow(&validator_set.validators, i);
             assert!(v.validator_addr != addr, error::already_exists(EALREADY_VALIDATOR));
+            assert!(
+                v.bls_public_key != bls_public_key,
+                error::already_exists(EDUPLICATE_BLS_KEY)
+            );
             i = i + 1;
         };
 

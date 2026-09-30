@@ -2911,44 +2911,65 @@ impl DagConsensus {
             consider(off.to_string(), round, item, &mut out);
         }
 
-        // 3. V4 proposer-twin rows (G1 EQ-1, G5 SL-3): keyed by epoch. The
+        // 3. V4 rows (G1 EQ-1 and CE-3, G5 SL-3): keyed by epoch. The
         // offender need not be in the live set (evidence is checked against
-        // the committee of its epoch); a jailed offender needs no more.
-        for (key, item) in self.storage.scan_prefix("sys:equiv_seen_v4:") {
-            if out.len() >= MAX_EVIDENCE_PER_VERTEX {
-                break;
-            }
-            let Some(rest) = key.strip_prefix("sys:equiv_seen_v4:") else {
-                continue;
-            };
-            let mut parts = rest.rsplitn(3, ':');
-            let (Some(round), Some(epoch), Some(off)) = (
-                parts.next().and_then(|r| r.parse::<u64>().ok()),
-                parts.next().and_then(|e| e.parse::<u64>().ok()),
-                parts.next(),
-            ) else {
-                continue;
-            };
-            if matches!(
-                self.storage.get(&format!("validator:jailed:{off}")),
-                Ok(Some(_))
-            ) || matches!(
-                self.storage
-                    .get(&crate::v4::evidence::carried_key(off, epoch, round)),
-                Ok(Some(_))
-            ) {
-                continue;
-            }
-            let flight = crate::v4::evidence::flight_key(off, epoch, round);
-            if let Ok(mut inflight) = self.evidence_inflight.lock() {
-                if let Some(&at) = inflight.get(&flight) {
-                    if current_round.saturating_sub(at) < INFLIGHT_TTL_ROUNDS {
-                        continue;
-                    }
+        // the committee of its epoch); a jailed twin author needs no more.
+        use crate::v4::evidence as ev;
+        type Keys = (
+            fn(&str, u64, u64) -> String,
+            fn(&str, u64, u64) -> (String, u64),
+        );
+        let kinds: [(&str, bool, Keys); 2] = [
+            (
+                "sys:equiv_seen_v4:",
+                true,
+                (ev::carried_key, ev::flight_key),
+            ),
+            (
+                "sys:equiv_cert_v4:",
+                false,
+                (ev::cert_carried_key, ev::cert_flight_key),
+            ),
+        ];
+        for (prefix, twin, (carried_key, flight_key)) in kinds {
+            for (key, item) in self.storage.scan_prefix(prefix) {
+                if out.len() >= MAX_EVIDENCE_PER_VERTEX {
+                    break;
                 }
-                inflight.insert(flight, current_round);
+                let Some(rest) = key.strip_prefix(prefix) else {
+                    continue;
+                };
+                let mut parts = rest.rsplitn(3, ':');
+                let (Some(round), Some(epoch), Some(off)) = (
+                    parts.next().and_then(|r| r.parse::<u64>().ok()),
+                    parts.next().and_then(|e| e.parse::<u64>().ok()),
+                    parts.next(),
+                ) else {
+                    continue;
+                };
+                if (twin
+                    && matches!(
+                        self.storage.get(&format!("validator:jailed:{off}")),
+                        Ok(Some(_))
+                    ))
+                    || matches!(
+                        self.storage.get(&carried_key(off, epoch, round)),
+                        Ok(Some(_))
+                    )
+                {
+                    continue;
+                }
+                let flight = flight_key(off, epoch, round);
+                if let Ok(mut inflight) = self.evidence_inflight.lock() {
+                    if let Some(&at) = inflight.get(&flight) {
+                        if current_round.saturating_sub(at) < INFLIGHT_TTL_ROUNDS {
+                            continue;
+                        }
+                    }
+                    inflight.insert(flight, current_round);
+                }
+                out.push(format!("{}{}", SLASH_EVIDENCE_PREFIX, item));
             }
-            out.push(format!("{}{}", SLASH_EVIDENCE_PREFIX, item));
         }
         out
     }
@@ -2963,10 +2984,7 @@ impl DagConsensus {
     fn canonicalize_evidence(executor: &Executor, carried: &[(String, String)]) -> Vec<String> {
         let items: Vec<String> = carried.iter().map(|(_, it)| it.clone()).collect();
         Self::canonical_block_evidence(items, |it| {
-            executor
-                .verify_slash_evidence(it)
-                .ok()
-                .map(|v| crate::v4::evidence::flight_key(&v.offender, v.epoch, v.round))
+            executor.verify_slash_evidence(it).ok().map(|v| v.key())
         })
         .into_iter()
         .map(|(it, _)| it)
@@ -3000,16 +3018,19 @@ impl DagConsensus {
             ) else {
                 continue;
             };
-            let v4_epoch = (v.get("kind").and_then(|k| k.as_str())
-                == Some(crate::v4::evidence::KIND))
-            .then(|| v.get("epoch").and_then(|e| e.as_u64()))
-            .flatten();
-            let flight = match v4_epoch {
-                Some(epoch) => {
-                    let _ = storage.put(&crate::v4::evidence::carried_key(off, epoch, round), "1");
-                    crate::v4::evidence::flight_key(off, epoch, round)
+            use crate::v4::evidence as ev;
+            let kind = v.get("kind").and_then(|k| k.as_str());
+            let epoch = v.get("epoch").and_then(|e| e.as_u64());
+            let flight = match (kind, epoch) {
+                (Some(ev::KIND), Some(epoch)) => {
+                    let _ = storage.put(&ev::carried_key(off, epoch, round), "1");
+                    ev::flight_key(off, epoch, round)
                 }
-                None => {
+                (Some(ev::CERT_KIND), Some(epoch)) => {
+                    let _ = storage.put(&ev::cert_carried_key(off, epoch, round), "1");
+                    ev::cert_flight_key(off, epoch, round)
+                }
+                _ => {
                     let _ = storage.put(&format!("sys:equiv_carried:{}:{}", off, round), "1");
                     (off.to_string(), round)
                 }
@@ -3028,9 +3049,11 @@ impl DagConsensus {
         serde_json::from_str::<serde_json::Value>(item)
             .ok()
             .and_then(|x| {
-                x.get("kind")
-                    .and_then(|k| k.as_str())
-                    .map(|k| k == "equivocation" || k == crate::v4::evidence::KIND)
+                x.get("kind").and_then(|k| k.as_str()).map(|k| {
+                    k == "equivocation"
+                        || k == crate::v4::evidence::KIND
+                        || k == crate::v4::evidence::CERT_KIND
+                })
             })
             .unwrap_or(false)
     }

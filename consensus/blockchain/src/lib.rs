@@ -2,6 +2,7 @@ use crypto::hash; // Use crypto module's hash function
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod attest;
 pub mod committee;
 pub mod identity_v2;
 

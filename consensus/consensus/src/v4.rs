@@ -885,6 +885,8 @@ impl Engine {
                 );
                 let evidence = serde_json::json!({ "held": held, "other": cert }).to_string();
                 let _ = self.storage.put(&alarm, &evidence);
+                // G5 SL-3: every attester in both signed both digests.
+                evidence::record_cert_conflict(&self.storage, held, &cert);
                 self.halted = Some(format!(
                     "two certificates for round {} author {}",
                     cert.body.round, cert.body.author

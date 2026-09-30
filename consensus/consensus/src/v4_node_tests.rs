@@ -1373,3 +1373,52 @@ fn a_v4_twin_is_recorded_carried_and_jails_its_author() {
     });
     assert!(carried, "a block carries the V4 evidence");
 }
+
+/// G1 CE-3, G5 SL-3 on real V4 nodes: a node that sees two certificates for
+/// one slot halts ordering (CE-3) and keeps the pair in an epoch-keyed row.
+/// The item verifies on the executor and convicts exactly the members whose
+/// bit is set in both certificates. A conflict means safety was attacked, so
+/// the chain halts where it is seen; the row is carried once ordering resumes
+/// after recovery, like any evidence row.
+#[test]
+fn a_certificate_conflict_is_recorded_as_evidence_against_both_signers() {
+    let mut c = Cluster::new("cert-conflict", &[131, 132, 133, 134], true);
+    c.run(6);
+    let author = c.known[1].0.clone();
+    let fake = "cd".repeat(32);
+    let forged = forge_cert(&c, 1, &author, &fake, &[131, 132, 133]);
+    let wire = format!(
+        "{}{}",
+        crate::v4::WIRE_PREFIX,
+        serde_json::to_string(&crate::v4::Msg::Cert(forged.clone())).unwrap()
+    );
+    c.node_mut(0).handle_message(&wire);
+    assert!(c.node(0).ordering_halted().is_some(), "not halted");
+    let row = crate::v4::evidence::cert_seen_key(&author, 0, 1);
+    let item = c
+        .node(0)
+        .storage
+        .get(&row)
+        .unwrap()
+        .expect("the halted node keeps the pair");
+    let verified = c
+        .node(0)
+        .executor
+        .verify_slash_evidence(&item)
+        .expect("the pair verifies on the executor");
+    let ordered = crate::qc::canonical_order(&c.committee);
+    let pair: serde_json::Value = serde_json::from_str(&item).unwrap();
+    let bitmap = |field: &str| -> Vec<u8> {
+        serde_json::from_value(pair[field]["signer_bitmap"].clone()).unwrap()
+    };
+    let (a, b) = (bitmap("cert_a"), bitmap("cert_b"));
+    let both: Vec<String> = ordered
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| blockchain::attest::bit_set(&a, *i) && blockchain::attest::bit_set(&b, *i))
+        .map(|(_, m)| m.address.clone())
+        .collect();
+    assert!(!both.is_empty(), "two quorums of four always overlap");
+    assert_eq!(verified.offenders, both);
+    assert_eq!((verified.epoch, verified.round), (0, 1));
+}

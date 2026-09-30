@@ -26,9 +26,22 @@ pub fn canonical_order(validators: &[ValidatorInfo]) -> Vec<ValidatorInfo> {
     v
 }
 
+/// Canonical hash of the validator set whose order defines QC bitmap indices.
+/// This is included in every FinalityVote so a QC cannot be replayed against a
+/// different epoch/set with the same address ordering.
+pub fn validator_set_hash(validators: &[ValidatorInfo]) -> String {
+    let canonical = canonical_order(validators);
+    let bytes = bcs::to_bytes(&canonical).expect("ValidatorInfo is BCS-serializable");
+    hex::encode(crypto::hash(&bytes))
+}
+
 /// G1 EP-2: a proposed committee is valid when its positive-stake members are
 /// 1 to 256 distinct validators whose Ed25519 keys derive their addresses and
 /// whose BLS proofs of possession verify. Returns it in canonical order.
+///
+/// G5 SL-3: no two members share a BLS key. A certificate bit proves that a
+/// registered key signed, so a shared key would make evidence name the wrong
+/// member.
 pub fn validate_committee(proposed: &[ValidatorInfo]) -> Result<Vec<ValidatorInfo>, String> {
     let members: Vec<ValidatorInfo> = proposed.iter().filter(|m| m.stake > 0).cloned().collect();
     if members.is_empty() {
@@ -38,10 +51,17 @@ pub fn validate_committee(proposed: &[ValidatorInfo]) -> Result<Vec<ValidatorInf
         return Err(format!("{} members, over 256", members.len()));
     }
     let mut seen = HashSet::new();
+    let mut keys = HashSet::new();
     let bls = BLSEngine::consensus();
     for m in &members {
         if !seen.insert(m.address.as_str()) {
             return Err(format!("member {} twice", m.address));
+        }
+        if !keys.insert(m.bls_public_key.to_ascii_lowercase()) {
+            return Err(format!(
+                "member {}: its BLS key is another member's",
+                m.address
+            ));
         }
         let derives = hex::decode(&m.ed25519_public_key)
             .ok()

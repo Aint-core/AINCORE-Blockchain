@@ -1,12 +1,15 @@
-//! G1 EQ-1 and G5 SL-3: proposer-twin evidence on a V4 chain.
+//! G1 EQ-1, CE-3 and G5 SL-3: equivocation evidence on a V4 chain.
 //!
-//! A slot (E, round, author) that reaches a node with a second digest is an
-//! equivocation by its author. The node keeps the pair in a durable,
+//! Proposer twins: a slot (E, round, author) that reaches a node with a second
+//! digest is an equivocation by its author. A certificate conflict: two
+//! certificates of one slot on different digests; every attester in both
+//! signed both digests. The node keeps the pair in a durable,
 //! epoch-keyed row before GC can drop either body, and carries it through
 //! the DAG (`SLASH_EVIDENCE:`) until a block holds it. Every node then checks
 //! the pair against C_E, never the live set (executor
 //! `verify_slash_evidence`). The rows are node-local bookkeeping, never state.
 
+use blockchain::attest::VertexCertificate;
 use blockchain::Vertex;
 use storage::StateDB;
 
@@ -82,4 +85,59 @@ pub fn other_bodies(storage: &StateDB, v: &Vertex) -> Vec<Vertex> {
             serde_json::from_str::<Vertex>(&raw).ok()
         })
         .collect()
+}
+
+/// The evidence kind of a certificate conflict (G1 CE-3).
+pub const CERT_KIND: &str = "certificate_conflict";
+
+/// The durable row holding a certificate-conflict item for a slot.
+pub fn cert_seen_key(author: &str, epoch: u64, round: u64) -> String {
+    format!("sys:equiv_cert_v4:{author}:{epoch}:{round}")
+}
+
+/// Written once a block this node carried the certificate item into holds it.
+pub fn cert_carried_key(author: &str, epoch: u64, round: u64) -> String {
+    format!("sys:equiv_cert_carried_v4:{author}:{epoch}:{round}")
+}
+
+/// The in-flight and dedup key of a certificate conflict: its own
+/// namespace, so a twin item of the same slot is never deduplicated against it.
+pub fn cert_flight_key(author: &str, epoch: u64, round: u64) -> (String, u64) {
+    (format!("cert:{author}:{epoch}"), round)
+}
+
+/// The item for two certificates of one slot on different digests, in digest
+/// order. None unless they conflict.
+pub fn cert_conflict_item(a: &VertexCertificate, b: &VertexCertificate) -> Option<String> {
+    if !a.body.same_slot(&b.body) || a.body.digest == b.body.digest {
+        return None;
+    }
+    let (first, second) = if a.body.digest < b.body.digest {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    Some(
+        serde_json::json!({
+            "kind": CERT_KIND,
+            "offender": first.body.author,
+            "epoch": first.body.epoch,
+            "round": first.body.round,
+            "cert_a": first,
+            "cert_b": second,
+        })
+        .to_string(),
+    )
+}
+
+/// Record a certificate conflict once.
+pub fn record_cert_conflict(storage: &StateDB, a: &VertexCertificate, b: &VertexCertificate) {
+    let Some(item) = cert_conflict_item(a, b) else {
+        return;
+    };
+    let key = cert_seen_key(&a.body.author, a.body.epoch, a.body.round);
+    if matches!(storage.get(&key), Ok(Some(_))) {
+        return;
+    }
+    let _ = storage.put(&key, &item);
 }

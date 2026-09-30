@@ -31,7 +31,7 @@ const VALIDATOR_BLS_DOMAIN: &[u8] = b"AINCORE_VALIDATOR_BLS_V1";
 
 /// Per-validator finality identity, and the committee order (G5: defined in
 /// `blockchain::committee` so the executor pays exactly this committee).
-pub use blockchain::committee::{canonical_order, ValidatorInfo};
+pub use blockchain::committee::{canonical_order, validator_set_hash, ValidatorInfo};
 
 /// The canonical message every validator signs for a finalized anchor. All
 /// validators MUST sign byte-identical bytes for `fast_aggregate_verify`.
@@ -158,15 +158,6 @@ pub fn derive_validator_bls_seed(node_identity: &[u8; 32]) -> [u8; 32] {
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&digest);
     seed
-}
-
-/// Canonical hash of the validator set whose order defines QC bitmap indices.
-/// This is included in every FinalityVote so a QC cannot be replayed against a
-/// different epoch/set with the same address ordering.
-pub fn validator_set_hash(validators: &[ValidatorInfo]) -> String {
-    let canonical = canonical_order(validators);
-    let bytes = bcs::to_bytes(&canonical).expect("ValidatorInfo is BCS-serializable");
-    hex::encode(Sha256::digest(bytes))
 }
 
 /// Decode a positional bitmap into the set signer indices.
