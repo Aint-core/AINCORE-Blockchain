@@ -25,8 +25,8 @@ module 0x1::epoch {
         let epoch = borrow_global_mut<Epoch>(@0x1);
         epoch.epoch_number = epoch.epoch_number + 1;
 
-        // Clean up old unbonding requests
-        staking::cleanup_old_unbonding(account);
+        // G5 UB-1: pay matured unbonding (never burn it).
+        staking::pay_matured_unbonding(account);
 
         // Distribute rewards
         staking::distribute_rewards(account);

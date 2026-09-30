@@ -69,10 +69,10 @@ pub struct GenMultiArgs {
     pub treasury_reserve_ain: u128,
 
     /// The block time measured on the release candidate, in milliseconds
-    /// (G5 P-1). Every deadline and the emission draw are derived from it and
-    /// written into genesis.json as block counts. The default is the time
-    /// measured on the running chain; measure the release before mainnet.
-    #[arg(long, default_value_t = 6_650)]
+    /// (G5 P-1). The consensus-time cap per block is derived from it. It is
+    /// required, with no default: a guessed block time is how the emission
+    /// and deadlines drifted before.
+    #[arg(long)]
     pub block_time_ms: u64,
 
     /// The stdlib bytecode the chain starts from; its hash is pinned into
@@ -113,12 +113,10 @@ pub struct GenesisFile {
     pub chain_id: String,
     pub validators: Vec<GenesisValidatorConfig>,
     pub treasury_reserve: String,
-    /// G5 P-1: every parameter in blocks, derived from the block time.
+    /// G5 P-1: derived from the measured block time (`derive_chain_params`):
+    /// the reward period in blocks and C_tau, the consensus-time cap per block.
     pub reward_period_blocks: u64,
-    pub unbonding_blocks: u64,
-    pub claim_grace_blocks: u64,
-    pub commission_delay_blocks: u64,
-    pub emission_draw_num: u128,
+    pub max_block_interval_secs: u64,
     /// G3 FX-7: the stdlib this chain starts from, by
     /// `node::genesis::stdlib_hash_of`. A node whose stdlib differs refuses
     /// the genesis.
@@ -247,10 +245,7 @@ pub fn build_genesis_file(
         validators,
         treasury_reserve: treasury_reserve.to_string(),
         reward_period_blocks: params.reward_period,
-        unbonding_blocks: params.unbonding_blocks,
-        claim_grace_blocks: params.claim_grace_blocks,
-        commission_delay_blocks: params.commission_delay_blocks,
-        emission_draw_num: params.draw_num,
+        max_block_interval_secs: params.max_block_interval_secs,
         stdlib_hash: stdlib_hash.to_string(),
         genesis_time: None,
     })
@@ -318,8 +313,8 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("🏦 Treasury reserve: {} quanta", genesis.treasury_reserve);
     println!(
-        "⏳ From {} ms blocks: unbonding {} blocks, reward period {}, emission draw {} per 10^12 per block",
-        args.block_time_ms, genesis.unbonding_blocks, genesis.reward_period_blocks, genesis.emission_draw_num
+        "⏳ From {} ms blocks: reward period {} blocks, consensus-time cap {} s per block",
+        args.block_time_ms, genesis.reward_period_blocks, genesis.max_block_interval_secs
     );
     println!("📚 Stdlib hash: {}", genesis.stdlib_hash);
     println!("✅ Wrote {}", args.out.display());

@@ -15,7 +15,6 @@ module 0x1::delegation {
     const ENO_DELEGATION: u64 = 3;
     const EUNBONDING_NOT_READY: u64 = 4;
     const EINVALID_COMMISSION: u64 = 5;
-    const ECOMMISSION_CHANGE_TOO_SOON: u64 = 6;
     /// FIX #2: caller is not the system address (@0x1)
     const EUNAUTHORIZED: u64 = 7;
     /// FIX H1: slash basis points out of range (> 10000)
@@ -41,10 +40,17 @@ module 0x1::delegation {
     
     /// Maximum commission: 30%
     const MAX_COMMISSION: u64 = 3000; // Basis points (3000 = 30%)
-    
-    // G5 CL-1: the commission notice and the unbonding period are genesis
-    // parameters in blocks (`chain::commission_delay_blocks`,
-    // `chain::unlock_height`), not seconds on a virtual clock.
+    /// G5 CM-1 (Delta c): the most one notice may raise the commission, in
+    /// basis points. A delegator locked in by the unbonding period tolerates
+    /// about (1 - c) x U / T before leaving pays (5.5 points for a one-year
+    /// delegator); Aptos caps a change at 10 points.
+    const MAX_COMMISSION_INCREASE: u64 = 500;
+    /// FIX: an increase above MAX_COMMISSION_INCREASE
+    const ECOMMISSION_INCREASE_TOO_LARGE: u64 = 11;
+
+    // G5 CL-1: the commission notice and the unbonding period are durations in
+    // consensus time (`chain::commission_notice_secs`,
+    // `chain::unbonding_unlock_time`), not blocks or a virtual clock.
 
     /// Individual delegation record
     struct Delegation has store, drop {
@@ -54,21 +60,24 @@ module 0x1::delegation {
     }
 
     /// Unbonding delegation (G5 SL-1, SL-2): the stake stopped weighting the
-    /// committee at `start_height`; it unlocks U blocks after the end of that
-    /// committee epoch and stays slashable until withdrawn.
+    /// committee at `start_height`; it unlocks at `unlock_time` in consensus
+    /// time, U after the end of that committee epoch, and stays slashable
+    /// until withdrawn.
     struct UnbondingDelegation has store, drop {
         delegator: address,
         amount: u128,
         start_height: u64,
-        unlock_height: u64,
+        unlock_time: u64,
     }
 
     /// Validator pool that accepts delegations
     struct ValidatorPool has key {
         validator_addr: address,
         commission_rate: u64,         // Basis points (100 = 1%)
-        pending_commission: u64,      // New commission rate (pending)
-        commission_change_height: u64, // When the pending rate may apply
+        // G5 CM-1: the one pending increase (equal to commission_rate when
+        // none is pending) and the consensus time it takes effect.
+        pending_commission: u64,
+        commission_effective_time: u64,
         total_delegated: u128,
         delegations: vector<Delegation>,
         unbonding_queue: vector<UnbondingDelegation>,
@@ -104,7 +113,7 @@ module 0x1::delegation {
             validator_addr: addr,
             commission_rate,
             pending_commission: commission_rate,
-            commission_change_height: 0,
+            commission_effective_time: 0,
             total_delegated: 0,
             delegations: vector::empty(),
             unbonding_queue: vector::empty(),
@@ -247,12 +256,11 @@ module 0x1::delegation {
         pool.total_delegated = pool.total_delegated - amount;
         
         // Add to unbonding queue
-        let h = chain::height();
         vector::push_back(&mut pool.unbonding_queue, UnbondingDelegation {
             delegator: delegator_addr,
             amount,
-            start_height: h,
-            unlock_height: chain::unlock_height(h),
+            start_height: chain::height(),
+            unlock_time: chain::unbonding_unlock_time(),
         });
     }
 
@@ -262,7 +270,7 @@ module 0x1::delegation {
         validator_addr: address
     ) acquires ValidatorPool {
         let delegator_addr = signer::address_of(delegator);
-        let now = chain::height();
+        let now = chain::time();
 
         assert!(exists<ValidatorPool>(validator_addr), error::not_found(EVALIDATOR_NOT_FOUND));
         let pool = borrow_global_mut<ValidatorPool>(validator_addr);
@@ -275,7 +283,7 @@ module 0x1::delegation {
         
         while (i < len) {
             let ud = vector::borrow(&pool.unbonding_queue, i);
-            if (ud.delegator == delegator_addr && now >= ud.unlock_height) {
+            if (ud.delegator == delegator_addr && now >= ud.unlock_time) {
                 total_withdraw = total_withdraw + ud.amount;
                 vector::push_back(&mut to_remove, i);
             };
@@ -332,33 +340,50 @@ module 0x1::delegation {
         abort error::not_found(ENO_DELEGATION)
     }
 
-    /// Update commission rate (requires 7-day notice)
+    /// G5 CM-1: announce a commission change. A decrease (or no change) takes
+    /// effect at once and cancels any pending increase. An increase may raise
+    /// the rate in force by at most MAX_COMMISSION_INCREASE, and takes effect
+    /// `chain::commission_notice_secs` later, fixed now; it applies on the
+    /// pool's next use, so it can be neither applied early nor held back. A
+    /// new announcement replaces a pending one.
     public entry fun update_commission(
         validator: &signer,
         new_commission: u64
     ) acquires ValidatorPool {
         let addr = signer::address_of(validator);
-        
+
         assert!(new_commission <= MAX_COMMISSION, error::invalid_argument(EINVALID_COMMISSION));
         assert!(exists<ValidatorPool>(addr), error::not_found(EVALIDATOR_NOT_FOUND));
-        
+
         let pool = borrow_global_mut<ValidatorPool>(addr);
-        // Set pending commission change (G5 P-1 notice, in blocks)
-        pool.pending_commission = new_commission;
-        pool.commission_change_height = chain::height() + chain::commission_delay_blocks();
+        settle_commission(pool);
+        if (new_commission <= pool.commission_rate) {
+            pool.commission_rate = new_commission;
+            pool.pending_commission = new_commission;
+            pool.commission_effective_time = 0;
+        } else {
+            assert!(
+                new_commission - pool.commission_rate <= MAX_COMMISSION_INCREASE,
+                error::invalid_argument(ECOMMISSION_INCREASE_TOO_LARGE)
+            );
+            pool.pending_commission = new_commission;
+            pool.commission_effective_time = chain::time() + chain::commission_notice_secs();
+        }
     }
 
-    /// Apply pending commission change (after 7 days)
-    public entry fun apply_commission_change(
-        validator: &signer
-    ) acquires ValidatorPool {
-        let addr = signer::address_of(validator);
-        assert!(exists<ValidatorPool>(addr), error::not_found(EVALIDATOR_NOT_FOUND));
-        let pool = borrow_global_mut<ValidatorPool>(addr);
+    /// The commission rate in force now (a matured pending increase counts).
+    fun commission_in_force(pool: &ValidatorPool): u64 {
+        if (pool.pending_commission != pool.commission_rate
+            && chain::time() >= pool.commission_effective_time) {
+            pool.pending_commission
+        } else {
+            pool.commission_rate
+        }
+    }
 
-        assert!(chain::height() >= pool.commission_change_height, error::invalid_state(ECOMMISSION_CHANGE_TOO_SOON));
-        
-        pool.commission_rate = pool.pending_commission;
+    /// Make a matured pending increase the rate.
+    fun settle_commission(pool: &mut ValidatorPool) {
+        pool.commission_rate = commission_in_force(pool);
     }
 
     /// Distribute rewards to delegators (called by system after block production)
@@ -378,7 +403,8 @@ module 0x1::delegation {
         };
         
         let pool = borrow_global_mut<ValidatorPool>(validator_addr);
-        
+        settle_commission(pool);
+
         if (pool.total_delegated == 0) {
             return
         };
@@ -553,6 +579,6 @@ module 0x1::delegation {
         let pool = borrow_global<ValidatorPool>(validator_addr);
         let num_delegators = vector::length(&pool.delegations);
         
-        (pool.total_delegated, pool.commission_rate, (num_delegators as u64))
+        (pool.total_delegated, commission_in_force(pool), (num_delegators as u64))
     }
 }

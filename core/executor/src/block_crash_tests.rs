@@ -104,6 +104,7 @@ fn rejected_admission_never_enters_execution_and_preserves_reopened_rows() {
             txs,
             &proposer,
             1,
+            block_time(1),
             &[],
             |view| {
                 assert!(view.get("sys:last_executed_height").unwrap().is_none());
@@ -133,6 +134,7 @@ fn admission_sees_parent_state_and_rejected_execution_remains_retryable() {
             txs.clone(),
             &proposer,
             1,
+            block_time(1),
             &[],
             |view| {
                 assert_eq!(rows(view), before);
@@ -158,6 +160,7 @@ fn admission_sees_parent_state_and_rejected_execution_remains_retryable() {
             txs,
             &proposer,
             1,
+            block_time(1),
             &[],
             |view| {
                 assert_eq!(rows(view), before);
@@ -233,7 +236,7 @@ fn block_crash_child() {
             std::process::exit(77); // no destructors or graceful RocksDB close
         }
     });
-    match executor.execute_block_parallel_at(txs, &proposer, 1, &[]) {
+    match executor.execute_block_parallel_at(txs, &proposer, 1, block_time(1), &[]) {
         BlockExecOutcome::Executed(summary) if !replay => {
             assert_eq!(
                 summary.executed_raws.len(),
@@ -251,8 +254,12 @@ fn block_crash_child() {
                 // universal_mining bounded device registration, and G5 S1 moved
                 // it in three proven steps (each alone, from bfd42aa6...): the
                 // height-clock stdlib 1ea8e128..., the genesis chain Params and
-                // Clock 94c32abd..., the per-block clock write this value.
-                "af45a2f325b8b3304e051dd994987b43122abd22dcb0e700bbec6dbdb9ecd2a5",
+                // Clock 94c32abd..., the per-block clock write af45a2f3....
+                // G5 amendment A1 moved it the same way, each step proven from
+                // af45a2f3...: the consensus-time stdlib 405a1f99..., the new
+                // Params and Clock layout 35d1e242..., the tau clock write (the
+                // block at timestamp 7) this value.
+                "3208d836fe9d403e746d281e54dd7efe15eedec6356e5a263a80ece2c6627af8",
                 "clean execution must preserve the pre-staging fixture root"
             );
         }
@@ -343,7 +350,7 @@ fn block_panic_child() {
         }
     });
     let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        executor.execute_block_parallel_at(txs.clone(), &proposer, 1, &[])
+        executor.execute_block_parallel_at(txs.clone(), &proposer, 1, block_time(1), &[])
     }));
     assert!(interrupted.is_err(), "injection must unwind execution");
     let partial = rows(&db);
@@ -356,7 +363,7 @@ fn block_panic_child() {
     // A new Executor must not bypass a poisoned process-wide execution lock.
     let retry_executor = Executor::new(Arc::clone(&db));
     let retry = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        retry_executor.execute_block_parallel_at(txs, &proposer, 1, &[])
+        retry_executor.execute_block_parallel_at(txs, &proposer, 1, block_time(1), &[])
     }));
     assert!(
         retry.is_err(),
@@ -457,7 +464,14 @@ fn checked_block_child() {
     };
     if mode == "reject_then_retry" {
         assert!(executor
-            .execute_block_checked_at(txs.clone(), &proposer, 1, &[], |s, v| accept(s, v, true))
+            .execute_block_checked_at(
+                txs.clone(),
+                &proposer,
+                1,
+                block_time(1),
+                &[],
+                |s, v| accept(s, v, true)
+            )
             .is_err());
         assert!(
             rows(&db) == before,
@@ -465,7 +479,9 @@ fn checked_block_child() {
         );
     }
     let result = executor
-        .execute_block_checked_at(txs.clone(), &proposer, 1, &[], |s, v| accept(s, v, false))
+        .execute_block_checked_at(txs.clone(), &proposer, 1, block_time(1), &[], |s, v| {
+            accept(s, v, false)
+        })
         .unwrap();
     assert!(matches!(
         result,

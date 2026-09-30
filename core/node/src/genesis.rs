@@ -586,7 +586,8 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
             params.epoch_blocks, interval
         )));
     }
-    let _clock: u64 = decode_resource(storage, &system_resource_key("0x1::chain::Clock"))?;
+    let _clock: (u64, u64, u64) =
+        decode_resource(storage, &system_resource_key("0x1::chain::Clock"))?;
     let _governance: GovernanceState = decode_resource(
         storage,
         &system_resource_key("0x1::governance::GovernanceState"),
@@ -642,19 +643,15 @@ pub struct GenesisFile {
     /// FX-7: seeded into `sys:config:tip_agreement_n`. Default 1.
     #[serde(default)]
     pub tip_agreement_n: Option<u64>,
-    /// G5 P-1: the chain parameters in blocks. The real genesis carries them
-    /// all, derived by genesis-tool from the measured block time
-    /// (`derive_chain_params`); an omitted one takes `ChainParams::DEFAULT`.
+    /// G5 P-1: the reward period (blocks) and the consensus-time cap per
+    /// block (seconds). The real genesis carries both, derived by
+    /// genesis-tool from the measured block time (`derive_chain_params`); an
+    /// omitted one takes `ChainParams::DEFAULT`. Durations (unbonding, the
+    /// commission notice, the emission rate) are stdlib constants.
     #[serde(default)]
     pub reward_period_blocks: Option<u64>,
     #[serde(default)]
-    pub unbonding_blocks: Option<u64>,
-    #[serde(default)]
-    pub claim_grace_blocks: Option<u64>,
-    #[serde(default)]
-    pub commission_delay_blocks: Option<u64>,
-    #[serde(default)]
-    pub emission_draw_num: Option<u128>,
+    pub max_block_interval_secs: Option<u64>,
     /// G1 S11 / RC-3: the launch time, unix seconds. A validator takes its
     /// first guard origin (`AINCORE_GUARD_ORIGIN_INIT=1`) only within the
     /// launch window after it, so the flag left set on a wiped database
@@ -663,39 +660,28 @@ pub struct GenesisFile {
     pub genesis_time: Option<u64>,
 }
 
-/// G5 P-1: the parameters every deadline and the emission count in, in
-/// blocks (the Move `0x1::chain::Params` resource). `epoch_blocks` is the
-/// pinned epoch interval.
+/// G5 P-1 (amendment A1): the genesis-pinned chain parameters (the Move
+/// `0x1::chain::Params` resource). `epoch_blocks` is the pinned epoch
+/// interval; `max_block_interval_secs` is C_tau, the most one block may
+/// advance consensus time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChainParams {
     pub epoch_blocks: u64,
     pub reward_period: u64,
-    pub unbonding_blocks: u64,
-    pub claim_grace_blocks: u64,
-    pub commission_delay_blocks: u64,
-    pub draw_num: u128,
+    pub max_block_interval_secs: u64,
 }
 
-/// 21 days, 31 days and 7 days, in milliseconds (G5 P-1).
-const UNBONDING_MS: u64 = 21 * 86_400_000;
-const CLAIM_GRACE_MS: u64 = 31 * 86_400_000;
-const COMMISSION_DELAY_MS: u64 = 7 * 86_400_000;
-/// The Julian year, milliseconds.
-const YEAR_MS: f64 = 31_557_600_000.0;
-/// The emission decision: 1.90 % a year of the remaining reserve.
-const EMISSION_RATE_PER_YEAR: f64 = 0.019;
+/// U, 21 days in seconds: the Move constant `0x1::chain::UNBONDING_SECS`,
+/// which bounds I x C_tau (P-1).
+const UNBONDING_SECS: u64 = 1_814_400;
 
 impl ChainParams {
-    /// Every value `derive_chain_params` gives for the 6,650 ms block time
-    /// measured on the running chain, except the epoch, which is the pinned
-    /// interval's default until G5 S2 moves the reward cadence off it.
+    /// The 6,650 ms values (C_tau = 14 s), with the pinned interval's default
+    /// epoch until G5 S2 moves the reward cadence off it.
     pub const DEFAULT: ChainParams = ChainParams {
         epoch_blocks: DEFAULT_EPOCH_BLOCK_INTERVAL,
         reward_period: 20,
-        unbonding_blocks: 273_000,
-        claim_grace_blocks: 402_767,
-        commission_delay_blocks: 90_948,
-        draw_num: 4_042,
+        max_block_interval_secs: 14,
     };
 
     /// P-1's constraints (the same as Move `chain::valid`).
@@ -703,12 +689,8 @@ impl ChainParams {
         let ok = self.epoch_blocks > 0
             && self.reward_period > 0
             && self.epoch_blocks.is_multiple_of(self.reward_period)
-            && self.unbonding_blocks > 0
-            && self.unbonding_blocks.is_multiple_of(self.epoch_blocks)
-            && self.claim_grace_blocks > 0
-            && self.commission_delay_blocks > 0
-            && self.draw_num > 0
-            && self.draw_num < 10_000;
+            && self.max_block_interval_secs > 0
+            && self.epoch_blocks <= UNBONDING_SECS / self.max_block_interval_secs;
         if ok {
             Ok(())
         } else {
@@ -719,10 +701,9 @@ impl ChainParams {
     }
 }
 
-/// G5 P-1 from the measured block time: I = 1,000 and R = 20 (research b.2,
-/// b.6), U = 21 days rounded up to whole epochs, the claim grace and the
-/// commission notice rounded up to whole blocks, and the draw per block that takes
-/// 1.90 % of the remaining reserve a year. genesis-tool runs this once and
+/// G5 P-1 from the block time measured on the release candidate: I = 1,000
+/// and R = 20 (research b.2, b.6), and C_tau = 2 x t_b rounded up to whole
+/// seconds (the clock research's k = 2). genesis-tool runs this once and
 /// writes integers into genesis.json; no node derives anything at run time.
 pub fn derive_chain_params(block_time_ms: u64) -> Result<ChainParams, GenesisError> {
     if block_time_ms == 0 {
@@ -730,17 +711,10 @@ pub fn derive_chain_params(block_time_ms: u64) -> Result<ChainParams, GenesisErr
             "block_time_ms must be positive".into(),
         ));
     }
-    let blocks = |ms: u64| ms.div_ceil(block_time_ms);
-    let epoch_blocks = 1_000u64;
-    let blocks_per_year = YEAR_MS / block_time_ms as f64;
-    let draw = -(1.0 - EMISSION_RATE_PER_YEAR).ln() / blocks_per_year;
     let params = ChainParams {
-        epoch_blocks,
+        epoch_blocks: 1_000,
         reward_period: 20,
-        unbonding_blocks: blocks(UNBONDING_MS).div_ceil(epoch_blocks) * epoch_blocks,
-        claim_grace_blocks: blocks(CLAIM_GRACE_MS),
-        commission_delay_blocks: blocks(COMMISSION_DELAY_MS),
-        draw_num: (draw * 1e12).round() as u128,
+        max_block_interval_secs: (2 * block_time_ms).div_ceil(1_000),
     };
     params.validate()?;
     Ok(params)
@@ -1131,12 +1105,9 @@ pub fn build_genesis(
         chain_params = ChainParams {
             epoch_blocks: genesis_epoch_block_interval,
             reward_period: config.reward_period_blocks.unwrap_or(d.reward_period),
-            unbonding_blocks: config.unbonding_blocks.unwrap_or(d.unbonding_blocks),
-            claim_grace_blocks: config.claim_grace_blocks.unwrap_or(d.claim_grace_blocks),
-            commission_delay_blocks: config
-                .commission_delay_blocks
-                .unwrap_or(d.commission_delay_blocks),
-            draw_num: config.emission_draw_num.unwrap_or(d.draw_num),
+            max_block_interval_secs: config
+                .max_block_interval_secs
+                .unwrap_or(d.max_block_interval_secs),
         };
         chain_params.validate()?;
         // FX-7: the defaults these keys' readers used when the keys were absent.
@@ -1317,14 +1288,20 @@ pub fn build_genesis(
     let epoch_bytes = bcs::to_bytes(&Epoch { epoch_number: 0 })?;
     storage.put(&epoch_key, &hex::encode(epoch_bytes))?;
 
-    // === G5 P-1, CL-2: the chain parameters and the clock at height 0 ===
+    // === G5 P-1, CL-2: the chain parameters, and the clock at height 0 ===
+    // Consensus time starts at 0; the launch time (if given) is the timestamp
+    // the first block's growth is measured from.
     storage.put(
         &system_resource_key("0x1::chain::Params"),
         &hex::encode(bcs::to_bytes(&chain_params)?),
     )?;
     storage.put(
         &system_resource_key("0x1::chain::Clock"),
-        &hex::encode(bcs::to_bytes(&0u64)?),
+        &hex::encode(bcs::to_bytes(&(
+            0u64,
+            0u64,
+            file.genesis_time.unwrap_or(0),
+        ))?),
     )?;
 
     // === Initialize Governance ===
@@ -1823,7 +1800,6 @@ mod tests {
         let mut params: ChainParams =
             bcs::from_bytes(&hex::decode(db.get(&params_key).unwrap().unwrap()).unwrap()).unwrap();
         params.epoch_blocks *= 2;
-        params.unbonding_blocks = params.epoch_blocks * 1_000;
         params.validate().expect("still a valid set on its own");
         let _seed = db.seeding();
         db.put(&params_key, &hex::encode(bcs::to_bytes(&params).unwrap()))
@@ -3149,26 +3125,21 @@ mod tests {
             let hex = &g.writes[&system_resource_key("0x1::chain::Params")];
             bcs::from_bytes(&hex::decode(hex).unwrap()).unwrap()
         };
+        let clock = |g: &GenesisState| -> (u64, u64, u64) {
+            let hex = &g.writes[&system_resource_key("0x1::chain::Clock")];
+            bcs::from_bytes(&hex::decode(hex).unwrap()).unwrap()
+        };
         assert_eq!(stored(&built), ChainParams::DEFAULT);
-        let clock = &built.writes[&system_resource_key("0x1::chain::Clock")];
-        assert_eq!(
-            bcs::from_bytes::<u64>(&hex::decode(clock).unwrap()).unwrap(),
-            0
-        );
+        assert_eq!(clock(&built), (0, 0, 0), "height 0, consensus time 0");
 
         // One valid change per field; each is stored and moves the identity.
         type Edit = fn(&mut GenesisFile);
-        let edits: [(&str, Edit); 6] = [
+        let edits: [(&str, Edit); 3] = [
             ("epoch_blocks", |f| f.epoch_block_interval = Some(40)),
             ("reward_period", |f| f.reward_period_blocks = Some(10)),
-            ("unbonding_blocks", |f| f.unbonding_blocks = Some(273_020)),
-            ("claim_grace_blocks", |f| {
-                f.claim_grace_blocks = Some(402_768)
+            ("max_block_interval_secs", |f| {
+                f.max_block_interval_secs = Some(15)
             }),
-            ("commission_delay_blocks", |f| {
-                f.commission_delay_blocks = Some(90_949)
-            }),
-            ("draw_num", |f| f.emission_draw_num = Some(4_043)),
         ];
         let mut identities = std::collections::BTreeSet::from([built.identity.clone()]);
         for (name, edit) in edits {
@@ -3181,17 +3152,26 @@ mod tests {
                 "{name} is not bound by the identity"
             );
         }
+        // The launch time is where the first block's growth is measured from.
+        let mut timed = base.clone();
+        timed.genesis_time = Some(1_790_000_000);
+        assert_eq!(
+            clock(&build_genesis(&timed, &stdlib()).unwrap()),
+            (0, 0, 1_790_000_000)
+        );
 
-        // P-1's constraints hold at genesis, not only in Move.
-        let refused: [(&str, Edit); 8] = [
+        // P-1's constraints hold at genesis, not only in Move. One epoch at the
+        // cap may not exceed U: 20 x 90,720 s = U exactly is allowed.
+        let mut edge = base.clone();
+        edge.max_block_interval_secs = Some(90_720);
+        build_genesis(&edge, &stdlib()).expect("I x C_tau = U is allowed");
+        let refused: [(&str, Edit); 4] = [
             ("R does not divide I", |f| f.reward_period_blocks = Some(7)),
-            ("U not whole epochs", |f| f.unbonding_blocks = Some(273_001)),
-            ("a zero grace", |f| f.claim_grace_blocks = Some(0)),
-            ("a zero notice", |f| f.commission_delay_blocks = Some(0)),
-            ("a draw of 1e-8", |f| f.emission_draw_num = Some(10_000)),
             ("a zero reward period", |f| f.reward_period_blocks = Some(0)),
-            ("a zero unbonding", |f| f.unbonding_blocks = Some(0)),
-            ("a zero draw", |f| f.emission_draw_num = Some(0)),
+            ("a zero clock cap", |f| f.max_block_interval_secs = Some(0)),
+            ("one epoch at the cap past U", |f| {
+                f.max_block_interval_secs = Some(90_721)
+            }),
         ];
         for (name, edit) in refused {
             let mut file = base.clone();
@@ -3201,44 +3181,46 @@ mod tests {
         }
     }
 
-    /// G5 P-1: genesis-tool's one input, the block time, reproduces the
-    /// contract's table at 6,650 ms, and the draw realizes 1.90 %/yr.
+    /// G5 P-1: `ChainParams::validate` mirrors Move `chain::valid`, so its U
+    /// must be the Move constant exactly; integer division hides an off-by-one
+    /// from every edge case above. The committed bytecode is pinned to these
+    /// sources (vm_move `committed_stdlib_bytecode_matches_its_sources`).
+    #[test]
+    fn the_unbonding_mirror_is_the_move_constant() {
+        let source = fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../vm_move/stdlib/sources/chain.move"),
+        )
+        .unwrap();
+        let declared = source
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("const UNBONDING_SECS: u64 = "))
+            .and_then(|v| v.strip_suffix(';'))
+            .expect("chain.move declares UNBONDING_SECS");
+        assert_eq!(declared.parse::<u64>().unwrap(), UNBONDING_SECS);
+    }
+
+    /// G5 P-1: genesis-tool's one input, the measured block time, gives
+    /// I = 1,000, R = 20 and C_tau = 2 x t_b rounded up to whole seconds.
     #[test]
     fn the_chain_parameters_derive_from_the_block_time() {
-        let p = derive_chain_params(6_650).unwrap();
         assert_eq!(
-            p,
+            derive_chain_params(6_650).unwrap(),
             ChainParams {
                 epoch_blocks: 1_000,
                 reward_period: 20,
-                unbonding_blocks: 273_000,
-                claim_grace_blocks: 402_767,
-                commission_delay_blocks: 90_948,
-                draw_num: 4_042,
+                max_block_interval_secs: 14,
             }
         );
-        // Every deadline is at least its duration in real time, and less than
-        // one block (U: one epoch) longer.
-        let t = 6_650u64;
-        assert!(p.unbonding_blocks * t >= UNBONDING_MS);
-        assert!((p.unbonding_blocks - p.epoch_blocks) * t < UNBONDING_MS);
-        for (blocks, ms) in [
-            (p.claim_grace_blocks, CLAIM_GRACE_MS),
-            (p.commission_delay_blocks, COMMISSION_DELAY_MS),
-        ] {
-            assert!(blocks * t >= ms && (blocks - 1) * t < ms);
-        }
-        let per_year = YEAR_MS / t as f64;
-        let realized = 1.0 - (1.0 - p.draw_num as f64 / 1e12).powf(per_year);
-        assert!(
-            (realized - EMISSION_RATE_PER_YEAR).abs() < 1e-5,
-            "{realized}"
-        );
-        // The derivation follows the block time; a zero block time is refused.
         assert_eq!(
-            derive_chain_params(2_000).unwrap().unbonding_blocks,
-            908_000
+            derive_chain_params(2_000).unwrap().max_block_interval_secs,
+            4
         );
+        assert_eq!(derive_chain_params(1).unwrap().max_block_interval_secs, 1);
+        // Blocks so slow that one epoch at the cap exceeds U are refused:
+        // 1,000 x 1,815 s > 21 days, 1,000 x 1,814 s is not.
+        assert!(derive_chain_params(907_000).is_ok());
+        assert!(derive_chain_params(907_001).is_err());
         assert!(derive_chain_params(0).is_err());
     }
 

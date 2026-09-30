@@ -1297,6 +1297,8 @@ impl ChainSync {
                 // The synced block's own height (epoch determinism — see
                 // executor::execute_block_parallel_at).
                 block.header.height,
+                // G5 CL-2: its certified BFT timestamp drives consensus time.
+                block.header.timestamp,
                 // RE-AUDIT HIGH: the block's own slash evidence, verified by
                 // the executor — identical on every node.
                 &block.slash_evidence,

@@ -3948,4 +3948,32 @@ mod tests {
         assert!(hx.is_some(), "vacuous: X placed no block");
         assert_eq!(hx, hz, "X and Z placed different blocks at height 1");
     }
+
+    /// G5 BT-1 at the call site: the quorum is measured against the whole
+    /// committee's stake, and a non-member's vote carries no weight. Two of
+    /// four members cannot move time; three can; an outsider adds nothing.
+    #[test]
+    fn a_block_timestamp_needs_a_quorum_of_the_committee() {
+        use crate::dag::committee_block_timestamp;
+        let committee: Vec<(String, u64)> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|m| (m.to_string(), 100))
+            .collect();
+        let sample = |authors: &[&str]| -> Vec<(String, u64)> {
+            authors.iter().map(|a| (a.to_string(), 5_000)).collect()
+        };
+        assert_eq!(
+            committee_block_timestamp(&sample(&["a", "b"]), &committee, 777),
+            777
+        );
+        assert_eq!(
+            committee_block_timestamp(&sample(&["a", "b", "outsider"]), &committee, 777),
+            777,
+            "a non-member does not complete a quorum"
+        );
+        assert_eq!(
+            committee_block_timestamp(&sample(&["a", "b", "c"]), &committee, 777),
+            5_000
+        );
+    }
 }

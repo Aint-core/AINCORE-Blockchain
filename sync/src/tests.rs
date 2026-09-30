@@ -81,19 +81,20 @@ mod tests {
         sync.storage.write_batch(seeded.batch).unwrap();
     }
 
-    /// G5 CL-2: the state root of an empty block at `height` on top of the
-    /// executed chain. An empty block changes one state key, the chain clock,
-    /// so this is the parent's tree plus that write; nothing is written. A
-    /// conflicting empty block at a height the fixture already executed (with
-    /// an empty block) has that version's root.
-    fn empty_block_root(sync: &ChainSync, height: u64) -> String {
+    /// G5 CL-2: the state root of an empty block at `height` with BFT
+    /// timestamp `timestamp`, on top of the executed chain. An empty block
+    /// changes one state key, the chain clock, so this is the parent's tree
+    /// plus that write; nothing is written. A block at a height the fixture
+    /// already executed (with an empty block) gets that version's root: it is
+    /// either the same block or a refused conflict.
+    fn empty_block_root(sync: &ChainSync, height: u64, timestamp: u64) -> String {
         let latest = state_commit::latest_version(&sync.storage)
             .unwrap()
             .unwrap();
         if height <= latest {
             return hex::encode(state_commit::root(&sync.storage, height).unwrap().0);
         }
-        let (key, value) = executor::chain_clock_write(height);
+        let (key, value) = executor::chain_clock_write(&sync.storage, height, timestamp);
         let applied = state_commit::apply(&sync.storage, height, [(key, Some(value.into_bytes()))])
             .expect("the parent version is executed");
         hex::encode(applied.root.0)
@@ -707,14 +708,18 @@ mod tests {
         set_validators(&sync, vec![(&proposer, 100)]);
         seed_state_tree(&sync);
         let executor = executor::Executor::new(sync.storage.clone());
-        let mut valid = Block::new_with_roots(
+        let mut valid = Block::new_with_roots_at(
             1,
             1,
             "genesis".into(),
             vec![],
             proposer,
-            empty_block_root(&sync, 1),
+            empty_block_root(&sync, 1, 23),
             executor.receipts_root_for_block(&[]),
+            23,
+            Vec::new(),
+            String::new(),
+            Vec::new(),
         );
         authenticate_block(&sync, &mut valid);
         for bad_state in [true, false] {
@@ -773,7 +778,8 @@ mod tests {
         seed_state_tree(&sync);
         assert_eq!(state_commit::root(&sync.storage, 0).unwrap(), genesis_root);
         let mut block_one_state = genesis_state;
-        let (clock_key, clock_value) = executor::chain_clock_write(1);
+        let (clock_key, clock_value) =
+            executor::chain_clock_write(&sync.storage, 1, block.header.timestamp);
         block_one_state.insert(clock_key, clock_value.into_bytes());
         let producer_root = state_commit::genesis_root(&block_one_state).unwrap();
         block.header.state_root = hex::encode(producer_root.0);

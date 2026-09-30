@@ -81,6 +81,9 @@ module 0x1::staking {
 
     const COIN_SCALE: u128 = 1000000000000000000;
     const MAX_BPS: u64 = 10000;
+    /// G5 UB-1 (K): matured unbonding entries paid per epoch boundary, a
+    /// bounded sweep like Ethereum's withdrawals.
+    const MAX_PAYOUTS_PER_BOUNDARY: u64 = 256;
     
     /// Marker struct for AINCORE Coin
     struct AincoreCoin has drop {}
@@ -98,14 +101,15 @@ module 0x1::staking {
         bls_pop: vector<u8>,
     }
     
-    /// Unbonding request. G5 CL-1 and SL-2: heights, not seconds. The stake
-    /// stopped weighting the committee at `start_height` and unlocks U blocks
-    /// after the end of that committee epoch (`chain::unlock_height`).
+    /// Unbonding request (G5 SL-1, SL-2). The stake stopped weighting the
+    /// committee at `start_height` and unlocks at `unlock_time` in consensus
+    /// time (`chain::unbonding_unlock_time`): U after the end of that
+    /// committee epoch. The queue is sorted by `unlock_time`.
     struct UnbondingRequest has store, drop {
         validator_addr: address,
         stake: u128,
         start_height: u64,
-        unlock_height: u64,
+        unlock_time: u64,
     }
 
     /// Global set of active validators
@@ -234,74 +238,62 @@ module 0x1::staking {
         let ValidatorConfig { validator_addr: _, stake, public_key: _, bls_public_key: _, bls_pop: _ } = config;
         
         // CRITICAL: Do NOT return stake immediately! It stays locked (and,
-        // G5 SL-1, slashable) for U blocks after its last committee epoch.
-        let h = chain::height();
+        // G5 SL-1, slashable) for U after its last committee epoch.
         let stake_amount = coin::value(&stake);
         coin::burn(stake); // Burn the coin (will re-mint on withdrawal)
 
         let unbonding_req = UnbondingRequest {
             validator_addr: addr,
             stake: stake_amount,
-            start_height: h,
-            unlock_height: chain::unlock_height(h),
+            start_height: chain::height(),
+            unlock_time: chain::unbonding_unlock_time(),
         };
         
         vector::push_back(&mut validator_set.unbonding_queue, unbonding_req);
     }
-    /// Clean up unbonding requests that are older than grace period
-    /// Called periodically by epoch::advance_epoch
-    public fun cleanup_old_unbonding(account: &signer) acquires ValidatorSet, SupplyStats {
-        let addr = signer::address_of(account);
-        assert!(addr == @0x1, error::permission_denied(ENOT_VALIDATOR));
-
-        // AUDIT-#8: ensure the burn ledger exists before we may credit it below
-        // (signer is @0x1 here). Keeps cumulative MINTED invariant under the
-        // auto-burn of unclaimed stake.
-        if (!exists<SupplyStats>(@0x1)) {
-            move_to(account, SupplyStats { cumulative_burned: 0 });
-        };
-
+    /// G5 UB-1: pay matured unbonding automatically. Called by
+    /// epoch::advance_epoch at every committee-epoch boundary. The queue is
+    /// sorted by unlock time, so matured entries are a prefix; at most
+    /// MAX_PAYOUTS_PER_BOUNDARY of them are paid per boundary and the rest wait
+    /// for the next one. Nothing is ever burned. This never aborts: an owner
+    /// without a CoinStore (not reachable today, since joining needs one and
+    /// none is ever removed) keeps its entry at the head for its own withdrawal.
+    public fun pay_matured_unbonding(account: &signer) acquires ValidatorSet {
+        assert!(signer::address_of(account) == @0x1, error::permission_denied(ENOT_VALIDATOR));
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
-        let now = chain::height();
-        // Claim grace after the unlock (G5 P-1, in blocks).
-        let grace = chain::claim_grace_blocks();
-
-        let queue_len = vector::length(&validator_set.unbonding_queue);
-        let i = 0;
-        
-        while (i < queue_len) {
-            let req = vector::borrow(&validator_set.unbonding_queue, i);
-            
-            // If request is older than grace period, auto-burn
-            if (now >= req.unlock_height + grace) {
-                let old_req = vector::remove(&mut validator_set.unbonding_queue, i);
-                let UnbondingRequest { validator_addr: _, stake: amount, start_height: _, unlock_height: _ } = old_req;
-                
-                // Auto-burn unclaimed stake (deflationary penalty for not withdrawing).
-                // AUDIT-#8: reduce net total_supply AND credit the burn ledger by the
-                // SAME clamped delta so cumulative MINTED (net + burned) is invariant.
-                let removed = if (validator_set.total_supply >= amount) {
-                    amount
-                } else {
-                    validator_set.total_supply
-                };
-                validator_set.total_supply = validator_set.total_supply - removed;
-                let stats = borrow_global_mut<SupplyStats>(@0x1);
-                stats.cumulative_burned = stats.cumulative_burned + removed;
-                
-                queue_len = queue_len - 1;
-                // Don't increment i (next item shifts down)
-            } else {
-                i = i + 1;
+        let queue = &mut validator_set.unbonding_queue;
+        let now = chain::time();
+        // Work from the back of the reversed queue: its head.
+        vector::reverse(queue);
+        let kept = vector::empty<UnbondingRequest>();
+        let seen = 0;
+        while (seen < MAX_PAYOUTS_PER_BOUNDARY && !vector::is_empty(queue)) {
+            let len = vector::length(queue);
+            if (vector::borrow(queue, len - 1).unlock_time > now) {
+                break
             };
+            let req = vector::pop_back(queue);
+            if (coin::has_store<AincoreCoin>(req.validator_addr)) {
+                let UnbondingRequest { validator_addr, stake: amount, start_height: _, unlock_time: _ } = req;
+                coin::deposit<AincoreCoin>(validator_addr, coin::mint<AincoreCoin>(amount));
+            } else {
+                vector::push_back(&mut kept, req);
+            };
+            seen = seen + 1;
         };
+        // Kept entries go back to the head in their original order.
+        while (!vector::is_empty(&kept)) {
+            vector::push_back(queue, vector::pop_back(&mut kept));
+        };
+        vector::destroy_empty(kept);
+        vector::reverse(queue);
     }
 
     /// Withdraw unbonded stake (after 21 days)
     public entry fun withdraw_unbonded(account: &signer) acquires ValidatorSet {
         let addr = signer::address_of(account);
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
-        let now = chain::height();
+        let now = chain::time();
 
         let len = vector::length(&validator_set.unbonding_queue);
         let i = 0;
@@ -311,7 +303,7 @@ module 0x1::staking {
         while (i < len) {
             let req = vector::borrow(&validator_set.unbonding_queue, i);
             if (req.validator_addr == addr) {
-                assert!(now >= req.unlock_height, error::invalid_state(EUNBONDING_NOT_READY));
+                assert!(now >= req.unlock_time, error::invalid_state(EUNBONDING_NOT_READY));
                 found = true;
                 index = i;
                 break
@@ -322,7 +314,7 @@ module 0x1::staking {
         assert!(found, error::not_found(ENO_UNBONDING_REQUEST));
         
         let unbonding_req = vector::remove(&mut validator_set.unbonding_queue, index);
-        let UnbondingRequest { validator_addr: _, stake: amount, start_height: _, unlock_height: _ } = unbonding_req;
+        let UnbondingRequest { validator_addr: _, stake: amount, start_height: _, unlock_time: _ } = unbonding_req;
         
         // Re-mint and return stake
         let coins = coin::mint<AincoreCoin>(amount);
@@ -601,12 +593,11 @@ module 0x1::staking {
             coin::burn(stake);
 
             if (remaining_amount > 0) {
-                let h = chain::height();
                 vector::push_back(&mut validator_set.unbonding_queue, UnbondingRequest {
                     validator_addr,
                     stake: remaining_amount,
-                    start_height: h,
-                    unlock_height: chain::unlock_height(h),
+                    start_height: chain::height(),
+                    unlock_time: chain::unbonding_unlock_time(),
                 });
             };
         };

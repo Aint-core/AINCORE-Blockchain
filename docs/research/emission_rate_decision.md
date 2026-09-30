@@ -3,6 +3,21 @@
 **Decision (founder, working):** 1.90%/yr of the remaining reserve, pinned **per block** at
 the block time measured at genesis (`epoch_and_rewards.md` b.7), not per epoch.
 
+> **Corrected (2026-09-30 source check).**
+> - The rule "5% only with delegation, 3.5% otherwise, err low, per Uribe" has no external
+>   source. It is the internal calibration doc's synthesis. Uribe (1997) models currency
+>   substitution and prescribes no emission rate.
+> - "Cuts fail" is wrong: Cosmos Hub Proposal 848 cut maximum inflation from 20% to 10%
+>   and passed (2023-11-25). "No chain has raised emission" is unsourced.
+> - "Commission typically 5–10%" is unsourced. For reference, the Hub's minimum commission
+>   is 5%.
+> - Year-1 emission here (2.77M) uses a 146M reserve base, and `epoch_and_rewards.md`
+>   (2.86M) uses 150M. The rate (1.90%/yr of the remaining reserve) is the same.
+> - Emission is now counted by consensus time, not per block (G5 amendment A1), so the rate
+>   no longer depends on the block time.
+> - The decision (1.90%/yr) stands. It rests on the re-run model below, not on the
+>   unsourced sentences.
+
 ## Why the number moved
 `DRAW_NUM = 81` per 20-block epoch was calibrated at 3.59 s blocks (3.5%/yr,
 `docs/AINCORE_EMISSION_CALIBRATION.md` candidate B). Blocks are measured at 6.65 s now, so

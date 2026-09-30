@@ -278,7 +278,7 @@ struct MoveUnbondingRequest {
     validator_addr: move_core_types::account_address::AccountAddress,
     stake: u128,
     start_height: u64,
-    unlock_height: u64,
+    unlock_time: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,13 +309,67 @@ struct FeeSweepEntry {
 
 /// Storage key of the Move `0x1::staking::ValidatorSet` resource. Pinned to
 /// the canonical encoder (`vm_move::state_keys`) by a golden test.
+/// Mirror of the Move `0x1::chain::Clock` resource (BCS field order).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainClock {
+    pub height: u64,
+    /// tau, consensus time in seconds.
+    pub time: u64,
+    /// The block's BFT timestamp, seconds.
+    pub block_timestamp: u64,
+}
+
+/// Mirror of the Move `0x1::chain::Params` resource (BCS field order).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct ChainParamsResource {
+    epoch_blocks: u64,
+    reward_period: u64,
+    max_block_interval_secs: u64,
+}
+
+/// G5 CL-1/CL-2 (amendment A1): the `0x1::chain::Clock` for block `height`
+/// whose BFT timestamp is `block_timestamp`, given the chain's state before
+/// it. tau grows by the timestamp's growth since the previous block, capped
+/// at the genesis-pinned `max_block_interval_secs`: it follows real time at
+/// any block speed, and a halt or a corrupted timestamp moves it by at most
+/// the cap per block. A timestamp that goes back adds nothing. Without
+/// `Params` (only a test fixture: boot refuses such a database) the cap is 0,
+/// so the clock is frozen.
+pub fn next_chain_clock(db: &StateDB, height: u64, block_timestamp: u64) -> ChainClock {
+    let read = |resource: &str| {
+        db.get(&vm_move::state_keys::resource_key_str(
+            &system_address(),
+            resource,
+        ))
+        .expect("CRITICAL: the chain clock state could not be read")
+        .map(|hex_value| hex::decode(hex_value).expect("CRITICAL: chain state is not hex"))
+    };
+    let previous: ChainClock = read("0x1::chain::Clock")
+        .map(|bytes| bcs::from_bytes(&bytes).expect("CRITICAL: 0x1::chain::Clock is corrupt"))
+        .unwrap_or_default();
+    let cap = read("0x1::chain::Params")
+        .map(|bytes| {
+            bcs::from_bytes::<ChainParamsResource>(&bytes)
+                .expect("CRITICAL: 0x1::chain::Params is corrupt")
+                .max_block_interval_secs
+        })
+        .unwrap_or(0);
+    let growth = block_timestamp.saturating_sub(previous.block_timestamp);
+    ChainClock {
+        height,
+        time: previous.time.saturating_add(growth.min(cap)),
+        block_timestamp: block_timestamp.max(previous.block_timestamp),
+    }
+}
+
 /// G5 CL-2: the state write every block makes before its transactions,
-/// `0x1::chain::Clock` = the block's height, as (key, stored value). It is
-/// the only state change an empty block makes.
-pub fn chain_clock_write(height: u64) -> (String, String) {
+/// `0x1::chain::Clock` (see [`next_chain_clock`]), as (key, stored value). It
+/// is the only state change an empty block makes.
+pub fn chain_clock_write(db: &StateDB, height: u64, block_timestamp: u64) -> (String, String) {
+    let clock = next_chain_clock(db, height, block_timestamp);
     (
         vm_move::state_keys::resource_key_str(&system_address(), "0x1::chain::Clock"),
-        hex::encode(bcs::to_bytes(&height).expect("u64 is BCS-serializable")),
+        hex::encode(bcs::to_bytes(&clock).expect("the clock is BCS-serializable")),
     )
 }
 
@@ -1209,10 +1263,11 @@ impl Executor {
             .unwrap_or(Self::DEFAULT_EPOCH_BLOCK_INTERVAL)
     }
 
-    /// G5 CL-2: `0x1::chain::Clock` holds the executing block's height. It is
-    /// a state write inside the block transaction (so the root covers it).
-    fn write_chain_clock(&self, height: u64) {
-        let (key, value) = chain_clock_write(height);
+    /// G5 CL-2: `0x1::chain::Clock` holds the executing block's height and
+    /// consensus time. It is a state write inside the block transaction (so
+    /// the root covers it).
+    fn write_chain_clock(&self, height: u64, block_timestamp: u64) {
+        let (key, value) = chain_clock_write(&self.db, height, block_timestamp);
         self.db
             .put(&key, &value)
             .expect("CRITICAL: the chain clock write failed inside the block transaction");
@@ -1596,16 +1651,19 @@ impl Executor {
             .unwrap_or_else(|| self.db.get_chain_height())
     }
 
-    /// Convenience wrapper for tools and tests: execute the next height in
-    /// order. Production consensus/sync paths call
-    /// [`Self::execute_block_parallel_at`] and handle the outcome explicitly.
+    /// Test convenience: execute the next height in order, at the previous
+    /// block's timestamp (no consensus time passes). Production
+    /// consensus/sync paths call [`Self::execute_block_admitted_at`] with the
+    /// block's own height and timestamp.
+    #[cfg(test)]
     pub fn execute_block_parallel(
         &self,
         txs_json: Vec<String>,
         proposer_hex: &str,
     ) -> BlockExecutionSummary {
         let height = self.last_executed_height().saturating_add(1);
-        match self.execute_block_parallel_at(txs_json, proposer_hex, height, &[]) {
+        let timestamp = next_chain_clock(&self.db, height, 0).block_timestamp;
+        match self.execute_block_parallel_at(txs_json, proposer_hex, height, timestamp, &[]) {
             BlockExecOutcome::Executed(summary) => summary,
             other => {
                 eprintln!("⚠️ execute_block_parallel: {:?} — returning current roots", other);
@@ -1635,17 +1693,27 @@ impl Executor {
     /// tx-bearing block onward. Height-as-parameter makes the boundary a pure
     /// function of the block, and the persisted `sys:last_epoch_boundary`
     /// marker makes each boundary fire exactly once per node.
+    ///
+    /// G5 CL-2: `block_timestamp` is the block's BFT timestamp (its header),
+    /// which drives consensus time.
     pub fn execute_block_parallel_at(
         &self,
         txs_json: Vec<String>,
         proposer_hex: &str,
         block_height: u64,
+        block_timestamp: u64,
         // RE-AUDIT HIGH: slash evidence CARRIED BY THE BLOCK (see apply_slash_evidence).
         slash_evidence: &[String],
     ) -> BlockExecOutcome {
         self.execute_block_checked_at(
-            txs_json, proposer_hex, block_height, slash_evidence, |_, _| Ok(()),
-        ).expect("block state transaction failed; no execution result may be published")
+            txs_json,
+            proposer_hex,
+            block_height,
+            block_timestamp,
+            slash_evidence,
+            |_, _| Ok(()),
+        )
+        .expect("block state transaction failed; no execution result may be published")
     }
 
     /// Stage execution, validate its result, and stage acceptance metadata before
@@ -1657,11 +1725,18 @@ impl Executor {
         txs_json: Vec<String>,
         proposer_hex: &str,
         block_height: u64,
+        block_timestamp: u64,
         slash_evidence: &[String],
         accept: impl FnOnce(&BlockExecutionSummary, &StateDB) -> Result<(), String>,
     ) -> Result<BlockExecOutcome, String> {
         self.execute_block_admitted_at(
-            txs_json, proposer_hex, block_height, slash_evidence, |_| Ok(()), accept,
+            txs_json,
+            proposer_hex,
+            block_height,
+            block_timestamp,
+            slash_evidence,
+            |_| Ok(()),
+            accept,
         )
     }
 
@@ -1670,11 +1745,13 @@ impl Executor {
     /// its supplied view; it must not use a captured base DB or mutate state.
     /// Neither callback may write through a captured base DB (writer deadlock).
     /// A prior network precheck is only an optimization, not admission authority.
+    #[allow(clippy::too_many_arguments)] // the block (content, height, timestamp, evidence) and its two checks are intrinsic
     pub fn execute_block_admitted_at(
         &self,
         txs_json: Vec<String>,
         proposer_hex: &str,
         block_height: u64,
+        block_timestamp: u64,
         slash_evidence: &[String],
         admit: impl FnOnce(&StateDB) -> Result<(), String>,
         accept: impl FnOnce(&BlockExecutionSummary, &StateDB) -> Result<(), String>,
@@ -1692,22 +1769,29 @@ impl Executor {
         // reads/writes (including governance) belong to this speculative block.
         // The block transaction is the only place consensus state may be
         // written (G3 WG-1); in S0 the mark only feeds the storage observer.
-        let outcome = self.db.block_transaction(|view| {
-            admit(&view).map_err(storage::StorageError::DatabaseOperation)?;
-            let executor = Executor::new(view.clone());
-            #[cfg(test)]
-            let executor = Executor {
-                block_boundary_hook: self.block_boundary_hook,
-                ..executor
-            };
-            let outcome = executor.execute_block_staged_at(
-                txs_json, proposer_hex, block_height, slash_evidence,
-            );
-            if let BlockExecOutcome::Executed(summary) = &outcome {
-                accept(summary, &view).map_err(storage::StorageError::DatabaseOperation)?;
-            }
-            Ok(outcome)
-        }).map_err(|error| error.to_string())?;
+        let outcome = self
+            .db
+            .block_transaction(|view| {
+                admit(&view).map_err(storage::StorageError::DatabaseOperation)?;
+                let executor = Executor::new(view.clone());
+                #[cfg(test)]
+                let executor = Executor {
+                    block_boundary_hook: self.block_boundary_hook,
+                    ..executor
+                };
+                let outcome = executor.execute_block_staged_at(
+                    txs_json,
+                    proposer_hex,
+                    block_height,
+                    block_timestamp,
+                    slash_evidence,
+                );
+                if let BlockExecOutcome::Executed(summary) = &outcome {
+                    accept(summary, &view).map_err(storage::StorageError::DatabaseOperation)?;
+                }
+                Ok(outcome)
+            })
+            .map_err(|error| error.to_string())?;
         #[cfg(test)]
         if let Some(hook) = self.block_boundary_hook {
             hook(4, &self.db);
@@ -1726,6 +1810,7 @@ impl Executor {
         txs_json: Vec<String>,
         proposer_hex: &str,
         block_height: u64,
+        block_timestamp: u64,
         slash_evidence: &[String],
     ) -> BlockExecOutcome {
 
@@ -1773,9 +1858,10 @@ impl Executor {
         if let Some(hook) = self.block_boundary_hook {
             hook(0, &self.db);
         }
-        // G5 CL-2: the height of this block, before anything of it runs, so
-        // every deadline a transaction or a system call checks is this block's.
-        self.write_chain_clock(block_height);
+        // G5 CL-2: the height and consensus time of this block, before
+        // anything of it runs, so every deadline a transaction or a system
+        // call checks is this block's.
+        self.write_chain_clock(block_height, block_timestamp);
         self.apply_slash_evidence(slash_evidence);
 
         // 1. Parse all transactions with N-2 FIX: cumulative object limit
@@ -3820,7 +3906,7 @@ mod tests {
         validator_addr: move_core_types::account_address::AccountAddress,
         stake: u128,
         start_height: u64,
-        unlock_height: u64,
+        unlock_time: u64,
     }
 
     #[derive(Serialize, Deserialize)]
@@ -3845,7 +3931,7 @@ mod tests {
         delegator: move_core_types::account_address::AccountAddress,
         amount: u128,
         start_height: u64,
-        unlock_height: u64,
+        unlock_time: u64,
     }
 
     #[derive(Serialize, Deserialize)]
@@ -3853,7 +3939,7 @@ mod tests {
         validator_addr: move_core_types::account_address::AccountAddress,
         commission_rate: u64,
         pending_commission: u64,
-        commission_change_height: u64,
+        commission_effective_time: u64,
         total_delegated: u128,
         delegations: Vec<TestDelegation>,
         unbonding_queue: Vec<TestUnbondingDelegation>,
@@ -3887,7 +3973,7 @@ mod tests {
             validator_addr,
             commission_rate: 0,
             pending_commission: 0,
-            commission_change_height: 0,
+            commission_effective_time: 0,
             total_delegated: total,
             delegations,
             unbonding_queue: vec![],
@@ -4095,10 +4181,15 @@ mod tests {
         seed_chain_params(db);
     }
 
-    /// G5 P-1: the `0x1::chain::Params` genesis writes (the 6,650 ms values,
-    /// epoch 20), and the clock at 0. Caller holds a seeding guard.
+    /// G5 P-1: the `0x1::chain::Params` genesis writes (epoch 20, reward
+    /// period 20, a 14 s clock cap, the 6,650 ms value), and the clock at 0.
+    /// Caller holds a seeding guard.
     fn seed_chain_params(db: &StateDB) {
-        let params: (u64, u64, u64, u64, u64, u128) = (20, 20, 273_000, 402_767, 90_948, 4_042);
+        seed_chain_params_with(db, (20, 20, 14));
+    }
+
+    /// `seed_chain_params` with (I, R, C_tau).
+    fn seed_chain_params_with(db: &StateDB, params: (u64, u64, u64)) {
         db.put(
             &vm_move::state_keys::resource_key_str(&system_address(), "0x1::chain::Params"),
             &hex::encode(bcs::to_bytes(&params).unwrap()),
@@ -4106,9 +4197,15 @@ mod tests {
         .expect("chain params stored");
         db.put(
             &vm_move::state_keys::resource_key_str(&system_address(), "0x1::chain::Clock"),
-            &hex::encode(bcs::to_bytes(&0u64).unwrap()),
+            &hex::encode(bcs::to_bytes(&ChainClock::default()).unwrap()),
         )
         .expect("chain clock stored");
+    }
+
+    /// A test block's BFT timestamp: 7 s per height. Any non-decreasing value
+    /// works; tests of consensus time pass their own.
+    fn block_time(height: u64) -> u64 {
+        height * 7
     }
 
     fn create_account(db: &StateDB, signing_key: &SigningKey) -> String {
@@ -5218,13 +5315,14 @@ mod tests {
                 .collect()
         };
         let before = state_rows(&db);
-        let s1 = match executor.execute_block_parallel_at(vec![], proposer, 1, &[]) {
+        let s1 = match executor.execute_block_parallel_at(vec![], proposer, 1, block_time(1), &[]) {
             BlockExecOutcome::Executed(s) => s,
             other => panic!("height 1 must execute: {:?}", other),
         };
         assert_eq!(executor.last_executed_height(), 1);
         // G5 CL-2: an empty block changes exactly one state key, the chain
-        // clock, and it holds the block's height.
+        // clock: its height, and consensus time grown by the timestamp's
+        // growth (7 s, under the 14 s cap).
         let after = state_rows(&db);
         let clock_key =
             vm_move::state_keys::resource_key_str(&system_address(), "0x1::chain::Clock");
@@ -5236,14 +5334,19 @@ mod tests {
             .filter(|k| before.get(*k) != after.get(*k))
             .collect();
         assert_eq!(changed, vec![&clock_key], "only the clock moves");
+        let clock = ChainClock {
+            height: 1,
+            time: 7,
+            block_timestamp: 7,
+        };
         assert_eq!(
             after[&clock_key],
-            hex::encode(bcs::to_bytes(&1u64).unwrap())
+            hex::encode(bcs::to_bytes(&clock).unwrap())
         );
 
         // Re-executing the SAME height is refused — this is the double execution
         // that corrupted the root chain live.
-        match executor.execute_block_parallel_at(vec![], proposer, 1, &[]) {
+        match executor.execute_block_parallel_at(vec![], proposer, 1, block_time(1), &[]) {
             BlockExecOutcome::AlreadyExecuted { last_executed } => {
                 assert_eq!(last_executed, 1)
             }
@@ -5256,7 +5359,7 @@ mod tests {
         );
 
         // Skipping ahead is refused: executing out of order corrupts the chain.
-        match executor.execute_block_parallel_at(vec![], proposer, 3, &[]) {
+        match executor.execute_block_parallel_at(vec![], proposer, 3, block_time(3), &[]) {
             BlockExecOutcome::Gap { expected, got } => {
                 assert_eq!((expected, got), (2, 3))
             }
@@ -5265,7 +5368,7 @@ mod tests {
         assert_eq!(executor.last_executed_height(), 1, "a refused gap consumes nothing");
 
         // The next height in order still works afterwards.
-        let s2 = match executor.execute_block_parallel_at(vec![], proposer, 2, &[]) {
+        let s2 = match executor.execute_block_parallel_at(vec![], proposer, 2, block_time(2), &[]) {
             BlockExecOutcome::Executed(s) => s,
             other => panic!("height 2 must execute after 1: {:?}", other),
         };
@@ -5278,38 +5381,35 @@ mod tests {
     }
 
     const G5_AIN: u128 = 1_000_000_000_000_000_000;
+    const DAY: u64 = 86_400;
+    /// U and N, as `0x1::chain` fixes them.
+    const UNBONDING: u64 = 21 * DAY;
+    const NOTICE: u64 = 7 * DAY;
 
-    /// A small chain for the G5 deadline tests: the stdlib, the given chain
-    /// parameters (I, R, U, G, C, draw) with I equal to the executor's
-    /// default epoch interval (20), the empty DelegationRegistry genesis
-    /// creates, a proposer with a coin store, whatever `seed` adds, and then
-    /// blocks run in order through the real executor.
+    /// A chain for the G5 deadline tests: the stdlib, `0x1::chain::Params`
+    /// with I = 20 (the executor's default epoch interval), R = 20 and the
+    /// given clock cap, the empty DelegationRegistry genesis creates, a
+    /// proposer with a coin store and whatever `seed` adds; then blocks run in
+    /// order through the real executor, at timestamps the test controls.
     struct G5Chain {
         db: Arc<StateDB>,
         executor: Executor,
         proposer: String,
+        cap: u64,
         height: u64,
+        timestamp: u64,
         nonces: std::collections::HashMap<String, u64>,
     }
 
     impl G5Chain {
-        fn new(
-            name: &str,
-            params: (u64, u64, u64, u64, u64, u128),
-            seed: impl FnOnce(&Arc<StateDB>),
-        ) -> Self {
-            assert_eq!(params.0, Executor::DEFAULT_EPOCH_BLOCK_INTERVAL);
+        fn new(name: &str, cap: u64, seed: impl FnOnce(&Arc<StateDB>)) -> Self {
             let db = temp_db(name);
             load_stdlib(&db);
             {
                 let _seed = db.seeding();
                 db.set_federation_key("00000000000000000000000000000000")
                     .unwrap();
-                db.put(
-                    &vm_move::state_keys::resource_key_str(&system_address(), "0x1::chain::Params"),
-                    &hex::encode(bcs::to_bytes(&params).unwrap()),
-                )
-                .unwrap();
+                seed_chain_params_with(&db, (Executor::DEFAULT_EPOCH_BLOCK_INTERVAL, 20, cap));
                 let no_pools: Vec<move_core_types::account_address::AccountAddress> = vec![];
                 db.put(
                     &vm_move::state_keys::resource_key_str(
@@ -5328,7 +5428,9 @@ mod tests {
                 db,
                 executor,
                 proposer,
+                cap,
                 height: 0,
+                timestamp: 0,
                 nonces: Default::default(),
             }
         }
@@ -5339,6 +5441,12 @@ mod tests {
             let address = create_account(db, &key);
             set_coin_store(db, &address, balance);
             (key, address)
+        }
+
+        /// The stored `0x1::chain::Clock`.
+        fn clock(&self) -> ChainClock {
+            let key = vm_move::state_keys::resource_key_str(&system_address(), "0x1::chain::Clock");
+            bcs::from_bytes(&hex::decode(self.db.get(&key).unwrap().unwrap()).unwrap()).unwrap()
         }
 
         /// A signed 0x1 entry call from `key`'s account with its next nonce.
@@ -5360,24 +5468,47 @@ mod tests {
             raw
         }
 
-        /// Runs empty blocks up to `target - 1`, then `txs` at `target`; each
-        /// must execute (an aborted call still executes, and pays gas).
-        fn run_to(&mut self, target: u64, txs: Vec<String>) {
-            assert!(target > self.height, "heights only go forward");
-            while self.height + 1 < target {
-                self.height += 1;
-                self.block(vec![]);
+        /// Runs empty blocks, each a full cap apart, up to `height - 1`, then
+        /// `txs` at `height` (also a cap after the previous block).
+        fn run_to(&mut self, height: u64, txs: Vec<String>) {
+            assert!(height > self.height, "heights only go forward");
+            while self.height + 1 < height {
+                self.block(self.timestamp + self.cap, vec![]);
             }
-            self.height += 1;
-            self.block(txs);
+            self.block(self.timestamp + self.cap, txs);
         }
 
-        fn block(&self, txs: Vec<String>) {
+        /// Runs blocks, each advancing consensus time by at most the cap,
+        /// until it is exactly `time`; `txs` go in the last block.
+        fn run_until(&mut self, time: u64, txs: Vec<String>) {
+            let mut txs = Some(txs);
+            loop {
+                let now = self.clock().time;
+                assert!(time >= now, "consensus time only goes forward");
+                let step = (time - now).min(self.cap);
+                let last = now + step == time;
+                let batch = if last { txs.take().unwrap() } else { vec![] };
+                self.block(self.timestamp + step, batch);
+                if last {
+                    assert_eq!(self.clock().time, time);
+                    return;
+                }
+            }
+        }
+
+        /// One block at `timestamp`; every tx must execute (an aborted call
+        /// still executes, and pays gas).
+        fn block(&mut self, timestamp: u64, txs: Vec<String>) {
+            self.height += 1;
+            self.timestamp = timestamp;
             let n = txs.len();
-            match self
-                .executor
-                .execute_block_parallel_at(txs, &self.proposer, self.height, &[])
-            {
+            match self.executor.execute_block_parallel_at(
+                txs,
+                &self.proposer,
+                self.height,
+                timestamp,
+                &[],
+            ) {
                 BlockExecOutcome::Executed(s) => {
                     assert_eq!(s.executed_raws.len(), n, "every tx runs at {}", self.height)
                 }
@@ -5390,16 +5521,69 @@ mod tests {
         bcs::to_bytes(&parse_move_address(address).unwrap()).unwrap()
     }
 
-    /// G5 CL-1, CL-2 and SL-2 through real blocks: a transaction reads the
-    /// height of the block that executes it, and every deadline expires at
-    /// exactly its height; one block earlier it is refused. The parameters
-    /// here are small (I = 20, U = 40, C = 5) so the blocks fit in a test;
-    /// genesis pins the real ones.
+    /// G5 CL-1 (amendment A1): consensus time is the sum of each block's
+    /// timestamp growth, capped per block. Fast blocks count in full, a halt
+    /// or a forged jump counts at most the cap, a timestamp that goes back
+    /// counts nothing, and without Params the clock is frozen.
     #[test]
-    fn g5_deadlines_expire_exactly_at_their_heights() {
+    fn g5_consensus_time_follows_timestamps_capped_per_block() {
+        let db = temp_db("g5_clock");
+        let _seed = db.seeding();
+        seed_chain_params_with(&db, (20, 20, 14));
+        let key = vm_move::state_keys::resource_key_str(&system_address(), "0x1::chain::Clock");
+        let step = |height: u64, timestamp: u64| -> ChainClock {
+            let clock = next_chain_clock(&db, height, timestamp);
+            let (k, v) = chain_clock_write(&db, height, timestamp);
+            assert_eq!(k, key);
+            assert_eq!(v, hex::encode(bcs::to_bytes(&clock).unwrap()));
+            db.put(&k, &v).unwrap();
+            clock
+        };
+        // 7 s blocks, then 1 s blocks: time follows the timestamps exactly.
+        assert_eq!(
+            step(1, 1_000).time,
+            14,
+            "the first block counts at most the cap"
+        );
+        assert_eq!(step(2, 1_007).time, 21);
+        assert_eq!(step(3, 1_008).time, 22);
+        // A 10-day halt ages consensus time by the cap only.
+        let halted = step(4, 1_008 + 10 * DAY);
+        assert_eq!(
+            (halted.time, halted.block_timestamp),
+            (36, 1_008 + 10 * DAY)
+        );
+        // A timestamp that goes back counts nothing and is not stored, so the
+        // next growth counts from the highest timestamp seen.
+        let back = step(5, 1_000);
+        assert_eq!(
+            (back.height, back.time, back.block_timestamp),
+            (5, 36, 1_008 + 10 * DAY)
+        );
+        assert_eq!(step(6, 1_008 + 10 * DAY + 1).time, 37);
+        // A forged stream of +1,000 s per block advances 14 s per block.
+        let mut t = 1_008 + 10 * DAY + 1;
+        for h in 7..17 {
+            t += 1_000;
+            step(h, t);
+        }
+        assert_eq!(step(17, t).time, 37 + 10 * 14);
+
+        // Without Params (a fixture; boot refuses it) the clock is frozen.
+        let bare = temp_db("g5_clock_bare");
+        let frozen = next_chain_clock(&bare, 1, 5_000);
+        assert_eq!((frozen.time, frozen.block_timestamp), (0, 5_000));
+    }
+
+    /// G5 CL-1, CL-2 and SL-2 through real blocks: a transaction reads the
+    /// consensus time of the block that executes it, and an unbonding unlocks
+    /// exactly U after its epoch bound (tau at leave + I x C_tau), refused one
+    /// second earlier. The cap here is one day, so 21 days fit in a test.
+    #[test]
+    fn g5_unbonding_unlocks_exactly_at_its_time() {
         let ain = G5_AIN;
         let mut keys = vec![];
-        let mut chain = G5Chain::new("g5_deadlines", (20, 20, 40, 402_767, 5, 4_042), |db| {
+        let mut chain = G5Chain::new("g5_deadlines", DAY, |db| {
             keys.push(G5Chain::account(db, 61, ain));
             keys.push(G5Chain::account(db, 62, 10 * ain));
             keys.push(G5Chain::account(db, 63, ain));
@@ -5427,7 +5611,8 @@ mod tests {
         );
         chain.run_to(2, vec![delegate]);
 
-        // Height 3 is in epoch 0 (blocks 1..=20), so both unlock at 20 + 40.
+        // At height 3 consensus time is 3 days; both unlock at
+        // 3 d + I x C_tau (20 d) + U (21 d) = 44 d.
         let undelegate = chain.tx(
             &delegator_key,
             "delegation",
@@ -5439,46 +5624,18 @@ mod tests {
         );
         let leave = chain.tx(&leaver_key, "staking", "leave_validator_set", vec![]);
         chain.run_to(3, vec![undelegate, leave]);
+        assert_eq!(chain.clock().time, 3 * DAY);
+        let unlock = 3 * DAY + 20 * DAY + UNBONDING;
         let pool = delegation_pool(&db, &validator);
         let entry = &pool.unbonding_queue[0];
         assert_eq!(
-            (entry.start_height, entry.unlock_height, entry.amount),
-            (3, 60, 2 * ain)
+            (entry.start_height, entry.unlock_time, entry.amount),
+            (3, unlock, 2 * ain)
         );
         let request = &validator_set(&db).unbonding_queue[0];
-        assert_eq!((request.start_height, request.unlock_height), (3, 60));
+        assert_eq!((request.start_height, request.unlock_time), (3, unlock));
 
-        // The commission notice: 4 + C = 9.
-        let update = chain.tx(
-            &validator_key,
-            "delegation",
-            "update_commission",
-            vec![bcs::to_bytes(&800u64).unwrap()],
-        );
-        chain.run_to(4, vec![update]);
-        assert_eq!(delegation_pool(&db, &validator).commission_change_height, 9);
-        let apply = chain.tx(
-            &validator_key,
-            "delegation",
-            "apply_commission_change",
-            vec![],
-        );
-        chain.run_to(8, vec![apply]);
-        assert_eq!(
-            delegation_pool(&db, &validator).commission_rate,
-            500,
-            "applied early"
-        );
-        let apply = chain.tx(
-            &validator_key,
-            "delegation",
-            "apply_commission_change",
-            vec![],
-        );
-        chain.run_to(9, vec![apply]);
-        assert_eq!(delegation_pool(&db, &validator).commission_rate, 800);
-
-        // One block before the unlock both withdrawals are refused.
+        // One second before the unlock both withdrawals are refused.
         let withdraw = chain.tx(
             &delegator_key,
             "delegation",
@@ -5486,7 +5643,7 @@ mod tests {
             vec![move_addr_arg(&validator)],
         );
         let exit = chain.tx(&leaver_key, "staking", "withdraw_unbonded", vec![]);
-        chain.run_to(59, vec![withdraw, exit]);
+        chain.run_until(unlock - 1, vec![withdraw, exit]);
         assert_eq!(
             delegation_pool(&db, &validator).unbonding_queue.len(),
             1,
@@ -5498,7 +5655,7 @@ mod tests {
             "unlocked early"
         );
 
-        // At the unlock height both pay out.
+        // At the unlock both pay out.
         let delegator_before = coin_balance(&db, &delegator);
         let leaver_before = coin_balance(&db, &leaver);
         let withdraw = chain.tx(
@@ -5508,7 +5665,11 @@ mod tests {
             vec![move_addr_arg(&validator)],
         );
         let exit = chain.tx(&leaver_key, "staking", "withdraw_unbonded", vec![]);
-        chain.run_to(60, vec![withdraw, exit]);
+        chain.run_until(unlock, vec![withdraw, exit]);
+        assert!(
+            chain.height < 60,
+            "paid by the withdrawals, not by a boundary"
+        );
         let pool = delegation_pool(&db, &validator);
         assert!(pool.unbonding_queue.is_empty());
         assert_eq!(pool.escrowed_coins.value, 3 * ain);
@@ -5519,84 +5680,222 @@ mod tests {
         assert!((1_000 * ain - 100_000..1_000 * ain).contains(&gained(leaver_before, &leaver)));
     }
 
-    /// G5 CL-1: unclaimed validator stake is burned at the first epoch
-    /// boundary at or after unlock + G, never before. G = 21 puts unlock + G
-    /// one block past a boundary, so a burn one block early would show at
-    /// that boundary. The boundary runs the real Move epoch advance.
+    /// G5 CM-1: an increase takes effect exactly N after its announcement,
+    /// never earlier; it may raise the rate in force by at most 500 bps; a
+    /// decrease applies at once and cancels a pending increase.
     #[test]
-    fn g5_unclaimed_stake_burns_at_unlock_plus_grace() {
+    fn g5_commission_increase_waits_its_notice_and_is_capped() {
         let ain = G5_AIN;
         let mut keys = vec![];
-        let mut chain = G5Chain::new("g5_grace", (20, 20, 40, 21, 5, 4_042), |db| {
+        let mut chain = G5Chain::new("g5_commission", DAY, |db| {
+            keys.push(G5Chain::account(db, 81, ain));
+        });
+        let (validator_key, validator) = keys.pop().unwrap();
+        let db = chain.db.clone();
+        let pool = || {
+            let p = delegation_pool(&db, &validator);
+            (
+                p.commission_rate,
+                p.pending_commission,
+                p.commission_effective_time,
+            )
+        };
+        let announce = |chain: &mut G5Chain, bps: u64| {
+            chain.tx(
+                &validator_key,
+                "delegation",
+                "update_commission",
+                vec![bcs::to_bytes(&bps).unwrap()],
+            )
+        };
+
+        let enable = chain.tx(
+            &validator_key,
+            "delegation",
+            "enable_delegation",
+            vec![bcs::to_bytes(&500u64).unwrap()],
+        );
+        chain.run_to(1, vec![enable]);
+        // +600 bps is over the cap: refused, nothing pending.
+        let over = announce(&mut chain, 1_100);
+        chain.run_to(2, vec![over]);
+        assert_eq!(pool(), (500, 500, 0));
+        // +500 bps at 3 d takes effect at 3 d + N.
+        let raise = announce(&mut chain, 1_000);
+        chain.run_to(3, vec![raise]);
+        let effective = 3 * DAY + NOTICE;
+        assert_eq!(pool(), (500, 1_000, effective));
+        // One second early the rate in force is still 500, so a further raise
+        // to 1,500 is over the cap and refused.
+        let early = announce(&mut chain, 1_500);
+        chain.run_until(effective - 1, vec![early]);
+        assert_eq!(
+            pool(),
+            (500, 1_000, effective),
+            "the increase applied early"
+        );
+        // At the effective time the rate in force is 1,000, so 1,500 is +500.
+        let on_time = announce(&mut chain, 1_500);
+        chain.run_until(effective, vec![on_time]);
+        assert_eq!(pool(), (1_000, 1_500, effective + NOTICE));
+        // A decrease applies at once and cancels the pending increase.
+        let cut = announce(&mut chain, 300);
+        chain.run_to(chain.height + 1, vec![cut]);
+        assert_eq!(pool(), (300, 300, 0));
+    }
+
+    /// Validators A, B and C with coin stores, `stake` each, and the Epoch
+    /// resource, so boundaries run the real Move epoch advance.
+    fn seed_three_validators(db: &StateDB, keys: &[(SigningKey, String)], stake: u128) {
+        let _seed = db.seeding();
+        let validators = keys
+            .iter()
+            .zip(1u8..)
+            .map(|((_, address), bls_seed)| {
+                let (bls_public_key, bls_pop) = test_bls_identity(bls_seed);
+                TestValidatorConfig {
+                    validator_addr: parse_move_address(address).unwrap(),
+                    stake: TestCoin { value: stake },
+                    public_key: vec![1, 2, 3],
+                    bls_public_key,
+                    bls_pop,
+                }
+            })
+            .collect();
+        let set = TestValidatorSet {
+            validators,
+            unbonding_queue: vec![],
+            total_supply: stake * keys.len() as u128,
+            current_epoch: 0,
+        };
+        db.put(
+            &validator_set_key(),
+            &hex::encode(bcs::to_bytes(&set).unwrap()),
+        )
+        .unwrap();
+        db.put(
+            &vm_move::state_keys::resource_key_str(&system_address(), "0x1::epoch::Epoch"),
+            &hex::encode(bcs::to_bytes(&0u64).unwrap()),
+        )
+        .unwrap();
+    }
+
+    fn move_epoch(db: &StateDB) -> u64 {
+        let key = vm_move::state_keys::resource_key_str(&system_address(), "0x1::epoch::Epoch");
+        bcs::from_bytes(&hex::decode(db.get(&key).unwrap().unwrap()).unwrap()).unwrap()
+    }
+
+    /// G5 UB-1: matured unbonding is paid automatically at the first epoch
+    /// boundary at or after its unlock, once, and never burned. Boundaries
+    /// run the real Move epoch advance.
+    #[test]
+    fn g5_matured_unbonding_is_paid_at_the_first_boundary() {
+        let ain = G5_AIN;
+        let mut keys = vec![];
+        let mut chain = G5Chain::new("g5_payout", DAY, |db| {
             for seed in [71u8, 72, 73] {
                 keys.push(G5Chain::account(db, seed, ain));
             }
-            let _seed = db.seeding();
-            let validators = keys
+            seed_three_validators(db, &keys, 1_000 * ain);
+        });
+        let db = chain.db.clone();
+        let queue = || -> Vec<(u64, u64)> {
+            validator_set(&db)
+                .unbonding_queue
                 .iter()
-                .zip(1u8..)
-                .map(|((_, address), bls_seed)| {
-                    let (bls_public_key, bls_pop) = test_bls_identity(bls_seed);
-                    TestValidatorConfig {
-                        validator_addr: parse_move_address(address).unwrap(),
-                        stake: TestCoin { value: 1_000 * ain },
-                        public_key: vec![1, 2, 3],
-                        bls_public_key,
-                        bls_pop,
-                    }
-                })
-                .collect();
-            let set = TestValidatorSet {
-                validators,
-                unbonding_queue: vec![],
-                total_supply: 3_000 * ain,
-                current_epoch: 0,
-            };
+                .map(|r| (r.start_height, r.unlock_time))
+                .collect()
+        };
+
+        // A leaves at height 3 (unlock 3 + 20 + 21 = 44 d), B at 45 (86 d).
+        let leave_a = chain.tx(&keys[0].0, "staking", "leave_validator_set", vec![]);
+        chain.run_to(3, vec![leave_a]);
+        let a_before = coin_balance(&db, &keys[0].1);
+        chain.run_to(44, vec![]);
+        assert_eq!(chain.clock().time, 44 * DAY);
+        let leave_b = chain.tx(&keys[1].0, "staking", "leave_validator_set", vec![]);
+        chain.run_to(45, vec![leave_b]);
+        // Matured at 44 d, but no boundary until height 60.
+        chain.run_to(59, vec![]);
+        assert_eq!(queue(), vec![(3, 44 * DAY), (45, 86 * DAY)]);
+        assert_eq!(coin_balance(&db, &keys[0].1), a_before);
+        chain.run_to(60, vec![]);
+        assert_eq!(
+            queue(),
+            vec![(45, 86 * DAY)],
+            "A is paid at the first boundary after 44 d"
+        );
+        let a_paid = coin_balance(&db, &keys[0].1);
+        assert!(
+            a_paid >= a_before + 1_000 * ain,
+            "A got its stake (and any rewards)"
+        );
+        chain.run_to(80, vec![]);
+        assert_eq!(queue(), vec![(45, 86 * DAY)], "B is not matured at 80 d");
+        chain.run_to(100, vec![]);
+        assert!(queue().is_empty(), "B is paid at the boundary after 86 d");
+        assert_eq!(
+            move_epoch(&db),
+            5,
+            "the boundaries at 20, 40, 60, 80 and 100 ran"
+        );
+    }
+
+    /// G5 UB-1: a boundary pays at most K = 256 matured entries, in queue
+    /// order; the rest wait for the next boundary. An owner without a coin
+    /// store keeps its entry at the head, and nothing aborts the epoch.
+    #[test]
+    fn g5_boundary_payouts_are_bounded_and_ordered() {
+        let ain = G5_AIN;
+        let owners: Vec<String> = (0..300u32)
+            .map(|i| format!("{:064x}", 0x1000 + i))
+            .collect();
+        let mut keys = vec![];
+        let mut chain = G5Chain::new("g5_payout_bound", DAY, |db| {
+            for seed in [74u8, 75, 76] {
+                keys.push(G5Chain::account(db, seed, ain));
+            }
+            seed_three_validators(db, &keys, 1_000 * ain);
+            let mut set = validator_set(db);
+            for (i, owner) in owners.iter().enumerate() {
+                // Owner 1 has no coin store.
+                if i != 1 {
+                    set_coin_store(db, owner, 0);
+                }
+                set.unbonding_queue.push(TestUnbondingRequest {
+                    validator_addr: parse_move_address(owner).unwrap(),
+                    stake: 1_000 + i as u128,
+                    start_height: 0,
+                    unlock_time: i as u64,
+                });
+            }
+            let _seed = db.seeding();
             db.put(
                 &validator_set_key(),
                 &hex::encode(bcs::to_bytes(&set).unwrap()),
             )
             .unwrap();
-            db.put(
-                &vm_move::state_keys::resource_key_str(&system_address(), "0x1::epoch::Epoch"),
-                &hex::encode(bcs::to_bytes(&0u64).unwrap()),
-            )
-            .unwrap();
         });
         let db = chain.db.clone();
-        let epoch = || -> u64 {
-            let key = vm_move::state_keys::resource_key_str(&system_address(), "0x1::epoch::Epoch");
-            bcs::from_bytes(&hex::decode(db.get(&key).unwrap().unwrap()).unwrap()).unwrap()
-        };
-        let queue = || -> Vec<(u64, u64)> {
+        let queued = || -> Vec<u64> {
             validator_set(&db)
                 .unbonding_queue
                 .iter()
-                .map(|r| (r.start_height, r.unlock_height))
+                .map(|r| r.unlock_time)
                 .collect()
         };
 
-        // A leaves in epoch 0 (unlock 20 + 40 = 60, burn from 81), B in
-        // epoch 1 (unlock 40 + 40 = 80, burn from 101). C stays.
-        let leave_a = chain.tx(&keys[0].0, "staking", "leave_validator_set", vec![]);
-        chain.run_to(3, vec![leave_a]);
-        let leave_b = chain.tx(&keys[1].0, "staking", "leave_validator_set", vec![]);
-        chain.run_to(21, vec![leave_b]);
-        chain.run_to(80, vec![]);
-        assert_eq!(epoch(), 4, "the boundaries at 20, 40, 60 and 80 ran");
-        assert_eq!(queue(), vec![(3, 60), (21, 80)], "burned before unlock + G");
-        chain.run_to(100, vec![]);
-        assert_eq!(
-            queue(),
-            vec![(21, 80)],
-            "A is burned at the first boundary past 81"
-        );
-        chain.run_to(120, vec![]);
-        assert!(
-            queue().is_empty(),
-            "B is burned at the first boundary past 101"
-        );
-        assert_eq!(epoch(), 6);
+        chain.run_to(20, vec![]);
+        // 256 scanned: 255 paid, owner 1 kept at the head, 256..299 wait.
+        let expected: Vec<u64> = std::iter::once(1).chain(256..300).collect();
+        assert_eq!(queued(), expected);
+        assert_eq!(coin_balance(&db, &owners[0]), 1_000);
+        assert_eq!(coin_balance(&db, &owners[255]), 1_255);
+        assert_eq!(coin_balance(&db, &owners[256]), 0, "past K, waits");
+        chain.run_to(40, vec![]);
+        assert_eq!(queued(), vec![1], "the rest paid; owner 1 still kept");
+        assert_eq!(coin_balance(&db, &owners[299]), 1_299);
+        assert_eq!(move_epoch(&db), 2);
     }
 
     /// Build a hex-encoded BCS `coin::transfer` payload from `from` to `to`.
@@ -6159,7 +6458,7 @@ mod tests {
     fn an_unlogged_state_write_is_provable_against_the_block_root() {
         let (db, sender, tx_json) = g3_burning_transfer("g3_unlogged_in_root");
         let outcome = Executor::new(db.clone())
-            .execute_block_checked_at(vec![tx_json], &sender, 1, &[], |_, _| Ok(()))
+            .execute_block_checked_at(vec![tx_json], &sender, 1, block_time(1), &[], |_, _| Ok(()))
             .unwrap();
         let BlockExecOutcome::Executed(summary) = outcome else {
             panic!("block 1 must execute: {outcome:?}");
@@ -6253,7 +6552,7 @@ mod tests {
         tx["public_key"] = serde_json::json!(public_key.to_ascii_uppercase());
         let tx = tx.to_string();
         let Ok(BlockExecOutcome::Executed(summary)) = Executor::new(db.clone())
-            .execute_block_checked_at(vec![tx], &address, 1, &[], |_, _| Ok(()))
+            .execute_block_checked_at(vec![tx], &address, 1, block_time(1), &[], |_, _| Ok(()))
         else {
             panic!("block must execute");
         };
@@ -6287,6 +6586,7 @@ mod tests {
             vec![tx_json.clone()],
             &sender,
             1,
+            block_time(1),
             &[],
             |_, _| Ok(()),
         ) else {
@@ -6307,6 +6607,7 @@ mod tests {
             vec![tx_json.clone()],
             &sender,
             2,
+            block_time(2),
             &[],
             |_, _| Ok(()),
         ) else {
@@ -6336,7 +6637,7 @@ mod tests {
         )
         .unwrap();
         let outcome = Executor::new(db.clone())
-            .execute_block_checked_at(vec![tx_json], &sender, 1, &[], |_, _| Ok(()))
+            .execute_block_checked_at(vec![tx_json], &sender, 1, block_time(1), &[], |_, _| Ok(()))
             .unwrap();
         assert!(matches!(outcome, BlockExecOutcome::Executed(_)));
         let queued: Vec<String> = db
@@ -6360,10 +6661,14 @@ mod tests {
     fn a_state_write_after_the_root_refuses_the_whole_block() {
         let (db, sender, tx_json) = g3_burning_transfer("g3_sealed_block");
         let executor = Executor::new(db.clone());
-        let refused =
-            executor.execute_block_checked_at(vec![tx_json.clone()], &sender, 1, &[], |_, view| {
-                view.put("obj:escapee", "x").map_err(|e| e.to_string())
-            });
+        let refused = executor.execute_block_checked_at(
+            vec![tx_json.clone()],
+            &sender,
+            1,
+            block_time(1),
+            &[],
+            |_, view| view.put("obj:escapee", "x").map_err(|e| e.to_string()),
+        );
         let err = refused.expect_err("a post-seal state write must refuse the block");
         assert!(err.contains("sealed"), "{err}");
         assert_eq!(executor.last_executed_height(), 0, "nothing committed");
@@ -6374,10 +6679,14 @@ mod tests {
             "no tree rows beyond genesis either"
         );
 
-        let accepted =
-            executor.execute_block_checked_at(vec![tx_json], &sender, 1, &[], |_, view| {
-                view.put("latest_height", "1").map_err(|e| e.to_string())
-            });
+        let accepted = executor.execute_block_checked_at(
+            vec![tx_json],
+            &sender,
+            1,
+            block_time(1),
+            &[],
+            |_, view| view.put("latest_height", "1").map_err(|e| e.to_string()),
+        );
         assert!(
             matches!(accepted, Ok(BlockExecOutcome::Executed(_))),
             "positive control: chain data after the seal is fine"
@@ -7455,9 +7764,18 @@ mod tests {
             &serde_json::json!({"reason":"downtime","round":78}).to_string(),
         )
         .unwrap();
-        // Mid-epoch 1 (blocks 21..=40): G5 SL-2 counts U from its end, 40.
-        let (clock_key, clock_value) = chain_clock_write(25);
-        db.put(&clock_key, &clock_value).unwrap();
+        // Height 25 at consensus time 1,000 s: G5 SL-2 unlocks the remainder U
+        // after the epoch bound, 1,000 + I x C_tau (20 x 14 s).
+        let clock = ChainClock {
+            height: 25,
+            time: 1_000,
+            block_timestamp: 9_000,
+        };
+        db.put(
+            &vm_move::state_keys::resource_key_str(&system_address(), "0x1::chain::Clock"),
+            &hex::encode(bcs::to_bytes(&clock).unwrap()),
+        )
+        .unwrap();
 
         let executor = Executor::new(db.clone());
         executor.execute_pending_slashes();
@@ -7482,8 +7800,8 @@ mod tests {
         assert_eq!(move_validators.unbonding_queue[0].stake, 950_000);
         let remainder = &move_validators.unbonding_queue[0];
         assert_eq!(
-            (remainder.start_height, remainder.unlock_height),
-            (25, 40 + 273_000)
+            (remainder.start_height, remainder.unlock_time),
+            (25, 1_000 + 280 + 21 * 86_400)
         );
         assert_eq!(move_validators.total_supply, 950_000);
     }
@@ -7592,7 +7910,7 @@ mod tests {
             validator_addr: parse_move_address(&validator).unwrap(),
             commission_rate: 0,
             pending_commission: 0,
-            commission_change_height: 0,
+            commission_effective_time: 0,
             total_delegated: 400_000,
             delegations: vec![TestDelegation {
                 delegator: parse_move_address(active).unwrap(),
@@ -7603,7 +7921,7 @@ mod tests {
                 delegator: parse_move_address(unbonding).unwrap(),
                 amount: 200_000,
                 start_height: 0,
-                unlock_height: 999_999_999,
+                unlock_time: 999_999_999,
             }],
             accumulated_rewards_per_share: 0,
             pending_rewards: 0,
@@ -8893,7 +9211,7 @@ mod tests {
         db.set_federation_key("00000000000000000000000000000000").unwrap();
         let exec = Executor::new(db.clone());
         let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
-        match exec.execute_block_parallel_at(vec![], proposer, 1, &[]) {
+        match exec.execute_block_parallel_at(vec![], proposer, 1, block_time(1), &[]) {
             BlockExecOutcome::Executed(_) => {}
             other => panic!("height 1 must execute: {:?}", other),
         }
@@ -8957,7 +9275,7 @@ mod tests {
         seed_genesis_tree(&db_a);
         let exec_a = Executor::new(db_a.clone());
         let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
-        match exec_a.execute_block_parallel_at(vec![], proposer, 1, &[]) {
+        match exec_a.execute_block_parallel_at(vec![], proposer, 1, block_time(1), &[]) {
             BlockExecOutcome::Executed(_) => {}
             other => panic!("height 1 must execute: {:?}", other),
         }
@@ -9051,7 +9369,7 @@ mod tests {
         seed_genesis_tree(&db_a);
         let exec_a = Executor::new(db_a.clone());
         let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
-        match exec_a.execute_block_parallel_at(vec![], proposer, 1, &[]) {
+        match exec_a.execute_block_parallel_at(vec![], proposer, 1, block_time(1), &[]) {
             BlockExecOutcome::Executed(_) => {}
             other => panic!("height 1 must execute: {:?}", other),
         }

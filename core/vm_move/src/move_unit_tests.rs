@@ -338,14 +338,18 @@ fn the_chain_parameters_and_clock_have_no_move_writer_but_initialize() {
     assert_eq!(writes, expected.into_iter().collect());
 }
 
-/// G5 CL-1: no stdlib module has a wall clock. Every deadline reads
-/// `chain::height`, so a halted chain ages nothing; a `timestamp` module, or
-/// a field or function named for seconds, time or a duration, is how a
-/// second clock would come back. Identifiers, not source text, so comments
-/// that explain the old clock do not count.
+/// G5 CL-1: the stdlib has one clock, `0x1::chain::Clock` (consensus time,
+/// written by the executor). A second clock is how deadlines drifted before:
+/// the virtual-seconds accumulator (`epoch_start_time`, `epoch_duration`,
+/// `now_seconds`), or a `timestamp` module. So no identifier may name seconds,
+/// a duration, a "now" function or a start time, and only `chain` may name a
+/// timestamp or declare a struct field called `time`. Identifiers, not source
+/// text, so comments that explain the old clock do not count.
 #[test]
-fn no_stdlib_module_has_a_wall_clock() {
-    use move_binary_format::{access::ModuleAccess, CompiledModule};
+fn the_stdlib_has_one_clock() {
+    use move_binary_format::{
+        access::ModuleAccess, file_format::StructFieldInformation, CompiledModule,
+    };
     let mut found = Vec::new();
     for entry in fs::read_dir(stdlib_dir("bytecode"))
         .expect("stdlib bytecode exists")
@@ -353,17 +357,35 @@ fn no_stdlib_module_has_a_wall_clock() {
     {
         let bytes = fs::read(entry.path()).expect("module readable");
         let module = CompiledModule::deserialize(&bytes).expect("module deserializes");
+        let name = module.self_id().name().to_string();
+        let is_chain = name == "chain";
         for ident in module.identifiers() {
             let ident = ident.as_str().to_ascii_lowercase();
-            if ["time", "second", "duration", "clock_secs"]
+            let second_clock = ["second", "duration", "now_", "start_time"]
                 .iter()
                 .any(|w| ident.contains(w))
-            {
-                found.push(format!("{}: {}", module.self_id().name(), ident));
+                || (ident.contains("timestamp") && !is_chain);
+            if second_clock {
+                found.push(format!("{name}: {ident}"));
+            }
+        }
+        for def in module.struct_defs() {
+            let handle = module.struct_handle_at(def.struct_handle);
+            let fields = match &def.field_information {
+                StructFieldInformation::Declared(fields) => fields.as_slice(),
+                StructFieldInformation::Native => &[],
+            };
+            for field in fields {
+                if module.identifier_at(field.name).as_str() == "time" && !is_chain {
+                    found.push(format!(
+                        "{name}::{}.time",
+                        module.identifier_at(handle.name)
+                    ));
+                }
             }
         }
     }
-    assert!(found.is_empty(), "wall-clock identifiers: {found:?}");
+    assert!(found.is_empty(), "a second clock: {found:?}");
 }
 
 /// The committed bytecode is what genesis installs and what the tests above

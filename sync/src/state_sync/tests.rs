@@ -1717,7 +1717,7 @@ impl Producer {
         let mut blocks = Vec::new();
         for height in 1..=n {
             // G5 CL-2: an empty block's one state change is the clock.
-            let (key, value) = executor::chain_clock_write(height);
+            let (key, value) = executor::chain_clock_write(&self.sync.storage, height, height);
             let root = hex::encode(
                 state_commit::apply(
                     &self.sync.storage,
@@ -1728,7 +1728,7 @@ impl Producer {
                 .root
                 .0,
             );
-            let mut block = Block::new_with_roots(
+            let mut block = Block::new_with_roots_at(
                 height,
                 height,
                 prev.clone(),
@@ -1736,6 +1736,10 @@ impl Producer {
                 self.proposer.clone(),
                 root,
                 executor.receipts_root_for_block(&[]),
+                height,
+                Vec::new(),
+                String::new(),
+                Vec::new(),
             );
             block.header.hash = blockchain::calculate_header_hash(&block.header);
             block.sign_proposer(&self.key, &self.proposer);

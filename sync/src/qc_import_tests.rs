@@ -100,7 +100,7 @@ fn block_at(sync: &ChainSync, height: u64, parent: &str, anchor: &str) -> Block 
         parent.into(),
         vec![],
         proposer.clone(),
-        empty_block_root(sync, height),
+        empty_block_root(sync, height, 23),
         exec.receipts_root_for_block(&[]),
         23,
         // The anchor is the last committed vertex (G0).

@@ -1,6 +1,14 @@
 {
   "version": 1,
   "packages": {
+    "blockchain": {
+      "required": [
+        "bft_time_tests::bft_timestamp_stays_in_the_honest_range_at_n_4",
+        "bft_time_tests::bft_timestamp_below_quorum_does_not_advance",
+        "bft_time_tests::bft_timestamp_is_monotonic_against_parent"
+      ],
+      "excluded_ignored": {}
+    },
     "chain_sync": {
       "required": [
         "tests::tests::block_identity::sync_must_reject_resegmented_round_timestamp_with_reused_signature",
@@ -34,7 +42,8 @@
         "v4::tests::a_resyncing_wiped_validator_is_not_rearmed_in_an_epoch_it_signed_in",
         "ordering::tests::the_descending_walk_is_walk_history_at_every_floor",
         "qc_producer::tests::persistence::a_qc_over_another_state_root_is_never_stored",
-        "tests::tests::v4_node_tests::v4_nodes_rotate_epochs_on_the_qc_of_each_boundary_block"
+        "tests::tests::v4_node_tests::v4_nodes_rotate_epochs_on_the_qc_of_each_boundary_block",
+        "tests::tests::a_block_timestamp_needs_a_quorum_of_the_committee"
       ],
       "excluded_ignored": {
         "ordering::tests::probe_corpus_arm_distribution": "Measurement of scheduler corpus distribution, not a safety assertion.",
@@ -51,9 +60,12 @@
       "required": [
         "tests::block_execution_writes_state_only_inside_the_block_transaction",
         "tests::test_height_executes_exactly_once_and_only_in_order",
-        "tests::g5_deadlines_expire_exactly_at_their_heights",
-        "tests::g5_unclaimed_stake_burns_at_unlock_plus_grace",
-        "tests::test_g5_governance_refuses_every_action_but_signalling"
+        "tests::test_g5_governance_refuses_every_action_but_signalling",
+        "tests::g5_consensus_time_follows_timestamps_capped_per_block",
+        "tests::g5_unbonding_unlocks_exactly_at_its_time",
+        "tests::g5_commission_increase_waits_its_notice_and_is_capped",
+        "tests::g5_matured_unbonding_is_paid_at_the_first_boundary",
+        "tests::g5_boundary_payouts_are_bounded_and_ordered"
       ],
       "excluded_ignored": {
         "tests::test_h6_state_root_is_blind_to_out_of_band_writes": "Superseded by G3 C1′/C2′ (the root is the JMT root of the state map): storage class::tests::the_write_gate_refuses_state_outside_the_block_transaction, state_commit tests::rc2_lists_every_flat_key_the_tree_disagrees_with and tests::forged_or_foreign_chunks_are_refused, chain_sync a_forged_chunk_is_refused_and_the_restore_completes_elsewhere, consensus a_qc_over_another_state_root_is_never_stored, executor block_execution_writes_state_only_inside_the_block_transaction. WG-1 refuses this test's own setup write, so it cannot run as written.",
@@ -65,7 +77,8 @@
         "genesis::tests::genesis_is_v4_and_binds_its_launch_time",
         "genesis::tests::every_chain_parameter_is_stored_and_bound_by_the_identity",
         "genesis::tests::the_chain_parameters_derive_from_the_block_time",
-        "genesis::tests::test_genesis_reopen_rejects_an_epoch_that_disagrees_with_the_interval"
+        "genesis::tests::test_genesis_reopen_rejects_an_epoch_that_disagrees_with_the_interval",
+        "genesis::tests::the_unbonding_mirror_is_the_move_constant"
       ],
       "excluded_ignored": {}
     },
@@ -88,7 +101,7 @@
         "move_unit_tests::the_move_test_runner_reports_wrong_outcomes",
         "move_unit_tests::committed_stdlib_bytecode_matches_its_sources",
         "move_unit_tests::the_chain_parameters_and_clock_have_no_move_writer_but_initialize",
-        "move_unit_tests::no_stdlib_module_has_a_wall_clock"
+        "move_unit_tests::the_stdlib_has_one_clock"
       ],
       "excluded_ignored": {}
     }

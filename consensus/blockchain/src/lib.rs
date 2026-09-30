@@ -136,7 +136,17 @@ pub const MAX_BLOCK_TIME_DRIFT_SECS: u64 = 30;
 ///
 /// `samples` is `(author, stake, timestamp)`; one vote per author (the max
 /// timestamp that author contributed, since a committed sequence can span rounds).
-pub fn bft_block_timestamp(samples: Vec<(String, u64, u64)>, parent_timestamp: u64) -> u64 {
+///
+/// G5 BT-1: the samples must carry a quorum of `committee_stake` (3·S > 2·total,
+/// the certificate rule). Only then is Byzantine stake below half of the sample,
+/// so the median lies between honest values; otherwise time does not advance.
+/// An anchor's round r−1 parents always carry a quorum, so this holds for every
+/// honest commit; the check makes the bound local instead of structural.
+pub fn bft_block_timestamp(
+    samples: Vec<(String, u64, u64)>,
+    parent_timestamp: u64,
+    committee_stake: u128,
+) -> u64 {
     use std::collections::BTreeMap;
 
     // One vote per author, keeping that author's latest timestamp.
@@ -162,6 +172,9 @@ pub fn bft_block_timestamp(samples: Vec<(String, u64, u64)>, parent_timestamp: u
     weighted.sort();
 
     let total_stake: u128 = weighted.iter().map(|(_, s, _)| *s as u128).sum();
+    if total_stake * 3 <= committee_stake * 2 {
+        return parent_timestamp;
+    }
     let mut cumulative: u128 = 0;
     let mut median = parent_timestamp;
     for (ts, stake, _) in &weighted {
@@ -992,8 +1005,8 @@ mod bft_time_tests {
         let mut node_b = node_a.clone();
         node_b.reverse();
 
-        let ts_a = bft_block_timestamp(node_a, 0);
-        let ts_b = bft_block_timestamp(node_b, 0);
+        let ts_a = bft_block_timestamp(node_a, 0, 300);
+        let ts_b = bft_block_timestamp(node_b, 0, 300);
         assert_eq!(ts_a, ts_b, "timestamp must not depend on sample order");
         assert!(
             (1_005..=1_020).contains(&ts_a),
@@ -1010,8 +1023,46 @@ mod bft_time_tests {
             ("honest2".to_string(), 100, 1_000),
             ("liar".to_string(), 100, 9_999_999),
         ];
-        let ts = bft_block_timestamp(samples, 0);
+        let ts = bft_block_timestamp(samples, 0, 300);
         assert_eq!(ts, 1_000, "one out-of-range vote must not move the median");
+    }
+
+    /// G5 BT-1: at n = 4 with one Byzantine member (f = 1), a vote 30 s ahead
+    /// (the ingress limit) or at 0 cannot move the median out of the honest
+    /// range, whichever quorum is sampled.
+    #[test]
+    fn bft_timestamp_stays_in_the_honest_range_at_n_4() {
+        let honest = [("h1", 1_000u64), ("h2", 1_003), ("h3", 1_006)];
+        for liar_ts in [1_036u64, 0] {
+            for skip in 0..3 {
+                let mut samples: Vec<(String, u64, u64)> = honest
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != skip)
+                    .map(|(_, (a, t))| (a.to_string(), 100, *t))
+                    .collect();
+                samples.push(("liar".to_string(), 100, liar_ts));
+                let ts = bft_block_timestamp(samples, 0, 400);
+                assert!((1_000..=1_006).contains(&ts), "liar at {liar_ts} moved T to {ts}");
+            }
+        }
+    }
+
+    /// G5 BT-1: a sample without a quorum of the committee's stake does not
+    /// advance time, since its median could be a Byzantine value.
+    #[test]
+    fn bft_timestamp_below_quorum_does_not_advance() {
+        let two_of_four = vec![
+            ("a".to_string(), 100u64, 5_000u64),
+            ("b".to_string(), 100, 5_000),
+        ];
+        assert_eq!(bft_block_timestamp(two_of_four.clone(), 777, 400), 777);
+        // Exactly 2/3 of the stake is not a quorum (the certificate rule).
+        assert_eq!(bft_block_timestamp(two_of_four.clone(), 777, 300), 777);
+        // 3 of 4 is a quorum (900 > 800).
+        let mut three = two_of_four;
+        three.push(("c".to_string(), 100, 5_000));
+        assert_eq!(bft_block_timestamp(three, 777, 400), 5_000);
     }
 
     /// Time never goes backwards, even if the committed vertices are older than
@@ -1019,16 +1070,16 @@ mod bft_time_tests {
     #[test]
     fn bft_timestamp_is_monotonic_against_parent() {
         let samples = vec![("val1".to_string(), 100u64, 500u64)];
-        let ts = bft_block_timestamp(samples, 1_000);
+        let ts = bft_block_timestamp(samples, 1_000, 100);
         assert_eq!(ts, 1_000, "must clamp to the parent timestamp");
     }
 
     /// No committed samples (or only zero-stake authors) falls back to the parent.
     #[test]
     fn bft_timestamp_without_samples_uses_parent() {
-        assert_eq!(bft_block_timestamp(vec![], 777), 777);
+        assert_eq!(bft_block_timestamp(vec![], 777, 0), 777);
         assert_eq!(
-            bft_block_timestamp(vec![("nobody".to_string(), 0, 5_000)], 777),
+            bft_block_timestamp(vec![("nobody".to_string(), 0, 5_000)], 777, 0),
             777,
             "zero-stake authors carry no weight"
         );
@@ -1059,8 +1110,8 @@ mod bft_time_tests {
             ("val3".to_string(), 100, 1_020),
         ];
         // Two nodes derive the timestamp independently from the same samples.
-        let ts_node_a = bft_block_timestamp(samples.clone(), 0);
-        let ts_node_b = bft_block_timestamp(samples, 0);
+        let ts_node_a = bft_block_timestamp(samples.clone(), 0, 300);
+        let ts_node_b = bft_block_timestamp(samples, 0, 300);
         assert_eq!(
             mk(ts_node_a).header.hash,
             mk(ts_node_b).header.hash,

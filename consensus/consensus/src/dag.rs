@@ -233,6 +233,24 @@ impl crate::v4::ConsensusNet for V4Net {
     }
 }
 
+/// G5 BT-1: the block timestamp from the committed vertices' `(author,
+/// timestamp)` samples, weighted by `committee` (non-members carry no weight),
+/// with the quorum measured against the whole committee's stake.
+pub(crate) fn committee_block_timestamp(
+    samples: &[(String, u64)],
+    committee: &[(String, u64)],
+    parent_ts: u64,
+) -> u64 {
+    let stakes: std::collections::HashMap<&str, u64> =
+        committee.iter().map(|(a, s)| (a.as_str(), *s)).collect();
+    let weighted = samples
+        .iter()
+        .filter_map(|(a, ts)| stakes.get(a.as_str()).map(|s| (a.clone(), *s, *ts)))
+        .collect();
+    let committee_stake = committee.iter().map(|(_, s)| *s as u128).sum();
+    blockchain::bft_block_timestamp(weighted, parent_ts, committee_stake)
+}
+
 impl DagConsensus {
     #[allow(clippy::too_many_arguments)] // intrinsic to DagConsensus dependencies
     pub fn new(
@@ -2124,17 +2142,8 @@ impl DagConsensus {
             // Join raw samples with a freshly sampled stake map: both the
             // membership filter and the weights must come from the set as of the
             // tip we are building on.
-            let weigh = |raw: &Vec<(String, u64)>,
-                         stakes: &std::collections::HashMap<String, u64>|
-             -> Vec<(String, u64, u64)> {
-                raw.iter()
-                    .filter_map(|(a, ts)| stakes.get(a).map(|s| (a.clone(), *s, *ts)))
-                    .collect()
-            };
-            let stakes_now: std::collections::HashMap<String, u64> =
-                self.decision_committee().into_iter().collect();
             let block_timestamp =
-                blockchain::bft_block_timestamp(weigh(&ts_raw, &stakes_now), parent_ts);
+                committee_block_timestamp(&ts_raw, &self.decision_committee(), parent_ts);
 
             // Execute without holding DAG/round-index locks.
             // We execute even if empty to trigger Block Rewards (Heartbeat Mining)
@@ -2213,6 +2222,8 @@ impl DagConsensus {
                             &reward_recipient,
                             // The block being BUILT: one above the current tip.
                             self.latest_block_height + 1,
+                            // G5 CL-2: its BFT timestamp drives consensus time.
+                            block_timestamp,
                             &slash_evidence,
                             // Nothing to admit for a block this node built. Tests
                             // may stage state here, BEFORE execution: after the

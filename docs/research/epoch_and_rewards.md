@@ -7,6 +7,45 @@
 - **Measured numbers used:** 6.65 s per block, a 3 s consensus tick, one block per committed anchor. That gives 12,992 blocks per day and 4,745,504 per year.
 - **Reproducible math:** `scratchpad/research/epoch_math.py`. Every number in section (b) comes from it.
 
+> **Superseded in part, and corrected (2026-09-30).**
+> - **Clock: superseded by G5 amendment A1** (`docs/research/clock_and_deadlines.md`). This
+>   report counts deadlines and emission in blocks. That holds in real time only while the
+>   block time stays at the value measured at genesis, and nothing enforces it. A1 counts
+>   them in capped consensus time τ instead. I and R stay in blocks.
+> - **Wrong here: "AINCORE has no BFT time" (b.5, (d) 6).** At HEAD the block timestamp is
+>   already the stake-weighted median of signed vertex timestamps
+>   (`consensus/blockchain/src/lib.rs` `bft_block_timestamp`), with a 30 s future-drift gate.
+> - A source check of every citation (89 claims) confirmed 74. The rest are corrected below
+>   and inline:
+>   1. *Wrong:* the survey by Deirmentzoglou et al. does not list Winkle. Its
+>      countermeasures are the longest-chain rule, moving checkpoints, key-evolving
+>      cryptography, context-aware transactions, the plenitude rule, economic finality and
+>      trusted hardware. Winkle is later work (Azouvi, Danezis and Nikolaenko, AFT 2020).
+>   2. *Wrong:* "none counts emission in a period that governance can stretch". Cosmos
+>      x/mint counts by `BlocksPerYear`, a governance parameter. The Hub mints about 1.27×
+>      its target today, because its blocks are faster than that parameter assumes.
+>   3. *Outdated:* the Cosmos Hub evidence age. Launch genesis had 3 weeks. Today it is 48 h
+>      AND 1,000,000 blocks, both required, about 66 days, while unbonding stays 21 days.
+>   4. *Outdated:* the Ethereum weak-subjectivity table. Electra (live since 2025-05-07)
+>      gives 665–3,532 epochs; mainnet is about 3,532 epochs, about 15.7 days.
+>   5. *Outdated:* Polkadot. Validators still unbond for 28 eras, with slashing deferred 27.
+>      Referendum 1910 (2026) made nominators unslashable with about 2 eras of unbonding. The
+>      RFC-0097 queue is not what shipped.
+>   6. *Outdated:* Solana. SIMD-0204 was merged in 2025 (it verifies and logs infractions
+>      only); SIMD-0212 (slashing) was closed unmerged in 2026-01. There is no active slashing.
+>   7. *Caveats:*
+>      - Cosmos SDK #6478 was closed by PR #6844 for the validator queue. Its height term is
+>        the unbonding start height, so delegations still complete by time only.
+>      - Buterin 2014 calls the rule "max revert N blocks", not "revert limit".
+>      - The Sui Lutris results quoted are in §7.4 and the §4 preamble, not §4.2.
+>      - Aptos's 16.8 s DKG is the paper's fast path.
+>      - The Sui staking URL now redirects to the tokenomics page.
+>      - Casper's δ is the delay between clients, and W = U is this report's application of
+>        it, not Casper's rule.
+>   8. *Unsourced:* "Diem epoch-change proofs", Solana's cool-down length, "100+
+>      validators" and "none rotates every 2 minutes" have no source here and carry no
+>      decision.
+
 **In plain words, for the founder.**
 1. Make the validator-set period (the "committee epoch") **1,000 blocks**, about 1.85 hours today. Fix it at genesis and never change it.
 2. Keep paying block rewards on a short schedule, **every 20 blocks** (about 2.2 minutes, as today), but make that schedule independent of the committee epoch.
@@ -123,7 +162,7 @@ If the lower bound ever exceeds the upper bound, fix the boundary cost rather th
 - The same block count lasts 11.3 d at 3.59 s blocks, 7.0 d at 2.2 s and 4.1 d at 1.3 s. So U must be re-derived from the block time measured at genesis, like I and the emission rate.
 - Casper's condition ω > 4δ then tolerates an evidence propagation and inclusion delay δ of up to U/4 ≈ 5.25 d while the chain runs.
 - **Counting in blocks has a real advantage here: a halted chain does not age evidence or unbonding.** The 10-day halt in this project's history would have consumed half of a 21-day wall-clock window. Cosmos SDK issue #6478 is exactly this bug: time-only unbonding against height-and-time evidence expiry.
-- Cosmos can require *both* time and height. AINCORE has no BFT time: block timestamps are raw proposer `SystemTime` (`AINCORE_EMISSION_CALIBRATION.md` §5). So blocks are the only safe clock for now.
+- Cosmos can require *both* time and height. ~~AINCORE has no BFT time~~ (corrected 2026-09-30: it has one, the stake-weighted median of vertex timestamps). A1 uses it through a capped clock τ.
 
 **Evidence retention.**
 - W = 273,000 blocks ≈ 605,150 rounds.
@@ -241,7 +280,7 @@ The decoupling therefore must land together with the I change, in the same fresh
    - Casper: ω > 4δ;
    - Ethereum: slashable until withdrawable.
    - AINCORE currently violates this in two places: F3 (unbonding stake is unslashable) and F4 (evidence is GC'd after about 3.5 d).
-4. **Emission is counted in the chain's own clock:** Bitcoin by height, Cosmos by block via `BlocksPerYear`, Ethereum by epoch with fixed 12-s slots. None counts in a period that governance or tuning can stretch.
+4. **Emission is counted in the chain's own clock:** Bitcoin by height, Cosmos by block via `BlocksPerYear`, Ethereum by epoch with fixed 12-s slots. Cosmos's `BlocksPerYear` is itself governable and drifts with block time (the Hub mints about 1.27× its target); see A1.
 
 ### Research basis
 
@@ -254,7 +293,7 @@ The decoupling therefore must land together with the I change, in the same fresh
   - §4.1: clients must "log on" regularly, and ω > 4δ guarantees that slashing lands in every chain a client accepts.
 - **Deirmentzoglou, Papakyriakopoulos and Patsakis (IEEE Access 7, 2019, DOI 10.1109/ACCESS.2019.2901858).**
   - Taxonomy: simple attacks, posterior corruption, and stake bleeding (Gaži, Kiayias and Russell, ePrint 2018/248).
-  - Countermeasures: moving checkpoints, key-evolving signatures, and Winkle.
+  - Countermeasures include moving checkpoints and key-evolving cryptography (Winkle, often cited alongside, is later work: Azouvi, Danezis and Nikolaenko, AFT 2020).
   - AINCORE's TA-0/TA-4 checkpoints are the "moving checkpoint" class. The unbonding lock is what bounds posterior corruption.
 - **Ethereum weak-subjectivity spec.** The safe checkpoint age is the withdrawability delay plus a term that shrinks as churn grows (`SAFETY_DECAY` = 10%).
   - AINCORE has **no churn limit**: the whole committee can change in one epoch. For a permissioned launch this is controlled by the operator. It must be revisited before permissionless operation (d, R10).
@@ -304,7 +343,7 @@ The price of freezing is G1 Open question 8: misbehaviour is removed from consen
 3. **Committee size.** At n=7 (f=2) one abstainer leaves slack, so longer epochs of 2,000–3,240 would be tolerable. I is immutable, though, and 1,000 costs only 0.15–0.3% at n=7. Keep 1,000 unless n ≥ 10 is certain at genesis.
 4. **Faster removal of a proven equivocator.** Removal at H+2, as in Cosmos, would need an evidence-triggered early epoch end. That breaks E(h) = ⌊(h−1)/I⌋ and is a G1 amendment. It is not recommended. At I = 1,000 the exposure is ≤1.85 h and cannot break safety.
 5. **Boundary code is the riskiest path.** FX-14 was a live halt at a boundary, and the abort-return at `executor lib.rs:1242-1248` is still present at this HEAD. I = 1,000 exercises it 13 times a day, which is good for finding bugs and bad if one ships. G1 S9 witnesses (a) to (k) and the unconditional rotation are prerequisites.
-6. **No BFT time.** If a median-timestamp source lands, adopt Cosmos-style "both height and time" expiry for U and W, per SDK issue #6478.
+6. **BFT time.** The median-timestamp source exists at HEAD. Adopted by G5 amendment A1 as the capped clock τ.
 7. **Delegation stream (DELEGATION_BPS > 0).** Per-block Δh accounting must feed the pool index (F1-style lazy accounting) before delegation is switched on.
 8. **Governance could re-couple the clocks.** `governance.move:183-186` lets a proposal change `epoch_duration`. Remove it; neither I nor R should be governable.
 9. **The emission rate itself.** This report fixes the *unit*. The *rate* is the founder's choice between 1.90%/yr (today's constants at 6.65 s) and 3.5%/yr (the calibration target). Either way it is set in blocks.

@@ -1,11 +1,14 @@
-/// G5 CL-1 and P-1: the one protocol clock (the block height) and the
-/// genesis-pinned parameters every deadline is counted in.
+/// G5 CL-1, CL-2 and P-1 (amendment A1): the chain's consensus time and the
+/// genesis-pinned parameters. Derivations: docs/research/clock_and_deadlines.md.
 ///
-/// The executor writes `Clock` before any transaction of a block (CL-2), so a
-/// transaction reads the height of the block that executes it; nothing in Move
-/// writes it (the executor's in-order height gate is what keeps it monotonic).
-/// `Params` is written by genesis and never changed: no function here, and no
-/// governance action, can alter it.
+/// `Clock.time` is tau, consensus time in seconds. Each block adds the growth
+/// of its BFT timestamp, capped at `Params.max_block_interval_secs`, so tau
+/// follows real time at any block speed, and a halt ages it by at most the
+/// cap. The executor writes `Clock` before any transaction of a block, so a
+/// transaction reads the time of the block that executes it; nothing in Move
+/// writes it. Every economic deadline counts tau. Heights stay the unit of the
+/// committee epoch and the reward period. `Params` is written by genesis and
+/// never changed: no function here, and no governance action, can alter it.
 module 0x1::chain {
     use std::error;
     use std::signer;
@@ -14,20 +17,27 @@ module 0x1::chain {
     const EALREADY_INITIALIZED: u64 = 2;
     const EINVALID_PARAMS: u64 = 3;
 
-    /// The height of the block being executed.
+    /// U: 21 days. U >= T_trust + T_mis with T_trust = 14 d (the longest halt
+    /// so far was 10 days; weekly checkpoints; bridge trust is 2/3 U) and
+    /// T_mis = 7 d to land evidence.
+    const UNBONDING_SECS: u64 = 1814400;
+    /// N: 7 days of notice before a commission increase applies.
+    const COMMISSION_NOTICE_SECS: u64 = 604800;
+
+    /// The block being executed: its height, tau and its BFT timestamp.
     struct Clock has key {
         height: u64,
+        time: u64,
+        block_timestamp: u64,
     }
 
-    /// Genesis-pinned, in blocks (G5 P-1). `draw_num` is the emission draw
-    /// per block on the remaining reserve, in units of 10^-12.
+    /// Genesis-pinned (G5 P-1): I and R in blocks, and C_tau, the most one
+    /// block may advance tau, in seconds (2 x the block time measured at
+    /// genesis).
     struct Params has key {
         epoch_blocks: u64,
         reward_period: u64,
-        unbonding_blocks: u64,
-        claim_grace_blocks: u64,
-        commission_delay_blocks: u64,
-        draw_num: u128,
+        max_block_interval_secs: u64,
     }
 
     /// Genesis only (tests call it too): the system signer, once.
@@ -35,52 +45,40 @@ module 0x1::chain {
         sys: &signer,
         epoch_blocks: u64,
         reward_period: u64,
-        unbonding_blocks: u64,
-        claim_grace_blocks: u64,
-        commission_delay_blocks: u64,
-        draw_num: u128,
+        max_block_interval_secs: u64,
     ) {
         assert!(signer::address_of(sys) == @0x1, error::permission_denied(EUNAUTHORIZED));
         assert!(!exists<Params>(@0x1), error::already_exists(EALREADY_INITIALIZED));
         assert!(
-            valid(epoch_blocks, reward_period, unbonding_blocks, claim_grace_blocks,
-                commission_delay_blocks, draw_num),
+            valid(epoch_blocks, reward_period, max_block_interval_secs),
             error::invalid_argument(EINVALID_PARAMS)
         );
-        move_to(sys, Params {
-            epoch_blocks,
-            reward_period,
-            unbonding_blocks,
-            claim_grace_blocks,
-            commission_delay_blocks,
-            draw_num,
-        });
-        move_to(sys, Clock { height: 0 });
+        move_to(sys, Params { epoch_blocks, reward_period, max_block_interval_secs });
+        move_to(sys, Clock { height: 0, time: 0, block_timestamp: 0 });
     }
 
-    /// P-1's constraints: every period positive, the reward period divides the
-    /// epoch, unbonding is whole epochs, and the draw below 10^-8 per block.
+    /// P-1's constraints: every value positive, the reward period divides the
+    /// epoch, and one epoch at the cap (the extra wait SL-2 adds) is at most U,
+    /// which also keeps `unbonding_unlock_time` from overflowing.
     public fun valid(
         epoch_blocks: u64,
         reward_period: u64,
-        unbonding_blocks: u64,
-        claim_grace_blocks: u64,
-        commission_delay_blocks: u64,
-        draw_num: u128,
+        max_block_interval_secs: u64,
     ): bool {
         epoch_blocks > 0
             && reward_period > 0
             && epoch_blocks % reward_period == 0
-            && unbonding_blocks > 0
-            && unbonding_blocks % epoch_blocks == 0
-            && claim_grace_blocks > 0
-            && commission_delay_blocks > 0
-            && draw_num > 0
-            && draw_num < 10000
+            && max_block_interval_secs > 0
+            && epoch_blocks <= UNBONDING_SECS / max_block_interval_secs
     }
 
     public fun height(): u64 acquires Clock {
         borrow_global<Clock>(@0x1).height
+    }
+
+    /// tau: consensus time in seconds.
+    public fun time(): u64 acquires Clock {
+        borrow_global<Clock>(@0x1).time
     }
 
     public fun epoch_blocks(): u64 acquires Params {
@@ -91,36 +89,24 @@ module 0x1::chain {
         borrow_global<Params>(@0x1).reward_period
     }
 
-    public fun unbonding_blocks(): u64 acquires Params {
-        borrow_global<Params>(@0x1).unbonding_blocks
+    public fun max_block_interval_secs(): u64 acquires Params {
+        borrow_global<Params>(@0x1).max_block_interval_secs
     }
 
-    public fun claim_grace_blocks(): u64 acquires Params {
-        borrow_global<Params>(@0x1).claim_grace_blocks
+    public fun unbonding_secs(): u64 {
+        UNBONDING_SECS
     }
 
-    public fun commission_delay_blocks(): u64 acquires Params {
-        borrow_global<Params>(@0x1).commission_delay_blocks
+    public fun commission_notice_secs(): u64 {
+        COMMISSION_NOTICE_SECS
     }
 
-    public fun draw_num(): u128 acquires Params {
-        borrow_global<Params>(@0x1).draw_num
-    }
-
-    /// H_{E(h)}: the last block of the committee epoch containing h (G1 EP-1:
-    /// E(h) = (h - 1) / I, and H_E = (E + 1) * I). Height 0 belongs to epoch 0.
-    public fun epoch_end(h: u64): u64 acquires Params {
-        let i = epoch_blocks();
-        if (h == 0) {
-            return i
-        };
-        ((h - 1) / i + 1) * i
-    }
-
-    /// G5 SL-2: when stake that stops weighting the committee at height h
-    /// unlocks: U blocks after the end of h's committee epoch, since the
-    /// stake still weighted the committee until then.
-    public fun unlock_height(h: u64): u64 acquires Params {
-        epoch_end(h) + unbonding_blocks()
+    /// G5 SL-2: when stake that stops weighting the committee in this block
+    /// unlocks. Its key can sign until the end of the current committee epoch,
+    /// whose tau is at most now + I x C_tau, and it must stay locked for U
+    /// after that. Non-decreasing over blocks, so queues stay sorted.
+    public fun unbonding_unlock_time(): u64 acquires Clock, Params {
+        let p = borrow_global<Params>(@0x1);
+        time() + p.epoch_blocks * p.max_block_interval_secs + UNBONDING_SECS
     }
 }
