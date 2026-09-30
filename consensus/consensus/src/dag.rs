@@ -3329,6 +3329,12 @@ impl DagConsensus {
             if let Ok(vertex) = serde_json::from_str::<Vertex>(content) {
                 self.add_vertex(vertex);
             }
+        } else if self.v4_chain
+            && (msg.starts_with("DOWNTIME_ATTEST:") || msg.starts_with("EQUIV_PROOF:"))
+        {
+            // G1 S11b: V3 evidence has no place on a V4 chain (its vertices are
+            // V3-hashed, so no honest V4 signature can appear in one, and the
+            // V4 evidence path is EQ-1). Dropped unparsed.
         } else if let Some(content) = msg.strip_prefix("DOWNTIME_ATTEST:") {
             // Phase 3 / H-02: Remote downtime attestation received from a peer.
             // Validate → store so executor can count towards BFT quorum.

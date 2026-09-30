@@ -1091,7 +1091,15 @@ Deferred:
   - The H6 pair is replaced by G3's C1′/C2′ witnesses.
   - Required additions include the crash regression, the IM-3 alarm, the walk equivalence,
     the RC-3 resume, epoch rotation and the QC state root.
-- **Next, S11b:** delete V3 ingress, producer and recovery, and port the tier-2 helpers.
+- **S11b, part 1:** on a V4 chain every V3 entry point is closed.
+  - A V3 vertex is refused (`add_vertex`).
+  - The V3 producer and recovery do not run.
+  - The V3 evidence messages `DOWNTIME_ATTEST:` and `EQUIV_PROOF:` are now dropped unparsed.
+    Before this, a valid V3 equivocation proof made a V4 node record slash evidence (witness
+    `a_v4_node_takes_no_v3_evidence`, checked against the ungated code).
+- **S11b, part 2** (deleting the V3 code and porting the tier-2 helpers) goes together with
+  G5's EQ-1, the V4 equivocation evidence that replaces the V3 evidence path. It must land
+  before the genesis cut.
 - **The genesis.json change** (`genesis_time`, and later I) is shown to the founder before it
   is made.
 

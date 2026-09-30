@@ -1259,3 +1259,40 @@ fn the_guard_origin_flag_is_honored_only_in_the_launch_window() {
     drop(db);
     let _ = std::fs::remove_dir_all(&path);
 }
+
+/// S11b: a V4 node takes no V3 evidence. A valid V3 equivocation proof by a
+/// committee member (two V3-hashed vertices of one round, both signed by its
+/// key) and a downtime attestation change nothing: no evidence row, no gossip
+/// mark, no attestation row.
+#[test]
+fn a_v4_node_takes_no_v3_evidence() {
+    let mut c = Cluster::new("v3-evidence", &[45, 46, 47, 48], true);
+    c.run(4);
+    let (addr, _, key) = tier2_keypair(46);
+    let mk = |payload: &str| {
+        let mut v = blockchain::Vertex::new(5, addr.clone(), vec!["genesis".into()], vec![payload.into()]);
+        v.sign_with_ed25519(&crypto::SigningKey::from_bytes(&key));
+        v
+    };
+    let (a, b) = (mk("a"), mk("b"));
+    assert_ne!(a.hash, b.hash);
+    let proof = serde_json::json!({ "vertex_a": a, "vertex_b": b }).to_string();
+    let rows = |c: &Cluster| -> usize {
+        ["sys:equiv_seen:", "sys:equiv_gossiped:", "sys:downtime", "sys:pending_slash:"]
+            .iter()
+            .map(|p| {
+                c.node(0)
+                    .storage
+                    .db
+                    .prefix_iterator(p.as_bytes())
+                    .take_while(|r| r.as_ref().is_ok_and(|(k, _)| k.starts_with(p.as_bytes())))
+                    .count()
+            })
+            .sum()
+    };
+    let before = rows(&c);
+    c.node_mut(0).handle_message(&format!("EQUIV_PROOF:{proof}"));
+    let attest = serde_json::json!({ "offender": addr, "reporter": addr, "round": 5 }).to_string();
+    c.node_mut(0).handle_message(&format!("DOWNTIME_ATTEST:{attest}"));
+    assert_eq!(rows(&c), before, "a V4 node recorded V3 evidence");
+}
