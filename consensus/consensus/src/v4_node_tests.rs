@@ -1232,3 +1232,30 @@ fn kill_m55_blocks_of_the_next_epoch_are_led_by_its_committee() {
     }
     assert!(differs > 0, "vacuous: C_0 and C_1 elect the same leaders here");
 }
+
+/// RC-3 (S11): the guard-origin flag is honored only from ten minutes before
+/// `sys:genesis_time` to an hour after it, and never without a genesis time.
+#[test]
+fn the_guard_origin_flag_is_honored_only_in_the_launch_window() {
+    let path = std::env::temp_dir()
+        .join(format!("aincore_launch_window_{}", std::process::id()))
+        .to_string_lossy()
+        .to_string();
+    let _ = std::fs::remove_dir_all(&path);
+    let db = StateDB::open(&path).unwrap();
+    assert!(!DagConsensus::within_launch_window(&db, 1_000_000));
+    {
+        let _seed = db.seeding();
+        db.put("sys:genesis_time", "1000000").unwrap();
+    }
+    let t = 1_000_000u64;
+    let w = crate::dag::LAUNCH_WINDOW_SECS;
+    let skew = crate::dag::LAUNCH_WINDOW_SKEW_SECS;
+    assert!(DagConsensus::within_launch_window(&db, t));
+    assert!(DagConsensus::within_launch_window(&db, t + w));
+    assert!(!DagConsensus::within_launch_window(&db, t + w + 1));
+    assert!(DagConsensus::within_launch_window(&db, t - skew));
+    assert!(!DagConsensus::within_launch_window(&db, t - skew - 1));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&path);
+}

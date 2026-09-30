@@ -80,6 +80,11 @@ pub struct GenMultiArgs {
     /// Overwrite the output file if it already exists.
     #[arg(long, default_value_t = false)]
     pub force: bool,
+
+    /// Launch time, unix seconds (G1 S11): validators take their first guard
+    /// origin only within an hour of it. Default: now.
+    #[arg(long)]
+    pub genesis_time: Option<u64>,
 }
 
 /// 10^18 quanta per whole AIN. Mirrors `node::genesis` COIN_SCALE.
@@ -111,6 +116,9 @@ pub struct GenesisFile {
     /// `node::genesis::stdlib_hash_of`. A node whose stdlib differs refuses
     /// the genesis.
     pub stdlib_hash: String,
+    /// G1 S11: the launch time, unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genesis_time: Option<u64>,
 }
 
 /// Derive every genesis field for one validator from its 32-byte node.key seed.
@@ -234,6 +242,7 @@ pub fn build_genesis_file(
         treasury_reserve: treasury_reserve.to_string(),
         epoch_duration,
         stdlib_hash: stdlib_hash.to_string(),
+        genesis_time: None,
     })
 }
 
@@ -261,13 +270,20 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let stdlib_hash = node::genesis::stdlib_hash_of(&args.stdlib_path)
         .map_err(|e| format!("cannot hash the stdlib at {}: {e}", args.stdlib_path))?;
-    let genesis = build_genesis_file(
+    let mut genesis = build_genesis_file(
         &specs,
         &args.chain_id,
         args.treasury_reserve_ain,
         args.epoch_duration,
         &stdlib_hash,
     )?;
+    genesis.genesis_time = Some(args.genesis_time.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }));
+    println!("🕒 Genesis time: {:?} (the guard-origin launch window starts here)", genesis.genesis_time);
 
     if args.out.exists() && !args.force {
         return Err(format!(

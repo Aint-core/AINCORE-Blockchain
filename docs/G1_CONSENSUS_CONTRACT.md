@@ -1065,6 +1065,36 @@ Deferred:
 - **A stored QC that conflicts with this node's own pending vote** (retry path) only errors.
   Storing one is already refused on V4.
 
+**S11 status, part a: activation mechanics.**
+- **Merged:** G3's side branches (the DeviceRegistry bound FX-17, and unique test temp-dir
+  names). G1 already contained all of `g3/activation`, so no other merge was needed.
+- **Genesis is V4.**
+  - `build_genesis` writes `genesis:vertex_format = 4`. It is a state key, so root 0, and with
+    it the genesis identity, binds the format.
+  - `GENESIS_VERSION` is `g1-certified-dag-v6`, so an older binary refuses the genesis.
+  - A node booting from a real genesis runs the V4 engine (witness
+    `genesis_is_v4_and_binds_its_launch_time`).
+- **RC-3 launch window** (closes the deferred init-flag finding).
+  - genesis.json takes `genesis_time` (unix seconds), stored as state key `sys:genesis_time`.
+  - `AINCORE_GUARD_ORIGIN_INIT=1` is honored only from 10 minutes before that time to one hour
+    after it. Without a genesis time it is never honored.
+  - A validator wiped later resumes by the RC-3 resume point instead.
+  - genesis-tool `gen-multi` writes the launch time (`--genesis-time`, default now).
+- **Epoch length:** the research's I = 1000 blocks is NOT set here. Today rewards are paid per
+  epoch (every 20 blocks), so I moves together with G5's reward decoupling.
+- **G3-F2** (a Move `advance_epoch` abort halting the chain) does not apply on V4: epoch
+  numbering and committees come from the epoch records, not the executor's rows.
+- **Release gate:** `scripts/release_security_gate.py` PASSES.
+  - The manifest now covers storage and state_commit too.
+  - The V3 witnesses (B2 substituted anchor, H1 dropped twin, equivocated parent) are
+    excluded, each with its V4 re-expression named: G0's anchor rule, A2c/A3c, the twin flood.
+  - The H6 pair is replaced by G3's C1′/C2′ witnesses.
+  - Required additions include the crash regression, the IM-3 alarm, the walk equivalence,
+    the RC-3 resume, epoch rotation and the QC state root.
+- **Next, S11b:** delete V3 ingress, producer and recovery, and port the tier-2 helpers.
+- **The genesis.json change** (`genesis_time`, and later I) is shown to the founder before it
+  is made.
+
 ### Imported decisions and finality votes (IM)
 
 **IM-1 (QC authority).**

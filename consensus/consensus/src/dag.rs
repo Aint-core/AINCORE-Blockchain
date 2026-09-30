@@ -28,6 +28,10 @@ pub const SLASH_EVIDENCE_PREFIX: &str = "SLASH_EVIDENCE:";
 pub const QC_WANT_PREFIX: &str = "QC_WANT:";
 pub const QC_CERT_PREFIX: &str = "QC_CERT:";
 const QC_WANT_EVERY_TICKS: u64 = 4;
+/// RC-3: how long after `sys:genesis_time` a validator may take its first
+/// guard origin, and the clock skew allowed before it.
+pub const LAUNCH_WINDOW_SECS: u64 = 3600;
+pub const LAUNCH_WINDOW_SKEW_SECS: u64 = 600;
 const QC_ANSWERS_PER_TICK: u32 = 4;
 const QC_ANSWERED_CAP: usize = 256;
 /// Upper bound on evidence items carried per vertex and applied per block
@@ -696,6 +700,21 @@ impl DagConsensus {
         })
     }
 
+    /// The genesis launch window: from `LAUNCH_WINDOW_SKEW_SECS` before
+    /// `sys:genesis_time` to `LAUNCH_WINDOW_SECS` after it. No genesis time,
+    /// no window.
+    pub(crate) fn within_launch_window(storage: &StateDB, now: u64) -> bool {
+        storage
+            .get("sys:genesis_time")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|t| {
+                now.saturating_add(LAUNCH_WINDOW_SKEW_SECS) >= t
+                    && now <= t.saturating_add(LAUNCH_WINDOW_SECS)
+            })
+    }
+
     /// The V4 engine's active epoch (None on a V3 chain).
     pub fn v4_epoch(&self) -> Option<u64> {
         self.v4.as_ref().map(|e| e.epoch())
@@ -933,7 +952,17 @@ impl DagConsensus {
             ordering: Arc::clone(&self.ordering_engine),
         };
         // RC-3: the guard origin is written only on an explicit first start.
-        let genesis_init = std::env::var("AINCORE_GUARD_ORIGIN_INIT").ok().as_deref() == Some("1");
+        // Only within the launch window after `sys:genesis_time`: the flag
+        // left set on a database wiped later must not re-arm signing (final
+        // review MEDIUM); that node resumes by RC-3's resume point instead.
+        let flag = std::env::var("AINCORE_GUARD_ORIGIN_INIT").ok().as_deref() == Some("1");
+        let genesis_init = flag && Self::within_launch_window(&self.storage, (self.now_secs)());
+        if flag && !genesis_init {
+            eprintln!(
+                "⚠️ [RC-3] AINCORE_GUARD_ORIGIN_INIT is set outside the launch window \
+                 (sys:genesis_time + {LAUNCH_WINDOW_SECS} s): ignored; remove it"
+            );
+        }
         let engine = crate::v4::Engine::open_shared(
             Arc::clone(&self.storage),
             cfg,

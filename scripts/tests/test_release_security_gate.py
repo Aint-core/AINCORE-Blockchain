@@ -18,6 +18,9 @@ def result(command, stdout, returncode=0, timeout=False):
 
 
 class GateTests(unittest.TestCase):
+    def required_count(self):
+        return sum(len(p["required"]) for p in self.manifest["packages"].values())
+
     def setUp(self):
         self.manifest = json.loads(gate.MANIFEST.read_text())
         self.calls = []
@@ -39,7 +42,7 @@ class GateTests(unittest.TestCase):
     def test_exact_witnesses_and_offline_locked(self):
         report = gate.evaluate(self.manifest, self.fake, offline=True)
         self.assertTrue(report["passed"])
-        self.assertEqual(len(report["witnesses"]), 14)
+        self.assertEqual(len(report["witnesses"]), self.required_count())
         for command in self.calls:
             self.assertIn("--locked", command)
             self.assertIn("--offline", command)
@@ -80,8 +83,8 @@ class GateTests(unittest.TestCase):
             return record
         report = gate.evaluate(self.manifest, fail_tests)
         self.assertFalse(report["passed"])
-        self.assertEqual(len(report["witnesses"]), 14)
-        self.assertEqual(len(report["errors"]), 14)
+        self.assertEqual(len(report["witnesses"]), self.required_count())
+        self.assertEqual(len(report["errors"]), self.required_count())
 
     def test_bad_inventory_or_failed_build_never_passes(self):
         for stdout, code in (("", 0), ("2 tests, 0 benchmarks\n", 0),

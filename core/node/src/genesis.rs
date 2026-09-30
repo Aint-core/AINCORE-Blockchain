@@ -17,7 +17,13 @@ use storage::StateDB;
 
 /// v5 (G3 S3): genesis is built in memory from genesis.json alone, committed
 /// as state-tree version 0, and its identity binds `state_root(0)`.
-const GENESIS_VERSION: &str = "g3-deterministic-v5";
+/// G1 S11: a genesis of this version is a V4 (certified-DAG) chain; an older
+/// binary refuses it.
+const GENESIS_VERSION: &str = "g1-certified-dag-v6";
+/// G1 S11: every new chain is V4 (`consensus::v4::VERTEX_FORMAT_KEY`).
+const GENESIS_VERTEX_FORMAT: &str = "4";
+/// G1 S11 / RC-3: the launch time (unix seconds), in the root.
+pub const GENESIS_TIME_KEY: &str = "sys:genesis_time";
 /// SEC-#13: storage key holding the canonical, genesis-pinned epoch-block
 /// interval. It is the only source (G3 FX-6): the node refuses to boot without
 /// it, and the AINCORE_EPOCH_BLOCK_INTERVAL env is never read. Folded into the
@@ -617,6 +623,12 @@ pub struct GenesisFile {
     /// FX-7: seeded into `sys:config:tip_agreement_n`. Default 1.
     #[serde(default)]
     pub tip_agreement_n: Option<u64>,
+    /// G1 S11 / RC-3: the launch time, unix seconds. A validator takes its
+    /// first guard origin (`AINCORE_GUARD_ORIGIN_INIT=1`) only within the
+    /// launch window after it, so the flag left set on a wiped database
+    /// later cannot re-arm signing. Without it the flag is never honored.
+    #[serde(default)]
+    pub genesis_time: Option<u64>,
 }
 
 /// The genesis state, built in memory by `build_genesis`.
@@ -1113,6 +1125,12 @@ pub fn build_genesis(
     // live set, so a slash/join/stake change followed by a restart can never
     // change a node's domain and brick it out of consensus.
     storage.put("genesis:validator_set:v1", &v1_json)?;
+    // G1 S11: the chain is V4; the key is state, so the root (and with it the
+    // identity) binds the format.
+    storage.put(consensus::v4::VERTEX_FORMAT_KEY, GENESIS_VERTEX_FORMAT)?;
+    if let Some(t) = file.genesis_time {
+        storage.put(GENESIS_TIME_KEY, &t.to_string())?;
+    }
     storage.put("sys:chain_id", &genesis_chain_id)?;
 
     // SEC-#13: pin the canonical epoch-block interval on-chain. The executor
@@ -2890,6 +2908,49 @@ mod tests {
     // ===== G3 S3: deterministic genesis as state-tree version 0 =====
 
     /// A single-validator genesis.json, as a value, for the S3 tests below.
+    /// G1 S11: every genesis is a V4 chain, and its launch time is state, so
+    /// the root (and the identity) binds both. A node booting from it runs
+    /// the certified-DAG engine.
+    #[test]
+    fn genesis_is_v4_and_binds_its_launch_time() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+        let file = s3_genesis_file();
+        let db = temp_db("s11_v4");
+        initialize_genesis_from(&db, &stdlib_path(), &write_file("s11_a", &file)).unwrap();
+        assert!(consensus::v4::is_v4_chain(&db), "genesis is not V4");
+        assert!(db.get(GENESIS_TIME_KEY).unwrap().is_none());
+        let mut timed = file.clone();
+        timed.genesis_time = Some(1_790_000_000);
+        let db2 = temp_db("s11_v4_timed");
+        initialize_genesis_from(&db2, &stdlib_path(), &write_file("s11_b", &timed)).unwrap();
+        assert_eq!(
+            db2.get(GENESIS_TIME_KEY).unwrap().as_deref(),
+            Some("1790000000")
+        );
+        assert_ne!(
+            stored_identity(&db),
+            stored_identity(&db2),
+            "the launch time is not bound by the identity"
+        );
+        let key = [50u8; 32];
+        let node_id = crypto::derive_address(
+            SigningKey::from_bytes(&key).verifying_key().as_bytes(),
+        )
+        .unwrap();
+        let c = consensus::dag::DagConsensus::new(
+            node_id,
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            Arc::new(std::sync::Mutex::new(mempool::Mempool::new())),
+            Arc::new(executor::Executor::new(Arc::clone(&db2))),
+            Arc::clone(&db2),
+            None,
+            None,
+            key,
+        );
+        assert_eq!(c.v4_epoch(), Some(0), "the node did not start the V4 engine");
+    }
+
     fn s3_genesis_file() -> GenesisFile {
         let path = single_validator_genesis(
             &crypto::derive_address(

@@ -14,7 +14,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "scripts/release_security_witnesses.json"
-PACKAGES = {"chain_sync", "consensus", "executor"}
+PACKAGES = {"chain_sync", "consensus", "executor", "storage", "state_commit"}
 NAME = re.compile(r"[A-Za-z_][A-Za-z_0-9]*(?:::[A-Za-z_][A-Za-z_0-9]*)+")
 
 
@@ -50,7 +50,7 @@ def validate_manifest(manifest):
     if (not isinstance(manifest, dict) or manifest.get("version") != 1
             or not isinstance(manifest.get("packages"), dict)
             or set(manifest["packages"]) != PACKAGES):
-        raise ValueError("Manifest must classify all three critical packages")
+        raise ValueError("Manifest must classify every critical package")
     for package, policy in manifest["packages"].items():
         if not isinstance(policy, dict):
             raise ValueError(f"{package}: policy must be an object")
