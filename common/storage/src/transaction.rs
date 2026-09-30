@@ -559,13 +559,14 @@ mod tests {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            // A counter, not the clock: macOS clocks tick in microseconds, so
+            // two parallel tests could build the same name.
+            static NEXT: AtomicU64 = AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
                 "aincore-tx-{}-{}",
                 std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
+                NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir(&path).unwrap();
             Self(path)

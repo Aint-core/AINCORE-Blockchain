@@ -19,12 +19,17 @@ mod tests {
     use storage::object::{Object, Owner};
     use storage::StateDB;
 
-    // Helper to get a unique DB path for each test
+    // Helper to get a unique DB path for each call. The counter keeps two
+    // calls apart even with the same suffix; the clock cannot (macOS ticks in
+    // microseconds).
     fn get_test_db_path(suffix: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "aincore_dag_test_db_{}_{}",
+            "aincore_dag_test_db_{}_{}_{}",
             std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
             suffix
         ));
         let _ = std::fs::remove_dir_all(&path); // Clean start
@@ -1732,16 +1737,10 @@ mod tests {
     /// the identical set at block-build time. It must be carried exactly once.
     #[test]
     fn test_evidence_rides_in_next_vertex_exactly_once() {
-        // Unique per invocation: this harness can run a test body twice in one
-        // process, and RocksDB refuses to open a path whose LOCK it already holds.
-        let suffix = format!(
-            "evidence_carry_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let (mut consensus, path) = setup_dag(&suffix);
+        // This harness can run a test body twice in one process, and RocksDB
+        // refuses to open a path whose LOCK it already holds; get_test_db_path
+        // gives every call its own directory.
+        let (mut consensus, path) = setup_dag("evidence_carry");
         consensus.current_round = 1;
         let offender = consensus.node_id.clone();
         let a = signed_vertex(&consensus, 1, 1_000);
@@ -1886,10 +1885,7 @@ mod tests {
     /// arbitrary real payload.
     #[test]
     fn test_ingress_rejects_live_vertex_with_payload_root() {
-        let (mut consensus, path) = setup_dag(&format!(
-            "payload_root_ingress_{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
+        let (mut consensus, path) = setup_dag("payload_root_ingress");
         consensus.current_round = 1;
         let full = signed_vertex(&consensus, 1, 5_000);
         let mut compact = full.to_compact_proof(); // hash unchanged, payload stripped
@@ -1907,10 +1903,7 @@ mod tests {
     /// root set) is never admitted as live.
     #[test]
     fn test_ingress_rejects_bad_parents_and_proof_form() {
-        let (mut consensus, path) = setup_dag(&format!(
-            "parents_ingress_{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
+        let (mut consensus, path) = setup_dag("parents_ingress");
         consensus.current_round = 1;
         // Copy identity out so the closure does not borrow `consensus`
         // (handle_message below needs it mutably).
@@ -1964,10 +1957,7 @@ mod tests {
     /// is the deterministic gate.
     #[test]
     fn test_drain_skip_is_round_scoped_not_offender_wide() {
-        let (mut consensus, path) = setup_dag(&format!(
-            "drain_slashed_{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
+        let (mut consensus, path) = setup_dag("drain_slashed");
         consensus.current_round = 1;
         let offender = consensus.node_id.clone();
         let a = signed_vertex(&consensus, 1, 1_000);
@@ -2005,10 +1995,7 @@ mod tests {
     /// An oversize DAG_VERTEX message is rejected before parsing.
     #[test]
     fn test_ingress_rejects_oversize_vertex() {
-        let (mut consensus, path) = setup_dag(&format!(
-            "oversize_ingress_{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
+        let (mut consensus, path) = setup_dag("oversize_ingress");
         let before = consensus.dag.lock().unwrap().len();
         let junk = "x".repeat(crate::dag::MAX_VERTEX_BYTES + 1);
         consensus.handle_message(&format!("DAG_VERTEX:{}", junk));
