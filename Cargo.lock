@@ -8525,6 +8525,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "move-binary-format",
+ "move-compiler",
  "move-core-types",
  "move-stdlib",
  "move-vm-runtime",

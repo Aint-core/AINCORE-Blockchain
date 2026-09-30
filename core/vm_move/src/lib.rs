@@ -18,6 +18,8 @@ use overlay::OverlayStorage;
 use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+mod move_unit_tests;
 mod tests;
 
 /// Storage adapter for Move VM backed by RocksDB (StateDB)

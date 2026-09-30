@@ -245,7 +245,10 @@ fn block_crash_child() {
                 // G3: the Jellyfish Merkle root of this fixture after block 1.
                 // It replaced the old hash-chain value 0b19b72b...; what the
                 // crash tests prove is that every replay equals this clean root.
-                "40051153e5a2d64458f78de0492b7c416abb934522293152243373c5b0fc5a9e",
+                // The fixture state holds the stdlib bytecode, so the root
+                // moves with it: 40051153... became this when universal_mining
+                // bounded device registration.
+                "bfd42aa627f13bae185a6cb9ceb583d0f4bcebcac589615f1eb9c9bd5d8aaf49",
                 "clean execution must preserve the pre-staging fixture root"
             );
         }

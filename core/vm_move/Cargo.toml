@@ -22,5 +22,7 @@ move-stdlib = { git = "https://github.com/move-language/move", branch = "aptos-v
 [dev-dependencies]
 # G3 WG-1: test fixtures seed their own genesis state (StateDB::seeding).
 storage = { path = "../../common/storage", features = ["test-seeding"] }
+# Compiles the Move unit tests under stdlib/tests (see src/move_unit_tests.rs).
+move-compiler = { git = "https://github.com/move-language/move", branch = "aptos-v1.3.0" }
 rand = "0.8"
 sha2 = "0.10"
