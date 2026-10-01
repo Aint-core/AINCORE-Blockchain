@@ -397,6 +397,40 @@ MEDIUM defects. Each fix below has a witness in the release manifest.
   carried). A second offense recorded in Move is unreachable (the executor's jail refuses it
   first); the Move check is defence in depth.
 
+## End-of-G5 mutation campaigns (2026-10-01/02)
+
+Each mutant was applied to the committed tree and the stage's witnesses were run (on the Pi
+and the NAS; scratchpad drivers `mut_g5end.py`, `mut_remote.py`).
+
+- **Campaign 1 (S4a, S4b, S4d, S4c kill lists): 24 of 27 killed.**
+  - A5 (D zero in the old `correlated_weight`): that function is gone in A3. Its
+    replacement, the linear sweep, is mutant F22, killed by
+    `g5_offenses_correlate_across_epochs_within_d`.
+  - A11 (a second offense counted in Move): unobservable. The executor's jail refuses a
+    second offense first; the Move check is defence in depth.
+  - B3 (a round-only evidence row key): equivalent. V4 rounds never repeat across epochs.
+- **Campaign 2 (A3 and A3b): 29 of 29 killed.** It covered:
+  - the staking entries made `public entry` again;
+  - the boundary refresh keeping members without Move stake;
+  - the top-256 election and the kept-committee filter;
+  - evidence age, retention and jailed refusal;
+  - the evidence key;
+  - settlement after evidence, the strict deadline, recording that settles again, and D = 0
+    in the sweep;
+  - the atomic record;
+  - the CE-3 relay;
+  - the jailed leader's bonus;
+  - the genesis committee check, the P-1 pins and the block-time range;
+  - conviction in full, its routing, frozen payouts at boundaries and by hand, and eviction
+    by an equal joiner;
+  - the S4c leftovers: decision rows, the inert node's three gates, the boot format check
+    and the V3 evidence kind.
+- **Not witnessed, accepted:**
+  - `record_twin` and the CE-3 alarm in one transaction: no crash test.
+  - The ticket guard in an unsettled scope: a ticket cannot mature before settlement unless
+    settlement is late.
+  - The 32-offense settlement cap: no test exceeds it.
+
 ## Stages
 
 Each stage lands with its witnesses and a mutation run; one independent review runs at the
