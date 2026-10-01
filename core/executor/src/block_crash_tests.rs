@@ -272,8 +272,11 @@ fn block_crash_child() {
                 // through the stdlib alone (staking entries `entry` only,
                 // linear settlement, frozen payouts, conviction in full,
                 // eviction from a full set): with S4c's bytecode the
-                // reviewed executor reproduces c5be08d5... exactly.
-                "247c3a722e4065b99738f2096b49497c9a67b887ed92909543128a3e610da0a8",
+                // reviewed executor reproduces c5be08d5... exactly. G5 CH-1
+                // moved it through the stdlib alone (ChurnState and
+                // admit_increase): with the A3/A3b bytecode the CH-1 executor
+                // reproduces 247c3a72... exactly.
+                "73137b35c6dbcb7e6e45c2eff1d2164474c0f8f50d389e848b6d1845e3e56059",
                 "clean execution must preserve the pre-staging fixture root"
             );
         }

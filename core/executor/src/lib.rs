@@ -469,6 +469,30 @@ pub struct ChainClock {
     pub block_timestamp: u64,
 }
 
+/// Mirror of the Move `0x1::staking::ChurnState` resource (BCS field order),
+/// G5 CH-1: the stake added to the active set in committee epoch `epoch`
+/// against that committee's total stake, in quanta.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChurnState {
+    pub epoch: u64,
+    pub base: u128,
+    pub added: u128,
+}
+
+pub fn churn_state_key() -> String {
+    vm_move::state_keys::resource_key_str(&system_address(), "0x1::staking::ChurnState")
+}
+
+/// G5 CH-1: the churn state that opens committee epoch `epoch`, whose
+/// committee holds `committee_stake` whole AIN.
+pub fn opening_churn_state(epoch: u64, committee_stake: u128) -> ChurnState {
+    ChurnState {
+        epoch,
+        base: committee_stake.saturating_mul(COIN_SCALE),
+        added: 0,
+    }
+}
+
 /// Mirror of the Move `0x1::chain::Params` resource (BCS field order).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct ChainParamsResource {
@@ -1972,6 +1996,24 @@ impl Executor {
                     &serde_json::to_string(&split).expect("a split is JSON"),
                 )
                 .expect("CRITICAL: the delegated-weight record write failed");
+        }
+        // G5 CH-1: the new epoch's allowance of added stake, against its
+        // committee. Genesis wrote epoch 0's; a chain without one has none.
+        let churn_key = churn_state_key();
+        if self
+            .db
+            .get(&churn_key)
+            .expect("CRITICAL: the churn state could not be read")
+            .is_some()
+        {
+            let stake: u128 = next.iter().map(|m| m.stake as u128).sum();
+            let state = opening_churn_state(new_epoch, stake);
+            self.db
+                .put(
+                    &churn_key,
+                    &hex::encode(bcs::to_bytes(&state).expect("the churn state is BCS")),
+                )
+                .expect("CRITICAL: the churn state write failed");
         }
         let _ = self.db.put("consensus:epoch", &new_epoch.to_string());
         let _ = self.db.put(
@@ -8740,6 +8782,145 @@ mod tests {
             "C is not paid for epoch 1"
         );
         assert!(coin_balance(&db, &a.address) > 0);
+    }
+
+    fn churn_state(db: &StateDB) -> ChurnState {
+        bcs::from_bytes(&hex::decode(db.get(&churn_state_key()).unwrap().unwrap()).unwrap())
+            .unwrap()
+    }
+
+    /// G5 CH-1 (`docs/research/churn_limit.md`): stake added to the active
+    /// set within one committee epoch (a join, `add_stake`, a delegation
+    /// deposit) is capped at 10 % of the epoch committee's stake. A
+    /// transaction past the cap aborts and moves no stake (it pays its gas);
+    /// the boundary opens a fresh allowance against the new committee, under
+    /// which the refused join and deposit pass.
+    #[test]
+    fn g5_added_stake_per_epoch_is_capped_at_a_tenth_of_the_committee() {
+        let ain = G5_AIN;
+        let supply = 1_000_000 * ain;
+        // A committee of 20,000 AIN: 2,000 AIN may be added in epoch 0.
+        let (a, b) = (committee_member(131, 10_000), committee_member(132, 10_000));
+        let mut keys = vec![];
+        let mut chain = G5Chain::new("g5_churn", 14, |db| {
+            seed_committee_chain(db, &[a.clone(), b.clone()], supply);
+            set_coin_store(db, &a.address, 1_000 * ain);
+            set_coin_store(db, &b.address, 10 * ain);
+            keys.push(G5Chain::account(db, 133, 2_000 * ain));
+            keys.push(G5Chain::account(db, 134, 2_000 * ain));
+            keys.push(G5Chain::account(db, 135, 2_000 * ain));
+            let _seed = db.seeding();
+            db.put(
+                "sys:validator_set:v1",
+                &serde_json::to_string(&vec![a.clone(), b.clone()]).unwrap(),
+            )
+            .unwrap();
+            db.put(
+                &churn_state_key(),
+                &hex::encode(bcs::to_bytes(&opening_churn_state(0, 20_000)).unwrap()),
+            )
+            .unwrap();
+        });
+        let db = chain.db.clone();
+        let [(one_key, one), (two_key, two), (delegator_key, delegator)] =
+            <[_; 3]>::try_from(keys).ok().unwrap();
+        let (a_key, b_key) = (
+            SigningKey::from_bytes(&[131; 32]),
+            SigningKey::from_bytes(&[132; 32]),
+        );
+        let member = |db: &StateDB, who: &str| {
+            validator_set(db)
+                .validators
+                .iter()
+                .any(|v| v.validator_addr == parse_move_address(who).unwrap())
+        };
+        // Whole AIN held, gas (a fraction of one AIN) rounded away.
+        let held = |db: &StateDB, who: &str| coin_balance(db, who).div_ceil(ain);
+        let join = |chain: &mut G5Chain, key: &SigningKey, seed: u8, stake: u128| {
+            let (bls_public_key, bls_pop) = test_bls_identity(seed);
+            chain.tx(
+                key,
+                "staking",
+                "join_validator_set",
+                vec![
+                    bcs::to_bytes(&stake).unwrap(),
+                    bcs::to_bytes(&key.verifying_key().to_bytes().to_vec()).unwrap(),
+                    bcs::to_bytes(&bls_public_key).unwrap(),
+                    bcs::to_bytes(&bls_pop).unwrap(),
+                ],
+            )
+        };
+
+        let tx = join(&mut chain, &one_key, 133, 1_200 * ain);
+        chain.run_to(1, vec![tx]);
+        assert!(member(&db, &one));
+        assert_eq!(churn_state(&db).added, 1_200 * ain);
+        // 1,200 + 1,000 > 2,000: refused, no stake moves.
+        let tx = join(&mut chain, &two_key, 134, 1_000 * ain);
+        chain.run_to(2, vec![tx]);
+        assert!(!member(&db, &two), "a join past the cap was admitted");
+        assert_eq!(held(&db, &two), 2_000);
+        assert_eq!(churn_state(&db).added, 1_200 * ain);
+        // Exactly up to the cap is allowed.
+        let tx = chain.tx(
+            &a_key,
+            "staking",
+            "add_stake",
+            vec![bcs::to_bytes(&(800 * ain)).unwrap()],
+        );
+        chain.run_to(3, vec![tx]);
+        assert_eq!(churn_state(&db).added, 2_000 * ain);
+        // (a's coin balance also takes its fee share as a member: check the stake.)
+        let stake_of = |db: &StateDB, who: &str| {
+            validator_set(db)
+                .validators
+                .iter()
+                .find(|v| v.validator_addr == parse_move_address(who).unwrap())
+                .map(|v| v.stake.value)
+        };
+        assert_eq!(stake_of(&db, &a.address), Some(10_800 * ain));
+        // A delegation deposit counts too.
+        let enable = chain.tx(
+            &b_key,
+            "delegation",
+            "enable_delegation",
+            vec![bcs::to_bytes(&500u64).unwrap()],
+        );
+        chain.run_to(4, vec![enable]);
+        let deposit = |chain: &mut G5Chain| {
+            chain.tx(
+                &delegator_key,
+                "delegation",
+                "delegate",
+                vec![
+                    move_addr_arg(&b.address),
+                    bcs::to_bytes(&(5 * ain)).unwrap(),
+                ],
+            )
+        };
+        let tx = deposit(&mut chain);
+        chain.run_to(5, vec![tx]);
+        assert_eq!(
+            held(&db, &delegator),
+            2_000,
+            "a deposit past the cap was taken"
+        );
+        assert_eq!(churn_state(&db).added, 2_000 * ain);
+
+        // The boundary at 20 opens epoch 1 against C_1's stake.
+        chain.run_blocks(20 - chain.height, 7);
+        let committee: u128 = g5_committee(&db, 1).iter().map(|(_, s)| *s as u128).sum();
+        assert_eq!(committee, 22_000, "C_1 holds the join and the top-up");
+        assert_eq!(churn_state(&db), opening_churn_state(1, committee));
+        let tx = join(&mut chain, &two_key, 134, 1_000 * ain);
+        let deposit_tx = deposit(&mut chain);
+        chain.run_to(21, vec![tx, deposit_tx]);
+        assert!(
+            member(&db, &two),
+            "the refused join passes in the next epoch"
+        );
+        assert_eq!(held(&db, &delegator), 1_995);
+        assert_eq!(churn_state(&db).added, 1_005 * ain);
     }
 
     /// Build a hex-encoded BCS `coin::transfer` payload from `from` to `to`.

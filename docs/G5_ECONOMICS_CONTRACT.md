@@ -93,7 +93,7 @@ software upgrade.
 |---|---|---|
 | I, committee epoch | 1,000 blocks (20 until S2) | research (a) 1 and b.2: boundary overhead ≤ 1 % gives I ≥ 1,000; exposure ≤ 2 h gives I ≤ 1,083 at 6.65 s. With wall-clock boundary cost ≤ 10 s, I = 1,000 meets both for t_b ∈ [1.0 s, 7.2 s] (clock research §4) |
 | R, reward period | 20 blocks | research (a) 2 and b.6: I mod R = 0 |
-| C_τ, clock cap per block | ⌈2·t_b⌉ s (14 s at 6.65 s) | k = 2 (clock research §5.2): above the normal spread of block intervals, and bounds a corrupted clock to 2× |
+| C_τ, clock cap per block | measured (S6): the smallest whole second at which capping loses ≤ 0.5 % of the release candidate's measured consensus time, within [⌈2·t_b⌉, ⌈4·t_b⌉]; 24 s on the S6 cluster (t_b 6.86 s) | k = 2 (clock research §5.2) assumed it was above the normal spread of intervals. The S6 measurement refutes that: about 15 % of anchors are skipped even with four honest validators (gaps of 2, 3 and up to 6 leader rounds), p99 21 s, max 43 s, and 14 s lost 3.99 % of consensus time (emission 1.82 %/yr, unbonding ~21.9 d). The upper bound k = 4 keeps a corrupted clock's speed-up of emission and deadlines at 4× (the BT-1 alarm flags it). `genesis-tool clock-cap` computes it from the block intervals |
 
 *Stdlib constants* (durations; bound by the stdlib hash that genesis pins):
 
@@ -451,18 +451,38 @@ end of G5, as with G1.
 
 ## Open (to measure, not to guess)
 
-- **t_b at genesis.** V4's block time is not measured yet. C_τ is derived from the value
-  measured on the release candidate; genesis-tool has no default.
-- **Boundary cost B**, split into protocol rounds and wall-clock time (fsync, BLS, the
-  QC(H_E) wait): measured in the G1 S10 harness on real hardware before genesis. I = 1,000
-  needs the wall-clock part at or below 10 s for blocks down to 1 s.
-- **Validator time:** NTS or several independent time sources on every validator, and the
-  60 s drift alarm (BT-1), before genesis.
-- **Churn limit:** no longer what keeps the committee valid (amendment A3 elects the top 256
-  by stake). A per-epoch limit on how much weight may join or leave (research (d) 10) is still
-  open before the validator set opens to independent operators, which precedes public mainnet.
-- **The BT-1 drift alarm** does not exist in code yet; it is a genesis blocker with the time
-  sources above.
-- **Recovery after a certificate-conflict halt** (G1 CE-3) is an operator procedure:
-  `docs/CERT_CONFLICT_RECOVERY_RUNBOOK.md`. Its tool, which pins the canonical certificate for
-  the slot and clears the alarm on every node, does not exist yet; it is a genesis blocker.
+- **t_b at genesis (measured, S6).** Four V4 validators on the NAS and the Pi, 1,126 blocks
+  over 2 h: mean 6.78 s by T (6.86 s by wall clock), p50 6 s, p90 12 s, p99 21 s, max 43 s.
+  The mainnet genesis re-measures on its release candidate with `genesis-tool clock-cap`.
+- **Boundary cost B (measured, S6).** Blocks 1,000 → 1,002 took 12 s, two normal intervals:
+  the wall-clock cost of the epoch boundary is within noise, under the 10 s that I = 1,000
+  needs. T(1,001) = T(1,000) (the first anchor of epoch 1 sampled below quorum, BT-1 holds T).
+- **Skipped anchors (performance, G1).** ~15 % of leader rounds commit no anchor with four
+  honest validators; this is the timer-driven round (3 s tick) and the cause of the interval
+  tail. Fixing it narrows the tail; C_τ is pinned at genesis from what was measured.
+- **Memory (measured, S6).** RSS is a sawtooth bounded by the RocksDB memtable (64 MiB, flushed
+  at ~1,050 blocks): peak ~110 MB per validator, 36–40 MB after a flush. No leak.
+- **Validator time:** NTS or several independent time sources on every validator, before
+  genesis. The operator guide gives the chrony NTS setup (`docs/NODE_OPERATOR_GUIDE.md`,
+  Time); each operator must apply it, and nothing in the node can check that it did.
+- **Churn limit (CH-1, implemented, uncommitted until its tests pass):** stake added within an epoch (join,
+  add_stake, delegation deposit) is capped at 10 % of C_E's stake, enforced in Move; exits are
+  not capped. It protects takeover speed (1/3 needs ≥ 5 epochs) and newcomer liveness, not
+  weak subjectivity (U > checkpoint age here). Derivation and sources:
+  `docs/research/churn_limit.md`. Required before the validator set opens to independent
+  operators, which precedes public mainnet.
+- **The BT-1 drift alarm** (done): a node alarms when the T of the blocks it places differs
+  from its clock by more than 60 s for 3 blocks in a row (`[BT-1 ALARM]` in the log,
+  `clock_drift_alarm_secs` in `aincore_getStatus`). Witness:
+  `a_node_whose_clock_drifts_from_the_chain_alarms`.
+- **Recovery after a certificate-conflict halt** (G1 CE-3, done): the operator procedure is
+  `docs/CERT_CONFLICT_RECOVERY_RUNBOOK.md`, and its tool is `cert_recovery` (inspect, choose,
+  export, pin). Pinning verifies the canonical certificate under C_E, replaces the slot's
+  certificate row, takes the certified role from the other digest and clears the alarm in one
+  transaction; it refuses a node that ordered the other digest, which is restored by state
+  sync. Witness: `the_recovery_tool_pins_the_canonical_certificate_on_every_node`.
+- **A genesis from public entries** (done): `genesis-tool validator-entry` prints a
+  validator's public entry, signed by its node key, and `gen-multi --entries-file` builds the
+  genesis from them, so no operator's seed leaves its machine. Required before independent
+  operators join. Witnesses: `public_entries_build_the_same_genesis_as_the_seeds`,
+  `a_forged_or_borrowed_entry_is_refused`.

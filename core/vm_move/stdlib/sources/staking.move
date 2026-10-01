@@ -28,6 +28,15 @@ module 0x1::staking {
     const EDUPLICATE_BLS_KEY: u64 = 10;
     /// G5 review (A3b): stake under an unsettled offense is not paid out.
     const EPAYOUT_FROZEN: u64 = 11;
+    /// G5 CH-1: this epoch's allowance of new stake is used up.
+    const ECHURN_LIMIT: u64 = 12;
+
+    /// G5 CH-1 (`docs/research/churn_limit.md`): stake added to the active
+    /// set within one committee epoch is at most this share of the epoch
+    /// committee's stake, in basis points (10 %, Aptos mainnet's
+    /// `voting_power_increase_limit` on a 2 h epoch).
+    const CHURN_INCREASE_BPS: u128 = 1000;
+    const BPS: u128 = 10000;
 
     /// Minimum stake required to join validator set (1000 AIN)
     const MIN_STAKE: u128 = 1000000000000000000000;
@@ -125,6 +134,17 @@ module 0x1::staking {
         from_epoch: u64,
     }
 
+    /// G5 CH-1: the stake added to the active set in committee epoch `epoch`
+    /// (`added`), against that epoch committee's total stake (`base`), both
+    /// in quanta. Genesis writes epoch 0's and the executor rewrites it at
+    /// every boundary with `added` at 0; nothing in Move creates it. A chain
+    /// without it (a test fixture) has no limit.
+    struct ChurnState has key {
+        epoch: u64,
+        base: u128,
+        added: u128,
+    }
+
     /// EMISSION v4: the accrued, cap-reserved budget of the DePIN mint
     /// stream (universal_mining). Amounts here were already counted against
     /// MAX_SUPPLY when drawn (`draw_emission`), so drawing from the budget
@@ -182,7 +202,7 @@ module 0x1::staking {
         public_key: vector<u8>,
         bls_public_key: vector<u8>,
         bls_pop: vector<u8>
-    ) acquires ValidatorSet {
+    ) acquires ValidatorSet, ChurnState {
         let addr = signer::address_of(account);
         assert!(stake_amount >= MIN_STAKE, error::invalid_argument(EINSUFFICIENT_STAKE));
         // BLS sizes are MinPk: pk=48 bytes (G1), pop=96 bytes (G2). The
@@ -239,6 +259,7 @@ module 0x1::staking {
             i = i + 1;
         };
 
+        admit_increase(stake_amount);
         // Withdraw stake from user account
         let stake = coin::withdraw<AincoreCoin>(account, stake_amount);
 
@@ -370,8 +391,10 @@ module 0x1::staking {
     }
 
     /// Add more stake
-    entry fun add_stake(account: &signer, amount: u128) acquires ValidatorSet {
+    entry fun add_stake(account: &signer, amount: u128) acquires ValidatorSet, ChurnState {
         let addr = signer::address_of(account);
+        assert!(is_validator(addr), error::not_found(ENOT_VALIDATOR));
+        admit_increase(amount);
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
         
         let len = vector::length(&validator_set.validators);
@@ -386,6 +409,23 @@ module 0x1::staking {
             i = i + 1;
         };
         abort error::not_found(ENOT_VALIDATOR)
+    }
+
+    /// G5 CH-1: count `amount` of stake added to the active set this epoch
+    /// (a join, `add_stake`, or a deposit into an open delegation pool), or
+    /// abort when the epoch's total would pass `CHURN_INCREASE_BPS` of the
+    /// base. Aborting rolls the count back with the rest of the transaction.
+    public(friend) fun admit_increase(amount: u128) acquires ChurnState {
+        if (!exists<ChurnState>(@0x1)) {
+            return
+        };
+        let churn = borrow_global_mut<ChurnState>(@0x1);
+        let added = churn.added + amount;
+        assert!(
+            added * BPS <= churn.base * CHURN_INCREASE_BPS,
+            error::resource_exhausted(ECHURN_LIMIT)
+        );
+        churn.added = added;
     }
 
     /// G5 EM-1: consensus time of the last payout. Created at the first

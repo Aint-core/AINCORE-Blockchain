@@ -55,29 +55,51 @@ val2 seed: 2222222222222222222222222222222222222222222222222222222222222222  sta
 val3 seed: 3333333333333333333333333333333333333333333333333333333333333333  stake 1500000 AIN
 ```
 
-> The genesis ceremony operator needs every validator's **seed** to derive the
-> embedded BLS keys. In a trust-minimized ceremony each operator can instead run
-> `gen-multi` for their own validator and the coordinator concatenates the
-> entries; the field derivation is fully deterministic, so the resulting
-> `genesis.json` is byte-identical regardless of who runs the tool.
+> With independent operators no seed leaves its validator. Each operator runs, on
+> its own machine:
+>
+> ```bash
+> ./target/release/genesis-tool validator-entry --key /path/to/datadir/node.key
+> ```
+>
+> and sends the printed entry (address, `public_key`, `bls_public_key`, `bls_pop`,
+> `entry_sig`; nothing secret) to the genesis coordinator. `entry_sig` is the node
+> key's signature binding the BLS key to the address; `bls_pop` proves the BLS key.
 
 ---
 
 ## 2. Build the shared `genesis.json`
 
-`--validator` takes `<node_key_seed_hex>:<stake_whole_ain>` and is repeated once
-per validator. Stakes are whole AIN (the tool scales them to 10^18 quanta).
+**Independent operators (the mainnet path).** The coordinator puts the entries in one
+JSON array, adds each validator's `stake_ain` (whole AIN), and runs:
 
 ```bash
 ./target/release/genesis-tool gen-multi \
-  --validator 1111111111111111111111111111111111111111111111111111111111111111:1000000 \
-  --validator 2222222222222222222222222222222222222222222222222222222222222222:2000000 \
-  --validator 3333333333333333333333333333333333333333333333333333333333333333:1500000 \
+  --entries-file entries.json \
   --chain-id AINCORE-MAINNET-1 \
   --treasury-reserve-ain 50000 \
-  --epoch-duration 10 \
+  --block-time-ms <t_b measured on the release candidate> \
   --out genesis.json
 ```
+
+Every entry is checked before the file is written: the address derives from
+`public_key`, `entry_sig` verifies under it, `bls_pop` verifies for `bls_public_key`,
+and no address or BLS key appears twice. The loader checks the committee again at boot.
+
+**One operator holding every seed (test clusters only).** `--seeds-file` takes one
+`<node_key_seed_hex>:<stake_whole_ain>` per line and derives the same entries; prefer it
+to `--validator`, which puts seeds in shell history and `ps`:
+
+```bash
+./target/release/genesis-tool gen-multi \
+  --seeds-file seeds.txt \
+  --chain-id AINCORE-LOCALTEST \
+  --block-time-ms 6650 \
+  --out genesis.json
+```
+
+Entries and seeds give byte-identical validator entries (witness:
+`public_entries_build_the_same_genesis_as_the_seeds`).
 
 This writes a `genesis.json` whose per-validator entries match exactly what the
 loader expects:
@@ -96,7 +118,11 @@ loader expects:
     /* ... one entry per validator ... */
   ],
   "treasury_reserve": "50000000000000000000000",
-  "epoch_duration": 10
+  "epoch_block_interval": 1000,
+  "reward_period_blocks": 20,
+  "max_block_interval_secs": 14,
+  "stdlib_hash": "…",
+  "genesis_time": 1790000000
 }
 ```
 

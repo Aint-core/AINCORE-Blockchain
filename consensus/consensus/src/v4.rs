@@ -162,6 +162,10 @@ pub struct Engine {
     /// OR-1: a parent digest → the certified children waiting on it.
     waiting: HashMap<String, HashSet<String>>,
     pending: PendingBuffer,
+    /// G5 BT-1: per member, the timestamp of its latest vertex refused as
+    /// ahead of this node's clock (`Verdict::Early`); cleared when one of
+    /// its vertices stages.
+    early: HashMap<String, u64>,
     /// This node's proposals, as broadcast (parent certificates embedded).
     own: BTreeMap<u64, Vertex>,
     /// CE-1 for this node's proposals not yet certified.
@@ -361,6 +365,7 @@ impl Engine {
             orderable: HashSet::new(),
             waiting: HashMap::new(),
             pending: PendingBuffer::default(),
+            early: HashMap::new(),
             own: BTreeMap::new(),
             collectors: BTreeMap::new(),
             decided: Vec::new(),
@@ -645,10 +650,13 @@ impl Engine {
         };
         match verdict {
             Verdict::Stage => {
+                self.early.remove(&v.author);
                 self.harvest_certs(&v, net);
                 self.stage_and_attest(v, net);
             }
             Verdict::PendingCert(missing) => {
+                // Past the clock check: its author is not early any more.
+                self.early.remove(&v.author);
                 // RE-1 (c): ask for the certificates it waits on, and for the
                 // whole gap below them when this node is far behind.
                 for i in missing {
@@ -666,6 +674,10 @@ impl Engine {
                 // The network activated E+1 and this node has not closed E:
                 // the rest of E is fetched (served from peers' closed tail).
                 self.want_gap(v.round.saturating_sub(1));
+            }
+            Verdict::Early => {
+                let ts = self.early.entry(v.author.clone()).or_insert(v.timestamp);
+                *ts = (*ts).max(v.timestamp);
             }
             Verdict::Invalid(_) | Verdict::Drop(_) | Verdict::Stale => {}
         }
@@ -889,10 +901,8 @@ impl Engine {
         let key = (cert.body.round, cert.body.author.clone());
         if let Some(held) = self.certs.get(&key) {
             if held.body.digest != cert.body.digest {
-                let alarm = format!(
-                    "alarm:vcert_conflict:{:020}:{:020}:{}",
-                    cert.body.epoch, cert.body.round, cert.body.author
-                );
+                let alarm =
+                    recovery::alarm_key(cert.body.epoch, cert.body.round, &cert.body.author);
                 let evidence = serde_json::json!({ "held": held, "other": cert }).to_string();
                 let first = matches!(self.storage.get(&alarm), Ok(None));
                 // G5 SL-3: every attester in both signed both digests. The
@@ -1271,6 +1281,16 @@ impl Engine {
         self.halted.as_deref()
     }
 
+    /// G5 BT-1: when the members whose latest vertex was refused as ahead of
+    /// this node's clock hold a stake quorum of the committee, their
+    /// stake-weighted median timestamp: this node's clock is behind theirs.
+    /// A Byzantine minority cannot raise it alone.
+    pub fn early_quorum(&self) -> Option<u64> {
+        let samples: Vec<(String, u64)> = self.early.iter().map(|(a, t)| (a.clone(), *t)).collect();
+        let t = crate::dag::committee_block_timestamp(&samples, &self.stakes, 0);
+        (t > 0).then_some(t)
+    }
+
     pub fn is_staged(&self, digest: &str) -> bool {
         lock(&self.dag).contains_key(digest)
     }
@@ -1329,6 +1349,7 @@ pub mod epoch;
 pub mod evidence;
 mod gc;
 pub mod pull;
+pub mod recovery;
 
 #[cfg(test)]
 mod tests;

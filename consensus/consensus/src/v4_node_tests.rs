@@ -1459,20 +1459,14 @@ fn a_certificate_conflict_is_recorded_as_evidence_against_both_signers() {
             "node {i} does not hold the pair"
         );
     }
-    // Recovery, an operator action on every node: the halt alarm is cleared
-    // and the node restarts. The evidence row stays and is carried.
+    // Recovery, an operator action on every node (runbook step 5): the
+    // canonical certificate is pinned, which clears the halt, and the node
+    // restarts. The evidence row stays and is carried.
+    let real = held_cert(&c, 0, 1, &author);
     for i in 0..4 {
-        let alarms: Vec<String> = c
-            .node(i)
-            .storage
-            .scan_prefix("alarm:vcert_conflict:")
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect();
-        assert!(!alarms.is_empty(), "node {i} has no halt to clear");
-        for k in alarms {
-            c.node(i).storage.delete(&k).unwrap();
-        }
+        let pinned = pin(&c, i, &real).expect("the real certificate pins");
+        assert!(pinned.alarm_cleared, "node {i} had no halt to clear");
+        assert!(c.node(i).storage.get(&row).unwrap().is_some(), "node {i} lost the pair");
         c.reopen(i);
         assert!(
             c.node(i).ordering_halted().is_none(),
@@ -1490,6 +1484,167 @@ fn a_certificate_conflict_is_recorded_as_evidence_against_both_signers() {
         assert_eq!(carried_at(&c, i, &item), Some(at), "node {i}");
     }
     c.assert_same_blocks(at);
+}
+
+/// The certificate row node `i` holds for slot (epoch 0, round, author).
+fn held_cert(c: &Cluster, i: usize, round: u64, author: &str) -> crate::vcert::VertexCertificate {
+    let raw = c
+        .node(i)
+        .storage
+        .get(&crate::staging::vcert_key(0, round, author))
+        .unwrap()
+        .expect("a certificate row");
+    serde_json::from_str(&raw).unwrap()
+}
+
+fn pin(
+    c: &Cluster,
+    i: usize,
+    cert: &crate::vcert::VertexCertificate,
+) -> Result<crate::v4::recovery::Pinned, String> {
+    crate::v4::recovery::pin_canonical(
+        &c.node(i).storage,
+        cert,
+        &c.committee,
+        &crate::qc::expected_chain_id(),
+        GENESIS_IDENTITY,
+    )
+}
+
+/// The recovery tool (runbook step 5) on a node whose certificate row holds
+/// the other digest: the canonical certificate replaces it, the other digest
+/// loses the certified role, and the restarted cluster places the same
+/// blocks. It refuses a certificate that does not verify, and a node that
+/// ordered the other digest, writing nothing in either case.
+#[test]
+fn the_recovery_tool_pins_the_canonical_certificate_on_every_node() {
+    let mut c = Cluster::new("cert-pin", &[141, 142, 143, 144], true);
+    c.run(6);
+    let author = c.known[1].0.clone();
+    let real = held_cert(&c, 0, 1, &author);
+    let fake = "ef".repeat(32);
+    let forged = forge_cert(&c, 1, &author, &fake, &[141, 142, 143]);
+    // Node 2 holds the forged certificate, as if it had arrived first: its
+    // slot row gives the forged digest the certified role, and the real
+    // body only the role of its own attestation.
+    let cert_row = crate::staging::vcert_key(0, 1, &author);
+    let slot_row = crate::staging::vslot_key(0, 1, &author);
+    let bytes_row = crate::staging::vbytes_key(0, &author);
+    let plain = |s: &StateDB| -> u64 {
+        s.get(&bytes_row).unwrap().map_or(0, |v| v.parse().unwrap())
+    };
+    let plain_before = {
+        let store = &c.node(2).storage;
+        store
+            .put(&cert_row, &serde_json::to_string(&forged).unwrap())
+            .unwrap();
+        let mut slot: Vec<crate::staging::SlotEntry> =
+            serde_json::from_str(&store.get(&slot_row).unwrap().unwrap()).unwrap();
+        for e in slot.iter_mut() {
+            e.role = crate::staging::Role::SelfAttested;
+        }
+        slot.push(crate::staging::SlotEntry {
+            digest: fake.clone(),
+            role: crate::staging::Role::Certified,
+            bytes: 100,
+        });
+        store.put(&slot_row, &serde_json::to_string(&slot).unwrap()).unwrap();
+        plain(store)
+    };
+    c.reopen(2);
+    // The real certificate reaches it: CE-3 halts it, and its relay halts
+    // the others.
+    let wire = format!(
+        "{}{}",
+        crate::v4::WIRE_PREFIX,
+        serde_json::to_string(&crate::v4::Msg::Cert(real.clone())).unwrap()
+    );
+    c.node_mut(2).handle_message(&wire);
+    c.deliver();
+    for i in 0..4 {
+        assert!(c.node(i).ordering_halted().is_some(), "node {i} did not halt");
+    }
+    // Step 4: every node ordered the real vertex, so it is canonical.
+    let states: Vec<_> = (0..4)
+        .map(|i| crate::v4::recovery::slot_state(&c.node(i).storage, 0, 1, &author).unwrap())
+        .collect();
+    let ordered: Vec<&str> = states
+        .iter()
+        .flat_map(|s| s.ordered.iter().map(String::as_str))
+        .collect();
+    assert!(!ordered.is_empty(), "vacuous: no node ordered the slot");
+    let pair = states[2].alarm_digests.clone().expect("node 2 holds the alarm");
+    let chosen =
+        crate::v4::recovery::choose_canonical((pair.0.as_str(), pair.1.as_str()), ordered).unwrap();
+    assert_eq!(chosen, real.body.digest);
+
+    // A certificate below quorum does not verify: nothing is written.
+    let thin = thin_cert(&c, 1, &author, &real.body.digest, &[141, 142, 143], 141);
+    let alarm = crate::v4::recovery::alarm_key(0, 1, &author);
+    assert!(pin(&c, 2, &thin).unwrap_err().contains("does not verify"));
+    assert!(
+        c.node(2).storage.get(&alarm).unwrap().is_some(),
+        "a refused pin cleared the alarm"
+    );
+    // A node that ordered the other digest is refused: nothing is written.
+    let cseq = "consensus:cseq:999999999";
+    c.node(3)
+        .storage
+        .put(cseq, &serde_json::to_string(&vec![fake.clone()]).unwrap())
+        .unwrap();
+    let refused = pin(&c, 3, &real).unwrap_err();
+    assert!(refused.contains("ordered"), "{refused}");
+    assert!(c.node(3).storage.get(&alarm).unwrap().is_some());
+    c.node(3).storage.delete(cseq).unwrap();
+
+    for i in 0..4 {
+        let pinned = pin(&c, i, &real).unwrap();
+        assert!(pinned.alarm_cleared, "node {i}");
+        if i == 2 {
+            assert_eq!(pinned.replaced.as_deref(), Some(fake.as_str()));
+            assert_eq!(pinned.demoted, vec![fake.clone()]);
+        } else {
+            assert_eq!(pinned.replaced, None, "node {i}");
+        }
+    }
+    assert_eq!(held_cert(&c, 2, 1, &author), real);
+    let slot: Vec<crate::staging::SlotEntry> =
+        serde_json::from_str(&c.node(2).storage.get(&slot_row).unwrap().unwrap()).unwrap();
+    let roles: HashMap<String, crate::staging::Role> =
+        slot.into_iter().map(|e| (e.digest, e.role)).collect();
+    assert_eq!(roles[&fake], crate::staging::Role::Staged);
+    assert_eq!(roles[&real.body.digest], crate::staging::Role::SelfAttested);
+    assert_eq!(plain(&c.node(2).storage), plain_before + 100);
+    for i in 0..4 {
+        c.reopen(i);
+        assert!(c.node(i).ordering_halted().is_none(), "node {i} is still halted");
+    }
+    let before = c.node(0).latest_block_height;
+    c.run_until(40, |c| (0..4).all(|i| c.node(i).latest_block_height > before + 2));
+    c.assert_same_blocks(before + 3);
+}
+
+/// A certificate of `signers` (a quorum) whose bitmap keeps only `keep`:
+/// below quorum, so it must not verify.
+fn thin_cert(
+    c: &Cluster,
+    round: u64,
+    author: &str,
+    digest: &str,
+    signers: &[u8],
+    keep: u8,
+) -> crate::vcert::VertexCertificate {
+    let mut cert = forge_cert(c, round, author, digest, signers);
+    let ordered = crate::qc::canonical_order(&c.committee);
+    let keep = validator_info(keep).address;
+    let mut bitmap = vec![0u8; cert.signer_bitmap.len()];
+    for (idx, m) in ordered.iter().enumerate() {
+        if m.address == keep {
+            bitmap[idx / 8] |= 1 << (idx % 8);
+        }
+    }
+    cert.signer_bitmap = bitmap;
+    cert
 }
 
 // ---------------------------------------------------------------------------
@@ -1872,4 +2027,58 @@ fn a_node_without_the_v4_format_is_inert() {
     );
     drop(node);
     assert_eq!(inert.rows(), before, "the inert node wrote to its database");
+}
+
+/// G5 BT-1, both directions on one node, the others as the control. Behind
+/// by 120 s it refuses every other member's vertices as early and places
+/// nothing: their stake quorum is the alarm. Ahead by 120 s the others refuse
+/// its vertices, but it orders theirs and places blocks whose T is 120 s
+/// behind its clock: `CLOCK_DRIFT_ALARM_BLOCKS` of them in a row are the
+/// alarm. Each clears with the clock, and no other node alarms (one member's
+/// early vertices are not a quorum).
+#[test]
+fn a_node_whose_clock_drifts_from_the_chain_alarms() {
+    use crate::dag::{CLOCK_DRIFT_ALARM_BLOCKS, CLOCK_DRIFT_ALARM_SECS};
+    let mut c = Cluster::new("clock-drift", &[151, 152, 153, 154], true);
+    c.run(6);
+    assert!(c.node(0).latest_block_height > 0, "vacuous: no block yet");
+    assert_eq!(c.node(0).clock_drift_alarm(), None);
+    let others_quiet = |c: &Cluster| {
+        for i in 1..4 {
+            assert_eq!(c.node(i).clock_drift_alarm(), None, "node {i}");
+        }
+    };
+
+    c.node_mut(0).set_now_secs(Arc::new(|| PINNED - 120));
+    let at = c.node(0).latest_block_height;
+    c.run(4);
+    assert_eq!(c.node(0).latest_block_height, at, "a node 120 s behind placed a block");
+    let drift = c.node(0).clock_drift_alarm().expect("no alarm when behind");
+    assert!(drift < -CLOCK_DRIFT_ALARM_SECS, "drift {drift}");
+    others_quiet(&c);
+
+    c.node_mut(0).set_now_secs(Arc::new(|| PINNED));
+    let at = c.node(0).latest_block_height;
+    c.run_until(60, |c| c.node(0).latest_block_height > at);
+    assert!(c.node(0).latest_block_height > at, "vacuous: no block after the fix");
+    assert_eq!(c.node(0).clock_drift_alarm(), None, "the behind alarm did not clear");
+
+    c.node_mut(0).set_now_secs(Arc::new(|| PINNED + 120));
+    let needed = CLOCK_DRIFT_ALARM_BLOCKS as u64;
+    let at = c.node(0).latest_block_height;
+    c.run_until(60, |c| c.node(0).latest_block_height >= at + needed);
+    assert!(
+        c.node(0).latest_block_height >= at + needed,
+        "vacuous: node 0 placed {} blocks ahead",
+        c.node(0).latest_block_height - at
+    );
+    let drift = c.node(0).clock_drift_alarm().expect("no alarm when ahead");
+    assert!(drift > CLOCK_DRIFT_ALARM_SECS, "drift {drift}");
+    others_quiet(&c);
+
+    c.node_mut(0).set_now_secs(Arc::new(|| PINNED));
+    let at = c.node(0).latest_block_height;
+    c.run_until(60, |c| c.node(0).latest_block_height > at);
+    assert!(c.node(0).latest_block_height > at, "vacuous: no block after the fix");
+    assert_eq!(c.node(0).clock_drift_alarm(), None, "the ahead alarm did not clear");
 }

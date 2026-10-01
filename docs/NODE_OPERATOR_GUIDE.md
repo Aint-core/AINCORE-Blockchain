@@ -44,6 +44,31 @@
 - RocksDB
 - OpenSSL
 
+### Time (Validators)
+
+A block's time T is the stake-weighted median of the committee's vertex timestamps (G5
+BT-1). Unbonding, commission changes and emission all count from it. Plain NTP can be shifted
+by an attacker on the path, so a validator syncs from several authenticated (NTS) sources:
+
+```bash
+sudo apt install chrony   # chrony 4.0+ speaks NTS; it replaces systemd-timesyncd
+sudo tee /etc/chrony/sources.d/aincore-nts.sources <<'EOF'
+server time.cloudflare.com iburst nts
+server nts.netnod.se iburst nts
+server ptbtime1.ptb.de iburst nts
+EOF
+echo 'minsources 2' | sudo tee /etc/chrony/conf.d/aincore.conf
+sudo systemctl restart chrony
+chronyc -N authdata   # every source shows NTS with a non-zero KeyID
+chronyc tracking      # "Leap status: Normal", offset in milliseconds
+```
+
+The node alarms when the T of the blocks it places differs from its own clock by more than
+60 s for 3 blocks in a row: the log shows `[BT-1 ALARM]`, and `aincore_getStatus` returns
+`clock_drift_alarm_secs` (local clock − T, in seconds; `null` while there is no alarm). An
+alarm on one validator means its clock is wrong; on most validators at once, suspect the time
+sources.
+
 ---
 
 ## Installation

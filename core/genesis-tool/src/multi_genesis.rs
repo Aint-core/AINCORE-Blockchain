@@ -24,9 +24,87 @@
 //! fields generated here match what each node derives from its own node.key.
 
 use clap::Args;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey, Verifier};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// One validator's public genesis entry: what its operator sends the genesis
+/// coordinator, from `genesis-tool validator-entry` on its own machine. No
+/// secret leaves the validator. `entry_sig` is the node key's ed25519
+/// signature over `entry_message`, binding the BLS key to the address and
+/// proving the operator holds the node key; `bls_pop` proves it holds the BLS
+/// key.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PublicEntry {
+    pub address: String,
+    pub public_key: String,
+    pub bls_public_key: String,
+    pub bls_pop: String,
+    pub entry_sig: String,
+}
+
+/// A line of `--entries-file`: an entry and the stake the coordinator
+/// assigns it, in whole AIN.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EntrySpec {
+    #[serde(flatten)]
+    pub entry: PublicEntry,
+    pub stake_ain: u128,
+}
+
+/// What `entry_sig` signs.
+fn entry_message(address: &str, bls_public_key: &str) -> Vec<u8> {
+    format!("AINCORE-GENESIS-ENTRY-V1:{address}:{bls_public_key}").into_bytes()
+}
+
+/// The entry for the validator whose node.key seed is `seed`.
+pub fn entry_from_seed(seed: &[u8; 32]) -> Result<PublicEntry, Box<dyn std::error::Error>> {
+    let (address, public_key, bls_public_key, bls_pop) = derive_validator_fields(seed)?;
+    let sig = SigningKey::from_bytes(seed).sign(&entry_message(&address, &bls_public_key));
+    Ok(PublicEntry {
+        address,
+        public_key,
+        bls_public_key,
+        bls_pop,
+        entry_sig: hex::encode(sig.to_bytes()),
+    })
+}
+
+/// Every check an entry must pass before it goes into a genesis file: the
+/// address derives from the key, the node key signed the entry, and the BLS
+/// key's proof of possession verifies. (The loader checks the committee
+/// again at boot.)
+pub fn check_entry(e: &PublicEntry) -> Result<(), String> {
+    let pk: [u8; 32] = hex::decode(&e.public_key)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| format!("{}: public_key is not 32 bytes of hex", e.address))?;
+    let derived = crypto::derive_address(&pk).map_err(|err| err.to_string())?;
+    if derived != e.address {
+        return Err(format!(
+            "{}: the address does not derive from public_key",
+            e.address
+        ));
+    }
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&pk)
+        .map_err(|err| format!("{}: public_key: {err}", e.address))?;
+    let sig: [u8; 64] = hex::decode(&e.entry_sig)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| format!("{}: entry_sig is not 64 bytes of hex", e.address))?;
+    key.verify(
+        &entry_message(&e.address, &e.bls_public_key),
+        &ed25519_dalek::Signature::from_bytes(&sig),
+    )
+    .map_err(|_| format!("{}: entry_sig does not verify under public_key", e.address))?;
+    let bls_pk = hex::decode(&e.bls_public_key)
+        .map_err(|_| format!("{}: bls_public_key is not hex", e.address))?;
+    let pop = hex::decode(&e.bls_pop).map_err(|_| format!("{}: bls_pop is not hex", e.address))?;
+    match crypto::bls::BLSEngine::consensus().verify_possession(&bls_pk, &pop) {
+        Ok(true) => Ok(()),
+        _ => Err(format!("{}: bls_pop does not verify", e.address)),
+    }
+}
 
 /// A single validator spec on the CLI: `--validator <seed_hex>:<stake_ain>`.
 /// `seed_hex` is the 32-byte (64 hex char) node.key seed; `stake_ain` is the
@@ -56,6 +134,14 @@ pub struct GenMultiArgs {
     #[arg(long = "seeds-file", value_name = "PATH")]
     pub seeds_file: Option<PathBuf>,
 
+    /// Public entries instead of seeds: a JSON array of
+    /// `{address, public_key, bls_public_key, bls_pop, entry_sig, stake_ain}`,
+    /// one per validator, each made by its operator with `validator-entry`.
+    /// This is the path for independent operators: no seed leaves its
+    /// machine. May be combined with the seed flags.
+    #[arg(long = "entries-file", value_name = "PATH")]
+    pub entries_file: Option<PathBuf>,
+
     /// Output path for the generated genesis.json.
     #[arg(short, long, default_value = "genesis.json")]
     pub out: PathBuf,
@@ -74,6 +160,12 @@ pub struct GenMultiArgs {
     /// and deadlines drifted before.
     #[arg(long)]
     pub block_time_ms: u64,
+
+    /// C_tau, the consensus-time cap per block, measured on the same run
+    /// (`genesis-tool clock-cap`): it must lie in [2 t_b, 4 t_b]. Required,
+    /// with no default, for the same reason as the block time.
+    #[arg(long)]
+    pub clock_cap_secs: u64,
 
     /// The stdlib bytecode the chain starts from; its hash is pinned into
     /// genesis.json (G3 FX-7).
@@ -190,20 +282,48 @@ pub fn parse_validator_spec(raw: &str) -> Result<ValidatorSpec, Box<dyn std::err
 }
 
 /// Build the in-memory `GenesisFile` from parsed validator specs + parameters.
+#[cfg(test)]
 pub fn build_genesis_file(
     specs: &[ValidatorSpec],
     chain_id: &str,
     treasury_reserve_ain: u128,
     block_time_ms: u64,
+    clock_cap_secs: u64,
+    stdlib_hash: &str,
+) -> Result<GenesisFile, Box<dyn std::error::Error>> {
+    let mut entries = Vec::with_capacity(specs.len());
+    for spec in specs {
+        entries.push(EntrySpec {
+            entry: entry_from_seed(&spec.seed)?,
+            stake_ain: spec.stake_ain,
+        });
+    }
+    build_genesis_from_entries(
+        &entries,
+        chain_id,
+        treasury_reserve_ain,
+        block_time_ms,
+        clock_cap_secs,
+        stdlib_hash,
+    )
+}
+
+/// The genesis file from public entries, each checked by `check_entry`.
+pub fn build_genesis_from_entries(
+    specs: &[EntrySpec],
+    chain_id: &str,
+    treasury_reserve_ain: u128,
+    block_time_ms: u64,
+    clock_cap_secs: u64,
     stdlib_hash: &str,
 ) -> Result<GenesisFile, Box<dyn std::error::Error>> {
     if specs.is_empty() {
-        return Err("at least one --validator is required".into());
+        return Err("at least one validator is required".into());
     }
     if chain_id.trim().is_empty() {
         return Err("chain_id must not be empty".into());
     }
-    let params = node::genesis::derive_chain_params(block_time_ms)
+    let params = node::genesis::derive_chain_params(block_time_ms, clock_cap_secs)
         .map_err(|e| format!("cannot derive the chain parameters: {e}"))?;
     if stdlib_hash.trim().is_empty() {
         return Err("stdlib_hash must not be empty".into());
@@ -211,14 +331,28 @@ pub fn build_genesis_file(
 
     let mut validators = Vec::with_capacity(specs.len());
     let mut seen_addr = std::collections::BTreeSet::new();
+    let mut seen_bls = std::collections::BTreeSet::new();
     for spec in specs {
-        let (address, public_key, bls_public_key, bls_pop) = derive_validator_fields(&spec.seed)?;
+        check_entry(&spec.entry)?;
+        if spec.stake_ain == 0 {
+            return Err(format!("{}: stake must be > 0", spec.entry.address).into());
+        }
+        let PublicEntry {
+            address,
+            public_key,
+            bls_public_key,
+            bls_pop,
+            ..
+        } = spec.entry.clone();
         if !seen_addr.insert(address.clone()) {
             return Err(format!(
-                "duplicate validator address {} — the same node-key seed was supplied twice",
+                "duplicate validator address {} — the same node key was supplied twice",
                 address
             )
             .into());
+        }
+        if !seen_bls.insert(bls_public_key.clone()) {
+            return Err(format!("{address}: its BLS key is another validator's").into());
         }
         let stake_quanta = spec
             .stake_ain
@@ -254,6 +388,81 @@ pub fn build_genesis_file(
     })
 }
 
+/// `clock-cap`: the release candidate's block intervals, one whole number of
+/// seconds per line (consecutive heights, from its block timestamps).
+#[derive(Args, Debug)]
+pub struct ClockCapArgs {
+    #[arg(long)]
+    pub intervals: PathBuf,
+}
+
+/// Print the measured mean block time and C_tau (G5 P-1, S6), the two
+/// inputs `gen-multi` takes.
+pub fn run_clock_cap(args: ClockCapArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let raw = std::fs::read_to_string(&args.intervals)
+        .map_err(|e| format!("cannot read {}: {e}", args.intervals.display()))?;
+    let mut intervals = Vec::new();
+    for line in raw.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        intervals.push(
+            line.parse::<u64>()
+                .map_err(|e| format!("bad interval {line:?}: {e}"))?,
+        );
+    }
+    if intervals.len() < 1_000 {
+        return Err(format!(
+            "{} intervals: measure at least 1,000 blocks, an epoch's worth",
+            intervals.len()
+        )
+        .into());
+    }
+    let total: u64 = intervals.iter().sum();
+    let block_time_ms = (total * 1_000).div_ceil(intervals.len() as u64);
+    let cap = node::genesis::clock_cap_from_intervals(&intervals).ok_or("no time measured")?;
+    let lost = |c: u64| -> f64 {
+        intervals.iter().map(|&x| x.saturating_sub(c)).sum::<u64>() as f64 * 100.0 / total as f64
+    };
+    println!("intervals: {}  mean: {block_time_ms} ms", intervals.len());
+    println!(
+        "C_tau: {cap} s (loses {:.2} % of consensus time; 2 x t_b would lose {:.2} %)",
+        lost(cap),
+        lost((2 * block_time_ms).div_ceil(1_000))
+    );
+    println!("gen-multi --block-time-ms {block_time_ms} --clock-cap-secs {cap}");
+    Ok(())
+}
+
+/// `validator-entry`: run by each operator on its own validator.
+#[derive(Args, Debug)]
+pub struct EntryArgs {
+    /// The validator's node.key, as the node reads it: 32 raw bytes or 64
+    /// hex characters.
+    #[arg(long)]
+    pub key: PathBuf,
+}
+
+/// The node.key seed, in either of the forms the node accepts.
+pub fn parse_node_key(bytes: &[u8]) -> Result<[u8; 32], String> {
+    if let Ok(seed) = <[u8; 32]>::try_from(bytes) {
+        return Ok(seed);
+    }
+    std::str::from_utf8(bytes)
+        .ok()
+        .map(str::trim)
+        .filter(|t| t.len() == 64)
+        .and_then(|t| hex::decode(t).ok())
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| "a node key is 32 raw bytes or 64 hex characters".to_string())
+}
+
+/// Print this validator's public entry. Nothing secret is printed.
+pub fn run_entry(args: EntryArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes =
+        std::fs::read(&args.key).map_err(|e| format!("cannot read {}: {e}", args.key.display()))?;
+    let entry = entry_from_seed(&parse_node_key(&bytes)?)?;
+    println!("{}", serde_json::to_string_pretty(&entry)?);
+    Ok(())
+}
+
 pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("🛠️  AINCORE Multi-Validator Genesis Generator");
 
@@ -268,21 +477,33 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    if raw_specs.is_empty() {
-        return Err("no validators given: pass --validator or --seeds-file".into());
+    if raw_specs.is_empty() && args.entries_file.is_none() {
+        return Err("no validators given: pass --entries-file, --validator or --seeds-file".into());
     }
-    let mut specs = Vec::with_capacity(raw_specs.len());
+    let mut entries = Vec::with_capacity(raw_specs.len());
     for raw in &raw_specs {
-        specs.push(parse_validator_spec(raw)?);
+        let spec = parse_validator_spec(raw)?;
+        entries.push(EntrySpec {
+            entry: entry_from_seed(&spec.seed)?,
+            stake_ain: spec.stake_ain,
+        });
+    }
+    if let Some(path) = &args.entries_file {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read --entries-file {}: {e}", path.display()))?;
+        let listed: Vec<EntrySpec> = serde_json::from_str(&raw)
+            .map_err(|e| format!("--entries-file {}: {e}", path.display()))?;
+        entries.extend(listed);
     }
 
     let stdlib_hash = node::genesis::stdlib_hash_of(&args.stdlib_path)
         .map_err(|e| format!("cannot hash the stdlib at {}: {e}", args.stdlib_path))?;
-    let mut genesis = build_genesis_file(
-        &specs,
+    let mut genesis = build_genesis_from_entries(
+        &entries,
         &args.chain_id,
         args.treasury_reserve_ain,
         args.block_time_ms,
+        args.clock_cap_secs,
         &stdlib_hash,
     )?;
     genesis.genesis_time = Some(args.genesis_time.unwrap_or_else(|| {
@@ -291,7 +512,10 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     }));
-    println!("🕒 Genesis time: {:?} (the guard-origin launch window starts here)", genesis.genesis_time);
+    println!(
+        "🕒 Genesis time: {:?} (the guard-origin launch window starts here)",
+        genesis.genesis_time
+    );
 
     if args.out.exists() && !args.force {
         return Err(format!(
@@ -423,8 +647,15 @@ mod tests {
                 stake_ain: 2000,
             },
         ];
-        let err = build_genesis_file(&specs, "AINCORE-MAINNET-1", 50_000, 6_650, "stdlib-hash")
-            .expect_err("duplicate must fail");
+        let err = build_genesis_file(
+            &specs,
+            "AINCORE-MAINNET-1",
+            50_000,
+            6_650,
+            14,
+            "stdlib-hash",
+        )
+        .expect_err("duplicate must fail");
         assert!(err.to_string().contains("duplicate validator address"));
     }
 
@@ -444,8 +675,15 @@ mod tests {
                 stake_ain: 2_000_000,
             },
         ];
-        let genesis =
-            build_genesis_file(&specs, "AINCORE-MAINNET-1", 50_000, 6_650, "stdlib-hash").unwrap();
+        let genesis = build_genesis_file(
+            &specs,
+            "AINCORE-MAINNET-1",
+            50_000,
+            6_650,
+            14,
+            "stdlib-hash",
+        )
+        .unwrap();
 
         // Reconstruct consensus::qc::ValidatorInfo from the emitted file (this is
         // the same shape genesis.rs writes to sys:validator_set:v1, with stake
@@ -496,6 +734,7 @@ mod tests {
             "AINCORE-MAINNET-1",
             50_000,
             6_650,
+            14,
             &node::genesis::stdlib_hash_of(&stdlib_path()).unwrap(),
         )
         .unwrap();
@@ -546,7 +785,7 @@ mod tests {
 
         // G5 P-1: the node stores exactly what the tool derived from the block
         // time, and pins the same epoch (I = 1,000) for consensus.
-        let derived = node::genesis::derive_chain_params(6_650).unwrap();
+        let derived = node::genesis::derive_chain_params(6_650, 14).unwrap();
         assert_eq!(derived.epoch_blocks, 1_000);
         assert_eq!(node::genesis::stored_chain_params(&db).unwrap(), derived);
         assert_eq!(
@@ -555,5 +794,92 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The coordinator's path: entries made on each validator from its own
+    /// node.key build the very genesis the seeds would, so no seed has to
+    /// leave its machine.
+    #[test]
+    fn public_entries_build_the_same_genesis_as_the_seeds() {
+        let specs = vec![
+            ValidatorSpec {
+                seed: seed(21),
+                stake_ain: 1_000_000,
+            },
+            ValidatorSpec {
+                seed: seed(22),
+                stake_ain: 2_000_000,
+            },
+        ];
+        let from_seeds = build_genesis_file(
+            &specs,
+            "AINCORE-MAINNET-1",
+            50_000,
+            6_650,
+            14,
+            "stdlib-hash",
+        )
+        .unwrap();
+        // Each entry travels as JSON, as the operator sends it.
+        let entries: Vec<EntrySpec> = specs
+            .iter()
+            .map(|s| {
+                let json = serde_json::to_string(&entry_from_seed(&s.seed).unwrap()).unwrap();
+                EntrySpec {
+                    entry: serde_json::from_str(&json).unwrap(),
+                    stake_ain: s.stake_ain,
+                }
+            })
+            .collect();
+        let from_entries = build_genesis_from_entries(
+            &entries,
+            "AINCORE-MAINNET-1",
+            50_000,
+            6_650,
+            14,
+            "stdlib-hash",
+        )
+        .unwrap();
+        assert_eq!(from_entries, from_seeds);
+        // The node.key forms the node reads give the same seed.
+        assert_eq!(parse_node_key(&seed(21)).unwrap(), seed(21));
+        let hex_key = format!("{}\n", hex::encode(seed(21)));
+        assert_eq!(parse_node_key(hex_key.as_bytes()).unwrap(), seed(21));
+        assert!(parse_node_key(b"short").is_err());
+    }
+
+    /// An entry is refused when its address is not its key's, when the node
+    /// key did not sign it, when its BLS proof is not its BLS key's, or when
+    /// its BLS key is another validator's.
+    #[test]
+    fn a_forged_or_borrowed_entry_is_refused() {
+        let good = entry_from_seed(&seed(31)).unwrap();
+        let other = entry_from_seed(&seed(32)).unwrap();
+        assert_eq!(check_entry(&good), Ok(()));
+        let mut e = good.clone();
+        e.address = other.address.clone();
+        assert!(check_entry(&e).unwrap_err().contains("does not derive"));
+        // Another validator's BLS key with its valid proof, claimed under
+        // this node key: the node-key signature does not cover it.
+        let mut e = good.clone();
+        e.bls_public_key = other.bls_public_key.clone();
+        e.bls_pop = other.bls_pop.clone();
+        assert!(check_entry(&e).unwrap_err().contains("entry_sig"));
+        let mut e = good.clone();
+        e.bls_pop = other.bls_pop.clone();
+        assert!(check_entry(&e).unwrap_err().contains("bls_pop"));
+        let spec = |entry: PublicEntry| EntrySpec {
+            entry,
+            stake_ain: 1_000,
+        };
+        let twice = vec![spec(good.clone()), spec(good.clone())];
+        let err = build_genesis_from_entries(&twice, "C", 0, 6_650, 14, "h").unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
+        let zero = vec![EntrySpec {
+            entry: good,
+            stake_ain: 0,
+        }];
+        let err = build_genesis_from_entries(&zero, "C", 0, 6_650, 14, "h").unwrap_err();
+        assert!(err.to_string().contains("stake"), "{err}");
     }
 }

@@ -482,10 +482,7 @@ fn layer_e_delays_but_never_refuses() {
         v4_verdict(1_000, v, &ctx, |_| None)
     };
     assert_eq!(at(NOW, 0, FIRST, &v), Verdict::Stage);
-    assert!(
-        matches!(at(v.timestamp - 31, 0, FIRST, &v), Verdict::Drop(_)),
-        "the clock"
-    );
+    assert_eq!(at(v.timestamp - 31, 0, FIRST, &v), Verdict::Early, "the clock");
     assert_eq!(
         at(v.timestamp - 30, 0, FIRST, &v),
         Verdict::Stage,

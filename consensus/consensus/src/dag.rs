@@ -30,6 +30,14 @@ const QC_WANT_EVERY_TICKS: u64 = 4;
 /// guard origin, and the clock skew allowed before it.
 pub const LAUNCH_WINDOW_SECS: u64 = 3600;
 pub const LAUNCH_WINDOW_SKEW_SECS: u64 = 600;
+/// G5 BT-1: a placed block's T further than this from the node's clock
+/// counts toward the drift alarm (twice the ingress gate's 30 s). A clock
+/// behind by more than the gate places no block at all: it alarms on the
+/// vertices it refuses as early instead (`Engine::early_quorum`).
+pub const CLOCK_DRIFT_ALARM_SECS: i64 = 60;
+/// The alarm holds after this many placed blocks in a row past the bound:
+/// an anchor committed late after a pause carries old timestamps once.
+pub const CLOCK_DRIFT_ALARM_BLOCKS: u32 = 3;
 const QC_ANSWERS_PER_TICK: u32 = 4;
 const QC_ANSWERED_CAP: usize = 256;
 /// Upper bound on evidence items carried per vertex and applied per block
@@ -77,6 +85,13 @@ pub struct DagConsensus {
     /// ordering engine — by local commit or by adopting a synced block. Heights
     /// above this that arrive via ChainSync are adopted in reload_chain_tip.
     pub last_adopted_height: u64,
+    /// G5 BT-1: placed blocks in a row whose T was more than
+    /// `CLOCK_DRIFT_ALARM_SECS` from this node's clock, and the last
+    /// difference (local − T, seconds).
+    clock_drift: (u32, i64),
+    /// Whether the alarm was on at the last check, so it is logged once
+    /// when it starts and once when it clears.
+    clock_alarm_logged: bool,
     qc_retry_cursor: String,
     pub accumulator: Accumulator,
     pub da_sequencer: Option<Arc<Mutex<DASequencer>>>, // Added DA Sequencer
@@ -310,6 +325,8 @@ impl DagConsensus {
             latest_block_timestamp,
             latest_block_round,
             last_adopted_height,
+            clock_drift: (0, 0),
+            clock_alarm_logged: false,
             qc_retry_cursor: String::new(),
             accumulator: Accumulator::new(),
             da_sequencer,
@@ -370,6 +387,47 @@ impl DagConsensus {
                 .as_ref()
                 .and_then(|e| e.halted().map(str::to_string))
         })
+    }
+
+    /// G5 BT-1: the drift alarm, this node's clock minus the chain's time in
+    /// seconds, while it holds. Either the T of the blocks it places has been
+    /// more than `CLOCK_DRIFT_ALARM_SECS` away for `CLOCK_DRIFT_ALARM_BLOCKS`
+    /// blocks in a row, or a stake quorum of members' vertices are refused as
+    /// early (then it places no block). An attacker can shift NTP; the
+    /// chain's time comes from a stake quorum.
+    pub fn clock_drift_alarm(&self) -> Option<i64> {
+        if self.clock_drift.0 >= CLOCK_DRIFT_ALARM_BLOCKS {
+            return Some(self.clock_drift.1);
+        }
+        let early = self.v4.as_ref()?.early_quorum()?;
+        Some(((self.now_secs)() as i64).saturating_sub(early as i64))
+    }
+
+    /// G5 BT-1: compare the T of a block this node placed with its clock.
+    fn check_clock_drift(&mut self, block_ts: u64) {
+        let drift = ((self.now_secs)() as i64).saturating_sub(block_ts as i64);
+        self.clock_drift = if drift.abs() > CLOCK_DRIFT_ALARM_SECS {
+            (self.clock_drift.0.saturating_add(1), drift)
+        } else {
+            (0, drift)
+        };
+        self.log_clock_alarm();
+    }
+
+    /// Log the drift alarm when it starts and when it clears.
+    fn log_clock_alarm(&mut self) {
+        let alarm = self.clock_drift_alarm();
+        if alarm.is_some() == self.clock_alarm_logged {
+            return;
+        }
+        self.clock_alarm_logged = alarm.is_some();
+        match alarm {
+            Some(drift) => eprintln!(
+                "⏰ [BT-1 ALARM] this node's clock differs from the chain's time by {drift} s: \
+                 check its time sources (NTS)"
+            ),
+            None => eprintln!("⏰ [BT-1] the clock drift alarm cleared"),
+        }
     }
 
     /// The genesis launch window: from `LAUNCH_WINDOW_SKEW_SECS` before
@@ -797,6 +855,7 @@ impl DagConsensus {
     pub fn try_create_vertex(&mut self) {
         if self.v4_chain {
             self.v4_tick();
+            self.log_clock_alarm();
         }
     }
 
@@ -1202,6 +1261,7 @@ impl DagConsensus {
                 self.latest_block_height = new_block.header.height;
                 self.latest_block_hash = new_block.header.hash.clone();
                 self.latest_block_timestamp = new_block.header.timestamp;
+                self.check_clock_drift(new_block.header.timestamp);
                 self.assert_anchor_height_map(commit.anchor_round, self.latest_block_height);
                 self.latest_block_round = commit.anchor_round;
                 self.last_adopted_height = self.latest_block_height;

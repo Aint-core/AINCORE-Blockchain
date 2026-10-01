@@ -51,6 +51,18 @@ enum Command {
     /// each other. Without embedded BLS keys a multi-validator genesis is
     /// rejected (a node cannot self-derive another node's BLS key).
     GenMulti(multi_genesis::GenMultiArgs),
+
+    /// Print this validator's public genesis entry from its node.key: the
+    /// address, keys, BLS proof of possession and a node-key signature. Each
+    /// operator runs it on its own machine and sends the output to the
+    /// genesis coordinator (`gen-multi --entries-file`); no seed leaves the
+    /// validator.
+    ValidatorEntry(multi_genesis::EntryArgs),
+
+    /// Derive the measured block time and the consensus-time cap C_tau from
+    /// the release candidate's block intervals (G5 P-1): the inputs of
+    /// `gen-multi`.
+    ClockCap(multi_genesis::ClockCapArgs),
 }
 
 fn run_init(
@@ -80,6 +92,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             genesis,
         }) => run_init(&db_path, &stdlib_path, &genesis),
         Some(Command::GenMulti(gen_args)) => multi_genesis::run(gen_args),
+        Some(Command::ValidatorEntry(entry_args)) => multi_genesis::run_entry(entry_args),
+        Some(Command::ClockCap(cap_args)) => multi_genesis::run_clock_cap(cap_args),
         None => {
             // Backwards-compatible default: behave like the legacy `init` path
             // when invoked with top-level flags (`genesis-tool --db-path ...`).

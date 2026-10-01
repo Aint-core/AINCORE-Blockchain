@@ -225,6 +225,8 @@ module 0x1::delegation {
         };
         let pool = borrow_global_mut<Pool>(validator_addr);
         assert!(!pool.closed, error::invalid_state(EPOOL_CLOSED));
+        // G5 CH-1: an open pool's coins count in its validator's weight.
+        staking::admit_increase(amount);
         let book = borrow_global_mut<Book>(addr);
 
         let (found, i) = position_index(&book.positions, validator_addr);

@@ -73,6 +73,11 @@ pub enum Verdict {
     /// a member of the active committee: dropped, but proof that the network
     /// passed a boundary this node has not reached (it fetches the gap).
     Ahead,
+    /// Authenticated, but timestamped more than `MAX_FUTURE_DRIFT_SECS`
+    /// ahead of this node's clock: dropped (it can be had again). A sample
+    /// for the BT-1 drift alarm: when members holding a stake quorum are all
+    /// ahead, this node's clock is behind.
+    Early,
     Stage,
 }
 
@@ -273,7 +278,7 @@ pub fn v4_verdict_cached(
     }
     // Layer E.
     if v.timestamp > ctx.now_secs.saturating_add(MAX_FUTURE_DRIFT_SECS) {
-        return Verdict::Drop("timestamp ahead of this node's clock".into());
+        return Verdict::Early;
     }
     if v.round <= ctx.gc_floor {
         return Verdict::Stale;

@@ -721,11 +721,38 @@ impl ChainParams {
     }
 }
 
-/// G5 P-1 from the block time measured on the release candidate: I = 1,000
-/// and R = 20 (research b.2, b.6), and C_tau = 2 x t_b rounded up to whole
-/// seconds (the clock research's k = 2). genesis-tool runs this once and
-/// writes integers into genesis.json; no node derives anything at run time.
-pub fn derive_chain_params(block_time_ms: u64) -> Result<ChainParams, GenesisError> {
+/// G5 P-1, amendment S6: the consensus time capping may cost on the release
+/// candidate's measured block intervals, in basis points (0.5 %).
+pub const CLOCK_LOSS_BUDGET_BPS: u64 = 50;
+
+/// G5 P-1 (S6): C_tau measured, not assumed. The smallest whole number of
+/// seconds c such that capping every interval at c loses at most
+/// `CLOCK_LOSS_BUDGET_BPS` of the measured time: sum(max(0, x - c)) <=
+/// budget x sum(x). None without intervals. On the S6 cluster (4 validators,
+/// 1,000 blocks, mean 6.76 s) k = 2 (14 s) lost 3.99 % and 24 s loses 0.50 %.
+pub fn clock_cap_from_intervals(intervals: &[u64]) -> Option<u64> {
+    let total: u128 = intervals.iter().map(|&x| x as u128).sum();
+    if total == 0 {
+        return None;
+    }
+    let max = *intervals.iter().max()?;
+    (1..=max).find(|&c| {
+        let lost: u128 = intervals.iter().map(|&x| x.saturating_sub(c) as u128).sum();
+        lost * 10_000 <= total * CLOCK_LOSS_BUDGET_BPS as u128
+    })
+}
+
+/// G5 P-1 from the release candidate's measurements: I = 1,000 and R = 20
+/// (research b.2, b.6) from the mean block time t_b, and C_tau as measured
+/// (`clock_cap_from_intervals`), which must lie in [2 t_b, 4 t_b]: at least
+/// the old k = 2, and at most 4, so a corrupted clock can speed emission and
+/// deadlines by at most 4x (the BT-1 alarm flags it). genesis-tool runs this
+/// once and writes integers into genesis.json; no node derives anything at
+/// run time.
+pub fn derive_chain_params(
+    block_time_ms: u64,
+    clock_cap_secs: u64,
+) -> Result<ChainParams, GenesisError> {
     // I = 1,000 keeps the boundary overhead at or below 1 % and the epoch at
     // or below 2 h only for t_b in [1.0 s, 7.2 s] (P-1's table); outside it
     // the table no longer derives I.
@@ -734,10 +761,20 @@ pub fn derive_chain_params(block_time_ms: u64) -> Result<ChainParams, GenesisErr
             "block_time_ms {block_time_ms} is outside [1000, 7200], where I = 1,000 holds"
         )));
     }
+    let (low, high) = (
+        (2 * block_time_ms).div_ceil(1_000),
+        (4 * block_time_ms).div_ceil(1_000),
+    );
+    if !(low..=high).contains(&clock_cap_secs) {
+        return Err(GenesisError::InvalidData(format!(
+            "clock cap {clock_cap_secs} s is outside [{low}, {high}] s, 2 to 4 times the \
+             {block_time_ms} ms block time"
+        )));
+    }
     let params = ChainParams {
         epoch_blocks: 1_000,
         reward_period: 20,
-        max_block_interval_secs: (2 * block_time_ms).div_ceil(1_000),
+        max_block_interval_secs: clock_cap_secs,
     };
     params.validate()?;
     Ok(params)
@@ -1313,6 +1350,18 @@ pub fn build_genesis(
             &hex::encode(bcs::to_bytes(&coin_store)?),
         )?;
     }
+
+    // === G5 CH-1: epoch 0's allowance of added stake ===
+    // The genesis committee's stake is the base; the executor rewrites it at
+    // every boundary.
+    let genesis_committee_stake: u128 = v1_validators.iter().map(|v| v.stake as u128).sum();
+    storage.put(
+        &system_resource_key("0x1::staking::ChurnState"),
+        &hex::encode(bcs::to_bytes(&executor::opening_churn_state(
+            0,
+            genesis_committee_stake,
+        ))?),
+    )?;
 
     // === Initialize Epoch (the reward-period counter) ===
     #[derive(serde::Serialize)]
@@ -2119,6 +2168,34 @@ mod tests {
         assert!(bls
             .verify_possession(&v.bls_public_key, &v.bls_pop)
             .unwrap());
+    }
+
+    /// G5 CH-1: genesis opens epoch 0's allowance of added stake against the
+    /// genesis committee's stake; the executor rewrites it at every boundary.
+    #[test]
+    fn the_genesis_opens_epoch_zeros_churn_allowance() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let validator_key = SigningKey::from_bytes(&[44u8; 32]);
+        let addr = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
+        let pubkey = hex::encode(validator_key.verifying_key().as_bytes());
+        let bls = crypto::bls::BLSEngine::consensus();
+        let bls_seed = [45u8; 32];
+        let path = write_genesis_json(
+            "churn",
+            &addr,
+            &pubkey,
+            Some(&hex::encode(bls.pubkey_raw(&bls_seed))),
+            Some(&hex::encode(bls.prove_possession_raw(&bls_seed))),
+        );
+        let db = temp_db("churn");
+        initialize_genesis_from(&db, &stdlib_path(), &path).expect("genesis initializes");
+        let raw = db
+            .get(&executor::churn_state_key())
+            .unwrap()
+            .expect("genesis writes the churn state");
+        let state: executor::ChurnState = bcs::from_bytes(&hex::decode(raw).unwrap()).unwrap();
+        // The one validator stakes 1,000 AIN.
+        assert_eq!(state, executor::opening_churn_state(0, 1_000));
     }
 
     #[test]
@@ -3283,12 +3360,12 @@ mod tests {
         }
     }
 
-    /// G5 P-1: genesis-tool's one input, the measured block time, gives
-    /// I = 1,000, R = 20 and C_tau = 2 x t_b rounded up to whole seconds.
+    /// G5 P-1: the measured block time gives I = 1,000 and R = 20; the
+    /// measured clock cap is taken as is within [2 t_b, 4 t_b].
     #[test]
     fn the_chain_parameters_derive_from_the_block_time() {
         assert_eq!(
-            derive_chain_params(6_650).unwrap(),
+            derive_chain_params(6_650, 14).unwrap(),
             ChainParams {
                 epoch_blocks: 1_000,
                 reward_period: 20,
@@ -3296,19 +3373,40 @@ mod tests {
             }
         );
         assert_eq!(
-            derive_chain_params(2_000).unwrap().max_block_interval_secs,
-            4
+            derive_chain_params(6_860, 24)
+                .unwrap()
+                .max_block_interval_secs,
+            24
         );
+        // 2 x 6.65 s rounds up to 14 and 4 x 6.65 s to 27.
+        assert!(derive_chain_params(6_650, 13).is_err());
+        assert!(derive_chain_params(6_650, 27).is_ok());
+        assert!(derive_chain_params(6_650, 28).is_err());
         assert_eq!(
-            derive_chain_params(1_000).unwrap().max_block_interval_secs,
+            derive_chain_params(1_000, 2)
+                .unwrap()
+                .max_block_interval_secs,
             2
         );
         // Only where the table derives I = 1,000 (G5 review). SL-5's bound,
         // (1,000 + 20) x C_tau <= U - W - D, holds far beyond it.
-        assert!(derive_chain_params(7_200).is_ok());
-        assert!(derive_chain_params(7_201).is_err());
-        assert!(derive_chain_params(999).is_err());
-        assert!(derive_chain_params(0).is_err());
+        assert!(derive_chain_params(7_200, 15).is_ok());
+        assert!(derive_chain_params(7_201, 15).is_err());
+        assert!(derive_chain_params(999, 2).is_err());
+        assert!(derive_chain_params(0, 1).is_err());
+    }
+
+    /// G5 P-1 (S6): the clock cap is the smallest that loses at most 0.5 %
+    /// of the measured time. Here 990 intervals of 6 s and ten of 30 s: a
+    /// cap of 26 s loses 40 s of 6,240 s (0.64 %), 27 s loses 30 s (0.48 %).
+    #[test]
+    fn the_clock_cap_is_the_smallest_within_the_loss_budget() {
+        let mut intervals = vec![6u64; 990];
+        intervals.extend([30u64; 10]);
+        assert_eq!(clock_cap_from_intervals(&intervals), Some(27));
+        assert_eq!(clock_cap_from_intervals(&[6; 100]), Some(6));
+        assert_eq!(clock_cap_from_intervals(&[]), None);
+        assert_eq!(clock_cap_from_intervals(&[0, 0]), None);
     }
 
     /// TA-1: the identity binds `state_root(0)`, so two genesis files that

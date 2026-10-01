@@ -51,7 +51,10 @@
         "tests::tests::a_block_timestamp_needs_a_quorum_of_the_committee",
         "tests::tests::v4_node_tests::a_v4_node_takes_no_v3_evidence",
         "tests::tests::v4_node_tests::a_node_without_the_v4_format_is_inert",
-        "tests::tests::test_only_equivocation_items_pass_kind_filter"
+        "tests::tests::test_only_equivocation_items_pass_kind_filter",
+        "tests::tests::v4_node_tests::the_recovery_tool_pins_the_canonical_certificate_on_every_node",
+        "tests::tests::v4_node_tests::a_node_whose_clock_drifts_from_the_chain_alarms",
+        "v4::recovery::tests::the_canonical_digest_is_the_ordered_one_else_the_lower"
       ],
       "excluded_ignored": {
         "ordering::tests::probe_corpus_arm_distribution": "Measurement of scheduler corpus distribution, not a safety assertion.",
@@ -97,7 +100,8 @@
         "tests::a1_a_leader_outside_the_paid_committee_gets_nothing",
         "tests::g5_a_certificate_conflict_raises_a_lesser_offense_to_full",
         "tests::g5_a_full_validator_set_takes_a_larger_joiner_and_unbonds_the_smallest",
-        "tests::g5_frozen_unbonding_is_not_paid_until_thawed"
+        "tests::g5_frozen_unbonding_is_not_paid_until_thawed",
+        "tests::g5_added_stake_per_epoch_is_capped_at_a_tenth_of_the_committee"
       ],
       "excluded_ignored": {
         "tests::test_h6_state_root_is_blind_to_out_of_band_writes": "Superseded by G3 C1′/C2′ (the root is the JMT root of the state map): storage class::tests::the_write_gate_refuses_state_outside_the_block_transaction, state_commit tests::rc2_lists_every_flat_key_the_tree_disagrees_with and tests::forged_or_foreign_chunks_are_refused, chain_sync a_forged_chunk_is_refused_and_the_restore_completes_elsewhere, consensus a_qc_over_another_state_root_is_never_stored, executor block_execution_writes_state_only_inside_the_block_transaction. WG-1 refuses this test's own setup write, so it cannot run as written.",
@@ -113,7 +117,8 @@
         "genesis::tests::the_unbonding_mirror_is_the_move_constant",
         "genesis::tests::a_database_without_the_v4_vertex_format_is_refused_at_boot",
         "public_claims_tests::the_public_documents_make_no_claim_the_code_contradicts",
-        "genesis::tests::a_genesis_committee_with_a_shared_bls_key_is_refused"
+        "genesis::tests::a_genesis_committee_with_a_shared_bls_key_is_refused",
+        "genesis::tests::the_genesis_opens_epoch_zeros_churn_allowance"
       ],
       "excluded_ignored": {}
     },

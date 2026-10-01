@@ -779,8 +779,13 @@ fn handle_rpc_method(
              // Never waits on the consensus lock (see `try_consensus`). While a
              // block is being committed the two in-memory fields come from
              // storage (or are null) and `consensus_busy` says so.
-             let (node_id, current_round, consensus_busy) = match try_consensus(data)? {
-                 Some(c) => (serde_json::json!(c.node_id), serde_json::json!(c.current_round), false),
+             let (node_id, current_round, consensus_busy, clock_drift_alarm) = match try_consensus(data)? {
+                 Some(c) => (
+                     serde_json::json!(c.node_id),
+                     serde_json::json!(c.current_round),
+                     false,
+                     serde_json::json!(c.clock_drift_alarm()),
+                 ),
                  None => (
                      serde_json::Value::Null,
                      match data.storage.get("latest_proposed_round") {
@@ -788,6 +793,7 @@ fn handle_rpc_method(
                          _ => serde_json::Value::Null,
                      },
                      true,
+                     serde_json::Value::Null,
                  ),
              };
              let peers_count = data.peers.lock().map_err(|e| JsonRpcError { code: -32000, message: format!("Peers lock error: {}", e) })?.len();
@@ -796,6 +802,9 @@ fn handle_rpc_method(
                  "node_id": node_id,
                  "current_round": current_round,
                  "consensus_busy": consensus_busy,
+                 // G5 BT-1: local clock − the chain's block time, in seconds,
+                 // while this node's drift alarm holds; null otherwise.
+                 "clock_drift_alarm_secs": clock_drift_alarm,
                  "peers_count": peers_count,
                  "latest_height": match data.storage.get("latest_height") {
                      Ok(Some(h)) => h,
