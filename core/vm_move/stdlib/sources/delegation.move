@@ -78,6 +78,10 @@ module 0x1::delegation {
     /// dropped once every ticket it may cut is paid; past the bound the two
     /// oldest merge into one that cuts at least as much (never less).
     const MAX_SLASH_EVENTS: u64 = 8;
+    /// G5 review (A3b): offenses settled per call, so a settlement's work is
+    /// bounded whatever the ledger and the unbonding queue hold. The rest
+    /// settle at the next call; their stake stays frozen until then.
+    const MAX_SETTLE_PER_CALL: u64 = 32;
     /// DL-2: the reward counter's scale (Polkadot's RewardCounter, FixedU128).
     const REWARD_SCALE: u128 = 1000000000000000000;
     /// DL-2: a pool with fewer points takes no reward, which bounds each step
@@ -161,10 +165,15 @@ module 0x1::delegation {
         self_weight: u64,
         delegated_weight: u64,
         settled: bool,
+        /// A certificate conflict convicted it: two certificates for one slot
+        /// prove a third of the committee signed both, so the fraction is
+        /// 100 % whatever Q its own epoch shows (G5 review, A3b).
+        full: bool,
     }
 
     /// Every accepted offense until no unsettled one can still count it, at
-    /// @0x1. One per validator: a validator's first offense is its only one.
+    /// @0x1. One per validator: a validator's first offense is its only one,
+    /// unless a certificate conflict later raises it to 100 %.
     struct Offenses has key {
         list: vector<Offense>,
     }
@@ -317,16 +326,20 @@ module 0x1::delegation {
     public entry fun withdraw_unbonded(
         delegator: &signer,
         validator_addr: address
-    ) acquires Pool, Book {
+    ) acquires Pool, Book, Offenses {
         let addr = signer::address_of(delegator);
         assert!(exists<Book>(addr), error::not_found(ENOTHING_MATURED));
+        // G5 review (A3b): a ticket in an unsettled offense's scope waits
+        // for the settlement that may cut it.
+        let (frozen, from_epoch) = unsettled_scope(validator_addr);
         let book = borrow_global_mut<Book>(addr);
         let now = chain::time();
         let paid = 0;
         let i = 0;
         while (i < vector::length(&book.tickets)) {
             let ticket = vector::borrow(&book.tickets, i);
-            if (ticket.validator == validator_addr && ticket.unlock_time <= now) {
+            if (ticket.validator == validator_addr && ticket.unlock_time <= now
+                && !(frozen && ticket.created_epoch >= from_epoch)) {
                 let ticket = vector::remove(&mut book.tickets, i);
                 pay_ticket(borrow_global_mut<Pool>(validator_addr), ticket, addr);
                 paid = paid + 1;
@@ -481,8 +494,11 @@ module 0x1::delegation {
     /// the frozen split of its weight, all from C_{epoch} (whole AIN). The
     /// offender leaves the active set with all its stake unbonding, and its
     /// pool closes; nothing is burned until the fraction is final. A second
-    /// offense by the same validator is ignored (the tombstone). Settles
-    /// whatever is due. System-only (FIX #1 binds the genuine @0x1 signer).
+    /// offense by the same validator is ignored (the tombstone). Recording
+    /// never settles (G5 review): acceptance must not depend on the size of
+    /// the ledger. The executor runs `settle_offenses` in the same block.
+    /// The ledger stays sorted by `epoch_began`. System-only (FIX #1 binds
+    /// the genuine @0x1 signer).
     public entry fun report_equivocation(
         account: &signer,
         validator_addr: address,
@@ -492,6 +508,41 @@ module 0x1::delegation {
         committee_weight: u64,
         self_weight: u64,
         delegated_weight: u64,
+    ) acquires Offenses, Pool {
+        record(account, validator_addr, epoch, epoch_time, weight, committee_weight,
+            self_weight, delegated_weight, false);
+    }
+
+    /// G5 SL-3, SL-4 (review, A3b): a certificate conflict convicts its
+    /// member. Two certificates for one slot overlap in more than a third of
+    /// the committee, so its fraction is 100 %. A member already recorded for
+    /// a lesser offense is raised to 100 %, with the earlier of the two scopes;
+    /// one already settled at less loses what remains in scope at once. Else
+    /// as `report_equivocation`. System-only.
+    public entry fun report_certificate_conflict(
+        account: &signer,
+        validator_addr: address,
+        epoch: u64,
+        epoch_time: u64,
+        weight: u64,
+        committee_weight: u64,
+        self_weight: u64,
+        delegated_weight: u64,
+    ) acquires Offenses, Pool {
+        record(account, validator_addr, epoch, epoch_time, weight, committee_weight,
+            self_weight, delegated_weight, true);
+    }
+
+    fun record(
+        account: &signer,
+        validator_addr: address,
+        epoch: u64,
+        epoch_time: u64,
+        weight: u64,
+        committee_weight: u64,
+        self_weight: u64,
+        delegated_weight: u64,
+        full: bool,
     ) acquires Offenses, Pool {
         assert!(signer::address_of(account) == @0x1, error::permission_denied(EUNAUTHORIZED));
         assert!(
@@ -506,12 +557,34 @@ module 0x1::delegation {
         let len = vector::length(&ledger.list);
         let i = 0;
         while (i < len) {
-            if (vector::borrow(&ledger.list, i).validator == validator_addr) {
+            let entry = vector::borrow_mut(&mut ledger.list, i);
+            if (entry.validator == validator_addr) {
+                if (!full || entry.full) {
+                    return
+                };
+                entry.full = true;
+                if (epoch < entry.epoch) {
+                    entry.epoch = epoch;
+                };
+                let scope = entry.epoch;
+                if (entry.settled) {
+                    staking::slash_unbonding(validator_addr, scope, MAX_BPS);
+                    if (exists<Pool>(validator_addr)) {
+                        slash_pool(borrow_global_mut<Pool>(validator_addr), MAX_BPS, scope);
+                    };
+                } else {
+                    staking::freeze_payouts(account, validator_addr, scope);
+                };
                 return
             };
             i = i + 1;
         };
-        vector::push_back(&mut ledger.list, Offense {
+        // After every offense whose epoch began no later: sorted, and stable.
+        let at = len;
+        while (at > 0 && vector::borrow(&ledger.list, at - 1).epoch_began > epoch_time) {
+            at = at - 1;
+        };
+        vector::insert(&mut ledger.list, Offense {
             validator: validator_addr,
             epoch,
             epoch_began: epoch_time,
@@ -520,12 +593,31 @@ module 0x1::delegation {
             self_weight,
             delegated_weight,
             settled: false,
-        });
+            full,
+        }, at);
         staking::remove_offender(validator_addr);
+        staking::freeze_payouts(account, validator_addr, epoch);
         if (exists<Pool>(validator_addr)) {
             borrow_global_mut<Pool>(validator_addr).closed = true;
         };
-        settle_due();
+    }
+
+    /// Whether `validator` has an unsettled offense, and the first committee
+    /// epoch in its scope.
+    fun unsettled_scope(validator: address): (bool, u64) acquires Offenses {
+        if (!exists<Offenses>(@0x1)) {
+            return (false, 0)
+        };
+        let list = &borrow_global<Offenses>(@0x1).list;
+        let i = 0;
+        while (i < vector::length(list)) {
+            let offense = vector::borrow(list, i);
+            if (offense.validator == validator && !offense.settled) {
+                return (true, offense.epoch)
+            };
+            i = i + 1;
+        };
+        (false, 0)
     }
 
     /// G5 SL-5 (settlement), run by the executor every reward period: settle
@@ -576,9 +668,15 @@ module 0x1::delegation {
     }
 
     /// Settle every unsettled offense whose fraction is final: 100 % already,
-    /// or D + I x C_tau + W after its epoch began, when every correlated
-    /// offense's evidence has landed or been refused (SL-5). Then drop
-    /// settled offenses no unsettled one can still count.
+    /// or once tau is past D + I x C_tau + W after its epoch began, when every
+    /// correlated offense's evidence has landed or been refused (SL-5:
+    /// evidence of epoch E is refused once tau > tau_start(E+1) + W, so the
+    /// deadline is strict). Then drop settled offenses no unsettled one can
+    /// still count.
+    ///
+    /// Linear in the ledger (G5 review): it is sorted by `epoch_began`, so one
+    /// sweep with two pointers keeps Q, the weight of the offenses whose
+    /// epochs began within D, for each offense in turn.
     fun settle_due() acquires Offenses, Pool {
         let now = chain::time();
         let window = chain::correlation_window_secs();
@@ -587,13 +685,28 @@ module 0x1::delegation {
             + chain::evidence_max_age_secs();
         let list = &mut borrow_global_mut<Offenses>(@0x1).list;
         let len = vector::length(list);
+        // Q = the weight of list[lo..hi).
+        let (lo, hi, q) = (0, 0, 0);
+        let settled_now = 0;
         let i = 0;
         while (i < len) {
+            let began = vector::borrow(list, i).epoch_began;
+            while (hi < len && vector::borrow(list, hi).epoch_began <= began + window) {
+                q = q + vector::borrow(list, hi).weight;
+                hi = hi + 1;
+            };
+            while (vector::borrow(list, lo).epoch_began + window < began) {
+                q = q - vector::borrow(list, lo).weight;
+                lo = lo + 1;
+            };
             let offense = *vector::borrow(list, i);
-            if (!offense.settled) {
-                let q = correlated_weight(list, offense.epoch_began, window);
-                let f = equivocation_bps(q, offense.committee_weight);
-                if (f == MAX_BPS || now >= offense.epoch_began + span) {
+            if (!offense.settled && settled_now < MAX_SETTLE_PER_CALL) {
+                let f = if (offense.full) {
+                    MAX_BPS
+                } else {
+                    equivocation_bps(q, offense.committee_weight)
+                };
+                if (f == MAX_BPS || now > offense.epoch_began + span) {
                     let (own, pool_bps) =
                         waterfall(f, offense.self_weight, offense.delegated_weight);
                     staking::slash_unbonding(offense.validator, offense.epoch, own);
@@ -605,42 +718,24 @@ module 0x1::delegation {
                         );
                     };
                     vector::borrow_mut(list, i).settled = true;
+                    staking::thaw_payouts(offense.validator);
+                    settled_now = settled_now + 1;
                 };
             };
             i = i + 1;
         };
         // An unsettled offense within D of a settled one settles by that
-        // one's time + 2D + I x C_tau + W at the latest.
-        let i = 0;
-        while (i < vector::length(list)) {
-            let offense = vector::borrow(list, i);
-            if (offense.settled && now > offense.epoch_began + window + span) {
-                vector::remove(list, i);
-            } else {
-                i = i + 1;
-            };
-        };
-    }
-
-    /// Q: the total weight of the offenses whose epochs began within `window`
-    /// of `began`.
-    fun correlated_weight(list: &vector<Offense>, began: u64, window: u64): u64 {
-        let q = 0;
-        let len = vector::length(list);
+        // one's time + 2D + I x C_tau + W at the latest. One pass, order kept.
+        let kept = vector::empty<Offense>();
         let i = 0;
         while (i < len) {
-            let other = vector::borrow(list, i);
-            let apart = if (other.epoch_began > began) {
-                other.epoch_began - began
-            } else {
-                began - other.epoch_began
-            };
-            if (apart <= window) {
-                q = q + other.weight;
+            let offense = *vector::borrow(list, i);
+            if (!offense.settled || now <= offense.epoch_began + window + span) {
+                vector::push_back(&mut kept, offense);
             };
             i = i + 1;
         };
-        q
+        *list = kept;
     }
 
     /// SL-1: cut a closed pool's active principal by `bps`, rounded up, and

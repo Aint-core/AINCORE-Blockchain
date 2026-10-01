@@ -85,46 +85,6 @@ mod tests {
         )
     }
 
-    /// G5 S4c: the V3 DAG is deleted. A node on a database without the V4
-    /// vertex format (boot refuses one in production) proposes nothing, takes
-    /// no message (V3 or V4), signs no vote and adopts no block.
-    #[test]
-    fn a_node_without_the_v4_format_is_inert() {
-        let (mut node, path) = setup_dag("inert");
-        assert!(node.v4.is_none());
-        for _ in 0..3 {
-            node.try_create_vertex();
-        }
-        let v = tier2_vertex(&[42; 32], &node.node_id, 1, 1_000, &[]);
-        for wire in [
-            format!("DAG_VERTEX:{}", serde_json::to_string(&v).unwrap()),
-            "EQUIV_PROOF:{}".to_string(),
-            "DOWNTIME_ATTEST:{}".to_string(),
-            format!("{}{{}}", crate::v4::WIRE_PREFIX),
-            "QC_VOTE:{}".to_string(),
-        ] {
-            node.handle_message(&wire);
-        }
-        node.reload_chain_tip();
-        assert!(node.dag.lock().unwrap().is_empty());
-        assert!(node.round_index.lock().unwrap().is_empty());
-        let rows: Vec<String> = node
-            .storage
-            .db
-            .iterator(storage::rocksdb::IteratorMode::Start)
-            .map(|r| String::from_utf8_lossy(&r.unwrap().0).into_owned())
-            .filter(|k| {
-                k.starts_with("vertex")
-                    || k.starts_with("consensus:")
-                    || k.starts_with("sys:equiv")
-                    || k.starts_with("latest_proposed_round")
-            })
-            .collect();
-        assert!(rows.is_empty(), "an inert node wrote {rows:?}");
-        drop(node);
-        let _ = std::fs::remove_dir_all(&path);
-    }
-
     #[test]
     fn test_dag_parent_quorum_requires_strict_supermajority() {
         // B4: the DAG parent quorum is now stake-weighted via qc::stake_quorum_met

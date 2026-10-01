@@ -268,8 +268,12 @@ fn block_crash_child() {
                 // bytecode the S4a executor reproduces 726ce81d... exactly. G5
                 // S4d moved it through the stdlib alone (join refuses a shared
                 // BLS key): with S4b's bytecode the S4d executor reproduces
-                // c5038a3d... exactly.
-                "c5be08d57f5e8d46a1cccb28c35bb599888f81b6ab2b599d2140a4c1899eb39c",
+                // c5038a3d... exactly. The G5 review (A3, A3b) moved it
+                // through the stdlib alone (staking entries `entry` only,
+                // linear settlement, frozen payouts, conviction in full,
+                // eviction from a full set): with S4c's bytecode the
+                // reviewed executor reproduces c5be08d5... exactly.
+                "247c3a722e4065b99738f2096b49497c9a67b887ed92909543128a3e610da0a8",
                 "clean execution must preserve the pre-staging fixture root"
             );
         }

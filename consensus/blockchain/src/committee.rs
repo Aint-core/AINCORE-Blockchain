@@ -35,6 +35,9 @@ pub fn validator_set_hash(validators: &[ValidatorInfo]) -> String {
     hex::encode(crypto::hash(&bytes))
 }
 
+/// At most this many members sign for an epoch (G1 EP-2).
+pub const MAX_COMMITTEE: usize = 256;
+
 /// G1 EP-2: a proposed committee is valid when its positive-stake members are
 /// 1 to 256 distinct validators whose Ed25519 keys derive their addresses and
 /// whose BLS proofs of possession verify. Returns it in canonical order.
@@ -47,8 +50,8 @@ pub fn validate_committee(proposed: &[ValidatorInfo]) -> Result<Vec<ValidatorInf
     if members.is_empty() {
         return Err("an empty committee".into());
     }
-    if members.len() > 256 {
-        return Err(format!("{} members, over 256", members.len()));
+    if members.len() > MAX_COMMITTEE {
+        return Err(format!("{} members, over {MAX_COMMITTEE}", members.len()));
     }
     let mut seen = HashSet::new();
     let mut keys = HashSet::new();
@@ -84,15 +87,129 @@ pub fn validate_committee(proposed: &[ValidatorInfo]) -> Result<Vec<ValidatorInf
     Ok(canonical_order(&members))
 }
 
+/// The `MAX_COMMITTEE` positive-stake members of `proposed` with the most
+/// stake, ties by address (G5 review: the active set is chosen by stake, as
+/// Cosmos chooses it by power under `MaxValidators`). More validators may be
+/// bonded; only these sign and are paid for the epoch.
+pub fn top_by_stake(proposed: &[ValidatorInfo]) -> Vec<ValidatorInfo> {
+    let mut members: Vec<ValidatorInfo> =
+        proposed.iter().filter(|m| m.stake > 0).cloned().collect();
+    members.sort_by(|a, b| {
+        b.stake
+            .cmp(&a.stake)
+            .then_with(|| a.address.cmp(&b.address))
+    });
+    members.truncate(MAX_COMMITTEE);
+    members
+}
+
 /// G1 EP-2: the committee of epoch E+1 from the live set proposed at the
-/// boundary H_E: the proposal if it is valid, C_E otherwise (the reason is
-/// returned so the caller can raise its alarm).
+/// boundary H_E: its top `MAX_COMMITTEE` by stake if they are valid.
+/// Otherwise C_E, without the members the live set no longer holds (G5
+/// review: a kept committee must not keep a member whose stake left), or
+/// all of C_E if that is not valid either. The reason is returned so the
+/// caller can raise its alarm.
 pub fn next_committee(
     current: &[ValidatorInfo],
     proposed: &[ValidatorInfo],
 ) -> (Vec<ValidatorInfo>, Option<String>) {
-    match validate_committee(proposed) {
+    match validate_committee(&top_by_stake(proposed)) {
         Ok(c) => (c, None),
-        Err(why) => (canonical_order(current), Some(why)),
+        Err(why) => {
+            let live: HashSet<&str> = proposed
+                .iter()
+                .filter(|m| m.stake > 0)
+                .map(|m| m.address.as_str())
+                .collect();
+            let kept: Vec<ValidatorInfo> = current
+                .iter()
+                .filter(|m| live.contains(m.address.as_str()))
+                .cloned()
+                .collect();
+            match validate_committee(&kept) {
+                Ok(c) => (c, Some(why)),
+                Err(_) => (canonical_order(current), Some(why)),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(seed: u32, stake: u64) -> ValidatorInfo {
+        let mut key = [0u8; 32];
+        key[..4].copy_from_slice(&seed.to_le_bytes());
+        key[31] = 1;
+        let ed = crypto::SigningKey::from_bytes(&key)
+            .verifying_key()
+            .to_bytes();
+        let bls = BLSEngine::consensus();
+        let bls_seed: [u8; 32] = crypto::hash(&key).try_into().unwrap();
+        ValidatorInfo {
+            address: crypto::derive_address(&ed).unwrap(),
+            stake,
+            ed25519_public_key: hex::encode(ed),
+            bls_public_key: hex::encode(bls.pubkey_raw(&bls_seed)),
+            bls_pop: hex::encode(bls.prove_possession_raw(&bls_seed)),
+        }
+    }
+
+    /// G5 review: 257 or more bonded validators no longer make the live set
+    /// invalid (which kept C_E, leavers included, for good): the committee is
+    /// the top 256 by stake, ties by address, whatever their order.
+    #[test]
+    fn more_than_256_validators_elect_the_top_256_by_stake() {
+        let mut live: Vec<ValidatorInfo> = (0..300).map(|i| member(i, 1_000)).collect();
+        live[7].stake = 5_000;
+        live[299].stake = 4_000;
+        live[3].stake = 0;
+        let mut reversed = live.clone();
+        reversed.reverse();
+        let (next, invalid) = next_committee(&live[..4], &live);
+        assert_eq!(invalid, None);
+        assert_eq!(next.len(), MAX_COMMITTEE);
+        assert_eq!(next_committee(&live[..4], &reversed).0, next);
+        let addresses: HashSet<&str> = next.iter().map(|m| m.address.as_str()).collect();
+        assert!(addresses.contains(live[7].address.as_str()));
+        assert!(addresses.contains(live[299].address.as_str()));
+        assert!(
+            !addresses.contains(live[3].address.as_str()),
+            "no zero stake"
+        );
+        // The 1,000-stake seats go to the lowest addresses.
+        let mut equal: Vec<&ValidatorInfo> = live.iter().filter(|m| m.stake == 1_000).collect();
+        equal.sort_by(|a, b| a.address.cmp(&b.address));
+        let (inside, outside) = equal.split_at(MAX_COMMITTEE - 2);
+        assert!(inside
+            .iter()
+            .all(|m| addresses.contains(m.address.as_str())));
+        assert!(outside
+            .iter()
+            .all(|m| !addresses.contains(m.address.as_str())));
+    }
+
+    /// G5 review: when the proposal is invalid, the kept committee drops the
+    /// members the live set no longer holds; with none left valid, C_E stays.
+    #[test]
+    fn a_kept_committee_drops_members_whose_stake_left() {
+        let (a, b, c) = (member(1, 100), member(2, 100), member(3, 100));
+        let mut bad = b.clone();
+        bad.bls_pop = a.bls_pop.clone();
+        let (next, invalid) = next_committee(&[a.clone(), b.clone(), c.clone()], &[a.clone(), bad]);
+        assert!(invalid.is_some());
+        assert_eq!(
+            next,
+            canonical_order(&[a.clone(), b.clone()]),
+            "C left, B kept as it was"
+        );
+        let (next, invalid) = next_committee(&[a.clone(), b.clone()], &[]);
+        assert!(invalid.is_some());
+        assert_eq!(
+            next,
+            canonical_order(&[a, b]),
+            "nothing valid is left: C_E stays"
+        );
     }
 }

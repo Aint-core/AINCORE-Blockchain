@@ -37,7 +37,7 @@ AINCORE is a high-performance Layer-1 blockchain built entirely in Rust, featuri
 | **Native Coin** | **$AIN** |
 | **Max Supply** | 150,000,000 AIN (Hard Cap, enforced in smart contract) |
 | **Genesis Allocation** | ~1,050,000 AIN (0.7% — Validator Stake + Treasury) |
-| **Community Supply** | ~148,950,000 AIN (99.3% — Mined via DePIN & Staking) |
+| **Community Supply** | ~148,950,000 AIN (99.3% — the emission reserve, paid to validators and their delegators) |
 | **VC Allocation** | **0% (Zero)** |
 | **Emission** | 1.90 % per year of the remaining reserve, paid to the committee every reward period (20 blocks) for the consensus time since the last payout |
 | **Emission Formula** | `e = remaining × λ × Δτ`, λ = −ln(0.981) per year; half of the reserve is emitted after about 36 years |
@@ -54,8 +54,8 @@ AINCORE follows a **No-VC Fairlaunch** model inspired by Hyperliquid:
 
 1. **Genesis Validator Lock:** The founder's initial stake (used to bootstrap the network) is **permanently locked** at the protocol level. The `Executor` rejects any `transfer` transaction from the Genesis address. This is enforced in code, not by promise.
 2. **Zero VC/Presale:** No tokens were sold to venture capitalists or institutional investors at a discount.
-3. **99.3% Community Owned:** Nearly all tokens are minted exclusively through DePIN Mining and Staking Rewards over time.
-4. **Buyback Ready:** Transaction fees flow to the Treasury, enabling protocol-level buyback mechanisms.
+3. **99.3% Community Owned:** Nearly all tokens are minted over time as staking rewards: 1.90 % a year of the remaining reserve, paid to the committee and its delegators. DePIN mining receives no share of emission at launch.
+4. **Fees:** 10 % of each block's fees is burned; of the rest, 20 % goes to the block's anchor leader and 80 % to the committee by stake.
 
 ---
 
@@ -261,10 +261,12 @@ Pruning only removes historical `block_*`, `block_txs:*`, and matching
 
 Public testnet nodes should use the default 3-second consensus ticker. Faster
 ticks are useful for private soak/stress runs, but they increase DB, indexer,
-and observer load.
+and observer load. A tick is not a block: a block is placed per committed
+anchor, and the block time of the current (V4) consensus is measured on the
+release candidate before genesis; it is not a published figure yet.
 
 ```bash
-# Default public-testnet cadence: roughly one block every 3 seconds.
+# Default consensus tick.
 export AINCORE_CONSENSUS_TICK_MS=3000
 ```
 
@@ -435,7 +437,7 @@ This guide walks you through becoming a validator on the AINCORE network.
 | **Network** | Stable internet, open port 9000 (TCP) |
 | **Stake** | 1,000 AIN tokens |
 
-> ⚠️ **WARNING:** Running a validator on unreliable hardware (laptop, home WiFi) risks **automatic slashing**. If your node misses 100+ consecutive rounds, the Jail System will slash 5% of your stake and lock the remaining 95% for 21 days. Use a reliable VPS provider (AWS, Google Cloud, Hetzner, etc.).
+> ⚠️ **WARNING:** Never run the same validator key on two machines, and never restore a validator from a backup of its database: two bodies or votes for one slot are equivocation, which jails the validator for good and slashes its stake and its delegators' (1 % alone, up to 100 % when a third of the committee equivocates together). Downtime is not slashed, but an offline validator earns nothing and weakens the committee, so use reliable hardware.
 
 ### Step 1: Install and Build
 
@@ -522,7 +524,7 @@ You should see in your node logs:
 ./target/release/aincore-cli balance
 ```
 
-Your staked amount will be locked. You will start earning block rewards every epoch.
+Your staked amount will be locked. From the next committee epoch you are in the committee if your stake is among the top 256, and you are paid every reward period (20 blocks) in proportion to your committee weight.
 
 ### Step 7: (Optional) Enable Delegation
 
@@ -557,9 +559,9 @@ If you wish to stop validating:
 | Protection | Implementation | File |
 |---|---|---|
 | **Genesis Lock** | Transfers from Genesis address permanently blocked | `executor/src/lib.rs` |
-| **Jail System** | 5% slash + 21-day forced unbonding for misbehavior | `staking.move` |
-| **Downtime Detection** | Detected + attested after 100+ missed rounds; NOT slashed (equivocation only) | `consensus/dag.rs` |
-| **Double-Sign Detection** | Equivocation proof triggers immediate slash | `consensus/dag.rs` |
+| **Equivocation slashing** | A proven double-sign jails the validator for good and moves its stake into 21-day unbonding at once; the fraction (1 % to 100 %, by the weight that equivocated together) is cut once it is final | `delegation.move`, `executor/src/lib.rs` |
+| **Downtime** | Not slashed in this protocol version | — |
+| **Double-Sign Detection** | Two bodies for one slot, or two certificates, become evidence carried through the DAG | `consensus/v4/evidence.rs` |
 | **Replay Protection** | Full transaction signing: `chain_id:sender:payload:seq_num` | `executor/src/lib.rs` |
 | **Chain ID Isolation** | Transactions rejected if chain_id mismatches | `executor/src/lib.rs` |
 | **Sequence Numbers** | Per-account nonce prevents transaction replay | `executor/src/lib.rs` |

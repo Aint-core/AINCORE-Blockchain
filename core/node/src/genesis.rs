@@ -640,10 +640,9 @@ pub struct GenesisFile {
     pub treasury_reserve: String,
     /// SEC-#13: the canonical epoch-BLOCK interval (in blocks). (G5 CL-1: the
     /// old `epoch_duration`, seconds on a virtual clock, is gone; a file that
-    /// still carries it parses, and the value is ignored.) When omitted,
-    /// DEFAULT_EPOCH_BLOCK_INTERVAL is used. Pinned
-    /// into state and the genesis identity so every node advances epochs at
-    /// identical heights.
+    /// still carries it parses, and the value is ignored.) Required (G5
+    /// P-1). Pinned into state and the genesis identity so every node
+    /// advances epochs at identical heights.
     #[serde(default)]
     pub epoch_block_interval: Option<u64>,
     /// FX-7: `stdlib_state_hash` of the stdlib this chain starts from.
@@ -656,9 +655,10 @@ pub struct GenesisFile {
     pub tip_agreement_n: Option<u64>,
     /// G5 P-1: the reward period (blocks) and the consensus-time cap per
     /// block (seconds). The real genesis carries both, derived by
-    /// genesis-tool from the measured block time (`derive_chain_params`); an
-    /// omitted one takes `ChainParams::DEFAULT`. Durations (unbonding, the
-    /// commission notice, the emission rate) are stdlib constants.
+    /// genesis-tool from the measured block time (`derive_chain_params`);
+    /// a file without them is refused (G5 review: none is a guess).
+    /// Durations (unbonding, the commission notice, the emission rate) are
+    /// stdlib constants.
     #[serde(default)]
     pub reward_period_blocks: Option<u64>,
     #[serde(default)]
@@ -726,10 +726,13 @@ impl ChainParams {
 /// seconds (the clock research's k = 2). genesis-tool runs this once and
 /// writes integers into genesis.json; no node derives anything at run time.
 pub fn derive_chain_params(block_time_ms: u64) -> Result<ChainParams, GenesisError> {
-    if block_time_ms == 0 {
-        return Err(GenesisError::InvalidData(
-            "block_time_ms must be positive".into(),
-        ));
+    // I = 1,000 keeps the boundary overhead at or below 1 % and the epoch at
+    // or below 2 h only for t_b in [1.0 s, 7.2 s] (P-1's table); outside it
+    // the table no longer derives I.
+    if !(1_000..=7_200).contains(&block_time_ms) {
+        return Err(GenesisError::InvalidData(format!(
+            "block_time_ms {block_time_ms} is outside [1000, 7200], where I = 1,000 holds"
+        )));
     }
     let params = ChainParams {
         epoch_blocks: 1_000,
@@ -1108,26 +1111,31 @@ pub fn build_genesis(
         }
         treasury_reserve_amount =
             parse_genesis_amount(&config.treasury_reserve, "treasury_reserve")?;
-        // SEC-#13: an explicit 0 is invalid (it would disable epoch advancement);
-        // omission falls back to the canonical default.
-        genesis_epoch_block_interval = match config.epoch_block_interval {
-            Some(0) => {
-                return Err(GenesisError::InvalidData(
-                    "genesis.json epoch_block_interval must be greater than 0".to_string(),
-                ));
-            }
-            Some(v) => v,
-            None => DEFAULT_EPOCH_BLOCK_INTERVAL,
+        // G5 P-1 (review): a genesis file pins all three; none is a guess.
+        // genesis-tool writes them from the measured block time. SEC-#13:
+        // an explicit 0 is invalid (it would disable epoch advancement).
+        let pinned = |value: Option<u64>, name: &str| {
+            value.ok_or_else(|| {
+                GenesisError::InvalidData(format!(
+                    "genesis.json must pin {name} (genesis-tool derives it from the measured block time)"
+                ))
+            })
         };
+        genesis_epoch_block_interval = pinned(config.epoch_block_interval, "epoch_block_interval")?;
+        if genesis_epoch_block_interval == 0 {
+            return Err(GenesisError::InvalidData(
+                "genesis.json epoch_block_interval must be greater than 0".to_string(),
+            ));
+        }
         // G5 P-1: one epoch everywhere (the Move parameter is the pinned
-        // interval), the rest from genesis.json or the measured defaults.
-        let d = ChainParams::DEFAULT;
+        // interval).
         chain_params = ChainParams {
             epoch_blocks: genesis_epoch_block_interval,
-            reward_period: config.reward_period_blocks.unwrap_or(d.reward_period),
-            max_block_interval_secs: config
-                .max_block_interval_secs
-                .unwrap_or(d.max_block_interval_secs),
+            reward_period: pinned(config.reward_period_blocks, "reward_period_blocks")?,
+            max_block_interval_secs: pinned(
+                config.max_block_interval_secs,
+                "max_block_interval_secs",
+            )?,
         };
         chain_params.validate()?;
         // FX-7: the defaults these keys' readers used when the keys were absent.
@@ -1211,6 +1219,13 @@ pub fn build_genesis(
             storage.put_object(&acc)?;
         }
     }
+
+    // G5 review: the genesis committee meets the rule every later committee
+    // meets (G1 EP-2, G5 SL-3): at most 256 members, keys that derive their
+    // addresses, valid proofs of possession, and no shared BLS key (a shared
+    // key would let certificate evidence convict the wrong member).
+    blockchain::committee::validate_committee(&v1_validators)
+        .map_err(|why| GenesisError::InvalidData(format!("genesis committee: {why}")))?;
 
     // === SYNC NATIVE CONSENSUS STATE (CRITICAL FIX) ===
     // Write 'sys:validators' so the Rust Consensus Engine knows who is allowed to mine.
@@ -2004,7 +2019,7 @@ mod tests {
             _ => String::new(),
         };
         let json = format!(
-            "{{\"chain_id\":\"AINCORE-MAINNET-1\",\"validators\":[{{\"address\":\"{}\",\"public_key\":\"{}\",\"stake\":\"1000000000000000000000\"{}}}],\"treasury_reserve\":\"0\",\"epoch_duration\":10,\"stdlib_hash\":\"{}\"}}",
+            "{{\"chain_id\":\"AINCORE-MAINNET-1\",\"validators\":[{{\"address\":\"{}\",\"public_key\":\"{}\",\"stake\":\"1000000000000000000000\"{}}}],\"treasury_reserve\":\"0\",\"epoch_duration\":10,\"epoch_block_interval\":20,\"reward_period_blocks\":20,\"max_block_interval_secs\":14,\"stdlib_hash\":\"{}\"}}",
             addr, pubkey, bls_fields, test_stdlib_hash()
         );
         fs::write(&path, json).expect("write genesis.json");
@@ -3194,6 +3209,20 @@ mod tests {
                 "{name} is not bound by the identity"
             );
         }
+        // A file must pin all three: none falls back to a guess (G5 review).
+        let unpinned: [(&str, Edit); 3] = [
+            ("epoch_block_interval", |f| f.epoch_block_interval = None),
+            ("reward_period_blocks", |f| f.reward_period_blocks = None),
+            ("max_block_interval_secs", |f| {
+                f.max_block_interval_secs = None
+            }),
+        ];
+        for (name, edit) in unpinned {
+            let mut file = base.clone();
+            edit(&mut file);
+            let err = build_genesis(&file, &stdlib()).expect_err(name);
+            assert!(err.to_string().contains("must pin"), "{name}: {err}");
+        }
         // The launch time is where the first block's growth is measured from.
         let mut timed = base.clone();
         timed.genesis_time = Some(1_790_000_000);
@@ -3270,12 +3299,15 @@ mod tests {
             derive_chain_params(2_000).unwrap().max_block_interval_secs,
             4
         );
-        assert_eq!(derive_chain_params(1).unwrap().max_block_interval_secs, 1);
-        // Blocks so slow that a slash could settle after its stake unlocks
-        // are refused (G5 SL-5): (1,000 + 20) x C_tau <= U - W - D =
-        // 1,123,200 s holds for C_tau = 1,101 s, not 1,102 s.
-        assert!(derive_chain_params(550_500).is_ok());
-        assert!(derive_chain_params(550_501).is_err());
+        assert_eq!(
+            derive_chain_params(1_000).unwrap().max_block_interval_secs,
+            2
+        );
+        // Only where the table derives I = 1,000 (G5 review). SL-5's bound,
+        // (1,000 + 20) x C_tau <= U - W - D, holds far beyond it.
+        assert!(derive_chain_params(7_200).is_ok());
+        assert!(derive_chain_params(7_201).is_err());
+        assert!(derive_chain_params(999).is_err());
         assert!(derive_chain_params(0).is_err());
     }
 
@@ -3371,6 +3403,20 @@ mod tests {
         file.validators.push(file.validators[0].clone());
         let err = build_genesis(&file, &stdlib()).expect_err("duplicate validator");
         assert!(err.to_string().contains("listed twice"), "{err}");
+    }
+
+    /// G5 review: a genesis committee in which two validators share a BLS
+    /// key is refused, as at every later boundary.
+    #[test]
+    fn a_genesis_committee_with_a_shared_bls_key_is_refused() {
+        let mut file = s3_genesis_file();
+        let mut second = file.validators[0].clone();
+        let key = SigningKey::from_bytes(&[51u8; 32]);
+        second.address = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        second.public_key = hex::encode(key.verifying_key().as_bytes());
+        file.validators.push(second);
+        let err = build_genesis(&file, &stdlib()).expect_err("a shared BLS key");
+        assert!(err.to_string().contains("genesis committee"), "{err}");
     }
 
     /// FX-7: the burn rate, tip agreement and burn counter are genesis state,

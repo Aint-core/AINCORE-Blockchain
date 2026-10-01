@@ -26,6 +26,8 @@ module 0x1::staking {
     const EMAX_VALIDATORS: u64 = 9;
     /// G5 SL-3: another active validator holds this BLS key.
     const EDUPLICATE_BLS_KEY: u64 = 10;
+    /// G5 review (A3b): stake under an unsettled offense is not paid out.
+    const EPAYOUT_FROZEN: u64 = 11;
 
     /// Minimum stake required to join validator set (1000 AIN)
     const MIN_STAKE: u128 = 1000000000000000000000;
@@ -109,6 +111,20 @@ module 0x1::staking {
         current_epoch: u64,
     }
 
+    /// G5 review (A3b): validators with an offense recorded and not yet
+    /// settled, at @0x1. Their unbonding entries of `from_epoch` or later are
+    /// in the slash's scope and are not paid until settlement thaws them, so
+    /// a settlement that is late (or keeps aborting) cannot let slashable
+    /// stake leave unslashed.
+    struct FrozenPayouts has key {
+        scopes: vector<FrozenScope>,
+    }
+
+    struct FrozenScope has store, drop, copy {
+        validator: address,
+        from_epoch: u64,
+    }
+
     /// EMISSION v4: the accrued, cap-reserved budget of the DePIN mint
     /// stream (universal_mining). Amounts here were already counted against
     /// MAX_SUPPLY when drawn (`draw_emission`), so drawing from the budget
@@ -153,8 +169,14 @@ module 0x1::staking {
         borrow_global<ValidatorSet>(@0x1).current_epoch
     }
 
-    /// Join the validator set
-    public entry fun join_validator_set(
+    /// Join the validator set.
+    ///
+    /// G5 review: `entry`, never `public`. The executor verifies the BLS
+    /// proof of possession, refuses a tombstoned validator and keeps the
+    /// committee's set in step only for a transaction that calls this
+    /// directly; a module call would skip all three. The same holds for
+    /// `leave_validator_set` and `add_stake`.
+    entry fun join_validator_set(
         account: &signer,
         stake_amount: u128,
         public_key: vector<u8>,
@@ -174,8 +196,34 @@ module 0x1::staking {
 
         // AUDIT-#2 FIX: bound the active set so advance_epoch's O(N) reward
         // loops can never exhaust the epoch gas budget and halt emission.
+        // G5 review (A3b): a full set does not freeze membership. A joiner
+        // with more stake than the smallest member displaces it, which starts
+        // unbonding like a leaver (the committee is the top 256 by stake, so
+        // the smallest of a full set is never in it).
+        if ((vector::length(&validator_set.validators) as u64) >= MAX_VALIDATORS) {
+            let (smallest, smallest_stake) = (0, coin::value(&vector::borrow(&validator_set.validators, 0).stake));
+            let j = 1;
+            while (j < vector::length(&validator_set.validators)) {
+                let s = coin::value(&vector::borrow(&validator_set.validators, j).stake);
+                if (s < smallest_stake) {
+                    smallest = j;
+                    smallest_stake = s;
+                };
+                j = j + 1;
+            };
+            assert!(stake_amount > smallest_stake, error::invalid_state(EMAX_VALIDATORS));
+            let ValidatorConfig { validator_addr: gone, stake, public_key: _, bls_public_key: _, bls_pop: _ } =
+                vector::remove(&mut validator_set.validators, smallest);
+            let amount = coin::value(&stake);
+            coin::burn(stake);
+            vector::push_back(&mut validator_set.unbonding_queue, UnbondingRequest {
+                validator_addr: gone,
+                stake: amount,
+                start_height: chain::height(),
+                unlock_time: chain::unbonding_unlock_time(),
+            });
+        };
         let len = vector::length(&validator_set.validators);
-        assert!((len as u64) < MAX_VALIDATORS, error::invalid_state(EMAX_VALIDATORS));
 
         // Check if already a validator. G5 SL-3: and that no active
         // validator holds this BLS key, since a certificate bit names a key,
@@ -205,7 +253,7 @@ module 0x1::staking {
     }
 
     /// Request to leave the validator set (starts 21-day unbonding)
-    public entry fun leave_validator_set(account: &signer) acquires ValidatorSet {
+    entry fun leave_validator_set(account: &signer) acquires ValidatorSet {
         let addr = signer::address_of(account);
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
         
@@ -251,8 +299,9 @@ module 0x1::staking {
     /// for the next one. Nothing is ever burned. This never aborts: an owner
     /// without a CoinStore (not reachable today, since joining needs one and
     /// none is ever removed) keeps its entry at the head for its own withdrawal.
-    public fun pay_matured_unbonding(account: &signer) acquires ValidatorSet {
+    public fun pay_matured_unbonding(account: &signer) acquires ValidatorSet, FrozenPayouts {
         assert!(signer::address_of(account) == @0x1, error::permission_denied(ENOT_VALIDATOR));
+        let frozen = frozen_scopes();
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
         let queue = &mut validator_set.unbonding_queue;
         let now = chain::time();
@@ -266,7 +315,8 @@ module 0x1::staking {
                 break
             };
             let req = vector::pop_back(queue);
-            if (coin::has_store<AincoreCoin>(req.validator_addr)) {
+            if (coin::has_store<AincoreCoin>(req.validator_addr)
+                && !in_frozen_scope(&frozen, req.validator_addr, req.start_height)) {
                 let UnbondingRequest { validator_addr, stake: amount, start_height: _, unlock_time: _ } = req;
                 coin::deposit<AincoreCoin>(validator_addr, coin::mint<AincoreCoin>(amount));
             } else {
@@ -283,8 +333,9 @@ module 0x1::staking {
     }
 
     /// Withdraw unbonded stake (after 21 days)
-    public entry fun withdraw_unbonded(account: &signer) acquires ValidatorSet {
+    public entry fun withdraw_unbonded(account: &signer) acquires ValidatorSet, FrozenPayouts {
         let addr = signer::address_of(account);
+        let frozen = frozen_scopes();
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
         let now = chain::time();
 
@@ -297,6 +348,10 @@ module 0x1::staking {
             let req = vector::borrow(&validator_set.unbonding_queue, i);
             if (req.validator_addr == addr) {
                 assert!(now >= req.unlock_time, error::invalid_state(EUNBONDING_NOT_READY));
+                assert!(
+                    !in_frozen_scope(&frozen, addr, req.start_height),
+                    error::invalid_state(EPAYOUT_FROZEN)
+                );
                 found = true;
                 index = i;
                 break
@@ -315,7 +370,7 @@ module 0x1::staking {
     }
 
     /// Add more stake
-    public entry fun add_stake(account: &signer, amount: u128) acquires ValidatorSet {
+    entry fun add_stake(account: &signer, amount: u128) acquires ValidatorSet {
         let addr = signer::address_of(account);
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
         
@@ -498,6 +553,68 @@ module 0x1::staking {
             stats.cumulative_burned = stats.cumulative_burned + removed;
         };
         coin::burn(coin_to_burn);
+    }
+
+    /// G5 review (A3b): freeze `validator`'s unbonding entries of
+    /// `from_epoch` or later until `thaw_payouts`. A second freeze keeps the
+    /// earlier epoch.
+    public(friend) fun freeze_payouts(sys: &signer, validator: address, from_epoch: u64) acquires FrozenPayouts {
+        if (!exists<FrozenPayouts>(@0x1)) {
+            move_to(sys, FrozenPayouts { scopes: vector::empty() });
+        };
+        let scopes = &mut borrow_global_mut<FrozenPayouts>(@0x1).scopes;
+        let i = 0;
+        while (i < vector::length(scopes)) {
+            let scope = vector::borrow_mut(scopes, i);
+            if (scope.validator == validator) {
+                if (from_epoch < scope.from_epoch) {
+                    scope.from_epoch = from_epoch;
+                };
+                return
+            };
+            i = i + 1;
+        };
+        vector::push_back(scopes, FrozenScope { validator, from_epoch });
+    }
+
+    /// Settlement is final: `validator`'s entries are paid as they mature.
+    public(friend) fun thaw_payouts(validator: address) acquires FrozenPayouts {
+        if (!exists<FrozenPayouts>(@0x1)) {
+            return
+        };
+        let scopes = &mut borrow_global_mut<FrozenPayouts>(@0x1).scopes;
+        let i = 0;
+        while (i < vector::length(scopes)) {
+            if (vector::borrow(scopes, i).validator == validator) {
+                vector::remove(scopes, i);
+                return
+            };
+            i = i + 1;
+        };
+    }
+
+    fun frozen_scopes(): vector<FrozenScope> acquires FrozenPayouts {
+        if (exists<FrozenPayouts>(@0x1)) {
+            borrow_global<FrozenPayouts>(@0x1).scopes
+        } else {
+            vector::empty()
+        }
+    }
+
+    /// Whether an entry of `validator` that started at `start_height` is in a
+    /// frozen scope (the committee epoch it started in, as `slash_unbonding`
+    /// computes it).
+    fun in_frozen_scope(scopes: &vector<FrozenScope>, validator: address, start_height: u64): bool {
+        let epoch = if (start_height == 0) { 0 } else { (start_height - 1) / chain::epoch_blocks() };
+        let i = 0;
+        while (i < vector::length(scopes)) {
+            let scope = vector::borrow(scopes, i);
+            if (scope.validator == validator && epoch >= scope.from_epoch) {
+                return true
+            };
+            i = i + 1;
+        };
+        false
     }
 
     /// G5 SL-5: an accepted offender leaves the active set. Its whole stake

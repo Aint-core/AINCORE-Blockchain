@@ -140,8 +140,8 @@ mints at most C_τ of emission.
   committee is.
 
 **EM-3 (order inside a boundary block H_E).** First the reward payout for (H_E − R, H_E] to
-C_E, then EP-2's derivation of C_{E+1} from the post-state, then the start of unbonding for
-members that leave at H_E. The derivation does not depend on Move's `advance_epoch`
+C_E, then EP-2's derivation of C_{E+1} from the post-state. (A leaver's unbonding starts at
+its leave transaction, not at H_E.) The derivation does not depend on Move's `advance_epoch`
 succeeding (FX-14): an aborted epoch advance still records the next committee. The Move
 epoch counter (`staking.current_epoch`, which `universal_mining` uses to limit DePIN
 payouts) advances at committee boundaries.
@@ -238,7 +238,8 @@ per epoch (DL-1). Tickets created after the slash are not cut twice.
 - **Infraction epoch.** E_i is the epoch of the equivocated slot, taken from the evidence
   (SL-3).
 - **Atomicity.** The validator's own stake and its pool are slashed in one Move call,
-  `delegation::slash`, so a slash cannot be half applied.
+  `delegation::report_equivocation` and `settle_offenses`, so a slash cannot be half applied:
+  without Move's offense record nothing is jailed or pruned (amendment A3).
 
 **SL-2 (unbonding counts from the end of the last committee epoch).** Stake that leaves at
 height h unlocks at `τ(h) + I·C_τ + U`. Its key can sign until H_{E(h)}, and
@@ -324,6 +325,78 @@ remaining reserve by consensus time and name no halving.
   (`last_reward_time`) and the rate.
 - `aincore_getEconomics` also reports the pinned I, R and C_τ.
 
+## Amendment A3 (the end-of-G5 review, 2026-10-01)
+
+Five independent reviews (Move economics, executor determinism, consensus evidence and the
+V3 deletion, an adversary, contract conformance) found one CRITICAL, five HIGH and several
+MEDIUM defects. Each fix below has a witness in the release manifest.
+
+- **One path into the validator set (CRITICAL).** `join_validator_set`,
+  `leave_validator_set` and `add_stake` are `entry`, never `public`. The executor checks the
+  BLS proof of possession, refuses a tombstoned validator and keeps `sys:validator_set:v1` in
+  step only for a direct call; a module could call the old `public entry` functions and skip
+  all three (leave through a module, take the stake back after U, keep the seat). Witness
+  `g5_a_module_cannot_call_the_staking_entries` (the attacker's module, compiled against the
+  old stdlib, published before and is refused now). The Move set is also the authority at
+  every boundary: a member it does not hold leaves `v1` (`g5_a_committee_member_without_move_stake_loses_its_seat`).
+- **EP-2's committee is the top 256 by stake** (HIGH). 257 joins made the live set invalid,
+  which kept C_E for good, leavers included. The committee is now the 256 positive-stake
+  members with the most stake, ties by address (Cosmos `MaxValidators`); more may be bonded
+  and are not paid. When the proposal is still invalid, the kept C_E drops members the live set
+  no longer holds. Witnesses `more_than_256_validators_elect_the_top_256_by_stake`,
+  `a_kept_committee_drops_members_whose_stake_left`.
+- **SL-3 fails closed** (HIGH). Evidence of epoch E is refused once E's records are pruned
+  (`sys:validator_set:retained_from`) or E+1's start time is gone while E+1 has begun; epoch
+  0's committee is the genesis record, never pruned, which made epoch-0 evidence acceptable
+  for ever.
+- **SL-3, one slot per offender** (HIGH). Evidence against a jailed validator is refused at
+  verification (it took one of the block's five slots), and the block's dedup key is the set
+  it convicts, not the slot, so a sacrificed equivocator cannot crowd out real evidence. A
+  node retires evidence rows the executor can never accept again.
+- **SL-5 never fails at acceptance** (HIGH). `report_equivocation` records and settles
+  nothing; the executor runs `settle_offenses` in the same block. Settlement is one linear
+  sweep over the ledger, kept sorted by `epoch_began` (it was quadratic: about 550 sybil
+  offenses made every record abort, and the executor then jailed without slashing). An
+  aborted record now applies nothing (SL-1). The deadline is strict, τ > τ_v + D + I·C_τ + W:
+  at equality a correlated offense's evidence can still land.
+- **CE-3 relays** (HIGH). A node that sees two certificates for a slot relays both once, so
+  every honest node halts and keeps the evidence (a coalition able to make two could halt the
+  chain anyway). It is carried after recovery (Open).
+- **P-1 has no default.** A genesis file must pin I, R and C_τ; genesis-tool derives them only
+  for t_b ∈ [1.0 s, 7.2 s], where I = 1,000 holds. The genesis committee is checked like every
+  later one (`validate_committee`: no shared BLS key, at most 256).
+- **EM-2:** a leader outside the paid committee (jailed since it was elected) gets no fee
+  bonus.
+- **DOC-1:** README and WHITEPAPER no longer claim a downtime slash, an immediate slash, a
+  block reward, a 1–2 s block time, 10,000 TPS, a zero genesis supply, fees to the treasury
+  or DePIN emission. Witness `the_public_documents_make_no_claim_the_code_contradicts` (a lib
+  test, in the gate). Still awaiting the founder: the "Genesis Lock" and Dilithium claims.
+- **A3b, from the review of A3** (one HIGH, two MEDIUM):
+  - *A certificate conflict convicts at 100 %* (HIGH). Two certificates for one slot overlap in
+    more than a third of the committee, so SL-4 gives 100 % without counting Q. Before, a
+    coalition could get each member jailed for a small, spread-out twin offense (about 2.7 %
+    each) and then, still holding its C_E seats for the rest of the epoch, make conflicting
+    certificates whose evidence was refused because all were jailed. Now the conflict raises
+    each convict's lesser offense: an unsettled one settles at 100 % with the earlier scope, a
+    settled one loses what remains in scope at once (`report_certificate_conflict`;
+    `validator:convicted_full` marks the end). Witness
+    `g5_a_certificate_conflict_raises_a_lesser_offense_to_full`.
+  - *Slashable stake cannot leave before settlement* (MEDIUM). An offender's unbonding entries
+    of its scope are frozen from acceptance to settlement (`staking::FrozenPayouts`), and a
+    delegator's ticket in an unsettled scope waits too. Settlement handles at most 32 offenses
+    per call, so its work is bounded whatever the unbonding queue holds; the rest wait frozen.
+  - *A full validator set does not freeze membership* (MEDIUM). With 1,000 members, a joiner
+    with more stake than the smallest member displaces it into unbonding; one with no more
+    stake is refused. Witness `g5_a_full_validator_set_takes_a_larger_joiner_and_unbonds_the_smallest`.
+  - Evidence age is checked before the committee lookup, and a node checks its in-flight map
+    before verifying a row, so a pruned epoch's rows are retired and no row is verified twice.
+  - Accepted LOW: with every member of the paid committee jailed, the fees still go to the
+    leader (the chain cannot continue then anyway).
+- **Known, accepted:** the first accepted offense of a validator sets its scope, so a later
+  acceptance of an earlier offense is ignored (the earliest twins are normally the first
+  carried). A second offense recorded in Move is unreachable (the executor's jail refuses it
+  first); the Move check is defence in depth.
+
 ## Stages
 
 Each stage lands with its witnesses and a mutation run; one independent review runs at the
@@ -332,9 +405,9 @@ end of G5, as with G1.
 | Stage | Content | Witnesses | Kill list |
 |---|---|---|---|
 | **S1** (done, `65cc92a`) | CL-1, CL-2, P-1, GV-1 counted in heights: the `0x1::chain` clock and parameters, heights in Move, genesis pins and derivation, the Rust governance path removed | every deadline expires exactly at its height; a halt ages nothing; the pins are bound by the identity; genesis-tool reproduces the table | a deadline in seconds; an unpinned parameter; governance able to change a parameter |
-| **S1b** | Amendment A1: CL-1 τ, BT-1's quorum guard, CL-2 writing τ from the block timestamp, P-1's new split (C_τ pinned; U, N, Δc, K constants; G removed), SL-2 unlock by τ, UB-1, CM-1 | with 1 s blocks unbonding completes at 21 d of block time, not at a block count; a 10-day timestamp jump advances τ by C_τ; a corrupted timestamp stream cannot unlock before U / C_τ blocks; a below-quorum sample does not advance T; one author at +30 s cannot move T out of the honest range; a matured entry is paid once, at the first boundary at or after its unlock, in queue order; a commission increase applies exactly at N and never earlier, above Δc it is refused, a decrease applies at once | τ uncapped; cap ignored after a halt; quorum guard removed; unlock from h without I·C_τ; burn restored; payout not bounded by K; manual apply restored; increase cap removed |
-| **S2** | EM-1..EM-3: payouts every R blocks by Δτ, committee recipients from a state record shared with consensus, fees to the committee, boundary order, rotation independent of Move, I = 1,000 written by genesis-tool | a payout mints exactly the EM-1 integer form and a day's draw compounds to 1.90 %/yr; the emission over the same τ matches (within 10⁻⁶) for 1 s or 7 s blocks and R ∈ {1, 20}; a payout after a long gap covers one day; a joiner is paid from its first committee epoch and a leaver until its last; fees pay C_{E(h)}, not the live set; a jailed member gets nothing; an invalid live set keeps the committee; the executor's record equals consensus's committee on real nodes | Δτ ignored; the cap removed; the live set paid; payout after derivation at H_E; jailed paid; fees to the live set; rotation skipped when Move aborts; consensus cross-check removed |
-| **S3** | DL-1..DL-3, CM-1 in the payout, the atomic slash: pools of aggregates with per-account positions and tickets; the reward split from the frozen record; bonded weight at boundaries; `math` u256 mul_div; the RPC reads the Move state | conservation: principal escrow = C + unbonding, Σ points = P, reward escrow covers every claim within dust; ρ·P + κ = S·Σπ exactly; each payout's two parts match the frozen split to the unit, and a mid-epoch joiner does not move it; a delegator is paid ⌊p·Δρ/S⌋ to the unit and a joiner nothing from before; weight changes at the next epoch only; commission uses the rate at the period start; the active and ticket slash follow SL-1 in one call; a closed pool refuses deposits; a pool's stored size does not grow with its delegators; a full account cannot block another's undelegation; exits and deposits round the pool's way; a claim past u128 works and a 1-unit shortfall does not abort | the carry dropped; points rounded up on deposit; coins rounded up on exit; deposits into a dead pool; tickets of an earlier epoch slashed; the applied-height guard dropped; live stake used in the split; a vector of delegators in the pool; the escrow clamp removed; u128 intermediates |
+| **S1b** | Amendment A1: CL-1 τ, BT-1's quorum guard, CL-2 writing τ from the block timestamp, P-1's new split (C_τ pinned; U, N, Δc, K constants; G removed), SL-2 unlock by τ, UB-1, CM-1 | with fast or slow blocks unbonding completes at 21 d of block time, not at a block count; a 10-day timestamp jump advances τ by C_τ; a corrupted timestamp stream cannot unlock before U / C_τ blocks; a below-quorum sample does not advance T; one author at +30 s cannot move T out of the honest range; a matured entry is paid once, at the first boundary at or after its unlock, in queue order; a commission increase applies exactly at N and never earlier, above Δc it is refused, a decrease applies at once | τ uncapped; cap ignored after a halt; quorum guard removed; unlock from h without I·C_τ; burn restored; payout not bounded by K; increase cap removed |
+| **S2** | EM-1..EM-3: payouts every R blocks by Δτ, committee recipients from a state record shared with consensus, fees to the committee, boundary order, rotation independent of Move, I = 1,000 written by genesis-tool | a payout mints exactly the EM-1 integer form and a day's draw compounds to 1.90 %/yr; the emission over the same τ matches (within 10⁻⁶) for 1 s or 7 s blocks and R ∈ {1, 20}; a payout after a long gap covers one day; a joiner is paid from its first committee epoch and a leaver until its last; fees pay C_{E(h)}, not the live set; a jailed member gets nothing; an invalid live set keeps the committee; the executor's record equals consensus's committee on real nodes | Δτ ignored; the cap removed; the live set paid; jailed paid; fees to the live set; rotation skipped when Move aborts; consensus cross-check removed |
+| **S3** | DL-1..DL-3, CM-1 in the payout, the atomic slash: pools of aggregates with per-account positions and tickets; the reward split from the frozen record; bonded weight at boundaries; `math` u256 mul_div; the RPC reads the Move state | conservation: principal escrow = C + unbonding, Σ points = P, reward escrow covers every claim within dust; ρ·P + κ = S·Σπ exactly; each payout's two parts match the frozen split to the unit, and a mid-epoch joiner does not move it; a delegator is paid ⌊p·Δρ/S⌋ to the unit and a joiner nothing from before; weight changes at the next epoch only; commission uses the rate at the period start; the active and ticket slash follow SL-1 in one call; a closed pool refuses deposits; a pool's stored size does not grow with its delegators; a full account cannot block another's undelegation; exits and deposits round the pool's way; a claim past u128 works and a 1-unit shortfall does not abort | the carry dropped; points rounded up on deposit; coins rounded up on exit; deposits into a dead pool; tickets of an earlier epoch slashed; live stake used in the split; a vector of delegators in the pool; the escrow clamp removed; u128 intermediates |
 | **S4a** | Amendment A2 policy: SL-4..SL-6, acceptance and settlement in Move, the offense ledger, the tombstone, W = 7 d and D = 1 d pinned | SL-4 to the basis point (isolated 1/4, 1/10, 1/100 of weight; a third); offenses within D count together, beyond D they do not; 3Q ≥ T settles at once at 100 %; otherwise nothing settles before τ_v + D + I·C_τ + W; the waterfall leaves delegators whole when the operator covers A; in-scope own unbonding is cut, earlier entries are not; a leaver that equivocates before its unlock loses its unbonding stake; every in-scope entry is still unpaid at settlement; a tombstoned join is refused | floor dropped; linear instead of square; threshold at half; D unbounded or zero; settlement before the deadline; waterfall reversed; pool left open at acceptance; out-of-scope entries cut |
 | **S4b** | SL-3: V4 proposer twins detected when a slot stages a second digest, kept in durable epoch-keyed rows before GC, carried through the DAG and verified against C_E with the age bound | a twin pair from real V4 nodes is recorded, carried in a block and jails its author on every node; a pair signed by a non-member of C_E (even a live validator), from another domain, of two slots or of an unrecorded epoch is refused; evidence of epoch 0 is accepted until τ_start(1) + W exactly and refused after; accepted, the offense is recorded in the evidence's own epoch | live-set membership; no age bound; a round-only key; the V3 hash |
 | **S4d** | SL-3's certificate-conflict kind: `join_validator_set` and committee validation refuse a BLS key already held; the attestation and certificate types move to `blockchain::attest`, so the executor checks the aggregates; the halting node keeps the pair; every signer in both is convicted | real V4 nodes keep the pair where CE-3 halts, and it convicts exactly the members in both; two convicts forming half the committee settle at 100 % at once; one digest, no member in both, another committee, a bit past the committee or a forged aggregate is refused; a shared BLS key is refused at join and in a committee | a duplicate key accepted; the intersection taken from one certificate |
@@ -351,5 +424,11 @@ end of G5, as with G1.
   needs the wall-clock part at or below 10 s for blocks down to 1 s.
 - **Validator time:** NTS or several independent time sources on every validator, and the
   60 s drift alarm (BT-1), before genesis.
-- **Churn limit:** needed before the validator set opens (research (d) 10). Not needed at the
-  permissioned launch, where the operator controls churn.
+- **Churn limit:** no longer what keeps the committee valid (amendment A3 elects the top 256
+  by stake). A per-epoch limit on how much weight may join or leave (research (d) 10) is still
+  open before the validator set opens to independent operators, which precedes public mainnet.
+- **The BT-1 drift alarm** does not exist in code yet; it is a genesis blocker with the time
+  sources above.
+- **Recovery after a certificate-conflict halt** (G1 CE-3) is an operator procedure:
+  `docs/CERT_CONFLICT_RECOVERY_RUNBOOK.md`. Its tool, which pins the canonical certificate for
+  the slot and clears the alarm on every node, does not exist yet; it is a genesis blocker.

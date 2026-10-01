@@ -59,8 +59,15 @@ pub fn guard_origin(chain_id: &str, genesis_identity: &str, node_key: &[u8; 32])
 
 /// Whether this chain's genesis pins the V4 vertex format. One DAG format per
 /// chain: a node never runs both.
+///
+/// Fail closed (G5 review): a read error must not route a V4 chain down a
+/// path meant for another format.
 pub fn is_v4_chain(storage: &StateDB) -> bool {
-    storage.get(VERTEX_FORMAT_KEY).ok().flatten().as_deref() == Some("4")
+    storage
+        .get(VERTEX_FORMAT_KEY)
+        .expect("CRITICAL: the chain's vertex format could not be read")
+        .as_deref()
+        == Some("4")
 }
 
 /// The V4 wire messages the engine exchanges (the push half of the contract's
@@ -755,14 +762,17 @@ impl Engine {
                 // Never sign a body this node does not hold (AT-3, Lemma A).
                 return Err(storage_err("an attested body that was not staged"));
             }
+            // In the same transaction (G5 review): a crash after staging
+            // must not lose the pair, since the staged body is never
+            // processed again.
+            for other in &twins {
+                evidence::record_twin(&view, other, &v);
+            }
             Ok((attestation, staged))
         });
         let Ok((attestation, staged)) = result else {
             return;
         };
-        for other in &twins {
-            evidence::record_twin(&self.storage, other, &v);
-        }
         {
             let mut dag = lock(&self.dag);
             match staged {
@@ -884,13 +894,26 @@ impl Engine {
                     cert.body.epoch, cert.body.round, cert.body.author
                 );
                 let evidence = serde_json::json!({ "held": held, "other": cert }).to_string();
-                let _ = self.storage.put(&alarm, &evidence);
-                // G5 SL-3: every attester in both signed both digests.
-                evidence::record_cert_conflict(&self.storage, held, &cert);
+                let first = matches!(self.storage.get(&alarm), Ok(None));
+                // G5 SL-3: every attester in both signed both digests. The
+                // alarm and the evidence row commit together.
+                let _ = self.storage.transaction(|view| {
+                    view.put(&alarm, &evidence)?;
+                    evidence::record_cert_conflict(&view, held, &cert);
+                    Ok(())
+                });
                 self.halted = Some(format!(
                     "two certificates for round {} author {}",
                     cert.body.round, cert.body.author
                 ));
+                // G5 review: relayed once, so every honest node holding
+                // either certificate halts too and keeps the evidence (a
+                // coalition able to make two could halt the chain anyway).
+                // It is carried once operators recover the chain.
+                if first {
+                    net.broadcast(Msg::Cert(held.clone()));
+                    net.broadcast(Msg::Cert(cert.clone()));
+                }
             }
             return;
         }

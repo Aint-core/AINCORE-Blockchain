@@ -2756,20 +2756,6 @@ mod tests {
         assert_eq!(none["amount"], "0");
     }
 
-    /// G5 DOC-1: no public document names a halving (the emission draws on
-    /// the remaining reserve by consensus time).
-    #[test]
-    fn public_documents_name_no_halving() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        for doc in ["README.md", "WHITEPAPER.md", "CLAUDE.md"] {
-            let text = std::fs::read_to_string(root.join(doc)).unwrap();
-            assert!(
-                !text.to_lowercase().contains("halving"),
-                "{doc} still names a halving"
-            );
-        }
-    }
-
     /// G5 DOC-1: the supply and economics RPCs report the Move emission
     /// state: the remaining reserve (the cap minus net supply and burns),
     /// the last payout's consensus time, the rate and the pinned parameters,

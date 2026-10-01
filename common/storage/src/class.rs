@@ -270,6 +270,7 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         ["sys", "slashed", a, r] if seg(a) && dec(r) => State,
         ["sys", "pending_slash", a] if seg(a) => State,
         ["validator", "jailed", a] if seg(a) => State,
+        ["validator", "convicted_full", a] if seg(a) => State,
         ["sys", "pending_module_upgrade", n] if ident(n) => State,
         ["sys", "committee", e] if dec20(e) => State,
 
@@ -398,6 +399,7 @@ pub const STATE_PREFIXES: &[&str] = &[
     "sys:slashed:",
     "sys:pending_slash:",
     "validator:jailed:",
+    "validator:convicted_full:",
     "sys:pending_module_upgrade:",
     "sys:committee:",
 ];
@@ -606,6 +608,7 @@ mod tests {
             (format!("sys:slashed:{H64}:77"), State),
             (format!("sys:pending_slash:{H64}"), State),
             (format!("validator:jailed:{H64}"), State),
+            (format!("validator:convicted_full:{H64}"), State),
             ("sys:stdlib_version".into(), State),
             ("sys:pending_module_upgrade:staking".into(), State),
             (format!("pqc_pubkey_{H64}"), State),

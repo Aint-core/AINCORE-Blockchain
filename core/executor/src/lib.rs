@@ -634,24 +634,20 @@ pub struct VerifiedEvidence {
     /// both conflicting certificates.
     pub offenders: Vec<String>,
     pub kind: String,
-    /// The committee epoch of the slot. A V3 proof binds none: the executing
-    /// block's stands in (the V3 path is deleted in G5 S4c).
+    /// The committee epoch of the slot.
     pub epoch: u64,
     pub round: u64,
 }
 
 impl VerifiedEvidence {
-    /// The dedup key of a block's evidence: one item per kind and slot.
+    /// The dedup key of a block's evidence: who it convicts, whatever the
+    /// slot (G5 review). A validator has one offense, so a second item
+    /// against the same offenders (another round, another epoch, swapped
+    /// bodies) cannot take another of the block's five slots.
     pub fn key(&self) -> (String, u64) {
-        let scope = if self.kind == "certificate_conflict" {
-            "cert:"
-        } else {
-            ""
-        };
-        (
-            format!("{scope}{}:{}", self.offender, self.epoch),
-            self.round,
-        )
+        let mut offenders = self.offenders.clone();
+        offenders.sort();
+        (offenders.join(","), 0)
     }
 }
 
@@ -1679,12 +1675,13 @@ impl Executor {
             ),
             Err(err) => eprintln!("⚠️ Reward payout failed at block {}: {}", height, err),
         }
-        self.settle_offenses(height);
+        self.settle_offenses(&format!("block {height}"));
     }
 
-    /// G5 SL-5: every reward period, settle the offenses whose slash fraction
-    /// is final (Move `delegation::settle_offenses`).
-    fn settle_offenses(&self, height: u64) {
+    /// G5 SL-5: every reward period, and in a block that records an offense,
+    /// settle the offenses whose slash fraction is final (Move
+    /// `delegation::settle_offenses`).
+    fn settle_offenses(&self, when: &str) {
         let action = MoveAction::CallEntryFunction(EntryFunctionCall {
             module: move_core_types::language_storage::ModuleId::new(
                 system_address(),
@@ -1710,10 +1707,10 @@ impl Executor {
                 }
             }
             Ok((_gas_used, _updates, status)) => eprintln!(
-                "⚠️ Offense settlement aborted at block {}: {:?}",
-                height, status.error
+                "⚠️ Offense settlement aborted at {}: {:?}",
+                when, status.error
             ),
-            Err(err) => eprintln!("⚠️ Offense settlement failed at block {}: {}", height, err),
+            Err(err) => eprintln!("⚠️ Offense settlement failed at {}: {}", when, err),
         }
     }
 
@@ -1811,9 +1808,12 @@ impl Executor {
     /// `sys:validators` mirror) to its bonded stake: its own stake in the
     /// Move ValidatorSet plus its open pool's active principal, in whole AIN.
     /// A delegation therefore weighs the committee from the next epoch, never
-    /// inside one. Returns the delegated part per member. A member the Move
-    /// set does not hold (only a test fixture) keeps its weight and adds no
-    /// delegation.
+    /// inside one. Returns the delegated part per member.
+    ///
+    /// The Move set is the authority (G5 review): a member it does not hold
+    /// is dropped from both, so a seat never outlives its stake whatever path
+    /// changed the Move set. Only a fixture without any Move set keeps its
+    /// weights.
     fn refresh_bonded_weights(&self) -> BTreeMap<String, u64> {
         let mut delegated = BTreeMap::new();
         let Some(mut live) = self
@@ -1824,22 +1824,28 @@ impl Executor {
         else {
             return delegated;
         };
-        let own: BTreeMap<move_core_types::account_address::AccountAddress, u128> = self
+        let move_set = self
             .db
             .get(&validator_set_key())
             .expect("CRITICAL: the Move validator set could not be read")
-            .and_then(|raw| decode_validator_set_hex(&raw))
+            .and_then(|raw| decode_validator_set_hex(&raw));
+        let own: BTreeMap<move_core_types::account_address::AccountAddress, u128> = move_set
+            .as_ref()
             .map(|set| {
                 set.validators
-                    .into_iter()
+                    .iter()
                     .map(|v| (v.validator_addr, v.stake.value))
                     .collect()
             })
             .unwrap_or_default();
         let mut bonded = BTreeMap::new();
+        let mut gone: Vec<String> = Vec::new();
         for entry in live.iter_mut() {
             let Some(own_stake) = parse_move_address(&entry.address).and_then(|a| own.get(&a))
             else {
+                if move_set.is_some() {
+                    gone.push(entry.address.clone());
+                }
                 continue;
             };
             let pool = delegated_weight(&self.db, &entry.address);
@@ -1854,7 +1860,11 @@ impl Executor {
                 bonded.insert(entry.address.clone(), weight);
             }
         }
-        if bonded.is_empty() {
+        if !gone.is_empty() {
+            eprintln!("⚠️  [G5] committee members without Move stake dropped: {gone:?}");
+            live.retain(|entry| !gone.contains(&entry.address));
+        }
+        if bonded.is_empty() && gone.is_empty() {
             return delegated;
         }
         self.db
@@ -1869,7 +1879,9 @@ impl Executor {
             .expect("CRITICAL: the validator mirror could not be read")
             .and_then(|raw| serde_json::from_str::<Vec<(String, u64)>>(&raw).ok())
         {
-            let mut changed = false;
+            let before = mirror.len();
+            mirror.retain(|(address, _)| !gone.contains(address));
+            let mut changed = mirror.len() != before;
             for (address, stake) in mirror.iter_mut() {
                 if let Some(weight) = bonded.get(address) {
                     *stake = *weight;
@@ -2083,10 +2095,12 @@ impl Executor {
     ///     the live set)
     ///
     /// The leader still receives any pool share they're entitled to from
-    /// their own stake (so a high-stake leader gets bonus + pool share).
+    /// their own stake (so a high-stake leader gets bonus + pool share). A
+    /// leader outside the paid committee (jailed) gets no bonus.
     ///
     /// Rounding remainder (from integer division) is given to anchor_leader
-    /// so the reward is fully consumed and never lost.
+    /// (or the committee's first member when the leader is not paid) so the
+    /// reward is fully consumed and never lost.
     ///
     /// Fallback: if the committee is empty, ALL goes to the leader.
     fn compute_block_payouts(
@@ -2116,7 +2130,14 @@ impl Executor {
         // is so large that LEADER_BONUS_PCT/100 actually saturated (only
         // possible via a future governance bug), `leader_bonus` could
         // exceed `total_reward` and an unchecked `-` would wrap.
-        let leader_bonus = total_reward.saturating_mul(LEADER_BONUS_PCT) / 100;
+        // G5 EM-2: a leader outside the paid committee (jailed since it was
+        // elected) gets nothing; its bonus stays in the pool.
+        let leader_paid = validators.iter().any(|(a, _)| a == anchor_leader);
+        let leader_bonus = if leader_paid {
+            total_reward.saturating_mul(LEADER_BONUS_PCT) / 100
+        } else {
+            0
+        };
         let pool = total_reward.saturating_sub(leader_bonus);
 
         // Step 3: stake-weighted distribution of the pool.
@@ -2140,7 +2161,14 @@ impl Executor {
         // own pool share crossed u128::MAX.
         let remainder = pool.saturating_sub(distributed_pool);
         let leader_credit = leader_bonus.saturating_add(remainder);
-        let entry = payouts.entry(anchor_leader.to_string()).or_insert(0);
+        // The remainder goes to the leader, or to the committee's first
+        // member (canonical order) when the leader is not paid.
+        let credited = if leader_paid {
+            anchor_leader
+        } else {
+            validators[0].0.as_str()
+        };
+        let entry = payouts.entry(credited.to_string()).or_insert(0);
         *entry = entry.saturating_add(leader_credit);
 
         payouts.into_iter().collect()
@@ -2989,114 +3017,17 @@ impl Executor {
         }
     }
 
-    /// Verify ONE evidence item against on-chain data only. Returns
-    /// (offender, reason, round_or_epoch) on success. Pure.
+    /// Verify one block-carried evidence item: a V4 twin pair (G1 EQ-1) or a
+    /// certificate conflict (CE-3), each against the committee of its epoch
+    /// (G5 SL-3). The V3 and downtime kinds were deleted with the V3 DAG (G5
+    /// S4c): nothing produces them, and the state transition takes no others.
     pub fn verify_slash_evidence(&self, item: &str) -> Result<VerifiedEvidence, String> {
-        use std::collections::{BTreeMap, BTreeSet};
         let ev: serde_json::Value =
             serde_json::from_str(item).map_err(|e| format!("bad json: {e}"))?;
         match ev.get("kind").and_then(|k| k.as_str()) {
-            Some("equivocation_v4") => return self.verify_v4_twins(&ev),
-            Some("certificate_conflict") => return self.verify_certificate_conflict(&ev),
-            _ => {}
-        }
-        let validators: Vec<(String, u64)> = self
-            .db
-            .get("sys:validators")
-            .ok()
-            .flatten()
-            .and_then(|j| serde_json::from_str(&j).ok())
-            .unwrap_or_default();
-        let stake: BTreeMap<&str, u64> = validators.iter().map(|(a, s)| (a.as_str(), *s)).collect();
-        let total: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
-        let offender = ev.get("offender").and_then(|v| v.as_str()).ok_or("missing offender")?.to_string();
-        if !stake.contains_key(offender.as_str()) {
-            return Err(format!("offender {offender} not in validator set"));
-        }
-        let pubkey_of = |addr: &str| -> Option<String> {
-            self.db.get_object(addr)
-                .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.data).ok())
-                .and_then(|v| v.get("public_key").and_then(|k| k.as_str()).map(String::from))
-        };
-        match ev.get("kind").and_then(|v| v.as_str()) {
-            Some("equivocation") => {
-                let round = ev
-                    .get("round")
-                    .and_then(|v| v.as_u64())
-                    .ok_or("missing round")?;
-                let a: blockchain::Vertex =
-                    serde_json::from_value(ev.get("vertex_a").cloned().unwrap_or_default())
-                        .map_err(|e| format!("vertex_a: {e}"))?;
-                let b: blockchain::Vertex =
-                    serde_json::from_value(ev.get("vertex_b").cloned().unwrap_or_default())
-                        .map_err(|e| format!("vertex_b: {e}"))?;
-                if a.author != offender || b.author != offender {
-                    return Err("author != offender".into());
-                }
-                if a.round != round || b.round != round {
-                    return Err("round mismatch".into());
-                }
-                if a.hash == b.hash {
-                    return Err("identical vertices are not equivocation".into());
-                }
-                // A V3 proof carries no epoch: the V3 hash does not bind one.
-                if a.epoch != 0 || b.epoch != 0 {
-                    return Err("a V3 proof carrying an epoch".into());
-                }
-                if a.calculate_hash() != a.hash || b.calculate_hash() != b.hash {
-                    return Err("vertex hash does not match body".into());
-                }
-                let pk = pubkey_of(&offender).ok_or("offender pubkey unresolvable")?;
-                if !a.verify_ed25519_signature(&pk) || !b.verify_ed25519_signature(&pk) {
-                    return Err("vertex signature invalid".into());
-                }
-                Ok(VerifiedEvidence {
-                    offenders: vec![offender.clone()],
-                    offender,
-                    kind: "equivocation".into(),
-                    epoch: self.executing_epoch(),
-                    round,
-                })
-            }
-            Some("downtime") => {
-                use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-                let epoch = ev.get("epoch").and_then(|v| v.as_u64()).ok_or("missing epoch")?;
-                let atts = ev.get("attestations").and_then(|v| v.as_array()).ok_or("missing attestations")?;
-                let mut reporters: BTreeSet<String> = BTreeSet::new();
-                for a in atts {
-                    let off = a.get("offender").and_then(|v| v.as_str()).ok_or("att: offender")?;
-                    let ep = a.get("epoch").and_then(|v| v.as_u64()).ok_or("att: epoch")?;
-                    let rep = a.get("reporter").and_then(|v| v.as_str()).ok_or("att: reporter")?;
-                    let round = a.get("round").and_then(|v| v.as_u64()).ok_or("att: round")?;
-                    let pk_hex = a.get("reporter_pubkey").and_then(|v| v.as_str()).ok_or("att: pubkey")?;
-                    let sig_hex = a.get("signature").and_then(|v| v.as_str()).ok_or("att: signature")?;
-                    if off != offender || ep != epoch { return Err("attestation does not match item".into()); }
-                    if !stake.contains_key(rep) { continue; } // not a validator: does not count
-                    let pk_bytes = hex::decode(pk_hex).map_err(|_| "att: pubkey hex")?;
-                    let derived = crypto::derive_address(&pk_bytes).map_err(|e| format!("att: derive: {e}"))?;
-                    if derived != rep { return Err("att: pubkey does not derive to reporter".into()); }
-                    let pk_arr: [u8; 32] = pk_bytes.as_slice().try_into().map_err(|_| "att: pubkey len")?;
-                    let vk = VerifyingKey::from_bytes(&pk_arr).map_err(|_| "att: pubkey")?;
-                    let sig_bytes = hex::decode(sig_hex).map_err(|_| "att: sig hex")?;
-                    let sig = Signature::from_slice(&sig_bytes).map_err(|_| "att: sig")?;
-                    // Same canonical preimage as DagConsensus::broadcast_attestation.
-                    let canonical = format!("{}:{}:{}:{}", off, ep, rep, round);
-                    vk.verify(canonical.as_bytes(), &sig).map_err(|_| "att: signature invalid")?;
-                    reporters.insert(rep.to_string());
-                }
-                let rs: u128 = reporters.iter().filter_map(|r| stake.get(r.as_str()).map(|s| *s as u128)).sum();
-                if rs.saturating_mul(3) <= total.saturating_mul(2) {
-                    return Err(format!("downtime quorum not met: {rs}/{total}"));
-                }
-                Ok(VerifiedEvidence {
-                    offenders: vec![offender.clone()],
-                    offender,
-                    kind: "downtime".into(),
-                    epoch,
-                    round: epoch,
-                })
-            }
-            _ => Err("unknown evidence kind".into()),
+            Some("equivocation_v4") => self.verify_v4_twins(&ev),
+            Some("certificate_conflict") => self.verify_certificate_conflict(&ev),
+            other => Err(format!("unknown evidence kind {other:?}")),
         }
     }
 
@@ -3119,6 +3050,9 @@ impl Executor {
             .get("round")
             .and_then(|v| v.as_u64())
             .ok_or("missing round")?;
+        // Age first (G5 review, A3b): evidence of a pruned or expired epoch
+        // is refused as such, before its committee is looked up.
+        self.check_evidence_age(epoch)?;
         let vertex = |field: &str| -> Result<blockchain::Vertex, String> {
             serde_json::from_value(ev.get(field).cloned().unwrap_or_default())
                 .map_err(|e| format!("{field}: {e}"))
@@ -3131,6 +3065,11 @@ impl Executor {
         }
         if a.hash == b.hash {
             return Err("identical vertices are not equivocation".into());
+        }
+        // G5 review: a jailed offender is convicted already (one offense per
+        // validator); its later evidence must not take a block's slot.
+        if self.is_jailed(&offender) {
+            return Err(format!("{offender} is jailed already"));
         }
         let genesis_identity = self
             .db
@@ -3153,7 +3092,6 @@ impl Executor {
         {
             return Err("vertex signature invalid".into());
         }
-        self.check_evidence_age(epoch)?;
         Ok(VerifiedEvidence {
             offenders: vec![offender.clone()],
             offender,
@@ -3163,12 +3101,53 @@ impl Executor {
         })
     }
 
-    /// G5 SL-3: evidence of `epoch` is refused once tau > tau_start(E+1) + W.
+    /// Convicted by a certificate conflict, at 100 % (state, A3b).
+    fn is_convicted_in_full(&self, validator: &str) -> bool {
+        self.db
+            .get(&format!("validator:convicted_full:{validator}"))
+            .expect("CRITICAL: a conviction record could not be read")
+            .is_some()
+    }
+
+    /// Jailed by an accepted offense (state, G5 SL-3).
+    fn is_jailed(&self, validator: &str) -> bool {
+        self.db
+            .get(&format!("validator:jailed:{validator}"))
+            .expect("CRITICAL: a jail record could not be read")
+            .is_some()
+    }
+
+    /// G5 SL-3: evidence of `epoch` is refused once tau > tau_start(E+1) + W,
+    /// and once E's records are pruned. Fail closed (G5 review): E+1 has
+    /// begun if it is not after the executing epoch, so its missing start
+    /// time means the records are gone, not that E is current. Epoch 0's
+    /// committee is the genesis record, never pruned, so its retention is
+    /// read from the marker.
     fn check_evidence_age(&self, epoch: u64) -> Result<(), String> {
-        if let Some(next) = self.epoch_began(epoch + 1) {
-            if committed_chain_clock(&self.db).time > next.saturating_add(EVIDENCE_MAX_AGE_SECS) {
+        let retained_from = self
+            .db
+            .get(RETAINED_FROM_KEY)
+            .expect("CRITICAL: the retention record could not be read")
+            .map(|raw| {
+                raw.parse::<u64>()
+                    .expect("CRITICAL: the retention record is corrupt")
+            })
+            .unwrap_or(0);
+        if epoch < retained_from {
+            return Err(format!("the records of epoch {epoch} are pruned"));
+        }
+        match self.epoch_began(epoch + 1) {
+            Some(next)
+                if committed_chain_clock(&self.db).time
+                    > next.saturating_add(EVIDENCE_MAX_AGE_SECS) =>
+            {
                 return Err(format!("evidence of epoch {epoch} is older than W"));
             }
+            Some(_) => {}
+            None if epoch < self.executing_epoch() => {
+                return Err(format!("the records of epoch {} are pruned", epoch + 1));
+            }
+            None => {}
         }
         Ok(())
     }
@@ -3202,6 +3181,7 @@ impl Executor {
                 .map_err(|e| format!("{field}: {e}"))
         };
         let (a, b) = (cert("cert_a")?, cert("cert_b")?);
+        self.check_evidence_age(epoch)?;
         let committee = self.committee_of_epoch(epoch);
         if committee.is_empty() {
             return Err(format!("no committee record for epoch {epoch}"));
@@ -3258,7 +3238,17 @@ impl Executor {
         if offenders.is_empty() {
             return Err("no member signed both".into());
         }
-        self.check_evidence_age(epoch)?;
+        // A conflict convicts at 100 % (A3b), so it still counts against
+        // members jailed for a lesser offense: it raises them. Only members
+        // already convicted at 100 % are left out, and evidence convicting
+        // no one new takes no slot.
+        let offenders: Vec<String> = offenders
+            .into_iter()
+            .filter(|m| !self.is_convicted_in_full(m))
+            .collect();
+        if offenders.is_empty() {
+            return Err("every member in both is jailed already at 100 %".into());
+        }
         Ok(VerifiedEvidence {
             offender: author,
             offenders,
@@ -3270,50 +3260,30 @@ impl Executor {
 
     /// Apply the block's slash evidence: verify each item independently, then
     /// execute. Invalid items are ignored (logged) — a proposer cannot slash
-    /// anyone without evidence every node can check.
+    /// anyone without evidence every node can check. If any offense was
+    /// recorded, settlement runs in this block (a fraction already at 100 %
+    /// settles at once, G5 SL-5).
     fn apply_slash_evidence(&self, items: &[String]) {
+        let mut recorded = false;
         for item in items.iter().take(5) {
-            // Consumer-side invariant (defense in depth, mirrors the producer's
-            // split filter): only equivocation is ordered through the DAG. A
-            // "downtime" item's apply path touched node-local rows.
-            let is_equiv = serde_json::from_str::<serde_json::Value>(item)
-                .ok()
-                .and_then(|v| {
-                    v.get("kind").and_then(|k| k.as_str()).map(|k| {
-                        k == "equivocation" || k == "equivocation_v4" || k == "certificate_conflict"
-                    })
-                })
-                .unwrap_or(false);
-            if !is_equiv {
-                eprintln!("⚠️  [SLASH] rejecting non-equivocation evidence kind in block");
-                continue;
-            }
             match self.verify_slash_evidence(item) {
                 Ok(VerifiedEvidence {
-                    offender,
                     offenders,
                     kind,
                     epoch,
                     round,
+                    ..
                 }) => {
+                    let full = kind == "certificate_conflict";
                     for convicted in &offenders {
-                        self.execute_one_slash(convicted, epoch, round);
-                    }
-                    if kind == "downtime" {
-                        // These attestation rows are NODE-LOCAL bookkeeping (written
-                        // with plain put by the local detector and by whatever gossip
-                        // this node happened to receive). They were never state-root
-                        // writes, so their deletion must not be either: logged_delete
-                        // here folded a per-node key set into the state root and forked
-                        // honest nodes on identical blocks. Plain delete.
-                        let prefix = format!("sys:downtime_attestation:{}:{}:", offender, round);
-                        for (k, _) in self.db.scan_prefix(&prefix) {
-                            let _ = self.db.delete(&k);
-                        }
+                        recorded |= self.execute_one_slash(convicted, epoch, round, full);
                     }
                 }
                 Err(e) => eprintln!("⚠️  [SLASH] rejecting block-carried evidence: {e}"),
             }
+        }
+        if recorded {
+            self.settle_offenses("evidence");
         }
     }
 
@@ -3332,14 +3302,17 @@ impl Executor {
                 .get("epoch")
                 .and_then(|v| v.as_u64())
                 .unwrap_or_else(|| self.executing_epoch());
-            self.execute_one_slash(addr, epoch, round);
+            self.execute_one_slash(addr, epoch, round, false);
         }
     }
 
     /// Execute ONE verified slash (the body of the former pending-slash scan,
     /// now driven exclusively by block-carried evidence). `round` is the
-    /// evidence round (equivocation) or epoch (downtime) used for the tombstone.
-    fn execute_one_slash(&self, validator_addr: &str, epoch: u64, round: u64) {
+    /// evidence round, used for the tombstone. All or nothing (G5 SL-1):
+    /// without Move's offense record nothing is jailed or pruned. `full`: a
+    /// certificate conflict, recorded at 100 % and raising a lesser offense
+    /// of a jailed validator (A3b). Returns whether the offense was recorded.
+    fn execute_one_slash(&self, validator_addr: &str, epoch: u64, round: u64, full: bool) -> bool {
         use move_core_types::account_address::AccountAddress;
         use move_core_types::identifier::Identifier;
         use move_core_types::language_storage::ModuleId;
@@ -3357,13 +3330,18 @@ impl Executor {
                 .ok()
                 .flatten()
                 .is_some();
-            if jailed || matches!(self.db.get(&tombstone_key), Ok(Some(_))) {
+            let done = if full {
+                self.is_convicted_in_full(&validator_addr)
+            } else {
+                jailed || matches!(self.db.get(&tombstone_key), Ok(Some(_)))
+            };
+            if done {
                 println!(
                     "   ⏭️  Skipping already processed slash event: {}",
                     event_id
                 );
                 let _ = self.logged_delete(key);
-                return;
+                return false;
             }
 
             println!(
@@ -3381,7 +3359,7 @@ impl Executor {
                     validator_addr, epoch
                 );
                 let _ = self.logged_delete(key);
-                return;
+                return false;
             };
             let vm_addr = match AccountAddress::from_hex_literal(&format!("0x{}", validator_addr)) {
                 Ok(addr) => addr,
@@ -3391,7 +3369,7 @@ impl Executor {
                         validator_addr
                     );
                     let _ = self.logged_delete(key);
-                    return;
+                    return false;
                 }
             };
             let args = vec![
@@ -3410,11 +3388,15 @@ impl Executor {
                     AccountAddress::ONE,
                     Identifier::new("delegation").expect("delegation identifier is valid"),
                 ),
-                "report_equivocation",
+                if full {
+                    "report_certificate_conflict"
+                } else {
+                    "report_equivocation"
+                },
                 vec![],
                 args,
-                // Bounded: the offense ledger holds each offender once, and the
-                // settlement it runs is linear in it.
+                // Bounded: recording is linear in the offense ledger, which
+                // holds each offender once, and settles nothing.
                 10_000_000,
                 // auth_signer: report_equivocation asserts signer==@0x1. With
                 // FIX #1 binding the signer slot to auth_signer, this MUST be
@@ -3432,16 +3414,18 @@ impl Executor {
                     println!("   ⚡ Offense recorded; the fraction settles by G5 SL-5");
                 }
                 Ok((_gas_used, _changes, status)) => {
-                    println!(
-                        "   ⚠️  Move VM offense record aborted ({:?}), falling back to consensus-only removal",
+                    eprintln!(
+                        "   🚨 Move VM offense record aborted ({:?}): nothing applied",
                         status.error
                     );
+                    return false;
                 }
                 Err(e) => {
-                    println!(
-                        "   ⚠️  Move VM offense record failed ({}), falling back to consensus-only removal",
+                    eprintln!(
+                        "   🚨 Move VM offense record failed ({}): nothing applied",
                         e
                     );
+                    return false;
                 }
             }
 
@@ -3508,11 +3492,15 @@ impl Executor {
                 &round.to_string(),
             );
             let _ = self.logged_put(&tombstone_key, "1");
+            if full {
+                let _ = self.logged_put(&format!("validator:convicted_full:{validator_addr}"), "1");
+            }
 
             // Delete the pending slash entry (processed)
             let _ = self.logged_delete(key);
             println!("   ✅ Slash executed and cleared from queue.");
         }
+        true
     }
 
     pub fn analyze_dependencies(&self, tx_json: &str) -> Vec<String> {
@@ -6008,168 +5996,6 @@ mod tests {
         );
     }
 
-    /// RE-AUDIT HIGH (slash determinism): slashes come ONLY from block-carried
-    /// evidence that every node can verify. A proposer cannot slash anyone
-    /// without real evidence, and real evidence verifies identically everywhere.
-    #[test]
-    fn test_slash_evidence_verification_equivocation() {
-        let db = temp_db("evidence_equiv");
-        let key = SigningKey::from_bytes(&[51u8; 32]);
-        let offender = create_account(&db, &key);
-        let _seed = db.seeding();
-        db.put("sys:validators", &format!(r#"[["{}",1000],["other0000",1000]]"#, offender))
-            .unwrap();
-        let executor = Executor::new(db.clone());
-
-        let mk = |ts: u64| {
-            let mut v = blockchain::Vertex {
-                epoch: 0,
-                round: 9,
-                author: offender.clone(),
-                parents: vec!["genesis".into()],
-                payload: vec![],
-                timestamp: ts,
-                hash: String::new(),
-                signature: String::new(),
-                aggregated_signature: None,
-            payload_root: None,
-                parents_root: None,
-                parent_refs: Vec::new(),
-            };
-            v.hash = v.calculate_hash();
-            v.sign_with_ed25519(&key);
-            v
-        };
-        let a = mk(1);
-        let b = mk(2);
-        let item = |a: &blockchain::Vertex, b: &blockchain::Vertex| {
-            serde_json::json!({"kind":"equivocation","offender":offender,"round":9,"vertex_a":a,"vertex_b":b})
-                .to_string()
-        };
-
-        let ok = executor
-            .verify_slash_evidence(&item(&a, &b))
-            .expect("valid proof");
-        assert_eq!(
-            (ok.offender, ok.kind, ok.round),
-            (offender.clone(), "equivocation".to_string(), 9)
-        );
-
-        // Same vertex twice is not equivocation.
-        assert!(executor.verify_slash_evidence(&item(&a, &a)).is_err());
-        // Tampered body (hash no longer matches) must fail.
-        let mut t = b.clone();
-        t.timestamp = 99;
-        assert!(executor.verify_slash_evidence(&item(&a, &t)).is_err());
-        // Forged: signed by someone else.
-        let mut f = b.clone();
-        f.sign_with_ed25519(&SigningKey::from_bytes(&[52u8; 32]));
-        assert!(executor.verify_slash_evidence(&item(&a, &f)).is_err());
-        // An epoch a relay set on a V3 proof (unhashed) is refused (G1 S2
-        // review 2): it would otherwise land in durable evidence.
-        let mut padded = b.clone();
-        padded.epoch = u64::MAX;
-        assert_eq!(
-            padded.calculate_hash(),
-            b.hash,
-            "the V3 hash ignores the epoch"
-        );
-        assert!(executor.verify_slash_evidence(&item(&a, &padded)).is_err());
-        assert!(executor.verify_slash_evidence(&item(&padded, &a)).is_err());
-
-        // COMPACT proofs (payload stripped, payload_root carried) must verify
-        // identically -- this is what keeps DAG-carried evidence tiny.
-        let mk_big = |ts: u64| {
-            let mut v = blockchain::Vertex {
-                epoch: 0,
-                round: 9,
-                author: offender.clone(),
-                parents: vec!["genesis".into()],
-                payload: vec!["z".repeat(200_000)],
-                timestamp: ts,
-                hash: String::new(),
-                signature: String::new(),
-                aggregated_signature: None,
-                payload_root: None,
-                parents_root: None,
-                parent_refs: Vec::new(),
-            };
-            v.hash = v.calculate_hash();
-            v.sign_with_ed25519(&key);
-            v
-        };
-        let (ba, bb) = (mk_big(3), mk_big(4));
-        let (ca, cb) = (ba.to_compact_proof(), bb.to_compact_proof());
-        let compact_item = item(&ca, &cb);
-        assert!(
-            compact_item.len() < 2_000,
-            "compact proof must be small: {}",
-            compact_item.len()
-        );
-        let compact = executor
-            .verify_slash_evidence(&compact_item)
-            .expect("compact proof verifies");
-        assert_eq!(
-            (compact.offender, compact.kind, compact.round),
-            (offender.clone(), "equivocation".to_string(), 9)
-        );
-        // A compact proof whose root was tampered fails hash binding.
-        let mut bad = ca.clone();
-        bad.payload_root = Some("00".repeat(32));
-        assert!(executor.verify_slash_evidence(&item(&bad, &cb)).is_err());
-    }
-
-    #[test]
-    fn test_slash_evidence_verification_downtime_quorum_and_signatures() {
-        use ed25519_dalek::Signer;
-        let db = temp_db("evidence_downtime");
-        let k1 = SigningKey::from_bytes(&[61u8; 32]);
-        let k2 = SigningKey::from_bytes(&[62u8; 32]);
-        let k3 = SigningKey::from_bytes(&[63u8; 32]);
-        let r1 = create_account(&db, &k1);
-        let r2 = create_account(&db, &k2);
-        let off = create_account(&db, &k3);
-        let _seed = db.seeding();
-        db.put(
-            "sys:validators",
-            &format!(r#"[["{}",1000],["{}",1000],["{}",1000]]"#, r1, r2, off),
-        )
-        .unwrap();
-        let executor = Executor::new(db.clone());
-
-        let att = |k: &SigningKey, rep: &str, good: bool| {
-            let canonical = format!("{}:{}:{}:{}", off, 4, rep, 400);
-            let mut sig = hex::encode(k.sign(canonical.as_bytes()).to_bytes());
-            if !good { sig.replace_range(0..2, "00"); }
-            serde_json::json!({
-                "offender": off, "epoch": 4, "reporter": rep, "round": 400, "rounds_missed": 150,
-                "reporter_pubkey": hex::encode(k.verifying_key().to_bytes()), "signature": sig,
-            })
-        };
-        let item = |atts: Vec<serde_json::Value>| {
-            serde_json::json!({"kind":"downtime","offender":off,"epoch":4,"attestations":atts}).to_string()
-        };
-
-        // 1 of 3 (33%) -> no quorum.
-        assert!(executor.verify_slash_evidence(&item(vec![att(&k1, &r1, true)])).is_err());
-        // 2 of 3 is exactly 2/3 -> strict quorum NOT met.
-        assert!(executor
-            .verify_slash_evidence(&item(vec![att(&k1, &r1, true), att(&k2, &r2, true)]))
-            .is_err());
-        // 3 of 3 including the offender itself attesting? offender is a validator too.
-        let ok = executor
-            .verify_slash_evidence(&item(vec![att(&k1, &r1, true), att(&k2, &r2, true), att(&k3, &off, true)]))
-            .expect("3/3 stake meets quorum");
-        assert_eq!(
-            (ok.offender, ok.kind, ok.round),
-            (off.clone(), "downtime".to_string(), 4)
-        );
-        // A bad signature invalidates the whole item (proposer cannot pad quorum).
-        assert!(executor
-            .verify_slash_evidence(&item(vec![att(&k1, &r1, true), att(&k2, &r2, true), att(&k3, &off, false)]))
-            .is_err());
-    }
-
     /// ROOT-CAUSE REGRESSION (2026-08-25 burn-in): a height must be executable
     /// exactly ONCE and only in order. Two paths (ChainSync import and the local
     /// commit loop) execute into the single `sys:state_root` chain; when a node
@@ -7064,6 +6890,7 @@ mod tests {
         self_weight: u64,
         delegated_weight: u64,
         settled: bool,
+        full: bool,
     }
 
     /// The offense ledger (`0x1::delegation::Offenses`), empty when absent.
@@ -7097,6 +6924,8 @@ mod tests {
             )
             .unwrap();
         chain.executor.execute_pending_slashes();
+        // As `apply_slash_evidence` does after recording an offense.
+        chain.executor.settle_offenses("evidence");
     }
 
     /// A validator's own unbonding entries: (start height, stake).
@@ -7116,6 +6945,252 @@ mod tests {
             .and_then(|raw| decode_supply_stats_hex(&raw))
             .map(|stats| stats.cumulative_burned)
             .unwrap_or(0)
+    }
+
+    /// G5 review (A3b), the escalation attack: a coalition jailed for small,
+    /// spread-out twin offenses still signs in C_E, and two certificates for
+    /// one slot prove a third of it signed both. The conflict raises each
+    /// lesser offense to 100 %: an unsettled one settles at 100 %, a settled
+    /// one loses what remains in scope at once. Until settlement the
+    /// offender's in-scope unbonding is frozen.
+    #[test]
+    fn g5_a_certificate_conflict_raises_a_lesser_offense_to_full() {
+        #[derive(Deserialize)]
+        struct Frozen {
+            scopes: Vec<(move_core_types::account_address::AccountAddress, u64)>,
+        }
+        let ain = G5_AIN;
+        let seeds: Vec<(u8, u64)> = (200..207).map(|seed| (seed, 1_000)).collect();
+        let (mut chain, validators, _) = delegation_chain("g5_sl_escalate", 1, DAY, &seeds, &[]);
+        let db = chain.db.clone();
+        let v = |i: usize| validators[i].1.clone();
+        let frozen = |db: &StateDB| -> Vec<move_core_types::account_address::AccountAddress> {
+            db.get(&vm_move::state_keys::resource_key_str(
+                &system_address(),
+                "0x1::staking::FrozenPayouts",
+            ))
+            .unwrap()
+            .map(|raw| bcs::from_bytes::<Frozen>(&hex::decode(raw).unwrap()).unwrap())
+            .map(|f| f.scopes.into_iter().map(|s| s.0).collect())
+            .unwrap_or_default()
+        };
+        chain.run_to(2, vec![]);
+
+        // V0 alone: (3/7)^2 = 18.37 %, not final; its payouts are frozen.
+        g5_report(&chain, &v(0), 0, 1);
+        assert!(!g5_offense(&db, &v(0)).settled);
+        assert_eq!(frozen(&db), vec![parse_move_address(&v(0)).unwrap()]);
+        // A certificate conflict convicts it again: 100 % at once, thawed.
+        // (Between blocks, as `g5_report` runs: the seeding scope stands in
+        // for the block transaction the evidence is applied in.)
+        {
+            let _seed = db.seeding();
+            assert!(chain.executor.execute_one_slash(&v(0), 0, 1, true));
+            chain.executor.settle_offenses("evidence");
+        }
+        let o0 = g5_offense(&db, &v(0));
+        assert!(o0.full && o0.settled);
+        assert_eq!(g5_own_unbonding(&db, &v(0)), vec![(2, 0)]);
+        assert!(frozen(&db).is_empty());
+        // Convicted in full: the same conflict convicts it no further.
+        {
+            let _seed = db.seeding();
+            assert!(!chain.executor.execute_one_slash(&v(0), 0, 1, true));
+        }
+
+        // V1 settles at the lesser fraction first (with V0 in its window:
+        // (6/7)^2 = 73.47 %), then a conflict takes what remains at once.
+        g5_report(&chain, &v(1), 0, 2);
+        chain.run_to(29, vec![]);
+        let o1 = g5_offense(&db, &v(1));
+        assert!(o1.settled && !o1.full);
+        let kept = 1_000 * ain - 1_000 * ain * 7_347 / 10_000;
+        assert_eq!(g5_own_unbonding(&db, &v(1)), vec![(2, kept)]);
+        {
+            let _seed = db.seeding();
+            assert!(chain.executor.execute_one_slash(&v(1), 0, 2, true));
+        }
+        assert!(g5_offense(&db, &v(1)).full);
+        assert_eq!(g5_own_unbonding(&db, &v(1)), vec![(2, 0)]);
+    }
+
+    /// G5 review (A3b): an unbonding entry in a frozen scope (an offense not
+    /// yet settled) is not paid at a boundary, matured or not, nor withdrawn
+    /// by hand; once thawed it is paid at the next boundary. Out of scope
+    /// (an earlier epoch) it is paid as usual.
+    #[test]
+    fn g5_frozen_unbonding_is_not_paid_until_thawed() {
+        #[derive(Serialize)]
+        struct Frozen {
+            scopes: Vec<(move_core_types::account_address::AccountAddress, u64)>,
+        }
+        let ain = G5_AIN;
+        let mut keys = vec![];
+        let mut chain = G5Chain::new("g5_frozen", DAY, |db| {
+            for seed in [74u8, 75, 76] {
+                keys.push(G5Chain::account(db, seed, ain));
+            }
+            seed_three_validators(db, &keys, 1_000 * ain);
+        });
+        let db = chain.db.clone();
+        let frozen_key =
+            vm_move::state_keys::resource_key_str(&system_address(), "0x1::staking::FrozenPayouts");
+        let freeze = |scopes: Vec<(&str, u64)>| {
+            let _seed = db.seeding();
+            let frozen = Frozen {
+                scopes: scopes
+                    .into_iter()
+                    .map(|(a, e)| (parse_move_address(a).unwrap(), e))
+                    .collect(),
+            };
+            db.put(&frozen_key, &hex::encode(bcs::to_bytes(&frozen).unwrap()))
+                .unwrap();
+        };
+        let (a, b) = (keys[0].1.clone(), keys[1].1.clone());
+        // A and B leave at height 3 (epoch 0); both unlock at 44 d.
+        let leave_a = chain.tx(&keys[0].0, "staking", "leave_validator_set", vec![]);
+        let leave_b = chain.tx(&keys[1].0, "staking", "leave_validator_set", vec![]);
+        chain.run_to(3, vec![leave_a, leave_b]);
+        // A's scope from epoch 0 holds its entry; B's from epoch 1 does not.
+        freeze(vec![(a.as_str(), 0), (b.as_str(), 1)]);
+        let in_queue = |who: &str| {
+            validator_set(&db)
+                .unbonding_queue
+                .iter()
+                .any(|r| r.validator_addr == parse_move_address(who).unwrap())
+        };
+        chain.run_to(60, vec![]);
+        assert!(in_queue(&a), "a frozen entry was paid at the boundary");
+        assert!(!in_queue(&b), "an entry out of the frozen scope was held");
+        let withdraw = chain.tx(&keys[0].0, "staking", "withdraw_unbonded", vec![]);
+        chain.run_to(61, vec![withdraw]);
+        assert!(in_queue(&a), "a frozen entry was withdrawn by hand");
+        // Thawed: paid at the next boundary.
+        freeze(vec![]);
+        let a_before = coin_balance(&db, &a);
+        chain.run_to(80, vec![]);
+        assert!(!in_queue(&a));
+        assert!(coin_balance(&db, &a) >= a_before + 1_000 * ain);
+    }
+
+    /// G5 review (A3b): a full validator set (1,000) does not freeze
+    /// membership. A joiner with more stake than the smallest member takes
+    /// its place, and the smallest starts unbonding like a leaver; a joiner
+    /// with no more stake is refused.
+    #[test]
+    fn g5_a_full_validator_set_takes_a_larger_joiner_and_unbonds_the_smallest() {
+        let ain = G5_AIN;
+        let address = |i: u32| {
+            let mut a = [0u8; 32];
+            a[..4].copy_from_slice(&i.to_le_bytes());
+            a[31] = 0xee;
+            move_core_types::account_address::AccountAddress::new(a)
+        };
+        let mut keys = vec![];
+        let mut chain = G5Chain::new("g5_full_set", DAY, |db| {
+            keys.push(G5Chain::account(db, 210, 10_000 * ain));
+            keys.push(G5Chain::account(db, 211, 10_000 * ain));
+            let _seed = db.seeding();
+            let set = TestValidatorSet {
+                validators: (0..1_000u32)
+                    .map(|i| TestValidatorConfig {
+                        validator_addr: address(i),
+                        stake: TestCoin {
+                            value: if i == 417 { 1_000 } else { 2_000 } * ain,
+                        },
+                        public_key: vec![1, 2, 3],
+                        bls_public_key: {
+                            let mut k = vec![0u8; 48];
+                            k[..4].copy_from_slice(&i.to_le_bytes());
+                            k
+                        },
+                        bls_pop: vec![0u8; 96],
+                    })
+                    .collect(),
+                unbonding_queue: vec![],
+                total_supply: 10_000_000 * ain,
+                current_epoch: 0,
+            };
+            db.put(
+                &validator_set_key(),
+                &hex::encode(bcs::to_bytes(&set).unwrap()),
+            )
+            .unwrap();
+        });
+        let db = chain.db.clone();
+        let join = |key: &SigningKey, sender: &str, seed: u8, stake: u128| {
+            let (bls_public_key, bls_pop) = test_bls_identity(seed);
+            let payload = entry_payload(
+                "staking",
+                "join_validator_set",
+                vec![],
+                vec![
+                    bcs::to_bytes(&parse_move_address(sender).unwrap()).unwrap(),
+                    bcs::to_bytes(&stake).unwrap(),
+                    bcs::to_bytes(&key.verifying_key().to_bytes().to_vec()).unwrap(),
+                    bcs::to_bytes(&bls_public_key).unwrap(),
+                    bcs::to_bytes(&bls_pop).unwrap(),
+                ],
+            );
+            signed_tx(key, sender, &payload, 0, 10_000_000, 1)
+        };
+        let ((equal_key, equal), (larger_key, larger)) = (keys[0].clone(), keys[1].clone());
+        let members = |db: &StateDB| -> Vec<_> {
+            validator_set(db)
+                .validators
+                .iter()
+                .map(|c| c.validator_addr)
+                .collect()
+        };
+        // No more stake than the smallest member: refused, nothing changes.
+        chain.run_to(1, vec![join(&equal_key, &equal, 212, 1_000 * ain)]);
+        assert_eq!(members(&db).len(), 1_000);
+        assert!(!members(&db).contains(&parse_move_address(&equal).unwrap()));
+        // More: it takes the smallest member's place.
+        chain.run_to(2, vec![join(&larger_key, &larger, 213, 1_500 * ain)]);
+        let now = members(&db);
+        assert_eq!(now.len(), 1_000);
+        assert!(now.contains(&parse_move_address(&larger).unwrap()));
+        assert!(!now.contains(&address(417)));
+        let queue = validator_set(&db).unbonding_queue;
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            (queue[0].validator_addr, queue[0].stake),
+            (address(417), 1_000 * ain)
+        );
+    }
+
+    /// G5 SL-4 across epochs (review: only same-epoch correlation was
+    /// tested). One-hour blocks and I = 20, so epoch 1 begins 20 h after
+    /// epoch 0: within D = 24 h. V0's offense of epoch 0 and V1's of epoch 1
+    /// count together: Q = 2,000 of 7,000 for both, (6/7)^2 = 73.47 % each,
+    /// where each alone would be (3/7)^2 = 18.37 %.
+    #[test]
+    fn g5_offenses_correlate_across_epochs_within_d() {
+        let ain = G5_AIN;
+        let hour = 3_600;
+        let seeds: Vec<(u8, u64)> = (170..177).map(|seed| (seed, 1_000)).collect();
+        let (mut chain, validators, _) =
+            delegation_chain("g5_sl_cross_epoch", 1, hour, &seeds, &[]);
+        let db = chain.db.clone();
+        let v = |i: usize| validators[i].1.clone();
+        chain.run_to(21, vec![]);
+        assert_eq!(g5_committee(&db, 1).len(), 7);
+        g5_report(&chain, &v(0), 0, 1);
+        g5_report(&chain, &v(1), 1, 21);
+        let (o0, o1) = (g5_offense(&db, &v(0)), g5_offense(&db, &v(1)));
+        assert_eq!(
+            o1.epoch_began - o0.epoch_began,
+            20 * hour,
+            "epochs 20 h apart"
+        );
+        // Settled once tau is past epoch 1's start + D + I x C_tau + W.
+        let span = DAY + 20 * hour + 7 * DAY;
+        chain.run_until(20 * hour + span + hour, vec![]);
+        assert!(g5_offense(&db, &v(0)).settled && g5_offense(&db, &v(1)).settled);
+        let kept = 1_000 * ain - 1_000 * ain * 7_347 / 10_000;
+        assert_eq!(g5_own_unbonding(&db, &v(0)), vec![(21, kept)]);
+        assert_eq!(g5_own_unbonding(&db, &v(1)), vec![(21, kept)]);
     }
 
     /// G5 SL-4, SL-5 through real blocks (R = 1, one-day blocks, 7 equal
@@ -7156,19 +7231,33 @@ mod tests {
         assert!(!g5_offense(&db, &v(2)).settled);
         assert_eq!(g5_own_unbonding(&db, &v(2)), vec![(21, 1_000 * ain)]);
         chain.run_to(22, vec![]);
-        g5_report(&chain, &v(3), 1, 22);
+        // Recording settles nothing (G5 review): the record alone leaves both
+        // pending; the block's settlement (as `apply_slash_evidence` runs it)
+        // settles them.
+        {
+            let _seed = db.seeding();
+            db.put(
+                &format!("sys:pending_slash:{}", v(3)),
+                &serde_json::json!({ "round": 22, "epoch": 1 }).to_string(),
+            )
+            .unwrap();
+            chain.executor.execute_pending_slashes();
+            assert!(!g5_offense(&db, &v(3)).settled, "recording settled");
+            chain.executor.settle_offenses("evidence");
+        }
         // 2,000 of 5,000 within D: a third, so 100 % at once for both.
         assert!(g5_offense(&db, &v(2)).settled && g5_offense(&db, &v(3)).settled);
         assert_eq!(g5_own_unbonding(&db, &v(2)), vec![(21, 0)]);
         assert_eq!(g5_own_unbonding(&db, &v(3)), vec![(22, 0)]);
         assert_eq!(g5_burned(&db), burned + 2_000 * ain);
 
-        // Epoch 0's pair settles at 28 d exactly, not a block earlier.
-        chain.run_to(27, vec![]);
-        assert_eq!(chain.clock().time, 27 * DAY);
+        // Epoch 0's pair settles once tau is past 28 d (D + I x C_tau + W),
+        // not at 28 d: evidence of a correlated epoch can still land then.
+        chain.run_to(28, vec![]);
+        assert_eq!(chain.clock().time, 28 * DAY);
         assert!(!g5_offense(&db, &v(0)).settled);
         assert_eq!(g5_own_unbonding(&db, &v(0)), vec![(3, 1_000 * ain)]);
-        chain.run_to(28, vec![]);
+        chain.run_to(29, vec![]);
         let kept = 1_000 * ain - 1_000 * ain * 7_347 / 10_000;
         assert_eq!(g5_own_unbonding(&db, &v(0)), vec![(3, kept)]);
         assert_eq!(g5_own_unbonding(&db, &v(1)), vec![(5, kept)]);
@@ -7279,10 +7368,10 @@ mod tests {
         let t2 = call(&mut chain, &b_key, v6, "undelegate", Some(100 * ain));
         chain.run_to(23, vec![t2]);
 
-        // Epoch 1 began at 20 d: settlement at 48 d.
-        chain.run_to(47, vec![]);
-        assert!(!g5_offense(&db, v6).settled);
+        // Epoch 1 began at 20 d: settlement once tau is past 48 d.
         chain.run_to(48, vec![]);
+        assert!(!g5_offense(&db, v6).settled);
+        chain.run_to(49, vec![]);
         assert!(g5_offense(&db, v6).settled && g5_offense(&db, v7).settled);
         let mut v7_entries = g5_own_unbonding(&db, v7);
         v7_entries.sort();
@@ -7317,12 +7406,12 @@ mod tests {
 
         // C leaves in full after settlement, at the slashed price.
         let t3 = call(&mut chain, &c_key, v6, "undelegate", Some(1_000 * ain));
-        chain.run_to(49, vec![t3]);
+        chain.run_to(50, vec![t3]);
         let x3 = g5_mul_div(100 * ain, active, 2_900 * ain);
         assert_eq!(book_of(&db, &c).tickets[0].amount, x3);
-        // All unlock by 49 d + I x C_tau + U = 90 d. C is paid first, while
+        // All unlock by 50 d + I x C_tau + U = 91 d. C is paid first, while
         // the event still waits for B's three tickets: in full.
-        chain.run_until(90 * DAY, vec![]);
+        chain.run_until(91 * DAY, vec![]);
         let c_before = coin_balance(&db, &c);
         let withdraw_c = call(&mut chain, &c_key, v6, "withdraw_unbonded", None);
         chain.run_to(chain.height + 1, vec![withdraw_c]);
@@ -7559,6 +7648,27 @@ mod tests {
         chain.run_to(27, vec![]);
         assert_eq!(chain.clock().time, 27 * DAY);
         assert!(chain.executor.verify_slash_evidence(&item(&a, &b)).is_ok());
+        // At 27 d, where it still verifies: once the next epoch's records are
+        // pruned, or the epoch's own, it is refused (epoch 0's committee is
+        // the genesis record, which is never pruned).
+        {
+            let _seed = db.seeding();
+            let began = db.get(&epoch_time_key(1)).unwrap().unwrap();
+            db.delete(&epoch_time_key(1)).unwrap();
+            let refused = chain
+                .executor
+                .verify_slash_evidence(&item(&a, &b))
+                .unwrap_err();
+            assert!(refused.contains("pruned"), "{refused}");
+            db.put(&epoch_time_key(1), &began).unwrap();
+            db.put(RETAINED_FROM_KEY, "1").unwrap();
+            let refused = chain
+                .executor
+                .verify_slash_evidence(&item(&a, &b))
+                .unwrap_err();
+            assert!(refused.contains("pruned"), "{refused}");
+            db.delete(RETAINED_FROM_KEY).unwrap();
+        }
         chain.run_until(27 * DAY + 1, vec![]);
         let refused = chain
             .executor
@@ -7599,6 +7709,73 @@ mod tests {
             g5_own_unbonding(&db, &offender),
             vec![(height, 1_000 * ain)]
         );
+        // Convicted already: its other evidence takes no block slot (G5
+        // review), whatever slot it names.
+        let refused = chain
+            .executor
+            .verify_slash_evidence(&item(&a1, &b1))
+            .unwrap_err();
+        assert!(refused.contains("jailed already"), "{refused}");
+    }
+
+    /// G5 review: a block's evidence is deduplicated by whom it convicts, not
+    /// by slot, so items against one offender at many slots take one of the
+    /// block's five slots, and a certificate conflict convicting others too
+    /// is a different item.
+    #[test]
+    fn g5_the_evidence_key_is_who_it_convicts() {
+        let twin = |round: u64, epoch: u64| VerifiedEvidence {
+            offender: "x".into(),
+            offenders: vec!["x".into()],
+            kind: "equivocation_v4".into(),
+            epoch,
+            round,
+        };
+        assert_eq!(twin(5, 0).key(), twin(6, 0).key());
+        assert_eq!(twin(5, 0).key(), twin(5, 3).key());
+        let conflict = |offenders: &[&str]| VerifiedEvidence {
+            offender: "author".into(),
+            offenders: offenders.iter().map(|o| o.to_string()).collect(),
+            kind: "certificate_conflict".into(),
+            epoch: 0,
+            round: 5,
+        };
+        assert_eq!(conflict(&["y", "x"]).key(), conflict(&["x", "y"]).key());
+        assert_ne!(conflict(&["x", "y"]).key(), twin(5, 0).key());
+    }
+
+    /// G5 SL-1 (review): acceptance is all or nothing. When Move cannot
+    /// record the offense (here, its module is missing), nothing is jailed,
+    /// tombstoned or pruned from the committee's set.
+    #[test]
+    fn g5_an_offense_move_cannot_record_applies_nothing() {
+        let seeds: Vec<(u8, u64)> = (180..184).map(|seed| (seed, 1_000)).collect();
+        // No block runs first: the VM has not loaded the module it loses.
+        let (chain, validators, _) = delegation_chain("g5_sl_atomic", 20, DAY, &seeds, &[]);
+        let db = chain.db.clone();
+        let offender = validators[1].1.clone();
+        let v1_before = db.get("sys:validator_set:v1").unwrap();
+        {
+            let _seed = db.seeding();
+            db.delete(&vm_move::state_keys::module_key(
+                &system_address(),
+                "delegation",
+            ))
+            .unwrap();
+        }
+        let mirror_before = db.get("sys:validators").unwrap();
+        g5_report(&chain, &offender, 0, 1);
+        assert!(db
+            .get(&format!("validator:jailed:{offender}"))
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get(&format!("sys:slashed:{offender}:1"))
+            .unwrap()
+            .is_none());
+        assert!(g5_offenses(&db).is_empty(), "an offense was recorded");
+        assert_eq!(db.get("sys:validator_set:v1").unwrap(), v1_before);
+        assert_eq!(db.get("sys:validators").unwrap(), mirror_before);
     }
 
     /// A certificate of slot (epoch 0, round, author) on `digest`, signed by
@@ -7743,10 +7920,15 @@ mod tests {
             other => panic!("the block must execute: {other:?}"),
         }
         for convict in [&ordered[1].address, &ordered[2].address] {
-            assert!(g5_offense(&db, convict).settled, "{convict}");
+            let offense = g5_offense(&db, convict);
+            assert!(offense.settled && offense.full, "{convict}");
             assert_eq!(g5_own_unbonding(&db, convict), vec![(height, 0)]);
             assert!(db
                 .get(&format!("validator:jailed:{convict}"))
+                .unwrap()
+                .is_some());
+            assert!(db
+                .get(&format!("validator:convicted_full:{convict}"))
                 .unwrap()
                 .is_some());
         }
@@ -7754,6 +7936,12 @@ mod tests {
             .get(&format!("validator:jailed:{}", ordered[3].address))
             .unwrap()
             .is_none());
+        // Convicted already: the same pair takes no block slot again.
+        let again = chain
+            .executor
+            .verify_slash_evidence(&item(&a, &b))
+            .unwrap_err();
+        assert!(again.contains("jailed already"), "{again}");
 
         // A shared BLS key: refused in a committee, and at join.
         let mut twin_key = committee[1].clone();
@@ -8287,8 +8475,10 @@ mod tests {
             set_coin_store(db, &m.address, 0);
         }
         let _seed = db.seeding();
+        // The Move set holds the members with their committee stake: it is
+        // the authority the boundary refresh follows (G5 review).
         let set = TestValidatorSet {
-            validators: vec![],
+            validators: members.iter().map(move_validator).collect(),
             unbonding_queue: vec![],
             total_supply,
             current_epoch: 0,
@@ -8301,6 +8491,31 @@ mod tests {
         db.put(
             "genesis:validator_set:v1",
             &serde_json::to_string(members).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// `m` as a Move `ValidatorConfig`, its stake in whole AIN.
+    fn move_validator(m: &blockchain::committee::ValidatorInfo) -> TestValidatorConfig {
+        TestValidatorConfig {
+            validator_addr: parse_move_address(&m.address).unwrap(),
+            stake: TestCoin {
+                value: m.stake as u128 * G5_AIN,
+            },
+            public_key: hex::decode(&m.ed25519_public_key).unwrap(),
+            bls_public_key: hex::decode(&m.bls_public_key).unwrap(),
+            bls_pop: hex::decode(&m.bls_pop).unwrap(),
+        }
+    }
+
+    /// Replace the Move set's members with `members`, keeping the rest.
+    fn set_move_members(db: &StateDB, members: &[blockchain::committee::ValidatorInfo]) {
+        let mut set = validator_set(db);
+        set.validators = members.iter().map(move_validator).collect();
+        let _seed = db.seeding();
+        db.put(
+            &validator_set_key(),
+            &hex::encode(bcs::to_bytes(&set).unwrap()),
         )
         .unwrap();
     }
@@ -8418,9 +8633,11 @@ mod tests {
             set_coin_store(db, &c.address, 0);
             set_coin_store(db, &bystander.address, 0);
             keys.push(G5Chain::account(db, 115, 10 * ain));
+            // The live set: B left, C joined, in Move and in the committee's
+            // set. A bystander is in the old reward mirror but in no
+            // committee.
+            set_move_members(db, &[a.clone(), c.clone()]);
             let _seed = db.seeding();
-            // The live set: B left, C joined. A bystander is in the old
-            // reward mirror but in no committee.
             db.put(
                 "sys:validator_set:v1",
                 &serde_json::to_string(&vec![a.clone(), c.clone()]).unwrap(),
@@ -8476,6 +8693,53 @@ mod tests {
         assert_eq!(chain.height, 40);
         assert_eq!(balance(&a), a_before, "a jailed member gets nothing");
         assert!(balance(&c) > c_before, "C is paid for epoch 1");
+    }
+
+    /// G5 review: the Move set is the authority for committee seats. A
+    /// member of the committee's set that the Move set no longer holds
+    /// (whatever path removed it) is dropped at the next boundary: it is not
+    /// in the next committee and is not paid for it.
+    #[test]
+    fn g5_a_committee_member_without_move_stake_loses_its_seat() {
+        let ain = G5_AIN;
+        let supply = 1_000_000 * ain;
+        let (a, b, c) = (
+            committee_member(121, 100),
+            committee_member(122, 100),
+            committee_member(123, 100),
+        );
+        let mut chain = G5Chain::new("g5_move_authority", 14, |db| {
+            seed_committee_chain(db, &[a.clone(), b.clone(), c.clone()], supply);
+            // C's Move entry is gone, its seat in the committee's set is not.
+            set_move_members(db, &[a.clone(), b.clone()]);
+            let _seed = db.seeding();
+            db.put(
+                "sys:validator_set:v1",
+                &serde_json::to_string(&vec![a.clone(), b.clone(), c.clone()]).unwrap(),
+            )
+            .unwrap();
+        });
+        let db = chain.db.clone();
+        chain.run_blocks(20, 7);
+        let recorded: Vec<blockchain::committee::ValidatorInfo> =
+            serde_json::from_str(&db.get("sys:validator_set:epoch:1").unwrap().unwrap()).unwrap();
+        assert_eq!(
+            recorded,
+            blockchain::committee::canonical_order(&[a.clone(), b.clone()]),
+            "C_1 holds only members with Move stake"
+        );
+        let live: Vec<blockchain::committee::ValidatorInfo> =
+            serde_json::from_str(&db.get("sys:validator_set:v1").unwrap().unwrap()).unwrap();
+        assert!(live.iter().all(|m| m.address != c.address));
+        let c_before = coin_balance(&db, &c.address);
+        chain.run_blocks(20, 7);
+        assert_eq!(chain.height, 40);
+        assert_eq!(
+            coin_balance(&db, &c.address),
+            c_before,
+            "C is not paid for epoch 1"
+        );
+        assert!(coin_balance(&db, &a.address) > 0);
     }
 
     /// Build a hex-encoded BCS `coin::transfer` payload from `from` to `to`.
@@ -11302,25 +11566,24 @@ mod tests {
         assert!(*map.get("alice").unwrap_or(&0) >= 20 + 26);
     }
 
+    /// G5 EM-2 (review): a leader outside the paid committee (jailed since
+    /// it was elected) gets no bonus; the whole reward is the committee's.
     #[test]
-    fn a1_non_validator_leader_still_gets_bonus() {
-        // Edge case: anchor_leader is NOT in validator set (e.g. transient state).
-        // Leader bonus still flows to leader; pool split among validators.
+    fn a1_a_leader_outside_the_paid_committee_gets_nothing() {
         let payouts = Executor::compute_block_payouts(
             "ghost_leader",
-            1_000,
+            1_001,
             &committee_a1(&[("bob", 100), ("carol", 100)]),
         );
 
         let map: std::collections::HashMap<String, u128> = payouts.into_iter().collect();
-        // ghost_leader gets 20% bonus = 200
-        assert_eq!(*map.get("ghost_leader").unwrap_or(&0), 200);
-        // bob + carol split 800 equally = 400 each
-        assert_eq!(*map.get("bob").unwrap_or(&0), 400);
-        assert_eq!(*map.get("carol").unwrap_or(&0), 400);
+        assert_eq!(map.get("ghost_leader"), None);
+        // The rounding remainder goes to the committee's first member.
+        assert_eq!(*map.get("bob").unwrap_or(&0), 501);
+        assert_eq!(*map.get("carol").unwrap_or(&0), 500);
 
         let total: u128 = map.values().sum();
-        assert_eq!(total, 1_000);
+        assert_eq!(total, 1_001);
     }
 
     /// SECURITY (forged non-leading signer): any account may publish its own
@@ -11418,6 +11681,55 @@ mod tests {
             1_000_000,
             "victim balance must be untouched: a non-leading signer slot must never \
              carry a caller-supplied address"
+        );
+    }
+
+    /// G5 review (CRITICAL class): the executor verifies the BLS proof of
+    /// possession, refuses a tombstoned validator and keeps the committee's
+    /// set in step with Move only for a transaction that calls
+    /// `0x1::staking::{join_validator_set, leave_validator_set, add_stake}`
+    /// directly. While they were `public entry`, a module could call them and
+    /// skip all three: leave through a module, take the stake back after
+    /// unbonding, and keep the committee seat. They are `entry` only now, so
+    /// a module calling them (tests/fixtures/staking_module_call.move,
+    /// compiled against the old stdlib) cannot even be published.
+    #[test]
+    fn g5_a_module_cannot_call_the_staking_entries() {
+        const ATTACKER_SEED: [u8; 32] = [91u8; 32];
+        let db = temp_db("g5_staking_module_call");
+        load_stdlib(&db);
+        let attacker_key = SigningKey::from_bytes(&ATTACKER_SEED);
+        let attacker = create_account(&db, &attacker_key);
+        assert_eq!(
+            attacker, "0e1b4e0d165bed857e8a3232ee9865b7001e4e7945887e6f7d149c5807ccaf08",
+            "attacker address drifted from the compiled fixture"
+        );
+        set_coin_store(&db, &attacker, 5_000_000);
+        {
+            let _seed = db.seeding();
+            db.set_federation_key("00000000000000000000000000000000")
+                .unwrap();
+        }
+        let executor = Executor::new(db.clone());
+        let module_bytes = include_bytes!("../tests/fixtures/staking_module_call.mv").to_vec();
+        let publish = vm_move::TransactionPayload::PublishModule(vec![module_bytes]);
+        let publish_hex = hex::encode(bcs::to_bytes(&publish).unwrap());
+        if let Some((updates, _)) = executor.execute_transaction(&signed_tx(
+            &attacker_key,
+            &attacker,
+            &publish_hex,
+            0,
+            1_000_000,
+            1,
+        )) {
+            let _seed = db.seeding();
+            apply_updates(&db, updates);
+        }
+        let module =
+            vm_move::state_keys::module_key(&parse_move_address(&attacker).unwrap(), "stakewrap");
+        assert!(
+            db.get(&module).unwrap().is_none(),
+            "a module calling the staking entries was published"
         );
     }
 

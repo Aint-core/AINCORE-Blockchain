@@ -1072,7 +1072,7 @@ async fn get_markets(data: web::Data<AppState>, query: web::Query<MarketsQuery>)
         })
         .collect();
 
-    markets.sort_by(|a, b| b.last_trade_at.cmp(&a.last_trade_at));
+    markets.sort_by_key(|m| std::cmp::Reverse(m.last_trade_at));
     markets.truncate(limit as usize);
 
     HttpResponse::Ok().json(markets)

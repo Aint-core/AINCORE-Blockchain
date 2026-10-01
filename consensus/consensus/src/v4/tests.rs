@@ -3275,7 +3275,8 @@ fn h3_rounds(c: &Cluster) -> (u64, usize, usize) {
 
 /// The twin of `test_h3_tier2_stateless_gate_prevents_the_ancestry_fork`.
 /// The leader of anchor round r+2 is Byzantine: at rounds r+1 and r+2 it
-/// sends one-parent vertices whose history excludes round r's leader.
+/// sends one-parent vertices whose history excludes round r's leader, each
+/// parent certified (so no missing certificate can be what holds them).
 /// Observer X gets every push; observer Y loses the two other honest
 /// round-(r+1) bodies (it pulls them later). Every node refuses both thin
 /// vertices from their bytes alone (Layer S), so no node can anchor on them,
@@ -3295,6 +3296,7 @@ fn v4_thin_byzantine_vertices_are_refused_alike_and_the_leader_commits() {
         .map(|i| c.members[i].info.address.clone())
         .collect();
     assert_eq!(lossy.len(), 2, "the scenario needs exactly two omissions");
+    let lossy_first = c.index_of(&lossy[0]);
     // The Byzantine author's own bodies at rounds r+1 and r+2 never leave it
     // (it sends the crafted ones instead), and it serves no pull.
     let lost = Cell::new(0);
@@ -3342,15 +3344,12 @@ fn v4_thin_byzantine_vertices_are_refused_alike_and_the_leader_commits() {
                 thin1 = Some(v);
             }
         }
-        if let (Some(t1), None) = (&thin1, &thin2) {
+        if let (Some(_), None) = (&thin1, &thin2) {
             if let Some(own) = c.engine(byz).own_proposal(r + 2).cloned() {
-                let p = ParentRef {
-                    round: r + 1,
-                    author: byz_addr.clone(),
-                    digest: t1.hash.clone(),
-                    proof: None,
-                    cert: None,
-                };
+                // ONE certified parent (an honest one): only Layer S's stake
+                // clause can refuse it, never a missing certificate.
+                let honest = c.members[lossy_first].info.address.clone();
+                let p = cert_ref(&c, byz, r + 1, &honest);
                 let v = recite(&own, vec![p], &key);
                 c.q.borrow_mut().push_back(Envelope {
                     from: byz_addr.clone(),
@@ -3365,6 +3364,8 @@ fn v4_thin_byzantine_vertices_are_refused_alike_and_the_leader_commits() {
     let thin1 = thin1.expect("the Byzantine author reached round r+1");
     let thin2 = thin2.expect("the Byzantine author reached round r+2");
     assert_eq!(thin1.parent_refs.len(), 1);
+    assert_eq!(thin2.parent_refs.len(), 1);
+    assert!(thin1.parent_refs[0].cert.is_some() && thin2.parent_refs[0].cert.is_some());
     assert_ne!(thin1.parent_refs[0].author, l_addr);
     refused_everywhere(&c, byz, &thin1);
     refused_everywhere(&c, byz, &thin2);
@@ -3474,14 +3475,18 @@ fn v4_a_round_skipping_anchor_is_refused_and_honest_vertices_are_not() {
 /// Round 2's leader takes part through round 3 and is silent after. Observer
 /// X gets every message once; observer Y gets every message, then all of them
 /// three more times, then reopens. Y's decisions match X's (anchor round and
-/// digest, sequence, finality digest), the replays change nothing, and the
-/// reopened Y goes on agreeing.
+/// digest, sequence, finality digest), the replays change nothing, each one
+/// is a durable decision row, and the reopened Y goes on agreeing. Observer
+/// Z, offline throughout, then gets Y's whole history in reverse order three
+/// times and reopens: it decides what X decided (G5 review: an order other
+/// than the live one, so the test is not idempotence alone).
 #[test]
 fn v4_complete_signed_history_decides_after_retransmission_and_reopen() {
-    let mut c = Cluster::new("history", 4, 2);
-    let (x, y) = (4, 5);
+    let mut c = Cluster::new("history", 4, 3);
+    let (x, y, z) = (4, 5, 6);
     let quiet = c.leader(2);
     let quiet_addr = c.members[quiet].info.address.clone();
+    let z_addr = c.members[z].info.address.clone();
     let log: RefCell<Vec<Msg>> = RefCell::new(Vec::new());
     let round_of = |m: &Msg| match m {
         Msg::Vertex(v) => Some(v.round),
@@ -3491,6 +3496,9 @@ fn v4_complete_signed_history_decides_after_retransmission_and_reopen() {
     };
     let map = |e: &Envelope, to: usize| -> Option<Msg> {
         if e.from == quiet_addr && round_of(&e.msg).is_none_or(|r| r > 3) {
+            return None;
+        }
+        if to == z || e.from == z_addr {
             return None;
         }
         if to == y {
@@ -3542,5 +3550,42 @@ fn v4_complete_signed_history_decides_after_retransmission_and_reopen() {
         c.decisions[y].len() > decided.len(),
         "Y stopped deciding after the reopen"
     );
+    for d in &decided {
+        assert_eq!(
+            decision_row(&c, y, d.0),
+            Some(format!("C:{}", d.1)),
+            "Y's decision at round {} is not durable",
+            d.0
+        );
+    }
+
+    // Z: the same history, reversed, three times, then a reopen.
+    assert!(c.decisions[z].is_empty(), "Z was not offline");
+    let mut reversed = messages.clone();
+    reversed.reverse();
+    for _ in 0..3 {
+        for m in &reversed {
+            c.receive(z, m.clone());
+        }
+    }
+    c.reopen(z);
+    for m in &reversed {
+        c.receive(z, m.clone());
+    }
+    c.deliver_map(&map);
+    let dz = c.decisions[z].clone();
+    assert!(
+        dz.iter().any(|d| d == &dx),
+        "Z did not decide round 2 as X did: {:?}",
+        dz.iter().map(|d| d.0).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        dz[..],
+        c.decisions[x][..dz.len()],
+        "Z decided differently from X"
+    );
+    for d in &dz {
+        assert_eq!(decision_row(&c, z, d.0), Some(format!("C:{}", d.1)));
+    }
     c.assert_agree_except(Some(quiet));
 }

@@ -1389,26 +1389,20 @@ impl DagConsensus {
     pub(crate) fn drain_evidence_for_vertex(&self, current_round: u64) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         // The offender need not be in the live set (evidence is checked
-        // against the committee of its epoch); a jailed twin author needs no
-        // more.
+        // against the committee of its epoch).
         use crate::v4::evidence as ev;
         type Keys = (
             fn(&str, u64, u64) -> String,
             fn(&str, u64, u64) -> (String, u64),
         );
-        let kinds: [(&str, bool, Keys); 2] = [
-            (
-                "sys:equiv_seen_v4:",
-                true,
-                (ev::carried_key, ev::flight_key),
-            ),
+        let kinds: [(&str, Keys); 2] = [
+            ("sys:equiv_seen_v4:", (ev::carried_key, ev::flight_key)),
             (
                 "sys:equiv_cert_v4:",
-                false,
                 (ev::cert_carried_key, ev::cert_flight_key),
             ),
         ];
-        for (prefix, twin, (carried_key, flight_key)) in kinds {
+        for (prefix, (carried_key, flight_key)) in kinds {
             for (key, item) in self.storage.scan_prefix(prefix) {
                 if out.len() >= MAX_EVIDENCE_PER_VERTEX {
                     break;
@@ -1424,25 +1418,36 @@ impl DagConsensus {
                 ) else {
                     continue;
                 };
-                if (twin
-                    && matches!(
-                        self.storage.get(&format!("validator:jailed:{off}")),
-                        Ok(Some(_))
-                    ))
-                    || matches!(
-                        self.storage.get(&carried_key(off, epoch, round)),
-                        Ok(Some(_))
-                    )
-                {
+                if matches!(
+                    self.storage.get(&carried_key(off, epoch, round)),
+                    Ok(Some(_))
+                ) {
                     continue;
                 }
+                // In flight in a recent vertex of ours: nothing to verify.
                 let flight = flight_key(off, epoch, round);
-                if let Ok(mut inflight) = self.evidence_inflight.lock() {
-                    if let Some(&at) = inflight.get(&flight) {
-                        if current_round.saturating_sub(at) < INFLIGHT_TTL_ROUNDS {
-                            continue;
-                        }
+                let in_flight = self.evidence_inflight.lock().is_ok_and(|inflight| {
+                    inflight
+                        .get(&flight)
+                        .is_some_and(|&at| current_round.saturating_sub(at) < INFLIGHT_TTL_ROUNDS)
+                });
+                if in_flight {
+                    continue;
+                }
+                // G5 review: only what the executor accepts takes a slot. A
+                // row it can never accept again (older than W, its records
+                // pruned, its offenders jailed) is retired, so it neither
+                // comes back every TTL nor grows the scan.
+                if let Err(why) = self.executor.verify_slash_evidence(&item) {
+                    if ["older than W", "pruned", "jailed already"]
+                        .iter()
+                        .any(|m| why.contains(m))
+                    {
+                        let _ = self.storage.delete(&key);
                     }
+                    continue;
+                }
+                if let Ok(mut inflight) = self.evidence_inflight.lock() {
                     inflight.insert(flight, current_round);
                 }
                 out.push(format!("{}{}", SLASH_EVIDENCE_PREFIX, item));

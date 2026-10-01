@@ -5,7 +5,9 @@
       "required": [
         "bft_time_tests::bft_timestamp_stays_in_the_honest_range_at_n_4",
         "bft_time_tests::bft_timestamp_below_quorum_does_not_advance",
-        "bft_time_tests::bft_timestamp_is_monotonic_against_parent"
+        "bft_time_tests::bft_timestamp_is_monotonic_against_parent",
+        "committee::tests::more_than_256_validators_elect_the_top_256_by_stake",
+        "committee::tests::a_kept_committee_drops_members_whose_stake_left"
       ],
       "excluded_ignored": {}
     },
@@ -44,11 +46,12 @@
         "ordering::tests::the_descending_walk_is_walk_history_at_every_floor",
         "qc_producer::tests::persistence::a_qc_over_another_state_root_is_never_stored",
         "tests::tests::v4_node_tests::v4_nodes_rotate_epochs_on_the_qc_of_each_boundary_block",
-        "tests::tests::v4_node_tests::a_v4_twin_is_recorded_carried_and_jails_its_author",
+        "tests::tests::v4_node_tests::a_v4_twin_is_recorded_and_carried_in_every_nodes_block",
         "tests::tests::v4_node_tests::a_certificate_conflict_is_recorded_as_evidence_against_both_signers",
         "tests::tests::a_block_timestamp_needs_a_quorum_of_the_committee",
         "tests::tests::v4_node_tests::a_v4_node_takes_no_v3_evidence",
-        "tests::tests::a_node_without_the_v4_format_is_inert"
+        "tests::tests::v4_node_tests::a_node_without_the_v4_format_is_inert",
+        "tests::tests::test_only_equivocation_items_pass_kind_filter"
       ],
       "excluded_ignored": {
         "ordering::tests::probe_corpus_arm_distribution": "Measurement of scheduler corpus distribution, not a safety assertion.",
@@ -85,7 +88,16 @@
         "tests::g5_pool_arithmetic_rounds_for_the_pool_and_never_aborts_on_dust",
         "tests::g5_only_open_pools_of_a_full_point_take_reward_or_weight",
         "tests::test_accepted_equivocation_unbonds_all_stake_and_removes_validator",
-        "tests::rotate_validator_epoch_snapshots_advances_and_prunes"
+        "tests::rotate_validator_epoch_snapshots_advances_and_prunes",
+        "tests::g5_a_module_cannot_call_the_staking_entries",
+        "tests::g5_a_committee_member_without_move_stake_loses_its_seat",
+        "tests::g5_offenses_correlate_across_epochs_within_d",
+        "tests::g5_the_evidence_key_is_who_it_convicts",
+        "tests::g5_an_offense_move_cannot_record_applies_nothing",
+        "tests::a1_a_leader_outside_the_paid_committee_gets_nothing",
+        "tests::g5_a_certificate_conflict_raises_a_lesser_offense_to_full",
+        "tests::g5_a_full_validator_set_takes_a_larger_joiner_and_unbonds_the_smallest",
+        "tests::g5_frozen_unbonding_is_not_paid_until_thawed"
       ],
       "excluded_ignored": {
         "tests::test_h6_state_root_is_blind_to_out_of_band_writes": "Superseded by G3 C1′/C2′ (the root is the JMT root of the state map): storage class::tests::the_write_gate_refuses_state_outside_the_block_transaction, state_commit tests::rc2_lists_every_flat_key_the_tree_disagrees_with and tests::forged_or_foreign_chunks_are_refused, chain_sync a_forged_chunk_is_refused_and_the_restore_completes_elsewhere, consensus a_qc_over_another_state_root_is_never_stored, executor block_execution_writes_state_only_inside_the_block_transaction. WG-1 refuses this test's own setup write, so it cannot run as written.",
@@ -99,7 +111,9 @@
         "genesis::tests::the_chain_parameters_derive_from_the_block_time",
         "genesis::tests::test_genesis_reopen_rejects_an_epoch_that_disagrees_with_the_interval",
         "genesis::tests::the_unbonding_mirror_is_the_move_constant",
-        "genesis::tests::a_database_without_the_v4_vertex_format_is_refused_at_boot"
+        "genesis::tests::a_database_without_the_v4_vertex_format_is_refused_at_boot",
+        "public_claims_tests::the_public_documents_make_no_claim_the_code_contradicts",
+        "genesis::tests::a_genesis_committee_with_a_shared_bls_key_is_refused"
       ],
       "excluded_ignored": {}
     },

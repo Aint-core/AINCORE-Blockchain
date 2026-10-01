@@ -12,8 +12,8 @@
 | **Konsensus** | **DAG-BFT PoS** (Proof of Stake + DAG Structure) |
 | **Supply** | 150,000,000 AIN (Fixed Max Supply) |
 | **Emisi** | 1,90 %/tahun dari sisa cadangan, dibayar tiap periode reward menurut waktu konsensus |
-| **Block Time** | ~1-2 detik |
-| **Fair Launch** | ✅ Ya (No Pre-mine, No ICO) |
+| **Block Time** | Diukur pada kandidat rilis sebelum genesis (belum dipublikasikan) |
+| **Fair Launch** | ✅ Ya (tanpa dana developer, tanpa ICO; genesis hanya berisi stake validator genesis dan cadangan treasury) |
 | **Smart Contract** | Move VM (sama seperti Aptos/Sui) |
 | **Unique Feature** | DePIN Mining (Mine dengan IoT/Biometrics) |
 
@@ -52,7 +52,7 @@ Round 4:    [V5] ────────┴─ [V6] ─────────
 ### Keunggulan vs Linear Chain:
 - **Parallel Processing** - Multiple validators bisa propose bersamaan
 - **Higher Throughput** - Tidak bottleneck pada satu block producer
-- **Faster Finality** - Transaksi final dalam 1-2 detik
+- **Finality per blok** - Setiap blok final dengan satu quorum certificate; waktunya diukur sebelum genesis
 
 ---
 
@@ -86,7 +86,7 @@ await connection.sendTransaction(tx.toString());
 | Metric | Value |
 |--------|-------|
 | **Max Supply** | 150,000,000 AIN |
-| **Genesis Supply** | 0 (Fair Launch!) |
+| **Genesis Supply** | ~1.050.000 AIN (0,7 %): stake validator genesis dan cadangan treasury |
 | **Emisi** | 1,90 %/tahun dari sisa cadangan (150 juta dikurangi semua yang sudah dicetak) |
 
 ### Kurva Emisi:
@@ -112,16 +112,16 @@ Tiap periode reward (20 blok) mencetak `sisa × λ × Δτ`, dengan λ = −ln(0
 
 ### ✅ AINCORE adalah Fair Launch:
 
-1. **No Pre-mine** - Tidak ada coin yang di-mine sebelum launch
+1. **Tanpa dana developer** - Genesis hanya berisi stake validator genesis dan cadangan treasury (~0,7 %); 99,3 % dicetak sebagai emisi
 2. **No ICO/IDO** - Tidak ada private sale
 3. **No VC Allocation** - Tidak ada token untuk investor
-4. **Equal Opportunity** - Semua orang bisa jadi validator dari block 1
+4. **Validator terbuka** - Siapa pun dengan stake minimum 1.000 AIN bisa mendaftar; komite setiap epoch adalah 256 validator dengan stake terbesar
 
 ### Bagaimana Dapat Coin Pertama?
 
 | Method | Deskripsi |
 |--------|-----------|
-| **Staking** | Jadi validator, stake AIN, dapat block reward |
+| **Staking** | Jadi validator (atau delegasi), stake AIN, dapat bagian emisi tiap periode reward |
 | **DePIN Mining** | Register IoT device, submit breath data, dapat reward |
 | **Transfer** | Terima dari orang lain yang sudah punya |
 | **Bridge** | Bridge dari chain lain (BTC → AIN-BTC) |
@@ -152,7 +152,7 @@ Untuk bootstrap awal, genesis validator mendapat initial stake untuk memulai cha
 ### BQI (Breath Quality Index):
 - **Score 0-100** berdasarkan kesehatan pernapasan
 - **Higher BQI = More Reward**
-- **Formula:** `reward = 0.36 AIN × (BQI / 100)`
+- **Formula (belum aktif: DePIN mendapat 0 % emisi saat ini):** `reward = 0.36 AIN × (BQI / 100)`
 
 ### Supported Devices:
 1. **Wearables** - Smartwatch, Fitness Band
@@ -287,7 +287,7 @@ await connection.sendTransaction(withdrawTx.toString());
 
 ### Reward Distribution Example:
 
-**Scenario:** Block Reward = 36 AIN, Validator Commission = 10%
+**Contoh:** emisi satu periode reward (20 blok) untuk validator ini dan pool-nya = 36 AIN (angka ilustrasi; tidak ada block reward tetap), komisi validator 10%
 
 | Participant | Stake | Share | Gross | Commission | Net Reward |
 |-------------|-------|-------|-------|------------|------------|
@@ -302,7 +302,7 @@ await connection.sendTransaction(withdrawTx.toString());
 
 | Type | Min Stake | Run Node? | Rewards |
 |------|-----------|-----------|---------|
-| **Solo Validator** | 1000 AIN | ✅ Yes | Full block reward |
+| **Solo Validator** | 1000 AIN | ✅ Yes | Bagian emisi komite menurut bobot, tiap periode reward |
 | **Delegation** | 1 AIN | ❌ No | Proportional (minus commission) |
 
 ---
@@ -318,10 +318,10 @@ await connection.sendTransaction(withdrawTx.toString());
 | Feature | AINCORE | Bitcoin | Ethereum | Solana | Aptos |
 |---------|---------|---------|----------|--------|-------|
 | Consensus | DAG-BFT PoS | PoW | PoS | PoH+PoS | BFT PoS |
-| TPS | ~10,000 | 7 | 30 | 65,000 | 160,000 |
-| Finality | 1-2s | 60min | 15min | 400ms | 1s |
+| TPS | belum diukur | 7 | 30 | 65,000 | 160,000 |
+| Finality | belum diukur | 60min | 15min | 400ms | 1s |
 | Smart Contract | Move | Script | Solidity | Rust | Move |
-| Mining | DePIN | ASIC | Staking | Staking | Staking |
+| Mining | Staking (DePIN 0 % saat ini) | ASIC | Staking | Staking | Staking |
 | Fair Launch | ✅ | ✅ | ❌ | ❌ | ❌ |
 
 ---

@@ -575,6 +575,11 @@ fn a_ce3_halted_node_places_no_more_blocks() {
     );
     c.node_mut(0).handle_message(&wire);
     assert!(c.node(0).ordering_halted().is_some(), "not halted");
+    // Its relay of the two certificates (G5 A3) is dropped here, so the
+    // others keep going as the control: this witness is about the halted
+    // node itself. The relay has its own witness,
+    // `a_certificate_conflict_is_recorded_as_evidence_against_both_signers`.
+    c.node(0).v4_outbox.as_ref().unwrap().lock().unwrap().clear();
     let at_halt = c.node(0).latest_block_height;
     c.run(10);
     assert_eq!(
@@ -1320,10 +1325,10 @@ fn a_v4_node_takes_no_v3_evidence() {
 
 /// G1 EQ-1, G5 SL-3 on real V4 nodes: an author that sends a second body
 /// for its slot to one node is caught there. That node keeps the pair in an
-/// epoch-keyed row, carries it through the DAG, and every node's block holds
-/// it and jails the author, checked against C_0 rather than the live set.
+/// epoch-keyed row and carries it through the DAG; every node's chain holds
+/// it in the same block.
 #[test]
-fn a_v4_twin_is_recorded_carried_and_jails_its_author() {
+fn a_v4_twin_is_recorded_and_carried_in_every_nodes_block() {
     let mut c = Cluster::new("twin-evidence", &[51, 52, 53, 54], true);
     c.run(3);
     let (author, _, key) = tier2_keypair(52);
@@ -1359,38 +1364,46 @@ fn a_v4_twin_is_recorded_carried_and_jails_its_author() {
         c.node(0).storage.get(&row).unwrap().is_some(),
         "the node that saw both bodies keeps the pair"
     );
-    let jailed = format!("validator:jailed:{author}");
-    c.run_until(60, |c| {
-        (0..4).all(|i| c.node(i).storage.get(&jailed).unwrap().is_some())
-    });
-    for i in 0..4 {
-        assert!(
-            c.node(i).storage.get(&jailed).unwrap().is_some(),
-            "node {i} applied the evidence"
-        );
+    let item = c.node(0).storage.get(&row).unwrap().unwrap();
+    c.run_until(60, |c| (0..4).all(|i| carried_at(c, i, &item).is_some()));
+    // Every node's chain carries the item at the same height, in the same
+    // blocks. (Conviction needs the Move stdlib, which these fixtures do not
+    // load: executor `g5_v4_twin_evidence_is_checked_against_its_committee_and_age`
+    // witnesses it on the same item shape.)
+    let at = carried_at(&c, 0, &item).expect("a block carries the V4 evidence");
+    for i in 1..4 {
+        assert_eq!(carried_at(&c, i, &item), Some(at), "node {i}");
     }
-    let common = c.assert_same_blocks(1);
-    let carried = (1..=common).any(|h| {
-        c.node(2)
+    c.assert_same_blocks(at);
+    // The bytes consensus built are the bytes the executor convicts on.
+    let verified = c.node(0).executor.verify_slash_evidence(&item).unwrap();
+    assert_eq!(verified.offenders, vec![author.clone()]);
+    assert_eq!(
+        (verified.epoch, verified.round),
+        (original.epoch, original.round)
+    );
+}
+
+/// The height of the first block on node `i` that carries `item`.
+fn carried_at(c: &Cluster, i: usize, item: &str) -> Option<u64> {
+    (1..=c.node(i).latest_block_height).find(|h| {
+        c.node(i)
             .storage
             .get(&format!("block_{h}"))
             .unwrap()
             .and_then(|j| serde_json::from_str::<blockchain::Block>(&j).ok())
-            .is_some_and(|b| {
-                b.slash_evidence
-                    .iter()
-                    .any(|e| e.contains("equivocation_v4"))
-            })
-    });
-    assert!(carried, "a block carries the V4 evidence");
+            .is_some_and(|b| b.slash_evidence.iter().any(|e| e == item))
+    })
 }
 
 /// G1 CE-3, G5 SL-3 on real V4 nodes: a node that sees two certificates for
 /// one slot halts ordering (CE-3) and keeps the pair in an epoch-keyed row.
 /// The item verifies on the executor and convicts exactly the members whose
 /// bit is set in both certificates. A conflict means safety was attacked, so
-/// the chain halts where it is seen; the row is carried once ordering resumes
-/// after recovery, like any evidence row.
+/// the chain halts where it is seen, and the node relays both certificates
+/// once so every honest node halts and keeps the pair. After recovery (the
+/// operators clear the halt) the row is carried like any evidence row, in
+/// the same block on every node.
 #[test]
 fn a_certificate_conflict_is_recorded_as_evidence_against_both_signers() {
     let mut c = Cluster::new("cert-conflict", &[131, 132, 133, 134], true);
@@ -1432,6 +1445,51 @@ fn a_certificate_conflict_is_recorded_as_evidence_against_both_signers() {
     assert!(!both.is_empty(), "two quorums of four always overlap");
     assert_eq!(verified.offenders, both);
     assert_eq!((verified.epoch, verified.round), (0, 1));
+
+    // G5 review: the halted node relays both certificates once, so every
+    // honest node halts too and keeps the pair (it was the only holder).
+    c.deliver();
+    for i in 0..4 {
+        assert!(
+            c.node(i).ordering_halted().is_some(),
+            "node {i} did not halt"
+        );
+        assert!(
+            c.node(i).storage.get(&row).unwrap().is_some(),
+            "node {i} does not hold the pair"
+        );
+    }
+    // Recovery, an operator action on every node: the halt alarm is cleared
+    // and the node restarts. The evidence row stays and is carried.
+    for i in 0..4 {
+        let alarms: Vec<String> = c
+            .node(i)
+            .storage
+            .scan_prefix("alarm:vcert_conflict:")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(!alarms.is_empty(), "node {i} has no halt to clear");
+        for k in alarms {
+            c.node(i).storage.delete(&k).unwrap();
+        }
+        c.reopen(i);
+        assert!(
+            c.node(i).ordering_halted().is_none(),
+            "node {i} is still halted"
+        );
+    }
+    c.run_until(40, |c| (0..4).all(|i| carried_at(c, i, &item).is_some()));
+    // Every node's chain carries the pair at the same height, in the same
+    // blocks; each verifies it to the same offenders. (Conviction needs the
+    // Move stdlib, which these fixtures do not load: executor
+    // `g5_a_certificate_conflict_convicts_every_attester_in_both` witnesses
+    // it on the same item shape.)
+    let at = carried_at(&c, 0, &item).expect("a block carries the pair after recovery");
+    for i in 0..4 {
+        assert_eq!(carried_at(&c, i, &item), Some(at), "node {i}");
+    }
+    c.assert_same_blocks(at);
 }
 
 // ---------------------------------------------------------------------------
@@ -1573,6 +1631,23 @@ fn v4_local_acceptance_child() {
                 "absence of the adoption marker is not proof of adoption"
             );
             node.local_acceptance_hook = Some(|boundary, view| {
+                // Cursor, decision rows and QC work, all in one transaction.
+                for row in [
+                    "consensus:finalized_round",
+                    "consensus:next_anchor_round",
+                    "consensus:finality_digest",
+                    "consensus:last_anchor_hash",
+                ] {
+                    assert!(view.get(row).unwrap().is_some(), "{row} is not staged");
+                }
+                let block: blockchain::Block =
+                    serde_json::from_str(&view.get("block_1").unwrap().unwrap()).unwrap();
+                assert_eq!(
+                    view.get(&crate::ordering::anchor_decision_key(0, block.header.round))
+                        .unwrap(),
+                    Some(format!("C:{}", block.anchor_hash)),
+                    "the decision row is not staged"
+                );
                 assert!(view
                     .get(std::str::from_utf8(PENDING_1).unwrap())
                     .unwrap()
@@ -1646,12 +1721,14 @@ fn v4_accepted_block_qc_work_survives_crash_before_attestation() {
     );
 }
 
-/// A follower holding block 1 and its QC (IM-1: adoption needs both) adopts
-/// it in one transaction: ordering cursor, pending QC row and adoption height
-/// commit together. A crash inside that transaction (boundary 2) leaves the
-/// rows unchanged; a crash after it (boundary 3) leaves all three. Either
-/// way the reopened follower checks the stored QC against its work and
-/// retires the row, the QC unchanged.
+/// A follower holding block 1 and its QC (IM-1: adoption needs both, and the
+/// QC's finality digest must be the follower's own fold) adopts it in one
+/// transaction: ordering cursor, decision rows, pending QC row and adoption
+/// height commit together. A crash inside that transaction (boundary 2)
+/// leaves the rows unchanged; a crash after it (boundary 3) leaves them all.
+/// Either way the reopened follower adopts or keeps block 1 and retires the
+/// pending row (it is outside the committee: it has no vote to sign), the
+/// QC unchanged.
 #[test]
 fn v4_adopted_block_qc_work_and_cursor_commit_together_across_crash() {
     let producer = LocalDir::seeded("producer", PRODUCER);
@@ -1686,6 +1763,11 @@ fn v4_adopted_block_qc_work_and_cursor_commit_together_across_crash() {
                 crashed.get(b"consensus:last_adopted_height".as_slice()),
                 Some(&b"1".to_vec())
             );
+            assert_eq!(
+                crashed.get(b"consensus:finality_digest".as_slice()),
+                producer_rows.get(b"consensus:finality_digest".as_slice()),
+                "the adopted cursor is the producer's"
+            );
             assert_ne!(crashed, before, "the adoption committed");
         }
         follower.run("resume", FOLLOWER, 0);
@@ -1697,4 +1779,97 @@ fn v4_adopted_block_qc_work_and_cursor_commit_together_across_crash() {
             "{mode}: the work is retired"
         );
     }
+}
+
+/// The pending QC row a producer staged with block 1, read at boundary 1.
+static PENDING_ROW: Mutex<Option<String>> = Mutex::new(None);
+
+/// G5 S4c (review): a node on a database without the V4 vertex format (boot
+/// refuses one in production) is inert, gate by gate. Its database holds a
+/// real block 1, the QC over it and the pending QC work a producer staged
+/// with it, so each gate has something to act on: it proposes nothing,
+/// answers no QC ask, adopts no block, signs no vote, and writes nothing.
+#[test]
+fn a_node_without_the_v4_format_is_inert() {
+    let producer = LocalDir::seeded("inert-producer", PRODUCER);
+    {
+        let mut node = open_node(&producer.0, PRODUCER);
+        node.local_acceptance_hook = Some(|boundary, view| {
+            if boundary == 1 {
+                *PENDING_ROW.lock().unwrap() =
+                    view.get(std::str::from_utf8(PENDING_1).unwrap()).unwrap();
+            }
+            Ok(())
+        });
+        produce_block_1(&mut node);
+    }
+    let pending = PENDING_ROW
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("block 1 staged QC work");
+    let produced = producer.rows();
+    let row = |k: &str| String::from_utf8(produced[k.as_bytes()].clone()).unwrap();
+    // The same rows on a V4 database and on one without the format.
+    let seed = |tag: &str, v4: bool| {
+        let dir = LocalDir::seeded(tag, FOLLOWER);
+        let db = StateDB::open(&dir.0).unwrap();
+        let _seeding = db.seeding();
+        if !v4 {
+            db.delete(crate::v4::VERTEX_FORMAT_KEY).unwrap();
+        }
+        db.save_block_json(1, &row("block_1")).unwrap();
+        db.put("consensus:qc:1", &row("consensus:qc:1")).unwrap();
+        db.put(std::str::from_utf8(PENDING_1).unwrap(), &pending)
+            .unwrap();
+        db.put("sys:last_executed_height", "1").unwrap();
+        drop(db);
+        dir
+    };
+    // Control: on the V4 database each gate has work. The node adopts block
+    // 1 and answers a QC ask.
+    let control = seed("inert-control", true);
+    {
+        let mut node = open_node(&control.0, FOLLOWER);
+        node.reload_chain_tip();
+        assert_eq!(node.last_adopted_height, 1, "the control did not adopt");
+        node.handle_message(&format!("{}1", crate::dag::QC_WANT_PREFIX));
+        assert!(
+            !node.v4_outbox.as_ref().unwrap().lock().unwrap().is_empty(),
+            "the control did not answer the QC ask"
+        );
+    }
+    let inert = seed("inert", false);
+    let before = inert.rows();
+    let mut node = open_node(&inert.0, FOLLOWER);
+    assert!(node.v4.is_none(), "the inert node started an engine");
+    for _ in 0..3 {
+        node.try_create_vertex();
+    }
+    node.reload_chain_tip();
+    let vertex = produced
+        .iter()
+        .find(|(k, _)| k.starts_with(b"vertex:"))
+        .map(|(_, v)| String::from_utf8(v.clone()).unwrap())
+        .expect("the producer stored a vertex");
+    for wire in [
+        format!("{}1", crate::dag::QC_WANT_PREFIX),
+        format!("{}{}", crate::dag::QC_CERT_PREFIX, row("consensus:qc:1")),
+        format!("{}{{\"Vertex\":{vertex}}}", crate::v4::WIRE_PREFIX),
+        format!("DAG_VERTEX:{vertex}"),
+        "EQUIV_PROOF:{}".to_string(),
+        "DOWNTIME_ATTEST:{}".to_string(),
+    ] {
+        node.handle_message(&wire);
+    }
+    assert_eq!(
+        node.last_adopted_height, 0,
+        "the inert node adopted block 1"
+    );
+    assert!(
+        node.v4_outbox.as_ref().unwrap().lock().unwrap().is_empty(),
+        "the inert node sent something"
+    );
+    drop(node);
+    assert_eq!(inert.rows(), before, "the inert node wrote to its database");
 }

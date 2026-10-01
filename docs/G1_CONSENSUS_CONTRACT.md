@@ -472,6 +472,9 @@ This is the core of `verify_qc` (`qc.rs:338-425`) refactored into one shared ver
 - No certificate for the slot → put it.
 - Same digest → no-op.
 - A different digest → write `alarm:vcert_conflict`, keep both certificates as accountability evidence, and **halt ordering**. The node never chooses between them.
+  - G5 amendment A3: the alarm and the evidence row (`sys:equiv_cert_v4`) commit in one transaction.
+  - The node relays both certificates once, so every honest node holding either halts and keeps the evidence.
+  - Recovery is an operator procedure: `docs/CERT_CONFLICT_RECOVERY_RUNBOOK.md`. Its tool is a genesis blocker.
 - Then run OR-1 for the digest. A missing body → fetch (RE).
 
 ### Orderable index (OR)
