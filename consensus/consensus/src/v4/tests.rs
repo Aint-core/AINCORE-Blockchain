@@ -3220,3 +3220,327 @@ fn body_fetches_are_paced_per_tick() {
         "{reqs} requests in one tick"
     );
 }
+
+// ---------------------------------------------------------------------------
+// G5 S4c: the V4 twins of the three V3 consensus controls deleted with V3
+// (`test_h3_tier2_*` and `complete_signed_history_*`). Same schedules, with
+// certificates; same assertions.
+
+/// `v` re-cited: `refs` replace its parents, re-hashed and re-signed by `key`.
+fn recite(v: &Vertex, refs: Vec<ParentRef>, key: &[u8; 32]) -> Vertex {
+    let mut w = v.clone();
+    w.parents = refs.iter().map(|r| r.digest.clone()).collect();
+    w.parent_refs = refs;
+    w.hash = w.hash_v4_with_domain(CHAIN, GENESIS);
+    w.sign_with_ed25519(&crypto::SigningKey::from_bytes(key));
+    w
+}
+
+/// `node`'s certified ref to (round, author), embedded certificate included.
+fn cert_ref(c: &Cluster, node: usize, round: u64, author: &str) -> ParentRef {
+    let cert = c
+        .engine(node)
+        .certs
+        .get(&(round, author.to_string()))
+        .expect("the parent is certified");
+    ParentRef {
+        round,
+        author: author.to_string(),
+        digest: cert.body.digest.clone(),
+        proof: None,
+        cert: Some(cert.compact()),
+    }
+}
+
+/// Every honest node and observer refuses `v`: none holds it in any role.
+fn refused_everywhere(c: &Cluster, byz: usize, v: &Vertex) {
+    for i in (0..c.members.len()).filter(|&i| i != byz) {
+        assert!(
+            !c.engine(i).is_staged(&v.hash),
+            "node {i} admitted {}",
+            v.hash
+        );
+    }
+}
+
+/// The first anchor round whose leader differs from the next anchor round's:
+/// the H3 schedules need an honest leader at `r` and a Byzantine one at `r + 2`.
+fn h3_rounds(c: &Cluster) -> (u64, usize, usize) {
+    let r = (1..8u64)
+        .map(|k| 2 * k)
+        .find(|&r| c.leader(r) != c.leader(r + 2))
+        .expect("two consecutive anchor rounds with distinct leaders");
+    (r, c.leader(r), c.leader(r + 2))
+}
+
+/// The twin of `test_h3_tier2_stateless_gate_prevents_the_ancestry_fork`.
+/// The leader of anchor round r+2 is Byzantine: at rounds r+1 and r+2 it
+/// sends one-parent vertices whose history excludes round r's leader.
+/// Observer X gets every push; observer Y loses the two other honest
+/// round-(r+1) bodies (it pulls them later). Every node refuses both thin
+/// vertices from their bytes alone (Layer S), so no node can anchor on them,
+/// and every node commits round r's leader in one sequence.
+///
+/// MUTATION: drop `parent_refs_admissible_above` from Layer S → red.
+#[test]
+fn v4_thin_byzantine_vertices_are_refused_alike_and_the_leader_commits() {
+    let mut c = Cluster::new("h3-thin", 4, 2);
+    let (r, l, byz) = h3_rounds(&c);
+    let (x, y) = (4, 5);
+    let byz_addr = c.members[byz].info.address.clone();
+    let l_addr = c.members[l].info.address.clone();
+    let lossy: Vec<String> = c
+        .validators()
+        .filter(|&i| i != l && i != byz)
+        .map(|i| c.members[i].info.address.clone())
+        .collect();
+    assert_eq!(lossy.len(), 2, "the scenario needs exactly two omissions");
+    // The Byzantine author's own bodies at rounds r+1 and r+2 never leave it
+    // (it sends the crafted ones instead), and it serves no pull.
+    let lost = Cell::new(0);
+    let map = |e: &Envelope, to: usize| -> Option<Msg> {
+        let from_byz = e.from == byz_addr;
+        match &e.msg {
+            Msg::Vertex(v)
+                if from_byz && v.author == byz_addr && (v.round == r + 1 || v.round == r + 2) =>
+            {
+                None
+            }
+            Msg::Req(_) | Msg::Resp { .. } if from_byz => None,
+            Msg::Vertex(v)
+                if v.round == r + 1
+                    && lossy.contains(&v.author)
+                    && to == y
+                    && e.from == v.author =>
+            {
+                lost.set(lost.get() + 1);
+                None
+            }
+            m => Some(m.clone()),
+        }
+    };
+    let (mut thin1, mut thin2): (Option<Vertex>, Option<Vertex>) = (None, None);
+    let key = c.members[byz].node_key;
+    for _ in 0..(24 + 2 * r as usize) {
+        c.tick_all();
+        c.deliver_map(&map);
+        if thin1.is_none() {
+            if let Some(own) = c.engine(byz).own_proposal(r + 1).cloned() {
+                // ONE parent, and not round r's leader.
+                let p = own
+                    .parent_refs
+                    .iter()
+                    .find(|p| p.author != l_addr)
+                    .expect("a non-leader parent")
+                    .clone();
+                let v = recite(&own, vec![p], &key);
+                c.q.borrow_mut().push_back(Envelope {
+                    from: byz_addr.clone(),
+                    to: To::All,
+                    msg: Msg::Vertex(v.clone()),
+                });
+                thin1 = Some(v);
+            }
+        }
+        if let (Some(t1), None) = (&thin1, &thin2) {
+            if let Some(own) = c.engine(byz).own_proposal(r + 2).cloned() {
+                let p = ParentRef {
+                    round: r + 1,
+                    author: byz_addr.clone(),
+                    digest: t1.hash.clone(),
+                    proof: None,
+                    cert: None,
+                };
+                let v = recite(&own, vec![p], &key);
+                c.q.borrow_mut().push_back(Envelope {
+                    from: byz_addr.clone(),
+                    to: To::All,
+                    msg: Msg::Vertex(v.clone()),
+                });
+                thin2 = Some(v);
+            }
+        }
+        c.deliver_map(&map);
+    }
+    let thin1 = thin1.expect("the Byzantine author reached round r+1");
+    let thin2 = thin2.expect("the Byzantine author reached round r+2");
+    assert_eq!(thin1.parent_refs.len(), 1);
+    assert_ne!(thin1.parent_refs[0].author, l_addr);
+    refused_everywhere(&c, byz, &thin1);
+    refused_everywhere(&c, byz, &thin2);
+    c.assert_agree_except(Some(byz));
+    let a = c.engine(l).own_proposal(r).unwrap().hash.clone();
+    for i in (0..c.members.len()).filter(|&i| i != byz) {
+        assert_eq!(
+            c.anchor(i, r).map(|d| d.1.as_str()),
+            Some(a.as_str()),
+            "node {i} did not commit round {r}'s leader"
+        );
+        assert!(
+            c.decisions[i].iter().any(|d| d.0 > r + 2),
+            "node {i} made no progress past the Byzantine round"
+        );
+    }
+    // X (every push) and Y (two lost) both decided it.
+    assert!(c.anchor(x, r).is_some() && c.anchor(y, r).is_some());
+    assert!(lost.get() >= 2, "Y lost no push");
+}
+
+/// The twin of `test_h3_tier2_round_skipping_anchor_is_refused`. The leader
+/// of anchor round r+2 is Byzantine and cites, at round r+2, the three
+/// round-r vertices other than round r's leader, each with its genuine
+/// certificate: 3 of 4 stake, so the stake clause admits it, and its history
+/// skips round r+1 and round r's leader. The round clause refuses it on
+/// every node, while every honest round-(r+2) vertex is admitted.
+///
+/// MUTATION: drop the round clause of `parent_refs_admissible_above` → red.
+#[test]
+fn v4_a_round_skipping_anchor_is_refused_and_honest_vertices_are_not() {
+    let mut c = Cluster::new("h3-skip", 4, 1);
+    let (r, l, byz) = h3_rounds(&c);
+    let byz_addr = c.members[byz].info.address.clone();
+    let map = |e: &Envelope, _: usize| -> Option<Msg> {
+        match &e.msg {
+            Msg::Vertex(v) if e.from == byz_addr && v.author == byz_addr && v.round == r + 2 => {
+                None
+            }
+            m => Some(m.clone()),
+        }
+    };
+    let mut skip: Option<Vertex> = None;
+    for _ in 0..(24 + 2 * r as usize) {
+        c.tick_all();
+        c.deliver_map(&map);
+        if skip.is_none() {
+            if let Some(own) = c.engine(byz).own_proposal(r + 2).cloned() {
+                let refs: Vec<ParentRef> = c
+                    .validators()
+                    .filter(|&i| i != l)
+                    .map(|i| cert_ref(&c, byz, r, &c.members[i].info.address))
+                    .collect();
+                let v = recite(&own, refs, &c.members[byz].node_key);
+                c.q.borrow_mut().push_back(Envelope {
+                    from: byz_addr.clone(),
+                    to: To::All,
+                    msg: Msg::Vertex(v.clone()),
+                });
+                skip = Some(v);
+            }
+        }
+        c.deliver_map(&map);
+    }
+    let skip = skip.expect("the Byzantine author reached round r+2");
+    // The stake clause is not what refuses it.
+    assert_eq!(skip.parent_refs.len(), 3);
+    assert!(skip
+        .parent_refs
+        .iter()
+        .all(|p| p.round == r && p.cert.is_some()));
+    let authors: std::collections::HashSet<&str> =
+        skip.parent_refs.iter().map(|p| p.author.as_str()).collect();
+    assert_eq!(authors.len(), 3);
+    assert!(!authors.contains(c.members[l].info.address.as_str()));
+    assert!(qc::stake_quorum_met(300, 400));
+    refused_everywhere(&c, byz, &skip);
+    // Non-vacuity: every honest round-(r+2) vertex is admitted everywhere.
+    for author in c.validators().filter(|&i| i != byz) {
+        let v = c
+            .engine(author)
+            .own_proposal(r + 2)
+            .expect("proposed")
+            .hash
+            .clone();
+        for i in (0..c.members.len()).filter(|&i| i != byz) {
+            assert!(
+                c.engine(i).is_staged(&v),
+                "node {i} refused an honest vertex"
+            );
+        }
+    }
+    c.assert_agree_except(Some(byz));
+    for i in (0..c.members.len()).filter(|&i| i != byz) {
+        assert!(
+            c.anchor(i, r).is_some(),
+            "node {i} did not decide round {r}"
+        );
+        assert!(
+            c.decisions[i].iter().any(|d| d.0 > r + 2),
+            "node {i} stalled"
+        );
+    }
+}
+
+/// The twin of `complete_signed_history_decides_after_retransmission_and_reopen`.
+/// Round 2's leader takes part through round 3 and is silent after. Observer
+/// X gets every message once; observer Y gets every message, then all of them
+/// three more times, then reopens. Y's decisions match X's (anchor round and
+/// digest, sequence, finality digest), the replays change nothing, and the
+/// reopened Y goes on agreeing.
+#[test]
+fn v4_complete_signed_history_decides_after_retransmission_and_reopen() {
+    let mut c = Cluster::new("history", 4, 2);
+    let (x, y) = (4, 5);
+    let quiet = c.leader(2);
+    let quiet_addr = c.members[quiet].info.address.clone();
+    let log: RefCell<Vec<Msg>> = RefCell::new(Vec::new());
+    let round_of = |m: &Msg| match m {
+        Msg::Vertex(v) => Some(v.round),
+        Msg::Attest(a) => Some(a.body.round),
+        Msg::Cert(cert) => Some(cert.body.round),
+        _ => None,
+    };
+    let map = |e: &Envelope, to: usize| -> Option<Msg> {
+        if e.from == quiet_addr && round_of(&e.msg).is_none_or(|r| r > 3) {
+            return None;
+        }
+        if to == y {
+            log.borrow_mut().push(e.msg.clone());
+        }
+        Some(e.msg.clone())
+    };
+    for _ in 0..16 {
+        c.tick_all();
+        c.deliver_map(&map);
+    }
+    let a = c.engine(quiet).own_proposal(2).unwrap().hash.clone();
+    let dx = c.anchor(x, 2).expect("X decided round 2").clone();
+    assert_eq!(dx.1, a, "round 2 commits its leader's vertex");
+    assert!(
+        c.decisions[x].iter().any(|d| d.0 > 4),
+        "X stalled after the leader went quiet"
+    );
+    assert_eq!(c.decisions[y], c.decisions[x], "Y decided differently");
+    let decided = c.decisions[y].clone();
+    let digest = c.engine(y).finality_digest();
+    let messages = log.borrow().clone();
+    assert!(!messages.is_empty());
+    for _ in 0..3 {
+        for m in &messages {
+            c.receive(y, m.clone());
+        }
+    }
+    assert_eq!(c.decisions[y], decided, "a replay decided again");
+    assert_eq!(c.engine(y).finality_digest(), digest);
+    c.reopen(y);
+    assert_eq!(
+        c.engine(y).finality_digest(),
+        digest,
+        "the reopen lost decisions"
+    );
+    for m in &messages {
+        c.receive(y, m.clone());
+    }
+    assert_eq!(
+        c.decisions[y], decided,
+        "a replay after the reopen decided again"
+    );
+    for _ in 0..8 {
+        c.tick_all();
+        c.deliver_map(&map);
+    }
+    assert!(
+        c.decisions[y].len() > decided.len(),
+        "Y stopped deciding after the reopen"
+    );
+    c.assert_agree_except(Some(quiet));
+}

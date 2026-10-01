@@ -26,13 +26,13 @@
     },
     "consensus": {
       "required": [
-        "tests::tests::local_acceptance_tests::accepted_block_qc_work_survives_crash_before_attestation",
-        "tests::tests::local_acceptance_tests::adopted_block_qc_work_and_cursor_commit_together_across_crash",
+        "tests::tests::v4_node_tests::v4_accepted_block_qc_work_survives_crash_before_attestation",
+        "tests::tests::v4_node_tests::v4_adopted_block_qc_work_and_cursor_commit_together_across_crash",
         "qc_producer::tests::persistence::recovery::crash_during_retry_atomically_keeps_work_or_publishes_guarded_outcome",
         "ordering::tests::test_h2_h4_twin_anchors_double_count_stake_and_break_subset_independence",
-        "tests::tests::equivocation_liveness_tests::complete_signed_history_decides_after_retransmission_and_reopen",
-        "tests::tests::test_h3_tier2_stateless_gate_prevents_the_ancestry_fork",
-        "tests::tests::test_h3_tier2_round_skipping_anchor_is_refused",
+        "v4::tests::v4_complete_signed_history_decides_after_retransmission_and_reopen",
+        "v4::tests::v4_thin_byzantine_vertices_are_refused_alike_and_the_leader_commits",
+        "v4::tests::v4_a_round_skipping_anchor_is_refused_and_honest_vertices_are_not",
         "ordering::tests::test_h9_restart_window_splits_one_anchor",
         "ordering::tests::test_h9_long_withheld_chain_halts_every_node",
         "v4::tests::a2c_certified_twin_decisions_agree_in_all_eight_delivery_orders",
@@ -46,7 +46,9 @@
         "tests::tests::v4_node_tests::v4_nodes_rotate_epochs_on_the_qc_of_each_boundary_block",
         "tests::tests::v4_node_tests::a_v4_twin_is_recorded_carried_and_jails_its_author",
         "tests::tests::v4_node_tests::a_certificate_conflict_is_recorded_as_evidence_against_both_signers",
-        "tests::tests::a_block_timestamp_needs_a_quorum_of_the_committee"
+        "tests::tests::a_block_timestamp_needs_a_quorum_of_the_committee",
+        "tests::tests::v4_node_tests::a_v4_node_takes_no_v3_evidence",
+        "tests::tests::a_node_without_the_v4_format_is_inert"
       ],
       "excluded_ignored": {
         "ordering::tests::probe_corpus_arm_distribution": "Measurement of scheduler corpus distribution, not a safety assertion.",
@@ -54,9 +56,7 @@
         "ordering::tests::probe_c1_decision_experiment": "Experimental C1 decision model, not a production release witness.",
         "ordering::tests::probe_validate_c1_legal_universe": "Validation of the experimental C1 corpus, not production execution.",
         "ordering::tests::probe_corpus_fingerprint": "G1 S4 measurement: a corpus fingerprint compared before and after a decision edit, not a safety assertion.",
-        "ordering::tests::test_h3_sparse_anchor_forks_direct_committer_from_ancestry_skipper": "Direct ordering input bypasses the enforced thin-anchor ingress premise. Both test_h3_tier2 ingress controls are mandatory above. This exclusion does not establish that the decision function is sound in isolation.",
-        "tests::tests::test_h1_dropped_twin_leaves_two_honest_nodes_holding_different_sets": "V3 ingress (deleted at G1 S11b). V4 re-expression (at most one certified twin is orderable; the other is only staged, and every node agrees): v4::tests::a2c_certified_twin_decisions_agree_in_all_eight_delivery_orders, a3c_push_the_certified_twin_commits_and_the_other_stays_staged, a3c_pull_a_withheld_body_is_fetched_from_its_signers.",
-        "tests::tests::equivocation_liveness_tests::equivocated_parent_must_not_permanently_block_supported_anchor": "V3 ingress (deleted at G1 S11b). V4 re-expression: v4::tests::a_twin_flood_leaves_every_next_vertex_citing_one_digest_per_author (the certified twin is cited and committed, the chain progresses)."
+        "ordering::tests::test_h3_sparse_anchor_forks_direct_committer_from_ancestry_skipper": "Direct ordering input bypasses the enforced thin-anchor ingress premise. Both V4 ingress controls are mandatory above (v4::tests::v4_thin_byzantine_vertices_are_refused_alike_and_the_leader_commits, v4_a_round_skipping_anchor_is_refused_and_honest_vertices_are_not). This exclusion does not establish that the decision function is sound in isolation."
       }
     },
     "executor": {
@@ -98,7 +98,8 @@
         "genesis::tests::every_chain_parameter_is_stored_and_bound_by_the_identity",
         "genesis::tests::the_chain_parameters_derive_from_the_block_time",
         "genesis::tests::test_genesis_reopen_rejects_an_epoch_that_disagrees_with_the_interval",
-        "genesis::tests::the_unbonding_mirror_is_the_move_constant"
+        "genesis::tests::the_unbonding_mirror_is_the_move_constant",
+        "genesis::tests::a_database_without_the_v4_vertex_format_is_refused_at_boot"
       ],
       "excluded_ignored": {}
     },

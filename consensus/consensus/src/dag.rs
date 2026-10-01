@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 // use serde::{Serialize, Deserialize}; // Unused
 use crate::ordering::OrderingEngine;
@@ -15,8 +15,6 @@ type ValidatorStakeCache = Arc<Mutex<Option<Vec<(String, u64)>>>>;
 
 #[cfg(test)]
 type LocalAcceptanceHook = fn(u8, &StateDB) -> Result<(), String>;
-#[cfg(test)]
-type BroadcastHook = Arc<dyn Fn(&Vertex) + Send + Sync>;
 
 /// PROTOCOL (deterministic slashing): a vertex payload item carrying this
 /// prefix is equivocation evidence, not a transaction. It rides through the DAG
@@ -50,15 +48,6 @@ pub const MAX_VERTEX_BYTES: usize = 768 * 1024;
 /// generous bound is an inflation attack (unbounded parents made an
 /// equivocator's own evidence undeliverable before parents were rooted).
 pub const MAX_PARENTS: usize = 256;
-/// Upper bound on a single evidence item we are willing to store/queue/carry.
-/// With payload and parents stripped a proof is ~1 KiB; this is belt-and-braces.
-const MAX_EVIDENCE_ITEM_BYTES: usize = 64 * 1024;
-
-/// SEC-#10: how long equivocation evidence (`sys:equiv_seen:{offender}:{round}`)
-/// is retained past the DAG prune horizon before garbage collection. Set well
-/// beyond any realistic forensic/governance window; the slash is applied and
-/// finalized long before this, so older records are safe to discard.
-pub(crate) const EQUIV_EVIDENCE_RETENTION_ROUNDS: u64 = 100_000;
 
 pub struct DagConsensus {
     pub node_id: String,
@@ -104,11 +93,6 @@ pub struct DagConsensus {
     /// the only time validator set may legitimately change during normal
     /// operation is via a slash, which happens during block execution).
     validators_cache: ValidatorStakeCache,
-    /// PROTOCOL: equivocation evidence waiting to ride in this node's NEXT
-    /// vertex (see SLASH_EVIDENCE_PREFIX). Local-only queue; the durable source
-    /// of truth is `sys:equiv_seen:*`, which try_create_vertex also re-scans so
-    /// a restart cannot lose evidence that was detected but not yet carried.
-    evidence_queue: Arc<Mutex<Vec<String>>>,
     /// (offender, round) -> round at which we carried it, for items carried in
     /// a vertex of ours not yet seen INCLUDED in a block. Stops consecutive
     /// vertices re-carrying the same item; an entry older than
@@ -141,8 +125,9 @@ pub struct DagConsensus {
     /// (`genesis:vertex_format` = 4). It then owns ingress, staging, O_E and
     /// production; `dag` holds its staged bodies and `round_index` O_E.
     pub(crate) v4: Option<crate::v4::Engine>,
-    /// Fixed at boot: this chain runs V4. Every V3/V4 branch reads this, not
-    /// whether the engine happens to be present at that moment.
+    /// Fixed at boot: this chain runs V4 (otherwise the node is inert). Every
+    /// gate reads this, not whether the engine happens to be present at that
+    /// moment.
     v4_chain: bool,
     /// C_0 as (address, stake), fixed at boot on a V4 chain (DE-7).
     v4_stakes: Vec<(String, u64)>,
@@ -161,9 +146,6 @@ pub struct DagConsensus {
     /// last point where consensus state may be staged (G3 CM-2).
     #[cfg(test)]
     pub(crate) pre_execution_hook: Option<LocalAcceptanceHook>,
-    /// Tests only: runs as a vertex is broadcast, before it leaves the process.
-    #[cfg(test)]
-    pub(crate) broadcast_hook: Option<BroadcastHook>,
     /// Tests only: V4 wire messages this node sent, instead of the network.
     #[cfg(any(test, feature = "sim"))]
     pub v4_outbox: Option<V4Outbox>,
@@ -263,299 +245,19 @@ impl DagConsensus {
         p2p_tx: Option<tokio::sync::mpsc::Sender<String>>, // Corrected to Sender
         node_key: [u8; 32],                                // H4 FIX: Accept the persistent key
     ) -> Self {
-        let mut dag_map = HashMap::new();
-        let mut round_idx_map: HashMap<u64, Vec<String>> = HashMap::new();
-        let mut max_round = 0;
-
-        // G1 S5: a V4 chain boots through the certified-DAG engine (RC-1), never
-        // through the V3 recovery below, which would read V4 bodies as V3.
-        // Fail closed: a node that cannot read its format must not guess V3.
+        // G1 S5: a V4 chain boots through the certified-DAG engine (RC-1).
+        // G5 S4c: the V3 DAG is deleted; a node on any other database is
+        // inert (it never proposes, signs or ingests). Fail closed: a node
+        // that cannot read its format must not guess.
         let v4_format = match storage.get(crate::v4::VERTEX_FORMAT_KEY) {
             Ok(v) => v.as_deref() == Some("4"),
             Err(e) => panic!("cannot read the chain's vertex format: {e}"),
         };
-        // OPTIMIZED RECOVERY: Use checkpoint instead of full scan (Aptos/Sui style)
-        let checkpoint_round = if v4_format {
-            0
-        } else {
-            storage.get_latest_checkpoint_round()
-        };
-        // An unusable checkpoint cannot justify skipping retained disk rows.
-        let mut recovered_checkpoint_round = 0;
-
-        if checkpoint_round > 0 {
-            // Fast path: Load from checkpoint with H-06 integrity verification.
-            //
-            // Pre-Phase-2 code loaded checkpoints blindly. An attacker with
-            // write access to the storage layer could inject a fake
-            // checkpoint and the node would happily restore from it on
-            // boot — silent rollback / arbitrary-state attack.
-            //
-            // Phase 2.5 → Phase 4.A2: production checkpoints are signed with
-            // the node's Ed25519 key. On load we re-verify the signature:
-            //   - signature present + valid  → fast recovery from checkpoint
-            //   - signature present + invalid → REJECT fast recovery, fall
-            //     back to full scan_vertices replay (safety over speed)
-            //   - signature absent           → REJECT fast recovery, fall
-            //     back to full scan_vertices replay (Phase 4.A2)
-            //
-            // ⚠️  PRECISE SCOPE OF A2 FIX:
-            //   "Reject unsigned checkpoint" here means "do not use it for
-            //   fast recovery"; it does NOT mean the node fails-fast on boot.
-            //   The node still boots successfully via the slower
-            //   scan_vertices replay path. This closes the legacy-bypass
-            //   attack vector (operator-level adversary deleting the
-            //   signature blob to forge a checkpoint) while preserving
-            //   one-time recovery for operators upgrading from pre-Phase-2
-            //   installs — they incur a single longer boot until their
-            //   node produces a fresh signed checkpoint.
-            let checkpoint_accepted: bool;
-            if let Some(checkpoint_data) = storage.get_dag_checkpoint(checkpoint_round) {
-                checkpoint_accepted = match storage.get_dag_checkpoint_signature(checkpoint_round) {
-                    Some(sig_hex) => {
-                        let signing_key = crypto::SigningKey::from_bytes(&node_key);
-                        let verifying_key = signing_key.verifying_key();
-                        let pubkey_bytes = verifying_key.to_bytes();
-                        match hex::decode(&sig_hex) {
-                            Ok(sig_bytes) if sig_bytes.len() == 64 => {
-                                match crypto::verify_signature(
-                                    &pubkey_bytes,
-                                    checkpoint_data.as_bytes(),
-                                    &sig_bytes,
-                                ) {
-                                    Ok(true) => true,
-                                    _ => {
-                                        eprintln!(
-                                            "🚨 [H-06] Checkpoint signature INVALID for round {} — \
-                                             refusing fast recovery; falling back to scan. \
-                                             Possible storage tampering.",
-                                            checkpoint_round
-                                        );
-                                        false
-                                    }
-                                }
-                            }
-                            _ => {
-                                eprintln!(
-                                    "🚨 [H-06] Checkpoint signature malformed for round {} — \
-                                     refusing fast recovery; falling back to scan.",
-                                    checkpoint_round
-                                );
-                                false
-                            }
-                        }
-                    }
-                    None => {
-                        // Phase 4.A2: REJECT FAST RECOVERY from unsigned
-                        // checkpoint (not a hard boot reject — node falls
-                        // back to scan replay below).
-                        eprintln!(
-                            "🚨 [H-06/A2] Checkpoint at round {} has NO signature — \
-                             REJECTING fast recovery path; falling back to \
-                             scan_vertices replay (legacy-bypass attack vector closed).",
-                            checkpoint_round
-                        );
-                        false
-                    }
-                };
-
-                if checkpoint_accepted {
-                    if let Ok(vertices) = serde_json::from_str::<Vec<Vertex>>(&checkpoint_data) {
-                        // Phase 5C.1 / NEW-001: enforce PWN-001 also at boot.
-                        // The checkpoint signature covers the JSON blob as a
-                        // whole, but each Vertex.hash inside MUST still match
-                        // a freshly computed hash of its body. Otherwise a
-                        // disk-write attacker could mutate vertices inside an
-                        // otherwise-valid checkpoint and bypass PWN-001 on
-                        // the recovery path.
-                        let mut accepted = 0usize;
-                        let mut rejected = 0usize;
-                        for vertex in vertices {
-                            if vertex.calculate_hash() != vertex.hash
-                                || !vertex.is_live_form()
-                                || !vertex.verify_parent_identities()
-                            {
-                                eprintln!(
-                                    "🚨 [NEW-001/boot] checkpoint vertex hash/form/parent proof invalid, \
-                                     dropping (hash={})",
-                                    vertex.hash
-                                );
-                                rejected += 1;
-                                continue;
-                            }
-                            if vertex.round > max_round {
-                                max_round = vertex.round;
-                            }
-                            if !vertex.is_live_form() {
-                        eprintln!("🚨 recovery: refusing proof-form vertex {} as live", vertex.hash);
-                        continue;
-                    }
-                    // Never revive a SECOND vertex from the same author at the
-                    // same round: that is an equivocating pair, and admitting
-                    // both would give this node a DAG its peers do not have.
-                    if round_idx_map
-                        .get(&vertex.round)
-                        .is_some_and(|hs| hs.iter().any(|h| {
-                            dag_map.get(h).is_some_and(|e: &Vertex| e.author == vertex.author)
-                        }))
-                    {
-                        eprintln!(
-                            "🚨 recovery: refusing second vertex from {} at round {}",
-                            vertex.author, vertex.round
-                        );
-                        continue;
-                    }
-                    // Index ONLY vertices that were actually admitted: a refused
-                    // vertex left in round_index becomes a parent hash that no
-                    // peer can resolve (try_create_vertex uses round_index
-                    // verbatim), so the vertex we build is unverifiable.
-                    round_idx_map
-                        .entry(vertex.round)
-                        .or_default()
-                        .push(vertex.hash.clone());
-                    dag_map.insert(vertex.hash.clone(), vertex);
-                            accepted += 1;
-                        }
-                        if rejected == 0 {
-                            recovered_checkpoint_round = checkpoint_round;
-                        }
-                        // Keep individually verified entries, but rescan all disk
-                        // rows when a partial checkpoint cannot justify tail-only replay.
-                        println!(
-                            "Checkpoint inspection: {} valid / {} rejected, round {}; replay cutoff {}",
-                            accepted, rejected, checkpoint_round, recovered_checkpoint_round
-                        );
-                    }
-                }
-                // Whether or not checkpoint was accepted, the tail-replay
-                // loop below still runs to fill in vertices written after
-                // the checkpoint. If the checkpoint was rejected, the
-                // tail replay alone reconstructs as much of the DAG as
-                // honest on-disk data permits.
-            }
-
-            // Checkpoints are saved periodically, while every proposed vertex is persisted
-            // individually. On cold restart we must replay the tail after the latest checkpoint;
-            // otherwise latest_proposed_round can advance past the in-memory round index and
-            // the node gets stuck with zero parents.
-            let mut replayed_tail = 0usize;
-            let mut tail_rejected = 0usize;
-            for v_json in storage.scan_vertices() {
-                if let Ok(vertex) = serde_json::from_str::<Vertex>(&v_json) {
-                    if vertex.round <= recovered_checkpoint_round || dag_map.contains_key(&vertex.hash) {
-                        continue;
-                    }
-                    // Phase 5C.1 / NEW-001: hash-integrity check on tail replay.
-                    if vertex.calculate_hash() != vertex.hash
-                        || !vertex.is_live_form()
-                        || !vertex.verify_parent_identities()
-                    {
-                        eprintln!(
-                            "🚨 [NEW-001/tail] vertex hash/form/parent proof invalid (hash={})",
-                            vertex.hash
-                        );
-                        tail_rejected += 1;
-                        continue;
-                    }
-                    if vertex.round > max_round {
-                        max_round = vertex.round;
-                    }
-                    if !vertex.is_live_form() {
-                        eprintln!("🚨 recovery: refusing proof-form vertex {} as live", vertex.hash);
-                        continue;
-                    }
-                    // Never revive a SECOND vertex from the same author at the
-                    // same round: that is an equivocating pair, and admitting
-                    // both would give this node a DAG its peers do not have.
-                    if round_idx_map
-                        .get(&vertex.round)
-                        .is_some_and(|hs| hs.iter().any(|h| {
-                            dag_map.get(h).is_some_and(|e: &Vertex| e.author == vertex.author)
-                        }))
-                    {
-                        eprintln!(
-                            "🚨 recovery: refusing second vertex from {} at round {}",
-                            vertex.author, vertex.round
-                        );
-                        continue;
-                    }
-                    // Index ONLY vertices that were actually admitted: a refused
-                    // vertex left in round_index becomes a parent hash that no
-                    // peer can resolve (try_create_vertex uses round_index
-                    // verbatim), so the vertex we build is unverifiable.
-                    round_idx_map
-                        .entry(vertex.round)
-                        .or_default()
-                        .push(vertex.hash.clone());
-                    dag_map.insert(vertex.hash.clone(), vertex);
-                    replayed_tail += 1;
-                }
-            }
-            if replayed_tail > 0 || tail_rejected > 0 {
-                println!(
-                    "🔄 Replayed {} DAG vertices after checkpoint round {} ({} tampered-dropped)",
-                    replayed_tail, recovered_checkpoint_round, tail_rejected
-                );
-            }
-        } else if !v4_format {
-            // Fallback: Scan for legacy data (only on first run or migration)
-            let vertices_json = storage.scan_vertices();
-            let mut legacy_rejected = 0usize;
-            for v_json in vertices_json {
-                if let Ok(vertex) = serde_json::from_str::<Vertex>(&v_json) {
-                    // Phase 5C.1 / NEW-001: hash-integrity check on legacy scan.
-                    if vertex.calculate_hash() != vertex.hash
-                        || !vertex.is_live_form()
-                        || !vertex.verify_parent_identities()
-                    {
-                        eprintln!(
-                            "🚨 [NEW-001/legacy] vertex hash/form/parent proof invalid (hash={})",
-                            vertex.hash
-                        );
-                        legacy_rejected += 1;
-                        continue;
-                    }
-                    if vertex.round > max_round {
-                        max_round = vertex.round;
-                    }
-                    if !vertex.is_live_form() {
-                        eprintln!("🚨 recovery: refusing proof-form vertex {} as live", vertex.hash);
-                        continue;
-                    }
-                    // Never revive a SECOND vertex from the same author at the
-                    // same round: that is an equivocating pair, and admitting
-                    // both would give this node a DAG its peers do not have.
-                    if round_idx_map
-                        .get(&vertex.round)
-                        .is_some_and(|hs| hs.iter().any(|h| {
-                            dag_map.get(h).is_some_and(|e: &Vertex| e.author == vertex.author)
-                        }))
-                    {
-                        eprintln!(
-                            "🚨 recovery: refusing second vertex from {} at round {}",
-                            vertex.author, vertex.round
-                        );
-                        continue;
-                    }
-                    // Index ONLY vertices that were actually admitted: a refused
-                    // vertex left in round_index becomes a parent hash that no
-                    // peer can resolve (try_create_vertex uses round_index
-                    // verbatim), so the vertex we build is unverifiable.
-                    round_idx_map
-                        .entry(vertex.round)
-                        .or_default()
-                        .push(vertex.hash.clone());
-                    dag_map.insert(vertex.hash.clone(), vertex);
-                }
-            }
-            if !dag_map.is_empty() {
-                println!(
-                    "♻️  Legacy recovery (scan): {} vertices ({} tampered-dropped), Max Round {}",
-                    dag_map.len(),
-                    legacy_rejected,
-                    max_round
-                );
-            }
+        if !v4_format {
+            eprintln!(
+                "⚠️ not a V4 chain ({}): this node is inert",
+                crate::v4::VERTEX_FORMAT_KEY
+            );
         }
 
         let latest_block_height = match storage.get("latest_height") {
@@ -588,60 +290,15 @@ impl DagConsensus {
             .map(|h| h.min(latest_block_height))
             .unwrap_or(0);
 
-
-        let explicit_max_round = match storage.get("latest_proposed_round") {
-            Ok(Some(r)) => r.parse::<u64>().unwrap_or(0),
-            _ => 0,
-        };
-
-        // AUDIT-B3 (boot half). This used to be `max(1, max_round + 1)`, and
-        // `max_round` is the maximum over EVERY author's recovered vertices —
-        // not over the rounds this node can actually build parents for. That is
-        // the same mistake AUDIT-B3 removed from the runtime path below, and it
-        // wedged the live chain on 2026-09-12: two of four validators restarted
-        // holding round-N vertices written by the two that never went down, so
-        // they booted at N+1, whose parents live at round N — a round that only
-        // ever held 2 of 4 authors and can therefore never reach the stake
-        // quorum. Neither node proposed again and no block was produced for ten
-        // days.
-        //
-        // Narwhal's rule, restated for boot: propose at `quorum_round + 1`, the
-        // highest round whose parent round we hold a stake quorum for. Vertices
-        // above that are still recovered and still count toward their own
-        // round's quorum; they just cannot set our proposal clock.
-        let boot_validators = Self::validators_from_storage(&storage);
-        let quorum_start =
-            Self::quorum_round(&round_idx_map, &dag_map, &boot_validators).saturating_add(1);
-        let mut final_start_round = std::cmp::max(1, quorum_start);
-
-        // Safety beats liveness on the one input that is genuinely ours: a round
-        // we already proposed at must never be reused, because a second vertex
-        // at that round is equivocation and is slashed 100%. Stalling is not.
-        // This case is self-healing — once peers fill the round, `quorum_round`
-        // rises past it.
-        if explicit_max_round >= final_start_round {
-            println!(
-                "🔄 Restoring from explicitly saved proposed round: {}",
-                explicit_max_round
-            );
-            final_start_round = explicit_max_round + 1;
-        }
-
-        println!(
-            "✅ DAG Initialized: {} vertices (max round {}), Starting Round {}",
-            dag_map.len(),
-            max_round,
-            final_start_round
-        );
-
         let storage_for_ordering = Arc::clone(&storage);
 
         let mut this = Self {
             node_id,
             peers,
-            current_round: final_start_round,
-            dag: Arc::new(Mutex::new(dag_map)),
-            round_index: Arc::new(Mutex::new(round_idx_map)),
+            // The engine sets the round at boot (`start_v4`).
+            current_round: 0,
+            dag: Arc::new(Mutex::new(HashMap::new())),
+            round_index: Arc::new(Mutex::new(HashMap::new())),
             mempool,
             executor,
             storage,
@@ -662,7 +319,6 @@ impl DagConsensus {
             // populates it from storage. Subsequent reads are cache hits
             // until the next block commit invalidates.
             validators_cache: Arc::new(Mutex::new(None)),
-            evidence_queue: Arc::new(Mutex::new(Vec::new())),
             evidence_inflight: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             // The real clock. The two call sites this replaces were written
             // differently (`.unwrap_or(Duration::from_secs(0)).as_secs()` vs
@@ -687,8 +343,6 @@ impl DagConsensus {
             local_acceptance_hook: None,
             #[cfg(test)]
             pre_execution_hook: None,
-            #[cfg(test)]
-            broadcast_hook: None,
             #[cfg(any(test, feature = "sim"))]
             v4_outbox: None,
         };
@@ -733,7 +387,7 @@ impl DagConsensus {
             })
     }
 
-    /// The V4 engine's active epoch (None on a V3 chain).
+    /// The V4 engine's active epoch (None on an inert node).
     pub fn v4_epoch(&self) -> Option<u64> {
         self.v4.as_ref().map(|e| e.epoch())
     }
@@ -878,7 +532,7 @@ impl DagConsensus {
     /// `QC_ANSWERS_PER_TICK` answers per tick in all, so however asks are
     /// spread over heights they cost a bounded number of answers.
     fn answer_qc_want(&mut self, raw: &str) {
-        if !self.v4_chain || raw.len() > 20 {
+        if raw.len() > 20 {
             return;
         }
         let Ok(h) = raw.parse::<u64>() else {
@@ -922,7 +576,7 @@ impl DagConsensus {
     /// verifies under that block's committee and binds the block (IM-1), then
     /// the epoch step runs (it may activate).
     fn on_boundary_qc(&mut self, json: &str) {
-        if !self.v4_chain || json.len() > 64 * 1024 {
+        if json.len() > 64 * 1024 {
             return;
         }
         let Ok(qc) = serde_json::from_str::<crate::qc::QuorumCertificate>(json) else {
@@ -943,8 +597,7 @@ impl DagConsensus {
     }
 
     /// Boot the certified-DAG engine on a V4 chain (RC-1). A V4 chain without
-    /// its genesis committee or identity cannot run, and must never fall back
-    /// to V3: boot stops.
+    /// its genesis committee or identity cannot run: boot stops.
     fn start_v4(&mut self) {
         let committee = crate::qc_producer::load_validator_set_for_epoch(&self.storage, 0)
             .expect("a V4 chain needs its genesis committee (genesis:validator_set:v1)");
@@ -1076,12 +729,6 @@ impl DagConsensus {
         }
     }
 
-    /// Phase 2.8 (M-08): force the next `get_validator_set` to re-read
-    /// from storage. Called on block commit because that's the only
-    /// moment validator set may legitimately change during normal
-    /// operation (slash execution updates `sys:validators`). Public so
-    /// out-of-band code paths (genesis init, integration tests,
-    /// admin tooling that mutates storage directly) can force a refresh.
     /// Has this anchor round already been placed on chain?
     ///
     /// AUDIT B4b — the single source of truth for "already done". It is decided by
@@ -1132,853 +779,31 @@ impl DagConsensus {
         );
     }
 
-    /// The EPOCH-FROZEN committee, for validity rules.
-    ///
-    /// A validity rule must reach the same verdict on every honest node, so it
-    /// cannot read a node-local, time-varying set. `get_validator_set_with_stake`
-    /// goes through a per-node cache and reflects joins/leaves the instant they
-    /// land, which would make an ingress reject non-unanimous — the refuted
-    /// possession rule by a different door.
-    ///
-    /// Do not bypass an unavailable historical committee by consulting the live
-    /// cache. Only legacy epoch-0 bootstrap may use `sys:validators` when no
-    /// BLS/genesis record exists. Bootstrap and assigning an epoch to delayed vertices
-    /// still need a protocol-level trust/transition contract.
-    fn epoch_committee(&self) -> Result<Vec<(String, u64)>, String> {
-        let current = self.storage.get("consensus:epoch").map_err(|e| e.to_string())?;
-        let epoch = match current {
-            Some(raw) => raw.parse::<u64>().map_err(|e| format!("invalid consensus epoch: {e}"))?,
-            None => 0,
-        };
-        if let Some(set) = crate::qc_producer::load_validator_set_for_epoch(&self.storage, epoch) {
-            return Ok(set.into_iter().map(|v| (v.address, v.stake)).collect());
-        }
-        if epoch == 0
-            && self.storage.get("sys:validator_set:epoch:0").map_err(|e| e.to_string())?.is_none()
-            && self.storage.get("sys:validator_set:v1").map_err(|e| e.to_string())?.is_none()
-            && self.storage.get("genesis:validator_set:v1").map_err(|e| e.to_string())?.is_none()
-        {
-            return Ok(self.get_validator_set_with_stake());
-        }
-        Err(format!("validator committee unavailable for epoch {epoch}"))
-    }
-
+    /// Phase 2.8 (M-08): force the next `get_validator_set` to re-read
+    /// from storage. Called on block commit because that's the only
+    /// moment validator set may legitimately change during normal
+    /// operation (slash execution updates `sys:validators`). Public so
+    /// out-of-band code paths (genesis init, integration tests,
+    /// admin tooling that mutates storage directly) can force a refresh.
     pub fn invalidate_validators_cache(&self) {
         if let Ok(mut guard) = self.validators_cache.lock() {
             *guard = None;
         }
     }
 
-    /// Highest round for which this node already holds a STAKE QUORUM of vertices.
-    ///
-    /// AUDIT-B3. This is the Narwhal round-advance predicate: a validator moves to
-    /// round r+1 only once it has collected vertices from >2/3 of stake at round r,
-    /// because those vertices are exactly the parents its next vertex must
-    /// reference. Deriving the local round from this — instead of from whatever
-    /// round a single remote vertex happens to claim — makes the wedge
-    /// unrepresentable: we can never sit at a round whose predecessor lacks the
-    /// parents we need.
-    ///
-    /// Pure function of (round_index, dag, validators) so it is identical on every
-    /// node given the same DAG contents, and it takes the already-held guards
-    /// rather than `&self` so it can run inside the ingest critical section.
-    fn quorum_round(
-        round_index: &HashMap<u64, Vec<String>>,
-        dag: &HashMap<String, Vertex>,
-        validators: &[(String, u64)],
-    ) -> u64 {
-        let total_stake: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
-        if total_stake == 0 {
-            return 0;
-        }
-        let stake_by_addr: HashMap<&str, u64> =
-            validators.iter().map(|(a, s)| (a.as_str(), *s)).collect();
-
-        let mut best = 0u64;
-        for (round, hashes) in round_index.iter() {
-            if *round <= best {
-                continue; // cannot improve the maximum
-            }
-            let mut authors: HashSet<&str> = HashSet::new();
-            for h in hashes {
-                if let Some(v) = dag.get(h) {
-                    authors.insert(v.author.as_str());
-                }
-            }
-            let round_stake: u128 = authors
-                .iter()
-                .filter_map(|a| stake_by_addr.get(a).map(|s| *s as u128))
-                .sum();
-            if crate::qc::stake_quorum_met(round_stake, total_stake) {
-                best = *round;
-            }
-        }
-        best
-    }
-
-    /// Jailed by a committed slash (state key `validator:jailed:*`) or by
-    /// this node's own equivocation detection (local key
-    /// `sys:equiv_local_jail:*`, G3 FX-1). The downtime detector skips both.
-    pub(crate) fn already_jailed(storage: &StateDB, validator_id: &str) -> bool {
-        [
-            format!("validator:jailed:{}", validator_id),
-            format!("sys:equiv_local_jail:{}", validator_id),
-        ]
-        .iter()
-        .any(|key| matches!(storage.get(key), Ok(Some(_))))
-    }
-
+    /// One consensus tick (G1 S5). Only a V4 chain has an engine; a node on
+    /// any other database is inert (G5 S4c: the V3 DAG is deleted, and boot
+    /// refuses such a database before it gets here).
     pub fn try_create_vertex(&mut self) {
         if self.v4_chain {
             self.v4_tick();
-            return;
-        }
-        self.retry_qc_work();
-        // 1. Check if we have enough parents from previous round
-        let prev_round = self.current_round - 1;
-        let mut parents = {
-            let round_idx = self
-                .round_index
-                .lock()
-                .expect("🚨 FATAL: Round index lock poisoned");
-            round_idx.get(&prev_round).cloned().unwrap_or_default()
-        };
-        // Producer-side bound matching the ingress rule (add_vertex rejects
-        // > MAX_PARENTS): without this a validator set larger than MAX_PARENTS
-        // makes every node build a vertex that every peer rejects — the chain
-        // stops. Deterministic selection (sorted by hash) so honest nodes that
-        // see the same previous round pick the same parents.
-        if parents.len() > MAX_PARENTS {
-            parents.sort_unstable();
-            parents.truncate(MAX_PARENTS);
-        }
-
-        // Ensure Round 1 links to genesis
-        if prev_round == 0 && parents.is_empty() {
-            parents.push("genesis".to_string());
-        }
-
-        // DYNAMIC CHECK: stake-aware validator set FIRST (B4).
-        let validators = self.get_validator_set_with_stake();
-        let is_active_validator = validators.iter().any(|(a, _)| a == &self.node_id);
-        let n = validators.len();
-        if n == 0 {
-            println!("⚠️ [Consensus] No validators found! Defaulting to Singleton Quorum.");
-        }
-        let total_stake: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
-
-        // B4: parent quorum is STAKE-weighted. A new vertex must reference parents
-        // whose DISTINCT authors represent strict > 2/3 of total stake (genesis
-        // round bootstraps with no parents). This is the liveness/connectivity
-        // gate; the BFT SAFETY gate is the stake-weighted COMMIT quorum in
-        // try_commit. Same `qc::stake_quorum_met` predicate as QC verification.
-        //
-        // The SAME pass also builds `parent_refs` — the self-describing
-        // (round, author, digest) triples the vertex will carry. Producing them
-        // here rather than in a second pass is what guarantees they are
-        // INDEX-ALIGNED with `parents`: both are appended together, so the two
-        // views of the parent set cannot drift apart. A parent this node cannot
-        // resolve is dropped from BOTH, because a vertex that cites a parent it
-        // cannot describe is precisely the B3/B4 shape.
-        let (parent_quorum_met, parent_refs) = if prev_round == 0 {
-            (true, Vec::<blockchain::ParentRef>::new())
-        } else {
-            let stake_by_addr: HashMap<&str, u64> =
-                validators.iter().map(|(a, s)| (a.as_str(), *s)).collect();
-            let (parent_stake, refs, kept): (u128, Vec<blockchain::ParentRef>, Vec<String>) = {
-                let dag = self.dag.lock().expect("🚨 FATAL: DAG lock poisoned");
-                let mut authors: HashSet<&str> = HashSet::new();
-                let mut refs = Vec::with_capacity(parents.len());
-                let mut kept = Vec::with_capacity(parents.len());
-                for ph in &parents {
-                    if let Some(v) = dag.get(ph) {
-                        let Some(public_key) = self.resolve_author_pubkey(&v.author) else {
-                            continue;
-                        };
-                        let reference = blockchain::ParentRef::authenticated(v, public_key);
-                        if !reference.verify_identity() {
-                            continue;
-                        }
-                        authors.insert(v.author.as_str());
-                        refs.push(reference);
-                        kept.push(ph.clone());
-                    }
-                }
-                let stake = authors
-                    .iter()
-                    .filter_map(|a| stake_by_addr.get(a).map(|s| *s as u128))
-                    .sum();
-                (stake, refs, kept)
-            };
-            parents = kept;
-            (
-                crate::qc::stake_quorum_met(parent_stake, total_stake),
-                refs,
-            )
-        };
-
-        println!(
-            "🔒 [Consensus] Round {}: Validators={}, Parents={}, StakeQuorum={}",
-            self.current_round,
-            n,
-            parents.len(),
-            parent_quorum_met
-        );
-
-        // SPLIT-BRAIN PREVENTION & OBSERVER MODE:
-        // Dynamic singleton detection: if exactly 1 validator and it's us, we are the genesis/bootstrap node
-        let is_singleton = validators.len() == 1 && is_active_validator;
-
-        let has_peers = {
-            if let Ok(p) = self.peers.lock() {
-                !p.is_empty()
-            } else {
-                false
-            }
-        };
-
-        // RULE 1: If I am NOT a validator, I am an Observer. Observers CANNOT mine.
-        if !is_active_validator {
-            if self.current_round.is_multiple_of(10) || self.current_round < 5 {
-                println!("⚠️  [Consensus] Observer Mode: I am not in Validator Set. Waiting to sync/register... (Round {})", self.current_round);
-            }
-            return;
-        }
-        // RULE 2: If I AM a validator, but I have NO peers (and not Singleton), I must stop to avoid Split-Brain.
-        else if !has_peers && !is_singleton {
-            println!("⚠️  [Consensus] Validator Isolated! Stopping mining to prevent fork. Waiting for peers...");
-            return;
-        }
-
-        // Standard logic for Genesis or Connected Nodes
-        if parent_quorum_met {
-            // 2. Create Payload (Fetch from Mempool)
-            // BYTE BUDGET: the payload-free wire size of this vertex, measured
-            // once; the payload is trimmed to fit (see gather_payload).
-            let overhead = {
-                let empty_probe = Vertex {
-                    epoch: 0,
-                    round: self.current_round,
-                    author: self.node_id.clone(),
-                    timestamp: u64::MAX,
-                    payload: Vec::new(),
-                    parents: parents.clone(),
-                    hash: "0".repeat(64),
-                    signature: "0".repeat(128),
-                    aggregated_signature: None,
-                    payload_root: None,
-                    parents_root: None,
-                    parent_refs: Vec::new(),
-                };
-                serde_json::to_string(&empty_probe)
-                    .map(|s| s.len())
-                    .unwrap_or(usize::MAX)
-                    + "DAG_VERTEX:".len()
-            };
-            let payload = self.gather_payload(self.current_round, overhead);
-
-            // 3. Create Vertex
-            let mut vertex = Vertex {
-                epoch: 0,
-                round: self.current_round,
-                author: self.node_id.clone(),
-                timestamp: (self.now_secs)(),
-                payload,
-                parents,
-                hash: String::new(),
-                signature: String::new(),
-                aggregated_signature: None,
-                payload_root: None,
-                parents_root: None,
-                parent_refs,
-            };
-
-            vertex.hash = vertex.calculate_hash();
-
-            // C-2 FIX: Use Ed25519 signing (BLS was actually symmetric MAC)
-            let signing_key = crypto::SigningKey::from_bytes(&self.node_key);
-            vertex.sign_with_ed25519(&signing_key);
-            // Final guard on the EXACT wire size (never ship an undeliverable vertex).
-            if serde_json::to_string(&vertex).map(|s| s.len()).unwrap_or(usize::MAX) + "DAG_VERTEX:".len()
-                > MAX_VERTEX_BYTES
-            {
-                eprintln!("🚫 not broadcasting vertex at round {}: exceeds MAX_VERTEX_BYTES after trim", vertex.round);
-                return;
-            }
-
-            // 4. Persist the round, then add and broadcast. The round is saved
-            // (a synced write) BEFORE the signature leaves the process: a crash
-            // between a broadcast and the save let the restarted node propose
-            // this round again, a double-sign (slashed 100%). A failed save
-            // publishes nothing.
-            if let Err(e) = self
-                .storage
-                .put("latest_proposed_round", &self.current_round.to_string())
-            {
-                eprintln!(
-                    "🚫 not broadcasting vertex at round {}: the proposed round was not saved: {e}",
-                    vertex.round
-                );
-                return;
-            }
-            self.add_vertex(vertex.clone());
-            self.broadcast_vertex(&vertex);
-
-            // === DOWNTIME DETECTION (Jail System Trigger) ===
-            // Track which validators participated in this round.
-            // If a validator misses 100+ consecutive rounds (~100 minutes), mark for slashing.
-            // DOWNTIME TOLERANCE IS TIME-BASED, NOT ROUND-BASED.
-            //
-            // The old constant (100 rounds) silently coupled the jail window to
-            // the consensus tick: at the original 3s tick it meant ~5 minutes of
-            // tolerance, but when the tick was tuned to 500ms it became FIFTY
-            // SECONDS — and the live 4-validator cluster promptly jailed its two
-            // slowest validators for ordinary lag, shrinking the set to 3. A
-            // liveness knob must not silently change meaning when a performance
-            // knob is turned. The window is now ~5 minutes of wall time,
-            // converted to rounds using the SAME tick env the round ticker uses
-            // (deterministic enough: per-node detection only feeds the
-            // BFT-quorum downtime attestation, which is what actually jails).
-            // Overridable directly via AINCORE_DOWNTIME_THRESHOLD_ROUNDS.
-            let downtime_threshold: u64 = std::env::var("AINCORE_DOWNTIME_THRESHOLD_ROUNDS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v >= 10)
-                .unwrap_or_else(|| {
-                    let tick_ms = std::env::var("AINCORE_CONSENSUS_TICK_MS")
-                        .ok()
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .filter(|v| *v >= 100)
-                        .unwrap_or(3_000);
-                    (300_000 / tick_ms).max(100) // ~5 minutes of rounds, floor 100
-                });
-
-            // Record our participation
-            let _ = self.storage.put(
-                &format!("validator:last_seen:{}", self.node_id),
-                &self.current_round.to_string(),
-            );
-
-            // Check all validators for downtime (only every 10 rounds to save CPU)
-            if self.current_round.is_multiple_of(10) {
-                for (validator_id, _stake) in &validators {
-                    if validator_id == &self.node_id {
-                        continue;
-                    } // Skip self
-
-                    let last_seen = match self
-                        .storage
-                        .get(&format!("validator:last_seen:{}", validator_id))
-                    {
-                        Ok(Some(r)) => r.parse::<u64>().unwrap_or(0),
-                        _ => 0,
-                    };
-
-                    let rounds_missed = self.current_round.saturating_sub(last_seen);
-
-                    if rounds_missed >= downtime_threshold && last_seen > 0 {
-                        // Already jailed (prevent double-slash): skip.
-                        if Self::already_jailed(&self.storage, validator_id) {
-                            continue;
-                        }
-
-                        // === H-02 PROMOTED (Phase 2.3): BFT ATTESTATION, NOT UNILATERAL SLASH ===
-                        //
-                        // The pre-Phase-2 path wrote `sys:pending_slash:{addr}`
-                        // directly from this single node's local observation.
-                        // That meant any single validator could trigger a 5%
-                        // slash + 21-day unbonding against any other validator,
-                        // which is unsafe during network partitions (an
-                        // isolated node sees everyone else as "down") and
-                        // open to griefing (a Byzantine validator slashing
-                        // honest peers).
-                        //
-                        // This node records and gossips *its own* downtime
-                        // observation for (offender, epoch). PROTOCOL v2: that
-                        // is where it ends -- downtime is DETECTED and ATTESTED
-                        // but NOT slashed. Only equivocation is slashed, and only
-                        // through evidence ordered by the DAG (see
-                        // SLASH_EVIDENCE_PREFIX). A deterministic downtime
-                        // protocol would have to order attestations the same
-                        // way before any downtime slash can be re-enabled.
-                        const DOWNTIME_EPOCH_ROUNDS: u64 = 50;
-                        let epoch = self.current_round / DOWNTIME_EPOCH_ROUNDS;
-
-                        println!(
-                            "🚨 DOWNTIME OBSERVED: Validator {} missed {} rounds (this node only)",
-                            validator_id, rounds_missed
-                        );
-                        println!(
-                            "⚖️  Recording BFT attestation for offender={}, epoch={}, reporter={}",
-                            validator_id, epoch, self.node_id
-                        );
-
-                        // Attestation key: distinct per (offender, epoch, reporter)
-                        // so the same node cannot inflate the count by
-                        // re-attesting within the same epoch.
-                        let attestation_key = format!(
-                            "sys:downtime_attestation:{}:{}:{}",
-                            validator_id, epoch, self.node_id
-                        );
-                        let attestation = serde_json::json!({
-                            "offender": validator_id,
-                            "epoch": epoch,
-                            "reporter": self.node_id,
-                            "round": self.current_round,
-                            "rounds_missed": rounds_missed,
-                        });
-
-                        // Attest ONCE per (offender, epoch): re-attesting every
-                        // 10 rounds only re-broadcast and re-wrote the same row.
-                        // NOTE: downtime is detected and attested but NOT slashed
-                        // in this protocol version (no deterministic DAG producer);
-                        // no unbounded slash_event rows are written any more.
-                        if matches!(self.storage.get(&attestation_key), Ok(None)) {
-                            self.broadcast_attestation(&attestation);
-                            let _ = self.storage.put(&attestation_key, &attestation.to_string());
-                        }
-                    }
-                }
-            }
-
-            // Advance round
-            self.current_round += 1;
-            println!(
-                "⚡ Created Vertex {} (Round {}) [BLS Signed]",
-                vertex.hash, vertex.round
-            );
-        } else {
-            // === BOOTSTRAP/PARTITION RECOVERY: RE-GOSSIP RECENT VERTICES ===
-            //
-            // Vertices are normally broadcast exactly once, at creation
-            // (above). On a multi-machine bootstrap a validator that was not
-            // yet connected — or whose peer_ip was not yet persisted, so the
-            // TCP fallback fell back to loopback — permanently misses that
-            // one-shot delivery. With a strict >2/3 stake quorum a small
-            // validator set (n=3 needs ALL three vertices per round) then
-            // deadlocks below parent quorum forever: no quorum → no new
-            // vertex → no new broadcast → no quorum. This is the
-            // multi-machine bootstrap deadlock noted in add_vertex's
-            // fast-forward comment; localhost never hits it because the
-            // loopback default address is actually correct there.
-            //
-            // Recovery: while stuck below parent quorum, re-gossip every
-            // vertex we hold from the recent round window — including peers'
-            // vertices, so delivery becomes transitive (A can relay B's
-            // vertex to C). By the time this fires, peer_ip entries are
-            // persisted and the TCP fallback reaches real LAN addresses.
-            // Duplicates are safe: add_vertex drops same-hash vertices
-            // before the equivocation check, so re-sending our own signed
-            // vertex can never read as a double-sign.
-            //
-            // Bounded: fires once per consensus tick and only while stuck;
-            // window is 4 rounds × n authors, trivially under the LiDAR
-            // per-peer rate limit for any realistic validator set.
-            let resend: Vec<Vertex> = {
-                let dag = self.dag.lock().expect("🚨 FATAL: DAG lock poisoned");
-                let min_round = self.current_round.saturating_sub(3);
-                dag.values()
-                    .filter(|v| v.round >= min_round)
-                    .cloned()
-                    .collect()
-            }; // DAG lock dropped before broadcasting.
-            if !resend.is_empty() {
-                println!(
-                    "🔁 [Consensus] Parent quorum not met at round {}; re-gossiping {} recent vertices (bootstrap/partition recovery)",
-                    self.current_round,
-                    resend.len()
-                );
-                for v in &resend {
-                    self.broadcast_vertex(v);
-                }
-            }
         }
     }
 
-    /// Phase 5B.2 + 5C.2 — round-bound limits:
-    ///
-    /// * `ABSOLUTE_ROUND_CEILING` is the hard upper bound on any vertex
-    ///   round. Set well below `u64::MAX` so `current_round += 1` and
-    ///   `vertex.round + 1` never wrap. Practically unreachable: at one
-    ///   block per second a chain would need ~300 quadrillion years to
-    ///   approach this. Defends PWN-002 anti-overflow attack.
-    ///
-    /// * `MAX_ROUND_JUMP` is the soft cap on a single-vertex round jump
-    ///   from the node's CURRENT view. Phase 5B.2 set this to 50, which
-    ///   the Phase 5C.2 re-audit revealed wedges legitimate long-partition
-    ///   recovery: a node offline for >50 rounds rejects every catch-up
-    ///   vertex and never re-syncs via P2P. Raised to 10_000 (~hours of
-    ///   downtime on a 1-block-per-second chain). Still rejects the
-    ///   "jump to u64::MAX" griefing attack because that lands above
-    ///   ABSOLUTE_ROUND_CEILING anyway.
-    const ABSOLUTE_ROUND_CEILING: u64 = u64::MAX / 2;
-    const MAX_ROUND_JUMP: u64 = 10_000;
-
-    pub fn add_vertex(&mut self, vertex: Vertex) {
-        // One DAG format per chain: a V4 chain takes vertices only through the
-        // certified-DAG engine.
-        if self.v4_chain {
-            return;
-        }
-        // G1 V4 fields have no place in a V3 vertex. Its hash binds neither the
-        // epoch nor a parent certificate, so a relay could pad them onto an
-        // honest vertex and have every node store and serve the padding.
-        if vertex.epoch != 0 || vertex.parent_refs.iter().any(|r| r.cert.is_some()) {
-            println!(
-                "🚨 REJECTED: a V3 vertex carrying V4 fields (epoch {} or a parent certificate)",
-                vertex.epoch
-            );
-            return;
-        }
-
-        // Anti-overflow: any vertex above ABSOLUTE_ROUND_CEILING is malicious
-        // — the chain cannot legitimately reach this magnitude.
-        if vertex.round > Self::ABSOLUTE_ROUND_CEILING {
-            println!(
-                "🚨 REJECTED [PWN-002/abs]: vertex round {} exceeds absolute ceiling {}",
-                vertex.round,
-                Self::ABSOLUTE_ROUND_CEILING
-            );
-            return;
-        }
-
-        // Anti-grief: reject "one giant jump" that an attacker could use to
-        // fast-forward `current_round` past honest progress. Legitimate
-        // catch-up is a STREAM of vertices, not one big-round vertex.
-        if vertex.round > self.current_round.saturating_add(Self::MAX_ROUND_JUMP) {
-            println!(
-                "🚨 REJECTED [PWN-002/jump]: vertex round {} exceeds local round {} + {} cap",
-                vertex.round,
-                self.current_round,
-                Self::MAX_ROUND_JUMP
-            );
-            return;
-        }
-
-        // PWN-003: bound vertex timestamp drift. The timestamp is folded into the
-        // signed vertex hash but its VALUE was never range-checked. Reject vertices
-        // dated too far in the future (clock-skew abuse / hash-grinding surface).
-        // Future-bound ONLY — a past/monotonic bound would reject legitimately
-        // delayed honest vertices and harm liveness.
-        {
-            const MAX_FUTURE_DRIFT_SECS: u64 = 30;
-            let now = (self.now_secs)();
-            if vertex.timestamp > now.saturating_add(MAX_FUTURE_DRIFT_SECS) {
-                println!(
-                    "🚨 REJECTED [PWN-003/ts]: vertex timestamp {} exceeds now {} + {}s drift",
-                    vertex.timestamp, now, MAX_FUTURE_DRIFT_SECS
-                );
-                return;
-            }
-        }
-
-        // C-10 FIX (#35): Resolve the FULL Ed25519 public key from the account object in storage.
-        // vertex.author is the 32-byte AINCORE address (64 hex chars) = hex(SHA256(pubkey)), but
-        // Ed25519 verification requires the full 32-byte public key (also 64 hex chars). The
-        // address cannot be expanded back into a key, so it is looked up and verified to derive
-        // the claimed author.
-        let author_pubkey_hex = match self.resolve_author_pubkey(&vertex.author) {
-            Some(pk) => pk,
-            None => return,
-        };
-
-        if !vertex.verify_ed25519_signature(&author_pubkey_hex) {
-            println!(
-                "🚨 REJECTED: Invalid Ed25519 signature from author {}",
-                vertex.author
-            );
-            return;
-        }
-
-        // Phase 5B.1 / PWN-001 CRITICAL: vertex.hash MUST equal a fresh
-        // calculate_hash(). Without this check, the signature only binds
-        // the attacker-controlled `hash` field to the author, NOT to the
-        // vertex body — letting one malicious validator emit two vertices
-        // with the same hash + signature but different `payload` / `parents`
-        // / `timestamp`, splitting state across honest peers.
-        // `aggregated_signature` is deserialised from untrusted gossip, is
-        // unbounded, and (since it is folded into the signed hash) is fully
-        // attacker-chosen padding. An equivocator used it to inflate its OWN
-        // conflicting vertices past MAX_EVIDENCE_ITEM_BYTES, which sends every
-        // honest reporter down the oversize branch -- no carryable evidence is
-        // recorded and the equivocator suppresses its own slash. Nothing in the
-        // tree ever sets this field, so a live vertex carrying it is rejected
-        // outright, exactly like the proof-only root fields below.
-        if vertex.aggregated_signature.is_some() {
-            println!(
-                "🚨 REJECTED: live vertex from {} carries aggregated_signature (unset by design)",
-                vertex.author
-            );
-            return;
-        }
-        // Only equivocation PROOFS may carry the compact roots. A live vertex
-        // with either set could make hash recomputation pass while its actual
-        // body is anything at all. Reject at ingress.
-        if !vertex.is_live_form() {
-            println!(
-                "🚨 REJECTED: live vertex from {} carries proof-only root fields",
-                vertex.author
-            );
-            return;
-        }
-        // Parents are bounded and unique: an unbounded/duplicated parent list is
-        // pure inflation (it once let an equivocator size its own evidence past
-        // the transport cap) and references nothing a valid DAG needs.
-        if vertex.parents.len() > MAX_PARENTS {
-            println!(
-                "🚨 REJECTED: vertex from {} has {} parents (> MAX_PARENTS {})",
-                vertex.author,
-                vertex.parents.len(),
-                MAX_PARENTS
-            );
-            return;
-        }
-        {
-            let mut uniq: std::collections::HashSet<&str> = std::collections::HashSet::new();
-            if !vertex.parents.iter().all(|p| uniq.insert(p.as_str())) {
-                println!("🚨 REJECTED: vertex from {} has duplicate parents", vertex.author);
-                return;
-            }
-        }
-        let recomputed = vertex.calculate_hash();
-        if recomputed != vertex.hash {
-            println!(
-                "🚨 REJECTED [PWN-001]: vertex.hash {} does not match \
-                 recomputed hash {} — body tampered after signing",
-                vertex.hash, recomputed
-            );
-            return;
-        }
-
-        // AUDIT H3 — the stateless parent gate. Placed AFTER the hash recompute
-        // so only AUTHENTICATED bytes are evaluated: `parent_refs` is folded into
-        // `parents_root` (domain V3), so passing the check above means the
-        // author signed exactly these refs.
-        //
-        // This is NOT the ingress rule the standing B3/B4 comment below warns
-        // against. That one had to RESOLVE parents against the local DAG, making
-        // admission a function of what this node happens to hold; this one reads
-        // the vertex's own bytes and the resolved committee. Agreement still
-        // requires a shared epoch/committee; a missing snapshot must not be
-        // replaced with different keys or stake weights.
-        let committee = match self.epoch_committee() {
-            Ok(committee) => committee,
-            Err(why) => {
-                eprintln!("DAG vertex {} deferred: {why}", vertex.hash);
-                return;
-            }
-        };
-        if let Err(why) = crate::qc::parent_refs_admissible(&vertex, &committee) {
-            println!(
-                "🚨 REJECTED [H3/parent-gate]: vertex {} from {} — {}",
-                vertex.hash, vertex.author, why
-            );
-            return;
-        }
-
-        // C-2 FIX: Cross-check against the active ValidatorSet.
-        // AUDIT-B3: fetch the STAKE-weighted set once, here, before any lock is
-        // taken — the quorum-gated round advance below needs stake weights, and
-        // it runs while the DAG/round-index guards are held, so it cannot call
-        // back into &self at that point.
-        let validators_with_stake = self.get_validator_set_with_stake();
-        let validators: Vec<String> = validators_with_stake
-            .iter()
-            .map(|(a, _)| a.clone())
-            .collect();
-        if !validators.contains(&vertex.author) && self.current_round > 0 {
-            println!(
-                "🚨 REJECTED: Vertex author {} is not in the active validator set",
-                vertex.author
-            );
-            return;
-        }
-        if !vertex.verify_parent_identities() {
-            println!("REJECTED: vertex {} has unauthenticated parent identities", vertex.hash);
-            return;
-        }
-
-        // AUDIT-CRITICAL B3/B4 REMAINS OPEN — deliberately, after four review
-        // rounds. A vertex naming a parent that will never exist still enters the
-        // DAG and can wedge `commit_one_anchor` permanently.
-        //
-        // Rejecting such a vertex at ingress closes that halt, and was tried
-        // twice. Both attempts were WORSE than the bug:
-        //   * Parking the vertex in an orphan buffer produced six defects across
-        //     three rounds (unbounded bytes, a TTL that could not evict
-        //     future-round entries, O(blocks x orphans) re-validation on catch-up,
-        //     a re-entrancy hole, a drain that never ran on non-validator nodes).
-        //   * Dropping it outright wedges any validator that misses ONE vertex.
-        //     The justification -- "re-gossip will redeliver it" -- is inverted:
-        //     the re-gossip loop PUSHES `dag.values()`, i.e. what a node already
-        //     holds, and the nodes that DO hold the missing vertex are above
-        //     parent quorum and so never enter that branch at all. There is no
-        //     pull anywhere in this tree (no VERTEX_REQ), so a dropped vertex is
-        //     unobtainable. Ordinary packet loss or a routine restart then ejects
-        //     a validator from block production permanently, and once stranded
-        //     validators hold >1/3 of stake the chain halts with no attacker.
-        //
-        // The correct fix is DAG vertex synchronization: a bounded park plus an
-        // explicit VERTEX_REQ/response pair, so a node can FETCH a parent from a
-        // peer that has it. That is a new P2P message type and belongs in its own
-        // designed, separately-gated change -- not bolted onto this ingress path.
-        // Until it exists, the malicious-vertex halt (needs a validator key) is
-        // the lesser risk versus a halt triggered by normal packet loss.
-
-        // 1. Scope for DAG and RoundIndex modification
-        {
-            let mut dag = self.dag.lock().expect(
-                "🚨 FATAL: DAG lock poisoned - consensus integrity compromised. Node must restart.",
-            );
-            println!(
-                "DEBUG: add_vertex: Hash='{}', Round={}",
-                vertex.hash, vertex.round
-            );
-            if dag.contains_key(&vertex.hash) {
-                println!("DEBUG: add_vertex: Duplicate hash! Skipping.");
-                return;
-            }
-
-            // NOTE: persistence happens AFTER the double-sign check below.
-            // Persisting first stored the SECOND vertex of an equivocating pair
-            // under vertex:{hash}; the check then returned without inserting it
-            // into `dag`/`round_index`, so prune_dag (which walks the in-memory
-            // DAG) never deleted it and the boot recovery loops revived it as a
-            // live vertex. A restarted node then had two vertices from one
-            // author at one round while its peers had one -> divergent commit
-            // sequences.
-
-            // === SLASHING DETECTION (Double-Sign) ===
-            let mut round_idx = self.round_index.lock()
-                .expect("🚨 FATAL: Round index lock poisoned - consensus integrity compromised. Node must restart.");
-            if let Some(hashes) = round_idx.get(&vertex.round) {
-                for existing_hash in hashes {
-                    if let Some(v_exist) = dag.get(existing_hash) {
-                        // Same Author, Same Round, Different Hash => EQUIVOCATION!
-                        if v_exist.author == vertex.author && existing_hash != &vertex.hash {
-                            println!("🚨🚨 CRITICAL SLASHING ALERT 🚨🚨");
-                            println!("⚔️  MALICIOUS BEHAVIOR DETECTED (Equivocation/Double-Sign)");
-                            println!("   Offender: {}", vertex.author);
-                            println!("   Round: {}", vertex.round);
-                            println!("   Proof A: {}", existing_hash);
-                            println!("   Proof B: {}", vertex.hash);
-                            println!("🔥 SLASHING STAKE OF {}", vertex.author);
-
-                            // SEC-#9/#10: route the slash through the shared
-                            // `apply_equivocation_slash` (idempotent + durable evidence) and
-                            // gossip the self-authenticating proof so every honest node
-                            // independently verifies and slashes — instead of slashing only
-                            // on whichever node happened to receive both conflicting vertices.
-                            // `proof_a` = the already-stored vertex, `proof_b` = the incoming
-                            // conflicting one (preserves the prior event field order).
-                            let proof_a = v_exist.clone();
-                            let proof_b = vertex.clone();
-                            self.apply_equivocation_slash(&proof_a, &proof_b);
-                            self.broadcast_equivocation_proof(&proof_a, &proof_b);
-                            return;
-                        }
-                    }
-                }
-            }
-
-            // Persist only a vertex that survived every check and is now live.
-            if let Ok(v_json) = serde_json::to_string(&vertex) {
-                if let Err(e) = self
-                    .storage
-                    .put(&format!("vertex:{}", vertex.hash), &v_json)
-                {
-                    println!("❌ Failed to persist DAG vertex: {}", e);
-                }
-            }
-
-            dag.insert(vertex.hash.clone(), vertex.clone());
-            round_idx
-                .entry(vertex.round)
-                .or_default()
-                .push(vertex.hash.clone());
-            println!(
-                "📥 Added Vertex to DAG: {} (Round {})",
-                vertex.hash, vertex.round
-            );
-
-            // C-04 FIX: Record peer activity to prevent false-positive downtime slashes
-            if vertex.author != self.node_id {
-                let current_last_seen = match self
-                    .storage
-                    .get(&format!("validator:last_seen:{}", vertex.author))
-                {
-                    Ok(Some(r)) => r.parse::<u64>().unwrap_or(0),
-                    _ => 0,
-                };
-                if vertex.round > current_last_seen {
-                    let _ = self.storage.put(
-                        &format!("validator:last_seen:{}", vertex.author),
-                        &vertex.round.to_string(),
-                    );
-                }
-            }
-
-            // Fast-forward local round to match the network (Amnesia Recovery),
-            // ONLY for remote vertices — try_create_vertex already increments for
-            // local ones.
-            //
-            // AUDIT-B3: this used to be `self.current_round = vertex.round + 1`,
-            // driven by a SINGLE remote vertex. That is a permanent chain wedge and
-            // it needs no Byzantine intent — a validator whose ticker runs slightly
-            // fast emits a vertex one round ahead, every node adopts round+1, and
-            // then `try_create_vertex` looks for parents at `current_round - 1`,
-            // a round that holds only that one vertex and can therefore NEVER reach
-            // the stake-weighted parent quorum. Block production stops network-wide,
-            // and because the value was persisted as `latest_proposed_round` it
-            // survived restarts.
-            //
-            // Narwhal's actual rule: a node advances to round r+1 only once it holds
-            // a stake quorum of round-r vertices. So we advance to
-            // `quorum_round + 1` — the highest round we can genuinely build parents
-            // for — and never to an arbitrary round some peer claims. A vertex far
-            // ahead is still stored and still counts toward its own round's quorum;
-            // it just cannot drag our proposal clock past what the DAG supports.
-            if vertex.author != self.node_id && vertex.round > self.current_round {
-                let target =
-                    Self::quorum_round(&round_idx, &dag, &validators_with_stake).saturating_add(1);
-                if target > self.current_round {
-                    self.current_round = target;
-                    let _ = self
-                        .storage
-                        .put("latest_proposed_round", &self.current_round.to_string());
-                }
-            }
-        } // Locks dropped here!
-
-        // Observer nodes may ingest and persist validator vertices so chain
-        // sync has visibility into the live network, but only active
-        // validators are allowed to run local ordering and commit blocks.
-        // Without this guard a non-validator observer can manufacture a
-        // private fork from incoming DAG traffic, then later fail sequential
-        // sync with parent-hash mismatches.
-        if !validators.contains(&self.node_id) {
-            if self.current_round.is_multiple_of(10) {
-                println!(
-                    "⚠️  [Consensus] Observer Mode: skipping local ordering/commit at round {}",
-                    self.current_round
-                );
-            }
-            // Skipping ORDERING, not admission: the vertex above is already in
-            // `dag`. Returning false here would strand its parked children.
-            return;
-        }
-
-        self.commit_ready_anchors(vertex.round);
-    }
-
-    /// The committee a decision reads: the live set on the V3 path; on V4 the
-    /// frozen C_0 (DE-7), for the leader, the votes, the reward and BFT time.
+    /// The committee a decision reads: the frozen C_E (DE-7), for the leader,
+    /// the votes, the reward and BFT time.
     fn decision_committee(&self) -> Vec<(String, u64)> {
-        if self.v4_chain {
-            self.v4_stakes.clone()
-        } else {
-            self.get_validator_set_with_stake()
-        }
+        self.v4_stakes.clone()
     }
 
     /// Decide and place every anchor that is ready: one anchor per decision,
@@ -2001,38 +826,40 @@ impl DagConsensus {
         // node-dependent) -> different reward recipient / anchor -> fork.
         // Every `continue` below re-enters this loop and re-decides.
         'anchors: loop {
-        self.reload_chain_tip();
-        // G1 (V4): the ordering state is valid only once it has absorbed
-        // every block on the chain. While a held block is not adopted (no
-        // QC yet, a crash between import and adoption), nothing is decided
-        // locally: a decision would re-collect that block's sequence.
-        if self.v4_chain && self.last_adopted_height < self.latest_block_height {
-            break;
-        }
-        let plan = {
-            let engine = self
-                .ordering_engine
-                .lock()
-                .expect("🚨 FATAL: Ordering engine lock poisoned");
-            let dag = self.dag.lock().expect("🚨 FATAL: DAG lock poisoned");
-            let round_idx = self
-                .round_index
-                .lock()
-                .expect("🚨 FATAL: Round index lock poisoned");
-            // B4: stake-aware set so the commit-side quorum is stake-weighted.
-            // Re-sampled on EVERY iteration: the previous anchor's block may have
-            // just changed it.
-            self.invalidate_validators_cache();
-            let validators = self.decision_committee();
-
-            let Some(plan) = engine.prepare_commit(trigger_round, &dag, &round_idx, &validators) else {
+            self.reload_chain_tip();
+            // G1 (V4): the ordering state is valid only once it has absorbed
+            // every block on the chain. While a held block is not adopted (no
+            // QC yet, a crash between import and adoption), nothing is decided
+            // locally: a decision would re-collect that block's sequence.
+            if self.last_adopted_height < self.latest_block_height {
                 break;
-            };
-            plan
-        }; // All locks dropped here!
-        let commit = plan.info.clone();
+            }
+            let plan = {
+                let engine = self
+                    .ordering_engine
+                    .lock()
+                    .expect("🚨 FATAL: Ordering engine lock poisoned");
+                let dag = self.dag.lock().expect("🚨 FATAL: DAG lock poisoned");
+                let round_idx = self
+                    .round_index
+                    .lock()
+                    .expect("🚨 FATAL: Round index lock poisoned");
+                // B4: stake-aware set so the commit-side quorum is stake-weighted.
+                // Re-sampled on EVERY iteration: the previous anchor's block may have
+                // just changed it.
+                self.invalidate_validators_cache();
+                let validators = self.decision_committee();
 
-        // AUDIT-B4b: ONE block per anchor, on every node identically.
+                let Some(plan) =
+                    engine.prepare_commit(trigger_round, &dag, &round_idx, &validators)
+                else {
+                    break;
+                };
+                plan
+            }; // All locks dropped here!
+            let commit = plan.info.clone();
+
+            // AUDIT-B4b: ONE block per anchor, on every node identically.
             // AUDIT-B4b (dedup): if the chain tip already covers this anchor, a
             // ChainSync import beat the local commit to it — the peer's block for
             // this anchor is ALREADY on our chain, fully executed and state-root
@@ -2252,7 +1079,7 @@ impl DagConsensus {
                                     block_timestamp, commit.sequence.clone(), commit.anchor_hash.clone(),
                                     slash_evidence.clone(),
                                 );
-                                if self.v4_chain && !block.anchor_is_bound() {
+                                if !block.anchor_is_bound() {
                                     // G0: every peer would refuse this block.
                                     return Err("the anchor is not the last committed vertex".to_string());
                                 }
@@ -2420,95 +1247,6 @@ impl DagConsensus {
                     self.retry_qc_work();
                 }
             }
-
-            // Garbage Collection (Pruning)
-            // We can do this in background or here.
-            // Since we dropped locks, it's safe to call prune_dag (which takes locks).
-            // Logic for max frame...
-            // We need to know max round of committed hashes.
-            // We lost reference to 'dag' map, but we have hashes.
-            // We can't look up round without DAG lock.
-            // Let's Skip intricate pruning update for this hotfix.
-            // Or re-acquire lock.
-            // V4 has no V3 pruning or checkpoints: its GC is S7 (GC-1..GC-5)
-            // and its boot never reads a checkpoint (RC-1).
-            if !commit.sequence.is_empty() && !self.v4_chain {
-                // H-5 FIX: Prune only FINALIZED rounds (check ordering engine)
-                // M3 FIX: Derive the prune watermark from the MONOTONIC finality
-                // high-water mark, not committed_rounds.iter().min(). The old
-                // min() was permanently pinned to the earliest committed round,
-                // so the watermark never advanced and pruning was a no-op
-                // (unbounded DAG growth). The high-water mark advances every
-                // commit, so the watermark now tracks finality forward.
-                if self.latest_block_height.is_multiple_of(10) && self.current_round > 50 {
-                    let finalized_round = {
-                        if let Ok(engine) = self.ordering_engine.lock() {
-                            engine.finalized_round
-                        } else {
-                            0 // Don't prune if we can't verify finality
-                        }
-                    };
-                    // CATCH-UP FORK FIX: one try_commit call can yield MANY anchors
-                    // (a node catching up after a restart commits dozens at once).
-                    // The engine's finalized_round then already points at the LAST
-                    // anchor of the batch while this loop is still building blocks
-                    // for the earlier ones — pruning off finalized_round here
-                    // deleted vertices those later-built blocks still needed, so
-                    // `dag.get(hash)` silently returned None for them: fewer
-                    // BFT-time samples (a header that differed from every other
-                    // node by a few seconds — the live PI-only fork) and, under
-                    // load, DROPPED TRANSACTIONS. The horizon is therefore bounded
-                    // by the round of the block just BUILT, which is always the
-                    // lowest round still being assembled.
-                    let horizon = finalized_round.min(self.latest_block_round);
-                    if horizon > 10 {
-                        self.prune_dag(horizon - 10);
-                    }
-                }
-
-                // CHECKPOINT SAVE: Save checkpoint every 100 rounds for fast
-                // recovery. Phase 2.5 (H-06): we now sign the checkpoint JSON
-                // with the node's Ed25519 key and route through
-                // `save_dag_checkpoint_signed` so the boot-time loader can
-                // detect tampering. A node booting against a checkpoint that
-                // doesn't verify against its OWN key will refuse to fast-
-                // recover from it and fall back to a full scan replay.
-                if self.current_round.is_multiple_of(100) {
-                    if let Ok(dag) = self.dag.lock() {
-                        // Phase 5B.10 / L-04: HashMap::values() yields
-                        // vertices in non-deterministic order, so two nodes
-                        // with identical state produced byte-different
-                        // checkpoint blobs (signature still verifies, but
-                        // checkpoints were not byte-reproducible across
-                        // peers / restarts). Sort by vertex hash to make
-                        // the on-disk representation canonical.
-                        let mut vertices: Vec<&Vertex> = dag.values().collect();
-                        vertices.sort_by(|a, b| a.hash.cmp(&b.hash));
-                        if let Ok(json) = serde_json::to_string(&vertices) {
-                            let signing_key = crypto::SigningKey::from_bytes(&self.node_key);
-                            use crypto::Signer;
-                            let sig = signing_key.sign(json.as_bytes());
-                            let sig_hex = hex::encode(sig.to_bytes());
-
-                            if let Err(e) = self.storage.save_dag_checkpoint_signed(
-                                self.current_round,
-                                &json,
-                                &sig_hex,
-                            ) {
-                                eprintln!("⚠️ Failed to save signed checkpoint: {}", e);
-                            } else {
-                                println!(
-                                    "💾 Signed checkpoint saved at Round {} ({}B sig)",
-                                    self.current_round,
-                                    sig_hex.len() / 2
-                                );
-                                // Prune old checkpoints (keep last 5)
-                                let _ = self.storage.prune_old_checkpoints(self.current_round, 500);
-                            }
-                        }
-                    }
-                }
-            }
         }
 
     }
@@ -2602,25 +1340,33 @@ impl DagConsensus {
     }
 
     fn retry_qc_work(&mut self) {
-        // A halted node signs no finality vote.
-        if self.ordering_halted().is_some() {
+        // A halted node signs no finality vote, nor does an inert one.
+        if !self.v4_chain || self.ordering_halted().is_some() {
             return;
         }
         let chain = self.resolve_chain_id();
         match crate::qc_producer::retry_pending_qcs(
-            &self.storage, &self.node_key, &self.node_id, &chain, &mut self.qc_retry_cursor,
+            &self.storage,
+            &self.node_key,
+            &self.node_id,
+            &chain,
+            &mut self.qc_retry_cursor,
         ) {
-            Ok(outcomes) => for outcome in outcomes {
-                match outcome {
-                    crate::qc_producer::QcOutcome::Partial(message) => self.broadcast_qc_vote(&message),
-                    crate::qc_producer::QcOutcome::Complete(cert) => {
-                        if let Ok(mut engine) = self.ordering_engine.lock() {
-                            engine.fold_qc_for_height(cert.block_height);
+            Ok(outcomes) => {
+                for outcome in outcomes {
+                    match outcome {
+                        crate::qc_producer::QcOutcome::Partial(message) => {
+                            self.broadcast_qc_vote(&message)
                         }
+                        crate::qc_producer::QcOutcome::Complete(cert) => {
+                            if let Ok(mut engine) = self.ordering_engine.lock() {
+                                engine.fold_qc_for_height(cert.block_height);
+                            }
+                        }
+                        crate::qc_producer::QcOutcome::Skipped => {}
                     }
-                    crate::qc_producer::QcOutcome::Skipped => {}
                 }
-            },
+            }
             Err(error) => eprintln!("[QC] pending work scan deferred: {error}"),
         }
     }
@@ -2633,287 +1379,18 @@ impl DagConsensus {
         crate::qc::expected_chain_id()
     }
 
-    fn broadcast_vertex(&self, vertex: &Vertex) {
-        #[cfg(test)]
-        if let Some(hook) = &self.broadcast_hook {
-            hook(vertex);
-        }
-        let serialized = match serde_json::to_string(vertex) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("❌ Failed to serialize vertex: {}", e);
-                return;
-            }
-        };
-        let msg = format!("DAG_VERTEX:{}", serialized);
-
-        // 1. Broadccast via Libp2p Gossipsub (Preferred Method)
-        if let Some(tx) = &self.p2p_tx {
-            let msg_clone = msg.clone();
-            let tx_clone = tx.clone();
-            // Important: Use spawn because Sender::send is async
-            tokio::spawn(async move {
-                let _ = tx_clone.send(msg_clone).await;
-            });
-        }
-
-        // 2. Broadcast via Legacy TCP (Fallback/Syncing Nodes without Libp2p connected)
-        use network::send_message;
-        if let Ok(peers) = self.peers.lock() {
-            for (peer_id, port) in peers.iter() {
-                // FIXED: Resolve valid IP from storage instead of hardcoded localhost
-                let ip = self
-                    .storage
-                    .get_peer_ip(peer_id)
-                    .unwrap_or_else(|| "127.0.0.1".to_string());
-                let addr = format!("{}:{}", ip, port);
-
-                // Don't send to self (redundant check but safe)
-                if *peer_id != self.node_id {
-                    let _ = send_message(&addr, &msg);
-                }
-            }
-        }
-    }
-
-    /// Phase 3 / H-02: Broadcast a downtime attestation to all peers via
-    /// Gossipsub + TCP so that BFT quorum can be reached across the validator
-    /// set.  The attestation JSON is signed with this node's Ed25519 key;
-    /// the reporter's raw public-key bytes are embedded so receivers can
-    /// independently verify authenticity without a PKI lookup.
-    fn broadcast_attestation(&self, attestation: &serde_json::Value) {
-        use crypto::Signer;
-        // Build the canonical payload that will be signed:
-        // strip "signature" + "reporter_pubkey" fields first, then sign.
-        let signing_key = crypto::SigningKey::from_bytes(&self.node_key);
-        let verifying_key = signing_key.verifying_key();
-        let pubkey_hex = hex::encode(verifying_key.to_bytes());
-
-        // Canonical message = deterministic JSON with known fields only.
-        let canonical = format!(
-            "{}:{}:{}:{}",
-            attestation["offender"].as_str().unwrap_or(""),
-            attestation["epoch"],
-            attestation["reporter"].as_str().unwrap_or(""),
-            attestation["round"],
-        );
-        let sig_bytes = signing_key.sign(canonical.as_bytes());
-        let sig_hex = hex::encode(sig_bytes.to_bytes());
-
-        let mut full = attestation.clone();
-        full["reporter_pubkey"] = serde_json::Value::String(pubkey_hex);
-        full["signature"] = serde_json::Value::String(sig_hex);
-
-        let serialized = match serde_json::to_string(&full) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("❌ [H-02] Failed to serialise attestation: {}", e);
-                return;
-            }
-        };
-        let msg = format!("DOWNTIME_ATTEST:{}", serialized);
-
-        // 1. Gossipsub
-        if let Some(tx) = &self.p2p_tx {
-            let tx_clone = tx.clone();
-            let msg_clone = msg.clone();
-            tokio::spawn(async move {
-                let _ = tx_clone.send(msg_clone).await;
-            });
-        }
-
-        // 2. TCP fallback
-        use network::send_message;
-        if let Ok(peers) = self.peers.lock() {
-            for (peer_id, port) in peers.iter() {
-                if *peer_id != self.node_id {
-                    let ip = self
-                        .storage
-                        .get_peer_ip(peer_id)
-                        .unwrap_or_else(|| "127.0.0.1".to_string());
-                    let addr = format!("{}:{}", ip, port);
-                    let _ = send_message(&addr, &msg);
-                }
-            }
-        }
-    }
-
-    /// Resolve the FULL 64-hex Ed25519 public key for a vertex author.
-    ///
-    /// (C-10 / #35) `vertex.author` is the 32-byte AINCORE address (64 hex
-    /// chars) = hex(SHA256(pubkey)). Ed25519 verification needs the full 32-byte
-    /// public key (also 64 hex chars), so we resolve it from the account object
-    /// in storage and confirm it actually derives the claimed author via
-    /// `crypto::derive_address` — never via a hex-length heuristic, since address
-    /// and pubkey are now the same width. Returns `None` (with a diagnostic) when
-    /// the key cannot be resolved or does not derive the author. Shared by
-    /// `add_vertex` and equivocation-proof verification.
-    fn resolve_author_pubkey(&self, author: &str) -> Option<String> {
-        if let Some(account_obj) = self.storage.get_object(author) {
-            if let Ok(account_data) =
-                serde_json::from_slice::<serde_json::Value>(&account_obj.data)
-            {
-                if let Some(pk) = account_data.get("public_key").and_then(|v| v.as_str()) {
-                    // A valid Ed25519 public key is exactly 32 bytes (64 hex).
-                    // Resolution succeeds ONLY when the stored key derives the
-                    // claimed author address; an explicit derive-and-compare,
-                    // not a length test on `author`.
-                    let resolved = hex::decode(pk)
-                        .ok()
-                        .filter(|bytes| bytes.len() == 32)
-                        .and_then(|bytes| crypto::derive_address(&bytes).ok())
-                        .map(|addr| addr == author)
-                        .unwrap_or(false);
-                    if resolved {
-                        Some(pk.to_string())
-                    } else {
-                        println!(
-                            "🚨 REJECTED: Stored public key does not derive author {}",
-                            author
-                        );
-                        None
-                    }
-                } else {
-                    println!("🚨 REJECTED: Account object for {} has no public_key", author);
-                    None
-                }
-            } else {
-                println!("🚨 REJECTED: Account object for {} is not valid JSON", author);
-                None
-            }
-        } else if author == self.node_id {
-            let signing_key = crypto::SigningKey::from_bytes(&self.node_key);
-            let public_key = signing_key.verifying_key();
-            match crypto::derive_address(public_key.as_bytes()) {
-                Ok(addr) if addr == author => Some(hex::encode(public_key.as_bytes())),
-                _ => {
-                    println!("🚨 REJECTED: Local node key does not derive author {}", author);
-                    None
-                }
-            }
-        } else {
-            println!("🚨 REJECTED: No public key available for vertex author {}", author);
-            None
-        }
-    }
-
-    /// PROTOCOL: turn the durable `sys:equiv_seen` row into the item that
-    /// rides in a vertex, and queue it. Byte-stable: the row is hash-ordered.
-    fn enqueue_evidence_item(&self, row: &serde_json::Value) {
-        let item = serde_json::json!({
-            "kind": "equivocation",
-            "offender": row.get("offender").cloned().unwrap_or(serde_json::Value::Null),
-            "round": row.get("round").cloned().unwrap_or(serde_json::Value::Null),
-            "vertex_a": row.get("vertex_a").cloned().unwrap_or(serde_json::Value::Null),
-            "vertex_b": row.get("vertex_b").cloned().unwrap_or(serde_json::Value::Null),
-        })
-        .to_string();
-        if let Ok(mut q) = self.evidence_queue.lock() {
-            if !q.contains(&item) {
-                q.push(item);
-            }
-        }
-    }
-
-    /// PROTOCOL: evidence items (WITH prefix) to carry in the vertex being built.
-    /// Drains the in-memory queue and re-scans durable `sys:equiv_seen` rows
-    /// (cheap: offender+round come from the KEY, markers are checked before the
-    /// value is parsed). An item is skipped if already slashed (`sys:slashed`,
-    /// written by block execution), already latched as included
-    /// (`sys:equiv_carried`, written only when it lands in a block we carried
-    /// it into), or in flight in a recent vertex of ours. No durable marker is
-    /// written here, so an orphaned or cap-dropped carry is re-carried after
-    /// INFLIGHT_TTL_ROUNDS. Local bookkeeping only -- never a state-root write.
+    /// PROTOCOL: evidence items (WITH prefix) to carry in the vertex being
+    /// built: the durable V4 rows (G1 EQ-1 and CE-3, G5 SL-3), keyed by epoch.
+    /// An item is skipped if already latched as included (written only when
+    /// it lands in a block this node carried it into) or in flight in a recent
+    /// vertex of ours. No durable marker is written here, so an orphaned or
+    /// cap-dropped carry is re-carried after INFLIGHT_TTL_ROUNDS. Local
+    /// bookkeeping only -- never a state-root write.
     pub(crate) fn drain_evidence_for_vertex(&self, current_round: u64) -> Vec<String> {
-        use std::collections::BTreeSet;
         let mut out: Vec<String> = Vec::new();
-        let mut seen: BTreeSet<(String, u64)> = BTreeSet::new();
-        let current_validators: std::collections::HashSet<String> =
-            self.get_validator_set().into_iter().collect();
-
-        let mut consider = |off: String, round: u64, item: String, out: &mut Vec<String>| {
-            if out.len() >= MAX_EVIDENCE_PER_VERTEX || seen.contains(&(off.clone(), round)) {
-                return;
-            }
-            if matches!(self.storage.get(&format!("sys:slashed:{}:{}", off, round)), Ok(Some(_)))
-                || matches!(self.storage.get(&format!("sys:equiv_carried:{}:{}", off, round)), Ok(Some(_)))
-            {
-                return;
-            }
-            // MEMBERSHIP, not slash history: an offender outside the current
-            // validator set can never pass verify_slash_evidence, so carrying
-            // its rows only burns vertex space every TTL until the ~100k-round
-            // GC. Keyed on membership rather than "has any sys:slashed row", so
-            // a re-joined equivocator is still slashable (the immunity bug the
-            // round-3 fix closed does not come back).
-            if !current_validators.contains(&off) {
-                return;
-            }
-            // NOTE: deliberately round-scoped. An earlier cut skipped whenever
-            // the offender had ANY sys:slashed row, assuming "slashed once =>
-            // out of the set forever". Nothing enforces that (join_validator_set
-            // is not blocked for a slashed address), so it handed a re-joined
-            // equivocator permanent immunity. Unverifiable rows are dropped by
-            // the block-side verifier instead, which is the deterministic gate.
-            if let Ok(mut inflight) = self.evidence_inflight.lock() {
-                if let Some(&at) = inflight.get(&(off.clone(), round)) {
-                    if current_round.saturating_sub(at) < INFLIGHT_TTL_ROUNDS {
-                        return;
-                    }
-                }
-                inflight.insert((off.clone(), round), current_round);
-            }
-            seen.insert((off, round));
-            out.push(format!("{}{}", SLASH_EVIDENCE_PREFIX, item));
-        };
-
-        // 1. queued this session (already canonical JSON)
-        let queued: Vec<String> = self
-            .evidence_queue
-            .lock()
-            .map(|mut q| q.drain(..).collect())
-            .unwrap_or_default();
-        for item in queued {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&item) else { continue };
-            let (Some(off), Some(round)) = (
-                v.get("offender").and_then(|x| x.as_str()).map(String::from),
-                v.get("round").and_then(|x| x.as_u64()),
-            ) else {
-                continue;
-            };
-            consider(off, round, item, &mut out);
-        }
-
-        // 2. durable rows: parse the KEY, check markers, only then parse the value
-        for (key, row) in self.storage.scan_prefix("sys:equiv_seen:") {
-            if out.len() >= MAX_EVIDENCE_PER_VERTEX {
-                break;
-            }
-            let Some(rest) = key.strip_prefix("sys:equiv_seen:") else { continue };
-            let Some((off, round_s)) = rest.rsplit_once(':') else { continue };
-            let Ok(round) = round_s.parse::<u64>() else { continue };
-            // Cheap marker checks from the KEY alone; the `seen` dedup lives
-            // inside `consider` (it owns the mutable borrow).
-            if matches!(self.storage.get(&format!("sys:slashed:{}:{}", off, round)), Ok(Some(_)))
-                || matches!(self.storage.get(&format!("sys:equiv_carried:{}:{}", off, round)), Ok(Some(_)))
-            {
-                continue;
-            }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&row) else { continue };
-            let item = serde_json::json!({
-                "kind": "equivocation",
-                "offender": v.get("offender").cloned().unwrap_or(serde_json::Value::Null),
-                "round": v.get("round").cloned().unwrap_or(serde_json::Value::Null),
-                "vertex_a": v.get("vertex_a").cloned().unwrap_or(serde_json::Value::Null),
-                "vertex_b": v.get("vertex_b").cloned().unwrap_or(serde_json::Value::Null),
-            })
-            .to_string();
-            consider(off.to_string(), round, item, &mut out);
-        }
-
-        // 3. V4 rows (G1 EQ-1 and CE-3, G5 SL-3): keyed by epoch. The
-        // offender need not be in the live set (evidence is checked against
-        // the committee of its epoch); a jailed twin author needs no more.
+        // The offender need not be in the live set (evidence is checked
+        // against the committee of its epoch); a jailed twin author needs no
+        // more.
         use crate::v4::evidence as ev;
         type Keys = (
             fn(&str, u64, u64) -> String,
@@ -3030,10 +1507,7 @@ impl DagConsensus {
                     let _ = storage.put(&ev::cert_carried_key(off, epoch, round), "1");
                     ev::cert_flight_key(off, epoch, round)
                 }
-                _ => {
-                    let _ = storage.put(&format!("sys:equiv_carried:{}:{}", off, round), "1");
-                    (off.to_string(), round)
-                }
+                _ => continue,
             };
             if let Ok(mut f) = inflight.lock() {
                 f.remove(&flight);
@@ -3041,19 +1515,17 @@ impl DagConsensus {
         }
     }
 
-    /// PROTOCOL: the only evidence kinds ordered through the DAG: V3 and V4
-    /// (G1 EQ-1) equivocation. Anything else (notably "downtime", whose apply
-    /// path touches node-local rows) is dropped at the block-build split
-    /// before it can reach the executor.
+    /// PROTOCOL: the only evidence kinds ordered through the DAG: V4
+    /// proposer twins and certificate conflicts (G1 EQ-1, G5 SL-3). Anything
+    /// else (the deleted V3 "equivocation" and "downtime" kinds) is dropped at
+    /// the block-build split before it can reach the executor.
     pub fn is_equivocation_item(item: &str) -> bool {
         serde_json::from_str::<serde_json::Value>(item)
             .ok()
             .and_then(|x| {
-                x.get("kind").and_then(|k| k.as_str()).map(|k| {
-                    k == "equivocation"
-                        || k == crate::v4::evidence::KIND
-                        || k == crate::v4::evidence::CERT_KIND
-                })
+                x.get("kind")
+                    .and_then(|k| k.as_str())
+                    .map(|k| k == crate::v4::evidence::KIND || k == crate::v4::evidence::CERT_KIND)
             })
             .unwrap_or(false)
     }
@@ -3084,223 +1556,6 @@ impl DagConsensus {
             }
         }
         out
-    }
-
-    /// SEC-#9: independently verify a self-authenticating equivocation proof.
-    ///
-    /// Returns `Some(offender)` only if BOTH vertices are signed by the same
-    /// author over the same round with distinct, body-bound hashes, and the
-    /// offender is a current validator. A forged proof cannot pass: producing
-    /// two distinct valid signatures over two distinct bodies at one round
-    /// requires the offender's own secret key.
-    fn verify_equivocation_proof(&self, a: &Vertex, b: &Vertex) -> Option<String> {
-        // 1. same author, same round, genuinely conflicting.
-        if a.author != b.author || a.round != b.round || a.hash == b.hash {
-            return None;
-        }
-        // A V3 proof carries no epoch: the V3 hash does not bind one, so a
-        // relay could pad it into the durable evidence (G1 S2 review 2).
-        if a.epoch != 0 || b.epoch != 0 {
-            return None;
-        }
-        // 2. each hash must bind its body (PWN-001) — stops pairing a real
-        //    vertex with a body-tampered twin.
-        if a.hash != a.calculate_hash() || b.hash != b.calculate_hash() {
-            return None;
-        }
-        // 3. resolve the offender's full pubkey and verify BOTH signatures.
-        let pubkey_hex = self.resolve_author_pubkey(&a.author)?;
-        if !a.verify_ed25519_signature(&pubkey_hex) || !b.verify_ed25519_signature(&pubkey_hex) {
-            return None;
-        }
-        // 4. offender must be a current validator (SEC-N03: no slashing /
-        //    storage growth against arbitrary non-validators).
-        if !self.get_validator_set().contains(&a.author) {
-            return None;
-        }
-        Some(a.author.clone())
-    }
-
-    /// SEC-#9/#10: idempotent, deterministic single-apply of an equivocation
-    /// slash. Both the local detector and inbound gossip funnel through here.
-    /// The first writer latches the dedup/evidence key; later duplicates (same
-    /// offender+round, whether re-received or locally re-detected) short-circuit.
-    fn apply_equivocation_slash(&self, proof_a: &Vertex, proof_b: &Vertex) {
-        let offender = &proof_a.author;
-        let round = proof_a.round;
-
-        let seen_key = format!("sys:equiv_seen:{}:{}", offender, round);
-        if matches!(self.storage.get(&seen_key), Ok(Some(_))) {
-            return; // already handled — exactly-once.
-        }
-
-        // Durable, self-contained evidence (plain KV — never a `vertex:{hash}`
-        // row, so DAG pruning cannot destroy it: closes #10).
-        // CANONICAL ORDER (audit 2026-08-26): record the pair ordered by vertex
-        // hash, never by arrival. Two nodes that both witness the same
-        // equivocation otherwise store byte-different proofs — harmless while
-        // the row is node-local, a fork the moment evidence is block-carried.
-        let (first, second) = if proof_a.hash <= proof_b.hash {
-            (proof_a, proof_b)
-        } else {
-            (proof_b, proof_a)
-        };
-        // COMPACT: strip payloads, carry payload_root. Hash + signature still
-        // bind the full body (blockchain::Vertex::calculate_hash), so the
-        // executor verifies the proof without the bodies, and the item stays a
-        // few hundred bytes no matter how large the equivocator made them.
-        let (first, second) = (first.to_compact_proof(), second.to_compact_proof());
-        let evidence = serde_json::json!({
-            "offender": offender,
-            "round": round,
-            "vertex_a": first,
-            "vertex_b": second,
-        });
-        let evidence_str = evidence.to_string();
-        if evidence_str.len() > MAX_EVIDENCE_ITEM_BYTES {
-            // Cannot happen with payload+parents stripped (~1 KiB), but never let
-            // an oversize row enter the carry path. Jail locally regardless.
-            //
-            // The dedup latch is written EITHER WAY: handle_remote_equivocation
-            // uses this key as its only duplicate suppressor before re-gossiping,
-            // so skipping it here turned an oversize proof into an unbounded
-            // broadcast amplifier (every receipt re-broadcast to every peer).
-            eprintln!(
-                "⚠️  equivocation evidence for {} round {} is {} bytes (> {}); not carrying",
-                offender, round, evidence_str.len(), MAX_EVIDENCE_ITEM_BYTES
-            );
-            // Do NOT write the sentinel into sys:equiv_seen: that key is the
-            // exactly-once gate for a REAL, carryable proof. Poisoning it would
-            // make a later, correctly-sized proof for the same (offender, round)
-            // early-return forever -- permanent evidence suppression. The
-            // re-gossip storm is suppressed by its own key instead.
-        } else {
-            let _ = self.storage.put(&seen_key, &evidence_str);
-            // PROTOCOL: queue the canonical item to ride in our next vertex. Built
-            // from the hash-ordered row above, so two nodes that both witness the
-            // same equivocation carry byte-identical items.
-            self.enqueue_evidence_item(&evidence);
-        }
-
-        // Canonical slash event — byte-stable across nodes (no timestamps /
-        // node-local fields) and matched by the executor's 100% equivocation path.
-        let slash_event = serde_json::json!({
-            "event": "equivocation_detected",
-            "validator": offender,
-            "round": round,
-            "proof_a": proof_a.hash,
-            "proof_b": proof_b.hash,
-            "reason": "equivocation",
-            "penalty": "100% slash + permanent removal"
-        });
-        // RE-AUDIT HIGH: no direct `sys:pending_slash` write any more — that made
-        // the slash a function of WHICH node saw both vertices. The durable
-        // `sys:equiv_seen` evidence row above is what the block proposer carries
-        // (executor::collect_slash_evidence) and every node verifies+applies.
-        let _ = slash_event;
-        // G3 FX-1: `validator:jailed:*` is consensus state, written only by
-        // block execution when the evidence is applied. What THIS node saw is
-        // a local fact, and it gets its own key: writing the state key here
-        // made its value depend on which equivocation a node saw first.
-        let _ = self.storage.put(
-            &format!("sys:equiv_local_jail:{}", offender),
-            &round.to_string(),
-        );
-    }
-
-    /// SEC-#9: gossip a self-authenticating equivocation proof (both signed
-    /// vertices) to all peers via Gossipsub + TCP fallback. Mirrors the
-    /// `broadcast_attestation` transport. No reporter signature is needed: the
-    /// embedded vertex signatures ARE the proof.
-    fn broadcast_equivocation_proof(&self, proof_a: &Vertex, proof_b: &Vertex) {
-        let payload = serde_json::json!({
-            "offender": proof_a.author,
-            "round": proof_a.round,
-            "vertex_a": proof_a.to_compact_proof(),
-            "vertex_b": proof_b.to_compact_proof(),
-        });
-        let serialized = match serde_json::to_string(&payload) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("❌ [SEC-#9] Failed to serialise equivocation proof: {}", e);
-                return;
-            }
-        };
-        let msg = format!("EQUIV_PROOF:{}", serialized);
-
-        // 1. Gossipsub.
-        if let Some(tx) = &self.p2p_tx {
-            let tx_clone = tx.clone();
-            let msg_clone = msg.clone();
-            tokio::spawn(async move {
-                let _ = tx_clone.send(msg_clone).await;
-            });
-        }
-
-        // 2. TCP fallback.
-        use network::send_message;
-        if let Ok(peers) = self.peers.lock() {
-            for (peer_id, port) in peers.iter() {
-                if *peer_id != self.node_id {
-                    let ip = self
-                        .storage
-                        .get_peer_ip(peer_id)
-                        .unwrap_or_else(|| "127.0.0.1".to_string());
-                    let addr = format!("{}:{}", ip, port);
-                    let _ = send_message(&addr, &msg);
-                }
-            }
-        }
-    }
-
-    /// SEC-#9: handle an inbound equivocation proof. Verify independently, then
-    /// — only on the FIRST valid receipt for this (offender, round) — apply the
-    /// slash and re-gossip once so the proof reaches nodes that saw only one of
-    /// the two conflicting vertices.
-    fn handle_remote_equivocation(&self, content: &str) {
-        let v: serde_json::Value = match serde_json::from_str(content) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("❌ [SEC-#9] Malformed equivocation proof JSON: {}", e);
-                return;
-            }
-        };
-        let a: Vertex = match serde_json::from_value(v["vertex_a"].clone()) {
-            Ok(x) => x,
-            Err(_) => {
-                eprintln!("❌ [SEC-#9] equivocation proof missing/invalid vertex_a");
-                return;
-            }
-        };
-        let b: Vertex = match serde_json::from_value(v["vertex_b"].clone()) {
-            Ok(x) => x,
-            Err(_) => {
-                eprintln!("❌ [SEC-#9] equivocation proof missing/invalid vertex_b");
-                return;
-            }
-        };
-
-        let offender = match self.verify_equivocation_proof(&a, &b) {
-            Some(o) => o,
-            None => {
-                eprintln!("❌ [SEC-#9] equivocation proof failed verification — dropping");
-                return;
-            }
-        };
-
-        // Re-gossip only ONCE per (offender, round), tracked by a dedicated key
-        // so it never blocks a real proof from being recorded. sys:equiv_seen is
-        // reserved for carryable evidence and must not double as a gossip latch.
-        let gossip_key = format!("sys:equiv_gossiped:{}:{}", offender, a.round);
-        let already_gossiped = matches!(self.storage.get(&gossip_key), Ok(Some(_)));
-        // Applying is idempotent (apply_equivocation_slash latches on
-        // sys:equiv_seen), so run it even if we have re-gossiped before: an
-        // earlier oversize proof may have left no carryable evidence behind.
-        self.apply_equivocation_slash(&a, &b);
-        if !already_gossiped {
-            let _ = self.storage.put(&gossip_key, "1");
-            self.broadcast_equivocation_proof(&a, &b);
-        }
     }
 
     /// QC Phase 3: gossip THIS node's partial finality vote so peers can
@@ -3383,6 +1638,13 @@ impl DagConsensus {
     }
 
     pub fn handle_message(&mut self, msg: &str) {
+        // G5 S4c: only a V4 chain takes messages. `DAG_VERTEX:`,
+        // `DOWNTIME_ATTEST:` and `EQUIV_PROOF:` (the deleted V3 DAG and its
+        // evidence) are dropped unparsed: no V4 signature can appear in a V3
+        // body, and V4 evidence travels in vertices (EQ-1).
+        if !self.v4_chain {
+            return;
+        }
         if let Some(h) = msg.strip_prefix(QC_WANT_PREFIX) {
             self.answer_qc_want(h);
             return;
@@ -3397,7 +1659,7 @@ impl DagConsensus {
             const WRAP: usize = r#"{"Vertex":}"#.len();
             // One bound for every message kind: a pull answer carrying one
             // maximal body must pass (the vertex copy is still bounded by S1).
-            if !self.v4_chain || content.len() > crate::v4::MAX_WIRE_BYTES {
+            if content.len() > crate::v4::MAX_WIRE_BYTES {
                 return;
             }
             if let Ok(m) = serde_json::from_str::<crate::v4::Msg>(content) {
@@ -3409,264 +1671,10 @@ impl DagConsensus {
             }
             return;
         }
-        if let Some(content) = msg.strip_prefix("DAG_VERTEX:") {
-            // Byte budget BEFORE parsing: an oversize vertex could never have
-            // been delivered by an honest transport anyway, and parsing it is
-            // the attacker's cheapest lever.
-            if content.len() > MAX_VERTEX_BYTES {
-                eprintln!(
-                    "🚫 REJECTED oversize DAG_VERTEX: {} bytes > {} budget",
-                    content.len(),
-                    MAX_VERTEX_BYTES
-                );
-                return;
-            }
-            if let Ok(vertex) = serde_json::from_str::<Vertex>(content) {
-                self.add_vertex(vertex);
-            }
-        } else if self.v4_chain
-            && (msg.starts_with("DOWNTIME_ATTEST:") || msg.starts_with("EQUIV_PROOF:"))
-        {
-            // G1 S11b: V3 evidence has no place on a V4 chain (its vertices are
-            // V3-hashed, so no honest V4 signature can appear in one, and the
-            // V4 evidence path is EQ-1). Dropped unparsed.
-        } else if let Some(content) = msg.strip_prefix("DOWNTIME_ATTEST:") {
-            // Phase 3 / H-02: Remote downtime attestation received from a peer.
-            // Validate → store so executor can count towards BFT quorum.
-            self.handle_remote_attestation(content);
-        } else if let Some(content) = msg.strip_prefix("EQUIV_PROOF:") {
-            // SEC-#9: a self-authenticating equivocation proof received from a
-            // peer. Independently verify (both vertices signed by the offender,
-            // same round, distinct bodies) before slashing, then re-gossip once.
-            self.handle_remote_equivocation(content);
-        } else if let Some(content) = msg.strip_prefix("QC_VOTE:") {
+        if let Some(content) = msg.strip_prefix("QC_VOTE:") {
             // QC Phase 3: a peer's partial finality vote for multi-party QC
             // aggregation. Verify + collect; aggregate a complete QC on quorum.
             self.handle_remote_qc_vote(content);
-        }
-    }
-
-    /// Validate and store a remote downtime attestation.
-    ///
-    /// Checks:
-    ///  1. JSON parses correctly and has all required fields.
-    ///  2. `reporter` is a known validator (in current validator set).
-    ///  3. `reporter_pubkey` derives to the claimed `reporter` address.
-    ///  4. Ed25519 signature over canonical payload is valid.
-    ///  5. Not a duplicate (storage key already guards this).
-    fn handle_remote_attestation(&mut self, content: &str) {
-        let attest: serde_json::Value = match serde_json::from_str(content) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("❌ [H-02] Malformed attestation JSON: {}", e);
-                return;
-            }
-        };
-
-        let offender = match attest["offender"].as_str() {
-            Some(s) => s.to_string(),
-            None => {
-                eprintln!("❌ [H-02] Missing offender field");
-                return;
-            }
-        };
-        let epoch = match attest["epoch"].as_u64() {
-            Some(e) => e,
-            None => {
-                eprintln!("❌ [H-02] Missing epoch field");
-                return;
-            }
-        };
-        let reporter = match attest["reporter"].as_str() {
-            Some(s) => s.to_string(),
-            None => {
-                eprintln!("❌ [H-02] Missing reporter field");
-                return;
-            }
-        };
-        let round = attest["round"].as_u64().unwrap_or(0);
-        let reporter_pubkey_hex = match attest["reporter_pubkey"].as_str() {
-            Some(s) => s.to_string(),
-            None => {
-                eprintln!("❌ [H-02] Missing reporter_pubkey");
-                return;
-            }
-        };
-        let sig_hex = match attest["signature"].as_str() {
-            Some(s) => s.to_string(),
-            None => {
-                eprintln!("❌ [H-02] Missing signature");
-                return;
-            }
-        };
-
-        // Don't re-process our own attestation broadcast back to us.
-        if reporter == self.node_id {
-            return;
-        }
-
-        // Phase 5B.6 / L-05: a reporter must not be able to attest its
-        // own downtime. Self-attestations cannot reach quorum alone but
-        // they inflate the attestation-set surface and complicate
-        // forensic review.
-        if reporter == offender {
-            eprintln!(
-                "❌ [L-05] Attestation rejected: reporter == offender ({})",
-                reporter
-            );
-            return;
-        }
-
-        // 1. Reporter must be a known validator.
-        let validators = self.get_validator_set();
-        if !validators.contains(&reporter) {
-            eprintln!(
-                "❌ [H-02] Attestation from unknown validator {}, dropping",
-                reporter
-            );
-            return;
-        }
-
-        // Phase 5B.6 / SEC-N03: offender must ALSO be a known validator.
-        // Without this check a single Byzantine reporter could write
-        // attestations against arbitrary addresses, producing unbounded
-        // `sys:downtime_attestation:` storage growth (bounded only by
-        // the scan-prefix cap). Even though such attestations cannot
-        // reach BFT quorum (no other reporter would echo a non-validator
-        // offender), the disk write itself is a DoS amplifier.
-        if !validators.contains(&offender) {
-            eprintln!(
-                "❌ [SEC-N03] Attestation rejected: offender {} is not in validator set",
-                offender
-            );
-            return;
-        }
-
-        // 2. Verify pubkey → address derivation matches claimed reporter.
-        let pubkey_bytes = match hex::decode(&reporter_pubkey_hex) {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("❌ [H-02] reporter_pubkey not valid hex");
-                return;
-            }
-        };
-        let derived_addr = match crypto::derive_address(&pubkey_bytes) {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("❌ [H-02] derive_address failed: {}", e);
-                return;
-            }
-        };
-        if derived_addr != reporter {
-            eprintln!(
-                "❌ [H-02] reporter_pubkey derives to {} but reporter claims {}",
-                derived_addr, reporter
-            );
-            return;
-        }
-
-        // 3. Verify Ed25519 signature over canonical payload.
-        let canonical = format!("{}:{}:{}:{}", offender, epoch, reporter, round);
-        let sig_bytes = match hex::decode(&sig_hex) {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("❌ [H-02] signature not valid hex");
-                return;
-            }
-        };
-        match crypto::verify_signature(&pubkey_bytes, canonical.as_bytes(), &sig_bytes) {
-            Ok(true) => {}
-            Ok(false) => {
-                eprintln!("❌ [H-02] Attestation signature INVALID from {}", reporter);
-                return;
-            }
-            Err(e) => {
-                eprintln!("❌ [H-02] Attestation signature verify error: {}", e);
-                return;
-            }
-        }
-
-        // 4. Store — key is unique per (offender, epoch, reporter) so this is
-        //    idempotent; the executor counts distinct reporters for BFT quorum.
-        let key = format!(
-            "sys:downtime_attestation:{}:{}:{}",
-            offender, epoch, reporter
-        );
-        // Only store if not already present (idempotency).
-        if let Ok(Some(_)) = self.storage.get(&key) {
-            return; // Already have this attestation, skip.
-        }
-
-        let payload = serde_json::json!({
-            "offender": offender,
-            "epoch": epoch,
-            "reporter": reporter,
-            "round": round,
-            "rounds_missed": attest["rounds_missed"].as_u64().unwrap_or(0),
-        });
-        match self.storage.put(&key, &payload.to_string()) {
-            Ok(_) => println!(
-                "✅ [H-02] Stored remote attestation: offender={} epoch={} reporter={}",
-                offender, epoch, reporter
-            ),
-            Err(e) => eprintln!("❌ [H-02] Failed to store remote attestation: {}", e),
-        }
-    }
-
-    pub fn prune_dag(&self, min_round: u64) {
-        let mut dag = match self.dag.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        let mut round_idx = match self.round_index.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-
-        let initial_size = dag.len();
-
-        // Identify vertices to remove
-        let mut to_remove = Vec::new();
-        for (hash, vertex) in dag.iter() {
-            if vertex.round < min_round {
-                to_remove.push(hash.clone());
-            }
-        }
-
-        // Remove from DB and Memory
-        for hash in &to_remove {
-            let _ = self.storage.delete(&format!("vertex:{}", hash));
-            dag.remove(hash);
-        }
-
-        // Remove old entries from Round Index
-        round_idx.retain(|r, _| *r >= min_round);
-
-        let removed_count = initial_size - dag.len();
-        if removed_count > 0 {
-            println!(
-                "🧹 Garbage Collection: Pruned {} vertices older than round {} from Disk & Memory",
-                removed_count, min_round
-            );
-        }
-
-        // SEC-#10: equivocation evidence (`sys:equiv_seen:{offender}:{round}`) is
-        // a plain KV row, never a `vertex:{hash}`, so it already survives the DAG
-        // prune above — this only bounds its growth long after the slash is
-        // finalized. Records are kept for a large retention window past the prune
-        // horizon; older ones are safe to discard (the slash is long applied).
-        let gc_below = min_round.saturating_sub(EQUIV_EVIDENCE_RETENTION_ROUNDS);
-        if gc_below > 0 {
-            for (key, _) in self.storage.scan_prefix("sys:equiv_seen:") {
-                // key = sys:equiv_seen:{offender}:{round}
-                if let Some(round_str) = key.rsplit(':').next() {
-                    if let Ok(r) = round_str.parse::<u64>() {
-                        if r < gc_below {
-                            let _ = self.storage.delete(&key);
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -3713,7 +1721,8 @@ impl DagConsensus {
             // local cursor moves past any gossip hole exactly as the producer's
             // did, then cast this node's finality vote for the block — a stalled
             // follower otherwise stops voting and the >2/3 QC quorum dies.
-            if self.ordering_halted().is_none() {
+            // Only a V4 node adopts (an inert node votes on nothing).
+            if self.v4_chain && self.ordering_halted().is_none() {
                 let mut validators = self.decision_committee();
                 let start_h = self.last_adopted_height.saturating_add(1);
                 for h in start_h..=new_height {
@@ -3743,18 +1752,15 @@ impl DagConsensus {
                         // G1 IM-1 (V4): a synced block is adopted only with a
                         // stored QC that verifies and binds it; without one,
                         // adoption waits (the QC is fetched with the block).
-                        let qc = if self.v4_chain {
-                            let verified = crate::qc_producer::stored_qc(&self.storage, h).filter(|q| {
-                                crate::qc_producer::verify_block_qc(&self.storage, &block, q).is_ok()
-                            });
-                            if verified.is_none() {
-                                eprintln!("V4: block {h} has no verified QC yet; adoption waits");
-                                self.want_qc(h);
-                                break;
-                            }
-                            verified
-                        } else {
-                            None
+                        let Some(qc) =
+                            crate::qc_producer::stored_qc(&self.storage, h).filter(|q| {
+                                crate::qc_producer::verify_block_qc(&self.storage, &block, q)
+                                    .is_ok()
+                            })
+                        else {
+                            eprintln!("V4: block {h} has no verified QC yet; adoption waits");
+                            self.want_qc(h);
+                            break;
                         };
                         let qc_chain_id = self.resolve_chain_id();
                         let mut conflict: Option<String> = None;
@@ -3771,15 +1777,13 @@ impl DagConsensus {
                                         // IM-1's last clause, where the digest is
                                         // computed: the QC's finality digest must be
                                         // this node's fold of the same sequence.
-                                        if let Some(q) = &qc {
-                                            if q.finality_digest != info.finality_digest {
-                                                return Err(format!(
-                                                    "{}: block {h}'s QC finality digest {} is not this node's {}",
-                                                    crate::ordering::DECISION_CONFLICT,
-                                                    q.finality_digest,
-                                                    info.finality_digest
-                                                ));
-                                            }
+                                        if qc.finality_digest != info.finality_digest {
+                                            return Err(format!(
+                                                "{}: block {h}'s QC finality digest {} is not this node's {}",
+                                                crate::ordering::DECISION_CONFLICT,
+                                                qc.finality_digest,
+                                                info.finality_digest
+                                            ));
                                         }
                                         crate::qc_producer::stage_pending_qc(view, &block, info, qc_chain_id)?;
                                         view.put("consensus:last_adopted_height", &h.to_string())
@@ -3831,13 +1835,11 @@ impl DagConsensus {
                         .put("consensus:last_adopted_height", &h.to_string());
                     // G1 EP-3/EP-4: an adopted H_E closes E, and its QC (held,
                     // since adoption needs it) activates E+1 before H_E + 1.
-                    if self.v4_chain {
-                        self.v4_epoch_step();
-                        if self.ordering_halted().is_some() {
-                            break;
-                        }
-                        validators = self.decision_committee();
+                    self.v4_epoch_step();
+                    if self.ordering_halted().is_some() {
+                        break;
                     }
+                    validators = self.decision_committee();
                 }
             }
 
@@ -3871,61 +1873,6 @@ impl DagConsensus {
                 // let a stale-high value from a superseded local block survive and
                 // skew the next block's BFT-time clamp (see the build site).
                 self.latest_block_timestamp = ts;
-            }
-
-            if let Some(round) = synced_round {
-                // AUDIT-B3 (second door): this used to be a BLIND
-                // `self.current_round = block.round + 1`, the exact same defect
-                // that was fixed in `add_vertex` — and it wedged a live 3-node
-                // cluster at round 85 even after that fix, because closing one
-                // door is not enough. A committed block's round says only that
-                // the round was FINALIZED; it says nothing about whether this
-                // node holds the round's vertices, and those vertices are what
-                // `try_create_vertex` needs as parents. Jumping past them leaves
-                // the node proposing at a round whose predecessor can never reach
-                // parent quorum, so it stops producing — permanently, since the
-                // value is persisted.
-                //
-                // Same Narwhal rule as the ingest path: advance only to
-                // `quorum_round + 1`, the highest round we can genuinely build
-                // parents for. A node that synced blocks ahead of its DAG simply
-                // waits for gossip to deliver the vertices instead of racing past
-                // them.
-                // Validators fetched BEFORE the locks: quorum_round runs while the
-                // DAG/round-index guards are held and cannot call back into &self.
-                let validators = self.get_validator_set_with_stake();
-                let quorum_target = {
-                    let round_idx = self
-                        .round_index
-                        .lock()
-                        .expect("🚨 FATAL: Round index lock poisoned");
-                    let dag = self.dag.lock().expect("🚨 FATAL: DAG lock poisoned");
-                    Self::quorum_round(&round_idx, &dag, &validators).saturating_add(1)
-                };
-                // ...but a node that synced thousands of blocks must not be left
-                // so far behind that the PWN-002 jump guard rejects every live
-                // vertex as "far future" — that is the catch-up deadlock this
-                // reload exists to prevent, and it is why the blind jump was here
-                // in the first place. So the quorum cap has a floor: never sit
-                // more than half the jump allowance below the synced tip. Normal
-                // operation (a gap of a few rounds, like the round-85 wedge) is
-                // fully quorum-gated; only a genuinely stranded node uses the
-                // floor, and it lands inside the guard's window so gossip can
-                // refill the DAG and quorum_round takes over again.
-                let tip_next = round.saturating_add(1);
-                let catchup_floor = tip_next.saturating_sub(Self::MAX_ROUND_JUMP / 2);
-                let next_round = tip_next.min(quorum_target.max(catchup_floor));
-                if next_round > self.current_round {
-                    println!(
-                        "🔄 [Consensus] Round reloaded from synced tip: {} -> {} \
-                         (tip round {}, quorum cap {}, catch-up floor {})",
-                        self.current_round, next_round, round, quorum_target, catchup_floor
-                    );
-                    self.current_round = next_round;
-                    let _ = self
-                        .storage
-                        .put("latest_proposed_round", &self.current_round.to_string());
-                }
             }
         }
     }

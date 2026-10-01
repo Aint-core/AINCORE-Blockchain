@@ -925,16 +925,15 @@ async fn main() {
                             }
                         }
                     }
-                } else if msg.starts_with("DAG_VERTEX:")
-                    || msg.starts_with("DAG_V4:")
-                    || msg.starts_with("DOWNTIME_ATTEST:")
-                    || msg.starts_with("EQUIV_PROOF:")
+                } else if msg.starts_with(consensus::v4::WIRE_PREFIX)
                     || msg.starts_with("QC_VOTE:")
                     || msg.starts_with(consensus::dag::QC_WANT_PREFIX)
                     || msg.starts_with(consensus::dag::QC_CERT_PREFIX)
                 {
-                    // WRITE LOCK required to update DAG / store remote attestation /
-                    // slash equivocator / collect+aggregate QC finality votes
+                    // WRITE LOCK required to update the DAG and collect or
+                    // aggregate QC finality votes. The deleted V3 messages
+                    // (`DAG_VERTEX:`, `DOWNTIME_ATTEST:`, `EQUIV_PROOF:`) take
+                    // no lock (G5 S4c).
                     if let Ok(mut guard) = node_consensus.write() {
                         guard.handle_message(&msg);
                     }
@@ -976,10 +975,7 @@ async fn main() {
                             }
                         }
                         None
-                    } else if msg.starts_with("DAG_VERTEX:")
-                        || msg.starts_with("DAG_V4:")
-                        || msg.starts_with("DOWNTIME_ATTEST:")
-                        || msg.starts_with("EQUIV_PROOF:")
+                    } else if msg.starts_with(consensus::v4::WIRE_PREFIX)
                         || msg.starts_with("QC_VOTE:")
                         || msg.starts_with(consensus::dag::QC_WANT_PREFIX)
                         || msg.starts_with(consensus::dag::QC_CERT_PREFIX)
@@ -1282,7 +1278,7 @@ async fn main() {
         }
 
         // === PARALLEL EXECUTION & DA INTEGRATION ===
-        // Execution is now handled by DagConsensus::add_vertex upon commit.
+        // Execution is handled by the consensus commit loop (V4 ticks).
         // DA Batch creation is triggered automatically by Consensus.
 
         // Update Metrics

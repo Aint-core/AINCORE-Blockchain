@@ -44,23 +44,39 @@ fn validator_info(seed: u8) -> ValidatorInfo {
     }
 }
 
+/// A node of seed `seed` on the database at `path`.
+fn open_node(path: &str, seed: u8) -> DagConsensus {
+    let db = Arc::new(StateDB::open(path).unwrap());
+    let key = [seed; 32];
+    let node_id = crypto::derive_address(
+        crypto::SigningKey::from_bytes(&key)
+            .verifying_key()
+            .as_bytes(),
+    )
+    .unwrap();
+    let mut c = DagConsensus::new(
+        node_id,
+        Arc::new(Mutex::new(HashMap::new())),
+        Arc::new(Mutex::new(Mempool::new())),
+        Arc::new(Executor::new(Arc::clone(&db))),
+        db,
+        None,
+        None,
+        key,
+    );
+    c.set_now_secs(Arc::new(|| PINNED));
+    c.placement_sleep = Arc::new(|_| {});
+    c.v4_outbox = Some(Arc::new(Mutex::new(Vec::new())));
+    c
+}
+
 impl Cluster {
     fn new(tag: &str, seeds: &[u8], v4: bool) -> Self {
         Self::with_interval(tag, seeds, v4, 1000)
     }
 
     fn with_interval(tag: &str, seeds: &[u8], v4: bool, epoch_interval: u64) -> Self {
-        let committee: Vec<ValidatorInfo> = seeds.iter().map(|s| validator_info(*s)).collect();
-        let known: Vec<(String, String)> = committee
-            .iter()
-            .map(|m| (m.address.clone(), m.ed25519_public_key.clone()))
-            .collect();
-        let mut cluster = Self {
-            nodes: Vec::new(),
-            committee,
-            known,
-            epoch_interval,
-        };
+        let mut cluster = Self::unopened(seeds, epoch_interval);
         for (i, seed) in seeds.iter().enumerate() {
             let path = std::env::temp_dir()
                 .join(format!("aincore_v4_node_{}_{tag}_{i}", std::process::id()))
@@ -76,6 +92,21 @@ impl Cluster {
             cluster.open(i);
         }
         cluster
+    }
+
+    /// The committee of `seeds`, with no node open yet.
+    fn unopened(seeds: &[u8], epoch_interval: u64) -> Self {
+        let committee: Vec<ValidatorInfo> = seeds.iter().map(|s| validator_info(*s)).collect();
+        let known: Vec<(String, String)> = committee
+            .iter()
+            .map(|m| (m.address.clone(), m.ed25519_public_key.clone()))
+            .collect();
+        Self {
+            nodes: Vec::new(),
+            committee,
+            known,
+            epoch_interval,
+        }
     }
 
     fn seed_db(&self, path: &str, seed: u8, v4: bool) {
@@ -133,27 +164,7 @@ impl Cluster {
 
     fn open(&mut self, i: usize) {
         let node = &self.nodes[i];
-        let db = Arc::new(StateDB::open(&node.path).unwrap());
-        let key = [node.seed; 32];
-        let node_id = crypto::derive_address(
-            crypto::SigningKey::from_bytes(&key)
-                .verifying_key()
-                .as_bytes(),
-        )
-        .unwrap();
-        let mut c = DagConsensus::new(
-            node_id,
-            Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(Mutex::new(Mempool::new())),
-            Arc::new(Executor::new(Arc::clone(&db))),
-            db,
-            None,
-            None,
-            key,
-        );
-        c.set_now_secs(Arc::new(|| PINNED));
-        c.placement_sleep = Arc::new(|_| {});
-        c.v4_outbox = Some(Arc::new(Mutex::new(Vec::new())));
+        let c = open_node(&node.path, node.seed);
         self.nodes[i].c = Some(c);
     }
 
@@ -345,14 +356,14 @@ fn v4_nodes_restart_and_keep_placing_the_same_blocks() {
     assert!(after > before);
 }
 
-/// One DAG format per chain: a V4 node ignores V3 vertices, and a V3 node
-/// ignores V4 messages.
+/// One DAG format per chain: a V4 node ignores V3 vertices, and a node
+/// without the V4 format (inert since G5 S4c deleted V3) ignores V4 messages.
 #[test]
 fn a_node_never_mixes_dag_formats() {
     let mut v4 = Cluster::new("mix4", &[89, 90, 91, 92], true);
     let mut v3 = Cluster::new("mix3", &[89, 90, 91, 92], false);
     assert!(v3.node(0).v4.is_none());
-    // A V4 message reaches a V3 node: nothing is staged.
+    // A V4 message reaches the inert node: nothing is staged.
     let outbox = v4.node(0).v4_outbox.clone().unwrap();
     v4.node_mut(0).try_create_vertex();
     let wire = outbox
@@ -1421,4 +1432,269 @@ fn a_certificate_conflict_is_recorded_as_evidence_against_both_signers() {
     assert!(!both.is_empty(), "two quorums of four always overlap");
     assert_eq!(verified.offenders, both);
     assert_eq!((verified.epoch, verified.round), (0, 1));
+}
+
+// ---------------------------------------------------------------------------
+// G5 S4c: the local-acceptance crash witnesses on a V4 genesis. They replace
+// `local_acceptance_tests` (V3 fixtures, deleted with V3) and keep its
+// schedule: a crash is a real process exit (77) at a test hook boundary, and
+// the rows on disk are compared across it. The committee is the producer
+// alone, so it certifies its own vertices and its block's QC.
+
+const PRODUCER: u8 = 91;
+const FOLLOWER: u8 = 92;
+const LOCAL_DB: &str = "AINCORE_TEST_V4_LOCAL_DB";
+const LOCAL_MODE: &str = "AINCORE_TEST_V4_LOCAL_MODE";
+const LOCAL_SEED: &str = "AINCORE_TEST_V4_LOCAL_SEED";
+const PENDING_1: &[u8] = b"consensus:qc_pending:00000000000000000001";
+
+struct LocalDir(String);
+
+impl LocalDir {
+    /// A V4 genesis whose committee is the producer alone, keyed for `seed`.
+    fn seeded(tag: &str, seed: u8) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir()
+            .join(format!(
+                "aincore_v4_local_{}_{}_{tag}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ))
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_dir_all(&path);
+        Cluster::unopened(&[PRODUCER], 1000).seed_db(&path, seed, true);
+        Self(path)
+    }
+
+    fn rows(&self) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+        let db = StateDB::open(&self.0).unwrap();
+        db.db
+            .iterator(storage::rocksdb::IteratorMode::Start)
+            .map(|row| {
+                let (key, value) = row.unwrap();
+                (key.to_vec(), value.to_vec())
+            })
+            // Producer and telemetry hints, written outside acceptance.
+            .filter(|(key, _)| {
+                key != b"latest_proposed_round" && !key.starts_with(b"validator:last_seen:")
+            })
+            .collect()
+    }
+
+    fn run(&self, mode: &str, seed: u8, code: i32) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::tests::v4_node_tests::v4_local_acceptance_child",
+                "--nocapture",
+            ])
+            .env(LOCAL_DB, &self.0)
+            .env(LOCAL_MODE, mode)
+            .env(LOCAL_SEED, seed.to_string())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "mode {mode}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+impl Drop for LocalDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Tick the lone producer until block 1 is placed (at most 20 ticks).
+fn produce_block_1(node: &mut DagConsensus) {
+    for _ in 0..20 {
+        if node.latest_block_height >= 1 {
+            return;
+        }
+        node.try_create_vertex();
+        node.v4_outbox.as_ref().unwrap().lock().unwrap().clear();
+    }
+}
+
+/// QC 1, verified under the epoch-0 committee.
+fn verified_qc_1(node: &DagConsensus) -> crate::qc::QuorumCertificate {
+    let cert = crate::qc_producer::stored_qc(&node.storage, 1)
+        .expect("block 1 lost its QC work across the crash");
+    let set = crate::qc_producer::load_validator_set_for_epoch(&node.storage, 0).unwrap();
+    crate::qc::verify_qc(&cert, &set, &cert.chain_id).unwrap();
+    cert
+}
+
+#[test]
+fn v4_local_acceptance_child() {
+    let Ok(path) = std::env::var(LOCAL_DB) else {
+        return;
+    };
+    let mode = std::env::var(LOCAL_MODE).unwrap();
+    let seed: u8 = std::env::var(LOCAL_SEED).unwrap().parse().unwrap();
+    let mut node = open_node(&path, seed);
+    assert!(node.v4.is_some(), "the fixture is not a V4 genesis");
+    match mode.as_str() {
+        "produce" => {
+            produce_block_1(&mut node);
+            assert_eq!(node.latest_block_height, 1);
+            verified_qc_1(&node);
+        }
+        "crash_after_acceptance" => {
+            node.local_acceptance_hook = Some(|boundary, view| {
+                // Block, execution marker and QC work commit together.
+                assert!(view.get("block_1").unwrap().is_some());
+                assert_eq!(
+                    view.get("sys:last_executed_height").unwrap().as_deref(),
+                    Some("1")
+                );
+                assert!(view
+                    .get(std::str::from_utf8(PENDING_1).unwrap())
+                    .unwrap()
+                    .is_some());
+                assert!(view.get("consensus:qc:1").unwrap().is_none());
+                if boundary == 1 {
+                    std::process::exit(77);
+                }
+                Ok(())
+            });
+            produce_block_1(&mut node);
+            panic!("the acceptance crash boundary was not reached");
+        }
+        "adopt_crash_before" | "adopt_crash_after" => {
+            assert_eq!(
+                node.last_adopted_height, 0,
+                "absence of the adoption marker is not proof of adoption"
+            );
+            node.local_acceptance_hook = Some(|boundary, view| {
+                assert!(view
+                    .get(std::str::from_utf8(PENDING_1).unwrap())
+                    .unwrap()
+                    .is_some());
+                assert_eq!(
+                    view.get("consensus:last_adopted_height")
+                        .unwrap()
+                        .as_deref(),
+                    Some("1")
+                );
+                let mode = std::env::var(LOCAL_MODE).unwrap();
+                if (mode == "adopt_crash_before" && boundary == 2)
+                    || (mode == "adopt_crash_after" && boundary == 3)
+                {
+                    std::process::exit(77);
+                }
+                Ok(())
+            });
+            node.reload_chain_tip();
+            panic!("the adoption crash boundary was not reached");
+        }
+        "resume" => {
+            let block = node.storage.get("block_1").unwrap();
+            assert!(block.is_some());
+            node.reload_chain_tip();
+            assert_eq!(node.storage.get("block_1").unwrap(), block);
+            assert_eq!(node.latest_block_height, 1);
+            assert_eq!(node.last_adopted_height, 1);
+            verified_qc_1(&node);
+            let round: blockchain::Block = serde_json::from_str(block.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                node.ordering_engine.lock().unwrap().finalized_round,
+                round.header.round
+            );
+        }
+        other => panic!("unknown mode {other}"),
+    }
+}
+
+/// A block accepted just before a crash keeps its QC work: block, execution
+/// marker and pending QC row commit in one transaction (boundary 0), the
+/// process dies after that commit and before any vote (boundary 1), and the
+/// reopened node certifies the same block.
+#[test]
+fn v4_accepted_block_qc_work_survives_crash_before_attestation() {
+    let control = LocalDir::seeded("control", PRODUCER);
+    control.run("produce", PRODUCER, 0);
+    let control_rows = control.rows();
+    assert!(control_rows.contains_key(b"consensus:qc:1".as_slice()));
+    assert!(
+        !control_rows.contains_key(PENDING_1),
+        "a placed QC retires its work"
+    );
+
+    let crashed = LocalDir::seeded("crashed", PRODUCER);
+    crashed.run("crash_after_acceptance", PRODUCER, 77);
+    let before = crashed.rows();
+    assert!(before.contains_key(b"block_1".as_slice()));
+    assert!(before.contains_key(PENDING_1));
+    assert!(!before.contains_key(b"consensus:qc:1".as_slice()));
+    crashed.run("resume", PRODUCER, 0);
+    let after = crashed.rows();
+    assert_eq!(
+        after.get(b"block_1".as_slice()),
+        before.get(b"block_1".as_slice())
+    );
+    assert!(after.contains_key(b"consensus:qc:1".as_slice()));
+    assert!(
+        !after.contains_key(PENDING_1),
+        "the QC retires the pending work"
+    );
+}
+
+/// A follower holding block 1 and its QC (IM-1: adoption needs both) adopts
+/// it in one transaction: ordering cursor, pending QC row and adoption height
+/// commit together. A crash inside that transaction (boundary 2) leaves the
+/// rows unchanged; a crash after it (boundary 3) leaves all three. Either
+/// way the reopened follower checks the stored QC against its work and
+/// retires the row, the QC unchanged.
+#[test]
+fn v4_adopted_block_qc_work_and_cursor_commit_together_across_crash() {
+    let producer = LocalDir::seeded("producer", PRODUCER);
+    producer.run("produce", PRODUCER, 0);
+    let producer_rows = producer.rows();
+    let block = producer_rows.get(b"block_1".as_slice()).unwrap().clone();
+    let qc = producer_rows
+        .get(b"consensus:qc:1".as_slice())
+        .unwrap()
+        .clone();
+    for mode in ["adopt_crash_before", "adopt_crash_after"] {
+        let follower = LocalDir::seeded("follower", FOLLOWER);
+        {
+            // The accepted sync store: block and QC as sync imports them, and
+            // the execution marker (this witness isolates adoption).
+            let db = StateDB::open(&follower.0).unwrap();
+            let _seeding = db.seeding();
+            db.save_block_json(1, std::str::from_utf8(&block).unwrap())
+                .unwrap();
+            db.put("consensus:qc:1", std::str::from_utf8(&qc).unwrap())
+                .unwrap();
+            db.put("sys:last_executed_height", "1").unwrap();
+        }
+        let before = follower.rows();
+        follower.run(mode, FOLLOWER, 77);
+        let crashed = follower.rows();
+        if mode == "adopt_crash_before" {
+            assert_eq!(crashed, before, "a crash inside adoption commits nothing");
+        } else {
+            assert!(crashed.contains_key(PENDING_1));
+            assert_eq!(
+                crashed.get(b"consensus:last_adopted_height".as_slice()),
+                Some(&b"1".to_vec())
+            );
+            assert_ne!(crashed, before, "the adoption committed");
+        }
+        follower.run("resume", FOLLOWER, 0);
+        let resumed = follower.rows();
+        assert_eq!(resumed.get(b"consensus:qc:1".as_slice()), Some(&qc));
+        assert_eq!(resumed.get(b"block_1".as_slice()), Some(&block));
+        assert!(
+            !resumed.contains_key(PENDING_1),
+            "{mode}: the work is retired"
+        );
+    }
 }

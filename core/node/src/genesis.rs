@@ -571,6 +571,17 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
             GENESIS_VERSION, version
         )));
     }
+    // G5 S4c: the V3 DAG is deleted, so a database without the V4 vertex
+    // format can no longer boot, whatever its version string says.
+    let format = storage.get(consensus::v4::VERTEX_FORMAT_KEY)?;
+    if format.as_deref() != Some(GENESIS_VERTEX_FORMAT) {
+        return Err(GenesisError::InvalidData(format!(
+            "{} is {:?}, not {}: a V3 chain cannot run on this build",
+            consensus::v4::VERTEX_FORMAT_KEY,
+            format,
+            GENESIS_VERTEX_FORMAT
+        )));
+    }
 
     let validator_set: ValidatorSet =
         decode_resource(storage, &system_resource_key("0x1::staking::ValidatorSet"))?;
@@ -1790,6 +1801,28 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    /// G5 S4c: V3 is deleted. A database whose vertex format is missing or
+    /// not V4 is refused at boot, even with the current version string.
+    #[test]
+    fn a_database_without_the_v4_vertex_format_is_refused_at_boot() {
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let key = SigningKey::from_bytes(&[27u8; 32]);
+        let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let pubkey = hex::encode(key.verifying_key().as_bytes());
+        for format in [None, Some("3")] {
+            let db = temp_db("v3_format_refused");
+            init_genesis(&db, &addr, &pubkey).expect("fresh genesis initializes");
+            init_genesis(&db, &addr, &pubkey).expect("a V4 database reopens");
+            let _seed = db.seeding();
+            match format {
+                None => db.delete(consensus::v4::VERTEX_FORMAT_KEY).unwrap(),
+                Some(f) => db.put(consensus::v4::VERTEX_FORMAT_KEY, f).unwrap(),
+            }
+            let err = init_genesis(&db, &addr, &pubkey).expect_err("a V3 database must not boot");
+            assert!(err.to_string().contains("a V3 chain cannot run"), "{err}");
+        }
     }
 
     /// G5 P-1: a database whose Move epoch disagrees with the pinned epoch

@@ -378,7 +378,7 @@ impl DASequencer {
         //
         // PERF (2026-09-28): each row used to be its own synced `put` -- about 33
         // fsyncs per block. On the NAS's spinning disk that measured 65 ms each,
-        // ~2 s per block, and it runs inside `add_vertex` while the consensus lock
+        // ~2 s per block, and it runs inside the commit loop while the consensus lock
         // is held: the NAS validators ticked every ~2.5 s instead of 1.5 s, trailed
         // the Pi by ~2 s per round, and every RPC that reads the consensus lock
         // waited behind it. One `WriteBatch` is one synced write, so durability is

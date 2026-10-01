@@ -1097,9 +1097,21 @@ Deferred:
   - The V3 evidence messages `DOWNTIME_ATTEST:` and `EQUIV_PROOF:` are now dropped unparsed.
     Before this, a valid V3 equivocation proof made a V4 node record slash evidence (witness
     `a_v4_node_takes_no_v3_evidence`, checked against the ungated code).
-- **S11b, part 2** (deleting the V3 code and porting the tier-2 helpers) goes together with
-  G5's EQ-1, the V4 equivocation evidence that replaces the V3 evidence path. It must land
-  before the genesis cut.
+- **S11b, part 2** landed as G5 S4c, after EQ-1 (G5 S4b, S4d).
+  - `dag.rs` keeps only the V4 path: V3 ingress, producer, boot recovery, checkpoints,
+    pruning and evidence are deleted. `verify_genesis_integrity` refuses a database
+    without the V4 format; a node opened on one is inert. Only V4 evidence kinds pass the
+    block split.
+  - The five V3-fixture release witnesses are re-expressed on V4 with the same schedules
+    and replace them in the manifest: `v4_accepted_block_qc_work_survives_crash_before_attestation`,
+    `v4_adopted_block_qc_work_and_cursor_commit_together_across_crash` (with the block's
+    QC delivered, as IM-1 requires), `v4_complete_signed_history_decides_after_retransmission_and_reopen`,
+    `v4_thin_byzantine_vertices_are_refused_alike_and_the_leader_commits` and
+    `v4_a_round_skipping_anchor_is_refused_and_honest_vertices_are_not`. The old schedules
+    cannot be built on V4: their fixtures carry no certificates, and V3 ingress is gone.
+  - Still V3-shaped, outside `dag.rs`, and unreachable on a V4 chain: sync's no-QC import
+    branch, `qc_producer`'s epoch fallbacks, the executor's V3 evidence verifier and the
+    storage checkpoint helpers. Their fixtures move to V4 before they are removed.
 - **The genesis.json change** (`genesis_time`, and later I) is shown to the founder before it
   is made.
 
