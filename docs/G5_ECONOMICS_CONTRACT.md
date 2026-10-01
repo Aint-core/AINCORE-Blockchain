@@ -318,8 +318,11 @@ that leaves, the remainder of a partial slash, and a delegator that undelegates.
 - An isolated fault reaches delegators only when f·b > s.
 
 **DOC-1 (honest claims).** The RPC and every public document describe the draw on the
-remaining reserve by consensus time, report `last_reward_height`, the realized rate and the
-remaining reserve, and name no halving.
+remaining reserve by consensus time and name no halving.
+- `aincore_getSupply` and `aincore_getEconomics` report, from Move state, the remaining
+  reserve (the cap minus net supply and burns), the consensus time of the last payout
+  (`last_reward_time`) and the rate.
+- `aincore_getEconomics` also reports the pinned I, R and C_τ.
 
 ## Stages
 
@@ -336,7 +339,7 @@ end of G5, as with G1.
 | **S4b** | SL-3: V4 proposer twins detected when a slot stages a second digest, kept in durable epoch-keyed rows before GC, carried through the DAG and verified against C_E with the age bound | a twin pair from real V4 nodes is recorded, carried in a block and jails its author on every node; a pair signed by a non-member of C_E (even a live validator), from another domain, of two slots or of an unrecorded epoch is refused; evidence of epoch 0 is accepted until τ_start(1) + W exactly and refused after; accepted, the offense is recorded in the evidence's own epoch | live-set membership; no age bound; a round-only key; the V3 hash |
 | **S4d** | SL-3's certificate-conflict kind: `join_validator_set` and committee validation refuse a BLS key already held; the attestation and certificate types move to `blockchain::attest`, so the executor checks the aggregates; the halting node keeps the pair; every signer in both is convicted | real V4 nodes keep the pair where CE-3 halts, and it convicts exactly the members in both; two convicts forming half the committee settle at 100 % at once; one digest, no member in both, another committee, a bit past the committee or a forged aggregate is refused; a shared BLS key is refused at join and in a committee | a duplicate key accepted; the intersection taken from one certificate |
 | **S4c** | G1 S11b part 2: V3 ingress, producer, recovery and evidence deleted; the V3-fixture witnesses re-expressed on V4 | the release gate's V3-fixture witnesses pass on V4 fixtures; a V4 node never records V3 evidence (kept from S11b) | — |
-| **S5** | DOC-1: RPC fields, README, WHITEPAPER, CLAUDE.md | the RPC reports the Move state; no document names a halving (a grep witness) | — |
+| **S5** | DOC-1: RPC fields, README, WHITEPAPER, CLAUDE.md | the supply and economics RPCs report the Move emission state and nothing of a halving; README, WHITEPAPER and CLAUDE.md name no halving (node witnesses `public_documents_name_no_halving`, `the_economics_rpcs_report_the_move_emission_state`) | — |
 | **S6** | The fresh genesis file from genesis-tool with the measured t_b, shown to the founder before it is used | the genesis identity changes with each pinned parameter | — |
 
 ## Open (to measure, not to guess)

@@ -520,6 +520,59 @@ pub fn next_chain_clock(db: &StateDB, height: u64, block_timestamp: u64) -> Chai
     }
 }
 
+/// G5 DOC-1: the emission as the RPC reports it, read from Move state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmissionView {
+    /// Cumulative minted: the net supply plus everything burned (AUDIT-#8).
+    pub minted: u128,
+    /// The reserve the emission draws on: MAX_SUPPLY minus `minted`.
+    pub remaining: u128,
+    /// Consensus time of the last payout (0 before the first).
+    pub last_reward_time: u64,
+}
+
+/// G5 DOC-1: the committed emission state. Unreadable state reads as none.
+pub fn emission_view(db: &StateDB) -> EmissionView {
+    let read = |tag: &str| {
+        db.get(&vm_move::state_keys::resource_key_str(
+            &system_address(),
+            tag,
+        ))
+        .ok()
+        .flatten()
+    };
+    let net = read("0x1::staking::ValidatorSet")
+        .and_then(|raw| decode_validator_set_hex(&raw))
+        .map(|set| set.total_supply)
+        .unwrap_or(0);
+    let burned = read("0x1::staking::SupplyStats")
+        .and_then(|raw| decode_supply_stats_hex(&raw))
+        .map(|stats| stats.cumulative_burned)
+        .unwrap_or(0);
+    let minted = net.saturating_add(burned);
+    EmissionView {
+        minted,
+        remaining: MAX_SUPPLY.saturating_sub(minted),
+        last_reward_time: read("0x1::staking::EmissionState")
+            .and_then(|raw| hex::decode(raw).ok())
+            .and_then(|bytes| bcs::from_bytes::<u64>(&bytes).ok())
+            .unwrap_or(0),
+    }
+}
+
+/// G5 P-1: the genesis-pinned (I, R, C_tau), for readers (the RPC).
+pub fn pinned_chain_params(db: &StateDB) -> Option<(u64, u64, u64)> {
+    let raw = db
+        .get(&vm_move::state_keys::resource_key_str(
+            &system_address(),
+            "0x1::chain::Params",
+        ))
+        .ok()
+        .flatten()?;
+    let p: ChainParamsResource = bcs::from_bytes(&hex::decode(raw).ok()?).ok()?;
+    Some((p.epoch_blocks, p.reward_period, p.max_block_interval_secs))
+}
+
 /// The committed `0x1::chain::Clock` (G5 CL-2), for readers (the RPC):
 /// before the first block, or unreadable, it reads as zero.
 pub fn committed_chain_clock(db: &StateDB) -> ChainClock {

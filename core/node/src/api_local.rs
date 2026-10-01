@@ -389,6 +389,14 @@ fn move_balance(storage: &Arc<StateDB>, addr: &str) -> String {
     coin_store_balance(storage, move_coin_store_key(move_addr))
 }
 
+/// G5 EM-1: the emission rate, of the remaining reserve per year.
+const EMISSION_RATE_PER_YEAR: &str = "0.019";
+
+/// G5 DOC-1: how the emission works, in one sentence.
+const EMISSION_MODEL: &str =
+    "1.90 % per year of the remaining reserve (the 150M cap minus everything minted), \
+     paid to the committee every reward period by consensus time";
+
 /// G5 DL-2: a pool as the RPC reports it. `active`: its validator is in the
 /// live set, so the pool takes delegations (unless a slash closed it).
 fn validator_pool_json(
@@ -1555,21 +1563,18 @@ fn handle_rpc_method(
                 _ => 0,
             };
             let (total_minted, circulating) = supply_view(net_supply, total_burned);
-
-            // S3: Calculate current reward from halving model (36 AIN base, halves every 2.1M blocks)
-            let latest_height = data.storage.get_chain_height();
-            let halving_interval: u64 = 2_102_400;
-            let halvings = latest_height / halving_interval;
-            let base_reward: u128 = 36_000_000_000_000_000_000; // 36 AIN
-            let current_reward = if halvings >= 128 { 0 } else { base_reward >> halvings };
+            // G5 DOC-1: the emission draws 1.90 %/yr of what remains of the
+            // cap, by consensus time; there is no per-block reward.
+            let emission = executor::emission_view(&data.storage);
 
             Ok(serde_json::json!({
                 "max_supply": max_supply.to_string(),
                 "total_minted": total_minted.to_string(),
                 "total_burned": total_burned.to_string(),
                 "circulating_supply": circulating.to_string(),
-                "current_block_reward": current_reward.to_string(),
-                "halving_epoch": halvings,
+                "remaining_reserve": emission.remaining.to_string(),
+                "emission_rate_per_year": EMISSION_RATE_PER_YEAR,
+                "last_reward_time": emission.last_reward_time,
                 "decimals": 18
             }))
         },
@@ -1709,23 +1714,28 @@ fn handle_rpc_method(
         // ============ IMPORTANT DAPP/EXPLORER ENDPOINTS ============
 
         "aincore_getEconomics" => {
-            let base_reward = data.storage.get_base_reward();
-            let halving_interval = data.storage.get_halving_interval();
+            // G5 DOC-1: the economics as the chain runs them, from Move state.
             let burn_percentage = data.storage.get_burn_percentage();
             let latest_height = data.storage.get_chain_height();
             let max_supply: u128 = 150_000_000 * 1_000_000_000_000_000_000;
-
-            // Calculate current epoch and effective reward
-            let epoch = if halving_interval > 0 { latest_height / halving_interval } else { 0 };
+            let emission = executor::emission_view(&data.storage);
+            let clock = executor::committed_chain_clock(&data.storage);
+            let (epoch_blocks, reward_period, max_block_interval_secs) =
+                executor::pinned_chain_params(&data.storage).unwrap_or((0, 0, 0));
 
             Ok(serde_json::json!({
-                "base_reward": base_reward,
-                "halving_interval": halving_interval,
-                "burn_percentage": burn_percentage,
-                "current_epoch": epoch,
+                "emission_model": EMISSION_MODEL,
+                "emission_rate_per_year": EMISSION_RATE_PER_YEAR,
                 "max_supply": max_supply.to_string(),
-                "block_height": latest_height,
-                "decay_model": "Halving (36 AIN base, halves every 2,102,400 blocks)"
+                "total_minted": emission.minted.to_string(),
+                "remaining_reserve": emission.remaining.to_string(),
+                "last_reward_time": emission.last_reward_time,
+                "consensus_time": clock.time,
+                "reward_period_blocks": reward_period,
+                "epoch_blocks": epoch_blocks,
+                "max_block_interval_secs": max_block_interval_secs,
+                "burn_percentage": burn_percentage,
+                "block_height": latest_height
             }))
         },
 
@@ -2744,6 +2754,100 @@ mod tests {
             serde_json::json!([format!("{:064x}", 0xee), validator]),
         );
         assert_eq!(none["amount"], "0");
+    }
+
+    /// G5 DOC-1: no public document names a halving (the emission draws on
+    /// the remaining reserve by consensus time).
+    #[test]
+    fn public_documents_name_no_halving() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for doc in ["README.md", "WHITEPAPER.md", "CLAUDE.md"] {
+            let text = std::fs::read_to_string(root.join(doc)).unwrap();
+            assert!(
+                !text.to_lowercase().contains("halving"),
+                "{doc} still names a halving"
+            );
+        }
+    }
+
+    /// G5 DOC-1: the supply and economics RPCs report the Move emission
+    /// state: the remaining reserve (the cap minus net supply and burns),
+    /// the last payout's consensus time, the rate and the pinned parameters,
+    /// and nothing of a halving.
+    #[test]
+    fn the_economics_rpcs_report_the_move_emission_state() {
+        #[derive(serde::Serialize)]
+        struct Set {
+            validators: Vec<u8>,
+            unbonding_queue: Vec<u8>,
+            total_supply: u128,
+            current_epoch: u64,
+        }
+        let db = temp_db("doc1_economics");
+        let ain: u128 = 1_000_000_000_000_000_000;
+        {
+            let _seed = db.seeding();
+            let put = |tag: &str, bytes: Vec<u8>| {
+                db.put(
+                    &vm_move::state_keys::resource_key_str(
+                        &move_address(&format!("{:064x}", 1)),
+                        tag,
+                    ),
+                    &hex::encode(bytes),
+                )
+                .unwrap();
+            };
+            put(
+                "0x1::staking::ValidatorSet",
+                bcs::to_bytes(&Set {
+                    validators: vec![],
+                    unbonding_queue: vec![],
+                    total_supply: 2_000_000 * ain,
+                    current_epoch: 3,
+                })
+                .unwrap(),
+            );
+            put(
+                "0x1::staking::SupplyStats",
+                bcs::to_bytes(&(500 * ain)).unwrap(),
+            );
+            put(
+                "0x1::staking::EmissionState",
+                bcs::to_bytes(&4_242u64).unwrap(),
+            );
+            put(
+                "0x1::chain::Params",
+                bcs::to_bytes(&(1_000u64, 20u64, 14u64)).unwrap(),
+            );
+            put(
+                "0x1::chain::Clock",
+                bcs::to_bytes(&(77u64, 4_300u64, 9_000u64)).unwrap(),
+            );
+        }
+        let state = test_state(Arc::clone(&db));
+        let remaining = (150_000_000 * ain - 2_000_500 * ain).to_string();
+        let supply = handle_rpc_method("aincore_getSupply", serde_json::json!([]), &state).unwrap();
+        assert_eq!(supply["remaining_reserve"], remaining);
+        assert_eq!(supply["last_reward_time"], 4_242);
+        assert_eq!(supply["emission_rate_per_year"], "0.019");
+        let economics =
+            handle_rpc_method("aincore_getEconomics", serde_json::json!([]), &state).unwrap();
+        assert_eq!(economics["remaining_reserve"], remaining);
+        assert_eq!(economics["total_minted"], (2_000_500 * ain).to_string());
+        assert_eq!(economics["consensus_time"], 4_300);
+        assert_eq!(
+            (
+                economics["epoch_blocks"].clone(),
+                economics["reward_period_blocks"].clone()
+            ),
+            (serde_json::json!(1_000), serde_json::json!(20))
+        );
+        for reply in [supply, economics] {
+            assert!(
+                !reply.to_string().to_lowercase().contains("halving"),
+                "{reply}"
+            );
+        }
     }
 
     /// Every address form reads the same account; a mistyped `A1n` is refused

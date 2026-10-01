@@ -18,14 +18,15 @@ AINCORE is a high-performance Layer-1 blockchain built entirely in Rust, featuri
 - **Consensus:** DAG-BFT (Bullshark-inspired) with VDF random beacon for unpredictable leader election
 - **Execution:** Parallel Move VM with conflict-aware batch scheduling (Rayon)
 - **Smart Contracts:** Move language (Aptos-compatible) for resource-safe programmability
-- **Staking:** DPoS with 1,000 AIN minimum stake, 21-day unbonding, halving rewards
-- **Jail System:** Misbehaving validators are slashed 5% and force-unbonded (not 100% burned)
+- **Staking:** DPoS with 1,000 AIN minimum stake, 21-day unbonding, delegation pools with commission
+- **Emission:** 1.90 % per year of the remaining reserve (the 150M cap minus everything minted), paid every reward period by consensus time, so it does not depend on block speed
+- **Slashing:** equivocation only, by the share of stake that equivocated together: `(3 × share)²`, at least 1 %, 100 % from a third (any safety attack); the operator's own stake pays first, and the offender is jailed for good
 - **Genesis Lock:** Founder's pre-mine is **mathematically locked** in smart contract — cannot be transferred or sold
 - **Token Factory:** Create custom tokens (ERC-20 equivalent) on-chain
 - **DEX:** Built-in AMM (Constant Product x*y=k) with 0.3% fee
 - **DePIN Integration:** Bio-Oracle for real-world data mining (Universal Mining)
 - **Security:** Ed25519 + Dilithium5 (PQC) signatures, ChaCha20-Poly1305 encrypted P2P, full-transaction replay protection
-- **Downtime Detection:** Validators missing 100+ rounds are detected and attested (gossip) but NOT slashed in this protocol version; only equivocation is slashed (100%, deterministic via DAG-carried evidence)
+- **Downtime Detection:** Validators missing 100+ rounds are detected and attested (gossip) but NOT slashed in this protocol version; only equivocation is slashed (see Slashing), through evidence carried in the DAG
 
 ---
 
@@ -38,12 +39,14 @@ AINCORE is a high-performance Layer-1 blockchain built entirely in Rust, featuri
 | **Genesis Allocation** | ~1,050,000 AIN (0.7% — Validator Stake + Treasury) |
 | **Community Supply** | ~148,950,000 AIN (99.3% — Mined via DePIN & Staking) |
 | **VC Allocation** | **0% (Zero)** |
-| **Block Reward** | 36 AIN per epoch (Halving model) |
-| **Halving Interval** | ~4 years (2,102,400 epochs) |
+| **Emission** | 1.90 % per year of the remaining reserve, paid to the committee every reward period (20 blocks) for the consensus time since the last payout |
+| **Emission Formula** | `e = remaining × λ × Δτ`, λ = −ln(0.981) per year; half of the reserve is emitted after about 36 years |
+| **Reward Split** | each committee member's share by stake (capped at 1/50 of the total); its own part and its commission go to the validator, the rest to its delegators by points |
+| **Fees** | 20 % to the anchor leader, 80 % to the committee by stake; 10 % burned by default |
 | **Min Validator Stake** | 1,000 AIN |
-| **Unbonding Period** | 21 days (1,814,400 seconds) |
-| **Slashing Penalty** | 5% stake burn + forced 21-day unbonding |
-| **Reward Formula** | `Reward = 36 AIN >> (epoch / 2,102,400)` |
+| **Unbonding Period** | 21 days of consensus time, counted from the end of the last committee epoch |
+| **Slashing Penalty** | equivocation only: `(3 × share that equivocated together)²`, minimum 1 %, 100 % from a third; settled once, when every correlated piece of evidence is in; the operator's own stake pays first |
+| **Commission** | at most 30 %; an increase is at most 5 percentage points and takes effect after 7 days; a decrease applies at once |
 
 ### Fairlaunch Model (No-VC, Hyperliquid-Style)
 
@@ -584,8 +587,8 @@ AINCORE uses the Move programming language. All core modules live in `core/vm_mo
 
 | Module | File | Description |
 |---|---|---|
-| `staking` | `staking.move` | DPoS validator staking, halving rewards, **Jail System** |
-| `delegation` | `delegation.move` | Liquid staking delegation with commission |
+| `staking` | `staking.move` | DPoS validator staking, the emission draw, validator unbonding |
+| `delegation` | `delegation.move` | Delegation pools (points and a reward counter), the committee payout, slashing |
 | `dex` | `dex.move` | AMM DEX (Constant Product x*y=k, 0.3% fee) |
 | `token_factory` | `token_factory.move` | Create/Mint/Burn/Transfer custom tokens |
 | `governance` | `governance.move` | On-chain proposal creation and voting |
@@ -679,7 +682,7 @@ export AINCORE_CHAIN_ID=AINCORE-MAINNET-1  # Required for production
 
 - DAG-BFT consensus with Bullshark-inspired ordering
 - Move VM integration with parallel execution (Rayon)
-- Full DPoS staking with halving economic model
+- Full DPoS staking (the original economic model, since replaced by consensus-time emission)
 - 21-day unbonding period (Nothing-at-Stake protection)
 - Consensus state persistence (RocksDB) for crash recovery
 - DAG checkpoint system for O(1) node startup

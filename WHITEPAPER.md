@@ -11,7 +11,7 @@
 |-------|---------|
 | **Konsensus** | **DAG-BFT PoS** (Proof of Stake + DAG Structure) |
 | **Supply** | 150,000,000 AIN (Fixed Max Supply) |
-| **Block Reward** | 36 AIN per block (Halving setiap 4 tahun) |
+| **Emisi** | 1,90 %/tahun dari sisa cadangan, dibayar tiap periode reward menurut waktu konsensus |
 | **Block Time** | ~1-2 detik |
 | **Fair Launch** | ✅ Ya (No Pre-mine, No ICO) |
 | **Smart Contract** | Move VM (sama seperti Aptos/Sui) |
@@ -73,9 +73,9 @@ await connection.sendTransaction(tx.toString());
 ```
 
 ### Slashing (Hukuman):
-- **Double-Sign** → Stake BURNED 100%
-- **Offline** → Penalty per missed round
-- **Unbonding Period** → 21 hari untuk withdraw stake
+- **Double-sign (equivocation)** → dipotong sebesar `(3 × porsi stake yang curang bersamaan)²`, minimal 1 %, 100 % jika ≥ 1/3 stake curang bersamaan (syarat minimum serangan apa pun). Validator di-jail permanen. Stake milik operator menanggung lebih dulu, baru delegator.
+- **Offline** → tidak dipotong (hanya dideteksi)
+- **Unbonding Period** → 21 hari waktu konsensus, dihitung dari akhir epoch komite terakhir
 
 ---
 
@@ -87,22 +87,24 @@ await connection.sendTransaction(tx.toString());
 |--------|-------|
 | **Max Supply** | 150,000,000 AIN |
 | **Genesis Supply** | 0 (Fair Launch!) |
-| **Block Reward** | 36 AIN (decreasing) |
-| **Halving** | Every 4 years (~2.1M blocks) |
+| **Emisi** | 1,90 %/tahun dari sisa cadangan (150 juta dikurangi semua yang sudah dicetak) |
 
-### Halving Schedule:
+### Kurva Emisi:
 
-| Year | Block Reward | Cumulative Supply |
-|------|-------------|-------------------|
-| 0-4 | 36 AIN | ~75M |
-| 4-8 | 18 AIN | ~112M |
-| 8-12 | 9 AIN | ~131M |
-| 12-16 | 4.5 AIN | ~140M |
-| ... | ... | → 150M (asymptotic) |
+Tiap periode reward (20 blok) mencetak `sisa × λ × Δτ`, dengan λ = −ln(0,981) per tahun dan Δτ = waktu konsensus sejak payout terakhir. Karena dihitung dari waktu, bukan jumlah blok, kecepatan blok tidak mengubah kurva.
+
+| Setelah | Bagian cadangan yang sudah dicetak |
+|---------|------------------------------------|
+| 1 tahun | 1,9 % |
+| 10 tahun | 17,5 % |
+| ~36 tahun | 50 % |
+| 100 tahun | 85,3 % |
 
 ### Reward Distribution:
-- **80%** → Block Proposer (Validator)
-- **20%** → DePIN Miners (IoT Devices)
+- Emisi dibagi ke anggota komite epoch itu menurut stake (dibatasi 1/50 dari total).
+- Bagian tiap validator dibagi lagi: bagian stake sendiri + komisi → validator; sisanya → delegator menurut poin.
+- **Fee transaksi:** 20 % ke anchor leader, 80 % ke komite menurut stake, 10 % dibakar (default).
+- **DePIN:** 0 % untuk saat ini, sampai distribusinya tersambung.
 
 ---
 
@@ -251,8 +253,8 @@ wAIN → Burn → Unlock → AIN
 |-----------|-------|
 | **Min Delegation** | 1 AIN |
 | **Max Commission** | 30% |
-| **Unbonding Period** | 21 hari |
-| **Commission Change Notice** | 7 hari |
+| **Unbonding Period** | 21 hari waktu konsensus |
+| **Commission Change Notice** | 7 hari; kenaikan maks. 5 poin persen sekali umumkan; penurunan langsung berlaku |
 
 ---
 

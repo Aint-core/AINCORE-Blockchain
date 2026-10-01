@@ -15,7 +15,7 @@ Arsitektur: **Modular** — terinspirasi Narwhal/Tusk (DAG consensus) + Sui Move
 - **Consensus:** DAG-based (Bullshark-lite ordering)
 - **Storage:** RocksDB (via `common/storage`)
 - **Network:** libp2p (Gossipsub) + TCP fallback
-- **Token:** AIN, 150 juta supply, halving model
+- **Token:** AIN, cap 150 juta; emisi 1,90 %/tahun dari sisa cadangan menurut waktu konsensus (G5)
 - **Chain ID:** `AINCORE-MAINNET-1` (env: `AINCORE_CHAIN_ID`)
 - **API Port:** 8002 (default), `port - 1000` jika custom port
 - **P2P Port:** 9001 (default)
@@ -124,8 +124,8 @@ User TX
 - **Validator set:** dibaca dari `sys:validators` (storage) atau BCS `ValidatorSet` resource
 - **Observer mode:** node yang bukan validator tidak boleh mine
 - **Split-brain prevention:** validator terisolasi (no peers) berhenti mine
-- **Downtime detection:** `DOWNTIME_THRESHOLD = 100 rounds` → attestation only (NOT slashed in protocol v2; only equivocation is slashed, 100%, via DAG-carried compact proofs)
-- **Equivocation (double-sign):** deteksi same author + same round + different hash → instant slash
+- **Downtime detection:** `DOWNTIME_THRESHOLD = 100 rounds` → attestation only (NOT slashed in protocol v2; only equivocation is slashed, via DAG-carried evidence)
+- **Equivocation:** V4 proposer twins (slot kedua dengan digest beda) atau dua sertifikat bertentangan → validator di-jail saat bukti diterima; fraksi slash `(3 × porsi yang curang bersamaan)²`, min 1 %, 100 % dari 1/3, diselesaikan sekali (G5 SL-3..SL-6)
 - **Checkpoint:** setiap 100 round, simpan DAG checkpoint untuk fast recovery
 - **Pruning:** setiap 10 blok, prune round < `min_committed_round - 10`
 
@@ -167,8 +167,8 @@ Validasi yang dilakukan sebelum TX masuk:
 - **Move system address:** `0x1` (semua stdlib ada di sini)
 - **AincoreCoin type:** `0x1::staking::AincoreCoin`
 - **CoinStore key format:** `resource_{addr}_{StructTag}`
-- **Reward:** distribusi ke `anchor_leader` (dari ordering engine)
-- **Fee:** sweep ke miner, bukan burn
+- **Reward:** `delegation::pay_rewards` tiap periode reward ke komite epoch blok itu (bukan live set), dibagi self/delegasi dari catatan komite (G5 EM-1..2, DL-2)
+- **Fee:** 20 % anchor leader, 80 % komite menurut stake; 10 % dibakar (default `burn_percentage`)
 
 ---
 
