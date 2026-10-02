@@ -11,6 +11,21 @@ the churn limit CH-1 (10 % of the committee's stake added per epoch, `churn_limi
 analysis in `docs/AINCORE_EMISSION_CALIBRATION.md` §3, §8, §9. References are in
 `docs/AINCORE_BIBLIOGRAPHY.md`.
 
+## Correction 2026-10-02: S = 15 M has no derivation once F = 0
+
+S = 15 M came from R2 (S > 2F) with F = 5 M. After the founder removed the DEX seed, F = 0
+and R2 holds for every S, so nothing derived 15 M any more; it was carried over by mistake.
+With F = 0, S affects only:
+- year-1 supply growth, 0.019 × (150 M − S) / S: 69 % at 4 M, 17 % at 15 M, 12 % at 20.5 M,
+  10 % at 24 M (Cagan's hyperinflation is 50 % per month; PoS chains launched at ~7–10 %/yr);
+- the permanent pre-allocation: with proportional rewards each holder's share is a martingale
+  (Roşu, Saleh 2021), so every coin of S stays a lasting share for whoever owns it.
+
+Low inflation and a small pre-allocation pull S in opposite directions; no paper picks the
+point. Under study (founder: research before the testnet): a protocol-owned bootstrap stake
+that earns nothing and returns to the emission reserve once public stake replaces it. The
+testnet waits for this research.
+
 ## Revision 2026-10-02 (founder): no business inputs
 
 The founder removed every business input: nothing in the design may depend on someone funding
