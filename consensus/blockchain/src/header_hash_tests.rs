@@ -223,12 +223,12 @@ fn check_commitments_binds_every_body_field() {
         (
             "a header field",
             |b| b.header.round = 21,
-            "Header hash mismatch",
+            "Hash Mismatch",
         ),
         (
             "da_root",
             |b| b.header.da_root = "00".repeat(32),
-            "Header hash mismatch",
+            "Hash Mismatch",
         ),
     ];
     for (name, edit, expected) in edits {

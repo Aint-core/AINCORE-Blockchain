@@ -120,7 +120,7 @@ impl Block {
         let computed = calculate_header_hash(h);
         if computed != h.hash {
             return Err(format!(
-                "Header hash mismatch: header {}, computed {}",
+                "Hash Mismatch. Expected: {}, Computed: {}",
                 h.hash, computed
             ));
         }
@@ -337,12 +337,12 @@ impl Block {
         let tx_hash = calculate_tx_hash(&transactions);
         let vertices_root = calculate_vertices_root(&committed_vertices);
         let evidence_root = calculate_evidence_root(&slash_evidence);
-        let da_root = da::da_root(&body_bytes(
+        let da_root = calculate_da_root(
             &transactions,
             &committed_vertices,
             &anchor_hash,
             &slash_evidence,
-        ));
+        );
 
         let mut header = BlockHeader {
             height,
@@ -494,6 +494,21 @@ pub fn body_bytes(
     p.str(anchor_hash);
     p.list(slash_evidence);
     p.0
+}
+
+/// The DA root of a body (B1): what `BlockHeader::da_root` carries.
+pub fn calculate_da_root(
+    transactions: &[String],
+    committed_vertices: &[String],
+    anchor_hash: &str,
+    slash_evidence: &[String],
+) -> String {
+    da::da_root(&body_bytes(
+        transactions,
+        committed_vertices,
+        anchor_hash,
+        slash_evidence,
+    ))
 }
 
 /// Root binding a block's slash evidence list (order-sensitive). Empty list

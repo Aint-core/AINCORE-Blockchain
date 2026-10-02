@@ -298,6 +298,12 @@ fn import_accepts_consistent_nonempty_body_commitments_after_reopen() {
     block.header.tx_hash = blockchain::calculate_tx_hash(&block.transactions);
     block.header.vertices_root = blockchain::calculate_vertices_root(&block.committed_vertices);
     block.header.evidence_root = blockchain::calculate_evidence_root(&block.slash_evidence);
+    block.header.da_root = blockchain::calculate_da_root(
+        &block.transactions,
+        &block.committed_vertices,
+        &block.anchor_hash,
+        &block.slash_evidence,
+    );
     block.header.hash = blockchain::calculate_header_hash(&block.header);
     db.put("block_10", &serde_json::to_string(&block).unwrap())
         .unwrap();

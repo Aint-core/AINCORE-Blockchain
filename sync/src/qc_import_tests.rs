@@ -394,10 +394,12 @@ fn v4_sync_refuses_a_boundary_qc_binding_another_committee() {
         .is_some());
 }
 
-/// G0 on V4: the anchor is bound through the header's vertices root. A
-/// validly signed block whose anchor is swapped for another hash (same header
-/// hash, same signature) is refused at validation, before any QC is looked
-/// at; the real block passes.
+/// G0 on V4: the anchor is the last committed vertex. A validly signed block
+/// whose anchor is swapped for another hash (same header hash, same
+/// signature) is refused at validation, before any QC is looked at: the
+/// header's DA root binds the anchor (B1). A block resealed around the wrong
+/// anchor (every root and the hash recomputed, signed again) is refused by
+/// the G0 rule itself. The real block passes.
 #[test]
 fn v4_validation_refuses_an_anchor_that_is_not_the_last_committed_vertex() {
     let (sync, _) = v4_sync("g0_anchor");
@@ -408,6 +410,29 @@ fn v4_validation_refuses_an_anchor_that_is_not_the_last_committed_vertex() {
     assert_eq!(swapped.header.hash, real.header.hash);
     assert_eq!(swapped.proposer_signature, real.proposer_signature);
     let err = sync.validate_block(&swapped, 1, "genesis").unwrap_err();
+    assert!(err.contains("DA root mismatch"), "{err}");
+
+    let h = &real.header;
+    let mut resealed = Block::new_with_roots_at(
+        h.height,
+        h.round,
+        h.prev_hash.clone(),
+        real.transactions.clone(),
+        h.proposer_id.clone(),
+        h.state_root.clone(),
+        h.receipts_root.clone(),
+        h.timestamp,
+        real.committed_vertices.clone(),
+        "ef".repeat(32),
+        real.slash_evidence.clone(),
+    );
+    let key = crypto::SigningKey::from_bytes(&[SEEDS[0]; 32]);
+    resealed.sign_proposer(&key, &h.proposer_id);
+    assert!(
+        resealed.check_commitments().is_ok(),
+        "control: every root matches"
+    );
+    let err = sync.validate_block(&resealed, 1, "genesis").unwrap_err();
     assert!(err.contains("last committed vertex"), "{err}");
     sync.validate_block(&real, 1, "genesis").unwrap();
 }
