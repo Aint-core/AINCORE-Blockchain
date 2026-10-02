@@ -938,6 +938,15 @@ pub fn build_local_genesis(stdlib_path: &str) -> Result<GenesisState, GenesisErr
     Ok(genesis)
 }
 
+/// Parse genesis.json text as the node parses it and build its state with
+/// the node's own rules, without a database; return its identity.
+/// `genesis-tool` refuses to write a file the node would refuse to boot.
+pub fn check_genesis_json(json: &str, stdlib_path: &str) -> Result<String, GenesisError> {
+    let file: GenesisFile = serde_json::from_str(json)
+        .map_err(|e| GenesisError::InvalidData(format!("not a valid genesis file: {e}")))?;
+    Ok(build_genesis(&file, &load_stdlib_modules(stdlib_path)?)?.identity)
+}
+
 /// `stdlib_state_hash` of a stdlib directory: the value genesis.json pins as
 /// `stdlib_hash`.
 pub fn stdlib_hash_of(stdlib_path: &str) -> Result<String, GenesisError> {
@@ -1414,9 +1423,11 @@ pub fn build_genesis(
     for account in &file.accounts {
         let balance = parse_genesis_amount(&account.balance, "account balance")?;
         let addr = parse_move_addr(&account.address)?;
+        // Compared as addresses, not strings: hex case must not hide a
+        // validator.
         if genesis_validators
             .iter()
-            .any(|(v, _): &(String, String)| v == &account.address)
+            .any(|(v, _): &(String, String)| parse_move_addr(v).is_ok_and(|v| v == addr))
             || genesis_accounts.iter().any(|(a, _)| *a == addr)
         {
             return Err(GenesisError::InvalidData(format!(
@@ -1481,6 +1492,9 @@ pub fn build_genesis(
     // === G5 A4 BW-1: the bootstrap state ===
     // Weight with no coins: it is never in a coin store, the Move stake or
     // the supply (BW-8), only in the committee weights above.
+    // Each operator's ceiling is its genesis weight and its score starts full
+    // (BW-6). Epoch 0's bootstrap split (BW-8) and the protected list (BW-12)
+    // are written with it.
     if let Some(boot) = &file.bootstrap {
         let state = executor::BootstrapState {
             s_min: boot.s_min_ain,
@@ -1488,12 +1502,21 @@ pub fn build_genesis(
                 .iter()
                 .map(|(address, weight)| executor::BootstrapOperator {
                     address: address.clone(),
+                    ceiling: *weight,
                     weight: *weight,
-                    strikes: 0,
+                    score: executor::BOOTSTRAP_SCORE_SCALE,
                 })
                 .collect(),
         };
         storage.put(executor::BOOTSTRAP_KEY, &serde_json::to_string(&state)?)?;
+        storage.put(
+            &executor::bootstrap_split_key(0),
+            &serde_json::to_string(&bootstrap_weights)?,
+        )?;
+        storage.put(
+            &executor::bootstrap_protected_key(),
+            &hex::encode(bcs::to_bytes(&executor::bootstrap_protected_of(&state))?),
+        )?;
     }
 
     // === Initialize Epoch (the reward-period counter) ===
@@ -2386,10 +2409,26 @@ mod tests {
         let state: executor::BootstrapState =
             serde_json::from_str(&built.writes[executor::BOOTSTRAP_KEY]).unwrap();
         assert_eq!((state.s_min, state.total()), (18_500_000, 18_500_000));
-        assert!(state
-            .operators
-            .iter()
-            .all(|o| o.weight == 4_625_000 && o.strikes == 0));
+        assert!(state.operators.iter().all(|o| o.weight == 4_625_000
+            && o.ceiling == 4_625_000
+            && o.score == executor::BOOTSTRAP_SCORE_SCALE));
+        // BW-8: epoch 0's bootstrap split; BW-12: every operator protected.
+        let split: BTreeMap<String, u64> =
+            serde_json::from_str(&built.writes[&executor::bootstrap_split_key(0)]).unwrap();
+        assert_eq!(
+            split,
+            state
+                .operators
+                .iter()
+                .map(|o| (o.address.clone(), o.weight))
+                .collect()
+        );
+        let protected: executor::BootstrapProtected = bcs::from_bytes(
+            &hex::decode(&built.writes[&executor::bootstrap_protected_key()]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(protected, executor::bootstrap_protected_of(&state));
+        assert_eq!(protected.validators.len(), 4);
         assert_eq!(built.writes["sys:total_supply"], (500 * AIN).to_string());
         let account_store = &built.writes[&coin_store_key(parse_move_addr(&account).unwrap())];
         assert_eq!(
@@ -2413,6 +2452,35 @@ mod tests {
         let mut f = file.clone();
         f.accounts[0].address = f.validators[0].address.clone();
         assert!(refused(&f).contains("is a validator"), "{}", refused(&f));
+        // Hex case does not hide a validator.
+        let mut f = file.clone();
+        f.accounts[0].address = f.validators[0].address.to_uppercase();
+        assert!(refused(&f).contains("is a validator"), "{}", refused(&f));
+        // Exactly a third is refused too.
+        let mut f = file.clone();
+        let mut exact = weights([6_000_000, 4_000_000, 4_000_000, 4_000_000], &f);
+        exact.s_min_ain = 18_000_000;
+        f.bootstrap = Some(exact);
+        assert!(refused(&f).contains("a third"), "{}", refused(&f));
+
+        // An operator may own stake too: the committee weighs owned plus
+        // bootstrap, the state holds only the bootstrap part, and the owned
+        // stake is minted as usual.
+        let mut f = file.clone();
+        f.validators[0] = bootstrap_member(61, 1_000);
+        f.bootstrap.as_mut().unwrap().weights[0].weight_ain = 4_624_000;
+        let built = build_genesis(&f, &stdlib()).unwrap();
+        let committee: Vec<consensus::qc::ValidatorInfo> =
+            serde_json::from_str(&built.writes["genesis:validator_set:v1"]).unwrap();
+        assert_eq!(committee.iter().map(|m| m.stake).sum::<u64>(), 18_500_000);
+        let state: executor::BootstrapState =
+            serde_json::from_str(&built.writes[executor::BOOTSTRAP_KEY]).unwrap();
+        assert_eq!(state.weight_of(&f.validators[0].address), 4_624_000);
+        assert_eq!(
+            built.writes["sys:total_supply"],
+            (1_500 * AIN).to_string(),
+            "the owned 1,000 and the account's 500"
+        );
     }
 
     #[test]

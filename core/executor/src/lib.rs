@@ -495,29 +495,38 @@ pub fn opening_churn_state(epoch: u64, committee_stake: u128) -> ChurnState {
 
 /// G5 A4 BW-1: bootstrap weight, consensus weight with no coins and no owner
 /// (docs/research/genesis_bootstrap.md). Genesis writes it; at every boundary
-/// the executor forfeits and shrinks it (BW-4..BW-6), never grows it. Weights
-/// are whole AIN, like committee stakes. A chain without the key has none.
+/// the executor scores, forfeits, scales and caps it (BW-4..BW-6, BW-11).
+/// Weights are whole AIN, like committee stakes. A chain without the key has
+/// none.
 pub const BOOTSTRAP_KEY: &str = "sys:bootstrap:v1";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BootstrapState {
     /// s_min: the committee weight bootstrap weight fills up to, whole AIN.
     pub s_min: u64,
-    /// Sorted by address. An operator whose weight reaches 0 is removed.
+    /// Sorted by address. A forfeited operator is removed.
     pub operators: Vec<BootstrapOperator>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BootstrapOperator {
     pub address: String,
+    /// BW-4: the most it can hold, its genesis weight.
+    pub ceiling: u64,
+    /// Its weight in the committee of the current epoch (BW-4, BW-11).
     pub weight: u64,
-    /// BW-6: consecutive epochs below a third of its expected leads.
-    pub strikes: u8,
+    /// BW-6: its participation score, in parts per million of its leader
+    /// slots committed; starts at one million.
+    pub score: u64,
 }
 
 impl BootstrapState {
     pub fn total(&self) -> u64 {
         self.operators.iter().map(|o| o.weight).sum()
+    }
+
+    pub fn ceilings(&self) -> u64 {
+        self.operators.iter().map(|o| o.ceiling).sum()
     }
 
     pub fn weight_of(&self, address: &str) -> u64 {
@@ -528,9 +537,19 @@ impl BootstrapState {
     }
 }
 
-/// BW-6: the blocks each committee member led in committee epoch `epoch`.
-pub fn bootstrap_led_key(epoch: u64) -> String {
-    format!("sys:bootstrap:led:{epoch}")
+/// BW-6: per operator, the leader slots it held in committee epoch `epoch`
+/// and how many of them committed: `{address: [slots, led]}`.
+pub fn bootstrap_slots_key(epoch: u64) -> String {
+    format!("sys:bootstrap:slots:{epoch}")
+}
+
+/// BW-6: the anchor round of the last executed block.
+pub const BOOTSTRAP_ROUND_KEY: &str = "sys:bootstrap:round";
+
+/// BW-8: the bootstrap part of each member's weight in the committee of
+/// `epoch`, recorded with it, so a slash never cuts weight without coins.
+pub fn bootstrap_split_key(epoch: u64) -> String {
+    format!("sys:validator_set:epoch_bootstrap:{epoch}")
 }
 
 /// The chain's bootstrap state, if it has one.
@@ -540,11 +559,189 @@ pub fn read_bootstrap(db: &StateDB) -> Option<BootstrapState> {
         .map(|raw| serde_json::from_str(&raw).expect("CRITICAL: the bootstrap state is corrupt"))
 }
 
-/// BW-6: strikes at which an operator forfeits its bootstrap weight.
-pub const BOOTSTRAP_MAX_STRIKES: u8 = 3;
-/// BW-6: below this many expected leads in an epoch, a member is not judged
-/// (P(led < 3 | Poisson 9) is about 0.6 %).
-pub const BOOTSTRAP_MIN_EXPECTED_LEADS: u128 = 9;
+/// BW-6: the score's unit (one million is every slot committed) and its
+/// prior.
+pub const BOOTSTRAP_SCORE_SCALE: u64 = 1_000_000;
+/// BW-6: an operator whose score falls below half forfeits. Honest
+/// validators commit 88-92 % of their slots (AINCORE-TESTNET-V4).
+pub const BOOTSTRAP_SCORE_FLOOR: u64 = 500_000;
+/// BW-6: the score is a moving average over epochs with weight 1/N, N = 128:
+/// a half-life of 88.4 epochs, 6.9 days at the measured 6.75 s blocks (the
+/// 7-day reaction budget T_mis of G5).
+pub const BOOTSTRAP_SCORE_EPOCHS: u64 = 128;
+/// BW-6: at most this many anchor rounds are scanned for one block; a longer
+/// gap counts only its last rounds.
+pub const BOOTSTRAP_MAX_ROUND_SCAN: u64 = 65_536;
+
+/// BW-6: one epoch's slots and commits folded into a score.
+pub fn next_bootstrap_score(score: u64, slots: u64, led: u64) -> u64 {
+    if slots == 0 {
+        return score;
+    }
+    let ratio = (led.min(slots) as u128 * BOOTSTRAP_SCORE_SCALE as u128 / slots as u128) as u64;
+    score - score / BOOTSTRAP_SCORE_EPOCHS + ratio / BOOTSTRAP_SCORE_EPOCHS
+}
+
+/// BW-4: the owned stake P that secures consensus: the owned weight of the
+/// members the next committee would hold, ranked as `top_by_stake` ranks
+/// them (owned plus the operators' current bootstrap weight).
+pub fn committee_owned_stake(owned: &BTreeMap<String, u64>, state: &BootstrapState) -> u128 {
+    let mut ranked: Vec<(&String, u64, u64)> = owned
+        .iter()
+        .map(|(address, &own)| (address, own, own.saturating_add(state.weight_of(address))))
+        .filter(|(_, _, total)| *total > 0)
+        .collect();
+    ranked.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(b.0)));
+    ranked
+        .iter()
+        .take(blockchain::committee::MAX_COMMITTEE)
+        .map(|(_, own, _)| *own as u128)
+        .sum()
+}
+
+/// G5 DL-1: each live member's owned weight in whole AIN, its own Move
+/// stake plus its open pool's principal; each member's pool part when it has
+/// one; and the members a Move set exists without (they lose their seat).
+/// Without any Move set (a test fixture) nobody is owned or gone.
+#[allow(clippy::type_complexity)] // three maps of one pass over the live set
+fn owned_weights_of(
+    db: &StateDB,
+    live: &[ValidatorSetV1Entry],
+) -> (BTreeMap<String, u64>, BTreeMap<String, u64>, Vec<String>) {
+    let move_set = db
+        .get(&validator_set_key())
+        .expect("CRITICAL: the Move validator set could not be read")
+        .and_then(|raw| decode_validator_set_hex(&raw));
+    let own: BTreeMap<move_core_types::account_address::AccountAddress, u128> = move_set
+        .as_ref()
+        .map(|set| {
+            set.validators
+                .iter()
+                .map(|v| (v.validator_addr, v.stake.value))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut owned = BTreeMap::new();
+    let mut pools = BTreeMap::new();
+    let mut gone = Vec::new();
+    for entry in live {
+        let Some(own_stake) = parse_move_address(&entry.address).and_then(|a| own.get(&a)) else {
+            if move_set.is_some() {
+                gone.push(entry.address.clone());
+            }
+            continue;
+        };
+        let pool = delegated_weight(db, &entry.address);
+        if pool > 0 {
+            pools.insert(entry.address.clone(), pool);
+        }
+        owned.insert(
+            entry.address.clone(),
+            u64::try_from(own_stake / COIN_SCALE)
+                .unwrap_or(u64::MAX)
+                .saturating_add(pool),
+        );
+    }
+    (owned, pools, gone)
+}
+
+/// G5 A4 BW-10: the bootstrap state with P and the target B the next
+/// boundary would compute now, by the boundary's own functions.
+pub struct BootstrapReport {
+    pub state: BootstrapState,
+    pub owned_stake: u128,
+    pub target: u128,
+}
+
+pub fn bootstrap_report(db: &StateDB) -> Option<BootstrapReport> {
+    let state = read_bootstrap(db)?;
+    let live: Vec<ValidatorSetV1Entry> = db
+        .get(validator_set_v1_key())
+        .expect("CRITICAL: the live validator set could not be read")
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let (owned, _, _) = owned_weights_of(db, &live);
+    let owned_stake = committee_owned_stake(&owned, &state);
+    Some(BootstrapReport {
+        target: (state.s_min as u128).saturating_sub(owned_stake),
+        state,
+        owned_stake,
+    })
+}
+
+/// BW-11: cut bootstrap weight so that no member of the next committee
+/// reaches a third of its weight. `members` are (address, owned, bootstrap);
+/// returns each one's bootstrap weight after the cut. Only bootstrap weight is
+/// cut, and the cut weight goes to nobody. The cap is the largest level L at
+/// which every member weighs at most max(owned, L) and 3L < the new total
+/// (3L <= with exactly three members, where below a third is impossible);
+/// with two or fewer members nothing is cut. Precedent: Sui caps each
+/// validator's voting power at max(10 %, 1/n) at every epoch.
+pub fn cap_below_a_third(members: &[(String, u64, u64)]) -> BTreeMap<String, u64> {
+    let mut out: BTreeMap<String, u64> = members
+        .iter()
+        .map(|(address, _, boot)| (address.clone(), *boot))
+        .collect();
+    let mut ranked: Vec<(&String, u128, u128)> = members
+        .iter()
+        .map(|(address, own, boot)| (address, *own as u128, *own as u128 + *boot as u128))
+        .filter(|(_, _, total)| *total > 0)
+        .collect();
+    ranked.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(b.0)));
+    ranked.truncate(blockchain::committee::MAX_COMMITTEE);
+    let n = ranked.len();
+    if n < 3 {
+        return out;
+    }
+    let strict: u128 = if n >= 4 { 1 } else { 0 };
+    let weighed_at = |level: u128| -> u128 {
+        ranked
+            .iter()
+            .map(|(_, own, total)| (*total).min((*own).max(level)))
+            .sum()
+    };
+    // The greatest L with 3L + strict <= T'(L): iterate down from the
+    // largest weight; T' is monotone, so this stops at the greatest such L.
+    let mut level = ranked[0].2;
+    for _ in 0..64 * (n + 2) {
+        let next = weighed_at(level).saturating_sub(strict) / 3;
+        if next >= level {
+            break;
+        }
+        level = next;
+    }
+    for (address, own, total) in &ranked {
+        if *total > level {
+            let boot = out
+                .get_mut(*address)
+                .expect("every ranked member is in the map");
+            *boot = (*boot as u128).min(level.saturating_sub(*own)) as u64;
+        }
+    }
+    out
+}
+
+/// BW-12: the Move resource `0x1::staking::BootstrapProtected`: validators
+/// a full set never displaces.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapProtected {
+    pub validators: Vec<move_core_types::account_address::AccountAddress>,
+}
+
+pub fn bootstrap_protected_key() -> String {
+    vm_move::state_keys::resource_key_str(&system_address(), "0x1::staking::BootstrapProtected")
+}
+
+/// BW-12: the protected list of a bootstrap state: its operators.
+pub fn bootstrap_protected_of(state: &BootstrapState) -> BootstrapProtected {
+    BootstrapProtected {
+        validators: state
+            .operators
+            .iter()
+            .filter_map(|o| parse_move_address(&o.address))
+            .collect(),
+    }
+}
 
 /// Mirror of the Move `0x1::chain::Params` resource (BCS field order).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -728,12 +925,15 @@ impl VerifiedEvidence {
     }
 }
 
-/// G5 SL-5: an offense's weights from the records of its epoch.
+/// G5 SL-5: an offense's weights from the records of its epoch. `own` is the
+/// operator's own coins: its weight less its pool's part and its bootstrap
+/// weight (G5 A4 BW-8), which has no coins to cut.
 struct OffenseRecord {
     began: u64,
     weight: u64,
     committee_weight: u64,
     delegated: u64,
+    own: u64,
 }
 
 fn dex_registry_key() -> String {
@@ -1366,9 +1566,13 @@ impl Executor {
         else {
             return Ok(()); // not an active validator — nothing to resync
         };
-        // G5 DL-1: the bonded weight, its own stake plus its open pool's.
+        // G5 DL-1: the bonded weight, its own stake plus its open pool's,
+        // plus its bootstrap weight (G5 A4 BW-3).
+        let bootstrap = read_bootstrap(&self.db).map_or(0, |b| b.weight_of(addr));
         let new_stake = match u64::try_from(cfg.stake.value / COIN_SCALE) {
-            Ok(s) => s.saturating_add(delegated_weight(&self.db, addr)),
+            Ok(s) => s
+                .saturating_add(delegated_weight(&self.db, addr))
+                .saturating_add(bootstrap),
             Err(_) => return Ok(()),
         };
 
@@ -1824,12 +2028,32 @@ impl Executor {
             .copied()
             .unwrap_or(0)
             .min(weight);
+        let bootstrap = self
+            .bootstrap_split_of_epoch(epoch)
+            .get(validator)
+            .copied()
+            .unwrap_or(0)
+            .min(weight - delegated);
         Some(OffenseRecord {
             began: self.epoch_began(epoch)?,
             weight,
             committee_weight,
             delegated,
+            own: weight - delegated - bootstrap,
         })
+    }
+
+    /// G5 A4 BW-8: the bootstrap part of each member's weight in the
+    /// committee of `epoch` (`sys:validator_set:epoch_bootstrap:{E}`; epoch
+    /// 0's is written by genesis). Absent: none.
+    fn bootstrap_split_of_epoch(&self, epoch: u64) -> BTreeMap<String, u64> {
+        self.db
+            .get(&bootstrap_split_key(epoch))
+            .expect("CRITICAL: the bootstrap-weight record could not be read")
+            .map(|raw| {
+                serde_json::from_str(&raw).expect("CRITICAL: a bootstrap-weight record is corrupt")
+            })
+            .unwrap_or_default()
     }
 
     /// The consensus time committee epoch `epoch` began: 0 for the genesis
@@ -1890,8 +2114,11 @@ impl Executor {
     /// The Move set is the authority (G5 review): a member it does not hold
     /// is dropped from both, so a seat never outlives its stake whatever path
     /// changed the Move set. Only a fixture without any Move set keeps its
-    /// weights.
-    fn refresh_bonded_weights(&self, new_epoch: u64) -> BTreeMap<String, u64> {
+    /// weights. Also returns each member's bootstrap weight (G5 A4).
+    fn refresh_bonded_weights(
+        &self,
+        new_epoch: u64,
+    ) -> (BTreeMap<String, u64>, BTreeMap<String, u64>) {
         let mut delegated = BTreeMap::new();
         let Some(mut live) = self
             .db
@@ -1899,44 +2126,11 @@ impl Executor {
             .expect("CRITICAL: the live validator set could not be read")
             .and_then(|raw| serde_json::from_str::<Vec<ValidatorSetV1Entry>>(&raw).ok())
         else {
-            return delegated;
+            return (delegated, BTreeMap::new());
         };
-        let move_set = self
-            .db
-            .get(&validator_set_key())
-            .expect("CRITICAL: the Move validator set could not be read")
-            .and_then(|raw| decode_validator_set_hex(&raw));
-        let own: BTreeMap<move_core_types::account_address::AccountAddress, u128> = move_set
-            .as_ref()
-            .map(|set| {
-                set.validators
-                    .iter()
-                    .map(|v| (v.validator_addr, v.stake.value))
-                    .collect()
-            })
-            .unwrap_or_default();
         let mut bonded = BTreeMap::new();
-        let mut gone: Vec<String> = Vec::new();
-        let mut owned_weights: BTreeMap<String, u64> = BTreeMap::new();
-        for entry in live.iter() {
-            let Some(own_stake) = parse_move_address(&entry.address).and_then(|a| own.get(&a))
-            else {
-                if move_set.is_some() {
-                    gone.push(entry.address.clone());
-                }
-                continue;
-            };
-            let pool = delegated_weight(&self.db, &entry.address);
-            if pool > 0 {
-                delegated.insert(entry.address.clone(), pool);
-            }
-            owned_weights.insert(
-                entry.address.clone(),
-                u64::try_from(own_stake / COIN_SCALE)
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(pool),
-            );
-        }
+        let (owned_weights, pools, gone) = owned_weights_of(&self.db, &live);
+        delegated.extend(pools);
         // G5 A4: bootstrap weight is settled after owned weights (BW-4) and
         // added to them; it never enters the pool split (BW-7).
         let bootstrap = self.settle_bootstrap(new_epoch, &owned_weights);
@@ -1955,7 +2149,7 @@ impl Executor {
             live.retain(|entry| !gone.contains(&entry.address));
         }
         if bonded.is_empty() && gone.is_empty() {
-            return delegated;
+            return (delegated, bootstrap);
         }
         self.db
             .put(
@@ -1987,45 +2181,86 @@ impl Executor {
                     .expect("CRITICAL: the validator mirror write failed");
             }
         }
-        delegated
+        (delegated, bootstrap)
     }
 
-    /// G5 A4 BW-6: count the block's leader toward its epoch's leads. Only a
-    /// chain with bootstrap operators counts.
-    fn count_bootstrap_lead(&self, height: u64, proposer_hex: &str) {
-        if height == 0 || read_bootstrap(&self.db).is_none_or(|b| b.operators.is_empty()) {
+    /// G5 A4 BW-6: count the leader slots of the anchor rounds this block
+    /// closes, (previous block's anchor round, `anchor_round`], against the
+    /// committee of its epoch with consensus's own leader schedule, and
+    /// whether the block's anchor is its leader's. Only operators are
+    /// counted, and only on a chain with bootstrap operators.
+    fn count_bootstrap_slots(&self, height: u64, anchor_round: u64, proposer_hex: &str) {
+        let last = self
+            .db
+            .get(BOOTSTRAP_ROUND_KEY)
+            .expect("CRITICAL: the bootstrap round could not be read")
+            .map(|raw| {
+                raw.parse::<u64>()
+                    .expect("CRITICAL: the bootstrap round is corrupt")
+            });
+        let Some(state) = read_bootstrap(&self.db).filter(|b| !b.operators.is_empty()) else {
+            return;
+        };
+        let last = last.unwrap_or(0);
+        if height == 0 || anchor_round <= last {
             return;
         }
-        let leader = if proposer_hex.len() > crypto::ADDRESS_HEX_LEN {
+        self.db
+            .put(BOOTSTRAP_ROUND_KEY, &anchor_round.to_string())
+            .expect("CRITICAL: the bootstrap round write failed");
+        let epoch = (height - 1) / self.epoch_block_interval();
+        let mut stakes: Vec<(String, u64)> = self
+            .committee_of_epoch(epoch)
+            .into_iter()
+            .map(|m| (m.address, m.stake))
+            .collect();
+        stakes.sort_by(|a, b| a.0.cmp(&b.0));
+        let leader_of_block = if proposer_hex.len() > crypto::ADDRESS_HEX_LEN {
             &proposer_hex[..crypto::ADDRESS_HEX_LEN]
         } else {
             proposer_hex
         };
-        if leader.is_empty() {
-            return;
-        }
-        let key = bootstrap_led_key((height - 1) / self.epoch_block_interval());
-        let mut led: BTreeMap<String, u64> = self
+        let key = bootstrap_slots_key(epoch);
+        let mut slots: BTreeMap<String, (u64, u64)> = self
             .db
             .get(&key)
-            .expect("CRITICAL: the bootstrap lead count could not be read")
+            .expect("CRITICAL: the bootstrap slot count could not be read")
             .map(|raw| {
-                serde_json::from_str(&raw).expect("CRITICAL: a bootstrap lead count is corrupt")
+                serde_json::from_str(&raw).expect("CRITICAL: a bootstrap slot count is corrupt")
             })
             .unwrap_or_default();
-        *led.entry(leader.to_string()).or_insert(0) += 1;
-        self.db
-            .put(
-                &key,
-                &serde_json::to_string(&led).expect("a lead count is JSON"),
-            )
-            .expect("CRITICAL: the bootstrap lead count write failed");
+        let before = slots.clone();
+        // Anchors live on even rounds.
+        let mut round = anchor_round
+            .saturating_sub(2 * (BOOTSTRAP_MAX_ROUND_SCAN - 1))
+            .max(last + 1);
+        round += round % 2;
+        while round <= anchor_round {
+            let leader = blockchain::committee::leader_for_round(round, &stakes, 0);
+            if state.operators.iter().any(|o| o.address == leader) {
+                let entry = slots.entry(leader.clone()).or_insert((0, 0));
+                entry.0 += 1;
+                if round == anchor_round && leader == leader_of_block {
+                    entry.1 += 1;
+                }
+            }
+            round += 2;
+        }
+        if slots != before {
+            self.db
+                .put(
+                    &key,
+                    &serde_json::to_string(&slots).expect("a slot count is JSON"),
+                )
+                .expect("CRITICAL: the bootstrap slot count write failed");
+        }
     }
 
     /// G5 A4 at the boundary opening `new_epoch`, given each live member's
-    /// owned weight: judge the closed epoch's leads (BW-6), forfeit (BW-5),
-    /// shrink to max(0, s_min - P) (BW-4), and write the state. Returns each
-    /// operator's bootstrap weight; empty on a chain without bootstrap.
+    /// owned weight: score the closed epoch (BW-6), forfeit (BW-5), scale to
+    /// B = max(0, s_min - P) within the ceilings (BW-4), cap below a third
+    /// (BW-11), and write the state and the protected list (BW-12). Returns
+    /// each operator's bootstrap weight; empty on a chain without bootstrap.
     fn settle_bootstrap(
         &self,
         new_epoch: u64,
@@ -2035,77 +2270,117 @@ impl Executor {
             return BTreeMap::new();
         };
         let closed = new_epoch.saturating_sub(1);
-        let led_key = bootstrap_led_key(closed);
-        let led: BTreeMap<String, u64> = self
+        let slots_key = bootstrap_slots_key(closed);
+        let slots: BTreeMap<String, (u64, u64)> = self
             .db
-            .get(&led_key)
-            .expect("CRITICAL: the bootstrap lead count could not be read")
+            .get(&slots_key)
+            .expect("CRITICAL: the bootstrap slot count could not be read")
             .map(|raw| {
-                serde_json::from_str(&raw).expect("CRITICAL: a bootstrap lead count is corrupt")
+                serde_json::from_str(&raw).expect("CRITICAL: a bootstrap slot count is corrupt")
             })
             .unwrap_or_default();
-        // BW-6: expected leads by C_E's weights; the election is stake-weighted.
-        let committee: BTreeMap<String, u64> = self
-            .committee_of_epoch(closed)
-            .into_iter()
-            .map(|m| (m.address, m.stake))
-            .collect();
-        let total: u128 = committee.values().map(|&w| w as u128).sum();
-        let blocks: u128 = led.values().map(|&n| n as u128).sum();
+        // BW-6: score the closed epoch.
         for op in state.operators.iter_mut() {
-            let Some(&w) = committee.get(&op.address) else {
-                continue;
-            };
-            if total == 0 {
-                continue;
+            if let Some(&(n, led)) = slots.get(&op.address) {
+                op.score = next_bootstrap_score(op.score, n, led);
             }
-            let expected = blocks * w as u128 / total;
-            if expected < BOOTSTRAP_MIN_EXPECTED_LEADS {
-                continue;
-            }
-            let got = led.get(&op.address).copied().unwrap_or(0) as u128;
-            op.strikes = if 3 * got < expected {
-                op.strikes.saturating_add(1)
-            } else {
-                0
-            };
         }
         // BW-5: forfeit for good.
         for op in state.operators.iter_mut() {
             if !owned.contains_key(&op.address)
                 || self.is_jailed(&op.address)
                 || self.is_convicted_in_full(&op.address)
-                || op.strikes >= BOOTSTRAP_MAX_STRIKES
+                || op.score < BOOTSTRAP_SCORE_FLOOR
             {
+                op.ceiling = 0;
                 op.weight = 0;
             }
         }
-        // BW-4: shrink to the target; never grow, drop the dust.
-        let p: u128 = owned.values().map(|&w| w as u128).sum();
+        // BW-4: fill to s_min - P within the ceilings; the bootstrap ends for
+        // good once P reaches s_min.
+        let p = committee_owned_stake(owned, &state);
         let target = (state.s_min as u128).saturating_sub(p);
-        let sum: u128 = state.operators.iter().map(|o| o.weight as u128).sum();
-        if sum > target {
+        if target == 0 {
             for op in state.operators.iter_mut() {
-                op.weight = (op.weight as u128 * target / sum) as u64;
+                op.ceiling = 0;
             }
         }
-        state.operators.retain(|o| o.weight > 0);
+        let ceilings = state.ceilings() as u128;
+        for op in state.operators.iter_mut() {
+            op.weight = (op.ceiling as u128 * target.min(ceilings))
+                .checked_div(ceilings)
+                .unwrap_or(0) as u64;
+        }
+        // BW-11: no member of the next committee at a third.
+        let members: Vec<(String, u64, u64)> = owned
+            .iter()
+            .map(|(address, &own)| (address.clone(), own, state.weight_of(address)))
+            .collect();
+        let capped = cap_below_a_third(&members);
+        for op in state.operators.iter_mut() {
+            if let Some(&w) = capped.get(&op.address) {
+                op.weight = w;
+            }
+        }
+        state.operators.retain(|o| o.ceiling > 0);
         self.db
             .put(
                 BOOTSTRAP_KEY,
                 &serde_json::to_string(&state).expect("the bootstrap state is JSON"),
             )
             .expect("CRITICAL: the bootstrap state write failed");
-        if !led.is_empty() {
+        self.db
+            .put(
+                &bootstrap_protected_key(),
+                &hex::encode(
+                    bcs::to_bytes(&bootstrap_protected_of(&state))
+                        .expect("the protected list is BCS"),
+                ),
+            )
+            .expect("CRITICAL: the protected list write failed");
+        if !slots.is_empty() {
             self.db
-                .delete(&led_key)
-                .expect("CRITICAL: the bootstrap lead count delete failed");
+                .delete(&slots_key)
+                .expect("CRITICAL: the bootstrap slot count delete failed");
         }
         state
             .operators
             .iter()
+            .filter(|o| o.weight > 0)
             .map(|o| (o.address.clone(), o.weight))
             .collect()
+    }
+
+    /// G5 A4 BW-5: an operator that leaves the Move set forfeits at once, in
+    /// the leave transaction, so a leave and a rejoin within one epoch cannot
+    /// keep the weight.
+    fn stage_bootstrap_forfeit(
+        &self,
+        updates: &mut Vec<(String, Option<String>)>,
+        addr: &str,
+    ) -> Result<(), String> {
+        let latest = updates
+            .iter()
+            .rev()
+            .find_map(|(k, v)| if k == BOOTSTRAP_KEY { v.clone() } else { None })
+            .or_else(|| self.db.get(BOOTSTRAP_KEY).ok().flatten());
+        let Some(raw) = latest else {
+            return Ok(());
+        };
+        let mut state: BootstrapState = serde_json::from_str(&raw)
+            .map_err(|e| format!("the bootstrap state is corrupt: {e}"))?;
+        let before = state.operators.len();
+        state.operators.retain(|o| o.address != addr);
+        if state.operators.len() != before {
+            updates.push((
+                BOOTSTRAP_KEY.to_string(),
+                Some(
+                    serde_json::to_string(&state)
+                        .map_err(|e| format!("serialize the bootstrap state failed: {e}"))?,
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// G5 EM-2: who is paid for block `height`: the members of the committee
@@ -2140,7 +2415,7 @@ impl Executor {
         }
         let new_epoch = boundary_height / interval;
 
-        let delegated = self.refresh_bonded_weights(new_epoch);
+        let (delegated, bootstrap) = self.refresh_bonded_weights(new_epoch);
         let current = self.committee_of_epoch(new_epoch.saturating_sub(1));
         let proposed: Vec<blockchain::committee::ValidatorInfo> = self
             .db
@@ -2180,6 +2455,26 @@ impl Executor {
                     &serde_json::to_string(&split).expect("a split is JSON"),
                 )
                 .expect("CRITICAL: the delegated-weight record write failed");
+        }
+        // G5 A4 BW-8: and the bootstrap part, so a slash cuts only coins.
+        let boot_split: BTreeMap<String, u64> = if invalid.is_some() {
+            self.bootstrap_split_of_epoch(new_epoch.saturating_sub(1))
+        } else {
+            next.iter()
+                .filter_map(|m| {
+                    bootstrap
+                        .get(&m.address)
+                        .map(|b| (m.address.clone(), (*b).min(m.stake)))
+                })
+                .collect()
+        };
+        if !boot_split.is_empty() {
+            self.db
+                .put(
+                    &bootstrap_split_key(new_epoch),
+                    &serde_json::to_string(&boot_split).expect("a split is JSON"),
+                )
+                .expect("CRITICAL: the bootstrap-weight record write failed");
         }
         // G5 CH-1: the new epoch's allowance of added stake, against its
         // committee. Genesis wrote epoch 0's; a chain without one has none.
@@ -2235,6 +2530,7 @@ impl Executor {
                 .db
                 .delete(&format!("sys:validator_set:epoch:{}", oldest));
             let _ = self.db.delete(&delegated_split_key(oldest));
+            let _ = self.db.delete(&bootstrap_split_key(oldest));
             let _ = self.db.delete(&epoch_time_key(oldest));
             let _ = self
                 .db
@@ -2533,7 +2829,7 @@ impl Executor {
     ) -> BlockExecutionSummary {
         let height = self.last_executed_height().saturating_add(1);
         let timestamp = next_chain_clock(&self.db, height, 0).block_timestamp;
-        match self.execute_block_parallel_at(txs_json, proposer_hex, height, timestamp, &[]) {
+        match self.execute_block_parallel_at(txs_json, proposer_hex, height, timestamp, 0, &[]) {
             BlockExecOutcome::Executed(summary) => summary,
             other => {
                 eprintln!("⚠️ execute_block_parallel: {:?} — returning current roots", other);
@@ -2572,6 +2868,8 @@ impl Executor {
         proposer_hex: &str,
         block_height: u64,
         block_timestamp: u64,
+        // G5 BW-6: the round of the block's anchor (its header's `round`).
+        anchor_round: u64,
         // RE-AUDIT HIGH: slash evidence CARRIED BY THE BLOCK (see apply_slash_evidence).
         slash_evidence: &[String],
     ) -> BlockExecOutcome {
@@ -2580,6 +2878,7 @@ impl Executor {
             proposer_hex,
             block_height,
             block_timestamp,
+            anchor_round,
             slash_evidence,
             |_, _| Ok(()),
         )
@@ -2590,12 +2889,14 @@ impl Executor {
     /// ONE durable write. `accept` must use only its supplied view for DB writes.
     /// Returning Err discards state, receipts, height, and acceptance writes.
     /// Callers remain responsible for authenticating the block and its parent.
+    #[allow(clippy::too_many_arguments)] // the block (content, height, timestamp, round, evidence) and its check
     pub fn execute_block_checked_at(
         &self,
         txs_json: Vec<String>,
         proposer_hex: &str,
         block_height: u64,
         block_timestamp: u64,
+        anchor_round: u64,
         slash_evidence: &[String],
         accept: impl FnOnce(&BlockExecutionSummary, &StateDB) -> Result<(), String>,
     ) -> Result<BlockExecOutcome, String> {
@@ -2604,6 +2905,7 @@ impl Executor {
             proposer_hex,
             block_height,
             block_timestamp,
+            anchor_round,
             slash_evidence,
             |_| Ok(()),
             accept,
@@ -2615,13 +2917,14 @@ impl Executor {
     /// its supplied view; it must not use a captured base DB or mutate state.
     /// Neither callback may write through a captured base DB (writer deadlock).
     /// A prior network precheck is only an optimization, not admission authority.
-    #[allow(clippy::too_many_arguments)] // the block (content, height, timestamp, evidence) and its two checks are intrinsic
+    #[allow(clippy::too_many_arguments)] // the block (content, height, timestamp, round, evidence) and its two checks are intrinsic
     pub fn execute_block_admitted_at(
         &self,
         txs_json: Vec<String>,
         proposer_hex: &str,
         block_height: u64,
         block_timestamp: u64,
+        anchor_round: u64,
         slash_evidence: &[String],
         admit: impl FnOnce(&StateDB) -> Result<(), String>,
         accept: impl FnOnce(&BlockExecutionSummary, &StateDB) -> Result<(), String>,
@@ -2654,6 +2957,7 @@ impl Executor {
                     proposer_hex,
                     block_height,
                     block_timestamp,
+                    anchor_round,
                     slash_evidence,
                 );
                 if let BlockExecOutcome::Executed(summary) = &outcome {
@@ -2681,6 +2985,7 @@ impl Executor {
         proposer_hex: &str,
         block_height: u64,
         block_timestamp: u64,
+        anchor_round: u64,
         slash_evidence: &[String],
     ) -> BlockExecOutcome {
 
@@ -3022,9 +3327,9 @@ impl Executor {
         // being executed (see execute_block_parallel_at doc).
         // G5 EM-3: the reward payout for (h - R, h] pays C_{E(h)} before a
         // boundary block records C_{E+1}.
-        // G5 A4 BW-6: the leader counts toward its epoch before a boundary
-        // judges that epoch.
-        self.count_bootstrap_lead(block_height, proposer_hex);
+        // G5 A4 BW-6: the block's slots count toward its epoch before a
+        // boundary scores that epoch.
+        self.count_bootstrap_slots(block_height, anchor_round, proposer_hex);
         self.maybe_pay_rewards(block_height);
         self.maybe_advance_epoch(block_height);
 
@@ -3608,7 +3913,7 @@ impl Executor {
                 bcs::to_bytes(&record.began).expect("a u64 is BCS"),
                 bcs::to_bytes(&record.weight).expect("a u64 is BCS"),
                 bcs::to_bytes(&record.committee_weight).expect("a u64 is BCS"),
-                bcs::to_bytes(&(record.weight - record.delegated)).expect("a u64 is BCS"),
+                bcs::to_bytes(&record.own).expect("a u64 is BCS"),
                 bcs::to_bytes(&record.delegated).expect("a u64 is BCS"),
             ];
             match self.vm.execute_public_entry_function(
@@ -4602,7 +4907,9 @@ impl Executor {
                                 // QC trust root + reward mirror on a successful leave.
                                 if let Some(addr) = leave_addr {
                                     if let Err(e) =
-                                        self.append_validator_removal(&mut updates, &addr)
+                                        self.append_validator_removal(&mut updates, &addr).and_then(
+                                            |()| self.stage_bootstrap_forfeit(&mut updates, &addr),
+                                        )
                                     {
                                         println!(
                                             "❌ Failed to stage validator removal on leave: {}",
@@ -6256,10 +6563,11 @@ mod tests {
                 .collect()
         };
         let before = state_rows(&db);
-        let s1 = match executor.execute_block_parallel_at(vec![], proposer, 1, block_time(1), &[]) {
-            BlockExecOutcome::Executed(s) => s,
-            other => panic!("height 1 must execute: {:?}", other),
-        };
+        let s1 =
+            match executor.execute_block_parallel_at(vec![], proposer, 1, block_time(1), 0, &[]) {
+                BlockExecOutcome::Executed(s) => s,
+                other => panic!("height 1 must execute: {:?}", other),
+            };
         assert_eq!(executor.last_executed_height(), 1);
         // G5 CL-2: an empty block changes exactly one state key, the chain
         // clock: its height, and consensus time grown by the timestamp's
@@ -6287,7 +6595,7 @@ mod tests {
 
         // Re-executing the SAME height is refused — this is the double execution
         // that corrupted the root chain live.
-        match executor.execute_block_parallel_at(vec![], proposer, 1, block_time(1), &[]) {
+        match executor.execute_block_parallel_at(vec![], proposer, 1, block_time(1), 0, &[]) {
             BlockExecOutcome::AlreadyExecuted { last_executed } => {
                 assert_eq!(last_executed, 1)
             }
@@ -6300,7 +6608,7 @@ mod tests {
         );
 
         // Skipping ahead is refused: executing out of order corrupts the chain.
-        match executor.execute_block_parallel_at(vec![], proposer, 3, block_time(3), &[]) {
+        match executor.execute_block_parallel_at(vec![], proposer, 3, block_time(3), 0, &[]) {
             BlockExecOutcome::Gap { expected, got } => {
                 assert_eq!((expected, got), (2, 3))
             }
@@ -6309,10 +6617,11 @@ mod tests {
         assert_eq!(executor.last_executed_height(), 1, "a refused gap consumes nothing");
 
         // The next height in order still works afterwards.
-        let s2 = match executor.execute_block_parallel_at(vec![], proposer, 2, block_time(2), &[]) {
-            BlockExecOutcome::Executed(s) => s,
-            other => panic!("height 2 must execute after 1: {:?}", other),
-        };
+        let s2 =
+            match executor.execute_block_parallel_at(vec![], proposer, 2, block_time(2), 0, &[]) {
+                BlockExecOutcome::Executed(s) => s,
+                other => panic!("height 2 must execute after 1: {:?}", other),
+            };
         assert_eq!(executor.last_executed_height(), 2);
         // The clock write is in the root, so each empty block moves it; the
         // height marker is what makes each height consumable exactly once.
@@ -6340,6 +6649,12 @@ mod tests {
         height: u64,
         timestamp: u64,
         nonces: std::collections::HashMap<String, u64>,
+        /// G5 BW-6: when set, blocks follow consensus's leader schedule: each
+        /// block's anchor is the next even round whose leader is not in this
+        /// set, and that leader proposes it. Otherwise `proposer` proposes
+        /// every block and no round is given.
+        offline: Option<std::collections::BTreeSet<String>>,
+        last_round: u64,
     }
 
     impl G5Chain {
@@ -6374,6 +6689,8 @@ mod tests {
                 height: 0,
                 timestamp: 0,
                 nonces: Default::default(),
+                offline: None,
+                last_round: 0,
             }
         }
 
@@ -6451,11 +6768,34 @@ mod tests {
             self.height += 1;
             self.timestamp = timestamp;
             let n = txs.len();
+            let (proposer, round) = match &self.offline {
+                None => (self.proposer.clone(), 0),
+                Some(offline) => {
+                    let epoch = (self.height - 1) / self.executor.epoch_block_interval();
+                    let mut stakes: Vec<(String, u64)> = self
+                        .executor
+                        .committee_of_epoch(epoch)
+                        .into_iter()
+                        .map(|m| (m.address, m.stake))
+                        .collect();
+                    stakes.sort();
+                    let mut round = self.last_round + 2;
+                    loop {
+                        let leader = blockchain::committee::leader_for_round(round, &stakes, 0);
+                        if !offline.contains(&leader) {
+                            self.last_round = round;
+                            break (leader, round);
+                        }
+                        round += 2;
+                    }
+                }
+            };
             match self.executor.execute_block_parallel_at(
                 txs,
-                &self.proposer,
+                &proposer,
                 self.height,
                 timestamp,
+                round,
                 &[],
             ) {
                 BlockExecOutcome::Executed(s) => {
@@ -7389,6 +7729,104 @@ mod tests {
         );
     }
 
+    /// G5 A4 BW-12 (review MEDIUM-HIGH-4): a full set never displaces a
+    /// validator holding bootstrap weight, whatever its Move stake (0 for an
+    /// operator that owns nothing). The joiner takes the smallest unprotected
+    /// member's place; with every smaller member protected it is refused.
+    #[test]
+    fn g5_a_full_set_never_displaces_a_bootstrap_operator() {
+        let ain = G5_AIN;
+        let address = |i: u32| {
+            let mut a = [0u8; 32];
+            a[..4].copy_from_slice(&i.to_le_bytes());
+            a[31] = 0xef;
+            move_core_types::account_address::AccountAddress::new(a)
+        };
+        let stake_of = |i: u32| match i {
+            417 => 0,
+            418 => 1_000,
+            419 => 1_200,
+            _ => 2_000,
+        };
+        let mut keys = vec![];
+        let mut chain = G5Chain::new("g5_full_set_protected", DAY, |db| {
+            keys.push(G5Chain::account(db, 214, 10_000 * ain));
+            keys.push(G5Chain::account(db, 215, 10_000 * ain));
+            let _seed = db.seeding();
+            let set = TestValidatorSet {
+                validators: (0..1_000u32)
+                    .map(|i| TestValidatorConfig {
+                        validator_addr: address(i),
+                        stake: TestCoin {
+                            value: stake_of(i) * ain,
+                        },
+                        public_key: vec![1, 2, 3],
+                        bls_public_key: {
+                            let mut k = vec![0u8; 48];
+                            k[..4].copy_from_slice(&i.to_le_bytes());
+                            k[47] = 1;
+                            k
+                        },
+                        bls_pop: vec![0u8; 96],
+                    })
+                    .collect(),
+                unbonding_queue: vec![],
+                total_supply: 10_000_000 * ain,
+                current_epoch: 0,
+            };
+            db.put(
+                &validator_set_key(),
+                &hex::encode(bcs::to_bytes(&set).unwrap()),
+            )
+            .unwrap();
+            db.put(
+                &bootstrap_protected_key(),
+                &hex::encode(
+                    bcs::to_bytes(&BootstrapProtected {
+                        validators: vec![address(417), address(418)],
+                    })
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        });
+        let db = chain.db.clone();
+        let join = |key: &SigningKey, sender: &str, seed: u8, stake: u128| {
+            let (bls_public_key, bls_pop) = test_bls_identity(seed);
+            let payload = entry_payload(
+                "staking",
+                "join_validator_set",
+                vec![],
+                vec![
+                    bcs::to_bytes(&parse_move_address(sender).unwrap()).unwrap(),
+                    bcs::to_bytes(&stake).unwrap(),
+                    bcs::to_bytes(&key.verifying_key().to_bytes().to_vec()).unwrap(),
+                    bcs::to_bytes(&bls_public_key).unwrap(),
+                    bcs::to_bytes(&bls_pop).unwrap(),
+                ],
+            );
+            signed_tx(key, sender, &payload, 0, 10_000_000, 1)
+        };
+        let ((small_key, small), (larger_key, larger)) = (keys[0].clone(), keys[1].clone());
+        let members = |db: &StateDB| -> Vec<_> {
+            validator_set(db)
+                .validators
+                .iter()
+                .map(|c| c.validator_addr)
+                .collect()
+        };
+        // 1,100 beats the protected 0 and 1,000 but not the unprotected 1,200.
+        chain.run_to(1, vec![join(&small_key, &small, 216, 1_100 * ain)]);
+        assert!(!members(&db).contains(&parse_move_address(&small).unwrap()));
+        assert_eq!(members(&db).len(), 1_000);
+        // 1,500 takes the place of 419, the smallest unprotected member.
+        chain.run_to(2, vec![join(&larger_key, &larger, 217, 1_500 * ain)]);
+        let now = members(&db);
+        assert!(now.contains(&parse_move_address(&larger).unwrap()));
+        assert!(now.contains(&address(417)) && now.contains(&address(418)));
+        assert!(!now.contains(&address(419)));
+    }
+
     /// G5 SL-4 across epochs (review: only same-epoch correlation was
     /// tested). One-hour blocks and I = 20, so epoch 1 begins 20 h after
     /// epoch 0: within D = 24 h. V0's offense of epoch 0 and V1's of epoch 1
@@ -7746,6 +8184,7 @@ mod tests {
             &chain.proposer.clone(),
             chain.height,
             chain.timestamp,
+            0,
             &[],
         );
         match outcome {
@@ -7920,6 +8359,7 @@ mod tests {
             &proposer,
             height,
             chain.timestamp,
+            0,
             &[item(&a1, &b1)],
         ) {
             BlockExecOutcome::Executed(_) => {}
@@ -8143,6 +8583,7 @@ mod tests {
             &proposer,
             height,
             chain.timestamp,
+            0,
             &[item(&a, &b)],
         ) {
             BlockExecOutcome::Executed(_) => {}
@@ -8765,7 +9206,7 @@ mod tests {
         chain.run_blocks(20, 7);
         let e = g5_expected_emission(supply, 140);
         assert!(e > 0);
-        // Equal weights (each clipped to 1/50 of the total): half each.
+        // Equal weights: half each.
         let each = e * 4 / 8;
         assert_eq!(coin_balance(&chain.db, &a.address), each);
         assert_eq!(coin_balance(&chain.db, &b.address), each);
@@ -8804,11 +9245,16 @@ mod tests {
             });
             chain.run_blocks(blocks, step);
             assert_eq!(chain.clock().time, 280);
-            // Stakes 100 and 300 both exceed the saturation point (1/50 of
-            // the total), so the two are paid alike.
-            assert_eq!(
+            // G5 A4 BW-7: paid by weight, 300 earns three times what 100
+            // earns (to the flooring of each payout).
+            let (small, large) = (
                 coin_balance(&chain.db, &members[0].address),
-                coin_balance(&chain.db, &members[1].address)
+                coin_balance(&chain.db, &members[1].address),
+            );
+            assert!(small > 0);
+            assert!(
+                (large as f64 / small as f64 - 3.0).abs() < 1e-6,
+                "{small} {large}"
             );
             validator_set(&chain.db).total_supply - supply
         };
@@ -8824,7 +9270,7 @@ mod tests {
 
     /// G5 EM-1: a committee weight far beyond any real stake (u64::MAX whole
     /// AIN) is bounded before the pot arithmetic. Unbounded, a day's pot
-    /// (about 8e21) times its clipped weight (about 3.7e17) overflows u128 and
+    /// (about 8e21) times its weight (about 1.8e19) overflows u128 and
     /// aborts every payout, which would stop emission.
     #[test]
     fn g5_an_oversized_committee_weight_cannot_stop_emission() {
@@ -9111,7 +9557,9 @@ mod tests {
     }
 
     /// A G5 A4 chain: each member owns `owned` AIN in the Move set and holds
-    /// `boot` AIN of bootstrap weight; the committees weigh owned + boot.
+    /// `boot` AIN of bootstrap weight (its ceiling, score full); the
+    /// committees weigh owned + boot, and epoch 0's split and the protected
+    /// list are written as genesis writes them.
     fn seed_bootstrap_chain(db: &StateDB, members: &[(u8, u64, u64)], supply: u128) {
         let owned: Vec<_> = members
             .iter()
@@ -9130,8 +9578,9 @@ mod tests {
                     .filter(|m| m.2 > 0)
                     .map(|&(seed, _, boot)| BootstrapOperator {
                         address: committee_member(seed, 0).address,
+                        ceiling: boot,
                         weight: boot,
-                        strikes: 0,
+                        score: BOOTSTRAP_SCORE_SCALE,
                     })
                     .collect();
                 ops.sort_by(|a, b| a.address.cmp(&b.address));
@@ -9144,28 +9593,61 @@ mod tests {
         db.put("sys:validator_set:v1", &json).unwrap();
         db.put(BOOTSTRAP_KEY, &serde_json::to_string(&state).unwrap())
             .unwrap();
+        let split: BTreeMap<String, u64> = state
+            .operators
+            .iter()
+            .map(|o| (o.address.clone(), o.weight))
+            .collect();
+        db.put(
+            &bootstrap_split_key(0),
+            &serde_json::to_string(&split).unwrap(),
+        )
+        .unwrap();
+        db.put(
+            &bootstrap_protected_key(),
+            &hex::encode(bcs::to_bytes(&bootstrap_protected_of(&state)).unwrap()),
+        )
+        .unwrap();
     }
 
     fn bootstrap_of(db: &StateDB) -> BootstrapState {
         read_bootstrap(db).expect("the chain has bootstrap state")
     }
 
-    /// G5 A4 BW-3, BW-4, BW-7, BW-8: bootstrap weight fills the committee up
-    /// to s_min, shrinks pro rata as owned stake grows, never grows back, and
-    /// is gone once owned stake reaches s_min. It is weight, not coins: the
-    /// Move stakes stay what members own, it counts in the payout weight, and
-    /// no pool is credited with it.
+    fn protected_of(db: &StateDB) -> Vec<String> {
+        let raw = db.get(&bootstrap_protected_key()).unwrap().unwrap();
+        let list: BootstrapProtected = bcs::from_bytes(&hex::decode(raw).unwrap()).unwrap();
+        list.validators
+            .iter()
+            .map(|a| hex::encode(a.into_bytes()))
+            .collect()
+    }
+
+    fn live_weight(db: &StateDB, address: &str) -> Option<u64> {
+        let live: Vec<ValidatorSetV1Entry> =
+            serde_json::from_str(&db.get(validator_set_v1_key()).unwrap().unwrap()).unwrap();
+        live.iter().find(|e| e.address == address).map(|e| e.stake)
+    }
+
+    /// G5 A4 BW-3, BW-4, BW-5, BW-7, BW-8: bootstrap weight fills the
+    /// committee to s_min within the operators' ceilings. It shrinks pro rata
+    /// as owned stake grows and regrows to the ceilings when owned stake
+    /// leaves; a leaver forfeits at its leave transaction; it ends for good
+    /// once owned stake reaches s_min. It is weight, not coins: the Move
+    /// stakes stay what members own, the live set carries it at once after a
+    /// top-up, it earns by weight like owned stake, and no pool is credited.
     #[test]
-    fn g5_bootstrap_weight_fills_to_s_min_and_shrinks_as_owned_stake_grows() {
+    fn g5_bootstrap_weight_fills_to_s_min_within_its_ceilings() {
         let ain = G5_AIN;
-        // a owns 100 + 4,900 bootstrap; b, c, d own 3,000 + 1,000: s_min 17,000.
+        // Five operators, each 1,000 owned + 2,000 bootstrap: s_min 15,000.
         let members = [
-            (151u8, 100u64, 4_900u64),
-            (152, 3_000, 1_000),
-            (153, 3_000, 1_000),
-            (154, 3_000, 1_000),
+            (151u8, 1_000u64, 2_000u64),
+            (152, 1_000, 2_000),
+            (153, 1_000, 2_000),
+            (154, 1_000, 2_000),
+            (155, 1_000, 2_000),
         ];
-        let mut chain = G5Chain::new("g5_boot_decay", 14, |db| {
+        let mut chain = G5Chain::new("g5_boot_fill", 14, |db| {
             seed_bootstrap_chain(db, &members, 1_000_000 * ain);
             for &(seed, _, _) in &members {
                 set_coin_store(db, &committee_member(seed, 0).address, 20_000 * ain);
@@ -9182,9 +9664,8 @@ mod tests {
         let balance = |db: &StateDB, seed: u8| coin_balance(db, &addr(seed));
         let before: Vec<u128> = members.iter().map(|m| balance(&db, m.0)).collect();
 
-        // BW-7: epoch 0 pays by C_0's weights. The saturation clip is
-        // total / 50 = 340: a's 5,000 and b's 4,000 both earn the clip. Owned
-        // stake alone, a's 100 would earn 100/340 of b's share.
+        // BW-7: epoch 0 pays by C_0's weights, pot x 3,000 / 15,000 each:
+        // bootstrap weight earns like owned weight.
         chain.run_blocks(20, 7);
         let paid: Vec<u128> = members
             .iter()
@@ -9192,19 +9673,20 @@ mod tests {
             .map(|(m, b)| balance(&db, m.0) - b)
             .collect();
         assert!(paid[0] > 0);
-        assert_eq!(
-            paid[0], paid[1],
-            "bootstrap weight counts in the payout weight"
+        assert!(
+            paid.iter().all(|p| *p == paid[0]),
+            "equal weights earn the same"
         );
-        // P = 9,100 owned: the target 7,900 is what is held, nothing moves.
-        assert_eq!(bootstrap_of(&db).total(), 7_900);
-        assert_eq!(weight(&db, 1, 151), 5_000);
+        // P = 5,000 owned: the target 10,000 is the ceilings, nothing moves.
+        assert_eq!(bootstrap_of(&db).total(), 10_000);
+        assert_eq!(weight(&db, 1, 151), 3_000);
         assert_eq!(
             g5_split_record(&db, 1),
             None,
             "bootstrap weight never enters a pool's split"
         );
-        // BW-8: the Move stakes are what members own.
+        // BW-8: the Move stakes are what members own; the record of C_1 holds
+        // each member's bootstrap part.
         let stake = |db: &StateDB, seed: u8| {
             validator_set(db)
                 .validators
@@ -9212,64 +9694,267 @@ mod tests {
                 .find(|v| v.validator_addr == parse_move_address(&addr(seed)).unwrap())
                 .map(|v| v.stake.value)
         };
-        assert_eq!(stake(&db, 151), Some(100 * ain));
+        assert_eq!(stake(&db, 151), Some(1_000 * ain));
+        let boot_split: BTreeMap<String, u64> =
+            serde_json::from_str(&db.get(&bootstrap_split_key(1)).unwrap().unwrap()).unwrap();
+        assert_eq!(boot_split.get(&addr(151)), Some(&2_000));
 
-        // a stakes 2,370 more: P = 11,470, target 5,530 = 7,900 x 0.7.
-        let key = SigningKey::from_bytes(&[151; 32]);
-        let tx = chain.tx(
-            &key,
-            "staking",
-            "add_stake",
-            vec![bcs::to_bytes(&(2_370 * ain)).unwrap()],
-        );
-        chain.run_to(21, vec![tx]);
+        // a and b stake 1,250 more each: P = 7,500, target 7,500 = 3/4 of
+        // the ceilings. The live set carries a's top-up at once, with its
+        // bootstrap weight (review: it used to drop it until the boundary).
+        let add = |chain: &mut G5Chain, seed: u8, amount: u128| {
+            let key = SigningKey::from_bytes(&[seed; 32]);
+            chain.tx(
+                &key,
+                "staking",
+                "add_stake",
+                vec![bcs::to_bytes(&(amount * ain)).unwrap()],
+            )
+        };
+        let txs = vec![add(&mut chain, 151, 1_250), add(&mut chain, 152, 1_250)];
+        chain.run_to(21, txs);
+        assert_eq!(live_weight(&db, &addr(151)), Some(2_250 + 2_000));
         chain.run_blocks(40 - chain.height, 7);
         let boot = bootstrap_of(&db);
-        assert_eq!(boot.total(), 5_530);
-        assert_eq!(boot.weight_of(&addr(151)), 3_430);
-        assert_eq!(boot.weight_of(&addr(152)), 700);
-        assert_eq!(weight(&db, 2, 151), 2_470 + 3_430);
+        assert_eq!(boot.total(), 7_500);
+        assert_eq!(boot.weight_of(&addr(151)), 1_500);
+        assert_eq!(
+            boot.ceilings(),
+            10_000,
+            "a ceiling is not cut by the scaling"
+        );
+        assert_eq!(weight(&db, 2, 151), 2_250 + 1_500);
         let committee_total: u64 = g5_committee(&db, 2).iter().map(|(_, w)| *w).sum();
-        assert_eq!(committee_total, 17_000, "the committee still weighs s_min");
+        assert_eq!(committee_total, 15_000, "the committee still weighs s_min");
 
-        // b leaves: P falls, the target rises, but bootstrap weight never grows.
+        // b leaves: it forfeits in its leave transaction (so a rejoin within
+        // the epoch keeps nothing). P falls to 5,250: the others regrow to
+        // their ceilings, never above; b's ceiling is gone for good.
         let leaver = SigningKey::from_bytes(&[152; 32]);
         let tx = chain.tx(&leaver, "staking", "leave_validator_set", vec![]);
         chain.run_to(41, vec![tx]);
+        assert_eq!(
+            bootstrap_of(&db).weight_of(&addr(152)),
+            0,
+            "forfeited at the leave"
+        );
+        assert!(bootstrap_of(&db)
+            .operators
+            .iter()
+            .all(|o| o.address != addr(152)));
         chain.run_blocks(60 - chain.height, 7);
         let boot = bootstrap_of(&db);
-        assert_eq!(boot.weight_of(&addr(151)), 3_430, "never grows");
-        assert_eq!(boot.weight_of(&addr(152)), 0, "the leaver forfeits");
-
-        // c stakes past s_min (P = 17,070): the bootstrap weight is gone.
-        let key = SigningKey::from_bytes(&[153; 32]);
-        let tx = chain.tx(
-            &key,
-            "staking",
-            "add_stake",
-            vec![bcs::to_bytes(&(8_600 * ain)).unwrap()],
+        assert_eq!(boot.weight_of(&addr(151)), 2_000, "regrown to its ceiling");
+        assert_eq!(boot.total(), 8_000);
+        assert!(!protected_of(&db).contains(&addr(152)));
+        assert_eq!(protected_of(&db).len(), 4);
+        let committee_total: u64 = g5_committee(&db, 3).iter().map(|(_, w)| *w).sum();
+        assert_eq!(
+            committee_total, 13_250,
+            "below s_min by the forfeited ceiling"
         );
-        chain.run_to(61, vec![tx]);
+
+        // c and d stake to s_min (P = 15,000): the bootstrap ends for good,
+        // and does not return when owned stake leaves again.
+        let txs = vec![add(&mut chain, 153, 4_875), add(&mut chain, 154, 4_875)];
+        chain.run_to(61, txs);
         chain.run_blocks(80 - chain.height, 7);
-        assert_eq!(bootstrap_of(&db).total(), 0);
         assert!(bootstrap_of(&db).operators.is_empty());
-        assert_eq!(weight(&db, 4, 151), 2_470);
+        assert!(protected_of(&db).is_empty());
+        assert_eq!(weight(&db, 4, 151), 2_250);
+        let leaver = SigningKey::from_bytes(&[154; 32]);
+        let tx = chain.tx(&leaver, "staking", "leave_validator_set", vec![]);
+        chain.run_to(81, vec![tx]);
+        chain.run_blocks(100 - chain.height, 7);
+        assert!(
+            bootstrap_of(&db).operators.is_empty(),
+            "the bootstrap never restarts"
+        );
+    }
+
+    /// G5 A4 BW-11 (review HIGH-1): forfeits must not lift a member to a
+    /// third. F holds 30 % at genesis; C is jailed and forfeits; F would hold
+    /// 36.5 % of what is left, so its bootstrap weight is cut to the largest
+    /// level below a third, and the cut goes to nobody. F and A together stay
+    /// below two thirds. The record of C_1 holds F's capped part.
+    #[test]
+    fn g5_bootstrap_weight_is_capped_below_a_third() {
+        let ain = G5_AIN;
+        let members = [
+            (181u8, 1_000u64, 4_400u64),
+            (182, 1_000, 3_200),
+            (183, 1_000, 3_200),
+            (184, 1_000, 3_200),
+        ];
+        let jailed = committee_member(184, 0).address;
+        let mut chain = G5Chain::new("g5_boot_cap", 14, |db| {
+            seed_bootstrap_chain(db, &members, 1_000_000 * ain);
+            let _seed = db.seeding();
+            db.put(&format!("validator:jailed:{jailed}"), "1").unwrap();
+        });
+        let db = chain.db.clone();
+        let f = committee_member(181, 0).address;
+        let a = committee_member(182, 0).address;
+        let (f_before, a_before) = (coin_balance(&db, &f), coin_balance(&db, &a));
+        chain.run_blocks(20, 7);
+        // BW-7: epoch 0 pays by weight, 5,400 against 4,200, never per seat
+        // (review HIGH-3: the old clip paid both the same).
+        let (f_paid, a_paid) = (
+            coin_balance(&db, &f) - f_before,
+            coin_balance(&db, &a) - a_before,
+        );
+        assert!(a_paid > 0);
+        assert!(
+            (f_paid * 4_200 / 5_400).abs_diff(a_paid) <= 1,
+            "{f_paid} vs {a_paid}"
+        );
+        let boot = bootstrap_of(&db);
+        assert_eq!(boot.weight_of(&jailed), 0);
+        // L + 9,400 >= 3L + 1: L = 4,699, F's bootstrap 3,699 of its 4,400.
+        assert_eq!(boot.weight_of(&f), 3_699);
+        assert_eq!(
+            boot.operators
+                .iter()
+                .find(|o| o.address == f)
+                .unwrap()
+                .ceiling,
+            4_400
+        );
+        let committee = g5_committee(&db, 1);
+        let total: u64 = committee.iter().map(|(_, w)| *w).sum();
+        let of = |who: &str| {
+            committee
+                .iter()
+                .find(|(m, _)| m == who)
+                .map_or(0, |(_, w)| *w)
+        };
+        assert_eq!((of(&f), total), (4_699, 14_099));
+        assert!(3 * of(&f) < total, "below a third");
+        assert!(
+            3 * (of(&f) + of(&a)) < 2 * total,
+            "F and A stay below two thirds"
+        );
+        let boot_split: BTreeMap<String, u64> =
+            serde_json::from_str(&db.get(&bootstrap_split_key(1)).unwrap().unwrap()).unwrap();
+        assert_eq!(boot_split.get(&f), Some(&3_699));
+    }
+
+    /// BW-11 as a function: below a third with four or more members, at most a
+    /// third with three, nothing with two; owned stake is never cut; members
+    /// outside the top 256 do not count.
+    #[test]
+    fn g5_the_cap_cuts_only_bootstrap_weight() {
+        let m = |a: &str, own: u64, boot: u64| (a.to_string(), own, boot);
+        let cut = cap_below_a_third(&[
+            m("f", 0, 5_550_000),
+            m("a", 333_333, 3_983_667),
+            m("b", 333_333, 3_983_667),
+            m("c", 333_333, 3_983_667),
+        ]);
+        assert_eq!(cut["f"], 5_550_000, "30 % is left alone");
+        let cut = cap_below_a_third(&[
+            m("f", 0, 5_550_000),
+            m("a", 0, 4_317_000),
+            m("b", 0, 4_317_000),
+        ]);
+        assert_eq!(
+            (cut["f"], cut["a"]),
+            (4_317_000, 4_317_000),
+            "three: equal at a third"
+        );
+        let two = [m("f", 0, 9_000), m("a", 0, 1_000)];
+        assert_eq!(cap_below_a_third(&two)["f"], 9_000, "two: nothing to do");
+        // A whale's owned stake is never cut; its bootstrap weight goes first.
+        let cut = cap_below_a_third(&[
+            m("w", 6_000, 1_000),
+            m("a", 0, 2_000),
+            m("b", 0, 2_000),
+            m("c", 0, 2_000),
+        ]);
+        assert_eq!(cut["w"], 0);
+        // Only the top 256 count: f and 255 members of 1 weigh 405, where f
+        // holds more than a third, though with 300 more members of 1 it
+        // would not. L + 255 >= 3L + 1: f keeps 127.
+        let mut many: Vec<(String, u64, u64)> = vec![m("f", 0, 150)];
+        many.extend((0..555).map(|i| m(&format!("m{i:03}"), 1, 0)));
+        assert_eq!(cap_below_a_third(&many)["f"], 127);
+    }
+
+    /// BW-4: P counts the owned stake of the next committee's members only,
+    /// ranked as the election ranks them.
+    #[test]
+    fn g5_owned_stake_counts_only_the_next_committee() {
+        let mut owned: BTreeMap<String, u64> = (0..300).map(|i| (format!("m{i:03}"), 10)).collect();
+        owned.insert("op".into(), 0);
+        let state = BootstrapState {
+            s_min: 100_000,
+            operators: vec![BootstrapOperator {
+                address: "op".into(),
+                ceiling: 50_000,
+                weight: 50_000,
+                score: BOOTSTRAP_SCORE_SCALE,
+            }],
+        };
+        // The operator and 255 members of 10: 2,550, not 3,000.
+        assert_eq!(committee_owned_stake(&owned, &state), 2_550);
+    }
+
+    /// BW-6 as a function: the score is a moving average with weight 1/128;
+    /// a silent operator falls below half after 89 epochs (6.95 days at the
+    /// measured 6.75 s blocks), one at 0.9 holds at 0.9, and an epoch without
+    /// slots changes nothing.
+    #[test]
+    fn g5_the_bootstrap_score_has_a_week_long_memory() {
+        let mut score = BOOTSTRAP_SCORE_SCALE;
+        let mut epochs = 0;
+        while score >= BOOTSTRAP_SCORE_FLOOR {
+            score = next_bootstrap_score(score, 7, 0);
+            epochs += 1;
+        }
+        assert_eq!(epochs, 89);
+        let mut score = BOOTSTRAP_SCORE_SCALE;
+        for _ in 0..3_000 {
+            score = next_bootstrap_score(score, 10, 9);
+        }
+        assert!((899_000..=901_000).contains(&score), "{score}");
+        assert_eq!(next_bootstrap_score(612_345, 0, 0), 612_345);
+        assert_eq!(
+            next_bootstrap_score(BOOTSTRAP_SCORE_SCALE, 5, 5),
+            BOOTSTRAP_SCORE_SCALE
+        );
+        assert_eq!(
+            next_bootstrap_score(BOOTSTRAP_SCORE_SCALE, 5, 9),
+            BOOTSTRAP_SCORE_SCALE
+        );
     }
 
     /// G5 A4 BW-5: a jailed or convicted operator forfeits its bootstrap
-    /// weight for good at the next boundary; the others keep theirs.
+    /// weight for good at the next boundary and loses its protection; the
+    /// others keep theirs.
     #[test]
     fn g5_a_jailed_bootstrap_operator_forfeits_its_weight() {
         let ain = G5_AIN;
         let members = [
-            (161u8, 1_000u64, 3_000u64),
-            (162, 1_000, 3_000),
-            (163, 1_000, 3_000),
-            (164, 1_000, 3_000),
+            (161u8, 1_000u64, 2_000u64),
+            (162, 1_000, 2_000),
+            (163, 1_000, 2_000),
+            (164, 1_000, 2_000),
+            (165, 1_000, 2_000),
+            (166, 1_000, 2_000),
         ];
         let mut chain = G5Chain::new("g5_boot_jail", 14, |db| {
             seed_bootstrap_chain(db, &members, 1_000_000 * ain);
+            // 166 leaves the Move set by another path than its own leave
+            // transaction: the boundary forfeits it too.
+            let mut set = validator_set(db);
+            let gone = parse_move_address(&committee_member(166, 0).address).unwrap();
+            set.validators.retain(|v| v.validator_addr != gone);
             let _seed = db.seeding();
+            db.put(
+                &validator_set_key(),
+                &hex::encode(bcs::to_bytes(&set).unwrap()),
+            )
+            .unwrap();
             db.put(
                 &format!("validator:jailed:{}", committee_member(161, 0).address),
                 "1",
@@ -9289,72 +9974,192 @@ mod tests {
         let boot = bootstrap_of(&db);
         assert_eq!(boot.weight_of(&committee_member(161, 0).address), 0);
         assert_eq!(boot.weight_of(&committee_member(162, 0).address), 0);
-        assert_eq!(boot.weight_of(&committee_member(163, 0).address), 3_000);
-        assert_eq!(boot.operators.len(), 2);
+        assert_eq!(boot.weight_of(&committee_member(163, 0).address), 2_000);
+        assert_eq!(
+            boot.weight_of(&committee_member(166, 0).address),
+            0,
+            "left the Move set"
+        );
+        assert_eq!(boot.operators.len(), 3);
+        let protected = protected_of(&db);
+        assert!(!protected.contains(&committee_member(161, 0).address));
+        assert!(protected.contains(&committee_member(163, 0).address));
     }
 
-    /// G5 A4 BW-6: an operator that leads no block takes a strike per judged
-    /// epoch and forfeits at 3; a judged epoch at a third or more of its
-    /// expectation resets the strikes (here 4 of 9); an operator expected to
-    /// lead fewer than 9 blocks (here 2) is not judged; each block counts in
-    /// its own epoch, and a judged epoch's counts are removed.
+    /// G5 A4 BW-6: blocks follow the leader schedule; an offline operator's
+    /// rounds are skipped, so it holds slots and commits none. Its score
+    /// falls by 1/128 of the gap each epoch, and below half it forfeits; an
+    /// online operator commits every slot. Each block counts in its own
+    /// epoch (the boundary block in the one it closes), and a scored epoch's
+    /// counts are removed.
     #[test]
-    fn g5_a_silent_bootstrap_operator_is_struck_out_after_three_epochs() {
+    fn g5_a_silent_bootstrap_operator_forfeits_when_its_score_falls_below_half() {
         let ain = G5_AIN;
-        // I = 20, W = 10,000: a and b expect 20 x 4,500 / 10,000 = 9 leads,
-        // c expects 2.
+        // d owns its 4,000: it is no operator, so nothing counts its slots.
         let members = [
-            (171u8, 1_000u64, 3_500u64),
-            (172, 1_000, 3_500),
-            (173, 100, 900),
+            (171u8, 1_000u64, 3_000u64),
+            (172, 1_000, 3_000),
+            (173, 1_000, 3_000),
+            (174, 4_000, 0),
         ];
-        let mut chain = G5Chain::new("g5_boot_strikes", 14, |db| {
-            seed_bootstrap_chain(db, &members, 1_000_000 * ain);
-        });
-        let db = chain.db.clone();
-        let (a, b, c) = (
+        let (a, b, c, d) = (
             committee_member(171, 0).address,
             committee_member(172, 0).address,
             committee_member(173, 0).address,
+            committee_member(174, 0).address,
         );
-        let strikes = |db: &StateDB, who: &str| {
-            bootstrap_of(db)
-                .operators
+        // b and c start just above the floor: one silent epoch drops b
+        // below it, while c, online, climbs.
+        let (b_seed, c_seed) = (b.clone(), c.clone());
+        let mut chain = G5Chain::new("g5_boot_score", 14, move |db| {
+            seed_bootstrap_chain(db, &members, 1_000_000 * ain);
+            let mut state = read_bootstrap(db).unwrap();
+            for op in state.operators.iter_mut() {
+                if op.address == b_seed || op.address == c_seed {
+                    op.score = 503_000;
+                }
+            }
+            let _seed = db.seeding();
+            db.put(BOOTSTRAP_KEY, &serde_json::to_string(&state).unwrap())
+                .unwrap();
+        });
+        chain.offline = Some([b.clone()].into_iter().collect());
+        let db = chain.db.clone();
+        chain.run_blocks(19, 7);
+        let slots: BTreeMap<String, (u64, u64)> =
+            serde_json::from_str(&db.get(&bootstrap_slots_key(0)).unwrap().unwrap()).unwrap();
+        let (b_slots, b_led) = slots[&b];
+        assert!(b_slots > 0 && b_led == 0, "b held slots and committed none");
+        let (a_slots, a_led) = slots[&a];
+        assert!(a_slots > 0 && a_led == a_slots, "a committed every slot");
+        assert!(!slots.contains_key(&d), "only operators are counted");
+        chain.run_blocks(1, 7);
+        assert!(
+            db.get(&bootstrap_slots_key(0)).unwrap().is_none(),
+            "scored counts are removed"
+        );
+        assert!(
+            db.get(&bootstrap_slots_key(1)).unwrap().is_none(),
+            "the boundary block counts in epoch 0"
+        );
+        let boot = bootstrap_of(&db);
+        assert_eq!(boot.weight_of(&b), 0, "503,000 - 3,929 is below half");
+        let score = |who: &str| {
+            boot.operators
                 .iter()
                 .find(|o| o.address == who)
-                .map(|o| o.strikes)
+                .map(|o| o.score)
         };
-        let lead = |chain: &mut G5Chain, leaders: &[&String], until: u64| {
-            let mut i = 0;
-            while chain.height < until {
-                chain.proposer = leaders[i % leaders.len()].clone();
-                chain.block(chain.timestamp + 7, vec![]);
-                i += 1;
-            }
-        };
-        lead(&mut chain, &[&a], 20);
-        assert_eq!(strikes(&db, &b), Some(1));
-        assert_eq!(strikes(&db, &a), Some(0));
-        assert_eq!(strikes(&db, &c), Some(0), "2 expected: not judged");
-        // b leads 4 of its 9: a third or more, so the strikes reset.
-        lead(&mut chain, &[&a, &a, &a, &a, &b], 40);
-        assert_eq!(strikes(&db, &b), Some(0), "a passing judged epoch resets");
-        lead(&mut chain, &[&a], 60);
-        lead(&mut chain, &[&a], 80);
-        assert_eq!(strikes(&db, &b), Some(2));
-        assert_eq!(bootstrap_of(&db).weight_of(&b), 3_500);
-        lead(&mut chain, &[&a], 100);
-        assert_eq!(strikes(&db, &b), None, "struck out: forfeited");
-        assert_eq!(bootstrap_of(&db).weight_of(&b), 0);
-        assert_eq!(strikes(&db, &c), Some(0), "never judged, never struck");
-        assert!(
-            db.get(&bootstrap_led_key(4)).unwrap().is_none(),
-            "judged counts are removed"
+        assert_eq!(score(&c), Some(503_000 - 3_929 + 7_812));
+        assert_eq!(score(&a), Some(BOOTSTRAP_SCORE_SCALE));
+        assert_eq!(boot.weight_of(&c), 3_000);
+
+        // In epoch 1: a block whose round is not past the last counts
+        // nothing and does not move the last round back.
+        chain.run_blocks(1, 7);
+        let counted = |db: &StateDB| db.get(&bootstrap_slots_key(1)).unwrap();
+        let before = counted(&db);
+        let last = chain.last_round;
+        chain.height += 1;
+        chain.timestamp += 7;
+        let stale = chain.executor.execute_block_parallel_at(
+            vec![],
+            &a,
+            chain.height,
+            chain.timestamp,
+            last - 2,
+            &[],
         );
-        assert!(
-            db.get(&bootstrap_led_key(5)).unwrap().is_none(),
-            "the boundary block counts in the epoch it closes"
+        assert!(matches!(stale, BlockExecOutcome::Executed(_)));
+        assert_eq!(counted(&db), before);
+        assert_eq!(db.get(BOOTSTRAP_ROUND_KEY).unwrap(), Some(last.to_string()));
+        // A block whose proposer is not its round's leader counts the slot
+        // and no commit (consensus never builds one; the check is defence).
+        let mut stakes: Vec<(String, u64)> = g5_committee(&db, 1);
+        stakes.sort();
+        let mut next = last + 2;
+        while ![&a, &c].contains(&&blockchain::committee::leader_for_round(next, &stakes, 0)) {
+            next += 2;
+        }
+        let leader = blockchain::committee::leader_for_round(next, &stakes, 0);
+        let other = if leader == a { c.clone() } else { a.clone() };
+        let held: BTreeMap<String, (u64, u64)> = before
+            .map(|raw| serde_json::from_str(&raw).unwrap())
+            .unwrap_or_default();
+        let (n0, l0) = held.get(&leader).copied().unwrap_or((0, 0));
+        chain.height += 1;
+        chain.timestamp += 7;
+        let foreign = chain.executor.execute_block_parallel_at(
+            vec![],
+            &other,
+            chain.height,
+            chain.timestamp,
+            next,
+            &[],
         );
+        assert!(matches!(foreign, BlockExecOutcome::Executed(_)));
+        let after: BTreeMap<String, (u64, u64)> =
+            serde_json::from_str(&counted(&db).unwrap()).unwrap();
+        assert_eq!(after[&leader], (n0 + 1, l0), "a slot, no commit");
+    }
+
+    /// G5 A4 BW-8 (review HIGH): a slash cuts coins only. The offense record
+    /// passes the operator's own coins (weight less its pool's part and its
+    /// bootstrap weight) as the waterfall's own part, so bootstrap weight
+    /// cannot absorb the loss its delegators owe; the correlation still uses
+    /// the whole weight.
+    #[test]
+    fn g5_an_offense_record_leaves_bootstrap_weight_out_of_the_waterfall() {
+        let db = temp_db("g5_boot_offense");
+        let exec = Executor::new(db.clone());
+        let member = committee_member(191, 10_000);
+        {
+            let _seed = db.seeding();
+            db.put(
+                "genesis:validator_set:v1",
+                &serde_json::to_string(&[member.clone(), committee_member(192, 20_000)]).unwrap(),
+            )
+            .unwrap();
+            db.put(
+                &delegated_split_key(0),
+                &serde_json::to_string(&BTreeMap::from([(member.address.clone(), 3_000u64)]))
+                    .unwrap(),
+            )
+            .unwrap();
+            db.put(
+                &bootstrap_split_key(0),
+                &serde_json::to_string(&BTreeMap::from([(member.address.clone(), 6_000u64)]))
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        let record = exec.offense_record(&member.address, 0).unwrap();
+        assert_eq!((record.weight, record.committee_weight), (10_000, 30_000));
+        assert_eq!((record.delegated, record.own), (3_000, 1_000));
+    }
+
+    /// BW-8 end to end: an operator with bootstrap weight equivocates; Move
+    /// records the offense with its whole weight for the correlation and its
+    /// 1,000 coins as its own part (the old `own + pool == weight` check
+    /// refused such an offense outright).
+    #[test]
+    fn g5_a_bootstrap_operators_offense_is_recorded_on_its_coins() {
+        let ain = G5_AIN;
+        let members = [
+            (195u8, 1_000u64, 3_000u64),
+            (196, 1_000, 3_000),
+            (197, 1_000, 3_000),
+            (198, 1_000, 3_000),
+        ];
+        let mut chain = G5Chain::new("g5_boot_offense_e2e", 14, |db| {
+            seed_bootstrap_chain(db, &members, 1_000_000 * ain);
+        });
+        chain.run_blocks(2, 7);
+        let offender = committee_member(195, 0).address;
+        g5_report(&chain, &offender, 0, 3);
+        let offense = g5_offense(&chain.db, &offender);
+        assert_eq!((offense.weight, offense.committee_weight), (4_000, 16_000));
+        assert_eq!((offense.self_weight, offense.delegated_weight), (1_000, 0));
     }
 
     /// Build a hex-encoded BCS `coin::transfer` payload from `from` to `to`.
@@ -9917,7 +10722,9 @@ mod tests {
     fn an_unlogged_state_write_is_provable_against_the_block_root() {
         let (db, sender, tx_json) = g3_burning_transfer("g3_unlogged_in_root");
         let outcome = Executor::new(db.clone())
-            .execute_block_checked_at(vec![tx_json], &sender, 1, block_time(1), &[], |_, _| Ok(()))
+            .execute_block_checked_at(vec![tx_json], &sender, 1, block_time(1), 0, &[], |_, _| {
+                Ok(())
+            })
             .unwrap();
         let BlockExecOutcome::Executed(summary) = outcome else {
             panic!("block 1 must execute: {outcome:?}");
@@ -10011,7 +10818,7 @@ mod tests {
         tx["public_key"] = serde_json::json!(public_key.to_ascii_uppercase());
         let tx = tx.to_string();
         let Ok(BlockExecOutcome::Executed(summary)) = Executor::new(db.clone())
-            .execute_block_checked_at(vec![tx], &address, 1, block_time(1), &[], |_, _| Ok(()))
+            .execute_block_checked_at(vec![tx], &address, 1, block_time(1), 0, &[], |_, _| Ok(()))
         else {
             panic!("block must execute");
         };
@@ -10046,6 +10853,7 @@ mod tests {
             &sender,
             1,
             block_time(1),
+            0,
             &[],
             |_, _| Ok(()),
         ) else {
@@ -10067,6 +10875,7 @@ mod tests {
             &sender,
             2,
             block_time(2),
+            0,
             &[],
             |_, _| Ok(()),
         ) else {
@@ -10100,7 +10909,9 @@ mod tests {
         )
         .unwrap();
         let outcome = Executor::new(db.clone())
-            .execute_block_checked_at(vec![tx_json], &sender, 1, block_time(1), &[], |_, _| Ok(()))
+            .execute_block_checked_at(vec![tx_json], &sender, 1, block_time(1), 0, &[], |_, _| {
+                Ok(())
+            })
             .unwrap();
         assert!(matches!(outcome, BlockExecOutcome::Executed(_)));
         let queued: Vec<String> = db
@@ -10129,6 +10940,7 @@ mod tests {
             &sender,
             1,
             block_time(1),
+            0,
             &[],
             |_, view| view.put("obj:escapee", "x").map_err(|e| e.to_string()),
         );
@@ -10147,6 +10959,7 @@ mod tests {
             &sender,
             1,
             block_time(1),
+            0,
             &[],
             |_, view| view.put("latest_height", "1").map_err(|e| e.to_string()),
         );
@@ -12547,7 +13360,7 @@ mod tests {
         db.set_federation_key("00000000000000000000000000000000").unwrap();
         let exec = Executor::new(db.clone());
         let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
-        match exec.execute_block_parallel_at(vec![], proposer, 1, block_time(1), &[]) {
+        match exec.execute_block_parallel_at(vec![], proposer, 1, block_time(1), 0, &[]) {
             BlockExecOutcome::Executed(_) => {}
             other => panic!("height 1 must execute: {:?}", other),
         }
@@ -12611,7 +13424,7 @@ mod tests {
         seed_genesis_tree(&db_a);
         let exec_a = Executor::new(db_a.clone());
         let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
-        match exec_a.execute_block_parallel_at(vec![], proposer, 1, block_time(1), &[]) {
+        match exec_a.execute_block_parallel_at(vec![], proposer, 1, block_time(1), 0, &[]) {
             BlockExecOutcome::Executed(_) => {}
             other => panic!("height 1 must execute: {:?}", other),
         }
@@ -12705,7 +13518,7 @@ mod tests {
         seed_genesis_tree(&db_a);
         let exec_a = Executor::new(db_a.clone());
         let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
-        match exec_a.execute_block_parallel_at(vec![], proposer, 1, block_time(1), &[]) {
+        match exec_a.execute_block_parallel_at(vec![], proposer, 1, block_time(1), 0, &[]) {
             BlockExecOutcome::Executed(_) => {}
             other => panic!("height 1 must execute: {:?}", other),
         }

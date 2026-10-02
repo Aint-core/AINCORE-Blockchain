@@ -256,20 +256,33 @@ curl -s http://localhost:8001/rpc -X POST \
 
 At launch the chain has no pre-mine. Part of the committee's weight is **bootstrap weight**: consensus weight with no coins, owned by nobody, assigned to launch operators in the genesis file (G5 amendment A4; `docs/research/genesis_bootstrap.md`). It earns rewards for the operator who runs it, but you cannot transfer, stake or withdraw it.
 
-The protocol takes it away automatically, with no human decision:
+The protocol adjusts it automatically, with no human decision:
 
-- **It shrinks** as owned stake grows. At every epoch boundary the total is cut to `s_min − owned stake`, pro rata. It never grows back.
-- **It is forfeited for good** if your validator is jailed, is convicted of equivocation, leaves the validator set, or takes **3 strikes**.
-- **A strike** is an epoch in which you led fewer than a third of the blocks your weight entitles you to. Leader election is stake-weighted, so an online validator leads in proportion to its weight. If you are expected to lead fewer than 9 blocks in an epoch, that epoch is not judged. A judged epoch at a third or more of your expectation clears your strikes.
+- **It fills the committee to `s_min`.** At every epoch boundary the operators' weights are
+  set to `s_min − owned stake`, pro rata to each operator's genesis weight (its ceiling): they
+  shrink as owned stake grows and regrow, never above the ceiling, if owned stake leaves. The
+  first time owned stake reaches `s_min`, bootstrap weight ends for good.
+- **No member reaches a third.** If forfeits would leave a member at a third or more of the
+  committee, its bootstrap weight is cut below that, every boundary, as long as needed.
+- **It is forfeited for good** if your validator is jailed (an accepted equivocation jails at
+  once), is convicted in full, leaves the validator set (at the leave transaction itself), or
+  its participation score falls below one half. A full validator set never displaces an
+  operator that holds bootstrap weight.
+- **The score** measures the leader slots the schedule gave you that became blocks. Leader
+  election is stake-weighted and public, so the chain knows exactly which rounds were yours;
+  an offline validator's rounds are skipped. The score is a moving average with a half-life of
+  about 7 days, and healthy validators commit about 90 % of their slots. A validator that goes
+  dark loses its bootstrap weight after about 6 days; each dark epoch (about 1.9 hours)
+  costs under 1 % of score, which comes back as it runs again.
 
 Check it with:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8002/rpc -H 'Content-Type: application/json' \
+curl -s -X POST http://127.0.0.1:8001/rpc -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"aincore_getBootstrap","params":[]}'
 ```
 
-It returns `s_min_ain`, `bootstrap_ain`, `owned_stake_ain`, `target_ain`, and each operator's `weight` and `strikes`.
+It returns `s_min_ain`, `bootstrap_ain`, `ceiling_ain`, `owned_stake_ain`, `target_ain`, and each operator's `ceiling`, `weight` and `score` (parts per million).
 
 ---
 

@@ -1299,6 +1299,8 @@ impl ChainSync {
                 block.header.height,
                 // G5 CL-2: its certified BFT timestamp drives consensus time.
                 block.header.timestamp,
+                // G5 BW-6: its certified anchor round.
+                block.header.round,
                 // RE-AUDIT HIGH: the block's own slash evidence, verified by
                 // the executor — identical on every node.
                 &block.slash_evidence,
@@ -1695,6 +1697,7 @@ pub(crate) fn dry_run_empty_block_root(storage: &Arc<StateDB>, height: u64, time
         "dry-run",
         height,
         timestamp,
+        0,
         &[],
         |_| Ok(()),
         |summary, _| {

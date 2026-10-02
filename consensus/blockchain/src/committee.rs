@@ -87,6 +87,41 @@ pub fn validate_committee(proposed: &[ValidatorInfo]) -> Result<Vec<ValidatorInf
     Ok(canonical_order(&members))
 }
 
+/// The leader of `round`: a stake-weighted draw seeded by the round and the
+/// committee (`validators` in canonical order, whole-AIN stakes). Consensus
+/// elects anchors with it; the executor measures bootstrap operators against
+/// it (G5 BW-6), so both use this one definition.
+pub fn leader_for_round(round: u64, validators: &[(String, u64)], attempt: u32) -> String {
+    if validators.is_empty() {
+        return String::new();
+    }
+    let mut preimage = b"AINCORE_LEADER_V2".to_vec();
+    preimage.extend_from_slice(&round.to_le_bytes());
+    preimage.extend_from_slice(&(attempt as u64).to_le_bytes());
+    for (addr, stake) in validators {
+        preimage.extend_from_slice(addr.as_bytes());
+        preimage.extend_from_slice(&stake.to_le_bytes());
+    }
+    let digest = crypto::hash(&preimage);
+    let seed = u64::from_le_bytes(digest[..8].try_into().expect("a SHA-256 digest"));
+    let total_stake: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
+    if total_stake == 0 {
+        // No stake information: uniform, so the chain never divides by zero.
+        return validators[(seed % validators.len() as u64) as usize]
+            .0
+            .clone();
+    }
+    let draw = (seed as u128) % total_stake;
+    let mut cumulative: u128 = 0;
+    for (addr, stake) in validators {
+        cumulative += *stake as u128;
+        if draw < cumulative {
+            return addr.clone();
+        }
+    }
+    validators[validators.len() - 1].0.clone()
+}
+
 /// The `MAX_COMMITTEE` positive-stake members of `proposed` with the most
 /// stake, ties by address (G5 review: the active set is chosen by stake, as
 /// Cosmos chooses it by power under `MaxValidators`). More validators may be
@@ -211,5 +246,35 @@ mod tests {
             canonical_order(&[a, b]),
             "nothing valid is left: C_E stays"
         );
+    }
+
+    /// G5 BW-6: the executor's leader schedule is consensus's. Pinned to the
+    /// first five blocks of the live AINCORE-TESTNET-V4 chain (2026-10-02):
+    /// four validators of 4,625,000 AIN, anchors on rounds 2, 4, 6, 8, 10.
+    #[test]
+    fn the_leader_schedule_matches_live_testnet_blocks() {
+        let validators: Vec<(String, u64)> = [
+            "b89a4bfd24ae7ecd69130215ab1009994887dd68286595eced85ce99c32ed772",
+            "c4ab03c269bcea7031e467ddcc04e970f2e22e419bf7bc1cbcca142914c8a433",
+            "d3ac8b5d68464ad24692653fb27f01bde5261dcfb3854064e0ecdbce8fab76d7",
+            "dd48891f6d6799d5aa71e17b150ba3a8c30cbfbfb02544f546801f057aa65d42",
+        ]
+        .iter()
+        .map(|a| (a.to_string(), 4_625_000))
+        .collect();
+        let proposers = [
+            (2, "d3ac8b5d6846"),
+            (4, "c4ab03c269bc"),
+            (6, "b89a4bfd24ae"),
+            (8, "b89a4bfd24ae"),
+            (10, "c4ab03c269bc"),
+        ];
+        for (round, proposer) in proposers {
+            assert!(
+                leader_for_round(round, &validators, 0).starts_with(proposer),
+                "round {round}"
+            );
+        }
+        assert_eq!(leader_for_round(1, &[], 0), "");
     }
 }

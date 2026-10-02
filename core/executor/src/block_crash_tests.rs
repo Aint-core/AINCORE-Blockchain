@@ -105,6 +105,7 @@ fn rejected_admission_never_enters_execution_and_preserves_reopened_rows() {
             &proposer,
             1,
             block_time(1),
+            0,
             &[],
             |view| {
                 assert!(view.get("sys:last_executed_height").unwrap().is_none());
@@ -135,6 +136,7 @@ fn admission_sees_parent_state_and_rejected_execution_remains_retryable() {
             &proposer,
             1,
             block_time(1),
+            0,
             &[],
             |view| {
                 assert_eq!(rows(view), before);
@@ -161,6 +163,7 @@ fn admission_sees_parent_state_and_rejected_execution_remains_retryable() {
             &proposer,
             1,
             block_time(1),
+            0,
             &[],
             |view| {
                 assert_eq!(rows(view), before);
@@ -236,7 +239,7 @@ fn block_crash_child() {
             std::process::exit(77); // no destructors or graceful RocksDB close
         }
     });
-    match executor.execute_block_parallel_at(txs, &proposer, 1, block_time(1), &[]) {
+    match executor.execute_block_parallel_at(txs, &proposer, 1, block_time(1), 0, &[]) {
         BlockExecOutcome::Executed(summary) if !replay => {
             assert_eq!(
                 summary.executed_raws.len(),
@@ -275,8 +278,12 @@ fn block_crash_child() {
                 // reviewed executor reproduces c5be08d5... exactly. G5 CH-1
                 // moved it through the stdlib alone (ChurnState and
                 // admit_increase): with the A3/A3b bytecode the CH-1 executor
-                // reproduces 247c3a72... exactly.
-                "73137b35c6dbcb7e6e45c2eff1d2164474c0f8f50d389e848b6d1845e3e56059",
+                // reproduces 247c3a72... exactly. G5 A4 (revised after review)
+                // moved it through the stdlib alone (BootstrapProtected and
+                // the protected eviction, rewards by weight, the offense split
+                // up to the weight): with 31c631e's bytecode the A4 executor
+                // reproduces 73137b35... exactly.
+                "7172c9b7385da3849939b37bb70489affec50f59edbda5d24061dfa8001f2554",
                 "clean execution must preserve the pre-staging fixture root"
             );
         }
@@ -367,7 +374,7 @@ fn block_panic_child() {
         }
     });
     let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        executor.execute_block_parallel_at(txs.clone(), &proposer, 1, block_time(1), &[])
+        executor.execute_block_parallel_at(txs.clone(), &proposer, 1, block_time(1), 0, &[])
     }));
     assert!(interrupted.is_err(), "injection must unwind execution");
     let partial = rows(&db);
@@ -380,7 +387,7 @@ fn block_panic_child() {
     // A new Executor must not bypass a poisoned process-wide execution lock.
     let retry_executor = Executor::new(Arc::clone(&db));
     let retry = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        retry_executor.execute_block_parallel_at(txs, &proposer, 1, block_time(1), &[])
+        retry_executor.execute_block_parallel_at(txs, &proposer, 1, block_time(1), 0, &[])
     }));
     assert!(
         retry.is_err(),
@@ -486,6 +493,7 @@ fn checked_block_child() {
                 &proposer,
                 1,
                 block_time(1),
+                0,
                 &[],
                 |s, v| accept(s, v, true)
             )
@@ -496,7 +504,7 @@ fn checked_block_child() {
         );
     }
     let result = executor
-        .execute_block_checked_at(txs.clone(), &proposer, 1, block_time(1), &[], |s, v| {
+        .execute_block_checked_at(txs.clone(), &proposer, 1, block_time(1), 0, &[], |s, v| {
             accept(s, v, false)
         })
         .unwrap();

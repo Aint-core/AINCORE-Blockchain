@@ -35,12 +35,26 @@ epochs at the measured 6.75 s blocks. One snapshot height is announced in advanc
 
 **IT-3 (operator qualification).** An operator qualifies if, over the window:
 - it is in the committee for at least 90 % of the epochs;
-- in at least 90 % of its judged epochs it led at least a third of its expected blocks (the
-  same test as BW-6, so the testnet rehearses mainnet's rule);
+- it committed at least 90 % as large a share of its scheduled leader slots as the median
+  committee member did. Slots come from the leader schedule, exactly as BW-6 counts them, so
+  the measure has no luck in it and the testnet rehearses mainnet's rule. Relative to the
+  median, a slow network does not fail everyone;
+- its BW-6 score never fell below one half;
 - it was never jailed or convicted;
 - it is not the founder.
 
-90 % sits between Solana's baseline (5 of 10 epochs) and its vote-credit bar (97 %).
+90 % sits between Solana's delegation bars: a baseline in 5 of the last 10 epochs, and vote
+credits at 97 % of the cluster average.
+
+**IT-3a (being measured needs slots).** Slots come in proportion to weight. To measure a
+commit ratio near 0.9 within ±0.05 at three standard deviations takes
+n ≥ 9 × 0.9 × 0.1 / 0.05² = 324 slots over the window. The window holds about 179 epochs of
+about 1,113 anchor rounds (631 rounds for 567 blocks on TESTNET-V4), so an operator needs
+324 / (179 × 1,113) = 0.16 % of the committee's weight: 30,100 test AIN at 18.5 M. The testnet
+genesis therefore lists a faucet account (`accounts`, test coins with no value), and every
+accepted operator applicant receives 50,000 test AIN from it: first come, same amount,
+published. 50 k keeps the 324 slots while the committee grows up to 30 M. Staking it shrinks
+the founder's bootstrap weight (BW-4), so the testnet also rehearses the handover.
 
 **IT-4 (operator share).**
 - The qualified operators share 1.0 M equally.
@@ -53,21 +67,29 @@ epochs at the measured 6.75 s blocks. One snapshot height is announced in advanc
 - The qualified operators share the rest equally. No operator's total (owned + bootstrap) may
   reach a third.
 - Mainnet needs at least 3 qualified independent operators: with 3, each holds about
-  (18.5 − 5.55) / 3 ≈ 4.3 M, 23 %.
+  (18.5 − 5.55) / 3 ≈ 4.3 M, 23 %. Five or more are recommended: with three, two forfeits
+  shrink the committee to about 2 M under BW-11; with five, to about 12.3 M
+  (`genesis_bootstrap.md`, revision after review).
 
 **IT-6 (public track).** Points for actions on the testnet chain:
-- a transfer, 1 point;
-- a delegation held for one epoch, 3 points;
+- a transfer to another account, 1 point (to itself, none);
+- a delegation held for one epoch inside the window (no undelegation within I blocks), 3 points;
 - a DEX swap or added liquidity, 2 points;
 - a governance vote, 2 points.
 
-An account counts only if its points fall on at least 3 distinct days (Arbitrum's rule against
+Only transactions whose receipt says they succeeded count, and validators of the window's
+committees earn nothing on this track (they have the operator track). An account counts only
+if its points fall on at least 3 distinct UTC days of block time (Arbitrum's rule against
 burst farming). The 0.5 M is split pro rata by points, capped at 1,000 AIN per account. What
 the cap leaves is not minted: it stays in the emission reserve.
 
-**IT-7 (reproducibility).** The scoring tool reads only chain data, and anyone running a
-testnet node can rerun it to the same output:
-- block proposers;
+**IT-7 (reproducibility).** The scoring tool (`genesis-tool score-testnet`) reads only chain
+data, and anyone running a testnet node can rerun it to the same output. It runs on a stopped
+node's datadir at least W (7 days) past the snapshot, so every offense of the window has
+landed (SL-5); a jail counts when its offense round is at or before the snapshot's. A
+qualified operator joins mainnet genesis with the key it qualified with
+(`gen-multi --allocations-file`). It reads:
+- block proposers and anchor rounds, to rebuild the leader schedule;
 - the committee record per epoch;
 - jail and conviction records;
 - transactions.
@@ -78,6 +100,6 @@ testnet node can rerun it to the same output:
   - Operators must run real nodes for 14 days and meet IT-3, and each share is capped.
   - Public accounts must act on 3 distinct days, and each account is capped at 1,000 AIN.
   - Neither defence makes sybils impossible; they make them expensive (Douceur).
-- Test AIN for joining the testnet comes from the founder's validators' rewards. Who gets it is
-  a gate the founder controls. The rules should be published so the gate is predictable:
-  first come, same amount each.
+- Test AIN for joining the testnet comes from the testnet faucet account (IT-3a). Who gets it
+  is a gate the founder controls. The rules make the gate predictable: published, first come,
+  50 k each for operators, a fixed small amount for the public track.

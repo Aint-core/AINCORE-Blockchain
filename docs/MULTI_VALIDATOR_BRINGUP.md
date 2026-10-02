@@ -106,7 +106,25 @@ operator a `bootstrap_ain` in its entry (it may own `stake_ain: 0`) and pass `--
 the genesis committee's weight. Stake plus bootstrap weight must sum to exactly `s_min`, and no
 operator may reach a third of it. Liquid balances for the incentivized testnet's public track
 go in `--accounts-file` as `[{"address": "...", "balance_ain": N}]`. Bootstrap weight is
-never a coin: the supply at genesis is the owned stake plus the accounts.
+never a coin: the supply at genesis is the owned stake, the treasury reserve and the
+accounts. A stake is 0 (with bootstrap weight) or at least 1,000 AIN.
+
+For mainnet, the incentivized testnet's scoring writes these inputs (G5 A4-S6). Stop a testnet
+node at least 7 days (W) after the announced snapshot and run, on its datadir:
+
+```bash
+genesis-tool score-testnet --datadir /data/aincore --from-height <first> --to-height <snapshot> \
+  --founder <founder-testnet-addresses> --out-dir score/
+```
+
+It writes `allocations.json` (each qualified operator's bonded stake and bootstrap weight),
+`accounts.json` (the public track) and `report.json` (every number behind them). Every
+qualified operator sends its `validator-entry` made with the key it qualified with; the founder
+adds its own entries with `bootstrap_ain` (at most 30 % of `s_min` in total). Then
+`gen-multi --entries-file entries.json --allocations-file score/allocations.json
+--accounts-file score/accounts.json --s-min-ain 18500000 ...` sets each allocated entry from
+the scoring. `gen-multi` builds the result with the node's own genesis rules before writing it
+and prints the genesis identity.
 
 This writes a `genesis.json` whose per-validator entries match exactly what the
 loader expects:

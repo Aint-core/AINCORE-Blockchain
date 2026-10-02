@@ -66,10 +66,9 @@ The way out is weight that nobody owns.
 4. **Handover is automatic.** B = max(0, S_min − P). B fills the gap to a minimum committee
    weight and shrinks as owned stake grows; nobody decides when.
 
-**Saturation.** EM-2 clips each member's payout weight at total / 50. With fewer than 50
-members every member earns the same share, so the founder's bootstrap weight earns no more
-than any operator's. The model's totals are unaffected (the whole emission is paid either
-way); only the split among members is flatter.
+**Rewards by weight.** Emission is paid by committee weight, pot × w / W (G5 A4 BW-7). The
+earlier saturation clip paid every seat the same slice below 50 members and was removed after
+review. The model's totals assume the whole draw is paid, which this keeps.
 
 **Comparison with Bitcoin.** Bitcoin issued 2.628 M BTC/yr at launch: 12.5 % of its cap
 per year. BW-1 issues 1.9 % of the cap per year, 6.6 times slower. Both start from almost no
@@ -112,6 +111,34 @@ the bootstrap weight is gone at 6.4 years. The worst month for owned-supply grow
 - **Handover gaming.** Bootstrap weight is never counted in any vote or threshold (NEAR's
   handover vote counted the foundation's own stake).
 - **Exchange capture once a market exists** (Steem, 2020).
+
+## Revision after review (2026-10-02)
+
+Three independent reviews of the first implementation changed four rules. The G5 contract,
+Amendment A4, has the rules; this is why.
+
+- **The founder must stay below a third after forfeits (BW-11).** With the founder at 30 %
+  and three operators of 23.3 % each, one operator's forfeit puts the founder at 38 %. Each
+  boundary now cuts bootstrap weight so that no member reaches a third, and the cut goes to
+  nobody. Worked cases (founder F 5.55 M, operators A, B, C 4.317 M with 333 k owned each):
+
+  | Case | Committee | Largest member | Two largest |
+  |---|---|---|---|
+  | Launch | 18.5 M | F 30.0 % | 53.3 % |
+  | C forfeits | 13.45 M | F 33.3 % (cut from 38 %) | 65.4 % |
+  | B and C forfeit | 2.0 M | F, A 33.3 % each | 66.7 % (B, C keep a veto) |
+
+  The last row is the price of having only two large parties left: the committee shrinks to
+  what the small members can balance. Five launch operators instead of three keep the
+  committee at 12.3 M after two forfeits.
+- **Losing the weight needs a week, not five hours (BW-6).** Participation is measured
+  against each operator's exact leader slots, taken from the leader schedule, as a moving
+  average with a 6.9-day half-life, and the weight is forfeited below one half. Measured on
+  AINCORE-TESTNET-V4, honest validators commit 88–92 % of their slots.
+- **s_min is a floor while the bootstrap lasts (BW-4).** Bootstrap weight regrows up to each
+  operator's genesis weight when owned stake leaves, and ends for good the first time owned
+  stake reaches s_min. "Never grows" let stake that came and left lower the floor.
+- **Paid by weight, not by seat (BW-7).** See above.
 
 ## What has to be built
 

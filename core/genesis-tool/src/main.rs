@@ -4,6 +4,7 @@ use std::sync::Arc;
 use storage::StateDB;
 
 mod multi_genesis;
+mod score;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -63,6 +64,12 @@ enum Command {
     /// the release candidate's block intervals (G5 P-1): the inputs of
     /// `gen-multi`.
     ClockCap(multi_genesis::ClockCapArgs),
+
+    /// Score the incentivized testnet's window from a stopped node's datadir
+    /// and write the mainnet genesis inputs: allocations.json (for
+    /// `gen-multi --allocations-file`), accounts.json (for `--accounts-file`)
+    /// and report.json (G5 A4-S6).
+    ScoreTestnet(score::ScoreArgs),
 }
 
 fn run_init(
@@ -94,6 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::GenMulti(gen_args)) => multi_genesis::run(gen_args),
         Some(Command::ValidatorEntry(entry_args)) => multi_genesis::run_entry(entry_args),
         Some(Command::ClockCap(cap_args)) => multi_genesis::run_clock_cap(cap_args),
+        Some(Command::ScoreTestnet(score_args)) => score::run(score_args),
         None => {
             // Backwards-compatible default: behave like the legacy `init` path
             // when invoked with top-level flags (`genesis-tool --db-path ...`).

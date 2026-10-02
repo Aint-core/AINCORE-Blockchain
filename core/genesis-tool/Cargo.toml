@@ -12,6 +12,11 @@ node = { path = "../node" }
 storage = { path = "../../common/storage" }
 crypto = { path = "../../common/crypto" }
 consensus = { path = "../../consensus/consensus" }
+blockchain = { path = "../../consensus/blockchain" }
+executor = { path = "../executor" }
+vm_move = { path = "../vm_move" }
+move-core-types = { git = "https://github.com/move-language/move", branch = "aptos-v1.3.0", features = ["address32"] }
+bcs = "0.1"
 ed25519-dalek = "2.0"
 
 [dev-dependencies]

@@ -145,6 +145,15 @@ module 0x1::staking {
         added: u128,
     }
 
+    /// G5 A4 BW-12: the validators that hold bootstrap weight not forfeited.
+    /// A full set never displaces them: their Move stake (often 0) is not
+    /// their committee weight, and displacement would forfeit that weight.
+    /// Genesis writes it and the executor rewrites it at every boundary;
+    /// nothing in Move creates it. Without it nobody is protected.
+    struct BootstrapProtected has key {
+        validators: vector<address>,
+    }
+
     /// EMISSION v4: the accrued, cap-reserved budget of the DePIN mint
     /// stream (universal_mining). Amounts here were already counted against
     /// MAX_SUPPLY when drawn (`draw_emission`), so drawing from the budget
@@ -202,7 +211,7 @@ module 0x1::staking {
         public_key: vector<u8>,
         bls_public_key: vector<u8>,
         bls_pop: vector<u8>
-    ) acquires ValidatorSet, ChurnState {
+    ) acquires ValidatorSet, ChurnState, BootstrapProtected {
         let addr = signer::address_of(account);
         assert!(stake_amount >= MIN_STAKE, error::invalid_argument(EINSUFFICIENT_STAKE));
         // BLS sizes are MinPk: pk=48 bytes (G1), pop=96 bytes (G2). The
@@ -219,19 +228,27 @@ module 0x1::staking {
         // G5 review (A3b): a full set does not freeze membership. A joiner
         // with more stake than the smallest member displaces it, which starts
         // unbonding like a leaver (the committee is the top 256 by stake, so
-        // the smallest of a full set is never in it).
+        // the smallest of a full set is never in it). G5 A4 BW-12: never a
+        // validator holding bootstrap weight.
         if ((vector::length(&validator_set.validators) as u64) >= MAX_VALIDATORS) {
-            let (smallest, smallest_stake) = (0, coin::value(&vector::borrow(&validator_set.validators, 0).stake));
-            let j = 1;
+            let protected = if (exists<BootstrapProtected>(@0x1)) {
+                *&borrow_global<BootstrapProtected>(@0x1).validators
+            } else {
+                vector::empty<address>()
+            };
+            let (found, smallest, smallest_stake) = (false, 0, 0);
+            let j = 0;
             while (j < vector::length(&validator_set.validators)) {
-                let s = coin::value(&vector::borrow(&validator_set.validators, j).stake);
-                if (s < smallest_stake) {
+                let v = vector::borrow(&validator_set.validators, j);
+                let s = coin::value(&v.stake);
+                if (!vector::contains(&protected, &v.validator_addr) && (!found || s < smallest_stake)) {
+                    found = true;
                     smallest = j;
                     smallest_stake = s;
                 };
                 j = j + 1;
             };
-            assert!(stake_amount > smallest_stake, error::invalid_state(EMAX_VALIDATORS));
+            assert!(found && stake_amount > smallest_stake, error::invalid_state(EMAX_VALIDATORS));
             let ValidatorConfig { validator_addr: gone, stake, public_key: _, bls_public_key: _, bls_pop: _ } =
                 vector::remove(&mut validator_set.validators, smallest);
             let amount = coin::value(&stake);

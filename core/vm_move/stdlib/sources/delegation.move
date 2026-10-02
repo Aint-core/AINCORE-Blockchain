@@ -89,10 +89,6 @@ module 0x1::delegation {
     const MIN_REWARD_POINTS: u128 = 1000000000000000000;
     /// EM-2: the largest committee weight, in whole AIN: all of MAX_SUPPLY.
     const MAX_WEIGHT: u128 = 150000000;
-    /// EM-2 saturation clip (Cardano-k / Polkadot style): a member's payout
-    /// weight is capped at total / SATURATION_DIVISOR. Flattens concentration
-    /// for honest distributions; not sybil-proof (documented limitation).
-    const SATURATION_DIVISOR: u128 = 50;
 
     /// SL-1: a slash recorded for the pool's unpaid tickets. It cuts a ticket
     /// created in `infraction_epoch` or later and before the slash
@@ -156,6 +152,8 @@ module 0x1::delegation {
 
     /// G5 SL-5: an accepted equivocation. `epoch_began` is tau when its
     /// committee epoch began; the weights are whole AIN in C_{epoch}.
+    /// `self_weight + delegated_weight <= weight`: the rest is bootstrap
+    /// weight, which nothing can slash.
     struct Offense has store, copy, drop {
         validator: address,
         epoch: u64,
@@ -421,7 +419,9 @@ module 0x1::delegation {
     /// whole AIN, from the committee record. System-only: the executor binds
     /// the genuine @0x1 signer and never lets a user forge it (FIX #1).
     ///
-    /// A member's share r of the pot (by saturation-clipped weight) splits
+    /// A member's share of the pot is r = pot x w / W, its weight over the
+    /// committee's whole weight (G5 A4 BW-7: as Cosmos, Ethereum and Solana
+    /// pay, so a seat earns by its weight, never by being a seat). r splits
     /// into floor(r x s / (s + d)) for its own stake and floor(r x d / (s + d))
     /// for its pool; the commission, at the rate in force when the period
     /// began, is taken from the pool's part. Nothing beyond the drawn
@@ -447,8 +447,8 @@ module 0x1::delegation {
             return
         };
 
-        // The pot is FIXED; members divide it by clipped weight. Adding
-        // members thins the slices; it cannot enlarge the pot.
+        // The pot is FIXED; each member's slice is its weight over the whole
+        // weight, so slices never sum above the pot.
         let total = 0u128;
         let k = 0;
         while (k < len) {
@@ -459,24 +459,11 @@ module 0x1::delegation {
             staking::close_emission(emission);
             return
         };
-        // Saturation point: weight above z0 earns nothing more.
-        let z0 = total / SATURATION_DIVISOR;
-        if (z0 == 0) {
-            z0 = total;
-        };
-        let clipped_total = 0u128;
-        let k = 0;
-        while (k < len) {
-            let w = member_weight(&self_weights, &delegated_weights, k);
-            clipped_total = clipped_total + (if (w > z0) { z0 } else { w });
-            k = k + 1;
-        };
 
         let i = 0;
         while (i < len) {
             let w = member_weight(&self_weights, &delegated_weights, i);
-            let clipped = if (w > z0) { z0 } else { w };
-            let share = math::mul_div_floor(pot, clipped, clipped_total);
+            let share = math::mul_div_floor(pot, w, total);
             pay_member(
                 &mut emission,
                 *vector::borrow(&members, i),
@@ -494,6 +481,9 @@ module 0x1::delegation {
     /// `validator_addr` for committee epoch `epoch`, which began at consensus
     /// time `epoch_time`, with its weight, the committee's total weight and
     /// the frozen split of its weight, all from C_{epoch} (whole AIN). The
+    /// split's own and pool parts may sum below the weight: bootstrap weight
+    /// (G5 A4 BW-8) counts in the weight and the correlation, has no coins,
+    /// and so is in neither part the waterfall cuts. The
     /// offender leaves the active set with all its stake unbonding, and its
     /// pool closes; nothing is burned until the fraction is final. A second
     /// offense by the same validator is ignored (the tombstone). Recording
@@ -549,7 +539,7 @@ module 0x1::delegation {
         assert!(signer::address_of(account) == @0x1, error::permission_denied(EUNAUTHORIZED));
         assert!(
             weight > 0 && weight <= committee_weight
-                && (self_weight as u128) + (delegated_weight as u128) == (weight as u128),
+                && (self_weight as u128) + (delegated_weight as u128) <= (weight as u128),
             error::invalid_argument(EINVALID_OFFENSE)
         );
         if (!exists<Offenses>(@0x1)) {

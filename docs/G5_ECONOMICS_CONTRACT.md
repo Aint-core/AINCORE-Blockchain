@@ -128,7 +128,8 @@ mints at most C_τ of emission.
 **EM-2 (recipients).** A payout at h pays the members of the frozen committee C_{E(h)}
 (G1 EP-2), not the live set.
 - **Weights and exclusions.** Jailed members are excluded. Weights are the committee stake,
-  in whole AIN, with today's saturation clip (1/50 of the total).
+  in whole AIN; a member's share is pot × w / W (Amendment A4, BW-7 removed the saturation
+  clip).
 - **Fees.** Per-block fees go to the same committee, split as today: 20 % to the anchor
   leader, 80 % by committee stake (research b.6).
 - **The committee record.** The executor records each committee in state as
@@ -156,7 +157,7 @@ at the next epoch, never inside one.
 **DL-2 (delegator rewards).** A pool keeps aggregates only (docs/research/delegation_pools.md
 §4): active principal C, points P, a reward counter ρ scaled by S = 10¹⁸ with a carried
 remainder κ, a principal escrow (C plus unbonding) and a reward escrow.
-- **Split.** A payout gives member v its clipped share r_v (EM-2), split with the frozen
+- **Split.** A payout gives member v its share r_v (EM-2), split with the frozen
   record (s_v, d_v) of its epoch, b_v = s_v + d_v:
   - r_s = ⌊r_v·s_v/b_v⌋ and r_d = ⌊r_v·d_v/b_v⌋;
   - the commission m = ⌊r_d·c*/10⁴⌋, with c* the rate in force at the start of the reward
@@ -397,18 +398,23 @@ MEDIUM defects. Each fix below has a witness in the release manifest.
   carried). A second offense recorded in Move is unreachable (the executor's jail refuses it
   first); the Move check is defence in depth.
 
-## Amendment A4: bootstrap weight (BW-1, 2026-10-02)
+## Amendment A4: bootstrap weight (BW-1, 2026-10-02; revised after review)
 
 Accepted by the founder after the research in `docs/research/genesis_bootstrap.md`: the
 chain launches without a pre-mine. Consensus weight at block 1 comes from **bootstrap
-weight**: weight with no coins, owned by nobody, assigned at genesis to operators. It
-shrinks as owned stake grows and is forfeited by operators who fail objective rules.
-Emission is unchanged and paid by committee weight, so the operators running the chain
-are paid for it, as miners are.
+weight**: weight with no coins, owned by nobody, assigned at genesis to operators. It fills
+the committee up to `s_min` while owned stake is short, and it is forfeited by operators who
+fail objective rules. Emission is paid by committee weight, so the operators running the
+chain are paid for it, as miners are.
+
+The first implementation (31c631e) was reviewed by three independent agents (conformance,
+correctness, adversarial). Their findings changed BW-4, BW-6 and BW-7 and added BW-11 and
+BW-12; the table at the end maps each finding to its fix.
 
 **BW-1 (state).** `sys:bootstrap:v1` (State class, in the root) holds:
 - `s_min`, the minimum committee weight in whole AIN;
-- per operator: `weight` (whole AIN) and `strikes`.
+- per operator: `ceiling` (its genesis weight), `weight` (its weight in the current
+  committee) and `score` (BW-6), all whole AIN except the score, in parts per million.
 
 Genesis writes it from `genesis.json`'s `bootstrap` field. A chain without the key has no
 bootstrap weight (test fixtures).
@@ -418,65 +424,164 @@ bootstrap weight (test fixtures).
 - The weights sum to exactly `s_min` minus the genesis committee's owned stake, so the
   genesis committee weighs exactly `s_min`.
 - No member's total (owned + bootstrap) reaches a third of the committee.
-- A genesis validator may own 0 AIN when its bootstrap weight is positive.
+- A genesis validator owns 0 AIN or at least 1,000 AIN; 0 only with bootstrap weight.
 - The genesis committee record, the leader and quorum weights, and `sys:validators` carry
-  owned + bootstrap weight.
+  owned + bootstrap weight. Genesis also writes epoch 0's bootstrap split (BW-8) and the
+  protected list (BW-12).
 - `genesis.json` may also list `accounts` (address, balance): liquid AIN for the public
-  track of the incentivized testnet, counted in the total supply.
+  track of the incentivized testnet, counted in the total supply. An account is compared
+  with the validators as an address, so hex case cannot hide a validator.
+- `genesis-tool gen-multi` builds the file with the node's own `build_genesis` before writing
+  it (`check_genesis_json`), so it cannot write a file the node refuses, and prints its
+  identity.
 
 **BW-3 (committee weight).** At every boundary refresh, a live-set member weighs its own Move
-stake, plus its open pool's coins, plus its bootstrap weight. A member absent from the Move
-set loses its seat and its bootstrap weight.
+stake, plus its open pool's coins, plus its bootstrap weight. A top-up inside an epoch
+updates the live set with the bootstrap weight included. A member absent from the Move set
+loses its seat and its bootstrap weight.
 
-**BW-4 (decay).**
-- At the boundary, after owned weights are refreshed: P = the sum of owned weight (own +
-  pool) over the live set, and the target is B = max(0, s_min − P).
-- If the operators' weights sum above B, each is scaled to ⌊weight × B / sum⌋.
-- Bootstrap weight never grows. Rounding dust is dropped, never redistributed.
-- Order of steps: refresh owned weights, forfeit (BW-5), scale (BW-4), add the weights to
-  the live set, then elect C_{E+1}.
+**BW-4 (fill to s_min within the ceilings).**
+- P is the owned weight (own + pool) of the members the next committee would hold: the top
+  256 by owned + current bootstrap weight, as the election ranks them. Owned stake outside
+  the committee secures nothing, so it does not count.
+- The target is B = max(0, s_min − P). Each operator's weight is
+  ⌊ceiling × min(B, C) / C⌋, with C the sum of the ceilings. So bootstrap weight shrinks pro
+  rata as owned stake grows and **regrows up to the ceilings** when owned stake leaves: s_min
+  is a floor while the bootstrap lasts (review LOW-7: under "never grows", stake that came
+  and left lowered the floor for good).
+- The bootstrap ends for good the first time B = 0: every ceiling becomes 0, and it never
+  returns, so an operator that held nothing for years cannot get weight back while absent.
+- A forfeited ceiling is never redistributed: nobody gains weight from another's forfeit.
+- Order at the boundary: refresh owned weights, score (BW-6), forfeit (BW-5), fill (BW-4),
+  cap (BW-11), add the weights to the live set, then elect C_{E+1}.
 
-**BW-5 (forfeit).** An operator's bootstrap weight becomes 0 for good when it is jailed, is
-convicted in full, leaves the Move set, or reaches 3 strikes (BW-6).
+**BW-5 (forfeit).** An operator's ceiling becomes 0 for good when it is jailed, is convicted
+in full, leaves the Move set, or its score falls below one half (BW-6). Leaving forfeits in
+the leave transaction itself, so a leave and a rejoin inside one epoch keep nothing.
 
-**BW-6 (participation).**
-- During epoch E the executor counts, per committee member, the blocks it led (each block's
-  proposer). The count lives in state, `sys:bootstrap:led:{E}`.
-- At the boundary, a member's expected count is n_E × w_i / W, by C_E weights. The leader
-  election is stake-weighted, so an online member leads in proportion to its weight.
-- If expected ≥ 9 and 3 × led < expected, the operator takes a strike. A judged epoch at or
-  above a third of its expectation resets the strikes; an unjudged epoch leaves them.
-- Below 9 expected the test is not run: P(led < 3 | λ = 9) ≈ 0.6 %.
-- A member that is offline leads nothing, because its leader rounds are skipped. Honest
-  members lead ~85 % of their expectation, since skipped anchors fall on everyone alike
-  (S6 measurement).
+**BW-6 (participation, by the leader schedule).**
+- Each block carries its anchor round (the header's `round`, certified with the block). The
+  executor counts, for every even round in (previous anchor round, this anchor round], the
+  leader that consensus's own function names (`blockchain::committee::leader_for_round`,
+  the one definition consensus uses) under the committee of the block's epoch: a slot for
+  that leader, and a commit if the round is this block's anchor. Only operators are counted,
+  in `sys:bootstrap:slots:{E}`; `sys:bootstrap:round` holds the last anchor round. A gap of
+  more than 65,536 rounds counts only its last rounds.
+- This is exact, not an estimate: an offline operator holds its slots and commits none. It
+  has no variance, so small operators are judged as well as large ones, and choosing the
+  schedule by grinding stake changes cannot make an online operator fail (review MEDIUM-6).
+- At the boundary each operator with slots in the closed epoch updates its score:
+  score ← score − ⌊score/128⌋ + ⌊ratio/128⌋, with ratio = 10⁶ × commits / slots. It starts
+  at 10⁶. An operator forfeits when its score is below 500,000.
+- Derivation:
+  - **Bar ½.** On AINCORE-TESTNET-V4 (567 blocks, 2026-10-02) every validator committed
+    88–92 % of its scheduled slots. Half leaves a margin of ~0.4 against honest operators and
+    requires 56 % uptime (0.9 × u ≥ ½); a lazy operator can no longer alternate failing and
+    passing epochs (review MEDIUM-5), since the score is an average.
+  - **Memory N = 128 epochs.** Half-life 88.4 epochs, 6.9 days at the measured 6.75 s blocks:
+    the 7-day human reaction budget T_mis this contract already uses (W). A dead operator
+    forfeits after 75 epochs (5.9 days) from 0.9, or 89 from a fresh start; an outage,
+    DDoS or censorship of a few hours costs a few percent of score, not the weight (review
+    HIGH-2: three failing epochs, ~5.7 h, used to forfeit for good).
+  - **False forfeit.** An honest operator's per-epoch ratio has variance at most 0.09/n for
+    n slots; the average's standard deviation is at most √(0.09/256) ≈ 0.019 with one slot an
+    epoch: the bar is 21 deviations below 0.9.
+- Residual risk: a coalition over a third can withhold votes for one operator's anchors for
+  six days, visibly, on chain. Any coalition over a third can halt the chain anyway.
 
-**BW-7 (rewards and fees).** These are unchanged: shares go by committee weight under EM-2's
-saturation clip (total / 50). Bootstrap weight counts in the member's own part, never its
-pool's: delegators did not provide it. Below 50 members every member reaches the clip and
-earns the same, so a large bootstrap weight earns no more than any other operator.
+**BW-7 (rewards and fees).** A member's share of a payout is pot × w / W, its weight over
+the paid committee's whole weight, as Cosmos, Ethereum and Solana pay. Bootstrap weight
+counts in the member's own part, never its pool's: delegators did not provide it.
+- The saturation clip (total / 50, inherited from before G5, not derived in it) is removed.
+  It divided the pot by the clipped total, so with fewer than 50 members every seat earned
+  the same slice: four founder seats took 4/7 of all emission and a 370 k seat earned what a
+  4.3 M seat earned (review HIGH-3). Paid by weight, a seat earns nothing by being a seat,
+  and splitting stake gains nothing.
+- Cardano's form of the cap (divide by the whole weight, leave the excess unpaid) was
+  considered and rejected. With no pre-mine, emission is the only source of coins; at launch
+  every member would be saturated, so only n/50 of each draw would be paid (10 % with five
+  members), owned stake would grow about ten times slower than the model assumes, and the
+  bootstrap phase, whose authority BW-1 exists to end, would last decades.
+- So the operators who run the chain earn the emission by their weight, as miners earn
+  Bitcoin's: the founder's validators at most 30 % of it, falling as owned stake replaces
+  bootstrap weight (`genesis_bootstrap.md`).
+- Fees are unchanged: 20 % to the anchor leader, 80 % by committee weight.
 
 **BW-8 (never coins).** Bootstrap weight never enters a CoinStore, `ValidatorSet` stake, the
-total supply, or the emission reserve's accounting. A slash cuts owned stake; bootstrap
-weight is forfeited (BW-5).
+total supply, or the emission reserve's accounting. At each boundary the executor records
+the bootstrap part of every member's weight next to the committee
+(`sys:validator_set:epoch_bootstrap:{E}`, pruned with it). An offense passes the waterfall
+the operator's own coins (weight − pool − bootstrap) and its pool's part; the correlation
+still uses the whole weight. Bootstrap weight cannot absorb a loss its delegators owe (review
+HIGH: it was counted as own stake, which left delegators almost unslashed).
 
 **BW-9 (churn, slashing).** CH-1's base and the correlation fraction's T are committee
 weights, so they include bootstrap weight. This is consistent with the leader and quorum
 weights.
 
-**BW-10 (transparency).** `aincore_getBootstrap` returns `s_min`, P, the target, and each
-operator's weight and strikes.
+**BW-10 (transparency).** `aincore_getBootstrap` returns `s_min_ain`, `bootstrap_ain`,
+`ceiling_ain`, `owned_stake_ain` (P as BW-4 counts it), `target_ain`, and each operator's
+ceiling, weight and score, all as numbers, computed by the executor's own functions.
+
+**BW-11 (below a third, at every boundary).** After BW-4, bootstrap weight is cut so that no
+member of the next committee reaches a third of it: each member's weight becomes at most
+max(owned, L), with L the largest level such that 3L is below the new total (at most the
+total with exactly three members; nothing is cut with two or fewer). Only bootstrap weight
+is cut, the cut goes to nobody, and it is recomputed every boundary from the ceilings.
+- Why: forfeits shrink the committee, so survivors' shares grow. With the founder at 30 % and
+  three operators, one forfeit would put the founder at 38 %, and a founder-plus-one
+  coalition (53 %) striking out another operator would reach 68 % (review HIGH-1). With the
+  cap, one forfeit leaves the founder below a third and any two members below two thirds.
+- Precedent: Sui caps each validator's voting power every epoch at max(10 %, 1/n)
+  (`voting_power.move`); it redistributes the excess, AINCORE drops it, so nobody gains.
+- Cost: when only two large members are left beside small ones, the cap shrinks the
+  committee to about three times the small members' weight (2 M AIN in the example of
+  `genesis_bootstrap.md`). That is the honest state of a chain with two large parties; more
+  launch operators keep a margin (IT-5).
+
+**BW-12 (protected seats).** `0x1::staking::BootstrapProtected` lists the operators with a
+ceiling. A full validator set (1,000) never displaces them; a joiner takes the smallest
+unprotected member's place, or is refused. Genesis writes the list and the executor rewrites
+it at every boundary. Without it, filling the set with 1,000-AIN validators (about 1 M AIN,
+refunded after unbonding) displaced operators that own 0 AIN and forfeited their weight
+(review MEDIUM-HIGH-4).
+
+**Known, accepted.**
+- If a boundary's proposed committee is invalid, C_E is kept with its old weights for one
+  epoch, so a forfeit takes effect one epoch late (review LOW-8).
+- An owned stake of a third or more is never cut (only bootstrap weight is); CH-1 bounds how
+  fast it can be bought (review INFO).
+- The founder's share (≤ 30 %) and the operator count are rules of the genesis ceremony, not
+  of the loader: the genesis file and the founder's addresses are public, so anyone can check
+  them (review INFO).
+
+**Review findings and their fixes.**
+
+| Finding | Severity | Fix |
+|---|---|---|
+| Bootstrap weight counted as own stake in the slash waterfall | HIGH | BW-8: per-epoch bootstrap split; own = weight − pool − bootstrap; Move `record` takes own + pool ≤ weight |
+| The third checked only at genesis | HIGH | BW-11 |
+| Three bad epochs (~5.7 h) forfeit for good | HIGH | BW-6: exact schedule, score with a 6.9-day half-life |
+| Saturation clip paid per seat | HIGH | BW-7: paid by weight, no clip |
+| A full set displaced operators owning 0 AIN | MEDIUM-HIGH | BW-12 |
+| A mid-epoch top-up dropped bootstrap weight from the live set | MEDIUM | BW-3 |
+| Alternating epochs kept full weight at 13 % uptime | MEDIUM | BW-6: averaged score, bar ½ |
+| Grinding the schedule to frame an operator | MEDIUM | BW-6: judged against its own slots |
+| Floored expectation, owned stake outside the committee in P, leave and rejoin kept weight | LOW | BW-6 replaced; BW-4 counts the next committee; BW-5 forfeits at the leave |
+| Stake that came and left lowered the floor | LOW | BW-4: regrowth to the ceilings |
+| Genesis compared accounts as strings; the tool accepted 1–999 AIN, duplicate and malformed accounts | LOW | BW-2: addresses compared, the node's rules run in the tool |
+| The lead count rewritten every block for every leader | LOW | only operators' slots, only when one is scheduled |
 
 **Stages.**
 
 | Stage | Content | Witnesses |
 |---|---|---|
-| A4-S1 | BW-1, BW-2, BW-8: genesis field, validation, committee and supply; genesis-tool `--bootstrap-file`, `--s-min-ain`, `--accounts-file` | genesis refuses a mismatched sum, a non-validator operator, a member at or above 1/3; committee weights include bootstrap weight; supply excludes it |
-| A4-S2 | BW-3, BW-4, BW-5, BW-7, BW-9 in the executor | decay keeps the committee at s_min until P ≥ s_min, then 0; weight never grows; forfeit on jail, conviction and leaving; bootstrap reward goes to the operator's own balance, not its pool |
-| A4-S3 | BW-6 participation | a silent operator takes 3 strikes and forfeits; a good epoch resets strikes; members below 9 expected are not judged |
-| A4-S4 | BW-10 RPC, operator guide | the RPC reports what the state holds |
+| A4-S1 | BW-1, BW-2, BW-8: genesis field, validation, committee and supply; genesis-tool entries' `bootstrap_ain`, `--s-min-ain`, `--accounts-file` | `a_bootstrap_genesis_weighs_s_min_and_mints_nothing`, `bootstrap_weight_fills_the_genesis_committee_without_coins` |
+| A4-S2 | BW-3, BW-4, BW-5, BW-7, BW-8, BW-9, BW-11, BW-12 in the executor and Move | `g5_bootstrap_weight_fills_to_s_min_within_its_ceilings`, `g5_bootstrap_weight_is_capped_below_a_third`, `g5_the_cap_cuts_only_bootstrap_weight`, `g5_owned_stake_counts_only_the_next_committee`, `g5_a_jailed_bootstrap_operator_forfeits_its_weight`, `g5_an_offense_record_leaves_bootstrap_weight_out_of_the_waterfall`, `g5_a_full_set_never_displaces_a_bootstrap_operator` |
+| A4-S3 | BW-6 participation by the schedule | `g5_a_silent_bootstrap_operator_forfeits_when_its_score_falls_below_half`, `g5_the_bootstrap_score_has_a_week_long_memory`, `the_leader_schedule_matches_live_testnet_blocks` |
+| A4-S4 | BW-10 RPC, operator guide | `get_bootstrap_reports_the_state` |
 | A4-S5 | Crash pin re-proof, mutation campaign, independent review | every kill list item killed; findings fixed |
-| A4-S6 | Incentivized-testnet scoring tool producing P0 (operators' genesis stake and the public track's accounts) from testnet blocks | reproducible from public chain data |
+| A4-S6 | Incentivized-testnet scoring (`genesis-tool score-testnet`, `gen-multi --allocations-file`) producing P0 (operators' genesis stake and bootstrap weight, the public track's accounts) from testnet chain data | `the_testnet_scores_operators_by_their_leader_slots`, `a_jail_counts_only_up_to_the_snapshot`, `the_public_track_counts_points_on_three_days` |
 
 ## End-of-G5 mutation campaigns (2026-10-01/02)
 

@@ -3067,15 +3067,20 @@ dependencies = [
 name = "genesis-tool"
 version = "0.1.0"
 dependencies = [
+ "bcs",
+ "blockchain",
  "clap 4.5.53",
  "consensus",
  "crypto",
  "ed25519-dalek",
+ "executor",
  "hex",
+ "move-core-types",
  "node",
  "serde",
  "serde_json",
  "storage",
+ "vm_move",
 ]
 
 [[package]]

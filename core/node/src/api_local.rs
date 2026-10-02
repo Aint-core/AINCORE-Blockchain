@@ -1723,35 +1723,21 @@ fn handle_rpc_method(
         // ============ IMPORTANT DAPP/EXPLORER ENDPOINTS ============
 
         "aincore_getBootstrap" => {
-            // G5 A4 BW-10: the bootstrap weight as the chain holds it. Owned
-            // stake P is each live member's weight minus its bootstrap weight.
-            let state: Option<executor::BootstrapState> = match data.storage.get(executor::BOOTSTRAP_KEY) {
-                Ok(Some(raw)) => serde_json::from_str(&raw).ok(),
-                _ => None,
-            };
-            let Some(state) = state else {
+            // G5 A4 BW-10: the bootstrap weight as the chain holds it, with
+            // the owned stake P and the target the next boundary would compute
+            // now (the executor's own functions). Whole AIN throughout.
+            let Some(report) = executor::bootstrap_report(&data.storage) else {
                 return Ok(serde_json::json!({ "active": false }));
             };
-            let live: Vec<serde_json::Value> = match data.storage.get("sys:validator_set:v1") {
-                Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or_default(),
-                _ => Vec::new(),
-            };
-            let owned: u128 = live
-                .iter()
-                .map(|m| {
-                    let address = m["address"].as_str().unwrap_or_default();
-                    let weight = m["stake"].as_u64().unwrap_or(0);
-                    weight.saturating_sub(state.weight_of(address)) as u128
-                })
-                .sum();
-            let target = (state.s_min as u128).saturating_sub(owned);
+            let whole = |v: u128| u64::try_from(v).unwrap_or(u64::MAX);
             Ok(serde_json::json!({
-                "active": !state.operators.is_empty(),
-                "s_min_ain": state.s_min,
-                "bootstrap_ain": state.total(),
-                "owned_stake_ain": owned.to_string(),
-                "target_ain": target.to_string(),
-                "operators": state.operators,
+                "active": !report.state.operators.is_empty(),
+                "s_min_ain": report.state.s_min,
+                "bootstrap_ain": report.state.total(),
+                "ceiling_ain": report.state.ceilings(),
+                "owned_stake_ain": whole(report.owned_stake),
+                "target_ain": whole(report.target),
+                "operators": report.state.operators,
             }))
         },
         "aincore_getEconomics" => {
@@ -2802,12 +2788,28 @@ mod tests {
     /// the target and each operator; a chain without bootstrap says so.
     #[test]
     fn get_bootstrap_reports_the_state() {
+        #[derive(serde::Serialize)]
+        struct Config {
+            validator_addr: [u8; 32],
+            stake: u128,
+            public_key: Vec<u8>,
+            bls_public_key: Vec<u8>,
+            bls_pop: Vec<u8>,
+        }
+        #[derive(serde::Serialize)]
+        struct Set {
+            validators: Vec<Config>,
+            unbonding_queue: Vec<u8>,
+            total_supply: u128,
+            current_epoch: u64,
+        }
         let db = temp_db("rpc_bootstrap");
         let state = test_state(Arc::clone(&db));
         let none =
             handle_rpc_method("aincore_getBootstrap", serde_json::json!([]), &state).unwrap();
         assert_eq!(none, serde_json::json!({ "active": false }));
-        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let (a, b, c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        let ain: u128 = 1_000_000_000_000_000_000;
         {
             let _seed = db.seeding();
             db.put(
@@ -2816,30 +2818,66 @@ mod tests {
                     s_min: 10_000,
                     operators: vec![executor::BootstrapOperator {
                         address: a.clone(),
-                        weight: 3_000,
-                        strikes: 1,
+                        ceiling: 3_000,
+                        weight: 2_500,
+                        score: 900_000,
                     }],
                 })
                 .unwrap(),
             )
             .unwrap();
+            // The live set: a owns 1,000 with its bootstrap weight, b owns
+            // 6,000, c holds a seat the Move set no longer has.
             db.put(
                 "sys:validator_set:v1",
                 &serde_json::json!([
-                    { "address": a, "stake": 4_000 },
-                    { "address": b, "stake": 6_000 },
+                    { "address": a, "stake": 3_500, "ed25519_public_key": "",
+                      "bls_public_key": "", "bls_pop": "" },
+                    { "address": b, "stake": 6_000, "ed25519_public_key": "",
+                      "bls_public_key": "", "bls_pop": "" },
+                    { "address": c, "stake": 9_000, "ed25519_public_key": "",
+                      "bls_public_key": "", "bls_pop": "" },
                 ])
                 .to_string(),
+            )
+            .unwrap();
+            let config = |who: &str, stake_ain: u128| Config {
+                validator_addr: hex::decode(who).unwrap().try_into().unwrap(),
+                stake: stake_ain * ain,
+                public_key: vec![],
+                bls_public_key: vec![],
+                bls_pop: vec![],
+            };
+            db.put(
+                &vm_move::state_keys::resource_key_str(
+                    &move_address(&format!("{:064x}", 1)),
+                    "0x1::staking::ValidatorSet",
+                ),
+                &hex::encode(
+                    bcs::to_bytes(&Set {
+                        validators: vec![config(&a, 1_000), config(&b, 6_000)],
+                        unbonding_queue: vec![],
+                        total_supply: 7_000 * ain,
+                        current_epoch: 0,
+                    })
+                    .unwrap(),
+                ),
             )
             .unwrap();
         }
         let r = handle_rpc_method("aincore_getBootstrap", serde_json::json!([]), &state).unwrap();
         assert_eq!(r["active"], true);
         assert_eq!(r["s_min_ain"], 10_000);
-        assert_eq!(r["bootstrap_ain"], 3_000);
-        assert_eq!(r["owned_stake_ain"], "7000");
-        assert_eq!(r["target_ain"], "3000");
-        assert_eq!(r["operators"][0]["strikes"], 1);
+        assert_eq!(r["bootstrap_ain"], 2_500);
+        assert_eq!(r["ceiling_ain"], 3_000);
+        // P is owned stake in the Move set (1,000 + 6,000), not the live
+        // weights less bootstrap weight (c's 9,000 has no Move stake).
+        assert_eq!(r["owned_stake_ain"], 7_000);
+        assert_eq!(
+            r["target_ain"], 3_000,
+            "the next boundary refills to the ceiling"
+        );
+        assert_eq!(r["operators"][0]["score"], 900_000);
     }
 
     /// G5 DOC-1: the supply and economics RPCs report the Move emission

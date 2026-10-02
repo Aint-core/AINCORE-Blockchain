@@ -1349,51 +1349,9 @@ impl OrderingEngine {
     /// outright safety break. The QC-folded beacon remains available via
     /// `get_random_beacon()` for NON-consensus randomness.
     pub(crate) fn leader_for_round(round: u64, validators: &[(String, u64)], attempt: u32) -> String {
-        if validators.is_empty() {
-            // M6 FIX: Instead of hardcoded "node_9009", return empty string
-            // The caller already handles the "no leader found" case properly
-            return String::new();
-        }
-
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"AINCORE_LEADER_V2");
-        hasher.update(round.to_le_bytes());
-        hasher.update((attempt as u64).to_le_bytes());
-        // `validators` is canonically sorted by address by
-        // get_validator_set_with_stake, so this preimage is identical everywhere.
-        for (addr, stake) in validators {
-            hasher.update(addr.as_bytes());
-            hasher.update(stake.to_le_bytes());
-        }
-        let digest = hasher.finalize();
-        let seed = u64::from_le_bytes([
-            digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
-        ]);
-
-        // B4: STAKE-WEIGHTED leader election. A validator's chance of being leader
-        // is proportional to its stake. Deterministic across honest nodes:
-        // `validators` is canonically sorted by address, so the cumulative-stake
-        // walk picks the same leader for the same seed everywhere.
-        let total_stake: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
-
-        if total_stake == 0 {
-            // Degenerate (no stake info): fall back to uniform round-robin so the
-            // chain never stalls on a divide-by-zero.
-            let idx = (seed % validators.len() as u64) as usize;
-            return validators[idx].0.clone();
-        }
-
-        let draw = (seed as u128) % total_stake;
-        let mut cumulative: u128 = 0;
-        for (addr, stake) in validators {
-            cumulative += *stake as u128;
-            if draw < cumulative {
-                return addr.clone();
-            }
-        }
-        // Unreachable: draw < total_stake guarantees a hit above. Safe fallback.
-        validators[validators.len() - 1].0.clone()
+        // B4: STAKE-WEIGHTED, seeded by the round and the canonically sorted
+        // committee. One definition, shared with the executor (G5 BW-6).
+        blockchain::committee::leader_for_round(round, validators, attempt)
     }
 
 }

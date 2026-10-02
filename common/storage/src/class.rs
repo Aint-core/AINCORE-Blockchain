@@ -164,6 +164,7 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         | "total_burned"
         | "gov:active_proposal_ids"
         | "sys:bootstrap:v1"
+        | "sys:bootstrap:round"
         | "sys:stdlib_version" => Some(State),
 
         "latest_height"
@@ -266,8 +267,10 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         ["sys", "validator_set", "epoch", e] if dec(e) => State,
         ["sys", "validator_set", "epoch_delegated", e] if dec(e) => State,
         ["sys", "validator_set", "epoch_time", e] if dec(e) => State,
-        // G5 A4 BW-6: blocks each member led in a committee epoch.
-        ["sys", "bootstrap", "led", e] if dec(e) => State,
+        // G5 A4 BW-8: the bootstrap part of each member's weight in an epoch.
+        ["sys", "validator_set", "epoch_bootstrap", e] if dec(e) => State,
+        // G5 A4 BW-6: each operator's leader slots and commits in an epoch.
+        ["sys", "bootstrap", "slots", e] if dec(e) => State,
         ["consensus", "epoch_start_height", e] if dec(e) => State,
         ["sys", "fee_sweep_queue", h, miner] if dec(h) && seg(miner) => State,
         ["sys", "slashed", a, r] if seg(a) && dec(r) => State,
@@ -384,6 +387,7 @@ pub const STATE_EXACT: &[&str] = &[
     "total_burned",
     "gov:active_proposal_ids",
     "sys:bootstrap:v1",
+    "sys:bootstrap:round",
     "sys:stdlib_version",
 ];
 
@@ -398,7 +402,8 @@ pub const STATE_PREFIXES: &[&str] = &[
     "sys:validator_set:epoch:",
     "sys:validator_set:epoch_delegated:",
     "sys:validator_set:epoch_time:",
-    "sys:bootstrap:led:",
+    "sys:validator_set:epoch_bootstrap:",
+    "sys:bootstrap:slots:",
     "consensus:epoch_start_height:",
     "sys:fee_sweep_queue:",
     "sys:slashed:",
@@ -596,7 +601,9 @@ mod tests {
             ("sys:validator_set:epoch_delegated:12".into(), State),
             ("sys:validator_set:epoch_time:12".into(), State),
             ("sys:bootstrap:v1".into(), State),
-            ("sys:bootstrap:led:12".into(), State),
+            ("sys:bootstrap:round".into(), State),
+            ("sys:bootstrap:slots:12".into(), State),
+            ("sys:validator_set:epoch_bootstrap:12".into(), State),
             ("sys:validator_set:retained_from".into(), State),
             ("consensus:epoch".into(), State),
             ("consensus:epoch_start_height:12".into(), State),
@@ -776,8 +783,10 @@ mod tests {
             "sys:validator_set:epoch_delegated:07",
             "sys:validator_set:epoch_time:",
             "sys:validator_set:epoch_time:x",
-            "sys:bootstrap:led:",
-            "sys:bootstrap:led:x",
+            "sys:bootstrap:slots:",
+            "sys:bootstrap:slots:x",
+            "sys:validator_set:epoch_bootstrap:",
+            "sys:validator_set:epoch_bootstrap:07",
             &format!("tx_index:{}", &H64[..63]),
             &format!("vertex:{}", H64.to_uppercase()),
             "sys:config:unknown",

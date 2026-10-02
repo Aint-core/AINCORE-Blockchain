@@ -163,6 +163,12 @@ pub struct GenMultiArgs {
     #[arg(long = "accounts-file", value_name = "PATH")]
     pub accounts_file: Option<PathBuf>,
 
+    /// G5 A4-S6: `score-testnet`'s allocations, a JSON array of
+    /// `{address, stake_ain, bootstrap_ain}`: each sets the stake and the
+    /// bootstrap weight of the entry with that address.
+    #[arg(long = "allocations-file", value_name = "PATH")]
+    pub allocations_file: Option<PathBuf>,
+
     /// Output path for the generated genesis.json.
     #[arg(short, long, default_value = "genesis.json")]
     pub out: PathBuf,
@@ -205,6 +211,8 @@ pub struct GenMultiArgs {
 
 /// 10^18 quanta per whole AIN. Mirrors `node::genesis` COIN_SCALE.
 const COIN_SCALE: u128 = 1_000_000_000_000_000_000;
+/// The Move `MIN_STAKE` and the genesis loader's minimum, in whole AIN.
+const MIN_STAKE_AIN: u128 = 1_000;
 
 /// Per-validator genesis entry. Field names + types match
 /// `node::genesis::GenesisValidatorConfig` EXACTLY (the loader's
@@ -362,10 +370,12 @@ pub fn build_genesis_from_entries(
     let mut seen_bls = std::collections::BTreeSet::new();
     for spec in specs {
         check_entry(&spec.entry)?;
-        if spec.stake_ain == 0 && spec.bootstrap_ain == 0 {
+        // The node's rule: at least 1,000 AIN, or none with bootstrap weight.
+        if spec.stake_ain < MIN_STAKE_AIN && !(spec.stake_ain == 0 && spec.bootstrap_ain > 0) {
             return Err(format!(
-                "{}: stake must be > 0 without bootstrap weight",
-                spec.entry.address
+                "{}: stake {} AIN is below the minimum {MIN_STAKE_AIN} AIN (0 is allowed only \
+                 with bootstrap weight)",
+                spec.entry.address, spec.stake_ain
             )
             .into());
         }
@@ -469,8 +479,19 @@ pub fn apply_bootstrap_and_accounts(
             });
         }
     }
+    let mut seen = std::collections::BTreeSet::new();
     for a in accounts {
-        if specs.iter().any(|s| s.entry.address == a.address) {
+        let canonical = a.address.to_ascii_lowercase();
+        if canonical.len() != 64 || hex::decode(&canonical).is_err() {
+            return Err(format!("account {} is not a 64-hex address", a.address).into());
+        }
+        if !seen.insert(canonical.clone()) {
+            return Err(format!("account {} is listed twice", a.address).into());
+        }
+        if specs
+            .iter()
+            .any(|s| s.entry.address.to_ascii_lowercase() == canonical)
+        {
             return Err(format!("{} is a validator and an account", a.address).into());
         }
         let quanta = a
@@ -481,6 +502,24 @@ pub fn apply_bootstrap_and_accounts(
             address: a.address.clone(),
             balance: quanta.to_string(),
         });
+    }
+    Ok(())
+}
+
+/// G5 A4-S6: set each allocated entry's stake and bootstrap weight from
+/// `score-testnet`. An allocation must name an entry: a qualified operator
+/// joins mainnet genesis with the key it qualified with.
+pub fn apply_allocations(
+    entries: &mut [EntrySpec],
+    allocations: &[crate::score::Allocation],
+) -> Result<(), String> {
+    for a in allocations {
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.entry.address.eq_ignore_ascii_case(&a.address))
+            .ok_or_else(|| format!("allocation {} has no validator entry", a.address))?;
+        entry.stake_ain = a.stake_ain as u128;
+        entry.bootstrap_ain = a.bootstrap_ain;
     }
     Ok(())
 }
@@ -594,6 +633,14 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
         entries.extend(listed);
     }
 
+    if let Some(path) = &args.allocations_file {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read --allocations-file {}: {e}", path.display()))?;
+        let allocations: Vec<crate::score::Allocation> = serde_json::from_str(&raw)
+            .map_err(|e| format!("--allocations-file {}: {e}", path.display()))?;
+        apply_allocations(&mut entries, &allocations)?;
+    }
+
     let stdlib_hash = node::genesis::stdlib_hash_of(&args.stdlib_path)
         .map_err(|e| format!("cannot hash the stdlib at {}: {e}", args.stdlib_path))?;
     let mut genesis = build_genesis_from_entries(
@@ -644,8 +691,13 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    // The node's own rules, on the file as written: what it would refuse to
+    // boot is never written.
     let json = serde_json::to_string_pretty(&genesis)?;
+    let identity = node::genesis::check_genesis_json(&json, &args.stdlib_path)
+        .map_err(|e| format!("the node refuses this genesis: {e}"))?;
     std::fs::write(&args.out, &json)?;
+    println!("🔏 Genesis identity: {identity}");
 
     println!("⛓️  Chain ID: {}", genesis.chain_id);
     println!("🛡️  Validators: {}", genesis.validators.len());
@@ -1075,5 +1127,56 @@ mod tests {
             balance_ain: 1,
         }];
         assert!(refuse(&ops, Some(18_500_000), &taken).contains("validator and an account"));
+        // Parity with the node (review): hex case, duplicates and bad hex.
+        let upper = vec![AccountSpec {
+            address: ops[0].entry.address.to_uppercase(),
+            balance_ain: 1,
+        }];
+        assert!(refuse(&ops, Some(18_500_000), &upper).contains("validator and an account"));
+        let twice = vec![public[0].clone(), public[0].clone()];
+        assert!(refuse(&ops, Some(18_500_000), &twice).contains("listed twice"));
+        let bad = vec![AccountSpec {
+            address: "zz".into(),
+            balance_ain: 1,
+        }];
+        assert!(refuse(&ops, Some(18_500_000), &bad).contains("64-hex"));
+        // 1 to 999 owned AIN is below the node's minimum, bootstrap or not.
+        let mut thin = ops.clone();
+        thin[0].stake_ain = 500;
+        thin[0].bootstrap_ain -= 500;
+        let err =
+            build_genesis_from_entries(&thin, "AINCORE-TESTNET-V4", 0, 6_749, 25, &stdlib_hash)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("below the minimum"), "{err}");
+        // What the tool writes, the node accepts: the same rules, one place.
+        // score-testnet's allocations set the entries they name, and an
+        // allocation without an entry is refused.
+        let mut allocated = ops.clone();
+        let alloc = crate::score::Allocation {
+            address: ops[1].entry.address.to_uppercase(),
+            stake_ain: 333_333,
+            bootstrap_ain: 4_291_667,
+        };
+        apply_allocations(&mut allocated, std::slice::from_ref(&alloc)).unwrap();
+        assert_eq!(
+            (allocated[1].stake_ain, allocated[1].bootstrap_ain),
+            (333_333, 4_291_667)
+        );
+        assert_eq!(allocated[0].bootstrap_ain, 4_625_000, "others keep theirs");
+        let stranger = crate::score::Allocation {
+            address: "ab".repeat(32),
+            ..alloc
+        };
+        assert!(apply_allocations(&mut allocated, &[stranger])
+            .unwrap_err()
+            .contains("no validator entry"));
+        let check = |g: &GenesisFile| {
+            node::genesis::check_genesis_json(&serde_json::to_string(g).unwrap(), &stdlib_path())
+        };
+        assert!(check(&genesis).is_ok());
+        let mut broken = genesis.clone();
+        broken.bootstrap.as_mut().unwrap().s_min_ain += 1;
+        assert!(check(&broken).is_err());
     }
 }

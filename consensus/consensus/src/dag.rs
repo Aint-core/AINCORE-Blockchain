@@ -1110,6 +1110,8 @@ impl DagConsensus {
                             self.latest_block_height + 1,
                             // G5 CL-2: its BFT timestamp drives consensus time.
                             block_timestamp,
+                            // G5 BW-6: its anchor round (the header's `round`).
+                            commit.anchor_round,
                             &slash_evidence,
                             // Nothing to admit for a block this node built. Tests
                             // may stage state here, BEFORE execution: after the
