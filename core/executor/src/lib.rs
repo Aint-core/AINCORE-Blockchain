@@ -10577,6 +10577,52 @@ mod tests {
             "one slot per even round"
         );
         assert!(slots[&offline].0 > 0 && slots[&offline].1 == 0);
+        // The boundary block H_1 counts in epoch 1, the epoch it closes: each
+        // score after it is epoch 1's counts, H_1's rounds included, folded
+        // into the score epoch 0 left. At H_1 only the operator that was
+        // offline all epoch is online, so H_1 is its first commit and every
+        // other operator misses its rounds: the scores depend on H_1.
+        let before = bootstrap_of(&db);
+        let mut expected = slots.clone();
+        let last = chain.last_round;
+        chain.offline = Some(
+            members
+                .iter()
+                .map(|m| committee_member(m.0, 0).address)
+                .filter(|a| *a != offline)
+                .collect(),
+        );
+        chain.run_blocks(1, 7);
+        assert_eq!(expected.get(&offline).map(|e| e.1), Some(0));
+        let mut stakes = g5_committee(&db, 1);
+        stakes.sort();
+        let mut round = last + 2;
+        while round <= chain.last_round {
+            let leader = blockchain::committee::leader_for_round(round, &stakes, 0);
+            let entry = expected.entry(leader).or_insert((0, 0));
+            entry.0 += 1;
+            if round == chain.last_round {
+                entry.1 += 1;
+            }
+            round += 2;
+        }
+        let after = bootstrap_of(&db);
+        for op in &before.operators {
+            let (n, led) = expected.get(&op.address).copied().unwrap_or((0, 0));
+            let score = after
+                .operators
+                .iter()
+                .find(|o| o.address == op.address)
+                .map(|o| o.score);
+            assert_eq!(
+                score,
+                Some(next_bootstrap_score(op.score, n, led)),
+                "{}",
+                op.address
+            );
+        }
+        let (n, led) = expected[&offline];
+        assert!(led == 1 && n > 1, "H_1 is its one commit of {n} slots");
     }
 
     /// G5 A4 BW-8 (review HIGH): a slash cuts coins only. The offense record

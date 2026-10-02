@@ -200,8 +200,14 @@ pub fn score(
     }
     let interval =
         epoch::epoch_interval(db).ok_or_else(|| err("the datadir pins no epoch length"))?;
-    let founder: BTreeSet<String> = founder.iter().map(|a| canonical(a)).collect();
+    // The founder holds the faucet: if the faucet's account validates, it
+    // counts as the founder's.
     let faucet = canonical(faucet);
+    let founder: BTreeSet<String> = founder
+        .iter()
+        .map(|a| canonical(a))
+        .chain(std::iter::once(faucet.clone()))
+        .collect();
 
     // IT-2: every window committee, with the founder below a third of each.
     let first_epoch = epoch::epoch_of_height(from_height, interval);
@@ -750,14 +756,15 @@ mod tests {
     /// and the founder's nodes neither qualify nor set the median.
     #[test]
     fn the_testnet_scores_operators_by_their_leader_slots() {
-        // Seven validators: 1 founder node (index 0), six operators, one of
-        // them (index 6) offline.
-        let stakes = [1_000; 7];
-        let (db, a) = testnet("operators", &stakes, &[6], &[]);
+        // Four founder nodes of 500 (indices 0-3, 25 % together), all
+        // offline, and six operators of 1,000, one of them (index 9) offline.
+        let stakes = [500, 500, 500, 500, 1_000, 1_000, 1_000, 1_000, 1_000, 1_000];
+        let (db, a) = testnet("operators", &stakes, &[0, 1, 2, 3, 9], &[]);
         let faucet = address_of(FAUCET);
-        let r = score(&db, 1, 60, &[a[0].clone()], &faucet, 18_500_000, 5_550_000).unwrap();
+        let founder: Vec<String> = a[..4].to_vec();
+        let r = score(&db, 1, 60, &founder, &faucet, 18_500_000, 5_550_000).unwrap();
         assert_eq!(r.epochs, vec![0, 1, 2]);
-        let offline = &r.operators[&a[6]];
+        let offline = &r.operators[&a[9]];
         assert!(offline.slots > 0 && offline.commits == 0);
         assert!(offline
             .reason
@@ -765,11 +772,13 @@ mod tests {
             .unwrap()
             .contains("committed 0 ppm"));
         assert_eq!(r.operators[&a[0]].reason.as_deref(), Some("founder"));
-        let online = &r.operators[&a[1]];
+        let online = &r.operators[&a[4]];
         assert_eq!(online.commits, online.slots);
         assert_eq!(online.blocks_in_committee, 60);
         // The median is the operators' (1,000,000 for the five online, 0 for
-        // the offline): the founder's node is not in it.
+        // the offline). The founder's offline nodes are not in it: with them
+        // it would be 500,000, and a slow operator could pass.
+        assert!((0..4).all(|i| r.operators[&a[i]].slots > 0));
         assert_eq!(r.median_commit_ppm, 1_000_000);
         assert_eq!(r.allocations.len(), 5);
         // 1,000,000 / 5 = 200,000 bonded each; (18,500,000 - 1,000,000 -
@@ -789,8 +798,9 @@ mod tests {
 
         // A founder over 30 % is refused, and so is a window with fewer than
         // five qualified operators.
-        assert!(score(&db, 1, 60, &[a[0].clone()], &faucet, 18_500_000, 5_550_001).is_err());
-        let few = score(&db, 1, 60, &a[..2], &faucet, 18_500_000, 5_550_000).unwrap_err();
+        assert!(score(&db, 1, 60, &founder, &faucet, 18_500_000, 5_550_001).is_err());
+        let (db, a) = testnet("few", &stakes, &[0, 1, 2, 3, 8, 9], &[]);
+        let few = score(&db, 1, 60, &a[..4], &faucet, 18_500_000, 5_550_000).unwrap_err();
         assert!(few.to_string().contains("at least 5"), "{few}");
     }
 
@@ -814,6 +824,9 @@ mod tests {
             5_550_000,
         )
         .unwrap_err();
+        assert!(refused.to_string().contains("not fair"), "{refused}");
+        // The faucet's account counts as the founder's.
+        let refused = score(&db, 1, 60, &[], &a[0], 18_500_000, 5_550_000).unwrap_err();
         assert!(refused.to_string().contains("not fair"), "{refused}");
     }
 
@@ -867,19 +880,20 @@ mod tests {
             (6, transfer(55, 51, 0)),
             (7, transfer(55, 51, 1)),
             (8, transfer(55, 51, 2)),
-            // 52: a vote, a delegation to pool 1 held although it left pool 2
-            // within the epoch, one to pool 2 pulled too soon, a transfer.
+            // 52: a vote, a delegation to pool 1 (block 7) held although 52
+            // left pool 2 at block 10, inside pool 1's epoch; the one to pool 2
+            // (block 8) pulled too soon; a transfer.
             (6, tx(52, "governance", "vote", vec![], 3)),
             (
                 7,
                 tx(52, "delegation", "delegate", vec![pool(1), amount()], 4),
             ),
             (
-                30,
+                8,
                 tx(52, "delegation", "delegate", vec![pool(2), amount()], 5),
             ),
             (
-                35,
+                10,
                 tx(52, "delegation", "undelegate", vec![pool(2), amount()], 6),
             ),
             (40, transfer(52, 50, 7)),

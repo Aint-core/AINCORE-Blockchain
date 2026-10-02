@@ -42,7 +42,8 @@ founder's choice, and a deliberate omission looks like latency).
   **375,000** (the founder's four nodes 93,750 each). Every further operator lowers the
   founder's share; at 375 k of operator stake the bootstrap reaches 0 and, after U, ends,
   which the testnet then rehearses too.
-- The window starts once the founder holds less than a third, announced in advance.
+- The window starts once the founder holds less than a third, announced in advance. The
+  founder holds the faucet, so the faucet's account counts as the founder's if it validates.
 
 **IT-3 (operator qualification).** An operator qualifies if, over the window:
 - it is in the committee for at least 90 % of the window's blocks;

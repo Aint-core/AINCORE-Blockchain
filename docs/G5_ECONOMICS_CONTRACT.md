@@ -651,7 +651,7 @@ refunded after unbonding) displaced operators that own 0 AIN and forfeited their
 | A4-S2 | BW-3, BW-4, BW-5, BW-7, BW-8, BW-9, BW-11, BW-12 in the executor and Move | `g5_bootstrap_weight_fills_to_s_min_within_its_ceilings`, `g5_bootstrap_weight_is_capped_below_a_third`, `g5_the_cap_cuts_only_bootstrap_weight`, `g5_owned_stake_counts_only_the_next_committee`, `g5_a_jailed_bootstrap_operator_forfeits_its_weight`, `g5_an_offense_record_leaves_bootstrap_weight_out_of_the_waterfall`, `g5_a_full_set_never_displaces_a_bootstrap_operator` |
 | A4-S3 | BW-6 participation by the schedule | `g5_a_silent_bootstrap_operator_forfeits_when_its_score_falls_below_half`, `g5_the_bootstrap_score_has_a_week_long_memory`, `the_leader_schedule_matches_live_testnet_blocks` |
 | A4-S4 | BW-10 RPC, operator guide | `get_bootstrap_reports_the_state` |
-| A4-S5 | Crash pin re-proof, mutation campaign, two independent review rounds | the A4 kill list (scratchpad `mut_a4v2.py`) recorded below; findings fixed |
+| A4-S5 | Crash pin re-proof, mutation campaign, two independent review rounds | campaign 3 below: 69 of 69 killed; findings fixed |
 | A4-S6 | Incentivized-testnet scoring (`genesis-tool score-testnet`, `gen-multi --allocations-file`) producing P0 (operators' genesis stake and bootstrap weight, the public track's accounts) from testnet chain data | `the_testnet_scores_operators_by_their_leader_slots`, `a_jail_counts_only_up_to_the_snapshot`, `the_public_track_counts_points_on_three_days` |
 
 ## End-of-G5 mutation campaigns (2026-10-01/02)
@@ -682,6 +682,29 @@ and the NAS; scratchpad drivers `mut_g5end.py`, `mut_remote.py`).
     by an equal joiner;
   - the S4c leftovers: decision rows, the inert node's three gates, the boot format check
     and the V3 evidence kind.
+- **Campaign 3 (Amendment A4 as revised after two reviews): 69 of 69 killed** (scratchpad
+  `mut_a4v3.py`, on the NAS and the Pi, each mutant against its stage's witnesses):
+  - the executor: the score (bar, memory, commits, the slot cap, operators only, the
+    proposer check, stale rounds, the boundary block's epoch, odd rounds, kept counts); the
+    forfeits (jail, conviction, leaving the Move set, the score, the leave transaction); the
+    fill (P beyond the committee, above the ceilings, ceilings left instead of C0, no end, no
+    U hold, a hold that never resets, P with bootstrap weight); the cap (not applied, at most
+    a third, off with three parties, cutting owned stake, beyond the top 256, ignoring
+    parties, searched from zero); the live set's top-up, the slash's own part, the
+    bootstrap split, the payout floor;
+  - Move: eviction ignoring protection, the offense split, the old clip, `min_total`;
+  - genesis and the tool: the sum, the third (absent and strict), parties, stake 0, the
+    committee weight, the state, the supply, accounts as strings, operators as validators,
+    the epoch-0 split, the protected list, C0, 1-999 AIN, duplicate and malformed accounts;
+  - scoring: the signer slot as recipient, the founder in the median, a founder-dominated
+    window, three operators, repeated transfers, funding clusters, undelegations by sender,
+    a jail after the snapshot; and the RPC, the leader schedule's attempt, the two key
+    classes.
+  - The first pass killed 62. Four mutants were malformed (fixed and rerun); three survived
+    and each made a witness stronger: the boundary block's epoch (the boundary test now
+    makes H_1 decisive for every score), the founder in the median (four offline founder
+    nodes would move it), and undelegations matched by sender (a pool-2 exit inside pool 1's
+    epoch).
 - **Not witnessed, accepted:**
   - `record_twin` and the CE-3 alarm in one transaction: no crash test.
   - The ticket guard in an unsettled scope: a ticket cannot mature before settlement unless
