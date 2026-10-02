@@ -457,26 +457,12 @@ impl ChainSync {
             ));
         }
 
-        let computed_tx_hash = blockchain::calculate_tx_hash(&block.transactions);
-        if block.header.tx_hash != computed_tx_hash {
-            return Err(format!(
-                "Transaction hash mismatch: expected {}, computed {}",
-                block.header.tx_hash, computed_tx_hash
-            ));
-        }
-
-        // LIVENESS/INTEGRITY: the block's committed vertex sequence is what a
-        // follower adopts into its ordering engine; bind it to the header so a
-        // peer cannot hand us a sequence that does not belong to this block.
-        // Unconditional (G3 FX-18): an empty header root must mean an empty
-        // sequence, or a peer could attach vertices to a block that has none.
-        let computed = blockchain::calculate_vertices_root(&block.committed_vertices);
-        if computed != block.header.vertices_root {
-            return Err(format!(
-                "Vertices root mismatch: expected {}, computed {}",
-                block.header.vertices_root, computed
-            ));
-        }
+        // Every header root against the body: transactions, the committed
+        // vertex sequence a follower adopts, slash evidence, and the DA root
+        // a light client samples against. Unconditional (G3 FX-18): an empty
+        // root must mean an empty list, or a peer could attach vertices to a
+        // block that has none.
+        block.check_commitments()?;
         // G0 (V4): the anchor is the sequence's last vertex, which the header
         // binds; a substituted anchor under a reused signature stops here.
         if consensus::v4::is_v4_chain(storage) && !block.anchor_is_bound() {
@@ -497,15 +483,6 @@ impl ChainSync {
                 block.header.height,
                 bad.chars().take(80).collect::<String>()
             ));
-        }
-        if !block.header.evidence_root.is_empty() || !block.slash_evidence.is_empty() {
-            let computed = blockchain::calculate_evidence_root(&block.slash_evidence);
-            if computed != block.header.evidence_root {
-                return Err(format!(
-                    "Evidence root mismatch: expected {}, computed {}",
-                    block.header.evidence_root, computed
-                ));
-            }
         }
 
         // S3-4a: Reject blocks with future timestamps (30s drift tolerance)

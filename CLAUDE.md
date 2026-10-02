@@ -45,7 +45,7 @@ AINCORE-Blockchain/
 │   ├── cli/             ← CLI wallet: send TX, keys, client
 │   ├── genesis-tool/    ← Generator genesis.json
 │   └── move_compiler_tool/ ← Compiler Move contracts
-├── da/                  ← DASequencer: erasure coding, Merkle, sharding, DAS sampling, fraud proofs
+├── da/                  ← DA root of a block body (Reed-Solomon 2x + RFC 6962 tree), sample verify
 ├── sync/                ← ChainSync: blok sinkronisasi antar node
 ├── governance/          ← Governance: Proposal, Vote, TimeLock, on-chain execution
 ├── depin/
@@ -91,9 +91,8 @@ User TX
 [Executor::execute_block_parallel()] → rayon parallel, Move VM, gas deduct
   ↓
 [StateDB (RocksDB)] → commit state, block hash, height
-  ↓
-[DASequencer::create_batch()] → erasure coding, Merkle proof, shard distribution
 ```
+(The block header's `da_root` is computed when the block is built: `da::da_root(block.body_bytes())`.)
 
 ---
 
@@ -174,13 +173,13 @@ Validasi yang dilakukan sebelum TX masuk:
 
 ## 📡 DA Layer (da/)
 
-- **DASequencer:** node_id, signing_key (Ed25519), epoch counter
-- **Erasure coding:** 16 data + 16 parity shards (reed-solomon)
-- **Compressor:** zstd level 3
-- **ShardManager:** 32 shards total, 3x replication
-- **Fraud proofs:** FraudProofVerifier, SlashingParams
-- **DAS sampling:** LightClient dapat verify tanpa download full block
-- **Integration:** dipanggil dari DagConsensus setelah block finalized
+- **B1 (2026-10-03):** the old DASequencer (signed batches, separate DA key, `DA_COMMIT`/`DA_SHARD` messages) is deleted; its storage keys classify as dead
+- **Commitment:** `BlockHeader.da_root` over `Block::body_bytes()` (transactions, committed vertices, anchor hash, slash evidence); in the header hash, so the QC certifies it
+- **Code:** `k = clamp(ceil(L/512), 1, 128)` data shards, `2k` total, Reed-Solomon GF(2^8) (`reed-solomon-erasure` 6.0, no compression); RFC 6962 tree; root binds the body length
+- **Checks:** `Block::check_commitments()` (sync, QC import, QC recovery, state-sync anchor)
+- **Serving:** RPC `aincore_getDaStatus [height?]`, `aincore_sampleDA [height, index]`; recomputed on request from the stored block, last 4 cached; no shard storage
+- **Light client:** `da::verify_sample` (Rust) / `verifyDaSample` (aincore-js); `s` random samples miss a withheld body with probability < 2^-s
+- **Golden values:** `da/reference/da_ref.py` (independent Python) → `da/src/tests.rs`, `da/vectors/da_vectors.json`; any change to the RS crate forks the chain, the goldens catch it
 
 ---
 

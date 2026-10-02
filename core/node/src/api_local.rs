@@ -587,6 +587,63 @@ pub struct JsonRpcError {
 /// blocks the consensus loop from taking it. So handlers take what they need
 /// with `try_read`, drop the guard at once, and answer from storage or say
 /// "busy" when the lock is held.
+/// The block held at `height`, or an RPC error if it is not held (unknown,
+/// or pruned).
+fn held_block(storage: &StateDB, height: u64) -> Result<blockchain::Block, JsonRpcError> {
+    let json = storage
+        .get(&format!("block_{}", height))
+        .map_err(|e| JsonRpcError {
+            code: -32000,
+            message: format!("storage error: {e}"),
+        })?
+        .ok_or_else(|| JsonRpcError {
+            code: -32004,
+            message: format!("block {height} is not held (unknown or pruned)"),
+        })?;
+    serde_json::from_str(&json).map_err(|e| JsonRpcError {
+        code: -32000,
+        message: format!("stored block {height} is unreadable: {e}"),
+    })
+}
+
+/// The body extension of a held block. A client samples a few indices of one
+/// block in a row, so the last few extensions are kept: an extension costs a
+/// Reed-Solomon encode of the whole body.
+fn extended_body(block: &blockchain::Block) -> Result<Arc<da::Extended>, JsonRpcError> {
+    const KEEP: usize = 4;
+    static RECENT: std::sync::OnceLock<
+        Mutex<std::collections::VecDeque<(String, Arc<da::Extended>)>>,
+    > = std::sync::OnceLock::new();
+    let recent = RECENT.get_or_init(Default::default);
+    let hash = &block.header.hash;
+    if let Some((_, ext)) = recent
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(h, _)| h == hash)
+    {
+        return Ok(Arc::clone(ext));
+    }
+    let ext = Arc::new(da::Extended::new(&block.body_bytes()));
+    // A held block passed check_commitments; a mismatch is local corruption,
+    // and samples from it would not verify. Refuse rather than serve them.
+    if ext.root() != block.header.da_root {
+        return Err(JsonRpcError {
+            code: -32000,
+            message: format!(
+                "held block {} does not match its DA root",
+                block.header.height
+            ),
+        });
+    }
+    let mut recent = recent.lock().unwrap_or_else(|p| p.into_inner());
+    if recent.len() == KEEP {
+        recent.pop_front();
+    }
+    recent.push_back((hash.clone(), Arc::clone(&ext)));
+    Ok(ext)
+}
+
 fn try_consensus(
     data: &AppState,
 ) -> Result<Option<std::sync::RwLockReadGuard<'_, DagConsensus>>, JsonRpcError> {
@@ -1208,20 +1265,28 @@ fn handle_rpc_method(
             }))
         },
         "aincore_getDaStatus" => {
-             // Retrieve DA internal state from storage keys
-             // DA Sequencer writes `da_root_{epoch}`
-             // We can guess current DA epoch by scanning or storing "da:latest_epoch"
-             // Since we don't have "da:latest_epoch" index yet, let's just return what we know.
-             // We could scan recent keys?
-             // Better: Return the `node_id` which acts as DA Proposer ID if active.
-             let sequencer_id = try_consensus(data)?.ok_or_else(consensus_busy)?.node_id.clone();
-
-             Ok(serde_json::json!({
-                 "da_mode": "Sovereign",
-                 "sequencer_id": sequencer_id,
-                 "erasure_coding": "Reed-Solomon (16/16)",
-                 "da_epoch": "Synced with Block Height (Approx)" // Placeholder until we index DA epoch
-             }))
+            // params: [height?] (default: the tip). B1: the block's DA root and
+            // the shard layout a light client samples within. A client checks
+            // samples against the da_root of a header it holds under a QC,
+            // never against this response.
+            let height = match params.get(0) {
+                Some(v) => v.as_u64().ok_or_else(|| JsonRpcError {
+                    code: -32602,
+                    message: "Invalid params: [height?]".into(),
+                })?,
+                None => data.storage.get_chain_height(),
+            };
+            let block = held_block(&data.storage, height)?;
+            let layout = da::Layout::of(block.body_bytes().len() as u64);
+            Ok(serde_json::json!({
+                "height": height,
+                "block_hash": block.header.hash,
+                "da_root": block.header.da_root,
+                "body_len": layout.body_len,
+                "data_shards": layout.data_shards,
+                "total_shards": layout.total_shards(),
+                "shard_size": layout.shard_size,
+            }))
         },
 
         // ============ DELEGATION QUERY METHODS ============
@@ -1749,62 +1814,30 @@ fn handle_rpc_method(
         },
 
         "aincore_sampleDA" => {
-            // params: [epoch, shard_id]
-            if let (Some(epoch), Some(shard_id)) = (
+            // params: [height, index]. B1: shard `index` of the block's body
+            // extension with its inclusion proof (`da::verify_sample`). The
+            // client picks the indices itself, uniformly at random.
+            let (Some(height), Some(index)) = (
                 params.get(0).and_then(|v| v.as_u64()),
-                params.get(1).and_then(|v| v.as_u64())
-            ) {
-                // Check if shard data exists
-                let shard_key = format!("da_shard_{}_{}", epoch, shard_id);
-                let commitment_key = format!("da_commitment_{}", epoch);
-
-                let shard_exists = matches!(data.storage.get(&shard_key), Ok(Some(_)));
-                let commitment = match data.storage.get(&commitment_key) {
-                    Ok(Some(c)) => c,
-                    _ => String::new(),
-                };
-
-                Ok(serde_json::json!({
-                    "epoch": epoch,
-                    "shard_id": shard_id,
-                    "available": shard_exists,
-                    "merkle_root": commitment,
-                    "sampling_result": if shard_exists { "PASS" } else { "MISSING" }
-                }))
-            } else {
-                Err(JsonRpcError { code: -32602, message: "Invalid params: [epoch, shard_id]".into() })
-            }
-        },
-
-
-        "aincore_getShardProof" => {
-            // params: [epoch, shard_id]
-            if let (Some(epoch), Some(shard_id)) = (
-                params.get(0).and_then(|v| v.as_u64()),
-                params.get(1).and_then(|v| v.as_u64())
-            ) {
-                let shard_key = format!("da_shard_{}_{}", epoch, shard_id);
-                let commitment_key = format!("da_commitment_{}", epoch);
-
-                let shard_data = match data.storage.get(&shard_key) {
-                    Ok(Some(d)) => d,
-                    _ => String::new(),
-                };
-                let merkle_root = match data.storage.get(&commitment_key) {
-                    Ok(Some(c)) => c,
-                    _ => String::new(),
-                };
-
-                Ok(serde_json::json!({
-                    "epoch": epoch,
-                    "shard_id": shard_id,
-                    "shard_data_hex": shard_data,
-                    "merkle_root": merkle_root,
-                    "proof_available": !shard_data.is_empty() && !merkle_root.is_empty()
-                }))
-            } else {
-                Err(JsonRpcError { code: -32602, message: "Invalid params: [epoch, shard_id]".into() })
-            }
+                params.get(1).and_then(|v| v.as_u64()),
+            ) else {
+                return Err(JsonRpcError { code: -32602, message: "Invalid params: [height, index]".into() });
+            };
+            let block = held_block(&data.storage, height)?;
+            let extended = extended_body(&block)?;
+            let sample = extended.sample(index).ok_or_else(|| JsonRpcError {
+                code: -32602,
+                message: format!(
+                    "index {index} is past the last shard ({} shards)",
+                    extended.layout().total_shards()
+                ),
+            })?;
+            Ok(serde_json::json!({
+                "height": height,
+                "block_hash": block.header.hash,
+                "da_root": block.header.da_root,
+                "sample": sample,
+            }))
         },
 
         "aincore_getFederationKey" => {
@@ -2478,7 +2511,6 @@ mod tests {
             Arc::new(Mutex::new(mempool::Mempool::new())),
             Arc::new(executor::Executor::new(Arc::clone(&db))),
             Arc::clone(&db),
-            None,
             None,
             [3u8; 32],
         )));
@@ -3255,7 +3287,6 @@ mod tests {
             Arc::new(executor::Executor::new(Arc::clone(&db))),
             Arc::clone(&db),
             None,
-            None,
             [1u8; 32],
         )));
         let peers = Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -3426,7 +3457,6 @@ mod tests {
             Arc::new(Mutex::new(mempool::Mempool::new())),
             Arc::new(executor::Executor::new(Arc::clone(&db))),
             Arc::clone(&db),
-            None,
             None,
             [2u8; 32],
         )));

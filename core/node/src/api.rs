@@ -31,7 +31,6 @@ mod qc_rpc_tests {
             Arc::new(executor::Executor::new(db.clone())),
             db.clone(),
             None,
-            None,
             [3; 32],
         )));
         AppState {

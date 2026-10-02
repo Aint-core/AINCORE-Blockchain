@@ -195,9 +195,7 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         | "consensus:epoch_active"
         | "consensus:standalone_height" => Some(Local),
 
-        "sys:da:signing_key_enc_v1"
-        | "sys:da:signing_key"
-        | "sys:block_prune_cursor_v1"
+        "sys:block_prune_cursor_v1"
         | "sys:kept_pin_blocks_v1"
         | "sys:restored_by"
         | "sys:tx_index_backfill_v1_complete"
@@ -213,6 +211,8 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         "jmt:latest" | "jmt:floor" => Some(Tree),
 
         "sys:fhe:global_public_key" | "total_supply" | "consensus:committed_sequence" => Some(Dead),
+        // The signed-batch DA layer's key, deleted with it (B1).
+        "sys:da:signing_key_enc_v1" | "sys:da:signing_key" => Some(Dead),
         _ => None,
     };
     if fixed.is_some() {
@@ -243,10 +243,12 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
     if let Some(id) = key.strip_prefix("obj:") {
         return (!id.is_empty()).then_some(State);
     }
+    // The signed-batch DA layer's rows, deleted with it (B1). Block DA roots
+    // live in block headers now.
     if let Some(rest) = key.strip_prefix("da_shard_") {
         let mut it = rest.splitn(2, '_');
         let (a, b) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
-        return (dec(a) && dec(b)).then_some(Local);
+        return (dec(a) && dec(b)).then_some(Dead);
     }
     for prefix in [
         "da_commitment_",
@@ -256,7 +258,7 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         "da_fraud_missingdata_",
     ] {
         if let Some(rest) = key.strip_prefix(prefix) {
-            return dec(rest).then_some(Local);
+            return dec(rest).then_some(Dead);
         }
     }
 
@@ -686,18 +688,10 @@ mod tests {
             ("consensus:guard_origin".into(), Node),
             ("consensus:guard_resume_after".into(), Node),
             (format!("alarm:vcert_conflict:00000000000000000003:00000000000000153030:{H64}"), Node),
-            ("da_shard_10000_0".into(), Local),
-            ("da_commitment_1".into(), Local),
-            ("da_data_1".into(), Local),
-            ("da_meta_1".into(), Local),
-            ("da_root_1".into(), Local),
-            ("da_fraud_missingdata_1".into(), Local),
             // N
             (format!("peer:{H64}"), Node),
             (format!("peer_ip:{H64}"), Node),
             ("peer_addr:12D3KooWMF5ur249RNXQYw6bvhfDRsHaemio5gcV9mxHXn4ZtVc2".into(), Node),
-            ("sys:da:signing_key_enc_v1".into(), Node),
-            ("sys:da:signing_key".into(), Node),
             ("sys:block_prune_cursor_v1".into(), Node),
             ("sys:tx_index_backfill_v1_complete".into(), Node),
             ("genesis_initialized".into(), Node),
@@ -720,6 +714,14 @@ mod tests {
             // Dead
             (format!("meta_resource_{H64}_0x1::coin::CoinStore<0x1::staking::AincoreCoin>"), Dead),
             (format!("vote_receipt:7:{H64}"), Dead),
+            ("da_shard_10000_0".into(), Dead),
+            ("da_commitment_1".into(), Dead),
+            ("da_data_1".into(), Dead),
+            ("da_meta_1".into(), Dead),
+            ("da_root_1".into(), Dead),
+            ("da_fraud_missingdata_1".into(), Dead),
+            ("sys:da:signing_key_enc_v1".into(), Dead),
+            ("sys:da:signing_key".into(), Dead),
             (format!("delegation:{H64}:{H64}"), Dead),
             (format!("unbonding:{H64}:5"), Dead),
             (format!("validator_pool:{H64}"), Dead),

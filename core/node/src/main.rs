@@ -15,9 +15,6 @@ use mempool::Mempool;
 // === --- IMPORT FASE 3 (Chain Sync) --- ===
 use chain_sync::ChainSync;
 
-// === --- IMPORT FASE 4 (DA Sequencer) --- ===
-use da_sequencer::DASequencer;
-
 // === --- IMPORT FASE 5 (P2P Network) --- ===
 // === --- IMPORT FASE 5 (P2P Network) --- ===
 use node::genesis;
@@ -796,19 +793,6 @@ async fn main() {
     // (pre-Phase-1) or fail-closed (Phase 1 mitigation).
     let mempool = Arc::new(Mutex::new(Mempool::with_storage(Arc::clone(&storage))));
 
-    // Phase 2.9 (M-09): pass the node's persistent Ed25519 key bytes
-    // so the DA signing key is encrypted at rest with a key derived
-    // from the node identity. Reading the RocksDB directory is no
-    // longer sufficient to extract the DA signing key — an attacker
-    // also needs `node.key`.
-    let node_identity_bytes = signing_key.to_bytes();
-    let da_sequencer = Arc::new(Mutex::new(DASequencer::new_encrypted(
-        node_id.clone(),
-        Arc::clone(&storage),
-        Arc::clone(&peers),
-        &node_identity_bytes,
-    )));
-
     // CRITICAL: Use RwLock for DAG Consensus
     let p2p_tx_clone = Some(_p2p_tx.clone()); // Pass the libp2p transmitter
 
@@ -818,8 +802,7 @@ async fn main() {
         Arc::clone(&mempool),
         Arc::clone(&executor),
         Arc::clone(&storage),
-        Some(Arc::clone(&da_sequencer)), // Wired DA Sequencer!
-        p2p_tx_clone,                    // Add Libp2p gossip channel
+        p2p_tx_clone,           // Add Libp2p gossip channel
         signing_key.to_bytes(), // H4 FIX: Pass the persistent Ed25519 key for BLS derivation
     )));
 
@@ -830,13 +813,11 @@ async fn main() {
         Arc::clone(&storage),
     ));
 
-    // === DA PLAYER (SOVEREIGN ONLY) ===
-    // Celestia integration removed per user request for Sovereign DA (privacy).
-    // The internal DASequencer (initialized above) handles all DA duties via Erasure Coding + P2P.
-    println!("🛡️ Running in SOVEREIGN DA mode (No external DA dependency)");
+    // Data availability (B1): each block header carries a DA root over the
+    // block body; nodes serve samples against it (aincore_sampleDA). There
+    // is no separate DA service, key or message.
 
     println!("⚙️ DagConsensus initialized (Narwhal-lite) [RwLock Enabled]");
-    println!("🧩 DA Sequencer initialized.");
 
     // === DECOUPLE CONSENSUS TO BACKGROUND TASK ===
     // We use a channel to signal when consensus creates a new vertex/block
@@ -903,7 +884,6 @@ async fn main() {
     // === Handle Incoming P2P Messages (Now that consensus is ready) ===
     {
         let node_consensus = Arc::clone(&consensus);
-        let da_seq_clone = Arc::clone(&da_sequencer);
         let shutdown_p2p_rx = Arc::clone(&shutdown);
 
         tokio::spawn(async move {
@@ -937,10 +917,6 @@ async fn main() {
                     if let Ok(mut guard) = node_consensus.write() {
                         guard.handle_message(&msg);
                     }
-                } else if let Some(stripped) = msg.strip_prefix("DA_COMMIT:") {
-                    if let Ok(guard) = da_seq_clone.lock() {
-                        guard.handle_incoming_batch(stripped);
-                    }
                 }
             }
         });
@@ -951,7 +927,6 @@ async fn main() {
         let node_peers = Arc::clone(&peers);
         let node_storage = Arc::clone(&storage);
         let node_consensus = Arc::clone(&consensus);
-        let da_seq_clone = Arc::clone(&da_sequencer);
         let node_chain_sync = Arc::clone(&chain_sync);
         let server_node_id = node_id.clone();
         let node_signing_key_server = Arc::clone(&node_signing_key);
@@ -984,22 +959,6 @@ async fn main() {
                             guard.handle_message(&msg);
                         }
                         None
-                    } else if let Some(stripped) = msg.strip_prefix("DA_COMMIT:") {
-                        if let Ok(guard) = da_seq_clone.lock() {
-                            guard.handle_incoming_batch(stripped);
-                        }
-                        None
-                    } else if msg.starts_with("DA_SHARD:") {
-                        // TASK #3 Stage-2 SERVE: route shard requests to the DA
-                        // sequencer. handle_p2p_message builds the ShardResponse
-                        // (DA_SHARD:{json}) which start_server writes back over the
-                        // same encrypted socket. Side-effect-only: serving shards
-                        // touches no consensus state, so it is determinism-safe.
-                        if let Ok(guard) = da_seq_clone.lock() {
-                            guard.handle_p2p_message(&msg)
-                        } else {
-                            None
-                        }
                     } else {
                         // Single serving implementation: chain_sync owns GET_HEIGHT,
                         // GET_FINALITY (with the quorum certificate), SYNC_REQ (blocks +

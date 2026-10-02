@@ -80,7 +80,7 @@ mod tests {
         seed_state_tree(&db);
 
         (
-            DagConsensus::new(node_id, peers, mempool, executor, db, None, None, node_key),
+            DagConsensus::new(node_id, peers, mempool, executor, db, None, node_key),
             path,
         )
     }

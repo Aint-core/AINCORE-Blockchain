@@ -690,15 +690,34 @@ export class Connection {
     }
 
     /**
-     * Get Data Availability (DA) layer status
+     * A block's data availability root and shard layout (the tip by default).
+     * Check samples against the da_root of a header you hold under a QC, not
+     * against this response.
      */
-    async getDaStatus(): Promise<{
-        da_mode: string;
-        sequencer_id: string;
-        erasure_coding: string;
-        da_epoch: string;
+    async getDaStatus(height?: number): Promise<{
+        height: number;
+        block_hash: string;
+        da_root: string;
+        body_len: number;
+        data_shards: number;
+        total_shards: number;
+        shard_size: number;
     }> {
-        return await this.request('aincore_getDaStatus', []);
+        return await this.request('aincore_getDaStatus', height === undefined ? [] : [height]);
+    }
+
+    /**
+     * Shard `index` of a block's body extension with its inclusion proof.
+     * Pick indices uniformly at random yourself: s samples that all verify
+     * leave a withheld body undetected with probability below 2^-s.
+     */
+    async sampleDA(height: number, index: number): Promise<{
+        height: number;
+        block_hash: string;
+        da_root: string;
+        sample: { body_len: number; index: number; shard: string; proof: string[] };
+    }> {
+        return await this.request('aincore_sampleDA', [height, index]);
     }
 
     // =====================

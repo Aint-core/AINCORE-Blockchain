@@ -26,6 +26,11 @@ pub struct BlockHeader {
     /// local state. Empty only for legacy blocks / no evidence.
     #[serde(default)]
     pub evidence_root: String,
+    /// B1: data availability root of the whole body (`Block::body_bytes`):
+    /// the commitment a light client samples shards against (`da` crate).
+    /// It also binds `anchor_hash`, which no other root covers.
+    #[serde(default)]
+    pub da_root: String,
     pub proposer_id: String, // ID node yang mengusulkan blok ini
     #[serde(default)]
     pub round: u64, // Consensus Round (DAG)
@@ -83,6 +88,71 @@ impl Block {
         let sig = secret_key.sign(self.header.hash.as_bytes());
         self.proposer_signature = hex::encode(sig.to_bytes());
         self.proposer_signer = signer.to_string();
+    }
+
+    /// The bytes `header.da_root` commits to (see [`body_bytes`]).
+    pub fn body_bytes(&self) -> Vec<u8> {
+        // Exhaustive on purpose: a new block field fails to compile here until
+        // it is put in the body or explicitly left out of it.
+        let Block {
+            header: _,
+            transactions,
+            committed_vertices,
+            anchor_hash,
+            proposer_signature: _,
+            proposer_signer: _,
+            slash_evidence,
+        } = self;
+        body_bytes(
+            transactions,
+            committed_vertices,
+            anchor_hash,
+            slash_evidence,
+        )
+    }
+
+    /// The header hashes to `header.hash` and every root in it is the root of
+    /// this block's body. The one check that a header and a body belong
+    /// together; every path that takes a block from storage or a peer runs it.
+    /// The DA root is checked last: it costs a Reed-Solomon extension.
+    pub fn check_commitments(&self) -> Result<(), String> {
+        let h = &self.header;
+        let computed = calculate_header_hash(h);
+        if computed != h.hash {
+            return Err(format!(
+                "Header hash mismatch: header {}, computed {}",
+                h.hash, computed
+            ));
+        }
+        let computed = calculate_tx_hash(&self.transactions);
+        if computed != h.tx_hash {
+            return Err(format!(
+                "Transaction hash mismatch: expected {}, computed {}",
+                h.tx_hash, computed
+            ));
+        }
+        let computed = calculate_vertices_root(&self.committed_vertices);
+        if computed != h.vertices_root {
+            return Err(format!(
+                "Vertices root mismatch: expected {}, computed {}",
+                h.vertices_root, computed
+            ));
+        }
+        let computed = calculate_evidence_root(&self.slash_evidence);
+        if computed != h.evidence_root {
+            return Err(format!(
+                "Evidence root mismatch: expected {}, computed {}",
+                h.evidence_root, computed
+            ));
+        }
+        let computed = da::da_root(&self.body_bytes());
+        if computed != h.da_root {
+            return Err(format!(
+                "DA root mismatch: expected {}, computed {}",
+                h.da_root, computed
+            ));
+        }
+        Ok(())
     }
 
     /// G0 anchor binding. The committed sequence is the anchor's history
@@ -267,6 +337,12 @@ impl Block {
         let tx_hash = calculate_tx_hash(&transactions);
         let vertices_root = calculate_vertices_root(&committed_vertices);
         let evidence_root = calculate_evidence_root(&slash_evidence);
+        let da_root = da::da_root(&body_bytes(
+            &transactions,
+            &committed_vertices,
+            &anchor_hash,
+            &slash_evidence,
+        ));
 
         let mut header = BlockHeader {
             height,
@@ -276,6 +352,7 @@ impl Block {
             receipts_root,
             vertices_root,
             evidence_root,
+            da_root,
             proposer_id,
             round,
             timestamp,
@@ -302,10 +379,12 @@ impl Block {
 // time 1790667886 hashed like round 201 at time 790667886. Every preimage now
 // starts with its own domain tag, and its fields cannot be re-segmented.
 // Consensus-breaking: it activates only with the fresh genesis (G3 S8).
-const HEADER_DOMAIN: &[u8] = b"AINCORE_BLOCK_HEADER_V1\0";
+// V2 (B1) adds `da_root`; a new layout takes a new domain.
+const HEADER_DOMAIN: &[u8] = b"AINCORE_BLOCK_HEADER_V2\0";
 const TXS_DOMAIN: &[u8] = b"AINCORE_BLOCK_TXS_V1\0";
 const VERTICES_DOMAIN: &[u8] = b"AINCORE_BLOCK_VERTICES_V1\0";
 const EVIDENCE_DOMAIN: &[u8] = b"AINCORE_BLOCK_EVIDENCE_V1\0";
+const BODY_DOMAIN: &[u8] = b"AINCORE_BLOCK_BODY_V1\0";
 
 /// Preimage writer: integers are u64 little-endian, a string is its byte length
 /// (u64 LE) then its bytes, a list is its count (u64 LE) then its strings, and
@@ -372,6 +451,7 @@ fn header_preimage(header: &BlockHeader) -> Vec<u8> {
         receipts_root,
         vertices_root,
         evidence_root,
+        da_root,
         proposer_id,
         round,
         timestamp,
@@ -385,6 +465,7 @@ fn header_preimage(header: &BlockHeader) -> Vec<u8> {
     p.opt_root(receipts_root);
     p.opt_root(vertices_root);
     p.opt_root(evidence_root);
+    p.str(da_root);
     p.str(proposer_id);
     p.u64(*round);
     p.u64(*timestamp);
@@ -397,6 +478,22 @@ fn header_preimage(header: &BlockHeader) -> Vec<u8> {
 /// `block_identity_tests.rs`).
 pub fn calculate_header_hash(header: &BlockHeader) -> String {
     hex::encode(hash(&header_preimage(header)))
+}
+
+/// The block body as the DA root commits to it: every field of the block
+/// outside the header and the proposer's signature, in declaration order.
+pub fn body_bytes(
+    transactions: &[String],
+    committed_vertices: &[String],
+    anchor_hash: &str,
+    slash_evidence: &[String],
+) -> Vec<u8> {
+    let mut p = Preimage::new(BODY_DOMAIN);
+    p.list(transactions);
+    p.list(committed_vertices);
+    p.str(anchor_hash);
+    p.list(slash_evidence);
+    p.0
 }
 
 /// Root binding a block's slash evidence list (order-sensitive). Empty list

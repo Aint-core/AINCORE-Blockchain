@@ -37,7 +37,7 @@ AINCORE adalah blockchain Layer 1 yang dibangun dengan Rust, menggunakan DAG-bas
 | Signatures | Ed25519, BLS, ECDSA |
 | P2P | libp2p (gossipsub + Kademlia) |
 | Storage | RocksDB |
-| DA Layer | Sovereign (erasure coding) |
+| DA Layer | DA root of each block body in its header (Reed-Solomon 2x, RFC 6962 tree); light clients sample shards against it |
 
 ---
 
@@ -64,8 +64,8 @@ AINCORE adalah blockchain Layer 1 yang dibangun dengan Rust, menggunakan DAG-bas
 │         ┌─────────────────────────┼─────────────────────────┐       │
 │         │                         │                         │       │
 │  ┌──────▼──────┐   ┌──────────────▼──────────────┐  ┌──────▼──────┐│
-│  │  Executor   │   │         Move VM             │  │ DA Sequencer││
-│  │ (parallel)  │◄──┤  (stdlib: 22 contracts)     │  │ (erasure)   ││
+│  │  Executor   │   │         Move VM             │  │  DA root    ││
+│  │ (parallel)  │◄──┤  (stdlib: 22 contracts)     │  │ (in header) ││
 │  └──────┬──────┘   └─────────────────────────────┘  └─────────────┘│
 │         │                                                           │
 │  ┌──────▼────────────────────────────────────────────────────────┐ │

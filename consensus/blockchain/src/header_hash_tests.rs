@@ -59,6 +59,7 @@ fn header() -> BlockHeader {
         receipts_root: "44".repeat(32),
         vertices_root: "55".repeat(32),
         evidence_root: "66".repeat(32),
+        da_root: "88".repeat(32),
         proposer_id: "77".repeat(32),
         round: 20,
         timestamp: 1_790_667_886,
@@ -98,10 +99,11 @@ fn golden_header_preimage_and_hash() {
     h.receipts_root = String::new();
     h.vertices_root = "v".into();
     h.evidence_root = String::new();
+    h.da_root = "d".into();
     h.proposer_id = "q".into();
     h.hash = "ignored: the hash field is not part of its own preimage".into();
     let expected = concat!(
-        "41494e434f52455f424c4f434b5f4845414445525f563100", // AINCORE_BLOCK_HEADER_V1\0
+        "41494e434f52455f424c4f434b5f4845414445525f563200", // AINCORE_BLOCK_HEADER_V2\0
         "0700000000000000",                                 // height 7
         "010000000000000070",                               // prev_hash "p"
         "010000000000000074",                               // tx_hash "t"
@@ -109,6 +111,7 @@ fn golden_header_preimage_and_hash() {
         "00",                                               // receipts_root absent
         "01010000000000000076",                             // vertices_root present "v"
         "00",                                               // evidence_root absent
+        "010000000000000064",                               // da_root "d"
         "010000000000000071",                               // proposer_id "q"
         "1400000000000000",                                 // round 20
         "6e6cbb6a00000000",                                 // timestamp 1790667886
@@ -116,7 +119,7 @@ fn golden_header_preimage_and_hash() {
     assert_eq!(hex::encode(header_preimage(&h)), expected);
     assert_eq!(
         calculate_header_hash(&h),
-        "a766fd0ab9faba5a0c2287d58b051297a8639a175744985e186abe82cd8b78a0"
+        "2575ef6d6c2034d78d84b6ca27b9b56e5f5e3d77dcfbffdd7402fd6914e1b22a"
     );
 }
 
@@ -125,7 +128,7 @@ fn golden_header_preimage_and_hash() {
 fn golden_header_hash_full() {
     assert_eq!(
         calculate_header_hash(&header()),
-        "a6a6803385301950d2da79e554ed8835da6519f6605d2ba2b8184fd51e6189fd"
+        "104c53635334a229b920d81fea16684aaffbe5785ef951d52408626d8942db74"
     );
 }
 
@@ -148,6 +151,119 @@ fn golden_body_roots() {
         calculate_evidence_root(&items),
         "f7cd4f77edbd5d1cc07c26f92e9e745c6bbe451aad2cb21e03d411b950fdde3b"
     );
+}
+
+/// B1: the body preimage, and its DA root from `da/reference/da_ref.py`.
+#[test]
+fn golden_body_bytes_and_da_root() {
+    let body = body_bytes(&strings(&["a", "bc"]), &strings(&["v"]), "v", &[]);
+    let expected = concat!(
+        "41494e434f52455f424c4f434b5f424f44595f563100", // AINCORE_BLOCK_BODY_V1\0
+        "0200000000000000",                             // 2 transactions
+        "010000000000000061",                           // "a"
+        "02000000000000006263",                         // "bc"
+        "0100000000000000",                             // 1 committed vertex
+        "010000000000000076",                           // "v"
+        "010000000000000076",                           // anchor_hash "v"
+        "0000000000000000",                             // no slash evidence
+    );
+    assert_eq!(hex::encode(&body), expected);
+    assert_eq!(
+        da::da_root(&body),
+        "261be83150698c97106af042a0bdbb503365c85cb555cb731d77a27e518ddc82"
+    );
+}
+
+fn block() -> Block {
+    Block::new_with_roots_at(
+        7,
+        20,
+        "11".repeat(32),
+        strings(&["tx1", "tx2"]),
+        "77".repeat(32),
+        "33".repeat(32),
+        "44".repeat(32),
+        1_790_667_886,
+        strings(&["v1", "v2"]),
+        "v2".into(),
+        strings(&["e1"]),
+    )
+}
+
+/// The header binds every body field, `anchor_hash` included (B1), and
+/// `check_commitments` finds every mismatch.
+#[test]
+fn check_commitments_binds_every_body_field() {
+    let b = block();
+    assert_eq!(b.check_commitments(), Ok(()), "control");
+    assert_eq!(b.header.da_root, da::da_root(&b.body_bytes()));
+
+    type Edit = fn(&mut Block);
+    let edits: [(&str, Edit, &str); 6] = [
+        (
+            "transactions",
+            |b| b.transactions.push("tx3".into()),
+            "Transaction hash mismatch",
+        ),
+        (
+            "committed_vertices",
+            |b| b.committed_vertices.reverse(),
+            "Vertices root mismatch",
+        ),
+        (
+            "slash_evidence",
+            |b| b.slash_evidence.clear(),
+            "Evidence root mismatch",
+        ),
+        (
+            "anchor_hash",
+            |b| b.anchor_hash = "v1".into(),
+            "DA root mismatch",
+        ),
+        (
+            "a header field",
+            |b| b.header.round = 21,
+            "Header hash mismatch",
+        ),
+        (
+            "da_root",
+            |b| b.header.da_root = "00".repeat(32),
+            "Header hash mismatch",
+        ),
+    ];
+    for (name, edit, expected) in edits {
+        let mut t = b.clone();
+        edit(&mut t);
+        let err = t.check_commitments().expect_err(name);
+        assert!(err.starts_with(expected), "{name}: {err}");
+    }
+
+    // Re-hashing the header after a body edit still fails on the root that
+    // binds the edited field: the body cannot be swapped under a fresh hash.
+    let mut t = b.clone();
+    t.anchor_hash = "v1".into();
+    t.header.hash = calculate_header_hash(&t.header);
+    assert!(t
+        .check_commitments()
+        .unwrap_err()
+        .starts_with("DA root mismatch"));
+
+    // Changing anchor_hash alone changes the block hash.
+    let rebuilt = Block::new_with_roots_at(
+        7,
+        20,
+        "11".repeat(32),
+        strings(&["tx1", "tx2"]),
+        "77".repeat(32),
+        "33".repeat(32),
+        "44".repeat(32),
+        1_790_667_886,
+        strings(&["v1", "v2"]),
+        "v1".into(),
+        strings(&["e1"]),
+    );
+    assert_ne!(rebuilt.header.hash, b.header.hash);
+    assert_eq!(rebuilt.check_commitments(), Ok(()));
 }
 
 /// An empty vertex sequence or evidence list is an absent root, which the
@@ -191,7 +307,7 @@ fn parse_preimage(bytes: &[u8]) -> Option<BlockHeader> {
             }
         }
     }
-    let mut r = Reader(bytes.strip_prefix(b"AINCORE_BLOCK_HEADER_V1\0")?);
+    let mut r = Reader(bytes.strip_prefix(b"AINCORE_BLOCK_HEADER_V2\0")?);
     // Struct expression fields evaluate in the order written: the layout order.
     let header = BlockHeader {
         height: r.u64()?,
@@ -201,6 +317,7 @@ fn parse_preimage(bytes: &[u8]) -> Option<BlockHeader> {
         receipts_root: r.opt_root()?,
         vertices_root: r.opt_root()?,
         evidence_root: r.opt_root()?,
+        da_root: r.str()?,
         proposer_id: r.str()?,
         round: r.u64()?,
         timestamp: r.u64()?,
@@ -211,6 +328,7 @@ fn parse_preimage(bytes: &[u8]) -> Option<BlockHeader> {
 
 type Fields = (
     u64,
+    String,
     String,
     String,
     String,
@@ -231,6 +349,7 @@ fn fields(h: &BlockHeader) -> Fields {
         h.receipts_root.clone(),
         h.vertices_root.clone(),
         h.evidence_root.clone(),
+        h.da_root.clone(),
         h.proposer_id.clone(),
         h.round,
         h.timestamp,
@@ -253,6 +372,7 @@ fn preimage_parses_back_into_its_header() {
             receipts_root: none(),
             vertices_root: none(),
             evidence_root: none(),
+            da_root: none(),
             proposer_id: none(),
             round: 0,
             timestamp: 0,
@@ -271,6 +391,7 @@ fn preimage_parses_back_into_its_header() {
             receipts_root: "\u{1}".into(),
             vertices_root: none(),
             evidence_root: fake_prefix.into(),
+            da_root: "\u{1}".into(),
             proposer_id: "\0\0\0\0\0\0\0\0".into(),
             ..header()
         },
@@ -308,11 +429,12 @@ fn a_field_cannot_swallow_its_neighbours_framing() {
             3 => h.receipts_root = value,
             4 => h.vertices_root = value,
             5 => h.evidence_root = value,
+            6 => h.da_root = value,
             _ => h.proposer_id = value,
         }
     }
     let is_root = |field: usize| (2..=5).contains(&field);
-    for field in 0..6 {
+    for field in 0..7 {
         let next = field + 1;
         // N's encoding of "Z", and the framing N's encoding puts before it.
         let (n_encoding, n_framing) = if is_root(next) {

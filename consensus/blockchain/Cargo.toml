@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 storage = { path = "../../common/storage" }
 crypto = { path = "../../common/crypto" }
+da = { path = "../../da" }
 serde = { version = "1.0", features = ["derive"] }
 hex = "0.4"
 ed25519-dalek = "2.0"

@@ -727,6 +727,7 @@ mod tests {
                     receipts_root: String::new(),
                     vertices_root: String::new(),
                     evidence_root: String::new(),
+                    da_root: String::new(),
                     proposer_id: blockchain::committee::leader_for_round(round, &sorted, 0),
                     round,
                     timestamp: h * 86_400,

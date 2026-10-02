@@ -756,13 +756,9 @@ fn check_anchor(cp: &Checkpoint, block: &Block, qc: &QuorumCertificate) -> Resul
     {
         return Err("the block is not the checkpoint's".into());
     }
-    if blockchain::calculate_header_hash(h) != h.hash
-        || blockchain::calculate_tx_hash(&block.transactions) != h.tx_hash
-        || blockchain::calculate_vertices_root(&block.committed_vertices) != h.vertices_root
-        || blockchain::calculate_evidence_root(&block.slash_evidence) != h.evidence_root
-    {
-        return Err("the block's header does not commit to its body".into());
-    }
+    block
+        .check_commitments()
+        .map_err(|e| format!("the block's header does not commit to its body: {e}"))?;
     if qc.block_height != h.height
         || qc.block_hash != h.hash
         || qc.state_root != h.state_root

@@ -109,11 +109,7 @@ fn validate_held(view: &StateDB, ctx: &CommitContext, chain_id: &str) -> Result<
         || block.anchor_hash != ctx.anchor_hash
         || block.header.state_root != ctx.state_root
         || block.header.receipts_root != ctx.receipts_root
-        || blockchain::calculate_header_hash(&block.header) != block.header.hash
-        || blockchain::calculate_tx_hash(&block.transactions) != block.header.tx_hash
-        || blockchain::calculate_vertices_root(&block.committed_vertices)
-            != block.header.vertices_root
-        || blockchain::calculate_evidence_root(&block.slash_evidence) != block.header.evidence_root
+        || block.check_commitments().is_err()
     {
         return Err("pending QC context/body differs from held block".into());
     }

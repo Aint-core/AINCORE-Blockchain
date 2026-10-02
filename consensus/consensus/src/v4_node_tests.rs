@@ -61,7 +61,6 @@ fn open_node(path: &str, seed: u8) -> DagConsensus {
         Arc::new(Executor::new(Arc::clone(&db))),
         db,
         None,
-        None,
         key,
     );
     c.set_now_secs(Arc::new(|| PINNED));

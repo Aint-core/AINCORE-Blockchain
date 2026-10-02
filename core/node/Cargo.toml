@@ -22,7 +22,7 @@ account = { path = "../../consensus/account" }
 chain_sync = { path = "../../sync" }
 
 # --- Data Availability ---
-da_sequencer = { path = "../../da" }
+da = { path = "../../da" }
 
 
 # --- Governance ---

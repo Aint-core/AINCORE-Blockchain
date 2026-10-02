@@ -596,13 +596,9 @@ fn stage_imported_finality(storage: &StateDB, cert: &QuorumCertificate) -> Resul
     {
         return Err("finality QC fields differ from the held block".into());
     }
-    if blockchain::calculate_header_hash(&block.header) != block.header.hash
-        || blockchain::calculate_tx_hash(&block.transactions) != block.header.tx_hash
-        || blockchain::calculate_vertices_root(&block.committed_vertices) != block.header.vertices_root
-        || blockchain::calculate_evidence_root(&block.slash_evidence) != block.header.evidence_root
-    {
-        return Err("finality QC held block has inconsistent header/body commitments".into());
-    }
+    block.check_commitments().map_err(|e| {
+        format!("finality QC held block has inconsistent header/body commitments: {e}")
+    })?;
 
     storage.put("consensus:finalized_round", &cert.finalized_round.to_string()).map_err(|e| e.to_string())?;
     #[cfg(test)]

@@ -3546,7 +3546,6 @@ mod tests {
             Arc::new(executor::Executor::new(Arc::clone(&db2))),
             Arc::clone(&db2),
             None,
-            None,
             key,
         );
         assert_eq!(c.v4_epoch(), Some(0), "the node did not start the V4 engine");

@@ -394,7 +394,7 @@ pub async fn start_server_with_peer<F>(
                             // Delegate every non-handshake message to the node-provided
                             // handler, which owns the SINGLE serving implementation
                             // (chain_sync::handle_message for GET_HEIGHT / GET_FINALITY /
-                            // SYNC_REQ, plus TX / DAG_VERTEX / DA_COMMIT side effects). Any
+                            // SYNC_REQ, plus TX / DAG_VERTEX side effects). Any
                             // response it returns is sent back over THIS encrypted socket.
                             // GET_HEIGHT/GET_FINALITY/SYNC_REQ were previously reimplemented
                             // inline here, silently shadowing chain_sync's handlers and

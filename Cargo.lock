@@ -1043,6 +1043,7 @@ version = "0.1.0"
 dependencies = [
  "bcs",
  "crypto",
+ "da",
  "ed25519-dalek",
  "hex",
  "serde",
@@ -1354,7 +1355,6 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
- "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -1622,7 +1622,6 @@ dependencies = [
  "blockchain",
  "config",
  "crypto",
- "da_sequencer",
  "executor",
  "hex",
  "mempool",
@@ -1964,23 +1963,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "da_sequencer"
-version = "0.1.0"
+name = "da"
+version = "0.2.0"
 dependencies = [
- "base64 0.21.7",
- "chrono",
- "crypto",
- "ed25519-dalek",
  "hex",
- "network",
- "rand 0.8.5",
  "reed-solomon-erasure",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "storage",
- "tokio",
- "zstd 0.13.3",
 ]
 
 [[package]]
@@ -5522,7 +5512,7 @@ dependencies = [
  "config",
  "consensus",
  "crypto",
- "da_sequencer",
+ "da",
  "ed25519-dalek",
  "executor",
  "futures",

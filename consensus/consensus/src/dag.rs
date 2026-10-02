@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use crate::ordering::OrderingEngine;
 use blockchain::Vertex;
 use crypto::accumulator::Accumulator;
-use da_sequencer::DASequencer;
 use executor::Executor;
 use mempool::Mempool;
 use network::PeerList;
@@ -94,7 +93,6 @@ pub struct DagConsensus {
     clock_alarm_logged: bool,
     qc_retry_cursor: String,
     pub accumulator: Accumulator,
-    pub da_sequencer: Option<Arc<Mutex<DASequencer>>>, // Added DA Sequencer
     pub p2p_tx: Option<tokio::sync::mpsc::Sender<String>>, // Added P2P Libp2p Channel
     pub node_key: [u8; 32], // H4 FIX: Store the persistent Ed25519 key for BLS derivation
     /// Phase 2.8 (M-08): cache of the active validator set.
@@ -256,7 +254,6 @@ impl DagConsensus {
         mempool: Arc<Mutex<Mempool>>,
         executor: Arc<Executor>,
         storage: Arc<StateDB>,
-        da_sequencer: Option<Arc<Mutex<DASequencer>>>,
         p2p_tx: Option<tokio::sync::mpsc::Sender<String>>, // Corrected to Sender
         node_key: [u8; 32],                                // H4 FIX: Accept the persistent key
     ) -> Self {
@@ -329,7 +326,6 @@ impl DagConsensus {
             clock_alarm_logged: false,
             qc_retry_cursor: String::new(),
             accumulator: Accumulator::new(),
-            da_sequencer,
             p2p_tx,
             node_key,
             // Phase 2.8 (M-08): empty cache; first get_validator_set call
@@ -1287,22 +1283,6 @@ impl DagConsensus {
                         "📦 Created Block #{} (Hash: {:.8})",
                         self.latest_block_height, self.latest_block_hash
                     );
-
-                    // === DA SEQUENCER INTEGRATION ===
-                    // L1 FIX: Wire DA verification into consensus finality
-                    if let Some(da_seq) = &self.da_sequencer {
-                        if let Ok(mut seq) = da_seq.lock() {
-                            println!("🧩 [Consensus] Triggering DA Batch with erasure coding verification...");
-                            seq.create_batch(self.latest_block_hash.clone(), block_txs.len());
-                            // DA batch includes: erasure coding, Merkle proof generation,
-                            // shard distribution to peers, and fraud proof readiness.
-                            // Light clients can now verify data availability via DAS sampling.
-                            println!(
-                                "✅ [DA] Block #{} data availability confirmed",
-                                self.latest_block_height
-                            );
-                        }
-                    }
 
                     // The request committed with the block. Signing/gossip may
                     // fail here; later ticks or reopen retry that same context.

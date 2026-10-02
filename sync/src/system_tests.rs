@@ -164,7 +164,6 @@ impl Sim {
             Arc::new(executor::Executor::new(Arc::clone(&db))),
             Arc::clone(&db),
             None,
-            None,
             key,
         );
         c.set_now_secs(Arc::new(|| PINNED));

@@ -15,3 +15,4 @@ export type {
 export * from './bcs';
 export * from './address';
 export * from './stateProof';
+export * from './da';
