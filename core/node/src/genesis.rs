@@ -631,6 +631,29 @@ pub struct GenesisValidatorConfig {
     pub bls_pop: Option<String>,
 }
 
+/// G5 A4 BW-2: bootstrap weight at genesis (docs/research/genesis_bootstrap.md):
+/// consensus weight with no coins, owned by nobody. The genesis committee
+/// weighs exactly `s_min_ain`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GenesisBootstrap {
+    pub s_min_ain: u64,
+    pub weights: Vec<GenesisBootstrapWeight>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GenesisBootstrapWeight {
+    pub address: String,
+    pub weight_ain: u64,
+}
+
+/// G5 A4 BW-2: liquid AIN at genesis, for the incentivized testnet's public
+/// track. `balance` is in quanta, like validator stakes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GenesisAccount {
+    pub address: String,
+    pub balance: String,
+}
+
 /// genesis.json: the only input genesis state depends on, besides the stdlib
 /// it pins by hash.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -669,6 +692,12 @@ pub struct GenesisFile {
     /// later cannot re-arm signing. Without it the flag is never honored.
     #[serde(default)]
     pub genesis_time: Option<u64>,
+    /// G5 A4 BW-2: bootstrap weight; none on a chain without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap: Option<GenesisBootstrap>,
+    /// G5 A4 BW-2: liquid genesis balances (the public track).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<GenesisAccount>,
 }
 
 /// G5 P-1 (amendment A1): the genesis-pinned chain parameters (the Move
@@ -1125,6 +1154,7 @@ pub fn build_genesis(
     let mut validator_configs = Vec::new();
     let mut v1_validators: Vec<consensus::qc::ValidatorInfo> = Vec::new();
     let mut total_bootstrap_stake: u128 = 0;
+    let mut bootstrap_weights: BTreeMap<String, u64>;
     let treasury_reserve_amount: u128;
     let chain_params: ChainParams;
     // SEC-#13: canonical epoch-block interval to pin into storage + identity hash.
@@ -1202,9 +1232,39 @@ pub fn build_genesis(
         // chain never finalizes. Enforce the real minimum (1000 AIN) here, matching the
         // Move staking module, so no genesis validator can be silently disenfranchised.
         const MIN_VALIDATOR_STAKE_QUANTA: u128 = 1000 * 1_000_000_000_000_000_000; // 1000 AIN
+
+        // G5 A4 BW-2: bootstrap weight per operator. An operator may own no
+        // stake: its weight is the bootstrap weight alone.
+        bootstrap_weights = BTreeMap::new();
+        if let Some(boot) = &config.bootstrap {
+            for w in &boot.weights {
+                if w.weight_ain == 0 {
+                    return Err(GenesisError::InvalidData(format!(
+                        "bootstrap weight of {} is 0",
+                        w.address
+                    )));
+                }
+                if bootstrap_weights
+                    .insert(w.address.clone(), w.weight_ain)
+                    .is_some()
+                {
+                    return Err(GenesisError::InvalidData(format!(
+                        "bootstrap operator {} is listed twice",
+                        w.address
+                    )));
+                }
+                if !config.validators.iter().any(|v| v.address == w.address) {
+                    return Err(GenesisError::InvalidData(format!(
+                        "bootstrap operator {} is not a genesis validator",
+                        w.address
+                    )));
+                }
+            }
+        }
         for val in &config.validators {
             let stake = parse_genesis_amount(&val.stake, "validator stake")?;
-            if stake < MIN_VALIDATOR_STAKE_QUANTA {
+            let boot = bootstrap_weights.get(&val.address).copied().unwrap_or(0);
+            if stake < MIN_VALIDATOR_STAKE_QUANTA && !(stake == 0 && boot > 0) {
                 return Err(GenesisError::InvalidData(format!(
                     "Genesis validator {} stake {} quanta is below the minimum {} quanta \
                      (1000 AIN) and would scale to {} whole-AIN voting power",
@@ -1244,13 +1304,18 @@ pub fn build_genesis(
                 bls_public_key: bls_public_key.clone(),
                 bls_pop: bls_pop.clone(),
             });
-            v1_validators.push(crypto_qc_validator_info(
+            let mut info = crypto_qc_validator_info(
                 &val.address,
                 stake,
                 &val.public_key,
                 &bls_public_key,
                 &bls_pop,
-            )?);
+            )?;
+            // BW-2: the committee weighs owned stake plus bootstrap weight.
+            info.stake = info.stake.checked_add(boot).ok_or_else(|| {
+                GenesisError::InvalidData("genesis committee weight overflows u64".to_string())
+            })?;
+            v1_validators.push(info);
 
             let acc = AccountManager::create_account(val.address.clone(), val.public_key.clone());
             storage.put_object(&acc)?;
@@ -1261,6 +1326,23 @@ pub fn build_genesis(
     // meets (G1 EP-2, G5 SL-3): at most 256 members, keys that derive their
     // addresses, valid proofs of possession, and no shared BLS key (a shared
     // key would let certificate evidence convict the wrong member).
+    // BW-2: the genesis committee weighs exactly s_min, and no member holds a
+    // third of it.
+    if let Some(boot) = &file.bootstrap {
+        let total: u128 = v1_validators.iter().map(|v| v.stake as u128).sum();
+        if total != boot.s_min_ain as u128 {
+            return Err(GenesisError::InvalidData(format!(
+                "the genesis committee weighs {total} AIN with bootstrap weight, not s_min {}",
+                boot.s_min_ain
+            )));
+        }
+        if let Some(v) = v1_validators.iter().find(|v| 3 * v.stake as u128 >= total) {
+            return Err(GenesisError::InvalidData(format!(
+                "genesis member {} weighs {} of {total} AIN: a third or more",
+                v.address, v.stake
+            )));
+        }
+    }
     blockchain::committee::validate_committee(&v1_validators)
         .map_err(|why| GenesisError::InvalidData(format!("genesis committee: {why}")))?;
 
@@ -1323,10 +1405,37 @@ pub fn build_genesis(
     // mints by exactly the treasury reserve over the chain's lifetime (a silent
     // ~50k AIN breach of the 150M cap). Seed it with bootstrap stake + treasury
     // so it agrees with sys:total_supply (set below) and the cap actually holds.
+    // G5 A4 BW-2: liquid genesis balances (the incentivized testnet's public
+    // track), counted in the supply. A validator's coin store is written
+    // below, so a validator cannot also be listed here.
+    let mut genesis_accounts: Vec<(move_core_types::account_address::AccountAddress, u128)> =
+        Vec::new();
+    let mut accounts_total: u128 = 0;
+    for account in &file.accounts {
+        let balance = parse_genesis_amount(&account.balance, "account balance")?;
+        let addr = parse_move_addr(&account.address)?;
+        if genesis_validators
+            .iter()
+            .any(|(v, _): &(String, String)| v == &account.address)
+            || genesis_accounts.iter().any(|(a, _)| *a == addr)
+        {
+            return Err(GenesisError::InvalidData(format!(
+                "genesis account {} is listed twice or is a validator",
+                account.address
+            )));
+        }
+        accounts_total = accounts_total.checked_add(balance).ok_or_else(|| {
+            GenesisError::InvalidData("genesis account balances overflow u128".to_string())
+        })?;
+        genesis_accounts.push((addr, balance));
+    }
     let initial_total_supply = total_bootstrap_stake
         .checked_add(treasury_reserve_amount)
+        .and_then(|s| s.checked_add(accounts_total))
         .ok_or_else(|| {
-            GenesisError::InvalidData("genesis stake plus treasury overflows u128".to_string())
+            GenesisError::InvalidData(
+                "genesis stake, treasury and accounts overflow u128".to_string(),
+            )
         })?;
     let validator_set = ValidatorSet {
         validators: validator_configs,
@@ -1350,6 +1459,12 @@ pub fn build_genesis(
             &hex::encode(bcs::to_bytes(&coin_store)?),
         )?;
     }
+    for (addr, balance) in &genesis_accounts {
+        storage.put(
+            &coin_store_key(*addr),
+            &hex::encode(bcs::to_bytes(&Coin { value: *balance })?),
+        )?;
+    }
 
     // === G5 CH-1: epoch 0's allowance of added stake ===
     // The genesis committee's stake is the base; the executor rewrites it at
@@ -1362,6 +1477,24 @@ pub fn build_genesis(
             genesis_committee_stake,
         ))?),
     )?;
+
+    // === G5 A4 BW-1: the bootstrap state ===
+    // Weight with no coins: it is never in a coin store, the Move stake or
+    // the supply (BW-8), only in the committee weights above.
+    if let Some(boot) = &file.bootstrap {
+        let state = executor::BootstrapState {
+            s_min: boot.s_min_ain,
+            operators: bootstrap_weights
+                .iter()
+                .map(|(address, weight)| executor::BootstrapOperator {
+                    address: address.clone(),
+                    weight: *weight,
+                    strikes: 0,
+                })
+                .collect(),
+        };
+        storage.put(executor::BOOTSTRAP_KEY, &serde_json::to_string(&state)?)?;
+    }
 
     // === Initialize Epoch (the reward-period counter) ===
     #[derive(serde::Serialize)]
@@ -2196,6 +2329,90 @@ mod tests {
         let state: executor::ChurnState = bcs::from_bytes(&hex::decode(raw).unwrap()).unwrap();
         // The one validator stakes 1,000 AIN.
         assert_eq!(state, executor::opening_churn_state(0, 1_000));
+    }
+
+    /// A genesis validator of key seed `seed` owning `stake_ain`, with BLS
+    /// keys of its own.
+    fn bootstrap_member(seed: u8, stake_ain: u128) -> GenesisValidatorConfig {
+        let key = SigningKey::from_bytes(&[seed; 32]);
+        let bls = crypto::bls::BLSEngine::consensus();
+        let bls_seed = [seed.wrapping_add(100); 32];
+        GenesisValidatorConfig {
+            address: crypto::derive_address(key.verifying_key().as_bytes()).unwrap(),
+            public_key: hex::encode(key.verifying_key().as_bytes()),
+            stake: (stake_ain * 1_000_000_000_000_000_000).to_string(),
+            bls_public_key: Some(hex::encode(bls.pubkey_raw(&bls_seed))),
+            bls_pop: Some(hex::encode(bls.prove_possession_raw(&bls_seed))),
+        }
+    }
+
+    /// G5 A4 BW-2, BW-8: four operators owning nothing share 18.5 M of
+    /// bootstrap weight. The genesis committee weighs s_min, the bootstrap
+    /// state records each weight, and nothing is minted for it: the supply
+    /// is the public-track account's balance alone. Every rule is enforced:
+    /// the sum, membership, the third, and owning nothing only with weight.
+    #[test]
+    fn a_bootstrap_genesis_weighs_s_min_and_mints_nothing() {
+        const AIN: u128 = 1_000_000_000_000_000_000;
+        let mut file = s3_genesis_file();
+        file.validators = (61..65).map(|s| bootstrap_member(s, 0)).collect();
+        let weights = |w: [u64; 4], f: &GenesisFile| GenesisBootstrap {
+            s_min_ain: 18_500_000,
+            weights: f
+                .validators
+                .iter()
+                .zip(w)
+                .map(|(v, weight_ain)| GenesisBootstrapWeight {
+                    address: v.address.clone(),
+                    weight_ain,
+                })
+                .collect(),
+        };
+        file.bootstrap = Some(weights([4_625_000; 4], &file));
+        let account = crypto::derive_address(
+            SigningKey::from_bytes(&[69u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap();
+        file.accounts = vec![GenesisAccount {
+            address: account.clone(),
+            balance: (500 * AIN).to_string(),
+        }];
+        let built = build_genesis(&file, &stdlib()).unwrap();
+        let committee: Vec<consensus::qc::ValidatorInfo> =
+            serde_json::from_str(&built.writes["genesis:validator_set:v1"]).unwrap();
+        assert_eq!(committee.iter().map(|m| m.stake).sum::<u64>(), 18_500_000);
+        let state: executor::BootstrapState =
+            serde_json::from_str(&built.writes[executor::BOOTSTRAP_KEY]).unwrap();
+        assert_eq!((state.s_min, state.total()), (18_500_000, 18_500_000));
+        assert!(state
+            .operators
+            .iter()
+            .all(|o| o.weight == 4_625_000 && o.strikes == 0));
+        assert_eq!(built.writes["sys:total_supply"], (500 * AIN).to_string());
+        let account_store = &built.writes[&coin_store_key(parse_move_addr(&account).unwrap())];
+        assert_eq!(
+            bcs::from_bytes::<u128>(&hex::decode(account_store).unwrap()).unwrap(),
+            500 * AIN
+        );
+
+        let refused = |f: &GenesisFile| build_genesis(f, &stdlib()).unwrap_err().to_string();
+        let mut f = file.clone();
+        f.bootstrap = Some(weights([4_000_000; 4], &f));
+        assert!(refused(&f).contains("not s_min"), "{}", refused(&f));
+        let mut f = file.clone();
+        f.bootstrap.as_mut().unwrap().weights[0].address = account.clone();
+        assert!(refused(&f).contains("not a genesis validator"));
+        let mut f = file.clone();
+        f.bootstrap = Some(weights([7_000_000, 4_000_000, 4_000_000, 3_500_000], &f));
+        assert!(refused(&f).contains("a third"), "{}", refused(&f));
+        let mut f = file.clone();
+        f.bootstrap.as_mut().unwrap().weights.pop();
+        assert!(refused(&f).contains("below the minimum"), "{}", refused(&f));
+        let mut f = file.clone();
+        f.accounts[0].address = f.validators[0].address.clone();
+        assert!(refused(&f).contains("is a validator"), "{}", refused(&f));
     }
 
     #[test]

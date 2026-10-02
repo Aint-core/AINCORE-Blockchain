@@ -43,13 +43,24 @@ pub struct PublicEntry {
     pub entry_sig: String,
 }
 
-/// A line of `--entries-file`: an entry and the stake the coordinator
-/// assigns it, in whole AIN.
+/// A line of `--entries-file`: an entry, the stake the coordinator assigns
+/// it, and its bootstrap weight (G5 A4 BW-2), both in whole AIN. An operator
+/// with bootstrap weight may own no stake.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EntrySpec {
     #[serde(flatten)]
     pub entry: PublicEntry,
     pub stake_ain: u128,
+    #[serde(default)]
+    pub bootstrap_ain: u64,
+}
+
+/// A line of `--accounts-file` (G5 A4 BW-2): liquid AIN at genesis for the
+/// incentivized testnet's public track, in whole AIN.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AccountSpec {
+    pub address: String,
+    pub balance_ain: u128,
 }
 
 /// What `entry_sig` signs.
@@ -142,6 +153,16 @@ pub struct GenMultiArgs {
     #[arg(long = "entries-file", value_name = "PATH")]
     pub entries_file: Option<PathBuf>,
 
+    /// G5 A4 BW-2: s_min, the genesis committee's weight in whole AIN, which
+    /// the entries' `bootstrap_ain` fill up to.
+    #[arg(long)]
+    pub s_min_ain: Option<u64>,
+
+    /// G5 A4 BW-2: liquid genesis balances, a JSON array of
+    /// `{address, balance_ain}` (the incentivized testnet's public track).
+    #[arg(long = "accounts-file", value_name = "PATH")]
+    pub accounts_file: Option<PathBuf>,
+
     /// Output path for the generated genesis.json.
     #[arg(short, long, default_value = "genesis.json")]
     pub out: PathBuf,
@@ -218,6 +239,12 @@ pub struct GenesisFile {
     /// G1 S11: the launch time, unix seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genesis_time: Option<u64>,
+    /// G5 A4 BW-2: bootstrap weight (consensus weight with no coins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap: Option<node::genesis::GenesisBootstrap>,
+    /// G5 A4 BW-2: liquid genesis balances.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<node::genesis::GenesisAccount>,
 }
 
 /// Derive every genesis field for one validator from its 32-byte node.key seed.
@@ -296,6 +323,7 @@ pub fn build_genesis_file(
         entries.push(EntrySpec {
             entry: entry_from_seed(&spec.seed)?,
             stake_ain: spec.stake_ain,
+            bootstrap_ain: 0,
         });
     }
     build_genesis_from_entries(
@@ -334,8 +362,12 @@ pub fn build_genesis_from_entries(
     let mut seen_bls = std::collections::BTreeSet::new();
     for spec in specs {
         check_entry(&spec.entry)?;
-        if spec.stake_ain == 0 {
-            return Err(format!("{}: stake must be > 0", spec.entry.address).into());
+        if spec.stake_ain == 0 && spec.bootstrap_ain == 0 {
+            return Err(format!(
+                "{}: stake must be > 0 without bootstrap weight",
+                spec.entry.address
+            )
+            .into());
         }
         let PublicEntry {
             address,
@@ -385,7 +417,72 @@ pub fn build_genesis_from_entries(
         max_block_interval_secs: params.max_block_interval_secs,
         stdlib_hash: stdlib_hash.to_string(),
         genesis_time: None,
+        bootstrap: None,
+        accounts: Vec::new(),
     })
+}
+
+/// G5 A4 BW-2: add bootstrap weight and liquid accounts to `genesis`,
+/// checked as the loader checks them: the committee weighs exactly `s_min`
+/// with bootstrap weight, and no member weighs a third of it or more.
+pub fn apply_bootstrap_and_accounts(
+    genesis: &mut GenesisFile,
+    specs: &[EntrySpec],
+    s_min_ain: Option<u64>,
+    accounts: &[AccountSpec],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let weights: Vec<node::genesis::GenesisBootstrapWeight> = specs
+        .iter()
+        .filter(|s| s.bootstrap_ain > 0)
+        .map(|s| node::genesis::GenesisBootstrapWeight {
+            address: s.entry.address.clone(),
+            weight_ain: s.bootstrap_ain,
+        })
+        .collect();
+    match (s_min_ain, weights.is_empty()) {
+        (None, true) => {}
+        (None, false) => return Err("bootstrap weights need --s-min-ain".into()),
+        (Some(_), true) => return Err("--s-min-ain needs entries with bootstrap_ain".into()),
+        (Some(s_min), false) => {
+            let totals: Vec<(String, u128)> = specs
+                .iter()
+                .map(|s| {
+                    (
+                        s.entry.address.clone(),
+                        s.stake_ain + s.bootstrap_ain as u128,
+                    )
+                })
+                .collect();
+            let sum: u128 = totals.iter().map(|(_, t)| *t).sum();
+            if sum != s_min as u128 {
+                return Err(format!(
+                    "stake plus bootstrap weight sums to {sum} AIN, not s_min {s_min}"
+                )
+                .into());
+            }
+            if let Some((a, t)) = totals.iter().find(|(_, t)| 3 * t >= sum) {
+                return Err(format!("{a} weighs {t} of {sum} AIN: a third or more").into());
+            }
+            genesis.bootstrap = Some(node::genesis::GenesisBootstrap {
+                s_min_ain: s_min,
+                weights,
+            });
+        }
+    }
+    for a in accounts {
+        if specs.iter().any(|s| s.entry.address == a.address) {
+            return Err(format!("{} is a validator and an account", a.address).into());
+        }
+        let quanta = a
+            .balance_ain
+            .checked_mul(COIN_SCALE)
+            .ok_or_else(|| format!("balance {} AIN overflows u128 quanta", a.balance_ain))?;
+        genesis.accounts.push(node::genesis::GenesisAccount {
+            address: a.address.clone(),
+            balance: quanta.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// `clock-cap`: the release candidate's block intervals, one whole number of
@@ -486,6 +583,7 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
         entries.push(EntrySpec {
             entry: entry_from_seed(&spec.seed)?,
             stake_ain: spec.stake_ain,
+            bootstrap_ain: 0,
         });
     }
     if let Some(path) = &args.entries_file {
@@ -506,6 +604,27 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.clock_cap_secs,
         &stdlib_hash,
     )?;
+    let accounts: Vec<AccountSpec> = match &args.accounts_file {
+        None => Vec::new(),
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| format!("cannot read --accounts-file {}: {e}", path.display()))?;
+            serde_json::from_str(&raw)
+                .map_err(|e| format!("--accounts-file {}: {e}", path.display()))?
+        }
+    };
+    apply_bootstrap_and_accounts(&mut genesis, &entries, args.s_min_ain, &accounts)?;
+    if let Some(boot) = &genesis.bootstrap {
+        let b: u64 = boot.weights.iter().map(|w| w.weight_ain).sum();
+        println!(
+            "🌱 Bootstrap weight (no coins): {b} AIN over {} operators, s_min {} AIN",
+            boot.weights.len(),
+            boot.s_min_ain
+        );
+    }
+    if !genesis.accounts.is_empty() {
+        println!("👥 Genesis accounts: {}", genesis.accounts.len());
+    }
     genesis.genesis_time = Some(args.genesis_time.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -828,6 +947,7 @@ mod tests {
                 EntrySpec {
                     entry: serde_json::from_str(&json).unwrap(),
                     stake_ain: s.stake_ain,
+                    bootstrap_ain: 0,
                 }
             })
             .collect();
@@ -871,6 +991,7 @@ mod tests {
         let spec = |entry: PublicEntry| EntrySpec {
             entry,
             stake_ain: 1_000,
+            bootstrap_ain: 0,
         };
         let twice = vec![spec(good.clone()), spec(good.clone())];
         let err = build_genesis_from_entries(&twice, "C", 0, 6_650, 14, "h").unwrap_err();
@@ -878,8 +999,81 @@ mod tests {
         let zero = vec![EntrySpec {
             entry: good,
             stake_ain: 0,
+            bootstrap_ain: 0,
         }];
         let err = build_genesis_from_entries(&zero, "C", 0, 6_650, 14, "h").unwrap_err();
         assert!(err.to_string().contains("stake"), "{err}");
+    }
+
+    /// G5 A4 BW-2: four operators that own no stake share 18.5 M of bootstrap
+    /// weight and a public-track account holds liquid AIN. The node loads the
+    /// file: the committee weighs s_min, the bootstrap state matches, and no
+    /// bootstrap weight is a coin (the supply is the account's balance
+    /// alone). The tool refuses what the loader refuses.
+    #[test]
+    fn bootstrap_weight_fills_the_genesis_committee_without_coins() {
+        std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+        let spec = |n: u8, stake_ain: u128, bootstrap_ain: u64| EntrySpec {
+            entry: entry_from_seed(&seed(n)).unwrap(),
+            stake_ain,
+            bootstrap_ain,
+        };
+        let ops: Vec<EntrySpec> = (41..45).map(|n| spec(n, 0, 4_625_000)).collect();
+        let stdlib_hash = node::genesis::stdlib_hash_of(&stdlib_path()).unwrap();
+        let base =
+            build_genesis_from_entries(&ops, "AINCORE-TESTNET-V4", 0, 6_749, 25, &stdlib_hash)
+                .unwrap();
+        let public = vec![AccountSpec {
+            address: entry_from_seed(&seed(45)).unwrap().address,
+            balance_ain: 1_000,
+        }];
+        let mut genesis = base.clone();
+        apply_bootstrap_and_accounts(&mut genesis, &ops, Some(18_500_000), &public).unwrap();
+
+        let dir =
+            std::env::temp_dir().join(format!("aincore_genmulti_boot_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("genesis.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&genesis).unwrap()).unwrap();
+        let db = temp_db("boot_load");
+        node::genesis::initialize_genesis_from(&db, &stdlib_path(), &path)
+            .expect("a bootstrap genesis loads");
+        let committee: Vec<consensus::qc::ValidatorInfo> =
+            serde_json::from_str(&db.get("genesis:validator_set:v1").unwrap().unwrap()).unwrap();
+        assert_eq!(committee.iter().map(|m| m.stake).sum::<u64>(), 18_500_000);
+        assert!(committee.iter().all(|m| m.stake == 4_625_000));
+        let state: serde_json::Value =
+            serde_json::from_str(&db.get("sys:bootstrap:v1").unwrap().unwrap()).unwrap();
+        assert_eq!(state["s_min"], 18_500_000);
+        assert_eq!(state["operators"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            db.get("sys:total_supply").unwrap().unwrap(),
+            (1_000 * COIN_SCALE).to_string(),
+            "bootstrap weight is no coin: the supply is the account alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let refuse = |specs: &[EntrySpec], s_min: Option<u64>, accounts: &[AccountSpec]| {
+            apply_bootstrap_and_accounts(&mut base.clone(), specs, s_min, accounts)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(refuse(&ops, Some(18_000_000), &[]).contains("not s_min"));
+        assert!(refuse(&ops, None, &[]).contains("--s-min-ain"));
+        let owned: Vec<EntrySpec> = (41..45).map(|n| spec(n, 1_000, 0)).collect();
+        assert!(refuse(&owned, Some(4_000), &[]).contains("bootstrap_ain"));
+        let lopsided = vec![
+            spec(41, 0, 7_000_000),
+            spec(42, 0, 4_000_000),
+            spec(43, 0, 4_000_000),
+            spec(44, 0, 3_500_000),
+        ];
+        assert!(refuse(&lopsided, Some(18_500_000), &[]).contains("a third"));
+        let taken = vec![AccountSpec {
+            address: ops[0].entry.address.clone(),
+            balance_ain: 1,
+        }];
+        assert!(refuse(&ops, Some(18_500_000), &taken).contains("validator and an account"));
     }
 }

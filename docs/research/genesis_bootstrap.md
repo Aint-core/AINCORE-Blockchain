@@ -66,6 +66,11 @@ The way out is weight that nobody owns.
 4. **Handover is automatic.** B = max(0, S_min − P). B fills the gap to a minimum committee
    weight and shrinks as owned stake grows; nobody decides when.
 
+**Saturation.** EM-2 clips each member's payout weight at total / 50. With fewer than 50
+members every member earns the same share, so the founder's bootstrap weight earns no more
+than any operator's. The model's totals are unaffected (the whole emission is paid either
+way); only the split among members is flatter.
+
 **Comparison with Bitcoin.** Bitcoin issued 2.628 M BTC/yr at launch: 12.5 % of its cap
 per year. BW-1 issues 1.9 % of the cap per year, 6.6 times slower. Both start from almost no
 owned supply, so growth measured against circulating supply is high at first in both.

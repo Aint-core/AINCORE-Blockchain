@@ -101,6 +101,13 @@ to `--validator`, which puts seeds in shell history and `ps`:
 Entries and seeds give byte-identical validator entries (witness:
 `public_entries_build_the_same_genesis_as_the_seeds`).
 
+**Bootstrap weight (G5 amendment A4).** For a launch without a pre-mine, give each launch
+operator a `bootstrap_ain` in its entry (it may own `stake_ain: 0`) and pass `--s-min-ain`,
+the genesis committee's weight. Stake plus bootstrap weight must sum to exactly `s_min`, and no
+operator may reach a third of it. Liquid balances for the incentivized testnet's public track
+go in `--accounts-file` as `[{"address": "...", "balance_ain": N}]`. Bootstrap weight is
+never a coin: the supply at genesis is the owned stake plus the accounts.
+
 This writes a `genesis.json` whose per-validator entries match exactly what the
 loader expects:
 

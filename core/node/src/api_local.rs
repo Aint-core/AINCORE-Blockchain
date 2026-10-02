@@ -1722,6 +1722,38 @@ fn handle_rpc_method(
 
         // ============ IMPORTANT DAPP/EXPLORER ENDPOINTS ============
 
+        "aincore_getBootstrap" => {
+            // G5 A4 BW-10: the bootstrap weight as the chain holds it. Owned
+            // stake P is each live member's weight minus its bootstrap weight.
+            let state: Option<executor::BootstrapState> = match data.storage.get(executor::BOOTSTRAP_KEY) {
+                Ok(Some(raw)) => serde_json::from_str(&raw).ok(),
+                _ => None,
+            };
+            let Some(state) = state else {
+                return Ok(serde_json::json!({ "active": false }));
+            };
+            let live: Vec<serde_json::Value> = match data.storage.get("sys:validator_set:v1") {
+                Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let owned: u128 = live
+                .iter()
+                .map(|m| {
+                    let address = m["address"].as_str().unwrap_or_default();
+                    let weight = m["stake"].as_u64().unwrap_or(0);
+                    weight.saturating_sub(state.weight_of(address)) as u128
+                })
+                .sum();
+            let target = (state.s_min as u128).saturating_sub(owned);
+            Ok(serde_json::json!({
+                "active": !state.operators.is_empty(),
+                "s_min_ain": state.s_min,
+                "bootstrap_ain": state.total(),
+                "owned_stake_ain": owned.to_string(),
+                "target_ain": target.to_string(),
+                "operators": state.operators,
+            }))
+        },
         "aincore_getEconomics" => {
             // G5 DOC-1: the economics as the chain runs them, from Move state.
             let burn_percentage = data.storage.get_burn_percentage();
@@ -2763,6 +2795,51 @@ mod tests {
             serde_json::json!([format!("{:064x}", 0xee), validator]),
         );
         assert_eq!(none["amount"], "0");
+    }
+
+    /// G5 A4 BW-10: getBootstrap reports what the state holds: s_min, the
+    /// bootstrap weight, owned stake (live weight minus bootstrap weight),
+    /// the target and each operator; a chain without bootstrap says so.
+    #[test]
+    fn get_bootstrap_reports_the_state() {
+        let db = temp_db("rpc_bootstrap");
+        let state = test_state(Arc::clone(&db));
+        let none =
+            handle_rpc_method("aincore_getBootstrap", serde_json::json!([]), &state).unwrap();
+        assert_eq!(none, serde_json::json!({ "active": false }));
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        {
+            let _seed = db.seeding();
+            db.put(
+                executor::BOOTSTRAP_KEY,
+                &serde_json::to_string(&executor::BootstrapState {
+                    s_min: 10_000,
+                    operators: vec![executor::BootstrapOperator {
+                        address: a.clone(),
+                        weight: 3_000,
+                        strikes: 1,
+                    }],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            db.put(
+                "sys:validator_set:v1",
+                &serde_json::json!([
+                    { "address": a, "stake": 4_000 },
+                    { "address": b, "stake": 6_000 },
+                ])
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let r = handle_rpc_method("aincore_getBootstrap", serde_json::json!([]), &state).unwrap();
+        assert_eq!(r["active"], true);
+        assert_eq!(r["s_min_ain"], 10_000);
+        assert_eq!(r["bootstrap_ain"], 3_000);
+        assert_eq!(r["owned_stake_ain"], "7000");
+        assert_eq!(r["target_ain"], "3000");
+        assert_eq!(r["operators"][0]["strikes"], 1);
     }
 
     /// G5 DOC-1: the supply and economics RPCs report the Move emission

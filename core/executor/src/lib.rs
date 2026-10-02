@@ -493,6 +493,59 @@ pub fn opening_churn_state(epoch: u64, committee_stake: u128) -> ChurnState {
     }
 }
 
+/// G5 A4 BW-1: bootstrap weight, consensus weight with no coins and no owner
+/// (docs/research/genesis_bootstrap.md). Genesis writes it; at every boundary
+/// the executor forfeits and shrinks it (BW-4..BW-6), never grows it. Weights
+/// are whole AIN, like committee stakes. A chain without the key has none.
+pub const BOOTSTRAP_KEY: &str = "sys:bootstrap:v1";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapState {
+    /// s_min: the committee weight bootstrap weight fills up to, whole AIN.
+    pub s_min: u64,
+    /// Sorted by address. An operator whose weight reaches 0 is removed.
+    pub operators: Vec<BootstrapOperator>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapOperator {
+    pub address: String,
+    pub weight: u64,
+    /// BW-6: consecutive epochs below a third of its expected leads.
+    pub strikes: u8,
+}
+
+impl BootstrapState {
+    pub fn total(&self) -> u64 {
+        self.operators.iter().map(|o| o.weight).sum()
+    }
+
+    pub fn weight_of(&self, address: &str) -> u64 {
+        self.operators
+            .iter()
+            .find(|o| o.address == address)
+            .map_or(0, |o| o.weight)
+    }
+}
+
+/// BW-6: the blocks each committee member led in committee epoch `epoch`.
+pub fn bootstrap_led_key(epoch: u64) -> String {
+    format!("sys:bootstrap:led:{epoch}")
+}
+
+/// The chain's bootstrap state, if it has one.
+pub fn read_bootstrap(db: &StateDB) -> Option<BootstrapState> {
+    db.get(BOOTSTRAP_KEY)
+        .expect("CRITICAL: the bootstrap state could not be read")
+        .map(|raw| serde_json::from_str(&raw).expect("CRITICAL: the bootstrap state is corrupt"))
+}
+
+/// BW-6: strikes at which an operator forfeits its bootstrap weight.
+pub const BOOTSTRAP_MAX_STRIKES: u8 = 3;
+/// BW-6: below this many expected leads in an epoch, a member is not judged
+/// (P(led < 3 | Poisson 9) is about 0.6 %).
+pub const BOOTSTRAP_MIN_EXPECTED_LEADS: u128 = 9;
+
 /// Mirror of the Move `0x1::chain::Params` resource (BCS field order).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct ChainParamsResource {
@@ -1838,7 +1891,7 @@ impl Executor {
     /// is dropped from both, so a seat never outlives its stake whatever path
     /// changed the Move set. Only a fixture without any Move set keeps its
     /// weights.
-    fn refresh_bonded_weights(&self) -> BTreeMap<String, u64> {
+    fn refresh_bonded_weights(&self, new_epoch: u64) -> BTreeMap<String, u64> {
         let mut delegated = BTreeMap::new();
         let Some(mut live) = self
             .db
@@ -1864,7 +1917,8 @@ impl Executor {
             .unwrap_or_default();
         let mut bonded = BTreeMap::new();
         let mut gone: Vec<String> = Vec::new();
-        for entry in live.iter_mut() {
+        let mut owned_weights: BTreeMap<String, u64> = BTreeMap::new();
+        for entry in live.iter() {
             let Some(own_stake) = parse_move_address(&entry.address).and_then(|a| own.get(&a))
             else {
                 if move_set.is_some() {
@@ -1876,9 +1930,21 @@ impl Executor {
             if pool > 0 {
                 delegated.insert(entry.address.clone(), pool);
             }
-            let weight = u64::try_from(own_stake / COIN_SCALE)
-                .unwrap_or(u64::MAX)
-                .saturating_add(pool);
+            owned_weights.insert(
+                entry.address.clone(),
+                u64::try_from(own_stake / COIN_SCALE)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(pool),
+            );
+        }
+        // G5 A4: bootstrap weight is settled after owned weights (BW-4) and
+        // added to them; it never enters the pool split (BW-7).
+        let bootstrap = self.settle_bootstrap(new_epoch, &owned_weights);
+        for entry in live.iter_mut() {
+            let Some(owned) = owned_weights.get(&entry.address) else {
+                continue;
+            };
+            let weight = owned.saturating_add(bootstrap.get(&entry.address).copied().unwrap_or(0));
             if entry.stake != weight {
                 entry.stake = weight;
                 bonded.insert(entry.address.clone(), weight);
@@ -1924,6 +1990,124 @@ impl Executor {
         delegated
     }
 
+    /// G5 A4 BW-6: count the block's leader toward its epoch's leads. Only a
+    /// chain with bootstrap operators counts.
+    fn count_bootstrap_lead(&self, height: u64, proposer_hex: &str) {
+        if height == 0 || read_bootstrap(&self.db).is_none_or(|b| b.operators.is_empty()) {
+            return;
+        }
+        let leader = if proposer_hex.len() > crypto::ADDRESS_HEX_LEN {
+            &proposer_hex[..crypto::ADDRESS_HEX_LEN]
+        } else {
+            proposer_hex
+        };
+        if leader.is_empty() {
+            return;
+        }
+        let key = bootstrap_led_key((height - 1) / self.epoch_block_interval());
+        let mut led: BTreeMap<String, u64> = self
+            .db
+            .get(&key)
+            .expect("CRITICAL: the bootstrap lead count could not be read")
+            .map(|raw| {
+                serde_json::from_str(&raw).expect("CRITICAL: a bootstrap lead count is corrupt")
+            })
+            .unwrap_or_default();
+        *led.entry(leader.to_string()).or_insert(0) += 1;
+        self.db
+            .put(
+                &key,
+                &serde_json::to_string(&led).expect("a lead count is JSON"),
+            )
+            .expect("CRITICAL: the bootstrap lead count write failed");
+    }
+
+    /// G5 A4 at the boundary opening `new_epoch`, given each live member's
+    /// owned weight: judge the closed epoch's leads (BW-6), forfeit (BW-5),
+    /// shrink to max(0, s_min - P) (BW-4), and write the state. Returns each
+    /// operator's bootstrap weight; empty on a chain without bootstrap.
+    fn settle_bootstrap(
+        &self,
+        new_epoch: u64,
+        owned: &BTreeMap<String, u64>,
+    ) -> BTreeMap<String, u64> {
+        let Some(mut state) = read_bootstrap(&self.db) else {
+            return BTreeMap::new();
+        };
+        let closed = new_epoch.saturating_sub(1);
+        let led_key = bootstrap_led_key(closed);
+        let led: BTreeMap<String, u64> = self
+            .db
+            .get(&led_key)
+            .expect("CRITICAL: the bootstrap lead count could not be read")
+            .map(|raw| {
+                serde_json::from_str(&raw).expect("CRITICAL: a bootstrap lead count is corrupt")
+            })
+            .unwrap_or_default();
+        // BW-6: expected leads by C_E's weights; the election is stake-weighted.
+        let committee: BTreeMap<String, u64> = self
+            .committee_of_epoch(closed)
+            .into_iter()
+            .map(|m| (m.address, m.stake))
+            .collect();
+        let total: u128 = committee.values().map(|&w| w as u128).sum();
+        let blocks: u128 = led.values().map(|&n| n as u128).sum();
+        for op in state.operators.iter_mut() {
+            let Some(&w) = committee.get(&op.address) else {
+                continue;
+            };
+            if total == 0 {
+                continue;
+            }
+            let expected = blocks * w as u128 / total;
+            if expected < BOOTSTRAP_MIN_EXPECTED_LEADS {
+                continue;
+            }
+            let got = led.get(&op.address).copied().unwrap_or(0) as u128;
+            op.strikes = if 3 * got < expected {
+                op.strikes.saturating_add(1)
+            } else {
+                0
+            };
+        }
+        // BW-5: forfeit for good.
+        for op in state.operators.iter_mut() {
+            if !owned.contains_key(&op.address)
+                || self.is_jailed(&op.address)
+                || self.is_convicted_in_full(&op.address)
+                || op.strikes >= BOOTSTRAP_MAX_STRIKES
+            {
+                op.weight = 0;
+            }
+        }
+        // BW-4: shrink to the target; never grow, drop the dust.
+        let p: u128 = owned.values().map(|&w| w as u128).sum();
+        let target = (state.s_min as u128).saturating_sub(p);
+        let sum: u128 = state.operators.iter().map(|o| o.weight as u128).sum();
+        if sum > target {
+            for op in state.operators.iter_mut() {
+                op.weight = (op.weight as u128 * target / sum) as u64;
+            }
+        }
+        state.operators.retain(|o| o.weight > 0);
+        self.db
+            .put(
+                BOOTSTRAP_KEY,
+                &serde_json::to_string(&state).expect("the bootstrap state is JSON"),
+            )
+            .expect("CRITICAL: the bootstrap state write failed");
+        if !led.is_empty() {
+            self.db
+                .delete(&led_key)
+                .expect("CRITICAL: the bootstrap lead count delete failed");
+        }
+        state
+            .operators
+            .iter()
+            .map(|o| (o.address.clone(), o.weight))
+            .collect()
+    }
+
     /// G5 EM-2: who is paid for block `height`: the members of the committee
     /// C_{E(height)} with their committee stake, never the live set; jailed
     /// members and zero stake excluded.
@@ -1956,7 +2140,7 @@ impl Executor {
         }
         let new_epoch = boundary_height / interval;
 
-        let delegated = self.refresh_bonded_weights();
+        let delegated = self.refresh_bonded_weights(new_epoch);
         let current = self.committee_of_epoch(new_epoch.saturating_sub(1));
         let proposed: Vec<blockchain::committee::ValidatorInfo> = self
             .db
@@ -2838,6 +3022,9 @@ impl Executor {
         // being executed (see execute_block_parallel_at doc).
         // G5 EM-3: the reward payout for (h - R, h] pays C_{E(h)} before a
         // boundary block records C_{E+1}.
+        // G5 A4 BW-6: the leader counts toward its epoch before a boundary
+        // judges that epoch.
+        self.count_bootstrap_lead(block_height, proposer_hex);
         self.maybe_pay_rewards(block_height);
         self.maybe_advance_epoch(block_height);
 
@@ -8921,6 +9108,253 @@ mod tests {
         );
         assert_eq!(held(&db, &delegator), 1_995);
         assert_eq!(churn_state(&db).added, 1_005 * ain);
+    }
+
+    /// A G5 A4 chain: each member owns `owned` AIN in the Move set and holds
+    /// `boot` AIN of bootstrap weight; the committees weigh owned + boot.
+    fn seed_bootstrap_chain(db: &StateDB, members: &[(u8, u64, u64)], supply: u128) {
+        let owned: Vec<_> = members
+            .iter()
+            .map(|&(seed, owned, _)| committee_member(seed, owned))
+            .collect();
+        seed_committee_chain(db, &owned, supply);
+        let weighted: Vec<_> = members
+            .iter()
+            .map(|&(seed, owned, boot)| committee_member(seed, owned + boot))
+            .collect();
+        let state = BootstrapState {
+            s_min: members.iter().map(|&(_, o, b)| o + b).sum(),
+            operators: {
+                let mut ops: Vec<_> = members
+                    .iter()
+                    .filter(|m| m.2 > 0)
+                    .map(|&(seed, _, boot)| BootstrapOperator {
+                        address: committee_member(seed, 0).address,
+                        weight: boot,
+                        strikes: 0,
+                    })
+                    .collect();
+                ops.sort_by(|a, b| a.address.cmp(&b.address));
+                ops
+            },
+        };
+        let _seed = db.seeding();
+        let json = serde_json::to_string(&weighted).unwrap();
+        db.put("genesis:validator_set:v1", &json).unwrap();
+        db.put("sys:validator_set:v1", &json).unwrap();
+        db.put(BOOTSTRAP_KEY, &serde_json::to_string(&state).unwrap())
+            .unwrap();
+    }
+
+    fn bootstrap_of(db: &StateDB) -> BootstrapState {
+        read_bootstrap(db).expect("the chain has bootstrap state")
+    }
+
+    /// G5 A4 BW-3, BW-4, BW-7, BW-8: bootstrap weight fills the committee up
+    /// to s_min, shrinks pro rata as owned stake grows, never grows back, and
+    /// is gone once owned stake reaches s_min. It is weight, not coins: the
+    /// Move stakes stay what members own, it counts in the payout weight, and
+    /// no pool is credited with it.
+    #[test]
+    fn g5_bootstrap_weight_fills_to_s_min_and_shrinks_as_owned_stake_grows() {
+        let ain = G5_AIN;
+        // a owns 100 + 4,900 bootstrap; b, c, d own 3,000 + 1,000: s_min 17,000.
+        let members = [
+            (151u8, 100u64, 4_900u64),
+            (152, 3_000, 1_000),
+            (153, 3_000, 1_000),
+            (154, 3_000, 1_000),
+        ];
+        let mut chain = G5Chain::new("g5_boot_decay", 14, |db| {
+            seed_bootstrap_chain(db, &members, 1_000_000 * ain);
+            for &(seed, _, _) in &members {
+                set_coin_store(db, &committee_member(seed, 0).address, 20_000 * ain);
+            }
+        });
+        let db = chain.db.clone();
+        let addr = |seed: u8| committee_member(seed, 0).address;
+        let weight = |db: &StateDB, epoch: u64, seed: u8| -> u64 {
+            g5_committee(db, epoch)
+                .into_iter()
+                .find(|(a, _)| *a == addr(seed))
+                .map_or(0, |(_, w)| w)
+        };
+        let balance = |db: &StateDB, seed: u8| coin_balance(db, &addr(seed));
+        let before: Vec<u128> = members.iter().map(|m| balance(&db, m.0)).collect();
+
+        // BW-7: epoch 0 pays by C_0's weights. The saturation clip is
+        // total / 50 = 340: a's 5,000 and b's 4,000 both earn the clip. Owned
+        // stake alone, a's 100 would earn 100/340 of b's share.
+        chain.run_blocks(20, 7);
+        let paid: Vec<u128> = members
+            .iter()
+            .zip(&before)
+            .map(|(m, b)| balance(&db, m.0) - b)
+            .collect();
+        assert!(paid[0] > 0);
+        assert_eq!(
+            paid[0], paid[1],
+            "bootstrap weight counts in the payout weight"
+        );
+        // P = 9,100 owned: the target 7,900 is what is held, nothing moves.
+        assert_eq!(bootstrap_of(&db).total(), 7_900);
+        assert_eq!(weight(&db, 1, 151), 5_000);
+        assert_eq!(
+            g5_split_record(&db, 1),
+            None,
+            "bootstrap weight never enters a pool's split"
+        );
+        // BW-8: the Move stakes are what members own.
+        let stake = |db: &StateDB, seed: u8| {
+            validator_set(db)
+                .validators
+                .iter()
+                .find(|v| v.validator_addr == parse_move_address(&addr(seed)).unwrap())
+                .map(|v| v.stake.value)
+        };
+        assert_eq!(stake(&db, 151), Some(100 * ain));
+
+        // a stakes 2,370 more: P = 11,470, target 5,530 = 7,900 x 0.7.
+        let key = SigningKey::from_bytes(&[151; 32]);
+        let tx = chain.tx(
+            &key,
+            "staking",
+            "add_stake",
+            vec![bcs::to_bytes(&(2_370 * ain)).unwrap()],
+        );
+        chain.run_to(21, vec![tx]);
+        chain.run_blocks(40 - chain.height, 7);
+        let boot = bootstrap_of(&db);
+        assert_eq!(boot.total(), 5_530);
+        assert_eq!(boot.weight_of(&addr(151)), 3_430);
+        assert_eq!(boot.weight_of(&addr(152)), 700);
+        assert_eq!(weight(&db, 2, 151), 2_470 + 3_430);
+        let committee_total: u64 = g5_committee(&db, 2).iter().map(|(_, w)| *w).sum();
+        assert_eq!(committee_total, 17_000, "the committee still weighs s_min");
+
+        // b leaves: P falls, the target rises, but bootstrap weight never grows.
+        let leaver = SigningKey::from_bytes(&[152; 32]);
+        let tx = chain.tx(&leaver, "staking", "leave_validator_set", vec![]);
+        chain.run_to(41, vec![tx]);
+        chain.run_blocks(60 - chain.height, 7);
+        let boot = bootstrap_of(&db);
+        assert_eq!(boot.weight_of(&addr(151)), 3_430, "never grows");
+        assert_eq!(boot.weight_of(&addr(152)), 0, "the leaver forfeits");
+
+        // c stakes past s_min (P = 17,070): the bootstrap weight is gone.
+        let key = SigningKey::from_bytes(&[153; 32]);
+        let tx = chain.tx(
+            &key,
+            "staking",
+            "add_stake",
+            vec![bcs::to_bytes(&(8_600 * ain)).unwrap()],
+        );
+        chain.run_to(61, vec![tx]);
+        chain.run_blocks(80 - chain.height, 7);
+        assert_eq!(bootstrap_of(&db).total(), 0);
+        assert!(bootstrap_of(&db).operators.is_empty());
+        assert_eq!(weight(&db, 4, 151), 2_470);
+    }
+
+    /// G5 A4 BW-5: a jailed or convicted operator forfeits its bootstrap
+    /// weight for good at the next boundary; the others keep theirs.
+    #[test]
+    fn g5_a_jailed_bootstrap_operator_forfeits_its_weight() {
+        let ain = G5_AIN;
+        let members = [
+            (161u8, 1_000u64, 3_000u64),
+            (162, 1_000, 3_000),
+            (163, 1_000, 3_000),
+            (164, 1_000, 3_000),
+        ];
+        let mut chain = G5Chain::new("g5_boot_jail", 14, |db| {
+            seed_bootstrap_chain(db, &members, 1_000_000 * ain);
+            let _seed = db.seeding();
+            db.put(
+                &format!("validator:jailed:{}", committee_member(161, 0).address),
+                "1",
+            )
+            .unwrap();
+            db.put(
+                &format!(
+                    "validator:convicted_full:{}",
+                    committee_member(162, 0).address
+                ),
+                "1",
+            )
+            .unwrap();
+        });
+        let db = chain.db.clone();
+        chain.run_blocks(20, 7);
+        let boot = bootstrap_of(&db);
+        assert_eq!(boot.weight_of(&committee_member(161, 0).address), 0);
+        assert_eq!(boot.weight_of(&committee_member(162, 0).address), 0);
+        assert_eq!(boot.weight_of(&committee_member(163, 0).address), 3_000);
+        assert_eq!(boot.operators.len(), 2);
+    }
+
+    /// G5 A4 BW-6: an operator that leads no block takes a strike per judged
+    /// epoch and forfeits at 3; a judged epoch at a third or more of its
+    /// expectation resets the strikes (here 4 of 9); an operator expected to
+    /// lead fewer than 9 blocks (here 2) is not judged; each block counts in
+    /// its own epoch, and a judged epoch's counts are removed.
+    #[test]
+    fn g5_a_silent_bootstrap_operator_is_struck_out_after_three_epochs() {
+        let ain = G5_AIN;
+        // I = 20, W = 10,000: a and b expect 20 x 4,500 / 10,000 = 9 leads,
+        // c expects 2.
+        let members = [
+            (171u8, 1_000u64, 3_500u64),
+            (172, 1_000, 3_500),
+            (173, 100, 900),
+        ];
+        let mut chain = G5Chain::new("g5_boot_strikes", 14, |db| {
+            seed_bootstrap_chain(db, &members, 1_000_000 * ain);
+        });
+        let db = chain.db.clone();
+        let (a, b, c) = (
+            committee_member(171, 0).address,
+            committee_member(172, 0).address,
+            committee_member(173, 0).address,
+        );
+        let strikes = |db: &StateDB, who: &str| {
+            bootstrap_of(db)
+                .operators
+                .iter()
+                .find(|o| o.address == who)
+                .map(|o| o.strikes)
+        };
+        let lead = |chain: &mut G5Chain, leaders: &[&String], until: u64| {
+            let mut i = 0;
+            while chain.height < until {
+                chain.proposer = leaders[i % leaders.len()].clone();
+                chain.block(chain.timestamp + 7, vec![]);
+                i += 1;
+            }
+        };
+        lead(&mut chain, &[&a], 20);
+        assert_eq!(strikes(&db, &b), Some(1));
+        assert_eq!(strikes(&db, &a), Some(0));
+        assert_eq!(strikes(&db, &c), Some(0), "2 expected: not judged");
+        // b leads 4 of its 9: a third or more, so the strikes reset.
+        lead(&mut chain, &[&a, &a, &a, &a, &b], 40);
+        assert_eq!(strikes(&db, &b), Some(0), "a passing judged epoch resets");
+        lead(&mut chain, &[&a], 60);
+        lead(&mut chain, &[&a], 80);
+        assert_eq!(strikes(&db, &b), Some(2));
+        assert_eq!(bootstrap_of(&db).weight_of(&b), 3_500);
+        lead(&mut chain, &[&a], 100);
+        assert_eq!(strikes(&db, &b), None, "struck out: forfeited");
+        assert_eq!(bootstrap_of(&db).weight_of(&b), 0);
+        assert_eq!(strikes(&db, &c), Some(0), "never judged, never struck");
+        assert!(
+            db.get(&bootstrap_led_key(4)).unwrap().is_none(),
+            "judged counts are removed"
+        );
+        assert!(
+            db.get(&bootstrap_led_key(5)).unwrap().is_none(),
+            "the boundary block counts in the epoch it closes"
+        );
     }
 
     /// Build a hex-encoded BCS `coin::transfer` payload from `from` to `to`.

@@ -252,6 +252,25 @@ curl -s http://localhost:8001/rpc -X POST \
   -d '{"method": "get_validators", "params": []}' | jq
 ```
 
+### 5. Bootstrap Weight (Launch Operators)
+
+At launch the chain has no pre-mine. Part of the committee's weight is **bootstrap weight**: consensus weight with no coins, owned by nobody, assigned to launch operators in the genesis file (G5 amendment A4; `docs/research/genesis_bootstrap.md`). It earns rewards for the operator who runs it, but you cannot transfer, stake or withdraw it.
+
+The protocol takes it away automatically, with no human decision:
+
+- **It shrinks** as owned stake grows. At every epoch boundary the total is cut to `s_min − owned stake`, pro rata. It never grows back.
+- **It is forfeited for good** if your validator is jailed, is convicted of equivocation, leaves the validator set, or takes **3 strikes**.
+- **A strike** is an epoch in which you led fewer than a third of the blocks your weight entitles you to. Leader election is stake-weighted, so an online validator leads in proportion to its weight. If you are expected to lead fewer than 9 blocks in an epoch, that epoch is not judged. A judged epoch at a third or more of your expectation clears your strikes.
+
+Check it with:
+
+```bash
+curl -s -X POST http://127.0.0.1:8002/rpc -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"aincore_getBootstrap","params":[]}'
+```
+
+It returns `s_min_ain`, `bootstrap_ain`, `owned_stake_ain`, `target_ain`, and each operator's `weight` and `strikes`.
+
 ---
 
 ## Monitoring
