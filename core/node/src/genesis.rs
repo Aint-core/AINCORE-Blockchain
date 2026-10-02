@@ -762,7 +762,8 @@ pub const CLOCK_LOSS_BUDGET_BPS: u64 = 50;
 /// seconds c such that capping every interval at c loses at most
 /// `CLOCK_LOSS_BUDGET_BPS` of the measured time: sum(max(0, x - c)) <=
 /// budget x sum(x). None without intervals. On the S6 cluster (4 validators,
-/// 1,000 blocks, mean 6.76 s) k = 2 (14 s) lost 3.99 % and 24 s loses 0.50 %.
+/// 1,000 intervals, mean 6.749 s) k = 2 (14 s) lost 3.99 %, 24 s loses 0.504 %
+/// and 25 s 0.415 %: C_tau = 25 s.
 pub fn clock_cap_from_intervals(intervals: &[u64]) -> Option<u64> {
     let total: u128 = intervals.iter().map(|&x| x as u128).sum();
     if total == 0 {
