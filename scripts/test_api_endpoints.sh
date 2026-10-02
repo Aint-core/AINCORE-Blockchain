@@ -23,12 +23,6 @@ echo "4. Testing /get_latest_blocks..."
 curl -s "$BASE_URL/get_latest_blocks?limit=1" | jq .
 echo "--------------------------------"
 
-echo "5. Testing JSON-RPC aincore_getMiningStats..."
-curl -s -X POST -H "Content-Type: application/json" \
-     -d '{"jsonrpc":"2.0", "method": "aincore_getMiningStats", "params": [], "id":1}' \
-     "$BASE_URL/rpc" | jq .
-echo "--------------------------------"
-
 echo "6. Testing JSON-RPC aincore_getDaStatus..."
 curl -s -X POST -H "Content-Type: application/json" \
      -d '{"jsonrpc":"2.0", "method": "aincore_getDaStatus", "params": [], "id":1}' \

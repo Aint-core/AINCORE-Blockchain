@@ -1018,6 +1018,21 @@ fn test_inflight_loan_ledger_requeues_orphans_and_settles_executed() {
     assert!(mp.add_transaction(tx_b).is_err(), "requeued tx stays deduped");
 }
 
+/// BUG_LEDGER B9: loans age in the caller's clock, not the wall clock. A
+/// loan stamped at 100 is not stale at 129 with a 30 s limit, and is at 130,
+/// however much wall time passed; a pinned clock never re-queues.
+#[test]
+fn loans_age_in_the_callers_clock() {
+    let mut mp = Mempool::new();
+    let tx = make_test_tx(0);
+    mp.add_transaction(tx.clone()).expect("admit");
+    assert_eq!(mp.get_pending_transactions_at(10, 100), vec![tx.clone()]);
+    assert_eq!(mp.requeue_stale_at(30, 100), 0, "a pinned clock never re-queues");
+    assert_eq!(mp.requeue_stale_at(30, 129), 0);
+    assert_eq!(mp.requeue_stale_at(30, 130), 1);
+    assert_eq!(mp.get_pending_transactions_at(10, 130), vec![tx]);
+}
+
 /// The block builder trims transactions that do not fit the vertex byte budget.
 /// Those raws are still LOANED (get_pending_transactions moved them to
 /// inflight), so they must be handed back intact and re-servable in their

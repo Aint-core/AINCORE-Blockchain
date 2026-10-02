@@ -85,6 +85,13 @@ const PQC_DILITHIUM5_HEX_LEN: usize = PQC_DILITHIUM5_SIG_BYTES * 2;
 /// Dilithium5 public key length as raw bytes (NIST round-3 spec).
 const PQC_DILITHIUM5_PUBKEY_BYTES: usize = 2592;
 
+/// Seconds since the Unix epoch, for callers without a clock of their own.
+fn wall_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 pub struct Mempool {
     pending_txs: VecDeque<String>,
     seen_txs: HashSet<String>,       // Deduplication
@@ -98,8 +105,11 @@ pub struct Mempool {
     /// briefly behind the network orphans its own vertex) silently destroyed
     /// its whole payload — the sender's nonce sequence then had a permanent
     /// hole, every later transaction died with "Invalid Sequence", and the
-    /// account was wedged forever. Keyed by the RAW transaction string; value is loaned_at.
-    inflight: std::collections::HashMap<String, (std::time::Instant, u8)>,
+    /// account was wedged forever. Keyed by the RAW transaction string; value is
+    /// (loaned at, in the caller's clock's seconds; attempts). The clock is the
+    /// caller's (consensus passes its injectable `now_secs`), so a simulated
+    /// cluster never re-queues by the wall clock (BUG_LEDGER B9).
+    inflight: std::collections::HashMap<String, (u64, u8)>,
     /// RE-AUDIT MEDIUM (perf): parsed (sender, sequence_number, gas_price) per
     /// raw tx, filled once at admission so selection never re-parses every
     /// pending transaction under the mempool lock on every tick.
@@ -585,7 +595,13 @@ impl Mempool {
         self.pending_txs.iter().any(|tx| matches(tx)) || self.inflight.keys().any(|tx| matches(tx))
     }
 
+    /// `get_pending_transactions_at` with the wall clock.
     pub fn get_pending_transactions(&mut self, limit: usize) -> Vec<String> {
+        self.get_pending_transactions_at(limit, wall_secs())
+    }
+
+    /// Select up to `limit` transactions and loan them, stamped `now_secs`.
+    pub fn get_pending_transactions_at(&mut self, limit: usize, now_secs: u64) -> Vec<String> {
         if limit == 0 || self.pending_txs.is_empty() {
             return Vec::new();
         }
@@ -653,7 +669,7 @@ impl Mempool {
 
         let selected_set: HashSet<usize> = selected.iter().copied().collect();
         let result: Vec<String> = selected.iter().map(|&i| raws[i].clone()).collect();
-        let now = std::time::Instant::now();
+        let now = now_secs;
         for raw in &result {
             self.remove_pending_nonce(raw);
             // Loaned, not gone: see the `inflight` field doc. Attempts carry
@@ -751,12 +767,18 @@ impl Mempool {
         }
     }
 
+    /// `requeue_stale_at` with the wall clock.
     pub fn requeue_stale(&mut self, max_age: std::time::Duration) -> usize {
-        let now = std::time::Instant::now();
+        self.requeue_stale_at(max_age.as_secs(), wall_secs())
+    }
+
+    /// Re-queue loans at least `max_age_secs` old at `now_secs`, in the same
+    /// clock the loans were stamped with.
+    pub fn requeue_stale_at(&mut self, max_age_secs: u64, now_secs: u64) -> usize {
         let stale: Vec<(String, u8)> = self
             .inflight
             .iter()
-            .filter(|(_, (at, _))| now.duration_since(*at) > max_age)
+            .filter(|(_, (at, _))| now_secs.saturating_sub(*at) >= max_age_secs)
             .map(|(raw, (_, n))| (raw.clone(), *n))
             .collect();
         let mut requeued = 0usize;

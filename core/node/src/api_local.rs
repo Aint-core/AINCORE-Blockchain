@@ -1141,17 +1141,6 @@ fn handle_rpc_method(
             Ok(serde_json::json!(peer_list))
         },
         // S3: aincore_debug REMOVED — raw DB key scanner is a data exfiltration vector on mainnet
-        "aincore_getMiningStats" => {
-            let peers = data.peers.lock()
-                .map_err(|e| JsonRpcError { code: -32000, message: format!("Peers lock error: {}", e) })?;
-            // Mock data for now, but active_miners is real (connected peers)
-            Ok(serde_json::json!({
-                "active_miners": peers.len(),
-                "avg_bqi": 0.0, // Oracle not yet connected
-                "network_hashrate": format!("{} TH/s (Est)", peers.len() * 10),
-                "difficulty": 1 // Genesis difficulty
-            }))
-        },
         "aincore_createProposal" => {
             // SECURITY (FIX-3): This handler previously mutated governance state
             // directly from an UNAUTHENTICATED `proposer` string param, bypassing
@@ -1217,13 +1206,6 @@ fn handle_rpc_method(
                 "status": "Active",
                 "pending_tx_count": mempool.len() // Real count!
             }))
-        },
-        "aincore_getFheKey" => {
-            let key = match data.storage.get("sys:fhe:global_public_key") {
-                Ok(Some(k)) => k,
-                _ => "FHE_MOCK_PUBLIC_KEY_12345".to_string()
-            };
-            Ok(serde_json::json!({ "public_key": key }))
         },
         "aincore_getDaStatus" => {
              // Retrieve DA internal state from storage keys
@@ -1794,23 +1776,6 @@ fn handle_rpc_method(
             }
         },
 
-        "aincore_verifyFraudProof" => {
-            // params: [proof_json]
-            if let Some(proof) = params.get(0) {
-                // Verify fraud proof structure
-                let is_valid = proof.get("proof_type").is_some()
-                    && proof.get("evidence").is_some()
-                    && proof.get("block_height").is_some();
-
-                Ok(serde_json::json!({
-                    "valid_structure": is_valid,
-                    "status": if is_valid { "accepted_for_review" } else { "invalid_format" },
-                    "required_fields": ["proof_type", "evidence", "block_height", "offender"]
-                }))
-            } else {
-                Err(JsonRpcError { code: -32602, message: "Invalid params: [proof_object]".into() })
-            }
-        },
 
         "aincore_getShardProof" => {
             // params: [epoch, shard_id]

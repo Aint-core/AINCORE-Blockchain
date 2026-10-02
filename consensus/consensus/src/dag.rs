@@ -1324,7 +1324,10 @@ impl DagConsensus {
             // that never executed (orphaned vertex payloads and
             // nonce-deferred txs). 30s ≈ well past commit latency, well
             // short of user-visible loss.
-            let _ = mp.requeue_stale(std::time::Duration::from_secs(30));
+            // In consensus's own clock (injectable), so a simulated cluster
+            // never re-queues by the wall clock (BUG_LEDGER B9).
+            let now = (self.now_secs)();
+            let _ = mp.requeue_stale_at(30, now);
             // Throughput tuning: pull size per vertex. Narwhal is designed for
             // large batches; 50 was a conservative bring-up cap and became the
             // de-facto per-round throughput ceiling. Env-tunable so the burn-in
@@ -1334,7 +1337,7 @@ impl DagConsensus {
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|v| (1..=10_000).contains(v))
                 .unwrap_or(500);
-            payload = mp.get_pending_transactions(pull);
+            payload = mp.get_pending_transactions_at(pull, now);
             if !payload.is_empty() {
                 println!("🚀 DAG PULLED {} TXS FROM MEMPOOL", payload.len());
             }

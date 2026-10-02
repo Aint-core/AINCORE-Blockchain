@@ -680,18 +680,6 @@ export class Connection {
     // =====================
 
     /**
-     * Get mining statistics
-     */
-    async getMiningStats(): Promise<{
-        active_miners: number;
-        avg_bqi: number;
-        network_hashrate: string;
-        difficulty: number;
-    }> {
-        return await this.request('aincore_getMiningStats', []);
-    }
-
-    /**
      * Get mempool status (pending transactions)
      */
     async getMempoolStatus(): Promise<{
@@ -699,13 +687,6 @@ export class Connection {
         pending_tx_count: number;
     }> {
         return await this.request('aincore_getMempoolStatus', []);
-    }
-
-    /**
-     * Get FHE (Fully Homomorphic Encryption) public key
-     */
-    async getFheKey(): Promise<{ public_key: string }> {
-        return await this.request('aincore_getFheKey', []);
     }
 
     /**
