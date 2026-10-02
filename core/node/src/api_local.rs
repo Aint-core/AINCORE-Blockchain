@@ -611,9 +611,8 @@ fn held_block(storage: &StateDB, height: u64) -> Result<blockchain::Block, JsonR
 /// Reed-Solomon encode of the whole body.
 fn extended_body(block: &blockchain::Block) -> Result<Arc<da::Extended>, JsonRpcError> {
     const KEEP: usize = 4;
-    static RECENT: std::sync::OnceLock<
-        Mutex<std::collections::VecDeque<(String, Arc<da::Extended>)>>,
-    > = std::sync::OnceLock::new();
+    type Recent = Mutex<std::collections::VecDeque<(String, Arc<da::Extended>)>>;
+    static RECENT: std::sync::OnceLock<Recent> = std::sync::OnceLock::new();
     let recent = RECENT.get_or_init(Default::default);
     let hash = &block.header.hash;
     if let Some((_, ext)) = recent
