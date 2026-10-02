@@ -2816,8 +2816,11 @@ mod tests {
                 executor::BOOTSTRAP_KEY,
                 &serde_json::to_string(&executor::BootstrapState {
                     s_min: 10_000,
+                    genesis_ceilings: 3_000,
+                    full_since: None,
                     operators: vec![executor::BootstrapOperator {
                         address: a.clone(),
+                        entity: a.clone(),
                         ceiling: 3_000,
                         weight: 2_500,
                         score: 900_000,

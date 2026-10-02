@@ -3,13 +3,13 @@
 //!
 //! It reads chain data only, from a stopped testnet node's datadir (or a copy):
 //! blocks with their proposers and anchor rounds, the committee records of each
-//! epoch, jail and conviction records, and transaction receipts. It writes the
-//! mainnet genesis inputs: `allocations.json` (each qualified operator's bonded
-//! stake and bootstrap weight, for `gen-multi --allocations-file`),
-//! `accounts.json` (the public track, for `gen-multi --accounts-file`) and
-//! `report.json` (every number behind them). Run on any node's datadir at least
-//! W (7 days) past the snapshot, so every offense of the window has landed, it
-//! gives the same output.
+//! epoch, jail records, and transaction receipts. It writes the mainnet genesis
+//! inputs: `allocations.json` (each qualified operator's bonded stake and
+//! bootstrap weight, for `gen-multi --allocations-file`), `accounts.json` (the
+//! public track, for `gen-multi --accounts-file`) and `report.json` (every
+//! number behind them). Run on any node's datadir at least W (7 days) past the
+//! snapshot, so every offense of the window has landed, it gives the same
+//! output.
 
 use clap::Args;
 use consensus::v4::epoch;
@@ -22,16 +22,17 @@ use storage::StateDB;
 pub const OPERATOR_POOL_AIN: u64 = 1_000_000;
 /// IT-1: the public track, liquid at mainnet genesis.
 pub const PUBLIC_POOL_AIN: u64 = 500_000;
-/// IT-6: the most one public account receives.
+/// IT-6: the most one funding cluster receives.
 pub const PUBLIC_CAP_AIN: u64 = 1_000;
 /// IT-6: points must fall on this many distinct days.
 pub const MIN_DAYS: usize = 3;
-/// IT-3: the share of window epochs an operator must sit in the committee.
+/// IT-3: the share of window blocks an operator must sit in the committee.
 pub const COMMITTEE_SHARE_BPS: u64 = 9_000;
-/// IT-3: an operator's commit share against the median member's.
+/// IT-3: an operator's commit share against the median operator's.
 pub const RELATIVE_COMMIT_BPS: u64 = 9_000;
-/// IT-5: mainnet needs at least this many qualified independent operators.
-pub const MIN_OPERATORS: usize = 3;
+/// IT-5: mainnet needs at least this many qualified operators, so that two
+/// forfeits still leave four parties (BW-11).
+pub const MIN_OPERATORS: usize = 5;
 /// IT-5: the founder's bootstrap weight is at most this share of s_min.
 pub const FOUNDER_MAX_BPS: u64 = 3_000;
 
@@ -46,9 +47,13 @@ pub struct ScoreArgs {
     /// The window's last block, the snapshot (IT-2: announced in advance).
     #[arg(long)]
     pub to_height: u64,
-    /// The founder's testnet validators: never scored, never paid (IT-3).
+    /// The founder's testnet validators: never scored, never paid, and below
+    /// a third of every window committee (IT-2, IT-3).
     #[arg(long, value_delimiter = ',')]
     pub founder: Vec<String>,
+    /// The testnet faucet account: the root of every funding cluster (IT-6).
+    #[arg(long)]
+    pub faucet: String,
     /// The mainnet s_min in whole AIN (BW-1: 18.5 M).
     #[arg(long, default_value_t = 18_500_000)]
     pub s_min_ain: u64,
@@ -72,7 +77,7 @@ pub struct Allocation {
 /// What the window shows of one committee member (IT-3).
 #[derive(Serialize, Debug, Clone, Default, PartialEq)]
 pub struct OperatorScore {
-    pub epochs_in_committee: u64,
+    pub blocks_in_committee: u64,
     pub slots: u64,
     pub commits: u64,
     /// The lowest BW-6 score over the window, parts per million.
@@ -89,6 +94,8 @@ pub struct OperatorScore {
 pub struct PublicScore {
     pub points: u64,
     pub days: usize,
+    /// The account the faucet funded, from which this one's funds came.
+    pub cluster: String,
     pub ain: u64,
 }
 
@@ -97,7 +104,7 @@ pub struct Report {
     pub from_height: u64,
     pub to_height: u64,
     pub epochs: Vec<u64>,
-    /// The median member's commit share, parts per million.
+    /// The median non-founder member's commit share, parts per million.
     pub median_commit_ppm: u64,
     pub operators: BTreeMap<String, OperatorScore>,
     pub allocations: Vec<Allocation>,
@@ -116,12 +123,22 @@ fn block_at(db: &StateDB, height: u64) -> Result<blockchain::Block, Box<dyn std:
     Ok(serde_json::from_str(&raw)?)
 }
 
-/// IT-6: what a successful transaction earns, and for a delegation, that it
-/// must be held for an epoch first.
+/// An address argument of an entry call, as lowercase hex.
+fn address_arg(call: &vm_move::EntryFunctionCall, index: usize) -> Option<String> {
+    let addr: move_core_types::account_address::AccountAddress =
+        bcs::from_bytes(call.args.get(index)?).ok()?;
+    Some(hex::encode(addr.to_vec()))
+}
+
+/// IT-6: what a successful transaction does that the public track counts.
+/// Argument 0 of an entry call is the signer slot; the call's own arguments
+/// follow it.
+#[derive(Debug, PartialEq)]
 enum Action {
-    Points(u64),
-    Delegate,
-    Undelegate,
+    Transfer { to: String },
+    Delegate { validator: String },
+    Undelegate { validator: String },
+    Points { kind: &'static str, points: u64 },
     None,
 }
 
@@ -138,22 +155,29 @@ fn classify(tx: &executor::Transaction) -> Action {
         return Action::None;
     }
     match (call.module.name().as_str(), call.function.as_str()) {
-        // A transfer to oneself proves nothing.
         ("coin", "transfer") => {
-            let to: Option<move_core_types::account_address::AccountAddress> =
-                call.args.first().and_then(|a| bcs::from_bytes(a).ok());
-            let from = hex::decode(tx.sender.trim_start_matches("0x")).ok();
-            match (to, from) {
-                (Some(to), Some(from)) if to.to_vec() != from => Action::Points(1),
-                _ => Action::None,
-            }
+            address_arg(&call, 1).map_or(Action::None, |to| Action::Transfer { to })
         }
-        ("delegation", "delegate") => Action::Delegate,
-        ("delegation", "undelegate") => Action::Undelegate,
-        ("dex", "swap_x_to_y" | "swap_y_to_x" | "add_liquidity") => Action::Points(2),
-        ("governance", "vote") => Action::Points(2),
+        ("delegation", "delegate") => {
+            address_arg(&call, 1).map_or(Action::None, |validator| Action::Delegate { validator })
+        }
+        ("delegation", "undelegate") => {
+            address_arg(&call, 1).map_or(Action::None, |validator| Action::Undelegate { validator })
+        }
+        ("dex", "swap_x_to_y" | "swap_y_to_x" | "add_liquidity") => Action::Points {
+            kind: "dex",
+            points: 2,
+        },
+        ("governance", "vote") => Action::Points {
+            kind: "vote",
+            points: 2,
+        },
         _ => Action::None,
     }
+}
+
+fn canonical(address: &str) -> String {
+    address.trim_start_matches("0x").to_ascii_lowercase()
 }
 
 /// Score the window and derive the mainnet allocations (IT-2..IT-6).
@@ -162,6 +186,7 @@ pub fn score(
     from_height: u64,
     to_height: u64,
     founder: &[String],
+    faucet: &str,
     s_min_ain: u64,
     founder_bootstrap_ain: u64,
 ) -> Result<Report, Box<dyn std::error::Error>> {
@@ -175,10 +200,10 @@ pub fn score(
     }
     let interval =
         epoch::epoch_interval(db).ok_or_else(|| err("the datadir pins no epoch length"))?;
-    let founder: BTreeSet<String> = founder.iter().map(|a| a.to_ascii_lowercase()).collect();
+    let founder: BTreeSet<String> = founder.iter().map(|a| canonical(a)).collect();
+    let faucet = canonical(faucet);
 
-    // IT-3: committee membership, slots and commits per epoch, by the
-    // leader schedule exactly as BW-6 counts it.
+    // IT-2: every window committee, with the founder below a third of each.
     let first_epoch = epoch::epoch_of_height(from_height, interval);
     let last_epoch = epoch::epoch_of_height(to_height, interval);
     let mut committees: BTreeMap<u64, Vec<(String, u64)>> = BTreeMap::new();
@@ -189,9 +214,25 @@ pub fn score(
             .map(|m| (m.address, m.stake))
             .collect();
         stakes.sort();
+        let total: u128 = stakes.iter().map(|(_, w)| *w as u128).sum();
+        let held: u128 = stakes
+            .iter()
+            .filter(|(a, _)| founder.contains(a))
+            .map(|(_, w)| *w as u128)
+            .sum();
+        if 3 * held >= total {
+            return Err(err(format!(
+                "the founder held {held} of {total} in epoch {e}'s committee: a third or more, \
+                 so the window was not fair"
+            )));
+        }
         committees.insert(e, stakes);
     }
+
+    // IT-3: membership, slots and commits per epoch, by the leader schedule
+    // exactly as BW-6 counts it.
     let mut per_epoch: BTreeMap<u64, BTreeMap<String, (u64, u64)>> = BTreeMap::new();
+    let mut operators: BTreeMap<String, OperatorScore> = BTreeMap::new();
     let mut last_round = if from_height > 1 {
         block_at(db, from_height - 1)?.header.round
     } else {
@@ -202,6 +243,15 @@ pub fn score(
         let block = block_at(db, h)?;
         let e = epoch::epoch_of_height(h, interval);
         let stakes = &committees[&e];
+        for (address, _) in stakes {
+            operators
+                .entry(address.clone())
+                .or_insert(OperatorScore {
+                    min_score: executor::BOOTSTRAP_SCORE_SCALE,
+                    ..Default::default()
+                })
+                .blocks_in_committee += 1;
+        }
         let anchor = block.header.round;
         let counts = per_epoch.entry(e).or_default();
         let mut round = last_round + 1;
@@ -220,16 +270,6 @@ pub fn score(
     }
     let snapshot_round = blocks.last().map_or(0, |b| b.header.round);
 
-    let mut operators: BTreeMap<String, OperatorScore> = BTreeMap::new();
-    for stakes in committees.values() {
-        for (address, _) in stakes {
-            let s = operators.entry(address.clone()).or_insert(OperatorScore {
-                min_score: executor::BOOTSTRAP_SCORE_SCALE,
-                ..Default::default()
-            });
-            s.epochs_in_committee += 1;
-        }
-    }
     let mut scores: BTreeMap<String, u64> = BTreeMap::new();
     for counts in per_epoch.values() {
         for (address, &(slots, commits)) in counts {
@@ -245,48 +285,43 @@ pub fn score(
             s.min_score = s.min_score.min(*score);
         }
     }
+    let share_of =
+        |s: &OperatorScore| (s.commits as u128 * 1_000_000 / s.slots.max(1) as u128) as u64;
+    // The median of the operators, never of the founder's nodes: the founder
+    // cannot move the bar.
     let mut shares: Vec<u64> = operators
-        .values()
-        .filter(|s| s.slots > 0)
-        .map(|s| (s.commits as u128 * 1_000_000 / s.slots as u128) as u64)
+        .iter()
+        .filter(|(a, s)| s.slots > 0 && !founder.contains(*a))
+        .map(|(_, s)| share_of(s))
         .collect();
     shares.sort_unstable();
-    let median_commit_ppm = if shares.is_empty() {
-        0
-    } else if shares.len() % 2 == 1 {
-        shares[shares.len() / 2]
-    } else {
-        (shares[shares.len() / 2 - 1] + shares[shares.len() / 2]) / 2
+    let median_commit_ppm = match shares.len() {
+        0 => 0,
+        n if n % 2 == 1 => shares[n / 2],
+        n => (shares[n / 2 - 1] + shares[n / 2]) / 2,
     };
-    let epochs = committees.len() as u64;
+    let window_blocks = to_height - from_height + 1;
     for (address, s) in operators.iter_mut() {
         // A jail record names the round of the offense; an offense up to the
-        // snapshot's round counts. A conviction comes with a jail record.
-        let jail = db.get(&format!("validator:jailed:{address}"))?;
-        s.jailed = jail
-            .as_deref()
-            .map(|r| {
+        // snapshot's round counts. A conviction always comes with one.
+        s.jailed = db
+            .get(&format!("validator:jailed:{address}"))?
+            .is_some_and(|r| {
                 r.trim()
                     .parse::<u64>()
                     .map_or(true, |round| round <= snapshot_round)
-            })
-            .unwrap_or(false)
-            || db
-                .get(&format!("validator:convicted_full:{address}"))?
-                .is_some();
+            });
         s.founder = founder.contains(address);
-        let share = if s.slots == 0 {
-            0
-        } else {
-            (s.commits as u128 * 1_000_000 / s.slots as u128) as u64
-        };
+        let share = share_of(s);
         s.reason = if s.founder {
             Some("founder".into())
-        } else if s.epochs_in_committee * 10_000 < epochs * COMMITTEE_SHARE_BPS {
+        } else if s.blocks_in_committee * 10_000 < window_blocks * COMMITTEE_SHARE_BPS {
             Some(format!(
-                "in {} of {epochs} committees",
-                s.epochs_in_committee
+                "in the committee for {} of {window_blocks} blocks",
+                s.blocks_in_committee
             ))
+        } else if s.slots == 0 {
+            Some("no leader slots in the window".into())
         } else if share as u128 * 10_000 < median_commit_ppm as u128 * RELATIVE_COMMIT_BPS as u128 {
             Some(format!(
                 "committed {share} ppm of its slots, median {median_commit_ppm}"
@@ -294,7 +329,7 @@ pub fn score(
         } else if s.min_score < executor::BOOTSTRAP_SCORE_FLOOR {
             Some(format!("its score fell to {}", s.min_score))
         } else if s.jailed {
-            Some("jailed or convicted".into())
+            Some("jailed".into())
         } else {
             None
         };
@@ -302,7 +337,8 @@ pub fn score(
     }
 
     // IT-4, IT-5: equal stake from the operator track, equal bootstrap
-    // weight from what the founder's share leaves; no member at a third.
+    // weight from what the founder's share leaves. With five or more
+    // operators no share can reach a third: (s_min - 0) / 5 is 20 %.
     let qualified: Vec<String> = operators
         .iter()
         .filter(|(_, s)| s.qualified)
@@ -329,79 +365,140 @@ pub fn score(
             bootstrap_ain: boot + u64::from((i as u64) < extra),
         })
         .collect();
-    if let Some(a) = allocations
-        .iter()
-        .find(|a| 3 * (a.stake_ain as u128 + a.bootstrap_ain as u128) >= s_min_ain as u128)
-    {
-        return Err(err(format!("{} would hold a third of s_min", a.address)));
-    }
 
-    // IT-6: points on at least three distinct days, by transactions that
-    // succeeded; a delegation counts once held for an epoch inside the window.
+    // IT-6: the funding tree. Each account's funder is the sender of the
+    // first successful transfer it received, from genesis on; its cluster is
+    // the account the faucet funded at the top of that chain.
+    let succeeded = |raw: &str| -> Result<bool, Box<dyn std::error::Error>> {
+        let key = format!("tx_receipt:{}", crypto::hash_hex(raw.as_bytes()));
+        Ok(db
+            .get(&key)?
+            .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+            .is_some_and(|r| r["status"] == "success"))
+    };
+    let mut funder: BTreeMap<String, String> = BTreeMap::new();
+    for h in 1..=to_height {
+        let block = if h >= from_height {
+            blocks[(h - from_height) as usize].clone()
+        } else {
+            block_at(db, h)?
+        };
+        for raw in &block.transactions {
+            let Ok(tx) = serde_json::from_str::<executor::Transaction>(raw) else {
+                continue;
+            };
+            if let Action::Transfer { to } = classify(&tx) {
+                let sender = canonical(&tx.sender);
+                if to != sender && !funder.contains_key(&to) && succeeded(raw)? {
+                    funder.insert(to, sender);
+                }
+            }
+        }
+    }
+    let cluster_of = |account: &str| -> String {
+        let mut at = account.to_string();
+        let mut seen = BTreeSet::new();
+        while let Some(f) = funder.get(&at) {
+            if *f == faucet || !seen.insert(at.clone()) {
+                break;
+            }
+            at = f.clone();
+        }
+        at
+    };
+
+    // Points: each kind counts once per account and UTC day of block time;
+    // a delegation counts once held for an epoch inside the window (no
+    // undelegation from the same pool within I blocks); only successful
+    // transactions; never validators of the window or the founder.
     let validators: BTreeSet<&String> = operators.keys().collect();
-    let mut points: BTreeMap<String, (u64, BTreeSet<u64>)> = BTreeMap::new();
-    let mut delegations: Vec<(String, u64, u64)> = Vec::new();
-    let mut undelegations: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    let mut earned: BTreeMap<String, BTreeMap<(u64, &'static str), u64>> = BTreeMap::new();
+    let mut delegations: Vec<(String, String, u64, u64)> = Vec::new();
+    let mut undelegations: BTreeMap<(String, String), Vec<u64>> = BTreeMap::new();
     for block in &blocks {
         let day = block.header.timestamp / 86_400;
         for raw in &block.transactions {
             let Ok(tx) = serde_json::from_str::<executor::Transaction>(raw) else {
                 continue;
             };
-            let receipt_key = format!("tx_receipt:{}", crypto::hash_hex(raw.as_bytes()));
-            let succeeded = db
-                .get(&receipt_key)?
-                .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
-                .is_some_and(|r| r["status"] == "success");
-            if !succeeded {
+            let sender = canonical(&tx.sender);
+            if validators.contains(&sender) || founder.contains(&sender) || sender == faucet {
                 continue;
             }
-            let sender = tx.sender.trim_start_matches("0x").to_ascii_lowercase();
-            if validators.contains(&sender) || founder.contains(&sender) {
+            let action = classify(&tx);
+            if action == Action::None || !succeeded(raw)? {
                 continue;
             }
-            match classify(&tx) {
-                Action::Points(p) => {
-                    let entry = points.entry(sender).or_default();
-                    entry.0 += p;
-                    entry.1.insert(day);
+            match action {
+                Action::Transfer { to } if to != sender => {
+                    earned
+                        .entry(sender)
+                        .or_default()
+                        .insert((day, "transfer"), 1);
                 }
-                Action::Delegate => delegations.push((sender, block.header.height, day)),
-                Action::Undelegate => undelegations
-                    .entry(sender)
+                Action::Points { kind, points } => {
+                    earned
+                        .entry(sender)
+                        .or_default()
+                        .insert((day, kind), points);
+                }
+                Action::Delegate { validator } => {
+                    delegations.push((sender, validator, block.header.height, day))
+                }
+                Action::Undelegate { validator } => undelegations
+                    .entry((sender, validator))
                     .or_default()
                     .push(block.header.height),
-                Action::None => {}
+                _ => {}
             }
         }
     }
-    for (sender, height, day) in delegations {
-        let held = height + interval <= to_height
-            && !undelegations
-                .get(&sender)
-                .is_some_and(|hs| hs.iter().any(|&u| u > height && u <= height + interval));
-        if held {
-            let entry = points.entry(sender).or_default();
-            entry.0 += 3;
-            entry.1.insert(day);
+    for (sender, validator, height, day) in delegations {
+        let pulled = undelegations
+            .get(&(sender.clone(), validator))
+            .is_some_and(|hs| hs.iter().any(|&u| u > height && u <= height + interval));
+        if height + interval <= to_height && !pulled {
+            earned
+                .entry(sender)
+                .or_default()
+                .insert((day, "delegation"), 3);
         }
     }
-    let eligible: BTreeMap<String, (u64, usize)> = points
-        .into_iter()
-        .filter(|(_, (_, days))| days.len() >= MIN_DAYS)
-        .map(|(a, (p, days))| (a, (p, days.len())))
-        .collect();
-    let total: u128 = eligible.values().map(|(p, _)| *p as u128).sum();
-    let public: BTreeMap<String, PublicScore> = eligible
-        .into_iter()
-        .map(|(a, (p, days))| {
+    let mut eligible: BTreeMap<String, (u64, usize, String)> = BTreeMap::new();
+    for (account, days) in earned {
+        let distinct: BTreeSet<u64> = days.keys().map(|(d, _)| *d).collect();
+        if distinct.len() >= MIN_DAYS {
+            let points = days.values().sum();
+            let cluster = cluster_of(&account);
+            eligible.insert(account, (points, distinct.len(), cluster));
+        }
+    }
+    // The pool pro rata by points, capped per funding cluster; a cluster's
+    // share is split among its accounts by points. What the cap leaves stays
+    // unminted.
+    let total: u128 = eligible.values().map(|(p, _, _)| *p as u128).sum();
+    let mut clusters: BTreeMap<&String, u64> = BTreeMap::new();
+    for (p, _, c) in eligible.values() {
+        *clusters.entry(c).or_default() += p;
+    }
+    let cluster_ain: BTreeMap<&String, (u64, u64)> = clusters
+        .iter()
+        .map(|(c, &p)| {
             let pro_rata = (PUBLIC_POOL_AIN as u128 * p as u128 / total.max(1)) as u64;
+            (*c, (pro_rata.min(PUBLIC_CAP_AIN), p))
+        })
+        .collect();
+    let public: BTreeMap<String, PublicScore> = eligible
+        .iter()
+        .map(|(a, (p, days, c))| {
+            let (ain, points) = cluster_ain[c];
             (
-                a,
+                a.clone(),
                 PublicScore {
-                    points: p,
-                    days,
-                    ain: pro_rata.min(PUBLIC_CAP_AIN),
+                    points: *p,
+                    days: *days,
+                    cluster: c.clone(),
+                    ain: (ain as u128 * *p as u128 / points.max(1) as u128) as u64,
                 },
             )
         })
@@ -428,6 +525,7 @@ pub fn run(args: ScoreArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.from_height,
         args.to_height,
         &args.founder,
+        &args.faucet,
         args.s_min_ain,
         args.founder_bootstrap_ain,
     )?;
@@ -448,11 +546,11 @@ pub fn run(args: ScoreArgs) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     write("accounts.json", serde_json::to_string_pretty(&accounts)?)?;
     write("report.json", serde_json::to_string_pretty(&report)?)?;
-    let qualified = report.allocations.len();
     let paid: u64 = accounts.iter().map(|a| a.balance_ain as u64).sum();
     println!(
-        "🏁 {qualified} operators qualified ({} AIN bonded, {} AIN of bootstrap weight each), \
+        "🏁 {} operators qualified ({} AIN bonded, {} AIN of bootstrap weight each), \
          {} public accounts paid {paid} AIN; written to {}",
+        report.allocations.len(),
         report.allocations[0].stake_ain,
         report.allocations[0].bootstrap_ain,
         accounts.len(),
@@ -468,30 +566,47 @@ mod tests {
     use std::sync::Arc;
 
     fn temp_db(name: &str) -> Arc<StateDB> {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "aincore_score_{name}_{}_{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
+        let _ = std::fs::remove_dir_all(&dir);
         Arc::new(StateDB::open(dir.to_str().unwrap()).unwrap())
     }
 
+    fn key(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn address_of(seed: u8) -> String {
+        crypto::derive_address(key(seed).verifying_key().as_bytes()).unwrap()
+    }
+
+    fn move_address(seed: u8) -> move_core_types::account_address::AccountAddress {
+        move_core_types::account_address::AccountAddress::from_hex_literal(&format!(
+            "0x{}",
+            address_of(seed)
+        ))
+        .unwrap()
+    }
+
     fn member(seed: u8, stake: u64) -> blockchain::committee::ValidatorInfo {
-        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
         blockchain::committee::ValidatorInfo {
-            address: crypto::derive_address(key.verifying_key().as_bytes()).unwrap(),
+            address: address_of(seed),
             stake,
-            ed25519_public_key: hex::encode(key.verifying_key().as_bytes()),
+            ed25519_public_key: hex::encode(key(seed).verifying_key().as_bytes()),
             bls_public_key: String::new(),
             bls_pop: String::new(),
         }
     }
 
-    fn tx(sender_seed: u8, module: &str, function: &str, args: Vec<Vec<u8>>) -> String {
-        let key = ed25519_dalek::SigningKey::from_bytes(&[sender_seed; 32]);
+    /// An entry call as clients send it: argument 0 is the signer slot (the
+    /// sender), the call's own arguments follow.
+    fn tx(sender: u8, module: &str, function: &str, args: Vec<Vec<u8>>, nonce: u64) -> String {
+        let mut all = vec![bcs::to_bytes(&move_address(sender)).unwrap()];
+        all.extend(args);
         let call = vm_move::EntryFunctionCall {
             module: move_core_types::language_storage::ModuleId::new(
                 vm_move::system_address(),
@@ -499,39 +614,53 @@ mod tests {
             ),
             function: function.into(),
             ty_args: vec![],
-            args,
+            args: all,
         };
         serde_json::json!({
             "chain_id": "AINCORE-TESTNET",
-            "sender": crypto::derive_address(key.verifying_key().as_bytes()).unwrap(),
+            "sender": address_of(sender),
             "input_objects": [],
             "payload": hex::encode(
                 bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap()
             ),
             "gas_limit": 100_000,
             "gas_price": 1,
-            "sequence_number": sender_seed as u64,
-            "public_key": hex::encode(key.verifying_key().as_bytes()),
+            "sequence_number": nonce,
+            "public_key": hex::encode(key(sender).verifying_key().as_bytes()),
             "signature": "",
         })
         .to_string()
     }
 
-    fn address_of(seed: u8) -> String {
-        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
-        crypto::derive_address(key.verifying_key().as_bytes()).unwrap()
+    fn transfer(from: u8, to: u8, nonce: u64) -> String {
+        tx(
+            from,
+            "coin",
+            "transfer",
+            vec![
+                bcs::to_bytes(&move_address(to)).unwrap(),
+                bcs::to_bytes(&1u128).unwrap(),
+            ],
+            nonce,
+        )
     }
 
-    /// A testnet of four equal validators over 3 epochs of I = 20 (60 blocks,
-    /// one a day): blocks follow the leader schedule, and `offline` members'
-    /// rounds are skipped. `txs` go into the given heights, all succeeding.
+    /// A testnet of `stakes` (validators seeded 1..) over 3 epochs of I = 20
+    /// (60 blocks, one a day): blocks follow the leader schedule, and
+    /// `offline` validators' rounds are skipped. `txs` go into the given
+    /// heights, all succeeding.
     fn testnet(
         name: &str,
+        stakes: &[u64],
         offline: &[usize],
         txs: &[(u64, String)],
     ) -> (Arc<StateDB>, Vec<String>) {
         let db = temp_db(name);
-        let members: Vec<_> = (1..=4).map(|s| member(s, 1_000)).collect();
+        let members: Vec<_> = stakes
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| member(i as u8 + 1, s))
+            .collect();
         let addresses: Vec<String> = members.iter().map(|m| m.address.clone()).collect();
         let _seed = db.seeding();
         db.put(epoch::EPOCH_INTERVAL_KEY, "20").unwrap();
@@ -558,13 +687,16 @@ mod tests {
             )
             .unwrap();
         }
-        let mut stakes: Vec<(String, u64)> = addresses.iter().map(|a| (a.clone(), 1_000)).collect();
-        stakes.sort();
+        let mut sorted: Vec<(String, u64)> = members
+            .iter()
+            .map(|m| (m.address.clone(), m.stake))
+            .collect();
+        sorted.sort();
         let mut round = 0;
         for h in 1..=60u64 {
             round += 2;
             while offline.iter().any(|&i| {
-                addresses[i] == blockchain::committee::leader_for_round(round, &stakes, 0)
+                addresses[i] == blockchain::committee::leader_for_round(round, &sorted, 0)
             }) {
                 round += 2;
             }
@@ -589,7 +721,7 @@ mod tests {
                     receipts_root: String::new(),
                     vertices_root: String::new(),
                     evidence_root: String::new(),
-                    proposer_id: blockchain::committee::leader_for_round(round, &stakes, 0),
+                    proposer_id: blockchain::committee::leader_for_round(round, &sorted, 0),
                     round,
                     timestamp: h * 86_400,
                     hash: String::new(),
@@ -611,39 +743,39 @@ mod tests {
         (db, addresses)
     }
 
+    const FAUCET: u8 = 90;
+
     /// IT-3..IT-5: online operators qualify and share the operator track and
-    /// what the founder's bootstrap weight leaves; an offline one, a jailed
-    /// one and the founder do not, each with its reason.
+    /// what the founder's bootstrap weight leaves; an offline one does not,
+    /// and the founder's nodes neither qualify nor set the median.
     #[test]
     fn the_testnet_scores_operators_by_their_leader_slots() {
-        let (db, a) = testnet("operators", &[3], &[]);
-        {
-            let _seed = db.seeding();
-            db.put(&format!("validator:jailed:{}", a[2]), "7").unwrap();
-        }
-        let refused = score(&db, 1, 60, &[a[0].clone()], 18_500_000, 5_550_000).unwrap_err();
-        assert!(refused.to_string().contains("at least 3"), "{refused}");
-
-        // Without the jail and the founder, three qualify.
-        let (db, a) = testnet("operators3", &[3], &[]);
-        let r = score(&db, 1, 60, &[], 18_500_000, 5_550_000).unwrap();
+        // Seven validators: 1 founder node (index 0), six operators, one of
+        // them (index 6) offline.
+        let stakes = [1_000; 7];
+        let (db, a) = testnet("operators", &stakes, &[6], &[]);
+        let faucet = address_of(FAUCET);
+        let r = score(&db, 1, 60, &[a[0].clone()], &faucet, 18_500_000, 5_550_000).unwrap();
         assert_eq!(r.epochs, vec![0, 1, 2]);
-        let offline = &r.operators[&a[3]];
+        let offline = &r.operators[&a[6]];
         assert!(offline.slots > 0 && offline.commits == 0);
         assert!(offline
             .reason
             .as_deref()
             .unwrap()
             .contains("committed 0 ppm"));
-        let online = &r.operators[&a[0]];
+        assert_eq!(r.operators[&a[0]].reason.as_deref(), Some("founder"));
+        let online = &r.operators[&a[1]];
         assert_eq!(online.commits, online.slots);
-        assert_eq!(online.epochs_in_committee, 3);
-        assert_eq!(r.allocations.len(), 3);
-        // 1,000,000 / 3 = 333,333 bonded each; (18,500,000 - 999,999 -
-        // 5,550,000) / 3 = 3,983,333 rest 2: the first two take 1 more.
-        let boots: Vec<u64> = r.allocations.iter().map(|x| x.bootstrap_ain).collect();
-        assert!(r.allocations.iter().all(|x| x.stake_ain == 333_333));
-        assert_eq!(boots, vec![3_983_334, 3_983_334, 3_983_333]);
+        assert_eq!(online.blocks_in_committee, 60);
+        // The median is the operators' (1,000,000 for the five online, 0 for
+        // the offline): the founder's node is not in it.
+        assert_eq!(r.median_commit_ppm, 1_000_000);
+        assert_eq!(r.allocations.len(), 5);
+        // 1,000,000 / 5 = 200,000 bonded each; (18,500,000 - 1,000,000 -
+        // 5,550,000) / 5 = 2,390,000.
+        assert!(r.allocations.iter().all(|x| x.stake_ain == 200_000));
+        assert!(r.allocations.iter().all(|x| x.bootstrap_ain == 2_390_000));
         let total: u64 = r
             .allocations
             .iter()
@@ -655,81 +787,117 @@ mod tests {
             "the genesis committee weighs s_min"
         );
 
-        // A founder over 30 % is refused.
-        assert!(score(&db, 1, 60, &[], 18_500_000, 5_550_001).is_err());
+        // A founder over 30 % is refused, and so is a window with fewer than
+        // five qualified operators.
+        assert!(score(&db, 1, 60, &[a[0].clone()], &faucet, 18_500_000, 5_550_001).is_err());
+        let few = score(&db, 1, 60, &a[..2], &faucet, 18_500_000, 5_550_000).unwrap_err();
+        assert!(few.to_string().contains("at least 5"), "{few}");
+    }
+
+    /// IT-2: a window in which the founder's nodes held a third of a
+    /// committee is refused: the founder could have decided who qualified.
+    #[test]
+    fn a_window_the_founder_dominated_is_refused() {
+        let (db, a) = testnet(
+            "founder_third",
+            &[3_000, 1_000, 1_000, 1_000, 1_000, 1_000],
+            &[],
+            &[],
+        );
+        let refused = score(
+            &db,
+            1,
+            60,
+            &[a[0].clone()],
+            &address_of(FAUCET),
+            18_500_000,
+            5_550_000,
+        )
+        .unwrap_err();
+        assert!(refused.to_string().contains("not fair"), "{refused}");
     }
 
     /// A jail whose offense round is past the snapshot does not count.
     #[test]
     fn a_jail_counts_only_up_to_the_snapshot() {
-        let (db, a) = testnet("jail", &[], &[]);
+        let (db, a) = testnet("jail", &[1_000; 7], &[], &[]);
         {
             let _seed = db.seeding();
             db.put(&format!("validator:jailed:{}", a[1]), "999999")
                 .unwrap();
             db.put(&format!("validator:jailed:{}", a[2]), "8").unwrap();
         }
-        let r = score(&db, 1, 60, &[], 18_500_000, 5_550_000).unwrap();
+        let r = score(
+            &db,
+            1,
+            60,
+            &[a[0].clone()],
+            &address_of(FAUCET),
+            18_500_000,
+            5_550_000,
+        )
+        .unwrap();
         assert!(r.operators[&a[1]].qualified, "jailed after the snapshot");
-        assert_eq!(
-            r.operators[&a[2]].reason.as_deref(),
-            Some("jailed or convicted")
-        );
+        assert_eq!(r.operators[&a[2]].reason.as_deref(), Some("jailed"));
     }
 
-    /// IT-6: points by kind, on three distinct days, from successful
-    /// transactions only; a delegation counts once held for an epoch; a
-    /// transfer to oneself counts nothing; validators earn nothing here; the
-    /// pool is shared pro rata under the cap.
+    /// IT-6: points by kind, once per kind per day, on three distinct days,
+    /// from successful transactions only; a delegation counts once held for
+    /// an epoch, and an undelegation from another pool does not void it; a
+    /// transfer to oneself counts nothing; validators and the faucet earn
+    /// nothing; the pool is capped per funding cluster.
     #[test]
     fn the_public_track_counts_points_on_three_days() {
-        let addr = |seed: u8| {
-            move_core_types::account_address::AccountAddress::from_hex_literal(&format!(
-                "0x{}",
-                address_of(seed)
-            ))
-            .unwrap()
-        };
-        let transfer = |from: u8, to: u8| {
-            tx(
-                from,
-                "coin",
-                "transfer",
-                vec![
-                    bcs::to_bytes(&addr(to)).unwrap(),
-                    bcs::to_bytes(&1u128).unwrap(),
-                ],
-            )
-        };
+        let pool = |seed: u8| bcs::to_bytes(&move_address(seed)).unwrap();
+        let amount = || bcs::to_bytes(&100u128).unwrap();
         let mut txs = vec![
-            // 50 on 3 days: transfers and a swap.
-            (1, transfer(50, 51)),
-            (2, transfer(50, 51)),
-            (3, tx(50, "dex", "swap_x_to_y", vec![])),
-            // 51 on 2 days: not eligible.
-            (4, transfer(51, 50)),
-            (5, transfer(51, 50)),
-            // 52: a vote, a delegation held, and one undelegated too soon.
-            (6, tx(52, "governance", "vote", vec![])),
-            (7, tx(52, "delegation", "delegate", vec![])),
-            (30, tx(52, "delegation", "delegate", vec![])),
-            (35, tx(52, "delegation", "undelegate", vec![])),
-            (40, transfer(52, 50)),
+            // The faucet funds 50 and 52; 50 funds 55 (55 is in 50's cluster).
+            (1, transfer(FAUCET, 50, 0)),
+            (1, transfer(FAUCET, 52, 1)),
+            (1, transfer(FAUCET, 53, 2)),
+            (1, transfer(FAUCET, 54, 3)),
+            (2, transfer(50, 55, 0)),
+            // 50: transfers on days 2, 3 and 4 (twice on day 3: once), a
+            // swap on day 5.
+            (3, transfer(50, 51, 1)),
+            (3, transfer(50, 52, 2)),
+            (4, transfer(50, 51, 3)),
+            (5, tx(50, "dex", "swap_x_to_y", vec![], 4)),
+            // 55 (funded by 50): three days of transfers.
+            (6, transfer(55, 51, 0)),
+            (7, transfer(55, 51, 1)),
+            (8, transfer(55, 51, 2)),
+            // 52: a vote, a delegation to pool 1 held although it left pool 2
+            // within the epoch, one to pool 2 pulled too soon, a transfer.
+            (6, tx(52, "governance", "vote", vec![], 3)),
+            (
+                7,
+                tx(52, "delegation", "delegate", vec![pool(1), amount()], 4),
+            ),
+            (
+                30,
+                tx(52, "delegation", "delegate", vec![pool(2), amount()], 5),
+            ),
+            (
+                35,
+                tx(52, "delegation", "undelegate", vec![pool(2), amount()], 6),
+            ),
+            (40, transfer(52, 50, 7)),
             // 53: only transfers to itself.
-            (8, transfer(53, 53)),
-            (9, transfer(53, 53)),
-            (10, transfer(53, 53)),
+            (8, transfer(53, 53, 0)),
+            (9, transfer(53, 53, 1)),
+            (10, transfer(53, 53, 2)),
             // A validator earns nothing on the public track.
-            (11, transfer(1, 50)),
-            (12, transfer(1, 50)),
-            (13, transfer(1, 50)),
+            (11, transfer(1, 50, 0)),
+            (12, transfer(1, 50, 1)),
+            (13, transfer(1, 50, 2)),
         ];
         // 54 transacts on 3 days but its third transaction failed.
-        txs.push((14, transfer(54, 50)));
-        txs.push((15, transfer(54, 50)));
-        let failed = transfer(54, 51);
+        txs.push((14, transfer(54, 50, 0)));
+        txs.push((15, transfer(54, 50, 1)));
+        let failed = transfer(54, 51, 2);
         txs.push((16, failed.clone()));
-        let (db, _) = testnet("public", &[], &txs);
+        let (db, a) = testnet("public", &[1_000; 7], &[], &txs);
         {
             let _seed = db.seeding();
             db.put(
@@ -738,15 +906,30 @@ mod tests {
             )
             .unwrap();
         }
-        let r = score(&db, 1, 60, &[], 18_500_000, 5_550_000).unwrap();
+        let r = score(
+            &db,
+            1,
+            60,
+            &[a[0].clone()],
+            &address_of(FAUCET),
+            18_500_000,
+            5_550_000,
+        )
+        .unwrap();
         let p = |seed: u8| r.public.get(&address_of(seed)).cloned();
-        assert_eq!(p(50).map(|s| (s.points, s.days)), Some((4, 3)));
-        assert_eq!(p(51), None, "two days");
+        assert_eq!(p(50).map(|s| (s.points, s.days)), Some((1 + 1 + 1 + 2, 4)));
+        assert_eq!(
+            p(55).map(|s| (s.points, s.cluster)),
+            Some((3, address_of(50)))
+        );
         assert_eq!(p(52).map(|s| (s.points, s.days)), Some((2 + 3 + 1, 3)));
         assert_eq!(p(53), None, "transfers to itself");
         assert_eq!(p(1), None, "a validator");
         assert_eq!(p(54), None, "the failed third");
-        // 500,000 x 4 / 10 is over the 1,000 cap.
-        assert_eq!(p(50).unwrap().ain, PUBLIC_CAP_AIN);
+        // The cluster of 50 (8 points) and of 52 (6): 500,000 x 8 / 14 is
+        // over the 1,000 cap, which 50 and 55 share 5 : 3.
+        assert_eq!(p(50).unwrap().ain, 625);
+        assert_eq!(p(55).unwrap().ain, 375);
+        assert_eq!(p(52).unwrap().ain, PUBLIC_CAP_AIN);
     }
 }

@@ -111,7 +111,13 @@
         "tests::g5_the_bootstrap_score_has_a_week_long_memory",
         "tests::g5_a_jailed_bootstrap_operator_forfeits_its_weight",
         "tests::g5_a_silent_bootstrap_operator_forfeits_when_its_score_falls_below_half",
-        "tests::g5_an_offense_record_leaves_bootstrap_weight_out_of_the_waterfall"
+        "tests::g5_an_offense_record_leaves_bootstrap_weight_out_of_the_waterfall",
+        "tests::g5_a_bootstrap_operators_offense_is_recorded_on_its_coins",
+        "tests::g5_the_bootstrap_ends_only_after_owned_stake_holds_s_min_for_u",
+        "tests::g5_a_forfeit_frees_weight_for_nobody",
+        "tests::g5_the_founders_validators_are_capped_as_one_party",
+        "tests::g5_payouts_divide_by_at_least_s_min",
+        "tests::g5_slots_follow_the_schedule_across_an_epoch_boundary"
       ],
       "excluded_ignored": {
         "tests::test_h6_state_root_is_blind_to_out_of_band_writes": "Superseded by G3 C1′/C2′ (the root is the JMT root of the state map): storage class::tests::the_write_gate_refuses_state_outside_the_block_transaction, state_commit tests::rc2_lists_every_flat_key_the_tree_disagrees_with and tests::forged_or_foreign_chunks_are_refused, chain_sync a_forged_chunk_is_refused_and_the_restore_completes_elsewhere, consensus a_qc_over_another_state_root_is_never_stored, executor block_execution_writes_state_only_inside_the_block_transaction. WG-1 refuses this test's own setup write, so it cannot run as written.",

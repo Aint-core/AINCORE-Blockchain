@@ -419,9 +419,13 @@ module 0x1::delegation {
     /// whole AIN, from the committee record. System-only: the executor binds
     /// the genuine @0x1 signer and never lets a user forge it (FIX #1).
     ///
-    /// A member's share of the pot is r = pot x w / W, its weight over the
-    /// committee's whole weight (G5 A4 BW-7: as Cosmos, Ethereum and Solana
-    /// pay, so a seat earns by its weight, never by being a seat). r splits
+    /// A member's share of the pot is r = pot x w / max(W, min_total), its
+    /// weight over the committee's whole weight, or over `min_total` (the
+    /// chain's s_min, G5 A4) when the committee weighs less (G5 A4 BW-7: as
+    /// Cosmos, Ethereum and Solana pay, a seat earns by its weight, never by
+    /// being a seat; below s_min the payout falls with the weight, as
+    /// Polkadot's below its ideal staking rate, so nobody earns more because
+    /// another member's weight was forfeited or capped). r splits
     /// into floor(r x s / (s + d)) for its own stake and floor(r x d / (s + d))
     /// for its pool; the commission, at the rate in force when the period
     /// began, is taken from the pool's part. Nothing beyond the drawn
@@ -433,6 +437,7 @@ module 0x1::delegation {
         members: vector<address>,
         self_weights: vector<u64>,
         delegated_weights: vector<u64>,
+        min_total: u64,
     ) acquires Pool {
         assert!(signer::address_of(account) == @0x1, error::permission_denied(EUNAUTHORIZED));
         let len = vector::length(&members);
@@ -458,6 +463,9 @@ module 0x1::delegation {
         if (total == 0) {
             staking::close_emission(emission);
             return
+        };
+        if (total < (min_total as u128)) {
+            total = (min_total as u128);
         };
 
         let i = 0;

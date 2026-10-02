@@ -504,6 +504,12 @@ pub const BOOTSTRAP_KEY: &str = "sys:bootstrap:v1";
 pub struct BootstrapState {
     /// s_min: the committee weight bootstrap weight fills up to, whole AIN.
     pub s_min: u64,
+    /// BW-4: C0, the sum of the genesis ceilings. Weights scale against it,
+    /// never against the ceilings left, so a forfeit gives nobody weight.
+    pub genesis_ceilings: u64,
+    /// BW-4: the consensus time owned stake first held s_min in the elected
+    /// committee, while it still does; the bootstrap ends once that lasts U.
+    pub full_since: Option<u64>,
     /// Sorted by address. A forfeited operator is removed.
     pub operators: Vec<BootstrapOperator>,
 }
@@ -511,6 +517,10 @@ pub struct BootstrapState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BootstrapOperator {
     pub address: String,
+    /// BW-11: the party it belongs to, declared at genesis (the founder's
+    /// validators share one); its own address otherwise. The cap treats a
+    /// party as one member.
+    pub entity: String,
     /// BW-4: the most it can hold, its genesis weight.
     pub ceiling: u64,
     /// Its weight in the committee of the current epoch (BW-4, BW-11).
@@ -534,6 +544,15 @@ impl BootstrapState {
             .iter()
             .find(|o| o.address == address)
             .map_or(0, |o| o.weight)
+    }
+
+    /// BW-11: the party of a committee member: its declared entity if it is
+    /// an operator, its own address otherwise.
+    pub fn entity_of(&self, address: &str) -> String {
+        self.operators
+            .iter()
+            .find(|o| o.address == address)
+            .map_or_else(|| address.to_string(), |o| o.entity.clone())
     }
 }
 
@@ -569,9 +588,20 @@ pub const BOOTSTRAP_SCORE_FLOOR: u64 = 500_000;
 /// a half-life of 88.4 epochs, 6.9 days at the measured 6.75 s blocks (the
 /// 7-day reaction budget T_mis of G5).
 pub const BOOTSTRAP_SCORE_EPOCHS: u64 = 128;
-/// BW-6: at most this many anchor rounds are scanned for one block; a longer
-/// gap counts only its last rounds.
-pub const BOOTSTRAP_MAX_ROUND_SCAN: u64 = 65_536;
+/// BW-6: at most this many anchor rounds (even rounds) are scanned for one
+/// block; a longer gap counts only its last ones. Each costs one leader draw,
+/// a hash over the committee (18 KB at 256 members): 4,096 bound a block's
+/// extra work at about 75 MB of SHA-256.
+pub const BOOTSTRAP_MAX_ROUND_SCAN: u64 = 4_096;
+
+/// BW-4: the bootstrap ends once owned stake has held s_min in the elected
+/// committee for U = 21 days of consensus time (G5's unbonding period), so
+/// stake borrowed across one boundary cannot end it.
+pub const BOOTSTRAP_END_HOLD_SECS: u64 = 21 * 86_400;
+
+/// BW-11: below this many parties holding bootstrap weight, the bootstrap is
+/// degraded and every boundary raises the alarm.
+pub const BOOTSTRAP_MIN_PARTIES: usize = 4;
 
 /// BW-6: one epoch's slots and commits folded into a score.
 pub fn next_bootstrap_score(score: u64, slots: u64, led: u64) -> u64 {
@@ -669,56 +699,130 @@ pub fn bootstrap_report(db: &StateDB) -> Option<BootstrapReport> {
     })
 }
 
-/// BW-11: cut bootstrap weight so that no member of the next committee
-/// reaches a third of its weight. `members` are (address, owned, bootstrap);
-/// returns each one's bootstrap weight after the cut. Only bootstrap weight is
-/// cut, and the cut weight goes to nobody. The cap is the largest level L at
-/// which every member weighs at most max(owned, L) and 3L < the new total
-/// (3L <= with exactly three members, where below a third is impossible);
-/// with two or fewer members nothing is cut. Precedent: Sui caps each
-/// validator's voting power at max(10 %, 1/n) at every epoch.
-pub fn cap_below_a_third(members: &[(String, u64, u64)]) -> BTreeMap<String, u64> {
-    let mut out: BTreeMap<String, u64> = members
+/// BW-4: the owned stake of the committee `top_by_stake` would elect with
+/// these bootstrap weights: what ends the bootstrap must be in the committee.
+pub fn elected_owned_stake(owned: &BTreeMap<String, u64>, boot: &BTreeMap<String, u64>) -> u128 {
+    let mut ranked: Vec<(&String, u64, u64)> = owned
         .iter()
-        .map(|(address, _, boot)| (address.clone(), *boot))
-        .collect();
-    let mut ranked: Vec<(&String, u128, u128)> = members
-        .iter()
-        .map(|(address, own, boot)| (address, *own as u128, *own as u128 + *boot as u128))
+        .map(|(address, &own)| {
+            let total = own.saturating_add(boot.get(address).copied().unwrap_or(0));
+            (address, own, total)
+        })
         .filter(|(_, _, total)| *total > 0)
         .collect();
     ranked.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(b.0)));
+    ranked
+        .iter()
+        .take(blockchain::committee::MAX_COMMITTEE)
+        .map(|(_, own, _)| *own as u128)
+        .sum()
+}
+
+/// BW-11: a committee member as the cap sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapMember {
+    pub address: String,
+    /// Its party (BW-11): the members of one party count as one.
+    pub entity: String,
+    pub owned: u64,
+    pub boot: u64,
+}
+
+/// BW-11: cut bootstrap weight so that, in the next committee, no party
+/// reaches a third (so no two reach two thirds). Parties are the
+/// genesis-declared entities (every other member is its own). Returns each
+/// member's bootstrap weight after the cut. Only bootstrap weight is cut, a
+/// party's cut is shared pro rata by its members, and the cut goes to nobody.
+///
+/// The cap is the greatest level L, at or above the largest owned stake of a
+/// party, at which every party weighs at most max(owned, L) and 3 x the
+/// largest < the new total (at most, with exactly three parties, where below
+/// is impossible); with two or fewer parties
+/// nothing is cut, and when owned stake alone breaks the bounds bootstrap
+/// weight is cut to the largest owned stake. Precedent: Sui caps each
+/// validator's voting power at max(10 %, 1/n) at every epoch.
+pub fn cap_bootstrap(members: &[CapMember]) -> BTreeMap<String, u64> {
+    let mut out: BTreeMap<String, u64> = members
+        .iter()
+        .map(|m| (m.address.clone(), m.boot))
+        .collect();
+    // The election: the top 256 members by weight.
+    let mut ranked: Vec<&CapMember> = members
+        .iter()
+        .filter(|m| m.owned as u128 + m.boot as u128 > 0)
+        .collect();
+    ranked.sort_by(|a, b| {
+        (b.owned as u128 + b.boot as u128)
+            .cmp(&(a.owned as u128 + a.boot as u128))
+            .then_with(|| a.address.cmp(&b.address))
+    });
     ranked.truncate(blockchain::committee::MAX_COMMITTEE);
-    let n = ranked.len();
+    // Parties: (owned, owned + boot, boot) summed over their elected members.
+    let mut parties: BTreeMap<&str, (u128, u128, u128)> = BTreeMap::new();
+    for m in &ranked {
+        let p = parties.entry(m.entity.as_str()).or_insert((0, 0, 0));
+        p.0 += m.owned as u128;
+        p.1 += m.owned as u128 + m.boot as u128;
+        p.2 += m.boot as u128;
+    }
+    let n = parties.len();
     if n < 3 {
         return out;
     }
     let strict: u128 = if n >= 4 { 1 } else { 0 };
-    let weighed_at = |level: u128| -> u128 {
-        ranked
-            .iter()
-            .map(|(_, own, total)| (*total).min((*own).max(level)))
-            .sum()
+    let holds = |level: u128| -> bool {
+        let weighed: Vec<u128> = parties
+            .values()
+            .map(|&(own, total, _)| total.min(own.max(level)))
+            .collect();
+        let t: u128 = weighed.iter().sum();
+        3 * weighed.iter().max().copied().unwrap_or(0) + strict <= t
     };
-    // The greatest L with 3L + strict <= T'(L): iterate down from the
-    // largest weight; T' is monotone, so this stops at the greatest such L.
-    let mut level = ranked[0].2;
-    for _ in 0..64 * (n + 2) {
-        let next = weighed_at(level).saturating_sub(strict) / 3;
-        if next >= level {
-            break;
-        }
-        level = next;
+    let top = parties.values().map(|p| p.1).max().unwrap_or(0);
+    if holds(top) {
+        return out;
     }
-    for (address, own, total) in &ranked {
-        if *total > level {
-            let boot = out
-                .get_mut(*address)
-                .expect("every ranked member is in the map");
-            *boot = (*boot as u128).min(level.saturating_sub(*own)) as u64;
+    // The greatest level that holds, at or above the largest owned stake of
+    // a party: there every party weighs min(total, L), the slack
+    // t - 3 x the largest is concave in L, and so what holds is an interval
+    // reaching down to that floor. If even the floor fails, owned stake alone breaks
+    // the bounds: bootstrap weight is cut to the floor, so it lifts no party
+    // above the largest owned stake, and no lower, which would only enlarge
+    // that owner.
+    // (At least 1: at 0 every party of bootstrap weight alone weighs nothing.)
+    let floor = parties.values().map(|p| p.0).max().unwrap_or(0).max(1);
+    let (mut lo, mut hi) = (floor, top);
+    while holds(lo) && lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if holds(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    for m in &ranked {
+        let (own, total, boot) = parties[m.entity.as_str()];
+        if total > lo && boot > 0 {
+            let keep = lo.max(own) - own;
+            let cut = out.get_mut(&m.address).expect("every member is in the map");
+            *cut = (m.boot as u128 * keep.min(boot) / boot) as u64;
         }
     }
     out
+}
+
+/// BW-11 for members that are each their own party.
+pub fn cap_below_a_third(members: &[(String, u64, u64)]) -> BTreeMap<String, u64> {
+    let members: Vec<CapMember> = members
+        .iter()
+        .map(|(address, owned, boot)| CapMember {
+            address: address.clone(),
+            entity: address.clone(),
+            owned: *owned,
+            boot: *boot,
+        })
+        .collect();
+    cap_bootstrap(&members)
 }
 
 /// BW-12: the Move resource `0x1::staking::BootstrapProtected`: validators
@@ -1934,6 +2038,10 @@ impl Executor {
                 bcs::to_bytes(&members).expect("addresses are BCS"),
                 bcs::to_bytes(&self_weights).expect("weights are BCS"),
                 bcs::to_bytes(&delegated_weights).expect("weights are BCS"),
+                // G5 A4 BW-7: pay against at least s_min, so a forfeited or
+                // capped weight's share stays in the reserve.
+                bcs::to_bytes(&read_bootstrap(&self.db).map_or(0u64, |b| b.s_min))
+                    .expect("a u64 is BCS"),
             ],
         });
         match self.vm.execute_transaction_actions(
@@ -2202,7 +2310,15 @@ impl Executor {
             return;
         };
         let last = last.unwrap_or(0);
-        if height == 0 || anchor_round <= last {
+        if height == 0 {
+            return;
+        }
+        if anchor_round <= last {
+            // Consensus never places an anchor at or below the last one.
+            eprintln!(
+                "🚨 [BOOTSTRAP_ROUND] block {height}: anchor round {anchor_round} is not past {last}; \
+                 its slots are not counted"
+            );
             return;
         }
         self.db
@@ -2296,31 +2412,69 @@ impl Executor {
                 op.weight = 0;
             }
         }
-        // BW-4: fill to s_min - P within the ceilings; the bootstrap ends for
-        // good once P reaches s_min.
+        // BW-4: fill to s_min - P, each operator in proportion to its ceiling
+        // against C0, the genesis ceilings: a forfeit frees weight for nobody.
         let p = committee_owned_stake(owned, &state);
         let target = (state.s_min as u128).saturating_sub(p);
-        if target == 0 {
-            for op in state.operators.iter_mut() {
-                op.ceiling = 0;
-            }
-        }
-        let ceilings = state.ceilings() as u128;
+        let c0 = state.genesis_ceilings as u128;
         for op in state.operators.iter_mut() {
-            op.weight = (op.ceiling as u128 * target.min(ceilings))
-                .checked_div(ceilings)
+            op.weight = (op.ceiling as u128 * target.min(c0))
+                .checked_div(c0)
                 .unwrap_or(0) as u64;
         }
-        // BW-11: no member of the next committee at a third.
-        let members: Vec<(String, u64, u64)> = owned
+        // BW-11: no party of the next committee at a third.
+        let members: Vec<CapMember> = owned
             .iter()
-            .map(|(address, &own)| (address.clone(), own, state.weight_of(address)))
+            .map(|(address, &own)| CapMember {
+                address: address.clone(),
+                entity: state.entity_of(address),
+                owned: own,
+                boot: state.weight_of(address),
+            })
             .collect();
-        let capped = cap_below_a_third(&members);
+        let capped = cap_bootstrap(&members);
         for op in state.operators.iter_mut() {
             if let Some(&w) = capped.get(&op.address) {
+                if w < op.weight {
+                    eprintln!(
+                        "⚖️  [BOOTSTRAP_CAP] epoch {new_epoch}: {} cut from {} to {} AIN",
+                        op.address, op.weight, w
+                    );
+                }
                 op.weight = w;
             }
+        }
+        // BW-4: the bootstrap ends for good once owned stake has held s_min
+        // in the elected committee for U.
+        let now = committed_chain_clock(&self.db).time;
+        let weights: BTreeMap<String, u64> = state
+            .operators
+            .iter()
+            .map(|o| (o.address.clone(), o.weight))
+            .collect();
+        if elected_owned_stake(owned, &weights) >= state.s_min as u128 {
+            let since = *state.full_since.get_or_insert(now);
+            if now.saturating_sub(since) >= BOOTSTRAP_END_HOLD_SECS {
+                for op in state.operators.iter_mut() {
+                    op.ceiling = 0;
+                    op.weight = 0;
+                }
+            }
+        } else {
+            state.full_since = None;
+        }
+        let parties: std::collections::BTreeSet<&str> = state
+            .operators
+            .iter()
+            .filter(|o| o.weight > 0)
+            .map(|o| o.entity.as_str())
+            .collect();
+        if !state.operators.is_empty() && parties.len() < BOOTSTRAP_MIN_PARTIES {
+            eprintln!(
+                "🚨 [BOOTSTRAP_DEGRADED] epoch {new_epoch}: {} parties hold bootstrap weight, \
+                 fewer than {BOOTSTRAP_MIN_PARTIES}",
+                parties.len()
+            );
         }
         state.operators.retain(|o| o.ceiling > 0);
         self.db
@@ -5514,6 +5668,9 @@ mod tests {
             .unwrap();
         };
         db.put("sys:validator_set:epoch:0", "[]").unwrap();
+        // G5 A4 BW-8: the bootstrap split is pruned with its committee.
+        db.put(&bootstrap_split_key(0), "{}").unwrap();
+        db.put(&bootstrap_split_key(1), "{}").unwrap();
         set_time(EVIDENCE_MAX_AGE_SECS);
         exec.rotate_validator_epoch(180); // epoch 9
         assert!(
@@ -5532,6 +5689,8 @@ mod tests {
             );
         }
         assert!(db.get(&epoch_time_key(1)).unwrap().is_none());
+        assert!(db.get(&bootstrap_split_key(0)).unwrap().is_none());
+        assert!(db.get(&bootstrap_split_key(1)).unwrap().is_none());
         assert_eq!(db.get(RETAINED_FROM_KEY).unwrap().as_deref(), Some("2"));
         assert_eq!(
             db.get(&epoch_time_key(10)).unwrap().as_deref(),
@@ -7752,6 +7911,7 @@ mod tests {
         let mut chain = G5Chain::new("g5_full_set_protected", DAY, |db| {
             keys.push(G5Chain::account(db, 214, 10_000 * ain));
             keys.push(G5Chain::account(db, 215, 10_000 * ain));
+            keys.push(G5Chain::account(db, 218, 10_000 * ain));
             let _seed = db.seeding();
             let set = TestValidatorSet {
                 validators: (0..1_000u32)
@@ -7825,6 +7985,24 @@ mod tests {
         assert!(now.contains(&parse_move_address(&larger).unwrap()));
         assert!(now.contains(&address(417)) && now.contains(&address(418)));
         assert!(!now.contains(&address(419)));
+        // With every member protected, a joiner is refused whatever its stake.
+        {
+            let _seed = db.seeding();
+            db.put(
+                &bootstrap_protected_key(),
+                &hex::encode(
+                    bcs::to_bytes(&BootstrapProtected {
+                        validators: now.clone(),
+                    })
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        }
+        let (rich_key, rich) = keys[2].clone();
+        chain.run_to(3, vec![join(&rich_key, &rich, 219, 5_000 * ain)]);
+        assert!(!members(&db).contains(&parse_move_address(&rich).unwrap()));
+        assert_eq!(members(&db), now, "nobody displaced");
     }
 
     /// G5 SL-4 across epochs (review: only same-epoch correlation was
@@ -9561,6 +9739,16 @@ mod tests {
     /// committees weigh owned + boot, and epoch 0's split and the protected
     /// list are written as genesis writes them.
     fn seed_bootstrap_chain(db: &StateDB, members: &[(u8, u64, u64)], supply: u128) {
+        seed_bootstrap_chain_with(db, members, supply, &[]);
+    }
+
+    /// `seed_bootstrap_chain` with declared parties: `(seed, entity)`.
+    fn seed_bootstrap_chain_with(
+        db: &StateDB,
+        members: &[(u8, u64, u64)],
+        supply: u128,
+        entities: &[(u8, &str)],
+    ) {
         let owned: Vec<_> = members
             .iter()
             .map(|&(seed, owned, _)| committee_member(seed, owned))
@@ -9572,12 +9760,18 @@ mod tests {
             .collect();
         let state = BootstrapState {
             s_min: members.iter().map(|&(_, o, b)| o + b).sum(),
+            genesis_ceilings: members.iter().map(|m| m.2).sum(),
+            full_since: None,
             operators: {
                 let mut ops: Vec<_> = members
                     .iter()
                     .filter(|m| m.2 > 0)
                     .map(|&(seed, _, boot)| BootstrapOperator {
                         address: committee_member(seed, 0).address,
+                        entity: entities.iter().find(|(s, _)| *s == seed).map_or_else(
+                            || committee_member(seed, 0).address,
+                            |(_, e)| e.to_string(),
+                        ),
                         ceiling: boot,
                         weight: boot,
                         score: BOOTSTRAP_SCORE_SCALE,
@@ -9728,8 +9922,9 @@ mod tests {
         assert_eq!(committee_total, 15_000, "the committee still weighs s_min");
 
         // b leaves: it forfeits in its leave transaction (so a rejoin within
-        // the epoch keeps nothing). P falls to 5,250: the others regrow to
-        // their ceilings, never above; b's ceiling is gone for good.
+        // the epoch keeps nothing). P falls to 5,250 and the target rises to
+        // 9,750: the others regrow toward their ceilings by 9,750 / C0, where
+        // C0 = 10,000 still counts b's ceiling, so b's share goes to nobody.
         let leaver = SigningKey::from_bytes(&[152; 32]);
         let tx = chain.tx(&leaver, "staking", "leave_validator_set", vec![]);
         chain.run_to(41, vec![tx]);
@@ -9744,32 +9939,238 @@ mod tests {
             .all(|o| o.address != addr(152)));
         chain.run_blocks(60 - chain.height, 7);
         let boot = bootstrap_of(&db);
-        assert_eq!(boot.weight_of(&addr(151)), 2_000, "regrown to its ceiling");
-        assert_eq!(boot.total(), 8_000);
+        assert_eq!(boot.weight_of(&addr(151)), 1_950, "regrown, against C0");
+        assert_eq!(boot.total(), 7_800);
         assert!(!protected_of(&db).contains(&addr(152)));
         assert_eq!(protected_of(&db).len(), 4);
         let committee_total: u64 = g5_committee(&db, 3).iter().map(|(_, w)| *w).sum();
-        assert_eq!(
-            committee_total, 13_250,
-            "below s_min by the forfeited ceiling"
-        );
+        assert_eq!(committee_total, 13_050, "b's whole weight left");
 
-        // c and d stake to s_min (P = 15,000): the bootstrap ends for good,
-        // and does not return when owned stake leaves again.
+        // c and d stake to s_min (P = 15,000): the target is 0, but the
+        // bootstrap ends only once owned stake has held s_min for U.
         let txs = vec![add(&mut chain, 153, 4_875), add(&mut chain, 154, 4_875)];
         chain.run_to(61, txs);
         chain.run_blocks(80 - chain.height, 7);
-        assert!(bootstrap_of(&db).operators.is_empty());
-        assert!(protected_of(&db).is_empty());
+        let boot = bootstrap_of(&db);
+        assert_eq!(boot.total(), 0);
+        assert_eq!(
+            boot.operators.len(),
+            4,
+            "not ended: held for minutes, not U"
+        );
+        assert!(boot.full_since.is_some());
+        assert_eq!(protected_of(&db).len(), 4);
         assert_eq!(weight(&db, 4, 151), 2_250);
+        // d leaves before U: P = 9,125, the bootstrap regrows.
         let leaver = SigningKey::from_bytes(&[154; 32]);
         let tx = chain.tx(&leaver, "staking", "leave_validator_set", vec![]);
         chain.run_to(81, vec![tx]);
         chain.run_blocks(100 - chain.height, 7);
+        let boot = bootstrap_of(&db);
+        assert_eq!(boot.full_since, None);
+        assert_eq!(boot.weight_of(&addr(151)), 2_000 * 5_875 / 10_000);
+    }
+
+    /// G5 A4 BW-4 (review LOW-7): the bootstrap ends only once owned stake
+    /// has held s_min in the elected committee for U = 21 days; stake that
+    /// reaches s_min and leaves within U ends nothing. Once ended it never
+    /// returns. One-day blocks, I = 20: boundaries 20 days apart.
+    #[test]
+    fn g5_the_bootstrap_ends_only_after_owned_stake_holds_s_min_for_u() {
+        let ain = G5_AIN;
+        let members = [
+            (141u8, 1_000u64, 2_000u64),
+            (142, 1_000, 2_000),
+            (143, 1_000, 2_000),
+            (144, 1_000, 2_000),
+            (145, 1_000, 2_000),
+        ];
+        let mut chain = G5Chain::new("g5_boot_end", DAY, |db| {
+            seed_bootstrap_chain(db, &members, 1_000_000 * ain);
+            for &(seed, _, _) in &members {
+                set_coin_store(db, &committee_member(seed, 0).address, 20_000 * ain);
+            }
+        });
+        let db = chain.db.clone();
+        let add = |chain: &mut G5Chain, seed: u8, amount: u128| {
+            let key = SigningKey::from_bytes(&[seed; 32]);
+            chain.tx(
+                &key,
+                "staking",
+                "add_stake",
+                vec![bcs::to_bytes(&(amount * ain)).unwrap()],
+            )
+        };
+        // P = 15,000 at block 1; the boundary at 20 days starts the clock.
+        let txs = vec![add(&mut chain, 141, 5_000), add(&mut chain, 142, 5_000)];
+        chain.run_to(1, txs);
+        chain.run_blocks(20 - chain.height, DAY);
+        assert_eq!(bootstrap_of(&db).full_since, Some(chain.clock().time));
+        assert_eq!(bootstrap_of(&db).operators.len(), 5);
+        // 142 leaves at day 21, 19 days after: P falls, the clock resets and
+        // the weight regrows at the next boundary.
+        let leaver = SigningKey::from_bytes(&[142; 32]);
+        let tx = chain.tx(&leaver, "staking", "leave_validator_set", vec![]);
+        chain.run_to(21, vec![tx]);
+        chain.run_blocks(40 - chain.height, DAY);
+        let boot = bootstrap_of(&db);
+        assert_eq!(boot.full_since, None);
+        assert!(boot.total() > 0, "regrown");
+        // 143 stakes back to s_min: held 20 days at the next boundary (not
+        // U), 40 days at the one after: ended for good.
+        let tx = add(&mut chain, 143, 6_000);
+        chain.run_to(41, vec![tx]);
+        chain.run_blocks(60 - chain.height, DAY);
+        assert_eq!(bootstrap_of(&db).operators.len(), 4);
+        chain.run_blocks(80 - chain.height, DAY);
+        assert_eq!(bootstrap_of(&db).operators.len(), 4, "20 days is not U");
+        chain.run_blocks(100 - chain.height, DAY);
+        assert!(bootstrap_of(&db).operators.is_empty(), "ended after U");
+        assert!(protected_of(&db).is_empty());
+        let leaver = SigningKey::from_bytes(&[143; 32]);
+        let tx = chain.tx(&leaver, "staking", "leave_validator_set", vec![]);
+        chain.run_to(101, vec![tx]);
+        chain.run_blocks(120 - chain.height, DAY);
         assert!(
             bootstrap_of(&db).operators.is_empty(),
             "the bootstrap never restarts"
         );
+    }
+
+    /// G5 A4 BW-4 (review H2): a forfeit frees weight for nobody, also while
+    /// owned stake has shrunk the bootstrap below its ceilings. P = 7,500
+    /// puts each operator at 2,000 x 7,500 / 10,000 = 1,500; when c is jailed
+    /// the others stay at 1,500 (dividing by the ceilings left would have
+    /// given them 1,875).
+    #[test]
+    fn g5_a_forfeit_frees_weight_for_nobody() {
+        let ain = G5_AIN;
+        let members = [
+            (131u8, 1_000u64, 2_000u64),
+            (132, 1_000, 2_000),
+            (133, 1_000, 2_000),
+            (134, 1_000, 2_000),
+            (135, 1_000, 2_000),
+        ];
+        let mut chain = G5Chain::new("g5_boot_c0", 14, |db| {
+            seed_bootstrap_chain(db, &members, 1_000_000 * ain);
+            for &(seed, _, _) in &members {
+                set_coin_store(db, &committee_member(seed, 0).address, 20_000 * ain);
+            }
+        });
+        let db = chain.db.clone();
+        let add = |chain: &mut G5Chain, seed: u8, amount: u128| {
+            let key = SigningKey::from_bytes(&[seed; 32]);
+            chain.tx(
+                &key,
+                "staking",
+                "add_stake",
+                vec![bcs::to_bytes(&(amount * ain)).unwrap()],
+            )
+        };
+        let txs = vec![add(&mut chain, 131, 1_250), add(&mut chain, 132, 1_250)];
+        chain.run_to(1, txs);
+        chain.run_blocks(20 - chain.height, 7);
+        let a = committee_member(131, 0).address;
+        assert_eq!(bootstrap_of(&db).weight_of(&a), 1_500);
+        {
+            let _seed = db.seeding();
+            db.put(
+                &format!("validator:jailed:{}", committee_member(133, 0).address),
+                "1",
+            )
+            .unwrap();
+        }
+        chain.run_blocks(40 - chain.height, 7);
+        let boot = bootstrap_of(&db);
+        assert_eq!(boot.operators.len(), 4);
+        assert!(boot.operators.iter().all(|o| o.weight == 1_500), "{boot:?}");
+    }
+
+    /// G5 A4 BW-11 (review HIGH-1, adversarial): the founder's validators are
+    /// one party. Four founder seats of 1,388 (30 % together) and three
+    /// operators of 333 + 3,983; C is jailed and forfeits. Per address no
+    /// seat comes near a third, but the founder party would hold 38 %: its
+    /// bootstrap weight is cut, pro rata over its seats, below a third, and
+    /// the founder with any operator stays below two thirds.
+    #[test]
+    fn g5_the_founders_validators_are_capped_as_one_party() {
+        let ain = G5_AIN;
+        let members = [
+            (121u8, 0u64, 1_388u64),
+            (122, 0, 1_388),
+            (123, 0, 1_388),
+            (124, 0, 1_388),
+            (125, 333, 3_983),
+            (126, 333, 3_983),
+            (127, 333, 3_985),
+        ];
+        let founder: Vec<(u8, &str)> = (121..125).map(|s| (s, "founder")).collect();
+        let jailed = committee_member(127, 0).address;
+        let mut chain = G5Chain::new("g5_boot_party", 14, |db| {
+            seed_bootstrap_chain_with(db, &members, 1_000_000 * ain, &founder);
+            let _seed = db.seeding();
+            db.put(&format!("validator:jailed:{jailed}"), "1").unwrap();
+        });
+        let db = chain.db.clone();
+        chain.run_blocks(20, 7);
+        let committee = g5_committee(&db, 1);
+        let total: u64 = committee.iter().map(|(_, w)| *w).sum();
+        let of = |seed: u8| {
+            committee
+                .iter()
+                .find(|(m, _)| *m == committee_member(seed, 0).address)
+                .map_or(0, |(_, w)| *w)
+        };
+        let party: u64 = (121..125).map(of).sum();
+        assert!(3 * party < total, "the founder party: {party} of {total}");
+        assert!(
+            3 * (party + of(125)) < 2 * total,
+            "with an operator: below two thirds"
+        );
+        assert!(
+            (121..125).all(|s| of(s) == of(121)),
+            "cut pro rata over its seats"
+        );
+        assert!(of(121) < 1_388);
+        assert_eq!(of(125), 333 + 3_983, "the operators are not cut");
+    }
+
+    /// G5 A4 BW-7 (review HIGH-2, adversarial): payouts divide by at least
+    /// s_min, so a capped or forfeited weight's share stays in the reserve
+    /// and nobody earns more per weight. In the capped committee of
+    /// `g5_bootstrap_weight_is_capped_below_a_third` (14,099 of s_min
+    /// 18,000), A earns in epoch 1 what it earned in epoch 0 (to the reserve's
+    /// tiny decay), not 18,000 / 14,099 times as much.
+    #[test]
+    fn g5_payouts_divide_by_at_least_s_min() {
+        let ain = G5_AIN;
+        let members = [
+            (186u8, 1_000u64, 4_400u64),
+            (187, 1_000, 3_200),
+            (188, 1_000, 3_200),
+            (189, 1_000, 3_200),
+        ];
+        let jailed = committee_member(189, 0).address;
+        let mut chain = G5Chain::new("g5_boot_floor", 14, |db| {
+            seed_bootstrap_chain(db, &members, 1_000_000 * ain);
+            let _seed = db.seeding();
+            db.put(&format!("validator:jailed:{jailed}"), "1").unwrap();
+        });
+        let db = chain.db.clone();
+        let a = committee_member(187, 0).address;
+        let start = coin_balance(&db, &a);
+        chain.run_blocks(20, 7);
+        let epoch0 = coin_balance(&db, &a) - start;
+        chain.run_blocks(20, 7);
+        let epoch1 = coin_balance(&db, &a) - start - epoch0;
+        // Epoch 0 paid C_0 (jailed C excluded: W = 13,800 < s_min 18,000).
+        // Both epochs pay 4,200 of 18,000 of a nearly equal pot.
+        assert!(epoch0 > 0);
+        let ratio = epoch1 as f64 / epoch0 as f64;
+        assert!((ratio - 1.0).abs() < 1e-4, "{epoch0} then {epoch1}");
+        let total: u64 = g5_committee(&db, 1).iter().map(|(_, w)| *w).sum();
+        assert_eq!(total, 14_099);
     }
 
     /// G5 A4 BW-11 (review HIGH-1): forfeits must not lift a member to a
@@ -9839,8 +10240,9 @@ mod tests {
         assert_eq!(boot_split.get(&f), Some(&3_699));
     }
 
-    /// BW-11 as a function: below a third with four or more members, at most a
-    /// third with three, nothing with two; owned stake is never cut; members
+    /// BW-11 as a function: below a third (and any two below two thirds)
+    /// with four or more parties, at most a third with three, nothing with
+    /// two; owned stake is never cut; a party's seats count as one; members
     /// outside the top 256 do not count.
     #[test]
     fn g5_the_cap_cuts_only_bootstrap_weight() {
@@ -9864,14 +10266,47 @@ mod tests {
         );
         let two = [m("f", 0, 9_000), m("a", 0, 1_000)];
         assert_eq!(cap_below_a_third(&two)["f"], 9_000, "two: nothing to do");
-        // A whale's owned stake is never cut; its bootstrap weight goes first.
+        // A whale's owned stake is never cut. Owned stake alone breaks the
+        // bounds here, so bootstrap weight is cut to the largest owned stake:
+        // the whale's own goes, the others (below it) keep theirs.
         let cut = cap_below_a_third(&[
             m("w", 6_000, 1_000),
             m("a", 0, 2_000),
             m("b", 0, 2_000),
             m("c", 0, 2_000),
         ]);
-        assert_eq!(cut["w"], 0);
+        assert_eq!((cut["w"], cut["a"]), (0, 2_000));
+        // Review HIGH-2: after two forfeits, A's owned stake grows to 666,334.
+        // Both are cut: F to 666,665 and A's bootstrap to 331, each just
+        // below a third, so together just below two thirds.
+        let cut = cap_below_a_third(&[
+            m("f", 0, 5_550_000),
+            m("a", 666_334, 3_983_667),
+            m("b", 333_333, 0),
+            m("c", 333_333, 0),
+        ]);
+        assert_eq!((cut["f"], cut["a"]), (666_665, 331));
+        // Parties: four founder seats of 1,388 count as one, cut pro rata.
+        let seat = |a: &str, e: &str, own: u64, boot: u64| CapMember {
+            address: a.into(),
+            entity: e.into(),
+            owned: own,
+            boot,
+        };
+        let mut members: Vec<CapMember> = (0..4)
+            .map(|i| seat(&format!("f{i}"), "founder", 0, 1_388))
+            .collect();
+        members.push(seat("a", "a", 333, 3_983));
+        members.push(seat("b", "b", 333, 3_983));
+        members.push(seat("c", "c", 333, 0));
+        let cut = cap_bootstrap(&members);
+        assert!((0..4).all(|i| cut[&format!("f{i}")] == 1_120));
+        assert_eq!(cut["a"], 3_983);
+        // Without the party, no single seat comes near a third.
+        for m in members.iter_mut() {
+            m.entity = m.address.clone();
+        }
+        assert_eq!(cap_bootstrap(&members)["f0"], 1_388);
         // Only the top 256 count: f and 255 members of 1 weigh 405, where f
         // holds more than a third, though with 300 more members of 1 it
         // would not. L + 255 >= 3L + 1: f keeps 127.
@@ -9888,8 +10323,11 @@ mod tests {
         owned.insert("op".into(), 0);
         let state = BootstrapState {
             s_min: 100_000,
+            genesis_ceilings: 50_000,
+            full_since: None,
             operators: vec![BootstrapOperator {
                 address: "op".into(),
+                entity: "op".into(),
                 ceiling: 50_000,
                 weight: 50_000,
                 score: BOOTSTRAP_SCORE_SCALE,
@@ -10101,6 +10539,44 @@ mod tests {
         let after: BTreeMap<String, (u64, u64)> =
             serde_json::from_str(&counted(&db).unwrap()).unwrap();
         assert_eq!(after[&leader], (n0 + 1, l0), "a slot, no commit");
+    }
+
+    /// G5 A4 BW-6 across a boundary (review INFO): with every member an
+    /// operator, epoch 1's counts hold exactly one commit per block of the
+    /// epoch and one slot per even round in (r*_0, r_last], where r*_0 is the
+    /// anchor round of epoch 0's boundary block: the first block of an epoch
+    /// counts the rounds after the previous epoch's last anchor, under the new
+    /// committee.
+    #[test]
+    fn g5_slots_follow_the_schedule_across_an_epoch_boundary() {
+        let ain = G5_AIN;
+        let members = [
+            (175u8, 1_000u64, 3_000u64),
+            (176, 1_000, 3_000),
+            (177, 1_000, 3_000),
+            (178, 1_000, 3_000),
+        ];
+        let mut chain = G5Chain::new("g5_boot_boundary", 14, |db| {
+            seed_bootstrap_chain(db, &members, 1_000_000 * ain);
+        });
+        let offline = committee_member(178, 0).address;
+        chain.offline = Some([offline.clone()].into_iter().collect());
+        let db = chain.db.clone();
+        chain.run_blocks(20, 7);
+        let boundary_round = chain.last_round;
+        chain.run_blocks(19, 7);
+        let slots: BTreeMap<String, (u64, u64)> =
+            serde_json::from_str(&db.get(&bootstrap_slots_key(1)).unwrap().unwrap()).unwrap();
+        let (n, led): (u64, u64) = slots
+            .values()
+            .fold((0, 0), |(n, l), &(a, b)| (n + a, l + b));
+        assert_eq!(led, 19, "one commit per block of epoch 1");
+        assert_eq!(
+            n,
+            (chain.last_round - boundary_round) / 2,
+            "one slot per even round"
+        );
+        assert!(slots[&offline].0 > 0 && slots[&offline].1 == 0);
     }
 
     /// G5 A4 BW-8 (review HIGH): a slash cuts coins only. The offense record

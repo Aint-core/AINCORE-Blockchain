@@ -282,8 +282,11 @@ fn block_crash_child() {
                 // moved it through the stdlib alone (BootstrapProtected and
                 // the protected eviction, rewards by weight, the offense split
                 // up to the weight): with 31c631e's bytecode the A4 executor
-                // reproduces 73137b35... exactly.
-                "7172c9b7385da3849939b37bb70489affec50f59edbda5d24061dfa8001f2554",
+                // reproduces 73137b35... exactly. The second A4 review moved
+                // it through the stdlib alone (pay_rewards against at least
+                // s_min): with 854f1ae's bytecode the reviewed executor
+                // reproduces 7172c9b7... exactly.
+                "922fb2f751ff998d726a684955e3deb87b07a68376bf5fa5b975f7e4ee5893ca",
                 "clean execution must preserve the pre-staging fixture root"
             );
         }

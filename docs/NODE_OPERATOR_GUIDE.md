@@ -260,10 +260,13 @@ The protocol adjusts it automatically, with no human decision:
 
 - **It fills the committee to `s_min`.** At every epoch boundary the operators' weights are
   set to `s_min − owned stake`, pro rata to each operator's genesis weight (its ceiling): they
-  shrink as owned stake grows and regrow, never above the ceiling, if owned stake leaves. The
-  first time owned stake reaches `s_min`, bootstrap weight ends for good.
-- **No member reaches a third.** If forfeits would leave a member at a third or more of the
+  shrink as owned stake grows and regrow, never above the ceiling, if owned stake leaves. A
+  forfeited operator's share goes to nobody. Once owned stake has held `s_min` for 21 days,
+  bootstrap weight ends for good.
+- **No party reaches a third.** If forfeits would leave a party (a validator, or the
+  validators declared as one entity, such as the founder's) at a third or more of the
   committee, its bootstrap weight is cut below that, every boundary, as long as needed.
+  Rewards are paid against at least `s_min`, so nobody earns more from a cut or a forfeit.
 - **It is forfeited for good** if your validator is jailed (an accepted equivocation jails at
   once), is convicted in full, leaves the validator set (at the leave transaction itself), or
   its participation score falls below one half. A full validator set never displaces an

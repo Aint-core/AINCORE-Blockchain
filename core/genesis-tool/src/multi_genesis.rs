@@ -53,6 +53,10 @@ pub struct EntrySpec {
     pub stake_ain: u128,
     #[serde(default)]
     pub bootstrap_ain: u64,
+    /// G5 A4 BW-11: the party this validator belongs to (the founder's
+    /// validators share one); its own otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity: Option<String>,
 }
 
 /// A line of `--accounts-file` (G5 A4 BW-2): liquid AIN at genesis for the
@@ -332,6 +336,7 @@ pub fn build_genesis_file(
             entry: entry_from_seed(&spec.seed)?,
             stake_ain: spec.stake_ain,
             bootstrap_ain: 0,
+            entity: None,
         });
     }
     build_genesis_from_entries(
@@ -447,6 +452,7 @@ pub fn apply_bootstrap_and_accounts(
         .map(|s| node::genesis::GenesisBootstrapWeight {
             address: s.entry.address.clone(),
             weight_ain: s.bootstrap_ain,
+            entity: s.entity.clone(),
         })
         .collect();
     match (s_min_ain, weights.is_empty()) {
@@ -470,7 +476,16 @@ pub fn apply_bootstrap_and_accounts(
                 )
                 .into());
             }
-            if let Some((a, t)) = totals.iter().find(|(_, t)| 3 * t >= sum) {
+            // BW-11 by party, as the node checks it.
+            let mut parties: std::collections::BTreeMap<String, u128> = Default::default();
+            for (spec, (_, t)) in specs.iter().zip(&totals) {
+                let party = spec
+                    .entity
+                    .clone()
+                    .unwrap_or_else(|| spec.entry.address.clone());
+                *parties.entry(party).or_default() += t;
+            }
+            if let Some((a, t)) = parties.iter().find(|(_, t)| 3 * **t >= sum) {
                 return Err(format!("{a} weighs {t} of {sum} AIN: a third or more").into());
             }
             genesis.bootstrap = Some(node::genesis::GenesisBootstrap {
@@ -623,6 +638,7 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
             entry: entry_from_seed(&spec.seed)?,
             stake_ain: spec.stake_ain,
             bootstrap_ain: 0,
+            entity: None,
         });
     }
     if let Some(path) = &args.entries_file {
@@ -1000,6 +1016,7 @@ mod tests {
                     entry: serde_json::from_str(&json).unwrap(),
                     stake_ain: s.stake_ain,
                     bootstrap_ain: 0,
+                    entity: None,
                 }
             })
             .collect();
@@ -1044,6 +1061,7 @@ mod tests {
             entry,
             stake_ain: 1_000,
             bootstrap_ain: 0,
+            entity: None,
         };
         let twice = vec![spec(good.clone()), spec(good.clone())];
         let err = build_genesis_from_entries(&twice, "C", 0, 6_650, 14, "h").unwrap_err();
@@ -1052,6 +1070,7 @@ mod tests {
             entry: good,
             stake_ain: 0,
             bootstrap_ain: 0,
+            entity: None,
         }];
         let err = build_genesis_from_entries(&zero, "C", 0, 6_650, 14, "h").unwrap_err();
         assert!(err.to_string().contains("stake"), "{err}");
@@ -1069,6 +1088,7 @@ mod tests {
             entry: entry_from_seed(&seed(n)).unwrap(),
             stake_ain,
             bootstrap_ain,
+            entity: None,
         };
         let ops: Vec<EntrySpec> = (41..45).map(|n| spec(n, 0, 4_625_000)).collect();
         let stdlib_hash = node::genesis::stdlib_hash_of(&stdlib_path()).unwrap();
@@ -1122,6 +1142,11 @@ mod tests {
             spec(44, 0, 3_500_000),
         ];
         assert!(refuse(&lopsided, Some(18_500_000), &[]).contains("a third"));
+        // A declared party counts as one: two operators of 25 % are 50 %.
+        let mut paired = ops.clone();
+        paired[0].entity = Some("founder".into());
+        paired[1].entity = Some("founder".into());
+        assert!(refuse(&paired, Some(18_500_000), &[]).contains("founder weighs"));
         let taken = vec![AccountSpec {
             address: ops[0].entry.address.clone(),
             balance_ain: 1,

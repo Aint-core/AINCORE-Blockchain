@@ -644,6 +644,10 @@ pub struct GenesisBootstrap {
 pub struct GenesisBootstrapWeight {
     pub address: String,
     pub weight_ain: u64,
+    /// BW-11: the party it belongs to; the founder's validators share one.
+    /// Without it the operator is its own party.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity: Option<String>,
 }
 
 /// G5 A4 BW-2: liquid AIN at genesis, for the incentivized testnet's public
@@ -1345,10 +1349,21 @@ pub fn build_genesis(
                 boot.s_min_ain
             )));
         }
-        if let Some(v) = v1_validators.iter().find(|v| 3 * v.stake as u128 >= total) {
+        // BW-11 by party: a declared entity's validators count as one.
+        let entity_of = |address: &str| {
+            boot.weights
+                .iter()
+                .find(|w| w.address == address)
+                .and_then(|w| w.entity.clone())
+                .unwrap_or_else(|| address.to_string())
+        };
+        let mut parties: BTreeMap<String, u128> = BTreeMap::new();
+        for v in &v1_validators {
+            *parties.entry(entity_of(&v.address)).or_default() += v.stake as u128;
+        }
+        if let Some((party, weight)) = parties.iter().find(|(_, w)| 3 * **w >= total) {
             return Err(GenesisError::InvalidData(format!(
-                "genesis member {} weighs {} of {total} AIN: a third or more",
-                v.address, v.stake
+                "genesis party {party} weighs {weight} of {total} AIN: a third or more"
             )));
         }
     }
@@ -1498,10 +1513,18 @@ pub fn build_genesis(
     if let Some(boot) = &file.bootstrap {
         let state = executor::BootstrapState {
             s_min: boot.s_min_ain,
+            genesis_ceilings: bootstrap_weights.values().sum(),
+            full_since: None,
             operators: bootstrap_weights
                 .iter()
                 .map(|(address, weight)| executor::BootstrapOperator {
                     address: address.clone(),
+                    entity: boot
+                        .weights
+                        .iter()
+                        .find(|w| &w.address == address)
+                        .and_then(|w| w.entity.clone())
+                        .unwrap_or_else(|| address.clone()),
                     ceiling: *weight,
                     weight: *weight,
                     score: executor::BOOTSTRAP_SCORE_SCALE,
@@ -2388,6 +2411,7 @@ mod tests {
                 .map(|(v, weight_ain)| GenesisBootstrapWeight {
                     address: v.address.clone(),
                     weight_ain,
+                    entity: None,
                 })
                 .collect(),
         };
@@ -2452,6 +2476,28 @@ mod tests {
         let mut f = file.clone();
         f.accounts[0].address = f.validators[0].address.clone();
         assert!(refused(&f).contains("is a validator"), "{}", refused(&f));
+        // BW-11: a declared party counts as one: two seats of 25 % are 50 %.
+        let mut f = file.clone();
+        for w in f.bootstrap.as_mut().unwrap().weights.iter_mut().take(2) {
+            w.entity = Some("founder".into());
+        }
+        assert!(refused(&f).contains("party founder"), "{}", refused(&f));
+        let built_party = {
+            let mut f = file.clone();
+            f.bootstrap.as_mut().unwrap().weights[0].entity = Some("founder".into());
+            build_genesis(&f, &stdlib()).unwrap()
+        };
+        let state: executor::BootstrapState =
+            serde_json::from_str(&built_party.writes[executor::BOOTSTRAP_KEY]).unwrap();
+        assert_eq!(
+            state
+                .operators
+                .iter()
+                .filter(|o| o.entity == "founder")
+                .count(),
+            1
+        );
+        assert_eq!(state.genesis_ceilings, 18_500_000);
         // Hex case does not hide a validator.
         let mut f = file.clone();
         f.accounts[0].address = f.validators[0].address.to_uppercase();

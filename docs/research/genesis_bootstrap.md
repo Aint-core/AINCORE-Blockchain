@@ -81,12 +81,15 @@ owned supply, so growth measured against circulating supply is high at first in 
 | Emission | 1.90 %/yr of the remaining reserve | G5 EM-1 (unchanged) | decided earlier |
 | P0, earned at genesis | 1.5 M (1 % of cap) | Keeps every month's owned-supply growth below Cagan's 50 % with margin: 0.30 % gives 52 % in month 1, 0.50 % gives 31 %, 1 % gives 15 %. Testnets gave 0.12–0.31 %, but those chains also had sales | math (bound) + choice of margin |
 | S_min | 18.5 M | Owned stake passes 2/3 of the committee (bootstrap weight below 1/3 cannot break safety alone) within 4 years, about one Bitcoin halving period | math given the 4-year target, which is a choice |
-| B at genesis | 17 M (= S_min − P0) | follows | math |
+| B at genesis | 17.5 M (= S_min − the 1.0 M bonded) | the public track's 0.5 M is liquid at genesis and counts once staked | math |
 | Founder share of B | ≤ 30 % | decided 2026-10-01 (founder < 1/3) | decided |
 | Founder pre-mine | 0 | goal | decided |
 
 With these: owned stake passes 1/3 of the committee at 1.7 years and 2/3 at 4.0 years, and
-the bootstrap weight is gone at 6.4 years. The worst month for owned-supply growth is 15 %.
+the bootstrap weight is gone at 6.4 years, if the whole 1.5 M is staked. With only the
+operators' 1.0 M staked: 1.9, 4.2 and 6.6 years (`genesis_bootstrap_model.py`, P0 = 1.0 M);
+the bootstrap ends U (21 days) after that. The worst month for owned-supply growth is 15 %
+(the supply holds the whole 1.5 M either way).
 
 | S_min | Owned > 1/3 | Owned > 2/3 | Bootstrap gone |
 |---|---|---|---|
@@ -114,31 +117,41 @@ the bootstrap weight is gone at 6.4 years. The worst month for owned-supply grow
 
 ## Revision after review (2026-10-02)
 
-Three independent reviews of the first implementation changed four rules. The G5 contract,
-Amendment A4, has the rules; this is why.
+Two rounds of three independent reviews changed these rules. The G5 contract, Amendment A4,
+has the rules and the findings; this is why.
 
 - **The founder must stay below a third after forfeits (BW-11).** With the founder at 30 %
   and three operators of 23.3 % each, one operator's forfeit puts the founder at 38 %. Each
-  boundary now cuts bootstrap weight so that no member reaches a third, and the cut goes to
-  nobody. Worked cases (founder F 5.55 M, operators A, B, C 4.317 M with 333 k owned each):
-
-  | Case | Committee | Largest member | Two largest |
-  |---|---|---|---|
-  | Launch | 18.5 M | F 30.0 % | 53.3 % |
-  | C forfeits | 13.45 M | F 33.3 % (cut from 38 %) | 65.4 % |
-  | B and C forfeit | 2.0 M | F, A 33.3 % each | 66.7 % (B, C keep a veto) |
-
-  The last row is the price of having only two large parties left: the committee shrinks to
-  what the small members can balance. Five launch operators instead of three keep the
-  committee at 12.3 M after two forfeits.
+  boundary now cuts bootstrap weight so that no party reaches a third, and the cut goes to
+  nobody. The founder's validators are one party, declared at genesis, so splitting them
+  changes nothing. With five operators (IT-5) the founder stays below a third through four
+  forfeits; the table is in the contract's BW-11. Only with two large parties left does the
+  committee shrink to what the small members can balance.
 - **Losing the weight needs a week, not five hours (BW-6).** Participation is measured
   against each operator's exact leader slots, taken from the leader schedule, as a moving
   average with a 6.9-day half-life, and the weight is forfeited below one half. Measured on
   AINCORE-TESTNET-V4, honest validators commit 88–92 % of their slots.
-- **s_min is a floor while the bootstrap lasts (BW-4).** Bootstrap weight regrows up to each
-  operator's genesis weight when owned stake leaves, and ends for good the first time owned
-  stake reaches s_min. "Never grows" let stake that came and left lower the floor.
-- **Paid by weight, not by seat (BW-7).** See above.
+- **s_min is a floor while the bootstrap lasts (BW-4).** Bootstrap weight regrows toward
+  each operator's genesis weight when owned stake leaves, scaled against the genesis
+  ceilings so that a forfeit frees weight for nobody, and ends for good once owned stake has
+  held s_min in the elected committee for U (21 days).
+- **Paid by weight, against at least s_min (BW-7).** See above; a forfeited or capped share
+  stays in the reserve, so no one earns more from another's loss.
+
+## The founder's earnings (a decision for the founder)
+
+Paid by weight, the founder's validators earn about 30 % of the emission at launch, falling
+as owned stake replaces bootstrap weight. If every party restakes everything, the founder
+ends the bootstrap with about 5.05 M owned (27 % of owned stake, 3.4 % of the cap): a slow
+allocation earned by running the chain, as Bitcoin's early miners earned theirs (second
+review MEDIUM-6). Two consistent choices:
+- **Keep it:** the founder's validators are paid like any operator's.
+- **Waive it:** the founder's bootstrap weight is unpaid; its share stays in the reserve
+  for later stakers, and the founder runs its validators as a public service. This also
+  removes any income motive the founder could have to shrink rivals' weight.
+
+The protocol supports either; waiving needs a genesis flag on the founder's entity and a
+change in the payout (its weight counted in W, its share not paid).
 
 ## What has to be built
 
