@@ -271,7 +271,8 @@ fn any_half_of_the_shards_recovers_the_body() {
             .map(|(i, s)| chosen(i).then(|| s.clone()))
             .collect()
     };
-    let patterns: [(&str, Box<dyn Fn(usize) -> bool>); 4] = [
+    type Keep = Box<dyn Fn(usize) -> bool>;
+    let patterns: [(&str, Keep); 4] = [
         ("data only", Box::new(move |i| i < k)),
         ("parity only", Box::new(move |i| i >= k)),
         ("even indices", Box::new(|i| i % 2 == 0)),
