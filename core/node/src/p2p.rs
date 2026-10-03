@@ -88,6 +88,8 @@ pub async fn start_p2p(
         .upgrade(upgrade::Version::V1)
         .authenticate(noise_config)
         .multiplex(yamux::Config::default())
+        // B24: a connection that does not finish its handshake is dropped.
+        .timeout(sessions::HANDSHAKE_TIMEOUT)
         .boxed();
 
     // === Gossipsub (M-05 config; G4 S5: validated before forwarding, peers
@@ -147,6 +149,9 @@ pub async fn start_p2p(
         pub relay: Toggle<relay::client::Behaviour>,
         consensus: request_response::Behaviour<sessions::FramedCodec>,
         sync: request_response::Behaviour<sessions::FramedCodec>,
+        // B24: admission before the handshake, per IP and in all.
+        gate: sessions::InboundGate,
+        limits: libp2p::connection_limits::Behaviour,
     }
 
     let behaviour = P2PBehaviour {
@@ -159,6 +164,11 @@ pub async fn start_p2p(
         sync: sessions::sync_behaviour(),
         dcutr: Toggle::from(dcutr_behaviour),
         relay: Toggle::from(relay_behaviour),
+        gate: sessions::InboundGate::default(),
+        limits: libp2p::connection_limits::Behaviour::new(
+            libp2p::connection_limits::ConnectionLimits::default()
+                .with_max_pending_incoming(Some(sessions::MAX_PENDING_INBOUND)),
+        ),
     };
 
     // === Swarm ===

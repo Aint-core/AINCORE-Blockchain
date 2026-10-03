@@ -359,6 +359,121 @@ impl<K: std::hash::Hash + Eq + Clone> Budget<K> {
     }
 }
 
+/// B24: how long a connection may take to finish Noise and yamux. A
+/// handshake is ~1.5 round trips; 10 s is a choice far above any honest
+/// one. The transport had no timeout: a connection that never finished
+/// held a descriptor and a task for good.
+pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// B24: unfinished inbound handshakes held at once, in all (a choice).
+pub const MAX_PENDING_INBOUND: u32 = 128;
+/// B24: unfinished inbound handshakes from one IP at once (a choice: one
+/// host runs a few nodes).
+pub const PENDING_PER_IP: usize = 4;
+/// B24 (NI-2's IP admission rate): new inbound connections an IP may open,
+/// per second and in a burst (choices: a node dials a peer a handful of
+/// times per boot).
+pub const ADMIT_PER_IP_PER_SEC: f64 = 2.0;
+pub const ADMIT_BURST_PER_IP: f64 = 16.0;
+
+/// B24: inbound admission before any handshake. Every cap of the network
+/// task runs once a connection is established, after the Noise handshake
+/// it costs; this gate refuses a connection from an IP that holds
+/// `PENDING_PER_IP` unfinished ones or has spent its admission budget,
+/// before the handshake starts.
+#[derive(Debug)]
+pub struct InboundGate {
+    pending: HashMap<libp2p::swarm::ConnectionId, std::net::IpAddr>,
+    admit: Budget<std::net::IpAddr>,
+}
+
+impl Default for InboundGate {
+    fn default() -> Self {
+        Self {
+            pending: HashMap::new(),
+            admit: Budget::new(ADMIT_PER_IP_PER_SEC, ADMIT_BURST_PER_IP),
+        }
+    }
+}
+
+fn ip_of(addr: &libp2p::Multiaddr) -> Option<std::net::IpAddr> {
+    addr.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(ip) => Some(ip.into()),
+        libp2p::multiaddr::Protocol::Ip6(ip) => Some(ip.into()),
+        _ => None,
+    })
+}
+
+impl libp2p::swarm::NetworkBehaviour for InboundGate {
+    type ConnectionHandler = libp2p::swarm::dummy::ConnectionHandler;
+    type ToSwarm = std::convert::Infallible;
+
+    fn handle_pending_inbound_connection(
+        &mut self,
+        connection_id: libp2p::swarm::ConnectionId,
+        _local_addr: &libp2p::Multiaddr,
+        remote_addr: &libp2p::Multiaddr,
+    ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        let Some(ip) = ip_of(remote_addr) else {
+            return Ok(());
+        };
+        let denied =
+            |why: &str| libp2p::swarm::ConnectionDenied::new(io::Error::other(why.to_string()));
+        if self.pending.values().filter(|p| **p == ip).count() >= PENDING_PER_IP {
+            return Err(denied("too many unfinished handshakes from this IP"));
+        }
+        if !self.admit.spend(&ip, std::time::Instant::now()) {
+            return Err(denied("this IP opens connections too fast"));
+        }
+        self.pending.insert(connection_id, ip);
+        Ok(())
+    }
+
+    fn handle_established_inbound_connection(
+        &mut self,
+        connection_id: libp2p::swarm::ConnectionId,
+        _peer: PeerId,
+        _local_addr: &libp2p::Multiaddr,
+        _remote_addr: &libp2p::Multiaddr,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        self.pending.remove(&connection_id);
+        Ok(libp2p::swarm::dummy::ConnectionHandler)
+    }
+
+    fn handle_established_outbound_connection(
+        &mut self,
+        _connection_id: libp2p::swarm::ConnectionId,
+        _peer: PeerId,
+        _addr: &libp2p::Multiaddr,
+        _role_override: libp2p::core::Endpoint,
+        _port_use: libp2p::core::transport::PortUse,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        Ok(libp2p::swarm::dummy::ConnectionHandler)
+    }
+
+    fn on_swarm_event(&mut self, event: libp2p::swarm::FromSwarm) {
+        if let libp2p::swarm::FromSwarm::ListenFailure(failure) = event {
+            self.pending.remove(&failure.connection_id);
+        }
+    }
+
+    fn on_connection_handler_event(
+        &mut self,
+        _peer_id: PeerId,
+        _connection_id: libp2p::swarm::ConnectionId,
+        event: libp2p::swarm::THandlerOutEvent<Self>,
+    ) {
+        match event {}
+    }
+
+    fn poll(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>>
+    {
+        std::task::Poll::Pending
+    }
+}
+
 /// NI-3: what the network task holds for the node while the node is busy
 /// (it holds the consensus lock through a block's execution). The swarm
 /// never waits on the node: a message past this many bytes is dropped, and
@@ -1414,5 +1529,65 @@ mod tests {
                 .parse::<libp2p::Multiaddr>()
                 .unwrap()]
         );
+    }
+
+    /// B24 witness: before any handshake, an IP holding `PENDING_PER_IP`
+    /// unfinished connections, or one past its admission burst, is refused;
+    /// another IP is not; a finished or failed handshake frees its place.
+    #[test]
+    fn the_gate_admits_per_ip_before_the_handshake() {
+        use libp2p::swarm::{ConnectionId, NetworkBehaviour};
+        let mut gate = InboundGate::default();
+        let local: Multiaddr = "/ip4/10.0.0.1/tcp/9101".parse().unwrap();
+        let from = |ip: &str| -> Multiaddr { format!("/ip4/{ip}/tcp/40000").parse().unwrap() };
+        let ids: Vec<ConnectionId> = (0..PENDING_PER_IP + 1)
+            .map(|_| ConnectionId::new_unchecked(rand::random::<u32>() as usize))
+            .collect();
+        for id in &ids[..PENDING_PER_IP] {
+            assert!(gate
+                .handle_pending_inbound_connection(*id, &local, &from("6.6.6.6"))
+                .is_ok());
+        }
+        assert!(
+            gate.handle_pending_inbound_connection(ids[PENDING_PER_IP], &local, &from("6.6.6.6"))
+                .is_err(),
+            "a fifth unfinished handshake from one IP"
+        );
+        let other = ConnectionId::new_unchecked(7);
+        assert!(gate
+            .handle_pending_inbound_connection(other, &local, &from("7.7.7.7"))
+            .is_ok());
+        let peer = local_keypair(&[1; 32]).public().to_peer_id();
+        assert!(gate
+            .handle_established_inbound_connection(ids[0], peer, &local, &from("6.6.6.6"))
+            .is_ok());
+        assert!(
+            gate.handle_pending_inbound_connection(ids[PENDING_PER_IP], &local, &from("6.6.6.6"))
+                .is_ok(),
+            "a finished handshake freed its place"
+        );
+        // The admission burst: 16 per IP, then refused at once.
+        let mut burst = InboundGate::default();
+        let admitted = (0..32)
+            .filter(|i| {
+                let id = ConnectionId::new_unchecked(1000 + i);
+                let ok = burst
+                    .handle_pending_inbound_connection(id, &local, &from("8.8.8.8"))
+                    .is_ok();
+                if ok {
+                    burst.pending.remove(&id);
+                }
+                ok
+            })
+            .count();
+        assert_eq!(admitted, ADMIT_BURST_PER_IP as usize);
+        // An address without an IP (the memory transport) is not gated.
+        assert!(burst
+            .handle_pending_inbound_connection(
+                ConnectionId::new_unchecked(5),
+                &local,
+                &"/memory/1".parse().unwrap()
+            )
+            .is_ok());
     }
 }
