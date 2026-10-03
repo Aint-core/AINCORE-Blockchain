@@ -35,3 +35,5 @@ sim = []
 [dev-dependencies]
 # G3 WG-1: test fixtures seed their own genesis state (StateDB::seeding).
 storage = { path = "../../common/storage", features = ["test-seeding"] }
+# B14: a cluster test executes a funded transaction end to end.
+executor = { path = "../../core/executor", features = ["test-support"] }

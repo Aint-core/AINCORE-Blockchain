@@ -42,7 +42,7 @@ AINCORE is a high-performance Layer-1 blockchain built entirely in Rust, featuri
 | **Emission** | 1.90 % per year of the remaining reserve, paid to the committee every reward period (20 blocks) for the consensus time since the last payout |
 | **Emission Formula** | `e = remaining × λ × Δτ`, λ = −ln(0.981) per year; half of the reserve is emitted after about 36 years |
 | **Reward Split** | each committee member's share by stake (capped at 1/50 of the total); its own part and its commission go to the validator, the rest to its delegators by points |
-| **Fees** | 20 % to the anchor leader, 80 % to the committee by stake; 10 % burned by default |
+| **Fees** | EIP-1559 base fee (burned) that moves at most 1/8 a block toward half-full blocks; the tip above it: 10 % burned, then 20 % to the anchor leader and 80 % to the committee by stake. Gas includes 400 per transaction byte |
 | **Min Validator Stake** | 1,000 AIN |
 | **Unbonding Period** | 21 days of consensus time, counted from the end of the last committee epoch |
 | **Slashing Penalty** | equivocation only: `(3 × share that equivocated together)²`, minimum 1 %, 100 % from a third; settled once, when every correlated piece of evidence is in; the operator's own stake pays first |
@@ -55,7 +55,7 @@ AINCORE follows a **No-VC Fairlaunch** model inspired by Hyperliquid:
 1. **Genesis Validator Lock:** The founder's initial stake (used to bootstrap the network) is **permanently locked** at the protocol level. The `Executor` rejects any `transfer` transaction from the Genesis address. This is enforced in code, not by promise.
 2. **Zero VC/Presale:** No tokens were sold to venture capitalists or institutional investors at a discount.
 3. **99.3% Community Owned:** Nearly all tokens are minted over time as staking rewards: 1.90 % a year of the remaining reserve, paid to the committee and its delegators. DePIN mining receives no share of emission at launch.
-4. **Fees:** 10 % of each block's fees is burned; of the rest, 20 % goes to the block's anchor leader and 80 % to the committee by stake.
+4. **Fees:** each block's base fee (EIP-1559) is burned for every unit of gas charged; of the tip above it, 10 % is burned, then 20 % goes to the block's anchor leader and 80 % to the committee by stake. Only transactions that executed and paid are stored in a block.
 
 ---
 

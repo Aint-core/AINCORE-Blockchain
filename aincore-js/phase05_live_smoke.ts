@@ -39,7 +39,6 @@ async function main() {
     const transferAmount = 123n;
     const gasLimit = 100_000;
     const gasPrice = 1;
-    const gasCost = BigInt(gasLimit * gasPrice);
 
     console.log(`[phase0.5] rpc=${rpcUrl}`);
     console.log(`[phase0.5] sender=${sender.address}`);
@@ -53,7 +52,7 @@ async function main() {
     console.log(`[phase0.5] before sender=${senderBefore} recipient=${recipientBefore}`);
 
     const tx = Transaction.createTransfer(sender, recipient.address, transferAmount, 0);
-    tx.gasLimit = gasLimit;
+    tx.executionGas = gasLimit; // B14: sign() adds the byte gas
     tx.gasPrice = gasPrice;
     tx.setChainId(chainId);
     tx.sign(sender);
@@ -61,6 +60,8 @@ async function main() {
     const txHash = await connection.sendTransaction(tx.toString());
     console.log(`[phase0.5] tx_hash=${txHash}`);
 
+    // The charge is the whole signed limit, bytes included (B14).
+    const gasCost = BigInt(tx.gasLimit * gasPrice);
     const expectedSender = faucetAmount - transferAmount - gasCost;
     const expectedRecipient = transferAmount;
 

@@ -13,14 +13,15 @@ fn tx(chain_id: &str, seq: u64) -> String {
         ]]))
         .unwrap(),
     );
+    // B14: the limit covers the transaction's ~450 bytes of byte gas.
     let msg = format!(
         "{}:{}:{}:{}:{}:{}:{}",
-        chain_id, sender, payload, seq, 1000u64, 1u128, ""
+        chain_id, sender, payload, seq, 1_000_000u64, 1u128, ""
     );
     let sig = hex::encode(sk.sign(msg.as_bytes()).to_bytes());
     serde_json::json!({
         "chain_id": chain_id, "sender": sender, "input_objects": [], "payload": payload,
-        "args": [], "gas_limit": 1000, "gas_price": 1, "sequence_number": seq,
+        "args": [], "gas_limit": 1_000_000, "gas_price": 1, "sequence_number": seq,
         "public_key": pk, "signature": sig,
     })
     .to_string()

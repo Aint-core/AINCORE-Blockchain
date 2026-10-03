@@ -44,6 +44,8 @@ async function main() {
         );
 
         // 4. User Signs Payload
+        // Name the paymaster first: the sender's gas limit covers its bytes.
+        tx.setPaymasterKey(paymasterKeypair.publicKey);
         tx.sign(userKeypair);
 
         // 5. Paymaster Signs for Gas

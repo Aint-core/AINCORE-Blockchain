@@ -311,6 +311,16 @@ impl ChainSync {
                 block.header.height, block.header.receipts_root, summary.receipts_root
             ));
         }
+        // B14: a body is what executed and paid. A transaction in it that does
+        // not execute here was stored for nothing on the producer.
+        if block.transactions != summary.body {
+            return Err(format!(
+                "block {} carries {} transactions, {} of which execute",
+                block.header.height,
+                block.transactions.len(),
+                summary.body.len()
+            ));
+        }
         Ok(())
     }
 

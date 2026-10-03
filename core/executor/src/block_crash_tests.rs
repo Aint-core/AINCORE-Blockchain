@@ -285,8 +285,13 @@ fn block_crash_child() {
                 // reproduces 73137b35... exactly. The second A4 review moved
                 // it through the stdlib alone (pay_rewards against at least
                 // s_min): with 854f1ae's bytecode the reviewed executor
-                // reproduces 7172c9b7... exactly.
-                "922fb2f751ff998d726a684955e3deb87b07a68376bf5fa5b975f7e4ee5893ca",
+                // reproduces 7172c9b7... exactly. B14/B15 moved it through the
+                // executor (byte gas; the base fee burned, the fee written
+                // only when it moves): with 419b9a0's bytecode the new
+                // executor gives e7e2ff0b.... B7 then moved it through the
+                // stdlib alone (0x1::treasury deleted, coin.mv without the
+                // friend): ba90d7a8....
+                "ba90d7a80598128ed9672b4895102f344be1a5ec5d8a1d64516cd23fc2e1de5d",
                 "clean execution must preserve the pre-staging fixture root"
             );
         }

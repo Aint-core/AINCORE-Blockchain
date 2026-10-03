@@ -1129,9 +1129,10 @@ impl DagConsensus {
                                 if stored_height != parent_height || stored_hash != parent_hash {
                                     return Err("local block parent changed before acceptance".to_string());
                                 }
+                                // B14: the body is what executed and paid.
                                 let mut block = blockchain::Block::new_with_roots_at(
                                     parent_height + 1, commit.anchor_round, parent_hash.clone(),
-                                    block_txs.clone(), reward_recipient.clone(),
+                                    summary.body.clone(), reward_recipient.clone(),
                                     summary.state_root.clone(), summary.receipts_root.clone(),
                                     block_timestamp, commit.sequence.clone(), commit.anchor_hash.clone(),
                                     slash_evidence.clone(),

@@ -36,6 +36,45 @@ fn load_wallet(pqc_seed: &Option<String>, keyfile: &str) -> anyhow::Result<Walle
     }
 }
 
+/// A signed transaction carrying `payload`: priced at the node's base fee
+/// (B15), with `execution` gas for Move on top of the intrinsic byte gas its
+/// own size owes (B14), signed over the seven fields (F4) by `wallet`.
+fn signed_tx_json(
+    client: &RpcClient,
+    wallet: &Wallet,
+    chain_id: &str,
+    payload: String,
+    sequence_number: u64,
+    execution: u64,
+) -> anyhow::Result<String> {
+    let price = client.call("aincore_getGasPrice", json!([]))?;
+    let gas_price: u128 = match &price {
+        serde_json::Value::String(s) => s.parse()?,
+        serde_json::Value::Number(n) => n.as_u64().map(u128::from).unwrap_or(1),
+        _ => anyhow::bail!("unexpected aincore_getGasPrice answer: {price}"),
+    };
+    let mut tx = executor::Transaction {
+        chain_id: chain_id.to_string(),
+        sender: wallet.address(),
+        input_objects: vec![],
+        payload,
+        args: vec![],
+        gas_limit: 0,
+        gas_price,
+        sequence_number,
+        public_key: wallet.public_key(),
+        // The signature's own size counts: a placeholder of the same length.
+        signature: wallet.sign(b"size"),
+        paymaster: None,
+        paymaster_signature: None,
+        zkp_proof: None,
+    };
+    let unsized_len = serde_json::to_string(&tx)?.len();
+    tx.gas_limit = executor::admission::gas_limit_covering(unsized_len, execution);
+    tx.signature = wallet.sign(executor::admission::signing_message(&tx).as_bytes());
+    Ok(serde_json::to_string(&tx)?)
+}
+
 mod client;
 mod keys;
 mod wallet;
@@ -249,28 +288,8 @@ fn main() -> anyhow::Result<()> {
             let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
             let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
             let seq_num = sequence_number;
-            // PROTOCOL UPDATE: Chain Binding
-            // F4: signature must cover gas_limit, gas_price, input_objects.
-            // input_objects=[] here, gas_limit=5000, gas_price=1 (must match tx_json below).
-            let message = format!(
-                "{}:{}:{}:{}:{}:{}:{}",
-                chain_id, sender, payload, seq_num, 5000u64, 1u128, ""
-            );
-            let signature = wallet.sign(message.as_bytes());
-
-            let tx_json = json!({
-                "chain_id": chain_id,
-                "sender": sender,
-                "public_key": wallet.public_key(),
-                "input_objects": [],
-                "payload": payload,
-                "gas_limit": 5000,
-                "gas_price": 1,
-                "sequence_number": seq_num,
-                "signature": signature
-            });
-
-            let res = client.call("aincore_sendTransaction", json!([tx_json.to_string()]))?;
+            let tx_json = signed_tx_json(&client, &wallet, &chain_id, payload, seq_num, 5_000)?;
+            let res = client.call("aincore_sendTransaction", json!([tx_json]))?;
             println!("✅ Proof Submitted: {}", res);
         }
         Commands::Balance { address } => {
@@ -368,31 +387,8 @@ fn main() -> anyhow::Result<()> {
             let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
             let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
             let seq_num = sequence_number; // Use current seq number (Executor expects match)
-            let gas_price = 1;
-            // PROTOCOL UPDATE: Chain Binding
-            // F4: bind gas_limit/gas_price/input_objects. input_objects=[] for native transfer.
-            let message = format!(
-                "{}:{}:{}:{}:{}:{}:{}",
-                chain_id, sender, payload, seq_num, gas_limit, gas_price, ""
-            );
-            let signature = wallet.sign(message.as_bytes());
-
-            // Construct Transaction JSON
-            // Note: In Account-Based model, input_objects is empty for native coin transfers.
-            // The dependency is implied by the sender address.
-            let tx_json = json!({
-                "chain_id": chain_id,
-                "sender": sender,
-                "public_key": wallet.public_key(),
-                "input_objects": [],
-                "payload": payload,
-                "gas_limit": gas_limit,
-                "gas_price": gas_price,
-                "sequence_number": seq_num,
-                "signature": signature
-            });
-
-            let tx_str = tx_json.to_string();
+                                           // `gas_limit` is the gas for execution; the byte gas is added.
+            let tx_str = signed_tx_json(&client, &wallet, &chain_id, payload, seq_num, gas_limit)?;
             let res = client.call("aincore_sendTransaction", json!([tx_str]))?;
             println!("✅ Transaction submitted: {}", res);
         }
@@ -481,26 +477,14 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             // F4: bind gas_limit/gas_price/input_objects (publish uses gas_limit 50000).
-            let message = format!(
-                "{}:{}:{}:{}:{}:{}:{}",
-                chain_id, sender, payload, sequence_number, 50000u64, 1u128, ""
-            );
-            let signature = wallet.sign(message.as_bytes());
-
-            // 4. Send Transaction
-            let tx_json = json!({
-                "chain_id": chain_id,
-                "sender": sender,
-                "public_key": wallet.public_key(),
-                "input_objects": [],
-                "payload": payload,
-                "gas_limit": 50000, // Higher limit for publish
-                "gas_price": 1,
-                "sequence_number": sequence_number,
-                "signature": signature
-            });
-
-            let tx_str = tx_json.to_string();
+            let tx_str = signed_tx_json(
+                &client,
+                &wallet,
+                &chain_id,
+                payload,
+                sequence_number,
+                50_000,
+            )?;
             let res = client.call("aincore_sendTransaction", json!([tx_str]))?;
             println!("✅ Publish Transaction submitted: {}", res);
 
@@ -558,27 +542,15 @@ fn main() -> anyhow::Result<()> {
             };
             let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
             let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
-            // PROTOCOL UPDATE: Chain Binding
-            // F4: bind gas_limit/gas_price/input_objects (register uses gas_limit 50000).
-            let message = format!(
-                "{}:{}:{}:{}:{}:{}:{}",
-                chain_id, sender, payload, sequence_number, 50000u64, 1u128, ""
-            );
-            let signature = wallet.sign(message.as_bytes());
-
-            let tx_json = json!({
-                "chain_id": chain_id,
-                "sender": sender,
-                "public_key": wallet.public_key(),
-                "input_objects": [],
-                "payload": payload,
-                "gas_limit": 50000,
-                "gas_price": 1,
-                "sequence_number": sequence_number,
-                "signature": signature
-            });
-
-            let res = client.call("aincore_sendTransaction", json!([tx_json.to_string()]))?;
+            let tx_json = signed_tx_json(
+                &client,
+                &wallet,
+                &chain_id,
+                payload,
+                sequence_number,
+                50_000,
+            )?;
+            let res = client.call("aincore_sendTransaction", json!([tx_json]))?;
             println!("✅ Validator Registration Submitted: {}", res);
         }
         Commands::Faucet { to, amount } => {
@@ -628,26 +600,15 @@ fn main() -> anyhow::Result<()> {
             };
             let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
             let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
-            // F4: bind gas_limit/gas_price/input_objects (faucet uses gas_limit 50000).
-            let message = format!(
-                "{}:{}:{}:{}:{}:{}:{}",
-                chain_id, sender, payload, sequence_number, 50000u64, 1u128, ""
-            );
-            let signature = wallet.sign(message.as_bytes());
-
-            let tx_json = json!({
-                "chain_id": chain_id,
-                "sender": sender,
-                "public_key": wallet.public_key(),
-                "input_objects": [],
-                "payload": payload,
-                "gas_limit": 50000,
-                "gas_price": 1,
-                "sequence_number": sequence_number,
-                "signature": signature
-            });
-
-            let res = client.call("aincore_sendTransaction", json!([tx_json.to_string()]))?;
+            let tx_json = signed_tx_json(
+                &client,
+                &wallet,
+                &chain_id,
+                payload,
+                sequence_number,
+                50_000,
+            )?;
+            let res = client.call("aincore_sendTransaction", json!([tx_json]))?;
             println!("✅ Faucet Transaction Submitted: {}", res);
         }
     }

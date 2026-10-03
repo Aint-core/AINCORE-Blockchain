@@ -75,7 +75,7 @@ async function submitTx(
 ): Promise<{ txHash: string; receipt: any }> {
     const sequence = await connection.getAccountNonce(signer.address);
     const tx = build(sequence);
-    tx.gasLimit = gasLimit;
+    tx.executionGas = gasLimit; // B14: sign() adds the byte gas
     tx.gasPrice = gasPrice;
     tx.setChainId(chainId);
     tx.sign(signer);

@@ -331,12 +331,12 @@ export class Connection {
     }
 
     /**
-     * Get current gas price
-     * Note: Returns default value as backend uses fixed gas pricing
+     * The node's base fee (B15), quanta per gas, as a decimal string (it can
+     * pass 2^53). A transaction's gasPrice must be at least this.
      */
-    async getGasPrice(): Promise<number> {
-        // AINCORE uses fixed gas pricing, return default
-        return 1;
+    async getGasPrice(): Promise<string> {
+        const res = await this.request('aincore_getGasPrice', []);
+        return String(res);
     }
 
     /**

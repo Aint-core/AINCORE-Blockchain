@@ -13,8 +13,21 @@ use sha2::{Digest, Sha256};
 
 /// The largest transaction, as raw JSON bytes.
 pub const MAX_TX_BYTES: usize = 100 * 1024;
-/// The lowest gas price.
+/// The lowest gas price any transaction may name. The price a block charges
+/// is its base fee (B15), at least the chain's `sys:config:min_base_fee`.
 pub const MIN_GAS_PRICE: u128 = 1;
+/// B14: gas per byte of the raw transaction, part of the `gas_limit` it must
+/// declare. Derived in docs/research/fees_and_block_resources.md: blocks may
+/// use half of the 100 GB minimum disk over the 100,000 blocks a full node
+/// keeps, 500 KB a block; less the ~10 KB empty-block overhead and with each
+/// body byte stored about twice, a 245 KB target body; the EIP-1559 target of
+/// 100M gas over it is 408 gas a byte, rounded down to 400.
+pub const BYTE_GAS: u64 = 400;
+
+/// The gas a transaction of `raw_len` bytes owes for its bytes.
+pub fn intrinsic_gas(raw_len: usize) -> u64 {
+    (raw_len as u64).saturating_mul(BYTE_GAS)
+}
 
 /// A transaction that passed [`check_stateless`].
 #[derive(Debug, Clone)]
@@ -24,6 +37,8 @@ pub struct CheckedTx {
     pub scheme: TxScheme,
     /// The address that pays gas: the sender, or the paymaster's address.
     pub payer: String,
+    /// `gas_limit` less the intrinsic byte gas: what Move execution may use.
+    pub execution_gas: u64,
 }
 
 /// The bytes the sender signs (F4: seven fields, ':'-joined).
@@ -87,9 +102,17 @@ pub fn check_stateless(raw: &str, chain_id: &str) -> Result<CheckedTx, String> {
     if tx.gas_limit == 0 {
         return Err("Gas limit must be greater than 0".to_string());
     }
-    if tx.gas_limit > MAX_GAS_LIMIT {
+    let intrinsic = intrinsic_gas(raw.len());
+    let Some(execution_gas) = tx.gas_limit.checked_sub(intrinsic) else {
         return Err(format!(
-            "Gas limit {} exceeds MAX_GAS_LIMIT {MAX_GAS_LIMIT}",
+            "Gas limit {} is below the intrinsic gas {intrinsic} of a {}-byte transaction ({BYTE_GAS} a byte)",
+            tx.gas_limit,
+            raw.len()
+        ));
+    };
+    if execution_gas > MAX_GAS_LIMIT {
+        return Err(format!(
+            "Gas limit {} leaves {execution_gas} for execution, over MAX_GAS_LIMIT {MAX_GAS_LIMIT}",
             tx.gas_limit
         ));
     }
@@ -136,7 +159,12 @@ pub fn check_stateless(raw: &str, chain_id: &str) -> Result<CheckedTx, String> {
                 .map_err(|e| format!("Paymaster address derivation failed: {e}"))?
         }
     };
-    Ok(CheckedTx { tx, scheme, payer })
+    Ok(CheckedTx {
+        tx,
+        scheme,
+        payer,
+        execution_gas,
+    })
 }
 
 /// The kind of a transaction payload.
@@ -156,6 +184,42 @@ pub fn signed_publish(
     sequence_number: u64,
     module: Vec<u8>,
 ) -> String {
+    signed_publish_with(
+        key_seed,
+        chain_id,
+        sequence_number,
+        module,
+        1_000,
+        MIN_GAS_PRICE,
+    )
+}
+
+/// The `gas_limit` for a transaction whose JSON is `len_with_zero_gas` bytes
+/// when its `gas_limit` is written `0`: `execution` for Move plus the
+/// intrinsic gas of the JSON once the limit's own digits are in it. The
+/// smallest digit count that holds is used, so the limit covers the bytes,
+/// and is exact whenever a digit count fits the limit it produces.
+pub fn gas_limit_covering(len_with_zero_gas: usize, execution: u64) -> u64 {
+    let without_digits = len_with_zero_gas.saturating_sub(1);
+    for digits in 1..=20usize {
+        let limit = execution.saturating_add(intrinsic_gas(without_digits + digits));
+        if limit.to_string().len() <= digits {
+            return limit;
+        }
+    }
+    execution.saturating_add(intrinsic_gas(without_digits + 20))
+}
+
+/// `signed_publish` with `execution` gas for Move on top of the intrinsic
+/// byte gas, at `gas_price`.
+pub fn signed_publish_with(
+    key_seed: [u8; 32],
+    chain_id: &str,
+    sequence_number: u64,
+    module: Vec<u8>,
+    execution: u64,
+    gas_price: u128,
+) -> String {
     use ed25519_dalek::{Signer, SigningKey};
     let key = SigningKey::from_bytes(&key_seed);
     let public_key = key.verifying_key().to_bytes();
@@ -166,15 +230,19 @@ pub fn signed_publish(
         input_objects: vec![],
         payload: hex::encode(bcs::to_bytes(&payload).expect("a payload encodes")),
         args: vec![],
-        gas_limit: 1000,
-        gas_price: 1,
+        gas_limit: 0,
+        gas_price,
         sequence_number,
         public_key: hex::encode(public_key),
-        signature: String::new(),
+        signature: "0".repeat(128),
         paymaster: None,
         paymaster_signature: None,
         zkp_proof: None,
     };
+    let unsized_len = serde_json::to_string(&tx)
+        .expect("a transaction serializes")
+        .len();
+    tx.gas_limit = gas_limit_covering(unsized_len, execution);
     tx.signature = hex::encode(key.sign(signing_message(&tx).as_bytes()).to_bytes());
     serde_json::to_string(&tx).expect("a transaction serializes")
 }
@@ -207,6 +275,18 @@ mod tests {
         }
     }
 
+    /// B14: a signed transaction's limit is its execution gas plus exactly
+    /// its own bytes' gas.
+    #[test]
+    fn the_limit_covers_exactly_the_transactions_own_bytes() {
+        for execution in [0, 1_000, 999_999, MAX_GAS_LIMIT] {
+            let tx = signed_publish_with([1; 32], CHAIN, 0, vec![5; 40], execution, 1);
+            let checked = check_stateless(&tx, CHAIN).expect("valid");
+            assert_eq!(checked.execution_gas, execution, "{execution}");
+            assert_eq!(checked.tx.gas_limit, execution + intrinsic_gas(tx.len()));
+        }
+    }
+
     #[test]
     fn junk_and_out_of_bounds_transactions_fail() {
         for junk in ["", "tx", "x".repeat(1000).as_str(), "{}", "[1,2]"] {
@@ -222,9 +302,10 @@ mod tests {
             ("gas_limit", serde_json::json!(0), "greater than 0"),
             (
                 "gas_limit",
-                serde_json::json!(MAX_GAS_LIMIT + 1),
+                serde_json::json!(u64::MAX / 2),
                 "MAX_GAS_LIMIT",
             ),
+            ("gas_limit", serde_json::json!(10), "intrinsic gas"),
             ("payload", serde_json::json!("zz"), "TransactionPayload"),
         ] {
             let mut t = v.clone();
@@ -246,7 +327,8 @@ mod tests {
     #[test]
     fn a_paymaster_pays_from_its_derived_address() {
         use ed25519_dalek::{Signer, SigningKey};
-        let tx = signed_publish([1; 32], CHAIN, 0, vec![9]);
+        // Execution headroom pays for the paymaster fields added after signing.
+        let tx = signed_publish_with([1; 32], CHAIN, 0, vec![9], 1_000_000, 1);
         let pm = SigningKey::from_bytes(&[2; 32]);
         let mut v: serde_json::Value = serde_json::from_str(&tx).unwrap();
         let parsed: Transaction = serde_json::from_value(v.clone()).unwrap();
@@ -282,6 +364,8 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_str(&tx).unwrap();
         v["public_key"] = serde_json::json!(hex::encode(key.public_key()));
         v["sender"] = serde_json::json!(crypto::derive_address(&key.public_key()).unwrap());
+        // Room for the 1,952-byte key and the 3,309-byte signature (B14).
+        v["gas_limit"] = serde_json::json!(10_000_000);
         let parsed: Transaction = serde_json::from_value(v.clone()).unwrap();
         v["signature"] =
             serde_json::json!(hex::encode(key.sign(signing_message(&parsed).as_bytes())));

@@ -39,7 +39,6 @@ pub const UPGRADEABLE_SYSTEM_MODULES: &[&str] = &[
     "dex",
     "epoch",
     "governance",
-    "treasury",
     "universal_mining",
 ];
 

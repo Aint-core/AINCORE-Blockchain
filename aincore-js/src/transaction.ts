@@ -43,11 +43,17 @@ function systemCall(
 // Transaction Class
 // ============================================================
 
+/** B14: gas per byte of the signed transaction JSON, as the node charges it. */
+export const BYTE_GAS = 400;
+
 export class Transaction {
     sender: string;
     inputObjects: string[];
     payload: string;
+    /** Set by `sign`: `executionGas` plus BYTE_GAS per byte of the signed JSON. */
     gasLimit: number;
+    /** Gas for Move execution; `sign` adds the byte gas on top. */
+    executionGas: number;
     gasPrice: number;
     sequenceNumber: number;
     publicKey: string;
@@ -60,7 +66,9 @@ export class Transaction {
         this.sender = '';
         this.inputObjects = [];
         this.payload = '';
-        this.gasLimit = 10000;
+        this.gasLimit = 0;
+        this.executionGas = 10000;
+        // At least the node's base fee (B15): `Number(await connection.getGasPrice())`.
         this.gasPrice = 1;
         this.sequenceNumber = 0;
         this.publicKey = '';
@@ -621,6 +629,18 @@ export class Transaction {
         // produced signatures the node rejects, because gas_limit, gas_price and
         // input_objects are bound into the signature (F4) -- leaving them out is
         // both a malleability hole and, in practice, a total submit failure.
+        // B14: the limit covers the signed JSON's own bytes. Measure it with
+        // placeholders of the final sizes (the key, an Ed25519 signature and,
+        // when a paymaster is set first, its signature), gas_limit 0, and 20
+        // bytes of slack for the limit's own digits.
+        this.publicKey = signer.publicKey;
+        this.gasLimit = 0;
+        this.signature = '0'.repeat(128);
+        const pending = this.paymaster !== undefined && this.paymasterSignature === undefined;
+        if (pending) this.paymasterSignature = '0'.repeat(128);
+        const unsized = Buffer.byteLength(this.toString());
+        if (pending) this.paymasterSignature = undefined;
+        this.gasLimit = this.executionGas + BYTE_GAS * (unsized + 20);
         const message = [
             this.chainId,
             this.sender,
@@ -631,7 +651,6 @@ export class Transaction {
             this.inputObjects.join(','),
         ].join(':');
         this.signature = signer.sign(Buffer.from(message));
-        this.publicKey = signer.publicKey;
     }
 
     /**
@@ -649,6 +668,15 @@ export class Transaction {
      * SHA-256("PAYMASTER_AUTH:{chain_id}:{sender}:{payload}:{gas_limit}:{sequence_number}"),
      * as the node verifies them (`executor::admission::paymaster_message`).
      */
+    /**
+     * Name the paymaster before the sender signs, so `sign` counts its
+     * signature's bytes in the gas limit; `signAsPaymaster` signs after.
+     */
+    setPaymasterKey(paymasterPublicKey: string) {
+        this.paymaster = paymasterPublicKey;
+        this.paymasterSignature = undefined;
+    }
+
     signAsPaymaster(paymasterKeypair: Keypair) {
         if (!this.chainId) {
             throw new Error('CRITICAL: Chain ID must be explicitly set to prevent replay attacks');

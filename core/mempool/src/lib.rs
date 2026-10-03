@@ -229,6 +229,14 @@ impl Mempool {
         // (B13): its signature is verified now, so its balance is the one that
         // pays. Without storage (unit tests) the gate is skipped.
         if let Some(storage) = &self.storage {
+            // B15: below the committed base fee the executor would refuse it.
+            let base_fee = executor::committed_base_fee(storage);
+            if parsed_tx.gas_price < base_fee {
+                return Err(format!(
+                    "Gas price {} is below the base fee {}",
+                    parsed_tx.gas_price, base_fee
+                ));
+            }
             if let Some(gas_cost) = (parsed_tx.gas_limit as u128).checked_mul(parsed_tx.gas_price) {
                 match executor::committed_ain_balance(storage, &checked.payer) {
                     Some(balance) if balance < gas_cost => {

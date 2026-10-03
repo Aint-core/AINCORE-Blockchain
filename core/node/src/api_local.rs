@@ -1251,8 +1251,9 @@ fn handle_rpc_method(
              }
         },
         "aincore_getGasPrice" => {
-            // Return safe minimum gas price (1 AIN-Sat)
-            Ok(serde_json::json!(1))
+            // B15: the committed base fee, quanta per gas, as a string (it can
+            // pass 2^53). A transaction needs at least this price.
+            Ok(serde_json::json!(executor::committed_base_fee(&data.storage).to_string()))
         },
         "aincore_getMempoolStatus" => {
             let mempool = data.mempool.lock()
@@ -1699,8 +1700,12 @@ fn handle_rpc_method(
         },
 
         "aincore_estimateGas" => {
-            // params: [tx_object] or [payload_string]
-            // Simple estimation based on payload type
+            // params: [tx_object] or [payload_string]. B14/B15: the execution
+            // estimate for the payload, the intrinsic byte gas when the whole
+            // transaction is given (a payload alone has no size yet, so it is
+            // estimated at the payload's own length plus a signed Ed25519
+            // envelope), and the base fee as the price.
+            let raw_len = params.get(0).and_then(|v| v.is_object().then(|| v.to_string().len()));
             let payload = params.get(0)
                 .and_then(|v| {
                     if v.is_string() { v.as_str().map(|s| s.to_string()) }
@@ -1708,13 +1713,19 @@ fn handle_rpc_method(
                     else { None }
                 })
                 .unwrap_or_default();
-
-            let gas = estimate_payload_gas(&payload);
-
+            // A signed Ed25519 transfer's JSON without its payload: ~420 bytes.
+            const ENVELOPE_BYTES: usize = 420;
+            let execution = estimate_payload_gas(&payload);
+            let bytes = raw_len.unwrap_or(payload.len() + ENVELOPE_BYTES);
+            let intrinsic = executor::admission::intrinsic_gas(bytes);
+            let gas = execution.saturating_add(intrinsic);
+            let price = executor::committed_base_fee(&data.storage);
             Ok(serde_json::json!({
                 "estimated_gas": gas,
-                "gas_price": 1,
-                "estimated_fee": gas.to_string()
+                "execution_gas": execution,
+                "intrinsic_gas": intrinsic,
+                "gas_price": price.to_string(),
+                "estimated_fee": (gas as u128).saturating_mul(price).to_string()
             }))
         },
 
@@ -2588,7 +2599,8 @@ mod tests {
             ]]))
             .unwrap(),
         );
-        let (seq, gas_limit, gas_price) = (0u64, 100_000u64, 1u128);
+        // A limit that covers the transaction's bytes (B14) with room to run.
+        let (seq, gas_limit, gas_price) = (0u64, 1_000_000u64, 1u128);
         let message = format!(
             "{}:{}:{}:{}:{}:{}:{}",
             chain_id, sender, payload, seq, gas_limit, gas_price, ""

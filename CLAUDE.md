@@ -165,7 +165,9 @@ nonce dedup `sender:sequence_number`, max pending 5000 TX.
 - **AincoreCoin type:** `0x1::staking::AincoreCoin`
 - **CoinStore key format:** `resource_{addr}_{StructTag}`
 - **Reward:** `delegation::pay_rewards` tiap periode reward ke komite epoch blok itu (bukan live set), dibagi self/delegasi dari catatan komite (G5 EM-1..2, DL-2)
-- **Fee:** 20 % anchor leader, 80 % komite menurut stake; 10 % dibakar (default `burn_percentage`)
+- **Fee (B15, EIP-1559):** base fee `sys:base_fee` naik/turun maks 1/8 per blok menuju target 100M gas (setengah plafon), lantai `sys:config:min_base_fee` (genesis-tool: blok penuh di lantai = emisi satu blok); `gas_limit × base_fee` DIBAKAR, tip (harga di atas base fee): 10 % dibakar, sisanya 20 % leader / 80 % komite
+- **Gas per byte (B14):** `BYTE_GAS = 400` per byte transaksi, termasuk dalam `gas_limit`; `MAX_GAS_LIMIT` hanya untuk bagian eksekusi
+- **Isi blok (B14):** hanya transaksi yang dieksekusi dan membayar (`BlockExecutionSummary::body`); sync menolak blok yang memuat transaksi tak tereksekusi
 
 ---
 

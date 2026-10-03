@@ -181,10 +181,6 @@ pub struct GenMultiArgs {
     #[arg(long, default_value = "AINCORE-MAINNET-1")]
     pub chain_id: String,
 
-    /// Treasury reserve in whole AIN (converted to 10^18 quanta).
-    #[arg(long, default_value_t = 50_000)]
-    pub treasury_reserve_ain: u128,
-
     /// The block time measured on the release candidate, in milliseconds
     /// (G5 P-1). The consensus-time cap per block is derived from it. It is
     /// required, with no default: a guessed block time is how the emission
@@ -237,7 +233,6 @@ pub struct GenesisValidatorConfig {
 pub struct GenesisFile {
     pub chain_id: String,
     pub validators: Vec<GenesisValidatorConfig>,
-    pub treasury_reserve: String,
     /// G5 P-1: derived from the measured block time (`derive_chain_params`):
     /// the committee epoch I and the reward period R in blocks, and C_tau,
     /// the consensus-time cap per block.
@@ -257,6 +252,27 @@ pub struct GenesisFile {
     /// G5 A4 BW-2: liquid genesis balances.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accounts: Vec<node::genesis::GenesisAccount>,
+    /// B15: the base fee's floor, quanta per gas (`derive_min_base_fee`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_base_fee: Option<String>,
+}
+
+/// staking.move's emission rate: per second, `remaining x RATE / 10^18`.
+/// A test reads it back from the Move source, so the two cannot drift.
+pub const EMISSION_RATE_E18_PER_SEC: u128 = 607_866_866;
+
+/// B15: the base fee's floor. A full block (`MAX_BLOCK_GAS_LIMIT` gas) at
+/// the floor costs one block of emission, so filling blocks is never cheaper
+/// than what the chain pays to produce them (docs/research/
+/// fees_and_block_resources.md). Emission over one `block_time_ms` block is
+/// `remaining x RATE x t / 10^18`, computed in staking.move's order.
+pub fn derive_min_base_fee(remaining_quanta: u128, block_time_ms: u64) -> u128 {
+    let per_block = (remaining_quanta / 1_000_000_000)
+        .saturating_mul(EMISSION_RATE_E18_PER_SEC)
+        .saturating_mul(block_time_ms as u128)
+        / 1_000
+        / 1_000_000_000;
+    (per_block / executor::MAX_BLOCK_GAS_LIMIT as u128).max(1)
 }
 
 /// Derive every genesis field for one validator from its 32-byte node.key seed.
@@ -325,7 +341,6 @@ pub fn parse_validator_spec(raw: &str) -> Result<ValidatorSpec, Box<dyn std::err
 pub fn build_genesis_file(
     specs: &[ValidatorSpec],
     chain_id: &str,
-    treasury_reserve_ain: u128,
     block_time_ms: u64,
     clock_cap_secs: u64,
     stdlib_hash: &str,
@@ -342,7 +357,6 @@ pub fn build_genesis_file(
     build_genesis_from_entries(
         &entries,
         chain_id,
-        treasury_reserve_ain,
         block_time_ms,
         clock_cap_secs,
         stdlib_hash,
@@ -353,7 +367,6 @@ pub fn build_genesis_file(
 pub fn build_genesis_from_entries(
     specs: &[EntrySpec],
     chain_id: &str,
-    treasury_reserve_ain: u128,
     block_time_ms: u64,
     clock_cap_secs: u64,
     stdlib_hash: &str,
@@ -414,19 +427,9 @@ pub fn build_genesis_from_entries(
         });
     }
 
-    let treasury_reserve = treasury_reserve_ain
-        .checked_mul(COIN_SCALE)
-        .ok_or_else(|| {
-            format!(
-                "treasury_reserve {} AIN overflows u128 quanta",
-                treasury_reserve_ain
-            )
-        })?;
-
     Ok(GenesisFile {
         chain_id: chain_id.to_string(),
         validators,
-        treasury_reserve: treasury_reserve.to_string(),
         epoch_block_interval: params.epoch_blocks,
         reward_period_blocks: params.reward_period,
         max_block_interval_secs: params.max_block_interval_secs,
@@ -434,6 +437,7 @@ pub fn build_genesis_from_entries(
         genesis_time: None,
         bootstrap: None,
         accounts: Vec::new(),
+        min_base_fee: None,
     })
 }
 
@@ -662,7 +666,6 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut genesis = build_genesis_from_entries(
         &entries,
         &args.chain_id,
-        args.treasury_reserve_ain,
         args.block_time_ms,
         args.clock_cap_secs,
         &stdlib_hash,
@@ -677,6 +680,24 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     apply_bootstrap_and_accounts(&mut genesis, &entries, args.s_min_ain, &accounts)?;
+    // B15: the floor from the reserve left after genesis allocates.
+    let allocated: u128 = genesis
+        .validators
+        .iter()
+        .map(|v| v.stake.parse::<u128>().unwrap_or(0))
+        .chain(
+            genesis
+                .accounts
+                .iter()
+                .map(|a| a.balance.parse::<u128>().unwrap_or(0)),
+        )
+        .sum();
+    let remaining = executor::MAX_SUPPLY.saturating_sub(allocated);
+    let floor = derive_min_base_fee(remaining, args.block_time_ms);
+    genesis.min_base_fee = Some(floor.to_string());
+    println!(
+        "⛽ Base fee floor: {floor} quanta per gas (a full block at it costs one block of emission)"
+    );
     if let Some(boot) = &genesis.bootstrap {
         let b: u64 = boot.weights.iter().map(|w| w.weight_ain).sum();
         println!(
@@ -725,7 +746,6 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
             &v.bls_public_key[..16.min(v.bls_public_key.len())]
         );
     }
-    println!("🏦 Treasury reserve: {} quanta", genesis.treasury_reserve);
     println!(
         "⏳ From {} ms blocks: reward period {} blocks, consensus-time cap {} s per block",
         args.block_time_ms, genesis.reward_period_blocks, genesis.max_block_interval_secs
@@ -743,6 +763,32 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B15: the Rust copy of the emission rate is staking.move's.
+    #[test]
+    fn the_emission_rate_is_staking_moves() {
+        let source = include_str!("../../vm_move/stdlib/sources/staking.move");
+        assert!(source.contains(&format!(
+            "const EMISSION_RATE_E18_PER_SEC: u128 = {EMISSION_RATE_E18_PER_SEC};"
+        )));
+    }
+
+    /// B15: with the V5 testnet's 18.5M AIN allocated and 6.78 s blocks, a
+    /// full block at the floor costs one block of emission: 0.54196 AIN,
+    /// as the continuous rate -ln(1 - 0.019) per year gives it.
+    #[test]
+    fn a_full_block_at_the_floor_costs_one_block_of_emission() {
+        let remaining = executor::MAX_SUPPLY - 18_500_000 * COIN_SCALE;
+        let floor = derive_min_base_fee(remaining, 6_780);
+        assert_eq!(floor, 2_709_779_308);
+        let block = floor * executor::MAX_BLOCK_GAS_LIMIT as u128;
+        let emission = remaining as f64 * -(1.0f64 - 0.019).ln() * 6.78 / 31_557_600.0;
+        assert!(
+            (block as f64 / emission - 1.0).abs() < 1e-6,
+            "{block} vs {emission}"
+        );
+        assert_eq!(derive_min_base_fee(0, 6_780), 1, "never below 1");
+    }
     use std::sync::Arc;
     use storage::StateDB;
 
@@ -834,15 +880,8 @@ mod tests {
                 stake_ain: 2000,
             },
         ];
-        let err = build_genesis_file(
-            &specs,
-            "AINCORE-MAINNET-1",
-            50_000,
-            6_650,
-            14,
-            "stdlib-hash",
-        )
-        .expect_err("duplicate must fail");
+        let err = build_genesis_file(&specs, "AINCORE-MAINNET-1", 6_650, 14, "stdlib-hash")
+            .expect_err("duplicate must fail");
         assert!(err.to_string().contains("duplicate validator address"));
     }
 
@@ -862,15 +901,8 @@ mod tests {
                 stake_ain: 2_000_000,
             },
         ];
-        let genesis = build_genesis_file(
-            &specs,
-            "AINCORE-MAINNET-1",
-            50_000,
-            6_650,
-            14,
-            "stdlib-hash",
-        )
-        .unwrap();
+        let genesis =
+            build_genesis_file(&specs, "AINCORE-MAINNET-1", 6_650, 14, "stdlib-hash").unwrap();
 
         // Reconstruct consensus::qc::ValidatorInfo from the emitted file (this is
         // the same shape genesis.rs writes to sys:validator_set:v1, with stake
@@ -919,7 +951,6 @@ mod tests {
         let genesis = build_genesis_file(
             &specs,
             "AINCORE-MAINNET-1",
-            50_000,
             6_650,
             14,
             &node::genesis::stdlib_hash_of(&stdlib_path()).unwrap(),
@@ -998,15 +1029,8 @@ mod tests {
                 stake_ain: 2_000_000,
             },
         ];
-        let from_seeds = build_genesis_file(
-            &specs,
-            "AINCORE-MAINNET-1",
-            50_000,
-            6_650,
-            14,
-            "stdlib-hash",
-        )
-        .unwrap();
+        let from_seeds =
+            build_genesis_file(&specs, "AINCORE-MAINNET-1", 6_650, 14, "stdlib-hash").unwrap();
         // Each entry travels as JSON, as the operator sends it.
         let entries: Vec<EntrySpec> = specs
             .iter()
@@ -1020,15 +1044,9 @@ mod tests {
                 }
             })
             .collect();
-        let from_entries = build_genesis_from_entries(
-            &entries,
-            "AINCORE-MAINNET-1",
-            50_000,
-            6_650,
-            14,
-            "stdlib-hash",
-        )
-        .unwrap();
+        let from_entries =
+            build_genesis_from_entries(&entries, "AINCORE-MAINNET-1", 6_650, 14, "stdlib-hash")
+                .unwrap();
         assert_eq!(from_entries, from_seeds);
         // The node.key forms the node reads give the same seed.
         assert_eq!(parse_node_key(&seed(21)).unwrap(), seed(21));
@@ -1064,7 +1082,7 @@ mod tests {
             entity: None,
         };
         let twice = vec![spec(good.clone()), spec(good.clone())];
-        let err = build_genesis_from_entries(&twice, "C", 0, 6_650, 14, "h").unwrap_err();
+        let err = build_genesis_from_entries(&twice, "C", 6_650, 14, "h").unwrap_err();
         assert!(err.to_string().contains("duplicate"), "{err}");
         let zero = vec![EntrySpec {
             entry: good,
@@ -1072,7 +1090,7 @@ mod tests {
             bootstrap_ain: 0,
             entity: None,
         }];
-        let err = build_genesis_from_entries(&zero, "C", 0, 6_650, 14, "h").unwrap_err();
+        let err = build_genesis_from_entries(&zero, "C", 6_650, 14, "h").unwrap_err();
         assert!(err.to_string().contains("stake"), "{err}");
     }
 
@@ -1092,9 +1110,8 @@ mod tests {
         };
         let ops: Vec<EntrySpec> = (41..45).map(|n| spec(n, 0, 4_625_000)).collect();
         let stdlib_hash = node::genesis::stdlib_hash_of(&stdlib_path()).unwrap();
-        let base =
-            build_genesis_from_entries(&ops, "AINCORE-TESTNET-V4", 0, 6_749, 25, &stdlib_hash)
-                .unwrap();
+        let base = build_genesis_from_entries(&ops, "AINCORE-TESTNET-V4", 6_749, 25, &stdlib_hash)
+            .unwrap();
         let public = vec![AccountSpec {
             address: entry_from_seed(&seed(45)).unwrap().address,
             balance_ain: 1_000,
@@ -1169,10 +1186,9 @@ mod tests {
         let mut thin = ops.clone();
         thin[0].stake_ain = 500;
         thin[0].bootstrap_ain -= 500;
-        let err =
-            build_genesis_from_entries(&thin, "AINCORE-TESTNET-V4", 0, 6_749, 25, &stdlib_hash)
-                .unwrap_err()
-                .to_string();
+        let err = build_genesis_from_entries(&thin, "AINCORE-TESTNET-V4", 6_749, 25, &stdlib_hash)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("below the minimum"), "{err}");
         // What the tool writes, the node accepts: the same rules, one place.
         // score-testnet's allocations set the entries they name, and an

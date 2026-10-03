@@ -841,6 +841,7 @@ mod tests {
             receipts_root: "r".to_string(),
             gas_charged: 0,
             tx_count: 0,
+            body: Vec::new(),
         };
 
         let err = sync.verify_execution_roots(&block, &summary).unwrap_err();
@@ -872,6 +873,7 @@ mod tests {
             receipts_root: "r".to_string(),
             gas_charged: 0,
             tx_count: 0,
+            body: Vec::new(),
         };
         let err = sync.verify_execution_roots(&block, &summary).unwrap_err();
         assert!(err.contains("empty state_root"), "{err}");
@@ -892,6 +894,7 @@ mod tests {
             receipts_root: "r".to_string(),
             gas_charged: 0,
             tx_count: 0,
+            body: Vec::new(),
         };
 
         let empty = Block::new_with_roots(

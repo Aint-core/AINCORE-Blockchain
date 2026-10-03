@@ -21,6 +21,11 @@ sha2 = "0.10"
 crypto = { path = "../../common/crypto" }
 blockchain = { path = "../../consensus/blockchain" }
 
+[features]
+# Seeding helpers for other crates' tests: the stdlib, chain parameters and
+# AIN balances, written as genesis writes them. Never in a build.
+test-support = ["storage/test-seeding"]
+
 [dev-dependencies]
 # G3 WG-1: test fixtures seed their own genesis state (StateDB::seeding).
 storage = { path = "../../common/storage", features = ["test-seeding"] }

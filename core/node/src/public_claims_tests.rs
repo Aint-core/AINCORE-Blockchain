@@ -22,11 +22,11 @@ const FALSE_CLAIMS: &[(&str, &str)] = &[
     ),
     (
         "genesis supply** | 0",
-        "genesis mints the validators' stake and the treasury",
+        "genesis mints the validators' stake and any genesis accounts",
     ),
     (
         "no pre-mine",
-        "genesis mints the validators' stake and the treasury",
+        "genesis mints the validators' stake and any genesis accounts",
     ),
     ("1-2 detik", "the V4 block time is not measured yet"),
     ("1-2s", "finality time is not measured yet"),
@@ -41,7 +41,7 @@ const FALSE_CLAIMS: &[(&str, &str)] = &[
     ),
     (
         "fees flow to the treasury",
-        "fees are burned 10 %, then 20/80 leader/committee",
+        "the base fee is burned; of the tip, 10 % burned, then 20/80 leader/committee",
     ),
     (
         "mined via depin",

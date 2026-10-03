@@ -14,7 +14,6 @@ module 0x1::coin {
     friend 0x1::dex;
     friend 0x1::delegation;
     friend 0x1::token_factory;
-    friend 0x1::treasury;
     friend 0x1::universal_mining;
     friend 0x1::governance;
     friend 0x1::wbtc;

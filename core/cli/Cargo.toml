@@ -16,6 +16,8 @@ anyhow = "1.0"
 config = { path = "../../common/config" }
 keystore = { path = "../../common/keystore" }
 crypto = { path = "../../common/crypto" }
+# B14/B15: the node's own transaction type, signing message and gas rule.
+executor = { path = "../executor" }
 rpassword = "7.0"
 
 sha2 = "0.10"

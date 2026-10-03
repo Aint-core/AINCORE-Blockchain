@@ -22,9 +22,9 @@ pub fn expected_chain_id() -> String {
 // SEC-#14: 150M AIN hard cap (in quanta). Minting is cap-clamped in
 // staking.move (distribute_rewards); this constant backs the executor-side
 // defense-in-depth tripwire in `append_supply_tracker_updates`.
-const MAX_SUPPLY: u128 = 150_000_000 * 1_000_000_000_000_000_000; // 150 Million AIN
-                                                                  // Note: Block rewards handled exclusively by staking.move (Halving model)
-                                                                  // Executor only distributes transaction fees — no inflationary minting here
+// Block rewards are handled exclusively by staking.move (halving model); the
+// executor only distributes transaction fees, no inflationary minting here.
+pub const MAX_SUPPLY: u128 = 150_000_000 * 1_000_000_000_000_000_000; // 150 Million AIN
 
 // N-2 FIX: Per-block cumulative object limit to prevent memory exhaustion DoS.
 // 10,000 TXs × 128 objects = 1.28M objects → 1.28GB RAM. Cap at 10K total.
@@ -54,6 +54,67 @@ pub use admission::MIN_GAS_PRICE;
 
 pub mod admission;
 
+/// Seeding for other crates' tests (`test-support` feature): enough of what
+/// genesis writes for a transaction to execute.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    use storage::StateDB;
+
+    /// Every stdlib module, as genesis installs it, and the chain
+    /// parameters and clock the epoch and reward code read.
+    pub fn load_stdlib(db: &StateDB) {
+        let _seed = db.seeding();
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vm_move/stdlib/bytecode");
+        let mut paths: Vec<_> = std::fs::read_dir(&dir)
+            .expect("stdlib bytecode dir exists")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("mv"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let bytes = std::fs::read(&path).expect("stdlib module readable");
+            let module = move_binary_format::CompiledModule::deserialize(&bytes)
+                .expect("stdlib module deserializes");
+            let id = module.self_id();
+            db.put(
+                &format!("module_{}_{}", id.address(), id.name()),
+                &hex::encode(bytes),
+            )
+            .expect("module stored");
+        }
+        db.put(
+            &vm_move::state_keys::resource_key_str(&super::system_address(), "0x1::chain::Params"),
+            &hex::encode(bcs::to_bytes(&(20u64, 20u64, 14u64)).unwrap()),
+        )
+        .expect("chain params stored");
+        db.put(
+            &vm_move::state_keys::resource_key_str(&super::system_address(), "0x1::chain::Clock"),
+            &hex::encode(bcs::to_bytes(&super::ChainClock::default()).unwrap()),
+        )
+        .expect("chain clock stored");
+    }
+
+    /// `address` holds `value` quanta of AIN.
+    pub fn set_ain_balance(db: &StateDB, address: &str, value: u128) {
+        let addr = super::parse_move_address(address).expect("a 64-hex address");
+        let _seed = db.seeding();
+        db.put(
+            &super::coin_store_key(addr),
+            &hex::encode(bcs::to_bytes(&value).unwrap()),
+        )
+        .expect("coin store stored");
+    }
+
+    /// The AIN `address` holds, if it has a coin store.
+    pub fn ain_balance(db: &StateDB, address: &str) -> Option<u128> {
+        let addr = super::parse_move_address(address)?;
+        let hex_value = db.get(&super::coin_store_key(addr)).ok()??;
+        bcs::from_bytes(&hex::decode(hex_value).ok()?).ok()
+    }
+}
+
 fn system_address() -> move_core_types::account_address::AccountAddress {
     move_core_types::account_address::AccountAddress::from_hex_literal("0x1")
         .expect("0x1 must be a valid Move system address")
@@ -75,7 +136,7 @@ fn aincore_coin_type() -> move_core_types::language_storage::TypeTag {
     ))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn coin_store_key(addr: move_core_types::account_address::AccountAddress) -> String {
     let tag = move_core_types::language_storage::StructTag {
         address: system_address(),
@@ -1504,6 +1565,76 @@ pub struct BlockExecutionSummary {
     /// and is re-queued by `requeue_stale` — so an orphaned vertex or a
     /// nonce-deferred transaction is a delay, never a permanent loss.
     pub executed_raws: Vec<String>,
+    /// B14: the block body. The transactions that executed and paid, in the
+    /// block's order; a raw transaction carried twice counts once at most.
+    /// The receipts root is over this list, and a block's body must equal
+    /// it: what did not execute (over the gas ceiling, a wrong nonce, a payer
+    /// who cannot pay) is not stored and paid nothing.
+    pub body: Vec<String>,
+}
+
+/// B15: the base fee a block charges, per gas (EIP-1559), in state.
+pub const BASE_FEE_KEY: &str = "sys:base_fee";
+/// B15: the floor of the base fee, fixed at genesis.
+pub const MIN_BASE_FEE_KEY: &str = "sys:config:min_base_fee";
+/// B15: the gas a block aims at, half the ceiling (EIP-1559's elasticity 2).
+pub const TARGET_BLOCK_GAS: u64 = MAX_BLOCK_GAS_LIMIT / 2;
+/// B15: EIP-1559's change denominator, so the fee moves at most 1/8 a block.
+pub const BASE_FEE_CHANGE_DENOMINATOR: u128 = 8;
+
+/// The chain's base-fee floor (`MIN_GAS_PRICE` where genesis set none, as in
+/// fixtures that seed state by hand).
+pub fn min_base_fee(db: &StateDB) -> u128 {
+    db.get(MIN_BASE_FEE_KEY)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u128>().ok())
+        .unwrap_or(admission::MIN_GAS_PRICE)
+}
+
+/// The base fee the next block charges.
+pub fn committed_base_fee(db: &StateDB) -> u128 {
+    db.get(BASE_FEE_KEY)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u128>().ok())
+        .unwrap_or_else(|| min_base_fee(db))
+}
+
+/// EIP-1559's update: a block over the target raises the fee by
+/// `base * (used - target) / target / 8` (at least 1), one under it lowers it
+/// by `base * (target - used) / target / 8`; never below `min`.
+pub fn next_base_fee(base: u128, min: u128, gas_used: u64) -> u128 {
+    let target = TARGET_BLOCK_GAS as u128;
+    let used = gas_used as u128;
+    let next = if used > target {
+        let delta = base.saturating_mul(used - target) / target / BASE_FEE_CHANGE_DENOMINATOR;
+        base.saturating_add(delta.max(1))
+    } else {
+        base.saturating_sub(
+            base.saturating_mul(target - used) / target / BASE_FEE_CHANGE_DENOMINATOR,
+        )
+    };
+    next.max(min)
+}
+
+/// The transactions of `all` that executed, in `all`'s order: each executed
+/// raw string keeps as many occurrences as it executed, the first ones.
+fn executed_in_order(all: &[String], executed: &[String]) -> Vec<String> {
+    let mut left: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for raw in executed {
+        *left.entry(raw.as_str()).or_default() += 1;
+    }
+    all.iter()
+        .filter(|raw| match left.get_mut(raw.as_str()) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                true
+            }
+            _ => false,
+        })
+        .cloned()
+        .collect()
 }
 
 pub struct Executor {
@@ -2996,6 +3127,7 @@ impl Executor {
                     gas_charged: 0,
                     executed_raws: Vec::new(),
                     tx_count: 0,
+                    body: Vec::new(),
                 }
             }
         }
@@ -3255,6 +3387,10 @@ impl Executor {
             let mut dropped = 0usize;
             for tx in parsed_txs.into_iter() {
                 let cost = tx.0.gas_limit;
+                // B14: the per-transaction cap bounds Move execution, so it is
+                // checked on the limit less the transaction's byte gas; the
+                // block ceiling counts the whole limit, bytes included.
+                let execution = cost.saturating_sub(admission::intrinsic_gas(tx.1.len()));
                 // GATE-CRITICAL: budget on a VALIDATED gas_limit. `gas_limit` is
                 // an attacker-declared field, and the per-tx ceiling is enforced
                 // later, inside execution. Budgeting on the raw value let one
@@ -3264,7 +3400,7 @@ impl Executor {
                 // since the transaction is then rejected and never pays. A
                 // transaction over the per-tx ceiling cannot execute at all, so
                 // it is skipped here without charging the block for it.
-                if cost > MAX_GAS_LIMIT {
+                if execution > MAX_GAS_LIMIT {
                     dropped += 1;
                     continue;
                 }
@@ -3296,6 +3432,8 @@ impl Executor {
         let mut total_fees: u128 = 0;
 
         let mut executed_raws: Vec<String> = Vec::new();
+        // B15: the gas this block charged (whole limits, bytes included).
+        let mut gas_used: u64 = 0;
         // (write log already armed at step 0, before apply_slash_evidence)
         // AUDIT-B4b (root determinism): the state root used to be chained ONCE
         // PER EXECUTION BATCH, which made it a function of how the conflict
@@ -3314,10 +3452,18 @@ impl Executor {
             let mut results: Vec<(
                 String,
                 String,
+                u64,
                 Option<(Vec<(String, Option<String>)>, u128)>,
             )> = batch
                 .par_iter()
-                .map(|(_tx, raw)| (tx_hash_hex(raw), raw.clone(), self.execute_transaction(raw)))
+                .map(|(tx, raw)| {
+                    (
+                        tx_hash_hex(raw),
+                        raw.clone(),
+                        tx.gas_limit,
+                        self.execute_transaction(raw),
+                    )
+                })
                 .collect();
             results.sort_by(|left, right| left.0.cmp(&right.0));
 
@@ -3335,9 +3481,10 @@ impl Executor {
             let mut writer_of_key: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
 
-            for (tx_hash, raw_tx, res) in results {
+            for (tx_hash, raw_tx, gas_limit, res) in results {
                 if let Some((mut updates, gas_charged)) = res {
                     executed_raws.push(raw_tx);
+                    gas_used = gas_used.saturating_add(gas_limit);
                     updates.sort_by(|left, right| left.0.cmp(&right.0));
                     for (key, val_opt) in updates {
                         if let Some(prev_writer) = writer_of_key.get(&key) {
@@ -3388,11 +3535,18 @@ impl Executor {
         };
 
         // Fee Logic & Burning (fees only, no inflation)
+        // B15 (EIP-1559): every charged gas unit's base fee is burned, so a
+        // producer cannot pay it to itself; the tip above it follows the fee
+        // rule (the burn percentage, then the leader and the committee). Every
+        // executed transaction offered at least the base fee, so the tips are
+        // the rest of the fees.
+        let base_fee = committed_base_fee(&self.db);
+        let burned_base = (gas_used as u128).saturating_mul(base_fee);
+        let tips = total_fees.saturating_sub(burned_base);
         let burn_pct = self.db.get_burn_percentage() as u128;
-        let total_fees_u128 = total_fees;
-
-        let burnt_fees = total_fees_u128.saturating_mul(burn_pct) / 100;
-        let miner_fees = total_fees_u128.saturating_sub(burnt_fees);
+        let burnt_tips = tips.saturating_mul(burn_pct) / 100;
+        let burnt_fees = burned_base.saturating_add(burnt_tips);
+        let miner_fees = tips.saturating_sub(burnt_tips);
 
         // Miner reward = fees ONLY (no block inflation from executor)
         let reward_amount = miner_fees;
@@ -3474,6 +3628,15 @@ impl Executor {
         // 6. Recover queued fee rewards whose recipient CoinStore is now valid.
         self.process_fee_sweep_queue();
 
+        // B15: the next block's base fee, from this block's gas (EIP-1559).
+        // Written only when it moves: an idle chain at the floor writes nothing.
+        let next_base = next_base_fee(base_fee, min_base_fee(&self.db), gas_used);
+        if next_base != base_fee {
+            if let Err(e) = self.db.put(BASE_FEE_KEY, &next_base.to_string()) {
+                panic!("CRITICAL: base fee write failed at height {block_height}: {e}");
+            }
+        }
+
         // 7. Promote downtime attestations to pending slashes when distinct
         //    reporters reach BFT quorum (Phase 2.3 / H-02). Equivocation
         //    slashes are written directly by the consensus equivocation
@@ -3528,12 +3691,14 @@ impl Executor {
             hook(3, &self.db);
         }
 
+        let body = executed_in_order(&txs_json, &executed_raws);
         let summary = BlockExecutionSummary {
             state_root,
-            receipts_root: self.receipts_root_for_block(&txs_json),
+            receipts_root: self.receipts_root_for_block(&body),
             gas_charged: total_fees,
             executed_raws,
-            tx_count: txs_json.len(),
+            tx_count: body.len(),
+            body,
         };
 
         println!(
@@ -4591,7 +4756,22 @@ impl Executor {
                 None
             }
         };
-        if let Some(admission::CheckedTx { tx, payer, .. }) = checked {
+        if let Some(admission::CheckedTx {
+            tx,
+            payer,
+            execution_gas,
+            ..
+        }) = checked
+        {
+            // B15: a block charges its base fee; a lower price does not run.
+            let base_fee = committed_base_fee(&self.db);
+            if tx.gas_price < base_fee {
+                println!(
+                    "❌ REJECTED: gas price {} below the base fee {}",
+                    tx.gas_price, base_fee
+                );
+                return None;
+            }
             // 1. Fetch Sender Account Object.
             //
             // ONBOARDING (second layer): a first-time sender has no AccountData
@@ -4654,13 +4834,13 @@ impl Executor {
             // 3. Check Balance & Deduct Gas
             // N-2 FIX: Charge gas for object loading upfront
             let object_load_gas = (tx.input_objects.len() as u64) * OBJECT_LOAD_GAS;
-            if object_load_gas > tx.gas_limit {
+            if object_load_gas > execution_gas {
                 println!(
-                    "❌ Insufficient gas for object loading: {} objects × {} gas = {} > gas_limit {}",
+                    "❌ Insufficient gas for object loading: {} objects × {} gas = {} > execution gas {}",
                     tx.input_objects.len(),
                     OBJECT_LOAD_GAS,
                     object_load_gas,
-                    tx.gas_limit
+                    execution_gas
                 );
                 return None;
             }
@@ -4876,7 +5056,7 @@ impl Executor {
                     match self.vm.execute_transaction_actions_with_prestaged(
                         actions,
                         sender_addr,
-                        tx.gas_limit,
+                        execution_gas,
                         prestaged,
                     ) {
                         Ok((_gas_used, vm_changes, status)) => {
@@ -4959,10 +5139,10 @@ impl Executor {
                         .saturating_add(
                             (modules.len() as u64).saturating_mul(PUBLISH_GAS_PER_MODULE),
                         );
-                    if tx.gas_limit < publish_floor {
+                    if execution_gas < publish_floor {
                         println!(
-                            "❌ Publish rejected: gas_limit {} below size-derived floor {} ({} bytes, {} modules)",
-                            tx.gas_limit,
+                            "❌ Publish rejected: execution gas {} below size-derived floor {} ({} bytes, {} modules)",
+                            execution_gas,
                             publish_floor,
                             publish_bytes,
                             modules.len()
@@ -4980,7 +5160,7 @@ impl Executor {
                     ));
                     match self
                         .vm
-                        .execute_transaction_actions(actions, sender_addr, tx.gas_limit)
+                        .execute_transaction_actions(actions, sender_addr, execution_gas)
                     {
                         Ok((_gas_used, vm_changes, status)) => {
                             if absorb_vm_result!(vm_changes, status) {
@@ -6206,36 +6386,46 @@ mod tests {
         );
     }
 
+    /// A signed transaction with `execution` gas for Move on top of its
+    /// intrinsic byte gas (B14): its `gas_limit` is `execution` plus
+    /// `BYTE_GAS` per byte. `gas_of` reads the limit back.
     fn signed_tx(
         signing_key: &SigningKey,
         sender: &str,
         payload: &str,
         sequence_number: u64,
-        gas_limit: u64,
+        execution: u64,
         gas_price: u128,
     ) -> String {
         let public_key = signing_key.verifying_key();
-        let message = format!(
-            "{}:{}:{}:{}:{}:{}:{}",
-            "AINCORE-MAINNET-1", sender, payload, sequence_number, gas_limit, gas_price, ""
-        );
-        let signature = signing_key.sign(message.as_bytes());
-        serde_json::to_string(&Transaction {
+        let mut tx = Transaction {
             chain_id: "AINCORE-MAINNET-1".to_string(),
             sender: sender.to_string(),
             input_objects: vec![],
             payload: payload.to_string(),
             args: vec![],
-            gas_limit,
+            gas_limit: 0,
             gas_price,
             sequence_number,
             public_key: hex::encode(public_key.as_bytes()),
-            signature: hex::encode(signature.to_bytes()),
+            signature: "00".repeat(64),
             paymaster: None,
             paymaster_signature: None,
             zkp_proof: None,
-        })
-        .expect("tx json")
+        };
+        let unsized_len = serde_json::to_string(&tx).expect("tx json").len();
+        tx.gas_limit = admission::gas_limit_covering(unsized_len, execution);
+        let signature = signing_key.sign(admission::signing_message(&tx).as_bytes());
+        tx.signature = hex::encode(signature.to_bytes());
+        serde_json::to_string(&tx).expect("tx json")
+    }
+
+    /// The `gas_limit` a transaction declares: what it is charged per unit of
+    /// gas price.
+    fn gas_of(tx_json: &str) -> u64 {
+        serde_json::from_str::<Transaction>(tx_json)
+            .expect("tx json")
+            .gas_limit
     }
 
     #[test]
@@ -6275,13 +6465,17 @@ mod tests {
         };
         let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
         let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
+        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
         let (updates, gas) = executor
-            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1))
+            .execute_transaction(&tx_json)
             .expect("transaction accepted");
-        assert_eq!(gas, 100_000);
+        assert_eq!(gas, gas_of(&tx_json) as u128);
         apply_updates(&db, updates);
 
-        assert_eq!(coin_balance(&db, &sender), 899_900);
+        assert_eq!(
+            coin_balance(&db, &sender),
+            1_000_000 - gas_of(&tx_json) as u128 - 100
+        );
         assert_eq!(coin_balance(&db, &recipient), 100);
         let sender_obj = db.get_object(&sender).expect("sender object");
         let sender_data: aa::AccountData = serde_json::from_slice(&sender_obj.data).unwrap();
@@ -6326,15 +6520,20 @@ mod tests {
         let executor = Executor::new(db.clone());
         // Far more than the sender holds -> the payload aborts.
         let payload = coin_transfer_payload(&sender, &recipient, 999_999_999);
+        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
         let (updates, gas) = executor
-            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1))
+            .execute_transaction(&tx_json)
             .expect("transaction is kept (gas is charged) even though the payload aborts");
-        assert_eq!(gas, 100_000, "gas must still be charged on an aborted tx");
+        assert_eq!(
+            gas,
+            gas_of(&tx_json) as u128,
+            "gas must still be charged on an aborted tx"
+        );
         apply_updates(&db, updates);
 
         assert_eq!(
             coin_balance(&db, &sender),
-            900_000,
+            1_000_000 - gas_of(&tx_json) as u128,
             "an aborted transfer must debit ONLY gas — no write from the \
              partially-executed payload may be committed"
         );
@@ -6366,14 +6565,15 @@ mod tests {
         let executor = Executor::new(db.clone());
         // Over-balance transfer -> payload aborts (see the note on the test above).
         let payload = coin_transfer_payload(&sender, &recipient, 999_999_999);
+        let tx_inline_1 = signed_tx(&sender_key, &sender, &payload, 0, 50_000, 1);
         let (updates, _gas) = executor
-            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 50_000, 1))
+            .execute_transaction(&tx_inline_1)
             .expect("aborted transaction is still kept and charged");
         apply_updates(&db, updates);
 
         assert_eq!(
             coin_balance(&db, &sender),
-            450_000,
+            500_000 - gas_of(&tx_inline_1) as u128,
             "gas must be deducted exactly once even though the payload aborted"
         );
     }
@@ -6413,8 +6613,9 @@ mod tests {
 
         let executor = Executor::new(db.clone());
         let payload = coin_transfer_payload(&sender, &recipient, 250);
+        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
         let (updates, _gas) = executor
-            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1))
+            .execute_transaction(&tx_json)
             .expect("transaction accepted");
         apply_updates(&db, updates);
 
@@ -6425,7 +6626,7 @@ mod tests {
         );
         assert_eq!(
             coin_balance(&db, &sender),
-            1_000_000 - 100_000 - 250,
+            1_000_000 - gas_of(&tx_json) as u128 - 250,
             "sender pays gas + the transferred amount"
         );
     }
@@ -6448,8 +6649,9 @@ mod tests {
 
         let executor = Executor::new(db.clone());
         let payload = coin_transfer_payload(&sender, &recipient, 23);
+        let tx_inline_2 = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
         let (updates, _gas) = executor
-            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1))
+            .execute_transaction(&tx_inline_2)
             .expect("transaction accepted");
         apply_updates(&db, updates);
 
@@ -6486,8 +6688,9 @@ mod tests {
 
         let executor = Executor::new(db.clone());
         let payload = coin_transfer_payload(&sender, &recipient, 500);
+        let tx_inline_3 = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
         let (updates, _gas) = executor
-            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1))
+            .execute_transaction(&tx_inline_3)
             .expect("a first-time sender must not be silently dropped");
         apply_updates(&db, updates);
 
@@ -6637,6 +6840,10 @@ mod tests {
     /// given clock cap, a proposer with a coin store and whatever `seed`
     /// adds; then blocks run in order through the real executor, at
     /// timestamps the test controls.
+    /// The most a `G5Chain::tx` can pay: it runs at gas price 1 with 100,000
+    /// execution gas plus its byte gas (B14), and `tx` checks the bound.
+    const G5_FEE_BOUND: u128 = 1_000_000;
+
     struct G5Chain {
         db: Arc<StateDB>,
         executor: Executor,
@@ -6719,6 +6926,10 @@ mod tests {
             all.extend(args);
             let payload = entry_payload(module, function, vec![], all);
             let raw = signed_tx(key, &sender, &payload, *nonce, 100_000, 1);
+            assert!(
+                (gas_of(&raw) as u128) < G5_FEE_BOUND,
+                "a G5 tx pays under the bound"
+            );
             *nonce += 1;
             raw
         }
@@ -6995,8 +7206,8 @@ mod tests {
         assert!(validator_set(&db).unbonding_queue.is_empty());
         // Each got its stake back less a gas fee below the 100,000 limit.
         let gained = |before: u128, a: &str| coin_balance(&db, a) - before;
-        assert!((2 * ain - 100_000..2 * ain).contains(&gained(delegator_before, &delegator)));
-        assert!((1_000 * ain - 100_000..1_000 * ain).contains(&gained(leaver_before, &leaver)));
+        assert!((2 * ain - G5_FEE_BOUND..2 * ain).contains(&gained(delegator_before, &delegator)));
+        assert!((1_000 * ain - G5_FEE_BOUND..1_000 * ain).contains(&gained(leaver_before, &leaver)));
     }
 
     /// G5 CM-1: an increase takes effect exactly N after its announcement,
@@ -8099,7 +8310,7 @@ mod tests {
         chain.run_to(chain.height + 1, vec![withdraw_c]);
         let gained_c = coin_balance(&db, &c) - c_before;
         assert!(
-            (x3 - 100_000..=x3).contains(&gained_c),
+            (x3 - G5_FEE_BOUND..=x3).contains(&gained_c),
             "{gained_c} vs {x3}"
         );
         assert_eq!(pool_of(&db, v6).slash_events[0].pending_tickets, 3);
@@ -8110,7 +8321,7 @@ mod tests {
         let paid_b = 100 * ain + 2 * (100 * ain * 4_429 / 10_000);
         let gained_b = coin_balance(&db, &b) - b_before;
         assert!(
-            (paid_b - 100_000..=paid_b).contains(&gained_b),
+            (paid_b - G5_FEE_BOUND..=paid_b).contains(&gained_b),
             "{gained_b} vs {paid_b}"
         );
         let v6_pool = pool_of(&db, v6);
@@ -8757,7 +8968,7 @@ mod tests {
         let withdraw = call(&mut chain, &a_key, "withdraw_unbonded", None);
         chain.run_to(chain.height + 1, vec![withdraw]);
         let gained = coin_balance(&db, &a) - before;
-        assert!((16 * ain - 100_000..=16 * ain).contains(&gained));
+        assert!((16 * ain - G5_FEE_BOUND..=16 * ain).contains(&gained));
         assert!(book_of(&db, &a).tickets.is_empty());
         let pool = pool_of(&db, validator);
         assert_eq!((pool.ticket_count, pool.unbonding_coins), (1, 5 * ain));
@@ -8946,7 +9157,7 @@ mod tests {
         chain.run_to(1, vec![claim]);
         let gained = coin_balance(&db, &a) - before;
         assert!(
-            (owed - 1 - 100_000..=owed - 1).contains(&gained),
+            (owed - 1 - G5_FEE_BOUND..=owed - 1).contains(&gained),
             "{gained}"
         );
         assert_eq!(pool_of(&db, validator).rewards, 0);
@@ -9357,7 +9568,8 @@ mod tests {
             blockchain::committee::canonical_order(&[a.clone(), c.clone()])
         );
 
-        // Block 21's fees pay C_1: C and A, not B, not the bystander.
+        // Block 21's fees pay C_1: C and A, not B, not the bystander. Price 2
+        // over the base fee of 1 leaves a tip to share (B15).
         let (b_before, c_before) = (balance(&b), balance(&c));
         let pay = signed_tx(
             &payer_key,
@@ -9365,7 +9577,7 @@ mod tests {
             &coin_transfer_payload(&payer, &a.address, 1),
             0,
             100_000,
-            1,
+            2,
         );
         chain.block(chain.timestamp + 7, vec![pay]);
         assert!(balance(&c) > c_before, "a C_1 member earns block 21's fees");
@@ -10710,7 +10922,6 @@ mod tests {
         let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
-        set_coin_store(&db, &sender, 100_050);
         set_coin_store(&db, &recipient, 0);
 
         let executor = Executor::new(db.clone());
@@ -10737,10 +10948,12 @@ mod tests {
         let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
         let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
         let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
+        // The gas plus 50: the 100 transfer aborts after the gas is paid.
+        set_coin_store(&db, &sender, gas_of(&tx_json) as u128 + 50);
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("transaction accepted");
-        assert_eq!(gas, 100_000);
+        assert_eq!(gas, gas_of(&tx_json) as u128);
         apply_updates(&db, updates);
 
         assert_eq!(coin_balance(&db, &sender), 50);
@@ -10751,7 +10964,7 @@ mod tests {
             .expect("receipt stored");
         let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
         assert_eq!(receipt["status"], "aborted");
-        assert_eq!(receipt["gas_charged"], "100000");
+        assert_eq!(receipt["gas_charged"], gas_of(&tx_json).to_string());
     }
 
     #[test]
@@ -10873,10 +11086,13 @@ mod tests {
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("transaction accepted");
-        assert_eq!(gas, 100_000);
+        assert_eq!(gas, gas_of(&tx_json) as u128);
         apply_updates(&db, updates);
 
-        assert_eq!(coin_balance(&db, &sender), 900_000);
+        assert_eq!(
+            coin_balance(&db, &sender),
+            1_000_000 - gas_of(&tx_json) as u128
+        );
         let sender_obj = db.get_object(&sender).expect("sender object");
         let sender_data: aa::AccountData = serde_json::from_slice(&sender_obj.data).unwrap();
         assert_eq!(sender_data.sequence_number, 1);
@@ -10887,7 +11103,7 @@ mod tests {
             .expect("receipt stored");
         let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
         assert_eq!(receipt["status"], "aborted");
-        assert_eq!(receipt["gas_charged"], "100000");
+        assert_eq!(receipt["gas_charged"], gas_of(&tx_json).to_string());
     }
 
     #[test]
@@ -10959,6 +11175,8 @@ mod tests {
         assert!(deps.contains(&recipient));
     }
 
+    /// B15: at a base fee of 1 and a price of 2, the base fee half of the
+    /// fees burns and 10 % of the tip half burns with it.
     #[test]
     fn test_block_fee_burn_updates_supply_trackers() {
         let db = temp_db("block_burn_supply");
@@ -10999,11 +11217,11 @@ mod tests {
         };
         let payload =
             hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
-        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
+        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 2);
         seed_genesis_tree(&db);
 
         let executor = Executor::new(db.clone());
-        executor.execute_block_parallel(vec![tx_json], &sender);
+        executor.execute_block_parallel(vec![tx_json.clone()], &sender);
 
         let total_burned = db
             .get("total_burned")
@@ -11017,9 +11235,15 @@ mod tests {
             .unwrap()
             .parse::<u128>()
             .unwrap();
-        assert_eq!(total_burned, 10_000);
-        assert_eq!(total_supply, 999_990_000);
-        assert_eq!(validator_set(&db).total_supply, 999_990_000);
+        let gas = gas_of(&tx_json) as u128;
+        let burned = gas + gas / 10; // base fee 1 x gas, then 10 % of the tip
+        assert_eq!(total_burned, burned);
+        assert_eq!(total_supply, 1_000_000_000 - burned);
+        assert_eq!(validator_set(&db).total_supply, 1_000_000_000 - burned);
+        // Far under the target: the fee would fall, and the floor holds it at
+        // 1. It did not move, so nothing was written.
+        assert_eq!(committed_base_fee(&db), 1);
+        assert_eq!(db.get(BASE_FEE_KEY).unwrap(), None);
     }
 
     /// G3 S3: genesis commits version 0 of the state tree (`commit_genesis`).
@@ -11041,7 +11265,9 @@ mod tests {
         let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
-        set_coin_store(&db, &sender, 1_000_000);
+        // B15: price 2 over a base fee of 1, so the block burns the base
+        // part and still has a tip to share (and to queue).
+        set_coin_store(&db, &sender, 10_000_000);
         set_coin_store(&db, &recipient, 0);
         set_validator_set(&db, &sender, 0, 1_000_000_000);
         db.put("sys:total_supply", "1000000000").unwrap();
@@ -11069,7 +11295,7 @@ mod tests {
         };
         let payload =
             hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
-        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
+        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 2);
         seed_genesis_tree(&db);
         (db, sender, tx_json)
     }
@@ -11080,6 +11306,7 @@ mod tests {
     #[test]
     fn an_unlogged_state_write_is_provable_against_the_block_root() {
         let (db, sender, tx_json) = g3_burning_transfer("g3_unlogged_in_root");
+        let gas = gas_of(&tx_json) as u128;
         let outcome = Executor::new(db.clone())
             .execute_block_checked_at(vec![tx_json], &sender, 1, block_time(1), 0, &[], |_, _| {
                 Ok(())
@@ -11089,7 +11316,13 @@ mod tests {
             panic!("block 1 must execute: {outcome:?}");
         };
         let supply = db.get("sys:total_supply").unwrap().unwrap();
-        assert_eq!(supply, "999990000", "positive control: the burn happened");
+        // B15: the base fee (1 a gas) burns, then 10 % of the tip (1 a gas).
+        let burned = gas + gas / 10;
+        assert_eq!(
+            supply,
+            (1_000_000_000 - burned).to_string(),
+            "positive control: the burn happened"
+        );
         let root = state_commit::root(&db, 1).unwrap();
         assert_eq!(
             hex::encode(root.0),
@@ -11241,12 +11474,10 @@ mod tests {
             panic!("block 2 must execute");
         };
         assert!(second.executed_raws.is_empty(), "the replay is refused");
-        // Outside a transaction nothing is staged, so this is the root with
-        // the transaction counted as NO_RECEIPT.
-        assert_eq!(
-            second.receipts_root,
-            executor.receipts_root_for_block(std::slice::from_ref(&tx_json))
-        );
+        // B14: the refused replay paid nothing, so it is not in the body and
+        // the receipts root is the empty body's.
+        assert!(second.body.is_empty(), "an unpaid replay is not stored");
+        assert_eq!(second.receipts_root, executor.receipts_root_for_block(&[]));
         assert_ne!(second.receipts_root, first.receipts_root);
     }
 
@@ -11404,7 +11635,10 @@ mod tests {
 
         let ain = aincore_coin_type();
         let wbtc = wbtc_coin_type();
-        set_coin_store_for(&db, &trader, ain.clone(), 1_000_000);
+        // AIN pays the gas, bytes included (B14): start with room for four
+        // transactions; the arithmetic below reads each one's limit.
+        const START: u128 = 10_000_000;
+        set_coin_store_for(&db, &trader, ain.clone(), START);
         set_coin_store_for(&db, &trader, wbtc.clone(), 1_000_000);
         set_dex_registry(&db, vec![]);
 
@@ -11419,7 +11653,7 @@ mod tests {
         let (updates, gas) = executor
             .execute_transaction(&create_tx)
             .expect("create pool accepted");
-        assert_eq!(gas, 10_000);
+        assert_eq!(gas, gas_of(&create_tx) as u128);
         apply_updates(&db, updates);
         assert_eq!(dex_registry(&db).pools.len(), 1);
 
@@ -11435,10 +11669,11 @@ mod tests {
                 bcs::to_bytes(&9_000u128).unwrap(),
             ],
         );
+        let tx_json = signed_tx(&trader_key, &trader, &add_payload, 1, 10_000, 1);
         let (updates, gas) = executor
-            .execute_transaction(&signed_tx(&trader_key, &trader, &add_payload, 1, 10_000, 1))
+            .execute_transaction(&tx_json)
             .expect("add liquidity accepted");
-        assert_eq!(gas, 10_000);
+        assert_eq!(gas, gas_of(&tx_json) as u128);
         apply_updates(&db, updates);
 
         let pool = dex_pool(&db, &trader, ain.clone(), wbtc.clone());
@@ -11451,8 +11686,9 @@ mod tests {
         );
         assert_eq!(
             coin_balance_for(&db, &trader, ain.clone()),
-            1_000_000 - 10_000 - 10_000 - 10_000
+            START - gas_of(&create_tx) as u128 - gas_of(&tx_json) as u128 - 10_000
         );
+        let after_add = START - gas_of(&create_tx) as u128 - gas_of(&tx_json) as u128 - 10_000;
         assert_eq!(coin_balance_for(&db, &trader, wbtc.clone()), 990_000);
 
         let swap_payload = entry_payload(
@@ -11470,13 +11706,14 @@ mod tests {
         let (updates, gas) = executor
             .execute_transaction(&swap_tx)
             .expect("swap accepted");
-        assert_eq!(gas, 10_000);
+        assert_eq!(gas, gas_of(&swap_tx) as u128);
         apply_updates(&db, updates);
 
         let pool = dex_pool(&db, &trader, ain.clone(), wbtc.clone());
         assert_eq!(pool.coin_x.value, 11_000);
         assert_eq!(pool.coin_y.value, 9_094);
-        assert_eq!(coin_balance_for(&db, &trader, ain.clone()), 959_000);
+        let after_swap = after_add - gas_of(&swap_tx) as u128 - 1_000;
+        assert_eq!(coin_balance_for(&db, &trader, ain.clone()), after_swap);
         assert_eq!(coin_balance_for(&db, &trader, wbtc.clone()), 990_906);
         let receipt = db
             .get(&format!("tx_receipt:{}", tx_hash_hex(&swap_tx)))
@@ -11519,17 +11756,11 @@ mod tests {
                 bcs::to_bytes(&900u128).unwrap(),
             ],
         );
+        let tx_json = signed_tx(&trader_key, &trader, &remove_payload, 3, 10_000, 1);
         let (updates, gas) = executor
-            .execute_transaction(&signed_tx(
-                &trader_key,
-                &trader,
-                &remove_payload,
-                3,
-                10_000,
-                1,
-            ))
+            .execute_transaction(&tx_json)
             .expect("remove liquidity accepted");
-        assert_eq!(gas, 10_000);
+        assert_eq!(gas, gas_of(&tx_json) as u128);
         apply_updates(&db, updates);
 
         let pool = dex_pool(&db, &trader, ain.clone(), wbtc.clone());
@@ -11540,7 +11771,10 @@ mod tests {
             dex_lp_balance(&db, &trader, ain.clone(), wbtc.clone()),
             8_000
         );
-        assert_eq!(coin_balance_for(&db, &trader, ain), 950_100);
+        assert_eq!(
+            coin_balance_for(&db, &trader, ain),
+            after_swap - gas_of(&tx_json) as u128 + 1_100
+        );
         assert_eq!(coin_balance_for(&db, &trader, wbtc), 991_815);
     }
 
@@ -11556,7 +11790,9 @@ mod tests {
 
         let ain = aincore_coin_type();
         let wbtc = wbtc_coin_type();
-        set_coin_store_for(&db, &trader, ain.clone(), 100_000);
+        // B14: each call pays its byte gas too, so AIN is funded well
+        // above the amounts traded; the checks subtract each call's gas.
+        set_coin_store_for(&db, &trader, ain.clone(), 10_000_000);
         set_coin_store_for(&db, &trader, wbtc.clone(), 100_000);
         set_dex_registry(&db, vec![]);
 
@@ -11567,15 +11803,9 @@ mod tests {
             vec![ain.clone(), wbtc.clone()],
             vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
         );
+        let tx_inline_4 = signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1);
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(
-                &trader_key,
-                &trader,
-                &create_payload,
-                0,
-                10_000,
-                1,
-            ))
+            .execute_transaction(&tx_inline_4)
             .expect("first create accepted");
         apply_updates(&db, updates);
         assert_eq!(dex_registry(&db).pools.len(), 1);
@@ -11605,7 +11835,11 @@ mod tests {
             .expect("duplicate create abort is accepted and gas-charged");
         apply_updates(&db, updates);
         assert_eq!(dex_registry(&db).pools.len(), 1);
-        assert_eq!(coin_balance_for(&db, &trader, ain), 70_000);
+        let gas = [&tx_inline_4, &reverse_tx, &duplicate_tx]
+            .iter()
+            .map(|tx| gas_of(tx) as u128)
+            .sum::<u128>();
+        assert_eq!(coin_balance_for(&db, &trader, ain), 10_000_000 - gas);
     }
 
     #[test]
@@ -11648,7 +11882,9 @@ mod tests {
 
         let ain = aincore_coin_type();
         let wbtc = wbtc_coin_type();
-        set_coin_store_for(&db, &trader, ain.clone(), 100_000);
+        // B14: each call pays its byte gas too, so AIN is funded well
+        // above the amounts traded; the checks subtract each call's gas.
+        set_coin_store_for(&db, &trader, ain.clone(), 10_000_000);
         set_coin_store_for(&db, &trader, wbtc.clone(), 100_000);
         set_dex_registry(&db, vec![]);
 
@@ -11659,17 +11895,12 @@ mod tests {
             vec![ain.clone(), wbtc.clone()],
             vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
         );
+        let tx_json = signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1);
         let (updates, gas) = executor
-            .execute_transaction(&signed_tx(
-                &trader_key,
-                &trader,
-                &create_payload,
-                0,
-                10_000,
-                1,
-            ))
+            .execute_transaction(&tx_json)
             .expect("create pool accepted");
-        assert_eq!(gas, 10_000);
+        assert_eq!(gas, gas_of(&tx_json) as u128);
+        let create_gas = gas;
         apply_updates(&db, updates);
 
         let payload = entry_payload(
@@ -11688,14 +11919,17 @@ mod tests {
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("minimum-liquidity abort is accepted and gas-charged");
-        assert_eq!(gas, 10_000);
+        assert_eq!(gas, gas_of(&tx_json) as u128);
         apply_updates(&db, updates);
 
         let pool = dex_pool(&db, &trader, ain.clone(), wbtc.clone());
         assert_eq!(pool.lp_supply, 0);
         assert_eq!(pool.coin_x.value, 0);
         assert_eq!(pool.coin_y.value, 0);
-        assert_eq!(coin_balance_for(&db, &trader, ain), 80_000);
+        assert_eq!(
+            coin_balance_for(&db, &trader, ain),
+            10_000_000 - create_gas - gas_of(&tx_json) as u128
+        );
         assert_eq!(coin_balance_for(&db, &trader, wbtc), 100_000);
         let receipt = db
             .get(&format!("tx_receipt:{}", tx_hash_hex(&tx_json)))
@@ -11718,7 +11952,8 @@ mod tests {
         let ain = aincore_coin_type();
         let wbtc = wbtc_coin_type();
         let overflow_input = (u128::MAX / 9_970) + 1;
-        set_coin_store_for(&db, &trader, ain.clone(), overflow_input + 10_000);
+        // The swap input plus room for two calls' gas, byte gas included.
+        set_coin_store_for(&db, &trader, ain.clone(), overflow_input + 10_000_000);
         set_coin_store_for(&db, &trader, wbtc.clone(), 100_000);
         set_dex_registry(&db, vec![]);
 
@@ -11729,17 +11964,12 @@ mod tests {
             vec![ain.clone(), wbtc.clone()],
             vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
         );
+        let tx_json = signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1);
         let (updates, gas) = executor
-            .execute_transaction(&signed_tx(
-                &trader_key,
-                &trader,
-                &create_payload,
-                0,
-                10_000,
-                1,
-            ))
+            .execute_transaction(&tx_json)
             .expect("create pool accepted");
-        assert_eq!(gas, 10_000);
+        assert_eq!(gas, gas_of(&tx_json) as u128);
+        let create_gas = gas;
         apply_updates(&db, updates);
         set_dex_pool(
             &db,
@@ -11766,13 +11996,16 @@ mod tests {
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("overflow abort is accepted and gas-charged");
-        assert_eq!(gas, 10_000);
+        assert_eq!(gas, gas_of(&tx_json) as u128);
         apply_updates(&db, updates);
 
         let pool = dex_pool(&db, &trader, ain.clone(), wbtc.clone());
         assert_eq!(pool.coin_x.value, 10_000);
         assert_eq!(pool.coin_y.value, 10_000);
-        assert_eq!(coin_balance_for(&db, &trader, ain), overflow_input - 10_000);
+        assert_eq!(
+            coin_balance_for(&db, &trader, ain),
+            overflow_input + 10_000_000 - create_gas - gas_of(&tx_json) as u128
+        );
         assert_eq!(coin_balance_for(&db, &trader, wbtc), 100_000);
         let receipt = db
             .get(&format!("tx_receipt:{}", tx_hash_hex(&tx_json)))
@@ -11794,7 +12027,9 @@ mod tests {
 
         let ain = aincore_coin_type();
         let wbtc = wbtc_coin_type();
-        set_coin_store_for(&db, &trader, ain.clone(), 100_000);
+        // B14: each call pays its byte gas too, so AIN is funded well
+        // above the amounts traded; the checks subtract each call's gas.
+        set_coin_store_for(&db, &trader, ain.clone(), 10_000_000);
         set_coin_store_for(&db, &trader, wbtc.clone(), 100_000);
         set_dex_registry(&db, vec![]);
 
@@ -11805,15 +12040,9 @@ mod tests {
             vec![ain.clone(), wbtc.clone()],
             vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
         );
+        let tx_inline_5 = signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1);
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(
-                &trader_key,
-                &trader,
-                &create_payload,
-                0,
-                10_000,
-                1,
-            ))
+            .execute_transaction(&tx_inline_5)
             .expect("create pool accepted");
         apply_updates(&db, updates);
         set_dex_pool(
@@ -11841,7 +12070,7 @@ mod tests {
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("zero-output swap abort is accepted and gas-charged");
-        assert_eq!(gas, 10_000);
+        assert_eq!(gas, gas_of(&tx_json) as u128);
         apply_updates(&db, updates);
 
         let pool = dex_pool(&db, &trader, ain.clone(), wbtc.clone());
@@ -11849,7 +12078,7 @@ mod tests {
         assert_eq!(pool.coin_y.value, 1);
         assert_eq!(
             coin_balance_for(&db, &trader, ain),
-            80_000,
+            10_000_000 - gas_of(&tx_inline_5) as u128 - gas_of(&tx_json) as u128,
             "only create-pool gas and aborted-swap gas should be charged",
         );
         assert_eq!(coin_balance_for(&db, &trader, wbtc), 100_000);
@@ -11873,7 +12102,9 @@ mod tests {
 
         let ain = aincore_coin_type();
         let wbtc = wbtc_coin_type();
-        set_coin_store_for(&db, &trader, ain.clone(), 100_000);
+        // B14: each call pays its byte gas too, so AIN is funded well
+        // above the amounts traded; the checks subtract each call's gas.
+        set_coin_store_for(&db, &trader, ain.clone(), 10_000_000);
         set_coin_store_for(&db, &trader, wbtc.clone(), 100_000);
         set_dex_registry(&db, vec![]);
 
@@ -11884,15 +12115,9 @@ mod tests {
             vec![ain.clone(), wbtc.clone()],
             vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
         );
+        let tx_inline_6 = signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1);
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(
-                &trader_key,
-                &trader,
-                &create_payload,
-                0,
-                10_000,
-                1,
-            ))
+            .execute_transaction(&tx_inline_6)
             .expect("create pool accepted");
         apply_updates(&db, updates);
         set_dex_pool(
@@ -11922,7 +12147,7 @@ mod tests {
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("zero-side remove abort is accepted and gas-charged");
-        assert_eq!(gas, 10_000);
+        assert_eq!(gas, gas_of(&tx_json) as u128);
         apply_updates(&db, updates);
 
         let pool = dex_pool(&db, &trader, ain.clone(), wbtc.clone());
@@ -11934,7 +12159,10 @@ mod tests {
             1,
             "LP token must not burn when one side rounds to zero",
         );
-        assert_eq!(coin_balance_for(&db, &trader, ain), 80_000);
+        assert_eq!(
+            coin_balance_for(&db, &trader, ain),
+            10_000_000 - gas_of(&tx_inline_6) as u128 - gas_of(&tx_json) as u128
+        );
         assert_eq!(coin_balance_for(&db, &trader, wbtc), 100_000);
         let receipt = db
             .get(&format!("tx_receipt:{}", tx_hash_hex(&tx_json)))
@@ -11958,9 +12186,10 @@ mod tests {
 
         let ain = aincore_coin_type();
         let wbtc = wbtc_coin_type();
-        set_coin_store_for(&db, &maker, ain.clone(), 100_000);
+        // B14: AIN covers each call's byte gas as well as the deposits.
+        set_coin_store_for(&db, &maker, ain.clone(), 10_000_000);
         set_coin_store_for(&db, &maker, wbtc.clone(), 100_000);
-        set_coin_store_for(&db, &lp2, ain.clone(), 100_000);
+        set_coin_store_for(&db, &lp2, ain.clone(), 10_000_000);
         set_coin_store_for(&db, &lp2, wbtc.clone(), 100_000);
         set_dex_registry(&db, vec![]);
 
@@ -11971,15 +12200,9 @@ mod tests {
             vec![ain.clone(), wbtc.clone()],
             vec![bcs::to_bytes(&parse_move_address(&maker).unwrap()).unwrap()],
         );
+        let tx_inline_7 = signed_tx(&maker_key, &maker, &create_payload, 0, 10_000, 1);
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(
-                &maker_key,
-                &maker,
-                &create_payload,
-                0,
-                10_000,
-                1,
-            ))
+            .execute_transaction(&tx_inline_7)
             .expect("create pool accepted");
         apply_updates(&db, updates);
 
@@ -11995,8 +12218,9 @@ mod tests {
                 bcs::to_bytes(&9_000u128).unwrap(),
             ],
         );
+        let tx_inline_8 = signed_tx(&maker_key, &maker, &seed_payload, 1, 10_000, 1);
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(&maker_key, &maker, &seed_payload, 1, 10_000, 1))
+            .execute_transaction(&tx_inline_8)
             .expect("seed liquidity accepted");
         apply_updates(&db, updates);
 
@@ -12012,15 +12236,9 @@ mod tests {
                 bcs::to_bytes(&4_000u128).unwrap(),
             ],
         );
+        let tx_inline_9 = signed_tx(&lp2_key, &lp2, &imbalanced_payload, 0, 10_000, 1);
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(
-                &lp2_key,
-                &lp2,
-                &imbalanced_payload,
-                0,
-                10_000,
-                1,
-            ))
+            .execute_transaction(&tx_inline_9)
             .expect("imbalanced add liquidity accepted");
         apply_updates(&db, updates);
 
@@ -12035,7 +12253,7 @@ mod tests {
         );
         assert_eq!(
             coin_balance_for(&db, &lp2, ain),
-            85_000,
+            10_000_000 - 5_000 - gas_of(&tx_inline_9) as u128,
             "only matched X plus gas should be deducted",
         );
         assert_eq!(
@@ -12082,8 +12300,9 @@ mod tests {
         let payload =
             hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
         let executor = Executor::new(db.clone());
+        let tx_inline_10 = signed_tx(&sender_key, &sender, &payload, 0, 10_000, 1);
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 10_000, 1))
+            .execute_transaction(&tx_inline_10)
             .expect("token creation accepted");
         apply_updates(&db, updates);
 
@@ -12133,8 +12352,9 @@ mod tests {
         let payload =
             hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
         let executor = Executor::new(db.clone());
+        let tx_inline_11 = signed_tx(&sender_key, &sender, &payload, 0, 10_000, 1);
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 10_000, 1))
+            .execute_transaction(&tx_inline_11)
             .expect("proposal accepted");
         apply_updates(&db, updates);
 
@@ -12168,6 +12388,7 @@ mod tests {
         db.put(&governance_state_key(), "000000000000000000")
             .unwrap();
         let executor = Executor::new(db.clone());
+        let mut gas = 0u128;
         for (nonce, action) in [1u8, 2, 255].into_iter().enumerate() {
             let payload = entry_payload(
                 "governance",
@@ -12181,6 +12402,7 @@ mod tests {
                 ],
             );
             let raw = signed_tx(&sender_key, &sender, &payload, nonce as u64, 10_000, 1);
+            gas += gas_of(&raw) as u128;
             let (updates, _) = executor
                 .execute_transaction(&raw)
                 .expect("tx runs and aborts");
@@ -12198,7 +12420,7 @@ mod tests {
         }
         assert_eq!(validator_set(&db).total_supply, starting_supply);
         let paid = starting_supply - coin_balance(&db, &sender);
-        assert!(paid <= 3 * 10_000, "more than gas was paid: {paid}");
+        assert_eq!(paid, gas, "only gas was paid");
     }
 
     #[test]
@@ -12250,14 +12472,15 @@ mod tests {
             bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(vote_call)).unwrap(),
         );
         let executor = Executor::new(db.clone());
+        let tx_inline_12 = signed_tx(&voter_key, &voter, &payload, 0, 10_000, 1);
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(&voter_key, &voter, &payload, 0, 10_000, 1))
+            .execute_transaction(&tx_inline_12)
             .expect("vote accepted");
         apply_updates(&db, updates);
 
-        let gas_per_tx = 10_000u128;
+        let vote_gas = gas_of(&tx_inline_12) as u128;
         let vote_gas_reserve = 1_000_000_000_000_000_000u128;
-        let locked = balance - gas_per_tx - vote_gas_reserve;
+        let locked = balance - vote_gas - vote_gas_reserve;
 
         assert_eq!(coin_balance(&db, &voter), vote_gas_reserve);
         assert_eq!(vote_escrow(&db, &voter).locked_coins.value, locked);
@@ -12284,12 +12507,16 @@ mod tests {
         let payload = hex::encode(
             bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(claim_call)).unwrap(),
         );
+        let tx_inline_13 = signed_tx(&voter_key, &voter, &payload, 1, 10_000, 1);
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(&voter_key, &voter, &payload, 1, 10_000, 1))
+            .execute_transaction(&tx_inline_13)
             .expect("claim accepted");
         apply_updates(&db, updates);
 
-        assert_eq!(coin_balance(&db, &voter), balance - (gas_per_tx * 2));
+        assert_eq!(
+            coin_balance(&db, &voter),
+            balance - vote_gas - gas_of(&tx_inline_13) as u128
+        );
         assert!(db.get(&vote_escrow_key(&voter)).unwrap().is_none());
         assert_eq!(
             db.get("sys:total_supply").unwrap().unwrap(),
@@ -12961,7 +13188,9 @@ mod tests {
             db.set_federation_key("00000000000000000000000000000000")
                 .unwrap();
         }
-        set_coin_store(&db, &sender, 1_000_000);
+        // The second registration carries a 4,096-byte key: millions of
+        // byte gas (B14).
+        set_coin_store(&db, &sender, 10_000_000);
         let executor = Executor::new(db.clone());
         let owner = parse_move_address(&sender).unwrap();
         let payload = |key: Vec<u8>| {
@@ -12977,17 +13206,11 @@ mod tests {
             )
         };
 
+        let tx_json = signed_tx(&signing_key, &sender, &payload(vec![1; 32]), 0, 100_000, 1);
         let (updates, gas) = executor
-            .execute_transaction(&signed_tx(
-                &signing_key,
-                &sender,
-                &payload(vec![1; 32]),
-                0,
-                100_000,
-                1,
-            ))
+            .execute_transaction(&tx_json)
             .expect("registration accepted");
-        assert_eq!(gas, 100_000);
+        assert_eq!(gas, gas_of(&tx_json) as u128);
         apply_updates(&db, updates);
         assert_eq!(
             device_claims(&db, &owner).unwrap().devices,
@@ -12996,26 +13219,31 @@ mod tests {
                 device_type: 3
             }]
         );
-        assert_eq!(coin_balance(&db, &sender), 900_000);
+        let first = gas_of(&tx_json) as u128;
+        assert_eq!(coin_balance(&db, &sender), 10_000_000 - first);
 
+        let tx_json = signed_tx(
+            &signing_key,
+            &sender,
+            &payload(vec![2; 4096]),
+            1,
+            100_000,
+            1,
+        );
         let (updates, gas) = executor
-            .execute_transaction(&signed_tx(
-                &signing_key,
-                &sender,
-                &payload(vec![2; 4096]),
-                1,
-                100_000,
-                1,
-            ))
+            .execute_transaction(&tx_json)
             .expect("the transaction is kept: gas is charged even though it aborts");
-        assert_eq!(gas, 100_000);
+        assert_eq!(gas, gas_of(&tx_json) as u128);
         apply_updates(&db, updates);
         assert_eq!(
             device_claims(&db, &owner).unwrap().devices.len(),
             1,
             "the over-long key was not registered"
         );
-        assert_eq!(coin_balance(&db, &sender), 800_000);
+        assert_eq!(
+            coin_balance(&db, &sender),
+            10_000_000 - first - gas_of(&tx_json) as u128
+        );
     }
 
     // ========================================================================
@@ -13423,8 +13651,9 @@ mod tests {
         let module_bytes = include_bytes!("../tests/fixtures/nonleading_signer_exploit.mv").to_vec();
         let publish = vm_move::TransactionPayload::PublishModule(vec![module_bytes]);
         let publish_hex = hex::encode(bcs::to_bytes(&publish).unwrap());
+        let tx_inline_14 = signed_tx(&attacker_key, &attacker, &publish_hex, 0, 1_000_000, 1);
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(&attacker_key, &attacker, &publish_hex, 0, 1_000_000, 1))
+            .execute_transaction(&tx_inline_14)
             .expect("publish tx accepted");
         apply_updates(&db, updates);
 
@@ -13560,8 +13789,9 @@ mod tests {
             include_bytes!("../tests/fixtures/vector_signer_mint_forge.mv").to_vec();
         let publish = vm_move::TransactionPayload::PublishModule(vec![module_bytes]);
         let publish_hex = hex::encode(bcs::to_bytes(&publish).unwrap());
+        let tx_inline_15 = signed_tx(&attacker_key, &attacker, &publish_hex, 0, 1_000_000, 1);
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(&attacker_key, &attacker, &publish_hex, 0, 1_000_000, 1))
+            .execute_transaction(&tx_inline_15)
             .expect("publish tx accepted");
         apply_updates(&db, updates);
 
@@ -13641,8 +13871,9 @@ mod tests {
         let module_bytes = include_bytes!("../tests/fixtures/coin_value_arg_forge.mv").to_vec();
         let publish = vm_move::TransactionPayload::PublishModule(vec![module_bytes]);
         let publish_hex = hex::encode(bcs::to_bytes(&publish).unwrap());
+        let tx_inline_16 = signed_tx(&attacker_key, &attacker, &publish_hex, 0, 1_000_000, 1);
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(&attacker_key, &attacker, &publish_hex, 0, 1_000_000, 1))
+            .execute_transaction(&tx_inline_16)
             .expect("publish tx accepted");
         apply_updates(&db, updates);
 

@@ -156,34 +156,52 @@ fn transfer_payload(from: &str, to: &str, amount: u128) -> String {
 /// The signed message binds chain_id, sender, payload, sequence number, gas limit,
 /// gas price and input objects (audit F4) — omitting any field would let it be
 /// mutated in flight, so the shape must match the node's verifier exactly.
+/// `execution` is the gas for Move; the intrinsic byte gas the transaction's
+/// own size owes is added (B14). `gas_price` must be at least the node's base
+/// fee (B15, `aincore_getGasPrice`).
 #[allow(clippy::too_many_arguments)]
 fn signed_tx(
     acct: &Account,
     chain_id: &str,
     payload: &str,
     seq: u64,
-    gas_limit: u64,
+    execution: u64,
     gas_price: u128,
 ) -> String {
-    let message = format!(
-        "{}:{}:{}:{}:{}:{}:{}",
-        chain_id, acct.address, payload, seq, gas_limit, gas_price, ""
-    );
-    let signature = hex::encode(acct.key.sign(message.as_bytes()).to_bytes());
-    json!({
-        "chain_id": chain_id,
-        "sender": acct.address,
-        "public_key": acct.public_key,
-        "input_objects": [],
-        "payload": payload,
-        "gas_limit": gas_limit,
-        "gas_price": gas_price,
-        "sequence_number": seq,
-        "signature": signature,
-        "paymaster": null,
-        "paymaster_signature": null,
-    })
-    .to_string()
+    let mut tx = executor::Transaction {
+        chain_id: chain_id.to_string(),
+        sender: acct.address.clone(),
+        input_objects: vec![],
+        payload: payload.to_string(),
+        args: vec![],
+        gas_limit: 0,
+        gas_price,
+        sequence_number: seq,
+        public_key: acct.public_key.clone(),
+        signature: "0".repeat(128),
+        paymaster: None,
+        paymaster_signature: None,
+        zkp_proof: None,
+    };
+    let unsized_len = serde_json::to_string(&tx)
+        .expect("a transaction serializes")
+        .len();
+    tx.gas_limit = executor::admission::gas_limit_covering(unsized_len, execution);
+    let message = executor::admission::signing_message(&tx);
+    tx.signature = hex::encode(acct.key.sign(message.as_bytes()).to_bytes());
+    serde_json::to_string(&tx).expect("a transaction serializes")
+}
+
+/// The node's base fee (B15), the lowest price a transaction may offer.
+async fn base_fee(client: &Client, url: &str) -> u128 {
+    match rpc(client, url, "aincore_getGasPrice", json!([])).await {
+        Some(v) => match &v["result"] {
+            Value::String(s) => s.parse().unwrap_or(1),
+            Value::Number(n) => n.as_u64().map(u128::from).unwrap_or(1),
+            _ => 1,
+        },
+        None => 1,
+    }
 }
 
 async fn rpc(client: &Client, url: &str, method: &str, params: Value) -> Option<Value> {
@@ -312,6 +330,9 @@ async fn main() {
             .unwrap()
             .progress_chars("#>-"),
     );
+    // B15: every transaction offers the node's base fee.
+    let price = base_fee(&client, &args.rpc).await;
+    println!("base fee: {price} quanta per gas");
     let mut funded = 0usize;
     for acct in &accounts {
         let payload = transfer_payload(&funder.address, &acct.address, args.fund_amount);
@@ -321,7 +342,7 @@ async fn main() {
             &payload,
             seq,
             args.gas_limit,
-            1,
+            price,
         );
         if submit(&client, &args.rpc, tx).await {
             funded += 1;
@@ -443,7 +464,7 @@ async fn main() {
 
             inflight.push(tokio::spawn(async move {
                 let payload = transfer_payload(&acct.address, &dest, amount);
-                let tx = signed_tx(&acct, &chain_id, &payload, seq, gas_limit, 1);
+                let tx = signed_tx(&acct, &chain_id, &payload, seq, gas_limit, price);
                 if submit(&client, &rpc_url, tx).await {
                     accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }

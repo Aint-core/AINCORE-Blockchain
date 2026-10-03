@@ -492,12 +492,6 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
         next_proposal_id: u64,
     }
     #[derive(serde::Deserialize)]
-    struct Treasury {
-        reserve: Coin,
-        total_sold: u128,
-        price_usd_cents: u64,
-    }
-    #[derive(serde::Deserialize)]
     struct PoolInfo {
         pool_key: Vec<u8>,
         pool_addr: AccountAddress,
@@ -603,8 +597,6 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
         storage,
         &system_resource_key("0x1::governance::GovernanceState"),
     )?;
-    let _treasury: Treasury =
-        decode_resource(storage, &system_resource_key("0x1::treasury::Treasury"))?;
     let _dex_registry: PoolRegistry =
         decode_resource(storage, &system_resource_key("0x1::dex::PoolRegistry"))?;
     let _bridge_config: WbtcBridgeConfig =
@@ -664,7 +656,10 @@ pub struct GenesisAccount {
 pub struct GenesisFile {
     pub chain_id: String,
     pub validators: Vec<GenesisValidatorConfig>,
-    pub treasury_reserve: String,
+    /// B7: the treasury module is deleted. A file may still carry the field
+    /// for a reserve of 0; any other amount is refused, never dropped.
+    #[serde(default)]
+    pub treasury_reserve: Option<String>,
     /// SEC-#13: the canonical epoch-BLOCK interval (in blocks). (G5 CL-1: the
     /// old `epoch_duration`, seconds on a virtual clock, is gone; a file that
     /// still carries it parses, and the value is ignored.) Required (G5
@@ -680,6 +675,12 @@ pub struct GenesisFile {
     /// FX-7: seeded into `sys:config:tip_agreement_n`. Default 1.
     #[serde(default)]
     pub tip_agreement_n: Option<u64>,
+    /// B15: the base fee's floor in quanta per gas, seeded into
+    /// `sys:config:min_base_fee` and as the first `sys:base_fee`.
+    /// genesis-tool derives it (a full block at the floor costs one block of
+    /// emission); absent means `MIN_GAS_PRICE`, as in test fixtures.
+    #[serde(default)]
+    pub min_base_fee: Option<String>,
     /// G5 P-1: the reward period (blocks) and the consensus-time cap per
     /// block (seconds). The real genesis carries both, derived by
     /// genesis-tool from the measured block time (`derive_chain_params`);
@@ -1169,12 +1170,12 @@ pub fn build_genesis(
     let mut v1_validators: Vec<consensus::qc::ValidatorInfo> = Vec::new();
     let mut total_bootstrap_stake: u128 = 0;
     let mut bootstrap_weights: BTreeMap<String, u64>;
-    let treasury_reserve_amount: u128;
     let chain_params: ChainParams;
     // SEC-#13: canonical epoch-block interval to pin into storage + identity hash.
     let genesis_epoch_block_interval: u64;
     let genesis_chain_id: String;
     let genesis_burn_percentage: u8;
+    let genesis_min_base_fee: u128;
     let genesis_tip_agreement_n: u64;
 
     {
@@ -1190,8 +1191,13 @@ pub fn build_genesis(
                 "genesis.json must contain at least one validator".to_string(),
             ));
         }
-        treasury_reserve_amount =
-            parse_genesis_amount(&config.treasury_reserve, "treasury_reserve")?;
+        if let Some(reserve) = &config.treasury_reserve {
+            if parse_genesis_amount(reserve, "treasury_reserve")? != 0 {
+                return Err(GenesisError::InvalidData(
+                    "treasury_reserve must be 0: the treasury module is deleted (B7)".to_string(),
+                ));
+            }
+        }
         // G5 P-1 (review): a genesis file pins all three; none is a guess.
         // genesis-tool writes them from the measured block time. SEC-#13:
         // an explicit 0 is invalid (it would disable epoch advancement).
@@ -1220,6 +1226,18 @@ pub fn build_genesis(
         };
         chain_params.validate()?;
         // FX-7: the defaults these keys' readers used when the keys were absent.
+        genesis_min_base_fee = match &config.min_base_fee {
+            Some(fee) => {
+                let fee = parse_genesis_amount(fee, "min_base_fee")?;
+                if fee < executor::admission::MIN_GAS_PRICE {
+                    return Err(GenesisError::InvalidData(
+                        "genesis.json min_base_fee must be at least 1".to_string(),
+                    ));
+                }
+                fee
+            }
+            None => executor::admission::MIN_GAS_PRICE,
+        };
         genesis_burn_percentage = match config.burn_percentage {
             Some(p) if p > 100 => {
                 return Err(GenesisError::InvalidData(format!(
@@ -1428,7 +1446,7 @@ pub fn build_genesis(
     // total_supply`. It MUST include every coin already allocated at genesis, or
     // emission treats the pre-allocated treasury as unminted head-room and over-
     // mints by exactly the treasury reserve over the chain's lifetime (a silent
-    // ~50k AIN breach of the 150M cap). Seed it with bootstrap stake + treasury
+    // ~50k AIN breach of the 150M cap). Seed it with bootstrap stake + accounts
     // so it agrees with sys:total_supply (set below) and the cap actually holds.
     // G5 A4 BW-2: liquid genesis balances (the incentivized testnet's public
     // track), counted in the supply. A validator's coin store is written
@@ -1457,12 +1475,9 @@ pub fn build_genesis(
         genesis_accounts.push((addr, balance));
     }
     let initial_total_supply = total_bootstrap_stake
-        .checked_add(treasury_reserve_amount)
-        .and_then(|s| s.checked_add(accounts_total))
+        .checked_add(accounts_total)
         .ok_or_else(|| {
-            GenesisError::InvalidData(
-                "genesis stake, treasury and accounts overflow u128".to_string(),
-            )
+            GenesisError::InvalidData("genesis stake and accounts overflow u128".to_string())
         })?;
     let validator_set = ValidatorSet {
         validators: validator_configs,
@@ -1660,27 +1675,6 @@ pub fn build_genesis(
     let oc_bytes = bcs::to_bytes(&oracle_config)?;
     storage.put(&oc_key, &hex::encode(oc_bytes))?;
 
-    // === Initialize Treasury (Bill Acceptor Reserve) ===
-    // We simulate a pre-filled "Vending Machine" with 50,000 AIN.
-    // This allows the Bill Acceptor to work immediately.
-    #[derive(serde::Serialize)]
-    struct Treasury {
-        reserve: Coin,
-        total_sold: u128,
-        price_usd_cents: u64,
-    }
-
-    let treasury = Treasury {
-        reserve: Coin {
-            value: treasury_reserve_amount,
-        }, // Funded by Genesis File or Fallback
-        total_sold: 0,
-        price_usd_cents: 100, // $1.00 Start Price
-    };
-    let treasury_key = system_resource_key("0x1::treasury::Treasury");
-    let treasury_bytes = bcs::to_bytes(&treasury)?;
-    storage.put(&treasury_key, &hex::encode(&treasury_bytes))?;
-
     // === Initialize DEX Pool Registry ===
     #[derive(serde::Serialize)]
     struct PoolInfo {
@@ -1761,7 +1755,7 @@ pub fn build_genesis(
     storage.put(&token_registry_key, &hex::encode(token_registry_bytes))?;
 
     // === FINAL CHECK: SET TOTAL SUPPLY ===
-    // Validators (1M) + Treasury (50k)
+    // Bootstrap stake plus genesis accounts (B7: no treasury reserve).
 
     storage.put("sys:total_supply", &initial_total_supply.to_string())?;
     storage.put("genesis_stdlib_hash", &stdlib_hash)?;
@@ -1782,6 +1776,11 @@ pub fn build_genesis(
         "sys:config:tip_agreement_n",
         &genesis_tip_agreement_n.to_string(),
     )?;
+    storage.put(
+        executor::MIN_BASE_FEE_KEY,
+        &genesis_min_base_fee.to_string(),
+    )?;
+    storage.put(executor::BASE_FEE_KEY, &genesis_min_base_fee.to_string())?;
     storage.put("total_burned", "0")?;
 
     storage.finish(
@@ -1807,7 +1806,6 @@ mod tests {
             "0x1::governance::GovernanceState",
             "0x1::universal_mining::DeviceRegistry",
             "0x1::universal_mining::OracleConfig",
-            "0x1::treasury::Treasury",
             "0x1::dex::PoolRegistry",
             "0x1::wbtc::BridgeConfig",
             "0x1::token_factory::TokenRegistry",
@@ -1931,36 +1929,36 @@ mod tests {
         hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap())
     }
 
+    /// `execution` gas for Move on top of the intrinsic byte gas (B14).
     fn signed_tx(
         signing_key: &SigningKey,
         sender: &str,
         payload: &str,
         sequence_number: u64,
-        gas_limit: u64,
+        execution: u64,
         gas_price: u128,
     ) -> String {
         let public_key = signing_key.verifying_key();
-        let message = format!(
-            "{}:{}:{}:{}:{}:{}:{}",
-            "AINCORE-MAINNET-1", sender, payload, sequence_number, gas_limit, gas_price, ""
-        );
-        let signature = signing_key.sign(message.as_bytes());
-        serde_json::to_string(&Transaction {
+        let mut tx = Transaction {
             chain_id: "AINCORE-MAINNET-1".to_string(),
             sender: sender.to_string(),
             input_objects: vec![],
             payload: payload.to_string(),
             args: vec![],
-            gas_limit,
+            gas_limit: 0,
             gas_price,
             sequence_number,
             public_key: hex::encode(public_key.as_bytes()),
-            signature: hex::encode(signature.to_bytes()),
+            signature: "00".repeat(64),
             paymaster: None,
             paymaster_signature: None,
             zkp_proof: None,
-        })
-        .expect("tx json")
+        };
+        let unsized_len = serde_json::to_string(&tx).expect("tx json").len();
+        tx.gas_limit = executor::admission::gas_limit_covering(unsized_len, execution);
+        let message = executor::admission::signing_message(&tx);
+        tx.signature = hex::encode(signing_key.sign(message.as_bytes()).to_bytes());
+        serde_json::to_string(&tx).expect("tx json")
     }
 
     #[test]
@@ -2656,13 +2654,17 @@ mod tests {
 
         let payload = transfer_payload(&sender, &recipient, 250);
         let executor = Executor::new(db.clone());
+        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
+        let gas_limit = serde_json::from_str::<Transaction>(&tx_json)
+            .unwrap()
+            .gas_limit as u128;
         let (updates, gas) = executor
-            .execute_transaction(&signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1))
+            .execute_transaction(&tx_json)
             .expect("BCS transfer accepted after fresh genesis");
-        assert_eq!(gas, 100_000);
+        assert_eq!(gas, gas_limit);
         apply_updates(&db, updates);
 
-        assert_eq!(coin_balance(&db, &sender), 899_750);
+        assert_eq!(coin_balance(&db, &sender), 1_000_000 - gas_limit - 250);
         assert_eq!(coin_balance(&db, &recipient), 250);
     }
 

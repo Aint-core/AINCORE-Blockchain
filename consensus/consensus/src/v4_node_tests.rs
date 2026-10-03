@@ -29,6 +29,9 @@ struct Cluster {
     known: Vec<(String, String)>,
     /// I, pinned in the seeded genesis (EP-1).
     epoch_interval: u64,
+    /// B14: accounts given AIN at genesis, with the stdlib installed, so a
+    /// transaction can execute. Empty: no stdlib, as before.
+    funded: Vec<(String, u128)>,
 }
 
 fn validator_info(seed: u8) -> ValidatorInfo {
@@ -75,7 +78,19 @@ impl Cluster {
     }
 
     fn with_interval(tag: &str, seeds: &[u8], v4: bool, epoch_interval: u64) -> Self {
+        Self::with_funded(tag, seeds, v4, epoch_interval, Vec::new())
+    }
+
+    /// A cluster whose genesis installs the stdlib and gives `funded` AIN.
+    fn with_funded(
+        tag: &str,
+        seeds: &[u8],
+        v4: bool,
+        epoch_interval: u64,
+        funded: Vec<(String, u128)>,
+    ) -> Self {
         let mut cluster = Self::unopened(seeds, epoch_interval);
+        cluster.funded = funded;
         for (i, seed) in seeds.iter().enumerate() {
             let path = std::env::temp_dir()
                 .join(format!("aincore_v4_node_{}_{tag}_{i}", std::process::id()))
@@ -105,6 +120,7 @@ impl Cluster {
             committee,
             known,
             epoch_interval,
+            funded: Vec::new(),
         }
     }
 
@@ -157,6 +173,12 @@ impl Cluster {
                 ),
             )
             .unwrap();
+        }
+        if !self.funded.is_empty() {
+            executor::test_support::load_stdlib(&db);
+            for (address, amount) in &self.funded {
+                executor::test_support::set_ain_balance(&db, address, *amount);
+            }
         }
         seed_state_tree(&db);
     }
@@ -415,14 +437,23 @@ fn a_node_never_mixes_dag_formats() {
 #[test]
 fn a_transaction_travels_through_a_v4_vertex_into_every_nodes_block() {
     use crypto::Signer;
-    let mut c = Cluster::new("tx", &[93, 94, 95, 96], true);
     let key = crypto::SigningKey::from_bytes(&[77u8; 32]);
     let sender = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+    // B14: the body is what executed and paid, so the sender has AIN.
+    const FUNDS: u128 = 1_000_000_000_000;
+    let mut c = Cluster::with_funded(
+        "tx",
+        &[93, 94, 95, 96],
+        true,
+        1000,
+        vec![(sender.clone(), FUNDS)],
+    );
     let chain_id = blockchain::chain_id();
     // BCS of `TransactionPayload::PublishModule(vec![vec![7, 7]])`: variant 2,
-    // one module of two bytes.
+    // one module of two bytes. Not a module: it aborts, after paying gas.
     let payload = hex::encode([2u8, 1, 2, 7, 7]);
-    let (seq, gas_limit, gas_price) = (0u64, 100_000u64, 1u128);
+    // A limit that covers the transaction's bytes (B14) with room to run.
+    let (seq, gas_limit, gas_price) = (0u64, 1_000_000u64, 1u128);
     let message = format!("{chain_id}:{sender}:{payload}:{seq}:{gas_limit}:{gas_price}:");
     let tx = serde_json::json!({
         "chain_id": chain_id,
@@ -456,6 +487,76 @@ fn a_transaction_travels_through_a_v4_vertex_into_every_nodes_block() {
         })
         .collect();
     assert_eq!(carrying.len(), 1, "the transaction is in exactly one block");
+    // Every node charged it the same, and every node holds the same base fee.
+    for i in 0..4 {
+        assert_eq!(
+            executor::test_support::ain_balance(&c.node(i).storage, &sender),
+            Some(FUNDS - gas_limit as u128 * gas_price),
+            "node {i}"
+        );
+        assert_eq!(
+            executor::committed_base_fee(&c.node(i).storage),
+            executor::committed_base_fee(&c.node(0).storage),
+            "node {i}"
+        );
+    }
+}
+
+/// B14: a transaction that cannot pay is ordered, executes nowhere, and is
+/// stored nowhere: every node builds the same blocks without it.
+#[test]
+fn an_unfunded_transaction_is_ordered_but_never_stored() {
+    use crypto::Signer;
+    let mut c = Cluster::new("unpaid", &[93, 94, 95, 96], true);
+    let key = crypto::SigningKey::from_bytes(&[78u8; 32]);
+    let sender = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+    let chain_id = blockchain::chain_id();
+    let payload = hex::encode([2u8, 1, 2, 7, 8]);
+    let (seq, gas_limit, gas_price) = (0u64, 1_000_000u64, 1u128);
+    let message = format!("{chain_id}:{sender}:{payload}:{seq}:{gas_limit}:{gas_price}:");
+    let tx = serde_json::json!({
+        "chain_id": chain_id,
+        "sender": sender,
+        "input_objects": [],
+        "payload": payload,
+        "args": [],
+        "gas_limit": gas_limit,
+        "gas_price": gas_price,
+        "sequence_number": seq,
+        "public_key": hex::encode(key.verifying_key().to_bytes()),
+        "signature": hex::encode(key.sign(message.as_bytes()).to_bytes()),
+    })
+    .to_string();
+    c.node(0)
+        .mempool
+        .lock()
+        .unwrap()
+        .add_transaction(tx.clone())
+        .expect("a signed transaction is admitted (no balance gate here)");
+    c.run(10);
+    let placed = c.assert_same_blocks(2);
+    let ordered = c
+        .node(0)
+        .dag
+        .lock()
+        .unwrap()
+        .values()
+        .any(|v| v.payload.contains(&tx));
+    assert!(ordered, "vacuous: the transaction never rode a vertex");
+    for h in 1..=placed {
+        let block: blockchain::Block = serde_json::from_str(
+            &c.node(0)
+                .storage
+                .get(&format!("block_{h}"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !block.transactions.contains(&tx),
+            "block {h} stored an unpaid transaction"
+        );
+    }
 }
 
 /// DE-7 through the node: the live validator set changes on one node mid-run
@@ -2085,4 +2186,73 @@ fn a_node_whose_clock_drifts_from_the_chain_alarms() {
     c.run_until(60, |c| c.node(0).latest_block_height > at);
     assert!(c.node(0).latest_block_height > at, "vacuous: no block after the fix");
     assert_eq!(c.node(0).clock_drift_alarm(), None, "the ahead alarm did not clear");
+}
+
+/// The family a storage key belongs to: its leading words, with ids,
+/// heights and hashes cut off.
+fn key_family(key: &str) -> String {
+    let words: Vec<&str> = key.split(':').collect();
+    let is_id = |w: &str| {
+        !w.is_empty()
+            && (w.bytes().all(|b| b.is_ascii_digit())
+                || (w.len() >= 32 && w.bytes().all(|b| b.is_ascii_hexdigit())))
+    };
+    if words.len() > 1 {
+        let kept: Vec<&str> = words.iter().take_while(|w| !is_id(w)).copied().collect();
+        return format!("{}:", kept.join(":"));
+    }
+    // `_`-separated families: block_12, resource_<addr>_<tag>, module_<addr>_<name>.
+    match key.split_once('_') {
+        Some((head, _)) => format!("{head}_"),
+        None => key.to_string(),
+    }
+}
+
+/// Per family: (keys, bytes of key + value).
+fn family_sizes(db: &StateDB) -> std::collections::BTreeMap<String, (i64, i64)> {
+    let mut out = std::collections::BTreeMap::new();
+    for (k, v) in db.scan_prefix("") {
+        let e = out.entry(key_family(&k)).or_insert((0i64, 0i64));
+        e.0 += 1;
+        e.1 += (k.len() + v.len()) as i64;
+    }
+    out
+}
+
+/// B6 measurement: what a validator keeps per block, by key family, on a
+/// four-node cluster whose blocks are empty. The net growth over a run, so
+/// rows pruned during it count against their family.
+/// `cargo test -p consensus --lib -- --ignored --nocapture b6_storage`.
+#[test]
+#[ignore = "a measurement, not a check"]
+fn b6_storage_per_empty_block_by_key_family() {
+    let mut c = Cluster::new("b6", &[101, 102, 103, 104], true);
+    c.run(6);
+    let before = family_sizes(&c.node(0).storage);
+    let h0 = c.node(0).latest_block_height;
+    c.run(80);
+    let h1 = c.node(0).latest_block_height;
+    let after = family_sizes(&c.node(0).storage);
+    let blocks = (h1 - h0).max(1) as i64;
+    let mut rows: Vec<(String, i64, i64)> = after
+        .iter()
+        .map(|(f, (n, b))| {
+            let (n0, b0) = before.get(f).copied().unwrap_or((0, 0));
+            (f.clone(), (n - n0), (b - b0))
+        })
+        .filter(|(_, n, b)| *n != 0 || *b != 0)
+        .collect();
+    rows.sort_by_key(|(_, _, b)| -b);
+    let total: i64 = rows.iter().map(|(_, _, b)| b).sum();
+    println!(
+        "b6: {blocks} blocks (height {h0} to {h1}); net logical bytes per block {}",
+        total / blocks
+    );
+    for (family, n, b) in rows {
+        println!(
+            "b6: {family:<48} keys/block {:>7.2}  bytes/block {:>8}",
+            n as f64 / blocks as f64,
+            b / blocks
+        );
+    }
 }

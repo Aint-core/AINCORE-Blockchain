@@ -21,7 +21,8 @@ impl KeysCmd {
         let path = dir.join(&uuid);
         println!("✅ Key generated successfully!");
         println!("📄 File: {}", path.display());
-        println!("🔑 Address (derived from key): [Hidden]"); // In real CLI we would derive public key/address here if needed
+        // In real CLI we would derive public key/address here if needed.
+        println!("🔑 Address (derived from key): [Hidden]");
         // KeyManager::create returns the key wrapped in zeroize::Zeroizing (memory
         // hygiene); deref to &str to print it. Showing the key once so the operator
         // can save it is the whole point of this command.

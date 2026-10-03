@@ -1,43 +1,46 @@
 use super::*;
 
+/// Sign `tx` (a JSON object; its `gas_limit` and `signature` are filled
+/// here) with the Ed25519 key `key`. The `gas_limit` is `execution` plus the
+/// intrinsic byte gas the transaction's own size owes (B14).
+fn sign_ed25519(
+    mut tx: serde_json::Value,
+    key: &ed25519_dalek::SigningKey,
+    execution: u64,
+) -> String {
+    use ed25519_dalek::Signer;
+    tx["gas_limit"] = serde_json::json!(0);
+    tx["signature"] = serde_json::json!("00".repeat(64));
+    let unsized_len = tx.to_string().len();
+    tx["gas_limit"] = serde_json::json!(executor::admission::gas_limit_covering(
+        unsized_len,
+        execution
+    ));
+    let parsed: executor::Transaction = serde_json::from_value(tx.clone()).unwrap();
+    let message = executor::admission::signing_message(&parsed);
+    tx["signature"] = serde_json::json!(hex::encode(key.sign(message.as_bytes()).to_bytes()));
+    tx.to_string()
+}
+
 /// Generate a valid signed test transaction for mempool testing
 fn make_test_tx(index: usize) -> String {
-    use ed25519_dalek::{Signer, SigningKey};
-
-    let seed = [42u8; 32];
-    let signing_key = SigningKey::from_bytes(&seed);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
     let public_key = hex::encode(signing_key.verifying_key().to_bytes());
     let sender = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
-
-    let chain_id =
-        blockchain::chain_id();
     let payload_struct =
         vm_move::TransactionPayload::PublishModule(vec![index.to_le_bytes().to_vec()]);
     let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
-    let sequence_number = index as u64;
-
-    // Sign canonical form (F4: + gas_limit:gas_price:input_objects).
-    // This helper emits gas_limit=1000, gas_price=1, input_objects=[].
-    let message = format!(
-        "{}:{}:{}:{}:{}:{}:{}",
-        chain_id, sender, payload, sequence_number, 1000u64, 1u128, ""
-    );
-    let signature = signing_key.sign(message.as_bytes());
-    let sig_hex = hex::encode(signature.to_bytes());
-
-    serde_json::json!({
-        "chain_id": chain_id,
+    let tx = serde_json::json!({
+        "chain_id": blockchain::chain_id(),
         "sender": sender,
         "input_objects": [],
         "payload": payload,
         "args": [],
-        "gas_limit": 1000,
         "gas_price": 1,
-        "sequence_number": sequence_number,
+        "sequence_number": index as u64,
         "public_key": public_key,
-        "signature": sig_hex,
-    })
-    .to_string()
+    });
+    sign_ed25519(tx, &signing_key, 1000)
 }
 
 /// A signed tx from a DISTINCT sender per `seed_byte`, all at sequence 0.
@@ -45,74 +48,48 @@ fn make_test_tx(index: usize) -> String {
 /// sorts each sender's queue by sequence_number, so same-sender fixtures make
 /// an order assertion pass even when the ordering under test is broken.
 fn make_test_tx_distinct_sender(seed_byte: u8) -> String {
-    use ed25519_dalek::{Signer, SigningKey};
-
-    let signing_key = SigningKey::from_bytes(&[seed_byte; 32]);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[seed_byte; 32]);
     let public_key = hex::encode(signing_key.verifying_key().to_bytes());
     let sender = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
-    let chain_id =
-        blockchain::chain_id();
-    let payload_struct =
-        vm_move::TransactionPayload::PublishModule(vec![vec![seed_byte; 4]]);
+    let payload_struct = vm_move::TransactionPayload::PublishModule(vec![vec![seed_byte; 4]]);
     let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
-    let message = format!(
-        "{}:{}:{}:{}:{}:{}:{}",
-        chain_id, sender, payload, 0u64, 1000u64, 1u128, ""
-    );
-    let signature = signing_key.sign(message.as_bytes());
-    serde_json::json!({
-        "chain_id": chain_id,
+    let tx = serde_json::json!({
+        "chain_id": blockchain::chain_id(),
         "sender": sender,
         "input_objects": [],
         "payload": payload,
-        "gas_limit": 1000,
         "gas_price": 1,
         "sequence_number": 0,
         "public_key": public_key,
-        "signature": hex::encode(signature.to_bytes()),
-    })
-    .to_string()
+    });
+    sign_ed25519(tx, &signing_key, 1000)
 }
 
 fn make_test_tx_with_payload(index: usize, payload: String) -> String {
     make_test_tx_with_payload_and_gas(index, payload, 1000, 1)
 }
 
+/// `execution` is the gas for Move; the byte gas is added (B14).
 fn make_test_tx_with_payload_and_gas(
     index: usize,
     payload: String,
-    gas_limit: u64,
+    execution: u64,
     gas_price: u128,
 ) -> String {
-    use ed25519_dalek::{Signer, SigningKey};
-
-    let seed = [43u8; 32];
-    let signing_key = SigningKey::from_bytes(&seed);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[43u8; 32]);
     let public_key = hex::encode(signing_key.verifying_key().to_bytes());
     let sender = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
-    let chain_id =
-        blockchain::chain_id();
-    let sequence_number = index as u64;
-    // F4: bind gas_limit/gas_price/input_objects (input_objects=[] here).
-    let message = format!(
-        "{}:{}:{}:{}:{}:{}:{}",
-        chain_id, sender, payload, sequence_number, gas_limit, gas_price, ""
-    );
-    let signature = signing_key.sign(message.as_bytes());
-
-    serde_json::json!({
-        "chain_id": chain_id,
+    let tx = serde_json::json!({
+        "chain_id": blockchain::chain_id(),
         "sender": sender,
         "input_objects": [],
         "payload": payload,
         "args": [],
-        "gas_limit": gas_limit,
         "gas_price": gas_price,
-        "sequence_number": sequence_number,
+        "sequence_number": index as u64,
         "public_key": public_key,
-        "signature": hex::encode(signature.to_bytes()),
-    })
-    .to_string()
+    });
+    sign_ed25519(tx, &signing_key, execution)
 }
 
 #[test]
@@ -313,12 +290,16 @@ mod ml_dsa_b8 {
             "input_objects": [],
             "payload": payload,
             "args": [],
-            "gas_limit": 1000,
+            "gas_limit": 0,
             "gas_price": 1,
             "sequence_number": sequence_number,
             "public_key": hex::encode(&public_key),
-            "signature": "",
+            "signature": "00".repeat(3309),
         });
+        // B14: the limit covers the ML-DSA-65 transaction's ~10.5 KB.
+        let unsized_len = tx.to_string().len();
+        tx["gas_limit"] =
+            serde_json::json!(executor::admission::gas_limit_covering(unsized_len, 1000));
         sign(&mut tx, &key);
         (tx, key)
     }
@@ -343,7 +324,7 @@ mod ml_dsa_b8 {
         let (tx, key) = ml_dsa_tx(2, 0);
 
         let mut gas = tx.clone();
-        gas["gas_limit"] = serde_json::json!(2000);
+        gas["gas_limit"] = serde_json::json!(tx["gas_limit"].as_u64().unwrap() + 1);
         let err = Mempool::new().add_transaction(gas.to_string()).unwrap_err();
         assert!(err.contains("Invalid signature"), "{err}");
 
@@ -382,6 +363,8 @@ mod ml_dsa_b8 {
             t["public_key"] = serde_json::json!(hex::encode(&key));
             t["sender"] = serde_json::json!(crypto::derive_address(&key).unwrap());
             t["signature"] = serde_json::json!("00".repeat(sig_bytes));
+            // Room for the larger key and signature, so the refusal is the size.
+            t["gas_limit"] = serde_json::json!(10_000_000);
             let err = Mempool::new().add_transaction(t.to_string()).unwrap_err();
             assert!(err.contains("no scheme"), "{key_bytes}/{sig_bytes}: {err}");
         }
@@ -413,7 +396,7 @@ fn test_zkp_garbage_hex_rejected_with_specific_diagnostic() {
     // F4: tx below uses gas_limit=1000, gas_price=1, input_objects=[].
     let message = format!(
         "{}:{}:{}:{}:{}:{}:{}",
-        chain_id, sender, payload, sequence_number, 1000u64, 1u128, ""
+        chain_id, sender, payload, sequence_number, 2_000_000u64, 1u128, ""
     );
     let signature = signing_key.sign(message.as_bytes());
     let sig_hex = hex::encode(signature.to_bytes());
@@ -427,7 +410,7 @@ fn test_zkp_garbage_hex_rejected_with_specific_diagnostic() {
         "input_objects": [],
         "payload": payload,
         "args": [],
-        "gas_limit": 1000,
+        "gas_limit": 2_000_000,
         "gas_price": 1,
         "sequence_number": sequence_number,
         "public_key": public_key,
@@ -478,7 +461,7 @@ fn test_zkp_replayed_proof_with_wrong_binding_rejected() {
     // F4: tx below uses gas_limit=1000, gas_price=1, input_objects=[].
     let canonical = format!(
         "{}:{}:{}:{}:{}:{}:{}",
-        chain_id, sender, payload, sequence_number, 1000u64, 1u128, ""
+        chain_id, sender, payload, sequence_number, 5_000_000u64, 1u128, ""
     );
     let signature = signing_key.sign(canonical.as_bytes());
     let sig_hex = hex::encode(signature.to_bytes());
@@ -496,7 +479,7 @@ fn test_zkp_replayed_proof_with_wrong_binding_rejected() {
         "input_objects": [],
         "payload": payload,
         "args": [],
-        "gas_limit": 1000,
+        "gas_limit": 5_000_000,
         "gas_price": 1,
         "sequence_number": sequence_number,
         "public_key": public_key,
@@ -542,10 +525,11 @@ fn pwn007_proper_replay_with_reordered_keys_rejected() {
         .unwrap(),
     );
     let seq = 42u64;
-    // F4: both tx_a and tx_b use gas_limit=1000, gas_price=1, input_objects=[].
+    // F4: both tx_a and tx_b use gas_limit=1_000_000 (enough for either
+    // encoding's bytes, B14), gas_price=1, input_objects=[].
     let canonical_msg = format!(
         "{}:{}:{}:{}:{}:{}:{}",
-        chain_id, sender, payload, seq, 1000u64, 1u128, ""
+        chain_id, sender, payload, seq, 1_000_000u64, 1u128, ""
     );
     let sig_hex = hex::encode(sk.sign(canonical_msg.as_bytes()).to_bytes());
 
@@ -556,7 +540,7 @@ fn pwn007_proper_replay_with_reordered_keys_rejected() {
         "input_objects": [],
         "payload": payload,
         "args": [],
-        "gas_limit": 1000,
+        "gas_limit": 1_000_000,
         "gas_price": 1u128,
         "sequence_number": seq,
         "public_key": pk,
@@ -567,7 +551,7 @@ fn pwn007_proper_replay_with_reordered_keys_rejected() {
     // Form B: same fields, REORDERED + extra whitespace. Different raw
     // bytes, IDENTICAL canonical signed form, identical signature.
     let tx_b = format!(
-        r#"{{ "signature": "{}", "public_key": "{}", "sequence_number": {}, "gas_price": 1, "gas_limit": 1000, "args": [], "payload": "{}", "input_objects": [], "sender": "{}", "chain_id": "{}" }}"#,
+        r#"{{ "signature": "{}", "public_key": "{}", "sequence_number": {}, "gas_price": 1, "gas_limit": 1000000, "args": [], "payload": "{}", "input_objects": [], "sender": "{}", "chain_id": "{}" }}"#,
         sig_hex, pk, seq, payload, sender, chain_id
     );
 
@@ -615,38 +599,26 @@ mod fee_market_admission {
     /// Build a valid Ed25519-signed tx with a sender derived from `seed_byte`
     /// (distinct seed => distinct sender) and the given seq/gas. Returns
     /// (json_tx, sender_address).
-    fn signed_tx(seed_byte: u8, seq: u64, gas_limit: u64, gas_price: u128) -> (String, String) {
-        use ed25519_dalek::{Signer, SigningKey};
-
-        let signing_key = SigningKey::from_bytes(&[seed_byte; 32]);
+    /// `execution` is the gas for Move; the byte gas is added (B14).
+    fn signed_tx(seed_byte: u8, seq: u64, execution: u64, gas_price: u128) -> (String, String) {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[seed_byte; 32]);
         let public_key = hex::encode(signing_key.verifying_key().to_bytes());
         let sender = crypto::derive_address(signing_key.verifying_key().as_bytes()).unwrap();
-        let chain_id =
-            blockchain::chain_id();
         // Vary payload bytes by (seed, seq) so no two test txs collide on dedup.
         let payload_struct =
             vm_move::TransactionPayload::PublishModule(vec![vec![seed_byte, seq as u8]]);
         let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
-        let message = format!(
-            "{}:{}:{}:{}:{}:{}:{}",
-            chain_id, sender, payload, seq, gas_limit, gas_price, ""
-        );
-        let signature = signing_key.sign(message.as_bytes());
-
         let tx = serde_json::json!({
-            "chain_id": chain_id,
+            "chain_id": blockchain::chain_id(),
             "sender": sender,
             "input_objects": [],
             "payload": payload,
             "args": [],
-            "gas_limit": gas_limit,
             "gas_price": gas_price,
             "sequence_number": seq,
             "public_key": public_key,
-            "signature": hex::encode(signature.to_bytes()),
-        })
-        .to_string();
-        (tx, sender)
+        });
+        (sign_ed25519(tx, &signing_key, execution), sender)
     }
 
     /// `any_pending` answers for THIS transaction only, through both states a
@@ -780,8 +752,8 @@ mod fee_market_admission {
     #[test]
     fn admission_admits_affordable_tx() {
         let db = temp_db("admission_affordable");
-        let (tx, sender) = signed_tx(12, 0, 1000, 5); // needs 5000
-        fund(&db, &sender, 10_000);
+        let (tx, sender) = signed_tx(12, 0, 1000, 5); // needs gas_limit x 5
+        fund(&db, &sender, 10_000_000);
         let mut mp = Mempool::with_storage(db);
         mp.add_transaction(tx)
             .expect("affordable tx must be admitted");
@@ -802,18 +774,41 @@ mod fee_market_admission {
         assert!(err.contains("no CoinStore"), "got: {err}");
     }
 
-    /// `tx` sponsored by the paymaster with Ed25519 key `seed`, signed by it;
-    /// returns the transaction and the paymaster's address.
-    fn sponsored(tx: &str, seed: u8) -> (String, String) {
+    /// A transaction by sender `sender_seed` sponsored by the paymaster with
+    /// Ed25519 key `pm_seed`. The sender's `gas_limit` covers the paymaster's
+    /// key and signature (B14), and the paymaster signs after it is fixed.
+    /// Returns the transaction, the sender and the paymaster's address.
+    fn sponsored_tx(
+        sender_seed: u8,
+        seq: u64,
+        gas_price: u128,
+        pm_seed: u8,
+    ) -> (String, String, String) {
         use ed25519_dalek::{Signer, SigningKey};
-        let pm = SigningKey::from_bytes(&[seed; 32]);
-        let mut v: serde_json::Value = serde_json::from_str(tx).unwrap();
+        let key = SigningKey::from_bytes(&[sender_seed; 32]);
+        let pm = SigningKey::from_bytes(&[pm_seed; 32]);
+        let sender = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let payload_struct =
+            vm_move::TransactionPayload::PublishModule(vec![vec![sender_seed, seq as u8]]);
+        let tx = serde_json::json!({
+            "chain_id": blockchain::chain_id(),
+            "sender": sender,
+            "input_objects": [],
+            "payload": hex::encode(bcs::to_bytes(&payload_struct).unwrap()),
+            "args": [],
+            "gas_price": gas_price,
+            "sequence_number": seq,
+            "public_key": hex::encode(key.verifying_key().to_bytes()),
+            "paymaster": hex::encode(pm.verifying_key().to_bytes()),
+            "paymaster_signature": "00".repeat(64),
+        });
+        let signed = sign_ed25519(tx, &key, 1000);
+        let mut v: serde_json::Value = serde_json::from_str(&signed).unwrap();
         let parsed: executor::Transaction = serde_json::from_value(v.clone()).unwrap();
-        let sig = pm.sign(&executor::admission::paymaster_message(&parsed));
-        v["paymaster"] = serde_json::json!(hex::encode(pm.verifying_key().to_bytes()));
-        v["paymaster_signature"] = serde_json::json!(hex::encode(sig.to_bytes()));
-        let address = crypto::derive_address(pm.verifying_key().as_bytes()).unwrap();
-        (v.to_string(), address)
+        let pm_sig = pm.sign(&executor::admission::paymaster_message(&parsed));
+        v["paymaster_signature"] = serde_json::json!(hex::encode(pm_sig.to_bytes()));
+        let pm_address = crypto::derive_address(pm.verifying_key().as_bytes()).unwrap();
+        (v.to_string(), sender, pm_address)
     }
 
     /// B13: the paymaster pays, so its balance (at the address derived from
@@ -821,15 +816,14 @@ mod fee_market_admission {
     #[test]
     fn admission_checks_the_paymasters_balance() {
         let db = temp_db("admission_paymaster");
-        let (tx, sender) = signed_tx(14, 0, 1000, 5); // needs 5000
+        let (tx_pm, sender, paymaster) = sponsored_tx(14, 0, 5, 40);
         fund(&db, &sender, 100); // the sender is broke
-        let (tx_pm, paymaster) = sponsored(&tx, 40);
-        fund(&db, &paymaster, 10_000);
+        fund(&db, &paymaster, 10_000_000);
         Mempool::with_storage(Arc::clone(&db))
             .add_transaction(tx_pm)
             .expect("a funded paymaster's sponsorship is admitted");
 
-        let (tx_broke_pm, broke) = sponsored(&tx, 41);
+        let (tx_broke_pm, _, broke) = sponsored_tx(14, 0, 5, 41);
         fund(&db, &broke, 10);
         let err = Mempool::with_storage(db)
             .add_transaction(tx_broke_pm)
@@ -843,19 +837,31 @@ mod fee_market_admission {
     #[test]
     fn a_paymaster_without_a_valid_signature_is_refused() {
         let db = temp_db("admission_paymaster_forged");
-        let (tx, sender) = signed_tx(15, 0, 1000, 5);
+        // The sender signs a transaction naming "deadbeef" as its paymaster,
+        // with no paymaster signature.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[15u8; 32]);
+        let sender = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
         fund(&db, &sender, 100);
-
-        let mut v: serde_json::Value = serde_json::from_str(&tx).unwrap();
-        v["paymaster"] = serde_json::json!("deadbeef");
+        let payload_struct = vm_move::TransactionPayload::PublishModule(vec![vec![15, 0]]);
+        let tx = serde_json::json!({
+            "chain_id": blockchain::chain_id(),
+            "sender": sender,
+            "input_objects": [],
+            "payload": hex::encode(bcs::to_bytes(&payload_struct).unwrap()),
+            "args": [],
+            "gas_price": 5,
+            "sequence_number": 0,
+            "public_key": hex::encode(key.verifying_key().to_bytes()),
+            "paymaster": "deadbeef",
+        });
         let err = Mempool::with_storage(Arc::clone(&db))
-            .add_transaction(v.to_string())
+            .add_transaction(sign_ed25519(tx, &key, 1000))
             .unwrap_err();
         assert!(err.contains("paymaster without a signature"), "{err}");
 
-        let (good, _) = sponsored(&tx, 42);
+        let (good, _, _) = sponsored_tx(15, 0, 5, 42);
+        let (other, _, _) = sponsored_tx(15, 0, 5, 43);
         let mut forged: serde_json::Value = serde_json::from_str(&good).unwrap();
-        let other = sponsored(&tx, 43).0;
         let other: serde_json::Value = serde_json::from_str(&other).unwrap();
         forged["paymaster_signature"] = other["paymaster_signature"].clone();
         let err = Mempool::with_storage(db)

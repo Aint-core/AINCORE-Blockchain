@@ -1,6 +1,6 @@
 # Fees and block resources (bug ledger B14, B15)
 
-Status: design, 2026-10-03. Not built yet. Every number below is either
+Status: built 2026-10-03 (B14 body and byte gas, B15 base fee); see the ledger for the commit. Every number below is either
 measured, read from the code or the operator guide, or marked **choice** with
 its reason.
 
