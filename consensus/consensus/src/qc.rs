@@ -452,11 +452,16 @@ pub(crate) fn verify_stake_aggregate(
     }
 
     let bls = BLSEngine::consensus();
-    match bls.fast_aggregate_verify(signing_bytes, &pubkeys, aggregate_signature) {
+    let verdict = match bls.fast_aggregate_verify(signing_bytes, &pubkeys, aggregate_signature) {
         Ok(true) => Ok(()),
         Ok(false) => Err(QcError::VerifyFailed("aggregate signature invalid".into())),
         Err(e) => Err(QcError::VerifyFailed(format!("{:?}", e))),
+    };
+    if verdict.is_err() {
+        // B51: the pairing was paid for nothing.
+        crate::work::note_failed_check();
     }
+    verdict
 }
 
 /// Aggregate per-signer signatures into a QC. Helper for tests and the future

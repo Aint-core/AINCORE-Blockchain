@@ -188,6 +188,9 @@ pub struct Engine {
     body_wants: BTreeMap<String, pull::Want>,
     /// RE-1 (b, c, d): certificates this node lacks, by slot.
     cert_wants: BTreeMap<(u64, String), pull::Want>,
+    /// B51: certificates an answer may still bring per wanted slot, one per
+    /// request this node sent for it (answers are unauthenticated).
+    cert_answers: HashMap<(u64, String), u8>,
     /// The tick at which a certificate last arrived (RE-1 d).
     last_cert_tick: u64,
     /// This node's last request number and the durable reservation above it.
@@ -379,6 +382,7 @@ impl Engine {
             now_secs,
             body_wants: BTreeMap::new(),
             cert_wants: BTreeMap::new(),
+            cert_answers: HashMap::new(),
             last_cert_tick: 0,
             pull_seq: seq,
             pull_seq_reserved: seq,
@@ -858,6 +862,16 @@ impl Engine {
                 self.early_keys.insert(key);
                 self.early_certs.push(cert);
             }
+            return;
+        }
+        // B51: a copy of a certificate already held costs nothing (each
+        // replay used to cost a pairing). Another digest for a held slot is
+        // verified: a valid one is a conflict `ingest_cert` reports.
+        if self
+            .certs
+            .get(&(cert.body.round, cert.body.author.clone()))
+            .is_some_and(|held| held.body.digest == cert.body.digest)
+        {
             return;
         }
         if vcert::verify_vertex_cert(

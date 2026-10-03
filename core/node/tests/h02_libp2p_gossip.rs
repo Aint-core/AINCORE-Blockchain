@@ -1,9 +1,10 @@
-//! Phase 5.2 / B2.network — Real libp2p stack-startup smoke test for H-02
-//! gossip.
+//! Phase 5.2 / B2.network — Real libp2p stack-startup smoke test for H-02.
+//! (B48: the node runs no gossip any more; a broadcast is pushed on member
+//! sessions. The file keeps its old name.)
 //!
 //! ## What this test DOES prove (verified on a developer machine)
 //!   ✅ Three independent libp2p stacks start successfully
-//!   ✅ TCP + Noise + Yamux + Gossipsub + Kademlia + mDNS + Identify all
+//!   ✅ TCP + Noise + Yamux + Kademlia + mDNS + Identify all
 //!      initialise without panic
 //!   ✅ mDNS service discovery surfaces peers on the loopback
 //!   ✅ Kademlia routing table populates with discovered peers
@@ -11,14 +12,14 @@
 //!      message for broadcast attempt
 //!
 //! ## What this test DOES NOT prove (honest scope)
-//!   ❌ End-to-end Gossipsub delivery across three swarms in a SINGLE
+//!   ❌ End-to-end delivery across three swarms in a SINGLE
 //!      tokio process. libp2p's TCP transport hits a documented
 //!      "AddrInUse" race when multiple swarms in one process try to
 //!      cross-dial on overlapping ports — this is a test-harness
 //!      limitation, NOT a runtime bug. Production deployments run
 //!      one swarm per process and do not exhibit it.
 //!   ❌ Network partition / heal scenarios
-//!   ❌ Byzantine peer behaviour (covered by the Phase 2.7 gossipsub
+//!   ❌ Byzantine peer behaviour (covered by the G4 session
 //!      hardening config — separate concern)
 //!
 //! ## What this covers (HONEST DECOMPOSITION) — NOTE: downtime SLASHING is
@@ -30,7 +31,7 @@
 //!      validator-set lookup, BFT quorum, and executor promotion.
 //!   2. THIS test proves the libp2p stack starts and accepts
 //!      DOWNTIME_ATTEST: payloads onto the broadcast channel.
-//!   3. STILL OPEN: full cross-process Gossipsub delivery.
+//!   3. STILL OPEN: full cross-process delivery.
 //!      `docker-compose.local.yml` exists in the repo as a deployment
 //!      runbook but is NOT executed by any automated test in this
 //!      branch. Cross-process delivery is therefore an OPERATOR /
@@ -78,7 +79,7 @@ async fn h02_libp2p_stack_starts_and_accepts_broadcast() {
     let storage_b = temp_storage("stack_b");
 
     // Start two stacks. Either MUST be successful — if libp2p fails to
-    // bring up Gossipsub/Kademlia/etc. that is a regression.
+    // bring up Kademlia/etc. that is a regression.
     let wiring = || {
         let book = Arc::new(std::sync::RwLock::new(node::sessions::PeerBook::default()));
         node::sessions::SessionWiring::new(book).0
@@ -109,7 +110,7 @@ async fn h02_libp2p_stack_starts_and_accepts_broadcast() {
     let msg = format!("DOWNTIME_ATTEST:{}", payload);
 
     // The broadcast channel must accept the payload without blocking.
-    // (Whether Gossipsub successfully delivers to peer B in a single-
+    // (Whether a member push delivers to peer B in a single-
     //  process scenario is NOT asserted here — see the file-level
     //  docs for why.)
     let send_result = timeout(

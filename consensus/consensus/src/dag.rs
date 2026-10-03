@@ -63,6 +63,16 @@ pub const MAX_VERTEX_BYTES: usize = 768 * 1024;
 /// equivocator's own evidence undeliverable before parents were rooted).
 pub const MAX_PARENTS: usize = 256;
 
+/// B51: failed costly checks a source may cause within the window (a
+/// choice: a few, against none from an honest member), and how long it is
+/// then not heard (a choice: a minute; what it missed comes back by pull and
+/// rebroadcast).
+pub const MAX_FAILED_CHECKS: u64 = 8;
+pub const FAILED_CHECK_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+pub const MUTE_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+/// Sources tracked before stale ones are swept.
+const MAX_TRACKED_SOURCES: usize = 1024;
+
 pub struct DagConsensus {
     pub node_id: String,
     pub current_round: u64,
@@ -158,8 +168,13 @@ pub struct DagConsensus {
     /// V4 ticks so far, and the QC(H_E) ask/answer throttles (EP-4).
     v4_ticks: u64,
     qc_want_next: u64,
+    qc_want_boundary_next: u64,
     qc_answered: HashMap<u64, u64>,
     qc_answer_budget: (u64, u32),
+    /// B51: each source's failed costly checks in its current window, and
+    /// the sources not heard until a time.
+    source_failures: HashMap<String, (std::time::Instant, u64)>,
+    muted: HashMap<String, std::time::Instant>,
     #[cfg(test)]
     pub(crate) local_acceptance_hook: Option<LocalAcceptanceHook>,
     /// Tests only: runs inside the block transaction BEFORE execution, the
@@ -356,8 +371,11 @@ impl DagConsensus {
             ordering_halt: None,
             v4_ticks: 0,
             qc_want_next: 0,
+            qc_want_boundary_next: 0,
             qc_answered: HashMap::new(),
             qc_answer_budget: (0, 0),
+            source_failures: HashMap::new(),
+            muted: HashMap::new(),
             #[cfg(test)]
             local_acceptance_hook: None,
             #[cfg(test)]
@@ -504,7 +522,7 @@ impl DagConsensus {
             // A node that missed the votes has no other way to this one QC
             // (sync asks for blocks above its tip, GET_FINALITY for the latest
             // QC): ask peers for it.
-            self.want_qc(next.prev_height);
+            self.want_boundary_qc(next.prev_height);
             return;
         };
         let binds = qc.block_height == next.prev_height
@@ -578,9 +596,20 @@ impl DagConsensus {
 
     /// Ask peers for the QC of a held height (`QC_WANT:{h}`), at most once
     /// per `QC_WANT_EVERY_TICKS`.
-    fn want_qc(&mut self, h: u64) {
+    pub(crate) fn want_qc(&mut self, h: u64) {
         if self.v4_ticks >= self.qc_want_next {
             self.qc_want_next = self.v4_ticks + QC_WANT_EVERY_TICKS;
+            self.v4_net().broadcast_wire(format!("{QC_WANT_PREFIX}{h}"));
+        }
+    }
+
+    /// B63: the QC(H_E) activation waits on, asked on its own throttle: the
+    /// lowest pending height is asked first every tick, and a QC that never
+    /// came there used to starve this one (activation then hung on votes
+    /// alone).
+    pub(crate) fn want_boundary_qc(&mut self, h: u64) {
+        if self.v4_ticks >= self.qc_want_boundary_next {
+            self.qc_want_boundary_next = self.v4_ticks + QC_WANT_EVERY_TICKS;
             self.v4_net().broadcast_wire(format!("{QC_WANT_PREFIX}{h}"));
         }
     }
@@ -1683,23 +1712,35 @@ impl DagConsensus {
             }
         };
 
-        // Bind the vote to OUR committed block at its anchor round, when known.
-        // We look up the block hash this node committed at the vote's height; if
-        // it disagrees the vote is for a different fork/block and is dropped by
-        // the aggregator. (When we have not committed that height yet, pass None
-        // and let the validator_set_hash + BLS-over-exact-vote binding guard it.)
-        let expected_block_hash = self
+        // B52: a vote counts only for a block this node holds, at that
+        // block's own round. A vote for a block not held (yet) was written
+        // to disk for any anchor round and never pruned (a member's votes
+        // grew every node's database ~8.6 GB a day); a voter re-sends its
+        // vote every tick until the QC forms (`retry_qc_work`), so this node
+        // counts it once it holds the block. Only the header is read, not
+        // the whole block.
+        #[derive(serde::Deserialize)]
+        struct Header {
+            hash: String,
+            round: u64,
+        }
+        #[derive(serde::Deserialize)]
+        struct HeaderOnly {
+            header: Header,
+        }
+        let Some(held) = self
             .storage
             .get(&format!("block_{}", vote_msg.vote.block_height))
             .ok()
             .flatten()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-            .and_then(|b| {
-                b.get("header")
-                    .and_then(|h| h.get("hash"))
-                    .and_then(|h| h.as_str())
-                    .map(|s| s.to_string())
-            });
+            .and_then(|raw| serde_json::from_str::<HeaderOnly>(&raw).ok())
+        else {
+            return;
+        };
+        if vote_msg.vote.anchor_round != held.header.round {
+            return;
+        }
+        let expected_block_hash = Some(held.header.hash);
 
         let outcome = crate::qc_producer::collect_vote_and_try_aggregate(
             &self.storage,
@@ -1721,6 +1762,49 @@ impl DagConsensus {
             if let Ok(mut engine) = self.ordering_engine.lock() {
                 engine.fold_qc_for_height(qc.block_height);
             }
+        }
+    }
+
+    /// B51: `msg` from `source` (the member address its session names, or
+    /// the peer a boundary QC was asked of). A source whose messages failed
+    /// `MAX_FAILED_CHECKS` costly checks (BLS verifications) within
+    /// `FAILED_CHECK_WINDOW` is not heard for `MUTE_FOR`: no honest member
+    /// sends what fails one, and each costs milliseconds under the
+    /// consensus lock (a member's junk pull answers carried 64 junk
+    /// certificates each, ~25,000 pairings a second at its budget).
+    pub fn handle_message_from(&mut self, source: &str, msg: &str) {
+        let now = std::time::Instant::now();
+        if self.muted.get(source).is_some_and(|until| now < *until) {
+            return;
+        }
+        let ((), failed) = crate::work::failed_in(|| self.handle_message(msg));
+        if failed == 0 {
+            return;
+        }
+        // Bounded: sources are members and peers this node asked; a
+        // stale window is forgotten.
+        if self.source_failures.len() > MAX_TRACKED_SOURCES {
+            self.source_failures
+                .retain(|_, (at, _)| now.duration_since(*at) < FAILED_CHECK_WINDOW);
+            self.muted.retain(|_, until| now < *until);
+        }
+        let entry = self
+            .source_failures
+            .entry(source.to_string())
+            .or_insert((now, 0));
+        if now.duration_since(entry.0) >= FAILED_CHECK_WINDOW {
+            *entry = (now, 0);
+        }
+        entry.1 = entry.1.saturating_add(failed);
+        if entry.1 >= MAX_FAILED_CHECKS {
+            eprintln!(
+                "🚫 [B51] not hearing {source} for {}s: {} failed checks in {}s",
+                MUTE_FOR.as_secs(),
+                entry.1,
+                FAILED_CHECK_WINDOW.as_secs()
+            );
+            self.muted.insert(source.to_string(), now + MUTE_FOR);
+            self.source_failures.remove(source);
         }
     }
 

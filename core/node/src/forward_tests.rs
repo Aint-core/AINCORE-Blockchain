@@ -327,3 +327,48 @@ async fn a_transaction_refused_in_every_pass_is_dropped_at_the_requeue_cap() {
         passes += 1;
     }
 }
+
+/// B53 witness: a member that answers Accepted and drops the transaction
+/// cannot censor its sender: once the loan goes stale, the transaction is
+/// forwarded again to the next member, which keeps it. Before, every
+/// re-forward went to the same first member.
+#[tokio::test]
+async fn an_accept_and_drop_member_cannot_censor() {
+    let observer = Arc::new(Mutex::new(Mempool::new()));
+    let members = [session("dropper", true), session("honest", true)];
+    let tx = (9..=255)
+        .map(|seed| signed_tx(seed, 0))
+        .find(|t| members_for(&sender_of(t), &members)[0] == "dropper")
+        .unwrap();
+    observer
+        .lock()
+        .unwrap()
+        .add_transaction(tx.clone())
+        .unwrap();
+    let honest = Arc::new(Mutex::new(Mempool::new()));
+    let served = Arc::clone(&honest);
+    let client = fake_network(members.to_vec(), move |peer, wire| match peer {
+        "dropper" => {
+            let n = serde_json::from_str::<Vec<String>>(wire.strip_prefix(TX_SUBMIT).unwrap())
+                .unwrap()
+                .len();
+            let yes = vec![Verdict::Accepted("dropped".into()); n];
+            Ok(format!(
+                "{TX_RESULT}{}",
+                serde_json::to_string(&yes).unwrap()
+            ))
+        }
+        _ => serve_tx_submit(&served, wire).ok_or_else(|| "refused".into()),
+    });
+    let held =
+        |m: &Arc<Mutex<Mempool>>| m.lock().unwrap().get_all_pending().iter().any(|p| *p == tx);
+    assert_eq!(forward_once(&observer, &client).await, 1);
+    assert!(
+        !held(&honest),
+        "control: the first forward went to the dropper"
+    );
+    // No block settled it: the loan goes stale and returns to the queue.
+    observer.lock().unwrap().requeue_stale_at(0, u64::MAX / 2);
+    forward_once(&observer, &client).await;
+    assert!(held(&honest), "the re-forward went to the same member");
+}

@@ -204,7 +204,12 @@ pub enum SampleError {
 
 /// Check one sample against a DA root. Total: hostile input is refused, never
 /// a panic or an allocation larger than the sample itself.
-pub fn verify_sample(da_root: &str, sample: &Sample) -> Result<(), SampleError> {
+///
+/// Returns the number of shards of the body the root commits to (B62): a
+/// client picks its indices from that range only. A count a server reports
+/// beside the sample (`aincore_getDaStatus`) is a hint, and one smaller than
+/// this lets a withholding server serve every index the client draws.
+pub fn verify_sample(da_root: &str, sample: &Sample) -> Result<u64, SampleError> {
     let expected = decode_hash(da_root).ok_or(SampleError::BadRoot)?;
     let layout = Layout::of(sample.body_len);
     let total = layout.total_shards();
@@ -229,7 +234,7 @@ pub fn verify_sample(da_root: &str, sample: &Sample) -> Result<(), SampleError> 
     if commitment(sample.body_len, &tree) != expected {
         return Err(SampleError::RootMismatch);
     }
-    Ok(())
+    Ok(total)
 }
 
 /// Rebuild a body from any `k` of its `2k` shards (`None` where missing) and

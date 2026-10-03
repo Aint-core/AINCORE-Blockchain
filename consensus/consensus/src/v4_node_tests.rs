@@ -657,6 +657,122 @@ fn forge_cert(
     out.expect("a quorum of signers")
 }
 
+/// B63 witness: the boundary QC is asked even in a tick whose throttle the
+/// lowest pending height already spent (one throttle served both, and the
+/// pending ask always came first).
+#[test]
+fn the_boundary_qc_is_asked_on_its_own_throttle() {
+    let mut c = Cluster::new("qcwant", &[111, 112, 113, 114], true);
+    c.run(2);
+    let outbox = c.node(0).v4_outbox.clone().unwrap();
+    outbox.lock().unwrap().clear();
+    // The pending heights spend their throttle (the second ask is held).
+    c.node_mut(0).want_qc(5);
+    c.node_mut(0).want_qc(6);
+    c.node_mut(0).want_boundary_qc(8);
+    let sent = outbox.lock().unwrap().clone();
+    let asked = |h: u64| {
+        sent.iter()
+            .any(|w| *w == format!("{}{h}", crate::dag::QC_WANT_PREFIX))
+    };
+    assert!(!asked(6), "control: the pending throttle was spent");
+    assert!(asked(8), "the boundary QC waited behind the pending height");
+}
+
+/// B52 witness: a member's finality vote is kept only for a block this node
+/// holds, at that block's round. Votes for a block not held (any round) and
+/// for a held block at another round write nothing; the control (the held
+/// block at its round) writes its row.
+#[test]
+fn a_vote_counts_only_for_a_held_block_at_its_round() {
+    let mut c = Cluster::new("votes", &[111, 112, 113, 114], true);
+    c.run(6);
+    let height = c.node(0).latest_block_height;
+    let (round, hash) = c.block(0, height).expect("a held block");
+    let signer = validator_info(112).address;
+    let set_hash = crate::qc::validator_set_hash(&c.committee);
+    let vote = |height: u64, round: u64, hash: &str| {
+        let vote = crate::qc::FinalityVote {
+            chain_id: crate::qc::expected_chain_id(),
+            epoch: 0,
+            finalized_round: round + 2,
+            anchor_round: round,
+            anchor_hash: "aa".repeat(32),
+            block_height: height,
+            block_hash: hash.to_string(),
+            state_root: "bb".repeat(32),
+            receipts_root: "cc".repeat(32),
+            finality_digest: "dd".repeat(32),
+            validator_set_hash: set_hash.clone(),
+            next_validator_set_hash: String::new(),
+        };
+        let signature = BLSEngine::consensus().sign_raw(
+            &vote.to_signing_bytes(),
+            &derive_validator_bls_seed(&[112; 32]),
+        );
+        let message = crate::qc_producer::QcVoteMessage {
+            vote,
+            signer_address: signer.clone(),
+            signature: hex::encode(signature),
+        };
+        format!("QC_VOTE:{}", serde_json::to_string(&message).unwrap())
+    };
+    let row = |round: u64| format!("consensus:qc_vote_agg:{round}:{signer}");
+    let rows = |c: &Cluster| {
+        c.node(0)
+            .storage
+            .scan_prefix("consensus:qc_vote_agg:")
+            .len()
+    };
+    let before = rows(&c);
+    let far = round + 1_000;
+    c.node_mut(0)
+        .handle_message(&vote(height + 50, far, &"ee".repeat(32)));
+    c.node_mut(0).handle_message(&vote(height, far + 1, &hash));
+    assert_eq!(rows(&c), before, "a vote off a held block was written");
+    c.node(0).storage.delete(&row(round)).unwrap();
+    c.node_mut(0).handle_message(&vote(height, round, &hash));
+    assert!(
+        c.node(0).storage.get(&row(round)).unwrap().is_some(),
+        "control: the held block's vote was not kept"
+    );
+}
+
+/// B51 witness: a source whose messages fail costly checks is not heard once
+/// it has failed `MAX_FAILED_CHECKS` of them in the window: junk
+/// certificates (a quorum signature moved onto another round) stop being
+/// checked; another source's are still checked.
+#[test]
+fn a_source_that_fails_costly_checks_is_muted() {
+    let mut c = Cluster::new("mute", &[111, 112, 113, 114], true);
+    c.run(4);
+    let author = c.known[1].0.clone();
+    let real = forge_cert(&c, 1, &author, &"ab".repeat(32), &[111, 112, 113]);
+    let junk = |round: u64| {
+        let mut cert = real.clone();
+        cert.body.round = round;
+        format!(
+            "{}{}",
+            crate::v4::WIRE_PREFIX,
+            serde_json::to_string(&crate::v4::Msg::Cert(cert)).unwrap()
+        )
+    };
+    let mut failed = 0;
+    for round in 100..120 {
+        let wire = junk(round);
+        failed +=
+            crate::work::failed_in(|| c.node_mut(0).handle_message_from("byzantine", &wire)).1;
+    }
+    assert_eq!(
+        failed,
+        crate::dag::MAX_FAILED_CHECKS,
+        "checked until muted, then not"
+    );
+    let wire = junk(200);
+    let other = crate::work::failed_in(|| c.node_mut(0).handle_message_from("honest", &wire)).1;
+    assert_eq!(other, 1, "another source is still heard");
+}
+
 /// CE-3 through the node (second review of S5, HIGH-1): a node that sees two
 /// certificates for one slot places no further block, signs no further
 /// finality vote, before and after a restart.

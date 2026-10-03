@@ -2780,16 +2780,53 @@ fn dos_an_unsolicited_answer_of_held_certificates_costs_a_pairing_each() {
         !c.engine(0).certs.contains_key(&slot),
         "an unsolicited certificate was taken"
     );
-    // Wanted: the same answer is taken (the control).
-    c.engines[0]
-        .as_mut()
-        .unwrap()
-        .want_cert(slot.0, &slot.1);
+    // Wanted and asked for: the same answer is taken (the control; B51: an
+    // answer is taken only for a request this node sent).
+    c.engines[0].as_mut().unwrap().want_cert(slot.0, &slot.1);
+    let net = c.net(0);
+    c.engines[0].as_mut().unwrap().send_due(&net);
     let msg = answer(&cert);
     c.receive(0, msg);
     assert!(
         c.engine(0).certs.contains_key(&slot),
         "vacuous: a wanted certificate was not taken"
+    );
+}
+
+/// B51 witness: an answer brings at most one certificate per request this
+/// node sent for the slot. A member's junk answer of 64 certificates (a real
+/// signature over another body) costs nothing before this node asked, one
+/// failed check once it asked, and the slot still certifies from honest
+/// answers. Before, every one of the 64 was checked.
+#[test]
+fn junk_answers_cost_one_check_per_request_sent() {
+    let mut c = Cluster::new("junk-answers", 4, 0);
+    c.run(30);
+    let mut held = c.engine(0).certs.values().cloned();
+    let cert = held.next().unwrap();
+    let other = held.next().unwrap();
+    let slot = (cert.body.round, cert.body.author.clone());
+    c.engines[0].as_mut().unwrap().certs.remove(&slot);
+    let mut junk = cert.clone();
+    junk.aggregate_signature = other.aggregate_signature.clone();
+    let answer = Msg::Resp {
+        to: c.members[0].info.address.clone(),
+        resp: pull::Response::Certs {
+            certs: vec![junk; 64],
+            unknown: vec![],
+        },
+    };
+    c.engines[0].as_mut().unwrap().want_cert(slot.0, &slot.1);
+    let ((), failed) = crate::work::failed_in(|| c.receive(0, answer.clone()));
+    assert_eq!(failed, 0, "checked before this node asked");
+    let net = c.net(0);
+    c.engines[0].as_mut().unwrap().send_due(&net);
+    let ((), failed) = crate::work::failed_in(|| c.receive(0, answer.clone()));
+    assert_eq!(failed, 1, "one check for the one request sent");
+    c.run_until(30, |c| c.engine(0).certs.contains_key(&slot));
+    assert!(
+        c.engine(0).certs.contains_key(&slot),
+        "the slot never certified from honest answers"
     );
 }
 

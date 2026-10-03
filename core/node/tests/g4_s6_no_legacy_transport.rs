@@ -15,6 +15,10 @@ const FORBIDDEN: [&str; 5] = [
     "start_server",
 ];
 
+/// The flood harness is an attacker, not a node: it dials from chosen
+/// loopback sources so one host floods as many (`--sources`).
+const ALLOWED: [&str; 1] = ["core/node/src/bin/flood.rs"];
+
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
@@ -49,6 +53,9 @@ fn no_crate_opens_a_raw_peer_socket() {
     );
     let mut found = Vec::new();
     for file in &files {
+        if ALLOWED.iter().any(|allowed| file.ends_with(allowed)) {
+            continue;
+        }
         let text = std::fs::read_to_string(file).unwrap_or_default();
         for name in offences(&text) {
             found.push(format!("{}: {name}", file.display()));

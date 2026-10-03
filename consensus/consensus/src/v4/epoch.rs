@@ -104,6 +104,67 @@ pub fn committee_of(storage: &StateDB, epoch: u64) -> Option<Vec<ValidatorInfo>>
         .map(|s| s.committee)
 }
 
+/// B50: C_E as a restored state records it. A snapshot carries state rows
+/// only, and E's record (`consensus:epoch_start`) is each node's own; the
+/// executor's `sys:validator_set:epoch:{E}` is state, and `stage_boundary`
+/// refuses a block whose record differs from it (G5 EM-2). Epoch 0's is the
+/// genesis set.
+pub fn recorded_committee(storage: &StateDB, epoch: u64) -> Option<Vec<ValidatorInfo>> {
+    if epoch == 0 {
+        return committee_of(storage, 0);
+    }
+    let raw = storage
+        .get(&format!("sys:validator_set:epoch:{epoch}"))
+        .ok()??;
+    let set: Vec<ValidatorInfo> = serde_json::from_str(&raw).ok()?;
+    (!set.is_empty()).then_some(set)
+}
+
+/// B50: E+1's record for a node restored at E's boundary block `block`, built
+/// from the block and its restored post-state by the rule `stage_boundary`
+/// ran on the nodes that executed it (C_E and the proposed set as the state
+/// records them, then `next_start`, then the executor's record must agree).
+/// A checkpoint that is not a boundary has no such record to rebuild.
+pub fn restored_next_start(
+    view: &StateDB,
+    block: &blockchain::Block,
+    chain_id: &str,
+    genesis_identity: &str,
+) -> Result<EpochStart, String> {
+    let interval = epoch_interval(view).ok_or("a V4 chain needs its epoch interval")?;
+    let height = block.header.height;
+    if height == 0 || !height.is_multiple_of(interval) {
+        return Err(format!(
+            "block {height} is not an epoch boundary (every {interval} blocks)"
+        ));
+    }
+    let epoch = epoch_of_height(height, interval);
+    let current = recorded_committee(view, epoch)
+        .ok_or("the restored state records no committee for the closing epoch")?;
+    let proposed: Vec<ValidatorInfo> = view
+        .get("sys:validator_set:v1")
+        .map_err(|e| e.to_string())?
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let boundary = Boundary {
+        epoch,
+        current: &current,
+        closing_round: block.header.round,
+        anchor: &block.anchor_hash,
+        block_hash: &block.header.hash,
+        height,
+        timestamp: block.header.timestamp,
+    };
+    let (start, _invalid) = next_start(chain_id, genesis_identity, &boundary, &proposed);
+    if recorded_committee(view, start.epoch).as_ref() != Some(&start.committee) {
+        return Err(format!(
+            "the restored state records another committee for epoch {}",
+            start.epoch
+        ));
+    }
+    Ok(start)
+}
+
 /// Epoch E's boundary block H_E, as EP-2 and EP-3 need it.
 pub struct Boundary<'a> {
     /// E, the epoch closing.

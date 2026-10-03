@@ -194,7 +194,19 @@ async fn answers_a_non_reader_holds_are_bounded_and_freed_on_close() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
 
+/// B30 witness, written answers: a client that reads gets its answers whole,
+/// and their bytes are freed as they are written, while its connection stays
+/// open (its own node: the host's budget, B60, is fresh).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reading_clients_answers_are_freed_as_written() {
+    const ANSWER: usize = 9 << 20;
+    let node_under_test = start_node("written", ANSWER).await;
+    let (target, held) = (
+        node_under_test.target.clone(),
+        Arc::clone(&node_under_test.held),
+    );
     // A client that reads: its answers are written whole and their bytes
     // freed while its connection stays open.
     let mut reader = new_client(sessions::FramedCodec::new(
@@ -479,6 +491,168 @@ async fn consensus_streams_open_for_members_only() {
     let node = connect(&mut member, &node_under_test.target).await;
     let answer = one_answer(&mut member, &node, "DAG_V4:hello".into()).await;
     assert_eq!(answer.ok().as_deref(), Some(sessions::CONSENSUS_ACK));
+}
+
+/// B60 witness: a non-member's answers are charged by their bytes. 2 MiB
+/// answers cost 32 more tokens each, so a host's burst of 128 tokens buys a
+/// handful of them, not 128 (the request count alone let a few hosts keep
+/// every serving thread busy with large answers).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_answers_spend_a_hosts_budget_by_their_bytes() {
+    let node_under_test = start_node("by_bytes", 2 << 20).await;
+    let mut client = new_client(sessions::FramedCodec::new(
+        sessions::SYNC_REQUEST_CAP,
+        sessions::SYNC_RESPONSE_CAP,
+    ));
+    let node = connect(&mut client, &node_under_test.target).await;
+    let (answered, refused) = ask_in_batches(&mut client, &node, 32, false).await;
+    assert!(
+        answered <= 2 * 8,
+        "{answered} answers of 2 MiB from one burst"
+    );
+    assert!(refused > 0, "control: the budget ran out");
+}
+
+/// B48 witness: the node runs no gossip (a member that stopped reading made
+/// every node queue gossipsub messages for it without bound): a gossipsub
+/// stream is refused at negotiation, member or not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_node_offers_no_gossip_protocol() {
+    let node_under_test = start_node("no_gossip", 2).await;
+    for protocol in ["/meshsub/1.1.0", "/meshsub/1.0.0"] {
+        let mut client = client_on(
+            sessions::FramedCodec::new(1024, 1024),
+            protocol,
+            libp2p::identity::Keypair::generate_ed25519(),
+        );
+        let node = connect(&mut client, &node_under_test.target).await;
+        match one_answer(&mut client, &node, "x".into()).await {
+            Err(request_response::OutboundFailure::UnsupportedProtocols) => {}
+            other => panic!("{protocol} was not refused: {other:?}"),
+        }
+    }
+}
+
+/// A member's sync client (the per-host cap on strangers is not what the
+/// duplicate tests test) and the node it reaches.
+fn member_client(
+    node_under_test: &NodeUnderTest,
+) -> Swarm<request_response::Behaviour<sessions::FramedCodec>> {
+    let key = libp2p::identity::Keypair::generate_ed25519();
+    let member = blockchain::committee::ValidatorInfo {
+        address: "member".into(),
+        stake: 1,
+        ed25519_public_key: hex::encode(key.public().try_into_ed25519().unwrap().to_bytes()),
+        bls_public_key: String::new(),
+        bls_pop: String::new(),
+    };
+    *node_under_test.book.write().unwrap() = sessions::PeerBook::new(0, &[&[member]]);
+    client_on(
+        sessions::FramedCodec::new(sessions::SYNC_REQUEST_CAP, sessions::SYNC_RESPONSE_CAP),
+        sessions::SYNC_PROTOCOL,
+        key,
+    )
+}
+
+/// The client's connections as it sees them open and close.
+#[derive(Default)]
+struct Seen {
+    opened: Vec<libp2p::swarm::ConnectionId>,
+    closed: std::collections::HashSet<libp2p::swarm::ConnectionId>,
+}
+
+impl Seen {
+    /// Open one more connection to `target`, each its own dial.
+    async fn open(
+        &mut self,
+        client: &mut Swarm<request_response::Behaviour<sessions::FramedCodec>>,
+        target: &Multiaddr,
+    ) {
+        let want = self.opened.len() + 1;
+        client
+            .dial(
+                libp2p::swarm::dial_opts::DialOpts::unknown_peer_id()
+                    .address(target.clone())
+                    .build(),
+            )
+            .expect("dial");
+        self.drive(client, Duration::from_secs(30), |s| s.opened.len() >= want)
+            .await;
+        assert_eq!(self.opened.len(), want, "a connection opened");
+    }
+
+    /// Drive the client until `done` or `within` passes.
+    async fn drive(
+        &mut self,
+        client: &mut Swarm<request_response::Behaviour<sessions::FramedCodec>>,
+        within: Duration,
+        done: impl Fn(&Self) -> bool,
+    ) {
+        let deadline = tokio::time::Instant::now() + within;
+        while tokio::time::Instant::now() < deadline && !done(self) {
+            tokio::select! {
+                ev = client.select_next_some() => match ev {
+                    SwarmEvent::ConnectionEstablished { connection_id, .. } => {
+                        self.opened.push(connection_id)
+                    }
+                    SwarmEvent::ConnectionClosed { connection_id, .. } => {
+                        self.closed.insert(connection_id);
+                    }
+                    _ => {}
+                },
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    }
+}
+
+/// Rehearsal regression witness (2026-10-03): libp2p dials a peer's
+/// addresses together, keeps the first connection that opens and drops the
+/// rest, so a node sees several open at once. The one kept used to be
+/// closed as a duplicate the moment it opened (the third over a limit of
+/// two), and the dialer redialled in a loop. It now survives its dropped
+/// siblings. (Each test stays under the node's 20 s idle timeout.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dialers_kept_connection_survives_its_dropped_siblings() {
+    let node_under_test = start_node("siblings", 2).await;
+    let mut client = member_client(&node_under_test);
+    let mut seen = Seen::default();
+    for _ in 0..3 {
+        seen.open(&mut client, &node_under_test.target).await;
+    }
+    // The dialer keeps the newest and drops the two others.
+    client.close_connection(seen.opened[0]);
+    client.close_connection(seen.opened[1]);
+    seen.drive(&mut client, Duration::from_secs(8), |_| false)
+        .await;
+    assert!(
+        !seen.closed.contains(&seen.opened[2]),
+        "the connection the dialer kept was closed"
+    );
+}
+
+/// The duplicate rule still holds: three connections that all outlive the
+/// grace are trimmed to two, the newest first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connections_past_the_grace_are_trimmed_to_two() {
+    let node_under_test = start_node("trimmed", 2).await;
+    let mut client = member_client(&node_under_test);
+    let mut seen = Seen::default();
+    for _ in 0..3 {
+        seen.open(&mut client, &node_under_test.target).await;
+    }
+    let newest = seen.opened[2];
+    seen.drive(&mut client, Duration::from_secs(15), |s| {
+        s.closed.contains(&newest)
+    })
+    .await;
+    assert!(seen.closed.contains(&newest), "the newest was not closed");
+    let live = seen
+        .opened
+        .iter()
+        .filter(|id| !seen.closed.contains(id))
+        .count();
+    assert_eq!(live, 2, "trimmed to two: closed {:?}", seen.closed);
 }
 
 /// Dial `target` and wait for the session.

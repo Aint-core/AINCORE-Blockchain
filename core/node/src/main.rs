@@ -914,35 +914,23 @@ async fn main() {
         let shutdown_p2p_rx = Arc::clone(&shutdown);
 
         tokio::spawn(async move {
-            while let Some(msg) = p2p_rx.recv().await {
+            while let Some((source, msg)) = p2p_rx.recv().await {
                 if shutdown_p2p_rx.load(Ordering::SeqCst) {
                     break;
                 }
-                // println!("📨 Main loop received P2P msg: {}", msg);
-                if msg.starts_with("TX:") || msg.starts_with('{') {
-                    // READ LOCK usually sufficient if mempool is internally mutexed,
-                    // BUT Mempool is stored as Arc<Mutex> inside DagConsensus struct in Main?
-                    // Actually DagConsensus struct definition: pub mempool: Arc<Mutex<Mempool>>
-                    // So we only need READ access to DagConsensus to get the Mempool Arc.
-                    if let Ok(guard) = node_consensus.read() {
-                        if let Ok(mut mp) = guard.mempool.lock() {
-                            let tx_msg = msg.strip_prefix("TX:").unwrap_or(&msg).to_string();
-                            if let Err(reason) = mp.add_transaction(tx_msg) {
-                                println!("❌ [P2P] Rejected transaction: {}", reason);
-                            }
-                        }
-                    }
-                } else if msg.starts_with(consensus::v4::WIRE_PREFIX)
+                // Only consensus messages reach here (members' pushes and the
+                // boundary QCs this node asked for; transactions travel by
+                // forwarding, B21, and gossip is gone, B48).
+                if msg.starts_with(consensus::v4::WIRE_PREFIX)
                     || msg.starts_with("QC_VOTE:")
                     || msg.starts_with(consensus::dag::QC_WANT_PREFIX)
                     || msg.starts_with(consensus::dag::QC_CERT_PREFIX)
                 {
                     // WRITE LOCK required to update the DAG and collect or
-                    // aggregate QC finality votes. The deleted V3 messages
-                    // (`DAG_VERTEX:`, `DOWNTIME_ATTEST:`, `EQUIV_PROOF:`) take
-                    // no lock (G5 S4c).
+                    // aggregate QC finality votes. B51: the source is held to
+                    // account for checks its messages fail.
                     if let Ok(mut guard) = node_consensus.write() {
-                        guard.handle_message(&msg);
+                        guard.handle_message_from(&source, &msg);
                     }
                 }
             }

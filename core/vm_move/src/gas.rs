@@ -26,10 +26,35 @@ impl Default for GasSchedule {
     }
 }
 
+/// B49: abstract value units (move-vm's abstract memory size: the bytes of a
+/// vector's elements, 16 a scalar, 40 a container) per gas unit, for the
+/// operations whose work grows with the value (copy, read, compare, write a
+/// resource). Aptos prices them at 140 internal units per abstract unit
+/// against 5,880 for an `add` (`aptos-gas-schedule`, instr.rs): one simple
+/// instruction per 42 units. They were flat (1 gas to deep-copy a megabyte).
+pub const ABSTRACT_UNITS_PER_GAS: u64 = 42;
+
+/// B49: the abstract value units a transaction may hold in copies at once
+/// (Aptos `memory_quota`, 10,000,000). A copy counts when it is made and is
+/// credited when it is popped, compared, overwritten through a reference or
+/// dropped with its frame; a value overwritten in a local is not credited
+/// (stricter than Aptos, which tracks every drop).
+pub const MEMORY_QUOTA: u64 = 10_000_000;
+
+fn units(val: &impl ValueView) -> u64 {
+    val.legacy_abstract_memory_size().into()
+}
+
+fn by_size(units: u64) -> u64 {
+    units.div_ceil(ABSTRACT_UNITS_PER_GAS)
+}
+
 pub struct AINCOREGasMeter {
     gas_limit: u64,
     gas_consumed: u64,
     schedule: GasSchedule,
+    /// B49: abstract units held in copies (`MEMORY_QUOTA`).
+    memory_held: u64,
 }
 
 impl AINCOREGasMeter {
@@ -38,7 +63,22 @@ impl AINCOREGasMeter {
             gas_limit,
             gas_consumed: 0,
             schedule: GasSchedule::default(),
+            memory_held: 0,
         }
+    }
+
+    /// B49: a copy of `units` is held.
+    fn hold(&mut self, units: u64) -> Result<(), PartialVMError> {
+        self.memory_held = self.memory_held.saturating_add(units);
+        if self.memory_held > MEMORY_QUOTA {
+            return Err(PartialVMError::new(StatusCode::MEMORY_LIMIT_EXCEEDED));
+        }
+        Ok(())
+    }
+
+    /// B49: `units` held are dropped.
+    fn release(&mut self, units: u64) {
+        self.memory_held = self.memory_held.saturating_sub(units);
     }
 
     pub fn gas_used(&self) -> u64 {
@@ -121,13 +161,16 @@ impl GasMeter for AINCOREGasMeter {
 
     fn charge_ld_const_after_deserialization(
         &mut self,
-        _val: impl ValueView,
+        val: impl ValueView,
     ) -> Result<(), PartialVMError> {
-        self.charge(1)
+        self.charge(1)?;
+        self.hold(units(&val))
     }
 
-    fn charge_copy_loc(&mut self, _val: impl ValueView) -> Result<(), PartialVMError> {
-        self.charge(1)
+    fn charge_copy_loc(&mut self, val: impl ValueView) -> Result<(), PartialVMError> {
+        let units = units(&val);
+        self.charge(1 + by_size(units))?;
+        self.hold(units)
     }
 
     fn charge_move_loc(&mut self, _val: impl ValueView) -> Result<(), PartialVMError> {
@@ -138,60 +181,75 @@ impl GasMeter for AINCOREGasMeter {
         self.charge(1)
     }
 
+    // B49: packing and unpacking move fields, so they cost by the field
+    // count (Aptos: a base of ~1.4 `add` and a quarter of one a field).
     fn charge_pack(
         &mut self,
         _is_generic: bool,
-        _args: impl ExactSizeIterator<Item = impl ValueView>,
+        args: impl ExactSizeIterator<Item = impl ValueView>,
     ) -> Result<(), PartialVMError> {
-        self.charge(5)
+        self.charge(5 + (args.len() as u64).div_ceil(4))
     }
 
     fn charge_unpack(
         &mut self,
         _is_generic: bool,
-        _args: impl ExactSizeIterator<Item = impl ValueView>,
+        args: impl ExactSizeIterator<Item = impl ValueView>,
     ) -> Result<(), PartialVMError> {
-        self.charge(5)
+        self.charge(5 + (args.len() as u64).div_ceil(4))
     }
 
-    fn charge_read_ref(&mut self, _val: impl ValueView) -> Result<(), PartialVMError> {
-        self.charge(1)
+    fn charge_read_ref(&mut self, val: impl ValueView) -> Result<(), PartialVMError> {
+        let units = units(&val);
+        self.charge(1 + by_size(units))?;
+        self.hold(units)
     }
 
     fn charge_write_ref(
         &mut self,
         _new_val: impl ValueView,
-        _old_val: impl ValueView,
+        old_val: impl ValueView,
     ) -> Result<(), PartialVMError> {
-        self.charge(1)
+        let old = units(&old_val);
+        self.charge(1 + by_size(old))?;
+        self.release(old);
+        Ok(())
     }
 
     fn charge_eq(
         &mut self,
-        _lhs: impl ValueView,
-        _rhs: impl ValueView,
+        lhs: impl ValueView,
+        rhs: impl ValueView,
     ) -> Result<(), PartialVMError> {
-        self.charge(1)
+        let units = units(&lhs).saturating_add(units(&rhs));
+        self.charge(1 + by_size(units))?;
+        self.release(units);
+        Ok(())
     }
 
     fn charge_neq(
         &mut self,
-        _lhs: impl ValueView,
-        _rhs: impl ValueView,
+        lhs: impl ValueView,
+        rhs: impl ValueView,
     ) -> Result<(), PartialVMError> {
-        self.charge(1)
+        let units = units(&lhs).saturating_add(units(&rhs));
+        self.charge(1 + by_size(units))?;
+        self.release(units);
+        Ok(())
     }
 
-    fn charge_pop(&mut self, _val: impl ValueView) -> Result<(), PartialVMError> {
-        self.charge(1)
+    fn charge_pop(&mut self, val: impl ValueView) -> Result<(), PartialVMError> {
+        self.charge(1)?;
+        self.release(units(&val));
+        Ok(())
     }
 
     fn charge_vec_pack<'a>(
         &mut self,
         _ty: impl TypeView + 'a,
-        _args: impl ExactSizeIterator<Item = impl ValueView>,
+        args: impl ExactSizeIterator<Item = impl ValueView>,
     ) -> Result<(), PartialVMError> {
-        self.charge(5)
+        self.charge(5 + (args.len() as u64).div_ceil(4))
     }
 
     fn charge_vec_len(&mut self, _ty: impl TypeView) -> Result<(), PartialVMError> {
@@ -229,9 +287,12 @@ impl GasMeter for AINCOREGasMeter {
 
     fn charge_drop_frame(
         &mut self,
-        _locals: impl Iterator<Item = impl ValueView>,
+        locals: impl Iterator<Item = impl ValueView>,
     ) -> Result<(), PartialVMError> {
-        self.charge(2)
+        self.charge(2)?;
+        let dropped: u64 = locals.map(|l| units(&l)).fold(0, u64::saturating_add);
+        self.release(dropped);
+        Ok(())
     }
 
     fn charge_borrow_global(
@@ -257,13 +318,15 @@ impl GasMeter for AINCOREGasMeter {
         &mut self,
         _is_generic: bool,
         _ty: impl TypeView,
-        _val: Option<impl ValueView>,
+        val: Option<impl ValueView>,
     ) -> Result<(), PartialVMError> {
-        // Charge base + size if value exists
-        if let Some(_val) = _val {
-            // Approximation of size cost
-            self.charge(self.schedule.load_base + self.schedule.storage_per_byte * 100)
-        // Simplified size
+        // Charge base + size if value exists (B49: by its size)
+        if let Some(val) = val {
+            self.charge(
+                self.schedule.load_base
+                    + self.schedule.storage_per_byte * 100
+                    + by_size(units(&val)),
+            )
         } else {
             self.charge(self.schedule.load_base)
         }
@@ -273,14 +336,11 @@ impl GasMeter for AINCOREGasMeter {
         &mut self,
         _is_generic: bool,
         _ty: impl TypeView,
-        _val: impl ValueView,
+        val: impl ValueView,
         _already_exists: bool,
     ) -> Result<(), PartialVMError> {
-        // Charge stricter storage fee for writing logic
-        // We can't easily get exact byte size from ValueView without serialization cost,
-        // so we charge a higher base cost + heuristic.
-        // For prototype, we charge 500 gas units per write to discourage spam.
-        self.charge(500)
+        // A write: 500 gas to discourage spam, and (B49) its size.
+        self.charge(500 + by_size(units(&val)))
     }
 
     fn charge_vec_unpack(
@@ -298,5 +358,53 @@ impl GasMeter for AINCOREGasMeter {
         _args: impl ExactSizeIterator<Item = impl ValueView>,
     ) -> Result<(), PartialVMError> {
         self.charge(2)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use move_vm_types::values::Value;
+
+    /// B49 witness: a copy costs by its size (a megabyte vector, ~25,000
+    /// gas, was 1), and a comparison by both sides.
+    #[test]
+    fn copies_and_comparisons_cost_by_size() {
+        let small = Value::u64(7);
+        let big = Value::vector_u8(vec![0u8; 1 << 20]);
+        let mut meter = AINCOREGasMeter::new(u64::MAX / 2);
+        meter.charge_copy_loc(&small).unwrap();
+        let small_cost = meter.gas_used();
+        assert!(small_cost <= 2, "a scalar copy costs {small_cost}");
+        meter.charge_copy_loc(&big).unwrap();
+        let big_cost = meter.gas_used() - small_cost;
+        assert!(
+            big_cost >= (1 << 20) / ABSTRACT_UNITS_PER_GAS,
+            "a megabyte copy costs {big_cost}"
+        );
+        let before = meter.gas_used();
+        meter.charge_eq(&big, &big).unwrap();
+        assert!(meter.gas_used() - before >= 2 * (1 << 20) / ABSTRACT_UNITS_PER_GAS);
+    }
+
+    /// B49 witness: copies held at once are bounded by the memory quota; a
+    /// copy that is popped is credited, so a copy-and-pop loop is bounded by
+    /// gas alone.
+    #[test]
+    fn held_copies_are_bounded_and_popped_ones_credited() {
+        let big = Value::vector_u8(vec![0u8; 1 << 20]);
+        let mut meter = AINCOREGasMeter::new(u64::MAX / 2);
+        for _ in 0..100 {
+            meter.charge_copy_loc(&big).unwrap();
+            meter.charge_pop(&big).unwrap();
+        }
+        let fits = MEMORY_QUOTA / units(&big);
+        for _ in 0..fits {
+            meter.charge_copy_loc(&big).unwrap();
+        }
+        assert_eq!(
+            meter.charge_copy_loc(&big).unwrap_err().major_status(),
+            StatusCode::MEMORY_LIMIT_EXCEEDED
+        );
     }
 }

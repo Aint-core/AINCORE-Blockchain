@@ -147,9 +147,10 @@ fn every_shard_of_every_body_verifies_against_its_root() {
         let total = ext.layout().total_shards();
         for index in 0..total {
             let sample = ext.sample(index).expect("an index below the total");
+            // B62: the verified count of shards, whatever a server reports.
             assert_eq!(
                 verify_sample(&ext.root(), &sample),
-                Ok(()),
+                Ok(total),
                 "{len} bytes, shard {index}"
             );
         }
@@ -217,7 +218,7 @@ fn a_tampered_sample_is_refused() {
         verify_sample(&"g".repeat(64), &good),
         Err(SampleError::BadRoot)
     );
-    assert_eq!(verify_sample(&root, &good), Ok(()), "control");
+    assert!(verify_sample(&root, &good).is_ok(), "control");
 }
 
 /// Hostile lengths and indices are refused without a panic or a large
@@ -407,7 +408,7 @@ fn shared_vectors_from_the_independent_reference() {
         let ext = Extended::new(&pattern(t.sample.body_len as usize));
         assert_eq!(ext.root(), t.da_root);
         assert_eq!(ext.sample(t.sample.index).as_ref(), Some(&t.sample));
-        assert_eq!(verify_sample(&t.da_root, &t.sample), Ok(()));
+        assert!(verify_sample(&t.da_root, &t.sample).is_ok());
     }
     for t in &v.invalid {
         let err = verify_sample(&t.da_root, &t.sample).expect_err(&t.name);

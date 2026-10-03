@@ -41,6 +41,9 @@ pub const PULL_DOMAIN: &[u8] = b"AINCORE_V4_PULL_V1";
 /// Request sequence numbers are reserved in blocks this size (`next_seq`).
 const SEQ_BLOCK: u64 = 1024;
 const SEQ_KEY: &str = "consensus:pull_seq";
+/// B51: certificates answers may bring for one slot before this node asks
+/// for it again (a choice: the requests of a few ticks in flight at once).
+pub const MAX_ANSWERS_PER_SLOT: u8 = 4;
 /// RE-1 (d): ticks without a new certificate before this node asks everyone
 /// for the certificates of its current and previous rounds.
 pub const STALL_TICKS: u64 = 4;
@@ -344,6 +347,12 @@ impl Engine {
         }
         for (target, slots) in slots {
             for batch in slots.chunks(MAX_REQ_SLOTS) {
+                // B51: each request lets one answer bring one certificate
+                // per slot asked (at most `MAX_ANSWERS_PER_SLOT` owed).
+                for slot in batch {
+                    let owed = self.cert_answers.entry(slot.clone()).or_insert(0);
+                    *owed = owed.saturating_add(1).min(MAX_ANSWERS_PER_SLOT);
+                }
                 let req = Request::Certs {
                     epoch: self.epoch,
                     slots: batch.to_vec(),
@@ -351,6 +360,8 @@ impl Engine {
                 self.request(&target, req, net);
             }
         }
+        let wants = &self.cert_wants;
+        self.cert_answers.retain(|slot, _| wants.contains_key(slot));
     }
 
     /// A node far behind learns what it misses one level at a time through
@@ -541,11 +552,17 @@ impl Engine {
             Response::Certs { certs, .. } => {
                 // Only what this node asked for and does not hold, at most a
                 // request's worth: an answer is unauthenticated, and each
-                // certificate costs a pairing (final review MEDIUM).
+                // certificate costs a pairing (final review MEDIUM). B51: and
+                // one certificate per request sent for the slot, so junk
+                // answers cost at most what this node asked for.
                 for c in certs.into_iter().take(MAX_REQ_SLOTS) {
                     let slot = (c.body.round, c.body.author.clone());
                     if !self.cert_wants.contains_key(&slot) || self.certs.contains_key(&slot) {
                         continue;
+                    }
+                    match self.cert_answers.get_mut(&slot) {
+                        Some(owed) if *owed > 0 => *owed -= 1,
+                        _ => continue,
                     }
                     self.on_cert(c, net);
                 }

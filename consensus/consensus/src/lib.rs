@@ -9,6 +9,7 @@ pub mod staging;
 pub mod state_proof_client;
 pub mod v4;
 pub mod vcert;
+pub mod work;
 
 #[cfg(test)]
 mod tests;

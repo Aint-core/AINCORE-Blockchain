@@ -1,4 +1,4 @@
-use actix_governor::{Governor, GovernorConfigBuilder};
+use actix_governor::{Governor, GovernorConfigBuilder, KeyExtractor, SimpleKeyExtractionError};
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, RwLock};
@@ -6,6 +6,12 @@ use std::sync::{Arc, Mutex, RwLock};
 // Input validation constants
 const MAX_BLOCK_HEIGHT: u64 = 1_000_000_000;
 const MAX_QUERY_LIMIT: u64 = 1000;
+/// B54: the bytes of blocks one `aincore_getBlocks` answer carries (a choice:
+/// the sync answer's 8 MiB, `SYNC_RESP_BLOCK_BYTES`); at least one block.
+const MAX_BLOCKS_BYTES: usize = 8 << 20;
+/// B54: the vertices `aincore_getDag` returns, newest first (a choice: a few
+/// rounds of a full committee).
+const MAX_DAG_VERTICES: usize = 256;
 
 // --- Shared State ---
 use consensus::DagConsensus;
@@ -771,6 +777,13 @@ fn handle_rpc_method(
             };
 
             if let Some(tx_str) = tx_str_opt {
+                // B54: the signature and proof checks run before the mempool
+                // lock (the consensus tick needs it); under it, only the
+                // stateful gates.
+                let checked = mempool::Mempool::check_admissible(&tx_str).map_err(|reason| JsonRpcError {
+                    code: -32010,
+                    message: format!("Transaction rejected by mempool: {}", reason),
+                })?;
                 let mut mempool = data.mempool.lock()
                     .map_err(|e| JsonRpcError { code: -32000, message: format!("Mempool lock error: {}", e) })?;
                 // `tx_hash` is the key this transaction can be LOOKED UP by: blocks
@@ -780,7 +793,7 @@ fn handle_rpc_method(
                 // it, so returning it meant a client's receipt lookup said
                 // "pending" forever. It is still returned, as `canonical_hash`.
                 let lookup_hash = StateDB::raw_tx_hash(&tx_str);
-                match mempool.add_transaction(tx_str) {
+                match mempool.add_checked(tx_str, checked) {
                     Ok(canonical_hash) => Ok(serde_json::json!({
                         "status": "sent",
                         "tx_hash": lookup_hash,
@@ -1051,7 +1064,15 @@ fn handle_rpc_method(
             let consensus = try_consensus(data)?.ok_or_else(consensus_busy)?;
             let dag = consensus.dag.lock().map_err(|e| JsonRpcError { code: -32000, message: format!("DAG lock error: {}", e) })?;
 
-            let vertices: Vec<_> = dag.values().cloned().collect();
+            // B54: the newest `MAX_DAG_VERTICES`, not the whole DAG cloned
+            // under the consensus lock.
+            let mut newest: Vec<(u64, &String)> = dag.iter().map(|(h, v)| (v.round, h)).collect();
+            newest.sort_unstable_by(|a, b| b.cmp(a));
+            let vertices: Vec<_> = newest
+                .into_iter()
+                .take(MAX_DAG_VERTICES)
+                .filter_map(|(_, h)| dag.get(h).cloned())
+                .collect();
             Ok(serde_json::json!(vertices))
         },
         "aincore_getTransaction" => {
@@ -1084,15 +1105,14 @@ fn handle_rpc_method(
                     }
                 }
 
-                // Fallback to mempool check if not in a block
-                let in_mempool = if let Ok(mp) = data.mempool.lock() {
-                    mp.get_all_pending().iter().find(|tx| {
-                         use sha2::{Sha256, Digest};
-                         let mut hasher = Sha256::new();
-                         hasher.update(tx.as_bytes());
-                         hex::encode(hasher.finalize()) == target_hash
-                    }).cloned()
-                } else { None };
+                // Fallback to mempool check if not in a block (B54: by the
+                // hash each transaction got at admission, nothing hashed under
+                // the lock).
+                let in_mempool = data
+                    .mempool
+                    .lock()
+                    .ok()
+                    .and_then(|mp| mp.pending_with_raw_hash(target_hash).map(str::to_string));
 
                 if let Some(tx_str) = in_mempool {
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&tx_str) {
@@ -1158,9 +1178,17 @@ fn handle_rpc_method(
                         "🔍 [RPC] getBlocks range: {}..={} (latest={})",
                         start_height, end_height, latest_height
                     );
+                    let mut bytes = 0usize;
                     for i in start_height..=end_height {
                         let key = format!("block_{}", i);
                         if let Ok(Some(block_json)) = data.storage.get(&key) {
+                            // B54: the answer stops at MAX_BLOCKS_BYTES (at
+                            // least one block); the caller asks again from
+                            // the next height.
+                            bytes += block_json.len();
+                            if bytes > MAX_BLOCKS_BYTES && !blocks.is_empty() {
+                                break;
+                            }
                             if let Ok(block_obj) =
                                 serde_json::from_str::<serde_json::Value>(&block_json)
                             {
@@ -1172,9 +1200,14 @@ fn handle_rpc_method(
                 None => {
                     println!("🔍 [RPC] getBlocks latest: head={} limit={}", latest_height, limit);
                     let start_index = latest_height.saturating_sub(limit);
+                    let mut bytes = 0usize;
                     for i in (start_index + 1..=latest_height).rev() {
                         let key = format!("block_{}", i);
                         if let Ok(Some(block_json)) = data.storage.get(&key) {
+                            bytes += block_json.len();
+                            if bytes > MAX_BLOCKS_BYTES && !blocks.is_empty() {
+                                break;
+                            }
                             if let Ok(block_obj) =
                                 serde_json::from_str::<serde_json::Value>(&block_json)
                             {
@@ -1687,7 +1720,7 @@ fn handle_rpc_method(
                     let in_mempool = data
                         .mempool
                         .lock()
-                        .map(|mp| mp.any_pending(|tx| StateDB::raw_tx_hash(tx) == tx_hash))
+                        .map(|mp| mp.pending_with_raw_hash(tx_hash).is_some())
                         .unwrap_or(false);
 
                     Ok(serde_json::json!({
@@ -1734,6 +1767,14 @@ fn handle_rpc_method(
         "aincore_getBlockByHash" => {
             // params: [block_hash]
             if let Some(target_hash) = params.get(0).and_then(|v| v.as_str()) {
+                // B58: the block whose own header hash this is. A substring
+                // test matched the child too (its `prev_hash`), and any
+                // fragment matched every block.
+                let target = target_hash.trim().trim_start_matches("0x").to_ascii_lowercase();
+                if target.len() != 64 || !target.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(JsonRpcError { code: -32602, message: "Invalid params: block_hash must be 64 hex characters".into() });
+                }
+                let needle = format!("\"hash\":\"{target}\"");
                 let latest_height = data.storage.get_chain_height();
                 let mut found_block = None;
 
@@ -1742,10 +1783,13 @@ fn handle_rpc_method(
                 for h in (search_start..=latest_height).rev() {
                     let key = format!("block_{}", h);
                     if let Ok(Some(block_json)) = data.storage.get(&key) {
-                        if block_json.contains(target_hash) {
+                        if block_json.contains(&needle) {
                             if let Ok(block_obj) = serde_json::from_str::<serde_json::Value>(&block_json) {
-                                found_block = Some(block_obj);
-                                break;
+                                let own = block_obj["header"]["hash"].as_str().unwrap_or_default();
+                                if own.eq_ignore_ascii_case(&target) {
+                                    found_block = Some(block_obj);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1948,74 +1992,10 @@ fn handle_rpc_method(
             }
         },
 
-        "aincore_aggregateBLS" => {
-            // params: [signatures_hex_array]
-            // Returns aggregated BLS signature info
-            if let Some(sigs) = params.get(0).and_then(|v| v.as_array()) {
-                Ok(serde_json::json!({
-                    "input_count": sigs.len(),
-                    "scheme": "BLS12-381",
-                    "status": "aggregation_available",
-                    "note": "Submit via sendTransaction with a hex-encoded BCS TransactionPayload"
-                }))
-            } else {
-                Err(JsonRpcError { code: -32602, message: "Invalid params: [signatures_array]".into() })
-            }
-        },
-
-        "aincore_verifyProof" => {
-            // params: [proof_type ("snark"|"stark"), proof_hex]
-            if let (Some(proof_type), Some(proof_hex)) = (
-                params.get(0).and_then(|v| v.as_str()),
-                params.get(1).and_then(|v| v.as_str())
-            ) {
-                let proof_bytes = hex::decode(proof_hex).unwrap_or_default();
-                let is_valid_format = !proof_bytes.is_empty();
-
-                Ok(serde_json::json!({
-                    "proof_type": proof_type,
-                    "proof_size_bytes": proof_bytes.len(),
-                    "valid_format": is_valid_format,
-                    "supported_types": ["snark", "stark"],
-                    "status": if is_valid_format { "proof_accepted" } else { "invalid_encoding" }
-                }))
-            } else {
-                Err(JsonRpcError { code: -32602, message: "Invalid params: [proof_type, proof_hex]".into() })
-            }
-        },
-
-        "aincore_verifyVDF" => {
-            // params: [input_hex, output_hex, iterations]
-            if let (Some(input_hex), Some(output_hex), Some(iterations)) = (
-                params.get(0).and_then(|v| v.as_str()),
-                params.get(1).and_then(|v| v.as_str()),
-                params.get(2).and_then(|v| v.as_u64())
-            ) {
-                let input_bytes = hex::decode(input_hex).unwrap_or_default();
-                let output_bytes = hex::decode(output_hex).unwrap_or_default();
-
-                use crypto::VDFEngine;
-                if let Ok(vdf) = VDFEngine::new(iterations) {
-                    if let Ok((computed_output, _proof)) = vdf.compute(&input_bytes) {
-                        let valid = computed_output == output_bytes;
-
-                        Ok(serde_json::json!({
-                            "valid": valid,
-                            "iterations": iterations,
-                            "input_len": input_bytes.len(),
-                            "output_len": output_bytes.len()
-                        }))
-                    } else {
-                        Ok(serde_json::json!({ "valid": false, "error": "VDF computation failed" }))
-                    }
-                } else {
-                    Err(JsonRpcError { code: -32602, message: "Invalid VDF iterations parameters".into() })
-                }
-            } else {
-                Err(JsonRpcError { code: -32602, message: "Invalid params: [input_hex, output_hex, iterations]".into() })
-            }
-        },
-
+        // B47: `aincore_verifyVDF` (client-sized work: 2^64 - 1 iterations
+        // aborted the node), `aincore_verifyProof` (answered "proof_accepted"
+        // for any bytes) and `aincore_aggregateBLS` (a placeholder) are gone:
+        // nothing on chain uses them.
         "aincore_ecdsaVerify" => {
             // params: [public_key_hex, message_hex, signature_hex]
             if let (Some(pubkey_hex), Some(msg_hex), Some(sig_hex)) = (
@@ -2113,7 +2093,9 @@ async fn json_rpc_handler(
     let method = req.method.as_str();
     let params = req.params.clone().unwrap_or(serde_json::Value::Null);
 
-    println!("📥 JSON-RPC Request: {} {:?}", method, params);
+    // B59: a bounded prefix (a request may carry 2 MiB of params).
+    let shown: String = params.to_string().chars().take(256).collect();
+    println!("📥 JSON-RPC Request: {} {}", method, shown);
 
     let result = handle_rpc_method(method, params, &data);
 
@@ -2404,6 +2386,49 @@ fn session_counts(sessions: &network::SessionTable) -> (usize, usize) {
     )
 }
 
+/// B59: the key the RPC rate limit counts a request against. Behind a local
+/// proxy every client is 127.0.0.1, so one client spent everyone's budget.
+/// When the operator names the header its proxy sets
+/// (`AINCORE_RPC_CLIENT_IP_HEADER`, e.g. `CF-Connecting-IP` behind a
+/// Cloudflare tunnel), a request from a loopback peer counts under that
+/// header's address; any other peer, and a loopback request without the
+/// header, under the peer's own (a header from anywhere else is the
+/// client's to forge).
+#[derive(Clone)]
+struct ClientIp {
+    header: Option<String>,
+}
+
+impl KeyExtractor for ClientIp {
+    type Key = std::net::IpAddr;
+    type KeyExtractionError = SimpleKeyExtractionError<&'static str>;
+
+    fn extract(
+        &self,
+        req: &actix_web::dev::ServiceRequest,
+    ) -> Result<Self::Key, Self::KeyExtractionError> {
+        let peer = req
+            .peer_addr()
+            .map(|socket| socket.ip())
+            .ok_or_else(|| SimpleKeyExtractionError::new("no peer address"))?;
+        if !peer.is_loopback() {
+            return Ok(peer);
+        }
+        let forwarded = self.header.as_deref().and_then(|name| {
+            req.headers()
+                .get(name)?
+                .to_str()
+                .ok()?
+                .split(',')
+                .next()?
+                .trim()
+                .parse()
+                .ok()
+        });
+        Ok(forwarded.unwrap_or(peer))
+    }
+}
+
 pub async fn start_api_server(
     api_port: u16,
     consensus: Arc<RwLock<DagConsensus>>,
@@ -2427,7 +2452,13 @@ pub async fn start_api_server(
     // NOTE: actix-governor 0.4 `per_second(n)` = replenish one cell every n
     // SECONDS, so per_second(100) throttled every IP to ~1 req/100s after a 200
     // burst — a frontend-bricking bug. per_millisecond(10) = true 100 req/s.
+    let client_ip = ClientIp {
+        header: std::env::var("AINCORE_RPC_CLIENT_IP_HEADER")
+            .ok()
+            .filter(|h| !h.trim().is_empty()),
+    };
     let governor_conf = GovernorConfigBuilder::default()
+        .key_extractor(client_ip)
         .per_millisecond(10)
         .burst_size(200)
         .finish()
@@ -2545,6 +2576,127 @@ mod tests {
             mempool: Arc::new(Mutex::new(mempool::Mempool::new())),
             governance,
             storage: db,
+        }
+    }
+
+    /// B58 witness: a block's hash finds that block, not its child (whose
+    /// `prev_hash` holds it), and a fragment of a hash finds nothing.
+    #[test]
+    fn a_block_hash_finds_its_own_block() {
+        let db = temp_db("block_by_hash");
+        let (parent, child) = ("ab".repeat(32), "cd".repeat(32));
+        let mut first = blockchain::Block::new(1, 1, "genesis".into(), vec![], "n".into());
+        first.header.hash = parent.clone();
+        let mut second = blockchain::Block::new(2, 2, parent.clone(), vec![], "n".into());
+        second.header.hash = child;
+        let seed = db.seeding();
+        db.put("block_1", &serde_json::to_string(&first).unwrap())
+            .unwrap();
+        db.put("block_2", &serde_json::to_string(&second).unwrap())
+            .unwrap();
+        db.put("latest_height", "2").unwrap();
+        drop(seed);
+        let state = test_state(db);
+        let found = handle_rpc_method(
+            "aincore_getBlockByHash",
+            serde_json::json!([parent]),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(found["header"]["height"], 1);
+        assert!(
+            handle_rpc_method("aincore_getBlockByHash", serde_json::json!(["ab"]), &state).is_err()
+        );
+    }
+
+    /// B54 witness: `getDag` returns the newest `MAX_DAG_VERTICES`, not the
+    /// whole DAG cloned under the consensus lock; `getBlocks` stops at
+    /// `MAX_BLOCKS_BYTES` (one block at least).
+    #[test]
+    fn dag_and_block_answers_are_bounded() {
+        let db = temp_db("bounded_answers");
+        let state = test_state(Arc::clone(&db));
+        {
+            let consensus = state.consensus.read().unwrap();
+            let mut dag = consensus.dag.lock().unwrap();
+            for round in 1..=(MAX_DAG_VERTICES as u64 + 44) {
+                let v = blockchain::Vertex::new(round, "a".into(), vec![], vec![]);
+                dag.insert(format!("{round:064x}"), v);
+            }
+        }
+        let dag = handle_rpc_method("aincore_getDag", serde_json::json!([]), &state).unwrap();
+        let rounds: Vec<u64> = dag
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["round"].as_u64().unwrap())
+            .collect();
+        assert_eq!(rounds.len(), MAX_DAG_VERTICES);
+        assert_eq!(rounds[0], MAX_DAG_VERTICES as u64 + 44, "the newest first");
+
+        let big = "x".repeat(3 << 20);
+        let seed = db.seeding();
+        for h in 1..=3u64 {
+            let block = serde_json::json!({ "header": { "height": h }, "transactions": [big] });
+            db.put(&format!("block_{h}"), &block.to_string()).unwrap();
+        }
+        db.put("latest_height", "3").unwrap();
+        drop(seed);
+        let blocks =
+            handle_rpc_method("aincore_getBlocks", serde_json::json!([10, 1]), &state).unwrap();
+        assert_eq!(
+            blocks.as_array().unwrap().len(),
+            2,
+            "three 3 MiB blocks pass 8 MiB at the third"
+        );
+    }
+
+    /// B59 witness: behind a loopback proxy, with the operator's header named,
+    /// each client is counted under its own address; a header from a remote
+    /// peer is ignored (it is the client's to forge), as it is with no header
+    /// named.
+    #[test]
+    fn the_rate_limit_counts_each_client_behind_a_proxy() {
+        let request = |peer: &str, header: Option<&str>| {
+            let mut req = actix_web::test::TestRequest::default().peer_addr(peer.parse().unwrap());
+            if let Some(ip) = header {
+                req = req.insert_header(("CF-Connecting-IP", ip));
+            }
+            req.to_srv_request()
+        };
+        let named = ClientIp {
+            header: Some("CF-Connecting-IP".into()),
+        };
+        let unnamed = ClientIp { header: None };
+        let key = |x: &ClientIp, req| x.extract(&req).unwrap().to_string();
+        assert_eq!(
+            key(&named, request("127.0.0.1:5000", Some("203.0.113.7"))),
+            "203.0.113.7"
+        );
+        assert_eq!(key(&named, request("127.0.0.1:5000", None)), "127.0.0.1");
+        assert_eq!(
+            key(&named, request("198.51.100.9:5000", Some("203.0.113.7"))),
+            "198.51.100.9"
+        );
+        assert_eq!(
+            key(&unnamed, request("127.0.0.1:5000", Some("203.0.113.7"))),
+            "127.0.0.1"
+        );
+    }
+
+    /// B47 witness: the demonstration crypto methods are gone (the VDF one
+    /// ran a client-chosen number of iterations; the proof one accepted any
+    /// bytes).
+    #[test]
+    fn demo_crypto_methods_are_not_served() {
+        let state = test_state(temp_db("demo_crypto"));
+        for (method, params) in [
+            ("aincore_verifyVDF", serde_json::json!(["00", "00", 1])),
+            ("aincore_verifyProof", serde_json::json!(["snark", "00"])),
+            ("aincore_aggregateBLS", serde_json::json!([["00"]])),
+        ] {
+            let answer = handle_rpc_method(method, params, &state);
+            assert_eq!(answer.err().map(|e| e.code), Some(-32601), "{method}");
         }
     }
 

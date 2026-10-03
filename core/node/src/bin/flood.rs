@@ -5,37 +5,44 @@
 //!   hold       connect and keep the connection (the non-member cap)
 //!   consensus  member-only consensus requests (refused: not a member)
 //!   sync       GET_HEIGHT as fast as `--rate` (the per-session sync budget)
-//!   gossip     junk DAG_V4 and TX gossip (rejected, the sender graylisted)
 //!   big        sync requests over the request cap (refused before read)
 //!
 //!   flood --target /ip4/H/tcp/P --identities 60 --seconds 180 --rate 50
-//!         [--mix hold,consensus,sync,gossip,big]
+//!         [--mix hold,consensus,sync,big] [--sources N]
+//!
+//! `--sources N` dials identity i from 127.0.0.(2 + i mod N), so a flood
+//! from one host reaches a node on that host as N hosts (its per-IP caps
+//! then let the non-member total be reached). Loopback targets only.
 //!
 //! `--target` is the node's libp2p address (base port + 100). Every 10 s and
 //! at the end it prints one JSON line of counts per kind. Run it against a
 //! rehearsal node only, never a live validator.
 
-use libp2p::futures::StreamExt;
+use libp2p::core::transport::{ListenerId, TransportError, TransportEvent};
+use libp2p::futures::{future::BoxFuture, FutureExt, StreamExt};
+use libp2p::multiaddr::Protocol;
 use libp2p::{
     core::upgrade,
-    gossipsub, identity, noise, request_response,
+    identity, noise, request_response,
     swarm::{dial_opts::DialOpts, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, Swarm, Transport,
 };
 use node::sessions::{self, FramedCodec};
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct Flood {
-    gossipsub: gossipsub::Behaviour,
     consensus: request_response::Behaviour<FramedCodec>,
     sync: request_response::Behaviour<FramedCodec>,
 }
 
-const KINDS: [&str; 5] = ["hold", "consensus", "sync", "gossip", "big"];
+const KINDS: [&str; 4] = ["hold", "consensus", "sync", "big"];
 
 #[derive(Default)]
 struct Count {
@@ -84,16 +91,80 @@ fn report(counts: &[Count], elapsed: Duration) {
     println!("{}", serde_json::Value::Object(line));
 }
 
-fn swarm(key: identity::Keypair) -> Swarm<Flood> {
-    let transport = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
-        .upgrade(upgrade::Version::V1)
-        .authenticate(noise::Config::new(&key).expect("noise"))
-        .multiplex(yamux::Config::default())
-        .boxed();
+/// A TCP dialer bound to one source address (`--sources`).
+struct FromSource(Ipv4Addr);
+
+impl Transport for FromSource {
+    type Output = tcp::tokio::TcpStream;
+    type Error = std::io::Error;
+    type ListenerUpgrade = std::future::Pending<Result<Self::Output, Self::Error>>;
+    type Dial = BoxFuture<'static, Result<Self::Output, Self::Error>>;
+
+    fn listen_on(
+        &mut self,
+        _: ListenerId,
+        addr: Multiaddr,
+    ) -> Result<(), TransportError<Self::Error>> {
+        Err(TransportError::MultiaddrNotSupported(addr))
+    }
+
+    fn remove_listener(&mut self, _: ListenerId) -> bool {
+        false
+    }
+
+    fn dial(
+        &mut self,
+        addr: Multiaddr,
+        _: libp2p::core::transport::DialOpts,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        let mut ip = None;
+        let mut port = None;
+        for part in addr.iter() {
+            match part {
+                Protocol::Ip4(a) => ip = Some(a),
+                Protocol::Tcp(p) => port = Some(p),
+                _ => {}
+            }
+        }
+        let (Some(ip), Some(port)) = (ip, port) else {
+            return Err(TransportError::MultiaddrNotSupported(addr));
+        };
+        let source = self.0;
+        Ok(async move {
+            let socket = tokio::net::TcpSocket::new_v4()?;
+            socket.bind(SocketAddr::from((source, 0)))?;
+            let stream = socket.connect(SocketAddr::from((ip, port))).await?;
+            stream.set_nodelay(true)?;
+            Ok(tcp::tokio::TcpStream(stream))
+        }
+        .boxed())
+    }
+
+    fn poll(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<TransportEvent<Self::ListenerUpgrade, Self::Error>> {
+        Poll::Pending
+    }
+}
+
+fn swarm(key: identity::Keypair, source: Option<Ipv4Addr>) -> Swarm<Flood> {
+    let noise = noise::Config::new(&key).expect("noise");
+    let transport = match source {
+        Some(source) => FromSource(source)
+            .upgrade(upgrade::Version::V1)
+            .authenticate(noise)
+            .multiplex(yamux::Config::default())
+            .boxed(),
+        None => tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
+            .upgrade(upgrade::Version::V1)
+            .authenticate(noise)
+            .multiplex(yamux::Config::default())
+            .boxed(),
+    };
     // Requests up to 4 MiB may be written, so `big` can exceed the node's caps.
     let big_codec = |response_cap| FramedCodec::new(4 << 20, response_cap);
     let behaviour = Flood {
-        gossipsub: sessions::gossip_behaviour(&key).expect("gossipsub"),
         consensus: request_response::Behaviour::with_codec(
             big_codec(sessions::CONSENSUS_ACK.len()),
             [(
@@ -127,10 +198,10 @@ async fn run(
     rate: u64,
     until: tokio::time::Instant,
     c: Arc<Vec<Count>>,
+    source: Option<Ipv4Addr>,
 ) {
     let c = &c[kind];
-    let mut swarm = swarm(identity::Keypair::generate_ed25519());
-    let topic = gossipsub::IdentTopic::new(sessions::GOSSIP_TOPIC);
+    let mut swarm = swarm(identity::Keypair::generate_ed25519(), source);
     let _ = swarm.dial(DialOpts::unknown_peer_id().address(target.clone()).build());
     let (mut peer, mut dialing): (Option<PeerId>, bool) = (None, true);
     let every = match KINDS[kind] {
@@ -189,11 +260,6 @@ async fn run(
                         swarm.behaviour_mut().sync.send_request(&p, "GET_HEIGHT".into());
                         true
                     }
-                    "gossip" => {
-                        let junk = if n.is_multiple_of(2) { "DAG_V4" } else { "TX" };
-                        let wire = format!("{junk}:flood-{}-{n}", swarm.local_peer_id());
-                        swarm.behaviour_mut().gossipsub.publish(topic.clone(), wire.into_bytes()).is_ok()
-                    }
                     "big" => {
                         let wire = format!("SYNC_REQ:{}", "x".repeat(sessions::SYNC_REQUEST_CAP + 1));
                         swarm.behaviour_mut().sync.send_request(&p, wire);
@@ -221,10 +287,11 @@ async fn main() {
         });
     let num = |k: &str, d: u64| f.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
     let (identities, seconds, rate) = (num("identities", 60), num("seconds", 180), num("rate", 50));
+    let sources = num("sources", 0).min(250);
     let mix: Vec<usize> = f
         .get("mix")
         .map(String::as_str)
-        .unwrap_or("hold,consensus,sync,gossip,big")
+        .unwrap_or("hold,consensus,sync,big")
         .split(',')
         .filter_map(|k| KINDS.iter().position(|x| *x == k))
         .collect();
@@ -235,12 +302,15 @@ async fn main() {
     let mut tasks = Vec::new();
     for i in 0..identities as usize {
         let kind = mix[i % mix.len()];
+        let source =
+            (sources > 0).then(|| Ipv4Addr::new(127, 0, 0, 2 + (i as u64 % sources) as u8));
         tasks.push(tokio::spawn(run(
             kind,
             target.clone(),
             rate,
             until,
             Arc::clone(&counts),
+            source,
         )));
     }
     let mut every = tokio::time::interval(Duration::from_secs(10));

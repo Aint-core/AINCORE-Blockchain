@@ -121,39 +121,8 @@ impl PeerBook {
 /// carries between members.
 pub const CONSENSUS_PREFIXES: &[&str] = &["DAG_V4:", "QC_VOTE:", "QC_WANT:", "QC_CERT:"];
 
-/// What only a member may publish on gossip: every consensus message.
-/// B25: gossip runs between members; an observer asks for a boundary QC
-/// over sync (`QC_WANT:` as a sync request, answered `QC_CERT:`).
-pub const MEMBER_ONLY_PREFIXES: &[&str] = CONSENSUS_PREFIXES;
-
-/// B25: gossip runs between committee members only. A non-member's
-/// application score is twice Lighthouse's graylist threshold, so gossipsub
-/// neither meshes with it, publishes or gossips to it, nor processes what
-/// it sends (gossipsub 0.47 queues without bound toward a peer that stops
-/// reading; non-members could join the mesh). Observers follow over sync:
-/// blocks with their QCs, and boundary QCs asked of members
-/// (`QC_WANT:` as a sync request).
-pub const NON_MEMBER_APP_SCORE: f64 = -32_000.0;
-
-/// B25: set `peer`'s gossip application score from the committee book.
-pub fn score_peer(gossip: &mut libp2p::gossipsub::Behaviour, book: &PeerBook, peer: &PeerId) {
-    let score = if book.member_of(peer).is_some() {
-        0.0
-    } else {
-        NON_MEMBER_APP_SCORE
-    };
-    gossip.set_application_score(peer, score);
-}
-
 pub fn is_consensus_message(wire: &str) -> bool {
     CONSENSUS_PREFIXES.iter().any(|p| wire.starts_with(p))
-}
-
-/// NI-1: a gossip message is admitted unless only a member may publish it
-/// and its signed publisher is not a member (or is unknown).
-pub fn admit_gossip(book: &PeerBook, publisher: Option<&PeerId>, wire: &str) -> bool {
-    !MEMBER_ONLY_PREFIXES.iter().any(|p| wire.starts_with(p))
-        || publisher.is_some_and(|p| book.member_of(p).is_some())
 }
 
 /// Frames are a u32 big-endian length and that many bytes of UTF-8. The
@@ -662,6 +631,28 @@ impl<K: std::hash::Hash + Eq + Clone> Budget<K> {
             false
         }
     }
+
+    /// B60: take `tokens` more from `key` after the fact (an answer's size is
+    /// known once it is made). The bucket may go below zero, down to
+    /// `-burst`, and the key's next requests wait for it to refill.
+    pub fn charge(&mut self, key: &K, tokens: f64, now: std::time::Instant) {
+        if let Some((held, at)) = self.buckets.get_mut(key) {
+            *held = (*held + now.duration_since(*at).as_secs_f64() * self.rate).min(self.burst);
+            *at = now;
+            *held = (*held - tokens).max(-self.burst);
+        }
+    }
+}
+
+/// B60: a non-member's sync answer costs one more token of its budget for
+/// each this many bytes (a choice: at 12.8 tokens a second a host is served
+/// ~820 KiB/s; the request count alone let a few hosts keep every serving
+/// thread busy with 8 MiB answers).
+pub const SYNC_ANSWER_TOKEN_BYTES: usize = 64 << 10;
+
+/// B60: the tokens an answer of `len` bytes costs beyond its request's.
+pub fn answer_tokens(len: usize) -> f64 {
+    (len / SYNC_ANSWER_TOKEN_BYTES) as f64
 }
 
 /// B24: how long a connection may take to finish Noise and yamux. A
@@ -679,6 +670,17 @@ pub const PENDING_PER_IP: usize = 4;
 /// times per boot).
 pub const ADMIT_PER_IP_PER_SEC: f64 = 2.0;
 pub const ADMIT_BURST_PER_IP: f64 = 16.0;
+/// B56: unfinished handshakes kept for IPs members connected from (a
+/// choice: four members reconnecting at once, `PENDING_PER_IP` each). The
+/// rest of `MAX_PENDING_INBOUND` is all other IPs': ~28 IPs holding silent
+/// handshakes used to fill every slot and keep a restarted member out.
+pub const PENDING_KEPT_FOR_MEMBERS: usize = 16;
+/// B56: member IPs remembered at most.
+pub const MAX_MEMBER_IPS: usize = 1024;
+
+/// B56: the IPs committee members connected from, which the network task
+/// adds to and the gate reads.
+pub type MemberIps = Arc<RwLock<std::collections::HashSet<std::net::IpAddr>>>;
 
 /// B24: inbound admission before any handshake. Every cap of the network
 /// task runs once a connection is established, after the Noise handshake
@@ -689,13 +691,22 @@ pub const ADMIT_BURST_PER_IP: f64 = 16.0;
 pub struct InboundGate {
     pending: HashMap<libp2p::swarm::ConnectionId, std::net::IpAddr>,
     admit: Budget<std::net::IpAddr>,
+    member_ips: MemberIps,
 }
 
 impl Default for InboundGate {
     fn default() -> Self {
+        Self::with_member_ips(MemberIps::default())
+    }
+}
+
+impl InboundGate {
+    /// A gate that keeps `PENDING_KEPT_FOR_MEMBERS` slots for `member_ips`.
+    pub fn with_member_ips(member_ips: MemberIps) -> Self {
         Self {
             pending: HashMap::new(),
             admit: Budget::new(ADMIT_PER_IP_PER_SEC, ADMIT_BURST_PER_IP),
+            member_ips,
         }
     }
 }
@@ -725,6 +736,20 @@ impl libp2p::swarm::NetworkBehaviour for InboundGate {
             |why: &str| libp2p::swarm::ConnectionDenied::new(io::Error::other(why.to_string()));
         if self.pending.values().filter(|p| **p == ip).count() >= PENDING_PER_IP {
             return Err(denied("too many unfinished handshakes from this IP"));
+        }
+        // B56: other IPs share all but the slots kept for members'.
+        if let Ok(members) = self.member_ips.read() {
+            let others = self
+                .pending
+                .values()
+                .filter(|p| !members.contains(p))
+                .count();
+            let limit = MAX_PENDING_INBOUND as usize - PENDING_KEPT_FOR_MEMBERS;
+            if !members.contains(&ip) && others >= limit {
+                return Err(denied(
+                    "the unfinished handshakes of other IPs are at their bound",
+                ));
+            }
         }
         if !self.admit.spend(&ip, std::time::Instant::now()) {
             return Err(denied("this IP opens connections too fast"));
@@ -786,40 +811,101 @@ impl libp2p::swarm::NetworkBehaviour for InboundGate {
 /// maximal vertices, well inside a validator's memory.
 pub const INBOX_MAX_BYTES: usize = 64 << 20;
 
-/// NI-3: the messages bound for the node, bounded in bytes.
+/// B55: one source's share of the inbox (a choice: a quarter, ~20 maximal
+/// vertices). A source is a member's address, or the peer a boundary QC was
+/// asked of.
+pub const INBOX_SOURCE_MAX_BYTES: usize = INBOX_MAX_BYTES / 4;
+
+/// NI-3 (B55): the messages bound for the node, a queue per source, handed
+/// to the node in turn. One FIFO let one member's flood fill the inbox and
+/// stand ahead of every other member's messages. A source holds at most
+/// `INBOX_SOURCE_MAX_BYTES`; when the whole inbox is full, the longest queue
+/// gives up its newest messages to a shorter one's.
 #[derive(Debug, Default)]
 pub struct Inbox {
-    queue: std::collections::VecDeque<String>,
+    /// Each source's messages, oldest first, and their bytes.
+    queues: HashMap<String, (std::collections::VecDeque<String>, usize)>,
+    /// The sources with something queued, in turn order.
+    turn: std::collections::VecDeque<String>,
     bytes: usize,
     dropped: u64,
 }
 
 impl Inbox {
-    /// Queue `msg`; false (and dropped) when it would pass the byte bound.
-    pub fn push(&mut self, msg: String) -> bool {
-        if self.bytes + msg.len() > INBOX_MAX_BYTES {
-            self.dropped += 1;
-            if self.dropped.is_power_of_two() {
-                eprintln!(
-                    "⚠️ [NI-3] node inbox full ({} bytes): {} messages dropped so far",
-                    self.bytes, self.dropped
-                );
-            }
-            return false;
+    /// Queue `msg` from `source`; false (and dropped) when it would pass the
+    /// source's share, or the whole bound with no longer queue to give way.
+    pub fn push(&mut self, source: &str, msg: String) -> bool {
+        let len = msg.len();
+        let held = self.queues.get(source).map_or(0, |(_, b)| *b);
+        if held + len > INBOX_SOURCE_MAX_BYTES {
+            return self.refuse();
         }
-        self.bytes += msg.len();
-        self.queue.push_back(msg);
+        while self.bytes + len > INBOX_MAX_BYTES {
+            let longest = self
+                .queues
+                .iter()
+                .filter(|(s, _)| s.as_str() != source)
+                .max_by_key(|(_, (_, b))| *b)
+                .map(|(s, (_, b))| (s.clone(), *b));
+            match longest {
+                Some((victim, bytes)) if bytes > held + len => self.evict_newest(&victim),
+                _ => return self.refuse(),
+            }
+        }
+        let (queue, bytes) = self.queues.entry(source.to_string()).or_default();
+        if queue.is_empty() {
+            self.turn.push_back(source.to_string());
+        }
+        queue.push_back(msg);
+        *bytes += len;
+        self.bytes += len;
         true
     }
 
-    pub fn pop(&mut self) -> Option<String> {
-        let msg = self.queue.pop_front()?;
+    fn evict_newest(&mut self, source: &str) {
+        let Some((queue, bytes)) = self.queues.get_mut(source) else {
+            return;
+        };
+        if let Some(msg) = queue.pop_back() {
+            *bytes -= msg.len();
+            self.bytes -= msg.len();
+            self.dropped += 1;
+        }
+        if queue.is_empty() {
+            self.queues.remove(source);
+            self.turn.retain(|s| s != source);
+        }
+    }
+
+    fn refuse(&mut self) -> bool {
+        self.dropped += 1;
+        if self.dropped.is_power_of_two() {
+            eprintln!(
+                "⚠️ [NI-3] node inbox full ({} bytes): {} messages dropped so far",
+                self.bytes, self.dropped
+            );
+        }
+        false
+    }
+
+    /// The next message, from the next source in turn, with its source
+    /// (B51: the node holds a source to account for what fails).
+    pub fn pop(&mut self) -> Option<(String, String)> {
+        let source = self.turn.pop_front()?;
+        let (queue, bytes) = self.queues.get_mut(&source)?;
+        let msg = queue.pop_front()?;
+        *bytes -= msg.len();
         self.bytes -= msg.len();
-        Some(msg)
+        if queue.is_empty() {
+            self.queues.remove(&source);
+        } else {
+            self.turn.push_back(source.clone());
+        }
+        Some((source, msg))
     }
 
     pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.turn.is_empty()
     }
 
     pub fn bytes(&self) -> usize {
@@ -1078,182 +1164,6 @@ impl Unresolved {
     }
 }
 
-/// G4 S5: the one gossip topic.
-pub const GOSSIP_TOPIC: &str = "aincore-gossip";
-
-/// G4 S5: what the network task tells gossipsub about a message it
-/// received. With `validate_messages` a message is forwarded only once it
-/// is accepted, so a message the node would drop is never relayed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GossipVerdict {
-    /// Delivered to the node and forwarded.
-    Accept,
-    /// Dropped, not forwarded, and counted against the peer that sent it
-    /// (gossipsub P4): no honest node sends it.
-    Reject,
-    /// Dropped and not forwarded, without blame: the sender may be an
-    /// honest relay whose committee book differs at an epoch boundary, or
-    /// the message is merely over a rate.
-    Ignore,
-}
-
-/// The gossip each prefix may carry and its size cap, checked before any
-/// parse. No honest node gossips anything else (transactions travel in
-/// vertices; `TX:` gossip had no publisher, B21).
-const GOSSIP_CAPS: &[(&str, usize)] = &[
-    (consensus::v4::WIRE_PREFIX, consensus::v4::MAX_WIRE_BYTES),
-    ("QC_VOTE:", consensus::dag::QC_VOTE_MAX_BYTES),
-    (consensus::dag::QC_WANT_PREFIX, 64),
-    (
-        consensus::dag::QC_CERT_PREFIX,
-        consensus::dag::QC_CERT_MAX_BYTES + consensus::dag::QC_CERT_PREFIX.len(),
-    ),
-];
-
-/// G4 S5 (NI-1): the verdict on a gossip message signed by `publisher`.
-/// B32: only what no honest node sends is blamed (over its type's cap). A
-/// prefix this node does not know may be a newer version's, and a publisher
-/// it does not know as a member may be one its book has not caught up with
-/// (an epoch boundary): both are dropped without blame. (Non-members' own
-/// gossip never gets here: they are scored below the graylist, B25.)
-pub fn judge_gossip(book: &PeerBook, publisher: Option<&PeerId>, wire: &str) -> GossipVerdict {
-    let Some(&(_, cap)) = GOSSIP_CAPS.iter().find(|(p, _)| wire.starts_with(p)) else {
-        return GossipVerdict::Ignore;
-    };
-    if wire.len() > cap {
-        return GossipVerdict::Reject;
-    }
-    if admit_gossip(book, publisher, wire) {
-        GossipVerdict::Accept
-    } else {
-        GossipVerdict::Ignore
-    }
-}
-
-/// G4 S5: gossipsub as the node runs it. `validate_messages`: nothing is
-/// forwarded before `judge_gossip` accepts it. Signed publishers with
-/// strict validation, a 1 MiB transmit cap, sha256 message ids and a 60 s
-/// duplicate cache (M-05).
-pub fn gossip_config() -> Result<libp2p::gossipsub::Config, String> {
-    use libp2p::gossipsub::{ConfigBuilder, MessageId, ValidationMode};
-    use sha2::{Digest, Sha256};
-    ConfigBuilder::default()
-        .validation_mode(ValidationMode::Strict)
-        .validate_messages()
-        .max_transmit_size(1 << 20)
-        .mesh_n(6)
-        .mesh_n_low(4)
-        .mesh_n_high(12)
-        .heartbeat_interval(std::time::Duration::from_secs(1))
-        .duplicate_cache_time(std::time::Duration::from_secs(60))
-        .message_id_fn(|msg| MessageId::from(Sha256::digest(&msg.data).to_vec()))
-        .build()
-        .map_err(|e| format!("gossipsub config: {e}"))
-}
-
-/// The gossipsub behaviour: `gossip_config`, peer scoring
-/// (`gossip_score_params`, `gossip_score_thresholds`), subscribed to
-/// `GOSSIP_TOPIC`.
-pub fn gossip_behaviour(key: &identity::Keypair) -> Result<libp2p::gossipsub::Behaviour, String> {
-    use libp2p::gossipsub::{Behaviour, IdentTopic, MessageAuthenticity};
-    let mut gossip = Behaviour::new(MessageAuthenticity::Signed(key.clone()), gossip_config()?)
-        .map_err(|e| e.to_string())?;
-    gossip.with_peer_score(gossip_score_params(), gossip_score_thresholds())?;
-    gossip
-        .subscribe(&IdentTopic::new(GOSSIP_TOPIC))
-        .map_err(|e| e.to_string())?;
-    Ok(gossip)
-}
-
-/// Lighthouse's peer-score thresholds
-/// (`lighthouse_network/src/service/gossipsub_scoring_parameters.rs`).
-pub fn gossip_score_thresholds() -> libp2p::gossipsub::PeerScoreThresholds {
-    libp2p::gossipsub::PeerScoreThresholds {
-        gossip_threshold: -4000.0,
-        publish_threshold: -8000.0,
-        graylist_threshold: -16000.0,
-        accept_px_threshold: 100.0,
-        opportunistic_graft_threshold: 5.0,
-    }
-}
-
-/// Score decays are ticked every second (gossipsub's default interval;
-/// Lighthouse ticks once a slot, at least a second).
-const SCORE_DECAY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-/// Lighthouse's epoch, the unit its decay times are given in (32 slots of
-/// 12 s).
-const LIGHTHOUSE_EPOCH_SECS: f64 = 384.0;
-/// Lighthouse: a peer's mesh time earns at most 10, its first deliveries at
-/// most 40, per unit of topic weight.
-const MAX_IN_MESH_SCORE: f64 = 10.0;
-const MAX_FIRST_DELIVERIES_SCORE: f64 = 40.0;
-
-/// The per-tick factor that takes a counter to 1 % in `secs` (Lighthouse
-/// `score_parameter_decay`).
-fn decay_over(secs: f64) -> f64 {
-    0.01f64.powf(SCORE_DECAY_INTERVAL.as_secs_f64() / secs)
-}
-
-/// G4 S5: gossipsub peer scoring, Lighthouse's rules on our one topic (its
-/// weight is one). An invalid delivery (P4) cancels the most a peer can
-/// earn (`-(10 + 40)`), and P4 is the square of the count, so a peer that
-/// sends 9 invalid messages falls below the gossip threshold and one that
-/// sends 18 below the graylist; the count decays to 1 % over 50 Lighthouse
-/// epochs. Mesh delivery rates (P3) are not scored: consensus gossip has no
-/// steady rate and Lighthouse leaves P3 off for such topics. More than 8
-/// peers on one IP are penalised (P6), behaviour penalties (P7) past 6.
-pub fn gossip_score_params() -> libp2p::gossipsub::PeerScoreParams {
-    use libp2p::gossipsub::{IdentTopic, PeerScoreParams, TopicScoreParams};
-    let max_positive = MAX_IN_MESH_SCORE + MAX_FIRST_DELIVERIES_SCORE;
-    let topic_weight = 1.0;
-    // Lighthouse: time in mesh reaches its cap after an hour.
-    let quantum = SCORE_DECAY_INTERVAL;
-    let time_in_mesh_cap = 3600.0 / quantum.as_secs_f64();
-    // A choice: first deliveries count up to 40 and decay to 1 % in an
-    // hour, so a peer earns the Lighthouse maximum by relaying 40 messages
-    // first.
-    let first_cap = MAX_FIRST_DELIVERIES_SCORE;
-    let topic = TopicScoreParams {
-        topic_weight,
-        time_in_mesh_weight: MAX_IN_MESH_SCORE / time_in_mesh_cap,
-        time_in_mesh_quantum: quantum,
-        time_in_mesh_cap,
-        first_message_deliveries_weight: MAX_FIRST_DELIVERIES_SCORE / first_cap,
-        first_message_deliveries_decay: decay_over(3600.0),
-        first_message_deliveries_cap: first_cap,
-        mesh_message_deliveries_weight: 0.0,
-        mesh_failure_penalty_weight: 0.0,
-        invalid_message_deliveries_weight: -max_positive / topic_weight,
-        invalid_message_deliveries_decay: decay_over(50.0 * LIGHTHOUSE_EPOCH_SECS),
-        ..TopicScoreParams::default()
-    };
-    let thresholds = gossip_score_thresholds();
-    let behaviour_penalty_threshold = 6.0;
-    let behaviour_penalty_decay = decay_over(10.0 * LIGHTHOUSE_EPOCH_SECS);
-    // Lighthouse: a peer earning 10 penalties an epoch converges to the
-    // gossip threshold.
-    let per_tick = 10.0 / LIGHTHOUSE_EPOCH_SECS * SCORE_DECAY_INTERVAL.as_secs_f64();
-    let converged = per_tick / (1.0 - behaviour_penalty_decay) - behaviour_penalty_threshold;
-    let topic_score_cap = max_positive * 0.5;
-    let mut params = PeerScoreParams {
-        topic_score_cap,
-        app_specific_weight: 1.0,
-        ip_colocation_factor_weight: -topic_score_cap,
-        ip_colocation_factor_threshold: 8.0,
-        behaviour_penalty_weight: thresholds.gossip_threshold / converged.powi(2),
-        behaviour_penalty_threshold,
-        behaviour_penalty_decay,
-        decay_interval: SCORE_DECAY_INTERVAL,
-        decay_to_zero: 0.01,
-        retain_score: std::time::Duration::from_secs_f64(100.0 * LIGHTHOUSE_EPOCH_SECS),
-        ..PeerScoreParams::default()
-    };
-    params
-        .topics
-        .insert(IdentTopic::new(GOSSIP_TOPIC).hash(), topic);
-    params
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1314,21 +1224,6 @@ mod tests {
         assert!(PeerBook::new(1, &[&[bad]]).is_empty());
     }
 
-    /// W6: vertices, attestations, certificates and votes are admitted from
-    /// a member publisher only; a boundary QC request or answer from anyone.
-    #[test]
-    fn consensus_gossip_needs_a_member_publisher() {
-        let (a, sa) = member(1);
-        let book = PeerBook::new(0, &[&[a]]);
-        let member = local_keypair(&sa).public().to_peer_id();
-        let stranger = local_keypair(&[9; 32]).public().to_peer_id();
-        for wire in ["DAG_V4:{}", "QC_VOTE:{}", "QC_WANT:7", "QC_CERT:{}"] {
-            assert!(admit_gossip(&book, Some(&member), wire), "{wire}");
-            assert!(!admit_gossip(&book, Some(&stranger), wire), "{wire}");
-            assert!(!admit_gossip(&book, None, wire), "{wire}");
-        }
-    }
-
     /// G4 S6: restore peers keep their `host:port` form (the base port, as
     /// bootnodes) and may pin a key with a full multiaddr.
     #[test]
@@ -1360,15 +1255,45 @@ mod tests {
     #[test]
     fn the_inbox_is_bounded_in_bytes_and_keeps_order() {
         let mut inbox = Inbox::default();
-        assert!(inbox.push("a".into()) && inbox.push("bc".into()));
+        assert!(inbox.push("m", "a".into()) && inbox.push("m", "bc".into()));
         assert_eq!(inbox.bytes(), 3);
-        assert!(!inbox.push("x".repeat(INBOX_MAX_BYTES)), "past the bound");
-        assert_eq!(inbox.pop().as_deref(), Some("a"));
-        assert_eq!(inbox.pop().as_deref(), Some("bc"));
+        assert!(
+            !inbox.push("m", "x".repeat(INBOX_SOURCE_MAX_BYTES)),
+            "past the source's share"
+        );
+        assert_eq!(inbox.pop(), Some(("m".into(), "a".into())));
+        assert_eq!(inbox.pop(), Some(("m".into(), "bc".into())));
         assert!(inbox.is_empty() && inbox.bytes() == 0);
         assert!(
-            inbox.push("x".repeat(INBOX_MAX_BYTES)),
-            "exactly the bound fits"
+            inbox.push("m", "x".repeat(INBOX_SOURCE_MAX_BYTES)),
+            "exactly the share fits"
+        );
+    }
+
+    /// B55 witness: members that flood fill their own shares; an honest
+    /// member's message is still taken, and the node gets it in its turn,
+    /// not behind the floods. With every share full, the longest queue gives
+    /// way to a shorter one.
+    #[test]
+    fn a_flooding_member_cannot_crowd_out_the_others() {
+        let mut inbox = Inbox::default();
+        let big = "x".repeat(1 << 20);
+        for flooder in ["f1", "f2", "f3", "f4"] {
+            while inbox.push(flooder, big.clone()) {}
+        }
+        assert_eq!(inbox.bytes(), INBOX_MAX_BYTES, "the floods fill the inbox");
+        assert!(inbox.push("honest", "vertex".into()), "room is made");
+        let mut order = Vec::new();
+        while let Some((_, msg)) = inbox.pop() {
+            order.push(msg);
+            if order.last().map(String::as_str) == Some("vertex") {
+                break;
+            }
+        }
+        assert!(
+            order.len() <= 5,
+            "the honest message came after {} others",
+            order.len() - 1
         );
     }
 
@@ -1393,6 +1318,49 @@ mod tests {
         assert!(held.admit(4, part), "freed bytes are admitted again");
         (1..5).for_each(|id| held.release(&id));
         assert_eq!(gauge.load(Ordering::Relaxed), 0);
+    }
+
+    /// B56 witness: with every slot other IPs may use held by silent
+    /// handshakes, a new IP is refused and a member's IP is still admitted.
+    #[test]
+    fn slots_are_kept_for_members_ips() {
+        use libp2p::swarm::NetworkBehaviour;
+        let members = MemberIps::default();
+        let member: std::net::IpAddr = "10.9.9.9".parse().unwrap();
+        members.write().unwrap().insert(member);
+        let mut gate = InboundGate::with_member_ips(members);
+        let local: libp2p::Multiaddr = "/ip4/10.0.0.1/tcp/9101".parse().unwrap();
+        let from =
+            |ip: String| -> libp2p::Multiaddr { format!("/ip4/{ip}/tcp/40000").parse().unwrap() };
+        let (mut ok, mut next) = (0, 0usize);
+        for i in 0..64u32 {
+            let ip = format!("192.0.2.{i}");
+            for _ in 0..PENDING_PER_IP {
+                next += 1;
+                let id = libp2p::swarm::ConnectionId::new_unchecked(next);
+                if gate
+                    .handle_pending_inbound_connection(id, &local, &from(ip.clone()))
+                    .is_ok()
+                {
+                    ok += 1;
+                }
+            }
+        }
+        assert_eq!(
+            ok,
+            MAX_PENDING_INBOUND as usize - PENDING_KEPT_FOR_MEMBERS,
+            "other IPs' share"
+        );
+        let id = libp2p::swarm::ConnectionId::new_unchecked(999_999);
+        assert!(gate
+            .handle_pending_inbound_connection(id, &local, &from("198.51.100.1".into()))
+            .is_err());
+        let id = libp2p::swarm::ConnectionId::new_unchecked(999_998);
+        assert!(
+            gate.handle_pending_inbound_connection(id, &local, &from(member.to_string()))
+                .is_ok(),
+            "a member's IP was kept out"
+        );
     }
 
     /// NI-3: a budget spends its burst, refuses past it, refills at its
@@ -1567,204 +1535,6 @@ mod tests {
         assert!(seen
             .iter()
             .any(|s| matches!(s, Seen::Refused(p) if *p == *stranger.local_peer_id())));
-    }
-
-    /// G4 S5 / B32: what a received gossip message gets. Accepted: a
-    /// member's consensus message. Rejected (blamed): only what is over its
-    /// type's cap. Ignored without blame: a publisher this node does not
-    /// know as a member (its book may lag an epoch), no publisher, and a
-    /// prefix it does not know (a newer version's, or transactions, B21).
-    #[test]
-    fn every_gossip_message_gets_the_node_rules_verdict() {
-        use GossipVerdict::*;
-        let (a, sa) = member(1);
-        let book = PeerBook::new(0, &[&[a]]);
-        let member = local_keypair(&sa).public().to_peer_id();
-        let stranger = local_keypair(&[9; 32]).public().to_peer_id();
-        for wire in ["DAG_V4:{}", "QC_VOTE:{}", "QC_WANT:7", "QC_CERT:{}"] {
-            assert_eq!(judge_gossip(&book, Some(&member), wire), Accept, "{wire}");
-            assert_eq!(judge_gossip(&book, Some(&stranger), wire), Ignore, "{wire}");
-            assert_eq!(judge_gossip(&book, None, wire), Ignore, "{wire}");
-        }
-        for wire in ["TX:{}", "{}", "DAG_VERTEX:{}", "HELLO", ""] {
-            assert_eq!(judge_gossip(&book, Some(&member), wire), Ignore, "{wire}");
-        }
-        let vote = format!("QC_VOTE:{}", "x".repeat(consensus::dag::QC_VOTE_MAX_BYTES));
-        assert_eq!(judge_gossip(&book, Some(&member), &vote), Reject);
-        let want = format!("QC_WANT:{}", "9".repeat(64));
-        assert_eq!(judge_gossip(&book, Some(&member), &want), Reject);
-        let cert = format!(
-            "QC_CERT:{}",
-            "x".repeat(consensus::dag::QC_CERT_MAX_BYTES + 1)
-        );
-        assert_eq!(
-            judge_gossip(&book, Some(&member), &cert),
-            Reject,
-            "B26: 64 KiB"
-        );
-    }
-
-    /// G4 S5: the scoring is valid for gossipsub and does what its comment
-    /// says: one invalid delivery cancels the most a peer can earn, 9 put
-    /// a peer below the gossip threshold, 18 below the graylist.
-    #[test]
-    fn the_peer_score_follows_lighthouses_rules() {
-        let params = gossip_score_params();
-        params.validate().unwrap();
-        let t = gossip_score_thresholds();
-        let topic = &params.topics[&libp2p::gossipsub::IdentTopic::new(GOSSIP_TOPIC).hash()];
-        let max_positive = topic.time_in_mesh_weight * topic.time_in_mesh_cap
-            + topic.first_message_deliveries_weight * topic.first_message_deliveries_cap;
-        assert!((max_positive - 50.0).abs() < 1e-9, "{max_positive}");
-        assert_eq!(topic.invalid_message_deliveries_weight, -max_positive);
-        let p4 = |k: f64| topic.invalid_message_deliveries_weight * k * k;
-        assert!(p4(8.0) > t.gossip_threshold && p4(9.0) < t.gossip_threshold);
-        assert!(p4(17.0) > t.graylist_threshold && p4(18.0) < t.graylist_threshold);
-        // The behaviour-penalty weight Lighthouse derives (-15.9 at its 12 s
-        // slot; the 1 s tick changes it by under 2 %).
-        assert!(
-            (-16.5..-15.5).contains(&params.behaviour_penalty_weight),
-            "{}",
-            params.behaviour_penalty_weight
-        );
-        // P4 halves in under 50 epochs: (decay ^ ticks) reaches 1 % then.
-        let after = topic
-            .invalid_message_deliveries_decay
-            .powf(50.0 * LIGHTHOUSE_EPOCH_SECS);
-        assert!((after - 0.01).abs() < 1e-6, "{after}");
-    }
-
-    fn gossip_swarm(key: &identity::Keypair) -> Swarm<libp2p::gossipsub::Behaviour> {
-        let transport = MemoryTransport::default()
-            .upgrade(upgrade::Version::V1)
-            .authenticate(noise::Config::new(key).unwrap())
-            .multiplex(yamux::Config::default())
-            .boxed();
-        Swarm::new(
-            transport,
-            gossip_behaviour(key).unwrap(),
-            key.public().to_peer_id(),
-            libp2p::swarm::Config::with_tokio_executor()
-                .with_idle_connection_timeout(Duration::from_secs(30)),
-        )
-    }
-
-    /// One swarm event, handled with the node's rule (`judge_gossip`, then
-    /// the verdict reported to gossipsub). Returns a received message.
-    fn on_gossip(
-        swarm: &mut Swarm<libp2p::gossipsub::Behaviour>,
-        book: &PeerBook,
-        ev: SwarmEvent<libp2p::gossipsub::Event>,
-    ) -> Option<String> {
-        use libp2p::gossipsub::{Event, MessageAcceptance};
-        if let SwarmEvent::ConnectionEstablished { peer_id, .. } = &ev {
-            score_peer(swarm.behaviour_mut(), book, peer_id);
-        }
-        let SwarmEvent::Behaviour(Event::Message {
-            propagation_source,
-            message_id,
-            message,
-        }) = ev
-        else {
-            return None;
-        };
-        let wire = String::from_utf8_lossy(&message.data).into_owned();
-        let acceptance = match judge_gossip(book, message.source.as_ref(), &wire) {
-            GossipVerdict::Accept => MessageAcceptance::Accept,
-            GossipVerdict::Reject => MessageAcceptance::Reject,
-            GossipVerdict::Ignore => MessageAcceptance::Ignore,
-        };
-        let _ = swarm.behaviour_mut().report_message_validation_result(
-            &message_id,
-            &propagation_source,
-            acceptance,
-        );
-        Some(wire)
-    }
-
-    /// G4 S5 / B25 witness, four in-memory swarms: members M, R, C, with M
-    /// and C reaching each other only through R, and a stranger S next to
-    /// R. M's message crosses R to C (the positive control); S hears
-    /// nothing (non-members get no gossip, so no queue toward them can
-    /// grow); C hears nothing of S's (R processes nothing a graylisted
-    /// peer sends); R holds S below the graylist. With non-members scored
-    /// like members, S joins the mesh and hears M.
-    #[tokio::test]
-    async fn gossip_runs_between_members_only() {
-        let (m_info, m_secret) = member(1);
-        let (r_info, r_secret) = member(2);
-        let (c_info, c_secret) = member(3);
-        let book = PeerBook::new(0, &[&[m_info, r_info, c_info]]);
-        let mut relay = gossip_swarm(&local_keypair(&r_secret));
-        let mut member_node = gossip_swarm(&local_keypair(&m_secret));
-        let mut receiver = gossip_swarm(&local_keypair(&c_secret));
-        let mut stranger = gossip_swarm(&local_keypair(&[9; 32]));
-        let addr: Multiaddr = format!("/memory/{}", rand::random::<u64>() | 1)
-            .parse()
-            .unwrap();
-        relay.listen_on(addr.clone()).unwrap();
-        for s in [&mut member_node, &mut receiver, &mut stranger] {
-            s.dial(addr.clone()).unwrap();
-        }
-        let stranger_id = *stranger.local_peer_id();
-        let topic = libp2p::gossipsub::IdentTopic::new(GOSSIP_TOPIC);
-        let (mut heard, mut stranger_heard) = (Vec::new(), Vec::new());
-        let (mut sent_member, mut sent_stranger) = (false, 0usize);
-        let start = tokio::time::Instant::now();
-        let mut tick = tokio::time::interval(Duration::from_millis(100));
-        while start.elapsed() < Duration::from_secs(12) {
-            tokio::select! {
-                ev = relay.select_next_some() => { on_gossip(&mut relay, &book, ev); }
-                ev = member_node.select_next_some() => { on_gossip(&mut member_node, &book, ev); }
-                ev = stranger.select_next_some() => {
-                    if let Some(wire) = on_gossip(&mut stranger, &book, ev) {
-                        stranger_heard.push(wire);
-                    }
-                }
-                ev = receiver.select_next_some() => {
-                    if let Some(wire) = on_gossip(&mut receiver, &book, ev) {
-                        heard.push(wire);
-                    }
-                }
-                _ = tick.tick() => {
-                    if start.elapsed() < Duration::from_secs(3) {
-                        continue;
-                    }
-                    if !sent_member {
-                        sent_member = member_node
-                            .behaviour_mut()
-                            .publish(topic.clone(), b"DAG_V4:member".to_vec())
-                            .is_ok();
-                    }
-                    if sent_stranger < 20 {
-                        let wire = format!("DAG_V4:stranger-{sent_stranger}");
-                        if stranger.behaviour_mut().publish(topic.clone(), wire.into_bytes()).is_ok() {
-                            sent_stranger += 1;
-                        }
-                    }
-                    if heard.iter().any(|w| w == "DAG_V4:member") && start.elapsed() > Duration::from_secs(8) {
-                        break;
-                    }
-                }
-            }
-        }
-        assert!(
-            heard.iter().any(|w| w == "DAG_V4:member"),
-            "positive control: the member's message crossed the relay: {heard:?}"
-        );
-        assert!(
-            !heard.iter().any(|w| w.contains("stranger")),
-            "the relay forwarded the stranger: {heard:?}"
-        );
-        assert!(
-            stranger_heard.is_empty(),
-            "a non-member got gossip: {stranger_heard:?}"
-        );
-        let score = relay.behaviour().peer_score(&stranger_id).unwrap();
-        assert!(
-            score < gossip_score_thresholds().graylist_threshold,
-            "the stranger's score at the relay: {score}"
-        );
     }
 
     /// B22: a bootnode is given by base port and dialled at base + 100,

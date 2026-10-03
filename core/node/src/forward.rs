@@ -10,8 +10,9 @@
 //! fullnodes forward their mempool upstream the same way). The member
 //! answers each transaction with its mempool's verdict. An accepted one
 //! stays on loan until a synced block settles it (`mark_executed`), or
-//! returns to the queue after 30 s and is forwarded again (bounded by the
-//! mempool's requeue cap); a refused one goes to the next member and is
+//! returns to the queue after 30 s and is forwarded again, starting at the
+//! next member (B53; bounded by the mempool's requeue cap); a refused one
+//! goes to the next member and is
 //! dropped once `REFUSALS_TO_DROP` members refused it (B39); an unanswered
 //! batch goes to the next member, and back to the queue when none answers.
 
@@ -127,11 +128,17 @@ fn batches(txs: Vec<String>, cap: usize) -> Vec<Vec<String>> {
 /// One forwarding pass: loan what the mempool holds, send it, settle the
 /// answers. Returns how many transactions a member accepted.
 pub async fn forward_once(mempool: &Arc<Mutex<Mempool>>, client: &network::SessionClient) -> usize {
-    let loaned = match mempool.lock() {
+    let loaned: Vec<(String, u8)> = match mempool.lock() {
         Ok(mut mp) => {
             let now = wall_secs();
             mp.requeue_stale_at(FORWARD_RETRY_SECS, now);
             mp.get_pending_transactions_at(FORWARD_BATCH * 4, now)
+                .into_iter()
+                .map(|tx| {
+                    let attempts = mp.loan_attempts(&tx);
+                    (tx, attempts)
+                })
+                .collect()
         }
         Err(_) => return 0,
     };
@@ -141,8 +148,15 @@ pub async fn forward_once(mempool: &Arc<Mutex<Mempool>>, client: &network::Sessi
     let sessions = client.sessions();
     // Group by the first member each sender maps to, keeping order.
     let mut groups: Vec<(Vec<String>, Vec<String>)> = Vec::new();
-    for tx in loaned {
-        let order = members_for(&sender_of(&tx), &sessions);
+    for (tx, attempts) in loaned {
+        // B53: a transaction loaned again (no block settled it within
+        // FORWARD_RETRY_SECS) starts at the next member: one that answered
+        // Accepted and dropped it cannot hold every one of its sender's.
+        let mut order = members_for(&sender_of(&tx), &sessions);
+        if !order.is_empty() {
+            let shift = usize::from(attempts) % order.len();
+            order.rotate_left(shift);
+        }
         match groups.iter_mut().find(|(o, _)| *o == order) {
             Some((_, txs)) => txs.push(tx),
             None => groups.push((order, vec![tx])),

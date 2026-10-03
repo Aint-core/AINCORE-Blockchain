@@ -123,6 +123,9 @@ struct Spec {
     validators: Vec<String>,
     /// The checkpoint block's BFT timestamp, in seconds.
     timestamp: u64,
+    /// A V4 chain: `genesis:vertex_format` 4, the executor's record of the
+    /// next epoch's committee, and a QC at H (an epoch boundary) that binds it.
+    v4: bool,
 }
 
 impl Default for Spec {
@@ -134,6 +137,7 @@ impl Default for Spec {
             epoch_one: None,
             validators: Vec::new(),
             timestamp: 1_000,
+            v4: false,
         }
     }
 }
@@ -167,6 +171,17 @@ fn chain_with(name: &str, spec: Spec) -> Chain {
         Some(seed) => (1, committee_of(seed, 2)),
         None => (0, members.clone()),
     };
+    // The live set at H (the anchor block's proposer is in it, as on a real
+    // chain), and E+1's committee by the rule every node runs at H.
+    let mut live = signing.clone();
+    live.push(ValidatorInfo {
+        address: proposer().1,
+        stake: 100,
+        ed25519_public_key: hex::encode(proposer().0.verifying_key().to_bytes()),
+        bls_public_key: String::new(),
+        bls_pop: String::new(),
+    });
+    let next = blockchain::committee::next_committee(&signing, &live).0;
     let mut state: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut at_h = BTreeMap::new();
     let mut root_h = None;
@@ -205,6 +220,17 @@ fn chain_with(name: &str, spec: Spec) -> Chain {
                 "sys:validators".into(),
                 Some(serde_json::to_vec(&active).unwrap()),
             ));
+            if spec.v4 {
+                v0.push(("genesis:vertex_format".into(), Some(b"4".to_vec())));
+                v0.push((
+                    "sys:validator_set:v1".into(),
+                    Some(serde_json::to_vec(&live).unwrap()),
+                ));
+                v0.push((
+                    format!("sys:validator_set:epoch:{}", epoch + 1),
+                    Some(serde_json::to_vec(&next).unwrap()),
+                ));
+            }
             v0.extend(spec.extra.iter().map(|(k, v)| (k.clone(), Some(v.clone()))));
             v0
         } else if version == 4 {
@@ -254,7 +280,11 @@ fn chain_with(name: &str, spec: Spec) -> Chain {
         receipts_root: block.header.receipts_root.clone(),
         finality_digest: "ee".repeat(32),
         validator_set_hash: validator_set_hash(&signing),
-        next_validator_set_hash: String::new(),
+        next_validator_set_hash: if spec.v4 {
+            validator_set_hash(&next)
+        } else {
+            String::new()
+        },
     };
     let signature =
         crypto::bls::BLSEngine::consensus().sign_raw(&vote.to_signing_bytes(), &spec.signer);
@@ -707,6 +737,71 @@ async fn a_checkpoint_in_a_later_epoch_verifies_under_its_committee() {
         .unwrap();
     assert_restored(&client, &a);
     assert_eq!(stored_qc(&a).epoch, 1);
+}
+
+/// B50 witness: a V4 node restored at an epoch boundary past epoch 0 holds
+/// the next epoch's record, as every node that executed the boundary block
+/// derived it, and that epoch is active: the next block's QC verifies under
+/// it. Before, the restore found no committee for the checkpoint's epoch (its
+/// record is not state) and failed after the whole download.
+#[tokio::test]
+async fn a_v4_restore_at_a_boundary_holds_the_next_epochs_record() {
+    let g = genesis();
+    let later = [8u8; 32];
+    let a = chain_with(
+        "v4_boundary_a",
+        Spec {
+            signer: later,
+            epoch_one: Some(later),
+            v4: true,
+            ..Spec::default()
+        },
+    );
+    let client = temp_db("v4_boundary_client");
+    let mut peers = [peer(&a, Behaviour::Honest)];
+    run(&client, &plan(&a.cp, &g, false), &mut peers)
+        .await
+        .expect("a V4 restore at a boundary completes");
+    assert_restored(&client, &a);
+    let block = stored_block(&a);
+    let next = consensus::v4::epoch::read_start_from(&client, 2)
+        .unwrap()
+        .expect("epoch 2's record is written");
+    let committee: Vec<ValidatorInfo> =
+        serde_json::from_str(&client.get("sys:validator_set:epoch:2").unwrap().unwrap()).unwrap();
+    assert_eq!(next.committee, committee, "the executor's record");
+    assert_eq!(next.first_round, block.header.round + 2);
+    assert_eq!(next.prev_block_hash, block.header.hash);
+    assert_eq!(
+        client
+            .get(consensus::v4::epoch::EPOCH_ACTIVE_KEY)
+            .unwrap()
+            .as_deref(),
+        Some("2")
+    );
+    assert_eq!(
+        consensus::qc_producer::load_validator_set_for_epoch(&client, 2),
+        Some(committee),
+        "the next block's QC verifies under epoch 2's committee"
+    );
+}
+
+/// B61 witness: a replace-restore drops the replaced chain's alarms (kept,
+/// they halted ordering on the restored state).
+#[tokio::test]
+async fn a_replace_restore_clears_the_old_chains_alarms() {
+    let g = genesis();
+    let a = chain("alarms_a", MEMBER);
+    let client = temp_db("alarms_client");
+    client
+        .put("alarm:decision_conflict:42", "DECISION_CONFLICT: old")
+        .unwrap();
+    let mut peers = [peer(&a, Behaviour::Honest)];
+    run(&client, &plan(&a.cp, &g, true), &mut peers)
+        .await
+        .unwrap();
+    assert_restored(&client, &a);
+    assert_eq!(client.get("alarm:decision_conflict:42").unwrap(), None);
 }
 
 /// The block and QC a peer offers must be the checkpoint's, field by field.

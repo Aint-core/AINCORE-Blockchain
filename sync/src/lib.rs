@@ -86,6 +86,17 @@ const SYNC_PEERS_PER_PASS: usize = 3;
 /// block is sent), so the answer stays under the 10 MiB a client reads.
 pub const SYNC_RESP_BLOCK_BYTES: usize = 8 << 20;
 
+/// A seed's finality tip as this node can judge it.
+enum Tip {
+    /// Its QC verifies under its epoch's committee.
+    Verified(Box<consensus::qc::QuorumCertificate>),
+    /// B57: its QC is in an epoch whose committee this node does not hold
+    /// yet, above this node's tip.
+    Ahead,
+    /// No answer, or a QC that does not verify.
+    None,
+}
+
 /// The peer a sync client talks to: a session the network task holds (G4
 /// S1).
 enum SyncLink {
@@ -595,6 +606,7 @@ impl ChainSync {
         if tip_n > 1 {
             let seed_set = self.active_validator_addresses();
             let mut tips = Vec::new();
+            let mut ahead = 0usize;
             for session in &sessions {
                 if !session
                     .member
@@ -607,14 +619,27 @@ impl ChainSync {
                     client: client.clone(),
                     peer: session.peer.clone(),
                 };
-                if let Some(qc) = self.verified_tip_over(&mut link).await {
-                    tips.push(qc);
-                    if tips.len() >= tip_n {
-                        break;
+                match self.verified_tip_over(&mut link).await {
+                    Tip::Verified(qc) => {
+                        tips.push(*qc);
+                        if tips.len() >= tip_n {
+                            break;
+                        }
                     }
+                    Tip::Ahead => ahead += 1,
+                    Tip::None => {}
                 }
             }
-            if let Err(e) = Self::tip_agreement_decision(&tips, tip_n) {
+            // B57: seeds whose tips lie in an epoch this node cannot verify
+            // yet (it has not imported the boundary block) are ahead of it;
+            // with too few verifiable tips then, the pass goes on, and every
+            // block it imports still needs its own QC. Refusing left a
+            // follower one boundary behind stalled for good.
+            if tips.len() < tip_n && ahead > 0 {
+                println!(
+                    "📡 [ChainSync] {ahead} seed(s) are past an epoch this node has not reached; syncing toward them"
+                );
+            } else if let Err(e) = Self::tip_agreement_decision(&tips, tip_n) {
                 eprintln!(
                     "🚨 [SECURITY][TIP_DISAGREEMENT] {} — refusing to advance",
                     e
@@ -804,21 +829,28 @@ impl ChainSync {
 
     /// A peer's finalized tip over `link`, iff its QC verifies against the
     /// trusted validator set of its epoch.
-    async fn verified_tip_over(
-        &self,
-        link: &mut SyncLink,
-    ) -> Option<consensus::qc::QuorumCertificate> {
-        let resp = link
-            .ask_within("GET_FINALITY", QUICK_ASK_TIMEOUT)
-            .await
-            .ok()?;
-        let json = resp.strip_prefix("FINALITY:")?;
-        let artifact = serde_json::from_str::<FinalityArtifact>(json).ok()?;
-        let qc = artifact.qc?;
-        let validators = self.trusted_validator_set(qc.epoch)?;
+    async fn verified_tip_over(&self, link: &mut SyncLink) -> Tip {
+        let Ok(resp) = link.ask_within("GET_FINALITY", QUICK_ASK_TIMEOUT).await else {
+            return Tip::None;
+        };
+        let Some(qc) = resp
+            .strip_prefix("FINALITY:")
+            .and_then(|json| serde_json::from_str::<FinalityArtifact>(json).ok())
+            .and_then(|artifact| artifact.qc)
+        else {
+            return Tip::None;
+        };
+        let Some(validators) = self.trusted_validator_set(qc.epoch) else {
+            // B57: no committee yet for its epoch, past this node's tip.
+            return if qc.block_height > self.get_local_height() {
+                Tip::Ahead
+            } else {
+                Tip::None
+            };
+        };
         match consensus::qc::verify_qc(&qc, &validators, &consensus::qc::expected_chain_id()) {
-            Ok(()) => Some(qc),
-            Err(_) => None,
+            Ok(()) => Tip::Verified(Box::new(qc)),
+            Err(_) => Tip::None,
         }
     }
 

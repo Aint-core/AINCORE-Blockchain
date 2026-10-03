@@ -1438,6 +1438,85 @@ mod tests {
         assert_eq!(sync.tip_agreement_n(), 1, "unparsable falls back to 1");
     }
 
+    /// B57 witness: with N=2, seeds whose tips are in an epoch this node holds
+    /// no committee for yet (it has not imported the boundary block) do not
+    /// stall it: the pass goes on and asks them for blocks (each block still
+    /// needs its own QC to be imported). Before, the shortfall refused every
+    /// pass, so a follower one boundary behind never synced again.
+    #[tokio::test]
+    async fn seeds_past_an_unknown_epoch_do_not_stall_the_follower() {
+        let (asks, mut queued) = tokio::sync::mpsc::channel::<network::SyncAsk>(16);
+        let (dials, _) = tokio::sync::mpsc::channel(1);
+        let block_asks = Arc::new(std::sync::Mutex::new(0usize));
+        let count = Arc::clone(&block_asks);
+        let qc = consensus::qc::QuorumCertificate {
+            version: 1,
+            chain_id: consensus::qc::expected_chain_id(),
+            epoch: 7,
+            finalized_round: 202,
+            anchor_round: 200,
+            anchor_hash: "aa".repeat(32),
+            block_height: 100,
+            block_hash: "bb".repeat(32),
+            state_root: "cc".repeat(32),
+            receipts_root: "dd".repeat(32),
+            finality_digest: "ee".repeat(32),
+            validator_set_hash: "ff".repeat(32),
+            next_validator_set_hash: String::new(),
+            signer_bitmap: vec![1],
+            signed_stake: 100,
+            total_stake: 100,
+            aggregate_signature: vec![0; 96],
+        };
+        let artifact = FinalityArtifact {
+            finalized_round: "202".into(),
+            last_anchor_round: "200".into(),
+            last_anchor_hash: "aa".repeat(32),
+            finality_digest: "ee".repeat(32),
+            qc: Some(qc),
+        };
+        let finality = format!("FINALITY:{}", serde_json::to_string(&artifact).unwrap());
+        tokio::spawn(async move {
+            while let Some(ask) = queued.recv().await {
+                let answer = match ask.wire.as_str() {
+                    "GET_FINALITY" => Ok(finality.clone()),
+                    "GET_HEIGHT" => Ok("HEIGHT:100".to_string()),
+                    wire => {
+                        if wire.starts_with("SYNC_REQ:") {
+                            *count.lock().unwrap() += 1;
+                        }
+                        Err("no".to_string())
+                    }
+                };
+                let _ = ask.reply.send(answer);
+            }
+        });
+        let member = |peer: &str, member: &str| network::SessionPeer {
+            peer: peer.into(),
+            member: Some(member.into()),
+        };
+        let client = network::SessionClient {
+            asks,
+            dials,
+            table: Arc::new(std::sync::RwLock::new(vec![
+                member("12D3KooWa", "validator_a"),
+                member("12D3KooWb", "validator_b"),
+            ])),
+        };
+        let sync = setup_sync("tip_ahead").with_sessions(client);
+        sync.storage.put("latest_height", "5").unwrap();
+        {
+            let _seed = sync.storage.seeding();
+            sync.storage.put("sys:config:tip_agreement_n", "2").unwrap();
+        }
+        set_validators(&sync, vec![("validator_a", 100), ("validator_b", 100)]);
+        sync.sync_from_peers().await;
+        assert!(
+            *block_asks.lock().unwrap() > 0,
+            "the follower refused to sync toward seeds past an unknown epoch"
+        );
+    }
+
     // End-to-end-ish: with N=2 configured and no answering seed sessions,
     // sync_from_peers must REFUSE to advance (tip shortfall) and return the
     // local height.

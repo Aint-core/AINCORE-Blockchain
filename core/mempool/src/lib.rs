@@ -101,6 +101,9 @@ struct TxMeta {
     payer: String,
     /// The most it can charge: `gas_limit * gas_price`.
     cost: u128,
+    /// B54: `StateDB::raw_tx_hash` of the raw string, the key RPC lookups
+    /// use, hashed once here and never again under the lock.
+    raw_hash: String,
 }
 
 pub struct Mempool {
@@ -365,6 +368,7 @@ impl Mempool {
                 gas_price: parsed_tx.gas_price,
                 cost: (parsed_tx.gas_limit as u128).saturating_mul(parsed_tx.gas_price),
                 payer: checked.payer,
+                raw_hash: StateDB::raw_tx_hash(&tx),
             },
         );
         self.pending_txs.push_back(tx.clone());
@@ -385,6 +389,22 @@ impl Mempool {
     /// anyone else had a transaction waiting.
     pub fn any_pending(&self, matches: impl Fn(&str) -> bool) -> bool {
         self.pending_txs.iter().any(|tx| matches(tx)) || self.inflight.keys().any(|tx| matches(tx))
+    }
+
+    /// B54: the raw transaction queued or on loan whose `StateDB::raw_tx_hash`
+    /// is `hash`, without hashing anything under the lock.
+    pub fn pending_with_raw_hash(&self, hash: &str) -> Option<&str> {
+        self.meta
+            .iter()
+            .find(|(_, m)| m.raw_hash == hash)
+            .map(|(raw, _)| raw.as_str())
+    }
+
+    /// How many times a loaned transaction was handed back to the queue and
+    /// loaned again (0 for its first loan). B53: an observer forwards each
+    /// new loan of a transaction to the next member.
+    pub fn loan_attempts(&self, raw: &str) -> u8 {
+        self.inflight.get(raw).map_or(0, |(_, attempts)| *attempts)
     }
 
     /// `get_pending_transactions_at` with the wall clock.

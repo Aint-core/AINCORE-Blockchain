@@ -12279,7 +12279,9 @@ mod tests {
             vec![ain.clone(), wbtc.clone()],
             vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
         );
-        let create_tx = signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1);
+        // B49: these calls use ~9,000-11,000 execution gas under size-based
+        // pricing (7,700-9,500 before); 20,000 leaves room.
+        let create_tx = signed_tx(&trader_key, &trader, &create_payload, 0, 20_000, 1);
         let (updates, gas) = executor
             .execute_transaction(&create_tx)
             .expect("create pool accepted");
@@ -12299,7 +12301,7 @@ mod tests {
                 bcs::to_bytes(&9_000u128).unwrap(),
             ],
         );
-        let tx_json = signed_tx(&trader_key, &trader, &add_payload, 1, 10_000, 1);
+        let tx_json = signed_tx(&trader_key, &trader, &add_payload, 1, 20_000, 1);
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("add liquidity accepted");
@@ -12332,7 +12334,7 @@ mod tests {
                 bcs::to_bytes(&900u128).unwrap(),
             ],
         );
-        let swap_tx = signed_tx(&trader_key, &trader, &swap_payload, 2, 10_000, 1);
+        let swap_tx = signed_tx(&trader_key, &trader, &swap_payload, 2, 20_000, 1);
         let (updates, gas) = executor
             .execute_transaction(&swap_tx)
             .expect("swap accepted");
@@ -12386,7 +12388,7 @@ mod tests {
                 bcs::to_bytes(&900u128).unwrap(),
             ],
         );
-        let tx_json = signed_tx(&trader_key, &trader, &remove_payload, 3, 10_000, 1);
+        let tx_json = signed_tx(&trader_key, &trader, &remove_payload, 3, 20_000, 1);
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("remove liquidity accepted");
@@ -12830,7 +12832,7 @@ mod tests {
             vec![ain.clone(), wbtc.clone()],
             vec![bcs::to_bytes(&parse_move_address(&maker).unwrap()).unwrap()],
         );
-        let tx_inline_7 = signed_tx(&maker_key, &maker, &create_payload, 0, 10_000, 1);
+        let tx_inline_7 = signed_tx(&maker_key, &maker, &create_payload, 0, 20_000, 1);
         let (updates, _) = executor
             .execute_transaction(&tx_inline_7)
             .expect("create pool accepted");
@@ -12848,7 +12850,7 @@ mod tests {
                 bcs::to_bytes(&9_000u128).unwrap(),
             ],
         );
-        let tx_inline_8 = signed_tx(&maker_key, &maker, &seed_payload, 1, 10_000, 1);
+        let tx_inline_8 = signed_tx(&maker_key, &maker, &seed_payload, 1, 20_000, 1);
         let (updates, _) = executor
             .execute_transaction(&tx_inline_8)
             .expect("seed liquidity accepted");
@@ -12866,7 +12868,7 @@ mod tests {
                 bcs::to_bytes(&4_000u128).unwrap(),
             ],
         );
-        let tx_inline_9 = signed_tx(&lp2_key, &lp2, &imbalanced_payload, 0, 10_000, 1);
+        let tx_inline_9 = signed_tx(&lp2_key, &lp2, &imbalanced_payload, 0, 20_000, 1);
         let (updates, _) = executor
             .execute_transaction(&tx_inline_9)
             .expect("imbalanced add liquidity accepted");

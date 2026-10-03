@@ -983,7 +983,11 @@ fn collect_vote_staged(
     let vote_bytes = vote.to_signing_bytes();
     match bls.verify(&vote_bytes, &sig_bytes, &pk_bytes) {
         Ok(true) => {}
-        _ => return Ok(QcOutcome::Skipped), // bad signature — drop, never store
+        _ => {
+            // Bad signature: drop, never store (B51: and count it).
+            crate::work::note_failed_check();
+            return Ok(QcOutcome::Skipped);
+        }
     }
 
     // (4) Dedup-persist this signer's vote for the round.

@@ -882,8 +882,23 @@ fn restored_committee(
     let height = plan.checkpoint.height;
     let epoch = consensus::qc_producer::epoch_for_block_height(storage, height)
         .ok_or("the restored state has no epoch for the checkpoint height")?;
-    let committee = consensus::qc_producer::load_validator_set_for_epoch(storage, epoch)
-        .ok_or("the restored state has no committee for the checkpoint's epoch")?;
+    // B50: on V4, C_E as the restored state records it (E's own record is
+    // not state). Past epoch 0 only a boundary block can be restored: E+1's
+    // record is rebuilt from it, and E's, which an inner checkpoint would
+    // need, cannot be (it is derived from H_{E-1}, which a restore lacks).
+    let committee = if consensus::v4::is_v4_chain(storage) {
+        let interval = consensus::v4::epoch::epoch_interval(storage)
+            .ok_or("a V4 chain needs its epoch interval")?;
+        if epoch > 0 && !height.is_multiple_of(interval) {
+            return Err(format!(
+                "a V4 checkpoint past epoch 0 must be an epoch boundary (every {interval} blocks), not {height}"
+            ));
+        }
+        consensus::v4::epoch::recorded_committee(storage, epoch)
+    } else {
+        consensus::qc_producer::load_validator_set_for_epoch(storage, epoch)
+    }
+    .ok_or("the restored state has no committee for the checkpoint's epoch")?;
     if let Some(me) = plan.local_signer {
         if recorded_validator(storage, me) {
             return Err(sn6_refusal(me));
@@ -965,10 +980,12 @@ fn verified_pair(
 /// the tree and removes the restore marker. The chain rows come from the
 /// checkpoint's block and its verified QC, never from a peer's database.
 fn bootstrap_record(
+    storage: &StateDB,
     mut batch: WriteBatch,
     plan: &RestorePlan<'_>,
     block: &Block,
     qc: &QuorumCertificate,
+    next: Option<&consensus::v4::epoch::EpochStart>,
 ) -> Result<WriteBatch, String> {
     let h = block.header.height.to_string();
     let block_json = serde_json::to_string(block).map_err(|e| e.to_string())?;
@@ -998,8 +1015,25 @@ fn bootstrap_record(
         // `h` exists now, and a sync halt was about the old state.
         (StateDB::BLOCK_PRUNE_CURSOR_KEY.into(), &h),
         (StateDB::KEPT_PIN_BLOCKS_KEY.into(), "[]"),
+        // B61: and the finality rows' pruning starts here too.
+        (consensus::qc_producer::FINALITY_PRUNE_CURSOR_KEY.into(), &h),
         (RESTORED_CHECKPOINT.into(), &checkpoint),
     ];
+    let next_json = next
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    let next_epoch = next.map(|n| n.epoch.to_string());
+    if let (Some(n), Some(json), Some(epoch)) = (next, &next_json, &next_epoch) {
+        rows.push((
+            consensus::v4::epoch::epoch_start_key(n.epoch),
+            json.as_str(),
+        ));
+        rows.push((
+            consensus::v4::epoch::EPOCH_ACTIVE_KEY.into(),
+            epoch.as_str(),
+        ));
+    }
     if let Some(me) = plan.local_signer {
         rows.push((RESTORED_BY.into(), me));
     }
@@ -1007,6 +1041,11 @@ fn bootstrap_record(
         batch.put(key.as_bytes(), value.as_bytes());
     }
     batch.delete(b"sync:halt_reason");
+    // B61: alarms described the replaced chain; kept, they halted ordering
+    // on the restored one.
+    for (key, _) in storage.scan_prefix("alarm:") {
+        batch.delete(key.as_bytes());
+    }
     // Genesis rows outside the state (stdlib pins, version), from this
     // node's own build; the state rows came with the restore.
     for (key, value) in plan.genesis {
@@ -1446,7 +1485,32 @@ where
                 }
             }
         };
-        let record = bootstrap_record(tree, plan, &block, &qc)?;
+        // B50: at a V4 boundary, E+1's record, which QC(H_E) must bind (the
+        // EP-4 check activation runs), and E+1 becomes the active epoch.
+        let interval = consensus::v4::epoch::epoch_interval(storage).unwrap_or(0);
+        let next = if consensus::v4::is_v4_chain(storage)
+            && interval > 0
+            && cp.height.is_multiple_of(interval)
+        {
+            let next = consensus::v4::epoch::restored_next_start(
+                storage,
+                &block,
+                &chain_id,
+                plan.genesis_identity,
+            )
+            .map_err(inconsistent)?;
+            let derived = consensus::qc::validator_set_hash(&next.committee);
+            if qc.next_validator_set_hash != derived {
+                return Err(inconsistent(format!(
+                    "QC({}) binds next committee {:?}, the restored state gives {derived}",
+                    cp.height, qc.next_validator_set_hash
+                )));
+            }
+            Some(next)
+        } else {
+            None
+        };
+        let record = bootstrap_record(storage, tree, plan, &block, &qc, next.as_ref())?;
         storage.write_batch(record).map_err(|e| e.to_string())?;
         return Ok(Restored {
             height: cp.height,

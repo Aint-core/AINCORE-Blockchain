@@ -155,16 +155,28 @@ pub struct VDFEngine {
     stride: u64,
 }
 
+/// B47: the most iterations an engine runs (a choice: ~1.7 s at the
+/// ~100 ns a hash the production note above measures). Unbounded, 2^64 - 1
+/// reserved 128 GiB of checkpoints at once (the process aborts) and 2^50 ran
+/// for days.
+pub const MAX_DIFFICULTY: u64 = 1 << 24;
+
 impl VDFEngine {
     /// Create a new VDF engine.
     ///
     /// # Errors
-    /// Returns `InvalidDifficulty` if `difficulty == 0`.
+    /// Returns `InvalidDifficulty` if `difficulty == 0` or above
+    /// `MAX_DIFFICULTY`.
     pub fn new(difficulty: u64) -> Result<Self, VDFError> {
         if difficulty == 0 {
             return Err(VDFError::InvalidDifficulty(
                 "Difficulty must be > 0".to_string(),
             ));
+        }
+        if difficulty > MAX_DIFFICULTY {
+            return Err(VDFError::InvalidDifficulty(format!(
+                "Difficulty must be at most {MAX_DIFFICULTY}"
+            )));
         }
         // stride = ceil(sqrt(difficulty)) — gives O(sqrt(t)) verification.
         let stride = (difficulty as f64).sqrt().ceil() as u64;
@@ -311,6 +323,15 @@ mod tests {
     fn test_vdf_creation() {
         assert!(VDFEngine::new(100).is_ok());
         assert!(VDFEngine::new(0).is_err());
+    }
+
+    /// B47 witness: a difficulty above the bound is refused before anything
+    /// is reserved or computed; the bound itself is accepted.
+    #[test]
+    fn a_difficulty_above_the_bound_is_refused() {
+        assert!(VDFEngine::new(MAX_DIFFICULTY).is_ok());
+        assert!(VDFEngine::new(MAX_DIFFICULTY + 1).is_err());
+        assert!(VDFEngine::new(u64::MAX).is_err());
     }
 
     #[test]
