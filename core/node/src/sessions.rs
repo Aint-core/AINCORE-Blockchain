@@ -39,8 +39,10 @@ pub const CONSENSUS_ACK: &str = "ok";
 /// its session authenticated.
 pub const SYNC_PROTOCOL: &str = "/aincore/sync/1";
 
-/// The largest sync request (a `SYNC_REQ` is a few hundred bytes).
-pub const SYNC_REQUEST_CAP: usize = 64 << 10;
+/// The largest sync request. A `SYNC_REQ` is a few hundred bytes; a
+/// forwarded transaction batch (`TX_SUBMIT:`, B21) is cut at this size, and
+/// one maximal transaction (100 KiB, at most doubled by JSON escaping) fits.
+pub const SYNC_REQUEST_CAP: usize = 256 << 10;
 
 /// The largest sync answer (`SYNC_RESP` blocks stop at
 /// `chain_sync::SYNC_RESP_BLOCK_BYTES`, 8 MiB, under it).

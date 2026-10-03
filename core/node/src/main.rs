@@ -798,9 +798,15 @@ async fn main() {
 
     // G4 S1: answer the sync requests sessions send, off the network task,
     // at most SYNC_SERVE_CONCURRENCY at once (the rest are refused).
+    // B21: whether this node is in the current committee (set by the
+    // consensus ticker). Members serve forwarded transactions; the rest
+    // forward theirs.
+    let in_committee = Arc::new(AtomicBool::new(false));
     {
         const SYNC_SERVE_CONCURRENCY: usize = 8;
         let serve_sync = Arc::clone(&chain_sync);
+        let serve_mempool = Arc::clone(&mempool);
+        let serve_member = Arc::clone(&in_committee);
         let permits = Arc::new(tokio::sync::Semaphore::new(SYNC_SERVE_CONCURRENCY));
         tokio::spawn(async move {
             while let Some(request) = sync_serves.recv().await {
@@ -813,8 +819,16 @@ async fn main() {
                     continue;
                 };
                 let serve_sync = Arc::clone(&serve_sync);
+                let serve_mempool = Arc::clone(&serve_mempool);
+                let member = serve_member.load(Ordering::SeqCst);
                 tokio::task::spawn_blocking(move || {
-                    let answer = serve_sync.serve_session(&request.wire, &request.peer);
+                    let answer = if request.wire.starts_with(node::forward::TX_SUBMIT) {
+                        member
+                            .then(|| node::forward::serve_tx_submit(&serve_mempool, &request.wire))
+                            .flatten()
+                    } else {
+                        serve_sync.serve_session(&request.wire, &request.peer)
+                    };
                     let _ = request.reply.send(answer);
                     drop(permit);
                 });
@@ -845,6 +859,15 @@ async fn main() {
     // an in-flight commit.
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    // B21: outside the committee, forward what this node's RPC accepted to
+    // a member (members put their own mempool into vertices).
+    tokio::spawn(node::forward::run_forwarder(
+        Arc::clone(&mempool),
+        session_client.clone(),
+        Arc::clone(&in_committee),
+        Arc::clone(&shutdown),
+    ));
+
     // Signal listener: docker stop sends SIGTERM (then SIGKILL after the grace
     // period); Ctrl-C sends SIGINT. Either flips the shutdown flag.
     {
@@ -873,6 +896,8 @@ async fn main() {
     let consensus_clone = Arc::clone(&consensus);
     let shutdown_consensus = Arc::clone(&shutdown);
     let ticker_book = Arc::clone(&session_book);
+    let ticker_member = Arc::clone(&in_committee);
+    let ticker_node_id = node_id.clone();
     tokio::spawn(async move {
         // (epoch, whether C_{E+1} is known) of the book's last refresh.
         let mut book_key: Option<(u64, bool)> = None;
@@ -889,6 +914,10 @@ async fn main() {
                     c.try_create_vertex();
                     // G4 S1: the sessions admit C_E and C_{E+1}.
                     if let Some((epoch, current, next)) = c.session_committees() {
+                        ticker_member.store(
+                            current.iter().any(|m| m.address == ticker_node_id),
+                            Ordering::SeqCst,
+                        );
                         let key = (epoch, next.is_some());
                         if book_key != Some(key) {
                             let mut committees: Vec<&[blockchain::committee::ValidatorInfo]> =

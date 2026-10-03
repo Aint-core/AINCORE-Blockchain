@@ -1,3 +1,5 @@
+/// B21: transactions forwarded from outside the committee.
+pub mod forward;
 pub mod genesis;
 pub mod p2p;
 pub mod qc_rpc;
