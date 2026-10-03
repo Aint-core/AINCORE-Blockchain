@@ -20,24 +20,6 @@ use node::p2p::start_p2p;
 mod api_local;
 use api_local as api;
 
-fn is_docker_bridge_host(host: &str) -> bool {
-    host.parse::<std::net::Ipv4Addr>()
-        .map(|ip| {
-            let octets = ip.octets();
-            octets[0] == 172 && (16..=31).contains(&octets[1])
-        })
-        .unwrap_or(false)
-}
-
-fn bootnode_host(addr: &str) -> Option<&str> {
-    let parts: Vec<&str> = addr.split('/').collect();
-    if parts.len() >= 5 && (parts[1] == "ip4" || parts[1] == "dns4") {
-        Some(parts[2])
-    } else {
-        None
-    }
-}
-
 /// G3 RC-2 and RC-3, at boot after RC-1.
 /// - RC-2: every flat consensus-state key equals its tree leaf, and the
 ///   reverse. This catches an out-of-band edit of the database.
@@ -530,24 +512,20 @@ async fn main() {
     println!("🚀 AINCORE node {} running on port {}", node_id, port);
 
     // === LOAD PERSISTED PEERS ===
-    let saved_peer_addrs = storage.scan_peer_addrs();
+    // B22: libp2p addresses saved from earlier sessions; dialled as they are.
+    let saved_peer_addrs: Vec<String> = storage
+        .scan_peer_addrs()
+        .into_iter()
+        .map(|(_, addr)| addr)
+        .collect();
     if !saved_peer_addrs.is_empty() {
         println!(
             "📚 Found {} saved peer addresses in database",
             saved_peer_addrs.len()
         );
-        for (_, addr) in saved_peer_addrs {
-            if bootnode_host(&addr).is_some_and(is_docker_bridge_host) {
-                println!("🧹 Skipping stale Docker bridge peer address: {}", addr);
-                continue;
-            }
-            if !bootnodes.contains(&addr) {
-                bootnodes.push(addr);
-            }
-        }
     }
 
-    if bootnodes.is_empty() {
+    if bootnodes.is_empty() && saved_peer_addrs.is_empty() {
         match std::env::var("AINCORE_PUBLIC_SEED_BOOTNODE") {
             Ok(seed) if !seed.trim().is_empty() => {
                 println!(
@@ -561,50 +539,10 @@ async fn main() {
         }
     }
 
-    // === NORMALIZE BOOTNODES ===
-    let normalized_bootnodes: Vec<String> = bootnodes
-        .iter()
-        .map(|s| {
-            if s.starts_with("/") {
-                s.clone()
-            } else {
-                // Try IP:PORT
-                if let Ok(addr) = s.parse::<std::net::SocketAddr>() {
-                    format!("/ip4/{}/tcp/{}", addr.ip(), addr.port())
-                } else {
-                    // Try DOMAIN:PORT (e.g. ngrok)
-                    let parts: Vec<&str> = s.split(':').collect();
-                    if parts.len() == 2 {
-                        if let Ok(p) = parts[1].parse::<u16>() {
-                            format!("/dns4/{}/tcp/{}", parts[0], p)
-                        } else {
-                            s.clone()
-                        }
-                    } else {
-                        s.clone()
-                    }
-                }
-            }
-        })
-        .collect();
-
-    // === LIBP2P BOOTNODES (Port + 100) ===
-    let libp2p_bootnodes: Vec<String> = normalized_bootnodes
-        .iter()
-        .map(|s| {
-            let parts: Vec<&str> = s.split('/').collect();
-            if parts.len() >= 5 && parts[3] == "tcp" {
-                if let Ok(p) = parts[4].parse::<u16>() {
-                    let new_port = p + 100;
-                    let mut new_parts = parts.clone();
-                    let port_str = new_port.to_string();
-                    new_parts[4] = &port_str;
-                    return new_parts.join("/");
-                }
-            }
-            s.clone()
-        })
-        .collect();
+    // === LIBP2P DIAL LIST (B22) ===
+    // The operator's bootnodes are base ports (dialled at base + 100); the
+    // saved addresses are libp2p addresses already, kept when routable.
+    let libp2p_bootnodes = node::sessions::boot_dial_list(&bootnodes, &saved_peer_addrs);
 
     println!(
         "🕸️  Kademlia DHT: Feeding {} bootnodes to Routing Table",
@@ -612,8 +550,11 @@ async fn main() {
     );
     if !libp2p_bootnodes.is_empty() {
         println!("   - Example Libp2p: {}", libp2p_bootnodes[0]);
-        if let Some(first) = normalized_bootnodes.first() {
-            println!("   - Given as: {} (base port; libp2p dials base + 100)", first);
+        if let Some(first) = bootnodes.first() {
+            println!(
+                "   - Given as: {} (base port; libp2p dials base + 100)",
+                first
+            );
         }
     }
 

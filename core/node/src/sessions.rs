@@ -463,6 +463,125 @@ pub fn admit_consensus_request<'a>(book: &'a PeerBook, peer: &PeerId) -> Option<
     book.member_of(peer)
 }
 
+/// B22: an operator's bootnode, given by its base port (`host:port`, or a
+/// multiaddr carrying the base port), as the libp2p address it is dialled
+/// at (base + 100; a `/p2p/<PeerId>` suffix is kept).
+pub fn libp2p_bootnode(given: &str) -> Result<String, String> {
+    use libp2p::multiaddr::Protocol;
+    let given = given.trim();
+    if !given.starts_with('/') {
+        return sync_peer_multiaddr(given);
+    }
+    let addr: libp2p::Multiaddr = given.parse().map_err(|e| format!("{given}: {e}"))?;
+    let mut out = libp2p::Multiaddr::empty();
+    let mut mapped = false;
+    for proto in addr.iter() {
+        match proto {
+            Protocol::Tcp(port) if !mapped => {
+                let port = port
+                    .checked_add(100)
+                    .ok_or_else(|| format!("{given}: port must be a base port below 65436"))?;
+                out.push(Protocol::Tcp(port));
+                mapped = true;
+            }
+            other => out.push(other),
+        }
+    }
+    if mapped {
+        Ok(out.to_string())
+    } else {
+        Err(format!("{given}: no tcp port"))
+    }
+}
+
+/// B22: whether another host can dial `addr`: not loopback, unspecified,
+/// link-local, or on a Docker bridge (172.16.0.0/12, which leaks through
+/// identify when nodes run in containers).
+pub fn routable_for_others(addr: &libp2p::Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().all(|proto| match proto {
+        Protocol::Ip4(ip) => {
+            let o = ip.octets();
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_link_local()
+                || (o[0] == 172 && (16..=31).contains(&o[1])))
+        }
+        Protocol::Ip6(ip) => !(ip.is_loopback() || ip.is_unspecified()),
+        _ => true,
+    })
+}
+
+/// B22: what a node dials at boot. The operator's bootnodes, mapped to their
+/// libp2p port; then the addresses saved from earlier sessions, which are
+/// libp2p addresses already (mapping them again dialled base + 200) and are
+/// kept only when another host could dial them (a peer's loopback address
+/// is its own). No address twice.
+pub fn boot_dial_list(bootnodes: &[String], saved: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for given in bootnodes {
+        match libp2p_bootnode(given) {
+            Ok(addr) if !out.contains(&addr) => out.push(addr),
+            Ok(_) => {}
+            Err(e) => eprintln!("⚠️ bootnode ignored: {e}"),
+        }
+    }
+    for addr in saved {
+        let routable = addr
+            .parse::<libp2p::Multiaddr>()
+            .is_ok_and(|a| routable_for_others(&a));
+        if routable && !out.contains(addr) {
+            out.push(addr.clone());
+        }
+    }
+    out
+}
+
+/// `addr` without a trailing `/p2p/<PeerId>`.
+pub fn without_peer(addr: &libp2p::Multiaddr) -> libp2p::Multiaddr {
+    let mut addr = addr.clone();
+    if matches!(
+        addr.iter().last(),
+        Some(libp2p::multiaddr::Protocol::P2p(_))
+    ) {
+        addr.pop();
+    }
+    addr
+}
+
+/// B22: bootnodes given without a PeerId, dialled again on every committee
+/// tick until a session this node dialled opens from that address. A node
+/// that booted before its peers otherwise never reached them: a bootnode is
+/// dialled once, and without a PeerId it is in no routing table.
+#[derive(Debug, Default)]
+pub struct Unresolved(Vec<libp2p::Multiaddr>);
+
+impl Unresolved {
+    pub fn new(dial_list: &[String]) -> Self {
+        Self(
+            dial_list
+                .iter()
+                .filter_map(|a| a.parse::<libp2p::Multiaddr>().ok())
+                .filter(|a| !matches!(a.iter().last(), Some(libp2p::multiaddr::Protocol::P2p(_))))
+                .collect(),
+        )
+    }
+
+    /// A session this node dialled at `dialled` opened: that bootnode is
+    /// resolved. Returns whether it was one.
+    pub fn resolved(&mut self, dialled: &libp2p::Multiaddr) -> bool {
+        let dialled = without_peer(dialled);
+        let before = self.0.len();
+        self.0.retain(|a| *a != dialled);
+        self.0.len() != before
+    }
+
+    /// The bootnodes still to dial.
+    pub fn due(&self) -> &[libp2p::Multiaddr] {
+        &self.0
+    }
+}
+
 /// G4 S5: the one gossip topic.
 pub const GOSSIP_TOPIC: &str = "aincore-gossip";
 
@@ -1132,6 +1251,121 @@ mod tests {
         assert!(
             score < gossip_score_thresholds().graylist_threshold,
             "the stranger's score at the relay: {score}"
+        );
+    }
+
+    /// B22: a bootnode is given by base port and dialled at base + 100,
+    /// once; a malformed one is refused.
+    #[test]
+    fn a_bootnode_is_dialled_at_its_base_port_plus_100() {
+        let id = local_keypair(&[3; 32]).public().to_peer_id();
+        for (given, dialled) in [
+            (
+                "/ip4/192.168.18.202/tcp/9411",
+                "/ip4/192.168.18.202/tcp/9511".to_string(),
+            ),
+            (
+                "192.168.18.66:9413",
+                "/ip4/192.168.18.66/tcp/9513".to_string(),
+            ),
+            (
+                "seed.example:9002",
+                "/dns4/seed.example/tcp/9102".to_string(),
+            ),
+            ("[::1]:9000", "/ip6/::1/tcp/9100".to_string()),
+            (
+                &format!("/dns4/seed/tcp/9002/p2p/{id}"),
+                format!("/dns4/seed/tcp/9102/p2p/{id}"),
+            ),
+        ] {
+            assert_eq!(
+                libp2p_bootnode(given).as_deref(),
+                Ok(dialled.as_str()),
+                "{given}"
+            );
+        }
+        for bad in [
+            "/ip4/1.2.3.4/udp/9000",
+            "/ip4/1.2.3.4/tcp/65500",
+            "nonsense",
+        ] {
+            assert!(libp2p_bootnode(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_addresses_another_host_can_dial_are_routable() {
+        let r = |a: &str| routable_for_others(&a.parse().unwrap());
+        for yes in [
+            "/ip4/192.168.18.66/tcp/9514",
+            "/ip4/8.8.8.8/tcp/1",
+            "/dns4/seed/tcp/1",
+        ] {
+            assert!(r(yes), "{yes}");
+        }
+        for no in [
+            "/ip4/127.0.0.1/tcp/9511",
+            "/ip4/0.0.0.0/tcp/9511",
+            "/ip4/169.254.1.1/tcp/1",
+            "/ip4/172.23.0.1/tcp/9032",
+            "/ip6/::1/tcp/1",
+        ] {
+            assert!(!r(no), "{no}");
+        }
+    }
+
+    /// B22 witness (the rehearsal's restart): saved addresses are libp2p
+    /// addresses and are dialled as they are, not at +100 again (d1 dialled
+    /// d4 at 9614 and never reached it); a peer's saved loopback address is
+    /// dropped; the operator's bootnodes are mapped once, loopback included.
+    #[test]
+    fn the_boot_dial_list_maps_bootnodes_once_and_keeps_saved_addresses() {
+        let id = local_keypair(&[4; 32]).public().to_peer_id();
+        let saved = vec![
+            format!("/ip4/192.168.18.66/tcp/9514/p2p/{id}"),
+            format!("/ip4/127.0.0.1/tcp/9513/p2p/{id}"),
+            "/ip4/192.168.18.202/tcp/9512".to_string(),
+        ];
+        let bootnodes = vec![
+            "/ip4/192.168.18.202/tcp/9412".to_string(),
+            "127.0.0.1:9000".to_string(),
+        ];
+        assert_eq!(
+            boot_dial_list(&bootnodes, &saved),
+            vec![
+                "/ip4/192.168.18.202/tcp/9512".to_string(),
+                "/ip4/127.0.0.1/tcp/9100".to_string(),
+                format!("/ip4/192.168.18.66/tcp/9514/p2p/{id}"),
+            ]
+        );
+    }
+
+    /// B22: a bootnode without a PeerId stays due until a session dialled at
+    /// it opens (with or without the PeerId on the dialled address).
+    #[test]
+    fn a_bootnode_is_due_until_a_dial_reaches_it() {
+        let id = local_keypair(&[5; 32]).public().to_peer_id();
+        let list = vec![
+            "/ip4/192.168.18.66/tcp/9514".to_string(),
+            "/ip4/192.168.18.66/tcp/9513".to_string(),
+            format!("/ip4/192.168.18.202/tcp/9512/p2p/{id}"),
+        ];
+        let mut due = Unresolved::new(&list);
+        assert_eq!(
+            due.due().len(),
+            2,
+            "a PeerId-pinned address is routed, not redialled"
+        );
+        let reached: libp2p::Multiaddr = format!("/ip4/192.168.18.66/tcp/9514/p2p/{id}")
+            .parse()
+            .unwrap();
+        assert!(due.resolved(&reached));
+        assert!(!due.resolved(&reached), "once");
+        assert_eq!(
+            due.due(),
+            &["/ip4/192.168.18.66/tcp/9513"
+                .parse::<libp2p::Multiaddr>()
+                .unwrap()]
         );
     }
 }

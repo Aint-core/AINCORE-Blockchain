@@ -180,6 +180,8 @@ pub async fn start_p2p(
             .with_idle_connection_timeout(Duration::from_secs(20)),
     );
 
+    // B22: bootnodes given without a PeerId are dialled again until reached.
+    let mut unresolved = sessions::Unresolved::new(&bootnodes);
     // Add bootnodes
     for peer_addr in bootnodes {
         if let Ok(multiaddr) = peer_addr.parse::<Multiaddr>() {
@@ -400,6 +402,10 @@ pub async fn start_p2p(
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(peer);
                     }
                     explicit = current;
+                    // B22: bootnodes not reached yet (they may boot after us).
+                    for addr in unresolved.due().to_vec() {
+                        let _ = swarm.dial(DialOpts::unknown_peer_id().address(addr).build());
+                    }
                     for peer in members(&book) {
                         if !swarm.is_connected(&peer) {
                             let _ = swarm.dial(
@@ -499,8 +505,10 @@ pub async fn start_p2p(
                             println!("👀 mDNS discovered a new peer: {:?}", peer_id);
                             swarm.behaviour_mut().kademlia.add_address(&peer_id, multiaddr.clone());
 
-                            // Persist peer
-                            let _ = storage.save_peer_addr(&peer_id.to_string(), &multiaddr.to_string());
+                            // Persist peer (B22: only what another host can dial)
+                            if sessions::routable_for_others(&multiaddr) {
+                                let _ = storage.save_peer_addr(&peer_id.to_string(), &multiaddr.to_string());
+                            }
                         }
                     }
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Mdns(MdnsEvent::Expired(list))) => {
@@ -516,7 +524,9 @@ pub async fn start_p2p(
                         // in containers, but remote peers cannot dial them. Persisting
                         // those addresses poisons the next boot's bootnode list and
                         // causes repeated TCP connect timeouts.
-                        if let Some(addr) = addresses.iter().find(|addr| !is_docker_bridge_addr(addr)) {
+                        // B22: nor a peer's loopback or link-local address, which
+                        // is its own and was dialled by others at the wrong host.
+                        if let Some(addr) = addresses.iter().find(|addr| sessions::routable_for_others(addr)) {
                              let _ = storage.save_peer_addr(&peer.to_string(), &addr.to_string());
                         }
                     }
@@ -649,6 +659,16 @@ pub async fn start_p2p(
                         if let Some(reply) = pending_dials.remove(&connection_id) {
                             let _ = reply.send(Ok(peer_id.to_string()));
                         }
+                        // B22: an address this node dialled is reachable: route
+                        // to it by PeerId from now on, and stop redialling it as
+                        // an unresolved bootnode.
+                        if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
+                            unresolved.resolved(address);
+                            swarm
+                                .behaviour_mut()
+                                .kademlia
+                                .add_address(&peer_id, sessions::without_peer(address));
+                        }
                         if num_established.get() > MAX_LIBP2P_CONNECTIONS_PER_PEER {
                             eprintln!(
                                 "⚠️ Closing duplicate libp2p connection to {:?}: established={} limit={}",
@@ -675,7 +695,9 @@ pub async fn start_p2p(
                         // mesh and its score.
                         match endpoint {
                             libp2p::core::ConnectedPoint::Dialer { address, .. } => {
-                                let _ = storage.save_peer_addr(&peer_id.to_string(), &address.to_string());
+                                if sessions::routable_for_others(&address) {
+                                    let _ = storage.save_peer_addr(&peer_id.to_string(), &address.to_string());
+                                }
                             }
                             libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => {
                                 // NI-2: a committee member never counts against the
