@@ -3108,11 +3108,13 @@ async fn value_parts_wait_out_busy_answers_without_starting_over() {
     );
     let client = temp_db("partbusy_client");
     let mut server = peer(&a, Behaviour::Honest);
-    // Eight parts, each after a 200 ms wait: longer than the timeout in all.
+    // Eight parts, each after a 600 ms wait (4.8 s): longer than the 3 s
+    // timeout in all, which each single part has room to meet on a loaded
+    // Pi (B17: at 1 s, a 1 MiB part outlived it there once).
     let polled = RestorePlan {
         patience: Patience {
-            backoff_start: Duration::from_millis(100),
-            request_timeout: Duration::from_secs(1),
+            backoff_start: Duration::from_millis(300),
+            request_timeout: Duration::from_secs(3),
             ..polling()
         },
         ..plan(&a.cp, &g, false)
@@ -3143,9 +3145,9 @@ async fn value_parts_wait_out_busy_answers_without_starting_over() {
     .unwrap();
     let parts: Vec<u64> = (0..8).map(|i| i * VALUE_PART_BYTES as u64).collect();
     assert_eq!(served, parts, "each part once, in order");
-    // One step each (200 ms). Growing, the third would wait 800 ms.
+    // One step each (600 ms). Growing, the third would wait 2.4 s.
     assert!(
-        waits.iter().all(|w| *w < Duration::from_millis(600)),
+        waits.iter().all(|w| *w < Duration::from_millis(1800)),
         "{waits:?}"
     );
     assert_restored(&client, &a);
