@@ -495,3 +495,47 @@ fn v4_a_verified_qc_for_another_block_at_a_held_height_raises_the_alarm() {
         "the conflicting QC was stored"
     );
 }
+
+/// B23 witness: a QC whose text carries the conflict marker (in its chain
+/// id, where the verifier's error quotes it) is refused and raises no
+/// alarm, through the certificate import (QC_CERT, GET_FINALITY) and with
+/// a synced block. Before, `record_decision_conflict` matched the text and
+/// one gossiped QC halted every validator for good. A real conflict still
+/// raises it (`v4_a_verified_qc_for_another_block_at_a_held_height_raises_the_alarm`).
+#[test]
+fn v4_a_forged_qc_carrying_the_conflict_text_raises_no_alarm() {
+    let (sync, c0) = v4_sync("b23_forged");
+    let b1 = block_at(&sync, 1, "genesis", &"a1".repeat(32));
+    assert_eq!(
+        sync.process_blocks_with_qcs(vec![b1.clone()], &[qc_for(&b1, &c0, &[0, 1, 2])], 0),
+        1
+    );
+    let alarms = |s: &ChainSync| {
+        s.storage
+            .scan_prefix_limited("alarm:", 16)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect::<Vec<_>>()
+    };
+    let other = block_at(&sync, 1, "genesis", &"b2".repeat(32));
+    for field in ["chain_id", "validator_set_hash"] {
+        let mut forged = qc_for(&other, &c0, &[0, 1, 2]);
+        let marker = format!("{} {field}", consensus::ordering::DECISION_CONFLICT);
+        match field {
+            "chain_id" => forged.chain_id = marker,
+            _ => forged.validator_set_hash = marker,
+        }
+        let err = consensus::qc_producer::import_finality_qc(&sync.storage, &forged).unwrap_err();
+        assert!(
+            err.contains(consensus::ordering::DECISION_CONFLICT),
+            "positive control: the error quotes the forged text: {err}"
+        );
+        assert!(alarms(&sync).is_empty(), "{field}: {:?}", alarms(&sync));
+        let _ = sync.process_blocks_with_qcs(vec![other.clone()], std::slice::from_ref(&forged), 1);
+        assert!(
+            alarms(&sync).is_empty(),
+            "{field} via sync: {:?}",
+            alarms(&sync)
+        );
+    }
+}

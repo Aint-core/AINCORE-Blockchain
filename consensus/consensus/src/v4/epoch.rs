@@ -166,10 +166,13 @@ pub fn write_next(
         if held == json {
             return Ok(());
         }
-        return Err(format!(
-            "{}: epoch {} already has a different record",
-            crate::ordering::DECISION_CONFLICT,
-            start.epoch
+        return Err(crate::alarm::raise(
+            crate::alarm::Alarm::DecisionConflict,
+            format!(
+                "{}: epoch {} already has a different record",
+                crate::ordering::DECISION_CONFLICT,
+                start.epoch
+            ),
         ));
     }
     if let Some(why) = invalid {
@@ -230,10 +233,13 @@ pub fn stage_boundary(
         .map_err(|e| e.to_string())?
         .and_then(|raw| serde_json::from_str(&raw).ok());
     if recorded.as_ref() != Some(&start.committee) {
-        return Err(format!(
-            "{}: the executor recorded another committee for epoch {}",
-            crate::ordering::DECISION_CONFLICT,
-            start.epoch
+        return Err(crate::alarm::raise(
+            crate::alarm::Alarm::DecisionConflict,
+            format!(
+                "{}: the executor recorded another committee for epoch {}",
+                crate::ordering::DECISION_CONFLICT,
+                start.epoch
+            ),
         ));
     }
     write_next(view, &start, invalid.as_deref())?;

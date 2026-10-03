@@ -1,3 +1,5 @@
+/// B23: consensus alarms raised by the code that finds them, never read from text.
+pub mod alarm;
 pub mod dag;
 pub mod ingress_v4;
 pub mod ordering;

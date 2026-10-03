@@ -974,6 +974,8 @@ impl ChainSync {
             if let Some(hook) = self.before_execution_hook {
                 hook(&self.storage);
             }
+            // B23: only an alarm this block's import raises can halt.
+            consensus::alarm::clear();
             match executor.execute_block_admitted_at(
                 block.transactions.clone(),
                 &block.header.proposer_id,
@@ -1006,11 +1008,14 @@ impl ChainSync {
                         let derived = consensus::qc::validator_set_hash(&start.committee);
                         if let Some(q) = &qc {
                             if q.next_validator_set_hash != derived {
-                                return Err(format!(
-                                    "{}: QC(H_{}) binds next committee {:?}, this node derived {derived}",
-                                    consensus::v4::epoch::COMMITTEE_MISMATCH,
-                                    start.epoch - 1,
-                                    q.next_validator_set_hash
+                                return Err(consensus::alarm::raise(
+                                    consensus::alarm::Alarm::CommitteeMismatch,
+                                    format!(
+                                        "{}: QC(H_{}) binds next committee {:?}, this node derived {derived}",
+                                        consensus::v4::epoch::COMMITTEE_MISMATCH,
+                                        start.epoch - 1,
+                                        q.next_validator_set_hash
+                                    ),
                                 ));
                             }
                         }
@@ -1081,7 +1086,7 @@ impl ChainSync {
                     // Except EP-4's: a verified QC(H_E) (>2/3 of C_E) certifies
                     // a next committee this node did not derive from the same
                     // post-state. That is not a peer's fault: the node halts.
-                    if error.contains(consensus::v4::epoch::COMMITTEE_MISMATCH) {
+                    if consensus::alarm::take() == Some(consensus::alarm::Alarm::CommitteeMismatch) {
                         if let Some(interval) = consensus::v4::epoch::epoch_interval(&self.storage) {
                             let next = consensus::v4::epoch::epoch_of_height(
                                 block.header.height,

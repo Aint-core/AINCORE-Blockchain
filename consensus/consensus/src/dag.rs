@@ -1112,6 +1112,8 @@ impl DagConsensus {
                     // Lock order: ordering -> executor -> storage writers. Sync
                     // releases execution/storage before reload acquires ordering.
                     // Never call reload_chain_tip while holding this guard.
+                    // B23: only an alarm this attempt raises can halt.
+                    crate::alarm::clear();
                     let outcome = {
                         let mut engine = engine_arc.lock().expect("ordering engine lock poisoned");
                         if !engine.prepared_is_current(&plan) {
@@ -1231,7 +1233,7 @@ impl DagConsensus {
                         }
                         Err(err) => {
                             eprintln!("[LOCAL_BLOCK_ACCEPTANCE_FAILED] anchor {}: {err}; ordering not advanced", commit.anchor_round);
-                            if err.contains(crate::ordering::DECISION_CONFLICT) {
+                            if crate::alarm::take() == Some(crate::alarm::Alarm::DecisionConflict) {
                                 let height = self.latest_block_height + 1;
                                 self.halt_on_decision_conflict(height, &err);
                             }
@@ -1850,6 +1852,8 @@ impl DagConsensus {
                         };
                         let qc_chain_id = self.resolve_chain_id();
                         let mut conflict: Option<String> = None;
+                        // B23: only an alarm this adoption raises can halt.
+                        crate::alarm::clear();
                         let adopted = match self.ordering_engine.lock() {
                             Ok(mut engine) => {
                                 let already_decided = block.header.round <= engine.finalized_round
@@ -1864,11 +1868,14 @@ impl DagConsensus {
                                         // computed: the QC's finality digest must be
                                         // this node's fold of the same sequence.
                                         if qc.finality_digest != info.finality_digest {
-                                            return Err(format!(
-                                                "{}: block {h}'s QC finality digest {} is not this node's {}",
-                                                crate::ordering::DECISION_CONFLICT,
-                                                qc.finality_digest,
-                                                info.finality_digest
+                                            return Err(crate::alarm::raise(
+                                                crate::alarm::Alarm::DecisionConflict,
+                                                format!(
+                                                    "{}: block {h}'s QC finality digest {} is not this node's {}",
+                                                    crate::ordering::DECISION_CONFLICT,
+                                                    qc.finality_digest,
+                                                    info.finality_digest
+                                                ),
                                             ));
                                         }
                                         crate::qc_producer::stage_pending_qc(view, &block, info, qc_chain_id)?;
@@ -1887,7 +1894,10 @@ impl DagConsensus {
                                         }
                                         info
                                     }
-                                    Err(e) if e.contains(crate::ordering::DECISION_CONFLICT) => {
+                                    Err(e)
+                                        if crate::alarm::take()
+                                            == Some(crate::alarm::Alarm::DecisionConflict) =>
+                                    {
                                         conflict = Some(e);
                                         None
                                     }

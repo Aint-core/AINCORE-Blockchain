@@ -621,26 +621,27 @@ fn check_held_block(storage: &StateDB, cert: &QuorumCertificate) -> Result<(), S
     };
     let held: blockchain::Block = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     if held.header.hash != cert.block_hash {
-        return Err(format!(
-            "{}: the QC of height {} certifies block {}, this node holds {}",
-            crate::ordering::DECISION_CONFLICT,
-            cert.block_height,
-            cert.block_hash,
-            held.header.hash
+        return Err(crate::alarm::raise(
+            crate::alarm::Alarm::DecisionConflict,
+            format!(
+                "{}: the QC of height {} certifies block {}, this node holds {}",
+                crate::ordering::DECISION_CONFLICT,
+                cert.block_height,
+                cert.block_hash,
+                held.header.hash
+            ),
         ));
     }
     Ok(())
 }
 
 /// Record a decision conflict found while handling a QC: the alarm row halts
-/// ordering (the node reads it at boot and on every tick). Only for an error
-/// that is one (a verified certificate for another block), never for a
-/// malformed or unverifiable input a peer can send at will.
+/// ordering (the node reads it at boot and on every tick). Called only by
+/// code that found one after verifying (B23: never decided from an error's
+/// text, which a peer can choose).
 pub fn record_decision_conflict(storage: &StateDB, height: u64, err: &str) {
-    if err.contains(crate::ordering::DECISION_CONFLICT) {
-        eprintln!("🚨 [IM-3] {err}: ordering halts");
-        let _ = storage.put(&format!("alarm:decision_conflict:{height}"), err);
-    }
+    eprintln!("🚨 [IM-3] {err}: ordering halts");
+    let _ = storage.put(&format!("alarm:decision_conflict:{height}"), err);
 }
 
 // Caller supplies a transaction view. All indexes describe one accepted QC;
@@ -683,11 +684,17 @@ fn store_certificate(storage: &StateDB, cert: &QuorumCertificate) -> Result<(), 
 /// The held block must have passed the caller's block-acceptance pipeline; this
 /// does not execute blocks, prove epoch transitions, or advance ordering memory.
 pub fn import_finality_qc(storage: &StateDB, cert: &QuorumCertificate) -> Result<bool, String> {
-    let advanced = storage.transaction(|view| {
-        stage_imported_finality(&view, cert).map_err(storage::StorageError::DatabaseOperation)
-    }).map_err(|e| {
+    let (result, alarm) = crate::alarm::raised_by(|| {
+        storage.transaction(|view| {
+            stage_imported_finality(&view, cert).map_err(storage::StorageError::DatabaseOperation)
+        })
+    });
+    let advanced = result.map_err(|e| {
         let e = e.to_string();
-        record_decision_conflict(storage, cert.block_height, &e);
+        // B23: halt only on a conflict found after the QC verified.
+        if alarm == Some(crate::alarm::Alarm::DecisionConflict) {
+            record_decision_conflict(storage, cert.block_height, &e);
+        }
         e
     })?;
     #[cfg(test)]

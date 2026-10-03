@@ -1177,9 +1177,13 @@ impl OrderingEngine {
             };
             match storage.get(&key).map_err(|err| err.to_string())? {
                 Some(held) if held != decision => {
-                    return Err(format!(
+                    let why = format!(
                         "{DECISION_CONFLICT}: anchor round {r} was decided {held}, not {decision}"
-                    ))
+                    );
+                    return Err(crate::alarm::raise(
+                        crate::alarm::Alarm::DecisionConflict,
+                        why,
+                    ));
                 }
                 Some(_) => {}
                 None => batch.put(key.as_bytes(), decision.as_bytes()),
