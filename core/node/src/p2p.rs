@@ -504,11 +504,6 @@ pub async fn start_p2p(
                         for (peer_id, multiaddr) in list {
                             println!("👀 mDNS discovered a new peer: {:?}", peer_id);
                             swarm.behaviour_mut().kademlia.add_address(&peer_id, multiaddr.clone());
-
-                            // Persist peer (B22: only what another host can dial)
-                            if sessions::routable_for_others(&multiaddr) {
-                                let _ = storage.save_peer_addr(&peer_id.to_string(), &multiaddr.to_string());
-                            }
                         }
                     }
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Mdns(MdnsEvent::Expired(list))) => {
@@ -518,17 +513,10 @@ pub async fn start_p2p(
                     }
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Kademlia(KademliaEvent::RoutingUpdated { peer, addresses, .. })) => {
                         println!("🕸️  Kademlia Routing Updated: peer={:?} addrs={:?}", peer, addresses);
-
-                        // Persist the first routable address. Docker bridge addresses
-                        // (172.16.0.0/12) leak through Identify/Kademlia when nodes run
-                        // in containers, but remote peers cannot dial them. Persisting
-                        // those addresses poisons the next boot's bootnode list and
-                        // causes repeated TCP connect timeouts.
-                        // B22: nor a peer's loopback or link-local address, which
-                        // is its own and was dialled by others at the wrong host.
-                        if let Some(addr) = addresses.iter().find(|addr| sessions::routable_for_others(addr)) {
-                             let _ = storage.save_peer_addr(&peer.to_string(), &addr.to_string());
-                        }
+                        // B22: nothing is saved from here. Kademlia reports back the
+                        // addresses it was given, wrong ones included (a saved 9612
+                        // came back on every boot); only an address a dial reached
+                        // is saved (ConnectionEstablished, Dialer).
                     }
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Gossipsub(GossipsubEvent::Message { propagation_source: peer_id, message_id, message })) => {
                         // G4 S5: every message gets a verdict; only an accepted
