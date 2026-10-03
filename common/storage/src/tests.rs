@@ -386,6 +386,9 @@ mod tests {
         let hash1 = hex::encode(Sha256::digest(tx1.as_bytes()));
         let hash2 = hex::encode(Sha256::digest(tx2.as_bytes()));
         let hash3 = hex::encode(Sha256::digest(tx3.as_bytes()));
+        // B6: receipts go with their block.
+        db.put(&format!("tx_receipt:{hash1}"), "r1").unwrap();
+        db.put(&format!("tx_receipt:{hash2}"), "r2").unwrap();
 
         assert_eq!(db.get_tx_block_height(&hash1), Some(1));
         assert_eq!(db.get_tx_block_height(&hash2), Some(2));
@@ -400,6 +403,8 @@ mod tests {
         assert_eq!(db.get("block_1").unwrap(), None);
         assert_eq!(db.get("block_txs:1").unwrap(), None);
         assert_eq!(db.get_tx_block_height(&hash1), None);
+        assert_eq!(db.get(&format!("tx_receipt:{hash1}")).unwrap(), None);
+        assert!(db.get(&format!("tx_receipt:{hash2}")).unwrap().is_some());
 
         assert!(db.get("block_2").unwrap().is_some());
         assert!(db.get("block_3").unwrap().is_some());

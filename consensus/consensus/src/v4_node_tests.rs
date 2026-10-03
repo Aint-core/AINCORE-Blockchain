@@ -2258,3 +2258,85 @@ fn b6_storage_per_empty_block_by_key_family() {
         );
     }
 }
+
+/// B6: pruning a block takes every row it left: the block, its QC under both
+/// keys, the vote and aggregation rows of its anchor round, the signing
+/// guards at its height and round, and the anchor decisions up to its round.
+/// The rows of the blocks kept stay.
+#[test]
+fn pruning_a_block_takes_its_finality_rows() {
+    let mut c = Cluster::new("b6-prune", &[111, 112, 113, 114], true);
+    c.run_until(400, |c| c.qc(0, 12).is_some());
+    let s = Arc::clone(&c.node(0).storage);
+    let tip = c.node(0).latest_block_height;
+    assert!(c.qc(0, 12).is_some(), "vacuous: no QC at height 12");
+    let rows = |prefix: &str| -> Vec<String> {
+        s.db.prefix_iterator(prefix.as_bytes())
+            .filter_map(Result::ok)
+            .take_while(|(k, _)| k.starts_with(prefix.as_bytes()))
+            .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+            .collect()
+    };
+    let guards = |suffix: &str| {
+        rows("consensus:qc_signing:v1:")
+            .into_iter()
+            .filter(|k| k.ends_with(suffix))
+            .count()
+    };
+    let round_of = |h: u64| c.qc(0, h).unwrap().anchor_round;
+    let (floor, kept) = (5u64, 8u64);
+    // A pinned height keeps its block and QC (SN-4); the rest go.
+    let pins = state_commit::pin_schedule(tip, tip - floor, state_commit::epoch_interval(&s));
+    let pruned: Vec<u64> = (1..floor).filter(|h| !pins.contains(h)).collect();
+    assert!(!pruned.is_empty() && !pins.contains(&kept));
+    let pruned_rounds: Vec<u64> = pruned.iter().map(|&h| round_of(h)).collect();
+    let kept_round = round_of(kept);
+    for (&h, r) in pruned.iter().zip(&pruned_rounds) {
+        assert!(
+            guards(&format!(":height:{h}")) > 0,
+            "vacuous: no guard at {h}"
+        );
+        assert!(
+            guards(&format!(":round:{r}")) > 0,
+            "vacuous: no guard at round {r}"
+        );
+    }
+    assert!(
+        !rows("consensus:anchor_decision:").is_empty(),
+        "vacuous: no decisions"
+    );
+
+    crate::dag::prune_history(&s, tip, Some((tip - floor, 1_000)));
+
+    for (&h, r) in pruned.iter().zip(&pruned_rounds) {
+        assert!(s.get(&format!("block_{h}")).unwrap().is_none(), "block {h}");
+        assert!(c.qc(0, h).is_none(), "qc {h}");
+        assert!(s
+            .get(&format!("consensus:qc_by_round:{r}"))
+            .unwrap()
+            .is_none());
+        assert!(
+            rows(&format!("consensus:qc_vote:{r}:")).is_empty(),
+            "votes {r}"
+        );
+        assert!(
+            rows(&format!("consensus:qc_vote_agg:{r}:")).is_empty(),
+            "agg {r}"
+        );
+        assert_eq!(guards(&format!(":height:{h}")), 0, "guard at {h}");
+        assert_eq!(guards(&format!(":round:{r}")), 0, "guard at round {r}");
+    }
+    let last_pruned = *pruned_rounds.last().unwrap();
+    for key in rows("consensus:anchor_decision:") {
+        let round: u64 = key.rsplit(':').next().unwrap().parse().unwrap();
+        assert!(round > last_pruned, "decision {key} survived");
+    }
+    // What is kept stays.
+    assert!(s.get(&format!("block_{kept}")).unwrap().is_some());
+    assert!(c.qc(0, kept).is_some());
+    assert!(guards(&format!(":height:{kept}")) > 0);
+    assert!(s
+        .get(&format!("consensus:qc_by_round:{kept_round}"))
+        .unwrap()
+        .is_some());
+}

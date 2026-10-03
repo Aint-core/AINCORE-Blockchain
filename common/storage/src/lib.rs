@@ -519,10 +519,12 @@ impl StateDB {
         }
     }
 
-    /// One block's body, its tx list and the tx indexes that point into it.
+    /// One block's body, its tx list, and the tx indexes and receipts of its
+    /// transactions (B6: receipts used to stay forever).
     fn delete_block(&self, height: u64, batch: &mut rocksdb::WriteBatch) {
         for tx_hash in self.block_tx_hashes(height) {
             batch.delete(format!("tx_index:{}", tx_hash).as_bytes());
+            batch.delete(format!("tx_receipt:{}", tx_hash).as_bytes());
         }
         batch.delete(format!("block_{}", height).as_bytes());
         batch.delete(format!("block_txs:{}", height).as_bytes());

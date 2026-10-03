@@ -1291,6 +1291,7 @@ impl ChainSync {
                 // RE-AUDIT HIGH: the block's own slash evidence, verified by
                 // the executor — identical on every node.
                 &block.slash_evidence,
+                &block.committed_authors,
                 |view| Self::validate_admission_in(view, block),
                 |summary, view| {
                     Self::verify_execution_roots_in(block, summary)?;
@@ -1685,6 +1686,7 @@ pub(crate) fn dry_run_empty_block_root(storage: &Arc<StateDB>, height: u64, time
         height,
         timestamp,
         0,
+        &[],
         &[],
         |_| Ok(()),
         |summary, _| {

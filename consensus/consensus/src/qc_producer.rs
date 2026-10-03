@@ -424,6 +424,148 @@ fn produce_qc_staged(
     Ok(QcOutcome::Complete(qc))
 }
 
+/// B6: where `prune_finality_rows` resumes.
+pub const FINALITY_PRUNE_CURSOR_KEY: &str = "consensus:finality_prune_cursor";
+
+/// B6: the finality rows of the blocks below `floor`, which block pruning
+/// removes: their QC under both keys, every vote and aggregation row of their
+/// anchor round, the signing guards at their height and round, and the
+/// anchor decisions of their epoch up to that round. They grew by ~7 KB a
+/// block forever, half of an empty block's storage. A node votes only on the
+/// block above its tip, and these heights are a retention window below it,
+/// so no guard is needed again (and a validator is never restored from a
+/// backup). Pinned heights keep their rows: a snapshot at a pin is served
+/// with its QC. At most `max_heights` per call, from a persisted cursor.
+/// Node-local. Returns how many heights it pruned.
+pub fn prune_finality_rows(
+    storage: &StateDB,
+    floor: u64,
+    pinned: &std::collections::BTreeSet<u64>,
+    max_heights: u64,
+) -> Result<usize, String> {
+    let mut cursor = storage
+        .get(FINALITY_PRUNE_CURSOR_KEY)
+        .map_err(|e| e.to_string())?
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(1);
+    if cursor >= floor || max_heights == 0 {
+        return Ok(0);
+    }
+    let end = floor.min(cursor.saturating_add(max_heights));
+    let mut doomed: Vec<String> = Vec::new();
+    let mut pruned = 0usize;
+    while cursor < end {
+        let height = cursor;
+        cursor += 1;
+        if !pinned.contains(&height) {
+            pruned += usize::from(finality_rows_of(storage, height, &mut doomed)?);
+        }
+    }
+    storage
+        .transaction(|view| {
+            for key in &doomed {
+                view.delete(key)?;
+            }
+            view.put(FINALITY_PRUNE_CURSOR_KEY, &cursor.to_string())
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(pruned)
+}
+
+/// B6: the finality rows of the one block at `height` (a pinned block whose
+/// pin expired goes this way). Node-local.
+pub fn prune_finality_height(storage: &StateDB, height: u64) -> Result<bool, String> {
+    let mut doomed = Vec::new();
+    let found = finality_rows_of(storage, height, &mut doomed)?;
+    storage
+        .transaction(|view| {
+            for key in &doomed {
+                view.delete(key)?;
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(found)
+}
+
+/// The keys of the finality rows of `height`, found through its QC. False
+/// when it has no QC (nothing of it was certified here).
+fn finality_rows_of(
+    storage: &StateDB,
+    height: u64,
+    doomed: &mut Vec<String>,
+) -> Result<bool, String> {
+    let qc_key = format!("consensus:qc:{height}");
+    let Some(raw) = storage.get(&qc_key).map_err(|e| e.to_string())? else {
+        return Ok(false);
+    };
+    let qc: QuorumCertificate = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let round = qc.anchor_round;
+    doomed.push(qc_key);
+    doomed.push(format!("consensus:qc_by_round:{round}"));
+    let keys_under = |prefix: &str| -> Vec<String> {
+        let mut keys = Vec::new();
+        for row in storage.db.prefix_iterator(prefix.as_bytes()) {
+            let Ok((key, _)) = row else { break };
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            if let Ok(key) = std::str::from_utf8(&key) {
+                keys.push(key.to_string());
+            }
+        }
+        keys
+    };
+    doomed.extend(keys_under(&format!("consensus:qc_vote:{round}:")));
+    doomed.extend(keys_under(&format!("consensus:qc_vote_agg:{round}:")));
+    // Every signing key's guards at this height and round: one seek per key
+    // that ever signed here, never a scan of every guard.
+    let chain = hex::encode(Sha256::digest(qc.chain_id.as_bytes()));
+    let guards = format!("consensus:qc_signing:v1:{chain}:");
+    for signer in guard_signers(storage, &guards) {
+        doomed.push(format!("{guards}{signer}:height:{height}"));
+        doomed.push(format!("{guards}{signer}:round:{round}"));
+    }
+    // The anchor decisions of its epoch up to its round (keys sort by round).
+    let decisions = format!("consensus:anchor_decision:{:020}:", qc.epoch);
+    for key in keys_under(&decisions) {
+        match key[decisions.len()..].parse::<u64>() {
+            Ok(r) if r <= round => doomed.push(key),
+            _ => break,
+        }
+    }
+    Ok(true)
+}
+
+/// The public keys with signing guards under `prefix`, found by seeking
+/// past each one's rows.
+fn guard_signers(storage: &StateDB, prefix: &str) -> Vec<String> {
+    let mut signers = Vec::new();
+    let mut seek = prefix.to_string();
+    loop {
+        let mut rows = storage.db.iterator(storage::rocksdb::IteratorMode::From(
+            seek.as_bytes(),
+            storage::rocksdb::Direction::Forward,
+        ));
+        let Some(Ok((key, _))) = rows.next() else {
+            break;
+        };
+        let Ok(key) = std::str::from_utf8(&key) else {
+            break;
+        };
+        let Some(signer) = key
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.split(':').next())
+        else {
+            break;
+        };
+        signers.push(signer.to_string());
+        // ';' sorts right after ':', past every row of this signer.
+        seek = format!("{prefix}{signer};");
+    }
+    signers
+}
+
 fn signing_guard_keys(vote: &FinalityVote, public_key: &str) -> [String; 2] {
     let chain = hex::encode(Sha256::digest(vote.chain_id.as_bytes()));
     let prefix = format!("consensus:qc_signing:v1:{chain}:{public_key}");

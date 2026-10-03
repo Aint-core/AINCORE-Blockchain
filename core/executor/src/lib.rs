@@ -642,6 +642,13 @@ pub fn bootstrap_slots_key(epoch: u64) -> String {
     format!("sys:bootstrap:slots:{epoch}")
 }
 
+/// B4: per operator, the rounds it could author a vertex in during committee
+/// epoch `epoch` and how many committed vertices it authored:
+/// `{address: [rounds, authored]}`.
+pub fn bootstrap_vertices_key(epoch: u64) -> String {
+    format!("sys:bootstrap:vertices:{epoch}")
+}
+
 /// BW-6: the anchor round of the last executed block.
 pub const BOOTSTRAP_ROUND_KEY: &str = "sys:bootstrap:round";
 
@@ -683,13 +690,41 @@ pub const BOOTSTRAP_END_HOLD_SECS: u64 = 21 * 86_400;
 /// degraded and every boundary raises the alarm.
 pub const BOOTSTRAP_MIN_PARTIES: usize = 4;
 
+/// BW-6: `part` of `whole` in parts per million, at most one million; none
+/// when there was nothing to take part in.
+pub fn participation_ppm(part: u64, whole: u64) -> Option<u64> {
+    (whole > 0)
+        .then(|| (part.min(whole) as u128 * BOOTSTRAP_SCORE_SCALE as u128 / whole as u128) as u64)
+}
+
+/// BW-6: one epoch's participation, in parts per million, folded into a
+/// score; an epoch with nothing to take part in leaves it.
+pub fn fold_bootstrap_score(score: u64, ratio: Option<u64>) -> u64 {
+    match ratio {
+        None => score,
+        Some(ratio) => score - score / BOOTSTRAP_SCORE_EPOCHS + ratio / BOOTSTRAP_SCORE_EPOCHS,
+    }
+}
+
 /// BW-6: one epoch's slots and commits folded into a score.
 pub fn next_bootstrap_score(score: u64, slots: u64, led: u64) -> u64 {
-    if slots == 0 {
-        return score;
+    fold_bootstrap_score(score, participation_ppm(led, slots))
+}
+
+/// B4: an epoch's participation is the lower of its two shares: of its
+/// leader slots committed (BW-6) and of its rounds with a committed vertex
+/// it authored. Leading alone, or authoring while withholding anchors, is
+/// not full participation.
+pub fn epoch_participation(
+    leader: Option<(u64, u64)>,
+    authored: Option<(u64, u64)>,
+) -> Option<u64> {
+    let leader = leader.and_then(|(slots, led)| participation_ppm(led, slots));
+    let authored = authored.and_then(|(rounds, authored)| participation_ppm(authored, rounds));
+    match (leader, authored) {
+        (Some(l), Some(a)) => Some(l.min(a)),
+        (l, a) => l.or(a),
     }
-    let ratio = (led.min(slots) as u128 * BOOTSTRAP_SCORE_SCALE as u128 / slots as u128) as u64;
-    score - score / BOOTSTRAP_SCORE_EPOCHS + ratio / BOOTSTRAP_SCORE_EPOCHS
 }
 
 /// BW-4: the owned stake P that secures consensus: the owned weight of the
@@ -2456,7 +2491,13 @@ impl Executor {
     /// committee of its epoch with consensus's own leader schedule, and
     /// whether the block's anchor is its leader's. Only operators are
     /// counted, and only on a chain with bootstrap operators.
-    fn count_bootstrap_slots(&self, height: u64, anchor_round: u64, proposer_hex: &str) {
+    fn count_bootstrap_slots(
+        &self,
+        height: u64,
+        anchor_round: u64,
+        proposer_hex: &str,
+        committed_authors: &[String],
+    ) {
         let last = self
             .db
             .get(BOOTSTRAP_ROUND_KEY)
@@ -2529,6 +2570,43 @@ impl Executor {
                 )
                 .expect("CRITICAL: the bootstrap slot count write failed");
         }
+
+        // B4: each operator in the committee could author one vertex per
+        // round the block closes (the rounds the leader scan covers), and is
+        // credited every committed vertex of the block it authored.
+        let first = anchor_round
+            .saturating_sub(2 * (BOOTSTRAP_MAX_ROUND_SCAN - 1))
+            .max(last + 1);
+        let rounds = anchor_round + 1 - first;
+        let mut authored: BTreeMap<&str, u64> = BTreeMap::new();
+        for author in committed_authors {
+            *authored.entry(author.as_str()).or_insert(0) += 1;
+        }
+        let key = bootstrap_vertices_key(epoch);
+        let mut vertices: BTreeMap<String, (u64, u64)> = self
+            .db
+            .get(&key)
+            .expect("CRITICAL: the bootstrap vertex count could not be read")
+            .map(|raw| {
+                serde_json::from_str(&raw).expect("CRITICAL: a bootstrap vertex count is corrupt")
+            })
+            .unwrap_or_default();
+        for op in &state.operators {
+            if !stakes.iter().any(|(address, _)| *address == op.address) {
+                continue;
+            }
+            let entry = vertices.entry(op.address.clone()).or_insert((0, 0));
+            entry.0 += rounds;
+            entry.1 += authored.get(op.address.as_str()).copied().unwrap_or(0);
+        }
+        if !vertices.is_empty() {
+            self.db
+                .put(
+                    &key,
+                    &serde_json::to_string(&vertices).expect("a vertex count is JSON"),
+                )
+                .expect("CRITICAL: the bootstrap vertex count write failed");
+        }
     }
 
     /// G5 A4 at the boundary opening `new_epoch`, given each live member's
@@ -2554,11 +2632,24 @@ impl Executor {
                 serde_json::from_str(&raw).expect("CRITICAL: a bootstrap slot count is corrupt")
             })
             .unwrap_or_default();
-        // BW-6: score the closed epoch.
+        let vertices_key = bootstrap_vertices_key(closed);
+        let vertices: BTreeMap<String, (u64, u64)> = self
+            .db
+            .get(&vertices_key)
+            .expect("CRITICAL: the bootstrap vertex count could not be read")
+            .map(|raw| {
+                serde_json::from_str(&raw).expect("CRITICAL: a bootstrap vertex count is corrupt")
+            })
+            .unwrap_or_default();
+        // BW-6, B4: score the closed epoch.
         for op in state.operators.iter_mut() {
-            if let Some(&(n, led)) = slots.get(&op.address) {
-                op.score = next_bootstrap_score(op.score, n, led);
-            }
+            op.score = fold_bootstrap_score(
+                op.score,
+                epoch_participation(
+                    slots.get(&op.address).copied(),
+                    vertices.get(&op.address).copied(),
+                ),
+            );
         }
         // BW-5: forfeit for good.
         for op in state.operators.iter_mut() {
@@ -2655,6 +2746,11 @@ impl Executor {
             self.db
                 .delete(&slots_key)
                 .expect("CRITICAL: the bootstrap slot count delete failed");
+        }
+        if !vertices.is_empty() {
+            self.db
+                .delete(&vertices_key)
+                .expect("CRITICAL: the bootstrap vertex count delete failed");
         }
         state
             .operators
@@ -3142,10 +3238,14 @@ impl Executor {
     ) -> BlockExecutionSummary {
         let height = self.last_executed_height().saturating_add(1);
         let timestamp = next_chain_clock(&self.db, height, 0).block_timestamp;
-        match self.execute_block_parallel_at(txs_json, proposer_hex, height, timestamp, 0, &[]) {
+        match self.execute_block_parallel_at(txs_json, proposer_hex, height, timestamp, 0, &[], &[])
+        {
             BlockExecOutcome::Executed(summary) => summary,
             other => {
-                eprintln!("⚠️ execute_block_parallel: {:?} — returning current roots", other);
+                eprintln!(
+                    "⚠️ execute_block_parallel: {:?} — returning current roots",
+                    other
+                );
                 BlockExecutionSummary {
                     state_root: self.current_state_root(),
                     receipts_root: self.receipts_root_for_block(&[]),
@@ -3176,6 +3276,7 @@ impl Executor {
     ///
     /// G5 CL-2: `block_timestamp` is the block's BFT timestamp (its header),
     /// which drives consensus time.
+    #[allow(clippy::too_many_arguments)] // the block (content, height, timestamp, round, evidence, authors)
     pub fn execute_block_parallel_at(
         &self,
         txs_json: Vec<String>,
@@ -3186,6 +3287,8 @@ impl Executor {
         anchor_round: u64,
         // RE-AUDIT HIGH: slash evidence CARRIED BY THE BLOCK (see apply_slash_evidence).
         slash_evidence: &[String],
+        // B4: the authors of the block's committed vertices.
+        committed_authors: &[String],
     ) -> BlockExecOutcome {
         self.execute_block_checked_at(
             txs_json,
@@ -3194,6 +3297,7 @@ impl Executor {
             block_timestamp,
             anchor_round,
             slash_evidence,
+            committed_authors,
             |_, _| Ok(()),
         )
         .expect("block state transaction failed; no execution result may be published")
@@ -3212,6 +3316,7 @@ impl Executor {
         block_timestamp: u64,
         anchor_round: u64,
         slash_evidence: &[String],
+        committed_authors: &[String],
         accept: impl FnOnce(&BlockExecutionSummary, &StateDB) -> Result<(), String>,
     ) -> Result<BlockExecOutcome, String> {
         self.execute_block_admitted_at(
@@ -3221,6 +3326,7 @@ impl Executor {
             block_timestamp,
             anchor_round,
             slash_evidence,
+            committed_authors,
             |_| Ok(()),
             accept,
         )
@@ -3240,6 +3346,7 @@ impl Executor {
         block_timestamp: u64,
         anchor_round: u64,
         slash_evidence: &[String],
+        committed_authors: &[String],
         admit: impl FnOnce(&StateDB) -> Result<(), String>,
         accept: impl FnOnce(&BlockExecutionSummary, &StateDB) -> Result<(), String>,
     ) -> Result<BlockExecOutcome, String> {
@@ -3273,6 +3380,7 @@ impl Executor {
                     block_timestamp,
                     anchor_round,
                     slash_evidence,
+                    committed_authors,
                 );
                 if let BlockExecOutcome::Executed(summary) = &outcome {
                     accept(summary, &view).map_err(storage::StorageError::DatabaseOperation)?;
@@ -3293,6 +3401,7 @@ impl Executor {
     // Only called with BLOCK_EXECUTION_LOCK and the storage writer gate held.
     // This function sees its own staged writes; none are durable until the
     // transaction driver publishes the complete result with one synced batch.
+    #[allow(clippy::too_many_arguments)] // the block (content, height, timestamp, round, evidence, authors)
     fn execute_block_staged_at(
         &self,
         txs_json: Vec<String>,
@@ -3301,8 +3410,8 @@ impl Executor {
         block_timestamp: u64,
         anchor_round: u64,
         slash_evidence: &[String],
+        committed_authors: &[String],
     ) -> BlockExecOutcome {
-
         // STRICT HEIGHT ORDER (see BlockExecOutcome). Checked INSIDE the lock and
         // paired with the marker write at the end of this function, so the
         // check-then-execute is atomic against the other execution path.
@@ -3676,7 +3785,7 @@ impl Executor {
         // boundary block records C_{E+1}.
         // G5 A4 BW-6: the block's slots count toward its epoch before a
         // boundary scores that epoch.
-        self.count_bootstrap_slots(block_height, anchor_round, proposer_hex);
+        self.count_bootstrap_slots(block_height, anchor_round, proposer_hex, committed_authors);
         self.maybe_pay_rewards(block_height);
         self.maybe_advance_epoch(block_height);
 
@@ -6835,11 +6944,18 @@ mod tests {
                 .collect()
         };
         let before = state_rows(&db);
-        let s1 =
-            match executor.execute_block_parallel_at(vec![], proposer, 1, block_time(1), 0, &[]) {
-                BlockExecOutcome::Executed(s) => s,
-                other => panic!("height 1 must execute: {:?}", other),
-            };
+        let s1 = match executor.execute_block_parallel_at(
+            vec![],
+            proposer,
+            1,
+            block_time(1),
+            0,
+            &[],
+            &[],
+        ) {
+            BlockExecOutcome::Executed(s) => s,
+            other => panic!("height 1 must execute: {:?}", other),
+        };
         assert_eq!(executor.last_executed_height(), 1);
         // G5 CL-2: an empty block changes exactly one state key, the chain
         // clock: its height, and consensus time grown by the timestamp's
@@ -6867,7 +6983,7 @@ mod tests {
 
         // Re-executing the SAME height is refused — this is the double execution
         // that corrupted the root chain live.
-        match executor.execute_block_parallel_at(vec![], proposer, 1, block_time(1), 0, &[]) {
+        match executor.execute_block_parallel_at(vec![], proposer, 1, block_time(1), 0, &[], &[]) {
             BlockExecOutcome::AlreadyExecuted { last_executed } => {
                 assert_eq!(last_executed, 1)
             }
@@ -6880,20 +6996,31 @@ mod tests {
         );
 
         // Skipping ahead is refused: executing out of order corrupts the chain.
-        match executor.execute_block_parallel_at(vec![], proposer, 3, block_time(3), 0, &[]) {
+        match executor.execute_block_parallel_at(vec![], proposer, 3, block_time(3), 0, &[], &[]) {
             BlockExecOutcome::Gap { expected, got } => {
                 assert_eq!((expected, got), (2, 3))
             }
             other => panic!("height 3 after 1 must be a Gap, got {:?}", other),
         }
-        assert_eq!(executor.last_executed_height(), 1, "a refused gap consumes nothing");
+        assert_eq!(
+            executor.last_executed_height(),
+            1,
+            "a refused gap consumes nothing"
+        );
 
         // The next height in order still works afterwards.
-        let s2 =
-            match executor.execute_block_parallel_at(vec![], proposer, 2, block_time(2), 0, &[]) {
-                BlockExecOutcome::Executed(s) => s,
-                other => panic!("height 2 must execute after 1: {:?}", other),
-            };
+        let s2 = match executor.execute_block_parallel_at(
+            vec![],
+            proposer,
+            2,
+            block_time(2),
+            0,
+            &[],
+            &[],
+        ) {
+            BlockExecOutcome::Executed(s) => s,
+            other => panic!("height 2 must execute after 1: {:?}", other),
+        };
         assert_eq!(executor.last_executed_height(), 2);
         // The clock write is in the root, so each empty block moves it; the
         // height marker is what makes each height consumable exactly once.
@@ -6931,6 +7058,9 @@ mod tests {
         /// every block and no round is given.
         offline: Option<std::collections::BTreeSet<String>>,
         last_round: u64,
+        /// B4: members that author a vertex only in the rounds they lead.
+        /// Everyone else online authors one in every round.
+        lazy: std::collections::BTreeSet<String>,
     }
 
     impl G5Chain {
@@ -6967,6 +7097,7 @@ mod tests {
                 nonces: Default::default(),
                 offline: None,
                 last_round: 0,
+                lazy: Default::default(),
             }
         }
 
@@ -7048,8 +7179,8 @@ mod tests {
             self.height += 1;
             self.timestamp = timestamp;
             let n = txs.len();
-            let (proposer, round) = match &self.offline {
-                None => (self.proposer.clone(), 0),
+            let (proposer, round, authors) = match &self.offline {
+                None => (self.proposer.clone(), 0, Vec::new()),
                 Some(offline) => {
                     let epoch = (self.height - 1) / self.executor.epoch_block_interval();
                     let mut stakes: Vec<(String, u64)> = self
@@ -7059,15 +7190,31 @@ mod tests {
                         .map(|m| (m.address, m.stake))
                         .collect();
                     stakes.sort();
+                    let first = self.last_round + 1;
                     let mut round = self.last_round + 2;
-                    loop {
+                    let leader = loop {
                         let leader = blockchain::committee::leader_for_round(round, &stakes, 0);
                         if !offline.contains(&leader) {
                             self.last_round = round;
-                            break (leader, round);
+                            break leader;
                         }
                         round += 2;
+                    };
+                    // B4: the vertices the anchor commits: one per online
+                    // member per round it closes, a lazy member's only in
+                    // the rounds it leads.
+                    let mut authors = Vec::new();
+                    for r in first..=round {
+                        for (member, _) in &stakes {
+                            let leads = r % 2 == 0
+                                && blockchain::committee::leader_for_round(r, &stakes, 0)
+                                    == *member;
+                            if !offline.contains(member) && (leads || !self.lazy.contains(member)) {
+                                authors.push(member.clone());
+                            }
+                        }
                     }
+                    (leader, round, authors)
                 }
             };
             match self.executor.execute_block_parallel_at(
@@ -7077,6 +7224,7 @@ mod tests {
                 timestamp,
                 round,
                 &[],
+                &authors,
             ) {
                 BlockExecOutcome::Executed(s) => {
                     assert_eq!(s.executed_raws.len(), n, "every tx runs at {}", self.height)
@@ -8485,6 +8633,7 @@ mod tests {
             chain.timestamp,
             0,
             &[],
+            &[],
         );
         match outcome {
             BlockExecOutcome::Executed(s) => assert!(s.executed_raws.is_empty(), "the join ran"),
@@ -8660,6 +8809,7 @@ mod tests {
             chain.timestamp,
             0,
             &[item(&a1, &b1)],
+            &[],
         ) {
             BlockExecOutcome::Executed(_) => {}
             other => panic!("the block must execute: {other:?}"),
@@ -8884,6 +9034,7 @@ mod tests {
             chain.timestamp,
             0,
             &[item(&a, &b)],
+            &[],
         ) {
             BlockExecOutcome::Executed(_) => {}
             other => panic!("the block must execute: {other:?}"),
@@ -10629,6 +10780,7 @@ mod tests {
             chain.timestamp,
             last - 2,
             &[],
+            &[],
         );
         assert!(matches!(stale, BlockExecOutcome::Executed(_)));
         assert_eq!(counted(&db), before);
@@ -10656,11 +10808,79 @@ mod tests {
             chain.timestamp,
             next,
             &[],
+            &[],
         );
         assert!(matches!(foreign, BlockExecOutcome::Executed(_)));
         let after: BTreeMap<String, (u64, u64)> =
             serde_json::from_str(&counted(&db).unwrap()).unwrap();
         assert_eq!(after[&leader], (n0 + 1, l0), "a slot, no commit");
+    }
+
+    /// B4: an operator that leads its slots but authors no other vertex has
+    /// a full leader share and a vertex share near 1/(2n): its score falls
+    /// below half and it forfeits, while an operator authoring every round
+    /// climbs. Both start just above the floor.
+    #[test]
+    fn b4_an_operator_that_only_leads_forfeits() {
+        let ain = G5_AIN;
+        let members = [
+            (181u8, 1_000u64, 3_000u64),
+            (182, 1_000, 3_000),
+            (183, 1_000, 3_000),
+            (184, 1_000, 3_000),
+        ];
+        let lazy = committee_member(182, 0).address;
+        let honest = committee_member(183, 0).address;
+        let (lazy_seed, honest_seed) = (lazy.clone(), honest.clone());
+        let mut chain = G5Chain::new("b4_lazy", 14, move |db| {
+            seed_bootstrap_chain(db, &members, 1_000_000 * ain);
+            let mut state = read_bootstrap(db).unwrap();
+            for op in state.operators.iter_mut() {
+                if op.address == lazy_seed || op.address == honest_seed {
+                    op.score = 501_000;
+                }
+            }
+            let _seed = db.seeding();
+            db.put(BOOTSTRAP_KEY, &serde_json::to_string(&state).unwrap())
+                .unwrap();
+        });
+        chain.offline = Some(Default::default());
+        chain.lazy = [lazy.clone()].into_iter().collect();
+        let db = chain.db.clone();
+        chain.run_blocks(19, 7);
+        let slots: BTreeMap<String, (u64, u64)> =
+            serde_json::from_str(&db.get(&bootstrap_slots_key(0)).unwrap().unwrap()).unwrap();
+        let vertices: BTreeMap<String, (u64, u64)> =
+            serde_json::from_str(&db.get(&bootstrap_vertices_key(0)).unwrap().unwrap()).unwrap();
+        let (n, led) = slots[&lazy];
+        assert!(n > 0 && led == n, "the lazy operator commits every slot");
+        let (rounds, authored) = vertices[&lazy];
+        assert!(
+            authored > 0 && authored * 4 < rounds,
+            "{authored} of {rounds}"
+        );
+        assert_eq!(
+            vertices[&honest].0, vertices[&honest].1,
+            "honest authors every round"
+        );
+        // The boundary block (one more anchor) closes epoch 0 for both.
+        chain.run_blocks(1, 7);
+        let boot = bootstrap_of(&db);
+        assert!(
+            boot.operators.iter().all(|o| o.address != lazy),
+            "the lazy operator forfeits and leaves the bootstrap set"
+        );
+        assert_eq!(boot.weight_of(&lazy), 0);
+        let honest_score = boot
+            .operators
+            .iter()
+            .find(|o| o.address == honest)
+            .expect("the honest operator stays")
+            .score;
+        assert!(honest_score > 501_000, "{honest_score}");
+        assert_eq!(boot.weight_of(&honest), 3_000);
+        // Control: its leader share alone would have kept it.
+        assert!(next_bootstrap_score(501_000, n, led) > BOOTSTRAP_SCORE_FLOOR);
     }
 
     /// G5 A4 BW-6 across a boundary (review INFO): with every member an
@@ -10706,6 +10926,14 @@ mod tests {
         // other operator misses its rounds: the scores depend on H_1.
         let before = bootstrap_of(&db);
         let mut expected = slots.clone();
+        // B4: online members authored a vertex in every round of epoch 1,
+        // the offline one in none.
+        let mut expected_vertices: BTreeMap<String, (u64, u64)> =
+            serde_json::from_str(&db.get(&bootstrap_vertices_key(1)).unwrap().unwrap()).unwrap();
+        for (address, (rounds, authored)) in &expected_vertices {
+            let want = if *address == offline { 0 } else { *rounds };
+            assert_eq!(*authored, want, "{address}");
+        }
         let last = chain.last_round;
         chain.offline = Some(
             members
@@ -10728,9 +10956,17 @@ mod tests {
             }
             round += 2;
         }
+        // B4: H_1 closes (last, r_last]; only its one online member authors.
+        let rounds = chain.last_round - last;
+        for (address, _) in &stakes {
+            let entry = expected_vertices.entry(address.clone()).or_insert((0, 0));
+            entry.0 += rounds;
+            if *address == offline {
+                entry.1 += rounds;
+            }
+        }
         let after = bootstrap_of(&db);
         for op in &before.operators {
-            let (n, led) = expected.get(&op.address).copied().unwrap_or((0, 0));
             let score = after
                 .operators
                 .iter()
@@ -10738,7 +10974,13 @@ mod tests {
                 .map(|o| o.score);
             assert_eq!(
                 score,
-                Some(next_bootstrap_score(op.score, n, led)),
+                Some(fold_bootstrap_score(
+                    op.score,
+                    epoch_participation(
+                        expected.get(&op.address).copied(),
+                        expected_vertices.get(&op.address).copied(),
+                    )
+                )),
                 "{}",
                 op.address
             );
@@ -11381,9 +11623,16 @@ mod tests {
         let (db, sender, tx_json) = g3_burning_transfer("g3_unlogged_in_root");
         let gas = gas_of(&tx_json) as u128;
         let outcome = Executor::new(db.clone())
-            .execute_block_checked_at(vec![tx_json], &sender, 1, block_time(1), 0, &[], |_, _| {
-                Ok(())
-            })
+            .execute_block_checked_at(
+                vec![tx_json],
+                &sender,
+                1,
+                block_time(1),
+                0,
+                &[],
+                &[],
+                |_, _| Ok(()),
+            )
             .unwrap();
         let BlockExecOutcome::Executed(summary) = outcome else {
             panic!("block 1 must execute: {outcome:?}");
@@ -11483,7 +11732,9 @@ mod tests {
         tx["public_key"] = serde_json::json!(public_key.to_ascii_uppercase());
         let tx = tx.to_string();
         let Ok(BlockExecOutcome::Executed(summary)) = Executor::new(db.clone())
-            .execute_block_checked_at(vec![tx], &address, 1, block_time(1), 0, &[], |_, _| Ok(()))
+            .execute_block_checked_at(vec![tx], &address, 1, block_time(1), 0, &[], &[], |_, _| {
+                Ok(())
+            })
         else {
             panic!("block must execute");
         };
@@ -11520,6 +11771,7 @@ mod tests {
             block_time(1),
             0,
             &[],
+            &[],
             |_, _| Ok(()),
         ) else {
             panic!("block 1 must execute");
@@ -11541,6 +11793,7 @@ mod tests {
             2,
             block_time(2),
             0,
+            &[],
             &[],
             |_, _| Ok(()),
         ) else {
@@ -11572,9 +11825,16 @@ mod tests {
         )
         .unwrap();
         let outcome = Executor::new(db.clone())
-            .execute_block_checked_at(vec![tx_json], &sender, 1, block_time(1), 0, &[], |_, _| {
-                Ok(())
-            })
+            .execute_block_checked_at(
+                vec![tx_json],
+                &sender,
+                1,
+                block_time(1),
+                0,
+                &[],
+                &[],
+                |_, _| Ok(()),
+            )
             .unwrap();
         assert!(matches!(outcome, BlockExecOutcome::Executed(_)));
         let queued: Vec<String> = db
@@ -11659,7 +11919,7 @@ mod tests {
         );
         txs.push(pay.clone());
         let Ok(BlockExecOutcome::Executed(summary)) = Executor::new(db.clone())
-            .execute_block_checked_at(txs, &honest, 1, block_time(1), 0, &[], |_, _| Ok(()))
+            .execute_block_checked_at(txs, &honest, 1, block_time(1), 0, &[], &[], |_, _| Ok(()))
         else {
             panic!("block must execute");
         };
@@ -11733,7 +11993,7 @@ mod tests {
         let pay = with_objects(&honest_key, &honest, 0, 999);
         txs.push(pay.clone());
         let Ok(BlockExecOutcome::Executed(summary)) = Executor::new(db.clone())
-            .execute_block_checked_at(txs, &honest, 1, block_time(1), 0, &[], |_, _| Ok(()))
+            .execute_block_checked_at(txs, &honest, 1, block_time(1), 0, &[], &[], |_, _| Ok(()))
         else {
             panic!("block must execute");
         };
@@ -11771,7 +12031,7 @@ mod tests {
         }
         seed_genesis_tree(&db);
         let Ok(BlockExecOutcome::Executed(summary)) = Executor::new(db.clone())
-            .execute_block_checked_at(txs, &sink, 1, block_time(1), 0, &[], |_, _| Ok(()))
+            .execute_block_checked_at(txs, &sink, 1, block_time(1), 0, &[], &[], |_, _| Ok(()))
         else {
             panic!("block must execute");
         };
@@ -11794,6 +12054,7 @@ mod tests {
             block_time(1),
             0,
             &[],
+            &[],
             |_, view| view.put("obj:escapee", "x").map_err(|e| e.to_string()),
         );
         let err = refused.expect_err("a post-seal state write must refuse the block");
@@ -11812,6 +12073,7 @@ mod tests {
             1,
             block_time(1),
             0,
+            &[],
             &[],
             |_, view| view.put("latest_height", "1").map_err(|e| e.to_string()),
         );
@@ -14209,10 +14471,11 @@ mod tests {
 
         let db = temp_db("h6_blind");
         load_stdlib(&db);
-        db.set_federation_key("00000000000000000000000000000000").unwrap();
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
         let exec = Executor::new(db.clone());
         let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
-        match exec.execute_block_parallel_at(vec![], proposer, 1, block_time(1), 0, &[]) {
+        match exec.execute_block_parallel_at(vec![], proposer, 1, block_time(1), 0, &[], &[]) {
             BlockExecOutcome::Executed(_) => {}
             other => panic!("height 1 must execute: {:?}", other),
         }
@@ -14276,7 +14539,7 @@ mod tests {
         seed_genesis_tree(&db_a);
         let exec_a = Executor::new(db_a.clone());
         let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
-        match exec_a.execute_block_parallel_at(vec![], proposer, 1, block_time(1), 0, &[]) {
+        match exec_a.execute_block_parallel_at(vec![], proposer, 1, block_time(1), 0, &[], &[]) {
             BlockExecOutcome::Executed(_) => {}
             other => panic!("height 1 must execute: {:?}", other),
         }
@@ -14370,7 +14633,7 @@ mod tests {
         seed_genesis_tree(&db_a);
         let exec_a = Executor::new(db_a.clone());
         let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
-        match exec_a.execute_block_parallel_at(vec![], proposer, 1, block_time(1), 0, &[]) {
+        match exec_a.execute_block_parallel_at(vec![], proposer, 1, block_time(1), 0, &[], &[]) {
             BlockExecOutcome::Executed(_) => {}
             other => panic!("height 1 must execute: {:?}", other),
         }

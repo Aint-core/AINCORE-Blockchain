@@ -885,6 +885,24 @@ impl Engine {
         if !self.is_staged(&cert.body.digest) {
             self.want_body(&cert);
         }
+        // B5 trace: an anchor leader's certificate that arrives after its
+        // round reached quorum, with how many ticks later and whether this
+        // node had already moved on without it.
+        if round >= 2 && round.is_multiple_of(2) {
+            if let Some(since) = self.quorum_since.get(&round).copied() {
+                if OrderingEngine::leader_for_round(round, &self.stakes, 0) == cert.body.author {
+                    println!(
+                        "⏱️ [B5] anchor {round}: leader certificate {} ticks after quorum{}",
+                        self.tick - since,
+                        if self.own.contains_key(&(round + 1)) {
+                            ", after this node proposed without it"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+        }
         self.certs.insert(key, cert);
         self.last_cert_tick = self.tick;
         let total: u128 = self.stakes.iter().map(|(_, s)| *s as u128).sum();
@@ -1134,8 +1152,17 @@ impl Engine {
         if round > self.first_round && prev >= 2 && prev.is_multiple_of(2) {
             let leader = OrderingEngine::leader_for_round(prev, &self.stakes, 0);
             let since = self.quorum_since.get(&prev).copied().unwrap_or(self.tick);
-            if !self.certs.contains_key(&(prev, leader)) && self.tick < since + T_LEADER_TICKS {
-                return None;
+            if !self.certs.contains_key(&(prev, leader.clone())) {
+                if self.tick < since + T_LEADER_TICKS {
+                    return None;
+                }
+                // B5 trace: the wait ran out; this vertex cannot support
+                // the anchor.
+                println!(
+                    "⏱️ [B5] round {round}: no certificate from anchor {prev}'s leader {:.8} after {} ticks",
+                    leader,
+                    self.tick - since
+                );
             }
         }
         let cursor = lock(&self.ordering).next_anchor_round;

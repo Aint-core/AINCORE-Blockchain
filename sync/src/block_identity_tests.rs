@@ -6,6 +6,7 @@ fn fixture(name: &str) -> (ChainSync, Block) {
 
 fn fixture_with(name: &str, committed_vertices: Vec<String>) -> (ChainSync, Block) {
     let anchor = committed_vertices.last().cloned().unwrap_or_default();
+    let authors = vec!["c1".repeat(32); committed_vertices.len()];
     let sync = setup_sync(&unique_name(&format!("identity_{name}")));
     let key = crypto::SigningKey::from_bytes(&[77; 32]);
     let proposer = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
@@ -22,6 +23,7 @@ fn fixture_with(name: &str, committed_vertices: Vec<String>) -> (ChainSync, Bloc
         executor.receipts_root_for_block(&[]),
         23,
         committed_vertices,
+        authors,
         anchor,
         vec![],
     );

@@ -49,6 +49,12 @@ pub struct Block {
     /// with the producer (same committed set, same cursor, same finality digest).
     #[serde(default)]
     pub committed_vertices: Vec<String>,
+    /// B4: the author of each committed vertex, index-aligned with
+    /// `committed_vertices`, so the executor measures each member's
+    /// participation by the vertices it authored. Bound with the sequence by
+    /// `vertices_root`; `check_commitments` requires the two to align.
+    #[serde(default)]
+    pub committed_authors: Vec<String>,
     /// The anchor vertex hash this block was built from (CommitInfo.anchor_hash).
     #[serde(default)]
     pub anchor_hash: String,
@@ -98,6 +104,7 @@ impl Block {
             header: _,
             transactions,
             committed_vertices,
+            committed_authors,
             anchor_hash,
             proposer_signature: _,
             proposer_signer: _,
@@ -106,6 +113,7 @@ impl Block {
         body_bytes(
             transactions,
             committed_vertices,
+            committed_authors,
             anchor_hash,
             slash_evidence,
         )
@@ -131,7 +139,14 @@ impl Block {
                 h.tx_hash, computed
             ));
         }
-        let computed = calculate_vertices_root(&self.committed_vertices);
+        if self.committed_authors.len() != self.committed_vertices.len() {
+            return Err(format!(
+                "Vertices root mismatch: {} authors for {} committed vertices",
+                self.committed_authors.len(),
+                self.committed_vertices.len()
+            ));
+        }
+        let computed = calculate_vertices_root(&self.committed_vertices, &self.committed_authors);
         if computed != h.vertices_root {
             return Err(format!(
                 "Vertices root mismatch: expected {}, computed {}",
@@ -309,6 +324,7 @@ impl Block {
             receipts_root,
             timestamp,
             Vec::new(),
+            Vec::new(),
             String::new(),
             Vec::new(),
         )
@@ -331,15 +347,17 @@ impl Block {
         receipts_root: String,
         timestamp: u64,
         committed_vertices: Vec<String>,
+        committed_authors: Vec<String>,
         anchor_hash: String,
         slash_evidence: Vec<String>,
     ) -> Self {
         let tx_hash = calculate_tx_hash(&transactions);
-        let vertices_root = calculate_vertices_root(&committed_vertices);
+        let vertices_root = calculate_vertices_root(&committed_vertices, &committed_authors);
         let evidence_root = calculate_evidence_root(&slash_evidence);
         let da_root = calculate_da_root(
             &transactions,
             &committed_vertices,
+            &committed_authors,
             &anchor_hash,
             &slash_evidence,
         );
@@ -366,6 +384,7 @@ impl Block {
             header,
             transactions,
             committed_vertices,
+            committed_authors,
             anchor_hash,
             proposer_signature: String::new(),
             proposer_signer: String::new(),
@@ -382,9 +401,10 @@ impl Block {
 // V2 (B1) adds `da_root`; a new layout takes a new domain.
 const HEADER_DOMAIN: &[u8] = b"AINCORE_BLOCK_HEADER_V2\0";
 const TXS_DOMAIN: &[u8] = b"AINCORE_BLOCK_TXS_V1\0";
-const VERTICES_DOMAIN: &[u8] = b"AINCORE_BLOCK_VERTICES_V1\0";
+// B4 adds the committed vertices' authors to the sequence root and the body.
+const VERTICES_DOMAIN: &[u8] = b"AINCORE_BLOCK_SEQUENCE_V1\0";
 const EVIDENCE_DOMAIN: &[u8] = b"AINCORE_BLOCK_EVIDENCE_V1\0";
-const BODY_DOMAIN: &[u8] = b"AINCORE_BLOCK_BODY_V1\0";
+const BODY_DOMAIN: &[u8] = b"AINCORE_BLOCK_BODY_V2\0";
 
 /// Preimage writer: integers are u64 little-endian, a string is its byte length
 /// (u64 LE) then its bytes, a list is its count (u64 LE) then its strings, and
@@ -485,12 +505,14 @@ pub fn calculate_header_hash(header: &BlockHeader) -> String {
 pub fn body_bytes(
     transactions: &[String],
     committed_vertices: &[String],
+    committed_authors: &[String],
     anchor_hash: &str,
     slash_evidence: &[String],
 ) -> Vec<u8> {
     let mut p = Preimage::new(BODY_DOMAIN);
     p.list(transactions);
     p.list(committed_vertices);
+    p.list(committed_authors);
     p.str(anchor_hash);
     p.list(slash_evidence);
     p.0
@@ -500,12 +522,14 @@ pub fn body_bytes(
 pub fn calculate_da_root(
     transactions: &[String],
     committed_vertices: &[String],
+    committed_authors: &[String],
     anchor_hash: &str,
     slash_evidence: &[String],
 ) -> String {
     da::da_root(&body_bytes(
         transactions,
         committed_vertices,
+        committed_authors,
         anchor_hash,
         slash_evidence,
     ))
@@ -522,14 +546,16 @@ pub fn calculate_evidence_root(items: &[String]) -> String {
     p.digest()
 }
 
-/// Root binding a block's committed vertex sequence (order-sensitive). Empty
-/// sequence => empty root, which the header hash encodes as absent.
-pub fn calculate_vertices_root(vertices: &[String]) -> String {
+/// Root binding a block's committed vertex sequence and their authors (B4),
+/// both order-sensitive. Empty sequence => empty root, which the header hash
+/// encodes as absent.
+pub fn calculate_vertices_root(vertices: &[String], authors: &[String]) -> String {
     if vertices.is_empty() {
         return String::new();
     }
     let mut p = Preimage::new(VERTICES_DOMAIN);
     p.list(vertices);
+    p.list(authors);
     p.digest()
 }
 
@@ -1214,6 +1240,7 @@ mod bft_time_tests {
                 "receipts".to_string(),
                 ts,
                 vec!["v1".to_string(), "v2".to_string()],
+                vec!["a1".to_string(), "a2".to_string()],
                 "v2".to_string(),
                 vec![],
             )
@@ -1239,6 +1266,7 @@ mod bft_time_tests {
     #[test]
     fn vertices_root_is_bound_into_header_hash() {
         let mk = |vs: Vec<&str>| {
+            let authors = vs.iter().map(|v| format!("author-of-{v}")).collect();
             Block::new_with_roots_at(
                 9,
                 44,
@@ -1249,6 +1277,7 @@ mod bft_time_tests {
                 "r".to_string(),
                 1_000,
                 vs.into_iter().map(String::from).collect(),
+                authors,
                 "anchor".to_string(),
                 vec![],
             )
@@ -1256,10 +1285,19 @@ mod bft_time_tests {
         let a = mk(vec!["x", "y"]);
         let b = mk(vec!["y", "x"]); // same set, different order
         let c = mk(vec!["x", "y"]);
-        assert_eq!(a.header.hash, c.header.hash, "identical sequence => identical hash");
+        assert_eq!(
+            a.header.hash, c.header.hash,
+            "identical sequence => identical hash"
+        );
         assert_ne!(a.header.hash, b.header.hash, "order is part of the binding");
-        assert_eq!(a.header.vertices_root, calculate_vertices_root(&a.committed_vertices));
-        assert!(mk(vec![]).header.vertices_root.is_empty(), "empty sequence => empty root");
+        assert_eq!(
+            a.header.vertices_root,
+            calculate_vertices_root(&a.committed_vertices, &a.committed_authors)
+        );
+        assert!(
+            mk(vec![]).header.vertices_root.is_empty(),
+            "empty sequence => empty root"
+        );
     }
 
     /// RE-AUDIT CRITICAL: a synced block must prove it came from its proposer.
@@ -1270,19 +1308,40 @@ mod bft_time_tests {
         let pk = hex::encode(key.verifying_key().to_bytes());
         let other_pk = hex::encode(other.verifying_key().to_bytes());
         let mut b = Block::new_with_roots_at(
-            3, 6, "prev".into(), vec![], "proposer".into(), "s".into(), "r".into(), 1_000,
-            vec!["v".into()], "v".into(), vec![],
+            3,
+            6,
+            "prev".into(),
+            vec![],
+            "proposer".into(),
+            "s".into(),
+            "r".into(),
+            1_000,
+            vec!["v".into()],
+            vec!["a".into()],
+            "v".into(),
+            vec![],
         );
-        assert!(!b.verify_proposer_signature(&pk), "unsigned must NOT verify");
+        assert!(
+            !b.verify_proposer_signature(&pk),
+            "unsigned must NOT verify"
+        );
         b.sign_proposer(&key, "proposer");
         assert!(b.verify_proposer_signature(&pk));
-        assert!(!b.verify_proposer_signature(&other_pk), "wrong key must not verify");
+        assert!(
+            !b.verify_proposer_signature(&other_pk),
+            "wrong key must not verify"
+        );
         // Tampering with the body after signing breaks the binding via the hash.
         let mut t = b.clone();
         t.committed_vertices.push("injected".into());
-        t.header.vertices_root = calculate_vertices_root(&t.committed_vertices);
+        t.committed_authors.push("a".into());
+        t.header.vertices_root =
+            calculate_vertices_root(&t.committed_vertices, &t.committed_authors);
         t.header.hash = calculate_header_hash(&t.header);
-        assert!(!t.verify_proposer_signature(&pk), "re-hashed tampered block must not verify");
+        assert!(
+            !t.verify_proposer_signature(&pk),
+            "re-hashed tampered block must not verify"
+        );
     }
 
     /// The vertex hash — and therefore the author's signature — must BIND the

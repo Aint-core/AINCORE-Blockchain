@@ -312,8 +312,18 @@ mod tests {
 
     fn finality_test_block(height: u64) -> Block {
         Block::new_with_roots_at(
-            height, height, "ab".repeat(32), vec![], "validator_1".into(),
-            "ef".repeat(32), "12".repeat(32), 1000, vec![], "ab".repeat(32), vec![],
+            height,
+            height,
+            "ab".repeat(32),
+            vec![],
+            "validator_1".into(),
+            "ef".repeat(32),
+            "12".repeat(32),
+            1000,
+            vec![],
+            vec![],
+            "ab".repeat(32),
+            vec![],
         )
     }
 
@@ -716,6 +726,7 @@ mod tests {
             executor.receipts_root_for_block(&[]),
             23,
             Vec::new(),
+            vec![],
             String::new(),
             Vec::new(),
         );

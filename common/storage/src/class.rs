@@ -198,6 +198,7 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         | "consensus:standalone_height" => Some(Local),
 
         "sys:block_prune_cursor_v1"
+        | "consensus:finality_prune_cursor"
         | "sys:kept_pin_blocks_v1"
         | "sys:restored_by"
         | "sys:tx_index_backfill_v1_complete"
@@ -277,6 +278,7 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         ["sys", "validator_set", "epoch_bootstrap", e] if dec(e) => State,
         // G5 A4 BW-6: each operator's leader slots and commits in an epoch.
         ["sys", "bootstrap", "slots", e] if dec(e) => State,
+        ["sys", "bootstrap", "vertices", e] if dec(e) => State,
         ["consensus", "epoch_start_height", e] if dec(e) => State,
         ["sys", "fee_sweep_queue", h, miner] if dec(h) && seg(miner) => State,
         ["sys", "slashed", a, r] if seg(a) && dec(r) => State,
@@ -411,6 +413,7 @@ pub const STATE_PREFIXES: &[&str] = &[
     "sys:validator_set:epoch_time:",
     "sys:validator_set:epoch_bootstrap:",
     "sys:bootstrap:slots:",
+    "sys:bootstrap:vertices:",
     "consensus:epoch_start_height:",
     "sys:fee_sweep_queue:",
     "sys:slashed:",
@@ -610,6 +613,7 @@ mod tests {
             ("sys:bootstrap:v1".into(), State),
             ("sys:bootstrap:round".into(), State),
             ("sys:bootstrap:slots:12".into(), State),
+            ("sys:bootstrap:vertices:12".into(), State),
             ("sys:validator_set:epoch_bootstrap:12".into(), State),
             ("sys:validator_set:retained_from".into(), State),
             ("consensus:epoch".into(), State),
@@ -700,6 +704,7 @@ mod tests {
             (format!("peer_ip:{H64}"), Node),
             ("peer_addr:12D3KooWMF5ur249RNXQYw6bvhfDRsHaemio5gcV9mxHXn4ZtVc2".into(), Node),
             ("sys:block_prune_cursor_v1".into(), Node),
+            ("consensus:finality_prune_cursor".into(), Node),
             ("sys:tx_index_backfill_v1_complete".into(), Node),
             ("genesis_initialized".into(), Node),
             ("alarm:anchor_height_violation:9".into(), Node),
@@ -794,6 +799,8 @@ mod tests {
             "sys:validator_set:epoch_time:x",
             "sys:bootstrap:slots:",
             "sys:bootstrap:slots:x",
+            "sys:bootstrap:vertices:",
+            "sys:bootstrap:vertices:x",
             "sys:validator_set:epoch_bootstrap:",
             "sys:validator_set:epoch_bootstrap:07",
             &format!("tx_index:{}", &H64[..63]),

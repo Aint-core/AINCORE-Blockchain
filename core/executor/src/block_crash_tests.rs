@@ -107,6 +107,7 @@ fn rejected_admission_never_enters_execution_and_preserves_reopened_rows() {
             block_time(1),
             0,
             &[],
+            &[],
             |view| {
                 assert!(view.get("sys:last_executed_height").unwrap().is_none());
                 Err("admission revoked".into())
@@ -138,6 +139,7 @@ fn admission_sees_parent_state_and_rejected_execution_remains_retryable() {
             block_time(1),
             0,
             &[],
+            &[],
             |view| {
                 assert_eq!(rows(view), before);
                 admitted.set(true);
@@ -164,6 +166,7 @@ fn admission_sees_parent_state_and_rejected_execution_remains_retryable() {
             1,
             block_time(1),
             0,
+            &[],
             &[],
             |view| {
                 assert_eq!(rows(view), before);
@@ -239,7 +242,7 @@ fn block_crash_child() {
             std::process::exit(77); // no destructors or graceful RocksDB close
         }
     });
-    match executor.execute_block_parallel_at(txs, &proposer, 1, block_time(1), 0, &[]) {
+    match executor.execute_block_parallel_at(txs, &proposer, 1, block_time(1), 0, &[], &[]) {
         BlockExecOutcome::Executed(summary) if !replay => {
             assert_eq!(
                 summary.executed_raws.len(),
@@ -382,7 +385,7 @@ fn block_panic_child() {
         }
     });
     let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        executor.execute_block_parallel_at(txs.clone(), &proposer, 1, block_time(1), 0, &[])
+        executor.execute_block_parallel_at(txs.clone(), &proposer, 1, block_time(1), 0, &[], &[])
     }));
     assert!(interrupted.is_err(), "injection must unwind execution");
     let partial = rows(&db);
@@ -395,7 +398,7 @@ fn block_panic_child() {
     // A new Executor must not bypass a poisoned process-wide execution lock.
     let retry_executor = Executor::new(Arc::clone(&db));
     let retry = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        retry_executor.execute_block_parallel_at(txs, &proposer, 1, block_time(1), 0, &[])
+        retry_executor.execute_block_parallel_at(txs, &proposer, 1, block_time(1), 0, &[], &[])
     }));
     assert!(
         retry.is_err(),
@@ -478,6 +481,7 @@ fn checked_block_child() {
             summary.receipts_root.clone(),
             1000,
             vec![],
+            vec![],
             "anchor-test".into(),
             vec![],
         );
@@ -503,6 +507,7 @@ fn checked_block_child() {
                 block_time(1),
                 0,
                 &[],
+                &[],
                 |s, v| accept(s, v, true)
             )
             .is_err());
@@ -512,9 +517,16 @@ fn checked_block_child() {
         );
     }
     let result = executor
-        .execute_block_checked_at(txs.clone(), &proposer, 1, block_time(1), 0, &[], |s, v| {
-            accept(s, v, false)
-        })
+        .execute_block_checked_at(
+            txs.clone(),
+            &proposer,
+            1,
+            block_time(1),
+            0,
+            &[],
+            &[],
+            |s, v| accept(s, v, false),
+        )
         .unwrap();
     assert!(matches!(
         result,

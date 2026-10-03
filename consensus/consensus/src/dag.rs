@@ -959,11 +959,15 @@ impl DagConsensus {
             // one pre-loop sample, so a tip move produced a timestamp weighted
             // by the OLD validator set while peers used the new one.
             let mut ts_raw: Vec<(String, u64)> = Vec::new();
+            // B4: the author of each committed vertex, in sequence order (a
+            // missing vertex defers the whole anchor, so they stay aligned).
+            let mut committed_authors: Vec<String> = Vec::with_capacity(commit.sequence.len());
 
             let dag = self.dag.lock().expect("🚨 FATAL: DAG lock poisoned");
 
             for hash in &commit.sequence {
                 if let Some(v) = dag.get(hash) {
+                    committed_authors.push(v.author.clone());
                     // Clone payload to release DAG lock faster?
                     // No, looking up payload is fast. Execution is slow.
                     // But we must NOT hold DAG lock during execution.
@@ -1109,6 +1113,7 @@ impl DagConsensus {
                             // G5 BW-6: its anchor round (the header's `round`).
                             commit.anchor_round,
                             &slash_evidence,
+                            &committed_authors,
                             // Nothing to admit for a block this node built. Tests
                             // may stage state here, BEFORE execution: after the
                             // state root is sealed (G3 CM-2) a state write fails
@@ -1131,10 +1136,17 @@ impl DagConsensus {
                                 }
                                 // B14: the body is what executed and paid.
                                 let mut block = blockchain::Block::new_with_roots_at(
-                                    parent_height + 1, commit.anchor_round, parent_hash.clone(),
-                                    summary.body.clone(), reward_recipient.clone(),
-                                    summary.state_root.clone(), summary.receipts_root.clone(),
-                                    block_timestamp, commit.sequence.clone(), commit.anchor_hash.clone(),
+                                    parent_height + 1,
+                                    commit.anchor_round,
+                                    parent_hash.clone(),
+                                    summary.body.clone(),
+                                    reward_recipient.clone(),
+                                    summary.state_root.clone(),
+                                    summary.receipts_root.clone(),
+                                    block_timestamp,
+                                    commit.sequence.clone(),
+                                    committed_authors.clone(),
+                                    commit.anchor_hash.clone(),
                                     slash_evidence.clone(),
                                 );
                                 if !block.anchor_is_bound() {
@@ -2099,10 +2111,32 @@ pub fn prune_history(storage: &Arc<StateDB>, height: u64, policy: Option<(u64, u
         Ok(_) => {}
         Err(e) => eprintln!("⚠️ Block history pruning failed: {}", e),
     }
+    // B6: the finality rows of the same blocks go with them.
+    let floor = height.saturating_sub(keep_blocks);
+    if height > keep_blocks {
+        if let Err(e) = crate::qc_producer::prune_finality_rows(storage, floor, &pins, max_delete) {
+            eprintln!("⚠️ Finality row pruning failed: {e}");
+        }
+    }
     // Blocks kept for a pin that no longer is one (the window moved, or the
     // retention changed) go; a run skipped by the lock is caught up here.
-    if let Err(e) = storage.prune_expired_pins(height, keep_blocks, &pins) {
-        eprintln!("⚠️ Pruning expired pin blocks failed: {e}");
+    let expired: Vec<u64> = storage
+        .kept_pin_blocks()
+        .map(|kept| {
+            kept.into_iter()
+                .filter(|h| !pins.contains(h) && *h < floor)
+                .collect()
+        })
+        .unwrap_or_default();
+    match storage.prune_expired_pins(height, keep_blocks, &pins) {
+        Ok(_) => {
+            for h in expired {
+                if let Err(e) = crate::qc_producer::prune_finality_height(storage, h) {
+                    eprintln!("⚠️ Finality row pruning at {h} failed: {e}");
+                }
+            }
+        }
+        Err(e) => eprintln!("⚠️ Pruning expired pin blocks failed: {e}"),
     }
     // State versions follow the same window, so proofs are served exactly as
     // long as blocks are.

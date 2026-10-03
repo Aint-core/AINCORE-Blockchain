@@ -28,6 +28,7 @@ fn context_and_vote(db: &StateDB, height: u64, epoch: u64) -> (CommitContext, Qc
         ctx.receipts_root.clone(),
         1000,
         vec![],
+        vec![],
         ctx.anchor_hash.clone(),
         vec![],
     );

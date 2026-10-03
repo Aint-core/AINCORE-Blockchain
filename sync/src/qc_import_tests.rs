@@ -105,6 +105,7 @@ fn block_at(sync: &ChainSync, height: u64, parent: &str, anchor: &str) -> Block 
         23,
         // The anchor is the last committed vertex (G0).
         vec!["aa".repeat(32), anchor.to_string()],
+        vec!["c1".repeat(32), "c2".repeat(32)],
         anchor.into(),
         vec![],
     );
@@ -423,6 +424,7 @@ fn v4_validation_refuses_an_anchor_that_is_not_the_last_committed_vertex() {
         h.receipts_root.clone(),
         h.timestamp,
         real.committed_vertices.clone(),
+        real.committed_authors.clone(),
         "ef".repeat(32),
         real.slash_evidence.clone(),
     );

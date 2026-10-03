@@ -19,6 +19,7 @@ fn fixture(name: &str) -> (ChainSync, Block, String) {
         executor.receipts_root_for_block(&[]),
         23,
         vec!["ab".repeat(32)],
+        vec!["c1".repeat(32)],
         "ab".repeat(32),
         vec![],
     );
@@ -167,6 +168,7 @@ fn replaced_parent_between_precheck_and_execution_must_not_commit() {
         executor.receipts_root_for_block(&[]),
         24,
         vec!["bc".repeat(32)],
+        vec!["c1".repeat(32)],
         "bc".repeat(32),
         vec![],
     );
@@ -198,6 +200,7 @@ fn missing_parent_between_precheck_and_execution_must_not_commit() {
         executor.receipts_root_for_block(&[]),
         24,
         vec!["bc".repeat(32)],
+        vec!["c1".repeat(32)],
         "bc".repeat(32),
         vec![],
     );

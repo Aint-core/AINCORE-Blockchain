@@ -237,6 +237,7 @@ fn chain_with(name: &str, spec: Spec) -> Chain {
         "dd".repeat(32),
         spec.timestamp,
         vec![],
+        vec![],
         "aa".repeat(32),
         vec![],
     );
@@ -1730,6 +1731,7 @@ impl Producer {
                 executor.receipts_root_for_block(&[]),
                 height,
                 Vec::new(),
+                vec![],
                 String::new(),
                 Vec::new(),
             );

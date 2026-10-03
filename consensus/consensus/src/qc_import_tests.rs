@@ -12,6 +12,7 @@ fn prepare_block(db: &StateDB, height: u64) {
         ctx.receipts_root,
         1000,
         vec![],
+        vec![],
         ctx.anchor_hash,
         vec![],
     );
@@ -294,13 +295,16 @@ fn import_accepts_consistent_nonempty_body_commitments_after_reopen() {
         serde_json::from_str(&db.get("block_10").unwrap().unwrap()).unwrap();
     block.transactions = vec!["fixture-tx".into()];
     block.committed_vertices = vec!["91".repeat(32), "92".repeat(32)];
+    block.committed_authors = vec!["c1".repeat(32), "c2".repeat(32)];
     block.slash_evidence = vec!["fixture-evidence".into()];
     block.header.tx_hash = blockchain::calculate_tx_hash(&block.transactions);
-    block.header.vertices_root = blockchain::calculate_vertices_root(&block.committed_vertices);
+    block.header.vertices_root =
+        blockchain::calculate_vertices_root(&block.committed_vertices, &block.committed_authors);
     block.header.evidence_root = blockchain::calculate_evidence_root(&block.slash_evidence);
     block.header.da_root = blockchain::calculate_da_root(
         &block.transactions,
         &block.committed_vertices,
+        &block.committed_authors,
         &block.anchor_hash,
         &block.slash_evidence,
     );

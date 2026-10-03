@@ -143,9 +143,11 @@ fn golden_body_roots() {
         calculate_tx_hash(&[]),
         "3c12570c42a0ac8980a8454a463f371964af5861c30fdc21d07f979d1824669d"
     );
+    // B4: the sequence with its authors, under AINCORE_BLOCK_SEQUENCE_V1
+    // (independent Python encoder; it reproduces the V1 value b87b41ea...).
     assert_eq!(
-        calculate_vertices_root(&items),
-        "b87b41ea222e13ff38d975ad30c38a7c1fe90993ad50fddce7a1520b4dd19fa6"
+        calculate_vertices_root(&items, &strings(&["x", "y"])),
+        "76c3cbca4b6d8b45041d168003524a24c0d2674d1f5a21370b0bd67cf01826e2"
     );
     assert_eq!(
         calculate_evidence_root(&items),
@@ -154,23 +156,33 @@ fn golden_body_roots() {
 }
 
 /// B1: the body preimage, and its DA root from `da/reference/da_ref.py`.
+/// B4 added the authors list and moved the domain to V2 (the reference
+/// reproduces the V1 root 261be831... and gives 23e279db... here).
 #[test]
 fn golden_body_bytes_and_da_root() {
-    let body = body_bytes(&strings(&["a", "bc"]), &strings(&["v"]), "v", &[]);
+    let body = body_bytes(
+        &strings(&["a", "bc"]),
+        &strings(&["v"]),
+        &strings(&["w"]),
+        "v",
+        &[],
+    );
     let expected = concat!(
-        "41494e434f52455f424c4f434b5f424f44595f563100", // AINCORE_BLOCK_BODY_V1\0
+        "41494e434f52455f424c4f434b5f424f44595f563200", // AINCORE_BLOCK_BODY_V2\0
         "0200000000000000",                             // 2 transactions
         "010000000000000061",                           // "a"
         "02000000000000006263",                         // "bc"
         "0100000000000000",                             // 1 committed vertex
         "010000000000000076",                           // "v"
+        "0100000000000000",                             // 1 author (B4)
+        "010000000000000077",                           // "w"
         "010000000000000076",                           // anchor_hash "v"
         "0000000000000000",                             // no slash evidence
     );
     assert_eq!(hex::encode(&body), expected);
     assert_eq!(
         da::da_root(&body),
-        "261be83150698c97106af042a0bdbb503365c85cb555cb731d77a27e518ddc82"
+        "23e279db90eb1c13c437f8fa3a583745415593d64b73e18d86bb7ca37a45f438"
     );
 }
 
@@ -185,6 +197,7 @@ fn block() -> Block {
         "44".repeat(32),
         1_790_667_886,
         strings(&["v1", "v2"]),
+        strings(&["a1", "a2"]),
         "v2".into(),
         strings(&["e1"]),
     )
@@ -199,7 +212,7 @@ fn check_commitments_binds_every_body_field() {
     assert_eq!(b.header.da_root, da::da_root(&b.body_bytes()));
 
     type Edit = fn(&mut Block);
-    let edits: [(&str, Edit, &str); 6] = [
+    let edits: [(&str, Edit, &str); 8] = [
         (
             "transactions",
             |b| b.transactions.push("tx3".into()),
@@ -208,6 +221,18 @@ fn check_commitments_binds_every_body_field() {
         (
             "committed_vertices",
             |b| b.committed_vertices.reverse(),
+            "Vertices root mismatch",
+        ),
+        (
+            "committed_authors",
+            |b| b.committed_authors.reverse(),
+            "Vertices root mismatch",
+        ),
+        (
+            "an author too few",
+            |b| {
+                b.committed_authors.pop();
+            },
             "Vertices root mismatch",
         ),
         (
@@ -259,6 +284,7 @@ fn check_commitments_binds_every_body_field() {
         "44".repeat(32),
         1_790_667_886,
         strings(&["v1", "v2"]),
+        strings(&["a1", "a2"]),
         "v1".into(),
         strings(&["e1"]),
     );
@@ -270,9 +296,12 @@ fn check_commitments_binds_every_body_field() {
 /// header encodes with the absent tag (sync relies on "" meaning "none").
 #[test]
 fn empty_vertices_and_evidence_are_absent_roots() {
-    assert_eq!(calculate_vertices_root(&[]), "");
+    assert_eq!(calculate_vertices_root(&[], &[]), "");
     assert_eq!(calculate_evidence_root(&[]), "");
-    assert_ne!(calculate_vertices_root(&strings(&[""])), "");
+    assert_ne!(
+        calculate_vertices_root(&strings(&[""]), &strings(&[""])),
+        ""
+    );
     assert_ne!(calculate_evidence_root(&strings(&[""])), "");
 }
 
@@ -839,10 +868,23 @@ fn vertices_root_binds_item_boundaries() {
         legacy_vertices_root(&b),
         "a real legacy collision"
     );
-    assert_ne!(calculate_vertices_root(&a), calculate_vertices_root(&b));
+    let none = strings(&["", ""]);
     assert_ne!(
-        calculate_vertices_root(&a),
-        calculate_vertices_root(&strings(&["c", "ab"]))
+        calculate_vertices_root(&a, &none),
+        calculate_vertices_root(&b, &none)
+    );
+    assert_ne!(
+        calculate_vertices_root(&a, &none),
+        calculate_vertices_root(&strings(&["c", "ab"]), &none)
+    );
+    // B4: an author cannot move into the sequence, or across authors.
+    assert_ne!(
+        calculate_vertices_root(&strings(&["ab"]), &strings(&["c"])),
+        calculate_vertices_root(&strings(&["a"]), &strings(&["bc"]))
+    );
+    assert_ne!(
+        calculate_vertices_root(&a, &strings(&["x", "y"])),
+        calculate_vertices_root(&a, &strings(&["y", "x"]))
     );
 }
 
@@ -863,7 +905,7 @@ fn evidence_root_binds_item_boundaries() {
 fn root_kinds_are_domain_separated() {
     let items = strings(&["x", "y"]);
     let tx = calculate_tx_hash(&items);
-    let vertices = calculate_vertices_root(&items);
+    let vertices = calculate_vertices_root(&items, &items);
     let evidence = calculate_evidence_root(&items);
     assert_ne!(tx, vertices);
     assert_ne!(tx, evidence);
@@ -885,6 +927,7 @@ fn constructed_blocks_use_the_canonical_commitments() {
             "r".into(),
             timestamp,
             strings(&["v1", "v2"]),
+            strings(&["a1", "a2"]),
             "v2".into(),
             strings(&["e1"]),
         )
@@ -894,7 +937,7 @@ fn constructed_blocks_use_the_canonical_commitments() {
     assert_eq!(a.header.tx_hash, calculate_tx_hash(&a.transactions));
     assert_eq!(
         a.header.vertices_root,
-        calculate_vertices_root(&a.committed_vertices)
+        calculate_vertices_root(&a.committed_vertices, &a.committed_authors)
     );
     assert_eq!(
         a.header.evidence_root,

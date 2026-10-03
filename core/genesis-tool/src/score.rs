@@ -735,6 +735,7 @@ mod tests {
                 },
                 transactions,
                 committed_vertices: vec![],
+                committed_authors: vec![],
                 anchor_hash: String::new(),
                 proposer_signature: String::new(),
                 proposer_signer: String::new(),

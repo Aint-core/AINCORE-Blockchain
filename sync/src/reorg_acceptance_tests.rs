@@ -23,6 +23,7 @@ fn signed_empty(sync: &ChainSync, height: u64, parent: &str, timestamp: u64) -> 
         exec.receipts_root_for_block(&[]),
         timestamp,
         vec!["ab".repeat(32)],
+        vec!["c1".repeat(32)],
         "ab".repeat(32),
         vec![],
     );

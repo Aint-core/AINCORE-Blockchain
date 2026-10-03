@@ -15,6 +15,7 @@ fn pending(db: &StateDB, height: u64) {
         "12".repeat(32),
         1000 + height,
         vec!["ab".repeat(32)],
+        vec!["c1".repeat(32)],
         "ab".repeat(32),
         vec![],
     );
