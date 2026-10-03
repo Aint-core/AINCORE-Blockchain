@@ -49,8 +49,8 @@ pub const MAX_GAS_LIMIT: u64 = 10_000_000;
 /// block can force on every validator.
 pub const MAX_BLOCK_GAS_LIMIT: u64 = 200_000_000;
 
-const OBJECT_LOAD_GAS: u64 = 100;
 pub use admission::MIN_GAS_PRICE;
+use admission::OBJECT_LOAD_GAS;
 
 pub mod admission;
 
@@ -1539,16 +1539,21 @@ fn receipt_metadata(
 }
 
 /// The kind of a hex-encoded BCS `TransactionPayload`.
-pub(crate) fn payload_kind(payload: &str) -> Result<admission::PayloadKind, String> {
+/// The payload's kind, and the execution gas its size requires (a module
+/// bundle's publish floor, audit M-5; 0 for a call).
+pub(crate) fn payload_kind(payload: &str) -> Result<(admission::PayloadKind, u64), String> {
     use admission::PayloadKind;
     let bytes = hex::decode(payload.trim_start_matches("0x"))
         .map_err(|_| "Invalid payload hex: expected BCS TransactionPayload".to_string())?;
     match bcs::from_bytes::<vm_move::TransactionPayload>(&bytes)
         .map_err(|e| format!("Invalid BCS TransactionPayload: {e}"))?
     {
-        vm_move::TransactionPayload::EntryFunction(_) => Ok(PayloadKind::EntryFunction),
-        vm_move::TransactionPayload::PublishModule(_) => Ok(PayloadKind::PublishModule),
-        vm_move::TransactionPayload::Script(_) => Ok(PayloadKind::Script),
+        vm_move::TransactionPayload::EntryFunction(_) => Ok((PayloadKind::EntryFunction, 0)),
+        vm_move::TransactionPayload::PublishModule(modules) => Ok((
+            PayloadKind::PublishModule,
+            admission::publish_floor(&modules),
+        )),
+        vm_move::TransactionPayload::Script(_) => Ok((PayloadKind::Script, 0)),
     }
 }
 
@@ -3474,6 +3479,15 @@ impl Executor {
                         println!("⛔ Transaction REJECTED: Too many input objects (>128)");
                         continue;
                     }
+                    // B27, in depth (vertex ingress refuses it first): a
+                    // transaction whose objects need more gas than its limit
+                    // leaves cannot run, so it never reserves block space.
+                    let execution = tx
+                        .gas_limit
+                        .saturating_sub(admission::intrinsic_gas(raw.len()));
+                    if (tx.input_objects.len() as u64).saturating_mul(OBJECT_LOAD_GAS) > execution {
+                        continue;
+                    }
                     parsed_txs.push((tx, raw.clone()));
                 }
                 Err(_e) => {}
@@ -5021,10 +5035,23 @@ impl Executor {
 
             // Check if payer has balance
             // We need to fetch payer object again (or use sender_obj if same)
+            // B27: a paymaster with no account record (funded by a transfer
+            // alone) gets one implicitly, as a sender does: its address is
+            // derived from the key that signed (`check_stateless`). Refusing
+            // here charged nothing for the space the block had reserved.
             let mut payer_obj = if payer_addr == tx.sender {
                 sender_obj.clone()
             } else {
-                self.db.get_object(&payer_addr)?
+                match self.db.get_object(&payer_addr) {
+                    Some(obj) => obj,
+                    None => aa::AccountManager::create_account(
+                        payer_addr.clone(),
+                        tx.paymaster
+                            .clone()
+                            .unwrap_or_default()
+                            .to_ascii_lowercase(),
+                    ),
+                }
             };
 
             let mut account_data: aa::AccountData = match serde_json::from_slice(&payer_obj.data) {
@@ -5136,6 +5163,38 @@ impl Executor {
                 }
             };
 
+            // B27: from here a refusal is a charged abort. The block reserved
+            // this transaction's space because it can pay (`can_pay`); a
+            // refusal that charged nothing let a transaction hold that space
+            // for free. The gas is deducted and the nonce bumped (`staged`),
+            // every other effect is dropped. Only a transaction the VM cannot
+            // even charge is refused, which `can_pay` rules out.
+            let staged = updates.clone();
+            let charged_abort = |reason: String| -> Option<(Vec<(String, Option<String>)>, u128)> {
+                let mut out = staged.clone();
+                match self.vm.execute_transaction_actions(
+                    pre_actions.clone(),
+                    sender_addr,
+                    execution_gas,
+                ) {
+                    Ok((_gas_used, changes, status)) if status.success => {
+                        out.extend(changes);
+                        self.append_supply_tracker_updates(&mut out);
+                    }
+                    _ => return None,
+                }
+                println!("❌ {} charged and aborted: {reason}", tx.sender);
+                out.push(receipt_update(
+                    &self.db,
+                    tx_json,
+                    &out,
+                    "aborted",
+                    gas_cost,
+                    Some(reason),
+                ));
+                Some((out, gas_cost))
+            };
+
             let payload_bytes = match hex::decode(tx.payload.trim_start_matches("0x")) {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -5162,11 +5221,7 @@ impl Executor {
                     // BLS pairing check, so reject a join_validator_set whose
                     // proof-of-possession does not verify BEFORE dispatch.
                     if let Err(reason) = verify_join_validator_pop(&call, &tx.public_key) {
-                        println!(
-                            "❌ REJECTED join_validator_set from {}: {}",
-                            tx.sender, reason
-                        );
-                        return None;
+                        return charged_abort(format!("join_validator_set: {reason}"));
                     }
                     // G5 SL-3 (tombstone): a validator with an accepted
                     // offense never re-enters a committee.
@@ -5177,11 +5232,9 @@ impl Executor {
                             .expect("CRITICAL: the jail record could not be read")
                             .is_some()
                     {
-                        println!(
-                            "❌ REJECTED join_validator_set from {}: tombstoned for equivocation",
-                            tx.sender
+                        return charged_abort(
+                            "join_validator_set: tombstoned for equivocation".to_string(),
                         );
-                        return None;
                     }
                     // B1: capture join_validator_set identity BEFORE the call is
                     // moved into the action, so we can append it to the live
@@ -5225,11 +5278,9 @@ impl Executor {
                                     if let Err(e) =
                                         self.append_validator_set_v1_update(&mut updates, info)
                                     {
-                                        println!(
-                                            "❌ Failed to stage sys:validator_set:v1 update: {}",
-                                            e
-                                        );
-                                        return None;
+                                        return charged_abort(format!(
+                                            "sys:validator_set:v1 update not staged: {e}"
+                                        ));
                                     }
                                 }
                                 // AUDIT-#1: prune the departing validator from the
@@ -5240,24 +5291,23 @@ impl Executor {
                                             |()| self.stage_bootstrap_forfeit(&mut updates, &addr),
                                         )
                                     {
-                                        println!(
-                                            "❌ Failed to stage validator removal on leave: {}",
-                                            e
-                                        );
-                                        return None;
+                                        return charged_abort(format!(
+                                            "validator removal on leave not staged: {e}"
+                                        ));
                                     }
-                                    println!("   🔻 Pruned departed validator {} from QC trust root", addr);
+                                    println!(
+                                        "   🔻 Pruned departed validator {} from QC trust root",
+                                        addr
+                                    );
                                 }
                                 // AUDIT-#5: resync QC weight after a stake increase.
                                 if let Some(addr) = add_stake_addr {
                                     if let Err(e) =
                                         self.refresh_validator_set_v1_stake(&mut updates, &addr)
                                     {
-                                        println!(
-                                            "❌ Failed to resync sys:validator_set:v1 stake on add_stake: {}",
-                                            e
-                                        );
-                                        return None;
+                                        return charged_abort(format!(
+                                            "sys:validator_set:v1 stake not resynced: {e}"
+                                        ));
                                     }
                                 }
                             } else {
@@ -5270,15 +5320,15 @@ impl Executor {
                             }
                         }
                         Err(e) => {
-                            println!("❌ EntryFunction Failed (Move VM fatal): {}", e);
-                            return None;
+                            return charged_abort(format!("Move VM: {e}"));
                         }
                     }
                 }
                 Ok(vm_move::TransactionPayload::PublishModule(modules)) => {
                     if sender_addr == system_address() {
-                        println!("❌ Publish rejected: user transactions cannot publish to 0x1");
-                        return None;
+                        return charged_abort(
+                            "user transactions cannot publish to 0x1".to_string(),
+                        );
                     }
                     // SEC (audit M-5): module publishing runs full bytecode verification
                     // (deserialize + verify_module_bundle_for_publication + dependency
@@ -5288,24 +5338,15 @@ impl Executor {
                     // validator for a near-minimal fee (cheap chain-halt-grade DoS).
                     // Require the declared gas_limit to cover a size-proportional floor so
                     // the fee scales with the verification cost imposed on the network.
-                    const PUBLISH_GAS_PER_BYTE: u64 = 10;
-                    const PUBLISH_GAS_PER_MODULE: u64 = 5_000;
-                    let publish_bytes: u64 =
-                        modules.iter().map(|m| m.len() as u64).sum::<u64>();
-                    let publish_floor = publish_bytes
-                        .saturating_mul(PUBLISH_GAS_PER_BYTE)
-                        .saturating_add(
-                            (modules.len() as u64).saturating_mul(PUBLISH_GAS_PER_MODULE),
-                        );
+                    // B27: also refused in `admission::check_stateless`, so a
+                    // block never reserves space for it.
+                    let publish_bytes: u64 = modules.iter().map(|m| m.len() as u64).sum::<u64>();
+                    let publish_floor = admission::publish_floor(&modules);
                     if execution_gas < publish_floor {
-                        println!(
-                            "❌ Publish rejected: execution gas {} below size-derived floor {} ({} bytes, {} modules)",
-                            execution_gas,
-                            publish_floor,
-                            publish_bytes,
+                        return charged_abort(format!(
+                            "execution gas {execution_gas} below the publish floor {publish_floor} ({publish_bytes} bytes, {} modules)",
                             modules.len()
-                        );
-                        return None;
+                        ));
                     }
                     let mut actions = pre_actions.clone();
                     // 3-tuple arity (FIX #1). PublishModule ignores auth_signer
@@ -5333,8 +5374,7 @@ impl Executor {
                             }
                         }
                         Err(e) => {
-                            println!("❌ Publish Failed (Move VM fatal): {}", e);
-                            return None;
+                            return charged_abort(format!("Move VM: {e}"));
                         }
                     }
                 }
@@ -8636,8 +8676,12 @@ mod tests {
             &[],
             &[],
         );
+        // B27: refused after the block reserved its space, so it is charged
+        // and aborted; it still never re-enters the set (below).
         match outcome {
-            BlockExecOutcome::Executed(s) => assert!(s.executed_raws.is_empty(), "the join ran"),
+            BlockExecOutcome::Executed(s) => {
+                assert_eq!(s.executed_raws.len(), 1, "charged and aborted")
+            }
             other => panic!("the block must execute: {other:?}"),
         }
         let active: Vec<_> = validator_set(&db)

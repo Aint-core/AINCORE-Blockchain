@@ -55,17 +55,28 @@ pub fn signing_message(tx: &Transaction) -> String {
     )
 }
 
-/// The bytes a paymaster signs: SHA-256 of
-/// `PAYMASTER_AUTH:{chain_id}:{sender}:{payload}:{gas_limit}:{sequence_number}`.
+/// The bytes a paymaster signs: SHA-256 of `PAYMASTER_AUTH_V2:` and the
+/// sender's signing message, so the paymaster binds every field the sender
+/// does. B28: the first form left out the gas price and the input objects,
+/// so a sponsored sender could set the price as high as the paymaster's
+/// balance allowed.
 pub fn paymaster_message(tx: &Transaction) -> [u8; 32] {
-    Sha256::digest(
-        format!(
-            "PAYMASTER_AUTH:{}:{}:{}:{}:{}",
-            tx.chain_id, tx.sender, tx.payload, tx.gas_limit, tx.sequence_number
-        )
-        .as_bytes(),
-    )
-    .into()
+    Sha256::digest(format!("PAYMASTER_AUTH_V2:{}", signing_message(tx)).as_bytes()).into()
+}
+
+/// Gas charged up front per input object (N-2).
+pub const OBJECT_LOAD_GAS: u64 = 100;
+/// The execution gas a module bundle must carry, per byte and per module
+/// (audit M-5: verification work scales with the bundle).
+pub const PUBLISH_GAS_PER_BYTE: u64 = 10;
+pub const PUBLISH_GAS_PER_MODULE: u64 = 5_000;
+
+/// The execution gas publishing `modules` requires.
+pub fn publish_floor(modules: &[Vec<u8>]) -> u64 {
+    let bytes: u64 = modules.iter().map(|m| m.len() as u64).sum();
+    bytes
+        .saturating_mul(PUBLISH_GAS_PER_BYTE)
+        .saturating_add((modules.len() as u64).saturating_mul(PUBLISH_GAS_PER_MODULE))
 }
 
 /// The paymaster's address: `paymaster` holds its public key (hex), and the
@@ -116,9 +127,24 @@ pub fn check_stateless(raw: &str, chain_id: &str) -> Result<CheckedTx, String> {
             tx.gas_limit
         ));
     }
-    match crate::payload_kind(&tx.payload)? {
+    let (kind, publish_floor) = crate::payload_kind(&tx.payload)?;
+    match kind {
         PayloadKind::EntryFunction | PayloadKind::PublishModule => {}
         PayloadKind::Script => return Err("Raw script payloads are disabled".to_string()),
+    }
+    // B27: what execution refuses before it charges, decided here, so no
+    // block reserves space for it (vertex ingress runs this check).
+    let object_load = (tx.input_objects.len() as u64).saturating_mul(OBJECT_LOAD_GAS);
+    if object_load > execution_gas {
+        return Err(format!(
+            "{} input objects need {object_load} gas, the limit leaves {execution_gas}",
+            tx.input_objects.len()
+        ));
+    }
+    if publish_floor > execution_gas {
+        return Err(format!(
+            "the module bundle needs {publish_floor} execution gas, the limit leaves {execution_gas}"
+        ));
     }
     if let Some(proof) = tx.zkp_proof.as_deref().filter(|p| !p.is_empty()) {
         let canonical = format!(
@@ -186,19 +212,21 @@ pub enum PayloadKind {
 
 /// A transaction that publishes `module` (any bytes), signed with the Ed25519
 /// key whose secret is `key_seed`: well-formed for [`check_stateless`]. For
-/// tests and tools that need valid payload items.
+/// tests and tools that need valid payload items. Its execution gas is the
+/// bundle's publish floor (B27).
 pub fn signed_publish(
     key_seed: [u8; 32],
     chain_id: &str,
     sequence_number: u64,
     module: Vec<u8>,
 ) -> String {
+    let execution = publish_floor(std::slice::from_ref(&module));
     signed_publish_with(
         key_seed,
         chain_id,
         sequence_number,
         module,
-        1_000,
+        execution,
         MIN_GAS_PRICE,
     )
 }
@@ -288,7 +316,8 @@ mod tests {
     /// its own bytes' gas.
     #[test]
     fn the_limit_covers_exactly_the_transactions_own_bytes() {
-        for execution in [0, 1_000, 999_999, MAX_GAS_LIMIT] {
+        // From the 40-byte bundle's publish floor (B27) up.
+        for execution in [5_400, 10_000, 999_999, MAX_GAS_LIMIT] {
             let tx = signed_publish_with([1; 32], CHAIN, 0, vec![5; 40], execution, 1);
             let checked = check_stateless(&tx, CHAIN).expect("valid");
             assert_eq!(checked.execution_gas, execution, "{execution}");
@@ -380,5 +409,78 @@ mod tests {
             serde_json::json!(hex::encode(key.sign(signing_message(&parsed).as_bytes())));
         let checked = check_stateless(&v.to_string(), CHAIN).expect("ML-DSA-65");
         assert_eq!(checked.scheme, TxScheme::MlDsa65);
+    }
+
+    /// Re-sign `v` as the sender (seed `[1; 32]`) after a field change.
+    fn resign(mut v: serde_json::Value) -> serde_json::Value {
+        use ed25519_dalek::{Signer, SigningKey};
+        let tx: Transaction = serde_json::from_value(v.clone()).unwrap();
+        v["signature"] = serde_json::json!(hex::encode(
+            SigningKey::from_bytes(&[1; 32])
+                .sign(signing_message(&tx).as_bytes())
+                .to_bytes()
+        ));
+        v
+    }
+
+    /// B28 witness: the paymaster's signature binds the gas price and the
+    /// input objects (it binds the sender's whole message). Before, a
+    /// sponsored sender re-signed a higher price and the paymaster paid it.
+    #[test]
+    fn the_paymaster_binds_the_gas_price_and_the_objects() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let tx = signed_publish_with([1; 32], CHAIN, 0, vec![9], 1_000_000, 1);
+        let pm = SigningKey::from_bytes(&[2; 32]);
+        let mut v: serde_json::Value = serde_json::from_str(&tx).unwrap();
+        let parsed: Transaction = serde_json::from_value(v.clone()).unwrap();
+        v["paymaster"] = serde_json::json!(hex::encode(pm.verifying_key().to_bytes()));
+        v["paymaster_signature"] =
+            serde_json::json!(hex::encode(pm.sign(&paymaster_message(&parsed)).to_bytes()));
+        check_stateless(&v.to_string(), CHAIN).expect("positive control: sponsored");
+        for (field, value) in [
+            ("gas_price", serde_json::json!(1_000_000_000u64)),
+            ("input_objects", serde_json::json!(["ab"])),
+        ] {
+            let mut t = v.clone();
+            t[field] = value;
+            let err = check_stateless(&resign(t).to_string(), CHAIN).unwrap_err();
+            assert!(
+                err.contains("Invalid paymaster signature"),
+                "{field}: {err}"
+            );
+        }
+    }
+
+    /// B27 witness: what execution refuses before it charges (objects that
+    /// need more gas than the limit leaves, a module bundle under its
+    /// publish floor) is refused here, so vertex ingress keeps it out of
+    /// every block and no block reserves space for it.
+    #[test]
+    fn what_execution_refuses_before_charging_is_refused_at_admission() {
+        // 2,000 bytes and one module: a floor of 2,000 * 10 + 5,000 = 25,000.
+        assert_eq!(publish_floor(&[vec![1; 2_000]]), 25_000);
+        let tx = signed_publish_with([1; 32], CHAIN, 0, vec![1; 2_000], 20_000, 1);
+        let err = check_stateless(&tx, CHAIN).unwrap_err();
+        assert!(err.contains("module bundle needs"), "{err}");
+        let ok = signed_publish_with([1; 32], CHAIN, 0, vec![1; 2_000], 25_000, 1);
+        check_stateless(&ok, CHAIN).expect("positive control: the floor is met");
+
+        // 100 objects need 10,000 gas; leave 9,000 for execution (above the
+        // 10-byte bundle's publish floor, 5,100). The limit is fitted to the
+        // transaction's final length.
+        let call = signed_publish_with([1; 32], CHAIN, 0, vec![1; 10], 1_000_000, 1);
+        let mut v: serde_json::Value = serde_json::from_str(&call).unwrap();
+        v["input_objects"] =
+            serde_json::json!((0..100).map(|i| format!("o{i}")).collect::<Vec<_>>());
+        for _ in 0..4 {
+            let len = resign(v.clone()).to_string().len();
+            v["gas_limit"] = serde_json::json!(intrinsic_gas(len) + 9_000);
+        }
+        let raw = resign(v).to_string();
+        let err = check_stateless(&raw, CHAIN).unwrap_err();
+        assert!(
+            err.contains("input objects need") && err.contains("leaves 9000"),
+            "{err}"
+        );
     }
 }

@@ -641,7 +641,12 @@ export class Transaction {
         const unsized = Buffer.byteLength(this.toString());
         if (pending) this.paymasterSignature = undefined;
         this.gasLimit = this.executionGas + BYTE_GAS * (unsized + 20);
-        const message = [
+        this.signature = signer.sign(Buffer.from(this.signingMessage()));
+    }
+
+    /** The seven fields the sender signs (F4), as the node rebuilds them. */
+    private signingMessage(): string {
+        return [
             this.chainId,
             this.sender,
             this.payload,
@@ -650,7 +655,6 @@ export class Transaction {
             this.gasPrice,
             this.inputObjects.join(','),
         ].join(':');
-        this.signature = signer.sign(Buffer.from(message));
     }
 
     /**
@@ -665,8 +669,9 @@ export class Transaction {
 
     /**
      * Sign the transaction as a Paymaster. The signed bytes are
-     * SHA-256("PAYMASTER_AUTH:{chain_id}:{sender}:{payload}:{gas_limit}:{sequence_number}"),
-     * as the node verifies them (`executor::admission::paymaster_message`).
+     * SHA-256("PAYMASTER_AUTH_V2:" + the sender's signing message), so the
+     * paymaster binds every field the sender does, the gas price included
+     * (`executor::admission::paymaster_message`, B28).
      */
     /**
      * Name the paymaster before the sender signs, so `sign` counts its
@@ -681,7 +686,7 @@ export class Transaction {
         if (!this.chainId) {
             throw new Error('CRITICAL: Chain ID must be explicitly set to prevent replay attacks');
         }
-        const message = `PAYMASTER_AUTH:${this.chainId}:${this.sender}:${this.payload}:${this.gasLimit}:${this.sequenceNumber}`;
+        const message = `PAYMASTER_AUTH_V2:${this.signingMessage()}`;
         const digest = createHash('sha256').update(message).digest();
         const signature = paymasterKeypair.sign(digest);
         this.setPaymaster(paymasterKeypair.publicKey, signature);

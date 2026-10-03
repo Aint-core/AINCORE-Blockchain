@@ -609,9 +609,16 @@ async fn a_node_restores_over_sessions() {
         vec!["12D3KooWserver"],
         "every request on the session the dial opened"
     );
+    // Charged to the session's key: its bucket exists (an untracked key reads
+    // NaN). Not its level, which refills by the wall clock (B46: on the Pi
+    // the restore outlasted the refill).
     assert!(
-        server.state_budget.balance(Some("12D3KooWclient")) < STATE_SERVE_UNITS_PER_SEC_PER_CLIENT,
+        !server.state_budget.balance(Some("12D3KooWclient")).is_nan(),
         "charged to the session's key"
+    );
+    assert!(
+        server.state_budget.balance(Some("12D3KooWserver")).is_nan(),
+        "and to no other"
     );
 }
 
@@ -2823,8 +2830,8 @@ fn serve_session_budgets_by_the_sessions_key() {
     let reply = sync.serve_session(&msg, key).unwrap();
     assert!(reply.starts_with(CHUNK_RESP), "{reply}");
     assert!(
-        sync.state_budget.balance(Some(key)) < STATE_SERVE_UNITS_PER_SEC_PER_CLIENT,
-        "charged to the session"
+        !sync.state_budget.balance(Some(key)).is_nan(),
+        "charged to the session (its bucket exists; its level refills, B46)"
     );
     assert!(
         sync.state_budget.balance(Some("12D3KooWother")).is_nan(),

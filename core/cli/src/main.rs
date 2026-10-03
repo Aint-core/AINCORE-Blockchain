@@ -461,6 +461,9 @@ fn main() -> anyhow::Result<()> {
             let bytecode_hex = hex::encode(bytecode);
 
             let bytes = hex::decode(&bytecode_hex).expect("invalid hex in publish command");
+            // B27: the bundle's publish floor, refused at admission when short.
+            let execution =
+                executor::admission::publish_floor(std::slice::from_ref(&bytes)).max(50_000);
             let payload_struct = vm_move::TransactionPayload::PublishModule(vec![bytes]);
             let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
             let balance_res = client.call("aincore_getBalance", json!([sender]))?;
@@ -476,14 +479,14 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            // F4: bind gas_limit/gas_price/input_objects (publish uses gas_limit 50000).
+            // F4: bind gas_limit/gas_price/input_objects.
             let tx_str = signed_tx_json(
                 &client,
                 &wallet,
                 &chain_id,
                 payload,
                 sequence_number,
-                50_000,
+                execution,
             )?;
             let res = client.call("aincore_sendTransaction", json!([tx_str]))?;
             println!("✅ Publish Transaction submitted: {}", res);

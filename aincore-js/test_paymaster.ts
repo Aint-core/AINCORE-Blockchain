@@ -50,7 +50,7 @@ async function main() {
 
         // 5. Paymaster Signs for Gas
         console.log('⛽ Paymaster signing for gas...');
-        // The paymaster signs SHA-256 of PAYMASTER_AUTH:{chain}:{sender}:{payload}:{gas_limit}:{seq}
+        // The paymaster signs SHA-256 of PAYMASTER_AUTH_V2: + the sender's seven-field message
         // and is named by its public key; the node charges its derived address (B13).
         tx.signAsPaymaster(paymasterKeypair);
 

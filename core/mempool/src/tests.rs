@@ -9,6 +9,8 @@ fn sign_ed25519(
     execution: u64,
 ) -> String {
     use ed25519_dalek::Signer;
+    // B27: a module bundle carries at least its publish floor.
+    let execution = execution.max(publish_floor_of(tx["payload"].as_str().unwrap_or_default()));
     tx["gas_limit"] = serde_json::json!(0);
     tx["signature"] = serde_json::json!("00".repeat(64));
     let unsized_len = tx.to_string().len();
@@ -20,6 +22,17 @@ fn sign_ed25519(
     let message = executor::admission::signing_message(&parsed);
     tx["signature"] = serde_json::json!(hex::encode(key.sign(message.as_bytes()).to_bytes()));
     tx.to_string()
+}
+
+/// The publish floor of a hex BCS payload (0 for a call or junk).
+fn publish_floor_of(payload: &str) -> u64 {
+    hex::decode(payload.trim_start_matches("0x"))
+        .ok()
+        .and_then(|b| bcs::from_bytes::<vm_move::TransactionPayload>(&b).ok())
+        .map_or(0, |p| match p {
+            vm_move::TransactionPayload::PublishModule(m) => executor::admission::publish_floor(&m),
+            _ => 0,
+        })
 }
 
 /// Generate a valid signed test transaction for mempool testing
@@ -298,8 +311,10 @@ mod ml_dsa_b8 {
         });
         // B14: the limit covers the ML-DSA-65 transaction's ~10.5 KB.
         let unsized_len = tx.to_string().len();
-        tx["gas_limit"] =
-            serde_json::json!(executor::admission::gas_limit_covering(unsized_len, 1000));
+        tx["gas_limit"] = serde_json::json!(executor::admission::gas_limit_covering(
+            unsized_len,
+            publish_floor_of(tx["payload"].as_str().unwrap_or_default())
+        ));
         sign(&mut tx, &key);
         (tx, key)
     }
