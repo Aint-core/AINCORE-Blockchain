@@ -311,6 +311,8 @@ pub async fn start_p2p(
             sessions::SYNC_REQUESTS_PER_SEC,
             sessions::SYNC_REQUEST_BURST,
         );
+        // G4 NI-3: messages bound for the node; the swarm never waits on it.
+        let mut inbox = sessions::Inbox::default();
         // G4 NI-2: inbound connections from non-members, all together.
         let mut non_member_inbound: std::collections::HashSet<libp2p::swarm::ConnectionId> =
             std::collections::HashSet::new();
@@ -350,6 +352,20 @@ pub async fn start_p2p(
                         }
                     }
                 },
+                // Hand the node what it can take now; the rest waits here.
+                permit = tx_in.reserve(), if !inbox.is_empty() => {
+                    match permit {
+                        Ok(permit) => {
+                            if let Some(msg) = inbox.pop() {
+                                permit.send(msg);
+                            }
+                        }
+                        Err(_) => {
+                            eprintln!("❌ The main loop is gone; dropping {} queued bytes", inbox.bytes());
+                            while inbox.pop().is_some() {}
+                        }
+                    }
+                }
                 Some(ask) = sync_asks.recv() => {
                     match ask.peer.parse::<PeerId>() {
                         Ok(peer) => {
@@ -411,9 +427,7 @@ pub async fn start_p2p(
                             .is_some_and(|m| member_budget.spend(m, std::time::Instant::now()));
                         if within_budget && sessions::is_consensus_message(&request) {
                             let _ = swarm.behaviour_mut().consensus.send_response(channel, sessions::CONSENSUS_ACK.to_string());
-                            if let Err(e) = tx_in.send(request).await {
-                                eprintln!("❌ Failed to send a session message to the main loop: {e}");
-                            }
+                            inbox.push(request);
                         } else {
                             drop(channel);
                         }
@@ -605,9 +619,7 @@ pub async fn start_p2p(
                         if !admitted {
                             continue;
                         }
-                        if let Err(e) = tx_in.send(msg_content).await {
-                            eprintln!("❌ Failed to send P2P msg to main loop: {}", e);
-                        }
+                        inbox.push(msg_content);
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         println!("🌐 P2P Listening on {:?}", address);

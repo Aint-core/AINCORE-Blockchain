@@ -114,18 +114,25 @@ impl PeerBook {
     }
 }
 
-/// The wire prefixes of consensus messages. Only a member may send them,
-/// on a session or as a gossip publisher.
+/// The wire prefixes of consensus messages: what the consensus protocol
+/// carries between members.
 pub const CONSENSUS_PREFIXES: &[&str] = &["DAG_V4:", "QC_VOTE:", "QC_WANT:", "QC_CERT:"];
+
+/// What only a member may publish: vertices, attestations, certificates and
+/// finality votes. A boundary QC and the request for one stay open to any
+/// publisher: an observer asks for the QC that activates the next epoch,
+/// the QC verifies itself against the committee, and answers are throttled.
+pub const MEMBER_ONLY_PREFIXES: &[&str] = &["DAG_V4:", "QC_VOTE:"];
 
 pub fn is_consensus_message(wire: &str) -> bool {
     CONSENSUS_PREFIXES.iter().any(|p| wire.starts_with(p))
 }
 
-/// NI-1: a gossip message is admitted unless it is consensus traffic whose
-/// signed publisher is not a member (or is unknown).
+/// NI-1: a gossip message is admitted unless only a member may publish it
+/// and its signed publisher is not a member (or is unknown).
 pub fn admit_gossip(book: &PeerBook, publisher: Option<&PeerId>, wire: &str) -> bool {
-    !is_consensus_message(wire) || publisher.is_some_and(|p| book.member_of(p).is_some())
+    !MEMBER_ONLY_PREFIXES.iter().any(|p| wire.starts_with(p))
+        || publisher.is_some_and(|p| book.member_of(p).is_some())
 }
 
 /// Frames are a u32 big-endian length and that many bytes of UTF-8. The
@@ -346,6 +353,54 @@ impl<K: std::hash::Hash + Eq + Clone> Budget<K> {
     }
 }
 
+/// NI-3: what the network task holds for the node while the node is busy
+/// (it holds the consensus lock through a block's execution). The swarm
+/// never waits on the node: a message past this many bytes is dropped, and
+/// the per-tick rebroadcast brings it again. 64 MiB is a choice: ~80
+/// maximal vertices, well inside a validator's memory.
+pub const INBOX_MAX_BYTES: usize = 64 << 20;
+
+/// NI-3: the messages bound for the node, bounded in bytes.
+#[derive(Debug, Default)]
+pub struct Inbox {
+    queue: std::collections::VecDeque<String>,
+    bytes: usize,
+    dropped: u64,
+}
+
+impl Inbox {
+    /// Queue `msg`; false (and dropped) when it would pass the byte bound.
+    pub fn push(&mut self, msg: String) -> bool {
+        if self.bytes + msg.len() > INBOX_MAX_BYTES {
+            self.dropped += 1;
+            if self.dropped.is_power_of_two() {
+                eprintln!(
+                    "⚠️ [NI-3] node inbox full ({} bytes): {} messages dropped so far",
+                    self.bytes, self.dropped
+                );
+            }
+            return false;
+        }
+        self.bytes += msg.len();
+        self.queue.push_back(msg);
+        true
+    }
+
+    pub fn pop(&mut self) -> Option<String> {
+        let msg = self.queue.pop_front()?;
+        self.bytes -= msg.len();
+        Some(msg)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
 /// The request-response behaviour of `/aincore/sync/1`.
 pub fn sync_behaviour() -> request_response::Behaviour<FramedCodec> {
     request_response::Behaviour::with_codec(
@@ -427,20 +482,40 @@ mod tests {
         assert!(PeerBook::new(1, &[&[bad]]).is_empty());
     }
 
-    /// W6: consensus gossip is admitted only from a member publisher; other
-    /// gossip from anyone.
+    /// W6: vertices, attestations, certificates and votes are admitted from
+    /// a member publisher only; a boundary QC request or answer from anyone.
     #[test]
     fn consensus_gossip_needs_a_member_publisher() {
         let (a, sa) = member(1);
         let book = PeerBook::new(0, &[&[a]]);
         let member = local_keypair(&sa).public().to_peer_id();
         let stranger = local_keypair(&[9; 32]).public().to_peer_id();
-        for wire in ["DAG_V4:{}", "QC_VOTE:{}", "QC_WANT:7", "QC_CERT:{}"] {
+        for wire in ["DAG_V4:{}", "QC_VOTE:{}"] {
             assert!(admit_gossip(&book, Some(&member), wire), "{wire}");
             assert!(!admit_gossip(&book, Some(&stranger), wire), "{wire}");
             assert!(!admit_gossip(&book, None, wire), "{wire}");
         }
-        assert!(admit_gossip(&book, Some(&stranger), "TX:{}"));
+        // An observer asks for and is answered a self-verifying boundary QC.
+        for wire in ["QC_WANT:7", "QC_CERT:{}", "TX:{}"] {
+            assert!(admit_gossip(&book, Some(&stranger), wire), "{wire}");
+        }
+    }
+
+    /// NI-3: the inbox keeps order, counts bytes exactly, and drops what
+    /// would pass its bound rather than block.
+    #[test]
+    fn the_inbox_is_bounded_in_bytes_and_keeps_order() {
+        let mut inbox = Inbox::default();
+        assert!(inbox.push("a".into()) && inbox.push("bc".into()));
+        assert_eq!(inbox.bytes(), 3);
+        assert!(!inbox.push("x".repeat(INBOX_MAX_BYTES)), "past the bound");
+        assert_eq!(inbox.pop().as_deref(), Some("a"));
+        assert_eq!(inbox.pop().as_deref(), Some("bc"));
+        assert!(inbox.is_empty() && inbox.bytes() == 0);
+        assert!(
+            inbox.push("x".repeat(INBOX_MAX_BYTES)),
+            "exactly the bound fits"
+        );
     }
 
     /// NI-3: a budget spends its burst, refuses past it, refills at its
