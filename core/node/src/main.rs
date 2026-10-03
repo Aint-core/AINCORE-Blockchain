@@ -122,8 +122,9 @@ fn refuse_removed_snapshot_install(env: Option<String>) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StateSyncSettings {
     checkpoint: chain_sync::state_sync::Checkpoint,
-    /// The peers' TCP ports (the port they serve sync on).
-    peers: Vec<(String, u16)>,
+    /// The peers' libp2p addresses (G4 S6: `host:port` is their base port,
+    /// as bootnodes are; a multiaddr may pin a key).
+    peers: Vec<String>,
     /// Replace an older chain this datadir holds.
     replace_existing: bool,
 }
@@ -134,7 +135,8 @@ const GENESIS_PIN: &str = "AINCORE_EXPECTED_GENESIS_HASH";
 
 impl StateSyncSettings {
     /// `AINCORE_STATE_SYNC_CHECKPOINT=height:block_hash:state_root`,
-    /// `AINCORE_STATE_SYNC_PEERS=ip:port,...` and, to replace an older chain,
+    /// `AINCORE_STATE_SYNC_PEERS=host:port,...` (or multiaddrs) and, to
+    /// replace an older chain,
     /// `AINCORE_STATE_SYNC_REPLACE=1`. `None` without a checkpoint.
     fn parse(
         checkpoint: Option<String>,
@@ -160,14 +162,8 @@ impl StateSyncSettings {
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(|p| {
-                let (ip, port) = p
-                    .rsplit_once(':')
-                    .filter(|(ip, _)| !ip.is_empty())
-                    .ok_or_else(|| format!("state sync peer {p:?} is not ip:port"))?;
-                let port = port
-                    .parse::<u16>()
-                    .map_err(|_| format!("state sync peer {p:?} has no valid port"))?;
-                Ok((ip.to_string(), port))
+                node::sessions::sync_peer_multiaddr(p)
+                    .map_err(|e| format!("state sync peer {p:?}: {e}"))
             })
             .collect::<Result<Vec<_>, String>>()?;
         let replace_existing = match replace.as_deref().map(str::trim) {
@@ -205,7 +201,7 @@ async fn restore_from_checkpoint(
     storage: &Arc<StateDB>,
     settings: &StateSyncSettings,
     genesis: impl FnOnce() -> Result<genesis::GenesisState, String>,
-    my_port: u16,
+    sessions: &network::SessionClient,
     local_signer: &str,
 ) -> Result<Option<chain_sync::state_sync::Restored>, String> {
     let cp = &settings.checkpoint;
@@ -270,7 +266,8 @@ async fn restore_from_checkpoint(
         settings.peers.len()
     );
     let restored =
-        chain_sync::state_sync::restore_over_tcp(storage, &plan, &settings.peers, my_port).await?;
+        chain_sync::state_sync::restore_over_sessions(storage, &plan, sessions, &settings.peers)
+            .await?;
     println!(
         "✅ [STATE_SYNC] restored height {} ({} leaves, {} restarts)",
         restored.height, restored.leaves, restored.restarts
@@ -714,9 +711,28 @@ async fn main() {
         Ok(Some(settings)) => {
             let local_genesis =
                 || genesis::build_local_genesis(stdlib_path).map_err(|e| e.to_string());
-            if let Err(e) =
-                restore_from_checkpoint(&storage, &settings, local_genesis, port, &node_id).await
-            {
+            let restore = restore_from_checkpoint(
+                &storage,
+                &settings,
+                local_genesis,
+                &session_client,
+                &node_id,
+            );
+            tokio::pin!(restore);
+            // G4 S6: the restore runs over sessions while the network task
+            // keeps going. What it hands the node meanwhile is dropped (no
+            // consensus yet, the state is being rebuilt), and every sync
+            // request is refused.
+            let restored = loop {
+                tokio::select! {
+                    result = &mut restore => break result,
+                    Some(_) = p2p_rx.recv() => {}
+                    Some(request) = sync_serves.recv() => {
+                        let _ = request.reply.send(None);
+                    }
+                }
+            };
+            if let Err(e) = restored {
                 eprintln!("❌ FATAL: state restore failed: {e}; refusing to boot");
                 std::process::exit(1);
             }
@@ -821,8 +837,11 @@ async fn main() {
         )
         // G4 S1: block sync over the libp2p sessions, not a connection of
         // its own.
-        .with_sessions(session_client),
+        .with_sessions(session_client.clone()),
     );
+
+    // G4 S6: the RPC counts the sessions the network task holds.
+    let session_table = Arc::clone(&session_client.table);
 
     // G4 S1: answer the sync requests sessions send, off the network task,
     // at most SYNC_SERVE_CONCURRENCY at once (the rest are refused).
@@ -833,12 +852,16 @@ async fn main() {
         tokio::spawn(async move {
             while let Some(request) = sync_serves.recv().await {
                 let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-                    let _ = request.reply.send(None);
+                    // A snapshot part waits a busy answer out; anything
+                    // else is refused.
+                    let _ = request
+                        .reply
+                        .send(chain_sync::state_sync::busy_reply(&request.wire));
                     continue;
                 };
                 let serve_sync = Arc::clone(&serve_sync);
                 tokio::task::spawn_blocking(move || {
-                    let answer = serve_sync.serve_session(&request.wire);
+                    let answer = serve_sync.serve_session(&request.wire, &request.peer);
                     let _ = request.reply.send(answer);
                     drop(permit);
                 });
@@ -1141,7 +1164,7 @@ async fn main() {
     // === START REST API SERVER ===
     {
         let api_consensus = Arc::clone(&consensus);
-        let api_peers = Arc::clone(&peers);
+        let api_sessions = Arc::clone(&session_table);
         let api_mempool = Arc::clone(&mempool);
         let api_storage = Arc::clone(&storage);
         let api_governance = Arc::clone(&governance);
@@ -1162,7 +1185,7 @@ async fn main() {
                         if let Err(e) = api::start_api_server(
                             api_port,
                             api_consensus,
-                            api_peers,
+                            api_sessions,
                             api_mempool,
                             api_storage,
                             api_governance,
@@ -1437,8 +1460,8 @@ mod boot_identity_tests {
         assert_eq!(
             parsed.peers,
             vec![
-                ("192.168.18.202".to_string(), 9022),
-                ("192.168.18.66".to_string(), 9032)
+                "/ip4/192.168.18.202/tcp/9122".to_string(),
+                "/ip4/192.168.18.66/tcp/9132".to_string()
             ]
         );
         assert!(parsed.replace_existing);
@@ -1511,6 +1534,13 @@ mod boot_identity_tests {
         Err("no genesis".into())
     }
 
+    /// A session client whose network task is gone: these restores stop
+    /// before asking any peer.
+    fn closed_sessions() -> network::SessionClient {
+        let book = std::sync::Arc::new(std::sync::RwLock::new(node::sessions::PeerBook::default()));
+        node::sessions::SessionWiring::new(book).1
+    }
+
     /// G3 S6: a datadir restored from this checkpoint, or past it on its
     /// chain, is left alone, so the settings may stay set across restarts.
     #[tokio::test]
@@ -1524,7 +1554,14 @@ mod boot_identity_tests {
             .unwrap();
         for replace in [false, true] {
             assert_eq!(
-                restore_from_checkpoint(&on_chain, &settings(replace), untouched, 0, &me).await,
+                restore_from_checkpoint(
+                    &on_chain,
+                    &settings(replace),
+                    untouched,
+                    &closed_sessions(),
+                    &me
+                )
+                .await,
                 Ok(None),
                 "on the checkpoint's chain (replace: {replace})"
             );
@@ -1537,14 +1574,28 @@ mod boot_identity_tests {
             )
             .unwrap();
         assert_eq!(
-            restore_from_checkpoint(&restored, &settings(true), untouched, 0, &me).await,
+            restore_from_checkpoint(
+                &restored,
+                &settings(true),
+                untouched,
+                &closed_sessions(),
+                &me
+            )
+            .await,
             Ok(None),
             "restored from it already"
         );
         // Mid-restore, it restores.
         on_chain.put(storage::RESTORE_MARKER, "{}").unwrap();
         assert_eq!(
-            restore_from_checkpoint(&on_chain, &settings(false), no_genesis, 0, &me).await,
+            restore_from_checkpoint(
+                &on_chain,
+                &settings(false),
+                no_genesis,
+                &closed_sessions(),
+                &me
+            )
+            .await,
             Err("no genesis".into())
         );
     }
@@ -1562,15 +1613,28 @@ mod boot_identity_tests {
         forked
             .put("block_7", &block_at_7(&"99".repeat(32)))
             .unwrap();
-        let err = restore_from_checkpoint(&forked, &settings(false), untouched, 0, &me)
-            .await
-            .unwrap_err();
+        let err = restore_from_checkpoint(
+            &forked,
+            &settings(false),
+            untouched,
+            &closed_sessions(),
+            &me,
+        )
+        .await
+        .unwrap_err();
         assert!(
             err.contains("another chain") && err.contains("REPLACE"),
             "{err}"
         );
         assert_eq!(
-            restore_from_checkpoint(&forked, &settings(true), no_genesis, 0, &me).await,
+            restore_from_checkpoint(
+                &forked,
+                &settings(true),
+                no_genesis,
+                &closed_sessions(),
+                &me
+            )
+            .await,
             Err("no genesis".into()),
             "replaced when asked"
         );
@@ -1594,7 +1658,14 @@ mod boot_identity_tests {
             .put("consensus:qc:7", &qc_at_7(&"ab".repeat(32)))
             .unwrap();
         assert_eq!(
-            restore_from_checkpoint(&pruned_on_chain, &settings(false), untouched, 0, &me).await,
+            restore_from_checkpoint(
+                &pruned_on_chain,
+                &settings(false),
+                untouched,
+                &closed_sessions(),
+                &me
+            )
+            .await,
             Ok(None),
             "the QC says: the checkpoint's chain"
         );
@@ -1603,19 +1674,38 @@ mod boot_identity_tests {
         pruned_forked
             .put("consensus:qc:7", &qc_at_7(&"99".repeat(32)))
             .unwrap();
-        let err = restore_from_checkpoint(&pruned_forked, &settings(false), untouched, 0, &me)
-            .await
-            .unwrap_err();
+        let err = restore_from_checkpoint(
+            &pruned_forked,
+            &settings(false),
+            untouched,
+            &closed_sessions(),
+            &me,
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("another chain"), "{err}");
         // Neither block nor QC: cannot tell, so refused unless replacing.
         let unknown = skip_db("unknown");
         unknown.put("latest_height", "100").unwrap();
-        let err = restore_from_checkpoint(&unknown, &settings(false), untouched, 0, &me)
-            .await
-            .unwrap_err();
+        let err = restore_from_checkpoint(
+            &unknown,
+            &settings(false),
+            untouched,
+            &closed_sessions(),
+            &me,
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("cannot be told"), "{err}");
         assert_eq!(
-            restore_from_checkpoint(&unknown, &settings(true), no_genesis, 0, &me).await,
+            restore_from_checkpoint(
+                &unknown,
+                &settings(true),
+                no_genesis,
+                &closed_sessions(),
+                &me
+            )
+            .await,
             Err("no genesis".into())
         );
         // Exactly at the checkpoint height counts as past it; one below
@@ -1624,12 +1714,14 @@ mod boot_identity_tests {
         at.put("latest_height", "7").unwrap();
         at.put("block_7", &block_at_7(&"ab".repeat(32))).unwrap();
         assert_eq!(
-            restore_from_checkpoint(&at, &settings(false), untouched, 0, &me).await,
+            restore_from_checkpoint(&at, &settings(false), untouched, &closed_sessions(), &me)
+                .await,
             Ok(None)
         );
         at.put("latest_height", "6").unwrap();
         assert_eq!(
-            restore_from_checkpoint(&at, &settings(true), no_genesis, 0, &me).await,
+            restore_from_checkpoint(&at, &settings(true), no_genesis, &closed_sessions(), &me)
+                .await,
             Err("no genesis".into())
         );
     }

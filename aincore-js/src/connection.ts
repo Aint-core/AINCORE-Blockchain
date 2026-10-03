@@ -352,10 +352,13 @@ export class Connection {
     async getNodeStatus(): Promise<{
         node_id: string;
         current_round: number;
+        /** Every libp2p session the node holds, observers included. */
         peers_count: number;
+        /** The sessions whose key names a committee member (G4 S6). */
+        committee_sessions?: number;
         latest_height: string;
     }> {
-        return await this.request('aincore_nodeStatus', []);
+        return await this.request('aincore_getStatus', []);
     }
 
     /**
@@ -607,7 +610,9 @@ export class Connection {
                 total_supply: 0,
                 circulating_supply: 0,
                 total_staked: 0,
-                validator_count: status.peers_count + 1,
+                // The committee sessions plus this node; peers_count counts
+                // observers too.
+                validator_count: (status.committee_sessions ?? status.peers_count) + 1,
                 block_height: parseInt(status.latest_height) || 0,
                 tps: 0,
             };

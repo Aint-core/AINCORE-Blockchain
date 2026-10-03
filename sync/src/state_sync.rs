@@ -17,7 +17,6 @@ use consensus::qc::QuorumCertificate;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use storage::class::{classify, KeyClass};
@@ -47,15 +46,16 @@ pub const VALUE_PART_BYTES: usize = 1024 * 1024;
 pub const MAX_LEAF_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_CHUNK_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 /// Snapshot serving, apart from vertex serving: requests in flight and cost
-/// units per second (a leaf, or `UNIT_BYTES` read), globally and per client
-/// IP, so no one client takes more than its share.
+/// units per second (a leaf, or `UNIT_BYTES` read), globally and per client,
+/// so no one client takes more than its share. A client is the key its
+/// session authenticated (G4 S6), or a legacy client's IP.
 pub const STATE_SERVE_IN_FLIGHT: usize = 4;
-pub const STATE_SERVE_IN_FLIGHT_PER_IP: usize = 1;
+pub const STATE_SERVE_IN_FLIGHT_PER_CLIENT: usize = 1;
 pub const STATE_SERVE_UNITS_PER_SEC: f64 = 8_000.0;
-pub const STATE_SERVE_UNITS_PER_SEC_PER_IP: f64 = 2_000.0;
+pub const STATE_SERVE_UNITS_PER_SEC_PER_CLIENT: f64 = 2_000.0;
 pub const UNIT_BYTES: u64 = 4 * 1024;
-/// Client IPs remembered at once; idle ones are forgotten first.
-const MAX_TRACKED_IPS: usize = 1_024;
+/// Clients remembered at once; idle ones are forgotten first.
+const MAX_TRACKED_CLIENTS: usize = 1_024;
 /// Rows deleted per batch while clearing a datadir.
 const CLEAR_BATCH: usize = 10_000;
 /// The longest wait between "busy" answers to a value part: a server's
@@ -64,7 +64,7 @@ const PART_BUSY_WAIT: Duration = Duration::from_secs(1);
 /// What a turn longer than `Patience::slow_turn` must deliver, or its peer
 /// sits out turns. An honest server delivers at its budget, several times
 /// this.
-const MIN_TURN_UNITS_PER_SEC: f64 = STATE_SERVE_UNITS_PER_SEC_PER_IP / 8.0;
+const MIN_TURN_UNITS_PER_SEC: f64 = STATE_SERVE_UNITS_PER_SEC_PER_CLIENT / 8.0;
 /// Where a restored node records the checkpoint it restored, and the key it
 /// restored with (N).
 pub const RESTORED_CHECKPOINT: &str = "sys:restored_checkpoint";
@@ -298,7 +298,7 @@ impl Bucket {
 
 struct Buckets {
     global: Bucket,
-    per_ip: HashMap<IpAddr, Bucket>,
+    per_client: HashMap<String, Bucket>,
 }
 
 /// Snapshot serving's budget: slots in flight and cost units, globally and
@@ -314,7 +314,7 @@ impl Default for StateBudget {
         Self {
             buckets: Mutex::new(Buckets {
                 global: Bucket::full(STATE_SERVE_UNITS_PER_SEC),
-                per_ip: HashMap::new(),
+                per_client: HashMap::new(),
             }),
         }
     }
@@ -323,7 +323,7 @@ impl Default for StateBudget {
 /// A request let in: `granted` units, and a slot released on drop.
 pub struct Admission<'a> {
     budget: &'a StateBudget,
-    ip: Option<IpAddr>,
+    client: Option<String>,
     pub granted: usize,
 }
 
@@ -333,20 +333,20 @@ impl StateBudget {
         self.buckets.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Let a request from `ip` in (`None`: in process, global limits only),
-    /// with up to `want` units both buckets hold. `None` when busy.
-    pub fn admit(&self, ip: Option<IpAddr>, want: usize) -> Option<Admission<'_>> {
-        self.admit_at_least(ip, want, 1)
+    /// Let a request from `client` in (`None`: in process, global limits
+    /// only), with up to `want` units both buckets hold. `None` when busy.
+    pub fn admit(&self, client: Option<&str>, want: usize) -> Option<Admission<'_>> {
+        self.admit_at_least(client, want, 1)
     }
 
     /// `admit`, only when both buckets hold all `units`.
-    pub fn admit_all(&self, ip: Option<IpAddr>, units: usize) -> Option<Admission<'_>> {
-        self.admit_at_least(ip, units, units)
+    pub fn admit_all(&self, client: Option<&str>, units: usize) -> Option<Admission<'_>> {
+        self.admit_at_least(client, units, units)
     }
 
     fn admit_at_least(
         &self,
-        ip: Option<IpAddr>,
+        client: Option<&str>,
         want: usize,
         least: usize,
     ) -> Option<Admission<'_>> {
@@ -357,26 +357,26 @@ impl StateBudget {
             return None;
         }
         let mut cap = st.global.tokens;
-        if let Some(ip) = ip {
-            if !st.per_ip.contains_key(&ip) && st.per_ip.len() >= MAX_TRACKED_IPS {
+        if let Some(client) = client {
+            if !st.per_client.contains_key(client) && st.per_client.len() >= MAX_TRACKED_CLIENTS {
                 // A bucket that has refilled and is idle is the same as a
                 // new one.
-                st.per_ip.retain(|_, b| {
+                st.per_client.retain(|_, b| {
                     let refilled = b.tokens
                         + now.saturating_duration_since(b.last).as_secs_f64()
-                            * STATE_SERVE_UNITS_PER_SEC_PER_IP;
-                    b.in_flight > 0 || refilled < STATE_SERVE_UNITS_PER_SEC_PER_IP
+                            * STATE_SERVE_UNITS_PER_SEC_PER_CLIENT;
+                    b.in_flight > 0 || refilled < STATE_SERVE_UNITS_PER_SEC_PER_CLIENT
                 });
-                if st.per_ip.len() >= MAX_TRACKED_IPS {
+                if st.per_client.len() >= MAX_TRACKED_CLIENTS {
                     return None;
                 }
             }
             let bucket = st
-                .per_ip
-                .entry(ip)
-                .or_insert_with(|| Bucket::full(STATE_SERVE_UNITS_PER_SEC_PER_IP));
-            bucket.refill(STATE_SERVE_UNITS_PER_SEC_PER_IP, now);
-            if bucket.in_flight >= STATE_SERVE_IN_FLIGHT_PER_IP {
+                .per_client
+                .entry(client.to_string())
+                .or_insert_with(|| Bucket::full(STATE_SERVE_UNITS_PER_SEC_PER_CLIENT));
+            bucket.refill(STATE_SERVE_UNITS_PER_SEC_PER_CLIENT, now);
+            if bucket.in_flight >= STATE_SERVE_IN_FLIGHT_PER_CLIENT {
                 return None;
             }
             cap = cap.min(bucket.tokens);
@@ -387,13 +387,13 @@ impl StateBudget {
         }
         st.global.tokens -= granted;
         st.global.in_flight += 1;
-        if let Some(bucket) = ip.and_then(|ip| st.per_ip.get_mut(&ip)) {
+        if let Some(bucket) = client.and_then(|c| st.per_client.get_mut(c)) {
             bucket.tokens -= granted;
             bucket.in_flight += 1;
         }
         Some(Admission {
             budget: self,
-            ip,
+            client: client.map(str::to_string),
             granted: granted as usize,
         })
     }
@@ -402,11 +402,11 @@ impl StateBudget {
 impl StateBudget {
     /// Tests only: the units a bucket holds now, before any refill.
     #[cfg(test)]
-    fn balance(&self, ip: Option<IpAddr>) -> f64 {
+    fn balance(&self, client: Option<&str>) -> f64 {
         let st = self.lock();
-        match ip {
+        match client {
             None => st.global.tokens,
-            Some(ip) => st.per_ip.get(&ip).map_or(f64::NAN, |b| b.tokens),
+            Some(c) => st.per_client.get(c).map_or(f64::NAN, |b| b.tokens),
         }
     }
 }
@@ -416,10 +416,14 @@ impl Admission<'_> {
     /// more than one second's worth for a client: a bucket in debt waits a
     /// second at most, so one costly request cannot lock a client out.
     fn charge(&self, bytes: u64) {
-        let units = (bytes.div_ceil(UNIT_BYTES) as f64).min(STATE_SERVE_UNITS_PER_SEC_PER_IP);
+        let units = (bytes.div_ceil(UNIT_BYTES) as f64).min(STATE_SERVE_UNITS_PER_SEC_PER_CLIENT);
         let mut st = self.budget.lock();
         st.global.tokens -= units;
-        if let Some(bucket) = self.ip.and_then(|ip| st.per_ip.get_mut(&ip)) {
+        if let Some(bucket) = self
+            .client
+            .as_deref()
+            .and_then(|c| st.per_client.get_mut(c))
+        {
             bucket.tokens -= units;
         }
     }
@@ -429,8 +433,12 @@ impl Admission<'_> {
         let units = units as f64;
         let mut st = self.budget.lock();
         st.global.tokens = (st.global.tokens + units).min(STATE_SERVE_UNITS_PER_SEC);
-        if let Some(bucket) = self.ip.and_then(|ip| st.per_ip.get_mut(&ip)) {
-            bucket.tokens = (bucket.tokens + units).min(STATE_SERVE_UNITS_PER_SEC_PER_IP);
+        if let Some(bucket) = self
+            .client
+            .as_deref()
+            .and_then(|c| st.per_client.get_mut(c))
+        {
+            bucket.tokens = (bucket.tokens + units).min(STATE_SERVE_UNITS_PER_SEC_PER_CLIENT);
         }
     }
 }
@@ -439,7 +447,11 @@ impl Drop for Admission<'_> {
     fn drop(&mut self) {
         let mut st = self.budget.lock();
         st.global.in_flight = st.global.in_flight.saturating_sub(1);
-        if let Some(bucket) = self.ip.and_then(|ip| st.per_ip.get_mut(&ip)) {
+        if let Some(bucket) = self
+            .client
+            .as_deref()
+            .and_then(|c| st.per_client.get_mut(c))
+        {
             bucket.in_flight = bucket.in_flight.saturating_sub(1);
         }
     }
@@ -478,7 +490,7 @@ impl ChainSync {
     /// read once, up to the first that does not fit. Charged a unit per leaf
     /// served and per `UNIT_BYTES` read (at most one second's worth), under
     /// the global and the per-IP budget; the reads off the shared workers.
-    pub fn serve_state_chunk(&self, req: ChunkRequest, peer: Option<IpAddr>) -> ChunkResponse {
+    pub fn serve_state_chunk(&self, req: ChunkRequest, peer: Option<&str>) -> ChunkResponse {
         let refuse = |why: &str| ChunkResponse {
             error: Some(why.to_string()),
             ..Default::default()
@@ -564,7 +576,7 @@ impl ChainSync {
     /// `peer`, for a value too large to travel inline. A part is let in only
     /// when its whole cost fits; reading a value that is not cached costs at
     /// most one more second's worth.
-    pub fn serve_state_value(&self, req: ValueRequest, peer: Option<IpAddr>) -> ValueResponse {
+    pub fn serve_state_value(&self, req: ValueRequest, peer: Option<&str>) -> ValueResponse {
         let refuse = |why: &str| ValueResponse {
             error: Some(why.to_string()),
             ..Default::default()
@@ -1430,6 +1442,73 @@ where
             restarts,
         });
     }
+}
+
+/// G4 S6: the answer to a chunk or value-part request a server cannot take
+/// now (its quota or its serving slots are spent): "busy", which a client
+/// waits out without losing its place. Constant size, reads no storage.
+/// `None` for any other request, which is simply refused.
+pub fn busy_reply(wire: &str) -> Option<String> {
+    if wire.starts_with(CHUNK_REQ) {
+        let busy = ChunkResponse {
+            error: Some(BUSY.into()),
+            ..Default::default()
+        };
+        return Some(format!(
+            "{CHUNK_RESP}{}",
+            serde_json::to_string(&busy).ok()?
+        ));
+    }
+    if wire.starts_with(VALUE_REQ) {
+        let busy = ValueResponse {
+            error: Some(BUSY.into()),
+            ..Default::default()
+        };
+        return Some(format!(
+            "{VALUE_RESP}{}",
+            serde_json::to_string(&busy).ok()?
+        ));
+    }
+    None
+}
+
+/// G4 S6: `restore_state` over the network task's sessions. Peer `i` is
+/// dialled at `addrs[i]` (a multiaddr) on first use and again after a
+/// failed request; each request runs on its own stream of the session, so
+/// a timed-out request cannot poison the next.
+pub async fn restore_over_sessions(
+    storage: &Arc<StateDB>,
+    plan: &RestorePlan<'_>,
+    client: &network::SessionClient,
+    addrs: &[String],
+) -> Result<Restored, String> {
+    const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+    let known: Arc<tokio::sync::Mutex<HashMap<usize, String>>> = Arc::default();
+    let timeout = plan.patience.request_timeout;
+    restore_state(storage, plan, addrs.len(), |peer, msg| {
+        let known = Arc::clone(&known);
+        let client = client.clone();
+        let addr = addrs[peer].clone();
+        async move {
+            let cached = known.lock().await.get(&peer).cloned();
+            let id = match cached {
+                Some(id) => id,
+                None => {
+                    let id = client.connect(&addr, DIAL_TIMEOUT).await?;
+                    known.lock().await.insert(peer, id.clone());
+                    id
+                }
+            };
+            match client.ask(&id, &msg, timeout).await {
+                Ok(reply) => Ok(reply),
+                Err(e) => {
+                    known.lock().await.remove(&peer);
+                    Err(format!("{addr}: {e}"))
+                }
+            }
+        }
+    })
+    .await
 }
 
 type Connections =

@@ -1530,21 +1530,12 @@ impl ChainSync {
         }
     }
 
-    /// G4 S1: a request a libp2p session sent: what `serves` lists, and a
-    /// boundary QC (`QC_WANT:h`, answered `QC_CERT:{qc}` for a held height,
-    /// so an observer can activate an epoch). Snapshot serving stays on the
-    /// legacy channel, budgeted per IP, until S6.
-    pub fn serve_session(&self, msg: &str) -> Option<String> {
-        if [
-            state_sync::ANCHOR_REQ,
-            state_sync::CHUNK_REQ,
-            state_sync::VALUE_REQ,
-        ]
-        .iter()
-        .any(|prefix| msg.starts_with(prefix))
-        {
-            return None;
-        }
+    /// G4 S1/S6: a request a libp2p session sent: what `serves` lists
+    /// (snapshot serving charged to `peer`, the key the session
+    /// authenticated), and a boundary QC (`QC_WANT:h`, answered
+    /// `QC_CERT:{qc}` for a held height, so an observer can activate an
+    /// epoch).
+    pub fn serve_session(&self, msg: &str, peer: &str) -> Option<String> {
         if let Some(height) = msg.strip_prefix(consensus::dag::QC_WANT_PREFIX) {
             let height = height.parse::<u64>().ok()?;
             if height > self.get_local_height() {
@@ -1558,7 +1549,7 @@ impl ChainSync {
             ));
         }
         if Self::serves(msg) {
-            self.handle_message_from(msg, None)
+            self.handle_request(msg, Some(peer))
         } else {
             None
         }
@@ -1572,6 +1563,13 @@ impl ChainSync {
     /// `handle_message` for a request from `peer`, whose IP snapshot serving
     /// budgets by. `None` is an in-process caller.
     pub fn handle_message_from(&self, msg: &str, peer: Option<std::net::IpAddr>) -> Option<String> {
+        let client = peer.map(|ip| ip.to_string());
+        self.handle_request(msg, client.as_deref())
+    }
+
+    /// A request charged to `client` (a session's key or a legacy IP;
+    /// `None` is an in-process caller, global limits only).
+    fn handle_request(&self, msg: &str, client: Option<&str>) -> Option<String> {
         // Handle Request Logic
         if msg == "GET_HEIGHT" {
             let h = self.get_local_height();
@@ -1596,12 +1594,12 @@ impl ChainSync {
         }
         if let Some(req_json) = msg.strip_prefix(state_sync::CHUNK_REQ) {
             let req = serde_json::from_str::<state_sync::ChunkRequest>(req_json).ok()?;
-            let resp = serde_json::to_string(&self.serve_state_chunk(req, peer)).ok()?;
+            let resp = serde_json::to_string(&self.serve_state_chunk(req, client)).ok()?;
             return Some(format!("{}{}", state_sync::CHUNK_RESP, resp));
         }
         if let Some(req_json) = msg.strip_prefix(state_sync::VALUE_REQ) {
             let req = serde_json::from_str::<state_sync::ValueRequest>(req_json).ok()?;
-            let resp = serde_json::to_string(&self.serve_state_value(req, peer)).ok()?;
+            let resp = serde_json::to_string(&self.serve_state_value(req, client)).ok()?;
             return Some(format!("{}{}", state_sync::VALUE_RESP, resp));
         }
         if let Some(req_json) = msg.strip_prefix(state_sync::ANCHOR_REQ) {

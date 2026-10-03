@@ -1,6 +1,5 @@
 use actix_governor::{Governor, GovernorConfigBuilder};
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
-use network::PeerList;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -547,7 +546,8 @@ fn stored_tx_receipt(storage: &Arc<StateDB>, tx_hash: &str) -> Option<serde_json
 // --- Shared State ---
 pub struct AppState {
     pub consensus: Arc<RwLock<DagConsensus>>,
-    pub peers: PeerList,
+    /// G4 S6: the sessions the network task holds.
+    pub sessions: network::SessionTable,
     pub mempool: Arc<Mutex<mempool::Mempool>>,
     pub governance: Arc<Mutex<GovernanceManager>>,
     pub storage: Arc<StateDB>,
@@ -852,7 +852,8 @@ fn handle_rpc_method(
                      serde_json::Value::Null,
                  ),
              };
-             let peers_count = data.peers.lock().map_err(|e| JsonRpcError { code: -32000, message: format!("Peers lock error: {}", e) })?.len();
+             // G4 S6: sessions, and how many of them name a committee member.
+             let (peers_count, committee_sessions) = session_counts(&data.sessions);
 
              Ok(serde_json::json!({
                  "node_id": node_id,
@@ -862,6 +863,7 @@ fn handle_rpc_method(
                  // while this node's drift alarm holds; null otherwise.
                  "clock_drift_alarm_secs": clock_drift_alarm,
                  "peers_count": peers_count,
+                 "committee_sessions": committee_sessions,
                  "latest_height": match data.storage.get("latest_height") {
                      Ok(Some(h)) => h,
                      _ => "0".to_string(),
@@ -2265,7 +2267,7 @@ async fn get_network_info_handler(data: web::Data<AppState>) -> impl Responder {
     // Copy what is needed and release both locks BEFORE the storage scan below:
     // holding the consensus read lock across 20 block reads blocked the
     // consensus loop from taking its write lock, from a public endpoint.
-    let peer_count = data.peers.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let (peer_count, committee_sessions) = session_counts(&data.sessions);
     let (node_id, current_round) = match data.consensus.try_read() {
         Ok(c) => (
             serde_json::json!(c.node_id),
@@ -2335,6 +2337,7 @@ async fn get_network_info_handler(data: web::Data<AppState>) -> impl Responder {
         "node_id": node_id,
         "version": "0.1.0-alpha",
         "peer_count": peer_count,
+        "committee_sessions": committee_sessions,
         "latest_block": height,
         "current_round": current_round,
         "tps": tps,
@@ -2392,10 +2395,19 @@ async fn metrics_handler() -> impl Responder {
 
 // ...
 
+/// G4 S6: the sessions held, and how many name a committee member.
+fn session_counts(sessions: &network::SessionTable) -> (usize, usize) {
+    let table = sessions.read().unwrap_or_else(|e| e.into_inner());
+    (
+        table.len(),
+        table.iter().filter(|s| s.member.is_some()).count(),
+    )
+}
+
 pub async fn start_api_server(
     api_port: u16,
     consensus: Arc<RwLock<DagConsensus>>,
-    peers: PeerList,
+    sessions: network::SessionTable,
     mempool: Arc<Mutex<mempool::Mempool>>,
     storage: Arc<StateDB>,
     governance: Arc<Mutex<GovernanceManager>>,
@@ -2404,7 +2416,7 @@ pub async fn start_api_server(
 
     let app_state = web::Data::new(AppState {
         consensus,
-        peers,
+        sessions,
         mempool,
         governance,
         storage,
@@ -2524,13 +2536,13 @@ mod tests {
             None,
             [3u8; 32],
         )));
-        let peers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let sessions: network::SessionTable = Arc::default();
         let governance = Arc::new(Mutex::new(governance::GovernanceManager::new(Arc::clone(
             &db,
         ))));
         AppState {
             consensus,
-            peers,
+            sessions,
             mempool: Arc::new(Mutex::new(mempool::Mempool::new())),
             governance,
             storage: db,
@@ -3300,13 +3312,13 @@ mod tests {
             None,
             [1u8; 32],
         )));
-        let peers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let sessions: network::SessionTable = Arc::default();
         let governance = Arc::new(Mutex::new(governance::GovernanceManager::new(Arc::clone(
             &db,
         ))));
         let state = AppState {
             consensus,
-            peers,
+            sessions,
             mempool: Arc::new(Mutex::new(mempool::Mempool::new())),
             governance,
             storage: Arc::clone(&db),
@@ -3471,13 +3483,13 @@ mod tests {
             None,
             [2u8; 32],
         )));
-        let peers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let sessions: network::SessionTable = Arc::default();
         let governance = Arc::new(Mutex::new(governance::GovernanceManager::new(Arc::clone(
             &db,
         ))));
         let state = AppState {
             consensus,
-            peers,
+            sessions,
             mempool: Arc::new(Mutex::new(mempool::Mempool::new())),
             governance,
             storage: db,

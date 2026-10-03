@@ -72,6 +72,7 @@ pub async fn start_p2p(
         book,
         table: session_table,
         asks: mut sync_asks,
+        dials: mut sync_dials,
         serves: sync_serves,
     } = wiring;
     let (tx_out, mut rx_in) = mpsc::channel::<Outbound>(64); // Main -> P2P
@@ -304,6 +305,11 @@ pub async fn start_p2p(
         > = std::collections::HashMap::new();
         let (served_tx, mut served_rx) =
             mpsc::channel::<(request_response::InboundRequestId, Option<String>)>(64);
+        // G4 S6: sessions the node asked for by address, until they open.
+        let mut pending_dials: std::collections::HashMap<
+            libp2p::swarm::ConnectionId,
+            tokio::sync::oneshot::Sender<Result<String, String>>,
+        > = std::collections::HashMap::new();
         // G4 NI-3: per-member consensus budget, per-session sync quota.
         let mut member_budget: sessions::Budget<String> =
             sessions::Budget::new(sessions::MEMBER_MSGS_PER_SEC, sessions::MEMBER_MSG_BURST);
@@ -363,6 +369,30 @@ pub async fn start_p2p(
                         Err(_) => {
                             eprintln!("❌ The main loop is gone; dropping {} queued bytes", inbox.bytes());
                             while inbox.pop().is_some() {}
+                        }
+                    }
+                }
+                Some(dial) = sync_dials.recv() => {
+                    match dial.addr.parse::<Multiaddr>() {
+                        Ok(addr) => {
+                            let opts = match addr.iter().last() {
+                                Some(Protocol::P2p(peer)) => {
+                                    DialOpts::peer_id(peer).addresses(vec![addr]).build()
+                                }
+                                _ => DialOpts::unknown_peer_id().address(addr).build(),
+                            };
+                            let id = opts.connection_id();
+                            match swarm.dial(opts) {
+                                Ok(()) => {
+                                    pending_dials.insert(id, dial.reply);
+                                }
+                                Err(e) => {
+                                    let _ = dial.reply.send(Err(e.to_string()));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = dial.reply.send(Err(format!("not a multiaddr: {e}")));
                         }
                     }
                 }
@@ -441,7 +471,15 @@ pub async fn start_p2p(
                         message: request_response::Message::Request { request_id, request, channel },
                     })) => {
                         if !sync_budget.spend(&peer, std::time::Instant::now()) {
-                            drop(channel); // NI-3: over its sync quota
+                            // NI-3: over its sync quota. A snapshot part is told
+                            // "busy" (its client waits it out without losing
+                            // its place); anything else is refused.
+                            match chain_sync::state_sync::busy_reply(&request) {
+                                Some(busy) => {
+                                    let _ = swarm.behaviour_mut().sync.send_response(channel, busy);
+                                }
+                                None => drop(channel),
+                            }
                             continue;
                         }
                         let member = book
@@ -625,6 +663,11 @@ pub async fn start_p2p(
                         println!("🌐 P2P Listening on {:?}", address);
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, num_established, .. } => {
+                        // G4 S6: a session the node asked for is open (answered
+                        // before any duplicate connection is closed below).
+                        if let Some(reply) = pending_dials.remove(&connection_id) {
+                            let _ = reply.send(Ok(peer_id.to_string()));
+                        }
                         if num_established.get() > MAX_LIBP2P_CONNECTIONS_PER_PEER {
                             eprintln!(
                                 "⚠️ Closing duplicate libp2p connection to {:?}: established={} limit={}",
@@ -728,7 +771,10 @@ pub async fn start_p2p(
                             swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                         }
                     }
-                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                    SwarmEvent::OutgoingConnectionError { peer_id, connection_id, error, .. } => {
+                        if let Some(reply) = pending_dials.remove(&connection_id) {
+                            let _ = reply.send(Err(error.to_string()));
+                        }
                         eprintln!("❌ P2P Outgoing Connection Error to {:?}: {:?}", peer_id, error);
                     }
                     SwarmEvent::Dialing { peer_id, .. } => {

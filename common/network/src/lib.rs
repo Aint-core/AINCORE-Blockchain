@@ -108,11 +108,21 @@ pub struct SyncServe {
     pub reply: tokio::sync::oneshot::Sender<Option<String>>,
 }
 
+/// G4 S6: a session the node asks the network task to open, to a peer given
+/// by address (a restore peer); answered with the PeerId the session
+/// authenticated.
+#[derive(Debug)]
+pub struct SyncDial {
+    pub addr: String,
+    pub reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+}
+
 /// G4 S1: how sync reaches peers: over the sessions the network task holds,
 /// never over a connection of its own.
 #[derive(Debug, Clone)]
 pub struct SessionClient {
     pub asks: tokio::sync::mpsc::Sender<SyncAsk>,
+    pub dials: tokio::sync::mpsc::Sender<SyncDial>,
     pub table: SessionTable,
 }
 
@@ -122,6 +132,27 @@ impl SessionClient {
         let mut sessions = self.table.read().map(|t| t.clone()).unwrap_or_default();
         sessions.sort_by_key(|s| s.member.is_none());
         sessions
+    }
+
+    /// Open (or reuse) a session to the peer at multiaddr `addr`; its PeerId.
+    pub async fn connect(
+        &self,
+        addr: &str,
+        timeout: std::time::Duration,
+    ) -> Result<String, String> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.dials
+            .send(SyncDial {
+                addr: addr.to_string(),
+                reply,
+            })
+            .await
+            .map_err(|_| "the network task is gone".to_string())?;
+        match tokio::time::timeout(timeout, answer).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("the network task dropped the dial".to_string()),
+            Err(_) => Err(format!("no session to {addr} within {timeout:?}")),
+        }
     }
 
     /// One request to `peer` and its answer, or why there is none.

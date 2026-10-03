@@ -255,6 +255,7 @@ pub struct SessionWiring {
     pub book: Arc<RwLock<PeerBook>>,
     pub table: network::SessionTable,
     pub asks: mpsc::Receiver<network::SyncAsk>,
+    pub dials: mpsc::Receiver<network::SyncDial>,
     pub serves: mpsc::Sender<network::SyncServe>,
 }
 
@@ -270,16 +271,19 @@ impl SessionWiring {
     ) {
         let table: network::SessionTable = Arc::default();
         let (asks_tx, asks) = mpsc::channel(64);
+        let (dials_tx, dials) = mpsc::channel(16);
         let (serves, serves_rx) = mpsc::channel(64);
         (
             Self {
                 book,
                 table: Arc::clone(&table),
                 asks,
+                dials,
                 serves,
             },
             network::SessionClient {
                 asks: asks_tx,
+                dials: dials_tx,
                 table,
             },
             serves_rx,
@@ -401,6 +405,41 @@ impl Inbox {
     }
 }
 
+/// G4 S6: a sync peer given as `host:port` (its base port, as bootnodes
+/// are) is its libp2p address `/ip4|ip6|dns4/host/tcp/(port+100)`; a
+/// multiaddr (optionally ending `/p2p/<PeerId>`, which pins its key) is
+/// taken as is.
+pub fn sync_peer_multiaddr(peer: &str) -> Result<String, String> {
+    let peer = peer.trim();
+    if peer.starts_with('/') {
+        return peer
+            .parse::<libp2p::Multiaddr>()
+            .map(|a| a.to_string())
+            .map_err(|e| format!("{peer}: {e}"));
+    }
+    let (host, port) = peer
+        .rsplit_once(':')
+        .ok_or_else(|| format!("{peer}: want host:port or a multiaddr"))?;
+    let port = port
+        .parse::<u16>()
+        .ok()
+        .and_then(|p| p.checked_add(100))
+        .ok_or_else(|| format!("{peer}: port must be a base port below 65436"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() {
+        return Err(format!("{peer}: no host"));
+    }
+    let proto = match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => "ip4",
+        Ok(std::net::IpAddr::V6(_)) => "ip6",
+        Err(_) => "dns4",
+    };
+    let addr = format!("/{proto}/{host}/tcp/{port}");
+    addr.parse::<libp2p::Multiaddr>()
+        .map(|a| a.to_string())
+        .map_err(|e| format!("{peer}: {e}"))
+}
+
 /// The request-response behaviour of `/aincore/sync/1`.
 pub fn sync_behaviour() -> request_response::Behaviour<FramedCodec> {
     request_response::Behaviour::with_codec(
@@ -499,6 +538,32 @@ mod tests {
         for wire in ["QC_WANT:7", "QC_CERT:{}", "TX:{}"] {
             assert!(admit_gossip(&book, Some(&stranger), wire), "{wire}");
         }
+    }
+
+    /// G4 S6: restore peers keep their `host:port` form (the base port, as
+    /// bootnodes) and may pin a key with a full multiaddr.
+    #[test]
+    fn a_sync_peer_is_its_libp2p_address() {
+        assert_eq!(
+            sync_peer_multiaddr("192.168.18.202:9022").unwrap(),
+            "/ip4/192.168.18.202/tcp/9122"
+        );
+        assert_eq!(
+            sync_peer_multiaddr("node.example:9002").unwrap(),
+            "/dns4/node.example/tcp/9102"
+        );
+        assert_eq!(
+            sync_peer_multiaddr("[::1]:9000").unwrap(),
+            "/ip6/::1/tcp/9100"
+        );
+        let pinned = format!(
+            "/ip4/10.0.0.1/tcp/9102/p2p/{}",
+            local_keypair(&[3; 32]).public().to_peer_id()
+        );
+        assert_eq!(sync_peer_multiaddr(&pinned).unwrap(), pinned);
+        assert!(sync_peer_multiaddr("10.0.0.1:65436").is_err());
+        assert!(sync_peer_multiaddr(":9022").is_err());
+        assert!(sync_peer_multiaddr("10.0.0.1").is_err());
     }
 
     /// NI-3: the inbox keeps order, counts bytes exactly, and drops what

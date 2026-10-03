@@ -560,6 +560,83 @@ fn stored_block(chain: &Chain) -> Block {
     serde_json::from_str(&chain.db.get(&format!("block_{H}")).unwrap().unwrap()).unwrap()
 }
 
+/// G4 S6: a node restores over the network task's sessions: each peer is
+/// dialled once by address, every request runs on that session, and each
+/// is charged to the key the server's session layer names.
+#[tokio::test]
+async fn a_node_restores_over_sessions() {
+    let g = genesis();
+    let a = chain("sessions_a", MEMBER);
+    let client = temp_db("sessions_client");
+    let server = Arc::new(peer(&a, Behaviour::Honest).sync);
+    let (asks_tx, mut asks) = tokio::sync::mpsc::channel::<network::SyncAsk>(8);
+    let (dials_tx, mut dials) = tokio::sync::mpsc::channel::<network::SyncDial>(8);
+    let sessions = network::SessionClient {
+        asks: asks_tx,
+        dials: dials_tx,
+        table: Default::default(),
+    };
+    let dialled = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = Arc::new(Mutex::new(std::collections::BTreeSet::<String>::new()));
+    let (task_dialled, task_seen, task_server) =
+        (Arc::clone(&dialled), Arc::clone(&seen), Arc::clone(&server));
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(dial) = dials.recv() => {
+                    task_dialled.lock().unwrap().push(dial.addr.clone());
+                    let _ = dial.reply.send(Ok("12D3KooWserver".into()));
+                }
+                Some(ask) = asks.recv() => {
+                    task_seen.lock().unwrap().insert(ask.peer.clone());
+                    let answer = task_server
+                        .serve_session(&ask.wire, "12D3KooWclient")
+                        .ok_or_else(|| "refused".to_string());
+                    let _ = ask.reply.send(answer);
+                }
+                else => break,
+            }
+        }
+    });
+    let addr = "/ip4/127.0.0.1/tcp/9102".to_string();
+    let done = restore_over_sessions(
+        &client,
+        &plan(&a.cp, &g, false),
+        &sessions,
+        std::slice::from_ref(&addr),
+    )
+    .await
+    .unwrap();
+    assert_eq!(done.leaves, a.state.len());
+    assert_restored(&client, &a);
+    assert_eq!(*dialled.lock().unwrap(), vec![addr], "one dial, then reuse");
+    assert_eq!(
+        seen.lock().unwrap().iter().collect::<Vec<_>>(),
+        vec!["12D3KooWserver"],
+        "every request on the session the dial opened"
+    );
+    assert!(
+        server.state_budget.balance(Some("12D3KooWclient")) < STATE_SERVE_UNITS_PER_SEC_PER_CLIENT,
+        "charged to the session's key"
+    );
+}
+
+/// G4 S6: a snapshot request a server cannot take now is told "busy" (its
+/// client waits it out); any other request has no busy answer.
+#[test]
+fn only_snapshot_parts_have_a_busy_answer() {
+    let chunk = busy_reply(&format!("{CHUNK_REQ}{{}}")).unwrap();
+    let chunk: ChunkResponse =
+        serde_json::from_str(chunk.strip_prefix(CHUNK_RESP).unwrap()).unwrap();
+    assert_eq!(chunk.error.as_deref(), Some("busy"));
+    let value = busy_reply(&format!("{VALUE_REQ}{{}}")).unwrap();
+    let value: ValueResponse =
+        serde_json::from_str(value.strip_prefix(VALUE_RESP).unwrap()).unwrap();
+    assert_eq!(value.error.as_deref(), Some("busy"));
+    assert_eq!(busy_reply("SYNC_REQ:{}"), None);
+    assert_eq!(busy_reply("GET_HEIGHT"), None);
+}
+
 #[tokio::test]
 async fn a_node_restores_from_honest_peers() {
     let g = genesis();
@@ -1197,7 +1274,7 @@ fn the_server_serves_only_what_it_retains() {
     let end = ask(H, Some(hex::encode(last.0)));
     assert!(end.done && end.entries.is_empty() && end.error.is_none());
     // The end of the stream costs nothing: its grant is given back.
-    let client = Some(IpAddr::from([10, 0, 0, 12]));
+    let client = Some("10.0.0.12");
     let end = sync.serve_state_chunk(
         ChunkRequest {
             version: H,
@@ -1209,7 +1286,7 @@ fn the_server_serves_only_what_it_retains() {
     assert!(end.done);
     assert_eq!(
         sync.state_budget.balance(client),
-        STATE_SERVE_UNITS_PER_SEC_PER_IP
+        STATE_SERVE_UNITS_PER_SEC_PER_CLIENT
     );
     // Value parts: the same retention, and the same slots.
     let value = |version: u64| {
@@ -1290,7 +1367,7 @@ fn one_client_cannot_starve_the_others() {
                 after: None,
                 max: MAX_CHUNK_ENTRIES,
             },
-            Some(IpAddr::from(ip)),
+            Some(IpAddr::from(ip).to_string().as_str()),
         )
     };
     let hog = [10, 0, 0, 1];
@@ -1300,7 +1377,7 @@ fn one_client_cannot_starve_the_others() {
         leaves += ask(hog).entries.len();
     }
     // At most a burst, then the per-IP rate, however fast it asks.
-    let allowed = STATE_SERVE_UNITS_PER_SEC_PER_IP * (1.0 + start.elapsed().as_secs_f64());
+    let allowed = STATE_SERVE_UNITS_PER_SEC_PER_CLIENT * (1.0 + start.elapsed().as_secs_f64());
     assert!(
         (leaves as f64) <= allowed,
         "the hog got {leaves} leaves, its share is {allowed}"
@@ -1317,7 +1394,7 @@ fn one_client_cannot_starve_the_others() {
         other.error
     );
     // One request in flight per client.
-    let third = IpAddr::from([10, 0, 0, 5]);
+    let third = "10.0.0.5";
     let held = sync.state_budget.admit(Some(third), 1);
     assert!(held.is_some());
     assert_eq!(ask([10, 0, 0, 5]).error.as_deref(), Some("busy"));
@@ -1330,28 +1407,31 @@ fn one_client_cannot_starve_the_others() {
 #[test]
 fn the_client_table_forgets_idle_clients_only() {
     let budget = StateBudget::default();
-    let ip = |i: u32| Some(IpAddr::from(i.to_be_bytes()));
-    for i in 0..MAX_TRACKED_IPS as u32 {
-        drop(budget.admit(ip(i), 1).expect("room"));
+    let ip = |i: u32| IpAddr::from(i.to_be_bytes()).to_string();
+    for i in 0..MAX_TRACKED_CLIENTS as u32 {
+        drop(budget.admit(Some(&ip(i)), 1).expect("room"));
     }
     std::thread::sleep(Duration::from_millis(5));
     assert!(
-        budget.admit(ip(1 << 20), 1).is_some(),
+        budget.admit(Some(&ip(1 << 20)), 1).is_some(),
         "an idle client forgotten"
     );
     // A client with a request in flight is never forgotten, so it cannot
     // dodge its one-slot limit by being evicted.
     let pinned = StateBudget::default();
-    let held = pinned.admit(ip(0), 1).expect("in flight");
-    for i in 1..MAX_TRACKED_IPS as u32 {
-        drop(pinned.admit(ip(i), 1).expect("room"));
+    let held = pinned.admit(Some(&ip(0)), 1).expect("in flight");
+    for i in 1..MAX_TRACKED_CLIENTS as u32 {
+        drop(pinned.admit(Some(&ip(i)), 1).expect("room"));
     }
     std::thread::sleep(Duration::from_millis(5));
     assert!(
-        pinned.admit(ip(1 << 22), 1).is_some(),
+        pinned.admit(Some(&ip(1 << 22)), 1).is_some(),
         "the table makes room"
     );
-    assert!(pinned.admit(ip(0), 1).is_none(), "still one in flight");
+    assert!(
+        pinned.admit(Some(&ip(0)), 1).is_none(),
+        "still one in flight"
+    );
     drop(held);
     // A table of clients all still refilling has no room, whatever the
     // global bucket holds.
@@ -1359,9 +1439,9 @@ fn the_client_table_forgets_idle_clients_only() {
     {
         let mut st = debt.lock();
         let now = Instant::now();
-        for i in 0..MAX_TRACKED_IPS as u32 {
-            st.per_ip.insert(
-                IpAddr::from(i.to_be_bytes()),
+        for i in 0..MAX_TRACKED_CLIENTS as u32 {
+            st.per_client.insert(
+                IpAddr::from(i.to_be_bytes()).to_string(),
                 Bucket {
                     tokens: -1.0,
                     last: now,
@@ -1370,8 +1450,15 @@ fn the_client_table_forgets_idle_clients_only() {
             );
         }
     }
-    assert!(debt.admit(ip(1 << 21), 1).is_none(), "every client in debt");
-    assert_eq!(debt.lock().per_ip.len(), MAX_TRACKED_IPS, "none forgotten");
+    assert!(
+        debt.admit(Some(&ip(1 << 21)), 1).is_none(),
+        "every client in debt"
+    );
+    assert_eq!(
+        debt.lock().per_client.len(),
+        MAX_TRACKED_CLIENTS,
+        "none forgotten"
+    );
     assert_eq!(debt.balance(None), STATE_SERVE_UNITS_PER_SEC, "not global");
 }
 
@@ -1379,16 +1466,19 @@ fn the_client_table_forgets_idle_clients_only() {
 #[test]
 fn a_bucket_holds_one_seconds_worth() {
     let budget = StateBudget::default();
-    let ip = IpAddr::from([10, 0, 0, 1]);
+    let ip = "10.0.0.1";
     drop(budget.admit(Some(ip), 1));
     {
         let mut st = budget.lock();
         let long_ago = Instant::now() - Duration::from_secs(60);
         st.global.last = long_ago;
-        st.per_ip.get_mut(&ip).unwrap().last = long_ago;
+        st.per_client.get_mut(ip).unwrap().last = long_ago;
     }
     let client = budget.admit(Some(ip), usize::MAX).unwrap();
-    assert_eq!(client.granted, STATE_SERVE_UNITS_PER_SEC_PER_IP as usize);
+    assert_eq!(
+        client.granted,
+        STATE_SERVE_UNITS_PER_SEC_PER_CLIENT as usize
+    );
     drop(client);
     budget.lock().global.last = Instant::now() - Duration::from_secs(60);
     let global = budget.admit(None, usize::MAX).unwrap();
@@ -1412,7 +1502,7 @@ fn value_reads_are_charged_by_their_bytes() {
         },
     );
     let sync = peer(&a, Behaviour::Honest).sync;
-    let client = Some(IpAddr::from([10, 0, 0, 3]));
+    let client = Some("10.0.0.3");
     let start = Instant::now();
     let mut served = 0u64;
     for i in 0..12u64 {
@@ -1432,7 +1522,7 @@ fn value_reads_are_charged_by_their_bytes() {
     // Each miss costs its part and the 3 MiB read, of 2,000 units a second
     // (plus one burst) for this client.
     let per_read = PART_UNITS as f64 + ((3 << 20) / UNIT_BYTES) as f64;
-    let allowed = STATE_SERVE_UNITS_PER_SEC_PER_IP * (1.0 + start.elapsed().as_secs_f64());
+    let allowed = STATE_SERVE_UNITS_PER_SEC_PER_CLIENT * (1.0 + start.elapsed().as_secs_f64());
     assert!(
         served as f64 * per_read <= allowed + per_read,
         "{served} whole-value reads served in {:?}",
@@ -1442,8 +1532,8 @@ fn value_reads_are_charged_by_their_bytes() {
     // Reading an 8 MiB value costs one second's worth on top of its part,
     // for the client and globally: in debt by the part, at most.
     let fresh = peer(&a, Behaviour::Honest).sync;
-    let heavy = Some(IpAddr::from([10, 0, 0, 4]));
-    let ask = |offset: u64, ip: Option<IpAddr>| {
+    let heavy = Some("10.0.0.4");
+    let ask = |offset: u64, ip: Option<&str>| {
         fresh.serve_state_value(
             ValueRequest {
                 version: H,
@@ -1455,24 +1545,24 @@ fn value_reads_are_charged_by_their_bytes() {
     };
     let first = ask(0, heavy);
     assert!(first.error.is_none(), "{:?}", first.error);
-    let cost = PART_UNITS as f64 + STATE_SERVE_UNITS_PER_SEC_PER_IP;
+    let cost = PART_UNITS as f64 + STATE_SERVE_UNITS_PER_SEC_PER_CLIENT;
     let client_balance = fresh.state_budget.balance(heavy);
-    assert_eq!(client_balance, STATE_SERVE_UNITS_PER_SEC_PER_IP - cost);
+    assert_eq!(client_balance, STATE_SERVE_UNITS_PER_SEC_PER_CLIENT - cost);
     let global_balance = fresh.state_budget.balance(None);
     assert_eq!(global_balance, STATE_SERVE_UNITS_PER_SEC - cost, "global");
     // Its next part is cached: the part alone, for any client.
-    let reader_ip = IpAddr::from([10, 0, 0, 5]);
+    let reader_ip = "10.0.0.5";
     let reader = Some(reader_ip);
     let next = ask(VALUE_PART_BYTES as u64, reader);
     assert!(next.error.is_none(), "{:?}", next.error);
     assert_eq!(
         fresh.state_budget.balance(reader),
-        STATE_SERVE_UNITS_PER_SEC_PER_IP - PART_UNITS as f64
+        STATE_SERVE_UNITS_PER_SEC_PER_CLIENT - PART_UNITS as f64
     );
     // A part is let in only when its whole cost fits.
     {
         let mut st = fresh.state_budget.lock();
-        let bucket = st.per_ip.get_mut(&reader_ip).unwrap();
+        let bucket = st.per_client.get_mut(reader_ip).unwrap();
         bucket.tokens = 100.0;
         bucket.last = Instant::now();
     }
@@ -1563,7 +1653,7 @@ fn a_chunk_stays_within_its_byte_budget() {
         + chunk.proof.len();
     assert!(size <= MAX_CHUNK_BYTES, "{size}");
     // Reading those values is charged by their bytes.
-    let reader = Some(IpAddr::from([10, 0, 0, 9]));
+    let reader = Some("10.0.0.9");
     let charged = sync.serve_state_chunk(
         ChunkRequest {
             version: H,
@@ -1580,9 +1670,9 @@ fn a_chunk_stays_within_its_byte_budget() {
         .unwrap()
         .unwrap();
     let read: u64 = read.iter().map(|(_, v)| v.len() as u64).sum();
-    let expected = STATE_SERVE_UNITS_PER_SEC_PER_IP
+    let expected = STATE_SERVE_UNITS_PER_SEC_PER_CLIENT
         - served as f64
-        - (read.div_ceil(UNIT_BYTES) as f64).min(STATE_SERVE_UNITS_PER_SEC_PER_IP);
+        - (read.div_ceil(UNIT_BYTES) as f64).min(STATE_SERVE_UNITS_PER_SEC_PER_CLIENT);
     // Exactly: a server that read more (every leaf granted, or the same
     // leaves again) would be charged more.
     assert!(read < 8 << 20, "under the charge's cap: {read}");
@@ -2714,7 +2804,7 @@ fn serve_from_budgets_by_the_clients_ip() {
     let reply = sync.serve_from(&msg, ip).unwrap();
     assert!(reply.starts_with(CHUNK_RESP), "{reply}");
     assert!(
-        sync.state_budget.balance(Some(ip)) < STATE_SERVE_UNITS_PER_SEC_PER_IP,
+        sync.state_budget.balance(Some(&ip.to_string())) < STATE_SERVE_UNITS_PER_SEC_PER_CLIENT,
         "charged to the client"
     );
     assert_eq!(sync.serve_from("TX:{}", ip), None);
@@ -2932,7 +3022,7 @@ async fn a_large_leaf_restores_on_the_per_ip_path_when_every_part_misses() {
                             key: obj(u64::from(i)),
                             offset: 0,
                         },
-                        Some(IpAddr::from([10, 1, 0, i])),
+                        Some(IpAddr::from([10, 1, 0, i]).to_string().as_str()),
                     );
                     assert!(read.error.is_none(), "{:?}", read.error);
                 }
@@ -2942,7 +3032,7 @@ async fn a_large_leaf_restores_on_the_per_ip_path_when_every_part_misses() {
         if let Some(json) = reply.strip_prefix(VALUE_RESP) {
             let part: ValueResponse = serde_json::from_str(json).unwrap();
             parts += usize::from(part.error.is_none());
-            lowest = lowest.min(server.state_budget.balance(Some(ip)));
+            lowest = lowest.min(server.state_budget.balance(Some(&ip.to_string())));
         }
         Ok(reply)
     })

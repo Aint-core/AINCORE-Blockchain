@@ -211,24 +211,40 @@ mod tests {
         );
     }
 
-    /// G4 S1: a session is served sync and boundary QCs it may have; snapshot
-    /// requests stay on the legacy channel until S6.
+    /// G4 S1/S6: a session is served sync, boundary QCs it may have and
+    /// snapshot requests (here refused by the server's setting, not by the
+    /// session layer); consensus traffic is not sync.
     #[test]
-    fn a_session_is_served_sync_but_not_snapshots() {
+    fn a_session_is_served_sync_and_snapshots() {
         let sync = setup_sync("serve_session");
+        let peer = "12D3KooWsession";
         assert!(sync
-            .serve_session("GET_HEIGHT")
+            .serve_session("GET_HEIGHT", peer)
             .unwrap()
             .starts_with("HEIGHT:"));
         assert!(sync
-            .serve_session("GET_FINALITY")
+            .serve_session("GET_FINALITY", peer)
             .unwrap()
             .starts_with("FINALITY:"));
-        let anchor = format!("{}{{}}", crate::state_sync::ANCHOR_REQ);
-        assert_eq!(sync.serve_session(&anchor), None);
-        assert_eq!(sync.serve_session("QC_WANT:1"), None, "above the tip");
-        assert_eq!(sync.serve_session("QC_WANT:x"), None);
-        assert_eq!(sync.serve_session("DAG_V4:{}"), None, "not sync");
+        let chunk = format!(
+            "{}{}",
+            crate::state_sync::CHUNK_REQ,
+            serde_json::to_string(&crate::state_sync::ChunkRequest {
+                version: 0,
+                after: None,
+                max: 1,
+            })
+            .unwrap()
+        );
+        let answer = sync.serve_session(&chunk, peer).expect("routed");
+        assert!(
+            answer.starts_with(crate::state_sync::CHUNK_RESP),
+            "{answer}"
+        );
+        assert!(answer.contains("snapshots not served here"), "{answer}");
+        assert_eq!(sync.serve_session("QC_WANT:1", peer), None, "above the tip");
+        assert_eq!(sync.serve_session("QC_WANT:x", peer), None);
+        assert_eq!(sync.serve_session("DAG_V4:{}", peer), None, "not sync");
     }
 
     #[test]
