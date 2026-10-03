@@ -461,6 +461,184 @@ pub fn admit_consensus_request<'a>(book: &'a PeerBook, peer: &PeerId) -> Option<
     book.member_of(peer)
 }
 
+/// G4 S5: the one gossip topic.
+pub const GOSSIP_TOPIC: &str = "aincore-gossip";
+
+/// G4 S5: what the network task tells gossipsub about a message it
+/// received. With `validate_messages` a message is forwarded only once it
+/// is accepted, so a message the node would drop is never relayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GossipVerdict {
+    /// Delivered to the node and forwarded.
+    Accept,
+    /// Dropped, not forwarded, and counted against the peer that sent it
+    /// (gossipsub P4): no honest node sends it.
+    Reject,
+    /// Dropped and not forwarded, without blame: the sender may be an
+    /// honest relay whose committee book differs at an epoch boundary, or
+    /// the message is merely over a rate.
+    Ignore,
+}
+
+/// The gossip each prefix may carry and its size cap, checked before any
+/// parse. No honest node gossips anything else (transactions travel in
+/// vertices; `TX:` gossip had no publisher, B21).
+const GOSSIP_CAPS: &[(&str, usize)] = &[
+    (consensus::v4::WIRE_PREFIX, consensus::v4::MAX_WIRE_BYTES),
+    ("QC_VOTE:", consensus::dag::QC_VOTE_MAX_BYTES),
+    (consensus::dag::QC_WANT_PREFIX, 64),
+    (consensus::dag::QC_CERT_PREFIX, CONSENSUS_REQUEST_CAP),
+];
+
+/// G4 S5 (NI-1): the verdict on a gossip message from `relay` (the peer
+/// that sent it) signed by `publisher`. A member-only message from a
+/// non-member is blamed on the relay only when the relay published it
+/// itself; relayed, it may be an honest view difference.
+pub fn judge_gossip(
+    book: &PeerBook,
+    publisher: Option<&PeerId>,
+    relay: &PeerId,
+    wire: &str,
+) -> GossipVerdict {
+    let Some(&(_, cap)) = GOSSIP_CAPS.iter().find(|(p, _)| wire.starts_with(p)) else {
+        return GossipVerdict::Reject;
+    };
+    if wire.len() > cap {
+        return GossipVerdict::Reject;
+    }
+    if admit_gossip(book, publisher, wire) {
+        GossipVerdict::Accept
+    } else if publisher.is_none_or(|p| p == relay) {
+        GossipVerdict::Reject
+    } else {
+        GossipVerdict::Ignore
+    }
+}
+
+/// G4 S5: gossipsub as the node runs it. `validate_messages`: nothing is
+/// forwarded before `judge_gossip` accepts it. Signed publishers with
+/// strict validation, a 1 MiB transmit cap, sha256 message ids and a 60 s
+/// duplicate cache (M-05).
+pub fn gossip_config() -> Result<libp2p::gossipsub::Config, String> {
+    use libp2p::gossipsub::{ConfigBuilder, MessageId, ValidationMode};
+    use sha2::{Digest, Sha256};
+    ConfigBuilder::default()
+        .validation_mode(ValidationMode::Strict)
+        .validate_messages()
+        .max_transmit_size(1 << 20)
+        .mesh_n(6)
+        .mesh_n_low(4)
+        .mesh_n_high(12)
+        .heartbeat_interval(std::time::Duration::from_secs(1))
+        .duplicate_cache_time(std::time::Duration::from_secs(60))
+        .message_id_fn(|msg| MessageId::from(Sha256::digest(&msg.data).to_vec()))
+        .build()
+        .map_err(|e| format!("gossipsub config: {e}"))
+}
+
+/// The gossipsub behaviour: `gossip_config`, peer scoring
+/// (`gossip_score_params`, `gossip_score_thresholds`), subscribed to
+/// `GOSSIP_TOPIC`.
+pub fn gossip_behaviour(key: &identity::Keypair) -> Result<libp2p::gossipsub::Behaviour, String> {
+    use libp2p::gossipsub::{Behaviour, IdentTopic, MessageAuthenticity};
+    let mut gossip = Behaviour::new(MessageAuthenticity::Signed(key.clone()), gossip_config()?)
+        .map_err(|e| e.to_string())?;
+    gossip.with_peer_score(gossip_score_params(), gossip_score_thresholds())?;
+    gossip
+        .subscribe(&IdentTopic::new(GOSSIP_TOPIC))
+        .map_err(|e| e.to_string())?;
+    Ok(gossip)
+}
+
+/// Lighthouse's peer-score thresholds
+/// (`lighthouse_network/src/service/gossipsub_scoring_parameters.rs`).
+pub fn gossip_score_thresholds() -> libp2p::gossipsub::PeerScoreThresholds {
+    libp2p::gossipsub::PeerScoreThresholds {
+        gossip_threshold: -4000.0,
+        publish_threshold: -8000.0,
+        graylist_threshold: -16000.0,
+        accept_px_threshold: 100.0,
+        opportunistic_graft_threshold: 5.0,
+    }
+}
+
+/// Score decays are ticked every second (gossipsub's default interval;
+/// Lighthouse ticks once a slot, at least a second).
+const SCORE_DECAY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Lighthouse's epoch, the unit its decay times are given in (32 slots of
+/// 12 s).
+const LIGHTHOUSE_EPOCH_SECS: f64 = 384.0;
+/// Lighthouse: a peer's mesh time earns at most 10, its first deliveries at
+/// most 40, per unit of topic weight.
+const MAX_IN_MESH_SCORE: f64 = 10.0;
+const MAX_FIRST_DELIVERIES_SCORE: f64 = 40.0;
+
+/// The per-tick factor that takes a counter to 1 % in `secs` (Lighthouse
+/// `score_parameter_decay`).
+fn decay_over(secs: f64) -> f64 {
+    0.01f64.powf(SCORE_DECAY_INTERVAL.as_secs_f64() / secs)
+}
+
+/// G4 S5: gossipsub peer scoring, Lighthouse's rules on our one topic (its
+/// weight is one). An invalid delivery (P4) cancels the most a peer can
+/// earn (`-(10 + 40)`), and P4 is the square of the count, so a peer that
+/// sends 9 invalid messages falls below the gossip threshold and one that
+/// sends 18 below the graylist; the count decays to 1 % over 50 Lighthouse
+/// epochs. Mesh delivery rates (P3) are not scored: consensus gossip has no
+/// steady rate and Lighthouse leaves P3 off for such topics. More than 8
+/// peers on one IP are penalised (P6), behaviour penalties (P7) past 6.
+pub fn gossip_score_params() -> libp2p::gossipsub::PeerScoreParams {
+    use libp2p::gossipsub::{IdentTopic, PeerScoreParams, TopicScoreParams};
+    let max_positive = MAX_IN_MESH_SCORE + MAX_FIRST_DELIVERIES_SCORE;
+    let topic_weight = 1.0;
+    // Lighthouse: time in mesh reaches its cap after an hour.
+    let quantum = SCORE_DECAY_INTERVAL;
+    let time_in_mesh_cap = 3600.0 / quantum.as_secs_f64();
+    // A choice: first deliveries count up to 40 and decay to 1 % in an
+    // hour, so a peer earns the Lighthouse maximum by relaying 40 messages
+    // first.
+    let first_cap = MAX_FIRST_DELIVERIES_SCORE;
+    let topic = TopicScoreParams {
+        topic_weight,
+        time_in_mesh_weight: MAX_IN_MESH_SCORE / time_in_mesh_cap,
+        time_in_mesh_quantum: quantum,
+        time_in_mesh_cap,
+        first_message_deliveries_weight: MAX_FIRST_DELIVERIES_SCORE / first_cap,
+        first_message_deliveries_decay: decay_over(3600.0),
+        first_message_deliveries_cap: first_cap,
+        mesh_message_deliveries_weight: 0.0,
+        mesh_failure_penalty_weight: 0.0,
+        invalid_message_deliveries_weight: -max_positive / topic_weight,
+        invalid_message_deliveries_decay: decay_over(50.0 * LIGHTHOUSE_EPOCH_SECS),
+        ..TopicScoreParams::default()
+    };
+    let thresholds = gossip_score_thresholds();
+    let behaviour_penalty_threshold = 6.0;
+    let behaviour_penalty_decay = decay_over(10.0 * LIGHTHOUSE_EPOCH_SECS);
+    // Lighthouse: a peer earning 10 penalties an epoch converges to the
+    // gossip threshold.
+    let per_tick = 10.0 / LIGHTHOUSE_EPOCH_SECS * SCORE_DECAY_INTERVAL.as_secs_f64();
+    let converged = per_tick / (1.0 - behaviour_penalty_decay) - behaviour_penalty_threshold;
+    let topic_score_cap = max_positive * 0.5;
+    let mut params = PeerScoreParams {
+        topic_score_cap,
+        app_specific_weight: 1.0,
+        ip_colocation_factor_weight: -topic_score_cap,
+        ip_colocation_factor_threshold: 8.0,
+        behaviour_penalty_weight: thresholds.gossip_threshold / converged.powi(2),
+        behaviour_penalty_threshold,
+        behaviour_penalty_decay,
+        decay_interval: SCORE_DECAY_INTERVAL,
+        decay_to_zero: 0.01,
+        retain_score: std::time::Duration::from_secs_f64(100.0 * LIGHTHOUSE_EPOCH_SECS),
+        ..PeerScoreParams::default()
+    };
+    params
+        .topics
+        .insert(IdentTopic::new(GOSSIP_TOPIC).hash(), topic);
+    params
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,7 +713,7 @@ mod tests {
             assert!(!admit_gossip(&book, None, wire), "{wire}");
         }
         // An observer asks for and is answered a self-verifying boundary QC.
-        for wire in ["QC_WANT:7", "QC_CERT:{}", "TX:{}"] {
+        for wire in ["QC_WANT:7", "QC_CERT:{}"] {
             assert!(admit_gossip(&book, Some(&stranger), wire), "{wire}");
         }
     }
@@ -751,5 +929,207 @@ mod tests {
         assert!(seen
             .iter()
             .any(|s| matches!(s, Seen::Refused(p) if *p == *stranger.local_peer_id())));
+    }
+
+    /// G4 S5: what a received gossip message gets. Accepted: a member's
+    /// consensus message, and a boundary QC request or answer from anyone.
+    /// Rejected (blamed on the sender): what no node gossips (transactions
+    /// included, B21), anything over its type's cap, and a member-only
+    /// message its non-member sender published itself. Ignored: the same
+    /// message relayed by another peer, whose view may differ.
+    #[test]
+    fn every_gossip_message_gets_the_node_rules_verdict() {
+        use GossipVerdict::*;
+        let (a, sa) = member(1);
+        let book = PeerBook::new(0, &[&[a]]);
+        let member = local_keypair(&sa).public().to_peer_id();
+        let stranger = local_keypair(&[9; 32]).public().to_peer_id();
+        let relay = local_keypair(&[5; 32]).public().to_peer_id();
+        for wire in ["DAG_V4:{}", "QC_VOTE:{}"] {
+            assert_eq!(judge_gossip(&book, Some(&member), &relay, wire), Accept);
+            assert_eq!(judge_gossip(&book, Some(&member), &member, wire), Accept);
+            assert_eq!(
+                judge_gossip(&book, Some(&stranger), &stranger, wire),
+                Reject
+            );
+            assert_eq!(judge_gossip(&book, None, &stranger, wire), Reject);
+            assert_eq!(judge_gossip(&book, Some(&stranger), &relay, wire), Ignore);
+        }
+        for wire in ["QC_WANT:7", "QC_CERT:{}"] {
+            assert_eq!(
+                judge_gossip(&book, Some(&stranger), &stranger, wire),
+                Accept
+            );
+        }
+        for wire in ["TX:{}", "{}", "DAG_VERTEX:{}", "HELLO", ""] {
+            assert_eq!(
+                judge_gossip(&book, Some(&member), &member, wire),
+                Reject,
+                "{wire}"
+            );
+        }
+        let vote = format!("QC_VOTE:{}", "x".repeat(consensus::dag::QC_VOTE_MAX_BYTES));
+        assert_eq!(judge_gossip(&book, Some(&member), &member, &vote), Reject);
+        let want = format!("QC_WANT:{}", "9".repeat(64));
+        assert_eq!(
+            judge_gossip(&book, Some(&stranger), &stranger, &want),
+            Reject
+        );
+    }
+
+    /// G4 S5: the scoring is valid for gossipsub and does what its comment
+    /// says: one invalid delivery cancels the most a peer can earn, 9 put
+    /// a peer below the gossip threshold, 18 below the graylist.
+    #[test]
+    fn the_peer_score_follows_lighthouses_rules() {
+        let params = gossip_score_params();
+        params.validate().unwrap();
+        let t = gossip_score_thresholds();
+        let topic = &params.topics[&libp2p::gossipsub::IdentTopic::new(GOSSIP_TOPIC).hash()];
+        let max_positive = topic.time_in_mesh_weight * topic.time_in_mesh_cap
+            + topic.first_message_deliveries_weight * topic.first_message_deliveries_cap;
+        assert!((max_positive - 50.0).abs() < 1e-9, "{max_positive}");
+        assert_eq!(topic.invalid_message_deliveries_weight, -max_positive);
+        let p4 = |k: f64| topic.invalid_message_deliveries_weight * k * k;
+        assert!(p4(8.0) > t.gossip_threshold && p4(9.0) < t.gossip_threshold);
+        assert!(p4(17.0) > t.graylist_threshold && p4(18.0) < t.graylist_threshold);
+        // The behaviour-penalty weight Lighthouse derives (-15.9 at its 12 s
+        // slot; the 1 s tick changes it by under 2 %).
+        assert!(
+            (-16.5..-15.5).contains(&params.behaviour_penalty_weight),
+            "{}",
+            params.behaviour_penalty_weight
+        );
+        // P4 halves in under 50 epochs: (decay ^ ticks) reaches 1 % then.
+        let after = topic
+            .invalid_message_deliveries_decay
+            .powf(50.0 * LIGHTHOUSE_EPOCH_SECS);
+        assert!((after - 0.01).abs() < 1e-6, "{after}");
+    }
+
+    fn gossip_swarm(key: &identity::Keypair) -> Swarm<libp2p::gossipsub::Behaviour> {
+        let transport = MemoryTransport::default()
+            .upgrade(upgrade::Version::V1)
+            .authenticate(noise::Config::new(key).unwrap())
+            .multiplex(yamux::Config::default())
+            .boxed();
+        Swarm::new(
+            transport,
+            gossip_behaviour(key).unwrap(),
+            key.public().to_peer_id(),
+            libp2p::swarm::Config::with_tokio_executor()
+                .with_idle_connection_timeout(Duration::from_secs(30)),
+        )
+    }
+
+    /// One swarm event, handled with the node's rule (`judge_gossip`, then
+    /// the verdict reported to gossipsub). Returns a received message.
+    fn on_gossip(
+        swarm: &mut Swarm<libp2p::gossipsub::Behaviour>,
+        book: &PeerBook,
+        ev: SwarmEvent<libp2p::gossipsub::Event>,
+    ) -> Option<String> {
+        use libp2p::gossipsub::{Event, MessageAcceptance};
+        let SwarmEvent::Behaviour(Event::Message {
+            propagation_source,
+            message_id,
+            message,
+        }) = ev
+        else {
+            return None;
+        };
+        let wire = String::from_utf8_lossy(&message.data).into_owned();
+        let acceptance =
+            match judge_gossip(book, message.source.as_ref(), &propagation_source, &wire) {
+                GossipVerdict::Accept => MessageAcceptance::Accept,
+                GossipVerdict::Reject => MessageAcceptance::Reject,
+                GossipVerdict::Ignore => MessageAcceptance::Ignore,
+            };
+        let _ = swarm.behaviour_mut().report_message_validation_result(
+            &message_id,
+            &propagation_source,
+            acceptance,
+        );
+        Some(wire)
+    }
+
+    /// G4 S5 witness: a stranger next to an honest relay cannot reach the
+    /// relay's other peers with consensus gossip or junk, while a member's
+    /// message crosses the same relay; and the stranger's invalid messages
+    /// drive its score at the relay below the graylist. Without
+    /// `validate_messages` the relay forwards before judging and the
+    /// observer hears the stranger.
+    #[tokio::test]
+    async fn a_relay_forwards_what_the_node_accepts_and_scores_the_rest() {
+        let (m_info, m_secret) = member(1);
+        let book = PeerBook::new(0, &[&[m_info]]);
+        let mut relay = gossip_swarm(&local_keypair(&[5; 32]));
+        let mut member_node = gossip_swarm(&local_keypair(&m_secret));
+        let mut stranger = gossip_swarm(&local_keypair(&[9; 32]));
+        let mut observer = gossip_swarm(&local_keypair(&[6; 32]));
+        let addr: Multiaddr = format!("/memory/{}", rand::random::<u64>() | 1)
+            .parse()
+            .unwrap();
+        relay.listen_on(addr.clone()).unwrap();
+        for s in [&mut member_node, &mut stranger, &mut observer] {
+            s.dial(addr.clone()).unwrap();
+        }
+        let stranger_id = *stranger.local_peer_id();
+        let topic = libp2p::gossipsub::IdentTopic::new(GOSSIP_TOPIC);
+        let (mut heard, mut sent_member, mut sent_stranger) = (Vec::new(), false, 0usize);
+        let start = tokio::time::Instant::now();
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        while start.elapsed() < Duration::from_secs(20) {
+            tokio::select! {
+                ev = relay.select_next_some() => { on_gossip(&mut relay, &book, ev); }
+                ev = member_node.select_next_some() => { on_gossip(&mut member_node, &book, ev); }
+                ev = stranger.select_next_some() => { on_gossip(&mut stranger, &book, ev); }
+                ev = observer.select_next_some() => {
+                    if let Some(wire) = on_gossip(&mut observer, &book, ev) {
+                        heard.push(wire);
+                    }
+                }
+                _ = tick.tick() => {
+                    // Publish once the mesh had three heartbeats to form.
+                    if start.elapsed() < Duration::from_secs(3) {
+                        continue;
+                    }
+                    if !sent_member {
+                        sent_member = member_node
+                            .behaviour_mut()
+                            .publish(topic.clone(), b"DAG_V4:member".to_vec())
+                            .is_ok();
+                    }
+                    if sent_stranger < 20 {
+                        let junk = if sent_stranger % 2 == 0 { "DAG_V4" } else { "TX" };
+                        let wire = format!("{junk}:stranger-{sent_stranger}");
+                        if stranger.behaviour_mut().publish(topic.clone(), wire.into_bytes()).is_ok() {
+                            sent_stranger += 1;
+                        }
+                    }
+                    let score = relay.behaviour().peer_score(&stranger_id).unwrap_or(0.0);
+                    if heard.iter().any(|w| w == "DAG_V4:member")
+                        && sent_stranger == 20
+                        && score < gossip_score_thresholds().graylist_threshold
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            heard.iter().any(|w| w == "DAG_V4:member"),
+            "positive control: the member's message crossed the relay: {heard:?}"
+        );
+        assert_eq!(sent_stranger, 20, "the stranger published");
+        assert!(
+            !heard.iter().any(|w| w.contains("stranger")),
+            "the relay forwarded the stranger: {heard:?}"
+        );
+        let score = relay.behaviour().peer_score(&stranger_id).unwrap();
+        assert!(
+            score < gossip_score_thresholds().graylist_threshold,
+            "the stranger's score at the relay: {score}"
+        );
     }
 }

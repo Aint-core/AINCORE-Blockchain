@@ -5,8 +5,7 @@ use libp2p::{
     core::upgrade,
     dcutr,
     gossipsub::{
-        Behaviour as GossipsubBehaviour, ConfigBuilder as GossipsubConfigBuilder,
-        Event as GossipsubEvent, IdentTopic, MessageAuthenticity, ValidationMode,
+        Behaviour as GossipsubBehaviour, Event as GossipsubEvent, IdentTopic, MessageAcceptance,
     },
     identify,
     kad::{
@@ -101,52 +100,11 @@ pub async fn start_p2p(
         .multiplex(yamux::Config::default())
         .boxed();
 
-    // === Gossipsub behaviour (Phase 2.7 / M-05 hardened config) ===
-    //
-    // Default libp2p Gossipsub config is tuned for general use, not for a
-    // BFT L1 with adversarial validators. M-05 tightens the params:
-    //
-    //   * validation_mode = Strict
-    //       Reject malformed messages immediately instead of forwarding,
-    //       so a Byzantine peer cannot waste mesh bandwidth flooding
-    //       garbage to its neighbours.
-    //   * max_transmit_size = 1 MiB
-    //       Bounds per-message work and aligns with the mempool's 100KB
-    //       tx limit + headroom for batched DAG vertices. Default is
-    //       much larger and lets a single peer push memory pressure.
-    //   * mesh params (D, D_lo, D_hi)
-    //       Default D=6 is fine for typical p2p; we keep it but pin the
-    //       low/high watermarks so adversarial churn cannot drift the
-    //       mesh into degenerate fan-out.
-    //   * heartbeat_interval = 1 s (default), but documented here so the
-    //       cadence is explicit when reading the config.
-    //   * duplicate_cache_time = 60 s
-    //       Suppresses replayed messages for a full minute. The default
-    //       (30 s) is on the low side for a chain with 5 s round times
-    //       under load.
-    //   * message_id_fn = sha256 of payload
-    //       Deduplication keys are cryptographic, not pointer-based, so
-    //       semantically-equal messages from different peers collapse.
-    let gossipsub_config = GossipsubConfigBuilder::default()
-        .validation_mode(ValidationMode::Strict)
-        .max_transmit_size(1 << 20) // 1 MiB
-        .mesh_n(6)
-        .mesh_n_low(4)
-        .mesh_n_high(12)
-        .heartbeat_interval(Duration::from_secs(1))
-        .duplicate_cache_time(Duration::from_secs(60))
-        .message_id_fn(|msg| {
-            use sha2::{Digest, Sha256};
-            libp2p::gossipsub::MessageId::from(Sha256::digest(&msg.data).to_vec())
-        })
-        .build()
-        .map_err(|e| -> Box<dyn Error> { format!("gossipsub config: {}", e).into() })?;
-    let mut gossipsub = GossipsubBehaviour::new(
-        MessageAuthenticity::Signed(local_key.clone()),
-        gossipsub_config,
-    )?;
-    let topic = IdentTopic::new("aincore-gossip");
-    gossipsub.subscribe(&topic)?;
+    // === Gossipsub (M-05 config; G4 S5: validated before forwarding, peers
+    // scored, explicit peering for committee members only) ===
+    let gossipsub = sessions::gossip_behaviour(&local_key)
+        .map_err(|e| -> Box<dyn Error> { e.into() })?;
+    let topic = IdentTopic::new(sessions::GOSSIP_TOPIC);
 
     // === mDNS behaviour (Optional) ===
     let mdns = if enable_mdns {
@@ -231,7 +189,6 @@ pub async fn start_p2p(
                     .behaviour_mut()
                     .kademlia
                     .add_address(&peer_id, multiaddr.clone());
-                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
             }
             // Force dial
             if let Err(e) = swarm.dial(multiaddr) {
@@ -322,6 +279,8 @@ pub async fn start_p2p(
         // G4 NI-2: inbound connections from non-members, all together.
         let mut non_member_inbound: std::collections::HashSet<libp2p::swarm::ConnectionId> =
             std::collections::HashSet::new();
+        // G4 S5: the explicit gossip peers, kept equal to the members.
+        let mut explicit: std::collections::HashSet<PeerId> = std::collections::HashSet::new();
         let members = |book: &Arc<RwLock<PeerBook>>| -> Vec<PeerId> {
             book.read()
                 .map(|b| b.peers().copied().filter(|p| *p != local_peer_id).collect())
@@ -335,7 +294,7 @@ pub async fn start_p2p(
                     // every connected member session; gossip alone drops a
                     // repeat of the same payload for a minute.
                     Outbound::Broadcast(wire) => {
-                        let _ = swarm.behaviour_mut().gossipsub.publish(IdentTopic::new("aincore-gossip"), wire.as_bytes());
+                        let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), wire.as_bytes());
                         if sessions::is_consensus_message(&wire) {
                             for peer in members(&book) {
                                 if swarm.is_connected(&peer) {
@@ -353,7 +312,7 @@ pub async fn start_p2p(
                                 swarm.behaviour_mut().consensus.send_request(&peer, wire);
                             }
                             _ => {
-                                let _ = swarm.behaviour_mut().gossipsub.publish(IdentTopic::new("aincore-gossip"), wire.as_bytes());
+                                let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), wire.as_bytes());
                             }
                         }
                     }
@@ -430,8 +389,18 @@ pub async fn start_p2p(
                     }
                     // Keep a session to every member (NI-1); a member is
                     // dialled at the addresses identify and Kademlia learned.
+                    // G4 S5: the members, and only they, are explicit gossip
+                    // peers (always sent to, never scored out of the mesh).
+                    let current: std::collections::HashSet<PeerId> =
+                        members(&book).into_iter().collect();
+                    for gone in explicit.difference(&current) {
+                        swarm.behaviour_mut().gossipsub.remove_explicit_peer(gone);
+                    }
+                    for peer in current.difference(&explicit) {
+                        swarm.behaviour_mut().gossipsub.add_explicit_peer(peer);
+                    }
+                    explicit = current;
                     for peer in members(&book) {
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
                         if !swarm.is_connected(&peer) {
                             let _ = swarm.dial(
                                 DialOpts::peer_id(peer)
@@ -528,7 +497,6 @@ pub async fn start_p2p(
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Mdns(MdnsEvent::Discovered(list))) => {
                         for (peer_id, multiaddr) in list {
                             println!("👀 mDNS discovered a new peer: {:?}", peer_id);
-                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                             swarm.behaviour_mut().kademlia.add_address(&peer_id, multiaddr.clone());
 
                             // Persist peer
@@ -538,12 +506,10 @@ pub async fn start_p2p(
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Mdns(MdnsEvent::Expired(list))) => {
                         for (peer_id, _multiaddr) in list {
                             println!("👋 mDNS peer expired: {:?}", peer_id);
-                            swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                         }
                     }
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Kademlia(KademliaEvent::RoutingUpdated { peer, addresses, .. })) => {
                         println!("🕸️  Kademlia Routing Updated: peer={:?} addrs={:?}", peer, addresses);
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
 
                         // Persist the first routable address. Docker bridge addresses
                         // (172.16.0.0/12) leak through Identify/Kademlia when nodes run
@@ -554,7 +520,10 @@ pub async fn start_p2p(
                              let _ = storage.save_peer_addr(&peer.to_string(), &addr.to_string());
                         }
                     }
-                    SwarmEvent::Behaviour(P2PBehaviourEvent::Gossipsub(GossipsubEvent::Message { propagation_source: peer_id, message_id: _, message })) => {
+                    SwarmEvent::Behaviour(P2PBehaviourEvent::Gossipsub(GossipsubEvent::Message { propagation_source: peer_id, message_id, message })) => {
+                        // G4 S5: every message gets a verdict; only an accepted
+                        // one reaches the node or is forwarded.
+                        let verdict = 'judge: {
                         // 🛡️ LiDAR PROTECTION LOGIC
                         let now = std::time::Instant::now();
 
@@ -599,7 +568,7 @@ pub async fn start_p2p(
                                         peer_id, *c_count
                                     );
                                 }
-                                continue; // drop this message only; never ban a relay
+                                break 'judge sessions::GossipVerdict::Ignore; // drop this message only; never ban a relay
                             }
                         }
 
@@ -645,19 +614,31 @@ pub async fn start_p2p(
                                     publisher, *count
                                 );
                             }
-                            continue; // drop only
+                            break 'judge sessions::GossipVerdict::Ignore; // drop only
                         }
 
-                        let msg_content = String::from_utf8_lossy(&message.data).to_string();
-                        // NI-1: consensus gossip only from a member publisher.
-                        let admitted = book
-                            .read()
-                            .map(|b| sessions::admit_gossip(&b, message.source.as_ref(), &msg_content))
-                            .unwrap_or(false);
-                        if !admitted {
-                            continue;
+                        let Ok(wire) = std::str::from_utf8(&message.data) else {
+                            break 'judge sessions::GossipVerdict::Reject;
+                        };
+                        // NI-1: consensus gossip only from a member publisher;
+                        // nothing a node never gossips (G4 S5).
+                        book.read()
+                            .map(|b| sessions::judge_gossip(&b, message.source.as_ref(), &peer_id, wire))
+                            .unwrap_or(sessions::GossipVerdict::Ignore)
+                        };
+                        let acceptance = match verdict {
+                            sessions::GossipVerdict::Accept => MessageAcceptance::Accept,
+                            sessions::GossipVerdict::Reject => MessageAcceptance::Reject,
+                            sessions::GossipVerdict::Ignore => MessageAcceptance::Ignore,
+                        };
+                        let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                            &message_id,
+                            &peer_id,
+                            acceptance,
+                        );
+                        if verdict == sessions::GossipVerdict::Accept {
+                            inbox.push(String::from_utf8_lossy(&message.data).into_owned());
                         }
-                        inbox.push(msg_content);
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         println!("🌐 P2P Listening on {:?}", address);
@@ -689,16 +670,9 @@ pub async fn start_p2p(
                                 table.push(network::SessionPeer { peer: peer_id.to_string(), member });
                             }
                         }
-                        // FIX (mesh propagation): register every established libp2p connection as
-                        // an explicit gossipsub peer, keyed on the peer id learned from the live
-                        // connection. Bootnodes are dialed as bare /ip4/<ip>/tcp/<port> (no
-                        // /p2p/<peerid> suffix) and the libp2p identity is ephemeral per boot, so
-                        // the bootnode loop never learns peer ids up-front and never calls
-                        // add_explicit_peer. In a small validator set (n=3) that left connected
-                        // validators OUT of each other's gossipsub mesh, so DAG vertices never
-                        // propagated and Parents stayed below quorum (chain stuck). Grafting on the
-                        // live peer id forces reliable forwarding regardless of how we dialed.
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                        // G4 S5: only committee members are explicit gossip
+                        // peers (committee dial); every other peer meets the
+                        // mesh and its score.
                         match endpoint {
                             libp2p::core::ConnectedPoint::Dialer { address, .. } => {
                                 let _ = storage.save_peer_addr(&peer_id.to_string(), &address.to_string());
