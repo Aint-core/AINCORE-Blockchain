@@ -205,10 +205,12 @@ impl V4Net {
                 if *peer_id == self.node_id {
                     continue;
                 }
-                let ip = self
-                    .storage
-                    .get_peer_ip(peer_id)
-                    .unwrap_or_else(|| "127.0.0.1".to_string());
+                // B2: only an address a session recorded. A guessed
+                // 127.0.0.1 sent consensus traffic to whatever else
+                // listened on that port of this host.
+                let Some(ip) = self.storage.get_peer_ip(peer_id) else {
+                    continue;
+                };
                 let _ = network::send_message(&format!("{ip}:{port}"), &wire);
             }
         }
@@ -2179,6 +2181,49 @@ pub(crate) fn prune_state_window(
     }
     let pinned = state_commit::pin_schedule(tip, keep, state_commit::epoch_interval(storage));
     state_commit::prune(storage, tip - keep, &pinned, max_rows).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod peer_address_tests {
+    use super::V4Net;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use storage::StateDB;
+
+    /// B2: a peer without a recorded address is not dialled at all (it was
+    /// dialled at 127.0.0.1 on its port); one with an address is.
+    #[test]
+    fn a_peer_without_a_recorded_address_is_never_dialled() {
+        let path = std::env::temp_dir().join(format!("b2_peer_ip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let storage = Arc::new(StateDB::open(path.to_str().unwrap()).unwrap());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peers = Arc::new(Mutex::new(HashMap::from([("peer".to_string(), port)])));
+        let net = V4Net {
+            node_id: "me".into(),
+            p2p_tx: None,
+            peers,
+            storage: Arc::clone(&storage),
+            outbox: None,
+        };
+        let dialled = || {
+            for _ in 0..30 {
+                if listener.accept().is_ok() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        };
+        net.broadcast_wire("DAG_V4:{}".into());
+        assert!(!dialled(), "a peer with no recorded address was dialled");
+        storage.save_peer_ip("peer", "127.0.0.1").unwrap();
+        net.broadcast_wire("DAG_V4:{}".into());
+        assert!(dialled(), "control: a recorded address is dialled");
+    }
 }
 
 #[cfg(test)]

@@ -1035,9 +1035,11 @@ async fn main() {
                     if peer_port == 0 || peer_port == my_port {
                         continue;
                     }
-                    let ip = storage_clone_reconnect
-                        .get_peer_ip(&peer_id)
-                        .unwrap_or_else(|| "127.0.0.1".to_string());
+                    // B2: only an address a session recorded; a peer seen
+                    // only behind a Docker bridge has none and dials us.
+                    let Some(ip) = storage_clone_reconnect.get_peer_ip(&peer_id) else {
+                        continue;
+                    };
                     // Peer hygiene: a saved peer whose IP is an ephemeral
                     // Docker-bridge address (172.16–31.x — e.g. the 172.23.0.1
                     // gateway left behind by a stopped sibling container / old
