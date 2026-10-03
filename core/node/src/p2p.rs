@@ -39,16 +39,6 @@ fn multiaddr_host(addr: &Multiaddr) -> Option<String> {
     })
 }
 
-fn is_docker_bridge_addr(addr: &Multiaddr) -> bool {
-    addr.iter().any(|protocol| match protocol {
-        Protocol::Ip4(ip) => {
-            let octets = ip.octets();
-            octets[0] == 172 && (16..=31).contains(&octets[1])
-        }
-        _ => false,
-    })
-}
-
 // === START P2P ===
 // Returns: (Sender to broadcast, Receiver for incoming messages)
 /// How often the network task dials the committee members it is not
@@ -181,7 +171,7 @@ pub async fn start_p2p(
     );
 
     // B22: bootnodes given without a PeerId are dialled again until reached.
-    let mut unresolved = sessions::Unresolved::new(&bootnodes);
+    let mut unresolved = sessions::Unresolved::new(&bootnodes, std::time::Instant::now());
     // Add bootnodes
     for peer_addr in bootnodes {
         if let Ok(multiaddr) = peer_addr.parse::<Multiaddr>() {
@@ -403,7 +393,7 @@ pub async fn start_p2p(
                     }
                     explicit = current;
                     // B22: bootnodes not reached yet (they may boot after us).
-                    for addr in unresolved.due().to_vec() {
+                    for addr in unresolved.due(std::time::Instant::now()) {
                         let _ = swarm.dial(DialOpts::unknown_peer_id().address(addr).build());
                     }
                     for peer in members(&book) {
@@ -747,9 +737,13 @@ pub async fn start_p2p(
                     }
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                         println!("🆔 Identify Received from {:?}: Agent={:?}, Addrs={:?}", peer_id, info.agent_version, info.listen_addrs);
+                        // B22: a peer reached over the network is routed only at
+                        // addresses another host can dial (its loopback is its
+                        // own); a peer on this host keeps them all.
+                        let local_peer = !sessions::routable_for_others(&info.observed_addr);
                         for addr in info.listen_addrs {
-                            if is_docker_bridge_addr(&addr) {
-                                println!("🧹 Ignoring Docker bridge peer address from Identify: {}", addr);
+                            unresolved.resolved(&addr);
+                            if !local_peer && !sessions::routable_for_others(&addr) {
                                 continue;
                             }
                             swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);

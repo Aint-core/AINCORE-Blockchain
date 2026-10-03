@@ -549,36 +549,66 @@ pub fn without_peer(addr: &libp2p::Multiaddr) -> libp2p::Multiaddr {
     addr
 }
 
-/// B22: bootnodes given without a PeerId, dialled again on every committee
-/// tick until a session this node dialled opens from that address. A node
-/// that booted before its peers otherwise never reached them: a bootnode is
-/// dialled once, and without a PeerId it is in no routing table.
+/// B22: bootnodes given without a PeerId, dialled again until a session
+/// this node dialled opens from that address, or a peer's identify names
+/// it as a listen address (the peer reached this node first, perhaps where
+/// only one direction is open). A node that booted before its peers
+/// otherwise never reached them: a bootnode is dialled once, and without a
+/// PeerId it is in no routing table. Redials back off from
+/// `REDIAL_FIRST` doubling to `REDIAL_MAX` (a choice: a member that comes
+/// up late is reached within a minute, a dead bootnode costs one dial a
+/// minute).
 #[derive(Debug, Default)]
-pub struct Unresolved(Vec<libp2p::Multiaddr>);
+pub struct Unresolved(Vec<(libp2p::Multiaddr, std::time::Instant, u32)>);
+
+pub const REDIAL_FIRST: std::time::Duration = std::time::Duration::from_secs(5);
+pub const REDIAL_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Unresolved {
-    pub fn new(dial_list: &[String]) -> Self {
+    /// `dial_list` was dialled at `now` (boot).
+    pub fn new(dial_list: &[String], now: std::time::Instant) -> Self {
         Self(
             dial_list
                 .iter()
                 .filter_map(|a| a.parse::<libp2p::Multiaddr>().ok())
                 .filter(|a| !matches!(a.iter().last(), Some(libp2p::multiaddr::Protocol::P2p(_))))
+                .map(|a| (a, now + REDIAL_FIRST, 0))
                 .collect(),
         )
     }
 
-    /// A session this node dialled at `dialled` opened: that bootnode is
-    /// resolved. Returns whether it was one.
-    pub fn resolved(&mut self, dialled: &libp2p::Multiaddr) -> bool {
-        let dialled = without_peer(dialled);
+    /// `addr` was reached (a dial opened a session there, or a peer listens
+    /// there): that bootnode is resolved. Returns whether it was one.
+    pub fn resolved(&mut self, addr: &libp2p::Multiaddr) -> bool {
+        let addr = without_peer(addr);
         let before = self.0.len();
-        self.0.retain(|a| *a != dialled);
+        self.0.retain(|(a, _, _)| *a != addr);
         self.0.len() != before
     }
 
-    /// The bootnodes still to dial.
-    pub fn due(&self) -> &[libp2p::Multiaddr] {
-        &self.0
+    /// The bootnodes to dial at `now`; each is then due again after twice
+    /// its last wait, at most `REDIAL_MAX`.
+    pub fn due(&mut self, now: std::time::Instant) -> Vec<libp2p::Multiaddr> {
+        let mut out = Vec::new();
+        for (addr, next, tries) in &mut self.0 {
+            if *next <= now {
+                out.push(addr.clone());
+                *tries = tries.saturating_add(1);
+                let wait = REDIAL_FIRST
+                    .saturating_mul(1 << (*tries).min(16))
+                    .min(REDIAL_MAX);
+                *next = now + wait;
+            }
+        }
+        out
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -1340,21 +1370,38 @@ mod tests {
         );
     }
 
-    /// B22: a bootnode without a PeerId stays due until a session dialled at
-    /// it opens (with or without the PeerId on the dialled address).
+    /// B22: a bootnode without a PeerId is redialled, backing off from 5 s
+    /// to 60 s, until a dial reaches it or a peer's identify names it (with
+    /// or without the PeerId on the address).
     #[test]
-    fn a_bootnode_is_due_until_a_dial_reaches_it() {
+    fn a_bootnode_is_redialled_with_backoff_until_reached() {
+        use std::time::{Duration, Instant};
         let id = local_keypair(&[5; 32]).public().to_peer_id();
         let list = vec![
             "/ip4/192.168.18.66/tcp/9514".to_string(),
             "/ip4/192.168.18.66/tcp/9513".to_string(),
             format!("/ip4/192.168.18.202/tcp/9512/p2p/{id}"),
         ];
-        let mut due = Unresolved::new(&list);
+        let t0 = Instant::now();
+        let mut due = Unresolved::new(&list, t0);
         assert_eq!(
-            due.due().len(),
+            due.len(),
             2,
             "a PeerId-pinned address is routed, not redialled"
+        );
+        assert!(due.due(t0).is_empty(), "dialled at boot");
+        let mut at = Vec::new();
+        let mut t = t0;
+        for _ in 0..240 {
+            t += Duration::from_secs(1);
+            if !due.due(t).is_empty() {
+                at.push((t - t0).as_secs());
+            }
+        }
+        assert_eq!(
+            at,
+            [5, 15, 35, 75, 135, 195],
+            "5 s doubling, capped at 60 s"
         );
         let reached: libp2p::Multiaddr = format!("/ip4/192.168.18.66/tcp/9514/p2p/{id}")
             .parse()
@@ -1362,8 +1409,8 @@ mod tests {
         assert!(due.resolved(&reached));
         assert!(!due.resolved(&reached), "once");
         assert_eq!(
-            due.due(),
-            &["/ip4/192.168.18.66/tcp/9513"
+            due.due(t + REDIAL_MAX),
+            ["/ip4/192.168.18.66/tcp/9513"
                 .parse::<libp2p::Multiaddr>()
                 .unwrap()]
         );
