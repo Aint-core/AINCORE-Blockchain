@@ -291,88 +291,24 @@ fn test_oversized_tx_rejected_before_signature_verification() {
     );
 }
 
-/// H-01 REGRESSION TEST
-///
-/// Mempool must fail-closed for PQC (9254-char Dilithium5 hex) signatures
-/// until full Dilithium5 verification is wired at the mempool layer.
-/// Previously this path silently accepted any string of the right length
-/// without checking sender↔pubkey binding or running signature verify,
-/// turning the mempool into a free DoS surface that only got cleaned up
-/// inside block execution.
-#[test]
-fn test_pqc_signature_rejected_at_mempool_when_storage_absent() {
-    // Phase 2.1 (H-01): a storage-less Mempool (Mempool::new) keeps the
-    // Phase 1 fail-closed behaviour because real Dilithium5 verification
-    // requires the storage handle to look up pqc_pubkey_{sender}.
-    let mut mempool = Mempool::new();
-
-    let chain_id =
-        blockchain::chain_id();
-    // 9254 hex chars = 4627 bytes raw = Dilithium5 detached signature length.
-    let fake_pqc_sig = "ab".repeat(9254 / 2);
-    assert_eq!(fake_pqc_sig.len(), 9254);
-
-    let payload = hex::encode(
-        bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![1u8]])).unwrap(),
-    );
-
-    let tx = serde_json::json!({
-        "chain_id": chain_id,
-        "sender": "deadbeefdeadbeefdeadbeefdeadbeef",
-        "input_objects": [],
-        "payload": payload,
-        "args": [],
-        "gas_limit": 1000,
-        "gas_price": 1,
-        "sequence_number": 0,
-        // Public key length is irrelevant — gate triggers off the
-        // signature length first.
-        "public_key": "00".repeat(32),
-        "signature": fake_pqc_sig,
-    })
-    .to_string();
-
-    let err = mempool
-        .add_transaction(tx)
-        .expect_err("PQC submissions must be rejected when mempool has no storage");
-
-    assert!(
-        err.contains("storage-backed") || err.contains("PQC") || err.contains("Dilithium"),
-        "PQC reject must clearly explain why. Got: {:?}",
-        err
-    );
-}
-
-/// Phase 2.1 (H-01) — REAL VERIFICATION TESTS
-///
-/// These tests exercise the full Dilithium5 verification path that
-/// replaces the Phase 1 fail-closed gate when the mempool has a
-/// storage handle. They cover:
-///   - happy path (legitimate PQC TX accepted)
-///   - missing pubkey registration (rejected)
-///   - wrong sender↔pubkey binding (rejected, prevents pubkey spoofing)
-///   - invalid signature bytes (rejected)
-///   - tampered message (rejected)
-mod pqc_phase21 {
+/// B8: post-quantum transactions are ML-DSA-65 (FIPS 204). The transaction
+/// carries its 1952-byte public key, the sender is SHA-256 of it, and the
+/// mempool verifies it with nothing but the transaction, like Ed25519.
+mod ml_dsa_b8 {
     use super::*;
-    use std::sync::Arc;
-    use storage::StateDB;
 
-    fn temp_db(name: &str) -> Arc<StateDB> {
-        let path = format!("/tmp/aincore_pqc_mempool_{}_{}", std::process::id(), name);
-        let _ = std::fs::remove_dir_all(&path);
-        Arc::new(StateDB::open(&path).expect("open temp db"))
-    }
-
-    fn build_pqc_tx(
-        sender: &str,
-        signature_hex: &str,
-        sequence_number: u64,
-        chain_id: &str,
-        payload: &str,
-    ) -> String {
-        serde_json::json!({
-            "chain_id": chain_id,
+    fn ml_dsa_tx(seed: u8, sequence_number: u64) -> (serde_json::Value, crypto::MlDsa65Key) {
+        let key = crypto::MlDsa65Key::from_seed(&[seed; 32]);
+        let public_key = key.public_key();
+        let sender = crypto::derive_address(&public_key).unwrap();
+        let payload = hex::encode(
+            bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![
+                seed,
+            ]]))
+            .unwrap(),
+        );
+        let mut tx = serde_json::json!({
+            "chain_id": blockchain::chain_id(),
             "sender": sender,
             "input_objects": [],
             "payload": payload,
@@ -380,166 +316,75 @@ mod pqc_phase21 {
             "gas_limit": 1000,
             "gas_price": 1,
             "sequence_number": sequence_number,
-            "public_key": "",
-            "signature": signature_hex,
-        })
-        .to_string()
+            "public_key": hex::encode(&public_key),
+            "signature": "",
+        });
+        sign(&mut tx, &key);
+        (tx, key)
     }
 
-    /// Generates (sender, pubkey_bytes, signing function, chain_id, payload) for tests.
-    fn fresh_pqc_identity() -> (
-        String,
-        Vec<u8>,
-        pqcrypto_dilithium::dilithium5::SecretKey,
-        String,
-        String,
-    ) {
-        use pqcrypto_traits::sign::PublicKey;
-        let (pk, sk) = pqcrypto_dilithium::dilithium5::keypair();
-        let pk_bytes = pk.as_bytes().to_vec();
-        let sender = crypto::derive_address(&pk_bytes).unwrap();
-        let chain_id =
-            blockchain::chain_id();
-        let payload = hex::encode(
-            bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![9u8]])).unwrap(),
-        );
-        (sender, pk_bytes, sk, chain_id, payload)
-    }
-
-    fn sign_pqc_message(
-        sk: &pqcrypto_dilithium::dilithium5::SecretKey,
-        chain_id: &str,
-        sender: &str,
-        payload: &str,
-        seq: u64,
-    ) -> String {
-        use pqcrypto_traits::sign::DetachedSignature;
-        // F4: build_pqc_tx emits gas_limit=1000, gas_price=1, input_objects=[].
-        let msg = format!(
-            "{}:{}:{}:{}:{}:{}:{}",
-            chain_id, sender, payload, seq, 1000u64, 1u128, ""
-        );
-        let sig = pqcrypto_dilithium::dilithium5::detached_sign(msg.as_bytes(), sk);
-        hex::encode(sig.as_bytes())
+    fn sign(tx: &mut serde_json::Value, key: &crypto::MlDsa65Key) {
+        let parsed: executor::Transaction = serde_json::from_value(tx.clone()).unwrap();
+        let message = executor::admission::signing_message(&parsed);
+        tx["signature"] = serde_json::json!(hex::encode(key.sign(message.as_bytes())));
     }
 
     #[test]
-    fn happy_path_real_dilithium5_signature_accepted() {
-        let db = temp_db("happy");
-        let (sender, pk_bytes, sk, chain_id, payload) = fresh_pqc_identity();
-        let _seed = db.seeding();
-        db.put(&format!("pqc_pubkey_{}", sender), &hex::encode(&pk_bytes))
-            .unwrap();
-        // Admission now fails CLOSED for senders with no CoinStore (re-audit
-        // HIGH); a legitimate sender is funded, so fund this one.
-        super::fee_market_admission::fund(&db, &sender, 1_000_000);
-        let sig_hex = sign_pqc_message(&sk, &chain_id, &sender, &payload, 0);
-
-        let mut mempool = Mempool::with_storage(db);
-        let tx = build_pqc_tx(&sender, &sig_hex, 0, &chain_id, &payload);
-
-        let hash = mempool
-            .add_transaction(tx)
-            .expect("legitimate PQC TX must be accepted");
-        assert_eq!(hash.len(), 64, "tx hash must be sha256 hex");
-        assert_eq!(mempool.len(), 1);
+    fn a_signed_ml_dsa_65_transaction_is_admitted() {
+        let (tx, _) = ml_dsa_tx(1, 0);
+        assert_eq!(tx["signature"].as_str().unwrap().len(), 2 * 3309);
+        Mempool::new()
+            .add_transaction(tx.to_string())
+            .expect("a valid ML-DSA-65 transaction");
     }
 
     #[test]
-    fn pubkey_not_registered_rejected() {
-        let db = temp_db("not_registered");
-        let (sender, _pk_bytes, sk, chain_id, payload) = fresh_pqc_identity();
-        // Deliberately DON'T put pqc_pubkey_{sender} into storage.
-        let sig_hex = sign_pqc_message(&sk, &chain_id, &sender, &payload, 0);
+    fn a_tampered_ml_dsa_65_transaction_is_refused() {
+        let (tx, key) = ml_dsa_tx(2, 0);
 
-        let mut mempool = Mempool::with_storage(db);
-        let tx = build_pqc_tx(&sender, &sig_hex, 0, &chain_id, &payload);
-        let err = mempool
-            .add_transaction(tx)
-            .expect_err("unregistered must fail");
-        assert!(
-            err.contains("not registered"),
-            "error must explain pubkey is not registered. Got: {:?}",
-            err
-        );
+        let mut gas = tx.clone();
+        gas["gas_limit"] = serde_json::json!(2000);
+        let err = Mempool::new().add_transaction(gas.to_string()).unwrap_err();
+        assert!(err.contains("Invalid signature"), "{err}");
+
+        let mut flipped = tx.clone();
+        let mut sig = hex::decode(tx["signature"].as_str().unwrap()).unwrap();
+        sig[17] ^= 1;
+        flipped["signature"] = serde_json::json!(hex::encode(sig));
+        let err = Mempool::new()
+            .add_transaction(flipped.to_string())
+            .unwrap_err();
+        assert!(err.contains("Invalid signature"), "{err}");
+
+        // Another key's signature over the same transaction.
+        let mut other = tx.clone();
+        sign(&mut other, &crypto::MlDsa65Key::from_seed(&[3; 32]));
+        assert!(Mempool::new().add_transaction(other.to_string()).is_err());
+
+        // A sender that is not the key's address, re-signed by the key.
+        let mut sender = tx.clone();
+        sender["sender"] = serde_json::json!("ab".repeat(32));
+        sign(&mut sender, &key);
+        let err = Mempool::new()
+            .add_transaction(sender.to_string())
+            .unwrap_err();
+        assert!(err.contains("Sender mismatch"), "{err}");
     }
 
+    /// The pre-standard Dilithium5 sizes (2592-byte key, 4627-byte signature)
+    /// and mixed sizes are no scheme: refused before any verification.
     #[test]
-    fn sender_pubkey_binding_mismatch_rejected() {
-        let db = temp_db("binding");
-        let (sender_a, pk_a, sk_a, chain_id, payload) = fresh_pqc_identity();
-        // Register A's pubkey, but the tx claims sender B (different address).
-        let _seed = db.seeding();
-        db.put(
-            &format!(
-                "pqc_pubkey_{}",
-                "1111111111111111111111111111111111111111111111111111111111111111"
-            ),
-            &hex::encode(&pk_a),
-        )
-        .unwrap();
-        let _ = sender_a;
-        // Sign with A's secret key but bind to the spoofed sender so the
-        // mempool's storage lookup actually finds the pubkey.
-        let spoofed = "1111111111111111111111111111111111111111111111111111111111111111";
-        let sig_hex = sign_pqc_message(&sk_a, &chain_id, spoofed, &payload, 0);
-
-        let mut mempool = Mempool::with_storage(db);
-        let tx = build_pqc_tx(spoofed, &sig_hex, 0, &chain_id, &payload);
-        let err = mempool
-            .add_transaction(tx)
-            .expect_err("binding mismatch must fail");
-        assert!(
-            err.contains("sender mismatch") || err.contains("tampered"),
-            "error must surface the pubkey↔sender binding violation. Got: {:?}",
-            err
-        );
-    }
-
-    #[test]
-    fn tampered_message_rejected() {
-        let db = temp_db("tampered_msg");
-        let (sender, pk_bytes, sk, chain_id, payload) = fresh_pqc_identity();
-        let _seed = db.seeding();
-        db.put(&format!("pqc_pubkey_{}", sender), &hex::encode(&pk_bytes))
-            .unwrap();
-        // Sign sequence_number=0 but submit sequence_number=1 → signature
-        // does not match the message the mempool will reconstruct.
-        let sig_hex = sign_pqc_message(&sk, &chain_id, &sender, &payload, 0);
-
-        let mut mempool = Mempool::with_storage(db);
-        let tx = build_pqc_tx(&sender, &sig_hex, 1, &chain_id, &payload);
-        let err = mempool
-            .add_transaction(tx)
-            .expect_err("tampered msg must fail");
-        assert!(
-            err.contains("verification"),
-            "error must call out failed signature verification. Got: {:?}",
-            err
-        );
-    }
-
-    #[test]
-    fn corrupt_signature_bytes_rejected() {
-        let db = temp_db("corrupt_sig");
-        let (sender, pk_bytes, _sk, chain_id, payload) = fresh_pqc_identity();
-        let _seed = db.seeding();
-        db.put(&format!("pqc_pubkey_{}", sender), &hex::encode(&pk_bytes))
-            .unwrap();
-        // Construct a syntactically-correct-length signature filled with
-        // zeros. Cryptographically invalid; verification must reject.
-        let bad_sig = hex::encode(vec![0u8; 4627]);
-
-        let mut mempool = Mempool::with_storage(db);
-        let tx = build_pqc_tx(&sender, &bad_sig, 0, &chain_id, &payload);
-        let err = mempool
-            .add_transaction(tx)
-            .expect_err("corrupt sig must fail");
-        assert!(
-            err.contains("verification") || err.contains("format"),
-            "error must call out verification or format failure. Got: {:?}",
-            err
-        );
+    fn sizes_of_no_scheme_are_refused() {
+        let (tx, _) = ml_dsa_tx(4, 0);
+        for (key_bytes, sig_bytes) in [(2592usize, 4627usize), (1952, 64), (32, 3309)] {
+            let key = vec![7u8; key_bytes];
+            let mut t = tx.clone();
+            t["public_key"] = serde_json::json!(hex::encode(&key));
+            t["sender"] = serde_json::json!(crypto::derive_address(&key).unwrap());
+            t["signature"] = serde_json::json!("00".repeat(sig_bytes));
+            let err = Mempool::new().add_transaction(t.to_string()).unwrap_err();
+            assert!(err.contains("no scheme"), "{key_bytes}/{sig_bytes}: {err}");
+        }
     }
 }
 
@@ -946,8 +791,7 @@ mod fee_market_admission {
     /// RE-AUDIT HIGH: this gate used to fail OPEN ("balance unknown -> admit").
     /// An account with no CoinStore can never pay gas, so admitting it handed an
     /// attacker free block space with unlimited fresh keypairs. It now fails
-    /// CLOSED; a paymaster-sponsored tx still bypasses the sender check (see the
-    /// test below).
+    /// CLOSED, for a paymaster too (see the tests below).
     fn admission_fails_closed_when_store_missing() {
         let db = temp_db("admission_no_store");
         let (tx, _sender) = signed_tx(13, 0, 1000, 5);
@@ -958,22 +802,66 @@ mod fee_market_admission {
         assert!(err.contains("no CoinStore"), "got: {err}");
     }
 
+    /// `tx` sponsored by the paymaster with Ed25519 key `seed`, signed by it;
+    /// returns the transaction and the paymaster's address.
+    fn sponsored(tx: &str, seed: u8) -> (String, String) {
+        use ed25519_dalek::{Signer, SigningKey};
+        let pm = SigningKey::from_bytes(&[seed; 32]);
+        let mut v: serde_json::Value = serde_json::from_str(tx).unwrap();
+        let parsed: executor::Transaction = serde_json::from_value(v.clone()).unwrap();
+        let sig = pm.sign(&executor::admission::paymaster_message(&parsed));
+        v["paymaster"] = serde_json::json!(hex::encode(pm.verifying_key().to_bytes()));
+        v["paymaster_signature"] = serde_json::json!(hex::encode(sig.to_bytes()));
+        let address = crypto::derive_address(pm.verifying_key().as_bytes()).unwrap();
+        (v.to_string(), address)
+    }
+
+    /// B13: the paymaster pays, so its balance (at the address derived from
+    /// its key) is the one the gate checks; the broke sender does not matter.
     #[test]
-    fn admission_skips_check_for_paymaster_sponsored_tx() {
+    fn admission_checks_the_paymasters_balance() {
         let db = temp_db("admission_paymaster");
         let (tx, sender) = signed_tx(14, 0, 1000, 5); // needs 5000
-        fund(&db, &sender, 100); // sender is broke...
+        fund(&db, &sender, 100); // the sender is broke
+        let (tx_pm, paymaster) = sponsored(&tx, 40);
+        fund(&db, &paymaster, 10_000);
+        Mempool::with_storage(Arc::clone(&db))
+            .add_transaction(tx_pm)
+            .expect("a funded paymaster's sponsorship is admitted");
 
-        // ...but a paymaster sponsors the gas, so the sender check is skipped.
-        // (paymaster is not part of the signed canonical form, so injecting it
-        // post-signing keeps the sender signature valid.)
+        let (tx_broke_pm, broke) = sponsored(&tx, 41);
+        fund(&db, &broke, 10);
+        let err = Mempool::with_storage(db)
+            .add_transaction(tx_broke_pm)
+            .unwrap_err();
+        assert!(err.contains("Insufficient balance for gas"), "{err}");
+    }
+
+    /// B13: naming a paymaster used to skip the balance gate with no
+    /// paymaster signature checked ("deadbeef" was admitted). A paymaster
+    /// without a valid signature is refused at admission now.
+    #[test]
+    fn a_paymaster_without_a_valid_signature_is_refused() {
+        let db = temp_db("admission_paymaster_forged");
+        let (tx, sender) = signed_tx(15, 0, 1000, 5);
+        fund(&db, &sender, 100);
+
         let mut v: serde_json::Value = serde_json::from_str(&tx).unwrap();
         v["paymaster"] = serde_json::json!("deadbeef");
-        let tx_pm = v.to_string();
+        let err = Mempool::with_storage(Arc::clone(&db))
+            .add_transaction(v.to_string())
+            .unwrap_err();
+        assert!(err.contains("paymaster without a signature"), "{err}");
 
-        let mut mp = Mempool::with_storage(db);
-        mp.add_transaction(tx_pm)
-            .expect("paymaster-sponsored tx must skip the sender balance check");
+        let (good, _) = sponsored(&tx, 42);
+        let mut forged: serde_json::Value = serde_json::from_str(&good).unwrap();
+        let other = sponsored(&tx, 43).0;
+        let other: serde_json::Value = serde_json::from_str(&other).unwrap();
+        forged["paymaster_signature"] = other["paymaster_signature"].clone();
+        let err = Mempool::with_storage(db)
+            .add_transaction(forged.to_string())
+            .unwrap_err();
+        assert!(err.contains("Invalid paymaster signature"), "{err}");
     }
 }
 

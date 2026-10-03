@@ -8,7 +8,7 @@
 
 ## Overview
 
-AINCORE now supports **Bitcoin-compatible ECDSA signatures** using the secp256k1 elliptic curve. This provides full compatibility with Bitcoin and Ethereum ecosystems while maintaining backward compatibility with existing Ed25519 and Dilithium5 signatures.
+AINCORE now supports **Bitcoin-compatible ECDSA signatures** using the secp256k1 elliptic curve. This provides full compatibility with Bitcoin and Ethereum ecosystems while maintaining backward compatibility with existing Ed25519 signatures. The post-quantum scheme is ML-DSA-65 (FIPS 204; B8 replaced pre-standard Dilithium5).
 
 ---
 
@@ -51,7 +51,7 @@ AINCORE supports **3 signature schemes** simultaneously:
 | Scheme | ID | Signature Size | Public Key Size | Quantum-Safe |
 |--------|----|----|----------------|--------------|
 | **Ed25519** | 0 | 64 bytes | 32 bytes | ❌ No |
-| **Dilithium5** | 1 | 4627 bytes | 2592 bytes | ✅ Yes |
+| **ML-DSA-65** | 1 | 3309 bytes | 1952 bytes | ✅ Yes (FIPS 204 category 3) |
 | **secp256k1** | 2 | 64 bytes | 33 bytes | ❌ No |
 
 ### Usage
@@ -137,11 +137,11 @@ Auto-detect signature scheme from signature length.
 
 ### Comparison
 
-| Primitive | Classical Security | Quantum Security | Speed |
-|-----------|-------------------|------------------|-------|
-| **Ed25519** | 10^25 years | Vulnerable | VERY FAST |
-| **Dilithium5** | 10^77 years | SAFE | MEDIUM |
-| **secp256k1** | 10^27 years | Vulnerable | FAST |
+| Primitive | Quantum attacker |
+|-----------|------------------|
+| **Ed25519** | broken (Shor) |
+| **ML-DSA-65** | FIPS 204 security category 3 |
+| **secp256k1** | broken (Shor) |
 
 ---
 
@@ -151,7 +151,7 @@ Auto-detect signature scheme from signature length.
 
 All existing code continues to work:
 - Ed25519 signatures (default)
-- Dilithium5 PQC signatures
+- ML-DSA-65 PQC signatures
 - Existing transaction verification
 
 New secp256k1 support is **additive only**.
@@ -181,13 +181,11 @@ cargo test --package crypto --lib multi_sig
 
 ## Performance
 
-### Benchmarks (approximate)
+### Measurements
 
-| Operation | Ed25519 | secp256k1 | Dilithium5 |
-|-----------|---------|-----------|------------|
-| **Keygen** | 50 μs | 100 μs | 500 μs |
-| **Sign** | 50 μs | 100 μs | 1 ms |
-| **Verify** | 150 μs | 200 μs | 500 μs |
+ML-DSA-65 (aws-lc-rs 1.18.1, release) on the NAS (Celeron N5095) while it was
+also building, 2026-10-03: verify 0.23 ms, sign 0.91 ms. The other schemes are
+not measured here.
 
 ---
 

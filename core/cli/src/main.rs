@@ -16,15 +16,24 @@ fn a1n(hex_address: &str) -> String {
     crypto::hex_to_a1n(hex_address).unwrap_or_else(|_| hex_address.to_string())
 }
 
-fn derive_validator_bls_identity(wallet: &Wallet) -> (Vec<u8>, Vec<u8>) {
+fn derive_validator_bls_identity(wallet: &Wallet) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"AINCORE_VALIDATOR_BLS_V1");
-    hasher.update(wallet.key_pair.to_bytes());
+    hasher.update(wallet.ed25519_secret()?);
     let digest = hasher.finalize();
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&digest);
     let bls = crypto::bls::BLSEngine::consensus();
-    (bls.pubkey_raw(&seed), bls.prove_possession_raw(&seed))
+    Ok((bls.pubkey_raw(&seed), bls.prove_possession_raw(&seed)))
+}
+
+/// The spending wallet: the ML-DSA-65 seed given with `--pqc-seed`, or else
+/// the Ed25519 key file.
+fn load_wallet(pqc_seed: &Option<String>, keyfile: &str) -> anyhow::Result<Wallet> {
+    match pqc_seed {
+        Some(seed) => Wallet::load_ml_dsa_65(Path::new(seed)),
+        None => Wallet::load_or_create(Path::new(keyfile)),
+    }
 }
 
 mod client;
@@ -55,6 +64,11 @@ struct Cli {
     #[arg(short, long, default_value = "wallet.key")]
     keyfile: String,
 
+    /// Sign with this ML-DSA-65 seed file (from `pqc-keygen`) instead of the
+    /// Ed25519 key file
+    #[arg(long)]
+    pqc_seed: Option<String>,
+
     /// Chain ID used in signed transactions (or AINCORE_CHAIN_ID env)
     #[arg(long, default_value = "AINCORE-MAINNET-1")]
     chain_id: String,
@@ -64,7 +78,7 @@ struct Cli {
 enum Commands {
     /// Generate a new keypair
     Keygen,
-    /// Generate a post-quantum keypair (Dilithium5)
+    /// Generate a post-quantum key (ML-DSA-65, FIPS 204)
     PqcKeygen {
         /// Output directory for keys
         #[arg(long, default_value = "./pqc_keys")]
@@ -141,35 +155,24 @@ fn main() -> anyhow::Result<()> {
             println!("Public Key: {}", wallet.public_key());
         }
         Commands::PqcKeygen { out } => {
-            use pqcrypto_dilithium::dilithium5;
-            use pqcrypto_traits::sign::{PublicKey, SecretKey};
+            use rand::RngCore;
 
-            // Create output directory
             std::fs::create_dir_all(&out)?;
+            // ML-DSA.KeyGen_internal(ξ) (FIPS 204): the 32-byte seed is the
+            // whole secret; the key pair is recomputed from it.
+            let mut seed = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut seed);
+            let key = crypto::MlDsa65Key::from_seed(&seed);
+            let public_key = key.public_key();
+            let address = crypto::derive_address(&public_key)
+                .map_err(|e| anyhow::anyhow!("failed to derive the address: {e}"))?;
 
-            // Generate Dilithium5 keypair
-            let (pk, sk) = dilithium5::keypair();
-
-            // Get bytes
-            let pk_bytes = pk.as_bytes();
-            let sk_bytes = sk.as_bytes();
-
-            // Derive the AINCORE address the same way the rest of the chain does:
-            // full 32-byte SHA256 of the public key (audit note: the old 16-byte
-            // truncation was inconsistent with the #35 32-byte hard fork).
-            let address = crypto::derive_address(pk_bytes)
-                .map_err(|e| anyhow::anyhow!("failed to derive PQC address: {e}"))?;
-
-            // Save files
-            let pk_path = format!("{}/pqc_pubkey.bin", out);
-            let sk_path = format!("{}/pqc_privkey.bin", out);
-            let addr_path = format!("{}/pqc_address.txt", out);
-
-            std::fs::write(&pk_path, pk_bytes)?;
-            // SECURITY (audit H-5): the Dilithium5 secret key is a spendable signing
-            // identity — write it owner-only (0600), never world-readable, mirroring
-            // the node.key hardening in core/node/src/main.rs. Create with the
-            // restrictive mode from the start so there is no world-readable window.
+            let seed_path = format!("{}/mldsa65.seed", out);
+            let pk_path = format!("{}/mldsa65.pub", out);
+            let addr_path = format!("{}/mldsa65_address.txt", out);
+            std::fs::write(&pk_path, hex::encode(&public_key))?;
+            // The seed is a spendable signing identity: owner-only (0600) from
+            // creation, like node.key (audit H-5).
             {
                 #[cfg(unix)]
                 {
@@ -177,33 +180,36 @@ fn main() -> anyhow::Result<()> {
                     use std::os::unix::fs::OpenOptionsExt;
                     let mut f = std::fs::OpenOptions::new()
                         .write(true)
-                        .create(true)
-                        .truncate(true)
+                        .create_new(true)
                         .mode(0o600)
-                        .open(&sk_path)?;
-                    f.write_all(sk_bytes)?;
+                        .open(&seed_path)?;
+                    f.write_all(hex::encode(seed).as_bytes())?;
                 }
                 #[cfg(not(unix))]
                 {
-                    std::fs::write(&sk_path, sk_bytes)?;
+                    std::fs::write(&seed_path, hex::encode(seed))?;
                 }
             }
             std::fs::write(&addr_path, &address)?;
 
-            println!("Post-Quantum Keypair Generated (Dilithium5)");
-            println!("Public Key:  {} ({} bytes)", pk_path, pk_bytes.len());
-            println!("Private Key: {} ({} bytes, mode 0600)", sk_path, sk_bytes.len());
+            println!("Post-quantum key generated (ML-DSA-65, FIPS 204)");
+            println!("Public key:  {} ({} bytes)", pk_path, public_key.len());
+            println!("Seed:        {} (32 bytes, mode 0600)", seed_path);
             println!("Address:     {}", a1n(&address));
             println!("Address hex: {}", address);
             println!();
-            println!("SECURITY: Keep pqc_privkey.bin secure (stored owner-only 0600, unencrypted).");
+            println!(
+                "Sign with it: aincore-cli --pqc-seed {} <command>",
+                seed_path
+            );
+            println!("SECURITY: the seed is the key; keep it secret (stored unencrypted, 0600).");
         }
         Commands::Info => {
             let res = client.call("aincore_getStatus", json!([]))?;
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
         Commands::SubmitProof { device, quality } => {
-            let wallet = Wallet::load_or_create(Path::new(&cli.keyfile))?;
+            let wallet = load_wallet(&cli.pqc_seed, &cli.keyfile)?;
             let sender = wallet.address();
 
             // Get Seq Number
@@ -271,7 +277,7 @@ fn main() -> anyhow::Result<()> {
             let addr = if let Some(a) = address {
                 require_address_hex(&a)?
             } else {
-                let wallet = Wallet::load_or_create(Path::new(&cli.keyfile))?;
+                let wallet = load_wallet(&cli.pqc_seed, &cli.keyfile)?;
                 wallet.address()
             };
 
@@ -312,7 +318,7 @@ fn main() -> anyhow::Result<()> {
             gas_limit,
         } => {
             let to = require_address_hex(&to)?;
-            let wallet = Wallet::load_or_create(Path::new(&cli.keyfile))?;
+            let wallet = load_wallet(&cli.pqc_seed, &cli.keyfile)?;
             let sender = wallet.address();
 
             println!("🔍 Loading sender metadata: {}", sender);
@@ -391,7 +397,7 @@ fn main() -> anyhow::Result<()> {
             println!("✅ Transaction submitted: {}", res);
         }
         Commands::Publish { path } => {
-            let wallet = Wallet::load_or_create(Path::new(&cli.keyfile))?;
+            let wallet = load_wallet(&cli.pqc_seed, &cli.keyfile)?;
             let sender = wallet.address();
             let source_path = Path::new(&path);
 
@@ -510,7 +516,7 @@ fn main() -> anyhow::Result<()> {
             }
         },
         Commands::RegisterValidator => {
-            let wallet = Wallet::load_or_create(Path::new(&cli.keyfile))?;
+            let wallet = load_wallet(&cli.pqc_seed, &cli.keyfile)?;
             let sender = wallet.address();
 
             println!("🔒 Registering Validator for address: {}", sender);
@@ -533,7 +539,7 @@ fn main() -> anyhow::Result<()> {
             // Skipping client-side balance check due to u64 parsing limitations in CLI for u128 balances
 
             let pk_bytes = hex::decode(wallet.public_key()).unwrap_or_default();
-            let (bls_public_key, bls_pop) = derive_validator_bls_identity(&wallet);
+            let (bls_public_key, bls_pop) = derive_validator_bls_identity(&wallet)?;
             let min_stake: u128 = 1_000_000_000_000_000_000_000; // 1000 AIN in quanta (smallest unit, 10^18)
             let call = vm_move::EntryFunctionCall {
                 module: move_core_types::language_storage::ModuleId::new(
@@ -577,7 +583,7 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Faucet { to, amount } => {
             let to = require_address_hex(&to)?;
-            let wallet = Wallet::load_or_create(Path::new(&cli.keyfile))?;
+            let wallet = load_wallet(&cli.pqc_seed, &cli.keyfile)?;
             let sender = wallet.address();
 
             println!("🚰 Faucet: Sending {} AIN to {}", amount, a1n(&to));

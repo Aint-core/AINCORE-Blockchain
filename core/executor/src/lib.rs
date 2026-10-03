@@ -50,7 +50,9 @@ pub const MAX_GAS_LIMIT: u64 = 10_000_000;
 pub const MAX_BLOCK_GAS_LIMIT: u64 = 200_000_000;
 
 const OBJECT_LOAD_GAS: u64 = 100;
-const MIN_GAS_PRICE: u128 = 1;
+pub use admission::MIN_GAS_PRICE;
+
+pub mod admission;
 
 fn system_address() -> move_core_types::account_address::AccountAddress {
     move_core_types::account_address::AccountAddress::from_hex_literal("0x1")
@@ -1423,16 +1425,17 @@ fn receipt_metadata(
     Some(metadata)
 }
 
-fn known_payload_format(payload: &str) -> bool {
-    let hex_payload = payload.trim_start_matches("0x");
-    if let Ok(bytes) = hex::decode(hex_payload) {
-        matches!(
-            bcs::from_bytes::<vm_move::TransactionPayload>(&bytes),
-            Ok(vm_move::TransactionPayload::EntryFunction(_))
-                | Ok(vm_move::TransactionPayload::PublishModule(_))
-        )
-    } else {
-        false
+/// The kind of a hex-encoded BCS `TransactionPayload`.
+pub(crate) fn payload_kind(payload: &str) -> Result<admission::PayloadKind, String> {
+    use admission::PayloadKind;
+    let bytes = hex::decode(payload.trim_start_matches("0x"))
+        .map_err(|_| "Invalid payload hex: expected BCS TransactionPayload".to_string())?;
+    match bcs::from_bytes::<vm_move::TransactionPayload>(&bytes)
+        .map_err(|e| format!("Invalid BCS TransactionPayload: {e}"))?
+    {
+        vm_move::TransactionPayload::EntryFunction(_) => Ok(PayloadKind::EntryFunction),
+        vm_move::TransactionPayload::PublishModule(_) => Ok(PayloadKind::PublishModule),
+        vm_move::TransactionPayload::Script(_) => Ok(PayloadKind::Script),
     }
 }
 
@@ -4344,9 +4347,11 @@ impl Executor {
         // a normal transfer FROM the paymaster racing a sponsored tx — serialize into
         // separate batches and each observes the updated balance.
         if let Some(pm) = &tx.paymaster {
-            let pm_token = parse_move_address(pm)
+            // B13: the paymaster pays from the address derived from its key.
+            let pm_addr = admission::paymaster_address(pm).unwrap_or_else(|| pm.clone());
+            let pm_token = parse_move_address(&pm_addr)
                 .map(|addr| addr.to_string())
-                .unwrap_or_else(|| pm.clone());
+                .unwrap_or(pm_addr);
             deps.push(pm_token);
         }
         for obj in &tx.input_objects {
@@ -4575,17 +4580,18 @@ impl Executor {
     ) -> Option<(Vec<(String, Option<String>)>, u128)> {
         let mut updates = Vec::new();
 
-        if let Ok(tx) = serde_json::from_str::<Transaction>(tx_json) {
-            // 0. Verify Chain ID
-            let expected_chain = expected_chain_id();
-            if tx.chain_id != expected_chain {
-                println!(
-                    "❌ Invalid Chain ID: Expected {}, Got {}",
-                    expected_chain, tx.chain_id
-                );
-                return None;
+        // B8/B12/B13: everything decidable without state (size, chain id, gas
+        // bounds, payload kind, ZK proof, sender and paymaster signatures in
+        // either scheme) through the one predicate the mempool and vertex
+        // ingress use.
+        let checked = match admission::check_stateless(tx_json, &expected_chain_id()) {
+            Ok(checked) => Some(checked),
+            Err(e) => {
+                println!("❌ REJECTED: {e}");
+                None
             }
-
+        };
+        if let Some(admission::CheckedTx { tx, payer, .. }) = checked {
             // 1. Fetch Sender Account Object.
             //
             // ONBOARDING (second layer): a first-time sender has no AccountData
@@ -4600,9 +4606,9 @@ impl Executor {
             // Accounts are therefore created IMPLICITLY on first send, the same way
             // Aptos does it. This is safe because the address is not a free
             // parameter: it is derived from the public key
-            // (`derive_address(pk) == tx.sender` is asserted a few lines below, and
-            // again in the mempool), and the signature is verified against that
-            // same key. So only the holder of the matching private key can produce
+            // (`derive_address(pk) == tx.sender` is asserted by
+            // `admission::check_stateless` above, in either signature scheme), and
+            // the signature is verified against that same key. So only the holder of the matching private key can produce
             // a transaction for this address, and the synthesized account starts at
             // sequence_number 0 — meaning the replay check below still forces the
             // very first transaction to be nonce 0, exactly as for a pre-existing
@@ -4626,103 +4632,8 @@ impl Executor {
                 }
             };
 
-            // 2. Verify Signature (Sender)
-            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-
-            let pk_bytes = match hex::decode(&tx.public_key) {
-                Ok(bytes) if bytes.len() == 32 => {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&bytes);
-                    arr
-                }
-                _ => return None,
-            };
-
-            let expected_sender = match crypto::derive_address(&pk_bytes) {
-                Ok(addr) => addr,
-                Err(e) => {
-                    println!("❌ Failed to derive sender address: {}", e);
-                    return None;
-                }
-            };
-            if tx.sender != expected_sender {
-                println!(
-                    "❌ SENDER ADDRESS MISMATCH: tx.sender={} expected={}",
-                    tx.sender, expected_sender
-                );
-                return None;
-            }
-
-            // Verify Sig
-            let sig_bytes = match hex::decode(&tx.signature) {
-                Ok(bytes) if bytes.len() == 64 => {
-                    let mut arr = [0u8; 64];
-                    arr.copy_from_slice(&bytes);
-                    arr
-                }
-                _ => return None,
-            };
-
-            let verifying_key = match VerifyingKey::from_bytes(&pk_bytes) {
-                Ok(vk) => vk,
-                Err(_) => return None,
-            };
-
-            let signature = Signature::from_bytes(&sig_bytes);
-            // F4: signature binds gas_limit, gas_price, input_objects so a
-            // network-mutated gas field or rewritten input_objects fails verify
-            // here too (defense-in-depth; sync/gossip txs bypass the mempool).
-            let message = format!(
-                "{}:{}:{}:{}:{}:{}:{}",
-                tx.chain_id,
-                tx.sender,
-                tx.payload,
-                tx.sequence_number,
-                tx.gas_limit,
-                tx.gas_price,
-                tx.input_objects.join(",")
-            );
-
-            if verifying_key
-                .verify(message.as_bytes(), &signature)
-                .is_err()
-            {
-                println!("❌ Invalid Signature Verification");
-                return None;
-            }
-
-            // 2b. H-04 PROMOTED (Phase 2.2): defense-in-depth STARK verify.
-            //
-            // The mempool's H-04 gate also calls the same dispatcher,
-            // so most ZKP-tagged transactions are rejected before they
-            // reach here. We re-run the check at the executor because
-            // block execution can also see transactions via sync /
-            // gossip / older peers that bypassed our mempool. Policy
-            // must be uniform: no execution path silently accepts an
-            // unverified ZKP claim.
-            //
-            // The check performs hex decode → STARKProofData parse →
-            // public-input binding to "{chain_id}:{sender}:{payload}:{seq}"
-            // → STARKVerifier::verify dispatch. The verifier itself is
-            // currently a Phase-2 placeholder; when it's wired to a
-            // real AIR, valid proofs flow through unchanged.
-            if let Some(ref proof_hex) = tx.zkp_proof {
-                if !proof_hex.is_empty() {
-                    let canonical_msg = format!(
-                        "{}:{}:{}:{}",
-                        tx.chain_id, tx.sender, tx.payload, tx.sequence_number
-                    );
-                    if let Err(e) =
-                        crypto::zkp::verify_tx_attached_proof(proof_hex, canonical_msg.as_bytes())
-                    {
-                        println!(
-                            "❌ Transaction zkp_proof rejected at executor (H-04): {}",
-                            e
-                        );
-                        return None;
-                    }
-                }
-            }
+            // 2. The sender's signature and any ZK proof were checked by
+            // `admission::check_stateless` above.
 
             // 2.5 Replay Protection
             let sender_data_check: aa::AccountData = match serde_json::from_slice(&sender_obj.data)
@@ -4736,43 +4647,9 @@ impl Executor {
                 return None;
             }
 
-            if !known_payload_format(&tx.payload) {
-                println!(
-                    "⚠️ REJECTED: Unrecognized payload format from {}. Raw hex script execution is disabled for security.",
-                    tx.sender
-                );
-                return None;
-            }
-
-            if tx.gas_price < MIN_GAS_PRICE {
-                println!(
-                    "❌ Gas price too low: {} < minimum {}",
-                    tx.gas_price, MIN_GAS_PRICE
-                );
-                return None;
-            }
-
-            if tx.gas_limit == 0 {
-                println!("❌ Gas limit must be greater than 0");
-                return None;
-            }
-
-            // AUDIT-CRITICAL (pre-mainnet B5): gas_limit had NO upper bound. The
-            // sender pre-pays gas_limit * gas_price, but with MIN_GAS_PRICE = 1 a
-            // gas_limit of 1e15 costs ~0.001 AIN and buys 1e15 units of Move
-            // execution that EVERY validator performs deterministically, on both
-            // the consensus and the sync path. There is no wall-clock timeout on
-            // Move execution, so one cheap transaction halts the whole chain.
-            // This gate lives in the executor, not only the mempool, because a
-            // malicious validator can place a transaction straight into a vertex
-            // and never offer it for admission.
-            if tx.gas_limit > MAX_GAS_LIMIT {
-                println!(
-                    "❌ REJECTED: gas_limit {} exceeds MAX_GAS_LIMIT {}",
-                    tx.gas_limit, MAX_GAS_LIMIT
-                );
-                return None;
-            }
+            // The payload kind and the gas bounds (MAX_GAS_LIMIT included:
+            // a validator can place a transaction straight into a vertex) are
+            // in `admission::check_stateless`.
 
             // 3. Check Balance & Deduct Gas
             // N-2 FIX: Charge gas for object loading upfront
@@ -4798,51 +4675,11 @@ impl Executor {
                 }
             };
 
-            // N-1 FIX (HARDENED): Paymaster Signature Validation
-            // Message now includes chain_id, sequence_number, gas_limit for full replay protection.
-            let payer_addr = if let Some(pm) = &tx.paymaster {
-                if let Some(pm_sig_hex) = &tx.paymaster_signature {
-                    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-                    let pm_valid = (|| -> Result<(), ()> {
-                        let pm_pubkey_bytes = hex::decode(pm).map_err(|_| ())?;
-                        if pm_pubkey_bytes.len() != 32 {
-                            return Err(());
-                        }
-                        let vk = VerifyingKey::from_bytes(
-                            pm_pubkey_bytes.as_slice().try_into().map_err(|_| ())?,
-                        )
-                        .map_err(|_| ())?;
-                        let sig_bytes = hex::decode(pm_sig_hex).map_err(|_| ())?;
-                        let sig = Signature::from_slice(&sig_bytes).map_err(|_| ())?;
-
-                        // N-1 FIX: Paymaster signs FULL context to prevent replay and cross-TX theft:
-                        // PAYMASTER_AUTH:{chain_id}:{sender}:{payload}:{gas_limit}:{sequence_number}
-                        let pm_message = format!(
-                            "PAYMASTER_AUTH:{}:{}:{}:{}:{}",
-                            tx.chain_id, tx.sender, tx.payload, tx.gas_limit, tx.sequence_number
-                        );
-                        use sha2::{Digest, Sha256};
-                        let hash = Sha256::digest(pm_message.as_bytes());
-                        vk.verify(&hash, &sig).map_err(|_| ())
-                    })();
-                    if pm_valid.is_err() {
-                        println!("❌ Invalid Paymaster Signature! Gas sponsorship rejected.");
-                        return None;
-                    }
-                    println!(
-                        "✅ Paymaster {} authorized gas payment for TX seq={}",
-                        pm, tx.sequence_number
-                    );
-                } else {
-                    println!("❌ Paymaster specified without signature! Rejected.");
-                    return None;
-                }
-                // G3 FX-9: one canonical spelling, so case variants of the
-                // same key cannot address different account objects.
-                pm.to_ascii_lowercase()
-            } else {
-                tx.sender.clone()
-            };
+            // The paymaster's signature (N-1: over chain id, sender, payload,
+            // gas limit and sequence number) was verified in
+            // `admission::check_stateless`; `payer` is the paymaster's address
+            // derived from its key (B13), or the sender.
+            let payer_addr = payer;
 
             // Check if payer has balance
             // We need to fetch payer object again (or use sender_obj if same)

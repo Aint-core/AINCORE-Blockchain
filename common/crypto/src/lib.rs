@@ -18,6 +18,7 @@ pub mod mpc;
 pub mod threshold;
 
 pub mod multi_sig;
+pub mod tx_sig;
 pub mod transport;
 pub mod vdf;
 
@@ -34,6 +35,7 @@ pub use address::{
 };
 pub use ecdsa::{ECDSACrypto, ECDSAError};
 pub use multi_sig::{MultiSigError, MultiSigVerifier, SignatureScheme};
+pub use tx_sig::{verify_tx_signature, MlDsa65Key, TxScheme};
 pub use vdf::{VDFEngine, VDFError};
 pub use zkp::{HashPreimageCircuit, SNARKError, SNARKProver, STARKError, STARKProver};
 

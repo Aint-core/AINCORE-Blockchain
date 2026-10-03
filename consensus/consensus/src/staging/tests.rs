@@ -56,13 +56,20 @@ fn sentinel() -> String {
 
 /// A first-round vertex by `m`; `tag` makes twins.
 fn twin(m: &Member, round: u64, tag: &str) -> Vertex {
+    with_payload(m, round, vec![crate::test_txs::tagged(CHAIN, tag)])
+}
+
+/// A signed first-round-shaped vertex by `m` carrying `payload`.
+fn with_payload(m: &Member, round: u64, payload: Vec<String>) -> Vertex {
     let mut v = Vertex {
         epoch: EPOCH,
         round,
         author: m.info.address.clone(),
         parents: vec![sentinel()],
         parent_refs: vec![],
-        payload: vec![tag.to_string()],
+        // A signed transaction that carries the tag (B12: ingress and boot
+        // refuse any payload item that is not one).
+        payload,
         timestamp: 1_000,
         hash: String::new(),
         signature: String::new(),
@@ -747,11 +754,12 @@ fn ingress_and_boot_bound_the_same_bytes() {
     let all = members();
     let c = committee(&all);
     let s = sentinel();
-    let base = serde_json::to_string(&twin(&all[0], FIRST, ""))
+    let base = serde_json::to_string(&with_payload(&all[0], FIRST, vec![]))
         .unwrap()
         .len();
     let at = |canonical_len: usize| {
-        let v = twin(&all[0], FIRST, &"x".repeat(canonical_len - base));
+        let payload = crate::test_txs::payload_of_size(CHAIN, 7, canonical_len - base);
+        let v = with_payload(&all[0], FIRST, payload);
         let canonical = serde_json::to_string(&v).unwrap();
         assert_eq!(canonical.len(), canonical_len);
         let raw = canonical.replacen("\"parent_refs\":[],", "", 1).replacen(

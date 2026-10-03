@@ -787,10 +787,7 @@ async fn main() {
     }
 
     let executor = Arc::new(Executor::new(Arc::clone(&storage)));
-    // Phase 2.1 (H-01): use with_storage so PQC (Dilithium5) submissions
-    // are verified at the mempool gate against the canonical
-    // pqc_pubkey_{sender} binding, instead of being silently accepted
-    // (pre-Phase-1) or fail-closed (Phase 1 mitigation).
+    // with_storage: the admission gate checks the gas payer's committed balance.
     let mempool = Arc::new(Mutex::new(Mempool::with_storage(Arc::clone(&storage))));
 
     // CRITICAL: Use RwLock for DAG Consensus

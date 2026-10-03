@@ -1125,14 +1125,14 @@ fn rev_withheld_body(tag: &str, seeds: [u8; 4], margin: usize) -> (u64, u64, u64
     assert!(refs.len() >= 3, "no quorum at r-1");
     let chain = crate::qc::expected_chain_id();
     let key = crypto::SigningKey::from_bytes(&[seeds[3]; 32]);
-    let build = |pad: usize| {
+    let build = |payload: Vec<String>| {
         let mut v = blockchain::Vertex {
             epoch: 0,
             round: r,
             author: byz_addr.clone(),
             parents: refs.iter().map(|x| x.digest.clone()).collect(),
             parent_refs: refs.clone(),
-            payload: vec!["x".repeat(pad)],
+            payload,
             timestamp: PINNED,
             hash: String::new(),
             signature: String::new(),
@@ -1144,8 +1144,12 @@ fn rev_withheld_body(tag: &str, seeds: [u8; 4], margin: usize) -> (u64, u64, u64
         v.sign_with_ed25519(&key);
         v
     };
-    let base = serde_json::to_string(&build(0)).unwrap().len();
-    let v = build(crate::dag::MAX_VERTEX_BYTES - margin - base);
+    let base = serde_json::to_string(&build(vec![])).unwrap().len();
+    let v = build(crate::test_txs::payload_of_size(
+        &chain,
+        seeds[3],
+        crate::dag::MAX_VERTEX_BYTES - margin - base,
+    ));
     let canonical = serde_json::to_string(&v).unwrap().len();
     assert_eq!(canonical, crate::dag::MAX_VERTEX_BYTES - margin);
     let wire = format!(
@@ -1346,7 +1350,8 @@ fn a_v4_twin_is_recorded_and_carried_in_every_nodes_block() {
         })
         .expect("node 1 proposed a vertex");
     let mut twin = original.clone();
-    twin.payload.push("a second body for the same slot".into());
+    twin.payload
+        .push(crate::test_txs::tx(&crate::qc::expected_chain_id(), 77, 0));
     twin.payload_root = None;
     twin.hash = twin.hash_v4_with_domain(&crate::qc::expected_chain_id(), GENESIS_IDENTITY);
     twin.sign_with_ed25519(&crypto::SigningKey::from_bytes(&key));

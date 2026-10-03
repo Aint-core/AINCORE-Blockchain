@@ -12,12 +12,11 @@ pub enum SignatureScheme {
     /// - Quantum-safe: NO
     Ed25519 = 0,
 
-    /// CRYSTALS-Dilithium5 (post-quantum)
-    /// - Signature size: 4627 bytes
-    /// - Public key size: 2592 bytes
-    /// - Speed: MEDIUM
+    /// ML-DSA-65 (FIPS 204, post-quantum; B8 replaced pre-standard Dilithium5)
+    /// - Signature size: 3309 bytes
+    /// - Public key size: 1952 bytes
     /// - Quantum-safe: YES
-    Dilithium5 = 1,
+    MlDsa65 = 1,
 
     /// secp256k1 ECDSA (Bitcoin-compatible)
     /// - Signature size: 64 bytes
@@ -32,7 +31,7 @@ impl SignatureScheme {
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(SignatureScheme::Ed25519),
-            1 => Some(SignatureScheme::Dilithium5),
+            1 => Some(SignatureScheme::MlDsa65),
             2 => Some(SignatureScheme::Secp256k1),
             _ => None,
         }
@@ -48,7 +47,7 @@ impl SignatureScheme {
 pub enum MultiSigError {
     UnsupportedScheme(u8),
     Ed25519Error(String),
-    Dilithium5Error(String),
+    MlDsa65Error(String),
     Secp256k1Error(String),
     InvalidPublicKeyLength(usize, usize), // expected, got
     InvalidSignatureLength(usize, usize), // expected, got
@@ -59,7 +58,7 @@ impl fmt::Display for MultiSigError {
         match self {
             MultiSigError::UnsupportedScheme(s) => write!(f, "Unsupported signature scheme: {}", s),
             MultiSigError::Ed25519Error(e) => write!(f, "Ed25519 error: {}", e),
-            MultiSigError::Dilithium5Error(e) => write!(f, "Dilithium5 error: {}", e),
+            MultiSigError::MlDsa65Error(e) => write!(f, "ML-DSA-65 error: {}", e),
             MultiSigError::Secp256k1Error(e) => write!(f, "secp256k1 error: {}", e),
             MultiSigError::InvalidPublicKeyLength(exp, got) => {
                 write!(
@@ -110,7 +109,7 @@ impl MultiSigVerifier {
     ) -> Result<bool, MultiSigError> {
         match scheme {
             SignatureScheme::Ed25519 => self.verify_ed25519(public_key, message, signature),
-            SignatureScheme::Dilithium5 => self.verify_dilithium5(public_key, message, signature),
+            SignatureScheme::MlDsa65 => self.verify_ml_dsa_65(public_key, message, signature),
             SignatureScheme::Secp256k1 => self.verify_secp256k1(public_key, message, signature),
         }
     }
@@ -135,40 +134,28 @@ impl MultiSigVerifier {
             .map_err(|e| MultiSigError::Ed25519Error(e.to_string()))
     }
 
-    /// Verify Dilithium5 signature (Post-Quantum)
-    fn verify_dilithium5(
+    /// Verify an ML-DSA-65 signature (FIPS 204, pure, empty context), the
+    /// transaction verifier's (`crate::tx_sig`).
+    fn verify_ml_dsa_65(
         &self,
         public_key: &[u8],
         message: &[u8],
         signature: &[u8],
     ) -> Result<bool, MultiSigError> {
-        use pqcrypto_dilithium::dilithium5;
-        use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
-
-        // Validate lengths
-        if public_key.len() != 2592 {
+        use crate::tx_sig::{ML_DSA_65_PUBLIC_KEY_BYTES, ML_DSA_65_SIGNATURE_BYTES};
+        if public_key.len() != ML_DSA_65_PUBLIC_KEY_BYTES {
             return Err(MultiSigError::InvalidPublicKeyLength(
-                2592,
+                ML_DSA_65_PUBLIC_KEY_BYTES,
                 public_key.len(),
             ));
         }
-        if signature.len() != 4627 {
-            return Err(MultiSigError::InvalidSignatureLength(4627, signature.len()));
+        if signature.len() != ML_DSA_65_SIGNATURE_BYTES {
+            return Err(MultiSigError::InvalidSignatureLength(
+                ML_DSA_65_SIGNATURE_BYTES,
+                signature.len(),
+            ));
         }
-
-        // Parse public key
-        let pk = dilithium5::PublicKey::from_bytes(public_key)
-            .map_err(|_| MultiSigError::Dilithium5Error("Invalid public key format".to_string()))?;
-
-        // Parse signature
-        let sig = dilithium5::DetachedSignature::from_bytes(signature)
-            .map_err(|_| MultiSigError::Dilithium5Error("Invalid signature format".to_string()))?;
-
-        // Verify signature
-        match dilithium5::verify_detached_signature(&sig, message, &pk) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
-        }
+        Ok(crate::tx_sig::verify_tx_signature(public_key, message, signature).is_ok())
     }
 
     /// Verify secp256k1 ECDSA signature
@@ -202,7 +189,7 @@ impl MultiSigVerifier {
     pub fn auto_detect_scheme(&self, signature: &[u8]) -> Option<SignatureScheme> {
         match signature.len() {
             64 => Some(SignatureScheme::Ed25519), // Could also be secp256k1
-            4627 => Some(SignatureScheme::Dilithium5),
+            3309 => Some(SignatureScheme::MlDsa65),
             _ => None,
         }
     }
@@ -221,10 +208,7 @@ mod tests {
     #[test]
     fn test_scheme_conversion() {
         assert_eq!(SignatureScheme::from_u8(0), Some(SignatureScheme::Ed25519));
-        assert_eq!(
-            SignatureScheme::from_u8(1),
-            Some(SignatureScheme::Dilithium5)
-        );
+        assert_eq!(SignatureScheme::from_u8(1), Some(SignatureScheme::MlDsa65));
         assert_eq!(
             SignatureScheme::from_u8(2),
             Some(SignatureScheme::Secp256k1)
@@ -232,7 +216,7 @@ mod tests {
         assert_eq!(SignatureScheme::from_u8(99), None);
 
         assert_eq!(SignatureScheme::Ed25519.to_u8(), 0);
-        assert_eq!(SignatureScheme::Dilithium5.to_u8(), 1);
+        assert_eq!(SignatureScheme::MlDsa65.to_u8(), 1);
         assert_eq!(SignatureScheme::Secp256k1.to_u8(), 2);
     }
 
@@ -307,15 +291,30 @@ mod tests {
             Some(SignatureScheme::Ed25519)
         );
 
-        // Dilithium5 signature
-        let sig_4627 = vec![0u8; 4627];
+        // ML-DSA-65 signature
+        let sig_3309 = vec![0u8; 3309];
         assert_eq!(
-            verifier.auto_detect_scheme(&sig_4627),
-            Some(SignatureScheme::Dilithium5)
+            verifier.auto_detect_scheme(&sig_3309),
+            Some(SignatureScheme::MlDsa65)
         );
+        // The old Dilithium5 size is no scheme now.
+        assert_eq!(verifier.auto_detect_scheme(&[0u8; 4627]), None);
 
         // Unknown
         let sig_unknown = vec![0u8; 100];
         assert_eq!(verifier.auto_detect_scheme(&sig_unknown), None);
+    }
+
+    #[test]
+    fn test_ml_dsa_65_verification() {
+        let verifier = MultiSigVerifier::new();
+        let key = crate::tx_sig::MlDsa65Key::from_seed(&[3; 32]);
+        let sig = key.sign(b"m");
+        let ok = verifier.verify(SignatureScheme::MlDsa65, &key.public_key(), b"m", &sig);
+        assert_eq!(ok, Ok(true));
+        let wrong = verifier.verify(SignatureScheme::MlDsa65, &key.public_key(), b"n", &sig);
+        assert_eq!(wrong, Ok(false));
+        let short = verifier.verify(SignatureScheme::MlDsa65, &key.public_key(), b"m", &sig[1..]);
+        assert!(short.is_err());
     }
 }

@@ -1911,7 +1911,7 @@ fn handle_rpc_method(
 
                 let scheme = match scheme_id {
                     0 => Some(SignatureScheme::Ed25519),
-                    1 => Some(SignatureScheme::Dilithium5),
+                    1 => Some(SignatureScheme::MlDsa65),
                     2 => Some(SignatureScheme::Secp256k1),
                     _ => None,
                 };
@@ -1928,7 +1928,7 @@ fn handle_rpc_method(
                         }))
                     }
                 } else {
-                    Err(JsonRpcError { code: -32602, message: "Invalid scheme: 0=Ed25519, 1=Dilithium5, 2=Secp256k1".into() })
+                    Err(JsonRpcError { code: -32602, message: "Invalid scheme: 0=Ed25519, 1=ML-DSA-65, 2=Secp256k1".into() })
                 }
             } else {
                 Err(JsonRpcError { code: -32602, message: "Invalid params: [scheme, pubkey_hex, message_hex, signature_hex]".into() })

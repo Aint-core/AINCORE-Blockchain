@@ -336,7 +336,7 @@ impl Cluster {
 /// parents, signed by the same key.
 fn twin_of(v: &Vertex, key: &[u8; 32], tag: &str) -> Vertex {
     let mut w = v.clone();
-    w.payload = vec![tag.to_string()];
+    w.payload = vec![crate::test_txs::tagged(CHAIN, tag)];
     w.hash = w.hash_v4_with_domain(CHAIN, GENESIS);
     w.sign_with_ed25519(&crypto::SigningKey::from_bytes(key));
     w
@@ -1933,7 +1933,7 @@ fn stale_and_wrong_sentinel_vertices_change_nothing_after_a_boundary() {
             author: m.info.address.clone(),
             parents,
             parent_refs: refs,
-            payload: vec!["x".into()],
+            payload: vec![crate::test_txs::tx(CHAIN, 9, 0)],
             timestamp: NOW,
             hash: String::new(),
             signature: String::new(),
@@ -2081,16 +2081,18 @@ fn an_orphaned_payload_is_handed_back_at_activation() {
     c.run_until(40, |c| c.decisions[1].len() >= 3);
     // A payload that does get committed in epoch 0, above its floor: it must
     // not come back.
+    let kept_tx = crate::test_txs::tx(CHAIN, 11, 0);
+    let orphan_tx = crate::test_txs::tx(CHAIN, 12, 0);
     let net = c.net(0);
     c.engines[0]
         .as_mut()
         .unwrap()
-        .on_tick(vec!["kept-tx".into()], &net);
+        .on_tick(vec![kept_tx.clone()], &net);
     let kept = c
         .engine(0)
         .own
         .values()
-        .find(|v| v.payload == ["kept-tx"])
+        .find(|v| v.payload == [kept_tx.clone()])
         .map(|v| v.hash.clone());
     let kept = kept.expect("node 0 proposed kept-tx");
     c.deliver(&|_, _| false);
@@ -2108,7 +2110,7 @@ fn an_orphaned_payload_is_handed_back_at_activation() {
     c.engines[0]
         .as_mut()
         .unwrap()
-        .on_tick(vec!["orphan-tx".into()], &net);
+        .on_tick(vec![orphan_tx.clone()], &net);
     let lost = c.members[0].info.address.clone();
     let quiet = move |e: &Envelope, to: usize| e.from == lost || to == 0;
     for _ in 0..40 {
@@ -2124,11 +2126,8 @@ fn an_orphaned_payload_is_handed_back_at_activation() {
     c.assert_agree();
     assert_eq!(epoch_of(&c, 0).0, 1);
     let back = c.engines[0].as_mut().unwrap().take_orphaned_payloads();
-    assert!(back.contains(&"orphan-tx".to_string()), "{back:?}");
-    assert!(
-        !back.contains(&"kept-tx".to_string()),
-        "a committed payload came back"
-    );
+    assert!(back.contains(&orphan_tx), "{back:?}");
+    assert!(!back.contains(&kept_tx), "a committed payload came back");
 }
 
 /// RC-1 across a boundary: the servers restart after activating epoch 1 and
@@ -2461,7 +2460,7 @@ fn dos_tick(c: &mut Cluster, payload_bytes: usize, wire: bool, cut: Option<usize
         let payload = if payload_bytes == 0 {
             vec![]
         } else {
-            vec![format!("{i}{}", "x".repeat(payload_bytes))]
+            crate::test_txs::payload_of_size(CHAIN, i as u8 + 1, payload_bytes)
         };
         c.engines[i].as_mut().unwrap().on_tick(payload, &net);
         c.collect(i);

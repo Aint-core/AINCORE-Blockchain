@@ -142,6 +142,30 @@ fn signed_by_member(
             .is_some_and(|m| v.verify_ed25519_signature(&m.ed25519_public_key))
 }
 
+/// B12: every payload item is either equivocation evidence or a well-formed
+/// transaction for this chain, signed by its sender: the predicate the
+/// mempool admits by and the executor runs first
+/// (`executor::admission::check_stateless`). It needs only the item and the
+/// chain id, so every node reaches the same verdict. A payload item used to
+/// be accepted unread, so a member could fill each vertex with 768 KiB of
+/// anything and every block body would carry it for good.
+fn payload_admissible(v: &Vertex, chain_id: &str) -> Result<(), String> {
+    for (i, item) in v.payload.iter().enumerate() {
+        match item.strip_prefix(crate::dag::SLASH_EVIDENCE_PREFIX) {
+            Some(evidence) => {
+                if !crate::DagConsensus::is_equivocation_item(evidence) {
+                    return Err(format!("payload item {i} is evidence of no ordered kind"));
+                }
+            }
+            None => {
+                executor::admission::check_stateless(item, chain_id)
+                    .map_err(|e| format!("payload item {i} is not a valid transaction: {e}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn layer_s(
     v: &Vertex,
     record: &EpochRecord<'_>,
@@ -164,6 +188,9 @@ pub(crate) fn layer_s(
     if !lower_hex(&v.signature, 128) || !v.verify_ed25519_signature(&author.ed25519_public_key) {
         return Err("the author's signature does not verify".into());
     }
+    // After the signature, so the work is spent only on what a member signed,
+    // and INVALID then means the author signed a bad payload.
+    payload_admissible(v, chain_id)?;
     if v.round < record.first_round || v.round > ABSOLUTE_ROUND_CEILING {
         return Err(format!(
             "round {} outside {}..={ABSOLUTE_ROUND_CEILING}",

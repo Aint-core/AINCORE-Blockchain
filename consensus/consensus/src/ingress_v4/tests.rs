@@ -77,7 +77,7 @@ fn vertex(
         author: m.info.address.clone(),
         parents,
         parent_refs: refs,
-        payload: vec!["tx".into()],
+        payload: vec![crate::test_txs::tx(CHAIN, 1, 0)],
         timestamp: NOW - 5,
         hash: String::new(),
         signature: String::new(),
@@ -285,7 +285,7 @@ fn a_duplicate_parent_author_is_invalid() {
     // Twins: two first-round vertices by member 0.
     let a = first_round(&all[0]);
     let mut b = vertex(&all[0], EPOCH, FIRST, vec![sentinel(EPOCH)], vec![]);
-    b.payload = vec!["other".into()];
+    b.payload = vec![crate::test_txs::tx(CHAIN, 2, 0)];
     seal(&mut b, &all[0]);
     let p1 = first_round(&all[1]);
     let cited = [&a, &b, &p1];

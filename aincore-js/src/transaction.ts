@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { Keypair } from './keypair';
 import {
     serializeTransactionPayload,
@@ -634,24 +635,28 @@ export class Transaction {
     }
 
     /**
-     * Set Paymaster details
+     * Set Paymaster details: the paymaster's PUBLIC KEY (hex) and its
+     * signature. The node pays gas from the address derived from that key
+     * (B13).
      */
-    setPaymaster(paymasterAddress: string, signature: string) {
-        this.paymaster = paymasterAddress;
+    setPaymaster(paymasterPublicKey: string, signature: string) {
+        this.paymaster = paymasterPublicKey;
         this.paymasterSignature = signature;
     }
 
     /**
-     * Sign the transaction as a Paymaster (Hardened payload)
-     * Payload: PAYMASTER_AUTH:{chain_id}:{sender}:{payload}:{gas_limit}:{sequence_number}
+     * Sign the transaction as a Paymaster. The signed bytes are
+     * SHA-256("PAYMASTER_AUTH:{chain_id}:{sender}:{payload}:{gas_limit}:{sequence_number}"),
+     * as the node verifies them (`executor::admission::paymaster_message`).
      */
     signAsPaymaster(paymasterKeypair: Keypair) {
         if (!this.chainId) {
             throw new Error('CRITICAL: Chain ID must be explicitly set to prevent replay attacks');
         }
         const message = `PAYMASTER_AUTH:${this.chainId}:${this.sender}:${this.payload}:${this.gasLimit}:${this.sequenceNumber}`;
-        const signature = paymasterKeypair.sign(Buffer.from(message));
-        this.setPaymaster(paymasterKeypair.address, signature);
+        const digest = createHash('sha256').update(message).digest();
+        const signature = paymasterKeypair.sign(digest);
+        this.setPaymaster(paymasterKeypair.publicKey, signature);
     }
 
     /**

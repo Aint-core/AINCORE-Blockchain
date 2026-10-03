@@ -185,7 +185,7 @@ let scheme = MultiSigVerifier::detect_scheme(&sig_bytes)?;
 
 match scheme {
     SignatureScheme::Ed25519 => println!("Standard Ed25519"),
-    SignatureScheme::Dilithium => println!("Post-quantum Dilithium"),
+    SignatureScheme::MlDsa65 => println!("Post-quantum ML-DSA-65"),
     SignatureScheme::BLS => println!("BLS signature"),
     SignatureScheme::ECDSA => println!("EVM-compatible ECDSA"),
 }
@@ -357,80 +357,51 @@ assert_eq!(decrypted, plaintext);
 
 ## Post-Quantum Cryptography (PQC)
 
-AINCORE supports quantum-resistant signatures using CRYSTALS-Dilithium5 (NIST Standard).
+Transactions may be signed with **ML-DSA-65** (FIPS 204, final, August 2024)
+instead of Ed25519 (bug ledger B8). The transaction carries its public key; the
+scheme follows from the key and signature sizes; the sender address is
+SHA-256 of the key, as for Ed25519. Nothing is registered on chain first.
 
-### Generate PQC Keypair
+### Generate a key
 
 ```bash
-# Using CLI
 aincore-cli pqc-keygen --out ./pqc_keys
+# writes ./pqc_keys/mldsa65.seed (32 bytes, hex, mode 0600), mldsa65.pub, mldsa65_address.txt
 
-# Output:
-# Post-Quantum Keypair Generated (Dilithium5)
-# Public Key:  ./pqc_keys/pqc_pubkey.bin (2592 bytes)
-# Private Key: ./pqc_keys/pqc_privkey.bin (4896 bytes)
-# Address:     a1b2c3d4e5f6...
+# sign any command with it instead of wallet.key
+aincore-cli --pqc-seed ./pqc_keys/mldsa65.seed transfer ...
 ```
 
-### Dilithium5 Specifications
+### ML-DSA-65 sizes (FIPS 204, Table 2)
 
 | Property | Value |
 |----------|-------|
-| Public Key Size | 2592 bytes |
-| Private Key Size | 4896 bytes |
-| Signature Size | 4627 bytes |
-| Security Level | NIST Level 5 (256-bit) |
-| Quantum Resistant | YES |
+| Public key | 1952 bytes |
+| Private key | 4032 bytes (stored as its 32-byte seed) |
+| Signature | 3309 bytes |
+| Security category | 3 |
 
-### Using Dilithium5 in Code
+Measured on the NAS (Celeron N5095) while it was also building, 2026-10-03:
+verify 0.23 ms, sign 0.91 ms (aws-lc-rs 1.18.1, release build).
 
-```rust
-use pqcrypto_dilithium::dilithium5;
-use pqcrypto_traits::sign::{PublicKey, SecretKey, DetachedSignature};
-
-// Generate keypair
-let (pk, sk) = dilithium5::keypair();
-
-// Sign message
-let message = b"Quantum-safe transaction";
-let signature = dilithium5::detached_sign(message, &sk);
-
-// Verify signature
-let is_valid = dilithium5::verify_detached_signature(
-    &signature, message, &pk
-).is_ok();
-```
-
-### Registering PQC Public Key
-
-To use PQC signatures, register your public key on-chain:
-
-```bash
-# Store PQC public key (hex encoded)
-aincore-cli store-pqc-key --pubkey-file ./pqc_keys/pqc_pubkey.bin
-```
-
-### Multi-Signature Verification
-
-The `MultiSigVerifier` automatically detects and verifies Dilithium5 signatures:
+### In code
 
 ```rust
-use crypto::multi_sig::{MultiSigVerifier, SignatureScheme};
+use crypto::{verify_tx_signature, MlDsa65Key, TxScheme};
 
-let verifier = MultiSigVerifier::new();
-
-// Verify Dilithium5 signature
-let result = verifier.verify(
-    SignatureScheme::Dilithium5,
-    &public_key,    // 2592 bytes
-    &message,
-    &signature,     // 4627 bytes
-)?;
-
-// Auto-detect scheme by signature length
-let scheme = verifier.auto_detect_scheme(&signature);
-// Returns SignatureScheme::Dilithium5 for 4627-byte signatures
+let key = MlDsa65Key::from_seed(&seed);          // FIPS 204 KeyGen_internal
+let signature = key.sign(message);                // 3309 bytes, hedged
+let scheme = verify_tx_signature(&key.public_key(), message, &signature)?;
+assert_eq!(scheme, TxScheme::MlDsa65);
 ```
+
+`verify_tx_signature` is the one transaction verifier (Ed25519 strictly, or
+ML-DSA-65). It is pinned to aws-lc-rs 1.18.1, whose ML-DSA is C-only code on
+every CPU; its keys and signatures are cross-checked against RustCrypto
+`ml-dsa` in the crate's tests. A version bump is a consensus change.
+
+`MultiSigVerifier` takes `SignatureScheme::MlDsa65` (id 1) for the
+`aincore_verifyMultiSig` RPC.
 
 ---
 
@@ -440,5 +411,5 @@ let scheme = verifier.auto_detect_scheme(&signature);
 - [BLS Signatures](https://crypto.stanford.edu/~dabo/pubs/papers/BLSmultisig.html)
 - [Winterfell STARK](https://github.com/facebook/winterfell)
 - [Poseidon Hash](https://www.poseidon-hash.info/)
-- [CRYSTALS-Dilithium](https://pq-crystals.org/dilithium/)
+- [FIPS 204: ML-DSA](https://csrc.nist.gov/pubs/fips/204/final)
 - [NIST PQC Standards](https://csrc.nist.gov/projects/post-quantum-cryptography)

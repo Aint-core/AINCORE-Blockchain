@@ -10,6 +10,8 @@ pub mod vcert;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) mod test_txs;
 pub use dag::DagConsensus;
 
 // The retired `SimpleConsensus` engine and its own `Block`, `BlockHeader`,

@@ -143,17 +143,15 @@ User TX
 
 ## 💾 Mempool (core/mempool)
 
-Validasi yang dilakukan sebelum TX masuk:
-1. Chain ID match (`AINCORE_CHAIN_ID` env)
-2. Gas price ≥ `MIN_GAS_PRICE = 1`
-3. Gas limit > 0
-4. BCS payload valid: hanya `EntryFunction` atau `PublishModule` (Script DISABLED)
-5. Ed25519 signature verify (64 byte) atau PQC (9254 byte = pass ke executor)
-6. Sender address derivasi match public key
-7. SHA256 dedup (seen_txs HashSet)
-8. Size limit: 100KB max per TX
-9. Nonce dedup: `sender:sequence_number`
-10. Max pending: 5000 TX
+Bagian tanpa-state = SATU fungsi `executor::admission::check_stateless(raw, chain_id)`
+(B8/B12/B13), dipakai mempool, ingress vertex (Layer S) dan executor:
+1. Size ≤ 100KB, chain ID (`sys:chain_id`), gas price ≥ 1, 0 < gas limit ≤ `MAX_GAS_LIMIT`
+2. BCS payload: hanya `EntryFunction` atau `PublishModule` (Script DISABLED)
+3. Sender = SHA256(public key); signature Ed25519 (32/64 B, strict) atau ML-DSA-65 (1952/3309 B)
+4. Paymaster: field = public key paymaster, signature diverifikasi, pembayar = alamat turunannya
+
+Lalu mempool sendiri: dedup kanonik, balance gate pembayar gas (fail closed),
+nonce dedup `sender:sequence_number`, max pending 5000 TX.
 
 ---
 
@@ -333,7 +331,7 @@ AINCORE dirancang sebagai **modular blockchain L1**:
 - **AA:** Native Account Abstraction (bukan ERC-4337)
 - **Interop:** Target IBC (Cosmos standard)
 - **Privacy:** Future: ZK-SNARK shielded pools (Zcash model)
-- **PQC:** CRYSTALS-Kyber/Dilithium untuk quantum resistance
+- **PQC:** ML-DSA-65 (FIPS 204) tanda tangan transaksi (B8, kode siap; belum mainnet)
 
 **Status vs Whitepaper:**
 - ✅ DAG consensus (Narwhal-lite) — DONE
@@ -347,7 +345,7 @@ AINCORE dirancang sebagai **modular blockchain L1**:
 - ❌ IBC — Belum
 - ❌ Celestia DA integration — Belum
 - ❌ ZK private TX — Belum
-- ❌ PQC mainnet — Belum
+- 🚧 PQC: ML-DSA-65 tanda tangan transaksi ada di kode (B8); belum di mainnet
 
 ---
 

@@ -229,8 +229,10 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
     if let Some(rest) = key.strip_prefix("meta_resource_") {
         return addr_then(rest).filter(|tag| struct_tag(tag)).map(|_| Dead);
     }
+    // The pre-standard Dilithium key binding: nothing writes or reads it
+    // since B8 (a transaction carries its ML-DSA-65 key).
     if let Some(rest) = key.strip_prefix("pqc_pubkey_") {
-        return hex64(rest).then_some(State);
+        return hex64(rest).then_some(Dead);
     }
     // `block_txs:{h}` shares the `block_` prefix; test it first.
     if let Some(rest) = key.strip_prefix("block_txs:") {
@@ -399,7 +401,6 @@ pub const STATE_EXACT: &[&str] = &[
 pub const STATE_PREFIXES: &[&str] = &[
     "resource_",
     "module_",
-    "pqc_pubkey_",
     "obj:",
     "sys:validator_set:epoch:",
     "sys:validator_set:epoch_delegated:",
@@ -627,7 +628,7 @@ mod tests {
             (format!("validator:convicted_full:{H64}"), State),
             ("sys:stdlib_version".into(), State),
             ("sys:pending_module_upgrade:staking".into(), State),
-            (format!("pqc_pubkey_{H64}"), State),
+            (format!("pqc_pubkey_{H64}"), Dead),
             ("sys:committee:00000000000000000003".into(), State),
             // C
             ("block_70016".into(), Chain),

@@ -48,18 +48,9 @@ async function main() {
 
         // 5. Paymaster Signs for Gas
         console.log('⛽ Paymaster signing for gas...');
-        // Paymaster signs the sender address to authorize gas for this sender? 
-        // Or signs the whole tx?
-        // In executor/src/lib.rs: 
-        // if let Some(pm_sig) = &tx.paymaster_signature { ... }
-        // The verification logic isn't strictly defined in the prototype code I saw earlier.
-        // Let's check executor logic again.
-        // "In real impl: Verify pm_sig against pm address"
-        // "pm.clone()"
-        // It seems the prototype MIGHT NOT actually verify the signature content yet, just checks if it exists?
-        // Let's assume we sign the sender address for now as a simple authorization.
-        const paymasterSig = paymasterKeypair.sign(Buffer.from(userKeypair.address));
-        tx.setPaymaster(paymasterKeypair.address, paymasterSig);
+        // The paymaster signs SHA-256 of PAYMASTER_AUTH:{chain}:{sender}:{payload}:{gas_limit}:{seq}
+        // and is named by its public key; the node charges its derived address (B13).
+        tx.signAsPaymaster(paymasterKeypair);
 
         // 6. Send Transaction
         console.log('🚀 Sending Sponsored Transaction...');

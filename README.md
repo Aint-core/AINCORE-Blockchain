@@ -25,7 +25,7 @@ AINCORE is a high-performance Layer-1 blockchain built entirely in Rust, featuri
 - **Token Factory:** Create custom tokens (ERC-20 equivalent) on-chain
 - **DEX:** Built-in AMM (Constant Product x*y=k) with 0.3% fee
 - **DePIN Integration:** Bio-Oracle for real-world data mining (Universal Mining)
-- **Security:** Ed25519 + Dilithium5 (PQC) signatures, ChaCha20-Poly1305 encrypted P2P, full-transaction replay protection
+- **Security:** Ed25519 + ML-DSA-65 (FIPS 204, post-quantum) transaction signatures, ChaCha20-Poly1305 encrypted P2P, full-transaction replay protection
 - **Downtime Detection:** Validators missing 100+ rounds are detected and attested (gossip) but NOT slashed in this protocol version; only equivocation is slashed (see Slashing), through evidence carried in the DAG
 
 ---
@@ -573,12 +573,12 @@ If you wish to stop validating:
 
 ### Cryptographic Stack
 
-- **Signatures:** Ed25519 (ed25519-dalek) + CRYSTALS-Dilithium5 (Post-Quantum)
+- **Signatures:** Ed25519 (ed25519-dalek, strict) + ML-DSA-65 (FIPS 204, aws-lc-rs, post-quantum)
 - **Hashing:** SHA-256 (sha2), SHA3-256 (sha3)
 - **BLS:** BLS12-381 aggregate signatures for consensus
 - **Key Exchange:** X25519 (Diffie-Hellman) for ephemeral session keys
 - **Encryption:** ChaCha20-Poly1305 authenticated encryption (timing-attack resistant)
-- **PQC:** CRYSTALS-Dilithium5 (NIST Standard) for quantum-resistant transaction signing
+- **PQC:** ML-DSA-65 (FIPS 204) for quantum-resistant transaction signing; the transaction carries its key
 - **Accumulator:** Cryptographic accumulator for state root proofs
 
 ---
