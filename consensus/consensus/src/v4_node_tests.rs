@@ -2227,10 +2227,12 @@ fn family_sizes(db: &StateDB) -> std::collections::BTreeMap<String, (i64, i64)> 
 #[ignore = "a measurement, not a check"]
 fn b6_storage_per_empty_block_by_key_family() {
     let mut c = Cluster::new("b6", &[101, 102, 103, 104], true);
-    c.run(6);
+    // Past the GC horizon (GC_DEPTH + RETAIN_SLACK = 100 rounds), so the
+    // DAG rows GC deletes are counted at their steady state.
+    c.run(260);
     let before = family_sizes(&c.node(0).storage);
     let h0 = c.node(0).latest_block_height;
-    c.run(80);
+    c.run(200);
     let h1 = c.node(0).latest_block_height;
     let after = family_sizes(&c.node(0).storage);
     let blocks = (h1 - h0).max(1) as i64;

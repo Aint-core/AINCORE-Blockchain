@@ -167,6 +167,15 @@ pub fn check_stateless(raw: &str, chain_id: &str) -> Result<CheckedTx, String> {
     })
 }
 
+/// B16: whoever pays `tx`'s gas: the address of its paymaster key, or its
+/// sender. Unverified; `check_stateless` checks the paymaster's signature.
+pub fn payer_address(tx: &Transaction) -> Option<String> {
+    match &tx.paymaster {
+        None => Some(tx.sender.clone()),
+        Some(paymaster) => crypto::derive_address(&hex::decode(paymaster).ok()?).ok(),
+    }
+}
+
 /// The kind of a transaction payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadKind {

@@ -107,6 +107,23 @@ pub mod test_support {
         .expect("coin store stored");
     }
 
+    /// `address`'s account, with key `public_key_hex`, has used
+    /// `sequence_number` transactions.
+    pub fn set_sequence_number(
+        db: &StateDB,
+        address: &str,
+        public_key_hex: &str,
+        sequence_number: u64,
+    ) {
+        let mut object =
+            aa::AccountManager::create_account(address.to_string(), public_key_hex.to_string());
+        let mut data: aa::AccountData = serde_json::from_slice(&object.data).unwrap();
+        data.sequence_number = sequence_number;
+        object.data = serde_json::to_vec(&data).unwrap();
+        let _seed = db.seeding();
+        db.put_object(&object).expect("account stored");
+    }
+
     /// The AIN `address` holds, if it has a coin store.
     pub fn ain_balance(db: &StateDB, address: &str) -> Option<u128> {
         let addr = super::parse_move_address(address)?;
@@ -1590,6 +1607,14 @@ pub fn min_base_fee(db: &StateDB) -> u128 {
         .flatten()
         .and_then(|v| v.parse::<u128>().ok())
         .unwrap_or(admission::MIN_GAS_PRICE)
+}
+
+/// The sequence number the account's next transaction must carry: its
+/// committed one, or 0 for an account no transaction has created yet.
+pub fn committed_sequence_number(db: &StateDB, address: &str) -> u64 {
+    db.get_object(address)
+        .and_then(|obj| serde_json::from_slice::<aa::AccountData>(&obj.data).ok())
+        .map_or(0, |data| data.sequence_number)
 }
 
 /// The base fee the next block charges.
@@ -3328,9 +3353,9 @@ impl Executor {
         self.write_chain_clock(block_height, block_timestamp);
         self.apply_slash_evidence(slash_evidence);
 
-        // 1. Parse all transactions with N-2 FIX: cumulative object limit
+        // 1. Parse all transactions. The per-block object limit (N-2) is
+        // spent at execution, by what can pay (B16, step 3).
         let mut parsed_txs = Vec::new();
-        let mut total_block_objects: usize = 0;
 
         for raw in &txs_json {
             match serde_json::from_str::<Transaction>(raw) {
@@ -3340,33 +3365,13 @@ impl Executor {
                         println!("⛔ Transaction REJECTED: Too many input objects (>128)");
                         continue;
                     }
-
-                    // N-2 FIX: Cumulative per-block object limit
-                    let new_total = total_block_objects + tx.input_objects.len();
-                    if new_total > MAX_OBJECTS_PER_BLOCK {
-                        println!(
-                            "⛔ BLOCK OBJECT LIMIT: {} + {} = {} exceeds cap ({}). Dropping remaining TXs.",
-                            total_block_objects,
-                            tx.input_objects.len(),
-                            new_total,
-                            MAX_OBJECTS_PER_BLOCK
-                        );
-                        break; // Block is "full" — no more TXs accepted
-                    }
-
-                    total_block_objects = new_total;
                     parsed_txs.push((tx, raw.clone()));
                 }
                 Err(_e) => {}
             }
         }
 
-        println!(
-            "📊 Block accepted {} TXs with {} total input objects (limit: {})",
-            parsed_txs.len(),
-            total_block_objects,
-            MAX_OBJECTS_PER_BLOCK
-        );
+        println!("📊 Block parsed {} TXs", parsed_txs.len());
 
         // GATE-CRITICAL (pre-mainnet): MAX_GAS_LIMIT bounds ONE transaction;
         // nothing bounded a BLOCK. A proposer (or an attacker filling the
@@ -3383,42 +3388,23 @@ impl Executor {
         // execute.
         let parsed_txs = {
             let mut kept = Vec::with_capacity(parsed_txs.len());
-            let mut budget: u64 = 0;
             let mut dropped = 0usize;
             for tx in parsed_txs.into_iter() {
-                let cost = tx.0.gas_limit;
                 // B14: the per-transaction cap bounds Move execution, so it is
-                // checked on the limit less the transaction's byte gas; the
-                // block ceiling counts the whole limit, bytes included.
-                let execution = cost.saturating_sub(admission::intrinsic_gas(tx.1.len()));
-                // GATE-CRITICAL: budget on a VALIDATED gas_limit. `gas_limit` is
-                // an attacker-declared field, and the per-tx ceiling is enforced
-                // later, inside execution. Budgeting on the raw value let one
-                // transaction declaring an absurd gas_limit consume the entire
-                // block budget and push every honest transaction out — free,
-                // deterministic censorship, and free block-space reservation,
-                // since the transaction is then rejected and never pays. A
-                // transaction over the per-tx ceiling cannot execute at all, so
-                // it is skipped here without charging the block for it.
+                // checked on the limit less the transaction's byte gas. A
+                // transaction over it cannot execute at all, so it is skipped
+                // here; the block ceiling is spent at execution (B16).
+                let execution =
+                    tx.0.gas_limit
+                        .saturating_sub(admission::intrinsic_gas(tx.1.len()));
                 if execution > MAX_GAS_LIMIT {
                     dropped += 1;
                     continue;
                 }
-                if budget.saturating_add(cost) > MAX_BLOCK_GAS_LIMIT {
-                    dropped += 1;
-                    continue;
-                }
-                budget = budget.saturating_add(cost);
                 kept.push(tx);
             }
             if dropped > 0 {
-                println!(
-                    "✂️  block gas ceiling: kept {} tx ({} gas), dropped {} over MAX_BLOCK_GAS_LIMIT {}",
-                    kept.len(),
-                    budget,
-                    dropped,
-                    MAX_BLOCK_GAS_LIMIT
-                );
+                println!("✂️  dropped {dropped} tx over MAX_GAS_LIMIT {MAX_GAS_LIMIT}");
             }
             kept
         };
@@ -3446,21 +3432,56 @@ impl Executor {
         // Seeded with the step-0 slash writes so a later tx write to the same
         // key correctly wins (matching RocksDB's actual ordering).
 
+        // B16: the block's resources, the gas ceiling and the object limit
+        // (N-2), are spent only by transactions that can pay. They used to be
+        // spent on what a transaction DECLARED before it ran, so one that then
+        // failed its nonce, price or balance check paid nothing yet took the
+        // space: free censorship of every paying transaction after it.
+        // Per batch: `can_pay` drops what `execute_transaction` would refuse
+        // before the VM (the batch's transactions are independent, so each
+        // sees exactly the state checked here); the rest reserve their
+        // declared gas and objects, which bounds the block's VM work by the
+        // ceiling; what executes keeps its share, what does not (a rare
+        // refusal after the check) gives it back to the next batch. A
+        // transaction that does not fit is not executed and leaves the body,
+        // as Aptos's block gas limit counts what executes.
+        let mut objects_used: usize = 0;
+        let mut over_ceiling = 0usize;
         for batch in batches.iter() {
+            let (mut reserved_gas, mut reserved_objects) = (0u64, 0usize);
+            let mut runnable = Vec::with_capacity(batch.len());
+            for item in batch.iter() {
+                if !self.can_pay(&item.0) {
+                    continue;
+                }
+                let gas = gas_used
+                    .saturating_add(reserved_gas)
+                    .saturating_add(item.0.gas_limit);
+                let objects = objects_used + reserved_objects + item.0.input_objects.len();
+                if gas > MAX_BLOCK_GAS_LIMIT || objects > MAX_OBJECTS_PER_BLOCK {
+                    over_ceiling += 1;
+                    continue;
+                }
+                reserved_gas = reserved_gas.saturating_add(item.0.gas_limit);
+                reserved_objects += item.0.input_objects.len();
+                runnable.push(item);
+            }
             // Execute in parallel to get updates
             #[allow(clippy::type_complexity)] // intrinsic to parallel TX result shape
             let mut results: Vec<(
                 String,
                 String,
                 u64,
+                usize,
                 Option<(Vec<(String, Option<String>)>, u128)>,
-            )> = batch
+            )> = runnable
                 .par_iter()
                 .map(|(tx, raw)| {
                     (
                         tx_hash_hex(raw),
                         raw.clone(),
                         tx.gas_limit,
+                        tx.input_objects.len(),
                         self.execute_transaction(raw),
                     )
                 })
@@ -3481,10 +3502,11 @@ impl Executor {
             let mut writer_of_key: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
 
-            for (tx_hash, raw_tx, gas_limit, res) in results {
+            for (tx_hash, raw_tx, gas_limit, objects, res) in results {
                 if let Some((mut updates, gas_charged)) = res {
                     executed_raws.push(raw_tx);
                     gas_used = gas_used.saturating_add(gas_limit);
+                    objects_used += objects;
                     updates.sort_by(|left, right| left.0.cmp(&right.0));
                     for (key, val_opt) in updates {
                         if let Some(prev_writer) = writer_of_key.get(&key) {
@@ -3520,6 +3542,11 @@ impl Executor {
             if let Some(hook) = self.block_boundary_hook {
                 hook(1, &self.db);
             }
+        }
+        if over_ceiling > 0 {
+            println!(
+                "✂️  block full: {over_ceiling} tx not executed ({gas_used} of {MAX_BLOCK_GAS_LIMIT} gas, {objects_used} of {MAX_OBJECTS_PER_BLOCK} objects)"
+            );
         }
 
         // 5. Apply Block Rewards
@@ -4664,6 +4691,28 @@ impl Executor {
     /// undecodable payload) is run ALONE in its own batch, fully serialized — we
     /// cannot prove it conflict-free, and two such calls racing a shared global in
     /// one parallel batch would fork the state root (#1).
+    /// B16: whether `tx` can pay on the current state: its price reaches the
+    /// base fee, its sequence number is its sender's next, and its payer holds
+    /// `gas_limit * gas_price`. When it is false, `execute_transaction`
+    /// refuses `tx` before the VM runs (the same three checks, and the gas
+    /// prologue cannot withdraw more than the payer holds), so a block skips
+    /// it without spending its resources on it.
+    fn can_pay(&self, tx: &Transaction) -> bool {
+        if tx.gas_price < committed_base_fee(&self.db) {
+            return false;
+        }
+        if tx.sequence_number != committed_sequence_number(&self.db, &tx.sender) {
+            return false;
+        }
+        let (Some(payer), Some(cost)) = (
+            admission::payer_address(tx),
+            (tx.gas_limit as u128).checked_mul(tx.gas_price),
+        ) else {
+            return false;
+        };
+        committed_ain_balance(&self.db, &payer).is_some_and(|balance| balance >= cost)
+    }
+
     fn schedule_batches(
         &self,
         parsed_txs: Vec<(Transaction, String)>,
@@ -6415,6 +6464,30 @@ mod tests {
         };
         let unsized_len = serde_json::to_string(&tx).expect("tx json").len();
         tx.gas_limit = admission::gas_limit_covering(unsized_len, execution);
+        let signature = signing_key.sign(admission::signing_message(&tx).as_bytes());
+        tx.signature = hex::encode(signature.to_bytes());
+        serde_json::to_string(&tx).expect("tx json")
+    }
+
+    /// A signed transaction declaring exactly `gas_limit` (bytes included).
+    fn signed_tx_with_limit(
+        signing_key: &SigningKey,
+        sender: &str,
+        payload: &str,
+        sequence_number: u64,
+        gas_limit: u64,
+        gas_price: u128,
+    ) -> String {
+        let mut tx: Transaction = serde_json::from_str(&signed_tx(
+            signing_key,
+            sender,
+            payload,
+            sequence_number,
+            0,
+            gas_price,
+        ))
+        .expect("tx json");
+        tx.gas_limit = gas_limit;
         let signature = signing_key.sign(admission::signing_message(&tx).as_bytes());
         tx.signature = hex::encode(signature.to_bytes());
         serde_json::to_string(&tx).expect("tx json")
@@ -11516,6 +11589,195 @@ mod tests {
                 .all(|k| k.starts_with("sys:fee_sweep_queue:1:")),
             "keyed by the executing height 1: {queued:?}"
         );
+    }
+
+    /// `tx` with its `gas_limit` covering `execution` (B14), signed by `key`.
+    fn sign_covering(key: &SigningKey, mut tx: Transaction, execution: u64) -> String {
+        tx.gas_limit = 0;
+        tx.signature = "00".repeat(64);
+        let unsized_len = serde_json::to_string(&tx).expect("tx json").len();
+        tx.gas_limit = admission::gas_limit_covering(unsized_len, execution);
+        tx.signature = hex::encode(
+            key.sign(admission::signing_message(&tx).as_bytes())
+                .to_bytes(),
+        );
+        serde_json::to_string(&tx).expect("tx json")
+    }
+
+    /// B16: block resources are spent only by transactions that can pay.
+    /// Twenty transactions from twenty senders, each paying itself, so they
+    /// are independent and share one parallel batch, declare 10M gas each,
+    /// the whole 200M ceiling: ten carry a sequence number their sender has
+    /// not reached, ten come from senders with no AIN. None can pay. The
+    /// paying transfer after them executes; spending the ceiling on declared
+    /// limits (or reserving it for a batch without the check) pushed it out
+    /// for free.
+    #[test]
+    fn transactions_that_cannot_pay_leave_the_ceiling_to_those_that_can() {
+        let db = temp_db("b16_free_reservation");
+        load_stdlib(&db);
+        {
+            let _seed = db.seeding();
+            db.set_federation_key("00000000000000000000000000000000")
+                .unwrap();
+        }
+        let honest_key = SigningKey::from_bytes(&[62u8; 32]);
+        let honest = create_account(&db, &honest_key);
+        set_coin_store(&db, &honest, 10_000_000);
+        let mut txs = Vec::new();
+        for i in 0..20u8 {
+            let key = SigningKey::from_bytes(&[130 + i; 32]);
+            let sender = create_account(&db, &key);
+            let (seq, balance) = if i < 10 {
+                (5, 1_000_000_000_000)
+            } else {
+                (0, 0)
+            };
+            set_coin_store(&db, &sender, balance);
+            txs.push(signed_tx_with_limit(
+                &key,
+                &sender,
+                &coin_transfer_payload(&sender, &sender, 1),
+                seq,
+                10_000_000,
+                1,
+            ));
+        }
+        let declared: u64 = txs.iter().map(|tx| gas_of(tx)).sum();
+        assert_eq!(
+            declared, MAX_BLOCK_GAS_LIMIT,
+            "the junk declares the ceiling"
+        );
+        seed_genesis_tree(&db);
+        let pay = signed_tx(
+            &honest_key,
+            &honest,
+            &coin_transfer_payload(&honest, &honest, 7),
+            0,
+            100_000,
+            1,
+        );
+        txs.push(pay.clone());
+        let Ok(BlockExecOutcome::Executed(summary)) = Executor::new(db.clone())
+            .execute_block_checked_at(txs, &honest, 1, block_time(1), 0, &[], |_, _| Ok(()))
+        else {
+            panic!("block must execute");
+        };
+        assert_eq!(summary.body, vec![pay.clone()], "only the paying transfer");
+        assert_eq!(
+            coin_balance(&db, &honest),
+            10_000_000 - gas_of(&pay) as u128,
+            "it executed and paid"
+        );
+    }
+
+    /// B16, the same class for the per-block object limit (N-2): eighty
+    /// independent transactions that cannot pay (wrong sequence numbers), each
+    /// declaring 128 short input objects (10,240 of the 10,000, under 100M
+    /// gas in all), come first. The paying transfer after them, with 128
+    /// objects of its own, executes; the limit used to be spent while
+    /// parsing, before anything paid.
+    #[test]
+    fn transactions_that_cannot_pay_leave_the_object_limit_to_those_that_can() {
+        let db = temp_db("b16_object_reservation");
+        load_stdlib(&db);
+        {
+            let _seed = db.seeding();
+            db.set_federation_key("00000000000000000000000000000000")
+                .unwrap();
+        }
+        let with_objects = |key: &SigningKey, sender: &str, seq: u64, tag: u64| {
+            let mut tx: Transaction = serde_json::from_str(&signed_tx(
+                key,
+                sender,
+                &coin_transfer_payload(sender, sender, 1),
+                seq,
+                0,
+                1,
+            ))
+            .unwrap();
+            tx.input_objects = (0..128u64)
+                .map(|o| format!("{:08x}", tag * 1_000 + o))
+                .collect();
+            sign_covering(key, tx, 100_000)
+        };
+        let mut txs = Vec::new();
+        for i in 0..80u8 {
+            let key = SigningKey::from_bytes(&[150 + i; 32]);
+            let sender = create_account(&db, &key);
+            set_coin_store(&db, &sender, 1_000_000_000_000);
+            txs.push(with_objects(&key, &sender, 5, i as u64));
+        }
+        let honest_key = SigningKey::from_bytes(&[63u8; 32]);
+        let honest = create_account(&db, &honest_key);
+        set_coin_store(&db, &honest, 10_000_000);
+        let objects: usize = txs
+            .iter()
+            .map(|tx| {
+                serde_json::from_str::<Transaction>(tx)
+                    .unwrap()
+                    .input_objects
+                    .len()
+            })
+            .sum();
+        assert!(
+            objects > MAX_OBJECTS_PER_BLOCK,
+            "the junk declares the limit"
+        );
+        let declared: u64 = txs.iter().map(|tx| gas_of(tx)).sum();
+        assert!(
+            declared < MAX_BLOCK_GAS_LIMIT / 2,
+            "objects, not gas, fill it"
+        );
+        seed_genesis_tree(&db);
+        let pay = with_objects(&honest_key, &honest, 0, 999);
+        txs.push(pay.clone());
+        let Ok(BlockExecOutcome::Executed(summary)) = Executor::new(db.clone())
+            .execute_block_checked_at(txs, &honest, 1, block_time(1), 0, &[], |_, _| Ok(()))
+        else {
+            panic!("block must execute");
+        };
+        assert_eq!(summary.body, vec![pay], "only the paying transfer");
+    }
+
+    /// B16: the block never executes more declared gas than the ceiling:
+    /// twenty-five funded transfers of 10M gas each, from distinct senders
+    /// (one parallel batch), execute twenty, exactly 200M. A full block is
+    /// over the 100M target, so the base fee rises (B15).
+    #[test]
+    fn a_block_executes_no_more_gas_than_the_ceiling() {
+        let db = temp_db("b16_ceiling");
+        load_stdlib(&db);
+        {
+            let _seed = db.seeding();
+            db.set_federation_key("00000000000000000000000000000000")
+                .unwrap();
+        }
+        let sink = create_account(&db, &SigningKey::from_bytes(&[90u8; 32]));
+        set_coin_store(&db, &sink, 0);
+        let mut txs = Vec::new();
+        for i in 0..25u8 {
+            let key = SigningKey::from_bytes(&[100 + i; 32]);
+            let sender = create_account(&db, &key);
+            set_coin_store(&db, &sender, 20_000_000);
+            txs.push(signed_tx_with_limit(
+                &key,
+                &sender,
+                &coin_transfer_payload(&sender, &sink, 1),
+                0,
+                10_000_000,
+                1,
+            ));
+        }
+        seed_genesis_tree(&db);
+        let Ok(BlockExecOutcome::Executed(summary)) = Executor::new(db.clone())
+            .execute_block_checked_at(txs, &sink, 1, block_time(1), 0, &[], |_, _| Ok(()))
+        else {
+            panic!("block must execute");
+        };
+        assert_eq!(summary.body.len(), 20, "200M of 10M transactions");
+        assert_eq!(coin_balance(&db, &sink), 20);
+        assert_eq!(committed_base_fee(&db), 2, "a full block raises the fee");
     }
 
     /// G3 CM-2: a consensus-state write in `accept`, after the root is sealed,

@@ -84,6 +84,25 @@ fn wall_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// B16: how far above the sender's committed sequence number a transaction
+/// may be admitted, so at most this many of one sender's transactions wait.
+/// A choice: Aptos's mempool holds at most 100 per account
+/// (`MempoolConfig::capacity_per_user`).
+pub const MAX_NONCE_AHEAD: u64 = 100;
+
+/// What admission parsed out of a waiting transaction, kept so selection never
+/// re-parses it and the payer's waiting total is a sum, not a scan of JSON.
+#[derive(Debug, Clone)]
+struct TxMeta {
+    sender: String,
+    seq: u64,
+    gas_price: u128,
+    /// Whoever pays its gas: the paymaster's address or the sender (B13).
+    payer: String,
+    /// The most it can charge: `gas_limit * gas_price`.
+    cost: u128,
+}
+
 pub struct Mempool {
     pending_txs: VecDeque<String>,
     seen_txs: HashSet<String>,       // Deduplication
@@ -102,10 +121,11 @@ pub struct Mempool {
     /// caller's (consensus passes its injectable `now_secs`), so a simulated
     /// cluster never re-queues by the wall clock (BUG_LEDGER B9).
     inflight: std::collections::HashMap<String, (u64, u8)>,
-    /// RE-AUDIT MEDIUM (perf): parsed (sender, sequence_number, gas_price) per
-    /// raw tx, filled once at admission so selection never re-parses every
-    /// pending transaction under the mempool lock on every tick.
-    meta: std::collections::HashMap<String, (String, u64, u128)>,
+    /// RE-AUDIT MEDIUM (perf): parsed metadata per raw tx, filled once at
+    /// admission so selection never re-parses every pending transaction under
+    /// the mempool lock on every tick. Queued and loaned transactions both
+    /// have an entry until they execute or are dropped.
+    meta: std::collections::HashMap<String, TxMeta>,
     /// Attempt counter carried from `requeue_stale` back into the next pull.
     requeue_attempts: std::collections::HashMap<String, u8>,
     /// Optional storage handle for the admission balance gate (the payer's
@@ -237,21 +257,48 @@ impl Mempool {
                     parsed_tx.gas_price, base_fee
                 ));
             }
-            if let Some(gas_cost) = (parsed_tx.gas_limit as u128).checked_mul(parsed_tx.gas_price) {
-                match executor::committed_ain_balance(storage, &checked.payer) {
-                    Some(balance) if balance < gas_cost => {
-                        return Err(format!(
-                            "Insufficient balance for gas: have {}, need {} (gas_limit {} × gas_price {})",
-                            balance, gas_cost, parsed_tx.gas_limit, parsed_tx.gas_price
-                        ));
-                    }
-                    Some(_) => {}
-                    None => {
-                        return Err(format!(
-                            "Gas payer {} has no AIN balance to pay gas (no CoinStore)",
-                            checked.payer
-                        ));
-                    }
+            // B16: a transaction the executor refuses for its nonce pays
+            // nothing, so it is not admitted. Below the committed sequence
+            // number it can never execute; far above it, it waits on a gap.
+            let next_seq = executor::committed_sequence_number(storage, &parsed_tx.sender);
+            if parsed_tx.sequence_number < next_seq {
+                return Err(format!(
+                    "Sequence number {} is already used: the sender's next is {}",
+                    parsed_tx.sequence_number, next_seq
+                ));
+            }
+            if parsed_tx.sequence_number - next_seq >= MAX_NONCE_AHEAD {
+                return Err(format!(
+                    "Sequence number {} is {} or more above the sender's next, {}",
+                    parsed_tx.sequence_number, MAX_NONCE_AHEAD, next_seq
+                ));
+            }
+            // B16: the payer must cover every transaction of its still
+            // waiting, not each one alone, or a balance for one buys many
+            // that cannot all pay.
+            let gas_cost = (parsed_tx.gas_limit as u128)
+                .checked_mul(parsed_tx.gas_price)
+                .ok_or_else(|| "Gas limit times gas price overflows".to_string())?;
+            let waiting: u128 = self
+                .meta
+                .values()
+                .filter(|m| m.payer == checked.payer)
+                .map(|m| m.cost)
+                .fold(0u128, u128::saturating_add);
+            let need = waiting.saturating_add(gas_cost);
+            match executor::committed_ain_balance(storage, &checked.payer) {
+                Some(balance) if balance < need => {
+                    return Err(format!(
+                        "Insufficient balance for gas: have {}, need {} (gas_limit {} × gas_price {}, plus {} for the payer's waiting transactions)",
+                        balance, need, parsed_tx.gas_limit, parsed_tx.gas_price, waiting
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    return Err(format!(
+                        "Gas payer {} has no AIN balance to pay gas (no CoinStore)",
+                        checked.payer
+                    ));
                 }
             }
         }
@@ -287,7 +334,13 @@ impl Mempool {
         self.pending_nonces.insert(nonce_key);
         self.meta.insert(
             tx.clone(),
-            (parsed_tx.sender.clone(), parsed_tx.sequence_number, parsed_tx.gas_price),
+            TxMeta {
+                sender: parsed_tx.sender.clone(),
+                seq: parsed_tx.sequence_number,
+                gas_price: parsed_tx.gas_price,
+                cost: (parsed_tx.gas_limit as u128).saturating_mul(parsed_tx.gas_price),
+                payer: checked.payer,
+            },
         );
         self.pending_txs.push_back(tx.clone());
 
@@ -337,11 +390,11 @@ impl Mempool {
         for (idx, raw) in raws.iter().enumerate() {
             // Metadata was parsed once at admission (see `meta`); a raw without
             // it (should not happen) is simply never selected rather than dropped.
-            if let Some((sender, seq, gp)) = self.meta.get(raw) {
+            if let Some(m) = self.meta.get(raw) {
                 by_sender
-                    .entry(sender.clone())
+                    .entry(m.sender.clone())
                     .or_default()
-                    .push((*seq, *gp, idx));
+                    .push((m.seq, m.gas_price, idx));
             }
         }
         for q in by_sender.values_mut() {
@@ -472,11 +525,12 @@ impl Mempool {
             // mark_executed removes meta when the tx lands via another
             // validator's vertex. Re-queuing it would pin it in pending_txs
             // forever, so drop it instead.
-            let Some((sender, seq, _)) = self.meta.get(raw).cloned() else {
+            let Some(m) = self.meta.get(raw) else {
                 self.requeue_attempts.remove(raw);
                 continue;
             };
-            self.pending_nonces.insert(format!("{}:{}", sender, seq));
+            self.pending_nonces
+                .insert(format!("{}:{}", m.sender, m.seq));
             self.pending_txs.push_front(raw.clone());
         }
     }
@@ -509,8 +563,9 @@ impl Mempool {
                 continue;
             }
             self.requeue_attempts.insert(raw.clone(), attempts + 1);
-            if let Some((sender, seq, _)) = self.meta.get(raw) {
-                self.pending_nonces.insert(format!("{}:{}", sender, seq));
+            if let Some(m) = self.meta.get(raw) {
+                self.pending_nonces
+                    .insert(format!("{}:{}", m.sender, m.seq));
             }
             self.pending_txs.push_back(raw.clone());
             requeued += 1;

@@ -749,6 +749,67 @@ mod fee_market_admission {
         );
     }
 
+    /// B16: a sequence number the sender has used can never execute, so it
+    /// is refused; its next one is admitted.
+    #[test]
+    fn a_used_sequence_number_is_refused() {
+        let db = temp_db("b16_stale_nonce");
+        let (stale, sender) = signed_tx(21, 2, 1000, 1);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[21; 32]);
+        executor::test_support::set_sequence_number(
+            &db,
+            &sender,
+            &hex::encode(key.verifying_key().to_bytes()),
+            3,
+        );
+        fund(&db, &sender, 1_000_000_000);
+        let mut mp = Mempool::with_storage(db);
+        let err = mp.add_transaction(stale).expect_err("seq 2 is used");
+        assert!(err.contains("already used"), "got: {err}");
+        let (next, _) = signed_tx(21, 3, 1000, 1);
+        mp.add_transaction(next).expect("seq 3 is the next one");
+    }
+
+    /// B16: at most `MAX_NONCE_AHEAD` above the sender's next sequence
+    /// number is admitted.
+    #[test]
+    fn a_sequence_number_far_ahead_is_refused() {
+        let db = temp_db("b16_far_nonce");
+        let (far, sender) = signed_tx(22, crate::MAX_NONCE_AHEAD, 1000, 1);
+        fund(&db, &sender, 1_000_000_000);
+        let mut mp = Mempool::with_storage(db);
+        let err = mp.add_transaction(far).expect_err("100 ahead");
+        assert!(err.contains("or more above"), "got: {err}");
+        let (last, _) = signed_tx(22, crate::MAX_NONCE_AHEAD - 1, 1000, 1);
+        mp.add_transaction(last).expect("99 ahead is admitted");
+    }
+
+    /// B16: the payer must cover all of its waiting transactions together,
+    /// not each one alone; another payer is not affected.
+    #[test]
+    fn the_payer_must_cover_its_waiting_transactions() {
+        let db = temp_db("b16_waiting_total");
+        let (first, sender) = signed_tx(23, 0, 1000, 1);
+        let (second, _) = signed_tx(23, 1, 1000, 1);
+        let cost = executor_gas(&first) as u128;
+        assert_eq!(executor_gas(&second) as u128, cost);
+        fund(&db, &sender, cost + cost / 2);
+        let (other, other_sender) = signed_tx(24, 0, 1000, 1);
+        fund(&db, &other_sender, cost);
+        let mut mp = Mempool::with_storage(db);
+        mp.add_transaction(first).expect("one is covered");
+        let err = mp.add_transaction(second).expect_err("two are not covered");
+        assert!(err.contains("waiting transactions"), "got: {err}");
+        mp.add_transaction(other)
+            .expect("another payer has its own balance");
+    }
+
+    fn executor_gas(tx: &str) -> u64 {
+        serde_json::from_str::<executor::Transaction>(tx)
+            .unwrap()
+            .gas_limit
+    }
+
     #[test]
     fn admission_admits_affordable_tx() {
         let db = temp_db("admission_affordable");

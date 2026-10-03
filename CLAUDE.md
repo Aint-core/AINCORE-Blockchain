@@ -150,8 +150,10 @@ Bagian tanpa-state = SATU fungsi `executor::admission::check_stateless(raw, chai
 3. Sender = SHA256(public key); signature Ed25519 (32/64 B, strict) atau ML-DSA-65 (1952/3309 B)
 4. Paymaster: field = public key paymaster, signature diverifikasi, pembayar = alamat turunannya
 
-Lalu mempool sendiri: dedup kanonik, balance gate pembayar gas (fail closed),
-nonce dedup `sender:sequence_number`, max pending 5000 TX.
+Lalu mempool sendiri: dedup kanonik, base fee, nonce di jendela
+`[nonce ter-commit, + MAX_NONCE_AHEAD=100)` (B16), saldo pembayar menutup SEMUA
+TX-nya yang menunggu (B16, fail closed), nonce dedup `sender:sequence_number`,
+max pending 5000 TX.
 
 ---
 
@@ -168,6 +170,7 @@ nonce dedup `sender:sequence_number`, max pending 5000 TX.
 - **Fee (B15, EIP-1559):** base fee `sys:base_fee` naik/turun maks 1/8 per blok menuju target 100M gas (setengah plafon), lantai `sys:config:min_base_fee` (genesis-tool: blok penuh di lantai = emisi satu blok); `gas_limit × base_fee` DIBAKAR, tip (harga di atas base fee): 10 % dibakar, sisanya 20 % leader / 80 % komite
 - **Gas per byte (B14):** `BYTE_GAS = 400` per byte transaksi, termasuk dalam `gas_limit`; `MAX_GAS_LIMIT` hanya untuk bagian eksekusi
 - **Isi blok (B14):** hanya transaksi yang dieksekusi dan membayar (`BlockExecutionSummary::body`); sync menolak blok yang memuat transaksi tak tereksekusi
+- **Plafon gas blok (B16):** `MAX_BLOCK_GAS_LIMIT = 200M` hanya menghitung TX yang dieksekusi; tiap batch paralel memesan gas deklarasinya dulu (batas kerja VM), yang gagal mengembalikan pesanannya
 
 ---
 
