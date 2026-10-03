@@ -2,165 +2,17 @@ use blockchain::Block;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use storage::StateDB;
 
 /// G3 S6: snapshot restore from peers (SN-2).
 pub mod state_sync;
 
-/// Request for specific DAG vertices by hash.
-///
-/// AUDIT B3/B4: AINCORE has no way to ASK for a vertex. The only redelivery is a
-/// push (`try_create_vertex`'s re-gossip) performed by nodes that are BELOW parent
-/// quorum — i.e. by nodes that lack data, never by the ones holding it. So a vertex
-/// dropped by the rate limiter (`p2p.rs:345-352, 391-398`), suppressed by the 60 s
-/// gossipsub dedup (`p2p.rs:119-123`), or missed across a restart is unobtainable,
-/// and every vertex citing it stays unresolvable forever.
-///
-/// This pair is the missing pull. It is deliberately ADDITIVE: it changes no
-/// admission rule, no citation rule and no commit decision. A fetched body re-enters
-/// through the ordinary `add_vertex` gate, so it is validated exactly as a gossiped
-/// one. The only difference it makes is that a node can now hold a vertex it would
-/// otherwise never have received.
-///
-/// It does NOT close the malicious half of B3/B4: a hash that never existed is
-/// answered `unknown` by every peer. It closes the honest half — loss, dedup,
-/// restart — which is the half that happens in ordinary operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VertexRequest {
-    /// Hashes wanted. Server truncates to MAX_VERTEX_REQ_HASHES.
-    pub hashes: Vec<String>,
-    pub requester_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VertexResponse {
-    /// Bodies found, as stored. Serialized size is capped; the remainder is
-    /// reported in `unknown` so the requester re-asks instead of assuming absence.
-    pub vertices: Vec<String>,
-    /// Hashes this peer does not hold (or could not fit). Echoed so a requester can
-    /// tell "peer does not have it" from "peer never answered".
-    pub unknown: Vec<String>,
-}
-
-/// Hashes served per request. Mirrors the 500-block cap on SYNC_REQ, sized down
-/// because one vertex may be up to MAX_VERTEX_BYTES (768 KiB) while the transport
-/// frame cap is 1 MiB (`common/network/src/lib.rs:239`).
-pub const MAX_VERTEX_REQ_HASHES: usize = 32;
-/// Serialized response ceiling, under the 1 MiB inbound frame cap.
-pub const MAX_VERTEX_RESP_BYTES: usize = 900 * 1024;
-
-/// AUDIT H8 — serving budget for VERTEX_REQ.
-///
-/// `handle_vertex_request` runs on the node's sync-serving task (at most eight
-/// requests at once, `core/node/src/main.rs`), and RocksDB point lookups are
-/// BLOCKING. Those same workers drive gossip ingress and the block pipeline, so
-/// unbounded serving converts one peer's request rate directly into consensus
-/// latency.
-///
-/// The session layer bounds sessions (50 non-member inbound) and requests per
-/// session (`node::sessions::SYNC_REQUESTS_PER_SEC`, burst 128). Those still
-/// admit `sessions * rate * MAX_VERTEX_REQ_HASHES` lookups/s. The three bounds
-/// below cap what reaches storage regardless of what the session layer admits.
-///
-/// The bucket is node-wide, not per-peer, so a spammer can take the vertex
-/// service's share from honest peers (it can no longer starve consensus,
-/// which is what H8 is about). `VertexRequest::requester_id` is an
-/// unauthenticated string and is never a key; the session's authenticated key
-/// is what a per-peer split would use.
-///
-/// Vertex lookups served per second, node-wide.
-pub const VERTEX_SERVE_LOOKUPS_PER_SEC: f64 = 512.0;
-/// Burst ceiling for the same bucket: an idle node answers a full catch-up sweep
-/// (32 hashes * 32 requests) without waiting, then settles to the refill rate.
-pub const VERTEX_SERVE_BURST: f64 = 1024.0;
-/// Wall clock one request may spend in storage before it stops early and reports
-/// the remainder as `unknown`. Bounds worst-case blocking of a tokio worker to
-/// MAX_CONCURRENT_VERTEX_SERVES * this.
-pub const VERTEX_SERVE_DEADLINE_MS: u64 = 50;
-/// Requests served concurrently, node-wide.
-pub const MAX_CONCURRENT_VERTEX_SERVES: usize = 4;
-
-/// Node-wide token bucket + in-flight counter guarding the vertex server.
-///
-/// Held by value on `ChainSync` (not a process-global) so that each node — and
-/// each test — has its own, and one test exhausting the bucket cannot fail another.
-#[derive(Debug)]
-pub struct VertexServeBudget {
-    inner: Mutex<BudgetState>,
-}
-
-#[derive(Debug)]
-struct BudgetState {
-    tokens: f64,
-    last_refill: Instant,
-    in_flight: usize,
-}
-
-impl Default for VertexServeBudget {
-    fn default() -> Self {
-        Self {
-            inner: Mutex::new(BudgetState {
-                tokens: VERTEX_SERVE_BURST,
-                last_refill: Instant::now(),
-                in_flight: 0,
-            }),
-        }
-    }
-}
-
-/// Occupies one of `MAX_CONCURRENT_VERTEX_SERVES` slots for its lifetime.
-pub struct ServeSlot<'a> {
-    budget: &'a VertexServeBudget,
-}
-
-impl Drop for ServeSlot<'_> {
-    fn drop(&mut self) {
-        let mut st = self.budget.lock_recover();
-        st.in_flight = st.in_flight.saturating_sub(1);
-    }
-}
-
-impl VertexServeBudget {
-    /// The guarded state is three plain counters, so a panic while holding the
-    /// lock leaves nothing inconsistent. Recovering from poisoning is therefore
-    /// correct AND necessary: propagating it would either wedge the vertex server
-    /// permanently (fail closed) or remove the bound entirely (fail open).
-    fn lock_recover(&self) -> std::sync::MutexGuard<'_, BudgetState> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Claim a concurrency slot, or `None` when `MAX_CONCURRENT_VERTEX_SERVES`
-    /// are already in flight. Callers shed load; they never queue.
-    pub fn try_enter(&self) -> Option<ServeSlot<'_>> {
-        let mut st = self.lock_recover();
-        if st.in_flight >= MAX_CONCURRENT_VERTEX_SERVES {
-            return None;
-        }
-        st.in_flight += 1;
-        drop(st);
-        Some(ServeSlot { budget: self })
-    }
-
-    /// Refill by elapsed time, then grant up to `want` lookups. Returns how many
-    /// were actually granted, which may be 0.
-    pub fn take_lookups(&self, want: usize) -> usize {
-        let mut st = self.lock_recover();
-        let now = Instant::now();
-        let elapsed = now.saturating_duration_since(st.last_refill).as_secs_f64();
-        st.last_refill = now;
-        st.tokens = (st.tokens + elapsed * VERTEX_SERVE_LOOKUPS_PER_SEC).min(VERTEX_SERVE_BURST);
-        let granted = (want as f64).min(st.tokens.max(0.0)).floor();
-        st.tokens -= granted;
-        granted as usize
-    }
-}
-
+/// `SYNC_REQ`: the blocks from `from_height` on. The requester is the
+/// session that sent it (G4); the request names no one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncRequest {
     pub from_height: u64,
-    pub sender_id: String,
-    pub sender_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,11 +49,7 @@ pub struct FinalityArtifact {
 }
 
 pub struct ChainSync {
-    node_id: String,
     storage: Arc<StateDB>,
-    /// AUDIT H8: bounds what VERTEX_REQ can push through blocking RocksDB reads
-    /// on the tokio workers shared with consensus. See `VertexServeBudget`.
-    serve_budget: VertexServeBudget,
     /// G3 S6: snapshot serving's own budget, global and per client IP.
     state_budget: state_sync::StateBudget,
     /// The values last served in parts.
@@ -246,11 +94,9 @@ impl SyncLink {
 }
 
 impl ChainSync {
-    pub fn new(node_id: String, storage: Arc<StateDB>) -> Self {
+    pub fn new(storage: Arc<StateDB>) -> Self {
         Self {
-            node_id,
             storage,
-            serve_budget: VertexServeBudget::default(),
             state_budget: state_sync::StateBudget::default(),
             state_value_cache: Mutex::new(state_sync::ValueCache::default()),
             serves_snapshots: std::env::var("AINCORE_SERVE_SNAPSHOTS").as_deref() == Ok("1"),
@@ -805,8 +651,6 @@ impl ChainSync {
             while current < peer_height {
                 let sync_req = SyncRequest {
                     from_height: current,
-                    sender_id: self.node_id.clone(),
-                    sender_port: 0,
                 };
                 let req_json = match serde_json::to_string(&sync_req) {
                     Ok(j) => j,
@@ -1290,7 +1134,6 @@ impl ChainSync {
             || msg == "GET_FINALITY"
             || [
                 "SYNC_REQ:",
-                "VERTEX_REQ:",
                 state_sync::ANCHOR_REQ,
                 state_sync::CHUNK_REQ,
                 state_sync::VALUE_REQ,
@@ -1345,15 +1188,6 @@ impl ChainSync {
             return None;
         }
 
-        if let Some(req_json) = msg.strip_prefix("VERTEX_REQ:") {
-            if let Ok(req) = serde_json::from_str::<VertexRequest>(req_json) {
-                let resp = self.handle_vertex_request(req);
-                if let Ok(resp_json) = serde_json::to_string(&resp) {
-                    return Some(format!("VERTEX_RESP:{}", resp_json));
-                }
-            }
-            return None;
-        }
         if let Some(req_json) = msg.strip_prefix(state_sync::CHUNK_REQ) {
             let req = serde_json::from_str::<state_sync::ChunkRequest>(req_json).ok()?;
             let resp = serde_json::to_string(&self.serve_state_chunk(req, client)).ok()?;
@@ -1378,84 +1212,6 @@ impl ChainSync {
             }
         }
         None
-    }
-
-    /// Serve requested vertex bodies from storage.
-    ///
-    /// Storage reads only — no consensus lock is taken, exactly as
-    /// `handle_sync_request` reads `block_{h}`. That matters because the consensus
-    /// RwLock is held across block execution (`dag.rs`), so touching it here would
-    /// let any unauthenticated TCP peer stall consensus.
-    ///
-    /// A vertex row exists only after it passed the full ingress gate on THIS node
-    /// (`dag.rs:1174-1181`), so nothing unvalidated is ever served. The requester
-    /// re-validates anyway, since a peer may be hostile.
-    pub fn handle_vertex_request(&self, req: VertexRequest) -> VertexResponse {
-        let considered: Vec<&String> = req.hashes.iter().take(MAX_VERTEX_REQ_HASHES).collect();
-        let mut vertices = Vec::new();
-        let mut unknown = Vec::new();
-        let mut bytes = 0usize;
-
-        // AUDIT H8, bound 1 of 3 — concurrency. Shed rather than queue: a queued
-        // request still owns its tokio worker, which is the resource being
-        // protected. `_slot` is released when this function returns, including on
-        // unwind.
-        let _slot = match self.serve_budget.try_enter() {
-            Some(slot) => slot,
-            None => {
-                return VertexResponse {
-                    vertices,
-                    unknown: considered.into_iter().cloned().collect(),
-                }
-            }
-        };
-
-        // Cost the budget only for hashes that can actually reach storage, so a
-        // flood of malformed hashes cannot drain the allowance an honest peer needs.
-        let well_formed = |h: &str| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit());
-        let candidates = considered.iter().filter(|h| well_formed(h)).count();
-
-        // Bound 2 of 3 — rate.
-        let mut lookups_left = self.serve_budget.take_lookups(candidates);
-        // Bound 3 of 3 — wall clock. This reads the clock, but on a path that
-        // performs NO state transition: the response is derived from storage and
-        // shed entries are reported, so a node serving less under load cannot
-        // diverge from one serving more.
-        let deadline = Instant::now() + Duration::from_millis(VERTEX_SERVE_DEADLINE_MS);
-
-        for hash in considered {
-            // Reject anything that is not a plain hex hash before it reaches
-            // storage: the key is interpolated, and a caller-shaped key must not
-            // be able to address rows outside the vertex namespace.
-            if !well_formed(hash) {
-                unknown.push(hash.clone());
-                continue;
-            }
-            // Out of allowance, or out of time. Reported, never silently dropped:
-            // the requester must be able to tell back-pressure from absence, or it
-            // would conclude the vertex does not exist and stop asking — which is
-            // exactly the unobtainability this pull exists to fix.
-            if lookups_left == 0 || Instant::now() >= deadline {
-                unknown.push(hash.clone());
-                continue;
-            }
-            lookups_left -= 1;
-            match self.storage.get(&format!("vertex:{}", hash)) {
-                Ok(Some(v_json)) => {
-                    if bytes.saturating_add(v_json.len()) > MAX_VERTEX_RESP_BYTES {
-                        // Over budget: report as unknown so the requester re-asks
-                        // rather than concluding the peer lacks it.
-                        unknown.push(hash.clone());
-                        continue;
-                    }
-                    bytes += v_json.len();
-                    vertices.push(v_json);
-                }
-                _ => unknown.push(hash.clone()),
-            }
-        }
-
-        VertexResponse { vertices, unknown }
     }
 
     pub fn handle_sync_request(&self, req: SyncRequest) -> SyncResponse {

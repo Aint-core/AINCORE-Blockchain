@@ -168,7 +168,7 @@ impl Sim {
         c.set_now_secs(Arc::new(|| PINNED));
         c.placement_sleep = Arc::new(|_| {});
         c.v4_outbox = Some(Arc::new(Mutex::new(Vec::new())));
-        let sync = ChainSync::new(node_id, db);
+        let sync = ChainSync::new(db);
         self.nodes[i].c = Some(c);
         self.nodes[i].sync = Some(sync);
     }
@@ -296,11 +296,7 @@ impl Sim {
             .sync
             .as_ref()
             .unwrap()
-            .handle_sync_request(SyncRequest {
-                from_height: from,
-                sender_id: "sim".into(),
-                sender_port: 1,
-            });
+            .handle_sync_request(SyncRequest { from_height: from });
         let got = self.nodes[i]
             .sync
             .as_ref()
@@ -614,11 +610,7 @@ impl Sim {
             .sync
             .as_ref()
             .unwrap()
-            .handle_sync_request(SyncRequest {
-                from_height: from,
-                sender_id: "sim".into(),
-                sender_port: 1,
-            });
+            .handle_sync_request(SyncRequest { from_height: from });
         self.nodes[i]
             .sync
             .as_ref()
@@ -679,21 +671,42 @@ fn rs_import_then_restart(tag: &str, seeds: &[u8], adopt_before_crash: bool) {
         // IM-3 / DE-6: does anything notice? Y asks X for X's chain from the
         // fork point, as ChainSync would.
         let fork_from = base;
-        let resp = sim.nodes[x].sync.as_ref().unwrap().handle_sync_request(SyncRequest {
-            from_height: fork_from,
-            sender_id: "sim".into(),
-            sender_port: 1,
-        });
+        let resp = sim.nodes[x]
+            .sync
+            .as_ref()
+            .unwrap()
+            .handle_sync_request(SyncRequest {
+                from_height: fork_from,
+            });
         let yh = sim.height(y);
-        let got = sim.nodes[y].sync.as_ref().unwrap().process_blocks_with_qcs(resp.blocks, &resp.qcs, yh);
+        let got =
+            sim.nodes[y]
+                .sync
+                .as_ref()
+                .unwrap()
+                .process_blocks_with_qcs(resp.blocks, &resp.qcs, yh);
         sim.node_mut(y).reload_chain_tip();
-        let alarm = sim.node(y).storage.db.prefix_iterator(b"alarm:").next()
-            .and_then(|r| r.ok()).map(|(k, _)| String::from_utf8_lossy(&k).to_string())
+        let alarm = sim
+            .node(y)
+            .storage
+            .db
+            .prefix_iterator(b"alarm:")
+            .next()
+            .and_then(|r| r.ok())
+            .map(|(k, _)| String::from_utf8_lossy(&k).to_string())
             .filter(|k| k.starts_with("alarm:"));
-        let own_qcs: Vec<u64> = (base + 1..=yh).filter(|h| sim.qc(y, *h)
-            .is_some_and(|q| Some(q.block_hash) == sim.block(y, *h))).collect();
-        let foreign_qcs: Vec<u64> = (base + 1..=yh).filter(|h| sim.qc(y, *h)
-            .is_some_and(|q| Some(q.block_hash) != sim.block(y, *h))).collect();
+        let own_qcs: Vec<u64> = (base + 1..=yh)
+            .filter(|h| {
+                sim.qc(y, *h)
+                    .is_some_and(|q| Some(q.block_hash) == sim.block(y, *h))
+            })
+            .collect();
+        let foreign_qcs: Vec<u64> = (base + 1..=yh)
+            .filter(|h| {
+                sim.qc(y, *h)
+                    .is_some_and(|q| Some(q.block_hash) != sim.block(y, *h))
+            })
+            .collect();
         eprintln!("after re-sync: got={got} Y halted={:?} alarm={alarm:?} Y-heights-with-QC-binding-Y's-own-block={own_qcs:?} Y-heights-whose-stored-QC-certifies-ANOTHER-block={foreign_qcs:?}",
             sim.node(y).ordering_halted());
     }
@@ -786,15 +799,20 @@ fn a_block_held_without_its_qc_is_adopted_after_fetching_it() {
         .sync
         .as_ref()
         .unwrap()
-        .handle_sync_request(SyncRequest {
-            from_height: from,
-            sender_id: "sim".into(),
-            sender_port: 1,
-        });
+        .handle_sync_request(SyncRequest { from_height: from });
     // Import up to h - 1 normally.
     let h = from + 2;
-    let first: Vec<Block> = resp.blocks.iter().filter(|b| b.header.height < h).cloned().collect();
-    let got = sim.nodes[y].sync.as_ref().unwrap().process_blocks_with_qcs(first, &resp.qcs, from);
+    let first: Vec<Block> = resp
+        .blocks
+        .iter()
+        .filter(|b| b.header.height < h)
+        .cloned()
+        .collect();
+    let got = sim.nodes[y]
+        .sync
+        .as_ref()
+        .unwrap()
+        .process_blocks_with_qcs(first, &resp.qcs, from);
     assert_eq!(got, h - 1);
     // Block h: its execution transaction commits, then the process dies before
     // `import_block_qc` (modelled by restoring every row the import writes).
@@ -921,17 +939,17 @@ fn poc_restart_between_import_and_adoption() {
         .sync
         .as_ref()
         .unwrap()
-        .handle_sync_request(SyncRequest {
-            from_height: from,
-            sender_id: "sim".into(),
-            sender_port: 1,
-        });
-    let got = sim.nodes[y]
-        .sync
-        .as_ref()
-        .unwrap()
-        .process_blocks_with_qcs(resp.blocks, &resp.qcs, from);
-    assert!(got >= from + 8, "vacuous: imported only up to {got} from {from}");
+        .handle_sync_request(SyncRequest { from_height: from });
+    let got =
+        sim.nodes[y]
+            .sync
+            .as_ref()
+            .unwrap()
+            .process_blocks_with_qcs(resp.blocks, &resp.qcs, from);
+    assert!(
+        got >= from + 8,
+        "vacuous: imported only up to {got} from {from}"
+    );
     // Crash before the consensus task's reload_chain_tip adopts the batch.
     sim.reopen(y);
     sim.node_mut(y).reload_chain_tip();
@@ -975,12 +993,17 @@ fn poc_crash_between_block_execution_and_qc_import_stalls_adoption() {
     assert!(sim.run_until(300, |s| s.height(x) >= s.height(y) + 8));
     sim.online[y] = true;
     let from = sim.height(y);
-    let resp = sim.nodes[x].sync.as_ref().unwrap().handle_sync_request(SyncRequest {
-        from_height: from,
-        sender_id: "sim".into(),
-        sender_port: 1,
-    });
-    let first = resp.blocks.iter().find(|b| b.header.height == from + 1).unwrap().clone();
+    let resp = sim.nodes[x]
+        .sync
+        .as_ref()
+        .unwrap()
+        .handle_sync_request(SyncRequest { from_height: from });
+    let first = resp
+        .blocks
+        .iter()
+        .find(|b| b.header.height == from + 1)
+        .unwrap()
+        .clone();
     // The state the QC-import transaction would have found: snapshot it,
     // import block from+1 (execution txn + QC txn), then undo the QC txn.
     let keys = [
@@ -1066,12 +1089,17 @@ fn kill_m37_a_held_block_without_its_qc_is_not_adopted() {
     assert!(sim.run_until(300, |s| s.height(x) >= s.height(y) + 4));
     sim.online[y] = true;
     let from = sim.height(y);
-    let resp = sim.nodes[x].sync.as_ref().unwrap().handle_sync_request(SyncRequest {
-        from_height: from,
-        sender_id: "sim".into(),
-        sender_port: 1,
-    });
-    let first = resp.blocks.iter().find(|b| b.header.height == from + 1).unwrap().clone();
+    let resp = sim.nodes[x]
+        .sync
+        .as_ref()
+        .unwrap()
+        .handle_sync_request(SyncRequest { from_height: from });
+    let first = resp
+        .blocks
+        .iter()
+        .find(|b| b.header.height == from + 1)
+        .unwrap()
+        .clone();
     let keys = [
         "consensus:finalized_round",
         "consensus:last_anchor_round",

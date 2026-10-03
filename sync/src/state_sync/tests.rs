@@ -306,7 +306,7 @@ struct Peer {
 
 fn peer(chain: &Chain, behaviour: Behaviour) -> Peer {
     Peer {
-        sync: ChainSync::new("server".into(), Arc::clone(&chain.db)).with_snapshot_serving(true),
+        sync: ChainSync::new(Arc::clone(&chain.db)).with_snapshot_serving(true),
         db: Arc::clone(&chain.db),
         behaviour,
         chunks: 0,
@@ -987,7 +987,7 @@ async fn a_pinned_version_below_block_retention_restores() {
     assert!(state_commit::servable(&a.db, H, Some(keep)).unwrap());
     let client = temp_db("pin_client");
     let mut server = peer(&a, Behaviour::Honest);
-    server.sync = ChainSync::new("server".into(), Arc::clone(&a.db))
+    server.sync = ChainSync::new(Arc::clone(&a.db))
         .with_retention(Some((keep, 1_000)))
         .with_snapshot_serving(true);
     let mut peers = [server];
@@ -1750,7 +1750,7 @@ impl Producer {
         let key = crypto::SigningKey::from_bytes(&[77; 32]);
         let proposer = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
         let pk = hex::encode(key.verifying_key().to_bytes());
-        let sync = ChainSync::new("producer".into(), temp_db(name))
+        let sync = ChainSync::new(temp_db(name))
             .with_retention(retention)
             .with_snapshot_serving(true);
         {
@@ -1887,7 +1887,7 @@ fn a_restored_node_follows_the_chain() {
         state_root: one.header.state_root.clone(),
     };
 
-    let client = ChainSync::new("client".into(), temp_db("follow_client"));
+    let client = ChainSync::new(temp_db("follow_client"));
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let restored = runtime
         .block_on(restore_state(
@@ -1919,7 +1919,6 @@ fn the_node_routes_the_restore_requests_to_chain_sync() {
         "GET_HEIGHT",
         "GET_FINALITY",
         "SYNC_REQ:{}",
-        "VERTEX_REQ:{}",
         "STATE_ANCHOR_REQ:{}",
         "STATE_CHUNK_REQ:{}",
         "STATE_VALUE_REQ:{}",
@@ -1928,6 +1927,8 @@ fn the_node_routes_the_restore_requests_to_chain_sync() {
     }
     for msg in [
         "TX:{}",
+        // B19: the V3 vertex fetch; V4 pulls over its own signed requests.
+        "VERTEX_REQ:{}",
         "DAG_VERTEX:{}",
         "QC_VOTE:{}",
         "STATE_CHUNK_RESP:{}",
@@ -2782,7 +2783,7 @@ fn a_node_serves_snapshots_only_when_asked_to() {
         key: obj(3),
         offset: 0,
     };
-    let default = ChainSync::new("server".into(), Arc::clone(&a.db));
+    let default = ChainSync::new(Arc::clone(&a.db));
     let off = if std::env::var("AINCORE_SERVE_SNAPSHOTS").is_err() {
         default
     } else {

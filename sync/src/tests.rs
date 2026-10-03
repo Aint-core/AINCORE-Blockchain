@@ -1,11 +1,7 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod tests {
-    use crate::{
-        ChainSync, FinalityArtifact, SyncRequest, SyncResponse, VertexRequest,
-        MAX_CONCURRENT_VERTEX_SERVES, MAX_VERTEX_REQ_HASHES, MAX_VERTEX_RESP_BYTES,
-        VERTEX_SERVE_BURST,
-    };
+    use crate::{ChainSync, FinalityArtifact, SyncRequest, SyncResponse};
     use blockchain::Block;
     use std::fs;
     use std::sync::{Arc, Mutex};
@@ -49,7 +45,7 @@ mod tests {
     }
 
     fn setup_sync(name: &str) -> ChainSync {
-        ChainSync::new("node_1".to_string(), temp_db(name))
+        ChainSync::new(temp_db(name))
     }
 
     /// Sessions the network task lists but cannot serve (it is gone): every
@@ -180,11 +176,7 @@ mod tests {
         }
 
         // Request blocks from height 2
-        let req = SyncRequest {
-            from_height: 2,
-            sender_id: "node_2".to_string(),
-            sender_port: 8081,
-        };
+        let req = SyncRequest { from_height: 2 };
 
         let resp = sync.handle_sync_request(req);
 
@@ -209,13 +201,12 @@ mod tests {
                 .save_block_json(h, &serde_json::to_string(&b).unwrap())
                 .unwrap();
         }
-        let req = SyncRequest {
-            from_height: 0,
-            sender_id: "node_2".to_string(),
-            sender_port: 8081,
-        };
+        let req = SyncRequest { from_height: 0 };
         let resp = sync.handle_sync_request(req);
-        assert!(resp.blocks.is_empty(), "requested range is below prune horizon");
+        assert!(
+            resp.blocks.is_empty(),
+            "requested range is below prune horizon"
+        );
         assert_eq!(
             resp.prune_horizon,
             Some(1000),
@@ -275,11 +266,7 @@ mod tests {
             let block_json = serde_json::to_string(&block).unwrap();
             sync.storage.save_block_json(height, &block_json).unwrap();
         }
-        let req = SyncRequest {
-            from_height: 0,
-            sender_id: "peer".into(),
-            sender_port: 1,
-        };
+        let req = SyncRequest { from_height: 0 };
         let resp = sync.handle_sync_request(req);
         assert_eq!(
             resp.blocks.len(),
@@ -293,11 +280,7 @@ mod tests {
         sync.storage
             .save_block_json(1, &serde_json::to_string(&block).unwrap())
             .unwrap();
-        let req = SyncRequest {
-            from_height: 0,
-            sender_id: "peer".into(),
-            sender_port: 1,
-        };
+        let req = SyncRequest { from_height: 0 };
         assert_eq!(sync.handle_sync_request(req).blocks.len(), 1);
     }
 
@@ -308,11 +291,7 @@ mod tests {
         let block_json = serde_json::to_string(&block).unwrap();
         sync.storage.save_block_json(1, &block_json).unwrap();
 
-        let req = SyncRequest {
-            from_height: 0,
-            sender_id: "node_2".to_string(),
-            sender_port: 8081,
-        };
+        let req = SyncRequest { from_height: 0 };
         let req_json = serde_json::to_string(&req).unwrap();
         let msg = format!("SYNC_REQ:{}", req_json);
 
@@ -1339,262 +1318,5 @@ mod tests {
 
         let height = sync.sync_from_peers().await;
         assert_eq!(height, 5, "must not advance when tip agreement is unmet");
-    }
-
-    /// AUDIT B3/B4 pull, server side. The vertex fetch is the mechanism AINCORE has
-    /// never had: without it a vertex lost to the rate limiter, suppressed by the
-    /// 60 s gossip dedup, or missed across a restart is unobtainable, and every
-    /// vertex citing it stays unresolvable forever. The server must be cheap and
-    /// unspoofable: storage reads only, a hard hash cap, a byte ceiling under the
-    /// 1 MiB frame limit, and a key a caller cannot shape.
-    #[test]
-    fn test_vertex_request_is_bounded_and_hex_only() {
-        let cs = setup_sync("vertex_req_bounded");
-
-        let good = "a".repeat(64);
-        cs.storage
-            .put(&format!("vertex:{}", good), "{\"body\":1}")
-            .unwrap();
-
-        let resp = cs.handle_vertex_request(VertexRequest {
-            hashes: vec![good.clone()],
-            requester_id: "r".into(),
-        });
-        assert_eq!(resp.vertices, vec!["{\"body\":1}".to_string()]);
-        assert!(resp.unknown.is_empty());
-
-        // A hash we do not hold is reported unknown, never silently omitted: the
-        // requester must distinguish "peer lacks it" from "peer never answered".
-        let missing = "b".repeat(64);
-        let resp = cs.handle_vertex_request(VertexRequest {
-            hashes: vec![missing.clone()],
-            requester_id: "r".into(),
-        });
-        assert!(resp.vertices.is_empty());
-        assert_eq!(resp.unknown, vec![missing]);
-
-        // Key shaping: a non-hex input must never be turned into a storage key.
-        // Proven by PLANTING rows at exactly the keys a shaped input would produce
-        // — without the hex guard the server would happily serve them. Asserting
-        // only "returns unknown" would pass either way, since a nonexistent key
-        // also returns unknown; the planted rows are what make this test able to
-        // fail.
-        let zeds = "z".repeat(64);
-        let shaped = ["../sys:validators", "vertex:evil", zeds.as_str(), "short", ""];
-        {
-            // Deliberately malformed keys: only the test may write them.
-            let _seed = cs.storage.seeding();
-            for bad in shaped {
-                cs.storage
-                    .put(&format!("vertex:{}", bad), "LEAKED")
-                    .unwrap();
-            }
-        }
-        for bad in shaped {
-            let resp = cs.handle_vertex_request(VertexRequest {
-                hashes: vec![bad.to_string()],
-                requester_id: "r".into(),
-            });
-            assert!(
-                resp.vertices.is_empty(),
-                "non-hex key {:?} was turned into a storage key and served: {:?}",
-                bad,
-                resp.vertices
-            );
-            assert_eq!(resp.unknown.len(), 1, "rejected hash must still be echoed");
-        }
-
-        // An over-long input must be rejected outright rather than concatenated
-        // into a multi-kilobyte RocksDB key.
-        let huge = "a".repeat(100_000);
-        let resp = cs.handle_vertex_request(VertexRequest {
-            hashes: vec![huge],
-            requester_id: "r".into(),
-        });
-        assert!(resp.vertices.is_empty());
-
-        // The hash count is capped server-side; the excess is not served at all.
-        let many: Vec<String> = (0..MAX_VERTEX_REQ_HASHES + 40)
-            .map(|i| format!("{:064x}", i))
-            .collect();
-        let resp = cs.handle_vertex_request(VertexRequest {
-            hashes: many,
-            requester_id: "r".into(),
-        });
-        assert_eq!(
-            resp.vertices.len() + resp.unknown.len(),
-            MAX_VERTEX_REQ_HASHES,
-            "server must answer at most MAX_VERTEX_REQ_HASHES entries"
-        );
-    }
-
-    /// The byte ceiling must hold even when every requested hash IS present: no peer
-    /// may pull a frame larger than the transport accepts.
-    #[test]
-    fn test_vertex_response_respects_byte_ceiling() {
-        let cs = setup_sync("vertex_bytes");
-
-        // 32 bodies of 100 KiB each = 3.2 MiB if unbounded.
-        let big = "x".repeat(100 * 1024);
-        let hashes: Vec<String> = (0..MAX_VERTEX_REQ_HASHES)
-            .map(|i| {
-                let h = format!("{:064x}", i);
-                cs.storage.put(&format!("vertex:{}", h), &big).unwrap();
-                h
-            })
-            .collect();
-
-        let resp = cs.handle_vertex_request(VertexRequest {
-            hashes: hashes.clone(),
-            requester_id: "r".into(),
-        });
-        let total: usize = resp.vertices.iter().map(|v| v.len()).sum();
-        assert!(
-            total <= MAX_VERTEX_RESP_BYTES,
-            "served {} bytes, ceiling is {}",
-            total,
-            MAX_VERTEX_RESP_BYTES
-        );
-        assert_eq!(
-            resp.vertices.len() + resp.unknown.len(),
-            hashes.len(),
-            "every requested hash must be accounted for, served or unknown"
-        );
-        assert!(
-            !resp.unknown.is_empty(),
-            "bodies dropped for budget must be reported unknown so they are re-asked"
-        );
-    }
-
-    /// AUDIT H8. `handle_vertex_request` runs on the tokio worker that owns the
-    /// requesting peer's connection and does BLOCKING RocksDB reads; those workers
-    /// also drive gossip ingress and the block pipeline. Unbounded, one peer's
-    /// request rate becomes consensus latency. Three bounds guard it — concurrency,
-    /// rate, deadline — and every shed hash must still be REPORTED, because a
-    /// requester that saw a silent omission would conclude the vertex does not
-    /// exist and stop asking, which is the exact unobtainability this pull exists
-    /// to fix.
-    ///
-    /// COVERAGE: the concurrency and rate bounds are mutation-proven (disabling
-    /// either fails a test here). The DEADLINE bound is not — asserting it needs
-    /// injectable time or a stallable StateDB, neither of which exists yet. It is
-    /// a backstop for the other two, not the primary bound.
-    #[test]
-    fn vertex_serve_concurrency_is_capped_and_slots_are_released() {
-        let cs = setup_sync("vertex_serve_concurrency");
-
-        let mut held: Vec<_> = (0..MAX_CONCURRENT_VERTEX_SERVES)
-            .map(|i| {
-                cs.serve_budget
-                    .try_enter()
-                    .unwrap_or_else(|| panic!("slot {} must be grantable", i))
-            })
-            .collect();
-
-        assert!(
-            cs.serve_budget.try_enter().is_none(),
-            "serve {} must be SHED — a queued request still owns its tokio worker, \
-             which is the resource being protected",
-            MAX_CONCURRENT_VERTEX_SERVES + 1
-        );
-
-        held.pop();
-        assert!(
-            cs.serve_budget.try_enter().is_some(),
-            "a released slot must be reusable, or the server wedges after one burst"
-        );
-    }
-
-    #[test]
-    fn vertex_serve_rate_bucket_bursts_then_starves_then_refills() {
-        let cs = setup_sync("vertex_serve_rate");
-        let burst = VERTEX_SERVE_BURST as usize;
-
-        assert_eq!(
-            cs.serve_budget.take_lookups(burst),
-            burst,
-            "an idle node must serve a full catch-up burst without waiting"
-        );
-        assert_eq!(
-            cs.serve_budget.take_lookups(burst),
-            0,
-            "the bucket must be empty immediately after a full burst"
-        );
-
-        // 50 ms at VERTEX_SERVE_LOOKUPS_PER_SEC = 512 refills ~25 tokens, so a
-        // request for 3 is granted in full. Sleeping longer only grants more, so
-        // this cannot flake on a slow machine — it can only fail if refill is gone.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(
-            cs.serve_budget.take_lookups(3),
-            3,
-            "the bucket must refill with elapsed time"
-        );
-    }
-
-    #[test]
-    fn vertex_serve_shed_load_is_reported_never_dropped() {
-        let cs = setup_sync("vertex_serve_shed");
-        let hashes: Vec<String> = (0..MAX_VERTEX_REQ_HASHES)
-            .map(|i| format!("{:064x}", i))
-            .collect();
-        for h in &hashes {
-            cs.storage
-                .put(&format!("vertex:{}", h), "{\"body\":1}")
-                .unwrap();
-        }
-        let ask = || VertexRequest {
-            hashes: hashes.clone(),
-            requester_id: "r".into(),
-        };
-
-        // Baseline: with budget available, every planted body is served. Without
-        // this the shed assertions below would pass on a server that never serves.
-        let resp = cs.handle_vertex_request(ask());
-        assert_eq!(
-            resp.vertices.len(),
-            MAX_VERTEX_REQ_HASHES,
-            "an unloaded node must serve every planted body"
-        );
-        assert!(resp.unknown.is_empty());
-
-        // Concurrency shed. Deterministic: the slots are held for the whole call.
-        {
-            let _slots: Vec<_> = (0..MAX_CONCURRENT_VERTEX_SERVES)
-                .map(|_| cs.serve_budget.try_enter().expect("slot"))
-                .collect();
-            let resp = cs.handle_vertex_request(ask());
-            assert!(
-                resp.vertices.is_empty(),
-                "no storage read may happen while every serve slot is occupied"
-            );
-            assert_eq!(
-                resp.unknown.len(),
-                MAX_VERTEX_REQ_HASHES,
-                "every hash shed for concurrency must be reported, or the requester \
-                 reads back-pressure as absence and stops asking"
-            );
-        }
-
-        // Rate shed. Drain the bucket, then ask for rows that ARE present.
-        for _ in 0..10_000 {
-            if cs.serve_budget.take_lookups(VERTEX_SERVE_BURST as usize) == 0 {
-                break;
-            }
-        }
-        let resp = cs.handle_vertex_request(ask());
-        assert!(
-            resp.vertices.len() < MAX_VERTEX_REQ_HASHES,
-            "a drained bucket must stop storage reads; serving all {} means the rate \
-             bound is not consulted (refilling {} tokens would take ~62 ms, so this \
-             cannot flake)",
-            MAX_VERTEX_REQ_HASHES,
-            MAX_VERTEX_REQ_HASHES
-        );
-        assert_eq!(
-            resp.vertices.len() + resp.unknown.len(),
-            MAX_VERTEX_REQ_HASHES,
-            "every named hash must come back served or reported — never omitted"
-        );
     }
 }

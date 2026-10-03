@@ -244,12 +244,11 @@ fn v4_sync_responses_carry_each_blocks_qc() {
     let (sync, committee) = v4_sync("serve_qcs");
     let b1 = block_at(&sync, 1, "genesis", &"ab".repeat(32));
     let qc = qc_for(&b1, &committee, &[0, 1, 2]);
-    assert_eq!(sync.process_blocks_with_qcs(vec![b1], std::slice::from_ref(&qc), 0), 1);
-    let resp = sync.handle_sync_request(SyncRequest {
-        from_height: 0,
-        sender_id: "peer".into(),
-        sender_port: 1,
-    });
+    assert_eq!(
+        sync.process_blocks_with_qcs(vec![b1], std::slice::from_ref(&qc), 0),
+        1
+    );
+    let resp = sync.handle_sync_request(SyncRequest { from_height: 0 });
     assert_eq!(resp.blocks.len(), 1);
     assert_eq!(
         resp.qcs.iter().map(|q| q.block_height).collect::<Vec<_>>(),

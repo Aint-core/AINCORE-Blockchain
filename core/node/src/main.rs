@@ -787,7 +787,7 @@ async fn main() {
     )));
 
     let chain_sync = Arc::new(
-        ChainSync::new(node_id.clone(), Arc::clone(&storage))
+        ChainSync::new(Arc::clone(&storage))
             // G4 S1: block sync over the libp2p sessions, not a connection of
             // its own.
             .with_sessions(session_client.clone()),
