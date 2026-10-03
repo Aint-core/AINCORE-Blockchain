@@ -841,8 +841,11 @@ mod tests {
     }
 
     fn temp_db(name: &str) -> crate::StateDB {
-        let path =
-            std::env::temp_dir().join(format!("aincore_class_{}_{}", name, std::process::id()));
+        let path = crate::test_dir::process_dir().join(format!(
+            "aincore_class_{}_{}",
+            name,
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&path);
         crate::StateDB::open(path.to_str().unwrap()).unwrap()
     }
@@ -994,8 +997,11 @@ mod seal_tests {
     use crate::StateDB;
 
     fn temp_db(name: &str) -> StateDB {
-        let path =
-            std::env::temp_dir().join(format!("aincore_seal_{}_{}", name, std::process::id()));
+        let path = crate::test_dir::process_dir().join(format!(
+            "aincore_seal_{}_{}",
+            name,
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&path);
         StateDB::open(path.to_str().unwrap()).unwrap()
     }

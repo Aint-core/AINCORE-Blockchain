@@ -9,7 +9,11 @@ mod tests {
     use std::fs;
 
     fn temp_db(name: &str) -> StateDB {
-        let path = format!("/tmp/aincore_test_db_{}", name);
+        let path = format!(
+            "{}/aincore_test_db_{}",
+            crate::test_dir::process_dir().display(),
+            name
+        );
         let _ = fs::remove_dir_all(&path);
         StateDB::open(&path).expect("Failed to open test DB")
     }
@@ -24,7 +28,8 @@ mod tests {
     /// own writer gate: two durable signing guards, one key, two signatures.
     #[test]
     fn a_second_handle_to_one_directory_is_refused_whatever_the_spelling() {
-        let base = std::env::temp_dir().join(format!("aincore-claim-{}", std::process::id()));
+        let base =
+            crate::test_dir::process_dir().join(format!("aincore-claim-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         let path = base.join("db");
@@ -125,8 +130,8 @@ mod tests {
     fn test_flush_persists_then_survives_reopen() {
         // #10 graceful-shutdown primitive: after flush(), data must be durable
         // across a fresh open of the same path (simulates clean stop + restart).
-        let path = "/tmp/aincore_test_db_flush_reopen";
-        let _ = fs::remove_dir_all(path);
+        let path = crate::test_dir_str("flush_reopen");
+        let path = path.as_str();
         {
             let db = StateDB::open(path).expect("open");
             let _seed = db.seeding();

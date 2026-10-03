@@ -5688,7 +5688,8 @@ mod tests {
 
     fn temp_db(name: &str) -> Arc<StateDB> {
         let path = format!(
-            "/tmp/aincore_phase0_executor_{}_{}",
+            "{}/aincore_phase0_executor_{}_{}",
+            storage::test_dir::process_dir().display(),
             name,
             std::process::id()
         );

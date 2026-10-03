@@ -85,7 +85,7 @@ impl Sim {
             slow: None,
         };
         for (i, seed) in seeds.iter().enumerate() {
-            let path = std::env::temp_dir()
+            let path = storage::test_dir::process_dir()
                 .join(format!(
                     "aincore_s10_{}_{}_{tag}_{i}",
                     std::process::id(),

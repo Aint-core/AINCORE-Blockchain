@@ -7,7 +7,7 @@ struct TestDir(PathBuf);
 
 impl TestDir {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
+        let path = storage::test_dir::process_dir().join(format!(
             "aincore-anchor-atomic-{}-{}",
             std::process::id(),
             rand::random::<u64>()

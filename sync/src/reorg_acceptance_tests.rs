@@ -60,7 +60,14 @@ fn fixture(name: &str, height: u64) -> (ChainSync, Vec<Block>, String) {
         height,
         "even empty blocks carry durable execution progress"
     );
-    (sync, blocks, format!("/tmp/aincore_sync_db_{name}"))
+    (
+        sync,
+        blocks,
+        format!(
+            "{}/aincore_sync_db_{name}",
+            storage::test_dir::process_dir().display()
+        ),
+    )
 }
 
 fn assert_preserved(sync: ChainSync, before: Rows, path: String) {

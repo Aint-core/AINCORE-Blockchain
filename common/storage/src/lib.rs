@@ -6,6 +6,11 @@ mod transaction;
 pub use transaction::ReadStore;
 #[cfg(any(test, feature = "test-seeding"))]
 pub use transaction::SeedingGuard;
+/// B20: test database directories, reaped when their process exits.
+#[cfg(any(test, feature = "test-seeding"))]
+pub mod test_dir;
+#[cfg(any(test, feature = "test-seeding"))]
+pub use test_dir::{test_dir, test_dir_str};
 #[cfg(test)]
 mod tests;
 use object::Object;

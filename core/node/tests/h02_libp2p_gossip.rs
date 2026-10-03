@@ -46,7 +46,7 @@ use storage::StateDB;
 use tokio::time::timeout;
 
 fn temp_storage(suffix: &str) -> Arc<StateDB> {
-    let mut p = std::env::temp_dir();
+    let mut p = storage::test_dir::process_dir();
     p.push(format!(
         "aincore_h02_libp2p_{}_{}",
         std::process::id(),

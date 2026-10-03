@@ -1141,7 +1141,8 @@ mod boot_identity_tests {
             build_qc, expected_chain_id, validator_set_hash, FinalityVote, ValidatorInfo,
         };
         use std::sync::Arc;
-        let path = std::env::temp_dir().join(format!("boot_audit_{}", std::process::id()));
+        let path =
+            storage::test_dir::process_dir().join(format!("boot_audit_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         let db = Arc::new(storage::StateDB::open(path.to_str().unwrap()).unwrap());
         let committee = vec![ValidatorInfo {
@@ -1298,7 +1299,7 @@ mod boot_identity_tests {
     }
 
     fn skip_db(name: &str) -> std::sync::Arc<storage::StateDB> {
-        let path = std::env::temp_dir().join(format!(
+        let path = storage::test_dir::process_dir().join(format!(
             "s6b_{name}_{}_{}",
             std::process::id(),
             rand::random::<u64>()

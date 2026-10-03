@@ -9,7 +9,7 @@ use consensus::qc::{
 struct QcDir(std::path::PathBuf);
 impl QcDir {
     fn new() -> Self {
-        Self(std::env::temp_dir().join(format!(
+        Self(storage::test_dir::process_dir().join(format!(
             "qc-rpc-{}-{}",
             std::process::id(),
             rand::random::<u64>()

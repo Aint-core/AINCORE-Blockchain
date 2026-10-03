@@ -91,7 +91,7 @@ impl Cluster {
         let mut cluster = Self::unopened(seeds, epoch_interval);
         cluster.funded = funded;
         for (i, seed) in seeds.iter().enumerate() {
-            let path = std::env::temp_dir()
+            let path = storage::test_dir::process_dir()
                 .join(format!("aincore_v4_node_{}_{tag}_{i}", std::process::id()))
                 .to_string_lossy()
                 .to_string();
@@ -1366,7 +1366,7 @@ fn kill_m55_blocks_of_the_next_epoch_are_led_by_its_committee() {
 /// `sys:genesis_time` to an hour after it, and never without a genesis time.
 #[test]
 fn the_guard_origin_flag_is_honored_only_in_the_launch_window() {
-    let path = std::env::temp_dir()
+    let path = storage::test_dir::process_dir()
         .join(format!("aincore_launch_window_{}", std::process::id()))
         .to_string_lossy()
         .to_string();
@@ -1772,7 +1772,7 @@ impl LocalDir {
     fn seeded(tag: &str, seed: u8) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir()
+        let path = storage::test_dir::process_dir()
             .join(format!(
                 "aincore_v4_local_{}_{}_{tag}",
                 std::process::id(),

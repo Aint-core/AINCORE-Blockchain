@@ -805,8 +805,11 @@ mod tests {
     }
 
     fn temp_db(name: &str) -> Arc<StateDB> {
-        let path =
-            std::env::temp_dir().join(format!("aincore_genmulti_{}_{}", name, std::process::id()));
+        let path = storage::test_dir::process_dir().join(format!(
+            "aincore_genmulti_{}_{}",
+            name,
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&path);
         Arc::new(StateDB::open(path.to_str().expect("utf8 temp path")).expect("test DB opens"))
     }
@@ -957,7 +960,8 @@ mod tests {
         )
         .unwrap();
 
-        let dir = std::env::temp_dir().join(format!("aincore_genmulti_e2e_{}", std::process::id()));
+        let dir = storage::test_dir::process_dir()
+            .join(format!("aincore_genmulti_e2e_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let genesis_path = dir.join("genesis.json");
@@ -1119,8 +1123,8 @@ mod tests {
         let mut genesis = base.clone();
         apply_bootstrap_and_accounts(&mut genesis, &ops, Some(18_500_000), &public).unwrap();
 
-        let dir =
-            std::env::temp_dir().join(format!("aincore_genmulti_boot_{}", std::process::id()));
+        let dir = storage::test_dir::process_dir()
+            .join(format!("aincore_genmulti_boot_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("genesis.json");

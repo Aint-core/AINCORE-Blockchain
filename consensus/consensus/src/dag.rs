@@ -2216,7 +2216,8 @@ mod prune_window_tests {
     /// executor deletes after 8 epochs (S7 review).
     #[test]
     fn the_state_window_prunes_old_versions_and_keeps_epoch_pins() {
-        let path = std::env::temp_dir().join(format!("prune_window_{}", std::process::id()));
+        let path =
+            storage::test_dir::process_dir().join(format!("prune_window_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         let db = Arc::new(StateDB::open(path.to_str().unwrap()).unwrap());
         let key = |i: u64| format!("obj:{i:064x}");

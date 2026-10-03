@@ -815,7 +815,7 @@ mod tests {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let pid = std::process::id();
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("aincore-governance-{name}-{pid}-{n}"))
+        storage::test_dir::process_dir().join(format!("aincore-governance-{name}-{pid}-{n}"))
     }
 
     fn put_coin_store(db: &StateDB, address: &str, amount: u128) {

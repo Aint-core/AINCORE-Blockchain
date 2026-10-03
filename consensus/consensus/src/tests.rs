@@ -21,7 +21,7 @@ mod tests {
     fn get_test_db_path(suffix: &str) -> String {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let mut path = std::env::temp_dir();
+        let mut path = storage::test_dir::process_dir();
         path.push(format!(
             "aincore_dag_test_db_{}_{}_{}",
             std::process::id(),

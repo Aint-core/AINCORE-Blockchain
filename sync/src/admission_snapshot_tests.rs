@@ -24,7 +24,14 @@ fn fixture(name: &str) -> (ChainSync, Block, String) {
         vec![],
     );
     authenticate_block(&sync, &mut block);
-    (sync, block, format!("/tmp/aincore_sync_db_{name}"))
+    (
+        sync,
+        block,
+        format!(
+            "{}/aincore_sync_db_{name}",
+            storage::test_dir::process_dir().display()
+        ),
+    )
 }
 
 fn rows(db: &StateDB) -> BTreeMap<Vec<u8>, Vec<u8>> {

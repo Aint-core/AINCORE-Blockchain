@@ -8,7 +8,11 @@ mod tests {
     use storage::StateDB;
 
     fn temp_db(name: &str) -> Arc<StateDB> {
-        let path = format!("/tmp/aincore_sync_db_{}", name);
+        let path = format!(
+            "{}/aincore_sync_db_{}",
+            storage::test_dir::process_dir().display(),
+            name
+        );
         let _ = fs::remove_dir_all(&path);
         Arc::new(StateDB::open(&path).expect("Failed to open DB"))
     }

@@ -81,7 +81,7 @@ module std::unit_test {
 ";
 
 fn compile_unit_test_stand_in() -> (ModuleId, Vec<u8>) {
-    let file = std::env::temp_dir().join(format!(
+    let file = storage::test_dir::process_dir().join(format!(
         "aincore_move_unit_stand_in_{}.move",
         std::process::id()
     ));
@@ -133,8 +133,11 @@ fn compile_tests(targets: Vec<String>) -> (Vec<(ModuleId, Vec<u8>)>, Vec<ModuleT
 
 /// A fresh StateDB holding the committed stdlib bytecode and `extra` modules.
 fn fresh_db(name: &str, extra: &[(ModuleId, Vec<u8>)]) -> (Arc<StateDB>, PathBuf) {
-    let path =
-        std::env::temp_dir().join(format!("aincore_move_unit_{}_{}", std::process::id(), name));
+    let path = storage::test_dir::process_dir().join(format!(
+        "aincore_move_unit_{}_{}",
+        std::process::id(),
+        name
+    ));
     let _ = fs::remove_dir_all(&path);
     let db = Arc::new(StateDB::open(path.to_str().expect("utf-8 path")).expect("test DB opens"));
     let _seed = db.seeding();
@@ -248,7 +251,8 @@ fn stdlib_move_unit_tests_pass_on_the_production_vm() {
 /// green suite.
 #[test]
 fn the_move_test_runner_reports_wrong_outcomes() {
-    let dir = std::env::temp_dir().join(format!("aincore_move_unit_meta_{}", std::process::id()));
+    let dir = storage::test_dir::process_dir()
+        .join(format!("aincore_move_unit_meta_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("temp dir");
     let file = dir.join("meta.move");

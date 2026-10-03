@@ -2,7 +2,7 @@ use super::*;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
 fn temp_db(name: &str) -> Arc<StateDB> {
-    let path = std::env::temp_dir().join(format!(
+    let path = storage::test_dir::process_dir().join(format!(
         "aincore_state_commit_{}_{}",
         name,
         std::process::id()

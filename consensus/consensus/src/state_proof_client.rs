@@ -160,8 +160,8 @@ mod tests {
     }
 
     fn answer_for(test: &str, key: &str, epoch: u64) -> (StateProofAnswer, Vec<ValidatorInfo>) {
-        let path =
-            std::env::temp_dir().join(format!("pf_client_{test}_{epoch}_{}", std::process::id()));
+        let path = storage::test_dir::process_dir()
+            .join(format!("pf_client_{test}_{epoch}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         let db = Arc::new(StateDB::open(path.to_str().unwrap()).unwrap());
         let mut v0: Vec<(String, Option<Vec<u8>>)> = (0..20)

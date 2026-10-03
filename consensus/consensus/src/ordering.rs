@@ -1387,10 +1387,10 @@ mod tests {
         out
     }
 
-
     fn temp_db(suffix: &str) -> Arc<StateDB> {
         let path = format!(
-            "/tmp/aincore_ordering_test_{}_{}",
+            "{}/aincore_ordering_test_{}_{}",
+            storage::test_dir::process_dir().display(),
             std::process::id(),
             suffix
         );
@@ -1489,7 +1489,8 @@ mod tests {
     #[test]
     fn beacon_reconstructs_from_persisted_state_on_restart() {
         let path = format!(
-            "/tmp/aincore_ordering_test_{}_beacon_restart",
+            "{}/aincore_ordering_test_{}_beacon_restart",
+            storage::test_dir::process_dir().display(),
             std::process::id()
         );
         let _ = std::fs::remove_dir_all(&path);
@@ -1732,7 +1733,8 @@ mod tests {
     #[test]
     fn qc_fold_reproduces_on_restart() {
         let path = format!(
-            "/tmp/aincore_ordering_test_{}_qcfold_restart",
+            "{}/aincore_ordering_test_{}_qcfold_restart",
+            storage::test_dir::process_dir().display(),
             std::process::id()
         );
         let _ = std::fs::remove_dir_all(&path);
@@ -1766,7 +1768,8 @@ mod tests {
     #[test]
     fn stale_fold_marker_not_reapplied_on_restart() {
         let path = format!(
-            "/tmp/aincore_ordering_test_{}_qcfold_stale",
+            "{}/aincore_ordering_test_{}_qcfold_stale",
+            storage::test_dir::process_dir().display(),
             std::process::id()
         );
         let _ = std::fs::remove_dir_all(&path);

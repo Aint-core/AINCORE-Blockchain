@@ -1049,20 +1049,45 @@ mod tests {
     #[test]
     fn local_vote_refuses_conflicting_context_after_reopen() {
         for minority in [false, true] {
-            let dir = std::env::temp_dir().join(format!("qc-sign-conflict-{}-{}", std::process::id(), rand::random::<u64>()));
+            let dir = storage::test_dir::process_dir().join(format!(
+                "qc-sign-conflict-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
             let db = StateDB::open(dir.to_str().unwrap()).unwrap();
             let mut set = vec![validator_for(&[7; 32], 40, "local")];
-            if minority { set.push(validator_for(&[8; 32], 60, "other")); }
+            if minority {
+                set.push(validator_for(&[8; 32], 60, "other"));
+            }
             let _seed = db.seeding();
-            db.put("genesis:validator_set:v1", &serde_json::to_string(&set).unwrap()).unwrap();
+            db.put(
+                "genesis:validator_set:v1",
+                &serde_json::to_string(&set).unwrap(),
+            )
+            .unwrap();
             let ctx = ctx_for(10);
-            assert!(!matches!(produce_and_store_qc(&db, &[7; 32], "local", &ctx), QcOutcome::Skipped));
+            assert!(!matches!(
+                produce_and_store_qc(&db, &[7; 32], "local", &ctx),
+                QcOutcome::Skipped
+            ));
             drop(db);
             let db = StateDB::open(dir.to_str().unwrap()).unwrap();
-            assert!(!matches!(produce_and_store_qc(&db, &[7; 32], "local", &ctx), QcOutcome::Skipped), "identical replay must remain possible");
+            assert!(
+                !matches!(
+                    produce_and_store_qc(&db, &[7; 32], "local", &ctx),
+                    QcOutcome::Skipped
+                ),
+                "identical replay must remain possible"
+            );
             let mut conflict = ctx_for(10);
             conflict.block_hash = "99".repeat(32);
-            assert!(matches!(produce_and_store_qc(&db, &[7; 32], "local", &conflict), QcOutcome::Skipped), "signed two conflicting votes in one slot (minority={minority})");
+            assert!(
+                matches!(
+                    produce_and_store_qc(&db, &[7; 32], "local", &conflict),
+                    QcOutcome::Skipped
+                ),
+                "signed two conflicting votes in one slot (minority={minority})"
+            );
             drop(db);
             std::fs::remove_dir_all(dir).unwrap();
         }
@@ -1071,15 +1096,39 @@ mod tests {
     #[test]
     fn local_vote_must_not_escape_failed_native_write() {
         for minority in [false, true] {
-            let dir = std::env::temp_dir().join(format!("qc-sign-readonly-{}-{}", std::process::id(), rand::random::<u64>()));
+            let dir = storage::test_dir::process_dir().join(format!(
+                "qc-sign-readonly-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
             let db = StateDB::open(dir.to_str().unwrap()).unwrap();
             let mut set = vec![validator_for(&[7; 32], 40, "local")];
-            if minority { set.push(validator_for(&[8; 32], 60, "other")); }
+            if minority {
+                set.push(validator_for(&[8; 32], 60, "other"));
+            }
             let _seed = db.seeding();
-            db.put("genesis:validator_set:v1", &serde_json::to_string(&set).unwrap()).unwrap();
+            db.put(
+                "genesis:validator_set:v1",
+                &serde_json::to_string(&set).unwrap(),
+            )
+            .unwrap();
             drop(db);
-            let db = StateDB { db: storage::rocksdb::DB::open_for_read_only(&storage::rocksdb::Options::default(), &dir, false).unwrap().into() };
-            assert!(matches!(produce_and_store_qc(&db, &[7; 32], "local", &ctx_for(10)), QcOutcome::Skipped), "vote/certificate escaped despite failed durable write (minority={minority})");
+            let db = StateDB {
+                db: storage::rocksdb::DB::open_for_read_only(
+                    &storage::rocksdb::Options::default(),
+                    &dir,
+                    false,
+                )
+                .unwrap()
+                .into(),
+            };
+            assert!(
+                matches!(
+                    produce_and_store_qc(&db, &[7; 32], "local", &ctx_for(10)),
+                    QcOutcome::Skipped
+                ),
+                "vote/certificate escaped despite failed durable write (minority={minority})"
+            );
             drop(db);
             std::fs::remove_dir_all(dir).unwrap();
         }
@@ -1115,7 +1164,8 @@ mod tests {
 
     #[test]
     fn single_validator_produces_verifiable_qc() {
-        let dir = std::env::temp_dir().join(format!("qc_prod_single_{}", std::process::id()));
+        let dir =
+            storage::test_dir::process_dir().join(format!("qc_prod_single_{}", std::process::id()));
         let storage = StateDB::open(dir.to_str().unwrap()).unwrap();
         let node_key = [7u8; 32];
         let addr = "deadbeef";
@@ -1148,7 +1198,8 @@ mod tests {
 
     #[test]
     fn observer_node_not_in_set_produces_nothing() {
-        let dir = std::env::temp_dir().join(format!("qc_prod_obs_{}", std::process::id()));
+        let dir =
+            storage::test_dir::process_dir().join(format!("qc_prod_obs_{}", std::process::id()));
         let storage = StateDB::open(dir.to_str().unwrap()).unwrap();
         // Set contains a DIFFERENT validator; our node_key is not registered.
         let other = validator_for(&[9u8; 32], 1_000_000, "aaaa");
@@ -1168,7 +1219,8 @@ mod tests {
 
     #[test]
     fn minority_stake_records_partial_vote_no_qc() {
-        let dir = std::env::temp_dir().join(format!("qc_prod_minor_{}", std::process::id()));
+        let dir =
+            storage::test_dir::process_dir().join(format!("qc_prod_minor_{}", std::process::id()));
         let storage = StateDB::open(dir.to_str().unwrap()).unwrap();
         let my_key = [7u8; 32];
         // Our node holds 10 of 100 total stake — far below >2/3.
@@ -1214,7 +1266,8 @@ mod tests {
     /// Exact snapshots take precedence; unknown epochs cannot borrow live keys.
     #[test]
     fn load_validator_set_for_epoch_requires_exact_nonzero_snapshot() {
-        let dir = std::env::temp_dir().join(format!("qc_prod_epoch_{}", std::process::id()));
+        let dir =
+            storage::test_dir::process_dir().join(format!("qc_prod_epoch_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let storage = StateDB::open(dir.to_str().unwrap()).unwrap();
 
@@ -1278,7 +1331,8 @@ mod tests {
     /// Two validators each contributing a vote aggregate into a verifiable >2/3 QC.
     #[test]
     fn two_validators_aggregate_into_complete_qc() {
-        let dir = std::env::temp_dir().join(format!("qc_agg_two_{}", std::process::id()));
+        let dir =
+            storage::test_dir::process_dir().join(format!("qc_agg_two_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let storage = StateDB::open(dir.to_str().unwrap()).unwrap();
 
@@ -1330,7 +1384,8 @@ mod tests {
     /// A vote with a bad signature must be rejected and never stored / aggregated.
     #[test]
     fn vote_with_bad_signature_rejected() {
-        let dir = std::env::temp_dir().join(format!("qc_agg_badsig_{}", std::process::id()));
+        let dir =
+            storage::test_dir::process_dir().join(format!("qc_agg_badsig_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let storage = StateDB::open(dir.to_str().unwrap()).unwrap();
 
@@ -1362,7 +1417,8 @@ mod tests {
     /// A vote whose validator_set_hash does not match the trusted set is rejected.
     #[test]
     fn vote_with_wrong_validator_set_hash_rejected() {
-        let dir = std::env::temp_dir().join(format!("qc_agg_wrongset_{}", std::process::id()));
+        let dir = storage::test_dir::process_dir()
+            .join(format!("qc_agg_wrongset_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let storage = StateDB::open(dir.to_str().unwrap()).unwrap();
 
@@ -1396,7 +1452,8 @@ mod tests {
     /// A vote for a different committed block_hash than ours is rejected.
     #[test]
     fn vote_for_wrong_block_hash_rejected() {
-        let dir = std::env::temp_dir().join(format!("qc_agg_wrongblk_{}", std::process::id()));
+        let dir = storage::test_dir::process_dir()
+            .join(format!("qc_agg_wrongblk_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let storage = StateDB::open(dir.to_str().unwrap()).unwrap();
 
@@ -1427,7 +1484,8 @@ mod tests {
     /// the same signer do not double-count toward the threshold.
     #[test]
     fn subquorum_and_duplicate_votes_do_not_finalize() {
-        let dir = std::env::temp_dir().join(format!("qc_agg_sub_{}", std::process::id()));
+        let dir =
+            storage::test_dir::process_dir().join(format!("qc_agg_sub_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let storage = StateDB::open(dir.to_str().unwrap()).unwrap();
 

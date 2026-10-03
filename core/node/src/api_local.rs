@@ -2517,7 +2517,7 @@ mod tests {
     }
 
     fn temp_db(name: &str) -> Arc<StateDB> {
-        let path = std::env::temp_dir().join(format!(
+        let path = storage::test_dir::process_dir().join(format!(
             "aincore_phase05_api_{}_{}",
             name,
             std::process::id()

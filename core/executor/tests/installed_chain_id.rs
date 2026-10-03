@@ -33,7 +33,8 @@ fn the_installed_chain_id_governs_execution() {
     blockchain::set_vertex_domain("AINCORE-LOCALTEST-4V-HEAD", "deadbeef");
     assert_eq!(executor::expected_chain_id(), "AINCORE-LOCALTEST-4V-HEAD");
     // A transaction for the default chain is dropped at the chain-id check.
-    let path = std::env::temp_dir().join(format!("installed_chain_exec_{}", std::process::id()));
+    let path = storage::test_dir::process_dir()
+        .join(format!("installed_chain_exec_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     let db = Arc::new(storage::StateDB::open(path.to_str().unwrap()).unwrap());
     let executor = executor::Executor::new(db);

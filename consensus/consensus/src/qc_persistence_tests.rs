@@ -20,7 +20,7 @@ struct TestDir(std::path::PathBuf);
 
 impl TestDir {
     fn new() -> Self {
-        Self(std::env::temp_dir().join(format!(
+        Self(storage::test_dir::process_dir().join(format!(
             "qc-durable-{}-{}",
             std::process::id(),
             rand::random::<u64>()

@@ -1832,7 +1832,7 @@ mod tests {
     }
 
     fn temp_db(name: &str) -> Arc<StateDB> {
-        let path = std::env::temp_dir().join(format!(
+        let path = storage::test_dir::process_dir().join(format!(
             "aincore_phase0_genesis_{}_{}",
             name,
             std::process::id()
@@ -1842,7 +1842,7 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
+        let path = storage::test_dir::process_dir().join(format!(
             "aincore_phase1_genesis_dir_{}_{}",
             name,
             std::process::id()

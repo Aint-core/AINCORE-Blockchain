@@ -591,7 +591,12 @@ mod fee_market_admission {
     use storage::StateDB;
 
     fn temp_db(name: &str) -> Arc<StateDB> {
-        let path = format!("/tmp/aincore_feemkt_mempool_{}_{}", std::process::id(), name);
+        let path = format!(
+            "{}/aincore_feemkt_mempool_{}_{}",
+            storage::test_dir::process_dir().display(),
+            std::process::id(),
+            name
+        );
         let _ = std::fs::remove_dir_all(&path);
         Arc::new(StateDB::open(&path).expect("open temp db"))
     }

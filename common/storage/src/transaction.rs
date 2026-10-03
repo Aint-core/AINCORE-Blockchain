@@ -563,7 +563,7 @@ mod tests {
             // A counter, not the clock: macOS clocks tick in microseconds, so
             // two parallel tests could build the same name.
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
+            let path = crate::test_dir::process_dir().join(format!(
                 "aincore-tx-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)

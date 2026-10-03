@@ -86,7 +86,7 @@ struct TempDb(PathBuf);
 
 impl TempDb {
     fn new(tag: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
+        let path = storage::test_dir::process_dir().join(format!(
             "aincore-vcert-{tag}-{}-{}",
             std::process::id(),
             DB_SEQ.fetch_add(1, Ordering::Relaxed)

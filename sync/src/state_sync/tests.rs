@@ -55,7 +55,7 @@ fn account((key, address): (crypto::SigningKey, String)) -> (String, Vec<u8>) {
 }
 
 fn temp_db(name: &str) -> Arc<StateDB> {
-    let path = std::env::temp_dir().join(format!(
+    let path = storage::test_dir::process_dir().join(format!(
         "s6_{name}_{}_{}",
         std::process::id(),
         rand::random::<u64>()

@@ -10,7 +10,7 @@ impl TestDir {
         // A counter, not the clock: macOS clocks tick in microseconds, so two
         // parallel tests (or two dirs made back to back) could share a name.
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
+        let path = storage::test_dir::process_dir().join(format!(
             "aincore-block-crash-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)

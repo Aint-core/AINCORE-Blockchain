@@ -573,7 +573,7 @@ mod tests {
 
     fn temp_db(name: &str) -> Arc<StateDB> {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = storage::test_dir::process_dir().join(format!(
             "aincore_score_{name}_{}_{}",
             std::process::id(),
             N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
