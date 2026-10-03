@@ -56,6 +56,98 @@ use storage::StateDB;
 
 pub type PeerList = Arc<Mutex<HashMap<String, u16>>>;
 
+/// G4 S1: what consensus hands the network task. Consensus traffic goes over
+/// libp2p sessions bound to committee keys (`node::sessions`), never over a
+/// connection opened per message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outbound {
+    /// To every member: gossip, plus a direct push on each member session
+    /// (gossip drops a repeat of the same payload for a minute; the push
+    /// carries the per-tick retry).
+    Broadcast(String),
+    /// To one member, by address: an attestation to its author, a pull
+    /// answer to its requester.
+    To { address: String, wire: String },
+}
+
+impl Outbound {
+    /// The wire string, wherever it goes.
+    pub fn wire(&self) -> &str {
+        match self {
+            Self::Broadcast(wire) | Self::To { wire, .. } => wire,
+        }
+    }
+}
+
+/// G4 S1: a session the network task holds: the peer's PeerId (as text) and
+/// the committee member its key names, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPeer {
+    pub peer: String,
+    pub member: Option<String>,
+}
+
+/// The sessions the network task holds, shared read-only with sync.
+pub type SessionTable = Arc<std::sync::RwLock<Vec<SessionPeer>>>;
+
+/// G4 S1: a request on the sync protocol, answered by the session it names.
+#[derive(Debug)]
+pub struct SyncAsk {
+    pub peer: String,
+    pub wire: String,
+    pub reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+}
+
+/// G4 S1: a sync request a session sent, for the node to answer (`None`
+/// refuses it: the requester sees a failure).
+#[derive(Debug)]
+pub struct SyncServe {
+    pub peer: String,
+    pub member: Option<String>,
+    pub wire: String,
+    pub reply: tokio::sync::oneshot::Sender<Option<String>>,
+}
+
+/// G4 S1: how sync reaches peers: over the sessions the network task holds,
+/// never over a connection of its own.
+#[derive(Debug, Clone)]
+pub struct SessionClient {
+    pub asks: tokio::sync::mpsc::Sender<SyncAsk>,
+    pub table: SessionTable,
+}
+
+impl SessionClient {
+    /// The sessions held now, committee members first.
+    pub fn sessions(&self) -> Vec<SessionPeer> {
+        let mut sessions = self.table.read().map(|t| t.clone()).unwrap_or_default();
+        sessions.sort_by_key(|s| s.member.is_none());
+        sessions
+    }
+
+    /// One request to `peer` and its answer, or why there is none.
+    pub async fn ask(
+        &self,
+        peer: &str,
+        wire: &str,
+        timeout: std::time::Duration,
+    ) -> Result<String, String> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.asks
+            .send(SyncAsk {
+                peer: peer.to_string(),
+                wire: wire.to_string(),
+                reply,
+            })
+            .await
+            .map_err(|_| "the network task is gone".to_string())?;
+        match tokio::time::timeout(timeout, answer).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("the network task dropped the request".to_string()),
+            Err(_) => Err(format!("no answer from {peer} within {timeout:?}")),
+        }
+    }
+}
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 

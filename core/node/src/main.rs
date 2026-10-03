@@ -615,12 +615,21 @@ async fn main() {
     }
 
     // === INISIALISASI P2P NETWORK (Start early to bind port) ===
+    // G4 S1: the committee members the consensus protocol admits; filled
+    // once consensus boots and refreshed by the ticker at every epoch change.
+    let session_book = Arc::new(RwLock::new(node::sessions::PeerBook::default()));
+    // Sync asks over the sessions through `session_client`; the requests
+    // sessions send arrive on `sync_serves`.
+    let (session_wiring, session_client, mut sync_serves) =
+        node::sessions::SessionWiring::new(Arc::clone(&session_book));
     let (_p2p_tx, mut p2p_rx) = match start_p2p(
         port,
         libp2p_bootnodes,
         Arc::clone(&storage),
         enable_mdns,
         enable_nat,
+        signing_key.to_bytes(),
+        session_wiring,
     )
     .await
     {
@@ -803,12 +812,39 @@ async fn main() {
         signing_key.to_bytes(), // H4 FIX: Pass the persistent Ed25519 key for BLS derivation
     )));
 
-    let chain_sync = Arc::new(ChainSync::new(
-        node_id.clone(),
-        port,
-        Arc::clone(&peers),
-        Arc::clone(&storage),
-    ));
+    let chain_sync = Arc::new(
+        ChainSync::new(
+            node_id.clone(),
+            port,
+            Arc::clone(&peers),
+            Arc::clone(&storage),
+        )
+        // G4 S1: block sync over the libp2p sessions, not a connection of
+        // its own.
+        .with_sessions(session_client),
+    );
+
+    // G4 S1: answer the sync requests sessions send, off the network task,
+    // at most SYNC_SERVE_CONCURRENCY at once (the rest are refused).
+    {
+        const SYNC_SERVE_CONCURRENCY: usize = 8;
+        let serve_sync = Arc::clone(&chain_sync);
+        let permits = Arc::new(tokio::sync::Semaphore::new(SYNC_SERVE_CONCURRENCY));
+        tokio::spawn(async move {
+            while let Some(request) = sync_serves.recv().await {
+                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    let _ = request.reply.send(None);
+                    continue;
+                };
+                let serve_sync = Arc::clone(&serve_sync);
+                tokio::task::spawn_blocking(move || {
+                    let answer = serve_sync.serve_session(&request.wire);
+                    let _ = request.reply.send(answer);
+                    drop(permit);
+                });
+            }
+        });
+    }
 
     // Data availability (B1): each block header carries a DA root over the
     // block body; nodes serve samples against it (aincore_sampleDA). There
@@ -860,7 +896,10 @@ async fn main() {
 
     let consensus_clone = Arc::clone(&consensus);
     let shutdown_consensus = Arc::clone(&shutdown);
+    let ticker_book = Arc::clone(&session_book);
     tokio::spawn(async move {
+        // (epoch, whether C_{E+1} is known) of the book's last refresh.
+        let mut book_key: Option<(u64, bool)> = None;
         loop {
             // Stop mining the moment shutdown is requested so we never start a
             // new vertex/commit while the main loop is draining + flushing.
@@ -872,6 +911,25 @@ async fn main() {
                 // WRITE LOCK FOR MINING
                 if let Ok(mut c) = consensus_clone.write() {
                     c.try_create_vertex();
+                    // G4 S1: the sessions admit C_E and C_{E+1}.
+                    if let Some((epoch, current, next)) = c.session_committees() {
+                        let key = (epoch, next.is_some());
+                        if book_key != Some(key) {
+                            let mut committees: Vec<&[blockchain::committee::ValidatorInfo]> =
+                                vec![&current];
+                            if let Some(next) = &next {
+                                committees.push(next);
+                            }
+                            if let Ok(mut book) = ticker_book.write() {
+                                *book = node::sessions::PeerBook::new(epoch, &committees);
+                                println!(
+                                    "🔐 Committee sessions for epoch {epoch}: {} members",
+                                    book.len()
+                                );
+                            }
+                            book_key = Some(key);
+                        }
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(consensus_tick_ms)).await;
@@ -947,14 +1005,11 @@ async fn main() {
                             }
                         }
                         None
-                    } else if msg.starts_with(consensus::v4::WIRE_PREFIX)
-                        || msg.starts_with("QC_VOTE:")
-                        || msg.starts_with(consensus::dag::QC_WANT_PREFIX)
-                        || msg.starts_with(consensus::dag::QC_CERT_PREFIX)
-                    {
-                        if let Ok(mut guard) = node_consensus.write() {
-                            guard.handle_message(&msg);
-                        }
+                    } else if node::sessions::is_consensus_message(&msg) {
+                        // G4 S1: consensus travels on committee sessions and
+                        // gossip only. This channel cannot name its sender (each
+                        // message comes with a fresh ephemeral key), so it is
+                        // never heard here.
                         None
                     } else {
                         // Single serving implementation: chain_sync owns GET_HEIGHT,

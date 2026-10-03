@@ -211,6 +211,68 @@ mod tests {
         );
     }
 
+    /// G4 S1: a session is served sync and boundary QCs it may have; snapshot
+    /// requests stay on the legacy channel until S6.
+    #[test]
+    fn a_session_is_served_sync_but_not_snapshots() {
+        let sync = setup_sync("serve_session");
+        assert!(sync
+            .serve_session("GET_HEIGHT")
+            .unwrap()
+            .starts_with("HEIGHT:"));
+        assert!(sync
+            .serve_session("GET_FINALITY")
+            .unwrap()
+            .starts_with("FINALITY:"));
+        let anchor = format!("{}{{}}", crate::state_sync::ANCHOR_REQ);
+        assert_eq!(sync.serve_session(&anchor), None);
+        assert_eq!(sync.serve_session("QC_WANT:1"), None, "above the tip");
+        assert_eq!(sync.serve_session("QC_WANT:x"), None);
+        assert_eq!(sync.serve_session("DAG_V4:{}"), None, "not sync");
+    }
+
+    #[test]
+    fn a_sync_answer_stops_at_its_byte_budget() {
+        let sync = setup_sync("sync_req_bytes");
+        // Three 3 MiB blocks: two fit the 8 MiB budget, the third does not.
+        let big = "x".repeat(3 << 20);
+        for height in 1..=3 {
+            let block = Block::new(
+                height,
+                height,
+                "prev".to_string(),
+                vec![big.clone()],
+                "node_1".to_string(),
+            );
+            let block_json = serde_json::to_string(&block).unwrap();
+            sync.storage.save_block_json(height, &block_json).unwrap();
+        }
+        let req = SyncRequest {
+            from_height: 0,
+            sender_id: "peer".into(),
+            sender_port: 1,
+        };
+        let resp = sync.handle_sync_request(req);
+        assert_eq!(
+            resp.blocks.len(),
+            2,
+            "B3/NI-4: the answer is bounded by bytes"
+        );
+        // One block over the whole budget still goes alone.
+        let huge = "x".repeat(crate::SYNC_RESP_BLOCK_BYTES + 1);
+        let sync = setup_sync("sync_req_one_huge");
+        let block = Block::new(1, 1, "prev".into(), vec![huge], "node_1".into());
+        sync.storage
+            .save_block_json(1, &serde_json::to_string(&block).unwrap())
+            .unwrap();
+        let req = SyncRequest {
+            from_height: 0,
+            sender_id: "peer".into(),
+            sender_port: 1,
+        };
+        assert_eq!(sync.handle_sync_request(req).blocks.len(), 1);
+    }
+
     #[test]
     fn test_handle_sync_request_message_parsing() {
         let sync = setup_sync("sync_req_msg");

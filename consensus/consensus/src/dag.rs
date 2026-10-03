@@ -93,7 +93,8 @@ pub struct DagConsensus {
     clock_alarm_logged: bool,
     qc_retry_cursor: String,
     pub accumulator: Accumulator,
-    pub p2p_tx: Option<tokio::sync::mpsc::Sender<String>>, // Added P2P Libp2p Channel
+    /// G4 S1: the network task (gossip and committee sessions).
+    pub p2p_tx: Option<tokio::sync::mpsc::Sender<network::Outbound>>,
     pub node_key: [u8; 32], // H4 FIX: Store the persistent Ed25519 key for BLS derivation
     /// Phase 2.8 (M-08): cache of the active validator set.
     ///
@@ -167,51 +168,44 @@ pub struct DagConsensus {
 #[cfg(any(test, feature = "sim"))]
 pub type V4Outbox = Arc<Mutex<Vec<String>>>;
 
-/// The production `ConsensusNet`: V4 messages go out as `DAG_V4:{json}` over
-/// gossip and the TCP fan-out, like `DAG_VERTEX`. An attestation, addressed to
-/// its author, travels the same way; every other node ignores it.
+/// The production `ConsensusNet`: V4 messages go out as `DAG_V4:{json}` to
+/// the network task, which floods a broadcast over gossip and pushes it on
+/// every member session, and sends an addressed message (an attestation, a
+/// pull answer) on its member's session only (G4 S1). No connection is
+/// opened per message.
 struct V4Net {
-    node_id: String,
-    p2p_tx: Option<tokio::sync::mpsc::Sender<String>>,
-    peers: PeerList,
-    storage: Arc<StateDB>,
+    p2p_tx: Option<tokio::sync::mpsc::Sender<network::Outbound>>,
     #[cfg(any(test, feature = "sim"))]
     outbox: Option<V4Outbox>,
 }
 
 impl V4Net {
-    /// Gossip plus the TCP fallback (in tests, the node's outbox).
     fn broadcast_wire(&self, wire: String) {
+        self.emit(network::Outbound::Broadcast(wire));
+    }
+
+    /// To the network task (in tests, the node's outbox, which the cluster
+    /// delivers to everyone: a receiver ignores what is not addressed to it).
+    fn emit(&self, out: network::Outbound) {
         #[cfg(any(test, feature = "sim"))]
         if let Some(outbox) = &self.outbox {
-            outbox.lock().unwrap_or_else(|e| e.into_inner()).push(wire);
+            outbox
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(out.wire().to_string());
             return;
         }
         if let Some(tx) = &self.p2p_tx {
-            let (tx, wire) = (tx.clone(), wire.clone());
+            let tx = tx.clone();
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
                     handle.spawn(async move {
-                        let _ = tx.send(wire).await;
+                        let _ = tx.send(out).await;
                     });
                 }
                 Err(_) => {
-                    let _ = tx.try_send(wire);
+                    let _ = tx.try_send(out);
                 }
-            }
-        }
-        if let Ok(peers) = self.peers.lock() {
-            for (peer_id, port) in peers.iter() {
-                if *peer_id == self.node_id {
-                    continue;
-                }
-                // B2: only an address a session recorded. A guessed
-                // 127.0.0.1 sent consensus traffic to whatever else
-                // listened on that port of this host.
-                let Some(ip) = self.storage.get_peer_ip(peer_id) else {
-                    continue;
-                };
-                let _ = network::send_message(&format!("{ip}:{port}"), &wire);
             }
         }
     }
@@ -225,8 +219,14 @@ impl crate::v4::ConsensusNet for V4Net {
         self.broadcast_wire(format!("{}{json}", crate::v4::WIRE_PREFIX));
     }
 
-    fn send(&self, _to: &str, msg: crate::v4::Msg) {
-        self.broadcast(msg);
+    fn send(&self, to: &str, msg: crate::v4::Msg) {
+        let Ok(json) = serde_json::to_string(&msg) else {
+            return;
+        };
+        self.emit(network::Outbound::To {
+            address: to.to_string(),
+            wire: format!("{}{json}", crate::v4::WIRE_PREFIX),
+        });
     }
 }
 
@@ -256,8 +256,8 @@ impl DagConsensus {
         mempool: Arc<Mutex<Mempool>>,
         executor: Arc<Executor>,
         storage: Arc<StateDB>,
-        p2p_tx: Option<tokio::sync::mpsc::Sender<String>>, // Corrected to Sender
-        node_key: [u8; 32],                                // H4 FIX: Accept the persistent key
+        p2p_tx: Option<tokio::sync::mpsc::Sender<network::Outbound>>,
+        node_key: [u8; 32], // H4 FIX: Accept the persistent key
     ) -> Self {
         // G1 S5: a V4 chain boots through the certified-DAG engine (RC-1).
         // G5 S4c: the V3 DAG is deleted; a node on any other database is
@@ -711,12 +711,28 @@ impl DagConsensus {
         self.now_secs = now_secs;
     }
 
+    /// G4 S1: the committees whose members the network admits on consensus
+    /// sessions: C_E, and C_{E+1} once E has closed. None without a V4
+    /// engine (an inert node admits nobody).
+    #[allow(clippy::type_complexity)] // (epoch, C_E, C_{E+1})
+    pub fn session_committees(
+        &self,
+    ) -> Option<(
+        u64,
+        Vec<crate::qc::ValidatorInfo>,
+        Option<Vec<crate::qc::ValidatorInfo>>,
+    )> {
+        let engine = self.v4.as_ref()?;
+        Some((
+            engine.epoch(),
+            engine.committee().to_vec(),
+            engine.next_committee().map(<[_]>::to_vec),
+        ))
+    }
+
     fn v4_net(&self) -> V4Net {
         V4Net {
-            node_id: self.node_id.clone(),
             p2p_tx: self.p2p_tx.clone(),
-            peers: self.peers.clone(),
-            storage: Arc::clone(&self.storage),
             #[cfg(any(test, feature = "sim"))]
             outbox: self.v4_outbox.clone(),
         }
@@ -2181,49 +2197,6 @@ pub(crate) fn prune_state_window(
     }
     let pinned = state_commit::pin_schedule(tip, keep, state_commit::epoch_interval(storage));
     state_commit::prune(storage, tip - keep, &pinned, max_rows).map_err(|e| e.to_string())
-}
-
-#[cfg(test)]
-mod peer_address_tests {
-    use super::V4Net;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-    use storage::StateDB;
-
-    /// B2: a peer without a recorded address is not dialled at all (it was
-    /// dialled at 127.0.0.1 on its port); one with an address is.
-    #[test]
-    fn a_peer_without_a_recorded_address_is_never_dialled() {
-        let path = std::env::temp_dir().join(format!("b2_peer_ip_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        let storage = Arc::new(StateDB::open(path.to_str().unwrap()).unwrap());
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let peers = Arc::new(Mutex::new(HashMap::from([("peer".to_string(), port)])));
-        let net = V4Net {
-            node_id: "me".into(),
-            p2p_tx: None,
-            peers,
-            storage: Arc::clone(&storage),
-            outbox: None,
-        };
-        let dialled = || {
-            for _ in 0..30 {
-                if listener.accept().is_ok() {
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            false
-        };
-        net.broadcast_wire("DAG_V4:{}".into());
-        assert!(!dialled(), "a peer with no recorded address was dialled");
-        storage.save_peer_ip("peer", "127.0.0.1").unwrap();
-        net.broadcast_wire("DAG_V4:{}".into());
-        assert!(dialled(), "control: a recorded address is dialled");
-    }
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+use crate::sessions::{self, PeerBook, SessionWiring};
 use libp2p::futures::StreamExt;
 use libp2p::{
     autonat,
@@ -7,18 +8,19 @@ use libp2p::{
         Behaviour as GossipsubBehaviour, ConfigBuilder as GossipsubConfigBuilder,
         Event as GossipsubEvent, IdentTopic, MessageAuthenticity, ValidationMode,
     },
-    identify, identity,
+    identify,
     kad::{
         store::MemoryStore, Behaviour as Kademlia, Config as KademliaConfig, Event as KademliaEvent,
     },
     mdns::{tokio::Behaviour as Mdns, Config as MdnsConfig, Event as MdnsEvent},
     multiaddr::Protocol,
-    noise, relay,
-    swarm::{Swarm, SwarmEvent},
+    noise, relay, request_response,
+    swarm::{dial_opts::DialOpts, dial_opts::PeerCondition, Swarm, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, Transport,
 };
+use network::Outbound;
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use storage::StateDB;
 use tokio::sync::mpsc;
@@ -50,18 +52,33 @@ fn is_docker_bridge_addr(addr: &Multiaddr) -> bool {
 
 // === START P2P ===
 // Returns: (Sender to broadcast, Receiver for incoming messages)
+/// How often the network task dials the committee members it is not
+/// connected to (gossipsub's own explicit-peer redial is 300 heartbeats).
+const COMMITTEE_DIAL_EVERY: Duration = Duration::from_secs(5);
+
+#[allow(clippy::too_many_arguments)] // the node's network inputs
 pub async fn start_p2p(
     port: u16,
     bootnodes: Vec<String>,
     storage: Arc<StateDB>,
     enable_mdns: bool,
     enable_nat: bool,
-) -> Result<(mpsc::Sender<String>, mpsc::Receiver<String>), Box<dyn Error>> {
-    let (tx_out, mut rx_in) = mpsc::channel::<String>(64); // Main -> P2P
+    // G4 S1: the node key (the session identity), and the committee book,
+    // session table and sync channels shared with the node.
+    node_key: [u8; 32],
+    wiring: SessionWiring,
+) -> Result<(mpsc::Sender<Outbound>, mpsc::Receiver<String>), Box<dyn Error>> {
+    let SessionWiring {
+        book,
+        table: session_table,
+        asks: mut sync_asks,
+        serves: sync_serves,
+    } = wiring;
+    let (tx_out, mut rx_in) = mpsc::channel::<Outbound>(64); // Main -> P2P
     let (tx_in, rx_out) = mpsc::channel::<String>(64); // P2P -> Main
 
-    // === Generate keypair ===
-    let local_key = identity::Keypair::generate_ed25519();
+    // === The session identity: the node key (G4 S1, NI-1) ===
+    let local_key = sessions::local_keypair(&node_key);
     let local_peer_id = PeerId::from(local_key.public());
     println!("🛰️ Local peer id: {:?}", local_peer_id);
 
@@ -179,6 +196,8 @@ pub async fn start_p2p(
         identify: identify::Behaviour,
         pub dcutr: Toggle<dcutr::Behaviour>,
         pub relay: Toggle<relay::client::Behaviour>,
+        consensus: request_response::Behaviour<sessions::FramedCodec>,
+        sync: request_response::Behaviour<sessions::FramedCodec>,
     }
 
     let behaviour = P2PBehaviour {
@@ -187,6 +206,8 @@ pub async fn start_p2p(
         kademlia,
         autonat,
         identify,
+        consensus: sessions::consensus_behaviour(),
+        sync: sessions::sync_behaviour(),
         dcutr: Toggle::from(dcutr_behaviour),
         relay: Toggle::from(relay_behaviour),
     };
@@ -267,14 +288,174 @@ pub async fn start_p2p(
     tokio::spawn(async move {
         let mut inbound_connections_by_host: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
+        // The inbound connections counted against their host, so a close
+        // gives back exactly what was taken (members are not counted).
+        let mut counted_inbound: std::collections::HashMap<libp2p::swarm::ConnectionId, String> =
+            std::collections::HashMap::new();
+        let mut committee_dial = tokio::time::interval(COMMITTEE_DIAL_EVERY);
+        // G4 S1: sync requests this node asked, and those it is answering.
+        let mut pending_asks: std::collections::HashMap<
+            request_response::OutboundRequestId,
+            tokio::sync::oneshot::Sender<Result<String, String>>,
+        > = std::collections::HashMap::new();
+        let mut pending_serves: std::collections::HashMap<
+            request_response::InboundRequestId,
+            request_response::ResponseChannel<String>,
+        > = std::collections::HashMap::new();
+        let (served_tx, mut served_rx) =
+            mpsc::channel::<(request_response::InboundRequestId, Option<String>)>(64);
+        let members = |book: &Arc<RwLock<PeerBook>>| -> Vec<PeerId> {
+            book.read()
+                .map(|b| b.peers().copied().filter(|p| *p != local_peer_id).collect())
+                .unwrap_or_default()
+        };
 
         loop {
             tokio::select! {
-                Some(msg) = rx_in.recv() => {
-                    // println!("📤 Broadcasting TX via P2P: {}", msg);
-                    let _ = swarm.behaviour_mut().gossipsub.publish(IdentTopic::new("aincore-gossip"), msg.as_bytes());
+                Some(out) = rx_in.recv() => match out {
+                    // G4 S1: a broadcast floods over gossip and is pushed on
+                    // every connected member session; gossip alone drops a
+                    // repeat of the same payload for a minute.
+                    Outbound::Broadcast(wire) => {
+                        let _ = swarm.behaviour_mut().gossipsub.publish(IdentTopic::new("aincore-gossip"), wire.as_bytes());
+                        if sessions::is_consensus_message(&wire) {
+                            for peer in members(&book) {
+                                if swarm.is_connected(&peer) {
+                                    swarm.behaviour_mut().consensus.send_request(&peer, wire.clone());
+                                }
+                            }
+                        }
+                    }
+                    // An addressed message goes on its member's session only;
+                    // an address the book does not name is flooded instead.
+                    Outbound::To { address, wire } => {
+                        let peer = book.read().ok().and_then(|b| b.peer_of(&address));
+                        match peer {
+                            Some(peer) if peer != local_peer_id => {
+                                swarm.behaviour_mut().consensus.send_request(&peer, wire);
+                            }
+                            _ => {
+                                let _ = swarm.behaviour_mut().gossipsub.publish(IdentTopic::new("aincore-gossip"), wire.as_bytes());
+                            }
+                        }
+                    }
+                },
+                Some(ask) = sync_asks.recv() => {
+                    match ask.peer.parse::<PeerId>() {
+                        Ok(peer) => {
+                            let id = swarm.behaviour_mut().sync.send_request(&peer, ask.wire);
+                            pending_asks.insert(id, ask.reply);
+                        }
+                        Err(e) => {
+                            let _ = ask.reply.send(Err(format!("not a PeerId: {e}")));
+                        }
+                    }
+                }
+                Some((id, answer)) = served_rx.recv() => {
+                    if let Some(channel) = pending_serves.remove(&id) {
+                        match answer {
+                            Some(answer) => {
+                                let _ = swarm.behaviour_mut().sync.send_response(channel, answer);
+                            }
+                            None => drop(channel),
+                        }
+                    }
+                }
+                _ = committee_dial.tick() => {
+                    // The session table names members by the current book.
+                    if let (Ok(b), Ok(mut table)) = (book.read(), session_table.write()) {
+                        for entry in table.iter_mut() {
+                            entry.member = entry
+                                .peer
+                                .parse::<PeerId>()
+                                .ok()
+                                .and_then(|p| b.member_of(&p).map(str::to_string));
+                        }
+                    }
+                    // Keep a session to every member (NI-1); a member is
+                    // dialled at the addresses identify and Kademlia learned.
+                    for peer in members(&book) {
+                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
+                        if !swarm.is_connected(&peer) {
+                            let _ = swarm.dial(
+                                DialOpts::peer_id(peer)
+                                    .condition(PeerCondition::DisconnectedAndNotDialing)
+                                    .build(),
+                            );
+                        }
+                    }
                 }
                 event = swarm.select_next_some() => match event {
+                    SwarmEvent::Behaviour(P2PBehaviourEvent::Consensus(request_response::Event::Message {
+                        peer,
+                        message: request_response::Message::Request { request, channel, .. },
+                    })) => {
+                        // NI-1: only a session whose key names a member is heard;
+                        // anyone else's channel is dropped (it sees a failure).
+                        let member = book
+                            .read()
+                            .ok()
+                            .and_then(|b| sessions::admit_consensus_request(&b, &peer).map(str::to_string));
+                        if member.is_some() && sessions::is_consensus_message(&request) {
+                            let _ = swarm.behaviour_mut().consensus.send_response(channel, sessions::CONSENSUS_ACK.to_string());
+                            if let Err(e) = tx_in.send(request).await {
+                                eprintln!("❌ Failed to send a session message to the main loop: {e}");
+                            }
+                        } else {
+                            drop(channel);
+                        }
+                    }
+                    SwarmEvent::Behaviour(P2PBehaviourEvent::Consensus(_)) => {}
+                    // G4 S1: a sync request from any session, attributed to
+                    // the key it authenticated; the node answers it off the
+                    // swarm task.
+                    SwarmEvent::Behaviour(P2PBehaviourEvent::Sync(request_response::Event::Message {
+                        peer,
+                        message: request_response::Message::Request { request_id, request, channel },
+                    })) => {
+                        let member = book
+                            .read()
+                            .ok()
+                            .and_then(|b| b.member_of(&peer).map(str::to_string));
+                        let (reply, answer) = tokio::sync::oneshot::channel();
+                        let serve = network::SyncServe {
+                            peer: peer.to_string(),
+                            member,
+                            wire: request,
+                            reply,
+                        };
+                        if sync_serves.try_send(serve).is_ok() {
+                            pending_serves.insert(request_id, channel);
+                            let served_tx = served_tx.clone();
+                            tokio::spawn(async move {
+                                let answer = answer.await.ok().flatten();
+                                let _ = served_tx.send((request_id, answer)).await;
+                            });
+                        } else {
+                            drop(channel); // the node is saturated: refuse
+                        }
+                    }
+                    SwarmEvent::Behaviour(P2PBehaviourEvent::Sync(request_response::Event::Message {
+                        message: request_response::Message::Response { request_id, response },
+                        ..
+                    })) => {
+                        if let Some(reply) = pending_asks.remove(&request_id) {
+                            let _ = reply.send(Ok(response));
+                        }
+                    }
+                    SwarmEvent::Behaviour(P2PBehaviourEvent::Sync(request_response::Event::OutboundFailure {
+                        request_id, error, ..
+                    })) => {
+                        if let Some(reply) = pending_asks.remove(&request_id) {
+                            let _ = reply.send(Err(error.to_string()));
+                        }
+                    }
+                    SwarmEvent::Behaviour(P2PBehaviourEvent::Sync(request_response::Event::InboundFailure {
+                        request_id, ..
+                    })) => {
+                        pending_serves.remove(&request_id);
+                    }
+                    SwarmEvent::Behaviour(P2PBehaviourEvent::Sync(_)) => {}
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Mdns(MdnsEvent::Discovered(list))) => {
                         for (peer_id, multiaddr) in list {
                             println!("👀 mDNS discovered a new peer: {:?}", peer_id);
@@ -399,7 +580,14 @@ pub async fn start_p2p(
                         }
 
                         let msg_content = String::from_utf8_lossy(&message.data).to_string();
-                        // println!("📨 Received P2P message from {:?}: {}", peer_id, msg_content);
+                        // NI-1: consensus gossip only from a member publisher.
+                        let admitted = book
+                            .read()
+                            .map(|b| sessions::admit_gossip(&b, message.source.as_ref(), &msg_content))
+                            .unwrap_or(false);
+                        if !admitted {
+                            continue;
+                        }
                         if let Err(e) = tx_in.send(msg_content).await {
                             eprintln!("❌ Failed to send P2P msg to main loop: {}", e);
                         }
@@ -420,6 +608,15 @@ pub async fn start_p2p(
                         }
 
                         println!("🤝 Connection established with {:?}", peer_id);
+                        if num_established.get() == 1 {
+                            let member = book
+                                .read()
+                                .ok()
+                                .and_then(|b| b.member_of(&peer_id).map(str::to_string));
+                            if let Ok(mut table) = session_table.write() {
+                                table.push(network::SessionPeer { peer: peer_id.to_string(), member });
+                            }
+                        }
                         // FIX (mesh propagation): register every established libp2p connection as
                         // an explicit gossipsub peer, keyed on the peer id learned from the live
                         // connection. Bootnodes are dialed as bare /ip4/<ip>/tcp/<port> (no
@@ -435,9 +632,16 @@ pub async fn start_p2p(
                                 let _ = storage.save_peer_addr(&peer_id.to_string(), &address.to_string());
                             }
                             libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => {
-                                if let Some(host) = multiaddr_host(&send_back_addr) {
+                                // NI-2: a committee member never counts against the
+                                // per-host cap (one host may run several members).
+                                let is_member = book
+                                    .read()
+                                    .map(|b| b.member_of(&peer_id).is_some())
+                                    .unwrap_or(false);
+                                if let (false, Some(host)) = (is_member, multiaddr_host(&send_back_addr)) {
                                     let count = inbound_connections_by_host.entry(host.clone()).or_insert(0);
                                     *count = count.saturating_add(1);
+                                    counted_inbound.insert(connection_id, host.clone());
                                     if *count > MAX_INBOUND_LIBP2P_CONNECTIONS_PER_HOST {
                                         eprintln!(
                                             "⚠️ Closing excess inbound libp2p connection from {}: established={} limit={}",
@@ -457,16 +661,18 @@ pub async fn start_p2p(
                             }
                         }
                     }
-                    SwarmEvent::ConnectionClosed { endpoint, .. } => {
-                        // pre-existing nesting; kept explicit for clarity over collapsing
-                        #[allow(clippy::collapsible_match)]
-                        if let libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } = endpoint {
-                            if let Some(host) = multiaddr_host(&send_back_addr) {
-                                if let Some(count) = inbound_connections_by_host.get_mut(&host) {
-                                    *count = count.saturating_sub(1);
-                                    if *count == 0 {
-                                        inbound_connections_by_host.remove(&host);
-                                    }
+                    SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
+                        if num_established == 0 {
+                            if let Ok(mut table) = session_table.write() {
+                                let peer = peer_id.to_string();
+                                table.retain(|s| s.peer != peer);
+                            }
+                        }
+                        if let Some(host) = counted_inbound.remove(&connection_id) {
+                            if let Some(count) = inbound_connections_by_host.get_mut(&host) {
+                                *count = count.saturating_sub(1);
+                                if *count == 0 {
+                                    inbound_connections_by_host.remove(&host);
                                 }
                             }
                         }

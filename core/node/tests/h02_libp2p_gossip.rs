@@ -79,12 +79,18 @@ async fn h02_libp2p_stack_starts_and_accepts_broadcast() {
 
     // Start two stacks. Either MUST be successful — if libp2p fails to
     // bring up Gossipsub/Kademlia/etc. that is a regression.
-    let (tx_a, mut rx_a) = node::p2p::start_p2p(port_a, vec![], storage_a, true, false)
-        .await
-        .expect("node A libp2p stack must start");
-    let (_tx_b, _rx_b) = node::p2p::start_p2p(port_b, vec![], storage_b, true, false)
-        .await
-        .expect("node B libp2p stack must start");
+    let wiring = || {
+        let book = Arc::new(std::sync::RwLock::new(node::sessions::PeerBook::default()));
+        node::sessions::SessionWiring::new(book).0
+    };
+    let (tx_a, mut rx_a) =
+        node::p2p::start_p2p(port_a, vec![], storage_a, true, false, [1; 32], wiring())
+            .await
+            .expect("node A libp2p stack must start");
+    let (_tx_b, _rx_b) =
+        node::p2p::start_p2p(port_b, vec![], storage_b, true, false, [2; 32], wiring())
+            .await
+            .expect("node B libp2p stack must start");
 
     // Settle: let the swarms boot, subscribe to the topic, and surface
     // any startup-time panic on the event loops.
@@ -106,7 +112,11 @@ async fn h02_libp2p_stack_starts_and_accepts_broadcast() {
     // (Whether Gossipsub successfully delivers to peer B in a single-
     //  process scenario is NOT asserted here — see the file-level
     //  docs for why.)
-    let send_result = timeout(Duration::from_secs(1), tx_a.send(msg.clone())).await;
+    let send_result = timeout(
+        Duration::from_secs(1),
+        tx_a.send(network::Outbound::Broadcast(msg.clone())),
+    )
+    .await;
     assert!(
         matches!(send_result, Ok(Ok(()))),
         "DOWNTIME_ATTEST: must be acceptable on tx_out within 1s"

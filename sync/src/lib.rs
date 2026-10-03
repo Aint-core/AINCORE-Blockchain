@@ -219,8 +219,47 @@ pub struct ChainSync {
     /// Block retention (`StateDB::block_pruning_policy_from_env`), read once.
     /// Imported blocks prune under it like built ones (G3 GC-1).
     retention: Option<(u64, u64)>,
+    /// G4 S1: the sessions the network task holds. When set, sync talks to
+    /// peers over them only; the legacy channel is the fallback until S6.
+    sessions: Option<network::SessionClient>,
     #[cfg(test)]
     before_execution_hook: Option<fn(&StateDB)>,
+}
+
+/// G4 S1: how long one sync request on a session may take.
+const SYNC_ASK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// NI-4: the blocks of one SYNC_RESP stop at this many bytes (at least one
+/// block is sent), so the answer stays under the 10 MiB a client reads.
+pub const SYNC_RESP_BLOCK_BYTES: usize = 8 << 20;
+
+/// The peer a sync client talks to: a session the network task holds (G4
+/// S1), or the legacy encrypted stream (until S6 retires it).
+enum SyncLink {
+    Session {
+        client: network::SessionClient,
+        peer: String,
+    },
+    Legacy {
+        stream: tokio::net::TcpStream,
+        key: [u8; 32],
+    },
+}
+
+impl SyncLink {
+    async fn ask(&mut self, msg: &str) -> Result<String, String> {
+        match self {
+            Self::Session { client, peer } => client.ask(peer, msg, SYNC_ASK_TIMEOUT).await,
+            Self::Legacy { stream, key } => {
+                send_encrypted_msg(stream, key, msg)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                read_encrypted_msg(stream, key)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        }
+    }
 }
 
 impl ChainSync {
@@ -240,6 +279,7 @@ impl ChainSync {
             state_value_cache: Mutex::new(state_sync::ValueCache::default()),
             serves_snapshots: std::env::var("AINCORE_SERVE_SNAPSHOTS").as_deref() == Ok("1"),
             retention: StateDB::block_pruning_policy_from_env(),
+            sessions: None,
             #[cfg(test)]
             before_execution_hook: None,
         }
@@ -255,6 +295,12 @@ impl ChainSync {
     /// Serve state snapshots (G3 S6), whatever `AINCORE_SERVE_SNAPSHOTS` says.
     pub fn with_snapshot_serving(mut self, serve: bool) -> Self {
         self.serves_snapshots = serve;
+        self
+    }
+
+    /// G4 S1: sync over the network task's sessions.
+    pub fn with_sessions(mut self, client: network::SessionClient) -> Self {
+        self.sessions = Some(client);
         self
     }
 
@@ -716,6 +762,10 @@ impl ChainSync {
             return self.get_local_height();
         }
 
+        if let Some(client) = self.sessions.clone() {
+            return self.sync_over_sessions(&client).await;
+        }
+
         let peers_map = self.peers.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if peers_map.is_empty() {
             println!("📡 [ChainSync] No peers available.");
@@ -795,178 +845,11 @@ impl ChainSync {
             )
             .await
             {
-                Ok((mut stream, shared_key, _peer_node_id)) => {
+                Ok((stream, key, _peer_node_id)) => {
                     println!("🔐 Secure Channel Established with {}", peer_id);
-
-                    // 2. Request Chain Height
-                    let req_msg = "GET_HEIGHT".to_string();
-                    if send_encrypted_msg(&mut stream, &shared_key, &req_msg)
-                        .await
-                        .is_err()
-                    {
-                        continue;
-                    }
-
-                    if let Ok(resp) = read_encrypted_msg(&mut stream, &shared_key).await {
-                        // Parse Height response e.g. "HEIGHT:100"
-                        if let Some(h_str) = resp.strip_prefix("HEIGHT:") {
-                            if let Ok(peer_height) = h_str.trim().parse::<u64>() {
-                                println!("📊 [ChainSync] Peer Height: {}", peer_height);
-
-                                if peer_height > my_height {
-                                    // 3. Request Blocks — loop in batches until caught up
-                                    let mut current = my_height;
-                                    while current < peer_height {
-                                        let sync_req = SyncRequest {
-                                            from_height: current,
-                                            sender_id: self.node_id.clone(),
-                                            sender_port: self.my_port,
-                                        };
-                                        let req_json = match serde_json::to_string(&sync_req) {
-                                            Ok(j) => j,
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "❌ [ChainSync] Failed to serialize sync request: {}",
-                                                    e
-                                                );
-                                                break;
-                                            }
-                                        };
-                                        let msg = format!("SYNC_REQ:{}", req_json);
-
-                                        if send_encrypted_msg(&mut stream, &shared_key, &msg)
-                                            .await
-                                            .is_err()
-                                        {
-                                            break;
-                                        }
-
-                                        // 4. Receive Blocks Batch
-                                        match read_encrypted_msg(&mut stream, &shared_key).await {
-                                            Ok(data_resp) => {
-                                                if let Some(json_data) =
-                                                    data_resp.strip_prefix("SYNC_RESP:")
-                                                {
-                                                    if let Ok(sync_resp) =
-                                                        serde_json::from_str::<SyncResponse>(
-                                                            json_data,
-                                                        )
-                                                    {
-                                                        let finality = sync_resp.finality.clone();
-                                                        if sync_resp.blocks.is_empty() {
-                                                            if let Some(finality) = finality {
-                                                                if let Err(e) = self
-                                                                    .apply_finality_artifact(
-                                                                        &finality,
-                                                                    )
-                                                                {
-                                                                    eprintln!(
-                                                                        "🚨 [SECURITY][SYNC_FINALITY_REJECT] {}",
-                                                                        e
-                                                                    );
-                                                                }
-                                                            }
-                                                            // Below the peer's prune horizon: block-replay
-                                                            // cannot bridge this gap. Surface it clearly
-                                                            // instead of looping silently on empty replies.
-                                                            if let Some(horizon) = sync_resp.prune_horizon {
-                                                                let local_now = self.get_local_height();
-                                                                if horizon > local_now + 1 {
-                                                                    eprintln!(
-                                                                        "🛑 [ChainSync] peer pruned below us: earliest block #{} but we are at #{}. \
-                                                                         Block-replay cannot bridge this, and verified snapshot restore (G3 S6) \
-                                                                         is not available yet: sync from a peer that keeps history.",
-                                                                        horizon, local_now
-                                                                    );
-                                                                }
-                                                            }
-                                                            break; // No more blocks
-                                                        }
-                                                        let synced = self.process_blocks_with_qcs(
-                                                            sync_resp.blocks,
-                                                            &sync_resp.qcs,
-                                                            current,
-                                                        );
-                                                        if synced <= current {
-                                                            eprintln!(
-                                                                "⚠️ [ChainSync] Batch made no progress from height {}",
-                                                                current
-                                                            );
-                                                            break; // No progress made
-                                                        }
-                                                        current = synced;
-                                                        final_height = synced;
-                                                        if let Some(finality) = finality {
-                                                            if let Err(e) = self
-                                                                .apply_finality_artifact(&finality)
-                                                            {
-                                                                eprintln!(
-                                                                    "🚨 [SECURITY][SYNC_FINALITY_REJECT] {}",
-                                                                    e
-                                                                );
-                                                            }
-                                                        }
-                                                    } else {
-                                                        eprintln!(
-                                                            "❌ [ChainSync] Failed to parse SYNC_RESP JSON ({} bytes)",
-                                                            json_data.len()
-                                                        );
-                                                        break;
-                                                    }
-                                                } else {
-                                                    eprintln!(
-                                                        "❌ [ChainSync] Unexpected sync response prefix: {}",
-                                                        data_resp
-                                                            .chars()
-                                                            .take(80)
-                                                            .collect::<String>()
-                                                    );
-                                                    break;
-                                                }
-                                            }
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "❌ [ChainSync] Failed to read SYNC_RESP from {}: {}",
-                                                    peer_id, e
-                                                );
-                                                break;
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    println!(
-                                        "✅ [ChainSync] Already caught up with peer {}",
-                                        peer_id
-                                    );
-                                }
-
-                                if send_encrypted_msg(&mut stream, &shared_key, "GET_FINALITY")
-                                    .await
-                                    .is_ok()
-                                {
-                                    if let Ok(finality_resp) =
-                                        read_encrypted_msg(&mut stream, &shared_key).await
-                                    {
-                                        if let Some(json) = finality_resp.strip_prefix("FINALITY:")
-                                        {
-                                            if let Ok(artifact) =
-                                                serde_json::from_str::<FinalityArtifact>(json)
-                                            {
-                                                if let Err(e) =
-                                                    self.apply_finality_artifact(&artifact)
-                                                {
-                                                    eprintln!(
-                                                        "🚨 [SECURITY][SYNC_FINALITY_REJECT] {}",
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let mut link = SyncLink::Legacy { stream, key };
+                    let reached = self.sync_over(&mut link, peer_id, my_height).await;
+                    final_height = final_height.max(reached);
                 }
                 Err(e) => {
                     eprintln!("❌ Connection Failed to {}: {}", peer_id, e);
@@ -974,6 +857,195 @@ impl ChainSync {
             }
         }
         final_height
+    }
+
+    /// G4 S1: sync over the sessions the network task holds, committee
+    /// members first. The tip-agreement gate counts a member only by the key
+    /// its session authenticated, never by an id a peer claims.
+    async fn sync_over_sessions(&self, client: &network::SessionClient) -> u64 {
+        let sessions = client.sessions();
+        let mut final_height = self.get_local_height();
+        if sessions.is_empty() {
+            println!("📡 [ChainSync] No sessions available.");
+            return final_height;
+        }
+        let tip_n = self.tip_agreement_n();
+        if tip_n > 1 {
+            let seed_set = self.active_validator_addresses();
+            let mut tips = Vec::new();
+            for session in &sessions {
+                if !session
+                    .member
+                    .as_ref()
+                    .is_some_and(|m| seed_set.contains(m))
+                {
+                    continue;
+                }
+                let mut link = SyncLink::Session {
+                    client: client.clone(),
+                    peer: session.peer.clone(),
+                };
+                if let Some(qc) = self.verified_tip_over(&mut link).await {
+                    tips.push(qc);
+                    if tips.len() >= tip_n {
+                        break;
+                    }
+                }
+            }
+            if let Err(e) = Self::tip_agreement_decision(&tips, tip_n) {
+                eprintln!(
+                    "🚨 [SECURITY][TIP_DISAGREEMENT] {} — refusing to advance",
+                    e
+                );
+                return final_height;
+            }
+        }
+        for session in sessions {
+            let label = session
+                .member
+                .clone()
+                .unwrap_or_else(|| session.peer.clone());
+            let mut link = SyncLink::Session {
+                client: client.clone(),
+                peer: session.peer,
+            };
+            let reached = self
+                .sync_over(&mut link, &label, self.get_local_height())
+                .await;
+            final_height = final_height.max(reached);
+        }
+        final_height
+    }
+
+    /// One peer's blocks over `link`: its height, then batches up to it, then
+    /// its finality artifact. Returns the height reached.
+    async fn sync_over(&self, link: &mut SyncLink, peer_id: &str, my_height: u64) -> u64 {
+        let mut final_height = my_height;
+        // 2. Request Chain Height
+        let Ok(resp) = link.ask("GET_HEIGHT").await else {
+            return final_height;
+        };
+        // Parse Height response e.g. "HEIGHT:100"
+        let Some(peer_height) = resp
+            .strip_prefix("HEIGHT:")
+            .and_then(|h| h.trim().parse::<u64>().ok())
+        else {
+            return final_height;
+        };
+        println!("📊 [ChainSync] Peer Height: {}", peer_height);
+
+        if peer_height > my_height {
+            // 3. Request Blocks — loop in batches until caught up
+            let mut current = my_height;
+            while current < peer_height {
+                let sync_req = SyncRequest {
+                    from_height: current,
+                    sender_id: self.node_id.clone(),
+                    sender_port: self.my_port,
+                };
+                let req_json = match serde_json::to_string(&sync_req) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        eprintln!("❌ [ChainSync] Failed to serialize sync request: {}", e);
+                        break;
+                    }
+                };
+                // 4. Receive Blocks Batch
+                let data_resp = match link.ask(&format!("SYNC_REQ:{}", req_json)).await {
+                    Ok(data_resp) => data_resp,
+                    Err(e) => {
+                        eprintln!(
+                            "❌ [ChainSync] Failed to read SYNC_RESP from {}: {}",
+                            peer_id, e
+                        );
+                        break;
+                    }
+                };
+                let Some(json_data) = data_resp.strip_prefix("SYNC_RESP:") else {
+                    eprintln!(
+                        "❌ [ChainSync] Unexpected sync response prefix: {}",
+                        data_resp.chars().take(80).collect::<String>()
+                    );
+                    break;
+                };
+                let Ok(sync_resp) = serde_json::from_str::<SyncResponse>(json_data) else {
+                    eprintln!(
+                        "❌ [ChainSync] Failed to parse SYNC_RESP JSON ({} bytes)",
+                        json_data.len()
+                    );
+                    break;
+                };
+                let finality = sync_resp.finality.clone();
+                if sync_resp.blocks.is_empty() {
+                    if let Some(finality) = finality {
+                        if let Err(e) = self.apply_finality_artifact(&finality) {
+                            eprintln!("🚨 [SECURITY][SYNC_FINALITY_REJECT] {}", e);
+                        }
+                    }
+                    // Below the peer's prune horizon: block-replay
+                    // cannot bridge this gap. Surface it clearly
+                    // instead of looping silently on empty replies.
+                    if let Some(horizon) = sync_resp.prune_horizon {
+                        let local_now = self.get_local_height();
+                        if horizon > local_now + 1 {
+                            eprintln!(
+                                "🛑 [ChainSync] peer pruned below us: earliest block #{} but we are at #{}. \
+                                 Block-replay cannot bridge this, and verified snapshot restore (G3 S6) \
+                                 is not available yet: sync from a peer that keeps history.",
+                                horizon, local_now
+                            );
+                        }
+                    }
+                    break; // No more blocks
+                }
+                let synced =
+                    self.process_blocks_with_qcs(sync_resp.blocks, &sync_resp.qcs, current);
+                if synced <= current {
+                    eprintln!(
+                        "⚠️ [ChainSync] Batch made no progress from height {}",
+                        current
+                    );
+                    break; // No progress made
+                }
+                current = synced;
+                final_height = synced;
+                if let Some(finality) = finality {
+                    if let Err(e) = self.apply_finality_artifact(&finality) {
+                        eprintln!("🚨 [SECURITY][SYNC_FINALITY_REJECT] {}", e);
+                    }
+                }
+            }
+        } else {
+            println!("✅ [ChainSync] Already caught up with peer {}", peer_id);
+        }
+
+        if let Ok(finality_resp) = link.ask("GET_FINALITY").await {
+            if let Some(json) = finality_resp.strip_prefix("FINALITY:") {
+                if let Ok(artifact) = serde_json::from_str::<FinalityArtifact>(json) {
+                    if let Err(e) = self.apply_finality_artifact(&artifact) {
+                        eprintln!("🚨 [SECURITY][SYNC_FINALITY_REJECT] {}", e);
+                    }
+                }
+            }
+        }
+        final_height
+    }
+
+    /// A peer's finalized tip over `link`, iff its QC verifies against the
+    /// trusted validator set of its epoch.
+    async fn verified_tip_over(
+        &self,
+        link: &mut SyncLink,
+    ) -> Option<consensus::qc::QuorumCertificate> {
+        let resp = link.ask("GET_FINALITY").await.ok()?;
+        let json = resp.strip_prefix("FINALITY:")?;
+        let artifact = serde_json::from_str::<FinalityArtifact>(json).ok()?;
+        let qc = artifact.qc?;
+        let validators = self.trusted_validator_set(qc.epoch)?;
+        match consensus::qc::verify_qc(&qc, &validators, &consensus::qc::expected_chain_id()) {
+            Ok(()) => Some(qc),
+            Err(_) => None,
+        }
     }
 
     /// TASK-#29: fetch one peer's advertised finalized tip and return its QC iff the
@@ -1458,6 +1530,40 @@ impl ChainSync {
         }
     }
 
+    /// G4 S1: a request a libp2p session sent: what `serves` lists, and a
+    /// boundary QC (`QC_WANT:h`, answered `QC_CERT:{qc}` for a held height,
+    /// so an observer can activate an epoch). Snapshot serving stays on the
+    /// legacy channel, budgeted per IP, until S6.
+    pub fn serve_session(&self, msg: &str) -> Option<String> {
+        if [
+            state_sync::ANCHOR_REQ,
+            state_sync::CHUNK_REQ,
+            state_sync::VALUE_REQ,
+        ]
+        .iter()
+        .any(|prefix| msg.starts_with(prefix))
+        {
+            return None;
+        }
+        if let Some(height) = msg.strip_prefix(consensus::dag::QC_WANT_PREFIX) {
+            let height = height.parse::<u64>().ok()?;
+            if height > self.get_local_height() {
+                return None;
+            }
+            let qc = consensus::qc_producer::stored_qc(&self.storage, height)?;
+            return Some(format!(
+                "{}{}",
+                consensus::dag::QC_CERT_PREFIX,
+                serde_json::to_string(&qc).ok()?
+            ));
+        }
+        if Self::serves(msg) {
+            self.handle_message_from(msg, None)
+        } else {
+            None
+        }
+    }
+
     /// Handle incoming encrypted message (called by Network Server Handler)
     pub fn handle_message(&self, msg: &str) -> Option<String> {
         self.handle_message_from(msg, None)
@@ -1598,11 +1704,18 @@ impl ChainSync {
 
         // Limit batch size to avoid huge messages (Optimized to 500 for Production Performance)
         let end_height = std::cmp::min(local_height, req.from_height + 500);
+        // NI-4: and by bytes, so the answer fits what a client reads (500
+        // full blocks would be far over it); at least one block goes.
+        let mut bytes = 0usize;
 
         for height in (req.from_height + 1)..=end_height {
             let key = format!("block_{}", height);
             if let Ok(Some(block_data)) = self.storage.get(&key) {
+                if !blocks_to_send.is_empty() && bytes + block_data.len() > SYNC_RESP_BLOCK_BYTES {
+                    break;
+                }
                 if let Ok(block) = serde_json::from_str::<Block>(&block_data) {
+                    bytes += block_data.len();
                     blocks_to_send.push(block);
                 }
             }
