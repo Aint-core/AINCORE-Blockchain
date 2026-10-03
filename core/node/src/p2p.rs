@@ -304,6 +304,16 @@ pub async fn start_p2p(
         > = std::collections::HashMap::new();
         let (served_tx, mut served_rx) =
             mpsc::channel::<(request_response::InboundRequestId, Option<String>)>(64);
+        // G4 NI-3: per-member consensus budget, per-session sync quota.
+        let mut member_budget: sessions::Budget<String> =
+            sessions::Budget::new(sessions::MEMBER_MSGS_PER_SEC, sessions::MEMBER_MSG_BURST);
+        let mut sync_budget: sessions::Budget<PeerId> = sessions::Budget::new(
+            sessions::SYNC_REQUESTS_PER_SEC,
+            sessions::SYNC_REQUEST_BURST,
+        );
+        // G4 NI-2: inbound connections from non-members, all together.
+        let mut non_member_inbound: std::collections::HashSet<libp2p::swarm::ConnectionId> =
+            std::collections::HashSet::new();
         let members = |book: &Arc<RwLock<PeerBook>>| -> Vec<PeerId> {
             book.read()
                 .map(|b| b.peers().copied().filter(|p| *p != local_peer_id).collect())
@@ -396,7 +406,10 @@ pub async fn start_p2p(
                             .read()
                             .ok()
                             .and_then(|b| sessions::admit_consensus_request(&b, &peer).map(str::to_string));
-                        if member.is_some() && sessions::is_consensus_message(&request) {
+                        let within_budget = member
+                            .as_ref()
+                            .is_some_and(|m| member_budget.spend(m, std::time::Instant::now()));
+                        if within_budget && sessions::is_consensus_message(&request) {
                             let _ = swarm.behaviour_mut().consensus.send_response(channel, sessions::CONSENSUS_ACK.to_string());
                             if let Err(e) = tx_in.send(request).await {
                                 eprintln!("❌ Failed to send a session message to the main loop: {e}");
@@ -413,6 +426,10 @@ pub async fn start_p2p(
                         peer,
                         message: request_response::Message::Request { request_id, request, channel },
                     })) => {
+                        if !sync_budget.spend(&peer, std::time::Instant::now()) {
+                            drop(channel); // NI-3: over its sync quota
+                            continue;
+                        }
                         let member = book
                             .read()
                             .ok()
@@ -638,6 +655,14 @@ pub async fn start_p2p(
                                     .read()
                                     .map(|b| b.member_of(&peer_id).is_some())
                                     .unwrap_or(false);
+                                if !is_member {
+                                    // NI-2: the non-members share one cap.
+                                    if non_member_inbound.len() >= sessions::MAX_NON_MEMBER_INBOUND {
+                                        let _ = swarm.close_connection(connection_id);
+                                        continue;
+                                    }
+                                    non_member_inbound.insert(connection_id);
+                                }
                                 if let (false, Some(host)) = (is_member, multiaddr_host(&send_back_addr)) {
                                     let count = inbound_connections_by_host.entry(host.clone()).or_insert(0);
                                     *count = count.saturating_add(1);
@@ -662,6 +687,7 @@ pub async fn start_p2p(
                         }
                     }
                     SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
+                        non_member_inbound.remove(&connection_id);
                         if num_established == 0 {
                             if let Ok(mut table) = session_table.write() {
                                 let peer = peer_id.to_string();

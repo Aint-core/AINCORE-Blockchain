@@ -1014,6 +1014,34 @@ fn collect_vote_staged(
 mod tests {
     use super::*;
     use crate::qc::ValidatorInfo;
+
+    /// G4 NI-4: a vote with every field at its longest fits its pre-parse cap
+    /// four times over.
+    #[test]
+    fn a_qc_vote_fits_its_cap_four_times() {
+        let h = "ab".repeat(32);
+        let vote = FinalityVote {
+            chain_id: "AINCORE-TESTNET-V5-LONG-NAME".into(),
+            epoch: u64::MAX,
+            finalized_round: u64::MAX,
+            anchor_round: u64::MAX,
+            anchor_hash: h.clone(),
+            block_height: u64::MAX,
+            block_hash: h.clone(),
+            state_root: h.clone(),
+            receipts_root: h.clone(),
+            finality_digest: h.clone(),
+            validator_set_hash: h.clone(),
+            next_validator_set_hash: h.clone(),
+        };
+        let message = QcVoteMessage {
+            vote,
+            signer_address: h,
+            signature: "cd".repeat(96),
+        };
+        let len = serde_json::to_string(&message).unwrap().len();
+        assert!(4 * len <= crate::dag::QC_VOTE_MAX_BYTES, "{len} bytes");
+    }
     mod persistence {
         include!("qc_persistence_tests.rs");
     }

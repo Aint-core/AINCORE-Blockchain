@@ -24,6 +24,11 @@ pub const SLASH_EVIDENCE_PREFIX: &str = "SLASH_EVIDENCE:";
 /// G1 EP-4: ask peers for QC(H_E) / answer with it (`answer_qc_want`).
 pub const QC_WANT_PREFIX: &str = "QC_WANT:";
 pub const QC_CERT_PREFIX: &str = "QC_CERT:";
+
+/// G4 NI-4: the largest `QC_VOTE:` body parsed. A vote with every field at
+/// its longest is ~1.1 KB (`a_qc_vote_fits_its_cap_four_times`); the cap is
+/// a choice with room for longer chain ids.
+pub const QC_VOTE_MAX_BYTES: usize = 8 << 10;
 const QC_WANT_EVERY_TICKS: u64 = 4;
 /// RC-3: how long after `sys:genesis_time` a validator may take its first
 /// guard origin, and the clock skew allowed before it.
@@ -1753,6 +1758,10 @@ impl DagConsensus {
             return;
         }
         if let Some(content) = msg.strip_prefix("QC_VOTE:") {
+            // G4 NI-4: bounded before parsing (a vote is ~1.1 KB).
+            if content.len() > QC_VOTE_MAX_BYTES {
+                return;
+            }
             // QC Phase 3: a peer's partial finality vote for multi-party QC
             // aggregation. Verify + collect; aggregate a complete QC on quorum.
             self.handle_remote_qc_vote(content);

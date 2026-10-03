@@ -280,6 +280,72 @@ impl SessionWiring {
     }
 }
 
+/// NI-2: inbound connections from peers no committee key names, all
+/// together (Aptos `MAX_INBOUND_CONNECTIONS` = 50, counting unknown peers
+/// only). Members are never counted.
+pub const MAX_NON_MEMBER_INBOUND: usize = 50;
+
+/// NI-3: consensus messages a member may send a second, and in a burst.
+/// A member sends at most a vertex, a certificate and one attestation per
+/// author each round: R = MAX_COMMITTEE + 2 = 258 at the 256-member cap,
+/// at most one round per 3 s tick (~86 a second). The burst is 4R and the
+/// rate 400 a second (4.6x the average): a choice that leaves room for pull
+/// traffic.
+pub const MEMBER_MSG_BURST: f64 = 4.0 * (blockchain::committee::MAX_COMMITTEE as f64 + 2.0);
+pub const MEMBER_MSGS_PER_SEC: f64 = 400.0;
+
+/// NI-3: sync requests a session may send (Lighthouse's quota for
+/// blocks-by-range: 128 per 10 s).
+pub const SYNC_REQUESTS_PER_SEC: f64 = 12.8;
+pub const SYNC_REQUEST_BURST: f64 = 128.0;
+
+/// NI-3: a token bucket per key, `rate` tokens a second up to `burst`.
+/// Spending past it only drops the message; nothing is banned (a key that
+/// relays others' traffic must not be punished for it).
+#[derive(Debug)]
+pub struct Budget<K> {
+    rate: f64,
+    burst: f64,
+    buckets: HashMap<K, (f64, std::time::Instant)>,
+}
+
+/// Keys a budget remembers before it forgets the idle ones; an attacker
+/// chooses its PeerIds, so the map must stay bounded.
+const BUDGET_KEYS: usize = 10_000;
+
+impl<K: std::hash::Hash + Eq + Clone> Budget<K> {
+    pub fn new(rate: f64, burst: f64) -> Self {
+        Self {
+            rate,
+            burst,
+            buckets: HashMap::new(),
+        }
+    }
+
+    /// Spend one token of `key` at `now`; false when its bucket is empty.
+    pub fn spend(&mut self, key: &K, now: std::time::Instant) -> bool {
+        if self.buckets.len() >= BUDGET_KEYS && !self.buckets.contains_key(key) {
+            let (rate, burst) = (self.rate, self.burst);
+            // A bucket idle long enough is full again: forgetting it is exact.
+            self.buckets.retain(|_, (tokens, at)| {
+                *tokens + now.duration_since(*at).as_secs_f64() * rate < burst
+            });
+            if self.buckets.len() >= BUDGET_KEYS {
+                return false;
+            }
+        }
+        let (tokens, at) = self.buckets.entry(key.clone()).or_insert((self.burst, now));
+        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * self.rate).min(self.burst);
+        *at = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// The request-response behaviour of `/aincore/sync/1`.
 pub fn sync_behaviour() -> request_response::Behaviour<FramedCodec> {
     request_response::Behaviour::with_codec(
@@ -375,6 +441,35 @@ mod tests {
             assert!(!admit_gossip(&book, None, wire), "{wire}");
         }
         assert!(admit_gossip(&book, Some(&stranger), "TX:{}"));
+    }
+
+    /// NI-3: a budget spends its burst, refuses past it, refills at its
+    /// rate, keeps keys apart, and stays bounded however many keys come.
+    #[test]
+    fn a_budget_refills_at_its_rate_and_stays_bounded() {
+        let t0 = std::time::Instant::now();
+        let mut b: Budget<u32> = Budget::new(10.0, 5.0);
+        assert!((0..5).all(|_| b.spend(&1, t0)), "the burst");
+        assert!(!b.spend(&1, t0), "past the burst");
+        assert!(b.spend(&2, t0), "another key has its own bucket");
+        let later = t0 + std::time::Duration::from_millis(200);
+        assert!(b.spend(&1, later) && b.spend(&1, later), "0.2 s at 10/s");
+        assert!(!b.spend(&1, later));
+        // Bounded: a flood of fresh keys never grows the map past the cap.
+        let mut b: Budget<u64> = Budget::new(1.0, 1.0);
+        for k in 0..(BUDGET_KEYS as u64 + 500) {
+            b.spend(&k, t0);
+        }
+        assert!(b.buckets.len() <= BUDGET_KEYS);
+    }
+
+    /// The member budget is above an honest member's burst at the largest
+    /// committee: a vertex, a certificate and an attestation per author.
+    #[test]
+    fn the_member_budget_covers_an_honest_round() {
+        let round = (blockchain::committee::MAX_COMMITTEE + 2) as f64;
+        assert!(MEMBER_MSG_BURST >= 4.0 * round);
+        assert!(MEMBER_MSGS_PER_SEC >= 4.0 * round / 3.0);
     }
 
     /// W9: a frame over the cap is refused after its 4-byte length, before
