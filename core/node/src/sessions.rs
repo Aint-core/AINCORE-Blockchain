@@ -120,11 +120,29 @@ impl PeerBook {
 /// carries between members.
 pub const CONSENSUS_PREFIXES: &[&str] = &["DAG_V4:", "QC_VOTE:", "QC_WANT:", "QC_CERT:"];
 
-/// What only a member may publish: vertices, attestations, certificates and
-/// finality votes. A boundary QC and the request for one stay open to any
-/// publisher: an observer asks for the QC that activates the next epoch,
-/// the QC verifies itself against the committee, and answers are throttled.
-pub const MEMBER_ONLY_PREFIXES: &[&str] = &["DAG_V4:", "QC_VOTE:"];
+/// What only a member may publish on gossip: every consensus message.
+/// B25: gossip runs between members; an observer asks for a boundary QC
+/// over sync (`QC_WANT:` as a sync request, answered `QC_CERT:`).
+pub const MEMBER_ONLY_PREFIXES: &[&str] = CONSENSUS_PREFIXES;
+
+/// B25: gossip runs between committee members only. A non-member's
+/// application score is twice Lighthouse's graylist threshold, so gossipsub
+/// neither meshes with it, publishes or gossips to it, nor processes what
+/// it sends (gossipsub 0.47 queues without bound toward a peer that stops
+/// reading; non-members could join the mesh). Observers follow over sync:
+/// blocks with their QCs, and boundary QCs asked of members
+/// (`QC_WANT:` as a sync request).
+pub const NON_MEMBER_APP_SCORE: f64 = -32_000.0;
+
+/// B25: set `peer`'s gossip application score from the committee book.
+pub fn score_peer(gossip: &mut libp2p::gossipsub::Behaviour, book: &PeerBook, peer: &PeerId) {
+    let score = if book.member_of(peer).is_some() {
+        0.0
+    } else {
+        NON_MEMBER_APP_SCORE
+    };
+    gossip.set_application_score(peer, score);
+}
 
 pub fn is_consensus_message(wire: &str) -> bool {
     CONSENSUS_PREFIXES.iter().any(|p| wire.starts_with(p))
@@ -753,29 +771,27 @@ const GOSSIP_CAPS: &[(&str, usize)] = &[
     (consensus::v4::WIRE_PREFIX, consensus::v4::MAX_WIRE_BYTES),
     ("QC_VOTE:", consensus::dag::QC_VOTE_MAX_BYTES),
     (consensus::dag::QC_WANT_PREFIX, 64),
-    (consensus::dag::QC_CERT_PREFIX, CONSENSUS_REQUEST_CAP),
+    (
+        consensus::dag::QC_CERT_PREFIX,
+        consensus::dag::QC_CERT_MAX_BYTES + consensus::dag::QC_CERT_PREFIX.len(),
+    ),
 ];
 
-/// G4 S5 (NI-1): the verdict on a gossip message from `relay` (the peer
-/// that sent it) signed by `publisher`. A member-only message from a
-/// non-member is blamed on the relay only when the relay published it
-/// itself; relayed, it may be an honest view difference.
-pub fn judge_gossip(
-    book: &PeerBook,
-    publisher: Option<&PeerId>,
-    relay: &PeerId,
-    wire: &str,
-) -> GossipVerdict {
+/// G4 S5 (NI-1): the verdict on a gossip message signed by `publisher`.
+/// B32: only what no honest node sends is blamed (over its type's cap). A
+/// prefix this node does not know may be a newer version's, and a publisher
+/// it does not know as a member may be one its book has not caught up with
+/// (an epoch boundary): both are dropped without blame. (Non-members' own
+/// gossip never gets here: they are scored below the graylist, B25.)
+pub fn judge_gossip(book: &PeerBook, publisher: Option<&PeerId>, wire: &str) -> GossipVerdict {
     let Some(&(_, cap)) = GOSSIP_CAPS.iter().find(|(p, _)| wire.starts_with(p)) else {
-        return GossipVerdict::Reject;
+        return GossipVerdict::Ignore;
     };
     if wire.len() > cap {
         return GossipVerdict::Reject;
     }
     if admit_gossip(book, publisher, wire) {
         GossipVerdict::Accept
-    } else if publisher.is_none_or(|p| p == relay) {
-        GossipVerdict::Reject
     } else {
         GossipVerdict::Ignore
     }
@@ -973,14 +989,10 @@ mod tests {
         let book = PeerBook::new(0, &[&[a]]);
         let member = local_keypair(&sa).public().to_peer_id();
         let stranger = local_keypair(&[9; 32]).public().to_peer_id();
-        for wire in ["DAG_V4:{}", "QC_VOTE:{}"] {
+        for wire in ["DAG_V4:{}", "QC_VOTE:{}", "QC_WANT:7", "QC_CERT:{}"] {
             assert!(admit_gossip(&book, Some(&member), wire), "{wire}");
             assert!(!admit_gossip(&book, Some(&stranger), wire), "{wire}");
             assert!(!admit_gossip(&book, None, wire), "{wire}");
-        }
-        // An observer asks for and is answered a self-verifying boundary QC.
-        for wire in ["QC_WANT:7", "QC_CERT:{}"] {
-            assert!(admit_gossip(&book, Some(&stranger), wire), "{wire}");
         }
     }
 
@@ -1197,12 +1209,11 @@ mod tests {
             .any(|s| matches!(s, Seen::Refused(p) if *p == *stranger.local_peer_id())));
     }
 
-    /// G4 S5: what a received gossip message gets. Accepted: a member's
-    /// consensus message, and a boundary QC request or answer from anyone.
-    /// Rejected (blamed on the sender): what no node gossips (transactions
-    /// included, B21), anything over its type's cap, and a member-only
-    /// message its non-member sender published itself. Ignored: the same
-    /// message relayed by another peer, whose view may differ.
+    /// G4 S5 / B32: what a received gossip message gets. Accepted: a
+    /// member's consensus message. Rejected (blamed): only what is over its
+    /// type's cap. Ignored without blame: a publisher this node does not
+    /// know as a member (its book may lag an epoch), no publisher, and a
+    /// prefix it does not know (a newer version's, or transactions, B21).
     #[test]
     fn every_gossip_message_gets_the_node_rules_verdict() {
         use GossipVerdict::*;
@@ -1210,36 +1221,26 @@ mod tests {
         let book = PeerBook::new(0, &[&[a]]);
         let member = local_keypair(&sa).public().to_peer_id();
         let stranger = local_keypair(&[9; 32]).public().to_peer_id();
-        let relay = local_keypair(&[5; 32]).public().to_peer_id();
-        for wire in ["DAG_V4:{}", "QC_VOTE:{}"] {
-            assert_eq!(judge_gossip(&book, Some(&member), &relay, wire), Accept);
-            assert_eq!(judge_gossip(&book, Some(&member), &member, wire), Accept);
-            assert_eq!(
-                judge_gossip(&book, Some(&stranger), &stranger, wire),
-                Reject
-            );
-            assert_eq!(judge_gossip(&book, None, &stranger, wire), Reject);
-            assert_eq!(judge_gossip(&book, Some(&stranger), &relay, wire), Ignore);
-        }
-        for wire in ["QC_WANT:7", "QC_CERT:{}"] {
-            assert_eq!(
-                judge_gossip(&book, Some(&stranger), &stranger, wire),
-                Accept
-            );
+        for wire in ["DAG_V4:{}", "QC_VOTE:{}", "QC_WANT:7", "QC_CERT:{}"] {
+            assert_eq!(judge_gossip(&book, Some(&member), wire), Accept, "{wire}");
+            assert_eq!(judge_gossip(&book, Some(&stranger), wire), Ignore, "{wire}");
+            assert_eq!(judge_gossip(&book, None, wire), Ignore, "{wire}");
         }
         for wire in ["TX:{}", "{}", "DAG_VERTEX:{}", "HELLO", ""] {
-            assert_eq!(
-                judge_gossip(&book, Some(&member), &member, wire),
-                Reject,
-                "{wire}"
-            );
+            assert_eq!(judge_gossip(&book, Some(&member), wire), Ignore, "{wire}");
         }
         let vote = format!("QC_VOTE:{}", "x".repeat(consensus::dag::QC_VOTE_MAX_BYTES));
-        assert_eq!(judge_gossip(&book, Some(&member), &member, &vote), Reject);
+        assert_eq!(judge_gossip(&book, Some(&member), &vote), Reject);
         let want = format!("QC_WANT:{}", "9".repeat(64));
+        assert_eq!(judge_gossip(&book, Some(&member), &want), Reject);
+        let cert = format!(
+            "QC_CERT:{}",
+            "x".repeat(consensus::dag::QC_CERT_MAX_BYTES + 1)
+        );
         assert_eq!(
-            judge_gossip(&book, Some(&stranger), &stranger, &want),
-            Reject
+            judge_gossip(&book, Some(&member), &cert),
+            Reject,
+            "B26: 64 KiB"
         );
     }
 
@@ -1296,6 +1297,9 @@ mod tests {
         ev: SwarmEvent<libp2p::gossipsub::Event>,
     ) -> Option<String> {
         use libp2p::gossipsub::{Event, MessageAcceptance};
+        if let SwarmEvent::ConnectionEstablished { peer_id, .. } = &ev {
+            score_peer(swarm.behaviour_mut(), book, peer_id);
+        }
         let SwarmEvent::Behaviour(Event::Message {
             propagation_source,
             message_id,
@@ -1305,12 +1309,11 @@ mod tests {
             return None;
         };
         let wire = String::from_utf8_lossy(&message.data).into_owned();
-        let acceptance =
-            match judge_gossip(book, message.source.as_ref(), &propagation_source, &wire) {
-                GossipVerdict::Accept => MessageAcceptance::Accept,
-                GossipVerdict::Reject => MessageAcceptance::Reject,
-                GossipVerdict::Ignore => MessageAcceptance::Ignore,
-            };
+        let acceptance = match judge_gossip(book, message.source.as_ref(), &wire) {
+            GossipVerdict::Accept => MessageAcceptance::Accept,
+            GossipVerdict::Reject => MessageAcceptance::Reject,
+            GossipVerdict::Ignore => MessageAcceptance::Ignore,
+        };
         let _ = swarm.behaviour_mut().report_message_validation_result(
             &message_id,
             &propagation_source,
@@ -1319,44 +1322,51 @@ mod tests {
         Some(wire)
     }
 
-    /// G4 S5 witness: a stranger next to an honest relay cannot reach the
-    /// relay's other peers with consensus gossip or junk, while a member's
-    /// message crosses the same relay; and the stranger's invalid messages
-    /// drive its score at the relay below the graylist. Without
-    /// `validate_messages` the relay forwards before judging and the
-    /// observer hears the stranger.
+    /// G4 S5 / B25 witness, four in-memory swarms: members M, R, C, with M
+    /// and C reaching each other only through R, and a stranger S next to
+    /// R. M's message crosses R to C (the positive control); S hears
+    /// nothing (non-members get no gossip, so no queue toward them can
+    /// grow); C hears nothing of S's (R processes nothing a graylisted
+    /// peer sends); R holds S below the graylist. With non-members scored
+    /// like members, S joins the mesh and hears M.
     #[tokio::test]
-    async fn a_relay_forwards_what_the_node_accepts_and_scores_the_rest() {
+    async fn gossip_runs_between_members_only() {
         let (m_info, m_secret) = member(1);
-        let book = PeerBook::new(0, &[&[m_info]]);
-        let mut relay = gossip_swarm(&local_keypair(&[5; 32]));
+        let (r_info, r_secret) = member(2);
+        let (c_info, c_secret) = member(3);
+        let book = PeerBook::new(0, &[&[m_info, r_info, c_info]]);
+        let mut relay = gossip_swarm(&local_keypair(&r_secret));
         let mut member_node = gossip_swarm(&local_keypair(&m_secret));
+        let mut receiver = gossip_swarm(&local_keypair(&c_secret));
         let mut stranger = gossip_swarm(&local_keypair(&[9; 32]));
-        let mut observer = gossip_swarm(&local_keypair(&[6; 32]));
         let addr: Multiaddr = format!("/memory/{}", rand::random::<u64>() | 1)
             .parse()
             .unwrap();
         relay.listen_on(addr.clone()).unwrap();
-        for s in [&mut member_node, &mut stranger, &mut observer] {
+        for s in [&mut member_node, &mut receiver, &mut stranger] {
             s.dial(addr.clone()).unwrap();
         }
         let stranger_id = *stranger.local_peer_id();
         let topic = libp2p::gossipsub::IdentTopic::new(GOSSIP_TOPIC);
-        let (mut heard, mut sent_member, mut sent_stranger) = (Vec::new(), false, 0usize);
+        let (mut heard, mut stranger_heard) = (Vec::new(), Vec::new());
+        let (mut sent_member, mut sent_stranger) = (false, 0usize);
         let start = tokio::time::Instant::now();
         let mut tick = tokio::time::interval(Duration::from_millis(100));
-        while start.elapsed() < Duration::from_secs(20) {
+        while start.elapsed() < Duration::from_secs(12) {
             tokio::select! {
                 ev = relay.select_next_some() => { on_gossip(&mut relay, &book, ev); }
                 ev = member_node.select_next_some() => { on_gossip(&mut member_node, &book, ev); }
-                ev = stranger.select_next_some() => { on_gossip(&mut stranger, &book, ev); }
-                ev = observer.select_next_some() => {
-                    if let Some(wire) = on_gossip(&mut observer, &book, ev) {
+                ev = stranger.select_next_some() => {
+                    if let Some(wire) = on_gossip(&mut stranger, &book, ev) {
+                        stranger_heard.push(wire);
+                    }
+                }
+                ev = receiver.select_next_some() => {
+                    if let Some(wire) = on_gossip(&mut receiver, &book, ev) {
                         heard.push(wire);
                     }
                 }
                 _ = tick.tick() => {
-                    // Publish once the mesh had three heartbeats to form.
                     if start.elapsed() < Duration::from_secs(3) {
                         continue;
                     }
@@ -1367,17 +1377,12 @@ mod tests {
                             .is_ok();
                     }
                     if sent_stranger < 20 {
-                        let junk = if sent_stranger % 2 == 0 { "DAG_V4" } else { "TX" };
-                        let wire = format!("{junk}:stranger-{sent_stranger}");
+                        let wire = format!("DAG_V4:stranger-{sent_stranger}");
                         if stranger.behaviour_mut().publish(topic.clone(), wire.into_bytes()).is_ok() {
                             sent_stranger += 1;
                         }
                     }
-                    let score = relay.behaviour().peer_score(&stranger_id).unwrap_or(0.0);
-                    if heard.iter().any(|w| w == "DAG_V4:member")
-                        && sent_stranger == 20
-                        && score < gossip_score_thresholds().graylist_threshold
-                    {
+                    if heard.iter().any(|w| w == "DAG_V4:member") && start.elapsed() > Duration::from_secs(8) {
                         break;
                     }
                 }
@@ -1387,10 +1392,13 @@ mod tests {
             heard.iter().any(|w| w == "DAG_V4:member"),
             "positive control: the member's message crossed the relay: {heard:?}"
         );
-        assert_eq!(sent_stranger, 20, "the stranger published");
         assert!(
             !heard.iter().any(|w| w.contains("stranger")),
             "the relay forwarded the stranger: {heard:?}"
+        );
+        assert!(
+            stranger_heard.is_empty(),
+            "a non-member got gossip: {stranger_heard:?}"
         );
         let score = relay.behaviour().peer_score(&stranger_id).unwrap();
         assert!(

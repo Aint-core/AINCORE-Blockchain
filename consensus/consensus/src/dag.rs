@@ -28,6 +28,9 @@ pub const QC_CERT_PREFIX: &str = "QC_CERT:";
 /// its longest is ~1.1 KB (`a_qc_vote_fits_its_cap_four_times`); the cap is
 /// a choice with room for longer chain ids.
 pub const QC_VOTE_MAX_BYTES: usize = 8 << 10;
+/// The largest boundary QC answer (`QC_CERT:` body) taken (a QC of the
+/// largest committee is a few KiB).
+pub const QC_CERT_MAX_BYTES: usize = 64 << 10;
 const QC_WANT_EVERY_TICKS: u64 = 4;
 /// RC-3: how long after `sys:genesis_time` a validator may take its first
 /// guard origin, and the clock skew allowed before it.
@@ -633,7 +636,7 @@ impl DagConsensus {
     /// verifies under that block's committee and binds the block (IM-1), then
     /// the epoch step runs (it may activate).
     fn on_boundary_qc(&mut self, json: &str) {
-        if json.len() > 64 * 1024 {
+        if json.len() > QC_CERT_MAX_BYTES {
             return;
         }
         let Ok(qc) = serde_json::from_str::<crate::qc::QuorumCertificate>(json) else {

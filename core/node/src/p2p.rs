@@ -219,7 +219,9 @@ pub async fn start_p2p(
     }
 
     // === LiDAR DDoS Protection ===
-    let mut lidar_tracker: std::collections::HashMap<PeerId, (std::time::Instant, u32)> =
+    // B29: keyed by (relay, publisher): a relay replaying a member's old
+    // messages spends only its own share of that member's budget.
+    let mut lidar_tracker: std::collections::HashMap<(PeerId, PeerId), (std::time::Instant, u32)> =
         std::collections::HashMap::new();
 
     // GATE-HIGH: keying ONLY on the authenticated publisher removed the
@@ -264,6 +266,10 @@ pub async fn start_p2p(
         > = std::collections::HashMap::new();
         let (served_tx, mut served_rx) =
             mpsc::channel::<(request_response::InboundRequestId, Option<String>)>(64);
+        // B25: boundary-QC asks this node made over sync for itself; their
+        // answers go to the node like gossip.
+        let mut inbox_asks: std::collections::HashSet<request_response::OutboundRequestId> =
+            std::collections::HashSet::new();
         // G4 S6: sessions the node asked for by address, until they open.
         let mut pending_dials: std::collections::HashMap<
             libp2p::swarm::ConnectionId,
@@ -295,6 +301,23 @@ pub async fn start_p2p(
                     // G4 S1: a broadcast floods over gossip and is pushed on
                     // every connected member session; gossip alone drops a
                     // repeat of the same payload for a minute.
+                    // B25: gossip runs between members; a node outside the
+                    // committee asks members for a boundary QC over sync and
+                    // takes the answer as if it had been gossiped.
+                    Outbound::Broadcast(wire)
+                        if wire.starts_with(consensus::dag::QC_WANT_PREFIX)
+                            && book.read().is_ok_and(|b| b.member_of(&local_peer_id).is_none()) =>
+                    {
+                        let asked: Vec<PeerId> = members(&book)
+                            .into_iter()
+                            .filter(|p| swarm.is_connected(p))
+                            .take(2)
+                            .collect();
+                        for peer in asked {
+                            let id = swarm.behaviour_mut().sync.send_request(&peer, wire.clone());
+                            inbox_asks.insert(id);
+                        }
+                    }
                     Outbound::Broadcast(wire) => {
                         let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), wire.as_bytes());
                         if sessions::is_consensus_message(&wire) {
@@ -402,6 +425,13 @@ pub async fn start_p2p(
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(peer);
                     }
                     explicit = current;
+                    // B25: the book may have changed (an epoch): rescore.
+                    let connected: Vec<PeerId> = swarm.connected_peers().copied().collect();
+                    if let Ok(b) = book.read() {
+                        for peer in &connected {
+                            sessions::score_peer(&mut swarm.behaviour_mut().gossipsub, &b, peer);
+                        }
+                    }
                     // B22: bootnodes not reached yet (they may boot after us).
                     for addr in unresolved.due(std::time::Instant::now()) {
                         let _ = swarm.dial(DialOpts::unknown_peer_id().address(addr).build());
@@ -430,9 +460,10 @@ pub async fn start_p2p(
                         let within_budget = member
                             .as_ref()
                             .is_some_and(|m| member_budget.spend(m, std::time::Instant::now()));
-                        if within_budget && sessions::is_consensus_message(&request) {
+                        // B26: acknowledged only once queued; a push the full
+                        // inbox drops fails at its sender, which sends it again.
+                        if within_budget && sessions::is_consensus_message(&request) && inbox.push(request) {
                             let _ = swarm.behaviour_mut().consensus.send_response(channel, sessions::CONSENSUS_ACK.to_string());
-                            inbox.push(request);
                         } else {
                             drop(channel);
                         }
@@ -483,13 +514,18 @@ pub async fn start_p2p(
                         message: request_response::Message::Response { request_id, response },
                         ..
                     })) => {
-                        if let Some(reply) = pending_asks.remove(&request_id) {
+                        if inbox_asks.remove(&request_id) {
+                            if response.starts_with(consensus::dag::QC_CERT_PREFIX) {
+                                inbox.push(response);
+                            }
+                        } else if let Some(reply) = pending_asks.remove(&request_id) {
                             let _ = reply.send(Ok(response));
                         }
                     }
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Sync(request_response::Event::OutboundFailure {
                         request_id, error, ..
                     })) => {
+                        inbox_asks.remove(&request_id);
                         if let Some(reply) = pending_asks.remove(&request_id) {
                             let _ = reply.send(Err(error.to_string()));
                         }
@@ -599,7 +635,7 @@ pub async fn start_p2p(
                                 now.duration_since(*t) <= std::time::Duration::from_secs(1)
                             });
                         }
-                        let (last_time, count) = lidar_tracker.entry(publisher).or_insert((now, 0));
+                        let (last_time, count) = lidar_tracker.entry((peer_id, publisher)).or_insert((now, 0));
                         if now.duration_since(*last_time) > std::time::Duration::from_secs(1) {
                             *last_time = now;
                             *count = 0;
@@ -621,7 +657,7 @@ pub async fn start_p2p(
                         // NI-1: consensus gossip only from a member publisher;
                         // nothing a node never gossips (G4 S5).
                         book.read()
-                            .map(|b| sessions::judge_gossip(&b, message.source.as_ref(), &peer_id, wire))
+                            .map(|b| sessions::judge_gossip(&b, message.source.as_ref(), wire))
                             .unwrap_or(sessions::GossipVerdict::Ignore)
                         };
                         let acceptance = match verdict {
@@ -670,6 +706,10 @@ pub async fn start_p2p(
 
                         println!("🤝 Connection established with {:?}", peer_id);
                         if num_established.get() == 1 {
+                            // B25: gossip runs between members only.
+                            if let Ok(b) = book.read() {
+                                sessions::score_peer(&mut swarm.behaviour_mut().gossipsub, &b, &peer_id);
+                            }
                             let member = book
                                 .read()
                                 .ok()
