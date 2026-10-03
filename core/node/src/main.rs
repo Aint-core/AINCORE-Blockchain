@@ -1,7 +1,5 @@
 // === --- IMPORT FASE 1 --- ===
 use storage::StateDB;
-// use network::{start_server, handshake}; // start_server unused
-use network::handshake;
 // use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -19,7 +17,6 @@ use chain_sync::ChainSync;
 // === --- IMPORT FASE 5 (P2P Network) --- ===
 use node::genesis;
 use node::p2p::start_p2p;
-// use node::api; // Bypass library issue
 mod api_local;
 use api_local as api;
 
@@ -115,6 +112,18 @@ fn refuse_removed_snapshot_install(env: Option<String>) -> Result<(), String> {
                 .to_string(),
         ),
         _ => Ok(()),
+    }
+}
+
+/// G4 S6: `--peers` dialled the legacy TCP channel, which is gone.
+fn refuse_removed_legacy_peers(initial_peers: &[u16]) -> Result<(), String> {
+    if initial_peers.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "--peers {initial_peers:?} dialled the legacy TCP channel, removed in G4 S6: \
+             give the peers as --bootnodes"
+        ))
     }
 }
 
@@ -518,10 +527,7 @@ async fn main() {
         }
     }
 
-    let peers = Arc::new(Mutex::new(std::collections::HashMap::<String, u16>::new()));
-
     println!("🚀 AINCORE node {} running on port {}", node_id, port);
-    println!("🌐 Listening on TCP port {}", port);
 
     // === LOAD PERSISTED PEERS ===
     let saved_peer_addrs = storage.scan_peer_addrs();
@@ -606,8 +612,8 @@ async fn main() {
     );
     if !libp2p_bootnodes.is_empty() {
         println!("   - Example Libp2p: {}", libp2p_bootnodes[0]);
-        if let Some(first_legacy) = normalized_bootnodes.first() {
-            println!("   - Example Legacy: {}", first_legacy);
+        if let Some(first) = normalized_bootnodes.first() {
+            println!("   - Given as: {} (base port; libp2p dials base + 100)", first);
         }
     }
 
@@ -640,58 +646,11 @@ async fn main() {
         }
     };
 
-    // === HANDSHAKE KE PEERS (legacy - optional now) ===
-    let node_signing_key = Arc::new(signing_key.clone());
-
-    // CRITICAL FIX: Parse bootnodes to extract IP and port for legacy TCP handshake
-    if !normalized_bootnodes.is_empty() {
-        println!(
-            "🔗 Attempting legacy TCP handshake with {} bootnodes",
-            normalized_bootnodes.len()
-        );
-        for bootnode in &normalized_bootnodes {
-            // Parse bootnode address: /ip4/192.168.18.90/tcp/9000 or /dns4/example.com/tcp/9000
-            let parts: Vec<&str> = bootnode.split('/').collect();
-            if parts.len() >= 5 {
-                let ip_or_dns = parts[2]; // "192.168.18.90" or "example.com"
-                if let Ok(port) = parts[4].parse::<u16>() {
-                    println!("🔗 Trying legacy TCP handshake to {}:{}", ip_or_dns, port);
-                    handshake(
-                        &node_id,
-                        ip_or_dns,
-                        port,
-                        port,
-                        Arc::clone(&peers),
-                        Arc::clone(&storage),
-                        Arc::clone(&node_signing_key),
-                    );
-                    thread::sleep(Duration::from_millis(500));
-                }
-            }
-        }
-    }
-
-    if !initial_peers.is_empty() {
-        println!(
-            "🔗 Connecting to {} initial peers (legacy TCP): {:?}",
-            initial_peers.len(),
-            initial_peers
-        );
-        for peer_port in &initial_peers {
-            // FIXED: Now accepts peer_ip parameter (localhost for legacy peers)
-            handshake(
-                &node_id,
-                "127.0.0.1",
-                *peer_port,
-                port,
-                Arc::clone(&peers),
-                Arc::clone(&storage),
-                Arc::clone(&node_signing_key),
-            );
-            thread::sleep(Duration::from_millis(100));
-        }
-    } else if normalized_bootnodes.is_empty() {
-        println!("📍 No initial legacy peers provided.");
+    // G4 S6: the legacy TCP channel is gone. `--peers` dialled it; libp2p
+    // sessions come from `--bootnodes` (and identify, Kademlia, mDNS).
+    if let Err(e) = refuse_removed_legacy_peers(&initial_peers) {
+        eprintln!("❌ FATAL: {e}");
+        std::process::exit(1);
     }
 
     // === INISIALISASI MODUL INTI ===
@@ -820,7 +779,6 @@ async fn main() {
 
     let consensus = Arc::new(RwLock::new(DagConsensus::new(
         node_id.clone(),
-        Arc::clone(&peers),
         Arc::clone(&mempool),
         Arc::clone(&executor),
         Arc::clone(&storage),
@@ -829,15 +787,10 @@ async fn main() {
     )));
 
     let chain_sync = Arc::new(
-        ChainSync::new(
-            node_id.clone(),
-            port,
-            Arc::clone(&peers),
-            Arc::clone(&storage),
-        )
-        // G4 S1: block sync over the libp2p sessions, not a connection of
-        // its own.
-        .with_sessions(session_client.clone()),
+        ChainSync::new(node_id.clone(), Arc::clone(&storage))
+            // G4 S1: block sync over the libp2p sessions, not a connection of
+            // its own.
+            .with_sessions(session_client.clone()),
     );
 
     // G4 S6: the RPC counts the sessions the network task holds.
@@ -995,162 +948,6 @@ async fn main() {
                     if let Ok(mut guard) = node_consensus.write() {
                         guard.handle_message(&msg);
                     }
-                }
-            }
-        });
-    }
-
-    // === START TCP SERVER (legacy transport) ===
-    {
-        let node_peers = Arc::clone(&peers);
-        let node_storage = Arc::clone(&storage);
-        let node_consensus = Arc::clone(&consensus);
-        let node_chain_sync = Arc::clone(&chain_sync);
-        let server_node_id = node_id.clone();
-        let node_signing_key_server = Arc::clone(&node_signing_key);
-
-        tokio::spawn(async move {
-            network::start_server_with_peer(
-                port,
-                server_node_id,
-                node_peers,
-                Arc::clone(&node_storage),
-                node_signing_key_server,
-                move |msg: String, peer: std::net::IpAddr| -> Option<String> {
-                    println!("📨 [Server] Received msg: {:.50}...", msg);
-                    if msg.starts_with("TX:") {
-                        if let Ok(guard) = node_consensus.read() {
-                            if let Ok(mut mp) = guard.mempool.lock() {
-                                let tx_msg = msg.strip_prefix("TX:").unwrap_or(&msg).to_string();
-                                if let Err(reason) = mp.add_transaction(tx_msg) {
-                                    println!("❌ [P2P] Rejected transaction: {}", reason);
-                                }
-                            }
-                        }
-                        None
-                    } else if node::sessions::is_consensus_message(&msg) {
-                        // G4 S1: consensus travels on committee sessions and
-                        // gossip only. This channel cannot name its sender (each
-                        // message comes with a fresh ephemeral key), so it is
-                        // never heard here.
-                        None
-                    } else {
-                        // Single serving implementation: chain_sync owns GET_HEIGHT,
-                        // GET_FINALITY (with the quorum certificate), SYNC_REQ (blocks +
-                        // finality QC + prune_horizon), VERTEX_REQ (DAG vertex bodies by
-                        // hash) and the G3 S6 snapshot restore (STATE_ANCHOR_REQ,
-                        // STATE_CHUNK_REQ, STATE_VALUE_REQ), which budgets per
-                        // client IP. The returned response is sent back
-                        // over the same encrypted socket by network::start_server. Keeping
-                        // this here — instead of reimplementing it inline in the transport —
-                        // is what stops serving-side fixes from silently landing on dead code.
-                        node_chain_sync.serve_from(&msg, peer)
-                    }
-                },
-            )
-            .await;
-        });
-    }
-
-    // === PERSISTENT P2P MAINTENANCE (AUTO-RECONNECT) ===
-    {
-        let peers_clone_reconnect = Arc::clone(&peers);
-        let storage_clone_reconnect = Arc::clone(&storage);
-        let node_id_reconnect = node_id.clone();
-        // Use the NORMALIZED bootnodes (`/ip4/<ip>/tcp/<port>`): the reconnect loop
-        // parses each entry with `split('/')` expecting a multiaddr (parts>=5). The raw
-        // `bootnodes` list is `<ip>:<port>` → split('/') yields 1 part → every bootnode is
-        // silently skipped → the auto-reconnect NEVER re-handshakes. On a real multi-machine
-        // cluster the boot-time handshakes race (peer TCP servers not up yet) and fail, and
-        // with the reconnect dead the peer mesh never recovers → no quorum → no finality.
-        // (Localhost hides this: boot handshakes succeed instantly.)
-        let bootnodes_clone = normalized_bootnodes.clone();
-        let my_port = port;
-        let signing_key_reconnect = Arc::clone(&node_signing_key);
-        let shutdown_reconnect = Arc::clone(&shutdown);
-
-        tokio::spawn(async move {
-            println!("🛡️ P2P Maintenance Service started (Auto-Reconnect every 15s)");
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-                if shutdown_reconnect.load(Ordering::SeqCst) {
-                    break;
-                }
-
-                // 1. Reconnect to Bootnodes
-                for bootnode_str in &bootnodes_clone {
-                    if shutdown_reconnect.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let parts: Vec<&str> = bootnode_str.split('/').collect();
-                    if parts.len() >= 5 {
-                        let ip = parts[2];
-                        let port_str = parts[4];
-                        if let Ok(p) = port_str.parse::<u16>() {
-                            if p != my_port {
-                                network::handshake(
-                                    &node_id_reconnect,
-                                    ip,
-                                    p,
-                                    my_port,
-                                    Arc::clone(&peers_clone_reconnect),
-                                    Arc::clone(&storage_clone_reconnect),
-                                    Arc::clone(&signing_key_reconnect),
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // 2. Reconnect to Saved Peers (from Storage)
-                // FIXED: Use scan_peers() which stores valid (peer_id, port) pairs,
-                // NOT scan_peer_addrs() which stores libp2p multiaddrs with ephemeral ports
-                let saved_peers = storage_clone_reconnect.scan_peers();
-                for (peer_id, peer_port) in saved_peers {
-                    if shutdown_reconnect.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    if peer_port == 0 || peer_port == my_port {
-                        continue;
-                    }
-                    // B2: only an address a session recorded; a peer seen
-                    // only behind a Docker bridge has none and dials us.
-                    let Some(ip) = storage_clone_reconnect.get_peer_ip(&peer_id) else {
-                        continue;
-                    };
-                    // Peer hygiene: a saved peer whose IP is an ephemeral
-                    // Docker-bridge address (172.16–31.x — e.g. the 172.23.0.1
-                    // gateway left behind by a stopped sibling container / old
-                    // lineage) is never a reachable node. Prune it instead of
-                    // re-handshaking it every 15s (which spams timeout noise).
-                    // Consistent with the boot-time skip already applied to
-                    // peer_addr entries.
-                    if is_docker_bridge_host(&ip) {
-                        match storage_clone_reconnect.remove_peer(&peer_id) {
-                            Ok(()) => {
-                                println!(
-                                    "🧹 Pruned stale Docker-bridge peer {} ({}:{})",
-                                    peer_id, ip, peer_port
-                                );
-                                if let Ok(mut p) = peers_clone_reconnect.lock() {
-                                    p.remove(&peer_id);
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("⚠️ Failed to prune stale peer {}: {}", peer_id, e)
-                            }
-                        }
-                        continue;
-                    }
-                    network::handshake(
-                        &node_id_reconnect,
-                        &ip,
-                        peer_port,
-                        my_port,
-                        Arc::clone(&peers_clone_reconnect),
-                        Arc::clone(&storage_clone_reconnect),
-                        Arc::clone(&signing_key_reconnect),
-                    );
                 }
             }
         });
@@ -1318,7 +1115,7 @@ async fn main() {
         // DA Batch creation is triggered automatically by Consensus.
 
         // Update Metrics
-        let peer_count = if let Ok(p) = peers.lock() { p.len() } else { 0 };
+        let peer_count = session_table.read().map(|t| t.len()).unwrap_or(0);
         node::metrics::PEER_COUNT.set(peer_count as i64);
 
         if let Ok(Some(height_str)) = storage.get("latest_height") {

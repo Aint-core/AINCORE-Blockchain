@@ -240,7 +240,7 @@ pub async fn start_p2p(
         }
     }
 
-    // === Listen on configured libp2p port (port + 100 to avoid conflict with legacy TCP) ===
+    // === Listen on the libp2p port: base port + 100 (the operators' bootnode convention) ===
     //
     // Lightweight observer nodes (e.g. Raspberry Pi) can run outbound-only by
     // setting AINCORE_P2P_LISTEN=0. They still dial bootnodes and receive

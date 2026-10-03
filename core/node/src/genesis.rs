@@ -3537,13 +3537,11 @@ mod tests {
             "the launch time is not bound by the identity"
         );
         let key = [50u8; 32];
-        let node_id = crypto::derive_address(
-            SigningKey::from_bytes(&key).verifying_key().as_bytes(),
-        )
-        .unwrap();
+        let node_id =
+            crypto::derive_address(SigningKey::from_bytes(&key).verifying_key().as_bytes())
+                .unwrap();
         let c = consensus::dag::DagConsensus::new(
             node_id,
-            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             Arc::new(std::sync::Mutex::new(mempool::Mempool::new())),
             Arc::new(executor::Executor::new(Arc::clone(&db2))),
             Arc::clone(&db2),

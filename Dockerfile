@@ -36,8 +36,8 @@ COPY --from=builder /usr/src/aincore/core/vm_move/stdlib/bytecode /root/.aincore
 # Copy the Genesis configuration
 COPY --from=builder /usr/src/aincore/genesis.json /root/.aincore/genesis.json
 
-# Expose P2P, API, and Indexer ports
-EXPOSE 9002 8002 3001
+# Expose libp2p (base port 9002 + 100), API, and Indexer ports
+EXPOSE 9102 8002 3001
 
 # Default command
 CMD ["node", "--port", "9002"]

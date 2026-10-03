@@ -1,5 +1,4 @@
 use blockchain::Block;
-use network::{read_encrypted_msg, secure_connect, send_encrypted_msg};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -53,25 +52,22 @@ pub const MAX_VERTEX_RESP_BYTES: usize = 900 * 1024;
 
 /// AUDIT H8 — serving budget for VERTEX_REQ.
 ///
-/// `handle_vertex_request` runs on the tokio worker that owns the requesting
-/// peer's connection (`network::start_server` spawns one task per connection and
-/// calls the node handler inline), and RocksDB point lookups are BLOCKING. Those
-/// same workers drive gossip ingress and the block pipeline, so unbounded serving
-/// converts one peer's request rate directly into consensus latency.
+/// `handle_vertex_request` runs on the node's sync-serving task (at most eight
+/// requests at once, `core/node/src/main.rs`), and RocksDB point lookups are
+/// BLOCKING. Those same workers drive gossip ingress and the block pipeline, so
+/// unbounded serving converts one peer's request rate directly into consensus
+/// latency.
 ///
-/// The transport bounds connections (100 node-wide, `AINCORE_MAX_CONN_PER_IP`
-/// — default 60 — per source IP) and messages (100/s per connection). Those still
-/// admit `conns * 100 * MAX_VERTEX_REQ_HASHES` lookups/s from a single IP. The
-/// three bounds below cap what reaches storage regardless of what the transport
-/// admits.
+/// The session layer bounds sessions (50 non-member inbound) and requests per
+/// session (`node::sessions::SYNC_REQUESTS_PER_SEC`, burst 128). Those still
+/// admit `sessions * rate * MAX_VERTEX_REQ_HASHES` lookups/s. The three bounds
+/// below cap what reaches storage regardless of what the session layer admits.
 ///
-/// NOT SOLVED, deliberately: the bucket is node-wide, not per-peer, so a spammer
-/// can starve honest peers of vertex service (it can no longer starve consensus,
-/// which is what H8 is about). Per-peer fairness is not achievable here —
-/// `VertexRequest::requester_id` is an unauthenticated attacker-chosen string, and
-/// the peer's real address is not plumbed to the handler (`start_server` passes
-/// `Fn(&str) -> Option<String>`). Keying on `requester_id` would look like a
-/// control and be bypassed by varying one field.
+/// The bucket is node-wide, not per-peer, so a spammer can take the vertex
+/// service's share from honest peers (it can no longer starve consensus,
+/// which is what H8 is about). `VertexRequest::requester_id` is an
+/// unauthenticated string and is never a key; the session's authenticated key
+/// is what a per-peer split would use.
 ///
 /// Vertex lookups served per second, node-wide.
 pub const VERTEX_SERVE_LOOKUPS_PER_SEC: f64 = 512.0;
@@ -202,8 +198,6 @@ pub struct FinalityArtifact {
 
 pub struct ChainSync {
     node_id: String,
-    my_port: u16,
-    peers: Arc<Mutex<HashMap<String, u16>>>,
     storage: Arc<StateDB>,
     /// AUDIT H8: bounds what VERTEX_REQ can push through blocking RocksDB reads
     /// on the tokio workers shared with consensus. See `VertexServeBudget`.
@@ -219,8 +213,9 @@ pub struct ChainSync {
     /// Block retention (`StateDB::block_pruning_policy_from_env`), read once.
     /// Imported blocks prune under it like built ones (G3 GC-1).
     retention: Option<(u64, u64)>,
-    /// G4 S1: the sessions the network task holds. When set, sync talks to
-    /// peers over them only; the legacy channel is the fallback until S6.
+    /// G4 S1: the sessions the network task holds; sync talks to peers over
+    /// them only (the legacy TCP channel is gone, S6). None in tests that
+    /// only serve.
     sessions: Option<network::SessionClient>,
     #[cfg(test)]
     before_execution_hook: Option<fn(&StateDB)>,
@@ -234,15 +229,11 @@ const SYNC_ASK_TIMEOUT: Duration = Duration::from_secs(60);
 pub const SYNC_RESP_BLOCK_BYTES: usize = 8 << 20;
 
 /// The peer a sync client talks to: a session the network task holds (G4
-/// S1), or the legacy encrypted stream (until S6 retires it).
+/// S1).
 enum SyncLink {
     Session {
         client: network::SessionClient,
         peer: String,
-    },
-    Legacy {
-        stream: tokio::net::TcpStream,
-        key: [u8; 32],
     },
 }
 
@@ -250,29 +241,14 @@ impl SyncLink {
     async fn ask(&mut self, msg: &str) -> Result<String, String> {
         match self {
             Self::Session { client, peer } => client.ask(peer, msg, SYNC_ASK_TIMEOUT).await,
-            Self::Legacy { stream, key } => {
-                send_encrypted_msg(stream, key, msg)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                read_encrypted_msg(stream, key)
-                    .await
-                    .map_err(|e| e.to_string())
-            }
         }
     }
 }
 
 impl ChainSync {
-    pub fn new(
-        node_id: String,
-        my_port: u16,
-        peers: Arc<Mutex<HashMap<String, u16>>>,
-        storage: Arc<StateDB>,
-    ) -> Self {
+    pub fn new(node_id: String, storage: Arc<StateDB>) -> Self {
         Self {
             node_id,
-            my_port,
-            peers,
             storage,
             serve_budget: VertexServeBudget::default(),
             state_budget: state_sync::StateBudget::default(),
@@ -393,29 +369,6 @@ impl ChainSync {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(1)
             .max(1)
-    }
-
-    /// TASK-#29 (pure, unit-testable): order peers so trusted seed/validator peers
-    /// are tried FIRST, then everyone else. HashMap iteration order is arbitrary;
-    /// seeding the sync from a validator peer (the trusted fallback-seed set) before
-    /// an unknown peer reduces the chance of being fed a bogus tip by a random peer.
-    ///
-    /// Ordering within each group, and the relative order of the two groups, is
-    /// stable/deterministic: peers are sorted by id, seeds (those whose id is in
-    /// `seed_set`) first. This keeps the iteration reproducible across nodes.
-    fn order_peers_seed_first(
-        peers: &HashMap<String, u16>,
-        seed_set: &[String],
-    ) -> Vec<(String, u16)> {
-        let is_seed = |id: &str| seed_set.iter().any(|s| s == id);
-        let mut ordered: Vec<(String, u16)> =
-            peers.iter().map(|(id, p)| (id.clone(), *p)).collect();
-        // Sort: seeds before non-seeds; then by peer id for determinism.
-        ordered.sort_by(|a, b| {
-            let (a_seed, b_seed) = (is_seed(&a.0), is_seed(&b.0));
-            b_seed.cmp(&a_seed).then_with(|| a.0.cmp(&b.0))
-        });
-        ordered
     }
 
     /// TASK-#29 (pure, unit-testable): decide whether a set of seed-advertised
@@ -743,10 +696,10 @@ impl ChainSync {
         Ok(())
     }
 
-    /// Unified Sync: Uses Persistent Encrypted Connection
+    /// Sync over the network sessions (G4 S1).
     /// Returns the final synced height (0 if no sync happened)
     pub async fn sync_from_peers(&self) -> u64 {
-        println!("🔄 [ChainSync] Starting Encrypted P2P Sync...");
+        println!("🔄 [ChainSync] Starting sync over network sessions...");
 
         // Audit #3: a prior state-root divergence must ACTUALLY stop syncing —
         // otherwise the node loops, re-executing onto already-divergent state.
@@ -762,101 +715,13 @@ impl ChainSync {
             return self.get_local_height();
         }
 
-        if let Some(client) = self.sessions.clone() {
-            return self.sync_over_sessions(&client).await;
-        }
-
-        let peers_map = self.peers.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if peers_map.is_empty() {
-            println!("📡 [ChainSync] No peers available.");
-            return 0;
-        }
-
-        let my_height = self.get_local_height();
-        println!("📊 [ChainSync] Local Height: {}", my_height);
-        let mut final_height = my_height;
-
-        // TASK-#29 (1) SEED PREFERENCE: the trusted fallback-seed set is the active
-        // validator set. Try seed/validator peers FIRST so the sync is anchored on a
-        // trusted source rather than whichever peer HashMap iteration happened to
-        // surface first.
-        let seed_set = self.active_validator_addresses();
-        let ordered_peers = Self::order_peers_seed_first(&peers_map, &seed_set);
-
-        // TASK-#29 (2) N-PEER TIP AGREEMENT: when configured to require more than one
-        // seed (sys:config:tip_agreement_n > 1), demand that >= N distinct seed peers
-        // advertise a CONSISTENT, individually-verifiable finalized tip before we sync
-        // past it. On disagreement we refuse to advance. This is an ADDITIONAL gate on
-        // top of the per-artifact QC crypto backstop in apply_finality_artifact — it is
-        // not a replacement for it.
-        let tip_n = self.tip_agreement_n();
-        if tip_n > 1 {
-            match self
-                .gather_and_check_seed_tips(&ordered_peers, &seed_set, tip_n)
-                .await
-            {
-                Ok((height, hash)) => {
-                    println!(
-                        "✅ [ChainSync] Tip agreement reached: {} seeds agree on finalized tip height={} hash={}",
-                        tip_n, height, hash
-                    );
-                }
-                Err(e) => {
-                    eprintln!("🚨 [SECURITY][TIP_DISAGREEMENT] {} — refusing to advance", e);
-                    return final_height;
-                }
+        match self.sessions.clone() {
+            Some(client) => self.sync_over_sessions(&client).await,
+            None => {
+                println!("📡 [ChainSync] No network sessions to sync over.");
+                self.get_local_height()
             }
         }
-
-        for (peer_id, peer_port) in ordered_peers.iter() {
-            let Some(peer_ip) = self.storage.get_peer_ip(peer_id) else {
-                // Inbound peers behind Docker/NAT are useful as live sessions, but
-                // their accepted socket source is not a routable sync target. Only
-                // outbound handshakes persist peer_ip; skip session-only peers here
-                // instead of trying 127.0.0.1:<peer_port> and spamming refused logs.
-                continue;
-            };
-
-            // Skip self-dials and bogus loopback entries. A stale peer record
-            // pointing at our own port (e.g. 127.0.0.1:<my_port>) just wastes a
-            // connect + handshake cycle and spams the log; it can never sync us.
-            let is_loopback = peer_ip == "127.0.0.1" || peer_ip == "localhost" || peer_ip == "::1";
-            if is_loopback && *peer_port == self.my_port {
-                continue;
-            }
-
-            println!(
-                "🌐 [ChainSync] Connecting to {} ({}:{})...",
-                peer_id, peer_ip, peer_port
-            );
-
-            // 1. Establish Secure Connection (With MitM Check)
-            use rand::rngs::OsRng;
-            let mut csprng = OsRng;
-            let ephemeral_signing_key = crypto::SigningKey::generate(&mut csprng);
-
-            match secure_connect(
-                &peer_ip,
-                *peer_port,
-                "__sync__",
-                self.my_port,
-                Some(peer_id),
-                &ephemeral_signing_key,
-            )
-            .await
-            {
-                Ok((stream, key, _peer_node_id)) => {
-                    println!("🔐 Secure Channel Established with {}", peer_id);
-                    let mut link = SyncLink::Legacy { stream, key };
-                    let reached = self.sync_over(&mut link, peer_id, my_height).await;
-                    final_height = final_height.max(reached);
-                }
-                Err(e) => {
-                    eprintln!("❌ Connection Failed to {}: {}", peer_id, e);
-                }
-            }
-        }
-        final_height
     }
 
     /// G4 S1: sync over the sessions the network task holds, committee
@@ -941,7 +806,7 @@ impl ChainSync {
                 let sync_req = SyncRequest {
                     from_height: current,
                     sender_id: self.node_id.clone(),
-                    sender_port: self.my_port,
+                    sender_port: 0,
                 };
                 let req_json = match serde_json::to_string(&sync_req) {
                     Ok(j) => j,
@@ -1046,91 +911,6 @@ impl ChainSync {
             Ok(()) => Some(qc),
             Err(_) => None,
         }
-    }
-
-    /// TASK-#29: fetch one peer's advertised finalized tip and return its QC iff the
-    /// QC is cryptographically verifiable against our trusted validator set for the
-    /// QC's epoch (the SAME crypto backstop used by apply_finality_artifact). A peer
-    /// that supplies no QC, an unverifiable QC, or no reachable channel contributes
-    /// nothing to tip agreement (returns None) — it cannot dilute the gate.
-    async fn fetch_verified_tip(
-        &self,
-        peer_id: &str,
-        peer_ip: &str,
-        peer_port: u16,
-    ) -> Option<consensus::qc::QuorumCertificate> {
-        use rand::rngs::OsRng;
-        let mut csprng = OsRng;
-        let ephemeral_signing_key = crypto::SigningKey::generate(&mut csprng);
-
-        let (mut stream, shared_key, _peer_node_id) = secure_connect(
-            peer_ip,
-            peer_port,
-            "__sync__",
-            self.my_port,
-            Some(peer_id),
-            &ephemeral_signing_key,
-        )
-        .await
-        .ok()?;
-
-        send_encrypted_msg(&mut stream, &shared_key, "GET_FINALITY")
-            .await
-            .ok()?;
-        let resp = read_encrypted_msg(&mut stream, &shared_key).await.ok()?;
-        let json = resp.strip_prefix("FINALITY:")?;
-        let artifact = serde_json::from_str::<FinalityArtifact>(json).ok()?;
-        let qc = artifact.qc?;
-
-        // Verify the QC against the trusted validator set for its epoch. Only a
-        // verifiable QC counts toward agreement (the crypto backstop is preserved).
-        let validators = self.trusted_validator_set(qc.epoch)?;
-        match consensus::qc::verify_qc(&qc, &validators, &consensus::qc::expected_chain_id()) {
-            Ok(()) => Some(qc),
-            Err(_) => None,
-        }
-    }
-
-    /// TASK-#29 (2): poll seed peers for their finalized tips and require >= `n`
-    /// distinct seed peers to advertise a CONSISTENT, individually-verifiable tip.
-    /// Returns the agreed `(block_height, block_hash)` or an `Err` the caller turns
-    /// into a `🚨 [SECURITY][TIP_DISAGREEMENT]` refusal. Only peers in `seed_set`
-    /// (the trusted validator set) are polled — a random peer cannot vote on the tip.
-    async fn gather_and_check_seed_tips(
-        &self,
-        ordered_peers: &[(String, u16)],
-        seed_set: &[String],
-        n: usize,
-    ) -> Result<(u64, String), String> {
-        let is_seed = |id: &str| seed_set.iter().any(|s| s == id);
-        let mut tips: Vec<consensus::qc::QuorumCertificate> = Vec::new();
-
-        for (peer_id, peer_port) in ordered_peers.iter() {
-            if !is_seed(peer_id) {
-                continue;
-            }
-            let Some(peer_ip) = self.storage.get_peer_ip(peer_id) else {
-                continue; // session-only peer without a routable IP
-            };
-            let is_loopback =
-                peer_ip == "127.0.0.1" || peer_ip == "localhost" || peer_ip == "::1";
-            if is_loopback && *peer_port == self.my_port {
-                continue; // self-dial
-            }
-            if let Some(qc) = self.fetch_verified_tip(peer_id, &peer_ip, *peer_port).await {
-                tips.push(qc);
-                // Enough verified tips collected to satisfy the gate even in the
-                // unanimous case — stop polling (no point hammering more seeds).
-                if tips.len() >= n {
-                    // Keep going only if we still might not agree; but a quick exit
-                    // once we have n verified tips is fine because the decision below
-                    // tolerates extra entries. Break to bound network work.
-                    break;
-                }
-            }
-        }
-
-        Self::tip_agreement_decision(&tips, n)
     }
 
     /// Process synced blocks — returns the final height reached
@@ -1503,7 +1283,7 @@ impl ChainSync {
         }
     }
 
-    /// The requests `handle_message` answers. The node's TCP handler routes
+    /// The requests `handle_message` answers. The node's session layer routes
     /// exactly these here, so a request type is added in one place.
     pub fn serves(msg: &str) -> bool {
         msg == "GET_HEIGHT"
@@ -1517,17 +1297,6 @@ impl ChainSync {
             ]
             .iter()
             .any(|prefix| msg.starts_with(prefix))
-    }
-
-    /// A request the node's TCP server received from `peer`: answered when
-    /// chain sync serves it (`serves`), snapshot serving budgeted by the
-    /// peer's IP.
-    pub fn serve_from(&self, msg: &str, peer: std::net::IpAddr) -> Option<String> {
-        if Self::serves(msg) {
-            self.handle_message_from(msg, Some(peer))
-        } else {
-            None
-        }
     }
 
     /// G4 S1/S6: a request a libp2p session sent: what `serves` lists
@@ -1555,19 +1324,12 @@ impl ChainSync {
         }
     }
 
-    /// Handle incoming encrypted message (called by Network Server Handler)
+    /// A request from an in-process caller (global limits only).
     pub fn handle_message(&self, msg: &str) -> Option<String> {
-        self.handle_message_from(msg, None)
+        self.handle_request(msg, None)
     }
 
-    /// `handle_message` for a request from `peer`, whose IP snapshot serving
-    /// budgets by. `None` is an in-process caller.
-    pub fn handle_message_from(&self, msg: &str, peer: Option<std::net::IpAddr>) -> Option<String> {
-        let client = peer.map(|ip| ip.to_string());
-        self.handle_request(msg, client.as_deref())
-    }
-
-    /// A request charged to `client` (a session's key or a legacy IP;
+    /// A request charged to `client` (the key a session authenticated;
     /// `None` is an in-process caller, global limits only).
     fn handle_request(&self, msg: &str, client: Option<&str>) -> Option<String> {
         // Handle Request Logic
@@ -1771,11 +1533,6 @@ impl ChainSync {
             }
         }
         hi
-    }
-
-    // Legacy Handler for compatibility if needed
-    pub fn handle_sync_response(&self, _resp: SyncResponse) {
-        // No-op in new pull model
     }
 }
 

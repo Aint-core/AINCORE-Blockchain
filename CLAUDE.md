@@ -14,11 +14,11 @@ Arsitektur: **Modular** — terinspirasi Narwhal/Tusk (DAG consensus) + Sui Move
 - **VM:** Move (via `move-vm-runtime`, bukan EVM)
 - **Consensus:** DAG-based (Bullshark-lite ordering)
 - **Storage:** RocksDB (via `common/storage`)
-- **Network:** libp2p (Gossipsub) + TCP fallback
+- **Network:** libp2p only (Noise + yamux, gossipsub, request-response sessions bound to node keys)
 - **Token:** AIN, cap 150 juta; emisi 1,90 %/tahun dari sisa cadangan menurut waktu konsensus (G5)
 - **Chain ID:** `AINCORE-MAINNET-1` (env: `AINCORE_CHAIN_ID`)
 - **API Port:** 8002 (default), `port - 1000` jika custom port
-- **P2P Port:** 9001 (default)
+- **P2P Port:** base 9001 (default); libp2p listens on base + 100
 
 ---
 
@@ -30,7 +30,7 @@ AINCORE-Blockchain/
 │   ├── crypto/          ← Semua primitif crypto (ED25519, STARK, BLS, ECDSA, MPC, VDF, ZKP)
 │   ├── config/          ← NodeConfig (port, datadir, bootnodes, peers)
 │   ├── keystore/        ← KeyManager: enkripsi/dekripsi keystore JSON
-│   ├── network/         ← TCP send_message, PeerList (Arc<Mutex<HashMap<String,u16>>>)
+│   ├── network/         ← tipe sesi: Outbound, SessionClient, SessionTable, SyncAsk/Dial/Serve
 │   └── storage/         ← StateDB (RocksDB), Object model, WAL hardened
 ├── consensus/
 │   ├── consensus/       ← DagConsensus + OrderingEngine (KRITIS: logika core)
@@ -186,13 +186,14 @@ max pending 5000 TX.
 
 ---
 
-## 🔗 Network Layer (common/network + core/node/p2p.rs)
+## 🔗 Network Layer (core/node/sessions.rs + core/node/p2p.rs; common/network = tipe saja)
 
-- **Libp2p:** Gossipsub untuk broadcast vertex (`DAG_VERTEX:{json}`)
-- **TCP fallback:** `send_message(addr, msg)` untuk legacy/sync nodes
-- **Peer IP resolution:** `storage.get_peer_ip(peer_id)` (default `127.0.0.1`)
-- **P2P channel:** `tokio::sync::mpsc::Sender<String>` di DagConsensus
-- **Message format:** `"DAG_VERTEX:{serialized_vertex}"`
+- **Satu-satunya jalur:** libp2p (base port + 100); PeerId = node key (G4 S1)
+- **`/aincore/consensus/1`:** members-only (committee E ∪ E+1, `PeerBook`); gossip DAG_V4/QC_VOTE hanya dari publisher anggota
+- **`/aincore/sync/1`:** terbuka untuk sesi mana pun, budget per sesi (`SyncDial`/`SyncAsk`/`SyncServe`)
+- **Legacy TCP DIHAPUS (G4 S6):** tidak ada `send_message`/`start_server`/`--peers`; witness `core/node/tests/g4_s6_no_legacy_transport.rs`
+- **Alamat peer:** hanya dari sesi terautentikasi atau `--bootnodes` (`peer_addr:` rows); tidak ada tebakan 127.0.0.1
+- **Channel consensus → network:** `tokio::sync::mpsc::Sender<network::Outbound>` (`Broadcast` / `To{address}`)
 
 ---
 
@@ -405,4 +406,4 @@ lalu koordinasi departemen yang tepat secara otomatis. User gak perlu tau detail
   - DAG checkpoint: stored via `storage.save_dag_checkpoint(round, json)`
   - Committed rounds: `consensus:committed_rounds`
   - Resource: `resource_{addr}_{StructTag}`
-  - Peer IP: stored via `storage.get_peer_ip(peer_id)`
+  - Peer address (libp2p dial book): `peer_addr:{peer_id}` via `storage.save_peer_addr`

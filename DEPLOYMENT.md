@@ -39,12 +39,16 @@ If you want Computer A and Computer B to talk to each other (form a network):
 2.  **Config**:
     *   **Computer A (Seed Node)**: Run as usual. Note its IP (e.g., `192.168.1.10`).
     *   **Computer B (Peer)**:
-        Edit `docker-compose.mainnet.yml` on Computer B.
-        Change the `AINCORE_PEERS` environment variable:
+        Edit `docker-compose.mainnet.yml` on Computer B and give Computer A
+        as a bootnode, by its base port (the node dials base port + 100,
+        where libp2p listens):
         ```yaml
-        environment:
-          - AINCORE_PEERS=192.168.1.10:9002  # IP of Computer A
+        command: [ "node", "--port", "9002", "--bootnodes", "/ip4/192.168.1.10/tcp/9002" ]
         ```
+        Use `/dns4/<hostname>/tcp/9002` for a hostname. Port 9102 must be
+        reachable on both computers. (`--peers` / `AINCORE_PEERS` dialled the
+        legacy TCP channel, removed in G4 S6; a node given `--peers` refuses
+        to start.)
 3.  **Start**: Run `docker compose up` on both. They will connect and sync blocks!
 
 ## Hardware Requirements (Minimum)

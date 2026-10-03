@@ -1,4 +1,3 @@
-pub mod api;
 pub mod genesis;
 pub mod p2p;
 pub mod qc_rpc;

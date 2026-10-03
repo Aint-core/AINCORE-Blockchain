@@ -21,8 +21,7 @@ services:
     container_name: aincore-validator
     restart: unless-stopped
     ports:
-      - "9102:9102"   # P2P Gossipsub
-      - "9002:9002"   # P2P Consensus
+      - "9102:9102"   # libp2p: consensus + sync sessions (base port + 100)
       - "8002:8002"   # REST API / RPC
     volumes:
       - ./nas_data:/root/.aincore/data
@@ -31,7 +30,6 @@ services:
       - AINCORE_PORT=9002
       - AINCORE_API_PORT=8002
       - AINCORE_GENESIS_PATH=/root/.aincore/genesis.json
-      - AINCORE_PEERS=
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     command: ["node", "--port", "9002", "--rpc-port", "8002", "--datadir", "/root/.aincore/data"]

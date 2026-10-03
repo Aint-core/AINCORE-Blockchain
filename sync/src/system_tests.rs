@@ -159,7 +159,6 @@ impl Sim {
         let (node_id, _, key) = keypair(node.seed);
         let mut c = DagConsensus::new(
             node_id.clone(),
-            Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(mempool::Mempool::new())),
             Arc::new(executor::Executor::new(Arc::clone(&db))),
             Arc::clone(&db),
@@ -169,12 +168,7 @@ impl Sim {
         c.set_now_secs(Arc::new(|| PINNED));
         c.placement_sleep = Arc::new(|_| {});
         c.v4_outbox = Some(Arc::new(Mutex::new(Vec::new())));
-        let sync = ChainSync::new(
-            node_id,
-            9000 + i as u16,
-            Arc::new(Mutex::new(HashMap::new())),
-            db,
-        );
+        let sync = ChainSync::new(node_id, db);
         self.nodes[i].c = Some(c);
         self.nodes[i].sync = Some(sync);
     }

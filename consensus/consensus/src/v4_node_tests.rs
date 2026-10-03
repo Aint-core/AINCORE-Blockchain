@@ -59,7 +59,6 @@ fn open_node(path: &str, seed: u8) -> DagConsensus {
     .unwrap();
     let mut c = DagConsensus::new(
         node_id,
-        Arc::new(Mutex::new(HashMap::new())),
         Arc::new(Mutex::new(Mempool::new())),
         Arc::new(Executor::new(Arc::clone(&db))),
         db,

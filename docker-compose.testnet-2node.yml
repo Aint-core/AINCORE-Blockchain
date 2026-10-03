@@ -10,8 +10,7 @@ services:
     container_name: aincore-testnet-1
     restart: always
     ports:
-      - "9000:9000" # Legacy TCP
-      - "9100:9100" # libp2p
+      - "9100:9100" # libp2p: consensus + sync sessions (base port + 100)
       - "8000:8000" # API/RPC
     volumes:
       - ./testnet_data_node1:/root/.aincore/data
@@ -30,7 +29,7 @@ services:
       - "/root/.aincore/data"
       - "--enable-mdns"
       - "--bootnodes"
-      - "/ip4/aincore-node-2/tcp/9001"
+      - "/dns4/aincore-node-2/tcp/9001"
     networks:
       - aincore-testnet
     depends_on:
@@ -45,8 +44,7 @@ services:
     container_name: aincore-testnet-2
     restart: always
     ports:
-      - "9001:9001" # Legacy TCP
-      - "9101:9101" # libp2p
+      - "9101:9101" # libp2p: consensus + sync sessions (base port + 100)
       - "8001:8001" # API/RPC
     volumes:
       - ./testnet_data_node2:/root/.aincore/data
@@ -65,7 +63,7 @@ services:
       - "/root/.aincore/data"
       - "--enable-mdns"
       - "--bootnodes"
-      - "/ip4/aincore-node-1/tcp/9000"
+      - "/dns4/aincore-node-1/tcp/9000"
     networks:
       - aincore-testnet
 

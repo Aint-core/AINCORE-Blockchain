@@ -4930,7 +4930,6 @@ dependencies = [
  "executor",
  "hex",
  "move-core-types",
- "network",
  "serde_json",
  "sha2 0.10.9",
  "storage",
@@ -5619,14 +5618,6 @@ dependencies = [
 name = "network"
 version = "0.1.0"
 dependencies = [
- "crypto",
- "ed25519-dalek",
- "hex",
- "once_cell",
- "rand 0.8.5",
- "rocksdb",
- "serde_json",
- "storage",
  "tokio",
 ]
 

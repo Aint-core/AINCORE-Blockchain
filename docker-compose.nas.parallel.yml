@@ -21,8 +21,7 @@ services:
     container_name: aincore-dexnode-parallel
     restart: unless-stopped
     ports:
-      - "9112:9102"   # P2P Gossipsub
-      - "9012:9002"   # P2P Consensus
+      - "9112:9102"   # libp2p: consensus + sync sessions (base port + 100)
       - "8012:8002"   # REST API / RPC
     volumes:
       - ./nas_data_parallel:/root/.aincore/data
@@ -32,7 +31,6 @@ services:
       - AINCORE_API_PORT=8002
       - AINCORE_PERMISSIVE_CORS=1
       - AINCORE_GENESIS_PATH=/root/.aincore/genesis.json
-      - AINCORE_PEERS=
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     command: ["node", "--port", "9002", "--rpc-port", "8002", "--datadir", "/root/.aincore/data"]

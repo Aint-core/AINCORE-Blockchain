@@ -10,6 +10,8 @@ agave 589b99b8).
 
 ## What exists today
 
+(As found on 2026-10-02, before S1-S6; the Stages table below records what each step changed.)
+
 | Surface | Today | Gap |
 |---|---|---|
 | libp2p (Noise + yamux, gossipsub, topic `aincore-gossip`) | Broadcast of vertices, attestations, certificates. Strict validation, 1 MiB transmit cap, message id = sha256(payload) | No peer scoring, no explicit validator peering, no link from PeerId to a committee member, no per-peer budgets |
@@ -83,7 +85,7 @@ peers 200 TPS) is a later option, not a launch rule.
 | S3 | Per-peer queues, request quotas and verification budgets | One member flooding each message type at line rate: the others keep finality, the victim's memory and CPU stay bounded |
 | S4 | Size caps per type before decode | An oversized frame of each type is dropped before any parse |
 | S5 | gossipsub scoring and explicit validator peering | A Sybil swarm of non-members cannot eclipse a member |
-| S6 | Retire the legacy TCP channel; DA over sessions (NI-8, fixing the identity bug) | No code path opens a connection per message; DA batches are accepted across nodes |
+| S6 | Retire the legacy TCP channel; DA over sessions (NI-8, fixing the identity bug) | No code path opens a connection per message; DA batches are accepted across nodes. DONE: S6a (cb78a03) moved snapshot restore onto sessions with budgets keyed by the session key; S6b deleted the legacy channel (server, handshake, per-message sends, `--peers`, the `peer:`/`peer_ip:` rows); witness `core/node/tests/g4_s6_no_legacy_transport.rs` scans every crate for a raw socket. DA batches no longer travel at all: B1 (a2ae5f1) replaced the batch layer with a header-bound DA root sampled over RPC, so there is no batch identity left to fix |
 | S7 | Flood harness and an adversarial review | The gate's "validator connectivity under abusive traffic", measured on the NAS and Pi |
 
 Open: parameter values are set from these sources and the S7 measurements on real hardware,

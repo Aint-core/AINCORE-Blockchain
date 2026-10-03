@@ -42,8 +42,8 @@ pub const SYNC_PROTOCOL: &str = "/aincore/sync/1";
 /// The largest sync request (a `SYNC_REQ` is a few hundred bytes).
 pub const SYNC_REQUEST_CAP: usize = 64 << 10;
 
-/// The largest sync answer: what a legacy client read (`SYNC_RESP` blocks
-/// stop at `chain_sync::SYNC_RESP_BLOCK_BYTES`).
+/// The largest sync answer (`SYNC_RESP` blocks stop at
+/// `chain_sync::SYNC_RESP_BLOCK_BYTES`, 8 MiB, under it).
 pub const SYNC_RESPONSE_CAP: usize = 10 << 20;
 
 /// The node's libp2p keypair: its node key.

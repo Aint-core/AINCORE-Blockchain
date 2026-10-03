@@ -48,7 +48,7 @@ pub const MAX_CHUNK_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 /// Snapshot serving, apart from vertex serving: requests in flight and cost
 /// units per second (a leaf, or `UNIT_BYTES` read), globally and per client,
 /// so no one client takes more than its share. A client is the key its
-/// session authenticated (G4 S6), or a legacy client's IP.
+/// session authenticated (G4 S6).
 pub const STATE_SERVE_IN_FLIGHT: usize = 4;
 pub const STATE_SERVE_IN_FLIGHT_PER_CLIENT: usize = 1;
 pub const STATE_SERVE_UNITS_PER_SEC: f64 = 8_000.0;
@@ -1509,79 +1509,6 @@ pub async fn restore_over_sessions(
         }
     })
     .await
-}
-
-type Connections =
-    tokio::sync::Mutex<std::collections::HashMap<usize, (tokio::net::TcpStream, [u8; 32])>>;
-
-/// `restore_state` over the node's encrypted TCP transport, to the peers'
-/// sync ports. One connection per peer, kept across requests and reopened
-/// after a failure or a timeout (`Patience::request_timeout`).
-pub async fn restore_over_tcp(
-    storage: &Arc<StateDB>,
-    plan: &RestorePlan<'_>,
-    peers: &[(String, u16)],
-    my_port: u16,
-) -> Result<Restored, String> {
-    let key = crypto::SigningKey::generate(&mut rand::rngs::OsRng);
-    let connections: Arc<Connections> = Arc::default();
-    let timeout = plan.patience.request_timeout;
-    restore_state(storage, plan, peers.len(), |peer, msg| {
-        let connections = Arc::clone(&connections);
-        let (ip, port) = peers[peer].clone();
-        let key = key.clone();
-        async move {
-            let asked = ask_over_tcp(&connections, peer, &ip, port, my_port, &key, &msg);
-            match tokio::time::timeout(timeout, asked).await {
-                Ok(reply) => reply,
-                Err(_) => {
-                    // The connection may be mid-frame: never reuse it.
-                    connections.lock().await.remove(&peer);
-                    Err(format!("{ip}:{port}: no answer in {timeout:?}"))
-                }
-            }
-        }
-    })
-    .await
-}
-
-async fn ask_over_tcp(
-    connections: &Connections,
-    peer: usize,
-    ip: &str,
-    port: u16,
-    my_port: u16,
-    key: &crypto::SigningKey,
-    msg: &str,
-) -> Result<String, String> {
-    let mut open = connections.lock().await;
-    // A kept connection the server has since closed (it drops idle ones)
-    // fails on its next use: that costs one fresh try, not a failure.
-    let reused = open.contains_key(&peer);
-    for attempt in 0..=u8::from(reused) {
-        if let std::collections::hash_map::Entry::Vacant(slot) = open.entry(peer) {
-            let (stream, shared, _) =
-                network::secure_connect(ip, port, "__state_sync__", my_port, None, key)
-                    .await
-                    .map_err(|e| format!("{ip}:{port}: {e}"))?;
-            slot.insert((stream, shared));
-        }
-        let (stream, shared) = open.get_mut(&peer).ok_or("no connection")?;
-        let reply = match network::send_encrypted_msg(stream, shared, msg).await {
-            Ok(()) => network::read_encrypted_msg(stream, shared).await,
-            Err(e) => Err(e),
-        };
-        match reply {
-            Ok(reply) => return Ok(reply),
-            Err(e) => {
-                open.remove(&peer);
-                if attempt == u8::from(reused) {
-                    return Err(format!("{ip}:{port}: {e}"));
-                }
-            }
-        }
-    }
-    Err(format!("{ip}:{port}: no connection"))
 }
 
 #[cfg(test)]

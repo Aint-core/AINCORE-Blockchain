@@ -3,7 +3,7 @@
 
 use super::*;
 use consensus::qc::{build_qc, validator_set_hash, FinalityVote, ValidatorInfo};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
 
@@ -306,13 +306,7 @@ struct Peer {
 
 fn peer(chain: &Chain, behaviour: Behaviour) -> Peer {
     Peer {
-        sync: ChainSync::new(
-            "server".into(),
-            0,
-            Arc::new(Mutex::new(HashMap::new())),
-            Arc::clone(&chain.db),
-        )
-        .with_snapshot_serving(true),
+        sync: ChainSync::new("server".into(), Arc::clone(&chain.db)).with_snapshot_serving(true),
         db: Arc::clone(&chain.db),
         behaviour,
         chunks: 0,
@@ -993,14 +987,9 @@ async fn a_pinned_version_below_block_retention_restores() {
     assert!(state_commit::servable(&a.db, H, Some(keep)).unwrap());
     let client = temp_db("pin_client");
     let mut server = peer(&a, Behaviour::Honest);
-    server.sync = ChainSync::new(
-        "server".into(),
-        0,
-        Arc::new(Mutex::new(HashMap::new())),
-        Arc::clone(&a.db),
-    )
-    .with_retention(Some((keep, 1_000)))
-    .with_snapshot_serving(true);
+    server.sync = ChainSync::new("server".into(), Arc::clone(&a.db))
+        .with_retention(Some((keep, 1_000)))
+        .with_snapshot_serving(true);
     let mut peers = [server];
     run(&client, &plan(&a.cp, &g, false), &mut peers)
         .await
@@ -1761,14 +1750,9 @@ impl Producer {
         let key = crypto::SigningKey::from_bytes(&[77; 32]);
         let proposer = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
         let pk = hex::encode(key.verifying_key().to_bytes());
-        let sync = ChainSync::new(
-            "producer".into(),
-            0,
-            Arc::new(Mutex::new(HashMap::new())),
-            temp_db(name),
-        )
-        .with_retention(retention)
-        .with_snapshot_serving(true);
+        let sync = ChainSync::new("producer".into(), temp_db(name))
+            .with_retention(retention)
+            .with_snapshot_serving(true);
         {
             let _seed = sync.storage.seeding();
             for (k, v) in &genesis() {
@@ -1903,12 +1887,7 @@ fn a_restored_node_follows_the_chain() {
         state_root: one.header.state_root.clone(),
     };
 
-    let client = ChainSync::new(
-        "client".into(),
-        0,
-        Arc::new(Mutex::new(HashMap::new())),
-        temp_db("follow_client"),
-    );
+    let client = ChainSync::new("client".into(), temp_db("follow_client"));
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let restored = runtime
         .block_on(restore_state(
@@ -1960,88 +1939,132 @@ fn the_node_routes_the_restore_requests_to_chain_sync() {
     }
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// What a fake network task does with one request.
+enum Fake {
+    Answer(Result<String, String>),
+    /// Never answered (the reply is held, so the asker times out).
+    Silent,
 }
 
-/// A node's TCP server for `chain`, routing by `ChainSync::serve_from` as
-/// the node does. Returns its port once it accepts connections.
-async fn spawn_server(chain: &Chain) -> u16 {
-    let server = Arc::new(peer(chain, Behaviour::Honest).sync);
-    let port = free_port();
-    let server_key = crypto::SigningKey::from_bytes(&[5; 32]);
-    let server_id = crypto::derive_address(server_key.verifying_key().as_bytes()).unwrap();
-    tokio::spawn(network::start_server_with_peer(
-        port,
-        server_id,
-        Arc::new(Mutex::new(HashMap::new())),
-        Arc::clone(&chain.db),
-        Arc::new(server_key),
-        move |msg: String, peer: IpAddr| server.serve_from(&msg, peer),
-    ));
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
-            break;
+/// A fake network task: `dial(addr)` is the session a dial opens (or why it
+/// fails), `ask(session, wire)` what a request on it gets. Returns the
+/// client and the addresses dialled, in order.
+fn fake_sessions(
+    dial: impl Fn(&str) -> Result<String, String> + Send + 'static,
+    mut ask: impl FnMut(&str, &str) -> Fake + Send + 'static,
+) -> (network::SessionClient, Arc<Mutex<Vec<String>>>) {
+    let (asks_tx, mut asks) = tokio::sync::mpsc::channel::<network::SyncAsk>(8);
+    let (dials_tx, mut dials) = tokio::sync::mpsc::channel::<network::SyncDial>(8);
+    let dialled = Arc::new(Mutex::new(Vec::new()));
+    let task_dialled = Arc::clone(&dialled);
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            tokio::select! {
+                Some(d) = dials.recv() => {
+                    task_dialled.lock().unwrap().push(d.addr.clone());
+                    let _ = d.reply.send(dial(&d.addr));
+                }
+                Some(a) = asks.recv() => match ask(&a.peer, &a.wire) {
+                    Fake::Answer(answer) => {
+                        let _ = a.reply.send(answer);
+                    }
+                    Fake::Silent => held.push(a.reply),
+                },
+                else => break,
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    port
+    });
+    let client = network::SessionClient {
+        asks: asks_tx,
+        dials: dials_tx,
+        table: Default::default(),
+    };
+    (client, dialled)
 }
 
-/// S6b: a restore over the node's real encrypted TCP transport, with a leaf
-/// that travels in parts. A peer that is down is skipped.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_node_restores_over_the_encrypted_transport() {
+/// G4 S6: a restore over sessions with a leaf that travels in parts; a peer
+/// whose dial fails is skipped.
+#[tokio::test]
+async fn a_node_restores_over_sessions_past_a_peer_that_is_down() {
     let g = genesis();
     let a = chain_with(
-        "tcp_a",
+        "sess_parts_a",
         Spec {
             extra: vec![(obj(500), vec![b't'; 3 << 20])],
             ..Spec::default()
         },
     );
-    let port = spawn_server(&a).await;
-    let down = ("127.0.0.1".to_string(), free_port());
-    let client = temp_db("tcp_client");
-    let done = restore_over_tcp(
+    let server = peer(&a, Behaviour::Honest).sync;
+    let (sessions, dialled) = fake_sessions(
+        |addr| {
+            if addr.ends_with("/tcp/1") {
+                Err("connection refused".into())
+            } else {
+                Ok("up".into())
+            }
+        },
+        move |_, wire| {
+            Fake::Answer(
+                server
+                    .serve_session(wire, "client")
+                    .ok_or_else(|| "refused".into()),
+            )
+        },
+    );
+    let client = temp_db("sess_parts_client");
+    let addrs = [
+        "/ip4/127.0.0.1/tcp/1".to_string(),
+        "/ip4/127.0.0.1/tcp/2".to_string(),
+    ];
+    let done = restore_over_sessions(&client, &plan(&a.cp, &g, false), &sessions, &addrs)
+        .await
+        .unwrap();
+    assert_eq!(done.leaves, a.state.len());
+    assert_restored(&client, &a);
+    assert!(
+        dialled.lock().unwrap().contains(&addrs[0]),
+        "positive control: the down peer was tried"
+    );
+}
+
+/// G4 S6: a session whose request failed is dialled again before its next
+/// request, never reused as it was (the old connection may be gone).
+#[tokio::test]
+async fn a_failed_request_redials_its_peer() {
+    let g = genesis();
+    let a = chain("sess_redial_a", MEMBER);
+    let server = peer(&a, Behaviour::Honest).sync;
+    let mut asked = 0usize;
+    let (sessions, dialled) = fake_sessions(
+        |_| Ok("only".into()),
+        move |_, wire| {
+            asked += 1;
+            if asked == 2 {
+                return Fake::Answer(Err("stream reset".into()));
+            }
+            Fake::Answer(
+                server
+                    .serve_session(wire, "client")
+                    .ok_or_else(|| "refused".into()),
+            )
+        },
+    );
+    let client = temp_db("sess_redial_client");
+    let addr = "/ip4/127.0.0.1/tcp/9102".to_string();
+    restore_over_sessions(
         &client,
         &plan(&a.cp, &g, false),
-        &[down, ("127.0.0.1".to_string(), port)],
-        0,
+        &sessions,
+        std::slice::from_ref(&addr),
     )
     .await
     .unwrap();
-    assert_eq!(done.leaves, a.state.len());
     assert_restored(&client, &a);
-}
-
-/// S6b: a connection the server dropped is reopened on the next request,
-/// never reused, and the request is retried on it once (review 3: a kept
-/// connection the server closed while idle failed its next request). Here
-/// the server drops it for exceeding its message rate.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_dropped_connection_is_reopened() {
-    let a = chain("tcp_drop", MEMBER);
-    let port = spawn_server(&a).await;
-    let connections = Connections::default();
-    let key = crypto::SigningKey::from_bytes(&[6; 32]);
-    let ask = |msg: &'static str| ask_over_tcp(&connections, 0, "127.0.0.1", port, 0, &key, msg);
-    let mut secrets = std::collections::HashSet::new();
-    for i in 0..250 {
-        let reply = ask("GET_HEIGHT").await;
-        assert_eq!(reply.as_deref(), Ok("HEIGHT:0"), "request {i}");
-        secrets.insert(connections.lock().await[&0].1);
-    }
-    assert!(
-        secrets.len() > 1,
-        "positive control: the server dropped the flooding connection"
+    assert_eq!(
+        *dialled.lock().unwrap(),
+        vec![addr.clone(), addr],
+        "dialled once, and once more after the failure"
     );
 }
 
@@ -2230,19 +2253,22 @@ async fn a_block_with_a_forged_proposer_signature_is_not_stored() {
 
 /// A server that never answers is left after the request timeout, and the
 /// restore completes from another.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn a_silent_server_times_out() {
     let g = genesis();
     let a = chain("silent_a", MEMBER);
-    let port = spawn_server(&a).await;
-    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let silent_port = silent.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        let mut held = Vec::new();
-        while let Ok((socket, _)) = silent.accept().await {
-            held.push(socket);
-        }
-    });
+    let server = peer(&a, Behaviour::Honest).sync;
+    let (sessions, _) = fake_sessions(
+        |addr| Ok(addr.rsplit('/').next().unwrap_or_default().to_string()),
+        move |session, wire| match session {
+            "silent" => Fake::Silent,
+            _ => Fake::Answer(
+                server
+                    .serve_session(wire, "client")
+                    .ok_or_else(|| "refused".into()),
+            ),
+        },
+    );
     let client = temp_db("silent_client");
     let patient = RestorePlan {
         patience: Patience {
@@ -2252,17 +2278,13 @@ async fn a_silent_server_times_out() {
         ..plan(&a.cp, &g, false)
     };
     let start = Instant::now();
-    restore_over_tcp(
-        &client,
-        &patient,
-        &[
-            ("127.0.0.1".to_string(), silent_port),
-            ("127.0.0.1".to_string(), port),
-        ],
-        0,
-    )
-    .await
-    .unwrap();
+    let addrs = [
+        "/dns4/x/tcp/silent".to_string(),
+        "/dns4/x/tcp/honest".to_string(),
+    ];
+    restore_over_sessions(&client, &patient, &sessions, &addrs)
+        .await
+        .unwrap();
     assert!(
         start.elapsed() < Duration::from_secs(30),
         "{:?}",
@@ -2760,12 +2782,7 @@ fn a_node_serves_snapshots_only_when_asked_to() {
         key: obj(3),
         offset: 0,
     };
-    let default = ChainSync::new(
-        "server".into(),
-        0,
-        Arc::new(Mutex::new(HashMap::new())),
-        Arc::clone(&a.db),
-    );
+    let default = ChainSync::new("server".into(), Arc::clone(&a.db));
     let off = if std::env::var("AINCORE_SERVE_SNAPSHOTS").is_err() {
         default
     } else {
@@ -2788,27 +2805,32 @@ fn a_node_serves_snapshots_only_when_asked_to() {
     assert!(on.handle_state_value(value()).error.is_none());
 }
 
-/// The node's server routes by `serve_from`: chain sync's requests are
-/// answered and budgeted by the client's IP; anything else is not answered.
+/// The node's session layer routes by `serve_session`: chain sync's
+/// requests are answered and budgeted by the session's key; anything else
+/// is not answered.
 #[test]
-fn serve_from_budgets_by_the_clients_ip() {
+fn serve_session_budgets_by_the_sessions_key() {
     let a = chain("route_a", MEMBER);
     let sync = peer(&a, Behaviour::Honest).sync;
-    let ip = IpAddr::from([10, 0, 0, 8]);
+    let key = "12D3KooWrequester";
     let request = ChunkRequest {
         version: H,
         after: None,
         max: 10,
     };
     let msg = format!("{CHUNK_REQ}{}", serde_json::to_string(&request).unwrap());
-    let reply = sync.serve_from(&msg, ip).unwrap();
+    let reply = sync.serve_session(&msg, key).unwrap();
     assert!(reply.starts_with(CHUNK_RESP), "{reply}");
     assert!(
-        sync.state_budget.balance(Some(&ip.to_string())) < STATE_SERVE_UNITS_PER_SEC_PER_CLIENT,
-        "charged to the client"
+        sync.state_budget.balance(Some(key)) < STATE_SERVE_UNITS_PER_SEC_PER_CLIENT,
+        "charged to the session"
     );
-    assert_eq!(sync.serve_from("TX:{}", ip), None);
-    assert!(sync.serve_from("GET_HEIGHT", ip).is_some());
+    assert!(
+        sync.state_budget.balance(Some("12D3KooWother")).is_nan(),
+        "and no other session is tracked"
+    );
+    assert_eq!(sync.serve_session("TX:{}", key), None);
+    assert!(sync.serve_session("GET_HEIGHT", key).is_some());
 }
 
 /// SN-6 on what the restored state records: a key in any retained epoch's
@@ -2985,12 +3007,12 @@ async fn the_same_anchor_from_many_peers_is_one_candidate() {
     assert_eq!(pairs.len(), 1);
 }
 
-/// Review 3 HIGH 1: a large leaf restores on the per-IP path from one
+/// Review 3 HIGH 1: a large leaf restores on the per-client path from one
 /// server, with production patience, even when every part misses the cache
 /// (other clients read as many other values in between): a miss costs at
 /// most one second's worth, and a busy part is waited for.
 #[tokio::test]
-async fn a_large_leaf_restores_on_the_per_ip_path_when_every_part_misses() {
+async fn a_large_leaf_restores_on_the_per_client_path_when_every_part_misses() {
     let g = genesis();
     let a = chain_with(
         "perip_big_a",
@@ -3001,7 +3023,7 @@ async fn a_large_leaf_restores_on_the_per_ip_path_when_every_part_misses() {
     );
     let client = temp_db("perip_big_client");
     let server = peer(&a, Behaviour::Honest).sync;
-    let ip = IpAddr::from([10, 0, 0, 7]);
+    let key = "12D3KooWrestorer";
     let patient = RestorePlan {
         patience: Patience {
             deadline: Duration::from_secs(120),
@@ -3022,17 +3044,17 @@ async fn a_large_leaf_restores_on_the_per_ip_path_when_every_part_misses() {
                             key: obj(u64::from(i)),
                             offset: 0,
                         },
-                        Some(IpAddr::from([10, 1, 0, i]).to_string().as_str()),
+                        Some(format!("12D3KooWother{i}").as_str()),
                     );
                     assert!(read.error.is_none(), "{:?}", read.error);
                 }
             }
         }
-        let reply = server.serve_from(msg, ip).ok_or("no answer")?;
+        let reply = server.serve_session(msg, key).ok_or("no answer")?;
         if let Some(json) = reply.strip_prefix(VALUE_RESP) {
             let part: ValueResponse = serde_json::from_str(json).unwrap();
             parts += usize::from(part.error.is_none());
-            lowest = lowest.min(server.state_budget.balance(Some(&ip.to_string())));
+            lowest = lowest.min(server.state_budget.balance(Some(key)));
         }
         Ok(reply)
     })

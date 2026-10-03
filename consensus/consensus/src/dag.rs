@@ -6,7 +6,6 @@ use blockchain::Vertex;
 use crypto::accumulator::Accumulator;
 use executor::Executor;
 use mempool::Mempool;
-use network::PeerList;
 use storage::StateDB;
 
 /// Cached active validator set as `(address, stake)` pairs, canonically sorted.
@@ -69,7 +68,6 @@ pub struct DagConsensus {
     pub mempool: Arc<Mutex<Mempool>>,
     pub executor: Arc<Executor>,
     pub storage: Arc<StateDB>,
-    pub peers: PeerList,
     pub ordering_engine: Arc<Mutex<OrderingEngine>>,
     pub latest_block_height: u64,
     pub latest_block_hash: String,
@@ -257,7 +255,6 @@ impl DagConsensus {
     #[allow(clippy::too_many_arguments)] // intrinsic to DagConsensus dependencies
     pub fn new(
         node_id: String,
-        peers: PeerList,
         mempool: Arc<Mutex<Mempool>>,
         executor: Arc<Executor>,
         storage: Arc<StateDB>,
@@ -313,7 +310,6 @@ impl DagConsensus {
 
         let mut this = Self {
             node_id,
-            peers,
             // The engine sets the round at boot (`start_v4`).
             current_round: 0,
             dag: Arc::new(Mutex::new(HashMap::new())),

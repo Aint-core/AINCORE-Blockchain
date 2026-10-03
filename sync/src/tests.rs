@@ -7,7 +7,6 @@ mod tests {
         VERTEX_SERVE_BURST,
     };
     use blockchain::Block;
-    use std::collections::HashMap;
     use std::fs;
     use std::sync::{Arc, Mutex};
     use storage::StateDB;
@@ -50,9 +49,19 @@ mod tests {
     }
 
     fn setup_sync(name: &str) -> ChainSync {
-        let db = temp_db(name);
-        let peers = Arc::new(Mutex::new(HashMap::new()));
-        ChainSync::new("node_1".to_string(), 8080, peers, db)
+        ChainSync::new("node_1".to_string(), temp_db(name))
+    }
+
+    /// Sessions the network task lists but cannot serve (it is gone): every
+    /// request on them fails.
+    fn unreachable_sessions(sessions: Vec<network::SessionPeer>) -> network::SessionClient {
+        let (asks, _) = tokio::sync::mpsc::channel(1);
+        let (dials, _) = tokio::sync::mpsc::channel(1);
+        network::SessionClient {
+            asks,
+            dials,
+            table: Arc::new(std::sync::RwLock::new(sessions)),
+        }
     }
 
     mod block_identity {
@@ -109,18 +118,21 @@ mod tests {
             .unwrap();
     }
 
+    /// G4 S6: sync goes over the network task's sessions only; without
+    /// them (or when no session answers) the node stays where it is.
     #[tokio::test]
-    async fn sync_skips_session_only_peer_without_persisted_ip() {
-        let sync = setup_sync("session_only_peer");
+    async fn sync_without_answering_sessions_keeps_the_local_height() {
+        let sync = setup_sync("no_sessions");
         sync.storage.put("latest_height", "7").unwrap();
-        sync.peers
-            .lock()
-            .unwrap()
-            .insert("session_only".to_string(), 9032);
-
-        let height = sync.sync_from_peers().await;
-
-        assert_eq!(height, 7);
+        assert_eq!(sync.sync_from_peers().await, 7);
+        let sync = setup_sync("dead_sessions").with_sessions(unreachable_sessions(vec![
+            network::SessionPeer {
+                peer: "12D3KooWgone".into(),
+                member: None,
+            },
+        ]));
+        sync.storage.put("latest_height", "7").unwrap();
+        assert_eq!(sync.sync_from_peers().await, 7);
     }
 
     fn rehash_block(block: &mut Block) {
@@ -1195,40 +1207,6 @@ mod tests {
 
     // ---- TASK-#29: seed-anchor / N-peer tip agreement ----
 
-    // (1) SEED PREFERENCE: seed/validator peers must be ordered FIRST, regardless of
-    // HashMap iteration order; remaining peers follow. Ordering is deterministic.
-    #[test]
-    fn test_order_peers_seed_first() {
-        let mut peers = HashMap::new();
-        peers.insert("zeta_peer".to_string(), 9001u16);
-        peers.insert("validator_b".to_string(), 9002u16);
-        peers.insert("alpha_peer".to_string(), 9003u16);
-        peers.insert("validator_a".to_string(), 9004u16);
-
-        let seeds = vec!["validator_a".to_string(), "validator_b".to_string()];
-        let ordered = ChainSync::order_peers_seed_first(&peers, &seeds);
-
-        let ids: Vec<&str> = ordered.iter().map(|(id, _)| id.as_str()).collect();
-        // Seeds first (sorted by id), then non-seeds (sorted by id).
-        assert_eq!(
-            ids,
-            vec!["validator_a", "validator_b", "alpha_peer", "zeta_peer"]
-        );
-        // Ports are carried through correctly.
-        assert_eq!(ordered[0], ("validator_a".to_string(), 9004));
-    }
-
-    #[test]
-    fn test_order_peers_seed_first_no_seeds_is_sorted() {
-        let mut peers = HashMap::new();
-        peers.insert("c".to_string(), 1u16);
-        peers.insert("a".to_string(), 2u16);
-        peers.insert("b".to_string(), 3u16);
-        let ordered = ChainSync::order_peers_seed_first(&peers, &[]);
-        let ids: Vec<&str> = ordered.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(ids, vec!["a", "b", "c"]);
-    }
-
     // Helper: a verified-shaped QC with a chosen finalized tip. tip_agreement_decision
     // is a PURE tally over already-verified QCs, so mutating block_height/block_hash
     // here is sound for these unit tests (no re-verification happens in the tally).
@@ -1339,27 +1317,25 @@ mod tests {
         assert_eq!(sync.tip_agreement_n(), 1, "unparsable falls back to 1");
     }
 
-    // End-to-end-ish: with N=2 configured and no reachable seeds, sync_from_peers must
-    // REFUSE to advance (tip disagreement / shortfall) and return the local height.
+    // End-to-end-ish: with N=2 configured and no answering seed sessions,
+    // sync_from_peers must REFUSE to advance (tip shortfall) and return the
+    // local height.
     #[tokio::test]
     async fn test_sync_refuses_when_tip_agreement_unmet() {
-        let sync = setup_sync("tip_refuse_sync");
+        let member = |peer: &str, member: &str| network::SessionPeer {
+            peer: peer.into(),
+            member: Some(member.into()),
+        };
+        let sync = setup_sync("tip_refuse_sync").with_sessions(unreachable_sessions(vec![
+            member("12D3KooWa", "validator_a"),
+            member("12D3KooWb", "validator_b"),
+        ]));
         sync.storage.put("latest_height", "5").unwrap();
         let _seed = sync.storage.seeding();
-        sync.storage
-            .put("sys:config:tip_agreement_n", "2")
-            .unwrap();
-        // Two validator seeds, but their peer_ip is never persisted -> unreachable,
-        // so zero verified tips are gathered -> shortfall -> refuse.
+        sync.storage.put("sys:config:tip_agreement_n", "2").unwrap();
+        // Two validator sessions, but neither answers, so zero verified tips
+        // are gathered -> shortfall -> refuse.
         set_validators(&sync, vec![("validator_a", 100), ("validator_b", 100)]);
-        sync.peers
-            .lock()
-            .unwrap()
-            .insert("validator_a".to_string(), 9101);
-        sync.peers
-            .lock()
-            .unwrap()
-            .insert("validator_b".to_string(), 9102);
 
         let height = sync.sync_from_peers().await;
         assert_eq!(height, 5, "must not advance when tip agreement is unmet");

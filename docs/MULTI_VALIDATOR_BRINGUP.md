@@ -188,16 +188,18 @@ chmod 600 data/val2/node.key
 
 ## 4. Start the cluster (peering via `--bootnodes`)
 
-Each node uses a P2P (TCP) port (`--port`, default `9001`) and an RPC/API port
-(auto-derived as `port - 1000`, or set with `--rpc-port`). Point every node at
+Each node has a base port (`--port`, default `9001`): libp2p listens on base
+port + 100 (every peer conversation, consensus and sync, runs over it), and the
+RPC/API port is auto-derived as `port - 1000` (or set with `--rpc-port`). Point every node at
 the **same** `genesis.json` (place it in the working directory or set
 `AINCORE_GENESIS_PATH`).
 
-Nodes discover each other with `--bootnodes`, a comma-separated list of libp2p
-multiaddrs of *other* nodes' P2P TCP listeners. The multiaddr form is:
+Nodes discover each other with `--bootnodes`, a comma-separated list of
+*other* nodes' addresses, each given by its **base** port (the node dials base
+port + 100):
 
 ```
-/ip4/<host>/tcp/<p2p_port>
+/ip4/<host>/tcp/<base_port>      or      /dns4/<hostname>/tcp/<base_port>
 ```
 
 Example three-node bring-up on one host (distinct ports), each pointed at the
@@ -224,11 +226,11 @@ AINCORE_CHAIN_ID=AINCORE-MAINNET-1 \
 ```
 
 Across separate machines, use each host's reachable IP/DNS in the multiaddr
-(e.g. `/ip4/10.0.0.12/tcp/9001`) and open the P2P TCP ports between hosts.
+(e.g. `/ip4/10.0.0.12/tcp/9001`) and open TCP base port + 100 (here 9101)
+between hosts.
 
-> `--peers <p2p_ports>` is the legacy localhost-only TCP fallback (comma-
-> separated port numbers, assumed `127.0.0.1`). Prefer `--bootnodes` multiaddrs
-> for anything beyond a single-host smoke test.
+> `--peers` (the legacy TCP channel) was removed in G4 S6: a node given
+> `--peers` refuses to start and names `--bootnodes` instead.
 
 ---
 

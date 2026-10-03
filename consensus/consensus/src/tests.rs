@@ -11,7 +11,6 @@ mod tests {
     use crate::dag::DagConsensus;
     use executor::Executor;
     use mempool::Mempool;
-    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use storage::object::{Object, Owner};
     use storage::StateDB;
@@ -52,7 +51,6 @@ mod tests {
         let _seed = db.seeding();
         let mempool = Arc::new(Mutex::new(Mempool::new()));
         let executor = Arc::new(Executor::new(Arc::clone(&db)));
-        let peers = Arc::new(Mutex::new(HashMap::new()));
 
         // Generate a deterministic Ed25519 key for testing
         let node_key = [42u8; 32]; // Deterministic seed
@@ -80,7 +78,7 @@ mod tests {
         seed_state_tree(&db);
 
         (
-            DagConsensus::new(node_id, peers, mempool, executor, db, None, node_key),
+            DagConsensus::new(node_id, mempool, executor, db, None, node_key),
             path,
         )
     }

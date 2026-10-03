@@ -7,8 +7,7 @@ services:
     container_name: aincore-local-node
     restart: always
     ports:
-      - "9000:9000"   # P2P Legacy
-      - "9100:9100"   # P2P Libp2p Gossip & Kademlia DHT
+      - "9100:9100"   # libp2p: consensus + sync sessions (base port + 100)
       - "8545:8000"   # API/RPC
     volumes:
       - ./local_data:/root/.aincore/data

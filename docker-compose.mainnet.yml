@@ -9,7 +9,7 @@ services:
     container_name: aincore-validator-1
     restart: always
     ports:
-      - "9002:9002" # P2P
+      - "9102:9102" # libp2p: consensus + sync sessions (base port + 100)
       - "8002:8002" # API
     volumes:
       - ./aincore_data:/root/.aincore/data
@@ -17,7 +17,6 @@ services:
     environment:
       - AINCORE_PORT=9002
       - AINCORE_API_PORT=8002
-      - AINCORE_PEERS=
       - RUST_LOG=info
     command: [ "node", "--port", "9002" ]
     networks:

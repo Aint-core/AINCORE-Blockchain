@@ -105,21 +105,20 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_peer_clears_all_records() {
-        // Peer hygiene: remove_peer must delete peer:, peer_ip:, and peer_addr:
-        // for the node so it no longer shows up in scans / reconnect.
-        let db = temp_db("remove_peer");
-        db.save_peer("nodeX", 9032).unwrap();
-        db.save_peer_ip("nodeX", "172.23.0.1").unwrap();
-        db.save_peer_addr("nodeX", "/ip4/172.23.0.1/tcp/9032")
+    fn peer_addresses_are_saved_and_scanned() {
+        let db = temp_db("peer_addrs");
+        db.save_peer_addr("nodeX", "/ip4/10.0.0.1/tcp/9132")
             .unwrap();
-        assert_eq!(db.get_peer("nodeX"), Some(9032));
-
-        db.remove_peer("nodeX").unwrap();
-        assert_eq!(db.get_peer("nodeX"), None);
-        assert_eq!(db.get_peer_ip("nodeX"), None);
-        assert!(db.scan_peers().iter().all(|(id, _)| id != "nodeX"));
-        assert!(db.scan_peer_addrs().iter().all(|(id, _)| id != "nodeX"));
+        db.save_peer_addr("nodeY", "/dns4/seed/tcp/9132").unwrap();
+        let mut addrs = db.scan_peer_addrs();
+        addrs.sort();
+        assert_eq!(
+            addrs,
+            [
+                ("nodeX".to_string(), "/ip4/10.0.0.1/tcp/9132".to_string()),
+                ("nodeY".to_string(), "/dns4/seed/tcp/9132".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -513,22 +512,6 @@ mod tests {
                 "hard cap must not be effectively unbounded"
             );
         }
-    }
-
-    #[test]
-    fn test_peer_save_and_get() {
-        let db = temp_db("peers");
-        db.save_peer("node_abc", 8080).unwrap();
-        assert_eq!(db.get_peer("node_abc"), Some(8080));
-        assert_eq!(db.get_peer("unknown"), None);
-    }
-
-    #[test]
-    fn test_peer_ip_tracking() {
-        let db = temp_db("peer_ip");
-        db.save_peer_ip("node_1", "192.168.1.100").unwrap();
-        assert_eq!(db.get_peer_ip("node_1"), Some("192.168.1.100".to_string()));
-        assert_eq!(db.get_peer_ip("node_2"), None);
     }
 
     #[test]

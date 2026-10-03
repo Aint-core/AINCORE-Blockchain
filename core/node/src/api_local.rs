@@ -2529,7 +2529,6 @@ mod tests {
     pub(super) fn test_state(db: Arc<StateDB>) -> AppState {
         let consensus = Arc::new(RwLock::new(consensus::DagConsensus::new(
             "node_test".to_string(),
-            Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(mempool::Mempool::new())),
             Arc::new(executor::Executor::new(Arc::clone(&db))),
             Arc::clone(&db),
@@ -3305,7 +3304,6 @@ mod tests {
 
         let consensus = Arc::new(RwLock::new(consensus::DagConsensus::new(
             "node_test".to_string(),
-            Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(mempool::Mempool::new())),
             Arc::new(executor::Executor::new(Arc::clone(&db))),
             Arc::clone(&db),
@@ -3476,7 +3474,6 @@ mod tests {
         let db = temp_db("legacy_rpc_disabled");
         let consensus = Arc::new(RwLock::new(consensus::DagConsensus::new(
             "node_test".to_string(),
-            Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(mempool::Mempool::new())),
             Arc::new(executor::Executor::new(Arc::clone(&db))),
             Arc::clone(&db),

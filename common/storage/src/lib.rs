@@ -290,66 +290,8 @@ impl StateDB {
         results
     }
 
-    // === HELPER FOR PEER MAN AGEMENT ===
-    pub fn save_peer(&self, node_id: &str, port: u16) -> std::result::Result<(), StorageError> {
-        let key = format!("peer:{}", node_id);
-        self.put(&key, &port.to_string())
-    }
-
-    pub fn get_peer(&self, node_id: &str) -> Option<u16> {
-        // Safe wrapper for get
-        if let Ok(Some(val_str)) = self.get(&format!("peer:{}", node_id)) {
-            val_str.parse().ok()
-        } else {
-            None
-        }
-    }
-
-    /// Peer hygiene: fully forget a peer — delete its `peer:`, `peer_ip:`, and
-    /// `peer_addr:` records so a stale/unreachable entry (e.g. an ephemeral
-    /// Docker-bridge address left over from a stopped sibling container) is not
-    /// reloaded and re-handshaked on every reconnect cycle.
-    pub fn remove_peer(&self, node_id: &str) -> std::result::Result<(), StorageError> {
-        self.delete(&format!("peer:{}", node_id))?;
-        self.delete(&format!("peer_ip:{}", node_id))?;
-        self.delete(&format!("peer_addr:{}", node_id))?;
-        Ok(())
-    }
-
-    pub fn scan_peers(&self) -> Vec<(String, u16)> {
-        let mut peers = Vec::new();
-        let prefix = b"peer:";
-        let iter = self.db.prefix_iterator(prefix);
-
-        for (key, value) in iter.flatten() {
-            if !key.starts_with(prefix) {
-                break;
-            }
-
-            let k = String::from_utf8(key.to_vec()).unwrap_or_default();
-            let val_str = String::from_utf8(value.to_vec()).unwrap_or_default();
-            if let Ok(port) = val_str.parse::<u16>() {
-                peers.push((k.replace("peer:", ""), port));
-            }
-        }
-
-        peers
-    }
-
-    // === PEER IP TRACKING (for multi-node sync) ===
-    pub fn save_peer_ip(&self, node_id: &str, ip: &str) -> std::result::Result<(), StorageError> {
-        let key = format!("peer_ip:{}", node_id);
-        self.put(&key, ip)
-    }
-
-    pub fn get_peer_ip(&self, node_id: &str) -> Option<String> {
-        if let Ok(Some(ip)) = self.get(&format!("peer_ip:{}", node_id)) {
-            Some(ip)
-        } else {
-            None
-        }
-    }
-
+    // === PEER ADDRESSES (libp2p dial book; G4 S6: the legacy `peer:` and
+    // `peer_ip:` rows of the removed TCP channel are no longer written) ===
     pub fn save_peer_addr(
         &self,
         peer_id: &str,
