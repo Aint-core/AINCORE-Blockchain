@@ -454,12 +454,19 @@ pub fn prune_finality_rows(
     let end = floor.min(cursor.saturating_add(max_heights));
     let mut doomed: Vec<String> = Vec::new();
     let mut pruned = 0usize;
+    let mut last_round = None;
     while cursor < end {
         let height = cursor;
         cursor += 1;
         if !pinned.contains(&height) {
-            pruned += usize::from(finality_rows_of(storage, height, &mut doomed)?);
+            if let Some(round) = finality_rows_of(storage, height, &mut doomed)? {
+                pruned += 1;
+                last_round = last_round.max(Some(round));
+            }
         }
+    }
+    if let Some(round) = last_round {
+        decisions_up_to(storage, round, &mut doomed);
     }
     storage
         .transaction(|view| {
@@ -477,6 +484,9 @@ pub fn prune_finality_rows(
 pub fn prune_finality_height(storage: &StateDB, height: u64) -> Result<bool, String> {
     let mut doomed = Vec::new();
     let found = finality_rows_of(storage, height, &mut doomed)?;
+    if let Some(round) = found {
+        decisions_up_to(storage, round, &mut doomed);
+    }
     storage
         .transaction(|view| {
             for key in &doomed {
@@ -485,19 +495,20 @@ pub fn prune_finality_height(storage: &StateDB, height: u64) -> Result<bool, Str
             Ok(())
         })
         .map_err(|e| e.to_string())?;
-    Ok(found)
+    Ok(found.is_some())
 }
 
-/// The keys of the finality rows of `height`, found through its QC. False
-/// when it has no QC (nothing of it was certified here).
+/// The keys of the finality rows of `height`, found through its QC, and
+/// its anchor round. None when it has no QC (nothing of it was certified
+/// here).
 fn finality_rows_of(
     storage: &StateDB,
     height: u64,
     doomed: &mut Vec<String>,
-) -> Result<bool, String> {
+) -> Result<Option<u64>, String> {
     let qc_key = format!("consensus:qc:{height}");
     let Some(raw) = storage.get(&qc_key).map_err(|e| e.to_string())? else {
-        return Ok(false);
+        return Ok(None);
     };
     let qc: QuorumCertificate = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     let round = qc.anchor_round;
@@ -526,15 +537,31 @@ fn finality_rows_of(
         doomed.push(format!("{guards}{signer}:height:{height}"));
         doomed.push(format!("{guards}{signer}:round:{round}"));
     }
-    // The anchor decisions of its epoch up to its round (keys sort by round).
-    let decisions = format!("consensus:anchor_decision:{:020}:", qc.epoch);
-    for key in keys_under(&decisions) {
-        match key[decisions.len()..].parse::<u64>() {
-            Ok(r) if r <= round => doomed.push(key),
+    Ok(Some(round))
+}
+
+/// The anchor decisions up to `round` (keys sort by round), under the epoch
+/// the writer uses for every epoch (B36: the QC's epoch matched nothing from
+/// epoch 1 on, and the rows grew forever). Once per batch, and the scan
+/// stops at the first later round.
+fn decisions_up_to(storage: &StateDB, round: u64, doomed: &mut Vec<String>) {
+    let prefix = format!(
+        "consensus:anchor_decision:{:020}:",
+        crate::ordering::DECISION_EPOCH
+    );
+    for row in storage.db.prefix_iterator(prefix.as_bytes()) {
+        let Ok((key, _)) = row else { break };
+        let Some(key) = std::str::from_utf8(&key)
+            .ok()
+            .filter(|k| k.starts_with(&prefix))
+        else {
+            break;
+        };
+        match key[prefix.len()..].parse::<u64>() {
+            Ok(r) if r <= round => doomed.push(key.to_string()),
             _ => break,
         }
     }
-    Ok(true)
 }
 
 /// The public keys with signing guards under `prefix`, found by seeking

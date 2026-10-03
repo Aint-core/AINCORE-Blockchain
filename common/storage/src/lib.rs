@@ -23,6 +23,11 @@ use std::sync::Mutex;
 /// restore transaction write consensus state.
 pub const RESTORE_MARKER: &str = "sys:restore_in_progress";
 
+/// B35: the height of the state-sync checkpoint this node is configured
+/// with. Pruning keeps its block and QC: the boot check that this datadir
+/// is on the checkpoint's chain reads them. Node-local.
+pub const CHECKPOINT_PIN: &str = "sys:checkpoint_pin";
+
 /// Every database directory this process currently has open, keyed by the
 /// directory's own identity rather than by the spelling of its path.
 ///
@@ -297,15 +302,36 @@ impl StateDB {
 
     // === PEER ADDRESSES (libp2p dial book; G4 S6: the legacy `peer:` and
     // `peer_ip:` rows of the removed TCP channel are no longer written) ===
+    /// A peer's libp2p address for the next boot, stamped with the time it
+    /// was saved (B43: the newest are the ones dialled).
     pub fn save_peer_addr(
         &self,
         peer_id: &str,
         multiaddr: &str,
     ) -> std::result::Result<(), StorageError> {
-        self.put(&format!("peer_addr:{}", peer_id), multiaddr)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.save_peer_addr_at(peer_id, multiaddr, now)
     }
 
-    pub fn scan_peer_addrs(&self) -> Vec<(String, String)> {
+    /// `save_peer_addr` at `saved_at` (seconds).
+    pub fn save_peer_addr_at(
+        &self,
+        peer_id: &str,
+        multiaddr: &str,
+        saved_at: u64,
+    ) -> std::result::Result<(), StorageError> {
+        self.put(
+            &format!("peer_addr:{}", peer_id),
+            &format!("{saved_at} {multiaddr}"),
+        )
+    }
+
+    /// Every saved peer address: (peer, address, saved at). A row written
+    /// before B43 (the bare address) counts as saved at 0.
+    fn scan_peer_rows(&self) -> Vec<(String, String, u64)> {
         let mut peers = Vec::new();
         let prefix = b"peer_addr:";
         let iter = self.db.prefix_iterator(prefix);
@@ -317,10 +343,36 @@ impl StateDB {
 
             let k = String::from_utf8_lossy(&key).into_owned();
             let node_id = k.replace("peer_addr:", "");
-            let addr = String::from_utf8_lossy(&value).into_owned();
-            peers.push((node_id, addr));
+            let value = String::from_utf8_lossy(&value).into_owned();
+            let (saved_at, addr) = match value.split_once(' ') {
+                Some((at, addr)) => (at.parse().unwrap_or(0), addr.to_string()),
+                None => (0, value),
+            };
+            peers.push((node_id, addr, saved_at));
         }
         peers
+    }
+
+    pub fn scan_peer_addrs(&self) -> Vec<(String, String)> {
+        self.scan_peer_rows()
+            .into_iter()
+            .map(|(peer, addr, _)| (peer, addr))
+            .collect()
+    }
+
+    /// B43: the `keep` most recently saved peer addresses, newest first;
+    /// every older row is deleted (rows from before B43 first), so a boot
+    /// dials what was saved last and the table stays bounded.
+    pub fn keep_newest_peer_addrs(&self, keep: usize) -> Vec<String> {
+        let mut rows = self.scan_peer_rows();
+        rows.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        for (peer, _, _) in rows.iter().skip(keep) {
+            let _ = self.delete(&format!("peer_addr:{peer}"));
+        }
+        rows.into_iter()
+            .take(keep)
+            .map(|(_, addr, _)| addr)
+            .collect()
     }
 
     pub fn scan_vertices(&self) -> Vec<String> {

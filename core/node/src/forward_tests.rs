@@ -158,8 +158,8 @@ fn fake_network(
 }
 
 /// B21 witness: what an observer's RPC accepted reaches a member's mempool,
-/// past a member that is down; a transaction the member refuses is dropped;
-/// with no member answering, everything goes back to the queue in order.
+/// past a member that is down; a transaction two members refuse (both hold
+/// it already) is dropped (B39: one refusal is not enough).
 #[tokio::test]
 async fn an_observer_forwards_its_mempool_to_a_member() {
     let observer = Arc::new(Mutex::new(Mempool::new()));
@@ -171,38 +171,42 @@ async fn an_observer_forwards_its_mempool_to_a_member() {
             .add_transaction(tx.clone())
             .unwrap();
     }
-    let member = Arc::new(Mutex::new(Mempool::new()));
-    // The member already holds the third: it refuses it as a duplicate.
-    member
-        .lock()
-        .unwrap()
-        .add_transaction(txs[2].clone())
-        .unwrap();
+    let (up, up2) = (
+        Arc::new(Mutex::new(Mempool::new())),
+        Arc::new(Mutex::new(Mempool::new())),
+    );
+    // Both answering members hold the third already: both refuse it.
+    up.lock().unwrap().add_transaction(txs[2].clone()).unwrap();
+    up2.lock().unwrap().add_transaction(txs[2].clone()).unwrap();
     let sessions = vec![
         session("down", true),
         session("up", true),
+        session("up2", true),
         session("obs", false),
     ];
-    let served = Arc::clone(&member);
+    let (s1, s2) = (Arc::clone(&up), Arc::clone(&up2));
     let asked = Arc::new(Mutex::new(Vec::<String>::new()));
     let log = Arc::clone(&asked);
     let client = fake_network(sessions, move |peer, wire| {
         log.lock().unwrap().push(peer.to_string());
         match peer {
-            "up" => serve_tx_submit(&served, wire).ok_or_else(|| "refused".into()),
+            "up" => serve_tx_submit(&s1, wire).ok_or_else(|| "refused".into()),
+            "up2" => serve_tx_submit(&s2, wire).ok_or_else(|| "refused".into()),
             _ => Err("connection reset".into()),
         }
     });
     assert_eq!(forward_once(&observer, &client).await, 2);
     {
-        let m = member.lock().unwrap();
-        let held: Vec<&String> = m.get_all_pending().iter().collect();
-        assert_eq!(held.len(), 3, "{held:?}");
-        assert!(txs.iter().all(|t| held.contains(&t)));
+        let held = |m: &Arc<Mutex<Mempool>>, t: &String| {
+            m.lock().unwrap().get_all_pending().iter().any(|p| p == t)
+        };
+        for t in &txs[..2] {
+            assert!(held(&up, t) || held(&up2, t), "accepted by a member");
+        }
     }
     {
         let o = observer.lock().unwrap();
-        assert!(o.is_empty(), "everything was loaned out");
+        assert!(o.is_empty(), "everything settled or on loan");
         let raw = |t: &str| storage::StateDB::raw_tx_hash(t);
         assert!(
             o.any_pending(|t| raw(t) == raw(&txs[0])),
@@ -210,11 +214,7 @@ async fn an_observer_forwards_its_mempool_to_a_member() {
         );
         assert!(
             !o.any_pending(|t| raw(t) == raw(&txs[2])),
-            "refused: dropped"
-        );
-        assert!(
-            asked.lock().unwrap().iter().any(|p| p == "up"),
-            "the member that answered was asked"
+            "refused by two members: dropped"
         );
         assert!(
             !asked.lock().unwrap().iter().any(|p| p == "obs"),
@@ -244,4 +244,86 @@ async fn an_observer_forwards_its_mempool_to_a_member() {
         .cloned()
         .collect();
     assert_eq!(after, before);
+}
+
+/// B39 witness: one member refusing everything cannot censor a sender: the
+/// refused transactions go to the next member, which accepts them.
+#[tokio::test]
+async fn one_refusing_member_cannot_censor() {
+    let observer = Arc::new(Mutex::new(Mempool::new()));
+    let members = [session("liar", true), session("honest", true)];
+    // A sender whose transactions go to the liar first.
+    let tx = (9..=255)
+        .map(|seed| signed_tx(seed, 0))
+        .find(|t| members_for(&sender_of(t), &members)[0] == "liar")
+        .unwrap();
+    observer
+        .lock()
+        .unwrap()
+        .add_transaction(tx.clone())
+        .unwrap();
+    let honest = Arc::new(Mutex::new(Mempool::new()));
+    let served = Arc::clone(&honest);
+    let client = fake_network(members.to_vec(), move |peer, wire| match peer {
+        "liar" => {
+            let n = serde_json::from_str::<Vec<String>>(wire.strip_prefix(TX_SUBMIT).unwrap())
+                .unwrap()
+                .len();
+            let no = vec![Verdict::Refused("no".into()); n];
+            Ok(format!(
+                "{TX_RESULT}{}",
+                serde_json::to_string(&no).unwrap()
+            ))
+        }
+        _ => serve_tx_submit(&served, wire).ok_or_else(|| "refused".into()),
+    });
+    assert_eq!(forward_once(&observer, &client).await, 1);
+    assert!(honest
+        .lock()
+        .unwrap()
+        .get_all_pending()
+        .iter()
+        .any(|p| *p == tx));
+}
+
+/// B39 review witness: a transaction one member refuses in every pass,
+/// its other member silent, is dropped after the mempool's requeue cap.
+/// Returned as unshipped, it was forwarded every pass forever.
+#[tokio::test]
+async fn a_transaction_refused_in_every_pass_is_dropped_at_the_requeue_cap() {
+    let observer = Arc::new(Mutex::new(Mempool::new()));
+    let tx = signed_tx(9, 0);
+    observer
+        .lock()
+        .unwrap()
+        .add_transaction(tx.clone())
+        .unwrap();
+    let members = vec![session("liar", true), session("silent", true)];
+    let client = fake_network(members, move |peer, wire| match peer {
+        "liar" => {
+            let n = serde_json::from_str::<Vec<String>>(wire.strip_prefix(TX_SUBMIT).unwrap())
+                .unwrap()
+                .len();
+            let no = vec![Verdict::Refused("no".into()); n];
+            Ok(format!(
+                "{TX_RESULT}{}",
+                serde_json::to_string(&no).unwrap()
+            ))
+        }
+        _ => Err("timeout".into()),
+    });
+    let raw = storage::StateDB::raw_tx_hash(&tx);
+    let waiting = |m: &Arc<Mutex<Mempool>>| {
+        m.lock()
+            .unwrap()
+            .any_pending(|t| storage::StateDB::raw_tx_hash(t) == raw)
+    };
+    assert_eq!(forward_once(&observer, &client).await, 0);
+    assert!(waiting(&observer), "one refusal does not drop it");
+    let mut passes = 1;
+    while waiting(&observer) {
+        assert!(passes < 10, "still forwarded after {passes} passes");
+        forward_once(&observer, &client).await;
+        passes += 1;
+    }
 }

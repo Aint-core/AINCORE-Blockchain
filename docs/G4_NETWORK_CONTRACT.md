@@ -26,6 +26,9 @@ agave 589b99b8).
 **NI-1 One authenticated session per peer, bound to committee keys.** All consensus, sync and
 DA traffic runs over persistent, encrypted, mutually authenticated sessions. The session
 identity is the node's ed25519 key, so a session names a committee member (or no member). The
+consensus protocol exists only on sessions whose key names a member when they open: anyone
+else's consensus stream is refused at negotiation, before a byte of it is read, and a session
+opened under an older committee is closed and dialled again (B30). The
 legacy per-message TCP channel is retired. Sources: Aptos Noise IK with
 `HandshakeAuthMode::Mutual` against the on-chain `ValidatorSet`
 (`network/framework/src/noise/handshake.rs`); Sui TLS 1.3 with `AllowPublicKeys` = committee

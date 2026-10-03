@@ -1,0 +1,502 @@
+//! Serving bounds against peers outside the committee, on one real node
+//! (`start_p2p`) whose sync requests are answered by the test.
+//!
+//! B30: a requester that never reads its answers cannot make a node hold
+//! more than `OPEN_HELD_MAX_BYTES` of them, and the bytes come back when its
+//! connection closes or the answers are written. Every request is answered
+//! with 9 MiB; a client outside the committee opens eight sync streams and
+//! never reads a response (its codec waits forever), so each answer stays
+//! in the node's write path until the request times out. Seven fit under
+//! the 64 MiB bound; the eighth is refused. Before the bound all eight
+//! (72 MiB) were held, and eight per connection on two connections per host
+//! from many hosts.
+//!
+//! B34: free identities on one host share one sync budget.
+
+use async_trait::async_trait;
+use libp2p::futures::{AsyncRead, AsyncWrite, StreamExt};
+use libp2p::{
+    core::upgrade, noise, request_response, swarm::SwarmEvent, tcp, yamux, Multiaddr,
+    StreamProtocol, Swarm, Transport,
+};
+use node::sessions::{self, OPEN_HELD_MAX_BYTES};
+use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// A sync client that writes requests and never reads an answer.
+#[derive(Debug, Clone, Copy, Default)]
+struct NeverReads;
+
+#[async_trait]
+impl request_response::Codec for NeverReads {
+    type Protocol = StreamProtocol;
+    type Request = String;
+    type Response = String;
+
+    async fn read_request<T>(&mut self, _: &StreamProtocol, _: &mut T) -> io::Result<String>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    async fn read_response<T>(&mut self, _: &StreamProtocol, _: &mut T) -> io::Result<String>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        std::future::pending().await
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _: &StreamProtocol,
+        io: &mut T,
+        req: String,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        sessions::write_frame(io, &req, sessions::SYNC_REQUEST_CAP).await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _: &StreamProtocol,
+        _: &mut T,
+        _: String,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+}
+
+trait SyncCodec:
+    request_response::Codec<Protocol = StreamProtocol, Request = String, Response = String>
+    + Clone
+    + Send
+    + 'static
+{
+}
+impl<C> SyncCodec for C where
+    C: request_response::Codec<Protocol = StreamProtocol, Request = String, Response = String>
+        + Clone
+        + Send
+        + 'static
+{
+}
+
+fn new_client<C: SyncCodec>(codec: C) -> Swarm<request_response::Behaviour<C>> {
+    client_on(
+        codec,
+        sessions::SYNC_PROTOCOL,
+        libp2p::identity::Keypair::generate_ed25519(),
+    )
+}
+
+fn client_on<C: SyncCodec>(
+    codec: C,
+    protocol: &'static str,
+    key: libp2p::identity::Keypair,
+) -> Swarm<request_response::Behaviour<C>> {
+    let transport = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
+        .upgrade(upgrade::Version::V1)
+        .authenticate(noise::Config::new(&key).expect("noise"))
+        .multiplex(yamux::Config::default())
+        .boxed();
+    let behaviour = request_response::Behaviour::with_codec(
+        codec,
+        [(
+            StreamProtocol::new(protocol),
+            request_response::ProtocolSupport::Outbound,
+        )],
+        // Longer than the test: a client never gives a stream up itself.
+        request_response::Config::default().with_request_timeout(Duration::from_secs(600)),
+    );
+    let peer = key.public().to_peer_id();
+    Swarm::new(
+        transport,
+        behaviour,
+        peer,
+        libp2p::swarm::Config::with_tokio_executor()
+            .with_idle_connection_timeout(Duration::from_secs(600)),
+    )
+}
+
+/// Drive `swarm` until `done` holds, or fail after `within`.
+async fn drive_until<C: SyncCodec>(
+    swarm: &mut Swarm<request_response::Behaviour<C>>,
+    within: Duration,
+    what: &str,
+    mut done: impl FnMut() -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + within;
+    while !done() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::select! {
+            _ = swarm.select_next_some() => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn answers_a_non_reader_holds_are_bounded_and_freed_on_close() {
+    const ANSWER: usize = 9 << 20;
+    const REQUESTS: usize = 8;
+    // Seven answers fit under the bound; the eighth does not.
+    const FIT: usize = OPEN_HELD_MAX_BYTES / ANSWER;
+    const _: () = assert!(FIT < REQUESTS);
+    let node_under_test = start_node("held", ANSWER).await;
+    let (target, held, answered) = (
+        node_under_test.target.clone(),
+        Arc::clone(&node_under_test.held),
+        Arc::clone(&node_under_test.answered),
+    );
+    let mut client = new_client(NeverReads);
+    let node = connect(&mut client, &target).await;
+    for _ in 0..REQUESTS {
+        client
+            .behaviour_mut()
+            .send_request(&node, "GET_HEIGHT".to_string());
+    }
+    drive_until(
+        &mut client,
+        Duration::from_secs(30),
+        "every request answered",
+        || answered.load(Ordering::SeqCst) == REQUESTS,
+    )
+    .await;
+    // Let the node hand off (or refuse) the last answer.
+    let settle = tokio::time::Instant::now() + Duration::from_secs(2);
+    drive_until(&mut client, Duration::from_secs(5), "settle", || {
+        tokio::time::Instant::now() >= settle
+    })
+    .await;
+
+    assert_eq!(
+        held.load(Ordering::SeqCst),
+        FIT * ANSWER,
+        "the answers that fit are held, the rest refused"
+    );
+
+    // The client goes away: the node frees what it held.
+    drop(client);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while held.load(Ordering::SeqCst) != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "held answers were not freed on close: {} bytes",
+            held.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // A client that reads: its answers are written whole and their bytes
+    // freed while its connection stays open.
+    let mut reader = new_client(sessions::FramedCodec::new(
+        sessions::SYNC_REQUEST_CAP,
+        sessions::SYNC_RESPONSE_CAP,
+    ));
+    let node = connect(&mut reader, &target).await;
+    for _ in 0..2 {
+        reader
+            .behaviour_mut()
+            .send_request(&node, "GET_HEIGHT".to_string());
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut read = 0;
+    while read < 2 {
+        assert!(tokio::time::Instant::now() < deadline, "answers not read");
+        tokio::select! {
+            ev = reader.select_next_some() => match ev {
+                SwarmEvent::Behaviour(request_response::Event::Message {
+                    message: request_response::Message::Response { response, .. },
+                    ..
+                }) => {
+                    assert_eq!(response.len(), ANSWER);
+                    read += 1;
+                }
+                SwarmEvent::Behaviour(request_response::Event::OutboundFailure { error, .. }) => {
+                    panic!("a request failed: {error}")
+                }
+                _ => {}
+            },
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+    drive_until(
+        &mut reader,
+        Duration::from_secs(10),
+        "written answers freed",
+        || held.load(Ordering::SeqCst) == 0,
+    )
+    .await;
+    assert!(
+        reader.is_connected(&node),
+        "freed by the writes, not a close"
+    );
+}
+
+/// One real node whose sync requests are all answered with `answer` bytes.
+struct NodeUnderTest {
+    target: Multiaddr,
+    book: Arc<std::sync::RwLock<sessions::PeerBook>>,
+    held: Arc<AtomicUsize>,
+    answered: Arc<AtomicUsize>,
+    dir: std::path::PathBuf,
+    // The node's network task runs while this is held.
+    _tx_out: tokio::sync::mpsc::Sender<network::Outbound>,
+}
+
+impl Drop for NodeUnderTest {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+async fn start_node(name: &str, answer: usize) -> NodeUnderTest {
+    let mut dir = storage::test_dir::process_dir();
+    dir.push(format!("aincore_serving_{name}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let storage = Arc::new(storage::StateDB::open(dir.to_str().unwrap()).expect("temp db"));
+
+    // A port for the node's libp2p listener (base port + 100): a pseudo-random
+    // one, another on a clash (the listener binds at start, so a port in use
+    // fails `start_p2p`; this crate opens no socket of its own, G4 S6).
+    let book = Arc::new(std::sync::RwLock::new(sessions::PeerBook::default()));
+    let seed = std::process::id() as u64
+        ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos() as u64;
+    let mut started = None;
+    for attempt in 0..32u64 {
+        let libp2p_port = 20_000 + (seed.wrapping_add(attempt * 7_919) % 40_000) as u16;
+        let (wiring, _client, serves) = sessions::SessionWiring::new(Arc::clone(&book));
+        let held = Arc::clone(&wiring.held_open_bytes);
+        if let Ok((tx_out, rx_in)) = node::p2p::start_p2p(
+            libp2p_port - 100,
+            vec![],
+            Arc::clone(&storage),
+            false,
+            false,
+            [7; 32],
+            wiring,
+        )
+        .await
+        {
+            started = Some((libp2p_port, held, serves, tx_out, rx_in));
+            break;
+        }
+    }
+    let (libp2p_port, held, mut serves, tx_out, mut rx_in) =
+        started.expect("the node starts on a free port");
+    tokio::spawn(async move { while rx_in.recv().await.is_some() {} });
+    let answered = Arc::new(AtomicUsize::new(0));
+    {
+        let answered = Arc::clone(&answered);
+        tokio::spawn(async move {
+            while let Some(serve) = serves.recv().await {
+                let _ = serve.reply.send(Some("x".repeat(answer)));
+                answered.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+    }
+    NodeUnderTest {
+        target: format!("/ip4/127.0.0.1/tcp/{libp2p_port}").parse().unwrap(),
+        book,
+        held,
+        answered,
+        dir,
+        _tx_out: tx_out,
+    }
+}
+
+/// Send `n` requests, at most 8 at a time (the node's open streams per
+/// connection), and count the answered and the refused.
+async fn ask_in_batches(
+    swarm: &mut Swarm<request_response::Behaviour<sessions::FramedCodec>>,
+    node: &libp2p::PeerId,
+    n: usize,
+    stop_at_first_refusal: bool,
+) -> (usize, usize) {
+    let (mut answered, mut refused) = (0, 0);
+    while answered + refused < n {
+        let batch = (n - answered - refused).min(8);
+        for _ in 0..batch {
+            swarm
+                .behaviour_mut()
+                .send_request(node, "GET_HEIGHT".to_string());
+        }
+        let mut outcomes = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while outcomes < batch {
+            assert!(tokio::time::Instant::now() < deadline, "a batch hung");
+            tokio::select! {
+                ev = swarm.select_next_some() => match ev {
+                    SwarmEvent::Behaviour(request_response::Event::Message {
+                        message: request_response::Message::Response { .. },
+                        ..
+                    }) => {
+                        answered += 1;
+                        outcomes += 1;
+                    }
+                    SwarmEvent::Behaviour(request_response::Event::OutboundFailure { .. }) => {
+                        refused += 1;
+                        outcomes += 1;
+                    }
+                    _ => {}
+                },
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        if stop_at_first_refusal && refused > 0 {
+            break;
+        }
+    }
+    (answered, refused)
+}
+
+/// B34 witness: free identities on one host share one sync budget. One
+/// identity spends the host's burst; a second, fresh identity from the same
+/// host gets only what the bucket refilled since. Keyed by PeerId (before),
+/// the second identity had a full burst of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn free_identities_on_one_host_share_one_sync_budget() {
+    const ASKED: usize = 64;
+    let node_under_test = start_node("budget", 2).await;
+    let reader = || {
+        new_client(sessions::FramedCodec::new(
+            sessions::SYNC_REQUEST_CAP,
+            sessions::SYNC_RESPONSE_CAP,
+        ))
+    };
+    let mut first = reader();
+    let node = connect(&mut first, &node_under_test.target).await;
+    let (spent, refused) = ask_in_batches(&mut first, &node, 400, true).await;
+    assert!(refused > 0, "the host's budget ran out");
+    assert!(
+        spent >= sessions::SYNC_REQUEST_BURST as usize,
+        "positive control: the burst was answered ({spent})"
+    );
+    let exhausted = std::time::Instant::now();
+    drop(first);
+
+    let mut second = reader();
+    let node = connect(&mut second, &node_under_test.target).await;
+    let (answered, _) = ask_in_batches(&mut second, &node, ASKED, false).await;
+    let refill = sessions::SYNC_REQUESTS_PER_SEC * exhausted.elapsed().as_secs_f64();
+    assert!(
+        refill + 1.0 < ASKED as f64,
+        "the test ran too slowly to tell the budgets apart ({refill:.1})"
+    );
+    assert!(
+        (answered as f64) <= refill.ceil() + 1.0,
+        "a fresh identity on the same host was answered {answered} times; \
+         the host's bucket refilled only {refill:.1}"
+    );
+}
+
+/// The one outcome of one request.
+async fn one_answer<C: SyncCodec>(
+    swarm: &mut Swarm<request_response::Behaviour<C>>,
+    node: &libp2p::PeerId,
+    request: String,
+) -> Result<String, request_response::OutboundFailure> {
+    swarm.behaviour_mut().send_request(node, request);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(tokio::time::Instant::now() < deadline, "no outcome");
+        tokio::select! {
+            ev = swarm.select_next_some() => match ev {
+                SwarmEvent::Behaviour(request_response::Event::Message {
+                    message: request_response::Message::Response { response, .. },
+                    ..
+                }) => return Ok(response),
+                SwarmEvent::Behaviour(request_response::Event::OutboundFailure { error, .. }) => {
+                    return Err(error)
+                }
+                _ => {}
+            },
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+}
+
+/// B30 witness: a peer outside the committee cannot open a consensus
+/// stream at all (refused at negotiation, before its frame is read). Once
+/// the book names it, the connection it opened under the old book is
+/// closed, and on a new one its consensus message is acknowledged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consensus_streams_open_for_members_only() {
+    let node_under_test = start_node("members_only", 2).await;
+    let key = libp2p::identity::Keypair::generate_ed25519();
+    let consensus_client = |key: &libp2p::identity::Keypair| {
+        client_on(
+            sessions::FramedCodec::consensus(),
+            sessions::CONSENSUS_PROTOCOL,
+            key.clone(),
+        )
+    };
+    let mut outsider = consensus_client(&key);
+    let node = connect(&mut outsider, &node_under_test.target).await;
+    let big = format!("DAG_V4:{}", "x".repeat(700 << 10));
+    match one_answer(&mut outsider, &node, big).await {
+        Err(request_response::OutboundFailure::UnsupportedProtocols) => {}
+        other => {
+            panic!("a non-member's consensus stream was not refused at negotiation: {other:?}")
+        }
+    }
+
+    // The book names the outsider now: the node closes the connection it
+    // opened as a non-member (the committee dial runs every 5 s).
+    let public = hex::encode(key.public().try_into_ed25519().unwrap().to_bytes());
+    let member = blockchain::committee::ValidatorInfo {
+        address: "member".into(),
+        stake: 1,
+        ed25519_public_key: public,
+        bls_public_key: String::new(),
+        bls_pop: String::new(),
+    };
+    *node_under_test.book.write().unwrap() = sessions::PeerBook::new(0, &[&[member]]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while outsider.is_connected(&node) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the connection opened as a non-member was not closed"
+        );
+        tokio::select! {
+            _ = outsider.select_next_some() => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+    drop(outsider);
+    let mut member = consensus_client(&key);
+    let node = connect(&mut member, &node_under_test.target).await;
+    let answer = one_answer(&mut member, &node, "DAG_V4:hello".into()).await;
+    assert_eq!(answer.ok().as_deref(), Some(sessions::CONSENSUS_ACK));
+}
+
+/// Dial `target` and wait for the session.
+async fn connect<C: SyncCodec>(
+    swarm: &mut Swarm<request_response::Behaviour<C>>,
+    target: &Multiaddr,
+) -> libp2p::PeerId {
+    swarm.dial(target.clone()).expect("dial");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(tokio::time::Instant::now() < deadline, "no session opened");
+        tokio::select! {
+            ev = swarm.select_next_some() => {
+                if let SwarmEvent::ConnectionEstablished { peer_id, .. } = ev {
+                    return peer_id;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+}

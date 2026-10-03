@@ -109,6 +109,30 @@ mod tests {
         assert_eq!(db.get("nonexistent").unwrap(), None);
     }
 
+    /// B43 witness: a boot keeps the most recently saved addresses and
+    /// deletes the rest, rows from before B43 (bare addresses) first. By
+    /// key order alone, old rows sorting first were dialled at every boot
+    /// and never expired.
+    #[test]
+    fn the_newest_peer_addresses_are_kept_and_the_rest_deleted() {
+        let db = temp_db("peer_addrs_newest");
+        db.put("peer_addr:a-legacy", "/ip4/10.0.0.9/tcp/9132")
+            .unwrap();
+        db.save_peer_addr_at("b-old", "/ip4/10.0.0.2/tcp/9132", 100)
+            .unwrap();
+        db.save_peer_addr_at("c-new", "/ip4/10.0.0.3/tcp/9132", 300)
+            .unwrap();
+        db.save_peer_addr_at("d-mid", "/ip4/10.0.0.4/tcp/9132", 200)
+            .unwrap();
+        assert_eq!(
+            db.keep_newest_peer_addrs(2),
+            ["/ip4/10.0.0.3/tcp/9132", "/ip4/10.0.0.4/tcp/9132"]
+        );
+        let mut left: Vec<String> = db.scan_peer_addrs().into_iter().map(|(p, _)| p).collect();
+        left.sort();
+        assert_eq!(left, ["c-new", "d-mid"], "the older rows are deleted");
+    }
+
     #[test]
     fn peer_addresses_are_saved_and_scanned() {
         let db = temp_db("peer_addrs");

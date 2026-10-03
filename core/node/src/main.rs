@@ -513,11 +513,9 @@ async fn main() {
 
     // === LOAD PERSISTED PEERS ===
     // B22: libp2p addresses saved from earlier sessions; dialled as they are.
-    let saved_peer_addrs: Vec<String> = storage
-        .scan_peer_addrs()
-        .into_iter()
-        .map(|(_, addr)| addr)
-        .collect();
+    // B43: the newest few; older rows are deleted.
+    let saved_peer_addrs: Vec<String> =
+        storage.keep_newest_peer_addrs(node::sessions::MAX_SAVED_PEERS);
     if !saved_peer_addrs.is_empty() {
         println!(
             "📚 Found {} saved peer addresses in database",
@@ -607,8 +605,20 @@ async fn main() {
     };
     // G3 S6: restore from a checkpoint first, when one is configured.
     match StateSyncSettings::from_env() {
-        Ok(None) => {}
+        Ok(None) => {
+            // B35: no checkpoint, no pinned height.
+            let _ = storage.delete(storage::CHECKPOINT_PIN);
+        }
         Ok(Some(settings)) => {
+            // B35: pruning keeps the checkpoint's block and QC, which the
+            // check below reads at every boot.
+            if let Err(e) = storage.put(
+                storage::CHECKPOINT_PIN,
+                &settings.checkpoint.height.to_string(),
+            ) {
+                eprintln!("❌ [STATE_SYNC] the checkpoint pin was not written: {e}");
+                std::process::exit(1);
+            }
             let local_genesis =
                 || genesis::build_local_genesis(stdlib_path).map_err(|e| e.to_string());
             let restore = restore_from_checkpoint(
@@ -744,14 +754,30 @@ async fn main() {
     // forward theirs.
     let in_committee = Arc::new(AtomicBool::new(false));
     {
-        const SYNC_SERVE_CONCURRENCY: usize = 8;
+        // B34: serving slots. Members keep their own (free identities used
+        // to take all eight); forwarded transactions have theirs (B31).
+        // Counts are choices.
+        const MEMBER_SERVES: usize = 4;
+        const OPEN_SERVES: usize = 4;
+        const TX_SUBMIT_SERVES: usize = 2;
         let serve_sync = Arc::clone(&chain_sync);
         let serve_mempool = Arc::clone(&mempool);
         let serve_member = Arc::clone(&in_committee);
-        let permits = Arc::new(tokio::sync::Semaphore::new(SYNC_SERVE_CONCURRENCY));
+        let member_permits = Arc::new(tokio::sync::Semaphore::new(MEMBER_SERVES));
+        let open_permits = Arc::new(tokio::sync::Semaphore::new(OPEN_SERVES));
+        let tx_permits = Arc::new(tokio::sync::Semaphore::new(TX_SUBMIT_SERVES));
         tokio::spawn(async move {
             while let Some(request) = sync_serves.recv().await {
-                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                let permit = if request.wire.starts_with(node::forward::TX_SUBMIT) {
+                    Arc::clone(&tx_permits).try_acquire_owned()
+                } else if request.member.is_some() {
+                    Arc::clone(&member_permits)
+                        .try_acquire_owned()
+                        .or_else(|_| Arc::clone(&open_permits).try_acquire_owned())
+                } else {
+                    Arc::clone(&open_permits).try_acquire_owned()
+                };
+                let Ok(permit) = permit else {
                     // A snapshot part waits a busy answer out; anything
                     // else is refused.
                     let _ = request

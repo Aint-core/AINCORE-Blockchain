@@ -11,11 +11,13 @@
 //! answers each transaction with its mempool's verdict. An accepted one
 //! stays on loan until a synced block settles it (`mark_executed`), or
 //! returns to the queue after 30 s and is forwarded again (bounded by the
-//! mempool's requeue cap); a refused one is dropped; an unanswered batch
-//! goes to the next member, and back to the queue when none answers.
+//! mempool's requeue cap); a refused one goes to the next member and is
+//! dropped once `REFUSALS_TO_DROP` members refused it (B39); an unanswered
+//! batch goes to the next member, and back to the queue when none answers.
 
 use mempool::Mempool;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -50,10 +52,18 @@ pub fn serve_tx_submit(mempool: &Mutex<Mempool>, wire: &str) -> Option<String> {
     if txs.is_empty() || txs.len() > FORWARD_BATCH {
         return None;
     }
-    let mut mp = mempool.lock().ok()?;
-    let verdicts: Vec<Verdict> = txs
+    // B31: the stateless checks (signatures included) run before the
+    // mempool lock, which the consensus ticker needs; only what passes is
+    // admitted under it, without being verified again.
+    let checked: Vec<Result<(String, executor::admission::CheckedTx), String>> = txs
         .into_iter()
-        .map(|tx| match mp.add_transaction(tx) {
+        .map(|tx| Mempool::check_admissible(&tx).map(|checked| (tx, checked)))
+        .collect();
+    let mut mp = mempool.lock().ok()?;
+    let verdicts: Vec<Verdict> = checked
+        .into_iter()
+        .map(|tx| tx.and_then(|(tx, checked)| mp.add_checked(tx, checked)))
+        .map(|admitted| match admitted {
             Ok(hash) => Verdict::Accepted(hash),
             Err(reason) => Verdict::Refused(reason),
         })
@@ -147,45 +157,73 @@ pub async fn forward_once(mempool: &Arc<Mutex<Mempool>>, client: &network::Sessi
     accepted
 }
 
+/// B39: a transaction is dropped only once this many members refused it
+/// (f + 1 for a committee of four: one Byzantine member cannot censor a
+/// sender by refusing; a choice for larger committees).
+pub const REFUSALS_TO_DROP: usize = 2;
+
 async fn send_batch(
     mempool: &Arc<Mutex<Mempool>>,
     client: &network::SessionClient,
     order: &[String],
     batch: Vec<String>,
 ) -> usize {
-    let Ok(wire) = serde_json::to_string(&batch).map(|json| format!("{TX_SUBMIT}{json}")) else {
-        return 0;
-    };
+    let mut pending = batch;
+    let mut refusals: HashMap<String, usize> = HashMap::new();
+    let mut dropped = Vec::new();
+    let mut accepted = 0;
     for peer in order {
+        if pending.is_empty() {
+            break;
+        }
+        let Ok(wire) = serde_json::to_string(&pending).map(|json| format!("{TX_SUBMIT}{json}"))
+        else {
+            break;
+        };
         let Ok(reply) = client.ask(peer, &wire, FORWARD_TIMEOUT).await else {
             continue;
         };
         let Some(verdicts) = reply
             .strip_prefix(TX_RESULT)
             .and_then(|json| serde_json::from_str::<Vec<Verdict>>(json).ok())
-            .filter(|v| v.len() == batch.len())
+            .filter(|v| v.len() == pending.len())
         else {
             continue;
         };
-        let refused: Vec<String> = batch
-            .iter()
-            .zip(&verdicts)
-            .filter(|(_, v)| matches!(v, Verdict::Refused(_)))
-            .map(|(tx, _)| tx.clone())
-            .collect();
-        if let Ok(mut mp) = mempool.lock() {
-            // Refused by the member: dropped here too (a used nonce, a
-            // payer that cannot pay, a transaction it already holds).
-            mp.mark_executed(&refused);
+        let mut next = Vec::new();
+        for (tx, verdict) in pending.into_iter().zip(verdicts) {
+            match verdict {
+                Verdict::Accepted(_) => accepted += 1,
+                Verdict::Refused(_) => {
+                    let count = refusals.entry(tx.clone()).or_insert(0);
+                    *count += 1;
+                    if *count >= REFUSALS_TO_DROP {
+                        dropped.push(tx);
+                    } else {
+                        next.push(tx);
+                    }
+                }
+            }
         }
-        return verdicts.len() - refused.len();
+        pending = next;
     }
-    // No member answered: back to the front of the queue, in order.
     if let Ok(mut mp) = mempool.lock() {
-        let reversed: Vec<String> = batch.into_iter().rev().collect();
-        mp.return_unshipped(&reversed);
+        // Refused by enough members: dropped here too (a used nonce, a payer
+        // that cannot pay, a transaction they already hold).
+        mp.mark_executed(&dropped);
+        // Not settled: back to the front of the queue, in order. Once any
+        // member answered, every one left was refused by too few members:
+        // a failed attempt, so one refused in every pass is dropped after
+        // the mempool's requeue cap (review of B39). None answered: the
+        // network's failure, not the transaction's.
+        let reversed: Vec<String> = pending.into_iter().rev().collect();
+        if refusals.is_empty() {
+            mp.return_unshipped(&reversed);
+        } else {
+            mp.return_refused(&reversed);
+        }
     }
-    0
+    accepted
 }
 
 fn wall_secs() -> u64 {

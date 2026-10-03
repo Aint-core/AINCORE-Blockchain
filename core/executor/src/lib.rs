@@ -11976,6 +11976,67 @@ mod tests {
         );
     }
 
+    /// B37: a block re-executed from its paid-only body (what a syncing node
+    /// imports) reaches the producer's state root, though dropping what did
+    /// not execute merges batches the producer kept apart. Here A and C are
+    /// independent; B, which cannot pay, shares an object with each, so the
+    /// producer runs [A] [B] [C] and the body alone runs [A, C].
+    #[test]
+    fn the_body_alone_reaches_the_producers_state_root() {
+        let setup = |name: &str| {
+            let db = temp_db(name);
+            load_stdlib(&db);
+            {
+                let _seed = db.seeding();
+                db.set_federation_key("00000000000000000000000000000000")
+                    .unwrap();
+            }
+            let keys: Vec<SigningKey> = (0..3u8)
+                .map(|i| SigningKey::from_bytes(&[90 + i; 32]))
+                .collect();
+            let addrs: Vec<String> = keys.iter().map(|k| create_account(&db, k)).collect();
+            set_coin_store(&db, &addrs[0], 10_000_000);
+            set_coin_store(&db, &addrs[1], 0);
+            set_coin_store(&db, &addrs[2], 10_000_000);
+            seed_genesis_tree(&db);
+            (db, keys, addrs)
+        };
+        let (producer, keys, addrs) = setup("b37_producer");
+        let (follower, _, _) = setup("b37_follower");
+        let with_objects = |i: usize, to: usize, objects: &[&str]| {
+            let mut tx: Transaction = serde_json::from_str(&signed_tx(
+                &keys[i],
+                &addrs[i],
+                &coin_transfer_payload(&addrs[i], &addrs[to], 5),
+                0,
+                0,
+                1,
+            ))
+            .unwrap();
+            tx.input_objects = objects.iter().map(|o| o.to_string()).collect();
+            sign_covering(&keys[i], tx, 100_000)
+        };
+        let a = with_objects(0, 0, &["o1"]);
+        let b = with_objects(1, 1, &["o1", "o2"]);
+        let c = with_objects(2, 2, &["o2"]);
+        let run = |db: &Arc<StateDB>, txs: Vec<String>| {
+            let Ok(BlockExecOutcome::Executed(summary)) = Executor::new(db.clone())
+                .execute_block_checked_at(txs, &addrs[0], 1, block_time(1), 0, &[], &[], |_, _| {
+                    Ok(())
+                })
+            else {
+                panic!("block must execute");
+            };
+            summary
+        };
+        let full = run(&producer, vec![a.clone(), b, c.clone()]);
+        assert_eq!(full.body, vec![a, c], "positive control: B did not pay");
+        let body = run(&follower, full.body.clone());
+        assert_eq!(body.body, full.body);
+        assert_eq!(body.state_root, full.state_root);
+        assert_eq!(body.receipts_root, full.receipts_root);
+    }
+
     /// B16, the same class for the per-block object limit (N-2): eighty
     /// independent transactions that cannot pay (wrong sequence numbers), each
     /// declaring 128 short input objects (10,240 of the 10,000, under 100M

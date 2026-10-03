@@ -2262,6 +2262,65 @@ fn b6_storage_per_empty_block_by_key_family() {
 /// keys, the vote and aggregation rows of its anchor round, the signing
 /// guards at its height and round, and the anchor decisions up to its round.
 /// The rows of the blocks kept stay.
+/// B35 and B36 witnesses. The configured state-sync checkpoint's height
+/// keeps its block and QC through pruning (the boot check reads them: a
+/// node past the checkpoint that pruned them refused to boot). And a QC of
+/// epoch 1 or later takes the anchor decisions up to its round, which are
+/// keyed under epoch 0 for every epoch (the pruner used the QC's epoch, so
+/// from epoch 1 on the rows grew forever).
+#[test]
+fn the_checkpoint_keeps_its_block_and_decisions_are_pruned_in_every_epoch() {
+    let mut c = Cluster::new("b35-pin", &[121, 122, 123, 124], true);
+    c.run_until(400, |c| c.qc(0, 12).is_some());
+    let s = Arc::clone(&c.node(0).storage);
+    let tip = c.node(0).latest_block_height;
+    let floor = 5u64;
+    let pins = state_commit::pin_schedule(tip, tip - floor, state_commit::epoch_interval(&s));
+    let checkpoint = (1..floor)
+        .find(|h| !pins.contains(h) && c.qc(0, *h).is_some())
+        .expect("vacuous: no unpinned height below the floor");
+    {
+        let _seed = s.seeding();
+        s.put(storage::CHECKPOINT_PIN, &checkpoint.to_string())
+            .unwrap();
+    }
+    crate::dag::prune_history(&s, tip, Some((tip - floor, 1_000)));
+    assert!(
+        s.get(&format!("block_{checkpoint}")).unwrap().is_some(),
+        "the checkpoint's block was pruned"
+    );
+    assert!(
+        c.qc(0, checkpoint).is_some(),
+        "the checkpoint's QC was pruned"
+    );
+    let other = (1..floor).find(|h| *h != checkpoint && !pins.contains(h));
+    if let Some(h) = other {
+        assert!(c.qc(0, h).is_none(), "positive control: {h} was pruned");
+    }
+
+    // B36: the QC at 12 relabelled to epoch 1 still takes its decisions.
+    let mut qc = c.qc(0, 12).unwrap();
+    let round = qc.anchor_round;
+    let decided = |s: &StateDB| {
+        (0..=round)
+            .filter(|r| {
+                s.get(&crate::ordering::anchor_decision_key(0, *r))
+                    .unwrap()
+                    .is_some()
+            })
+            .count()
+    };
+    assert!(decided(&s) > 0, "vacuous: no decision up to round {round}");
+    qc.epoch = 1;
+    {
+        let _seed = s.seeding();
+        s.put("consensus:qc:12", &serde_json::to_string(&qc).unwrap())
+            .unwrap();
+    }
+    crate::qc_producer::prune_finality_height(&s, 12).unwrap();
+    assert_eq!(decided(&s), 0, "decisions up to round {round} survived");
+}
+
 #[test]
 fn pruning_a_block_takes_its_finality_rows() {
     let mut c = Cluster::new("b6-prune", &[111, 112, 113, 114], true);

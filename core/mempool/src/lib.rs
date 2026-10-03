@@ -222,22 +222,47 @@ impl Mempool {
             return Err(format!("Duplicate transaction: {}", tx_hash));
         }
 
-        // B8/B12/B13: the stateless half of validity (chain id from
-        // `sys:chain_id`, gas bounds, payload kind with scripts disabled, ZK
-        // proof, the sender's signature in Ed25519 or ML-DSA-65, and the
-        // paymaster's) is the one predicate vertex ingress and the executor
-        // run too. `payer` is whoever pays the gas.
-        let checked = executor::admission::check_stateless(&tx, &blockchain::chain_id())?;
+        let checked = Self::check_admissible(&tx)?;
+        self.add_checked(tx, checked)
+    }
 
-        // B1 (best-effort early reject): a join_validator_set call's BLS
-        // proof-of-possession is checked here so a rogue-key join never enters
-        // the mempool. The executor's pre-dispatch gate is the authoritative one.
-        let payload_bytes = hex::decode(parsed_tx.payload.trim_start_matches("0x"))
+    /// The stateless half of admission, which needs no mempool state: run it
+    /// before taking the mempool's lock (B31), then `add_checked`.
+    ///
+    /// B8/B12/B13: the stateless half of validity (chain id from
+    /// `sys:chain_id`, gas bounds, payload kind with scripts disabled, ZK
+    /// proof, the sender's signature in Ed25519 or ML-DSA-65, and the
+    /// paymaster's) is the one predicate vertex ingress and the executor run
+    /// too. `payer` is whoever pays the gas. B1 (best-effort early reject): a
+    /// join_validator_set call's BLS proof-of-possession is checked here so a
+    /// rogue-key join never enters the mempool; the executor's pre-dispatch
+    /// gate is the authoritative one.
+    pub fn check_admissible(tx: &str) -> Result<executor::admission::CheckedTx, String> {
+        let checked = executor::admission::check_stateless(tx, &blockchain::chain_id())?;
+        let payload_bytes = hex::decode(checked.tx.payload.trim_start_matches("0x"))
             .map_err(|_| "Invalid payload hex: expected BCS TransactionPayload".to_string())?;
         if let Ok(vm_move::TransactionPayload::EntryFunction(call)) =
             bcs::from_bytes::<vm_move::TransactionPayload>(&payload_bytes)
         {
-            verify_join_validator_pop_mempool(&call, &parsed_tx.public_key)?;
+            verify_join_validator_pop_mempool(&call, &checked.tx.public_key)?;
+        }
+        Ok(checked)
+    }
+
+    /// Admit `tx`, whose `check_admissible` already passed as `checked`: the
+    /// replay, economic and capacity gates, which read the mempool and the
+    /// committed state. Nothing here verifies a signature again (B31: a
+    /// batch of validly signed transactions from unfunded keys used to be
+    /// verified a second time under the lock).
+    pub fn add_checked(
+        &mut self,
+        tx: String,
+        checked: executor::admission::CheckedTx,
+    ) -> Result<String, String> {
+        let parsed_tx = &checked.tx;
+        let tx_hash = Self::canonical_tx_hash(parsed_tx);
+        if self.seen_txs.contains(&tx_hash) {
+            return Err(format!("Duplicate transaction: {}", tx_hash));
         }
 
         // Economic gate, after authentication so a bad signature is reported as
@@ -531,6 +556,32 @@ impl Mempool {
             };
             self.pending_nonces
                 .insert(format!("{}:{}", m.sender, m.seq));
+            self.pending_txs.push_front(raw.clone());
+        }
+    }
+
+    /// B39: forwarded transactions a member refused, though too few members
+    /// to drop them yet: back to the front of the queue as a failed attempt.
+    /// One that is refused in every pass (its other members silent) is
+    /// dropped after `MAX_REQUEUE_ATTEMPTS` instead of forwarded every pass
+    /// forever. `raws` in reverse order, as `return_unshipped` takes them.
+    pub fn return_refused(&mut self, raws: &[String]) {
+        for raw in raws.iter() {
+            let Some((_, attempts)) = self.inflight.remove(raw) else {
+                continue;
+            };
+            let Some(m) = self.meta.get(raw) else {
+                self.requeue_attempts.remove(raw);
+                continue;
+            };
+            if attempts + 1 >= MAX_REQUEUE_ATTEMPTS {
+                self.meta.remove(raw);
+                self.requeue_attempts.remove(raw);
+                continue;
+            }
+            self.pending_nonces
+                .insert(format!("{}:{}", m.sender, m.seq));
+            self.requeue_attempts.insert(raw.clone(), attempts + 1);
             self.pending_txs.push_front(raw.clone());
         }
     }

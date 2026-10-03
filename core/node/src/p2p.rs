@@ -63,6 +63,7 @@ pub async fn start_p2p(
         asks: mut sync_asks,
         dials: mut sync_dials,
         serves: sync_serves,
+        held_open_bytes,
     } = wiring;
     let (tx_out, mut rx_in) = mpsc::channel::<Outbound>(64); // Main -> P2P
     let (tx_in, rx_out) = mpsc::channel::<String>(64); // P2P -> Main
@@ -140,6 +141,11 @@ pub async fn start_p2p(
     // === Combine behaviours ===
     #[derive(libp2p::swarm::NetworkBehaviour)]
     struct P2PBehaviour {
+        // B24: admission before the handshake, per IP and in all. First: a
+        // behaviour asked after one that denies a connection has already
+        // set up state for it (the derive asks the fields in this order).
+        gate: sessions::InboundGate,
+        limits: libp2p::connection_limits::Behaviour,
         gossipsub: GossipsubBehaviour,
         mdns: Toggle<Mdns>,
         kademlia: Kademlia<MemoryStore>,
@@ -147,11 +153,9 @@ pub async fn start_p2p(
         identify: identify::Behaviour,
         pub dcutr: Toggle<dcutr::Behaviour>,
         pub relay: Toggle<relay::client::Behaviour>,
-        consensus: request_response::Behaviour<sessions::FramedCodec>,
+        // B30: the protocol exists on members' connections only.
+        consensus: sessions::MembersOnly,
         sync: request_response::Behaviour<sessions::FramedCodec>,
-        // B24: admission before the handshake, per IP and in all.
-        gate: sessions::InboundGate,
-        limits: libp2p::connection_limits::Behaviour,
     }
 
     let behaviour = P2PBehaviour {
@@ -160,7 +164,7 @@ pub async fn start_p2p(
         kademlia,
         autonat,
         identify,
-        consensus: sessions::consensus_behaviour(),
+        consensus: sessions::MembersOnly::new(Arc::clone(&book)),
         sync: sessions::sync_behaviour(),
         dcutr: Toggle::from(dcutr_behaviour),
         relay: Toggle::from(relay_behaviour),
@@ -260,10 +264,17 @@ pub async fn start_p2p(
             request_response::OutboundRequestId,
             tokio::sync::oneshot::Sender<Result<String, String>>,
         > = std::collections::HashMap::new();
+        // The channel, and for a non-member its busy reply if the request
+        // has one (B30: the held-answer bound refuses with it).
         let mut pending_serves: std::collections::HashMap<
             request_response::InboundRequestId,
-            request_response::ResponseChannel<String>,
+            (
+                request_response::ResponseChannel<String>,
+                Option<Option<String>>,
+            ),
         > = std::collections::HashMap::new();
+        let mut held_answers: sessions::HeldAnswers<request_response::InboundRequestId> =
+            sessions::HeldAnswers::new(held_open_bytes);
         let (served_tx, mut served_rx) =
             mpsc::channel::<(request_response::InboundRequestId, Option<String>)>(64);
         // B25: boundary-QC asks this node made over sync for itself; their
@@ -278,13 +289,21 @@ pub async fn start_p2p(
         // G4 NI-3: per-member consensus budget, per-session sync quota.
         let mut member_budget: sessions::Budget<String> =
             sessions::Budget::new(sessions::MEMBER_MSGS_PER_SEC, sessions::MEMBER_MSG_BURST);
-        let mut sync_budget: sessions::Budget<PeerId> = sessions::Budget::new(
+        // B34: members by key, everyone else by host (a host's free
+        // identities share one budget).
+        let mut sync_budget: sessions::Budget<String> = sessions::Budget::new(
             sessions::SYNC_REQUESTS_PER_SEC,
             sessions::SYNC_REQUEST_BURST,
         );
         // G4 NI-3: messages bound for the node; the swarm never waits on it.
         let mut inbox = sessions::Inbox::default();
         // G4 NI-2: inbound connections from non-members, all together.
+        // B34: the host each connected peer reached this node from (or at).
+        let mut peer_hosts: std::collections::HashMap<PeerId, String> =
+            std::collections::HashMap::new();
+        // B40: and outbound to non-members.
+        let mut non_member_outbound: std::collections::HashSet<libp2p::swarm::ConnectionId> =
+            std::collections::HashSet::new();
         let mut non_member_inbound: std::collections::HashSet<libp2p::swarm::ConnectionId> =
             std::collections::HashSet::new();
         // G4 S5: the explicit gossip peers, kept equal to the members.
@@ -392,10 +411,23 @@ pub async fn start_p2p(
                     }
                 }
                 Some((id, answer)) = served_rx.recv() => {
-                    if let Some(channel) = pending_serves.remove(&id) {
+                    if let Some((channel, open)) = pending_serves.remove(&id) {
                         match answer {
                             Some(answer) => {
-                                let _ = swarm.behaviour_mut().sync.send_response(channel, answer);
+                                // B30: when non-members already hold too many
+                                // unread answers, a snapshot part is told busy
+                                // and anything else is refused.
+                                let refused = open.is_some() && !held_answers.admit(id, answer.len());
+                                if refused {
+                                    match open.flatten() {
+                                        Some(busy) => {
+                                            let _ = swarm.behaviour_mut().sync.send_response(channel, busy);
+                                        }
+                                        None => drop(channel),
+                                    }
+                                } else if swarm.behaviour_mut().sync.send_response(channel, answer).is_err() {
+                                    held_answers.release(&id);
+                                }
                             }
                             None => drop(channel),
                         }
@@ -430,6 +462,17 @@ pub async fn start_p2p(
                     if let Ok(b) = book.read() {
                         for peer in &connected {
                             sessions::score_peer(&mut swarm.behaviour_mut().gossipsub, &b, peer);
+                        }
+                    }
+                    // B30: a connection opened under an older book carries the
+                    // wrong consensus handler: close it; a member is dialled
+                    // again at once (its consensus fails until it is).
+                    for (peer, id) in swarm.behaviour().consensus.misfiled() {
+                        swarm.close_connection(id);
+                        if book.read().is_ok_and(|b| b.member_of(&peer).is_some()) {
+                            let _ = swarm.dial(
+                                DialOpts::peer_id(peer).condition(PeerCondition::Always).build(),
+                            );
                         }
                     }
                     // B22: bootnodes not reached yet (they may boot after us).
@@ -476,7 +519,15 @@ pub async fn start_p2p(
                         peer,
                         message: request_response::Message::Request { request_id, request, channel },
                     })) => {
-                        if !sync_budget.spend(&peer, std::time::Instant::now()) {
+                        let member = book
+                            .read()
+                            .ok()
+                            .and_then(|b| b.member_of(&peer).map(str::to_string));
+                        let budget_key = match (&member, peer_hosts.get(&peer)) {
+                            (None, Some(host)) => format!("host:{host}"),
+                            _ => peer.to_string(),
+                        };
+                        if !sync_budget.spend(&budget_key, std::time::Instant::now()) {
                             // NI-3: over its sync quota. A snapshot part is told
                             // "busy" (its client waits it out without losing
                             // its place); anything else is refused.
@@ -488,11 +539,10 @@ pub async fn start_p2p(
                             }
                             continue;
                         }
-                        let member = book
-                            .read()
-                            .ok()
-                            .and_then(|b| b.member_of(&peer).map(str::to_string));
                         let (reply, answer) = tokio::sync::oneshot::channel();
+                        let open = member
+                            .is_none()
+                            .then(|| chain_sync::state_sync::busy_reply(&request));
                         let serve = network::SyncServe {
                             peer: peer.to_string(),
                             member,
@@ -500,7 +550,7 @@ pub async fn start_p2p(
                             reply,
                         };
                         if sync_serves.try_send(serve).is_ok() {
-                            pending_serves.insert(request_id, channel);
+                            pending_serves.insert(request_id, (channel, open));
                             let served_tx = served_tx.clone();
                             tokio::spawn(async move {
                                 let answer = answer.await.ok().flatten();
@@ -534,8 +584,13 @@ pub async fn start_p2p(
                         request_id, ..
                     })) => {
                         pending_serves.remove(&request_id);
+                        held_answers.release(&request_id);
                     }
-                    SwarmEvent::Behaviour(P2PBehaviourEvent::Sync(_)) => {}
+                    SwarmEvent::Behaviour(P2PBehaviourEvent::Sync(request_response::Event::ResponseSent {
+                        request_id, ..
+                    })) => {
+                        held_answers.release(&request_id);
+                    }
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Mdns(MdnsEvent::Discovered(list))) => {
                         for (peer_id, multiaddr) in list {
                             println!("👀 mDNS discovered a new peer: {:?}", peer_id);
@@ -686,8 +741,9 @@ pub async fn start_p2p(
                         // B22: an address this node dialled is reachable: route
                         // to it by PeerId from now on, and stop redialling it as
                         // an unresolved bootnode.
+                        let mut was_bootnode = false;
                         if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
-                            unresolved.resolved(address);
+                            was_bootnode = unresolved.resolved(address);
                             swarm
                                 .behaviour_mut()
                                 .kademlia
@@ -705,6 +761,13 @@ pub async fn start_p2p(
                         }
 
                         println!("🤝 Connection established with {:?}", peer_id);
+                        let host = match &endpoint {
+                            libp2p::core::ConnectedPoint::Dialer { address, .. } => multiaddr_host(address),
+                            libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => multiaddr_host(send_back_addr),
+                        };
+                        if let Some(host) = host {
+                            peer_hosts.insert(peer_id, host);
+                        }
                         if num_established.get() == 1 {
                             // B25: gossip runs between members only.
                             if let Ok(b) = book.read() {
@@ -723,7 +786,22 @@ pub async fn start_p2p(
                         // mesh and its score.
                         match endpoint {
                             libp2p::core::ConnectedPoint::Dialer { address, .. } => {
-                                if sessions::routable_for_others(&address) {
+                                let is_member = book
+                                    .read()
+                                    .map(|b| b.member_of(&peer_id).is_some())
+                                    .unwrap_or(false);
+                                // B40: outbound non-member connections share a cap.
+                                if !is_member {
+                                    if non_member_outbound.len() >= sessions::MAX_NON_MEMBER_OUTBOUND {
+                                        let _ = swarm.close_connection(connection_id);
+                                        continue;
+                                    }
+                                    non_member_outbound.insert(connection_id);
+                                }
+                                // B43: only a member's or a bootnode's address is
+                                // saved for the next boot (rows grew with every
+                                // peer Kademlia ever dialled).
+                                if (is_member || was_bootnode) && sessions::routable_for_others(&address) {
                                     let _ = storage.save_peer_addr(&peer_id.to_string(), &address.to_string());
                                 }
                             }
@@ -767,7 +845,9 @@ pub async fn start_p2p(
                     }
                     SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
                         non_member_inbound.remove(&connection_id);
+                        non_member_outbound.remove(&connection_id);
                         if num_established == 0 {
+                            peer_hosts.remove(&peer_id);
                             if let Ok(mut table) = session_table.write() {
                                 let peer = peer_id.to_string();
                                 table.retain(|s| s.peer != peer);
@@ -792,7 +872,6 @@ pub async fn start_p2p(
                         // own); a peer on this host keeps them all.
                         let local_peer = !sessions::routable_for_others(&info.observed_addr);
                         for addr in info.listen_addrs {
-                            unresolved.resolved(&addr);
                             if !local_peer && !sessions::routable_for_others(&addr) {
                                 continue;
                             }

@@ -105,6 +105,26 @@ fn make_test_tx_with_payload_and_gas(
     sign_ed25519(tx, &signing_key, execution)
 }
 
+/// B31 witness: `add_checked` trusts the stateless checks it is handed
+/// and verifies no signature again (the member's TX_SUBMIT runs them before
+/// the mempool lock; under it, only the stateful gates run). A transaction
+/// whose signature was broken after its check is admitted; through
+/// `add_transaction` the same one is refused.
+#[test]
+fn add_checked_does_not_verify_the_signature_again() {
+    let raw = make_test_tx(0);
+    let mut checked = Mempool::check_admissible(&raw).expect("a valid transaction");
+    checked.tx.signature = "00".repeat(64);
+    let broken = serde_json::to_string(&checked.tx).unwrap();
+    assert!(
+        Mempool::check_admissible(&broken).is_err(),
+        "control: broken"
+    );
+    let mut mempool = Mempool::new();
+    assert!(mempool.add_transaction(broken.clone()).is_err());
+    assert!(mempool.add_checked(broken, checked).is_ok());
+}
+
 #[test]
 fn test_rejects_invalid_bcs_payload_before_enqueue() {
     let mut mempool = Mempool::new();

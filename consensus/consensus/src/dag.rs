@@ -2138,7 +2138,17 @@ pub fn prune_history(storage: &Arc<StateDB>, height: u64, policy: Option<(u64, u
     // The pinned versions keep their blocks too, so a snapshot at a pin has
     // its anchor block (SN-4).
     let interval = state_commit::epoch_interval(storage);
-    let pins = state_commit::pin_schedule(height, keep_blocks, interval);
+    let mut pins = state_commit::pin_schedule(height, keep_blocks, interval);
+    // B35: the configured state-sync checkpoint keeps its block and QC; the
+    // boot check that the datadir is on its chain reads them.
+    if let Some(h) = storage
+        .get(storage::CHECKPOINT_PIN)
+        .ok()
+        .flatten()
+        .and_then(|h| h.parse::<u64>().ok())
+    {
+        pins.insert(h);
+    }
     match storage.prune_old_blocks(height, keep_blocks, max_delete, &pins) {
         Ok(deleted) if deleted > 0 => println!(
             "🧹 Block history pruning: removed {} old blocks (retain={}, batch={})",

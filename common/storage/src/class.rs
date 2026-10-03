@@ -206,6 +206,7 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         | "sync:halt_reason"
         | "sys:restore_in_progress"
         | "sys:restored_checkpoint"
+        | "sys:checkpoint_pin"
         | "consensus:guard_origin"
         | "consensus:guard_resume_after" => Some(Node),
 
@@ -345,7 +346,9 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         ["consensus", "epoch_start", e] if dec20(e) => Local,
 
         // N
-        ["peer" | "peer_ip" | "peer_addr", id] if seg(id) => Node,
+        ["peer_addr", id] if seg(id) => Node,
+        // B45: the legacy TCP channel's rows (removed in G4 S6).
+        ["peer" | "peer_ip", id] if seg(id) => Dead,
         ["alarm", "anchor_height_violation", h] if dec(h) => Node,
         ["alarm", "vcert_conflict", e, r, a] if dec20(e) && dec20(r) && seg(a) => Node,
         ["alarm", "decision_conflict", h] if dec(h) => Node,
@@ -700,8 +703,8 @@ mod tests {
             ("consensus:guard_resume_after".into(), Node),
             (format!("alarm:vcert_conflict:00000000000000000003:00000000000000153030:{H64}"), Node),
             // N
-            (format!("peer:{H64}"), Node),
-            (format!("peer_ip:{H64}"), Node),
+            (format!("peer:{H64}"), Dead),
+            (format!("peer_ip:{H64}"), Dead),
             ("peer_addr:12D3KooWMF5ur249RNXQYw6bvhfDRsHaemio5gcV9mxHXn4ZtVc2".into(), Node),
             ("sys:block_prune_cursor_v1".into(), Node),
             ("consensus:finality_prune_cursor".into(), Node),

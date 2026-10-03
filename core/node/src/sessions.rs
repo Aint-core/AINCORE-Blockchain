@@ -21,6 +21,7 @@ use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{identity, request_response, PeerId, StreamProtocol};
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
@@ -177,6 +178,9 @@ impl FramedCodec {
     }
 }
 
+/// B30: what a frame reserves before its bytes arrive.
+const FRAME_CHUNK: usize = 64 << 10;
+
 pub async fn read_frame<T: AsyncRead + Unpin + Send>(io: &mut T, cap: usize) -> io::Result<String> {
     let mut len = [0u8; 4];
     io.read_exact(&mut len).await?;
@@ -187,8 +191,16 @@ pub async fn read_frame<T: AsyncRead + Unpin + Send>(io: &mut T, cap: usize) -> 
             format!("a {len}-byte frame is over the {cap}-byte cap"),
         ));
     }
-    let mut buf = vec![0u8; len];
-    io.read_exact(&mut buf).await?;
+    // B30: the buffer grows with the bytes that arrive, not with the length
+    // a peer declares (a 4-byte prefix used to reserve up to the cap).
+    let mut buf = Vec::with_capacity(len.min(FRAME_CHUNK));
+    io.take(len as u64).read_to_end(&mut buf).await?;
+    if buf.len() != len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the frame ended early",
+        ));
+    }
     String::from_utf8(buf)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the frame is not UTF-8"))
 }
@@ -264,8 +276,271 @@ pub fn consensus_behaviour() -> request_response::Behaviour<FramedCodec> {
         )],
         request_response::Config::default()
             .with_request_timeout(std::time::Duration::from_secs(10))
-            .with_max_concurrent_streams(32),
+            // B30: a connection's unanswered consensus streams hold at most
+            // 16 frames (a member keeps a few pushes in flight to a peer).
+            .with_max_concurrent_streams(16),
     )
+}
+
+/// B30: `/aincore/consensus/1` exists only on connections whose peer a
+/// committee key names. libp2p's request-response handler reads a whole
+/// request before the behaviour learns who sent it, so a non-member could
+/// make this node read 16 frames of up to 776 KiB per connection, on every
+/// connection it holds, only for them to be dropped. A connection's handler
+/// is chosen when it opens: the request-response handler for a member, one
+/// that supports no protocol for anyone else (a stream is refused at
+/// negotiation, before a byte of it is read). A connection keeps its handler
+/// while its peer's membership changes; `misfiled` names it for the node to
+/// close, and the committee dial reconnects a new member.
+pub struct MembersOnly {
+    inner: request_response::Behaviour<FramedCodec>,
+    book: Arc<RwLock<PeerBook>>,
+    /// Handlers chosen, until the connection is established or fails.
+    chosen: HashMap<libp2p::swarm::ConnectionId, bool>,
+    /// Connections with the request-response handler, by peer.
+    served: HashMap<PeerId, Vec<libp2p::swarm::ConnectionId>>,
+    /// Connections with none.
+    refused: HashMap<libp2p::swarm::ConnectionId, PeerId>,
+}
+
+impl MembersOnly {
+    pub fn new(book: Arc<RwLock<PeerBook>>) -> Self {
+        Self {
+            inner: consensus_behaviour(),
+            book,
+            chosen: HashMap::new(),
+            served: HashMap::new(),
+            refused: HashMap::new(),
+        }
+    }
+
+    fn is_member(&self, peer: &PeerId) -> bool {
+        self.book
+            .read()
+            .map(|b| b.member_of(peer).is_some())
+            .unwrap_or(false)
+    }
+
+    /// Connections whose handler no longer fits their peer: a member's
+    /// without the protocol, a former member's with it.
+    pub fn misfiled(&self) -> Vec<(PeerId, libp2p::swarm::ConnectionId)> {
+        let mut out: Vec<(PeerId, libp2p::swarm::ConnectionId)> = self
+            .refused
+            .iter()
+            .filter(|(_, peer)| self.is_member(peer))
+            .map(|(id, peer)| (*peer, *id))
+            .collect();
+        for (peer, ids) in &self.served {
+            if !self.is_member(peer) {
+                out.extend(ids.iter().map(|id| (*peer, *id)));
+            }
+        }
+        out
+    }
+
+    fn handler(
+        &mut self,
+        connection_id: libp2p::swarm::ConnectionId,
+        peer: PeerId,
+        inner: impl FnOnce(
+            &mut request_response::Behaviour<FramedCodec>,
+        ) -> Result<
+            libp2p::swarm::THandler<request_response::Behaviour<FramedCodec>>,
+            libp2p::swarm::ConnectionDenied,
+        >,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        use libp2p::swarm::derive_prelude::Either;
+        let member = self.is_member(&peer);
+        let handler = if member {
+            Either::Left(inner(&mut self.inner)?)
+        } else {
+            Either::Right(libp2p::swarm::dummy::ConnectionHandler)
+        };
+        self.chosen.insert(connection_id, member);
+        Ok(handler)
+    }
+}
+
+impl std::ops::Deref for MembersOnly {
+    type Target = request_response::Behaviour<FramedCodec>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for MembersOnly {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl libp2p::swarm::NetworkBehaviour for MembersOnly {
+    type ConnectionHandler = libp2p::swarm::derive_prelude::Either<
+        libp2p::swarm::THandler<request_response::Behaviour<FramedCodec>>,
+        libp2p::swarm::dummy::ConnectionHandler,
+    >;
+    type ToSwarm = request_response::Event<String, String>;
+
+    fn handle_pending_inbound_connection(
+        &mut self,
+        connection_id: libp2p::swarm::ConnectionId,
+        local_addr: &libp2p::Multiaddr,
+        remote_addr: &libp2p::Multiaddr,
+    ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        self.inner
+            .handle_pending_inbound_connection(connection_id, local_addr, remote_addr)
+    }
+
+    fn handle_established_inbound_connection(
+        &mut self,
+        connection_id: libp2p::swarm::ConnectionId,
+        peer: PeerId,
+        local_addr: &libp2p::Multiaddr,
+        remote_addr: &libp2p::Multiaddr,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        self.handler(connection_id, peer, |inner| {
+            inner.handle_established_inbound_connection(
+                connection_id,
+                peer,
+                local_addr,
+                remote_addr,
+            )
+        })
+    }
+
+    fn handle_pending_outbound_connection(
+        &mut self,
+        connection_id: libp2p::swarm::ConnectionId,
+        maybe_peer: Option<PeerId>,
+        addresses: &[libp2p::Multiaddr],
+        effective_role: libp2p::core::Endpoint,
+    ) -> Result<Vec<libp2p::Multiaddr>, libp2p::swarm::ConnectionDenied> {
+        self.inner.handle_pending_outbound_connection(
+            connection_id,
+            maybe_peer,
+            addresses,
+            effective_role,
+        )
+    }
+
+    fn handle_established_outbound_connection(
+        &mut self,
+        connection_id: libp2p::swarm::ConnectionId,
+        peer: PeerId,
+        addr: &libp2p::Multiaddr,
+        role_override: libp2p::core::Endpoint,
+        port_use: libp2p::core::transport::PortUse,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        self.handler(connection_id, peer, |inner| {
+            inner.handle_established_outbound_connection(
+                connection_id,
+                peer,
+                addr,
+                role_override,
+                port_use,
+            )
+        })
+    }
+
+    fn on_swarm_event(&mut self, event: libp2p::swarm::FromSwarm) {
+        use libp2p::swarm::behaviour::{ConnectionClosed, ConnectionEstablished};
+        use libp2p::swarm::FromSwarm;
+        // The inner behaviour hears only of the connections it has a handler
+        // on, with the counts of those alone.
+        match event {
+            FromSwarm::ConnectionEstablished(e) => {
+                if self.chosen.remove(&e.connection_id) == Some(true) {
+                    let ids = self.served.entry(e.peer_id).or_default();
+                    let other_established = ids.len();
+                    ids.push(e.connection_id);
+                    self.inner.on_swarm_event(FromSwarm::ConnectionEstablished(
+                        ConnectionEstablished {
+                            other_established,
+                            ..e
+                        },
+                    ));
+                } else {
+                    self.refused.insert(e.connection_id, e.peer_id);
+                    // Requests queued for this peer while it was dialled
+                    // wait for a connection with the protocol; this one has
+                    // none, and no dial failure follows: fail them now.
+                    let aborted = libp2p::swarm::DialError::Aborted;
+                    self.inner
+                        .on_swarm_event(FromSwarm::DialFailure(libp2p::swarm::DialFailure {
+                            peer_id: Some(e.peer_id),
+                            error: &aborted,
+                            connection_id: e.connection_id,
+                        }));
+                }
+            }
+            FromSwarm::ConnectionClosed(e) => {
+                if self.refused.remove(&e.connection_id).is_some() {
+                    return;
+                }
+                let Some(ids) = self.served.get_mut(&e.peer_id) else {
+                    return;
+                };
+                let before = ids.len();
+                ids.retain(|id| *id != e.connection_id);
+                if ids.len() == before {
+                    return;
+                }
+                let remaining_established = ids.len();
+                if ids.is_empty() {
+                    self.served.remove(&e.peer_id);
+                }
+                self.inner
+                    .on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
+                        remaining_established,
+                        ..e
+                    }));
+            }
+            FromSwarm::AddressChange(e) => {
+                if self
+                    .served
+                    .get(&e.peer_id)
+                    .is_some_and(|ids| ids.contains(&e.connection_id))
+                {
+                    self.inner.on_swarm_event(event);
+                }
+            }
+            FromSwarm::DialFailure(e) => {
+                self.chosen.remove(&e.connection_id);
+                self.inner.on_swarm_event(event);
+            }
+            FromSwarm::ListenFailure(e) => {
+                self.chosen.remove(&e.connection_id);
+                self.inner.on_swarm_event(event);
+            }
+            other => self.inner.on_swarm_event(other),
+        }
+    }
+
+    fn on_connection_handler_event(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: libp2p::swarm::ConnectionId,
+        event: libp2p::swarm::THandlerOutEvent<Self>,
+    ) {
+        use libp2p::swarm::derive_prelude::Either;
+        match event {
+            Either::Left(event) => {
+                self.inner
+                    .on_connection_handler_event(peer_id, connection_id, event)
+            }
+            Either::Right(never) => match never {},
+        }
+    }
+
+    fn poll(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>>
+    {
+        self.inner
+            .poll(cx)
+            .map(|action| action.map_in(libp2p::swarm::derive_prelude::Either::Left))
+    }
 }
 
 /// G4 S1: what the network task shares with the node: the committee book,
@@ -277,6 +552,8 @@ pub struct SessionWiring {
     pub asks: mpsc::Receiver<network::SyncAsk>,
     pub dials: mpsc::Receiver<network::SyncDial>,
     pub serves: mpsc::Sender<network::SyncServe>,
+    /// B30: the bytes of answers non-members hold unread (a gauge).
+    pub held_open_bytes: Arc<AtomicUsize>,
 }
 
 impl SessionWiring {
@@ -300,6 +577,7 @@ impl SessionWiring {
                 asks,
                 dials,
                 serves,
+                held_open_bytes: Arc::default(),
             },
             network::SessionClient {
                 asks: asks_tx,
@@ -315,6 +593,15 @@ impl SessionWiring {
 /// together (Aptos `MAX_INBOUND_CONNECTIONS` = 50, counting unknown peers
 /// only). Members are never counted.
 pub const MAX_NON_MEMBER_INBOUND: usize = 50;
+
+/// B40: outbound connections to peers no committee key names (Kademlia's
+/// bootstrap dials peers others named), all together. The same count as
+/// inbound, a choice.
+pub const MAX_NON_MEMBER_OUTBOUND: usize = 50;
+
+/// B43: saved peer addresses dialled at boot (members and bootnodes are
+/// the only ones saved now; older rows are capped here, a choice).
+pub const MAX_SAVED_PEERS: usize = 64;
 
 /// NI-3: consensus messages a member may send a second, and in a burst.
 /// A member sends at most a vertex, a certificate and one attestation per
@@ -540,6 +827,53 @@ impl Inbox {
     }
 }
 
+/// B30: answers handed to non-members and not yet written, all together.
+/// A choice: the inbox's bound, six answers at the 10 MiB response cap.
+pub const OPEN_HELD_MAX_BYTES: usize = 64 << 20;
+
+/// B30: a requester that stops reading holds every answer it was sent
+/// until its request times out (60 s), and free identities on many hosts
+/// add up. An answer to a non-member counts from hand-off until it is
+/// written or fails; past `OPEN_HELD_MAX_BYTES` a new one is refused.
+#[derive(Debug)]
+pub struct HeldAnswers<K> {
+    held: HashMap<K, usize>,
+    bytes: Arc<AtomicUsize>,
+}
+
+impl<K: std::hash::Hash + Eq> HeldAnswers<K> {
+    pub fn new(bytes: Arc<AtomicUsize>) -> Self {
+        bytes.store(0, Ordering::Relaxed);
+        Self {
+            held: HashMap::new(),
+            bytes,
+        }
+    }
+
+    /// Count `len` bytes for `id`; false (nothing counted) when that would
+    /// pass the bound.
+    pub fn admit(&mut self, id: K, len: usize) -> bool {
+        let now = self.bytes.load(Ordering::Relaxed);
+        if now.saturating_add(len) > OPEN_HELD_MAX_BYTES {
+            return false;
+        }
+        let before = self.held.insert(id, len).unwrap_or(0);
+        self.bytes.store(now + len - before, Ordering::Relaxed);
+        true
+    }
+
+    /// `id`'s answer was written, or failed: its bytes are free.
+    pub fn release(&mut self, id: &K) {
+        if let Some(len) = self.held.remove(id) {
+            self.bytes.fetch_sub(len, Ordering::Relaxed);
+        }
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
+}
+
 /// G4 S6: a sync peer given as `host:port` (its base port, as bootnodes
 /// are) is its libp2p address `/ip4|ip6|dns4/host/tcp/(port+100)`; a
 /// multiaddr (optionally ending `/p2p/<PeerId>`, which pins its key) is
@@ -683,9 +1017,8 @@ pub fn without_peer(addr: &libp2p::Multiaddr) -> libp2p::Multiaddr {
 }
 
 /// B22: bootnodes given without a PeerId, dialled again until a session
-/// this node dialled opens from that address, or a peer's identify names
-/// it as a listen address (the peer reached this node first, perhaps where
-/// only one direction is open). A node that booted before its peers
+/// this node dialled opens from that address (only a dial proves it: a
+/// peer's identify could claim any address, B40). A node that booted before its peers
 /// otherwise never reached them: a bootnode is dialled once, and without a
 /// PeerId it is in no routing table. Redials back off from
 /// `REDIAL_FIRST` doubling to `REDIAL_MAX` (a choice: a member that comes
@@ -710,8 +1043,8 @@ impl Unresolved {
         )
     }
 
-    /// `addr` was reached (a dial opened a session there, or a peer listens
-    /// there): that bootnode is resolved. Returns whether it was one.
+    /// A dial at `addr` opened a session: that bootnode is resolved.
+    /// Returns whether it was one.
     pub fn resolved(&mut self, addr: &libp2p::Multiaddr) -> bool {
         let addr = without_peer(addr);
         let before = self.0.len();
@@ -1039,6 +1372,29 @@ mod tests {
         );
     }
 
+    /// B30: held answers count exactly, refuse past the bound, and free
+    /// their bytes once (a second release of one id frees nothing).
+    #[test]
+    fn held_answers_are_bounded_and_released_once() {
+        let gauge = Arc::new(AtomicUsize::new(7));
+        let mut held: HeldAnswers<u32> = HeldAnswers::new(Arc::clone(&gauge));
+        assert_eq!(held.bytes(), 0, "a new tracker starts the gauge at zero");
+        let part = OPEN_HELD_MAX_BYTES / 4;
+        assert!(
+            (0..4).all(|id| held.admit(id, part)),
+            "exactly the bound fits"
+        );
+        assert!(!held.admit(4, 1), "past the bound");
+        assert_eq!(gauge.load(Ordering::Relaxed), OPEN_HELD_MAX_BYTES);
+        held.release(&0);
+        held.release(&0);
+        held.release(&9);
+        assert_eq!(held.bytes(), OPEN_HELD_MAX_BYTES - part);
+        assert!(held.admit(4, part), "freed bytes are admitted again");
+        (1..5).for_each(|id| held.release(&id));
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
+    }
+
     /// NI-3: a budget spends its burst, refuses past it, refills at its
     /// rate, keeps keys apart, and stays bounded however many keys come.
     #[test]
@@ -1092,6 +1448,10 @@ mod tests {
         let mut bad = (2u32).to_be_bytes().to_vec();
         bad.extend([0xff, 0xfe]);
         assert!(run(bad, 10).0.is_err());
+        // B30: a frame that ends before its declared length is refused.
+        let mut short = (10u32).to_be_bytes().to_vec();
+        short.extend(b"abc");
+        assert!(run(short, 10).0.is_err());
         // A writer refuses to exceed the cap too.
         let mut sink = libp2p::futures::io::Cursor::new(Vec::new());
         assert!(futures::executor::block_on(write_frame(&mut sink, "abc", 2)).is_err());

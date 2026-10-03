@@ -1424,14 +1424,26 @@ where
         let inconsistent = |e: String| format!("the checkpoint is inconsistent: {e}");
         let chain_id = check_genesis(storage, plan).map_err(inconsistent)?;
         let (epoch, committee) = restored_committee(storage, plan).map_err(inconsistent)?;
-        let (block, qc) = match verified_pair(storage, &chain_id, epoch, &committee, &pairs) {
-            Ok(pair) => pair,
-            // The peer that held the good pair may have missed the first
-            // round: ask once more.
-            Err(_) => {
-                let fresh = fetch_anchor(cp, peers, &mut ask, patience).await?;
-                verified_pair(storage, &chain_id, epoch, &committee, &fresh)
-                    .map_err(inconsistent)?
+        // B42: the anchor pairs gathered before the download may all be a
+        // liar's (honest peers that missed that round): keep asking, within
+        // the deadline, until a pair verifies against the restored state.
+        let mut candidates = pairs;
+        let mut asked = 1u32;
+        let (block, qc) = loop {
+            match verified_pair(storage, &chain_id, epoch, &committee, &candidates) {
+                Ok(pair) => break pair,
+                Err(e) if started.elapsed() > patience.deadline => {
+                    return Err(inconsistent(e));
+                }
+                Err(_) => {
+                    tokio::time::sleep(patience.backoff(asked as usize, peers)).await;
+                    asked = asked.saturating_add(1);
+                    // Rounds that found no pair count against the deadline
+                    // only: giving up here would throw the download away.
+                    candidates = fetch_anchor(cp, peers, &mut ask, patience)
+                        .await
+                        .unwrap_or_default();
+                }
             }
         };
         let record = bootstrap_record(tree, plan, &block, &qc)?;

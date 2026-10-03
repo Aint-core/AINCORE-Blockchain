@@ -802,6 +802,121 @@ async fn the_block_is_stored_with_its_own_verified_qc() {
     assert!(!stored.contains(&forged), "the forged block was not stored");
 }
 
+/// B42 witness: the only anchor pair offered until late is a liar's (the
+/// honest peer answers its first three anchor asks without one). The
+/// restore keeps asking within its deadline and stores the honest pair.
+/// Before, it asked once more after the download and failed.
+#[tokio::test]
+async fn the_anchor_is_asked_for_until_a_pair_verifies() {
+    let g = genesis();
+    let a = chain("late_a", MEMBER);
+    let client = temp_db("late_client");
+    let mut honest = peer(&a, Behaviour::Honest);
+    let mut byz = peer(&a, Behaviour::Honest);
+    // The real block with a QC whose signature is wrong: it names the
+    // checkpoint's block, so it passes the checks before the download and
+    // fails only against the restored committee.
+    let honest_qc = serde_json::to_string(&stored_qc(&a)).unwrap();
+    let mut qc = stored_qc(&a);
+    qc.aggregate_signature[0] ^= 0xff;
+    let byz_anchor = format!(
+        "{ANCHOR_RESP}{}",
+        serde_json::to_string(&AnchorResponse {
+            block: Some(stored_block(&a)),
+            quorum_certificate: Some(qc)
+        })
+        .unwrap()
+    );
+    let mut honest_anchor_asks = 0;
+    run_with(&client, &plan(&a.cp, &g, false), 2, |i, msg| {
+        if msg.starts_with(ANCHOR_REQ) {
+            if i == 0 {
+                return Ok(byz_anchor.clone());
+            }
+            honest_anchor_asks += 1;
+            if honest_anchor_asks <= 3 {
+                // Answered, but without a pair: the round returns the
+                // liar's pair alone, so only asking again finds this one.
+                return Ok(format!(
+                    "{ANCHOR_RESP}{}",
+                    serde_json::to_string(&AnchorResponse {
+                        block: None,
+                        quorum_certificate: None
+                    })
+                    .unwrap()
+                ));
+            }
+            return serve(&mut honest, msg);
+        }
+        if i == 0 {
+            serve(&mut byz, msg)
+        } else {
+            serve(&mut honest, msg)
+        }
+    })
+    .await
+    .expect("the restore completes");
+    assert_restored(&client, &a);
+    let stored = client.get(&format!("consensus:qc:{H}")).unwrap().unwrap();
+    assert_eq!(stored, honest_qc, "the verified QC was stored");
+    assert!(
+        honest_anchor_asks > 3,
+        "positive control: asked past the misses"
+    );
+}
+
+/// B42 review witness: after the download, a whole `fetch_anchor` (six
+/// rounds in the test's patience) finds no pair at all; the restore keeps
+/// asking within its deadline instead of throwing the download away.
+#[tokio::test]
+async fn anchor_rounds_without_a_pair_do_not_end_the_restore() {
+    let g = genesis();
+    let a = chain("nopair_a", MEMBER);
+    let client = temp_db("nopair_client");
+    let mut honest = peer(&a, Behaviour::Honest);
+    let mut byz = peer(&a, Behaviour::Honest);
+    let mut qc = stored_qc(&a);
+    qc.aggregate_signature[0] ^= 0xff;
+    let anchor = |block: Option<Block>, qc: Option<QuorumCertificate>| {
+        Ok(format!(
+            "{ANCHOR_RESP}{}",
+            serde_json::to_string(&AnchorResponse {
+                block,
+                quorum_certificate: qc
+            })
+            .unwrap()
+        ))
+    };
+    let (mut byz_asks, mut honest_asks) = (0, 0);
+    let misses = 1 + fast().max_failures + 1;
+    run_with(&client, &plan(&a.cp, &g, false), 2, |i, msg| {
+        if msg.starts_with(ANCHOR_REQ) {
+            if i == 0 {
+                byz_asks += 1;
+                // The bad pair once, before the download; nothing after.
+                return match byz_asks {
+                    1 => anchor(Some(stored_block(&a)), Some(qc.clone())),
+                    _ => anchor(None, None),
+                };
+            }
+            honest_asks += 1;
+            if honest_asks <= misses {
+                return anchor(None, None);
+            }
+            return serve(&mut honest, msg);
+        }
+        if i == 0 {
+            serve(&mut byz, msg)
+        } else {
+            serve(&mut honest, msg)
+        }
+    })
+    .await
+    .expect("the restore completes");
+    assert_restored(&client, &a);
+    assert!(honest_asks > misses, "positive control: past the misses");
+}
+
 /// SN-2 step 3: a forged chunk is refused, its peer is shut out, and the
 /// restore completes against the checkpoint root from another peer.
 #[tokio::test]

@@ -118,6 +118,102 @@ mod tests {
             .unwrap();
     }
 
+    /// B33 witness: sessions that never answer cost a pass one short
+    /// timeout, together, not a minute each one after another (three
+    /// silent sessions held the old pass three minutes).
+    #[tokio::test]
+    async fn silent_sessions_cost_a_pass_one_short_timeout() {
+        let (asks, mut queued) = tokio::sync::mpsc::channel::<network::SyncAsk>(16);
+        let (dials, _) = tokio::sync::mpsc::channel(1);
+        // The network task takes every ask and never answers it.
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(ask) = queued.recv().await {
+                held.push(ask);
+            }
+        });
+        let session = |p: &str| network::SessionPeer {
+            peer: p.into(),
+            member: Some(format!("m-{p}")),
+        };
+        let client = network::SessionClient {
+            asks,
+            dials,
+            table: Arc::new(std::sync::RwLock::new(vec![
+                session("a"),
+                session("b"),
+                session("c"),
+            ])),
+        };
+        let sync = setup_sync("silent_sessions").with_sessions(client);
+        sync.storage.put("latest_height", "4").unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(sync.sync_from_peers().await, 4);
+        let took = start.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(20),
+            "a pass took {took:?}"
+        );
+        assert!(
+            took >= std::time::Duration::from_secs(4),
+            "positive control: the pass waited for the asks ({took:?})"
+        );
+    }
+
+    /// B33 review witness: three sessions that advertise a height far above
+    /// this node's and never serve a block hold the pass's three slots only
+    /// once; the next pass asks the honest session for blocks. Ordered by
+    /// membership and height alone, they held every slot of every pass.
+    #[tokio::test]
+    async fn sessions_that_never_serve_lose_their_slots() {
+        let (asks, mut queued) = tokio::sync::mpsc::channel::<network::SyncAsk>(16);
+        let (dials, _) = tokio::sync::mpsc::channel(1);
+        let block_asks = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = Arc::clone(&block_asks);
+        tokio::spawn(async move {
+            while let Some(ask) = queued.recv().await {
+                let answer = match (ask.peer.as_str(), ask.wire.as_str()) {
+                    ("honest", "GET_HEIGHT") => Ok("HEIGHT:5".to_string()),
+                    (_, "GET_HEIGHT") => Ok("HEIGHT:1000".to_string()),
+                    (peer, wire) => {
+                        if wire.starts_with("SYNC_REQ:") {
+                            log.lock().unwrap().push(peer.to_string());
+                        }
+                        Err("no".to_string())
+                    }
+                };
+                let _ = ask.reply.send(answer);
+            }
+        });
+        let session = |p: &str| network::SessionPeer {
+            peer: p.into(),
+            member: Some(format!("m-{p}")),
+        };
+        let client = network::SessionClient {
+            asks,
+            dials,
+            table: Arc::new(std::sync::RwLock::new(vec![
+                session("liar1"),
+                session("liar2"),
+                session("liar3"),
+                session("honest"),
+            ])),
+        };
+        let sync = setup_sync("never_serve").with_sessions(client);
+        sync.storage.put("latest_height", "4").unwrap();
+        sync.sync_from_peers().await;
+        assert!(
+            !block_asks.lock().unwrap().iter().any(|p| p == "honest"),
+            "control: the first pass goes to the highest"
+        );
+        sync.sync_from_peers().await;
+        assert!(
+            block_asks.lock().unwrap().iter().any(|p| p == "honest"),
+            "the honest session was never asked for blocks: {:?}",
+            block_asks.lock().unwrap()
+        );
+    }
+
     /// G4 S6: sync goes over the network task's sessions only; without
     /// them (or when no session answers) the node stays where it is.
     #[tokio::test]
@@ -702,10 +798,36 @@ mod tests {
         );
         block.header.tx_hash = "fake_tx_hash".to_string();
         rehash_block(&mut block);
+        // B41: the body is checked once a validator's signature binds the
+        // header, so the block is signed to reach that check.
+        authenticate_block(&sync, &mut block);
 
         let result = sync.validate_block(&block, 2, "prev_hash_1");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Transaction hash mismatch"));
+    }
+
+    /// B41 witness: a block naming a validator as signer, without its
+    /// signature, is refused for the signature before its body is checked
+    /// (the DA root's encode costs up to ~0.6 s a batch).
+    #[test]
+    fn test_validate_block_checks_the_signature_before_the_body() {
+        let sync = setup_sync("val_sig_first");
+        set_validators(&sync, vec![("node_1", 100)]);
+        let mut block = Block::new(
+            2,
+            2,
+            "prev_hash_1".to_string(),
+            vec!["tx1".to_string()],
+            "node_1".to_string(),
+        );
+        block.header.tx_hash = "fake_tx_hash".to_string();
+        rehash_block(&mut block);
+        block.proposer_signer = "node_1".to_string();
+
+        let err = sync.validate_block(&block, 2, "prev_hash_1").unwrap_err();
+        assert!(!err.contains("Transaction hash mismatch"), "{err}");
+        assert!(err.contains("signer node_1"), "{err}");
     }
 
     #[test]
@@ -1225,22 +1347,38 @@ mod tests {
         );
     }
 
-    // N=2, two seeds but DIFFERENT tips -> disagreement -> refuse.
+    // N=2, two seeds certify DIFFERENT blocks at one height -> disagreement.
     #[test]
     fn test_tip_agreement_disagreement_refuses() {
         let sync = setup_sync("tip_agree_disagree");
         let tips = vec![
             qc_with_tip(&sync, 100, &"aa".repeat(32)),
-            qc_with_tip(&sync, 101, &"bb".repeat(32)),
+            qc_with_tip(&sync, 100, &"bb".repeat(32)),
         ];
         let err = ChainSync::tip_agreement_decision(&tips, 2).unwrap_err();
         assert!(
-            err.contains("disagree") || err.contains("no tip reached"),
-            "expected disagreement message, got: {err}"
+            err.contains("disagree"),
+            "expected disagreement, got: {err}"
         );
     }
 
-    // Mixed: 2 of 3 seeds agree, 1 dissents, N=2 -> the agreeing tip wins.
+    // B44: a seed one block behind agrees with the head (each tip is a
+    // verified QC); before, it failed the pass.
+    #[test]
+    fn test_tip_agreement_a_tip_behind_agrees() {
+        let sync = setup_sync("tip_agree_behind");
+        let tips = vec![
+            qc_with_tip(&sync, 100, &"aa".repeat(32)),
+            qc_with_tip(&sync, 101, &"bb".repeat(32)),
+        ];
+        assert_eq!(
+            ChainSync::tip_agreement_decision(&tips, 2),
+            Ok((101, "bb".repeat(32)))
+        );
+    }
+
+    // Three seeds, one further ahead: no two certify different blocks at one
+    // height, so the head is the highest verified tip.
     #[test]
     fn test_tip_agreement_majority_with_one_dissenter() {
         let sync = setup_sync("tip_agree_majority");
@@ -1251,7 +1389,7 @@ mod tests {
             qc_with_tip(&sync, 200, &"cc".repeat(32)),
         ];
         let decision = ChainSync::tip_agreement_decision(&tips, 2);
-        assert_eq!(decision, Ok((100, agreed)));
+        assert_eq!(decision, Ok((200, "cc".repeat(32))));
     }
 
     // N=1 PRESERVES CURRENT BEHAVIOUR: a single advertised tip is accepted.

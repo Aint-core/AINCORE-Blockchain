@@ -65,12 +65,22 @@ pub struct ChainSync {
     /// them only (the legacy TCP channel is gone, S6). None in tests that
     /// only serve.
     sessions: Option<network::SessionClient>,
+    /// B33 review: passes in which each session advertised a height above
+    /// this node's and delivered nothing. Those sessions are asked after
+    /// the others, so peers that advertise a height they never serve cannot
+    /// hold every one of a pass's slots.
+    stalls: Mutex<HashMap<String, u32>>,
     #[cfg(test)]
     before_execution_hook: Option<fn(&StateDB)>,
 }
 
 /// G4 S1: how long one sync request on a session may take.
 const SYNC_ASK_TIMEOUT: Duration = Duration::from_secs(60);
+/// B33: how long a height or finality answer may take (a few bytes; a
+/// choice far above a round trip).
+const QUICK_ASK_TIMEOUT: Duration = Duration::from_secs(5);
+/// B33: the sessions a pass takes blocks from, the highest first (a choice).
+const SYNC_PEERS_PER_PASS: usize = 3;
 
 /// NI-4: the blocks of one SYNC_RESP stop at this many bytes (at least one
 /// block is sent), so the answer stays under the 10 MiB a client reads.
@@ -87,8 +97,12 @@ enum SyncLink {
 
 impl SyncLink {
     async fn ask(&mut self, msg: &str) -> Result<String, String> {
+        self.ask_within(msg, SYNC_ASK_TIMEOUT).await
+    }
+
+    async fn ask_within(&mut self, msg: &str, timeout: Duration) -> Result<String, String> {
         match self {
-            Self::Session { client, peer } => client.ask(peer, msg, SYNC_ASK_TIMEOUT).await,
+            Self::Session { client, peer } => client.ask(peer, msg, timeout).await,
         }
     }
 }
@@ -102,6 +116,7 @@ impl ChainSync {
             serves_snapshots: std::env::var("AINCORE_SERVE_SNAPSHOTS").as_deref() == Ok("1"),
             retention: StateDB::block_pruning_policy_from_env(),
             sessions: None,
+            stalls: Mutex::default(),
             #[cfg(test)]
             before_execution_hook: None,
         }
@@ -241,33 +256,28 @@ impl ChainSync {
                 tips.len()
             ));
         }
-        // Tally distinct (height, hash) tips.
-        let mut counts: HashMap<(u64, String), usize> = HashMap::new();
+        // B44: each tip is a verified QC, so a tip that is merely behind
+        // agrees with the head; only two different blocks certified at one
+        // height disagree (a member one block behind used to fail the pass).
+        let mut at: HashMap<u64, &str> = HashMap::new();
         for qc in tips {
-            *counts
-                .entry((qc.block_height, qc.block_hash.clone()))
-                .or_insert(0) += 1;
+            match at.get(&qc.block_height) {
+                Some(hash) if *hash != qc.block_hash => {
+                    return Err(format!(
+                        "seeds disagree on the finalized head: two blocks certified at height {}",
+                        qc.block_height
+                    ))
+                }
+                _ => {
+                    at.insert(qc.block_height, &qc.block_hash);
+                }
+            }
         }
-        // Pick the most-advertised tip (deterministic tie-break by height then hash).
-        let best = counts
+        let head = tips
             .iter()
-            .max_by(|a, b| {
-                a.1.cmp(b.1)
-                    .then_with(|| a.0 .0.cmp(&b.0 .0))
-                    .then_with(|| a.0 .1.cmp(&b.0 .1))
-            })
-            .map(|((h, hash), c)| ((*h, hash.clone()), *c));
-
-        match best {
-            Some(((height, hash), count)) if count >= n => Ok((height, hash)),
-            Some((_, count)) => Err(format!(
-                "no tip reached {} agreeing seeds (best had {} of {}); seeds disagree on the finalized head",
-                n,
-                count,
-                tips.len()
-            )),
-            None => Err("no seed advertised a verifiable finalized tip".to_string()),
-        }
+            .max_by(|a, b| a.block_height.cmp(&b.block_height))
+            .map(|qc| (qc.block_height, qc.block_hash.clone()));
+        head.ok_or_else(|| "no seed advertised a verifiable finalized tip".to_string())
     }
 
     fn validate_block(
@@ -312,20 +322,6 @@ impl ChainSync {
             ));
         }
 
-        // Every header root against the body: transactions, the committed
-        // vertex sequence a follower adopts, slash evidence, and the DA root
-        // a light client samples against. Unconditional (G3 FX-18): an empty
-        // root must mean an empty list, or a peer could attach vertices to a
-        // block that has none.
-        block.check_commitments()?;
-        // G0 (V4): the anchor is the sequence's last vertex, which the header
-        // binds; a substituted anchor under a reused signature stops here.
-        if consensus::v4::is_v4_chain(storage) && !block.anchor_is_bound() {
-            return Err(format!(
-                "block {}'s anchor {} is not its last committed vertex",
-                block.header.height, block.anchor_hash
-            ));
-        }
         // Consumer-side invariant: only equivocation evidence is ordered
         // through the DAG. Reject a block carrying any other kind outright.
         if let Some(bad) = block
@@ -378,7 +374,24 @@ impl ChainSync {
                 block.header.height, signer
             ));
         }
-        Self::verify_proposer_signature_in(storage, block)
+        Self::verify_proposer_signature_in(storage, block)?;
+        // B41: the costly checks last, once a validator's signature binds the
+        // header (the DA root's encode costs up to ~0.6 s a batch).
+        // Every header root against the body: transactions, the committed
+        // vertex sequence a follower adopts, slash evidence, and the DA root
+        // a light client samples against. Unconditional (G3 FX-18): an empty
+        // root must mean an empty list, or a peer could attach vertices to a
+        // block that has none.
+        block.check_commitments()?;
+        // G0 (V4): the anchor is the sequence's last vertex, which the header
+        // binds; a substituted anchor under a reused signature stops here.
+        if consensus::v4::is_v4_chain(storage) && !block.anchor_is_bound() {
+            return Err(format!(
+                "block {}'s anchor {} is not its last committed vertex",
+                block.header.height, block.anchor_hash
+            ));
+        }
+        Ok(())
     }
 
     /// Who may lead or sign block `height`. On V4 (G1 DE-7) the frozen
@@ -547,12 +560,10 @@ impl ChainSync {
     pub async fn sync_from_peers(&self) -> u64 {
         println!("🔄 [ChainSync] Starting sync over network sessions...");
 
-        // Audit #3: a prior state-root divergence must ACTUALLY stop syncing —
-        // otherwise the node loops, re-executing onto already-divergent state.
-        // `sync:halt_reason` is set by process_blocks on a state-root mismatch;
-        // refuse to sync while it is present. The operator clears it (deletes the
-        // key) after investigating (a state divergence is usually a node-binary
-        // mismatch against the seed).
+        // Audit #3: `sync:halt_reason` stops syncing while it is present. No
+        // code writes it any more (a block whose roots differ is refused on
+        // its own, B45); an operator may set it to hold a node, and deletes
+        // it to resume.
         if let Ok(Some(reason)) = self.storage.get("sync:halt_reason") {
             eprintln!(
                 "🛑 [ChainSync] HALTED after a state divergence: {reason} — not syncing. \
@@ -611,19 +622,70 @@ impl ChainSync {
                 return final_height;
             }
         }
+        // B33: every session's height at once, each within
+        // QUICK_ASK_TIMEOUT; then blocks from the highest few, members first.
+        // Asked one after another with 60 s timeouts, one stalling peer cost
+        // every pass about two minutes.
+        let sessions_now: std::collections::HashSet<String> =
+            sessions.iter().map(|s| s.peer.clone()).collect();
+        let mut asks = tokio::task::JoinSet::new();
         for session in sessions {
+            let client = client.clone();
+            asks.spawn(async move {
+                let height = client
+                    .ask(&session.peer, "GET_HEIGHT", QUICK_ASK_TIMEOUT)
+                    .await
+                    .ok()
+                    .and_then(|r| {
+                        r.strip_prefix("HEIGHT:")
+                            .and_then(|h| h.trim().parse::<u64>().ok())
+                    });
+                (session, height)
+            });
+        }
+        // Peers at this node's height too: their finality artifact may carry
+        // the QC of the tip.
+        let mut ahead = Vec::new();
+        while let Some(joined) = asks.join_next().await {
+            if let Ok((session, Some(height))) = joined {
+                if height >= final_height {
+                    ahead.push((session, height));
+                }
+            }
+        }
+        let stalls = self.stalls.lock().map(|s| s.clone()).unwrap_or_default();
+        let stalled = |peer: &str| stalls.get(peer).copied().unwrap_or(0);
+        ahead.sort_by(|(a, ha), (b, hb)| {
+            stalled(&a.peer)
+                .cmp(&stalled(&b.peer))
+                .then(b.member.is_some().cmp(&a.member.is_some()))
+                .then(hb.cmp(ha))
+                .then(a.peer.cmp(&b.peer))
+        });
+        for (session, advertised) in ahead.into_iter().take(SYNC_PEERS_PER_PASS) {
             let label = session
                 .member
                 .clone()
                 .unwrap_or_else(|| session.peer.clone());
+            let peer = session.peer.clone();
             let mut link = SyncLink::Session {
                 client: client.clone(),
                 peer: session.peer,
             };
-            let reached = self
-                .sync_over(&mut link, &label, self.get_local_height())
-                .await;
+            let before = self.get_local_height();
+            let reached = self.sync_over(&mut link, &label, before).await;
             final_height = final_height.max(reached);
+            if let Ok(mut stalls) = self.stalls.lock() {
+                if reached > before {
+                    stalls.remove(&peer);
+                } else if advertised > before {
+                    let n = stalls.entry(peer).or_insert(0);
+                    *n = n.saturating_add(1);
+                }
+            }
+        }
+        if let Ok(mut stalls) = self.stalls.lock() {
+            stalls.retain(|peer, _| sessions_now.contains(peer));
         }
         final_height
     }
@@ -633,7 +695,7 @@ impl ChainSync {
     async fn sync_over(&self, link: &mut SyncLink, peer_id: &str, my_height: u64) -> u64 {
         let mut final_height = my_height;
         // 2. Request Chain Height
-        let Ok(resp) = link.ask("GET_HEIGHT").await else {
+        let Ok(resp) = link.ask_within("GET_HEIGHT", QUICK_ASK_TIMEOUT).await else {
             return final_height;
         };
         // Parse Height response e.g. "HEIGHT:100"
@@ -699,8 +761,8 @@ impl ChainSync {
                         if horizon > local_now + 1 {
                             eprintln!(
                                 "🛑 [ChainSync] peer pruned below us: earliest block #{} but we are at #{}. \
-                                 Block-replay cannot bridge this, and verified snapshot restore (G3 S6) \
-                                 is not available yet: sync from a peer that keeps history.",
+                                 Block-replay cannot bridge this: restore from a checkpoint \
+                                 (AINCORE_STATE_SYNC_CHECKPOINT) or sync from a peer that keeps history.",
                                 horizon, local_now
                             );
                         }
@@ -728,7 +790,7 @@ impl ChainSync {
             println!("✅ [ChainSync] Already caught up with peer {}", peer_id);
         }
 
-        if let Ok(finality_resp) = link.ask("GET_FINALITY").await {
+        if let Ok(finality_resp) = link.ask_within("GET_FINALITY", QUICK_ASK_TIMEOUT).await {
             if let Some(json) = finality_resp.strip_prefix("FINALITY:") {
                 if let Ok(artifact) = serde_json::from_str::<FinalityArtifact>(json) {
                     if let Err(e) = self.apply_finality_artifact(&artifact) {
@@ -746,7 +808,10 @@ impl ChainSync {
         &self,
         link: &mut SyncLink,
     ) -> Option<consensus::qc::QuorumCertificate> {
-        let resp = link.ask("GET_FINALITY").await.ok()?;
+        let resp = link
+            .ask_within("GET_FINALITY", QUICK_ASK_TIMEOUT)
+            .await
+            .ok()?;
         let json = resp.strip_prefix("FINALITY:")?;
         let artifact = serde_json::from_str::<FinalityArtifact>(json).ok()?;
         let qc = artifact.qc?;

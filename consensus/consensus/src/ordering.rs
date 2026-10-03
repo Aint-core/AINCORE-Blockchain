@@ -122,6 +122,10 @@ const GC_FLOOR_KEY: &str = "consensus:gc_floor";
 
 /// DE-6: `consensus:anchor_decision:{E:020}:{r:020}` holds `C:{digest}` or
 /// `S`, written once in the acceptance transaction.
+/// B36: anchor decisions are keyed under this epoch whatever the epoch
+/// (rounds never repeat across epochs); writer and pruner share it.
+pub const DECISION_EPOCH: u64 = 0;
+
 pub fn anchor_decision_key(epoch: u64, round: u64) -> String {
     format!("consensus:anchor_decision:{epoch:020}:{round:020}")
 }
@@ -1169,7 +1173,7 @@ impl OrderingEngine {
                 .saturating_sub(2 * (MAX_DECISION_ROWS - 1)),
         );
         for r in (first_row..=info.anchor_round).step_by(2) {
-            let key = anchor_decision_key(0, r);
+            let key = anchor_decision_key(DECISION_EPOCH, r);
             let decision = if r == info.anchor_round {
                 format!("C:{}", info.anchor_hash)
             } else {
