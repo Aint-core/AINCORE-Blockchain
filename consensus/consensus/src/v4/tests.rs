@@ -670,6 +670,137 @@ fn a_slow_honest_leader_is_still_committed() {
     }
 }
 
+/// B5 witness, the rehearsal's missed anchors: the other three members
+/// propose and certify the anchor round before the leader's tick comes, so
+/// the leader's current round is already the next one. It still proposes
+/// its anchor, the others' next proposals wait for its certificate, and the
+/// anchor commits on every node. Before the fix the leader went straight to
+/// the next round and the anchor was never certified.
+#[test]
+fn a_leader_whose_tick_comes_after_its_anchor_quorum_still_proposes_it() {
+    let mut c = Cluster::new("late_tick", 4, 0);
+    c.run(1);
+    let leader = c.leader(2);
+    for i in c.validators().filter(|&i| i != leader) {
+        c.tick(i);
+    }
+    c.deliver(&|_, _| false);
+    assert_eq!(
+        c.engine(leader).current_round(),
+        3,
+        "positive control: round 2 reached quorum without the leader"
+    );
+    c.tick(leader);
+    c.deliver(&|_, _| false);
+    let leader_vertex = c
+        .engine(leader)
+        .own_proposal(2)
+        .expect("the leader proposed its anchor round")
+        .hash
+        .clone();
+    c.run(8);
+    c.assert_agree();
+    for i in c.validators() {
+        assert_eq!(
+            c.anchor(i, 2).map(|d| &d.1),
+            Some(&leader_vertex),
+            "node {i}"
+        );
+    }
+}
+
+/// B5 review (a): one tick after the anchor's quorum the others are still
+/// waiting for the leader's certificate; the late anchor reaches them in
+/// time and their next round cites it.
+#[test]
+fn the_others_wait_for_a_late_owed_anchor_and_cite_it() {
+    let mut c = Cluster::new("late_wait", 4, 0);
+    c.run(1);
+    let leader = c.leader(2);
+    let others: Vec<usize> = c.validators().filter(|&i| i != leader).collect();
+    for &i in &others {
+        c.tick(i);
+    }
+    c.deliver(&|_, _| false);
+    for &i in &others {
+        c.tick(i);
+    }
+    c.deliver(&|_, _| false);
+    for &i in &others {
+        assert!(
+            c.engine(i).own_proposal(3).is_none(),
+            "node {i} did not wait"
+        );
+    }
+    c.tick(leader);
+    c.deliver(&|_, _| false);
+    let anchor = c.engine(leader).own_proposal(2).unwrap().hash.clone();
+    for &i in &others {
+        c.tick(i);
+    }
+    c.deliver(&|_, _| false);
+    for &i in &others {
+        let v = c.engine(i).own_proposal(3).expect("round 3 proposed");
+        assert!(
+            v.parent_refs
+                .iter()
+                .any(|r| r.round == 2 && r.digest == anchor),
+            "node {i} did not cite the anchor"
+        );
+    }
+}
+
+/// B5 review LOW-3: a leader that proposed its anchor late waits for that
+/// anchor's certificate from when it proposed it, not from the older
+/// quorum, so its own next round cites it.
+#[test]
+fn a_leader_waits_for_its_own_late_anchor_from_when_it_proposed_it() {
+    let mut c = Cluster::new("late_own", 4, 0);
+    c.run(1);
+    let leader = c.leader(2);
+    for i in c.validators().filter(|&i| i != leader) {
+        c.tick(i);
+    }
+    c.deliver(&|_, _| false);
+    c.tick(leader);
+    let slow = move |e: &Envelope, i: usize| i == leader && matches!(e.msg, Msg::Attest(_));
+    c.deliver(&slow);
+    let anchor = c.engine(leader).own_proposal(2).unwrap().hash.clone();
+    c.tick(leader);
+    c.deliver(&slow);
+    assert!(
+        c.engine(leader).own_proposal(3).is_none(),
+        "the leader moved on before its own anchor was certified"
+    );
+    c.release();
+    c.deliver(&|_, _| false);
+    c.tick(leader);
+    c.deliver(&|_, _| false);
+    let v = c.engine(leader).own_proposal(3).expect("round 3 proposed");
+    assert!(v
+        .parent_refs
+        .iter()
+        .any(|r| r.round == 2 && r.digest == anchor));
+}
+
+/// B5 review LOW-1: an anchor is never owed once this node proposed the
+/// round above it (nothing would cite it).
+#[test]
+fn an_anchor_is_not_owed_after_the_round_above_it() {
+    let mut c = Cluster::new("owed_above", 4, 0);
+    c.run(1);
+    let leader = c.leader(2);
+    let other = c.validators().find(|&i| i != leader).unwrap();
+    for i in c.validators().filter(|&i| i != leader) {
+        c.tick(i);
+    }
+    c.deliver(&|_, _| false);
+    assert_eq!(c.engine(leader).anchor_owed(), Some(2), "positive control");
+    let any = c.engine(other).own_proposal(2).unwrap().clone();
+    c.engines[leader].as_mut().unwrap().own.insert(3, any);
+    assert_eq!(c.engine(leader).anchor_owed(), None);
+}
+
 /// A leader that never shows up is waited for only T_LEADER ticks: its round
 /// is skipped and the chain goes on.
 #[test]

@@ -155,6 +155,10 @@ pub struct Engine {
     cert_stake: BTreeMap<u64, u128>,
     /// PR-3: the tick at which a quorum of certificates at a round was first held.
     quorum_since: HashMap<u64, u64>,
+    /// B5: the tick at which this node proposed an anchor it owed (it leads
+    /// it, and the round reached quorum before its tick). Its own wait for
+    /// that anchor's certificate starts there, not at the older quorum.
+    owed_at: HashMap<u64, u64>,
     /// O_E: round → orderable digests (one per author, OR-2), shared with the
     /// host as `round_index`, and its membership.
     round_index: Arc<Mutex<HashMap<u64, Vec<String>>>>,
@@ -361,6 +365,7 @@ impl Engine {
             certs: HashMap::new(),
             cert_stake: BTreeMap::new(),
             quorum_since: HashMap::new(),
+            owed_at: HashMap::new(),
             round_index: shared.round_index,
             orderable: HashSet::new(),
             waiting: HashMap::new(),
@@ -1140,7 +1145,8 @@ impl Engine {
         if !self.may_sign() || self.closing_round.is_some() {
             return None;
         }
-        let round = self.current_round();
+        let owed = self.anchor_owed();
+        let round = owed.unwrap_or_else(|| self.current_round());
         if self.own.contains_key(&round) {
             return None;
         }
@@ -1152,6 +1158,8 @@ impl Engine {
         if round > self.first_round && prev >= 2 && prev.is_multiple_of(2) {
             let leader = OrderingEngine::leader_for_round(prev, &self.stakes, 0);
             let since = self.quorum_since.get(&prev).copied().unwrap_or(self.tick);
+            // B5: an anchor this node proposed late is waited for from then.
+            let since = since.max(self.owed_at.get(&prev).copied().unwrap_or(0));
             if !self.certs.contains_key(&(prev, leader.clone())) {
                 if self.tick < since + T_LEADER_TICKS {
                     return None;
@@ -1165,11 +1173,51 @@ impl Engine {
                 );
             }
         }
+        if let Some(anchor) = owed {
+            self.owed_at.insert(anchor, self.tick);
+        }
         let cursor = lock(&self.ordering).next_anchor_round;
         Some(Slot {
             round,
             carry_payload: round <= cursor.saturating_add(ingress_v4::LEAD),
         })
+    }
+
+    /// B5: the anchor round this node leads and still owes a vertex: the
+    /// round below `current_round`, when the other members certified a
+    /// quorum of it before this node's tick came (ticks are not aligned
+    /// across nodes). Proposing `current_round` instead skipped the anchor
+    /// for good: it was never certified and its round committed nothing
+    /// (every missed anchor of the S7a rehearsal, 8 of 138, was its own
+    /// leader's skip). The vertex still reaches the next round in time:
+    /// its proposals wait `T_LEADER_TICKS` for exactly this certificate.
+    ///
+    /// Never after this node proposed the round above (a vertex nothing
+    /// would cite, review LOW-1). An epoch's first round is an anchor too;
+    /// it cites the sentinel, so no quorum below it is needed (LOW-2).
+    fn anchor_owed(&self) -> Option<u64> {
+        let anchor = self.current_round().checked_sub(1)?;
+        let unproposed = |round: u64| {
+            !self.own.contains_key(&round)
+                && matches!(self.storage.get(&self.proposed_key(round)), Ok(None))
+        };
+        let parents_held = anchor == self.first_round
+            || (anchor > self.first_round && self.quorum_held(anchor - 1));
+        let owed = anchor >= 2
+            && anchor.is_multiple_of(2)
+            && parents_held
+            && OrderingEngine::leader_for_round(anchor, &self.stakes, 0) == self.cfg.address
+            && unproposed(anchor)
+            && unproposed(anchor + 1);
+        owed.then_some(anchor)
+    }
+
+    /// Whether this node holds certificates of a stake quorum for `round`.
+    fn quorum_held(&self, round: u64) -> bool {
+        let total: u128 = self.stakes.iter().map(|(_, s)| *s as u128).sum();
+        self.cert_stake
+            .get(&round)
+            .is_some_and(|held| qc::stake_quorum_met(*held, total))
     }
 
     /// `tick`, then `propose` with `payload` when a slot is open.

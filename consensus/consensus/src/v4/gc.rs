@@ -148,6 +148,7 @@ impl Engine {
         self.certs.retain(|(r, _), _| *r > cut);
         self.cert_stake.retain(|r, _| *r > cut);
         self.quorum_since.retain(|r, _| *r > cut);
+        self.owed_at.retain(|r, _| *r > cut);
         self.own.retain(|r, _| *r > cut);
         self.collectors.retain(|r, _| *r > cut);
     }

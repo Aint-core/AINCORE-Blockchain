@@ -488,6 +488,7 @@ impl Engine {
         lock(&self.round_index).clear();
         self.cert_stake.clear();
         self.quorum_since.clear();
+        self.owed_at.clear();
         self.orderable.clear();
         self.waiting.clear();
         self.body_wants.clear();
