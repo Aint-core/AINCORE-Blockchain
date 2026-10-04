@@ -655,6 +655,61 @@ async fn connections_past_the_grace_are_trimmed_to_two() {
     assert_eq!(live, 2, "trimmed to two: closed {:?}", seen.closed);
 }
 
+/// A non-member's sync client: an identity no committee names.
+fn stranger_client() -> Swarm<request_response::Behaviour<sessions::FramedCodec>> {
+    client_on(
+        sessions::FramedCodec::new(sessions::SYNC_REQUEST_CAP, sessions::SYNC_RESPONSE_CAP),
+        sessions::SYNC_PROTOCOL,
+        libp2p::identity::Keypair::generate_ed25519(),
+    )
+}
+
+/// B67 witness (rehearsal, 2026-10-04): the per-host cap on non-members
+/// counts identities, not connections. An observer's own extra connections
+/// (it dials a node's addresses at once and keeps one) are not closed when
+/// they open: the one it kept survives its dropped siblings. A third
+/// identity from the same host is still refused. Counting connections closed
+/// the observer's kept connection at once, and it redialled in a loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_strangers_own_connections_are_not_counted_as_new_identities() {
+    let node_under_test = start_node("stranger_siblings", 2).await;
+    let target = &node_under_test.target;
+    let mut observer = stranger_client();
+    let mut seen = Seen::default();
+    for _ in 0..3 {
+        seen.open(&mut observer, target).await;
+    }
+    observer.close_connection(seen.opened[0]);
+    observer.close_connection(seen.opened[1]);
+    seen.drive(&mut observer, Duration::from_secs(7), |_| false)
+        .await;
+    assert!(
+        !seen.closed.contains(&seen.opened[2]),
+        "the connection the observer kept was closed"
+    );
+
+    let mut second = stranger_client();
+    let mut second_seen = Seen::default();
+    second_seen.open(&mut second, target).await;
+    let mut third = stranger_client();
+    let mut third_seen = Seen::default();
+    third_seen.open(&mut third, target).await;
+    third_seen
+        .drive(&mut third, Duration::from_secs(5), |s| !s.closed.is_empty())
+        .await;
+    assert!(
+        third_seen.closed.contains(&third_seen.opened[0]),
+        "a third identity from one host was admitted"
+    );
+    second_seen
+        .drive(&mut second, Duration::from_millis(500), |_| false)
+        .await;
+    assert!(
+        second_seen.closed.is_empty(),
+        "the second identity was refused"
+    );
+}
+
 /// Dial `target` and wait for the session.
 async fn connect<C: SyncCodec>(
     swarm: &mut Swarm<request_response::Behaviour<C>>,

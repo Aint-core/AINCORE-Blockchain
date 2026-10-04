@@ -42,6 +42,9 @@ never count against the caps for other peers. Non-members share a fixed cap (Apt
 anemo `PeerAffinity::High` bypasses `max_concurrent_connections`). Before authentication only
 an IP admission rate applies (anemo 10 per second per IP, burst 100; Agave 8 connections per
 minute per IP).
+One host holds inbound sessions for at most 2 non-member identities; an identity's own extra
+connections fall under the per-peer duplicate rule (closed after a 5 s grace), not under this
+cap (B67: counting connections closed an observer's kept connection as it opened).
 
 **NI-3 Budgets per authenticated peer, not per IP.** Each peer has bounded queues and token
 buckets keyed on its session identity:

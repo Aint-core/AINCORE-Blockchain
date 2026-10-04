@@ -35,7 +35,13 @@ const MAX_LIBP2P_CONNECTIONS_PER_PEER: u32 = 2;
 /// concurrency, 8, from each side).
 const DUPLICATE_GRACE: Duration = Duration::from_secs(5);
 const MAX_LIBP2P_CONNECTIONS_HARD: u32 = 16;
-const MAX_INBOUND_LIBP2P_CONNECTIONS_PER_HOST: u32 = 2;
+/// NI-2: the non-member identities one host may hold inbound connections
+/// for. B67: identities, not connections: a peer's own extra connections (a
+/// dial by PeerId opens one per address and keeps one) are the per-peer
+/// rule's, closed once they outlive `DUPLICATE_GRACE`. Counting them here
+/// closed an observer's kept connection the moment it opened, and it
+/// redialled in a loop (rehearsal, 2026-10-04: ~70 a minute a node).
+const MAX_INBOUND_PEERS_PER_HOST: usize = 2;
 
 fn multiaddr_host(addr: &Multiaddr) -> Option<String> {
     addr.iter().find_map(|protocol| match protocol {
@@ -234,12 +240,18 @@ pub async fn start_p2p(
 
     // === Event Loop ===
     tokio::spawn(async move {
-        let mut inbound_connections_by_host: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
+        // The non-member identities each host holds inbound connections
+        // for, with each identity's connection count (B67).
+        let mut inbound_peers_by_host: std::collections::HashMap<
+            String,
+            std::collections::HashMap<PeerId, u32>,
+        > = std::collections::HashMap::new();
         // The inbound connections counted against their host, so a close
         // gives back exactly what was taken (members are not counted).
-        let mut counted_inbound: std::collections::HashMap<libp2p::swarm::ConnectionId, String> =
-            std::collections::HashMap::new();
+        let mut counted_inbound: std::collections::HashMap<
+            libp2p::swarm::ConnectionId,
+            (String, PeerId),
+        > = std::collections::HashMap::new();
         let mut committee_dial = tokio::time::interval(COMMITTEE_DIAL_EVERY);
         // G4 S1: sync requests this node asked, and those it is answering.
         let mut pending_asks: std::collections::HashMap<
@@ -719,19 +731,21 @@ pub async fn start_p2p(
                                     non_member_inbound.insert(connection_id);
                                 }
                                 if let (false, Some(host)) = (is_member, multiaddr_host(&send_back_addr)) {
-                                    let count = inbound_connections_by_host.entry(host.clone()).or_insert(0);
-                                    *count = count.saturating_add(1);
-                                    counted_inbound.insert(connection_id, host.clone());
-                                    if *count > MAX_INBOUND_LIBP2P_CONNECTIONS_PER_HOST {
+                                    let peers = inbound_peers_by_host.entry(host.clone()).or_default();
+                                    if !peers.contains_key(&peer_id)
+                                        && peers.len() >= MAX_INBOUND_PEERS_PER_HOST
+                                    {
                                         eprintln!(
-                                            "⚠️ Closing excess inbound libp2p connection from {}: established={} limit={}",
+                                            "⚠️ Closing inbound libp2p connection from a new identity on {}: identities={} limit={}",
                                             host,
-                                            count,
-                                            MAX_INBOUND_LIBP2P_CONNECTIONS_PER_HOST
+                                            peers.len(),
+                                            MAX_INBOUND_PEERS_PER_HOST
                                         );
                                         let _ = swarm.close_connection(connection_id);
                                         continue;
                                     }
+                                    *peers.entry(peer_id).or_insert(0) += 1;
+                                    counted_inbound.insert(connection_id, (host, peer_id));
                                 }
                                 // Do not persist inbound send-back addresses: they are usually
                                 // ephemeral source ports, not stable listen addresses. Persisting
@@ -760,11 +774,16 @@ pub async fn start_p2p(
                                 table.retain(|s| s.peer != peer);
                             }
                         }
-                        if let Some(host) = counted_inbound.remove(&connection_id) {
-                            if let Some(count) = inbound_connections_by_host.get_mut(&host) {
-                                *count = count.saturating_sub(1);
-                                if *count == 0 {
-                                    inbound_connections_by_host.remove(&host);
+                        if let Some((host, peer)) = counted_inbound.remove(&connection_id) {
+                            if let Some(peers) = inbound_peers_by_host.get_mut(&host) {
+                                if let Some(count) = peers.get_mut(&peer) {
+                                    *count = count.saturating_sub(1);
+                                    if *count == 0 {
+                                        peers.remove(&peer);
+                                    }
+                                }
+                                if peers.is_empty() {
+                                    inbound_peers_by_host.remove(&host);
                                 }
                             }
                         }
