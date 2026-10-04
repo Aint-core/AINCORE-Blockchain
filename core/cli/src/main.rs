@@ -86,6 +86,27 @@ fn signed_tx_json(
     Ok(serde_json::to_string(&tx)?)
 }
 
+/// The sequence number `address`'s next transaction must carry.
+fn account_nonce(client: &RpcClient, address: &str) -> anyhow::Result<u64> {
+    let answer = client.call("aincore_getAccountNonce", json!([address]))?;
+    answer["sequence_number"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("unexpected aincore_getAccountNonce answer: {answer}"))
+}
+
+/// An object's `data` as the node serves it: its text (B66), or the array
+/// of its bytes.
+fn object_data(value: &serde_json::Value) -> Option<Vec<u8>> {
+    match value {
+        serde_json::Value::String(text) => Some(text.as_bytes().to_vec()),
+        serde_json::Value::Array(bytes) => bytes
+            .iter()
+            .map(|b| b.as_u64().and_then(|b| u8::try_from(b).ok()))
+            .collect(),
+        _ => None,
+    }
+}
+
 mod client;
 mod keys;
 mod wallet;
@@ -269,19 +290,7 @@ fn main() -> anyhow::Result<()> {
             let sender = wallet.address();
 
             // Get Seq Number
-            let balance_res = client.call("aincore_getBalance", json!([sender]))?;
-            let mut sequence_number = 0;
-            if let Some(obj) = balance_res.as_object() {
-                if let Some(data_bytes) = obj.get("data").and_then(|v| v.as_array()) {
-                    let bytes: Vec<u8> = data_bytes
-                        .iter()
-                        .map(|b| b.as_u64().unwrap_or(0) as u8)
-                        .collect();
-                    if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        sequence_number = account_data["sequence_number"].as_u64().unwrap_or(0);
-                    }
-                }
-            }
+            let sequence_number = account_nonce(&client, &sender)?;
 
             println!(
                 "📡 Submitting Proof for Device: {} (BQI: {})",
@@ -334,11 +343,7 @@ fn main() -> anyhow::Result<()> {
                 if let Some(move_balance) = obj.get("move_balance").and_then(|v| v.as_str()) {
                     balance = move_balance.to_string();
                 }
-                if let Some(data_bytes) = obj.get("data").and_then(|v| v.as_array()) {
-                    let bytes: Vec<u8> = data_bytes
-                        .iter()
-                        .map(|b| b.as_u64().unwrap_or(0) as u8)
-                        .collect();
+                if let Some(bytes) = obj.get("data").and_then(object_data) {
                     // AccountData now stores metadata; keep btc_balance read for bridge tooling.
                     if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                         if let Some(btc) = account_data.get("btc_balance").and_then(|v| v.as_u64())
@@ -365,21 +370,7 @@ fn main() -> anyhow::Result<()> {
             let sender = wallet.address();
 
             println!("🔍 Loading sender metadata: {}", sender);
-            let balance_res = client.call("aincore_getBalance", json!([sender]))?;
-
-            let mut sequence_number = 0;
-
-            if let Some(obj) = balance_res.as_object() {
-                if let Some(data_bytes) = obj.get("data").and_then(|v| v.as_array()) {
-                    let bytes: Vec<u8> = data_bytes
-                        .iter()
-                        .map(|b| b.as_u64().unwrap_or(0) as u8)
-                        .collect();
-                    if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        sequence_number = account_data["sequence_number"].as_u64().unwrap_or(0);
-                    }
-                }
-            }
+            let sequence_number = account_nonce(&client, &sender)?;
 
             println!("✅ Sender metadata loaded (Seq: {})", sequence_number);
             println!(
@@ -497,19 +488,7 @@ fn main() -> anyhow::Result<()> {
             let bytes = hex::decode(&bytecode_hex).expect("invalid hex in publish command");
             let payload_struct = vm_move::TransactionPayload::PublishModule(vec![bytes]);
             let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
-            let balance_res = client.call("aincore_getBalance", json!([sender]))?;
-            let mut sequence_number = 0;
-            if let Some(obj) = balance_res.as_object() {
-                if let Some(data_bytes) = obj.get("data").and_then(|v| v.as_array()) {
-                    let bytes: Vec<u8> = data_bytes
-                        .iter()
-                        .map(|b| b.as_u64().unwrap_or(0) as u8)
-                        .collect();
-                    if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        sequence_number = account_data["sequence_number"].as_u64().unwrap_or(0);
-                    }
-                }
-            }
+            let sequence_number = account_nonce(&client, &sender)?;
             // F4: bind gas_limit/gas_price/input_objects.
             let tx_str = signed_tx_json(
                 &client,
@@ -540,19 +519,7 @@ fn main() -> anyhow::Result<()> {
             println!("🔒 Registering Validator for address: {}", sender);
 
             // Check Balance
-            let res = client.call("aincore_getBalance", json!([sender]))?;
-            let mut sequence_number = 0;
-            if let Some(obj) = res.as_object() {
-                if let Some(data_bytes) = obj.get("data").and_then(|v| v.as_array()) {
-                    let bytes: Vec<u8> = data_bytes
-                        .iter()
-                        .map(|b| b.as_u64().unwrap_or(0) as u8)
-                        .collect();
-                    if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        sequence_number = account_data["sequence_number"].as_u64().unwrap_or(0);
-                    }
-                }
-            }
+            let sequence_number = account_nonce(&client, &sender)?;
 
             // Skipping client-side balance check due to u64 parsing limitations in CLI for u128 balances
 
@@ -595,19 +562,7 @@ fn main() -> anyhow::Result<()> {
             println!("🚰 Faucet: Sending {} AIN to {}", amount, a1n(&to));
 
             // Get sequence number
-            let res = client.call("aincore_getBalance", json!([sender]))?;
-            let mut sequence_number = 0;
-            if let Some(obj) = res.as_object() {
-                if let Some(data_bytes) = obj.get("data").and_then(|v| v.as_array()) {
-                    let bytes: Vec<u8> = data_bytes
-                        .iter()
-                        .map(|b| b.as_u64().unwrap_or(0) as u8)
-                        .collect();
-                    if let Ok(account_data) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        sequence_number = account_data["sequence_number"].as_u64().unwrap_or(0);
-                    }
-                }
-            }
+            let sequence_number = account_nonce(&client, &sender)?;
 
             // Convert AIN to quanta (AINCORE smallest unit, 18 decimals).
             // 1 AIN = 10^18 quanta.

@@ -293,8 +293,12 @@ fn block_crash_child() {
                 // only when it moves): with 419b9a0's bytecode the new
                 // executor gives e7e2ff0b.... B7 then moved it through the
                 // stdlib alone (0x1::treasury deleted, coin.mv without the
-                // friend): ba90d7a8....
-                "ba90d7a80598128ed9672b4895102f344be1a5ec5d8a1d64516cd23fc2e1de5d",
+                // friend): ba90d7a8.... B66 moved it through the object
+                // encoding alone (an account's data stored as its text): with
+                // data stored as a byte array again, the B66 executor
+                // reproduces ba90d7a8... exactly. B65 did not move it (the
+                // block adds less than the state target: no byte gas write).
+                "9e6887ef55db1980dd8db63b915589ca957950d7bee410f1973f53db83179f0f",
                 "clean execution must preserve the pre-staging fixture root"
             );
         }

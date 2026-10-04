@@ -672,4 +672,53 @@ mod tests {
         db.put("key", "v2").unwrap();
         assert_eq!(db.get("key").unwrap(), Some("v2".to_string()));
     }
+    /// B66 witness: an object's text data is stored as text, one encoding a
+    /// value; bytes that are not UTF-8 stay an array; the array form is still
+    /// read. The record's stored form is under half the array's.
+    #[test]
+    fn object_data_is_stored_compactly_with_one_encoding() {
+        let record = r#"{"address":"ab","public_key":"cd","sequence_number":7}"#;
+        let account = Object::new(
+            "ab".repeat(32),
+            object::Owner::Address("ab".repeat(32)),
+            record.as_bytes().to_vec(),
+            "account".to_string(),
+        );
+        let stored = serde_json::to_string(&account).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(value["data"], serde_json::json!(record));
+        let back: Object = serde_json::from_str(&stored).unwrap();
+        assert_eq!(back.data, record.as_bytes());
+        assert_eq!(
+            serde_json::to_string(&back).unwrap(),
+            stored,
+            "one encoding"
+        );
+
+        let mut as_array = value.clone();
+        as_array["data"] = serde_json::json!(record.as_bytes());
+        let legacy = as_array.to_string();
+        let read: Object = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(read.data, record.as_bytes(), "the array form is read");
+        assert_eq!(serde_json::to_string(&read).unwrap(), stored);
+        let (text, array) = (value["data"].to_string(), as_array["data"].to_string());
+        assert!(
+            text.len() * 2 < array.len(),
+            "{} vs {}",
+            text.len(),
+            array.len()
+        );
+
+        let binary = Object::new(
+            "obj".to_string(),
+            object::Owner::Shared,
+            vec![0xff, 0x00, 0x80],
+            "blob".to_string(),
+        );
+        let stored = serde_json::to_string(&binary).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(value["data"], serde_json::json!([255, 0, 128]));
+        let back: Object = serde_json::from_str(&stored).unwrap();
+        assert_eq!(back.data, vec![0xff, 0x00, 0x80]);
+    }
 }

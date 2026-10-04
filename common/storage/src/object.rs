@@ -27,8 +27,38 @@ pub struct Object {
     pub id: ObjectID,
     pub version: u64,
     pub owner: Owner,
-    pub data: Vec<u8>,       // Raw data, can be JSON or BCS/Borsh later
+    /// Raw data (an account's is its JSON record), stored by `compact_bytes`.
+    #[serde(with = "compact_bytes")]
+    pub data: Vec<u8>,
     pub type_struct: String, // e.g., "0x2::coin::Coin<0x2::sui::SUI>"
+}
+
+/// B66: `data` is stored as its text when it is UTF-8 (an account record is
+/// JSON), else as the array of its bytes, so a value has one encoding and
+/// state roots stay canonical. The array alone cost ~3.5 bytes of state a
+/// byte (`123,`), which B65's state gas charges. Both forms are read.
+mod compact_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        match std::str::from_utf8(data) {
+            Ok(text) => serializer.serialize_str(text),
+            Err(_) => serializer.collect_seq(data),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Stored {
+            Text(String),
+            Bytes(Vec<u8>),
+        }
+        Ok(match Stored::deserialize(deserializer)? {
+            Stored::Text(text) => text.into_bytes(),
+            Stored::Bytes(bytes) => bytes,
+        })
+    }
 }
 
 impl Object {
