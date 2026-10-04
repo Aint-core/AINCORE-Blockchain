@@ -76,6 +76,8 @@ prometheus = "0.13"
 lazy_static = "1.4"
 
 [dev-dependencies]
+# B65: the estimate test seeds the stdlib and a balance.
+executor = { path = "../executor", features = ["test-support"] }
 # G3 WG-1: test fixtures seed their own genesis state (StateDB::seeding).
 storage = { path = "../../common/storage", features = ["test-seeding"] }
 # G3 PF: tests verify the proof RPC with the client verifier.

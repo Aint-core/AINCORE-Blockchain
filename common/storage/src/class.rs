@@ -161,6 +161,7 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         | "sys:config:burn_percentage"
         | "sys:config:min_base_fee"
         | "sys:base_fee"
+        | "sys:state_byte_gas"
         | "sys:config:tip_agreement_n"
         | "sys:total_supply"
         | "total_burned"
@@ -395,6 +396,7 @@ pub const STATE_EXACT: &[&str] = &[
     "sys:config:burn_percentage",
     "sys:config:min_base_fee",
     "sys:base_fee",
+    "sys:state_byte_gas",
     "sys:config:tip_agreement_n",
     "sys:total_supply",
     "total_burned",
@@ -629,6 +631,7 @@ mod tests {
             ("sys:config:burn_percentage".into(), State),
             ("sys:config:min_base_fee".into(), State),
             ("sys:base_fee".into(), State),
+            ("sys:state_byte_gas".into(), State),
             ("sys:config:federation_addr".into(), State),
             ("sys:config:base_reward".into(), State),
             ("sys:config:halving_interval".into(), State),

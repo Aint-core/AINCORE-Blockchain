@@ -1304,3 +1304,57 @@ fn a_key_recreated_during_pruning_keeps_its_preimage() {
     assert_eq!(count_rows(&db, VDEAD), 0, "the old deletion row went");
 }
 
+/// The bytes of the tree's own rows a state key adds or rewrites
+/// (`jmt:*`), over a 20,000-key tree; the measurement behind
+/// `executor::state_gas::NEW_KEY_BYTES` (B65). Run with `--ignored`.
+#[test]
+#[ignore]
+fn measure_tree_bytes_per_key() {
+    fn tree_bytes(db: &StateDB) -> usize {
+        let mut n = 0usize;
+        for row in db.db.prefix_iterator(b"jmt:") {
+            let (k, v) = row.unwrap();
+            if !k.starts_with(b"jmt:") {
+                break;
+            }
+            n += k.len() + v.len();
+        }
+        n
+    }
+    fn key(i: usize, klen: usize) -> String {
+        let base = format!("obj:p{i}:");
+        format!("{base}{}", "k".repeat(klen.saturating_sub(base.len())))
+    }
+    const PREFILL: usize = 20_000;
+    const NEW: usize = 2_000;
+    for (klen, vlen) in [(40usize, 50usize), (40, 1050), (240, 50), (110, 200)] {
+        let db = temp_db(&format!("measure_{klen}_{vlen}"));
+        let value = |seed: usize| {
+            let mut v = format!("{seed}:").into_bytes();
+            v.resize(vlen, b'x');
+            v
+        };
+        let prefill = (0..PREFILL).map(|i| (key(i, klen), Some(value(i))));
+        commit(&db, 0, prefill.collect());
+        let before = tree_bytes(&db);
+        let added = (PREFILL..PREFILL + NEW).map(|i| (key(i, klen), Some(value(i))));
+        commit(&db, 1, added.collect());
+        let added_before_prune = tree_bytes(&db);
+        prune(&db, 1, &Default::default(), usize::MAX).unwrap();
+        let after_add = tree_bytes(&db);
+        let rewritten = (0..NEW).map(|i| (key(i, klen), Some(value(i + 7_000_000))));
+        commit(&db, 2, rewritten.collect());
+        let rewritten_before_prune = tree_bytes(&db);
+        prune(&db, 2, &Default::default(), usize::MAX).unwrap();
+        let after_rewrite = tree_bytes(&db);
+        let per = |a: usize, b: usize| (a as f64 - b as f64) / NEW as f64;
+        println!(
+            "MEASURE key {klen} value {vlen}: a new key {:.1} tree bytes ({:.1} before pruning); \
+             a rewrite {:.1} before pruning, {:.1} after",
+            per(after_add, before),
+            per(added_before_prune, before),
+            per(rewritten_before_prune, after_add),
+            per(after_rewrite, after_add),
+        );
+    }
+}

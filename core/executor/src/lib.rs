@@ -30,7 +30,9 @@ pub const MAX_SUPPLY: u128 = 150_000_000 * 1_000_000_000_000_000_000; // 150 Mil
 // 10,000 TXs × 128 objects = 1.28M objects → 1.28GB RAM. Cap at 10K total.
 const MAX_OBJECTS_PER_BLOCK: usize = 10_000;
 // Gas cost per input object loaded (prevents zero-cost object flooding)
-/// Protocol ceiling on a single transaction's `gas_limit`.
+/// Protocol ceiling on the gas one transaction's Move execution may use
+/// (B65: the gas its writes cost comes on top, up to `MAX_BLOCK_GAS_LIMIT`
+/// for the whole limit, as EIP-8037 caps execution gas apart from state gas).
 ///
 /// AUDIT-CRITICAL (pre-mainnet B5). Real transactions here use 1_000..100_000
 /// gas, so this leaves ~100x headroom while bounding the work one transaction
@@ -53,6 +55,8 @@ pub use admission::MIN_GAS_PRICE;
 use admission::OBJECT_LOAD_GAS;
 
 pub mod admission;
+pub mod state_gas;
+use state_gas::GasEstimate;
 
 /// Seeding for other crates' tests (`test-support` feature): enough of what
 /// genesis writes for a transaction to execute.
@@ -3513,21 +3517,18 @@ impl Executor {
             let mut kept = Vec::with_capacity(parsed_txs.len());
             let mut dropped = 0usize;
             for tx in parsed_txs.into_iter() {
-                // B14: the per-transaction cap bounds Move execution, so it is
-                // checked on the limit less the transaction's byte gas. A
-                // transaction over it cannot execute at all, so it is skipped
-                // here; the block ceiling is spent at execution (B16).
-                let execution =
-                    tx.0.gas_limit
-                        .saturating_sub(admission::intrinsic_gas(tx.1.len()));
-                if execution > MAX_GAS_LIMIT {
+                // B65: Move execution is capped when it runs and the rest of a
+                // limit pays for writes, so only a limit over what a block
+                // holds cannot execute at all (`check_stateless` refuses it
+                // too); the block ceiling is spent at execution (B16).
+                if tx.0.gas_limit > MAX_BLOCK_GAS_LIMIT {
                     dropped += 1;
                     continue;
                 }
                 kept.push(tx);
             }
             if dropped > 0 {
-                println!("✂️  dropped {dropped} tx over MAX_GAS_LIMIT {MAX_GAS_LIMIT}");
+                println!("✂️  dropped {dropped} tx over MAX_BLOCK_GAS_LIMIT {MAX_BLOCK_GAS_LIMIT}");
             }
             kept
         };
@@ -3570,11 +3571,15 @@ impl Executor {
         // as Aptos's block gas limit counts what executes.
         let mut objects_used: usize = 0;
         let mut over_ceiling = 0usize;
+        // B65: the state bytes this block's transactions add, each counted
+        // against the state before its batch, as it was charged.
+        let byte_gas = state_gas::committed_state_byte_gas(&self.db);
+        let mut state_bytes_added: u64 = 0;
         for batch in batches.iter() {
             let (mut reserved_gas, mut reserved_objects) = (0u64, 0usize);
             let mut runnable = Vec::with_capacity(batch.len());
             for item in batch.iter() {
-                if !self.can_pay(&item.0) {
+                if !self.can_pay(&item.0, &item.1) {
                     continue;
                 }
                 let gas = gas_used
@@ -3627,6 +3632,8 @@ impl Executor {
 
             for (tx_hash, raw_tx, gas_limit, objects, res) in results {
                 if let Some((mut updates, gas_charged)) = res {
+                    state_bytes_added = state_bytes_added
+                        .saturating_add(state_gas::write_cost(&self.db, &updates).new_bytes);
                     executed_raws.push(raw_tx);
                     gas_used = gas_used.saturating_add(gas_limit);
                     objects_used += objects;
@@ -3784,6 +3791,17 @@ impl Executor {
         if next_base != base_fee {
             if let Err(e) = self.db.put(BASE_FEE_KEY, &next_base.to_string()) {
                 panic!("CRITICAL: base fee write failed at height {block_height}: {e}");
+            }
+        }
+        // B65: the next block's state byte gas, from the bytes this block
+        // added. Written only when it moves.
+        let next_byte_gas = state_gas::next_state_byte_gas(byte_gas, state_bytes_added);
+        if next_byte_gas != byte_gas {
+            if let Err(e) = self
+                .db
+                .put(state_gas::STATE_BYTE_GAS_KEY, &next_byte_gas.to_string())
+            {
+                panic!("CRITICAL: state byte gas write failed at height {block_height}: {e}");
             }
         }
 
@@ -4816,11 +4834,12 @@ impl Executor {
     /// one parallel batch would fork the state root (#1).
     /// B16: whether `tx` can pay on the current state: its price reaches the
     /// base fee, its sequence number is its sender's next, and its payer holds
-    /// `gas_limit * gas_price`. When it is false, `execute_transaction`
-    /// refuses `tx` before the VM runs (the same three checks, and the gas
+    /// `gas_limit * gas_price`. B65: and its limit covers the charge's own
+    /// writes and its object loads. When it is false, `execute_transaction`
+    /// refuses `tx` before the VM runs (the same checks, and the gas
     /// prologue cannot withdraw more than the payer holds), so a block skips
     /// it without spending its resources on it.
-    fn can_pay(&self, tx: &Transaction) -> bool {
+    fn can_pay(&self, tx: &Transaction, raw: &str) -> bool {
         if tx.gas_price < committed_base_fee(&self.db) {
             return false;
         }
@@ -4833,7 +4852,124 @@ impl Executor {
         ) else {
             return false;
         };
+        let Some(account_writes) = self.charge_account_writes(tx, &payer) else {
+            return false;
+        };
+        let execution = tx
+            .gas_limit
+            .saturating_sub(admission::intrinsic_gas(raw.len()));
+        if self.charge_gas(tx, &account_writes) > execution {
+            return false;
+        }
         committed_ain_balance(&self.db, &payer).is_some_and(|balance| balance >= cost)
+    }
+
+    /// B65: the gas a transaction owes before anything runs: its object
+    /// loads (N-2) and the account writes its charge makes, at this block's
+    /// state byte gas.
+    fn charge_gas(&self, tx: &Transaction, account_writes: &[(String, Option<String>)]) -> u64 {
+        let object_load = (tx.input_objects.len() as u64).saturating_mul(OBJECT_LOAD_GAS);
+        object_load.saturating_add(
+            state_gas::write_cost(&self.db, account_writes)
+                .gas(state_gas::committed_state_byte_gas(&self.db)),
+        )
+    }
+
+    /// The account writes a transaction's charge makes before anything runs,
+    /// in the order the charge stages them: the sender's record with its
+    /// nonce bumped, and the payer's. `None` when a record does not parse,
+    /// the nonce is not the sender's next, or it would overflow.
+    ///
+    /// ONBOARDING (second layer): a first-time sender has no AccountData
+    /// object, and `get_object(...)?` used to drop its transaction SILENTLY
+    /// — no log, no receipt, nothing. Combined with the CoinStore deadlock
+    /// this meant a new account could neither receive NOR send; after the
+    /// CoinStore fix it could receive but still never spend, which is the
+    /// same launch-blocking dead end one step further in. Caught on the live
+    /// cluster: 6 funded accounts each held exactly their 1 AIN and every one
+    /// of their 60 outgoing transactions vanished without a trace.
+    ///
+    /// Accounts are therefore created IMPLICITLY on first send, the same way
+    /// Aptos does it. This is safe because the address is not a free
+    /// parameter: it is derived from the public key
+    /// (`derive_address(pk) == tx.sender` is asserted by
+    /// `admission::check_stateless`, in either signature scheme), and the
+    /// signature is verified against that same key. So only the holder of
+    /// the matching private key can produce a transaction for this address,
+    /// and the synthesized account starts at sequence_number 0 — meaning the
+    /// replay check still forces the very first transaction to be nonce 0,
+    /// exactly as for a pre-existing account. Nothing is granted here; an
+    /// impossible precondition is removed.
+    ///
+    /// B27: a paymaster with no account record (funded by a transfer alone)
+    /// gets one implicitly, as a sender does: its address is derived from
+    /// the key that signed (`check_stateless`). Refusing it charged nothing
+    /// for the space the block had reserved.
+    fn charge_account_writes(
+        &self,
+        tx: &Transaction,
+        payer: &str,
+    ) -> Option<Vec<(String, Option<String>)>> {
+        // G3 FX-10: the ONE account constructor genesis uses too, so a
+        // logical account has one encoding in the state tree whichever path
+        // created it. KV-2: one spelling of the key, whatever case the client
+        // sent.
+        let sender_obj = self.db.get_object(&tx.sender).unwrap_or_else(|| {
+            aa::AccountManager::create_account(
+                tx.sender.clone(),
+                tx.public_key.to_ascii_lowercase(),
+            )
+        });
+        // Replay protection.
+        let sender_data: aa::AccountData = serde_json::from_slice(&sender_obj.data).ok()?;
+        if tx.sequence_number != sender_data.sequence_number {
+            return None;
+        }
+        let mut payer_obj = if payer == tx.sender {
+            sender_obj.clone()
+        } else {
+            self.db.get_object(payer).unwrap_or_else(|| {
+                aa::AccountManager::create_account(
+                    payer.to_string(),
+                    tx.paymaster
+                        .clone()
+                        .unwrap_or_default()
+                        .to_ascii_lowercase(),
+                )
+            })
+        };
+        let mut payer_data: aa::AccountData = serde_json::from_slice(&payer_obj.data).ok()?;
+        // ALWAYS increment the SENDER's sequence number, even if a paymaster
+        // pays the gas.
+        let next = sender_data.sequence_number.checked_add(1)?;
+        let mut writes = Vec::new();
+        if payer == tx.sender {
+            payer_data.sequence_number = next;
+        } else {
+            let mut sender_data = sender_data;
+            sender_data.sequence_number = next;
+            let mut updated_sender_obj = sender_obj;
+            if let Ok(new_sender_data) = serde_json::to_vec(&sender_data) {
+                updated_sender_obj.data = new_sender_data;
+                writes.push((
+                    format!("obj:{}", updated_sender_obj.id),
+                    Some(
+                        serde_json::to_string(&updated_sender_obj)
+                            .unwrap_or_else(|_| "{}".to_string()),
+                    ),
+                ));
+            }
+        }
+        // The payer's record (its nonce when it is the sender; gas is
+        // deducted through the Move VM).
+        if let Ok(new_data) = serde_json::to_vec(&payer_data) {
+            payer_obj.data = new_data;
+            writes.push((
+                format!("obj:{}", payer_obj.id),
+                Some(serde_json::to_string(&payer_obj).unwrap_or_else(|_| "{}".to_string())),
+            ));
+        }
+        Some(writes)
     }
 
     fn schedule_batches(
@@ -4915,495 +5051,467 @@ impl Executor {
         &self,
         tx_json: &str,
     ) -> Option<(Vec<(String, Option<String>)>, u128)> {
-        let mut updates = Vec::new();
-
         // B8/B12/B13: everything decidable without state (size, chain id, gas
         // bounds, payload kind, ZK proof, sender and paymaster signatures in
         // either scheme) through the one predicate the mempool and vertex
         // ingress use.
-        let checked = match admission::check_stateless(tx_json, &expected_chain_id()) {
-            Ok(checked) => Some(checked),
+        match admission::check_stateless(tx_json, &expected_chain_id()) {
+            Ok(checked) => self.execute_checked(checked, tx_json, None),
             Err(e) => {
                 println!("❌ REJECTED: {e}");
                 None
             }
-        };
-        if let Some(admission::CheckedTx {
+        }
+    }
+
+    /// B65 (`aincore_estimateGas`): what `tx_json` would use if it executed
+    /// now, its signatures unchecked. It runs with the most gas a block
+    /// holds at the lowest price, so neither its own limit nor its payer's
+    /// balance decides the answer; nothing it computes is written.
+    pub fn estimate_gas(&self, tx_json: &str) -> Result<GasEstimate, String> {
+        let mut checked = admission::check_unsigned(tx_json, &expected_chain_id())?;
+        checked.tx.gas_price = admission::MIN_GAS_PRICE;
+        checked.tx.gas_limit = MAX_BLOCK_GAS_LIMIT;
+        checked.execution_gas =
+            MAX_BLOCK_GAS_LIMIT.saturating_sub(admission::intrinsic_gas(tx_json.len()));
+        let report = std::cell::RefCell::new(GasEstimate::default());
+        match self.execute_checked(checked, tx_json, Some(&report)) {
+            Some(_) => Ok(report.into_inner()),
+            None => Err(
+                "the transaction would not execute: a wrong sequence number, \
+                 a payer that cannot pay, or a refused payload"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// `execute_transaction` after the stateless checks. `report`, when
+    /// given, receives what the transaction used (`estimate_gas`), and the
+    /// base fee is not required of it.
+    #[allow(clippy::type_complexity)]
+    fn execute_checked(
+        &self,
+        checked: admission::CheckedTx,
+        tx_json: &str,
+        report: Option<&std::cell::RefCell<GasEstimate>>,
+    ) -> Option<(Vec<(String, Option<String>)>, u128)> {
+        let mut updates = Vec::new();
+        let admission::CheckedTx {
             tx,
             payer,
             execution_gas,
             ..
-        }) = checked
-        {
-            // B15: a block charges its base fee; a lower price does not run.
-            let base_fee = committed_base_fee(&self.db);
-            if tx.gas_price < base_fee {
+        } = checked;
+        // B15: a block charges its base fee; a lower price does not run (an
+        // estimate runs at the lowest price).
+        let base_fee = committed_base_fee(&self.db);
+        if report.is_none() && tx.gas_price < base_fee {
+            println!(
+                "❌ REJECTED: gas price {} below the base fee {}",
+                tx.gas_price, base_fee
+            );
+            return None;
+        }
+        // 1-2.5. The account writes the charge makes (the sender's nonce,
+        // an account created by its first transaction): see
+        // `charge_account_writes`. The signatures and any ZK proof were
+        // checked by `admission::check_stateless`.
+        if self.db.get_object(&tx.sender).is_none() {
+            println!(
+                "🆕 Implicitly creating account {} on its first transaction",
+                tx.sender
+            );
+        }
+        let Some(account_writes) = self.charge_account_writes(&tx, &payer) else {
+            println!("❌ Invalid Sequence Number (or an unreadable account record)");
+            return None;
+        };
+        updates.extend(account_writes);
+
+        // 3. Check Balance & Deduct Gas
+        // N-2 FIX: Charge gas for object loading upfront
+        let object_load_gas = (tx.input_objects.len() as u64) * OBJECT_LOAD_GAS;
+        if object_load_gas > execution_gas {
+            println!(
+                "❌ Insufficient gas for object loading: {} objects × {} gas = {} > execution gas {}",
+                tx.input_objects.len(),
+                OBJECT_LOAD_GAS,
+                object_load_gas,
+                execution_gas
+            );
+            return None;
+        }
+        let gas_cost: u128 = match (tx.gas_limit as u128).checked_mul(tx.gas_price) {
+            Some(cost) => cost,
+            None => {
                 println!(
-                    "❌ REJECTED: gas price {} below the base fee {}",
-                    tx.gas_price, base_fee
+                    "❌ Gas cost overflow: gas_limit={} gas_price={}",
+                    tx.gas_limit, tx.gas_price
                 );
                 return None;
             }
-            // 1. Fetch Sender Account Object.
-            //
-            // ONBOARDING (second layer): a first-time sender has no AccountData
-            // object, and `get_object(...)?` used to drop its transaction SILENTLY
-            // — no log, no receipt, nothing. Combined with the CoinStore deadlock
-            // this meant a new account could neither receive NOR send; after the
-            // CoinStore fix it could receive but still never spend, which is the
-            // same launch-blocking dead end one step further in. Caught on the live
-            // cluster: 6 funded accounts each held exactly their 1 AIN and every one
-            // of their 60 outgoing transactions vanished without a trace.
-            //
-            // Accounts are therefore created IMPLICITLY on first send, the same way
-            // Aptos does it. This is safe because the address is not a free
-            // parameter: it is derived from the public key
-            // (`derive_address(pk) == tx.sender` is asserted by
-            // `admission::check_stateless` above, in either signature scheme), and
-            // the signature is verified against that same key. So only the holder of the matching private key can produce
-            // a transaction for this address, and the synthesized account starts at
-            // sequence_number 0 — meaning the replay check below still forces the
-            // very first transaction to be nonce 0, exactly as for a pre-existing
-            // account. Nothing is granted here; an impossible precondition is
-            // removed.
-            let sender_obj = match self.db.get_object(&tx.sender) {
-                Some(obj) => obj,
-                None => {
-                    println!(
-                        "🆕 Implicitly creating account {} on its first transaction",
-                        tx.sender
-                    );
-                    // G3 FX-10: the ONE account constructor genesis uses too,
-                    // so a logical account has one encoding in the state tree
-                    // whichever path created it.
-                    // KV-2: one spelling of the key, whatever case the client sent.
-                    aa::AccountManager::create_account(
-                        tx.sender.clone(),
-                        tx.public_key.to_ascii_lowercase(),
-                    )
-                }
-            };
+        };
 
-            // 2. The sender's signature and any ZK proof were checked by
-            // `admission::check_stateless` above.
+        // The paymaster's signature (N-1: over chain id, sender, payload,
+        // gas limit and sequence number) was verified in
+        // `admission::check_stateless`; `payer` is the paymaster's address
+        // derived from its key (B13), or the sender.
+        let payer_addr = payer;
 
-            // 2.5 Replay Protection
-            let sender_data_check: aa::AccountData = match serde_json::from_slice(&sender_obj.data)
-            {
-                Ok(d) => d,
-                Err(_) => return None,
-            };
-
-            if tx.sequence_number != sender_data_check.sequence_number {
-                println!("❌ Invalid Sequence Number");
-                return None;
-            }
-
-            // The payload kind and the gas bounds (MAX_GAS_LIMIT included:
-            // a validator can place a transaction straight into a vertex) are
-            // in `admission::check_stateless`.
-
-            // 3. Check Balance & Deduct Gas
-            // N-2 FIX: Charge gas for object loading upfront
-            let object_load_gas = (tx.input_objects.len() as u64) * OBJECT_LOAD_GAS;
-            if object_load_gas > execution_gas {
-                println!(
-                    "❌ Insufficient gas for object loading: {} objects × {} gas = {} > execution gas {}",
-                    tx.input_objects.len(),
-                    OBJECT_LOAD_GAS,
-                    object_load_gas,
-                    execution_gas
-                );
-                return None;
-            }
-            let gas_cost: u128 = match (tx.gas_limit as u128).checked_mul(tx.gas_price) {
-                Some(cost) => cost,
-                None => {
-                    println!(
-                        "❌ Gas cost overflow: gas_limit={} gas_price={}",
-                        tx.gas_limit, tx.gas_price
-                    );
-                    return None;
-                }
-            };
-
-            // The paymaster's signature (N-1: over chain id, sender, payload,
-            // gas limit and sequence number) was verified in
-            // `admission::check_stateless`; `payer` is the paymaster's address
-            // derived from its key (B13), or the sender.
-            let payer_addr = payer;
-
-            // Check if payer has balance
-            // We need to fetch payer object again (or use sender_obj if same)
-            // B27: a paymaster with no account record (funded by a transfer
-            // alone) gets one implicitly, as a sender does: its address is
-            // derived from the key that signed (`check_stateless`). Refusing
-            // here charged nothing for the space the block had reserved.
-            let mut payer_obj = if payer_addr == tx.sender {
-                sender_obj.clone()
-            } else {
-                match self.db.get_object(&payer_addr) {
-                    Some(obj) => obj,
-                    None => aa::AccountManager::create_account(
-                        payer_addr.clone(),
-                        tx.paymaster
-                            .clone()
-                            .unwrap_or_default()
-                            .to_ascii_lowercase(),
-                    ),
-                }
-            };
-
-            let mut account_data: aa::AccountData = match serde_json::from_slice(&payer_obj.data) {
-                Ok(d) => d,
-                Err(_) => return None,
-            };
-
-            // === MOVE GAS DEDUCTION ===
-            // AccountData is now identity/nonce metadata. AIN balance lives in
-            // 0x1::coin::CoinStore<0x1::staking::AincoreCoin>.
-            let mut pre_actions = vec![];
-            if gas_cost > 0 {
-                let payer_move_addr = match parse_move_address(&payer_addr) {
-                    Some(addr) => addr,
-                    None => {
-                        println!("❌ Invalid gas payer address");
-                        return None;
-                    }
-                };
-                let gas_module = move_core_types::language_storage::ModuleId::new(
-                    system_address(),
-                    move_core_types::identifier::Identifier::new("coin")
-                        .expect("coin identifier is valid"),
-                );
-                let arg_sys = bcs::to_bytes(&system_address()).unwrap_or_default();
-                let arg_user = bcs::to_bytes(&payer_move_addr).unwrap_or_default();
-                let arg_amount = bcs::to_bytes(&gas_cost).unwrap_or_default();
-                let gas_action = MoveAction::CallEntryFunction(EntryFunctionCall {
-                    module: gas_module,
-                    function: "deduct_gas".to_string(),
-                    ty_args: vec![aincore_coin_type()],
-                    args: vec![arg_sys, arg_user, arg_amount],
-                });
-                // deduct_gas asserts signer::address_of(sys)==@0x1, so the
-                // authenticated signer for this system pre-action is @0x1, NOT the
-                // tx sender. This is why auth_signer must be per-action (FIX #1).
-                pre_actions.push((gas_action, true, system_address())); // must succeed
-            }
-
-            // CRITICAL FIX: ALWAYS increment the SENDER's sequence number, even if Paymaster pays gas
-            let mut sender_account_data: aa::AccountData = if payer_addr == tx.sender {
-                account_data.clone()
-            } else {
-                sender_data_check
-            };
-
-            if let Some(new_seq) = sender_account_data.sequence_number.checked_add(1) {
-                sender_account_data.sequence_number = new_seq;
-            } else {
-                println!("❌ Sender Sequence Number Overflow");
-                return None;
-            }
-
-            if payer_addr == tx.sender {
-                account_data.sequence_number = sender_account_data.sequence_number;
-            } else {
-                // Save the sender's updated sequence number independently
-                let mut updated_sender_obj = sender_obj.clone();
-                if let Ok(new_sender_data) = serde_json::to_vec(&sender_account_data) {
-                    updated_sender_obj.data = new_sender_data;
-                    updates.push((
-                        format!("obj:{}", updated_sender_obj.id),
-                        Some(
-                            serde_json::to_string(&updated_sender_obj)
-                                .unwrap_or_else(|_| "{}".to_string()),
-                        ),
-                    ));
-                }
-            }
-
-            // Save Payer Update (sequence number only; gas is deducted via Move VM)
-            if let Ok(new_data) = serde_json::to_vec(&account_data) {
-                payer_obj.data = new_data;
-                updates.push((
-                    format!("obj:{}", payer_obj.id),
-                    Some(serde_json::to_string(&payer_obj).unwrap_or_else(|_| "{}".to_string())),
-                ));
-            }
-
-            let actual_gas = gas_cost;
-            let mut tx_status = "success".to_string();
-            let mut tx_error: Option<String> = None;
-            macro_rules! absorb_vm_result {
-                ($vm_changes:expr, $status:expr) => {{
-                    for (k, v) in $vm_changes {
-                        updates.push((k, v));
-                    }
-                    self.append_supply_tracker_updates(&mut updates);
-                    if !$status.success {
-                        tx_status = "aborted".to_string();
-                        tx_error = Some(
-                            $status
-                                .error
-                                .unwrap_or_else(|| "Move execution aborted".to_string()),
-                        );
-                        false
-                    } else {
-                        true
-                    }
-                }};
-            }
-
-            // 4. Execution Payload (Structured BCS)
-            let sender_addr = match parse_move_address(&tx.sender) {
+        // === MOVE GAS DEDUCTION ===
+        // AccountData is now identity/nonce metadata. AIN balance lives in
+        // 0x1::coin::CoinStore<0x1::staking::AincoreCoin>.
+        let mut pre_actions = vec![];
+        if gas_cost > 0 {
+            let payer_move_addr = match parse_move_address(&payer_addr) {
                 Some(addr) => addr,
                 None => {
-                    println!("❌ Invalid sender address format");
+                    println!("❌ Invalid gas payer address");
                     return None;
                 }
             };
+            let gas_module = move_core_types::language_storage::ModuleId::new(
+                system_address(),
+                move_core_types::identifier::Identifier::new("coin")
+                    .expect("coin identifier is valid"),
+            );
+            let arg_sys = bcs::to_bytes(&system_address()).unwrap_or_default();
+            let arg_user = bcs::to_bytes(&payer_move_addr).unwrap_or_default();
+            // An estimate runs the same deduction for nothing: its limit is
+            // a block's, which its payer need not hold.
+            let deducted = if report.is_some() { 0 } else { gas_cost };
+            let arg_amount = bcs::to_bytes(&deducted).unwrap_or_default();
+            let gas_action = MoveAction::CallEntryFunction(EntryFunctionCall {
+                module: gas_module,
+                function: "deduct_gas".to_string(),
+                ty_args: vec![aincore_coin_type()],
+                args: vec![arg_sys, arg_user, arg_amount],
+            });
+            // deduct_gas asserts signer::address_of(sys)==@0x1, so the
+            // authenticated signer for this system pre-action is @0x1, NOT the
+            // tx sender. This is why auth_signer must be per-action (FIX #1).
+            pre_actions.push((gas_action, true, system_address())); // must succeed
+        }
 
-            // B27: from here a refusal is a charged abort. The block reserved
-            // this transaction's space because it can pay (`can_pay`); a
-            // refusal that charged nothing let a transaction hold that space
-            // for free. The gas is deducted and the nonce bumped (`staged`),
-            // every other effect is dropped. Only a transaction the VM cannot
-            // even charge is refused, which `can_pay` rules out.
-            let staged = updates.clone();
-            let charged_abort = |reason: String| -> Option<(Vec<(String, Option<String>)>, u128)> {
-                let mut out = staged.clone();
-                match self.vm.execute_transaction_actions(
-                    pre_actions.clone(),
-                    sender_addr,
-                    execution_gas,
-                ) {
-                    Ok((_gas_used, changes, status)) if status.success => {
-                        out.extend(changes);
-                        self.append_supply_tracker_updates(&mut out);
-                    }
-                    _ => return None,
+        let actual_gas = gas_cost;
+        // B65: Move execution has its own cap (EIP-8037 caps execution gas
+        // apart from state gas); the writes are charged after it, from what
+        // the limit leaves.
+        let vm_limit = execution_gas.min(MAX_GAS_LIMIT);
+        let byte_gas = state_gas::committed_state_byte_gas(&self.db);
+        // Set by the payload's VM run; every other path returns first.
+        let vm_gas_used: u64;
+        // B65: the object loads and the charge's own writes (the nonce, an
+        // account created by a first transaction) must fit the limit before
+        // anything runs. `can_pay` refuses the same transactions, so no
+        // block reserves space for one; once the VM has run, every outcome
+        // is charged.
+        let charge_gas = self.charge_gas(&tx, &updates);
+        if charge_gas > execution_gas {
+            println!(
+                "❌ REJECTED: the charge's own writes and object loads need {charge_gas} gas, the limit leaves {execution_gas}"
+            );
+            return None;
+        }
+        let mut tx_status = "success".to_string();
+        let mut tx_error: Option<String> = None;
+        macro_rules! absorb_vm_result {
+            ($vm_changes:expr, $status:expr) => {{
+                for (k, v) in $vm_changes {
+                    updates.push((k, v));
                 }
-                println!("❌ {} charged and aborted: {reason}", tx.sender);
-                out.push(receipt_update(
-                    &self.db,
-                    tx_json,
-                    &out,
-                    "aborted",
-                    gas_cost,
-                    Some(reason),
-                ));
-                Some((out, gas_cost))
-            };
-
-            let payload_bytes = match hex::decode(tx.payload.trim_start_matches("0x")) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    // C-11 FIX: Backwards compatibility for genesis and old tools (TEMPORARY)
-                    // If it's not valid hex, maybe it's a legacy string payload.
-                    // For now, if we are in Phase 0 / 1 transition, we can optionally parse legacy here,
-                    // but the objective says: "Hapus semua if tx.payload.starts_with...".
-                    // However, we MUST NOT break the entire chain right now before we fix the CLI.
-                    // Actually, the instruction was clear: Replace it entirely to enforce structured ABI.
-                    println!(
-                        "⚠️ REJECTED: Unrecognized payload format from {}. Must be hex-encoded BCS TransactionPayload. Err: {}",
-                        tx.sender, e
+                self.append_supply_tracker_updates(&mut updates);
+                if !$status.success {
+                    tx_status = "aborted".to_string();
+                    tx_error = Some(
+                        $status
+                            .error
+                            .unwrap_or_else(|| "Move execution aborted".to_string()),
                     );
-                    return None;
+                    false
+                } else {
+                    true
                 }
-            };
+            }};
+        }
 
-            let parsed_payload: Result<vm_move::TransactionPayload, _> =
-                bcs::from_bytes(&payload_bytes);
-
-            match parsed_payload {
-                Ok(vm_move::TransactionPayload::EntryFunction(call)) => {
-                    // SECURITY (B1): authoritative PoP gate. Move cannot run the
-                    // BLS pairing check, so reject a join_validator_set whose
-                    // proof-of-possession does not verify BEFORE dispatch.
-                    if let Err(reason) = verify_join_validator_pop(&call, &tx.public_key) {
-                        return charged_abort(format!("join_validator_set: {reason}"));
-                    }
-                    // G5 SL-3 (tombstone): a validator with an accepted
-                    // offense never re-enters a committee.
-                    if extract_join_validator_v1(&call, &tx.sender).is_some()
-                        && self
-                            .db
-                            .get(&format!("validator:jailed:{}", tx.sender))
-                            .expect("CRITICAL: the jail record could not be read")
-                            .is_some()
-                    {
-                        return charged_abort(
-                            "join_validator_set: tombstoned for equivocation".to_string(),
-                        );
-                    }
-                    // B1: capture join_validator_set identity BEFORE the call is
-                    // moved into the action, so we can append it to the live
-                    // sys:validator_set:v1 after a successful execution.
-                    let join_v1_entry = extract_join_validator_v1(&call, &tx.sender);
-                    // AUDIT-#1: capture a leave_validator_set BEFORE the call is
-                    // moved, so we can prune the departing validator from the QC
-                    // trust root + reward mirror after a successful execution.
-                    let leave_addr = extract_leave_validator(&call, &tx.sender);
-                    // AUDIT-#5: capture an add_stake BEFORE the call is moved, so we
-                    // can resync the staker's QC weight from the Move ValidatorSet
-                    // after a successful stake increase.
-                    let add_stake_addr = extract_add_stake(&call, &tx.sender);
-                    // ONBOARDING: a coin::transfer to an address that has never held
-                    // AIN would abort inside coin::deposit, and that address can never
-                    // fix it itself (registering costs gas, and gas is only taken from
-                    // an existing CoinStore). Pre-stage the empty store so the deposit
-                    // lands. See auto_register_writes.
-                    let prestaged = self.auto_register_writes(&call);
-                    let mut actions = pre_actions.clone();
-                    // SECURITY (FIX #1): the user's entry call may only act as the
-                    // authenticated tx sender. bind_signer_args overwrites the
-                    // leading &signer slots with sender_addr, so a forged @0x1 (or
-                    // any other principal) embedded in the payload is discarded.
-                    actions.push((
-                        vm_move::MoveAction::CallEntryFunction(call),
-                        false,
-                        sender_addr,
-                    ));
-                    match self.vm.execute_transaction_actions_with_prestaged(
-                        actions,
-                        sender_addr,
-                        execution_gas,
-                        prestaged,
-                    ) {
-                        Ok((_gas_used, vm_changes, status)) => {
-                            if absorb_vm_result!(vm_changes, status) {
-                                println!("✅ Move EntryFunction executed by {}", tx.sender);
-                                // B1: keep sys:validator_set:v1 live on runtime join.
-                                if let Some(info) = join_v1_entry {
-                                    if let Err(e) =
-                                        self.append_validator_set_v1_update(&mut updates, info)
-                                    {
-                                        return charged_abort(format!(
-                                            "sys:validator_set:v1 update not staged: {e}"
-                                        ));
-                                    }
-                                }
-                                // AUDIT-#1: prune the departing validator from the
-                                // QC trust root + reward mirror on a successful leave.
-                                if let Some(addr) = leave_addr {
-                                    if let Err(e) =
-                                        self.append_validator_removal(&mut updates, &addr).and_then(
-                                            |()| self.stage_bootstrap_forfeit(&mut updates, &addr),
-                                        )
-                                    {
-                                        return charged_abort(format!(
-                                            "validator removal on leave not staged: {e}"
-                                        ));
-                                    }
-                                    println!(
-                                        "   🔻 Pruned departed validator {} from QC trust root",
-                                        addr
-                                    );
-                                }
-                                // AUDIT-#5: resync QC weight after a stake increase.
-                                if let Some(addr) = add_stake_addr {
-                                    if let Err(e) =
-                                        self.refresh_validator_set_v1_stake(&mut updates, &addr)
-                                    {
-                                        return charged_abort(format!(
-                                            "sys:validator_set:v1 stake not resynced: {e}"
-                                        ));
-                                    }
-                                }
-                            } else {
-                                println!(
-                                    "❌ EntryFunction aborted after gas charge: {}",
-                                    tx_error
-                                        .clone()
-                                        .unwrap_or_else(|| "unknown Move error".to_string())
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            return charged_abort(format!("Move VM: {e}"));
-                        }
-                    }
-                }
-                Ok(vm_move::TransactionPayload::PublishModule(modules)) => {
-                    if sender_addr == system_address() {
-                        return charged_abort(
-                            "user transactions cannot publish to 0x1".to_string(),
-                        );
-                    }
-                    // SEC (audit M-5): module publishing runs full bytecode verification
-                    // (deserialize + verify_module_bundle_for_publication + dependency
-                    // checks) with the move-vm gas meter ignored, and the executor charges
-                    // a flat gas_limit upfront (ignoring VM gas_used). A large adversarial
-                    // bundle could therefore force superlinear verification work on every
-                    // validator for a near-minimal fee (cheap chain-halt-grade DoS).
-                    // Require the declared gas_limit to cover a size-proportional floor so
-                    // the fee scales with the verification cost imposed on the network.
-                    // B27: also refused in `admission::check_stateless`, so a
-                    // block never reserves space for it.
-                    let publish_bytes: u64 = modules.iter().map(|m| m.len() as u64).sum::<u64>();
-                    let publish_floor = admission::publish_floor(&modules);
-                    if execution_gas < publish_floor {
-                        return charged_abort(format!(
-                            "execution gas {execution_gas} below the publish floor {publish_floor} ({publish_bytes} bytes, {} modules)",
-                            modules.len()
-                        ));
-                    }
-                    let mut actions = pre_actions.clone();
-                    // 3-tuple arity (FIX #1). PublishModule ignores auth_signer
-                    // (it uses the fn `sender` param for the 0x1 reservation check),
-                    // but the tuple must carry an address; pass sender_addr.
-                    actions.push((
-                        vm_move::MoveAction::PublishModule(modules),
-                        false,
-                        sender_addr,
-                    ));
-                    match self
-                        .vm
-                        .execute_transaction_actions(actions, sender_addr, execution_gas)
-                    {
-                        Ok((_gas_used, vm_changes, status)) => {
-                            if absorb_vm_result!(vm_changes, status) {
-                                println!("✅ Move module published by {}", tx.sender);
-                            } else {
-                                println!(
-                                    "❌ Publish aborted after gas charge: {}",
-                                    tx_error
-                                        .clone()
-                                        .unwrap_or_else(|| "unknown Move error".to_string())
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            return charged_abort(format!("Move VM: {e}"));
-                        }
-                    }
-                }
-                Ok(vm_move::TransactionPayload::Script(_)) => {
-                    println!("🚫 [SECURITY] Raw script execution BLOCKED");
-                    return None;
-                }
-                Err(e) => {
-                    println!(
-                        "⚠️ REJECTED: Failed to deserialize BCS TransactionPayload from {}: {}",
-                        tx.sender, e
-                    );
-                    // Invalid format -> no gas charged
-                    return None;
-                }
+        // 4. Execution Payload (Structured BCS)
+        let sender_addr = match parse_move_address(&tx.sender) {
+            Some(addr) => addr,
+            None => {
+                println!("❌ Invalid sender address format");
+                return None;
             }
+        };
 
-            updates.push(receipt_update(
+        // B27: from here a refusal is a charged abort. The block reserved
+        // this transaction's space because it can pay (`can_pay`); a
+        // refusal that charged nothing let a transaction hold that space
+        // for free. The gas is deducted and the nonce bumped (`staged`),
+        // every other effect is dropped. Only a transaction the VM cannot
+        // even charge is refused, which `can_pay` rules out.
+        let staged = updates.clone();
+        let charged_abort = |reason: String| -> Option<(Vec<(String, Option<String>)>, u128)> {
+            let mut out = staged.clone();
+            match self
+                .vm
+                .execute_transaction_actions(pre_actions.clone(), sender_addr, vm_limit)
+            {
+                Ok((_gas_used, changes, status)) if status.success => {
+                    out.extend(changes);
+                    self.append_supply_tracker_updates(&mut out);
+                }
+                _ => return None,
+            }
+            // B65: no refusal from here. The account writes were priced
+            // before anything ran (`charge_gas`); the prologue adds only the
+            // fee, a rewrite of the payer's CoinStore at its own length.
+            if let Some(report) = report {
+                report.borrow_mut().aborted = Some(reason.clone());
+            }
+            println!("❌ {} charged and aborted: {reason}", tx.sender);
+            out.push(receipt_update(
                 &self.db,
                 tx_json,
-                &updates,
-                &tx_status,
-                actual_gas,
-                tx_error.clone(),
+                &out,
+                "aborted",
+                gas_cost,
+                Some(reason),
             ));
-            Some((updates, actual_gas))
-        } else {
-            None
+            Some((out, gas_cost))
+        };
+
+        let payload_bytes = match hex::decode(tx.payload.trim_start_matches("0x")) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // C-11 FIX: Backwards compatibility for genesis and old tools (TEMPORARY)
+                // If it's not valid hex, maybe it's a legacy string payload.
+                // For now, if we are in Phase 0 / 1 transition, we can optionally parse legacy here,
+                // but the objective says: "Hapus semua if tx.payload.starts_with...".
+                // However, we MUST NOT break the entire chain right now before we fix the CLI.
+                // Actually, the instruction was clear: Replace it entirely to enforce structured ABI.
+                println!(
+                    "⚠️ REJECTED: Unrecognized payload format from {}. Must be hex-encoded BCS TransactionPayload. Err: {}",
+                    tx.sender, e
+                );
+                return None;
+            }
+        };
+
+        let parsed_payload: Result<vm_move::TransactionPayload, _> =
+            bcs::from_bytes(&payload_bytes);
+
+        match parsed_payload {
+            Ok(vm_move::TransactionPayload::EntryFunction(call)) => {
+                // SECURITY (B1): authoritative PoP gate. Move cannot run the
+                // BLS pairing check, so reject a join_validator_set whose
+                // proof-of-possession does not verify BEFORE dispatch.
+                if let Err(reason) = verify_join_validator_pop(&call, &tx.public_key) {
+                    return charged_abort(format!("join_validator_set: {reason}"));
+                }
+                // G5 SL-3 (tombstone): a validator with an accepted
+                // offense never re-enters a committee.
+                if extract_join_validator_v1(&call, &tx.sender).is_some()
+                    && self
+                        .db
+                        .get(&format!("validator:jailed:{}", tx.sender))
+                        .expect("CRITICAL: the jail record could not be read")
+                        .is_some()
+                {
+                    return charged_abort(
+                        "join_validator_set: tombstoned for equivocation".to_string(),
+                    );
+                }
+                // B1: capture join_validator_set identity BEFORE the call is
+                // moved into the action, so we can append it to the live
+                // sys:validator_set:v1 after a successful execution.
+                let join_v1_entry = extract_join_validator_v1(&call, &tx.sender);
+                // AUDIT-#1: capture a leave_validator_set BEFORE the call is
+                // moved, so we can prune the departing validator from the QC
+                // trust root + reward mirror after a successful execution.
+                let leave_addr = extract_leave_validator(&call, &tx.sender);
+                // AUDIT-#5: capture an add_stake BEFORE the call is moved, so we
+                // can resync the staker's QC weight from the Move ValidatorSet
+                // after a successful stake increase.
+                let add_stake_addr = extract_add_stake(&call, &tx.sender);
+                // ONBOARDING: a coin::transfer to an address that has never held
+                // AIN would abort inside coin::deposit, and that address can never
+                // fix it itself (registering costs gas, and gas is only taken from
+                // an existing CoinStore). Pre-stage the empty store so the deposit
+                // lands. See auto_register_writes.
+                let prestaged = self.auto_register_writes(&call);
+                let mut actions = pre_actions.clone();
+                // SECURITY (FIX #1): the user's entry call may only act as the
+                // authenticated tx sender. bind_signer_args overwrites the
+                // leading &signer slots with sender_addr, so a forged @0x1 (or
+                // any other principal) embedded in the payload is discarded.
+                actions.push((
+                    vm_move::MoveAction::CallEntryFunction(call),
+                    false,
+                    sender_addr,
+                ));
+                match self.vm.execute_transaction_actions_with_prestaged(
+                    actions,
+                    sender_addr,
+                    vm_limit,
+                    prestaged,
+                ) {
+                    Ok((gas_used, vm_changes, status)) => {
+                        vm_gas_used = gas_used;
+                        if absorb_vm_result!(vm_changes, status) {
+                            println!("✅ Move EntryFunction executed by {}", tx.sender);
+                            // B1: keep sys:validator_set:v1 live on runtime join.
+                            if let Some(info) = join_v1_entry {
+                                if let Err(e) =
+                                    self.append_validator_set_v1_update(&mut updates, info)
+                                {
+                                    return charged_abort(format!(
+                                        "sys:validator_set:v1 update not staged: {e}"
+                                    ));
+                                }
+                            }
+                            // AUDIT-#1: prune the departing validator from the
+                            // QC trust root + reward mirror on a successful leave.
+                            if let Some(addr) = leave_addr {
+                                if let Err(e) =
+                                    self.append_validator_removal(&mut updates, &addr).and_then(
+                                        |()| self.stage_bootstrap_forfeit(&mut updates, &addr),
+                                    )
+                                {
+                                    return charged_abort(format!(
+                                        "validator removal on leave not staged: {e}"
+                                    ));
+                                }
+                                println!(
+                                    "   🔻 Pruned departed validator {} from QC trust root",
+                                    addr
+                                );
+                            }
+                            // AUDIT-#5: resync QC weight after a stake increase.
+                            if let Some(addr) = add_stake_addr {
+                                if let Err(e) =
+                                    self.refresh_validator_set_v1_stake(&mut updates, &addr)
+                                {
+                                    return charged_abort(format!(
+                                        "sys:validator_set:v1 stake not resynced: {e}"
+                                    ));
+                                }
+                            }
+                        } else {
+                            println!(
+                                "❌ EntryFunction aborted after gas charge: {}",
+                                tx_error
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown Move error".to_string())
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        return charged_abort(format!("Move VM: {e}"));
+                    }
+                }
+            }
+            Ok(vm_move::TransactionPayload::PublishModule(modules)) => {
+                if sender_addr == system_address() {
+                    return charged_abort("user transactions cannot publish to 0x1".to_string());
+                }
+                // SEC (audit M-5): module publishing runs full bytecode verification
+                // (deserialize + verify_module_bundle_for_publication + dependency
+                // checks) with the move-vm gas meter ignored, and the executor charges
+                // a flat gas_limit upfront (ignoring VM gas_used). A large adversarial
+                // bundle could therefore force superlinear verification work on every
+                // validator for a near-minimal fee (cheap chain-halt-grade DoS).
+                // Require the declared gas_limit to cover a size-proportional floor so
+                // the fee scales with the verification cost imposed on the network.
+                // B27: also refused in `admission::check_stateless`, so a
+                // block never reserves space for it.
+                let publish_bytes: u64 = modules.iter().map(|m| m.len() as u64).sum::<u64>();
+                let publish_floor = admission::publish_floor(&modules);
+                if vm_limit < publish_floor {
+                    return charged_abort(format!(
+                        "execution gas {vm_limit} below the publish floor {publish_floor} ({publish_bytes} bytes, {} modules)",
+                        modules.len()
+                    ));
+                }
+                let mut actions = pre_actions.clone();
+                // 3-tuple arity (FIX #1). PublishModule ignores auth_signer
+                // (it uses the fn `sender` param for the 0x1 reservation check),
+                // but the tuple must carry an address; pass sender_addr.
+                actions.push((
+                    vm_move::MoveAction::PublishModule(modules),
+                    false,
+                    sender_addr,
+                ));
+                match self
+                    .vm
+                    .execute_transaction_actions(actions, sender_addr, vm_limit)
+                {
+                    Ok((gas_used, vm_changes, status)) => {
+                        vm_gas_used = gas_used;
+                        if absorb_vm_result!(vm_changes, status) {
+                            println!("✅ Move module published by {}", tx.sender);
+                        } else {
+                            println!(
+                                "❌ Publish aborted after gas charge: {}",
+                                tx_error
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown Move error".to_string())
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        return charged_abort(format!("Move VM: {e}"));
+                    }
+                }
+            }
+            Ok(vm_move::TransactionPayload::Script(_)) => {
+                println!("🚫 [SECURITY] Raw script execution BLOCKED");
+                return None;
+            }
+            Err(e) => {
+                println!(
+                    "⚠️ REJECTED: Failed to deserialize BCS TransactionPayload from {}: {}",
+                    tx.sender, e
+                );
+                // Invalid format -> no gas charged
+                return None;
+            }
         }
+
+        // B65: the writes cost their I/O and the state bytes they add, on
+        // top of what Move execution used; a limit that does not cover both
+        // aborts, charged.
+        let writes = state_gas::write_cost(&self.db, &updates);
+        let needed = vm_gas_used
+            .saturating_add(object_load_gas)
+            .saturating_add(writes.gas(byte_gas));
+        if let Some(report) = report {
+            *report.borrow_mut() = GasEstimate {
+                vm_gas: vm_gas_used.saturating_add(object_load_gas),
+                writes,
+                state_byte_gas: byte_gas,
+                floor: payload_kind(&tx.payload).map_or(0, |(_, floor)| floor),
+                aborted: tx_error.clone(),
+            };
+        }
+        if needed > execution_gas {
+            return charged_abort(format!(
+                "out of gas: execution used {vm_gas_used} and the writes cost {} \
+                 ({} new state bytes at {byte_gas} a byte), {needed} in all; the limit leaves {execution_gas}",
+                writes.gas(byte_gas),
+                writes.new_bytes
+            ));
+        }
+
+        updates.push(receipt_update(
+            &self.db,
+            tx_json,
+            &updates,
+            &tx_status,
+            actual_gas,
+            tx_error.clone(),
+        ));
+        Some((updates, actual_gas))
     }
 }
 
@@ -5412,6 +5520,9 @@ mod tests {
     use super::*;
     mod block_crash_tests {
         include!("block_crash_tests.rs");
+    }
+    mod state_gas_tests {
+        include!("state_gas_tests.rs");
     }
     use ed25519_dalek::{Signer, SigningKey};
     use move_binary_format::CompiledModule;
@@ -6643,6 +6754,23 @@ mod tests {
         serde_json::to_string(&tx).expect("tx json")
     }
 
+    /// B65: `payload` from `sender` at `seq`, signed with the execution gas
+    /// `executor` estimates for it on its current state (Move and the state
+    /// its writes add), at price 1, as a wallet does.
+    fn estimated_tx(
+        executor: &Executor,
+        key: &SigningKey,
+        sender: &str,
+        payload: &str,
+        seq: u64,
+    ) -> String {
+        let execution = executor
+            .estimate_gas(&signed_tx(key, sender, payload, seq, 0, 1))
+            .unwrap_or_else(|e| panic!("no estimate for {sender} at {seq}: {e}"))
+            .execution_gas();
+        signed_tx(key, sender, payload, seq, execution, 1)
+    }
+
     /// The `gas_limit` a transaction declares: what it is charged per unit of
     /// gas price.
     fn gas_of(tx_json: &str) -> u64 {
@@ -6739,6 +6867,8 @@ mod tests {
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
         set_coin_store(&db, &sender, 1_000_000);
+        // A store to stay at 0: this is about atomicity, not onboarding.
+        set_coin_store(&db, &recipient, 0);
 
         let executor = Executor::new(db.clone());
         // Far more than the sender holds -> the payload aborts.
@@ -6836,7 +6966,13 @@ mod tests {
 
         let executor = Executor::new(db.clone());
         let payload = coin_transfer_payload(&sender, &recipient, 250);
-        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
+        // B65: the new CoinStore is new state; the estimate prices it.
+        let execution = executor
+            .estimate_gas(&signed_tx(&sender_key, &sender, &payload, 0, 0, 1))
+            .expect("an estimate")
+            .execution_gas();
+        assert!(execution > 300_000, "the CoinStore's bytes: {execution}");
+        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, execution, 1);
         let (updates, _gas) = executor
             .execute_transaction(&tx_json)
             .expect("transaction accepted");
@@ -6901,8 +7037,11 @@ mod tests {
         let sender = crypto::derive_address(sender_key.verifying_key().as_bytes()).unwrap();
         let recipient = create_account(&db, &recipient_key);
         let _seed = db.seeding();
-        db.set_federation_key("00000000000000000000000000000000").unwrap();
-        set_coin_store(&db, &sender, 1_000_000);
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        // B65: its first transaction pays for its account and the
+        // recipient's CoinStore.
+        set_coin_store(&db, &sender, 10_000_000);
 
         assert!(
             db.get_object(&sender).is_none(),
@@ -6911,7 +7050,7 @@ mod tests {
 
         let executor = Executor::new(db.clone());
         let payload = coin_transfer_payload(&sender, &recipient, 500);
-        let tx_inline_3 = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
+        let tx_inline_3 = estimated_tx(&executor, &sender_key, &sender, &payload, 0);
         let (updates, _gas) = executor
             .execute_transaction(&tx_inline_3)
             .expect("a first-time sender must not be silently dropped");
@@ -7081,9 +7220,11 @@ mod tests {
     /// given clock cap, a proposer with a coin store and whatever `seed`
     /// adds; then blocks run in order through the real executor, at
     /// timestamps the test controls.
-    /// The most a `G5Chain::tx` can pay: it runs at gas price 1 with 100,000
-    /// execution gas plus its byte gas (B14), and `tx` checks the bound.
-    const G5_FEE_BOUND: u128 = 1_000_000;
+    /// The most a `G5Chain::tx` can pay: it runs at gas price 1 with
+    /// 3,000,000 execution gas (B65: room for the pools, books and entries
+    /// it creates, ~5.8 KB of state at the floor) plus its byte gas (B14),
+    /// and `tx` checks the bound.
+    const G5_FEE_BOUND: u128 = 4_000_000;
 
     struct G5Chain {
         db: Arc<StateDB>,
@@ -7170,7 +7311,7 @@ mod tests {
             let mut all = vec![bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap()];
             all.extend(args);
             let payload = entry_payload(module, function, vec![], all);
-            let raw = signed_tx(key, &sender, &payload, *nonce, 100_000, 1);
+            let raw = signed_tx(key, &sender, &payload, *nonce, 3_000_000, 1);
             assert!(
                 (gas_of(&raw) as u128) < G5_FEE_BOUND,
                 "a G5 tx pays under the bound"
@@ -11744,7 +11885,8 @@ mod tests {
         let key = SigningKey::from_bytes(&[33u8; 32]);
         let public_key = hex::encode(key.verifying_key().as_bytes());
         let address = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
-        set_coin_store(&db, &address, 1_000_000);
+        // B65: the first transaction pays for the account it creates.
+        set_coin_store(&db, &address, 10_000_000);
         assert!(db.get_object(&address).is_none(), "no account object yet");
         let payload = {
             let call = vm_move::EntryFunctionCall {
@@ -11772,8 +11914,14 @@ mod tests {
         // The client sends its key in upper case; the preimage does not cover
         // it, so the signature still verifies. The stored account must not
         // depend on the spelling (KV-2).
-        let mut tx: serde_json::Value =
-            serde_json::from_str(&signed_tx(&key, &address, &payload, 0, 100_000, 1)).unwrap();
+        let mut tx: serde_json::Value = serde_json::from_str(&estimated_tx(
+            &Executor::new(db.clone()),
+            &key,
+            &address,
+            &payload,
+            0,
+        ))
+        .unwrap();
         tx["public_key"] = serde_json::json!(public_key.to_ascii_uppercase());
         let tx = tx.to_string();
         let Ok(BlockExecOutcome::Executed(summary)) = Executor::new(db.clone())
@@ -12279,9 +12427,9 @@ mod tests {
             vec![ain.clone(), wbtc.clone()],
             vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
         );
-        // B49: these calls use ~9,000-11,000 execution gas under size-based
-        // pricing (7,700-9,500 before); 20,000 leaves room.
-        let create_tx = signed_tx(&trader_key, &trader, &create_payload, 0, 20_000, 1);
+        // B65: each call is signed with the executor's estimate (the pool
+        // and the LP token are new state).
+        let create_tx = estimated_tx(&executor, &trader_key, &trader, &create_payload, 0);
         let (updates, gas) = executor
             .execute_transaction(&create_tx)
             .expect("create pool accepted");
@@ -12301,7 +12449,7 @@ mod tests {
                 bcs::to_bytes(&9_000u128).unwrap(),
             ],
         );
-        let tx_json = signed_tx(&trader_key, &trader, &add_payload, 1, 20_000, 1);
+        let tx_json = estimated_tx(&executor, &trader_key, &trader, &add_payload, 1);
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("add liquidity accepted");
@@ -12334,7 +12482,7 @@ mod tests {
                 bcs::to_bytes(&900u128).unwrap(),
             ],
         );
-        let swap_tx = signed_tx(&trader_key, &trader, &swap_payload, 2, 20_000, 1);
+        let swap_tx = estimated_tx(&executor, &trader_key, &trader, &swap_payload, 2);
         let (updates, gas) = executor
             .execute_transaction(&swap_tx)
             .expect("swap accepted");
@@ -12388,7 +12536,7 @@ mod tests {
                 bcs::to_bytes(&900u128).unwrap(),
             ],
         );
-        let tx_json = signed_tx(&trader_key, &trader, &remove_payload, 3, 20_000, 1);
+        let tx_json = estimated_tx(&executor, &trader_key, &trader, &remove_payload, 3);
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("remove liquidity accepted");
@@ -12435,7 +12583,7 @@ mod tests {
             vec![ain.clone(), wbtc.clone()],
             vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
         );
-        let tx_inline_4 = signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1);
+        let tx_inline_4 = estimated_tx(&executor, &trader_key, &trader, &create_payload, 0);
         let (updates, _) = executor
             .execute_transaction(&tx_inline_4)
             .expect("first create accepted");
@@ -12448,7 +12596,7 @@ mod tests {
             vec![wbtc.clone(), ain.clone()],
             vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
         );
-        let reverse_tx = signed_tx(&trader_key, &trader, &reverse_payload, 1, 10_000, 1);
+        let reverse_tx = estimated_tx(&executor, &trader_key, &trader, &reverse_payload, 1);
         let (updates, _) = executor
             .execute_transaction(&reverse_tx)
             .expect("reverse create abort is accepted and gas-charged");
@@ -12461,7 +12609,7 @@ mod tests {
         let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
         assert_eq!(receipt["status"], "aborted");
 
-        let duplicate_tx = signed_tx(&trader_key, &trader, &create_payload, 2, 10_000, 1);
+        let duplicate_tx = estimated_tx(&executor, &trader_key, &trader, &create_payload, 2);
         let (updates, _) = executor
             .execute_transaction(&duplicate_tx)
             .expect("duplicate create abort is accepted and gas-charged");
@@ -12527,7 +12675,7 @@ mod tests {
             vec![ain.clone(), wbtc.clone()],
             vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
         );
-        let tx_json = signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1);
+        let tx_json = estimated_tx(&executor, &trader_key, &trader, &create_payload, 0);
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("create pool accepted");
@@ -12547,7 +12695,7 @@ mod tests {
                 bcs::to_bytes(&0u128).unwrap(),
             ],
         );
-        let tx_json = signed_tx(&trader_key, &trader, &payload, 1, 10_000, 1);
+        let tx_json = estimated_tx(&executor, &trader_key, &trader, &payload, 1);
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("minimum-liquidity abort is accepted and gas-charged");
@@ -12596,7 +12744,7 @@ mod tests {
             vec![ain.clone(), wbtc.clone()],
             vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
         );
-        let tx_json = signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1);
+        let tx_json = estimated_tx(&executor, &trader_key, &trader, &create_payload, 0);
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("create pool accepted");
@@ -12624,7 +12772,7 @@ mod tests {
                 bcs::to_bytes(&0u128).unwrap(),
             ],
         );
-        let tx_json = signed_tx(&trader_key, &trader, &payload, 1, 10_000, 1);
+        let tx_json = estimated_tx(&executor, &trader_key, &trader, &payload, 1);
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("overflow abort is accepted and gas-charged");
@@ -12672,7 +12820,7 @@ mod tests {
             vec![ain.clone(), wbtc.clone()],
             vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
         );
-        let tx_inline_5 = signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1);
+        let tx_inline_5 = estimated_tx(&executor, &trader_key, &trader, &create_payload, 0);
         let (updates, _) = executor
             .execute_transaction(&tx_inline_5)
             .expect("create pool accepted");
@@ -12698,7 +12846,7 @@ mod tests {
                 bcs::to_bytes(&0u128).unwrap(),
             ],
         );
-        let tx_json = signed_tx(&trader_key, &trader, &payload, 1, 10_000, 1);
+        let tx_json = estimated_tx(&executor, &trader_key, &trader, &payload, 1);
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("zero-output swap abort is accepted and gas-charged");
@@ -12747,7 +12895,7 @@ mod tests {
             vec![ain.clone(), wbtc.clone()],
             vec![bcs::to_bytes(&parse_move_address(&trader).unwrap()).unwrap()],
         );
-        let tx_inline_6 = signed_tx(&trader_key, &trader, &create_payload, 0, 10_000, 1);
+        let tx_inline_6 = estimated_tx(&executor, &trader_key, &trader, &create_payload, 0);
         let (updates, _) = executor
             .execute_transaction(&tx_inline_6)
             .expect("create pool accepted");
@@ -12775,7 +12923,7 @@ mod tests {
                 bcs::to_bytes(&0u128).unwrap(),
             ],
         );
-        let tx_json = signed_tx(&trader_key, &trader, &payload, 1, 10_000, 1);
+        let tx_json = estimated_tx(&executor, &trader_key, &trader, &payload, 1);
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("zero-side remove abort is accepted and gas-charged");
@@ -12832,7 +12980,7 @@ mod tests {
             vec![ain.clone(), wbtc.clone()],
             vec![bcs::to_bytes(&parse_move_address(&maker).unwrap()).unwrap()],
         );
-        let tx_inline_7 = signed_tx(&maker_key, &maker, &create_payload, 0, 20_000, 1);
+        let tx_inline_7 = estimated_tx(&executor, &maker_key, &maker, &create_payload, 0);
         let (updates, _) = executor
             .execute_transaction(&tx_inline_7)
             .expect("create pool accepted");
@@ -12850,7 +12998,7 @@ mod tests {
                 bcs::to_bytes(&9_000u128).unwrap(),
             ],
         );
-        let tx_inline_8 = signed_tx(&maker_key, &maker, &seed_payload, 1, 20_000, 1);
+        let tx_inline_8 = estimated_tx(&executor, &maker_key, &maker, &seed_payload, 1);
         let (updates, _) = executor
             .execute_transaction(&tx_inline_8)
             .expect("seed liquidity accepted");
@@ -12868,7 +13016,7 @@ mod tests {
                 bcs::to_bytes(&4_000u128).unwrap(),
             ],
         );
-        let tx_inline_9 = signed_tx(&lp2_key, &lp2, &imbalanced_payload, 0, 20_000, 1);
+        let tx_inline_9 = estimated_tx(&executor, &lp2_key, &lp2, &imbalanced_payload, 0);
         let (updates, _) = executor
             .execute_transaction(&tx_inline_9)
             .expect("imbalanced add liquidity accepted");
@@ -12932,7 +13080,7 @@ mod tests {
         let payload =
             hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
         let executor = Executor::new(db.clone());
-        let tx_inline_10 = signed_tx(&sender_key, &sender, &payload, 0, 10_000, 1);
+        let tx_inline_10 = estimated_tx(&executor, &sender_key, &sender, &payload, 0);
         let (updates, _) = executor
             .execute_transaction(&tx_inline_10)
             .expect("token creation accepted");
@@ -12984,7 +13132,7 @@ mod tests {
         let payload =
             hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
         let executor = Executor::new(db.clone());
-        let tx_inline_11 = signed_tx(&sender_key, &sender, &payload, 0, 10_000, 1);
+        let tx_inline_11 = estimated_tx(&executor, &sender_key, &sender, &payload, 0);
         let (updates, _) = executor
             .execute_transaction(&tx_inline_11)
             .expect("proposal accepted");
@@ -13104,7 +13252,7 @@ mod tests {
             bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(vote_call)).unwrap(),
         );
         let executor = Executor::new(db.clone());
-        let tx_inline_12 = signed_tx(&voter_key, &voter, &payload, 0, 10_000, 1);
+        let tx_inline_12 = estimated_tx(&executor, &voter_key, &voter, &payload, 0);
         let (updates, _) = executor
             .execute_transaction(&tx_inline_12)
             .expect("vote accepted");
@@ -13139,7 +13287,7 @@ mod tests {
         let payload = hex::encode(
             bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(claim_call)).unwrap(),
         );
-        let tx_inline_13 = signed_tx(&voter_key, &voter, &payload, 1, 10_000, 1);
+        let tx_inline_13 = estimated_tx(&executor, &voter_key, &voter, &payload, 1);
         let (updates, _) = executor
             .execute_transaction(&tx_inline_13)
             .expect("claim accepted");
@@ -13838,7 +13986,7 @@ mod tests {
             )
         };
 
-        let tx_json = signed_tx(&signing_key, &sender, &payload(vec![1; 32]), 0, 100_000, 1);
+        let tx_json = estimated_tx(&executor, &signing_key, &sender, &payload(vec![1; 32]), 0);
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("registration accepted");
@@ -13854,14 +14002,8 @@ mod tests {
         let first = gas_of(&tx_json) as u128;
         assert_eq!(coin_balance(&db, &sender), 10_000_000 - first);
 
-        let tx_json = signed_tx(
-            &signing_key,
-            &sender,
-            &payload(vec![2; 4096]),
-            1,
-            100_000,
-            1,
-        );
+        // Estimated, so the Move guard refuses it, not a short limit (B65).
+        let tx_json = estimated_tx(&executor, &signing_key, &sender, &payload(vec![2; 4096]), 1);
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("the transaction is kept: gas is charged even though it aborts");

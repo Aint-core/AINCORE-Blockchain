@@ -2761,9 +2761,9 @@ mod tests {
 
         let holder_key = SigningKey::from_bytes(&[32u8; 32]);
         let holder = create_account(&db, &holder_key);
-        set_coin_store(&db, &holder, 1_000_000);
+        set_coin_store(&db, &holder, 10_000_000);
         create_account(&db, &authority_key);
-        set_coin_store(&db, &authority, 1_000_000);
+        set_coin_store(&db, &authority, 10_000_000);
 
         let executor = Executor::new(db.clone());
 
@@ -2776,7 +2776,7 @@ mod tests {
             vec![bcs::to_bytes(&parse_move_addr(&holder).unwrap()).unwrap()],
         );
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(&holder_key, &holder, &register, 0, 100_000, 1))
+            .execute_transaction(&estimated_tx(&executor, &holder_key, &holder, &register, 0))
             .expect("holder registers a WBTC store");
         apply_updates(&db, updates);
 
@@ -2791,7 +2791,13 @@ mod tests {
             ],
         );
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(&authority_key, &authority, &mint, 0, 100_000, 1))
+            .execute_transaction(&estimated_tx(
+                &executor,
+                &authority_key,
+                &authority,
+                &mint,
+                0,
+            ))
             .expect("bridge authority mints wBTC through the seeded BridgeConfig");
         apply_updates(&db, updates);
 
@@ -2931,9 +2937,25 @@ mod tests {
         seq: u64,
     ) {
         let (updates, _) = executor
-            .execute_transaction(&signed_tx(key, addr, payload, seq, 100_000, 1))
+            .execute_transaction(&estimated_tx(executor, key, addr, payload, seq))
             .unwrap_or_else(|| panic!("tx seq {} for {} was rejected outright", seq, addr));
         apply_updates(db, updates);
+    }
+
+    /// B65: `payload` signed with the execution gas the node estimates for
+    /// it (Move and the state its writes add), at price 1.
+    fn estimated_tx(
+        executor: &Executor,
+        key: &SigningKey,
+        addr: &str,
+        payload: &str,
+        seq: u64,
+    ) -> String {
+        let execution = executor
+            .estimate_gas(&signed_tx(key, addr, payload, seq, 0, 1))
+            .unwrap_or_else(|e| panic!("no estimate for seq {seq} of {addr}: {e}"))
+            .execution_gas();
+        signed_tx(key, addr, payload, seq, execution, 1)
     }
 
     /// 0x1::dex had never executed once on any running chain. Drive the whole

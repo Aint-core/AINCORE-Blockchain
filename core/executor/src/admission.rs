@@ -7,7 +7,7 @@
 //! disagree about what a transaction is. What it cannot decide (nonce, balance,
 //! the paymaster's balance) is the executor's.
 
-use crate::{Transaction, MAX_GAS_LIMIT};
+use crate::{Transaction, MAX_BLOCK_GAS_LIMIT, MAX_GAS_LIMIT};
 use crypto::TxScheme;
 use sha2::{Digest, Sha256};
 
@@ -121,9 +121,12 @@ pub fn check_stateless(raw: &str, chain_id: &str) -> Result<CheckedTx, String> {
             raw.len()
         ));
     };
-    if execution_gas > MAX_GAS_LIMIT {
+    // B65: Move execution is capped at MAX_GAS_LIMIT when it runs; the rest
+    // of a limit pays for the transaction's writes, so the whole limit is
+    // bounded by what a block holds.
+    if tx.gas_limit > MAX_BLOCK_GAS_LIMIT {
         return Err(format!(
-            "Gas limit {} leaves {execution_gas} for execution, over MAX_GAS_LIMIT {MAX_GAS_LIMIT}",
+            "Gas limit {} is over MAX_BLOCK_GAS_LIMIT {MAX_BLOCK_GAS_LIMIT}",
             tx.gas_limit
         ));
     }
@@ -141,9 +144,10 @@ pub fn check_stateless(raw: &str, chain_id: &str) -> Result<CheckedTx, String> {
             tx.input_objects.len()
         ));
     }
-    if publish_floor > execution_gas {
+    if publish_floor > execution_gas.min(MAX_GAS_LIMIT) {
         return Err(format!(
-            "the module bundle needs {publish_floor} execution gas, the limit leaves {execution_gas}"
+            "the module bundle needs {publish_floor} execution gas, the limit leaves {}",
+            execution_gas.min(MAX_GAS_LIMIT)
         ));
     }
     if let Some(proof) = tx.zkp_proof.as_deref().filter(|p| !p.is_empty()) {
@@ -190,6 +194,55 @@ pub fn check_stateless(raw: &str, chain_id: &str) -> Result<CheckedTx, String> {
         scheme,
         payer,
         execution_gas,
+    })
+}
+
+/// B65 (`aincore_estimateGas`): what `check_stateless` checks of a
+/// transaction's form and identity, without its gas fields and signatures,
+/// which an estimate is asked for before they are final. The signature must
+/// have its scheme's length (zeros do): the byte gas counts it.
+/// `execution_gas` is left 0 for the caller to set.
+pub fn check_unsigned(raw: &str, chain_id: &str) -> Result<CheckedTx, String> {
+    if raw.len() > MAX_TX_BYTES {
+        return Err(format!(
+            "transaction too large: {} bytes, limit {MAX_TX_BYTES}",
+            raw.len()
+        ));
+    }
+    let tx: Transaction =
+        serde_json::from_str(raw).map_err(|_| "Invalid JSON format".to_string())?;
+    if tx.chain_id != chain_id {
+        return Err(format!(
+            "Invalid Chain ID (Expected {}, Got {})",
+            chain_id, tx.chain_id
+        ));
+    }
+    if crate::payload_kind(&tx.payload)?.0 == PayloadKind::Script {
+        return Err("Raw script payloads are disabled".to_string());
+    }
+    let key = hex::decode(&tx.public_key).map_err(|_| "public key is not hex".to_string())?;
+    let derived =
+        crypto::derive_address(&key).map_err(|e| format!("Address derivation failed: {e}"))?;
+    if derived != tx.sender {
+        return Err(format!(
+            "Sender mismatch (expected {derived}, got {})",
+            tx.sender
+        ));
+    }
+    let signature = hex::decode(&tx.signature).map_err(|_| "signature is not hex".to_string())?;
+    let scheme = TxScheme::of(key.len(), signature.len()).ok_or_else(|| {
+        format!(
+            "no scheme has a {}-byte key and a {}-byte signature (send zeros of the signature's length)",
+            key.len(),
+            signature.len()
+        )
+    })?;
+    let payer = payer_address(&tx).ok_or_else(|| "paymaster key is not hex".to_string())?;
+    Ok(CheckedTx {
+        tx,
+        scheme,
+        payer,
+        execution_gas: 0,
     })
 }
 
@@ -313,11 +366,12 @@ mod tests {
     }
 
     /// B14: a signed transaction's limit is its execution gas plus exactly
-    /// its own bytes' gas.
+    /// its own bytes' gas. B65: execution gas past MAX_GAS_LIMIT pays for
+    /// writes, up to what a block holds.
     #[test]
     fn the_limit_covers_exactly_the_transactions_own_bytes() {
         // From the 40-byte bundle's publish floor (B27) up.
-        for execution in [5_400, 10_000, 999_999, MAX_GAS_LIMIT] {
+        for execution in [5_400, 10_000, 999_999, MAX_GAS_LIMIT, 5 * MAX_GAS_LIMIT] {
             let tx = signed_publish_with([1; 32], CHAIN, 0, vec![5; 40], execution, 1);
             let checked = check_stateless(&tx, CHAIN).expect("valid");
             assert_eq!(checked.execution_gas, execution, "{execution}");
@@ -341,7 +395,12 @@ mod tests {
             (
                 "gas_limit",
                 serde_json::json!(u64::MAX / 2),
-                "MAX_GAS_LIMIT",
+                "MAX_BLOCK_GAS_LIMIT",
+            ),
+            (
+                "gas_limit",
+                serde_json::json!(MAX_BLOCK_GAS_LIMIT + 1),
+                "MAX_BLOCK_GAS_LIMIT",
             ),
             ("gas_limit", serde_json::json!(10), "intrinsic gas"),
             ("payload", serde_json::json!("zz"), "TransactionPayload"),

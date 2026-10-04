@@ -1,6 +1,7 @@
 use actix_governor::{Governor, GovernorConfigBuilder, KeyExtractor, SimpleKeyExtractionError};
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 // Input validation constants
@@ -557,6 +558,33 @@ pub struct AppState {
     pub mempool: Arc<Mutex<mempool::Mempool>>,
     pub governance: Arc<Mutex<GovernanceManager>>,
     pub storage: Arc<StateDB>,
+    /// B65: the consensus executor, for `aincore_estimateGas`'s dry run.
+    pub executor: Arc<executor::Executor>,
+    /// B65: dry runs executing now (`DRY_RUNS_AT_ONCE` at most).
+    pub dry_runs: Arc<AtomicUsize>,
+}
+
+/// B65: dry runs (`aincore_estimateGas`) executing at once. One executes
+/// Move up to MAX_GAS_LIMIT; two at most leave the node's other cores to
+/// consensus whatever the request rate (geth bounds `eth_estimateGas` by a
+/// gas cap and a timeout for the same reason).
+const DRY_RUNS_AT_ONCE: usize = 2;
+
+/// A dry run's slot, given back when dropped.
+struct DryRun(Arc<AtomicUsize>);
+
+impl DryRun {
+    fn begin(running: &Arc<AtomicUsize>) -> Option<Self> {
+        let before = running.fetch_add(1, Ordering::SeqCst);
+        let slot = DryRun(Arc::clone(running));
+        (before < DRY_RUNS_AT_ONCE).then_some(slot)
+    }
+}
+
+impl Drop for DryRun {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 // --- Handlers ---
@@ -1735,30 +1763,63 @@ fn handle_rpc_method(
         },
 
         "aincore_estimateGas" => {
-            // params: [tx_object] or [payload_string]. B14/B15: the execution
-            // estimate for the payload, the intrinsic byte gas when the whole
-            // transaction is given (a payload alone has no size yet, so it is
-            // estimated at the payload's own length plus a signed Ed25519
-            // envelope), and the base fee as the price.
-            let raw_len = params.get(0).and_then(|v| v.is_object().then(|| v.to_string().len()));
-            let payload = params.get(0)
-                .and_then(|v| {
-                    if v.is_string() { v.as_str().map(|s| s.to_string()) }
-                    else if v.is_object() { v.get("payload").and_then(|p| p.as_str()).map(|s| s.to_string()) }
-                    else { None }
-                })
-                .unwrap_or_default();
+            // params: [tx_object] or [payload_string].
+            // B65: a whole transaction (its signature zero-filled at the
+            // scheme's length) runs against the current state, and the answer
+            // is what it would use: Move execution, its writes' I/O, the state
+            // bytes it adds priced at the most the byte gas can reach two
+            // blocks on (x 81/64: a transaction usually executes in the next
+            // block or the one after), and its own bytes (B14). A payload
+            // alone cannot run (no sender), so it gets the per-function table
+            // and no write cost.
+            let price = executor::committed_base_fee(&data.storage);
+            if let Some(object) = params.get(0).filter(|v| v.is_object()) {
+                let Some(_slot) = DryRun::begin(&data.dry_runs) else {
+                    return Err(JsonRpcError {
+                        code: -32005,
+                        message: "estimates are busy; retry".into(),
+                    });
+                };
+                let estimate = data
+                    .executor
+                    .estimate_gas(&object.to_string())
+                    .map_err(|e| JsonRpcError { code: -32602, message: format!("Invalid params: {e}") })?;
+                if let Some(reason) = &estimate.aborted {
+                    return Err(JsonRpcError {
+                        code: -32000,
+                        message: format!("the transaction would abort: {reason}"),
+                    });
+                }
+                let byte_gas = estimate.state_byte_gas;
+                let execution =
+                    estimate.execution_gas_at(byte_gas.saturating_mul(81).div_ceil(64));
+                let mut zero_limit = object.clone();
+                zero_limit["gas_limit"] = serde_json::json!(0);
+                let gas = executor::admission::gas_limit_covering(zero_limit.to_string().len(), execution);
+                return Ok(serde_json::json!({
+                    "estimated_gas": gas,
+                    "execution_gas": execution,
+                    "intrinsic_gas": gas.saturating_sub(execution),
+                    "vm_gas": estimate.vm_gas,
+                    "io_gas": estimate.writes.io_gas,
+                    "new_state_bytes": estimate.writes.new_bytes,
+                    "state_byte_gas": byte_gas,
+                    "includes_writes": true,
+                    "gas_price": price.to_string(),
+                    "estimated_fee": (gas as u128).saturating_mul(price).to_string()
+                }));
+            }
+            let payload = params.get(0).and_then(|v| v.as_str()).unwrap_or_default().to_string();
             // A signed Ed25519 transfer's JSON without its payload: ~420 bytes.
             const ENVELOPE_BYTES: usize = 420;
             let execution = estimate_payload_gas(&payload);
-            let bytes = raw_len.unwrap_or(payload.len() + ENVELOPE_BYTES);
-            let intrinsic = executor::admission::intrinsic_gas(bytes);
+            let intrinsic = executor::admission::intrinsic_gas(payload.len() + ENVELOPE_BYTES);
             let gas = execution.saturating_add(intrinsic);
-            let price = executor::committed_base_fee(&data.storage);
             Ok(serde_json::json!({
                 "estimated_gas": gas,
                 "execution_gas": execution,
                 "intrinsic_gas": intrinsic,
+                "includes_writes": false,
                 "gas_price": price.to_string(),
                 "estimated_fee": (gas as u128).saturating_mul(price).to_string()
             }))
@@ -2097,7 +2158,20 @@ async fn json_rpc_handler(
     let shown: String = params.to_string().chars().take(256).collect();
     println!("📥 JSON-RPC Request: {} {}", method, shown);
 
-    let result = handle_rpc_method(method, params, &data);
+    // B65: a dry run executes Move, so it runs on the blocking pool, not on
+    // this worker (`DRY_RUNS_AT_ONCE` bounds how many).
+    let result = if method == "aincore_estimateGas" {
+        let state = data.clone();
+        match web::block(move || handle_rpc_method("aincore_estimateGas", params, &state)).await {
+            Ok(result) => result,
+            Err(_) => Err(JsonRpcError {
+                code: -32603,
+                message: "the estimate failed".into(),
+            }),
+        }
+    } else {
+        handle_rpc_method(method, params, &data)
+    };
 
     let response = match result {
         Ok(res) => JsonRpcResponse {
@@ -2439,12 +2513,20 @@ pub async fn start_api_server(
 ) -> std::io::Result<()> {
     println!("🌐 Starting REST API server on port {}...", api_port);
 
+    let executor = Arc::clone(
+        &consensus
+            .read()
+            .map_err(|_| std::io::Error::other("consensus lock poisoned"))?
+            .executor,
+    );
     let app_state = web::Data::new(AppState {
         consensus,
         sessions,
         mempool,
         governance,
         storage,
+        executor,
+        dry_runs: Arc::default(),
     });
 
     // M1: Rate limiter — 100 requests/second per IP, burst up to 200.
@@ -2558,10 +2640,11 @@ mod tests {
     }
 
     pub(super) fn test_state(db: Arc<StateDB>) -> AppState {
+        let executor = Arc::new(executor::Executor::new(Arc::clone(&db)));
         let consensus = Arc::new(RwLock::new(consensus::DagConsensus::new(
             "node_test".to_string(),
             Arc::new(Mutex::new(mempool::Mempool::new())),
-            Arc::new(executor::Executor::new(Arc::clone(&db))),
+            Arc::clone(&executor),
             Arc::clone(&db),
             None,
             [3u8; 32],
@@ -2576,7 +2659,139 @@ mod tests {
             mempool: Arc::new(Mutex::new(mempool::Mempool::new())),
             governance,
             storage: db,
+            executor,
+            dry_runs: Arc::default(),
         }
+    }
+
+    /// B65 witness: at most DRY_RUNS_AT_ONCE estimates execute at once; the
+    /// next is told to retry, and a finished one frees its slot.
+    #[test]
+    fn dry_runs_are_bounded() {
+        let state = test_state(temp_db("b65_dry_runs"));
+        let held: Vec<_> = (0..DRY_RUNS_AT_ONCE)
+            .map(|_| DryRun::begin(&state.dry_runs).expect("a free slot"))
+            .collect();
+        let tx = serde_json::json!({ "sender": "ab" });
+        let err = handle_rpc_method("aincore_estimateGas", serde_json::json!([tx]), &state)
+            .expect_err("busy");
+        assert_eq!(err.code, -32005);
+        drop(held);
+        let err = handle_rpc_method("aincore_estimateGas", serde_json::json!([tx]), &state)
+            .expect_err("a malformed transaction");
+        assert_eq!(err.code, -32602, "{}", err.message);
+        assert_eq!(state.dry_runs.load(Ordering::SeqCst), 0);
+    }
+
+    /// B65 witness: `aincore_estimateGas` on a whole transaction runs it, so a
+    /// transfer to an address with no coins is estimated with the CoinStore
+    /// it creates, and the transaction signed with the estimate executes.
+    #[test]
+    fn the_gas_estimate_covers_the_writes_a_transaction_makes() {
+        use ed25519_dalek::Signer;
+        let db = temp_db("b65_estimate");
+        executor::test_support::load_stdlib(&db);
+        let key = SigningKey::from_bytes(&[71u8; 32]);
+        let public_key = hex::encode(key.verifying_key().to_bytes());
+        let sender = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        executor::test_support::set_ain_balance(&db, &sender, 10u128.pow(21));
+        {
+            // An account that has sent before, so the new state is the
+            // recipient's CoinStore alone (the negative control below).
+            let _seed = db.seeding();
+            db.put_object(&aa::AccountManager::create_account(
+                sender.clone(),
+                public_key.clone(),
+            ))
+            .unwrap();
+        }
+        let recipient = "ab".repeat(32);
+        let state = test_state(Arc::clone(&db));
+        let ain = move_core_types::language_storage::TypeTag::Struct(Box::new(
+            move_core_types::language_storage::StructTag {
+                address: move_core_types::account_address::AccountAddress::ONE,
+                module: move_core_types::identifier::Identifier::new("staking").unwrap(),
+                name: move_core_types::identifier::Identifier::new("AincoreCoin").unwrap(),
+                type_params: vec![],
+            },
+        ));
+        let call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                move_core_types::account_address::AccountAddress::ONE,
+                move_core_types::identifier::Identifier::new("coin").unwrap(),
+            ),
+            function: "transfer".to_string(),
+            ty_args: vec![ain],
+            args: vec![
+                bcs::to_bytes(&move_address(&sender)).unwrap(),
+                bcs::to_bytes(&move_address(&recipient)).unwrap(),
+                bcs::to_bytes(&100u128).unwrap(),
+            ],
+        };
+        let payload =
+            hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
+        let chain_id = blockchain::chain_id();
+        let tx = serde_json::json!({
+            "chain_id": chain_id,
+            "sender": sender,
+            "input_objects": [],
+            "payload": payload,
+            "args": [],
+            "gas_limit": 0,
+            "gas_price": 1,
+            "sequence_number": 0,
+            "public_key": public_key,
+            "signature": "00".repeat(64),
+        });
+        let answer = handle_rpc_method("aincore_estimateGas", serde_json::json!([tx]), &state)
+            .expect("an estimate");
+        assert_eq!(answer["includes_writes"], true);
+        assert!(
+            answer["new_state_bytes"].as_u64().unwrap() > 0,
+            "the recipient's CoinStore is new state"
+        );
+        let field = |name: &str| answer[name].as_u64().unwrap();
+        let byte_gas = field("state_byte_gas");
+        assert_eq!(
+            field("execution_gas"),
+            field("vm_gas")
+                + field("io_gas")
+                + field("new_state_bytes") * (byte_gas * 81).div_ceil(64),
+            "the new bytes at the byte gas two blocks on"
+        );
+        let gas = answer["estimated_gas"].as_u64().unwrap();
+        let sign = |gas: u64| {
+            let mut tx = tx.clone();
+            tx["gas_limit"] = serde_json::json!(gas);
+            let message = format!(
+                "{}:{}:{}:{}:{}:{}:{}",
+                chain_id, sender, payload, 0, gas, 1, ""
+            );
+            tx["signature"] =
+                serde_json::json!(hex::encode(key.sign(message.as_bytes()).to_bytes()));
+            tx.to_string()
+        };
+        let status = |raw: &str| {
+            let (updates, _) = state.executor.execute_transaction(raw).expect("executes");
+            let receipt = updates
+                .iter()
+                .find(|(k, _)| k.starts_with("tx_receipt:"))
+                .and_then(|(_, v)| v.clone())
+                .expect("a receipt");
+            serde_json::from_str::<serde_json::Value>(&receipt).unwrap()["status"].clone()
+        };
+        // Control: the estimate less the new bytes' share is not enough.
+        let state_part = answer["new_state_bytes"].as_u64().unwrap()
+            * answer["state_byte_gas"].as_u64().unwrap();
+        assert_eq!(status(&sign(gas - state_part)), "aborted");
+        let raw = sign(gas);
+        let checked = executor::admission::check_stateless(&raw, &chain_id).expect("admitted");
+        assert_eq!(
+            checked.execution_gas,
+            answer["execution_gas"].as_u64().unwrap(),
+            "the estimate is the limit's execution part exactly"
+        );
+        assert_eq!(status(&raw), "success");
     }
 
     /// B58 witness: a block's hash finds that block, not its child (whose
@@ -3454,10 +3669,11 @@ mod tests {
         db.put("consensus:finality_digest", "deadbeef")
             .expect("write digest");
 
+        let executor = Arc::new(executor::Executor::new(Arc::clone(&db)));
         let consensus = Arc::new(RwLock::new(consensus::DagConsensus::new(
             "node_test".to_string(),
             Arc::new(Mutex::new(mempool::Mempool::new())),
-            Arc::new(executor::Executor::new(Arc::clone(&db))),
+            Arc::clone(&executor),
             Arc::clone(&db),
             None,
             [1u8; 32],
@@ -3472,6 +3688,8 @@ mod tests {
             mempool: Arc::new(Mutex::new(mempool::Mempool::new())),
             governance,
             storage: Arc::clone(&db),
+            executor,
+            dry_runs: Arc::default(),
         };
 
         let status = handle_rpc_method("aincore_getFinalityStatus", serde_json::json!([]), &state)
@@ -3624,10 +3842,11 @@ mod tests {
     #[test]
     fn test_submit_transaction_with_key_is_disabled() {
         let db = temp_db("legacy_rpc_disabled");
+        let executor = Arc::new(executor::Executor::new(Arc::clone(&db)));
         let consensus = Arc::new(RwLock::new(consensus::DagConsensus::new(
             "node_test".to_string(),
             Arc::new(Mutex::new(mempool::Mempool::new())),
-            Arc::new(executor::Executor::new(Arc::clone(&db))),
+            Arc::clone(&executor),
             Arc::clone(&db),
             None,
             [2u8; 32],
@@ -3642,6 +3861,8 @@ mod tests {
             mempool: Arc::new(Mutex::new(mempool::Mempool::new())),
             governance,
             storage: db,
+            executor,
+            dry_runs: Arc::default(),
         };
 
         let err = handle_rpc_method("submit_transaction_with_key", serde_json::json!([]), &state)

@@ -52,7 +52,13 @@ export class Transaction {
     payload: string;
     /** Set by `sign`: `executionGas` plus BYTE_GAS per byte of the signed JSON. */
     gasLimit: number;
-    /** Gas for Move execution; `sign` adds the byte gas on top. */
+    /**
+     * Execution gas: Move execution and the state the writes add (B65);
+     * `sign` adds the byte gas on top. Set it from
+     * `connection.estimateExecutionGas(tx, publicKey)` before signing: a
+     * transfer to an address with no coins, or a publish, needs far more
+     * than the default.
+     */
     executionGas: number;
     gasPrice: number;
     sequenceNumber: number;
@@ -642,6 +648,21 @@ export class Transaction {
         if (pending) this.paymasterSignature = undefined;
         this.gasLimit = this.executionGas + BYTE_GAS * (unsized + 20);
         this.signature = signer.sign(Buffer.from(this.signingMessage()));
+    }
+
+    /**
+     * B65: the transaction as `aincore_estimateGas` takes it before signing:
+     * the sender's key, zero signatures of the final length, gas_limit 0.
+     */
+    estimateDraft(publicKey: string): Record<string, unknown> {
+        const draft = JSON.parse(this.toString());
+        draft.public_key = publicKey;
+        draft.signature = '0'.repeat(128);
+        draft.gas_limit = 0;
+        if (this.paymaster !== undefined && this.paymasterSignature === undefined) {
+            draft.paymaster_signature = '0'.repeat(128);
+        }
+        return draft;
     }
 
     /** The seven fields the sender signs (F4), as the node rebuilds them. */

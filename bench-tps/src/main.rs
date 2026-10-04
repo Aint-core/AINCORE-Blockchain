@@ -78,8 +78,11 @@ struct Args {
     #[arg(long, default_value_t = 20)]
     abort_rate: u8,
 
-    /// Gas limit per transaction
-    #[arg(long, default_value_t = 100_000u64)]
+    /// Execution gas per transaction (the byte gas is added). B65: a
+    /// funding transfer creates a CoinStore (645 state bytes) and an
+    /// account's first transaction its account, at 510 gas a byte at the
+    /// floor; 1M covers both with room while the byte gas is low.
+    #[arg(long, default_value_t = 1_000_000u64)]
     gas_limit: u64,
 
     /// Max concurrent in-flight requests during the load phase

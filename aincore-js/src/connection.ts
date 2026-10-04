@@ -1,4 +1,5 @@
 import axios, { AxiosInstance } from 'axios';
+import { Transaction } from './transaction';
 
 export interface DexPool {
     pool_key: string;
@@ -295,6 +296,16 @@ export class Connection {
      */
     async getTransactionReceipt(hash: string): Promise<TransactionReceipt> {
         return await this.request('aincore_getTransactionReceipt', [hash]);
+    }
+
+    /**
+     * B65: the execution gas `tx` needs, the state its writes add included:
+     * the node runs it against the current state. Set `tx.executionGas` to
+     * the answer, then `sign`.
+     */
+    async estimateExecutionGas(tx: Transaction, publicKey: string): Promise<number> {
+        const res = await this.request('aincore_estimateGas', [tx.estimateDraft(publicKey)]);
+        return Number(res.execution_gas);
     }
 
     /**

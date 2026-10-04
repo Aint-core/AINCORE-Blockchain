@@ -37,15 +37,17 @@ fn load_wallet(pqc_seed: &Option<String>, keyfile: &str) -> anyhow::Result<Walle
 }
 
 /// A signed transaction carrying `payload`: priced at the node's base fee
-/// (B15), with `execution` gas for Move on top of the intrinsic byte gas its
-/// own size owes (B14), signed over the seven fields (F4) by `wallet`.
+/// (B15), with `execution` gas on top of the intrinsic byte gas its own size
+/// owes (B14), signed over the seven fields (F4) by `wallet`. B65: without
+/// `execution`, the node runs the transaction and answers what it would use,
+/// the state its writes add included (`aincore_estimateGas`).
 fn signed_tx_json(
     client: &RpcClient,
     wallet: &Wallet,
     chain_id: &str,
     payload: String,
     sequence_number: u64,
-    execution: u64,
+    execution: Option<u64>,
 ) -> anyhow::Result<String> {
     let price = client.call("aincore_getGasPrice", json!([]))?;
     let gas_price: u128 = match &price {
@@ -70,6 +72,15 @@ fn signed_tx_json(
         zkp_proof: None,
     };
     let unsized_len = serde_json::to_string(&tx)?.len();
+    let execution = match execution {
+        Some(gas) => gas,
+        None => {
+            let answer = client.call("aincore_estimateGas", json!([serde_json::to_value(&tx)?]))?;
+            answer["execution_gas"]
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("unexpected aincore_estimateGas answer: {answer}"))?
+        }
+    };
     tx.gas_limit = executor::admission::gas_limit_covering(unsized_len, execution);
     tx.signature = wallet.sign(executor::admission::signing_message(&tx).as_bytes());
     Ok(serde_json::to_string(&tx)?)
@@ -111,6 +122,11 @@ struct Cli {
     /// Chain ID used in signed transactions (or AINCORE_CHAIN_ID env)
     #[arg(long, default_value = "AINCORE-MAINNET-1")]
     chain_id: String,
+
+    /// Execution gas for every signed transaction; the node's estimate
+    /// (`aincore_estimateGas`) when not given (B65)
+    #[arg(long, global = true)]
+    execution_gas: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -140,8 +156,9 @@ enum Commands {
     Transfer {
         to: String,
         amount: u64,
-        #[arg(long, default_value = "10000")]
-        gas_limit: u64,
+        /// Execution gas; the node's estimate when not given (B65).
+        #[arg(long)]
+        gas_limit: Option<u64>,
     },
     /// Publish a Move module
     Publish { path: String },
@@ -288,7 +305,14 @@ fn main() -> anyhow::Result<()> {
             let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
             let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
             let seq_num = sequence_number;
-            let tx_json = signed_tx_json(&client, &wallet, &chain_id, payload, seq_num, 5_000)?;
+            let tx_json = signed_tx_json(
+                &client,
+                &wallet,
+                &chain_id,
+                payload,
+                seq_num,
+                cli.execution_gas,
+            )?;
             let res = client.call("aincore_sendTransaction", json!([tx_json]))?;
             println!("✅ Proof Submitted: {}", res);
         }
@@ -359,8 +383,11 @@ fn main() -> anyhow::Result<()> {
 
             println!("✅ Sender metadata loaded (Seq: {})", sequence_number);
             println!(
-                "💸 Sending {} from {} to {} (Gas Limit: {})",
-                amount, sender, to, gas_limit
+                "💸 Sending {} from {} to {} (execution gas: {})",
+                amount,
+                sender,
+                to,
+                gas_limit.map_or_else(|| "estimated".to_string(), |g| g.to_string())
             );
 
             // Construct payload
@@ -388,7 +415,14 @@ fn main() -> anyhow::Result<()> {
             let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
             let seq_num = sequence_number; // Use current seq number (Executor expects match)
                                            // `gas_limit` is the gas for execution; the byte gas is added.
-            let tx_str = signed_tx_json(&client, &wallet, &chain_id, payload, seq_num, gas_limit)?;
+            let tx_str = signed_tx_json(
+                &client,
+                &wallet,
+                &chain_id,
+                payload,
+                seq_num,
+                gas_limit.or(cli.execution_gas),
+            )?;
             let res = client.call("aincore_sendTransaction", json!([tx_str]))?;
             println!("✅ Transaction submitted: {}", res);
         }
@@ -461,9 +495,6 @@ fn main() -> anyhow::Result<()> {
             let bytecode_hex = hex::encode(bytecode);
 
             let bytes = hex::decode(&bytecode_hex).expect("invalid hex in publish command");
-            // B27: the bundle's publish floor, refused at admission when short.
-            let execution =
-                executor::admission::publish_floor(std::slice::from_ref(&bytes)).max(50_000);
             let payload_struct = vm_move::TransactionPayload::PublishModule(vec![bytes]);
             let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
             let balance_res = client.call("aincore_getBalance", json!([sender]))?;
@@ -486,7 +517,7 @@ fn main() -> anyhow::Result<()> {
                 &chain_id,
                 payload,
                 sequence_number,
-                execution,
+                cli.execution_gas,
             )?;
             let res = client.call("aincore_sendTransaction", json!([tx_str]))?;
             println!("✅ Publish Transaction submitted: {}", res);
@@ -551,7 +582,7 @@ fn main() -> anyhow::Result<()> {
                 &chain_id,
                 payload,
                 sequence_number,
-                50_000,
+                cli.execution_gas,
             )?;
             let res = client.call("aincore_sendTransaction", json!([tx_json]))?;
             println!("✅ Validator Registration Submitted: {}", res);
@@ -609,7 +640,7 @@ fn main() -> anyhow::Result<()> {
                 &chain_id,
                 payload,
                 sequence_number,
-                50_000,
+                cli.execution_gas,
             )?;
             let res = client.call("aincore_sendTransaction", json!([tx_json]))?;
             println!("✅ Faucet Transaction Submitted: {}", res);
