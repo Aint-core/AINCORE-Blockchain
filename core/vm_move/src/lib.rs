@@ -211,9 +211,38 @@ impl AINCOREVM {
         }
     }
 
+    /// B69: the bytecode verifier's limits. `MoveVM::new` ran with none on
+    /// dependency depth or module shape. These are Aptos's production
+    /// verifier limits (`aptos_prod_verifier_config`, read 2026-10-04:
+    /// loops 5 deep, 32 generic arguments, 128 parameters, 1,024 basic
+    /// blocks, 256 type nodes, 10,000 pushes, 200 structs, 64 fields, 1,000
+    /// functions). The dependency depth is 100, the value move's verifier
+    /// suggests and its loader tests use; the verifier's metering keeps
+    /// move's default here (8,000,000 units a function and a module, a tenth
+    /// of Aptos's).
+    pub fn vm_config() -> move_vm_runtime::config::VMConfig {
+        move_vm_runtime::config::VMConfig {
+            verifier: move_bytecode_verifier::VerifierConfig {
+                max_loop_depth: Some(5),
+                max_generic_instantiation_length: Some(32),
+                max_function_parameters: Some(128),
+                max_basic_blocks: Some(1024),
+                max_type_nodes: Some(256),
+                max_push_size: Some(10_000),
+                max_dependency_depth: Some(100),
+                max_struct_definitions: Some(200),
+                max_fields_in_struct: Some(64),
+                max_function_definitions: Some(1000),
+                ..move_bytecode_verifier::VerifierConfig::default()
+            },
+            ..move_vm_runtime::config::VMConfig::default()
+        }
+    }
+
     pub fn new(db: Arc<StateDB>) -> Self {
-        let natives = move_stdlib::natives::all_natives(system_address(), Self::native_gas_params());
-        let vm = MoveVM::new(natives).unwrap_or_else(|e| {
+        let natives =
+            move_stdlib::natives::all_natives(system_address(), Self::native_gas_params());
+        let vm = MoveVM::new_with_config(natives, Self::vm_config()).unwrap_or_else(|e| {
             eprintln!("⚠️  WARNING: Failed to create MoveVM: {}", e);
             panic!("Critical: MoveVM initialization failed")
         });

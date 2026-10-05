@@ -21,7 +21,9 @@ fn sign_ed25519(
     let parsed: executor::Transaction = serde_json::from_value(tx.clone()).unwrap();
     let message = executor::admission::signing_message(&parsed);
     tx["signature"] = serde_json::json!(hex::encode(key.sign(message.as_bytes()).to_bytes()));
-    tx.to_string()
+    // B73: in the canonical encoding, the one the pool keeps and offers.
+    let raw = tx.to_string();
+    executor::admission::canonicalize(&raw).unwrap_or(raw)
 }
 
 /// The publish floor of a hex BCS payload (0 for a call or junk).
@@ -970,6 +972,110 @@ mod fee_market_admission {
             .unwrap_err();
         assert!(err.contains("Invalid paymaster signature"), "{err}");
     }
+
+    /// B70 witness: only READY transactions are offered to a block: from the
+    /// sender's committed sequence number, contiguous over what is waiting and
+    /// loaned, at least the base fee. A transaction behind a gap waits (parked)
+    /// until the gap fills; one priced under a risen base fee is not offered.
+    #[test]
+    fn only_ready_transactions_are_offered_to_a_block() {
+        let db = temp_db("b70_ready");
+        let (a0, a) = signed_tx(81, 0, 100_000, 1);
+        let (a2, _) = signed_tx(81, 2, 100_000, 1);
+        let (b1, b) = signed_tx(82, 1, 100_000, 1);
+        fund(&db, &a, 1_000_000_000_000_000_000);
+        fund(&db, &b, 1_000_000_000_000_000_000);
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        for tx in [&a0, &a2, &b1] {
+            mp.add_transaction(tx.clone()).expect("admitted");
+        }
+        // B73: the pool keeps, and offers, the canonical encoding.
+        let kept = |raw: &str| executor::admission::canonicalize(raw).unwrap();
+        assert_eq!(
+            mp.get_pending_transactions(10),
+            vec![kept(&a0)],
+            "only the ready one"
+        );
+        let (a1, _) = signed_tx(81, 1, 100_000, 1);
+        mp.add_transaction(a1.clone()).expect("admitted");
+        assert_eq!(
+            mp.get_pending_transactions(10),
+            vec![kept(&a1), kept(&a2)],
+            "the gap filled: the run continues past the loaned seq 0"
+        );
+        {
+            let _seed = db.seeding();
+            db.put(executor::BASE_FEE_KEY, "5").unwrap();
+        }
+        let (b0, _) = signed_tx(82, 0, 100_000, 5);
+        mp.add_transaction(b0.clone())
+            .expect("admitted at the new fee");
+        assert_eq!(
+            mp.get_pending_transactions(10),
+            vec![kept(&b0)],
+            "b1 at price 1 is under the base fee: not offered"
+        );
+    }
+
+    /// B70 witness: a pool full of parked transactions (nonce gaps) makes room
+    /// for a ready one by evicting a parked one; a new parked one is refused.
+    #[test]
+    fn a_full_pool_evicts_a_parked_transaction_for_a_ready_one() {
+        let db = temp_db("b70_full");
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        let per_sender = (MAX_NONCE_AHEAD - 1) as usize;
+        let senders = MAX_PENDING_TXS.div_ceil(per_sender);
+        let mut admitted = 0;
+        'fill: for s in 0..senders {
+            for seq in 1..=per_sender as u64 {
+                let (tx, sender) = signed_tx(100 + s as u8, seq, 100_000, 1);
+                if seq == 1 {
+                    fund(&db, &sender, 1_000_000_000_000_000_000_000);
+                }
+                mp.add_transaction(tx)
+                    .expect("a parked tx is admitted while there is room");
+                admitted += 1;
+                if admitted == MAX_PENDING_TXS {
+                    break 'fill;
+                }
+            }
+        }
+        assert_eq!(mp.len(), MAX_PENDING_TXS);
+        let (parked, late) = signed_tx(99, 5, 100_000, 1);
+        fund(&db, &late, 1_000_000_000_000_000_000);
+        assert!(
+            mp.add_transaction(parked).is_err(),
+            "a parked tx is refused when full"
+        );
+        let (ready, _) = signed_tx(99, 0, 100_000, 1);
+        mp.add_transaction(ready.clone())
+            .expect("a ready tx evicts a parked one");
+        assert_eq!(mp.len(), MAX_PENDING_TXS);
+        assert_eq!(
+            mp.get_pending_transactions(10),
+            vec![executor::admission::canonicalize(&ready).unwrap()]
+        );
+    }
+
+    /// B70 witness: a transaction whose sequence number another one already
+    /// used can never run; it leaves the pool instead of waiting forever.
+    #[test]
+    fn a_used_sequence_number_leaves_the_pool() {
+        let db = temp_db("b70_dead");
+        let (tx, sender) = signed_tx(83, 0, 100_000, 1);
+        fund(&db, &sender, 1_000_000_000_000_000_000);
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        mp.add_transaction(tx).expect("admitted");
+        let key = ed25519_dalek::SigningKey::from_bytes(&[83u8; 32]);
+        executor::test_support::set_sequence_number(
+            &db,
+            &sender,
+            &hex::encode(key.verifying_key().to_bytes()),
+            1,
+        );
+        assert!(mp.get_pending_transactions(10).is_empty());
+        assert_eq!(mp.len(), 0, "the dead transaction is gone");
+    }
 }
 
 /// Orphan-loss fix: a pulled transaction that never executes must come BACK,
@@ -1150,4 +1256,28 @@ fn admission_never_reads_the_chain_id_env() {
     let result = Mempool::new().add_transaction(make_test_tx(0));
     std::env::remove_var("AINCORE_CHAIN_ID");
     result.expect("a transaction for the installed chain is admitted");
+}
+
+/// B73: whatever encoding a transaction arrives in (spacing, key order, a
+/// relay's junk field), the pool keeps, offers and forwards its canonical
+/// one, so a block carries the sender's bytes and the id is the same.
+mod canonical_b73 {
+    use super::*;
+
+    #[test]
+    fn the_pool_keeps_the_canonical_encoding() {
+        let tx =
+            executor::admission::signed_publish([21; 32], &blockchain::chain_id(), 0, vec![21]);
+        assert_eq!(executor::admission::canonicalize(&tx).unwrap(), tx);
+        let mut v: serde_json::Value = serde_json::from_str(&tx).unwrap();
+        v["junk"] = serde_json::json!("x".repeat(500));
+        let padded = serde_json::to_string_pretty(&v).unwrap();
+        let mut mp = Mempool::new();
+        mp.add_transaction(padded).expect("admitted");
+        assert_eq!(
+            mp.pending_with_raw_hash(&StateDB::raw_tx_hash(&tx)),
+            Some(tx.as_str()),
+            "kept as the canonical string"
+        );
+    }
 }

@@ -73,6 +73,13 @@ pub fn validate_committee(proposed: &[ValidatorInfo]) -> Result<Vec<ValidatorInf
         if !derives {
             return Err(format!("member {}: its key does not derive it", m.address));
         }
+        // B86: a small-order key "signs" every message for anyone.
+        if !hex::decode(&m.ed25519_public_key).is_ok_and(|pk| crypto::ed25519_key_is_usable(&pk)) {
+            return Err(format!(
+                "member {}: its Ed25519 key is small-order",
+                m.address
+            ));
+        }
         let pop_ok = match (hex::decode(&m.bls_public_key), hex::decode(&m.bls_pop)) {
             (Ok(pk), Ok(pop)) => bls.verify_possession(&pk, &pop).unwrap_or(false),
             _ => false,
@@ -246,6 +253,24 @@ mod tests {
             canonical_order(&[a, b]),
             "nothing valid is left: C_E stays"
         );
+    }
+
+    /// B86: a member whose Ed25519 key is small-order (the identity point,
+    /// whose address it derives) is refused: under it (R = identity, s = 0)
+    /// would verify for every vertex and block.
+    #[test]
+    fn a_small_order_member_key_is_refused() {
+        let honest = member(1, 100);
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let weak = ValidatorInfo {
+            address: crypto::derive_address(&identity).unwrap(),
+            ed25519_public_key: hex::encode(identity),
+            ..member(2, 100)
+        };
+        let refused = validate_committee(&[honest.clone(), weak]).unwrap_err();
+        assert!(refused.contains("small-order"), "{refused}");
+        assert!(validate_committee(&[honest]).is_ok());
     }
 
     /// G5 BW-6: the executor's leader schedule is consensus's. Pinned to the

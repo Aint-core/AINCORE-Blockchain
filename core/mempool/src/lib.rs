@@ -189,17 +189,9 @@ impl Mempool {
     /// version of a TX that has already been seen.
     fn canonical_tx_hash(tx: &executor::Transaction) -> String {
         // F4: dedup identity must match the signed canonical form, which now
-        // also binds gas_limit, gas_price, and input_objects.
-        let canonical = format!(
-            "{}:{}:{}:{}:{}:{}:{}",
-            tx.chain_id,
-            tx.sender,
-            tx.payload,
-            tx.sequence_number,
-            tx.gas_limit,
-            tx.gas_price,
-            tx.input_objects.join(",")
-        );
+        // also binds gas_limit, gas_price, and input_objects (B73: and the
+        // paymaster).
+        let canonical = executor::admission::signing_message(tx);
         let mut hasher = Sha256::new();
         hasher.update(canonical.as_bytes());
         hex::encode(hasher.finalize())
@@ -240,8 +232,12 @@ impl Mempool {
     /// join_validator_set call's BLS proof-of-possession is checked here so a
     /// rogue-key join never enters the mempool; the executor's pre-dispatch
     /// gate is the authoritative one.
+    ///
+    /// B73: what it checks is `tx` in its canonical encoding, the one the
+    /// mempool keeps (`add_checked`).
     pub fn check_admissible(tx: &str) -> Result<executor::admission::CheckedTx, String> {
-        let checked = executor::admission::check_stateless(tx, &blockchain::chain_id())?;
+        let canonical = executor::admission::canonicalize(tx)?;
+        let checked = executor::admission::check_stateless(&canonical, &blockchain::chain_id())?;
         let payload_bytes = hex::decode(checked.tx.payload.trim_start_matches("0x"))
             .map_err(|_| "Invalid payload hex: expected BCS TransactionPayload".to_string())?;
         if let Ok(vm_move::TransactionPayload::EntryFunction(call)) =
@@ -259,9 +255,12 @@ impl Mempool {
     /// verified a second time under the lock).
     pub fn add_checked(
         &mut self,
-        tx: String,
+        _arrived_as: String,
         checked: executor::admission::CheckedTx,
     ) -> Result<String, String> {
+        // B73: kept, offered and forwarded in its canonical encoding only,
+        // whatever encoding it arrived in (vertex ingress takes no other).
+        let tx = executor::admission::canonical_json(&checked.tx);
         let parsed_tx = &checked.tx;
         let tx_hash = Self::canonical_tx_hash(parsed_tx);
         if self.seen_txs.contains(&tx_hash) {
@@ -333,13 +332,33 @@ impl Mempool {
 
         // RE-AUDIT HIGH: the cap must count LOANED transactions too, or a pull
         // simply moves 500 into `inflight` and frees 500 slots for the attacker.
+        // B70: a full pool makes room for a READY transaction by evicting a
+        // parked one (behind a nonce gap, or priced under the base fee):
+        // parked transactions are never offered to a block and pay nothing,
+        // so they cannot hold the pool against transactions that can run.
         if self.pending_txs.len() + self.inflight.len() >= MAX_PENDING_TXS {
-            return Err(format!(
-                "Mempool full ({}+{} inflight / {})",
-                self.pending_txs.len(),
-                self.inflight.len(),
-                MAX_PENDING_TXS
-            ));
+            let evicted = match &self.storage {
+                Some(storage)
+                    if self.is_ready(
+                        storage,
+                        &parsed_tx.sender,
+                        parsed_tx.sequence_number,
+                        parsed_tx.gas_price,
+                    ) =>
+                {
+                    let storage = Arc::clone(storage);
+                    self.evict_parked(&storage)
+                }
+                _ => false,
+            };
+            if !evicted {
+                return Err(format!(
+                    "Mempool full ({}+{} inflight / {})",
+                    self.pending_txs.len(),
+                    self.inflight.len(),
+                    MAX_PENDING_TXS
+                ));
+            }
         }
 
         let nonce_key = format!("{}:{}", parsed_tx.sender, parsed_tx.sequence_number);
@@ -446,6 +465,39 @@ impl Mempool {
             q.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
         }
 
+        // B70: only READY transactions are offered: from the sender's
+        // committed sequence number, contiguous over what is waiting and what
+        // is loaned, each at least the base fee. One behind a gap (or under
+        // the fee) would be skipped by every block and pay nothing, so it is
+        // parked here instead of riding in vertices for free.
+        // A transaction whose sequence number is already used can never run:
+        // it leaves the pool.
+        let mut dead: Vec<String> = Vec::new();
+        if let Some(storage) = self.storage.clone() {
+            let loaned = self.loaned_seqs();
+            let base_fee = executor::committed_base_fee(&storage);
+            for (sender, q) in by_sender.iter_mut() {
+                let committed = executor::committed_sequence_number(&storage, sender);
+                let mut expected = committed;
+                let mut ready = Vec::with_capacity(q.len());
+                for &(seq, gas_price, idx) in q.iter() {
+                    if seq < committed {
+                        dead.push(raws[idx].clone());
+                        continue;
+                    }
+                    while loaned.get(sender).is_some_and(|s| s.contains(&expected)) {
+                        expected += 1;
+                    }
+                    if seq != expected || gas_price < base_fee {
+                        break;
+                    }
+                    ready.push((seq, gas_price, idx));
+                    expected += 1;
+                }
+                *q = ready;
+            }
+        }
+
         // Per-sender cursor into its nonce-ordered queue.
         let mut cursor: BTreeMap<String, usize> =
             by_sender.keys().map(|s| (s.clone(), 0usize)).collect();
@@ -481,6 +533,12 @@ impl Mempool {
 
         let selected_set: HashSet<usize> = selected.iter().copied().collect();
         let result: Vec<String> = selected.iter().map(|&i| raws[i].clone()).collect();
+        for raw in &dead {
+            self.remove_pending_nonce(raw);
+            self.meta.remove(raw);
+            self.requeue_attempts.remove(raw);
+        }
+        let dead: HashSet<String> = dead.into_iter().collect();
         let now = now_secs;
         for raw in &result {
             self.remove_pending_nonce(raw);
@@ -493,7 +551,7 @@ impl Mempool {
         self.pending_txs = raws
             .into_iter()
             .enumerate()
-            .filter(|(i, _)| !selected_set.contains(i))
+            .filter(|(i, r)| !selected_set.contains(i) && !dead.contains(r))
             .map(|(_, r)| r)
             .collect();
 
@@ -648,6 +706,90 @@ impl Mempool {
             );
         }
         requeued
+    }
+
+    /// B70: each sender's sequence numbers loaned to vertices.
+    fn loaned_seqs(&self) -> std::collections::HashMap<String, HashSet<u64>> {
+        let mut out: std::collections::HashMap<String, HashSet<u64>> =
+            std::collections::HashMap::new();
+        for raw in self.inflight.keys() {
+            if let Some(m) = self.meta.get(raw) {
+                out.entry(m.sender.clone()).or_default().insert(m.seq);
+            }
+        }
+        out
+    }
+
+    /// B70: whether `sender`'s transaction `seq` at `gas_price` is ready: at
+    /// least the base fee, and its sequence number the committed next or
+    /// right after a run of the sender's waiting and loaned transactions that
+    /// starts there.
+    fn is_ready(&self, storage: &StateDB, sender: &str, seq: u64, gas_price: u128) -> bool {
+        if gas_price < executor::committed_base_fee(storage) {
+            return false;
+        }
+        let held: HashSet<u64> = self
+            .meta
+            .values()
+            .filter(|m| m.sender == sender)
+            .map(|m| m.seq)
+            .collect();
+        let mut expected = executor::committed_sequence_number(storage, sender);
+        while expected < seq && held.contains(&expected) {
+            expected += 1;
+        }
+        expected == seq
+    }
+
+    /// B70: evict one parked transaction (not ready, still waiting): the one
+    /// furthest above its sender's next sequence number, ties by its raw
+    /// string, so the choice is deterministic. Its sender may submit it again.
+    /// One pass: each sender's ready run is found once.
+    fn evict_parked(&mut self, storage: &StateDB) -> bool {
+        let base_fee = executor::committed_base_fee(storage);
+        let mut held: std::collections::HashMap<&str, HashSet<u64>> =
+            std::collections::HashMap::new();
+        for m in self.meta.values() {
+            held.entry(m.sender.as_str()).or_default().insert(m.seq);
+        }
+        // Per sender: its committed next and the end of its ready run.
+        let mut runs: std::collections::HashMap<&str, (u64, u64)> =
+            std::collections::HashMap::new();
+        for (sender, seqs) in &held {
+            let committed = executor::committed_sequence_number(storage, sender);
+            let mut end = committed;
+            while seqs.contains(&end) {
+                end += 1;
+            }
+            runs.insert(sender, (committed, end));
+        }
+        let mut victim: Option<(u64, &str)> = None;
+        for raw in &self.pending_txs {
+            let Some(m) = self.meta.get(raw) else {
+                continue;
+            };
+            let Some(&(committed, end)) = runs.get(m.sender.as_str()) else {
+                continue;
+            };
+            let parked = m.gas_price < base_fee || m.seq >= end;
+            let ahead = m.seq.saturating_sub(committed);
+            if parked && victim.is_none_or(|(a, r)| (ahead, raw.as_str()) > (a, r)) {
+                victim = Some((ahead, raw.as_str()));
+            }
+        }
+        let Some((_, raw)) = victim else {
+            return false;
+        };
+        let raw = raw.to_string();
+        self.pending_txs.retain(|r| *r != raw);
+        self.remove_pending_nonce(&raw);
+        self.meta.remove(&raw);
+        self.requeue_attempts.remove(&raw);
+        if let Ok(parsed) = serde_json::from_str::<executor::Transaction>(&raw) {
+            self.seen_txs.remove(&Self::canonical_tx_hash(&parsed));
+        }
+        println!("🧹 Mempool full: evicted a parked transaction for a ready one");
+        true
     }
 
     fn remove_pending_nonce(&mut self, tx: &str) {

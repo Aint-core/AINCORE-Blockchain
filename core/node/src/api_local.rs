@@ -13,6 +13,11 @@ const MAX_BLOCKS_BYTES: usize = 8 << 20;
 /// B54: the vertices `aincore_getDag` returns, newest first (a choice: a few
 /// rounds of a full committee).
 const MAX_DAG_VERTICES: usize = 256;
+/// B76: the payload bytes one `aincore_getDag` answer carries (a choice: the
+/// same 8 MiB as `MAX_BLOCKS_BYTES`; the payload is the part of a vertex that
+/// grows to 768 KiB, the rest is bounded by the committee); at least one
+/// vertex.
+const MAX_DAG_BYTES: usize = MAX_BLOCKS_BYTES;
 
 // --- Shared State ---
 use consensus::DagConsensus;
@@ -558,8 +563,6 @@ pub struct AppState {
     pub mempool: Arc<Mutex<mempool::Mempool>>,
     pub governance: Arc<Mutex<GovernanceManager>>,
     pub storage: Arc<StateDB>,
-    /// B65: the consensus executor, for `aincore_estimateGas`'s dry run.
-    pub executor: Arc<executor::Executor>,
     /// B65: dry runs executing now (`DRY_RUNS_AT_ONCE` at most).
     pub dry_runs: Arc<AtomicUsize>,
 }
@@ -820,7 +823,10 @@ fn handle_rpc_method(
                 // fields -- right for deduplication, but nothing is stored under
                 // it, so returning it meant a client's receipt lookup said
                 // "pending" forever. It is still returned, as `canonical_hash`.
-                let lookup_hash = StateDB::raw_tx_hash(&tx_str);
+                // B73: of the canonical encoding, the one the mempool keeps and
+                // blocks carry.
+                let lookup_hash =
+                    StateDB::raw_tx_hash(&executor::admission::canonical_json(&checked.tx));
                 match mempool.add_checked(tx_str, checked) {
                     Ok(canonical_hash) => Ok(serde_json::json!({
                         "status": "sent",
@@ -1093,14 +1099,23 @@ fn handle_rpc_method(
             let dag = consensus.dag.lock().map_err(|e| JsonRpcError { code: -32000, message: format!("DAG lock error: {}", e) })?;
 
             // B54: the newest `MAX_DAG_VERTICES`, not the whole DAG cloned
-            // under the consensus lock.
+            // under the consensus lock. B76: and at most `MAX_DAG_BYTES` of
+            // payload (one vertex at least), copied under the locks and
+            // serialized after them, so consensus writers do not wait on it.
             let mut newest: Vec<(u64, &String)> = dag.iter().map(|(h, v)| (v.round, h)).collect();
             newest.sort_unstable_by(|a, b| b.cmp(a));
-            let vertices: Vec<_> = newest
-                .into_iter()
-                .take(MAX_DAG_VERTICES)
-                .filter_map(|(_, h)| dag.get(h).cloned())
-                .collect();
+            let mut vertices = Vec::new();
+            let mut bytes = 0usize;
+            for (_, h) in newest.into_iter().take(MAX_DAG_VERTICES) {
+                let Some(v) = dag.get(h) else { continue };
+                bytes = bytes.saturating_add(v.payload.iter().map(String::len).sum::<usize>());
+                if bytes > MAX_DAG_BYTES && !vertices.is_empty() {
+                    break;
+                }
+                vertices.push(v.clone());
+            }
+            drop(dag);
+            drop(consensus);
             Ok(serde_json::json!(vertices))
         },
         "aincore_getTransaction" => {
@@ -1249,14 +1264,15 @@ fn handle_rpc_method(
             Ok(serde_json::json!(blocks))
         },
         "aincore_getPeers" => {
-            let peers = data.storage.scan_peer_addrs();
-            // Convert to a cleaner JSON format
-            let peer_list: Vec<serde_json::Value> = peers.into_iter().map(|(id, addr)| {
-                serde_json::json!({
-                    "peer_id": id,
-                    "multiaddr": addr
-                })
-            }).collect();
+            // B90: the sessions held, by PeerId and whether a committee key
+            // names them; never an address (this answered any client with
+            // the saved validators' addresses, a map for whoever wants to
+            // flood them).
+            let table = data.sessions.read().unwrap_or_else(|e| e.into_inner());
+            let peer_list: Vec<serde_json::Value> = table
+                .iter()
+                .map(|s| serde_json::json!({ "peer_id": s.peer, "member": s.member.is_some() }))
+                .collect();
             Ok(serde_json::json!(peer_list))
         },
         // S3: aincore_debug REMOVED — raw DB key scanner is a data exfiltration vector on mainnet
@@ -1780,8 +1796,11 @@ fn handle_rpc_method(
                         message: "estimates are busy; retry".into(),
                     });
                 };
-                let estimate = data
-                    .executor
+                // B84: on a fresh VM, as a block runs (`execute_block_parallel`),
+                // so it runs the code on chain now: a VM that lived as long as
+                // the node kept its module cache across upgrades, and grew
+                // with every module estimated.
+                let estimate = executor::Executor::new(Arc::clone(&data.storage))
                     .estimate_gas(&object.to_string())
                     .map_err(|e| JsonRpcError { code: -32602, message: format!("Invalid params: {e}") })?;
                 if let Some(reason) = &estimate.aborted {
@@ -2464,42 +2483,101 @@ fn session_counts(sessions: &network::SessionTable) -> (usize, usize) {
 /// proxy every client is 127.0.0.1, so one client spent everyone's budget.
 /// When the operator names the header its proxy sets
 /// (`AINCORE_RPC_CLIENT_IP_HEADER`, e.g. `CF-Connecting-IP` behind a
-/// Cloudflare tunnel), a request from a loopback peer counts under that
-/// header's address; any other peer, and a loopback request without the
-/// header, under the peer's own (a header from anywhere else is the
-/// client's to forge).
+/// Cloudflare tunnel), a request counts under that header's address.
+///
+/// B74: only from a proxy the operator names (`AINCORE_RPC_TRUSTED_PROXIES`,
+/// comma-separated addresses): any loopback peer used to be trusted, and a
+/// socket proxy on loopback passes the client's own header through. The
+/// header's last element is taken (the hop the proxy appended; a client
+/// writes the first). An IPv6 client counts by its /64 (one host holds
+/// 2^64 addresses), and keys fall into `RATE_LIMIT_BUCKETS` buckets by a
+/// per-process random hash, so the limiter's map, which actix-governor never
+/// shrinks, holds at most that many entries.
 #[derive(Clone)]
 struct ClientIp {
     header: Option<String>,
+    trusted: Vec<std::net::IpAddr>,
+    buckets: std::collections::hash_map::RandomState,
+}
+
+/// B74: the rate limiter's keys at most (a choice: a few MB of state; two
+/// clients share a budget with probability 1 / 65,536, not one an attacker
+/// can aim, the hash key being random).
+const RATE_LIMIT_BUCKETS: u32 = 1 << 16;
+
+/// B74: the address a request counts under: the trusted proxy's last
+/// forwarded hop, else the peer; an IPv6 address by its /64.
+fn client_address(
+    peer: std::net::IpAddr,
+    header: Option<&str>,
+    trusted: &[std::net::IpAddr],
+) -> std::net::IpAddr {
+    use std::net::{IpAddr, Ipv6Addr};
+    let client = if trusted.contains(&peer) {
+        header
+            .and_then(|h| h.rsplit(',').next()?.trim().parse().ok())
+            .unwrap_or(peer)
+    } else {
+        peer
+    };
+    match client {
+        IpAddr::V4(_) => client,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let s = v6.segments();
+                IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+            }
+        },
+    }
+}
+
+impl ClientIp {
+    fn from_env() -> Self {
+        let header = std::env::var("AINCORE_RPC_CLIENT_IP_HEADER")
+            .ok()
+            .filter(|h| !h.trim().is_empty());
+        let trusted: Vec<std::net::IpAddr> = std::env::var("AINCORE_RPC_TRUSTED_PROXIES")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|a| a.trim().parse().ok())
+            .collect();
+        if header.is_some() && trusted.is_empty() {
+            eprintln!(
+                "⚠️ AINCORE_RPC_CLIENT_IP_HEADER is ignored: name the proxy that sets it \
+                 in AINCORE_RPC_TRUSTED_PROXIES"
+            );
+        }
+        Self {
+            header,
+            trusted,
+            buckets: Default::default(),
+        }
+    }
+
+    fn address(&self, req: &actix_web::dev::ServiceRequest) -> Option<std::net::IpAddr> {
+        let peer = req.peer_addr()?.ip();
+        let header = self
+            .header
+            .as_deref()
+            .and_then(|name| req.headers().get(name)?.to_str().ok());
+        Some(client_address(peer, header, &self.trusted))
+    }
 }
 
 impl KeyExtractor for ClientIp {
-    type Key = std::net::IpAddr;
+    type Key = u32;
     type KeyExtractionError = SimpleKeyExtractionError<&'static str>;
 
     fn extract(
         &self,
         req: &actix_web::dev::ServiceRequest,
     ) -> Result<Self::Key, Self::KeyExtractionError> {
-        let peer = req
-            .peer_addr()
-            .map(|socket| socket.ip())
+        use std::hash::BuildHasher;
+        let address = self
+            .address(req)
             .ok_or_else(|| SimpleKeyExtractionError::new("no peer address"))?;
-        if !peer.is_loopback() {
-            return Ok(peer);
-        }
-        let forwarded = self.header.as_deref().and_then(|name| {
-            req.headers()
-                .get(name)?
-                .to_str()
-                .ok()?
-                .split(',')
-                .next()?
-                .trim()
-                .parse()
-                .ok()
-        });
-        Ok(forwarded.unwrap_or(peer))
+        Ok((self.buckets.hash_one(address) % u64::from(RATE_LIMIT_BUCKETS)) as u32)
     }
 }
 
@@ -2513,19 +2591,12 @@ pub async fn start_api_server(
 ) -> std::io::Result<()> {
     println!("🌐 Starting REST API server on port {}...", api_port);
 
-    let executor = Arc::clone(
-        &consensus
-            .read()
-            .map_err(|_| std::io::Error::other("consensus lock poisoned"))?
-            .executor,
-    );
     let app_state = web::Data::new(AppState {
         consensus,
         sessions,
         mempool,
         governance,
         storage,
-        executor,
         dry_runs: Arc::default(),
     });
 
@@ -2534,11 +2605,7 @@ pub async fn start_api_server(
     // NOTE: actix-governor 0.4 `per_second(n)` = replenish one cell every n
     // SECONDS, so per_second(100) throttled every IP to ~1 req/100s after a 200
     // burst — a frontend-bricking bug. per_millisecond(10) = true 100 req/s.
-    let client_ip = ClientIp {
-        header: std::env::var("AINCORE_RPC_CLIENT_IP_HEADER")
-            .ok()
-            .filter(|h| !h.trim().is_empty()),
-    };
+    let client_ip = ClientIp::from_env();
     let governor_conf = GovernorConfigBuilder::default()
         .key_extractor(client_ip)
         .per_millisecond(10)
@@ -2659,7 +2726,6 @@ mod tests {
             mempool: Arc::new(Mutex::new(mempool::Mempool::new())),
             governance,
             storage: db,
-            executor,
             dry_runs: Arc::default(),
         }
     }
@@ -2772,7 +2838,9 @@ mod tests {
             tx.to_string()
         };
         let status = |raw: &str| {
-            let (updates, _) = state.executor.execute_transaction(raw).expect("executes");
+            let (updates, _) = executor::Executor::new(Arc::clone(&db))
+                .execute_transaction(raw)
+                .expect("executes");
             let receipt = updates
                 .iter()
                 .find(|(k, _)| k.starts_with("tx_receipt:"))
@@ -2792,6 +2860,21 @@ mod tests {
             "the estimate is the limit's execution part exactly"
         );
         assert_eq!(status(&raw), "success");
+
+        // B84: each estimate runs the code on chain now: once `coin` is gone
+        // the estimate fails (a VM living as long as the node ran its cached
+        // copy).
+        {
+            let _seed = db.seeding();
+            db.delete(&vm_move::state_keys::module_key(
+                &move_core_types::account_address::AccountAddress::ONE,
+                "coin",
+            ))
+            .unwrap();
+        }
+        let err = handle_rpc_method("aincore_estimateGas", serde_json::json!([tx]), &state)
+            .expect_err("coin is no longer on chain");
+        assert_ne!(err.code, -32005, "{}", err.message);
     }
 
     /// B58 witness: a block's hash finds that block, not its child (whose
@@ -2849,6 +2932,30 @@ mod tests {
         assert_eq!(rounds.len(), MAX_DAG_VERTICES);
         assert_eq!(rounds[0], MAX_DAG_VERTICES as u64 + 44, "the newest first");
 
+        // B76: three newer vertices of 3 MiB payload each pass 8 MiB at the
+        // third: two come back, the newest first.
+        {
+            let consensus = state.consensus.read().unwrap();
+            let mut dag = consensus.dag.lock().unwrap();
+            for round in 1000..1003u64 {
+                let v =
+                    blockchain::Vertex::new(round, "a".into(), vec![], vec!["x".repeat(3 << 20)]);
+                dag.insert(format!("{round:064x}"), v);
+            }
+        }
+        let dag = handle_rpc_method("aincore_getDag", serde_json::json!([]), &state).unwrap();
+        let rounds: Vec<u64> = dag
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["round"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            rounds,
+            vec![1002, 1001],
+            "the payload bytes stop the answer"
+        );
+
         let big = "x".repeat(3 << 20);
         let seed = db.seeding();
         for h in 1..=3u64 {
@@ -2866,10 +2973,12 @@ mod tests {
         );
     }
 
-    /// B59 witness: behind a loopback proxy, with the operator's header named,
-    /// each client is counted under its own address; a header from a remote
+    /// B59 witness: behind the operator's proxy, with its header named, each
+    /// client is counted under its own address; a header from any other
     /// peer is ignored (it is the client's to forge), as it is with no header
-    /// named.
+    /// named. B74: a loopback peer the operator did not name is such a peer
+    /// (a socket proxy passes the client's header through); the last hop is
+    /// taken; an IPv6 client counts by its /64; the keys are bounded.
     #[test]
     fn the_rate_limit_counts_each_client_behind_a_proxy() {
         let request = |peer: &str, header: Option<&str>| {
@@ -2879,24 +2988,90 @@ mod tests {
             }
             req.to_srv_request()
         };
+        let proxy: std::net::IpAddr = "127.0.0.1".parse().unwrap();
         let named = ClientIp {
             header: Some("CF-Connecting-IP".into()),
+            trusted: vec![proxy],
+            buckets: Default::default(),
         };
-        let unnamed = ClientIp { header: None };
-        let key = |x: &ClientIp, req| x.extract(&req).unwrap().to_string();
+        let untrusted = ClientIp {
+            trusted: vec![],
+            ..named.clone()
+        };
+        let unnamed = ClientIp {
+            header: None,
+            ..named.clone()
+        };
+        let addr = |x: &ClientIp, req| x.address(&req).unwrap().to_string();
         assert_eq!(
-            key(&named, request("127.0.0.1:5000", Some("203.0.113.7"))),
+            addr(&named, request("127.0.0.1:5000", Some("203.0.113.7"))),
             "203.0.113.7"
         );
-        assert_eq!(key(&named, request("127.0.0.1:5000", None)), "127.0.0.1");
+        assert_eq!(addr(&named, request("127.0.0.1:5000", None)), "127.0.0.1");
         assert_eq!(
-            key(&named, request("198.51.100.9:5000", Some("203.0.113.7"))),
+            addr(&named, request("198.51.100.9:5000", Some("203.0.113.7"))),
             "198.51.100.9"
         );
         assert_eq!(
-            key(&unnamed, request("127.0.0.1:5000", Some("203.0.113.7"))),
+            addr(&unnamed, request("127.0.0.1:5000", Some("203.0.113.7"))),
             "127.0.0.1"
         );
+        // B74: a loopback peer that is not the named proxy is not trusted.
+        assert_eq!(
+            addr(&untrusted, request("127.0.0.1:5000", Some("203.0.113.7"))),
+            "127.0.0.1"
+        );
+        // B74: the hop the proxy appended, not the client's first element.
+        assert_eq!(
+            addr(
+                &named,
+                request("127.0.0.1:5000", Some("1.2.3.4, 203.0.113.7"))
+            ),
+            "203.0.113.7"
+        );
+        // B74: an IPv6 client by its /64, a mapped IPv4 as IPv4.
+        let v6 = |ip: &str| client_address(ip.parse().unwrap(), None, &[]).to_string();
+        assert_eq!(v6("2001:db8:1:2:aaaa::1"), v6("2001:db8:1:2:ffff::9"));
+        assert_ne!(v6("2001:db8:1:2::1"), v6("2001:db8:1:3::1"));
+        assert_eq!(v6("::ffff:203.0.113.7"), "203.0.113.7");
+        // B74: keys fall in RATE_LIMIT_BUCKETS buckets, one per address.
+        let key = |req| named.extract(&req).unwrap();
+        let a = key(request("127.0.0.1:5000", Some("203.0.113.7")));
+        assert_eq!(a, key(request("127.0.0.1:6000", Some("203.0.113.7"))));
+        let keys: std::collections::HashSet<u32> = (0..5_000u32)
+            .map(|i| {
+                let ip = std::net::Ipv4Addr::from(0x0a00_0000 + i).to_string();
+                key(request("127.0.0.1:5000", Some(&ip)))
+            })
+            .collect();
+        assert!(keys.iter().all(|k| *k < RATE_LIMIT_BUCKETS));
+        assert!(
+            keys.len() > 4_500,
+            "distinct clients mostly get distinct keys"
+        );
+    }
+
+    /// B90 witness: `aincore_getPeers` names the sessions, never an address,
+    /// though saved peer addresses exist.
+    #[test]
+    fn get_peers_gives_no_addresses() {
+        let db = temp_db("get_peers");
+        {
+            let _seed = db.seeding();
+            db.save_peer_addr("12D3KooWsaved", "/ip4/192.0.2.1/tcp/9101")
+                .unwrap();
+        }
+        let state = test_state(Arc::clone(&db));
+        state.sessions.write().unwrap().push(network::SessionPeer {
+            peer: "12D3KooWlive".into(),
+            member: Some("ab".repeat(32)),
+        });
+        let peers = handle_rpc_method("aincore_getPeers", serde_json::json!([]), &state).unwrap();
+        assert_eq!(
+            peers,
+            serde_json::json!([{ "peer_id": "12D3KooWlive", "member": true }])
+        );
+        assert!(!peers.to_string().contains("192.0.2.1"));
     }
 
     /// B47 witness: the demonstration crypto methods are gone (the VDF one
@@ -3016,7 +3191,9 @@ mod tests {
         // Control: an unknown hash is not "pending" merely because this tx is queued.
         assert_eq!(receipt(&"00".repeat(32))["status"], "not_found");
 
-        let block = serde_json::json!({ "header": {}, "transactions": [tx] }).to_string();
+        // B73: a block carries the canonical encoding the mempool kept.
+        let kept = executor::admission::canonicalize(&tx).unwrap();
+        let block = serde_json::json!({ "header": {}, "transactions": [kept] }).to_string();
         db.save_block_json(1, &block).unwrap();
         assert_eq!(
             receipt(&hash)["block_height"],
@@ -3688,7 +3865,6 @@ mod tests {
             mempool: Arc::new(Mutex::new(mempool::Mempool::new())),
             governance,
             storage: Arc::clone(&db),
-            executor,
             dry_runs: Arc::default(),
         };
 
@@ -3861,7 +4037,6 @@ mod tests {
             mempool: Arc::new(Mutex::new(mempool::Mempool::new())),
             governance,
             storage: db,
-            executor,
             dry_runs: Arc::default(),
         };
 

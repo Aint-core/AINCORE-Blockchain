@@ -6,10 +6,11 @@
 //! connection closes or the answers are written. Every request is answered
 //! with 9 MiB; a client outside the committee opens eight sync streams and
 //! never reads a response (its codec waits forever), so each answer stays
-//! in the node's write path until the request times out. Seven fit under
-//! the 64 MiB bound; the eighth is refused. Before the bound all eight
-//! (72 MiB) were held, and eight per connection on two connections per host
-//! from many hosts.
+//! in the node's write path until the request times out. Before the bound
+//! all eight (72 MiB) were held, and eight per connection on two
+//! connections per host from many hosts; under the 64 MiB pool seven fit,
+//! and (B75) one network group holds at most `OPEN_HELD_PER_GROUP_BYTES`,
+//! so two fit and six are refused.
 //!
 //! B34: free identities on one host share one sync budget.
 
@@ -19,7 +20,7 @@ use libp2p::{
     core::upgrade, noise, request_response, swarm::SwarmEvent, tcp, yamux, Multiaddr,
     StreamProtocol, Swarm, Transport,
 };
-use node::sessions::{self, OPEN_HELD_MAX_BYTES};
+use node::sessions::{self, OPEN_HELD_PER_GROUP_BYTES};
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -147,8 +148,9 @@ async fn drive_until<C: SyncCodec>(
 async fn answers_a_non_reader_holds_are_bounded_and_freed_on_close() {
     const ANSWER: usize = 9 << 20;
     const REQUESTS: usize = 8;
-    // Seven answers fit under the bound; the eighth does not.
-    const FIT: usize = OPEN_HELD_MAX_BYTES / ANSWER;
+    // B75: one client is one network group, so two answers fit under its
+    // share (20 MiB) of the pool; the rest do not.
+    const FIT: usize = OPEN_HELD_PER_GROUP_BYTES / ANSWER;
     const _: () = assert!(FIT < REQUESTS);
     let node_under_test = start_node("held", ANSWER).await;
     let (target, held, answered) = (

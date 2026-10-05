@@ -131,6 +131,12 @@ fn parse_validator_public_key(
             public_key.len()
         )));
     }
+    // B86: a small-order key "signs" every message for anyone.
+    if !crypto::ed25519_key_is_usable(&public_key) {
+        return Err(GenesisError::InvalidData(format!(
+            "genesis validator {validator_addr} has a small-order (weak) Ed25519 key"
+        )));
+    }
     let derived = crypto::derive_address(&public_key).map_err(|err| {
         GenesisError::InvalidData(format!(
             "Failed to derive genesis validator address: {}",
@@ -484,7 +490,7 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
         executed: bool,
         action_type: u8,
         action_value: u64,
-        voters: Vec<AccountAddress>,
+        voting_ends: u64,
     }
     #[derive(serde::Deserialize)]
     struct GovernanceState {
@@ -1479,6 +1485,14 @@ pub fn build_genesis(
         .ok_or_else(|| {
             GenesisError::InvalidData("genesis stake and accounts overflow u128".to_string())
         })?;
+    // B91: genesis mints at most the cap the emission and the supply
+    // tripwire enforce afterwards.
+    if initial_total_supply > executor::MAX_SUPPLY {
+        return Err(GenesisError::InvalidData(format!(
+            "genesis stake and accounts total {initial_total_supply}, above MAX_SUPPLY {}",
+            executor::MAX_SUPPLY
+        )));
+    }
     let validator_set = ValidatorSet {
         validators: validator_configs,
         unbonding_queue: vec![],
@@ -1594,7 +1608,7 @@ pub fn build_genesis(
         executed: bool,
         action_type: u8,
         action_value: u64,
-        voters: Vec<move_core_types::account_address::AccountAddress>,
+        voting_ends: u64,
     }
 
     #[derive(serde::Serialize)]
@@ -2475,6 +2489,18 @@ mod tests {
         let mut f = file.clone();
         f.accounts[0].address = f.validators[0].address.clone();
         assert!(refused(&f).contains("is a validator"), "{}", refused(&f));
+        // B91: a genesis above the 150 M cap is refused; at the cap it builds.
+        let mut f = file.clone();
+        f.accounts[0].balance = (executor::MAX_SUPPLY + 1).to_string();
+        assert!(refused(&f).contains("above MAX_SUPPLY"), "{}", refused(&f));
+        f.accounts[0].balance = executor::MAX_SUPPLY.to_string();
+        build_genesis(&f, &stdlib()).unwrap();
+        // B86: a small-order Ed25519 key (the identity point) is refused.
+        let mut f = file.clone();
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        f.validators[0].public_key = hex::encode(identity);
+        assert!(refused(&f).contains("small-order"), "{}", refused(&f));
         // BW-11: a declared party counts as one: two seats of 25 % are 50 %.
         let mut f = file.clone();
         for w in f.bootstrap.as_mut().unwrap().weights.iter_mut().take(2) {
@@ -3268,6 +3294,54 @@ mod tests {
             trader_ain_before - gas,
             "the trader loses gas and nothing else"
         );
+
+        // B85: a swap's Move execution costs the same however many pools the
+        // registry holds (255 more, written in, ahead of the real one): it no
+        // longer scans the registry, which anyone could grow. (The charge is
+        // the whole limit, so the VM's gas is what is compared.)
+        let gas_of = || {
+            executor
+                .estimate_gas(&signed_tx(&trader_key, &trader, &swap, 2, 100_000, 1))
+                .expect("estimated")
+                .vm_gas
+        };
+        let alone = gas_of();
+        assert!(alone > 0, "vacuous: no VM gas measured");
+        #[derive(serde::Serialize)]
+        struct FakePool {
+            pool_key: Vec<u8>,
+            pool_addr: AccountAddress,
+            token_x_name: Vec<u8>,
+            token_y_name: Vec<u8>,
+            fee_bp: u64,
+            creator: AccountAddress,
+            active: bool,
+        }
+        let key = system_resource_key("0x1::dex::PoolRegistry");
+        let held = hex::decode(db.get(&key).unwrap().unwrap()).unwrap();
+        assert_eq!(held[0], 1, "one pool registered");
+        let mut crowded = vec![0x80, 0x02]; // ULEB128 256
+        for i in 0..255u8 {
+            let name = format!("0x{i:02x}::fake::Coin").into_bytes();
+            crowded.extend(
+                bcs::to_bytes(&FakePool {
+                    pool_key: [name.clone(), b"::".to_vec(), name.clone()].concat(),
+                    pool_addr: AccountAddress::new([i; 32]),
+                    token_x_name: name.clone(),
+                    token_y_name: name,
+                    fee_bp: 30,
+                    creator: AccountAddress::new([i; 32]),
+                    active: true,
+                })
+                .unwrap(),
+            );
+        }
+        crowded.extend_from_slice(&held[1..]);
+        {
+            let _seed = db.seeding();
+            db.put(&key, &hex::encode(crowded)).unwrap();
+        }
+        assert_eq!(gas_of(), alone, "the swap's gas grew with the registry");
     }
 
     // ===== SEC-#30: genesis-hash pin =====

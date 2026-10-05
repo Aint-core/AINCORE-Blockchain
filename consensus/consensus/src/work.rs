@@ -30,3 +30,15 @@ pub fn failed_in<T>(f: impl FnOnce() -> T) -> (T, u64) {
     let out = f();
     (out, failed_checks().saturating_sub(before))
 }
+
+/// B68: run `f` without charging what fails in it to the message being
+/// handled. A buffered vertex or certificate re-evaluated because this
+/// message woke it (a certificate it waited on, an epoch activating) was
+/// delivered by someone else: its failures must not mute this sender, or a
+/// Byzantine member frames honest ones with junk it buffered earlier.
+pub fn uncounted<T>(f: impl FnOnce() -> T) -> T {
+    let before = failed_checks();
+    let out = f();
+    FAILED.with(|count| count.set(before));
+    out
+}

@@ -382,7 +382,8 @@ export class Connection {
     /**
      * Get connected peers list
      */
-    async getPeers(): Promise<Array<{ peer_id: string; multiaddr: string }>> {
+    /** The node's sessions: PeerId and whether a committee key names it (B90: no addresses). */
+    async getPeers(): Promise<Array<{ peer_id: string; member: boolean }>> {
         return await this.request('aincore_getPeers', []);
     }
 

@@ -374,3 +374,166 @@ fn the_charges_own_writes_are_priced_before_anything_runs() {
     run(&db, &executor, &tx).expect("charged");
     assert_eq!(receipt_status(&db, &tx), "aborted");
 }
+
+/// B69: a module at 0xd0d named `name` that pulls in `dep` (if any) and
+/// carries `padding` bytes of extra identifiers. Parsed, never verified: the
+/// dependency charge reads only the module's handles.
+fn chained_module(name: &str, dep: Option<&str>, padding: usize) -> Vec<u8> {
+    use move_binary_format::file_format::{
+        empty_module, AddressIdentifierIndex, IdentifierIndex, ModuleHandle,
+    };
+    let mut m = empty_module();
+    m.address_identifiers = vec![AccountAddress::from_hex_literal("0xd0d").unwrap()];
+    m.identifiers = vec![Identifier::new(name).unwrap()];
+    if let Some(dep) = dep {
+        m.identifiers.push(Identifier::new(dep).unwrap());
+        m.module_handles.push(ModuleHandle {
+            address: AddressIdentifierIndex(0),
+            name: IdentifierIndex(1),
+        });
+    }
+    let mut left = padding;
+    let mut i = 0;
+    while left > 0 {
+        let len = left.min(4_000);
+        m.identifiers
+            .push(Identifier::new(format!("p{i}{}", "x".repeat(len))).unwrap());
+        left -= len;
+        i += 1;
+    }
+    let mut bytes = vec![];
+    m.serialize(&mut bytes).unwrap();
+    bytes
+}
+
+/// Seeds `count` chained modules m0 <- m1 <- ... and returns the call of the
+/// last one's `run`.
+fn seed_chain(db: &StateDB, sender: &str, count: usize, padding: usize) -> String {
+    let _seed = db.seeding();
+    for i in 0..count {
+        let name = format!("m{i}");
+        let dep = (i > 0).then(|| format!("m{}", i - 1));
+        let bytes = chained_module(&name, dep.as_deref(), padding);
+        let key = vm_move::state_keys::module_key(
+            &AccountAddress::from_hex_literal("0xd0d").unwrap(),
+            &name,
+        );
+        db.put(&key, &hex::encode(bytes)).unwrap();
+    }
+    let call = EntryFunctionCall {
+        module: ModuleId::new(
+            AccountAddress::from_hex_literal("0xd0d").unwrap(),
+            Identifier::new(format!("m{}", count - 1)).unwrap(),
+        ),
+        function: "run".to_string(),
+        ty_args: vec![],
+        args: vec![bcs::to_bytes(&parse_move_address(sender).unwrap()).unwrap()],
+    };
+    hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap())
+}
+
+/// B69 witness: a call pays for the modules it loads (each module and its
+/// bytes, over the whole closure), before the VM runs: the closure of the
+/// blob module is itself and `signer` (its `vector` calls compile to vector
+/// instructions, so it does not depend on `vector`: 389 + 130 bytes on
+/// disk), and a limit that covers everything but that is charged and
+/// aborts.
+#[test]
+fn a_call_pays_for_the_modules_it_loads() {
+    let (db, key, sender) = blob_chain("b69_closure", 66);
+    let executor = Executor::new(db.clone());
+    let size = |module: &str, address: &str| {
+        let key = vm_move::state_keys::module_key(
+            &AccountAddress::from_hex_literal(address).unwrap(),
+            module,
+        );
+        (db.get(&key).unwrap().unwrap().len() / 2) as u64
+    };
+    let blob = ModuleId::new(blob_address(), Identifier::new("blob").unwrap());
+    let closure = executor.modules.closure(&db, [blob]).unwrap();
+    assert_eq!(
+        closure,
+        deps::Closure {
+            modules: 2,
+            bytes: size("blob", "0xcafe") + size("signer", "0x1"),
+        }
+    );
+    assert_eq!(
+        closure.bytes,
+        389 + 130,
+        "the fixture's and signer.mv's sizes"
+    );
+    assert_eq!(
+        closure.gas(),
+        2 * deps::GAS_PER_DEPENDENCY + closure.bytes.div_ceil(deps::DEPENDENCY_BYTES_PER_GAS)
+    );
+    let store = blob_call("store", Some(&sender), Some(100));
+    let estimate = executor
+        .estimate_gas(&signed_tx(&key, &sender, &store, 0, 0, 1))
+        .unwrap();
+    assert!(
+        estimate.vm_gas > closure.gas(),
+        "the estimate counts the closure"
+    );
+    let short = estimate.execution_gas() - closure.gas();
+    let tx = signed_tx(&key, &sender, &store, 0, short, 1);
+    run(&db, &executor, &tx).expect("charged");
+    assert_eq!(
+        receipt_status(&db, &tx),
+        "aborted",
+        "the modules' load was not paid"
+    );
+    let tx = signed_tx(&key, &sender, &store, 1, estimate.execution_gas(), 1);
+    run(&db, &executor, &tx).expect("executes");
+    assert_eq!(receipt_status(&db, &tx), "success");
+}
+
+/// B69 witness: a call whose closure is past Aptos's limits (768 modules,
+/// 1.8 MB) is charged and aborted before the VM loads any of it.
+#[test]
+fn a_closure_past_the_limits_is_refused_before_the_vm() {
+    let (db, key, sender) = blob_chain("b69_limits", 67);
+    let executor = Executor::new(db.clone());
+    let reason = |db: &StateDB, raw: &str| {
+        let receipt = db
+            .get(&format!("tx_receipt:{}", tx_hash_hex(raw)))
+            .unwrap()
+            .expect("receipt");
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["status"], "aborted");
+        receipt["error"].as_str().unwrap_or_default().to_string()
+    };
+    let deep = seed_chain(&db, &sender, deps::MAX_DEPENDENCIES as usize + 1, 0);
+    let tx = signed_tx(&key, &sender, &deep, 0, 5_000_000, 1);
+    run(&db, &executor, &tx).expect("charged");
+    assert!(
+        reason(&db, &tx).contains("dependency limits"),
+        "{}",
+        reason(&db, &tx)
+    );
+
+    let (db, key, sender) = blob_chain("b69_bytes", 68);
+    let executor = Executor::new(db.clone());
+    let heavy = seed_chain(&db, &sender, 10, 200_000);
+    let tx = signed_tx(&key, &sender, &heavy, 0, 5_000_000, 1);
+    run(&db, &executor, &tx).expect("charged");
+    assert!(
+        reason(&db, &tx).contains("dependency limits"),
+        "{}",
+        reason(&db, &tx)
+    );
+
+    let (db, key, sender) = blob_chain("b69_within", 69);
+    let executor = Executor::new(db.clone());
+    let fine = seed_chain(&db, &sender, 9, 200_000);
+    // Within the limits, the closure (~1.8 MB) is paid before the VM loads
+    // it: a limit under its cost is charged and aborts on the charge.
+    let tx = signed_tx(&key, &sender, &fine, 0, 100_000, 1);
+    run(&db, &executor, &tx).expect("charged");
+    let why = reason(&db, &tx);
+    assert!(
+        !why.contains("dependency limits"),
+        "control: 1.8 MB fits: {why}"
+    );
+    assert!(why.contains("loading its modules costs"), "{why}");
+}

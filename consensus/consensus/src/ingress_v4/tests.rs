@@ -361,6 +361,21 @@ fn layer_s_refuses_what_every_node_refuses() {
     v.aggregated_signature = Some("00".into());
     seal(&mut v, &all[0]);
     assert!(refused(&v), "an aggregate signature");
+    // B73: a valid transaction in another encoding: its keys in another
+    // order, the same length, so it passes every other check (its byte gas
+    // included) and only the canonical rule refuses it.
+    let tx = crate::test_txs::tx(CHAIN, 1, 0);
+    let reordered = serde_json::from_str::<serde_json::Value>(&tx)
+        .unwrap()
+        .to_string();
+    assert_ne!(reordered, tx);
+    assert_eq!(reordered.len(), tx.len());
+    executor::admission::check_stateless(&reordered, CHAIN)
+        .expect("control: the same transaction, valid in itself");
+    let mut v = ok.clone();
+    v.payload = vec![reordered];
+    seal(&mut v, &all[0]);
+    assert!(refused(&v), "a transaction in another encoding");
     // Refs that pass every other rule: three members' claims make a quorum,
     // the rest are distinct non-members, so only the parent count refuses.
     let claims = |round: u64, n: usize| -> (Vec<String>, Vec<ParentRef>) {

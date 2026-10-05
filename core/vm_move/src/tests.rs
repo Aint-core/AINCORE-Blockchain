@@ -128,4 +128,25 @@ mod tests {
         assert_eq!(one, AccountAddress::ONE);
         assert_eq!(one.to_vec().len(), 32);
     }
+
+    /// B69: the VM runs with a bounded dependency depth and Aptos's
+    /// production module limits, not move's unbounded defaults.
+    #[test]
+    fn the_vm_runs_with_the_production_verifier_limits() {
+        let config = crate::AINCOREVM::vm_config().verifier;
+        assert_eq!(config.max_dependency_depth, Some(100));
+        assert_eq!(config.max_loop_depth, Some(5));
+        assert_eq!(config.max_generic_instantiation_length, Some(32));
+        assert_eq!(config.max_function_parameters, Some(128));
+        assert_eq!(config.max_basic_blocks, Some(1024));
+        assert_eq!(config.max_type_nodes, Some(256));
+        assert_eq!(config.max_push_size, Some(10_000));
+        assert_eq!(config.max_struct_definitions, Some(200));
+        assert_eq!(config.max_fields_in_struct, Some(64));
+        assert_eq!(config.max_function_definitions, Some(1000));
+        assert!(
+            config.max_per_mod_meter_units.is_some(),
+            "verification is metered"
+        );
+    }
 }

@@ -158,8 +158,13 @@ fn payload_admissible(v: &Vertex, chain_id: &str) -> Result<(), String> {
                 }
             }
             None => {
-                executor::admission::check_stateless(item, chain_id)
+                let checked = executor::admission::check_stateless(item, chain_id)
                     .map_err(|e| format!("payload item {i} is not a valid transaction: {e}"))?;
+                // B73: in its one encoding, so no relay changed its bytes
+                // (its id, its byte gas).
+                if executor::admission::canonical_json(&checked.tx) != *item {
+                    return Err(format!("payload item {i} is not in canonical form"));
+                }
             }
         }
     }

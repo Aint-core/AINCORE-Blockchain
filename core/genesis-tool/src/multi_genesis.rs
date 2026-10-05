@@ -24,7 +24,7 @@
 //! fields generated here match what each node derives from its own node.key.
 
 use clap::Args;
-use ed25519_dalek::{Signer, SigningKey, Verifier};
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -103,11 +103,18 @@ pub fn check_entry(e: &PublicEntry) -> Result<(), String> {
     }
     let key = ed25519_dalek::VerifyingKey::from_bytes(&pk)
         .map_err(|err| format!("{}: public_key: {err}", e.address))?;
+    // B86: a small-order key "signs" every message for anyone.
+    if key.is_weak() {
+        return Err(format!(
+            "{}: public_key is a small-order (weak) key",
+            e.address
+        ));
+    }
     let sig: [u8; 64] = hex::decode(&e.entry_sig)
         .ok()
         .and_then(|b| b.try_into().ok())
         .ok_or_else(|| format!("{}: entry_sig is not 64 bytes of hex", e.address))?;
-    key.verify(
+    key.verify_strict(
         &entry_message(&e.address, &e.bls_public_key),
         &ed25519_dalek::Signature::from_bytes(&sig),
     )

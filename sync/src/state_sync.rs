@@ -990,8 +990,18 @@ fn bootstrap_record(
     let h = block.header.height.to_string();
     let block_json = serde_json::to_string(block).map_err(|e| e.to_string())?;
     let qc_json = serde_json::to_string(qc).map_err(|e| e.to_string())?;
+    // B82: a restored node only adopts (SN-6, checked again here); its
+    // ordering cursors are written, not left to derivation: nothing at or
+    // below the restored anchor is ordered again (the GC floor), and the
+    // next anchor is scanned above the finalized round.
+    if let Some(me) = plan.local_signer {
+        if recorded_validator(storage, me) {
+            return Err(sn6_refusal(me));
+        }
+    }
     let anchor_round = qc.anchor_round.to_string();
     let finalized_round = qc.finalized_round.to_string();
+    let next_anchor_round = qc.finalized_round.saturating_add(1).to_string();
     let checkpoint = plan.checkpoint.to_string();
     let mut rows: Vec<(String, &str)> = vec![
         ("jmt:floor".into(), &h),
@@ -1004,6 +1014,8 @@ fn bootstrap_record(
         ("consensus:last_anchor_round".into(), &anchor_round),
         ("consensus:last_anchor_hash".into(), &qc.anchor_hash),
         ("consensus:finalized_round".into(), &finalized_round),
+        ("consensus:gc_floor".into(), &anchor_round),
+        ("consensus:next_anchor_round".into(), &next_anchor_round),
         (format!("consensus:qc:{h}"), &qc_json),
         (format!("consensus:qc_by_round:{anchor_round}"), &qc_json),
         ("consensus:qc:latest".into(), &qc_json),

@@ -55,6 +55,7 @@ pub use admission::MIN_GAS_PRICE;
 use admission::OBJECT_LOAD_GAS;
 
 pub mod admission;
+pub mod deps;
 pub mod state_gas;
 use state_gas::GasEstimate;
 
@@ -1709,6 +1710,8 @@ fn executed_in_order(all: &[String], executed: &[String]) -> Vec<String> {
 pub struct Executor {
     db: Arc<StateDB>,
     vm: AINCOREVM,
+    /// B69: parsed modules, for the dependency charge.
+    modules: deps::ModuleIndex,
     #[cfg(test)]
     block_boundary_hook: Option<fn(u8, &StateDB)>,
 }
@@ -1727,6 +1730,7 @@ impl Executor {
         Self {
             db,
             vm,
+            modules: deps::ModuleIndex::default(),
             #[cfg(test)]
             block_boundary_hook: None,
         }
@@ -3130,7 +3134,7 @@ impl Executor {
         let arg_miner = bcs::to_bytes(&miner_account).map_err(|e| e.to_string())?;
         let arg_amount = bcs::to_bytes(&amount).map_err(|e| e.to_string())?;
 
-        let (_gas_used, vm_changes, _) = self
+        let (_gas_used, vm_changes, status) = self
             .vm
             .execute_public_entry_function(
                 vec![],
@@ -3142,6 +3146,13 @@ impl Executor {
                 system_address(), // auth_signer: deposit_fee_reward asserts @0x1
             )
             .map_err(|e| e.to_string())?;
+        // B83: an abort comes back as Ok with no writes; it is a failure, so
+        // the caller queues the share for the sweep instead of losing it.
+        if !status.success {
+            return Err(status
+                .error
+                .unwrap_or_else(|| "deposit_fee_reward aborted".to_string()));
+        }
 
         for (k, v) in vm_changes {
             match v {
@@ -3479,7 +3490,7 @@ impl Executor {
             match serde_json::from_str::<Transaction>(raw) {
                 Ok(tx) => {
                     // Per-TX limit (existing)
-                    if tx.input_objects.len() > 128 {
+                    if tx.input_objects.len() > admission::MAX_INPUT_OBJECTS {
                         println!("⛔ Transaction REJECTED: Too many input objects (>128)");
                         continue;
                     }
@@ -5339,6 +5350,22 @@ impl Executor {
                 // fix it itself (registering costs gas, and gas is only taken from
                 // an existing CoinStore). Pre-stage the empty store so the deposit
                 // lands. See auto_register_writes.
+                // B69: the modules this call loads are paid for before the
+                // VM loads them: the called module and those naming its
+                // type arguments, with their dependencies and friends.
+                let mut roots = vec![call.module.clone()];
+                for tag in &call.ty_args {
+                    deps::type_modules(tag, &mut roots);
+                }
+                let dependency_gas = match self.modules.closure(&self.db, roots) {
+                    Ok(closure) => closure.gas(),
+                    Err(e) => return charged_abort(e),
+                };
+                let Some(vm_budget) = vm_limit.checked_sub(dependency_gas) else {
+                    return charged_abort(format!(
+                        "loading its modules costs {dependency_gas} gas, the limit leaves {vm_limit}"
+                    ));
+                };
                 let prestaged = self.auto_register_writes(&call);
                 let mut actions = pre_actions.clone();
                 // SECURITY (FIX #1): the user's entry call may only act as the
@@ -5353,11 +5380,11 @@ impl Executor {
                 match self.vm.execute_transaction_actions_with_prestaged(
                     actions,
                     sender_addr,
-                    vm_limit,
+                    vm_budget,
                     prestaged,
                 ) {
                     Ok((gas_used, vm_changes, status)) => {
-                        vm_gas_used = gas_used;
+                        vm_gas_used = gas_used.saturating_add(dependency_gas);
                         if absorb_vm_result!(vm_changes, status) {
                             println!("✅ Move EntryFunction executed by {}", tx.sender);
                             // B1: keep sys:validator_set:v1 live on runtime join.
@@ -5433,6 +5460,19 @@ impl Executor {
                         modules.len()
                     ));
                 }
+                // B69: the modules the bundle pulls in from the chain are
+                // paid for before the VM loads them.
+                let dependency_gas = match deps::bundle_roots(&modules)
+                    .and_then(|roots| self.modules.closure(&self.db, roots))
+                {
+                    Ok(closure) => closure.gas(),
+                    Err(e) => return charged_abort(e),
+                };
+                let Some(vm_budget) = vm_limit.checked_sub(dependency_gas) else {
+                    return charged_abort(format!(
+                        "loading its modules costs {dependency_gas} gas, the limit leaves {vm_limit}"
+                    ));
+                };
                 let mut actions = pre_actions.clone();
                 // 3-tuple arity (FIX #1). PublishModule ignores auth_signer
                 // (it uses the fn `sender` param for the 0x1 reservation check),
@@ -5444,10 +5484,10 @@ impl Executor {
                 ));
                 match self
                     .vm
-                    .execute_transaction_actions(actions, sender_addr, vm_limit)
+                    .execute_transaction_actions(actions, sender_addr, vm_budget)
                 {
                     Ok((gas_used, vm_changes, status)) => {
-                        vm_gas_used = gas_used;
+                        vm_gas_used = gas_used.saturating_add(dependency_gas);
                         if absorb_vm_result!(vm_changes, status) {
                             println!("✅ Move module published by {}", tx.sender);
                         } else {
@@ -5793,7 +5833,7 @@ mod tests {
         executed: bool,
         action_type: u8,
         action_value: u64,
-        voters: Vec<move_core_types::account_address::AccountAddress>,
+        voting_ends: u64,
     }
 
     #[derive(Serialize, Deserialize)]
@@ -5803,9 +5843,14 @@ mod tests {
     }
 
     #[derive(Serialize, Deserialize)]
-    struct TestVoteEscrow {
-        locked_coins: TestCoin,
+    struct TestLock {
         proposal_id: u64,
+        coins: TestCoin,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct TestVoteEscrow {
+        locks: Vec<TestLock>,
     }
 
     #[derive(Serialize, Deserialize)]
@@ -11912,18 +11957,16 @@ mod tests {
             hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap())
         };
         // The client sends its key in upper case; the preimage does not cover
-        // it, so the signature still verifies. The stored account must not
-        // depend on the spelling (KV-2).
-        let mut tx: serde_json::Value = serde_json::from_str(&estimated_tx(
-            &Executor::new(db.clone()),
-            &key,
-            &address,
-            &payload,
-            0,
-        ))
-        .unwrap();
-        tx["public_key"] = serde_json::json!(public_key.to_ascii_uppercase());
-        let tx = tx.to_string();
+        // it, so the signature still verifies. KV-2: the stored account must
+        // not depend on the spelling. B73: so only one spelling is taken at
+        // all: the upper-case one is refused before execution.
+        let lower = estimated_tx(&Executor::new(db.clone()), &key, &address, &payload, 0);
+        let mut upper: serde_json::Value = serde_json::from_str(&lower).unwrap();
+        upper["public_key"] = serde_json::json!(public_key.to_ascii_uppercase());
+        let refused =
+            admission::check_stateless(&upper.to_string(), &expected_chain_id()).unwrap_err();
+        assert!(refused.contains("lowercase hex"), "{refused}");
+        let tx = lower;
         let Ok(BlockExecOutcome::Executed(summary)) = Executor::new(db.clone())
             .execute_block_checked_at(vec![tx], &address, 1, block_time(1), 0, &[], &[], |_, _| {
                 Ok(())
@@ -12164,9 +12207,10 @@ mod tests {
             tx.input_objects = objects.iter().map(|o| o.to_string()).collect();
             sign_covering(&keys[i], tx, 100_000)
         };
-        let a = with_objects(0, 0, &["o1"]);
-        let b = with_objects(1, 1, &["o1", "o2"]);
-        let c = with_objects(2, 2, &["o2"]);
+        // B73: object ids are lowercase hex.
+        let a = with_objects(0, 0, &["a1"]);
+        let b = with_objects(1, 1, &["a1", "a2"]);
+        let c = with_objects(2, 2, &["a2"]);
         let run = |db: &Arc<StateDB>, txs: Vec<String>| {
             let Ok(BlockExecOutcome::Executed(summary)) = Executor::new(db.clone())
                 .execute_block_checked_at(txs, &addrs[0], 1, block_time(1), 0, &[], &[], |_, _| {
@@ -13203,6 +13247,29 @@ mod tests {
         assert_eq!(paid, gas, "only gas was paid");
     }
 
+    /// The chain's consensus clock at `time` seconds.
+    fn set_chain_time(db: &StateDB, time: u64) {
+        let _seed = db.seeding();
+        db.put(
+            &vm_move::state_keys::resource_key_str(&system_address(), "0x1::chain::Clock"),
+            &hex::encode(
+                bcs::to_bytes(&ChainClock {
+                    height: 0,
+                    time,
+                    block_timestamp: time,
+                })
+                .unwrap(),
+            ),
+        )
+        .expect("clock stored");
+    }
+
+    /// B71 witness: a vote locks only the amount the voter chooses, one lock
+    /// per proposal (a second vote on it is refused); the coins stay locked
+    /// while voting is open and come back once it ends, whatever the outcome:
+    /// here the proposal fails its quorum and is never resolved. The supply
+    /// trackers do not move. The old escrow took the whole balance and gave
+    /// it back only after a proposal executed.
     #[test]
     fn test_governance_vote_escrow_locks_real_coin_without_supply_drift() {
         let db = temp_db("governance_vote_escrow");
@@ -13217,6 +13284,7 @@ mod tests {
         set_validator_set(&db, &voter, 0, balance);
         db.put("sys:total_supply", &balance.to_string()).unwrap();
         db.put("total_burned", "0").unwrap();
+        let voting_ends = 604_800;
         set_governance_state(
             &db,
             &TestGovernanceState {
@@ -13227,77 +13295,86 @@ mod tests {
                     votes_for: 0,
                     votes_against: 0,
                     executed: false,
-                    action_type: 1,
-                    action_value: 60,
-                    voters: vec![],
+                    action_type: 0,
+                    action_value: 0,
+                    voting_ends,
                 }],
                 next_proposal_id: 1,
             },
         );
-
-        let vote_call = vm_move::EntryFunctionCall {
-            module: move_core_types::language_storage::ModuleId::new(
-                system_address(),
-                move_core_types::identifier::Identifier::new("governance").unwrap(),
-            ),
-            function: "vote".to_string(),
-            ty_args: vec![],
-            args: vec![
-                bcs::to_bytes(&parse_move_address(&voter).unwrap()).unwrap(),
-                bcs::to_bytes(&0u64).unwrap(),
-                bcs::to_bytes(&true).unwrap(),
-            ],
+        let call = |function: &str, args: Vec<Vec<u8>>| {
+            let call = vm_move::EntryFunctionCall {
+                module: move_core_types::language_storage::ModuleId::new(
+                    system_address(),
+                    move_core_types::identifier::Identifier::new("governance").unwrap(),
+                ),
+                function: function.to_string(),
+                ty_args: vec![],
+                args,
+            };
+            hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap())
         };
-        let payload = hex::encode(
-            bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(vote_call)).unwrap(),
+        let me = bcs::to_bytes(&parse_move_address(&voter).unwrap()).unwrap();
+        let weight = 250_000_000_000_000_000_000u128;
+        let vote = call(
+            "vote",
+            vec![
+                me.clone(),
+                bcs::to_bytes(&0u64).unwrap(),
+                bcs::to_bytes(&false).unwrap(),
+                bcs::to_bytes(&weight).unwrap(),
+            ],
         );
         let executor = Executor::new(db.clone());
-        let tx_inline_12 = estimated_tx(&executor, &voter_key, &voter, &payload, 0);
-        let (updates, _) = executor
-            .execute_transaction(&tx_inline_12)
-            .expect("vote accepted");
-        apply_updates(&db, updates);
-
-        let vote_gas = gas_of(&tx_inline_12) as u128;
-        let vote_gas_reserve = 1_000_000_000_000_000_000u128;
-        let locked = balance - vote_gas - vote_gas_reserve;
-
-        assert_eq!(coin_balance(&db, &voter), vote_gas_reserve);
-        assert_eq!(vote_escrow(&db, &voter).locked_coins.value, locked);
-        assert_eq!(
-            db.get("sys:total_supply").unwrap().unwrap(),
-            balance.to_string()
-        );
-        assert_eq!(db.get("total_burned").unwrap().unwrap(), "0");
-        assert_eq!(validator_set(&db).total_supply, balance);
-
-        let mut state = governance_state(&db);
-        state.proposals[0].executed = true;
-        set_governance_state(&db, &state);
-
-        let claim_call = vm_move::EntryFunctionCall {
-            module: move_core_types::language_storage::ModuleId::new(
-                system_address(),
-                move_core_types::identifier::Identifier::new("governance").unwrap(),
-            ),
-            function: "claim_vote_tokens".to_string(),
-            ty_args: vec![],
-            args: vec![bcs::to_bytes(&parse_move_address(&voter).unwrap()).unwrap()],
+        let paid = std::cell::Cell::new(0u128);
+        let seq = std::cell::Cell::new(0u64);
+        let send = |payload: &str| {
+            let tx = estimated_tx(&executor, &voter_key, &voter, payload, seq.get());
+            let (updates, _) = executor.execute_transaction(&tx).expect("accepted");
+            apply_updates(&db, updates);
+            paid.set(paid.get() + gas_of(&tx) as u128);
+            seq.set(seq.get() + 1);
+            let receipt = db
+                .get(&format!("tx_receipt:{}", tx_hash_hex(&tx)))
+                .unwrap()
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&receipt).unwrap()["status"]
+                .as_str()
+                .unwrap()
+                .to_string()
         };
-        let payload = hex::encode(
-            bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(claim_call)).unwrap(),
-        );
-        let tx_inline_13 = estimated_tx(&executor, &voter_key, &voter, &payload, 1);
-        let (updates, _) = executor
-            .execute_transaction(&tx_inline_13)
-            .expect("claim accepted");
-        apply_updates(&db, updates);
-
+        assert_eq!(send(&vote), "success");
+        assert_eq!(vote_escrow(&db, &voter).locks.len(), 1);
+        assert_eq!(vote_escrow(&db, &voter).locks[0].coins.value, weight);
         assert_eq!(
             coin_balance(&db, &voter),
-            balance - vote_gas - gas_of(&tx_inline_13) as u128
+            balance - weight - paid.get(),
+            "only the chosen amount"
         );
+        assert_eq!(governance_state(&db).proposals[0].votes_against, weight);
+        assert_eq!(send(&vote), "aborted", "a second vote on one proposal");
+
+        let claim = call("claim_vote_tokens", vec![me.clone()]);
+        assert_eq!(send(&claim), "success");
+        assert_eq!(
+            vote_escrow(&db, &voter).locks.len(),
+            1,
+            "still locked while voting is open"
+        );
+
+        set_chain_time(&db, voting_ends);
+        let resolve = call(
+            "execute_proposal",
+            vec![me.clone(), bcs::to_bytes(&0u64).unwrap()],
+        );
+        assert_eq!(send(&resolve), "aborted", "it failed its quorum");
+        assert_eq!(send(&claim), "success");
         assert!(db.get(&vote_escrow_key(&voter)).unwrap().is_none());
+        assert_eq!(
+            coin_balance(&db, &voter),
+            balance - paid.get(),
+            "every coin came back"
+        );
         assert_eq!(
             db.get("sys:total_supply").unwrap().unwrap(),
             balance.to_string()
@@ -13340,6 +13417,27 @@ mod tests {
 
         assert!(db.scan_prefix("sys:fee_sweep_queue:").is_empty());
         assert_eq!(coin_balance(&db, &miner), amount);
+    }
+
+    /// B83 witness: a fee deposit that Move aborts (the recipient has no coin
+    /// store) is an error, so the caller queues the share for the sweep; it
+    /// used to report success with nothing written and the share was lost.
+    #[test]
+    fn an_aborted_fee_deposit_is_an_error() {
+        let db = temp_db("b83_abort");
+        load_stdlib(&db);
+        let miner = create_account(&db, &SigningKey::from_bytes(&[27u8; 32]));
+        let executor = Executor::new(db.clone());
+        let _seed = db.seeding();
+        assert!(
+            executor.deposit_fee_reward(&miner, 1_000).is_err(),
+            "an aborted deposit reported success"
+        );
+        set_coin_store(&db, &miner, 0);
+        executor
+            .deposit_fee_reward(&miner, 1_000)
+            .expect("a store takes the deposit");
+        assert_eq!(coin_balance(&db, &miner), 1_000);
     }
 
     /// G5 SL-5 (acceptance): verified evidence takes the offender out of the

@@ -25,7 +25,8 @@ fn signed_tx(seed: u8, seq: u64) -> String {
     let parsed: executor::Transaction = serde_json::from_value(tx.clone()).unwrap();
     let message = executor::admission::signing_message(&parsed);
     tx["signature"] = serde_json::json!(hex::encode(key.sign(message.as_bytes()).to_bytes()));
-    tx.to_string()
+    // B73: the canonical encoding, the one a mempool keeps and forwards.
+    executor::admission::canonicalize(&tx.to_string()).unwrap()
 }
 
 fn submit(txs: &[String]) -> String {

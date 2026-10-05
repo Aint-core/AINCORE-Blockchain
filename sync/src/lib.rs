@@ -634,8 +634,27 @@ impl ChainSync {
             // yet (it has not imported the boundary block) are ahead of it;
             // with too few verifiable tips then, the pass goes on, and every
             // block it imports still needs its own QC. Refusing left a
-            // follower one boundary behind stalled for good.
-            if tips.len() < tip_n && ahead > 0 {
+            // follower one boundary behind stalled for good. B72: an "ahead"
+            // claim is unverified, so it counts as one seed's answer, never
+            // as the agreement of N: the pass goes on only when verified
+            // tips and ahead claims together reach N, and the verified tips
+            // still agree among themselves. One seed naming an epoch the
+            // node does not know used to waive the gate.
+            if tips.len() < tip_n && tips.len() + ahead >= tip_n {
+                // The verified tips, if any, must agree (with none, the
+                // ahead claims alone reach N: B57's follower).
+                let disagree = if tips.is_empty() {
+                    Ok(())
+                } else {
+                    Self::tip_agreement_decision(&tips, tips.len()).map(|_| ())
+                };
+                if let Err(e) = disagree {
+                    eprintln!(
+                        "🚨 [SECURITY][TIP_DISAGREEMENT] {} — refusing to advance",
+                        e
+                    );
+                    return final_height;
+                }
                 println!(
                     "📡 [ChainSync] {ahead} seed(s) are past an epoch this node has not reached; syncing toward them"
                 );

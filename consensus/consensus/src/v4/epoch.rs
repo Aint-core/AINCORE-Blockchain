@@ -589,13 +589,17 @@ impl Engine {
             self.delete_epoch_rows(old, u64::MAX);
         }
         self.early_keys.clear();
-        for cert in std::mem::take(&mut self.early_certs) {
-            self.on_cert(cert, net);
-        }
-        for v in self.pending.take_all() {
-            let len = ingress_v4::canonical_body(&v).map_or(usize::MAX, |b| b.len());
-            self.on_vertex(len, v, net);
-        }
+        // B68: what was buffered for this epoch is checked now, on behalf of
+        // whoever delivered it, not the message that completed the epoch.
+        crate::work::uncounted(|| {
+            for cert in std::mem::take(&mut self.early_certs) {
+                self.on_cert(cert, net);
+            }
+            for v in self.pending.take_all() {
+                let len = ingress_v4::canonical_body(&v).map_or(usize::MAX, |b| b.len());
+                self.on_vertex(len, v, net);
+            }
+        });
         Ok(())
     }
 

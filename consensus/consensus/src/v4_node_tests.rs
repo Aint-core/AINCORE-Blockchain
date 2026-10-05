@@ -467,6 +467,8 @@ fn a_transaction_travels_through_a_v4_vertex_into_every_nodes_block() {
         "signature": hex::encode(key.sign(message.as_bytes()).to_bytes()),
     })
     .to_string();
+    // B73: the node keeps and orders the canonical encoding.
+    let tx = executor::admission::canonicalize(&tx).unwrap();
     c.node(0)
         .mempool
         .lock()
@@ -526,6 +528,8 @@ fn an_unfunded_transaction_is_ordered_but_never_stored() {
         "signature": hex::encode(key.sign(message.as_bytes()).to_bytes()),
     })
     .to_string();
+    // B73: the node keeps and orders the canonical encoding.
+    let tx = executor::admission::canonicalize(&tx).unwrap();
     c.node(0)
         .mempool
         .lock()
@@ -1267,6 +1271,46 @@ fn dos_qc_want_throttle_is_bypassed_by_rotating_17_heights() {
         answers <= 4,
         "{answers} answers to {} asks in one tick",
         rounds * heights.len()
+    );
+}
+
+/// B81: a member's `QC_WANT` is answered to that member only, not pushed to
+/// every member (n sends where one was asked).
+#[test]
+fn a_qc_want_is_answered_to_its_asker() {
+    let mut c = Cluster::with_interval("qcwant-asker", &[75, 76, 77, 78], true, 4);
+    c.run_until(200, |c| c.node(1).latest_block_height >= 2);
+    assert!(
+        c.node(1).latest_block_height >= 2,
+        "vacuous: too few blocks"
+    );
+    c.node(1)
+        .storage
+        .put("consensus:qc:1", "{\"stand_in_for_qc\":1}")
+        .unwrap();
+    // Ticks with nothing delivered: the throttle and the per-tick budget the
+    // run may have used have passed.
+    for _ in 0..6 {
+        c.node_mut(1).try_create_vertex();
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let node = c.node_mut(1);
+    node.v4_outbox = None;
+    node.p2p_tx = Some(tx);
+    node.handle_message_from("asker", &format!("{}1", crate::dag::QC_WANT_PREFIX));
+    let mut sent = Vec::new();
+    while let Ok(out) = rx.try_recv() {
+        sent.push(out);
+    }
+    let answers: Vec<_> = sent
+        .iter()
+        .filter(|o| o.wire().starts_with(crate::dag::QC_CERT_PREFIX))
+        .collect();
+    assert_eq!(answers.len(), 1, "one answer: {sent:?}");
+    assert!(
+        matches!(answers[0], network::Outbound::To { address, .. } if address == "asker"),
+        "answered to the asker, not to everyone: {:?}",
+        answers[0]
     );
 }
 

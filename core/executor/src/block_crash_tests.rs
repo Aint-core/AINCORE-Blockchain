@@ -298,7 +298,13 @@ fn block_crash_child() {
                 // data stored as a byte array again, the B66 executor
                 // reproduces ba90d7a8... exactly. B65 did not move it (the
                 // block adds less than the state target: no byte gas write).
-                "9e6887ef55db1980dd8db63b915589ca957950d7bee410f1973f53db83179f0f",
+                // Round 3 moved it through the stdlib alone, each step proven
+                // from 9e6887ef...: with the old governance.mv and dex.mv and
+                // no dependency charge the round-3 executor reproduces
+                // 9e6887ef... exactly, and so it does with the B69 charge;
+                // B71's governance.mv gives 1a91a159..., then B85's dex.mv
+                // a1f25c44....
+                "a1f25c44ea5298971cd280aefea6a586c522a175d45df77747a0573bdb358cc7",
                 "clean execution must preserve the pre-staging fixture root"
             );
         }

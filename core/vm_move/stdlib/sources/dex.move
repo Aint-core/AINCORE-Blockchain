@@ -17,6 +17,12 @@ module 0x1::dex {
     const EINVALID_PAIR: u64 = 6;
     const ENOT_SYSTEM: u64 = 7;
     const EINVALID_AMOUNT: u64 = 8;
+    /// B85: the registry holds `MAX_POOLS` pools.
+    const ETOO_MANY_POOLS: u64 = 9;
+
+    /// B85: the pools the registry holds (a choice: a few hundred pairs;
+    /// creating one scans the registry, so it may not grow without bound).
+    const MAX_POOLS: u64 = 256;
 
     const MINIMUM_LIQUIDITY: u128 = 1000;
     const FIXED_FEE_BP: u64 = 30;
@@ -70,6 +76,10 @@ module 0x1::dex {
 
         let registry = borrow_global_mut<PoolRegistry>(@0x1);
         assert!(!pool_exists(&registry.pools, &pool_key), error::already_exists(EDUPLICATE_POOL));
+        assert!(
+            vector::length(&registry.pools) < MAX_POOLS,
+            error::resource_exhausted(ETOO_MANY_POOLS)
+        );
 
         move_to(creator, LiquidityPool<X, Y> {
             coin_x: coin::mint<X>(0),
@@ -96,7 +106,7 @@ module 0x1::dex {
         amount_x: u128,
         amount_y: u128,
         min_lp: u128
-    ) acquires PoolRegistry, LiquidityPool, LPToken {
+    ) acquires LiquidityPool, LPToken {
         assert!(amount_x > 0 && amount_y > 0, error::invalid_argument(EINVALID_AMOUNT));
         assert_registered_pool<X, Y>(pool_addr);
 
@@ -172,7 +182,7 @@ module 0x1::dex {
         lp_amount: u128,
         min_x: u128,
         min_y: u128
-    ) acquires PoolRegistry, LiquidityPool, LPToken {
+    ) acquires LiquidityPool, LPToken {
         assert!(lp_amount > 0, error::invalid_argument(EINVALID_AMOUNT));
         assert_registered_pool<X, Y>(pool_addr);
 
@@ -213,7 +223,7 @@ module 0x1::dex {
         pool_addr: address,
         amount_x_in: u128,
         min_y_out: u128
-    ) acquires PoolRegistry, LiquidityPool {
+    ) acquires LiquidityPool {
         assert!(amount_x_in > 0, error::invalid_argument(EINVALID_AMOUNT));
         assert_registered_pool<X, Y>(pool_addr);
 
@@ -240,7 +250,7 @@ module 0x1::dex {
         pool_addr: address,
         amount_y_in: u128,
         min_x_out: u128
-    ) acquires PoolRegistry, LiquidityPool {
+    ) acquires LiquidityPool {
         assert!(amount_y_in > 0, error::invalid_argument(EINVALID_AMOUNT));
         assert_registered_pool<X, Y>(pool_addr);
 
@@ -262,19 +272,19 @@ module 0x1::dex {
     }
 
     /// Get current reserves and pool fee.
-    public fun get_reserves<X, Y>(pool_addr: address): (u128, u128, u128, u64) acquires PoolRegistry, LiquidityPool {
+    public fun get_reserves<X, Y>(pool_addr: address): (u128, u128, u128, u64) acquires LiquidityPool {
         assert_registered_pool<X, Y>(pool_addr);
         let pool = borrow_global<LiquidityPool<X, Y>>(pool_addr);
         (coin::value(&pool.coin_x), coin::value(&pool.coin_y), pool.lp_supply, pool.fee_bp)
     }
 
-    fun assert_registered_pool<X, Y>(pool_addr: address) acquires PoolRegistry {
-        let (token_x_name, token_y_name) = canonical_token_names<X, Y>();
-        let pool_key = make_pool_key(token_x_name, token_y_name);
-        assert!(exists<PoolRegistry>(@0x1), error::not_found(EPOOL_NOT_FOUND));
-        let registry = borrow_global<PoolRegistry>(@0x1);
-        let (found, active) = pool_status(&registry.pools, &pool_key, pool_addr);
-        assert!(found && active, error::not_found(EPOOL_NOT_FOUND));
+    /// B85: in constant time. A `LiquidityPool<X, Y>` exists only where
+    /// `create_pool` registered it (the struct is this module's, and no pool
+    /// is ever deactivated), so its existence is its registration; every
+    /// swap used to scan the whole registry, which anyone could grow.
+    fun assert_registered_pool<X, Y>(pool_addr: address) {
+        let (_, _) = canonical_token_names<X, Y>();
+        assert!(exists<LiquidityPool<X, Y>>(pool_addr), error::not_found(EPOOL_NOT_FOUND));
     }
 
     fun canonical_token_names<X, Y>(): (vector<u8>, vector<u8>) {
@@ -307,19 +317,6 @@ module 0x1::dex {
             i = i + 1;
         };
         false
-    }
-
-    fun pool_status(pools: &vector<PoolInfo>, pool_key: &vector<u8>, pool_addr: address): (bool, bool) {
-        let len = vector::length(pools);
-        let i = 0;
-        while (i < len) {
-            let info = vector::borrow(pools, i);
-            if (info.pool_key == *pool_key && info.pool_addr == pool_addr) {
-                return (true, info.active)
-            };
-            i = i + 1;
-        };
-        (false, false)
     }
 
     fun quote_out(amount_in: u128, reserve_in: u128, reserve_out: u128, fee_bp: u64): u128 {

@@ -158,11 +158,23 @@ pub fn verify_signature(
             .map_err(|_| CryptoError::InvalidSignature("Failed to convert bytes".to_string()))?,
     );
 
-    // Verify
-    match pubkey.verify(message, &sig) {
+    // B86: strict, as transactions are (`tx_sig`): plain verification
+    // accepts (R = identity, s = 0) under a small-order key for every message.
+    match pubkey.verify_strict(message, &sig) {
         Ok(_) => Ok(true),
         Err(_) => Ok(false),
     }
+}
+
+/// B86: whether `public_key` is an Ed25519 key that can stand for one
+/// signer: 32 bytes that decode to a point outside the small-order subgroup.
+/// A small-order key "signs" every message for anyone (strict verification
+/// refuses those signatures, and genesis and committees refuse the key).
+pub fn ed25519_key_is_usable(public_key: &[u8]) -> bool {
+    <[u8; 32]>::try_from(public_key)
+        .ok()
+        .and_then(|bytes| VerifyingKey::from_bytes(&bytes).ok())
+        .is_some_and(|key| !key.is_weak())
 }
 
 /// Width of an AINCORE address in bytes (matches Move AccountAddress::LENGTH
@@ -244,5 +256,32 @@ mod tests {
     fn test_verify_signature_invalid_sig_length() {
         let result = verify_signature(&[0u8; 32], b"msg", &[0u8; 32]);
         assert!(result.is_err());
+    }
+
+    /// B86: under the identity-point key, (R = identity, s = 0) passes plain
+    /// verification for every message; `verify_signature` refuses it, the key
+    /// is unusable, and an honest key and signature still verify.
+    #[test]
+    fn a_small_order_key_signs_nothing() {
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut forged = [0u8; 64];
+        forged[0] = 1;
+        let key = VerifyingKey::from_bytes(&identity).unwrap();
+        assert!(
+            Verifier::verify(&key, b"any", &Signature::from_bytes(&forged)).is_ok(),
+            "control: plain verification accepts the forgery"
+        );
+        assert!(!verify_signature(&identity, b"any", &forged).unwrap());
+        assert!(!verify_signature(&identity, b"other", &forged).unwrap());
+        assert!(!ed25519_key_is_usable(&identity));
+        assert!(!ed25519_key_is_usable(&[0u8; 31]));
+
+        let honest = SigningKey::from_bytes(&[5u8; 32]);
+        let public = honest.verifying_key().to_bytes();
+        let sig = honest.sign(b"any").to_bytes();
+        assert!(ed25519_key_is_usable(&public));
+        assert!(verify_signature(&public, b"any", &sig).unwrap());
+        assert!(!verify_signature(&public, b"other", &sig).unwrap());
     }
 }

@@ -547,6 +547,9 @@ fn assert_restored(client: &Arc<StateDB>, chain: &Chain) {
         ("consensus:last_anchor_hash", "aa".repeat(32)),
         ("consensus:finalized_round", (2 * H + 2).to_string()),
         ("consensus:qc:latest_round", anchor_round.clone()),
+        // B82: the ordering cursors, written by the restore.
+        ("consensus:gc_floor", anchor_round.clone()),
+        ("consensus:next_anchor_round", (2 * H + 3).to_string()),
     ] {
         assert_eq!(
             client.get(key).unwrap().as_deref(),

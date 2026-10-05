@@ -666,6 +666,16 @@ impl Engine {
             Verdict::PendingCert(missing) => {
                 // Past the clock check: its author is not early any more.
                 self.early.remove(&v.author);
+                // B68: the embedded certificates that failed were charged to
+                // whoever delivered this vertex; they are dropped so a later
+                // wake does not check (and charge) them again. A transport
+                // field: the digest does not cover them.
+                let mut v = v;
+                for &i in &missing {
+                    if let Some(r) = v.parent_refs.get_mut(i) {
+                        r.cert = None;
+                    }
+                }
                 // RE-1 (c): ask for the certificates it waits on, and for the
                 // whole gap below them when this node is far behind.
                 for i in missing {
@@ -999,9 +1009,10 @@ impl Engine {
             for v in wait {
                 self.pending.push(v);
             }
+            // B68: woken by this certificate, not delivered by its sender.
             for v in wake {
                 let len = ingress_v4::canonical_body(&v).map_or(usize::MAX, |b| b.len());
-                self.on_vertex(len, v, net);
+                crate::work::uncounted(|| self.on_vertex(len, v, net));
             }
         }
     }

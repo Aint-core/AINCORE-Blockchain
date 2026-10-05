@@ -329,8 +329,46 @@ fn check_epoch_interval_pinned(stored: Option<String>, env: Option<String>) -> R
     Ok(pinned)
 }
 
+/// B87: write a secret (node.key: it derives the Ed25519 identity, the
+/// validator's BLS seed and the DA at-rest key) owner-only from the first
+/// byte: a temporary file created 0600 and exclusively, written, synced,
+/// then renamed into place. `fs::write` created it with the umask (0644)
+/// and the narrowing after it ignored its error.
+fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(std::io::Error::other(format!(
+                "{} is mode {mode:o}, not 600",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
+    // B77: a panic ends the process (systemd restarts it) instead of
+    // poisoning a lock every loop then skips.
+    node::abort_on_panic();
     // === ARGUMENT PARSER ===
     let config = config::NodeConfig::parse();
 
@@ -408,19 +446,8 @@ async fn main() {
         );
         let mut csprng = rand::rngs::OsRng;
         let new_key = SigningKey::generate(&mut csprng);
-        match std::fs::write(key_path, new_key.to_bytes()) {
+        match write_secret_file(std::path::Path::new(key_path), &new_key.to_bytes()) {
             Ok(_) => {
-                // node.key is the root secret: it re-derives the Ed25519 consensus
-                // identity, the validator BLS finality seed, and the DA at-rest key.
-                // Restrict to owner-only (0600) so it is never world-readable.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        key_path,
-                        std::fs::Permissions::from_mode(0o600),
-                    );
-                }
                 println!("✅ Generated new node key: {}", key_path);
                 println!(
                     "🔑 Public Key: {}",
@@ -771,9 +798,10 @@ async fn main() {
                 let permit = if request.wire.starts_with(node::forward::TX_SUBMIT) {
                     Arc::clone(&tx_permits).try_acquire_owned()
                 } else if request.member.is_some() {
-                    Arc::clone(&member_permits)
-                        .try_acquire_owned()
-                        .or_else(|_| Arc::clone(&open_permits).try_acquire_owned())
+                    // B88: members keep to their own slots (taking the open
+                    // ones too, one member could hold all eight with 8 MiB
+                    // answers and starve every observer).
+                    Arc::clone(&member_permits).try_acquire_owned()
                 } else {
                     Arc::clone(&open_permits).try_acquire_owned()
                 };
@@ -875,7 +903,9 @@ async fn main() {
                 break;
             }
             // Run one consensus attempt per configured ticker interval.
-            {
+            // B77: off the async workers (the lock is a std one and a block
+            // holds it for seconds): the swarm task keeps running.
+            tokio::task::block_in_place(|| {
                 // WRITE LOCK FOR MINING
                 if let Ok(mut c) = consensus_clone.write() {
                     c.try_create_vertex();
@@ -903,7 +933,7 @@ async fn main() {
                         }
                     }
                 }
-            }
+            });
             tokio::time::sleep(Duration::from_millis(consensus_tick_ms)).await;
         }
     });
@@ -928,10 +958,13 @@ async fn main() {
                 {
                     // WRITE LOCK required to update the DAG and collect or
                     // aggregate QC finality votes. B51: the source is held to
-                    // account for checks its messages fail.
-                    if let Ok(mut guard) = node_consensus.write() {
-                        guard.handle_message_from(&source, &msg);
-                    }
+                    // account for checks its messages fail. B77: off the
+                    // async workers.
+                    tokio::task::block_in_place(|| {
+                        if let Ok(mut guard) = node_consensus.write() {
+                            guard.handle_message_from(&source, &msg);
+                        }
+                    });
                 }
             }
         });
@@ -1008,9 +1041,11 @@ async fn main() {
 
         // Reload consensus chain tip to prevent fork
         if synced_height > 0 {
-            if let Ok(mut c) = consensus_post_sync.write() {
-                c.reload_chain_tip();
-            }
+            tokio::task::block_in_place(|| {
+                if let Ok(mut c) = consensus_post_sync.write() {
+                    c.reload_chain_tip();
+                }
+            });
         }
 
         // Auto-register as validator if not already in the set
@@ -1064,9 +1099,11 @@ async fn main() {
             }
             // Reload consensus chain tip after every sync
             if synced_height > 0 {
-                if let Ok(mut c) = consensus_periodic.write() {
-                    c.reload_chain_tip();
-                }
+                tokio::task::block_in_place(|| {
+                    if let Ok(mut c) = consensus_periodic.write() {
+                        c.reload_chain_tip();
+                    }
+                });
             }
         }
     });
@@ -1603,5 +1640,32 @@ mod boot_identity_tests {
         assert!(check_epoch_interval_pinned(None, some("20")).is_err());
         assert!(check_epoch_interval_pinned(some("0"), None).is_err());
         assert!(check_epoch_interval_pinned(some("abc"), None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod secret_file_tests {
+    use super::write_secret_file;
+
+    /// B87: node.key is owner-only from the first byte, under any umask,
+    /// and a second write replaces it whole.
+    #[test]
+    fn a_secret_file_is_created_owner_only() {
+        let dir = storage::test_dir::process_dir().join(format!("secret_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.key");
+        write_secret_file(&path, &[7u8; 32]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![7u8; 32]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "node.key must be owner-only, is {mode:o}");
+        }
+        write_secret_file(&path, &[9u8; 32]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![9u8; 32]);
+        assert!(!path.with_extension("tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -41,9 +41,13 @@ pub struct CheckedTx {
     pub execution_gas: u64,
 }
 
-/// The bytes the sender signs (F4: seven fields, ':'-joined).
+/// The bytes the sender signs (F4: seven fields, ':'-joined). B73: and,
+/// for a sponsored transaction, an eighth, the paymaster's key: a relay
+/// could strip the paymaster (the sender then paid in full) or name one.
+/// Input objects are lowercase hex (`check_stateless`), so no field holds a
+/// ':' or a ',' and the message reads one way only.
 pub fn signing_message(tx: &Transaction) -> String {
-    format!(
+    let mut message = format!(
         "{}:{}:{}:{}:{}:{}:{}",
         tx.chain_id,
         tx.sender,
@@ -52,7 +56,102 @@ pub fn signing_message(tx: &Transaction) -> String {
         tx.gas_limit,
         tx.gas_price,
         tx.input_objects.join(",")
-    )
+    );
+    if let Some(paymaster) = &tx.paymaster {
+        message.push(':');
+        message.push_str(paymaster);
+    }
+    message
+}
+
+/// B73: the one JSON encoding of a transaction: compact, its fields in this
+/// order (the SDK's), an absent paymaster or proof left out, `args` never
+/// (they must be empty). Nodes keep, forward and order transactions only in
+/// it, and vertex ingress refuses any other, so a relay cannot change a
+/// transaction's bytes: its id (the hash of these bytes) or its byte gas.
+pub fn canonical_json(tx: &Transaction) -> String {
+    #[derive(serde::Serialize)]
+    struct Canonical<'a> {
+        chain_id: &'a str,
+        sender: &'a str,
+        input_objects: &'a [String],
+        payload: &'a str,
+        gas_limit: u64,
+        gas_price: u128,
+        sequence_number: u64,
+        public_key: &'a str,
+        signature: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        paymaster: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        paymaster_signature: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        zkp_proof: Option<&'a str>,
+    }
+    serde_json::to_string(&Canonical {
+        chain_id: &tx.chain_id,
+        sender: &tx.sender,
+        input_objects: &tx.input_objects,
+        payload: &tx.payload,
+        gas_limit: tx.gas_limit,
+        gas_price: tx.gas_price,
+        sequence_number: tx.sequence_number,
+        public_key: &tx.public_key,
+        signature: &tx.signature,
+        paymaster: tx.paymaster.as_deref(),
+        paymaster_signature: tx.paymaster_signature.as_deref(),
+        zkp_proof: tx.zkp_proof.as_deref().filter(|p| !p.is_empty()),
+    })
+    .expect("a transaction serializes")
+}
+
+/// B73: `raw` in its canonical encoding (`canonical_json`).
+pub fn canonicalize(raw: &str) -> Result<String, String> {
+    if raw.len() > MAX_TX_BYTES {
+        return Err(format!(
+            "transaction too large: {} bytes, limit {MAX_TX_BYTES}",
+            raw.len()
+        ));
+    }
+    let tx: Transaction =
+        serde_json::from_str(raw).map_err(|_| "Invalid JSON format".to_string())?;
+    Ok(canonical_json(&tx))
+}
+
+fn is_lower_hex(s: &str) -> bool {
+    s.bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// B73: what no signature covers may not vary: `args` (scripts are
+/// disabled) must be empty, a paymaster signature needs a paymaster, and
+/// keys, signatures and object ids are lowercase hex (`hex::decode` reads
+/// either case, so a relay could change the case and the bytes).
+fn unsigned_parts_fixed(tx: &Transaction) -> Result<(), String> {
+    if !tx.args.is_empty() {
+        return Err("args are not signed (scripts are disabled): send none".to_string());
+    }
+    if tx.paymaster.is_none() && tx.paymaster_signature.is_some() {
+        return Err("a paymaster signature without a paymaster".to_string());
+    }
+    for object in &tx.input_objects {
+        if object.is_empty() || object.len() > 64 || !is_lower_hex(object) {
+            return Err(format!(
+                "input object {object:.70} is not an object id (1 to 64 lowercase hex digits)"
+            ));
+        }
+    }
+    for (field, value) in [
+        ("public_key", Some(&tx.public_key)),
+        ("signature", Some(&tx.signature)),
+        ("paymaster", tx.paymaster.as_ref()),
+        ("paymaster_signature", tx.paymaster_signature.as_ref()),
+    ] {
+        if value.is_some_and(|v| !is_lower_hex(v)) {
+            return Err(format!("{field} is not lowercase hex"));
+        }
+    }
+    Ok(())
 }
 
 /// The bytes a paymaster signs: SHA-256 of `PAYMASTER_AUTH_V2:` and the
@@ -66,6 +165,9 @@ pub fn paymaster_message(tx: &Transaction) -> [u8; 32] {
 
 /// Gas charged up front per input object (N-2).
 pub const OBJECT_LOAD_GAS: u64 = 100;
+/// The most input objects a transaction may name: a block skips one with
+/// more (B70: admission refuses it, so it never waits for free).
+pub const MAX_INPUT_OBJECTS: usize = 128;
 /// The execution gas a module bundle must carry, per byte and per module
 /// (audit M-5: verification work scales with the bundle).
 pub const PUBLISH_GAS_PER_BYTE: u64 = 10;
@@ -104,6 +206,14 @@ pub fn check_stateless(raw: &str, chain_id: &str) -> Result<CheckedTx, String> {
             chain_id, tx.chain_id
         ));
     }
+    // B70: the count first (a structural bound, whatever the gas).
+    if tx.input_objects.len() > MAX_INPUT_OBJECTS {
+        return Err(format!(
+            "{} input objects, the most is {MAX_INPUT_OBJECTS}",
+            tx.input_objects.len()
+        ));
+    }
+    unsigned_parts_fixed(&tx)?;
     if tx.gas_price < MIN_GAS_PRICE {
         return Err(format!(
             "Gas price too low: {} < minimum {MIN_GAS_PRICE}",
@@ -220,6 +330,7 @@ pub fn check_unsigned(raw: &str, chain_id: &str) -> Result<CheckedTx, String> {
     if crate::payload_kind(&tx.payload)?.0 == PayloadKind::Script {
         return Err("Raw script payloads are disabled".to_string());
     }
+    unsigned_parts_fixed(&tx)?;
     let key = hex::decode(&tx.public_key).map_err(|_| "public key is not hex".to_string())?;
     let derived =
         crypto::derive_address(&key).map_err(|e| format!("Address derivation failed: {e}"))?;
@@ -329,12 +440,11 @@ pub fn signed_publish_with(
         paymaster_signature: None,
         zkp_proof: None,
     };
-    let unsized_len = serde_json::to_string(&tx)
-        .expect("a transaction serializes")
-        .len();
+    // In the canonical encoding (B73), the only one vertex ingress takes.
+    let unsized_len = canonical_json(&tx).len();
     tx.gas_limit = gas_limit_covering(unsized_len, execution);
     tx.signature = hex::encode(key.sign(signing_message(&tx).as_bytes()).to_bytes());
-    serde_json::to_string(&tx).expect("a transaction serializes")
+    canonical_json(&tx)
 }
 
 #[cfg(test)]
@@ -403,6 +513,11 @@ mod tests {
                 "MAX_BLOCK_GAS_LIMIT",
             ),
             ("gas_limit", serde_json::json!(10), "intrinsic gas"),
+            (
+                "input_objects",
+                serde_json::json!(vec!["ab"; MAX_INPUT_OBJECTS + 1]),
+                "input objects",
+            ),
             ("payload", serde_json::json!("zz"), "TransactionPayload"),
         ] {
             let mut t = v.clone();
@@ -427,11 +542,7 @@ mod tests {
         // Execution headroom pays for the paymaster fields added after signing.
         let tx = signed_publish_with([1; 32], CHAIN, 0, vec![9], 1_000_000, 1);
         let pm = SigningKey::from_bytes(&[2; 32]);
-        let mut v: serde_json::Value = serde_json::from_str(&tx).unwrap();
-        let parsed: Transaction = serde_json::from_value(v.clone()).unwrap();
-        v["paymaster"] = serde_json::json!(hex::encode(pm.verifying_key().to_bytes()));
-        v["paymaster_signature"] =
-            serde_json::json!(hex::encode(pm.sign(&paymaster_message(&parsed)).to_bytes()));
+        let v = sponsor(serde_json::from_str(&tx).unwrap(), &pm);
         let checked = check_stateless(&v.to_string(), CHAIN).expect("sponsored");
         let address = crypto::derive_address(pm.verifying_key().as_bytes()).unwrap();
         assert_eq!(checked.payer, address);
@@ -470,6 +581,18 @@ mod tests {
         assert_eq!(checked.scheme, TxScheme::MlDsa65);
     }
 
+    /// `v` sponsored by `pm`: the paymaster named, the sender's signature
+    /// renewed over it (B73), then the paymaster's.
+    fn sponsor(mut v: serde_json::Value, pm: &ed25519_dalek::SigningKey) -> serde_json::Value {
+        use ed25519_dalek::Signer;
+        v["paymaster"] = serde_json::json!(hex::encode(pm.verifying_key().to_bytes()));
+        let mut v = resign(v);
+        let parsed: Transaction = serde_json::from_value(v.clone()).unwrap();
+        v["paymaster_signature"] =
+            serde_json::json!(hex::encode(pm.sign(&paymaster_message(&parsed)).to_bytes()));
+        v
+    }
+
     /// Re-sign `v` as the sender (seed `[1; 32]`) after a field change.
     fn resign(mut v: serde_json::Value) -> serde_json::Value {
         use ed25519_dalek::{Signer, SigningKey};
@@ -487,14 +610,10 @@ mod tests {
     /// sponsored sender re-signed a higher price and the paymaster paid it.
     #[test]
     fn the_paymaster_binds_the_gas_price_and_the_objects() {
-        use ed25519_dalek::{Signer, SigningKey};
+        use ed25519_dalek::SigningKey;
         let tx = signed_publish_with([1; 32], CHAIN, 0, vec![9], 1_000_000, 1);
         let pm = SigningKey::from_bytes(&[2; 32]);
-        let mut v: serde_json::Value = serde_json::from_str(&tx).unwrap();
-        let parsed: Transaction = serde_json::from_value(v.clone()).unwrap();
-        v["paymaster"] = serde_json::json!(hex::encode(pm.verifying_key().to_bytes()));
-        v["paymaster_signature"] =
-            serde_json::json!(hex::encode(pm.sign(&paymaster_message(&parsed)).to_bytes()));
+        let v = sponsor(serde_json::from_str(&tx).unwrap(), &pm);
         check_stateless(&v.to_string(), CHAIN).expect("positive control: sponsored");
         for (field, value) in [
             ("gas_price", serde_json::json!(1_000_000_000u64)),
@@ -530,7 +649,7 @@ mod tests {
         let call = signed_publish_with([1; 32], CHAIN, 0, vec![1; 10], 1_000_000, 1);
         let mut v: serde_json::Value = serde_json::from_str(&call).unwrap();
         v["input_objects"] =
-            serde_json::json!((0..100).map(|i| format!("o{i}")).collect::<Vec<_>>());
+            serde_json::json!((0..100).map(|i| format!("{i:02x}")).collect::<Vec<_>>());
         for _ in 0..4 {
             let len = resign(v.clone()).to_string().len();
             v["gas_limit"] = serde_json::json!(intrinsic_gas(len) + 9_000);
@@ -541,5 +660,79 @@ mod tests {
             err.contains("input objects need") && err.contains("leaves 9000"),
             "{err}"
         );
+    }
+
+    /// B73 witness: the sender's signature binds its paymaster, so a relay
+    /// can neither strip it (the sender would pay) nor name another; what no
+    /// signature covers cannot vary; and every encoding of a transaction
+    /// comes back as one canonical string, the same id.
+    #[test]
+    fn a_relay_cannot_change_what_a_transaction_is() {
+        use ed25519_dalek::SigningKey;
+        let tx = signed_publish_with([1; 32], CHAIN, 0, vec![9], 1_000_000, 1);
+        let pm = SigningKey::from_bytes(&[2; 32]);
+        let v = sponsor(serde_json::from_str(&tx).unwrap(), &pm);
+        check_stateless(&v.to_string(), CHAIN).expect("positive control: sponsored");
+        let mut stripped = v.clone();
+        stripped.as_object_mut().unwrap().remove("paymaster");
+        stripped
+            .as_object_mut()
+            .unwrap()
+            .remove("paymaster_signature");
+        let err = check_stateless(&stripped.to_string(), CHAIN).unwrap_err();
+        assert!(err.contains("Invalid signature"), "stripped: {err}");
+        let other = SigningKey::from_bytes(&[3; 32]);
+        let mut swapped = v.clone();
+        swapped["paymaster"] = serde_json::json!(hex::encode(other.verifying_key().to_bytes()));
+        let err = check_stateless(&swapped.to_string(), CHAIN).unwrap_err();
+        assert!(err.contains("Invalid signature"), "swapped: {err}");
+
+        // What no signature covers: refused if it varies.
+        let plain: serde_json::Value = serde_json::from_str(&tx).unwrap();
+        for (field, value, needle) in [
+            ("args", serde_json::json!(["00"]), "args"),
+            (
+                "paymaster_signature",
+                serde_json::json!("00"),
+                "without a paymaster",
+            ),
+            (
+                "signature",
+                serde_json::json!(plain["signature"].as_str().unwrap().to_uppercase()),
+                "lowercase hex",
+            ),
+            (
+                "public_key",
+                serde_json::json!(plain["public_key"].as_str().unwrap().to_uppercase()),
+                "lowercase hex",
+            ),
+        ] {
+            let mut t = plain.clone();
+            t[field] = value;
+            let err = check_stateless(&t.to_string(), CHAIN).unwrap_err();
+            assert!(err.contains(needle), "{field}: {err}");
+        }
+        for objects in [vec!["ab,cd"], vec!["ab:cd"], vec!["AB"], vec![""]] {
+            let mut t = plain.clone();
+            t["input_objects"] = serde_json::json!(objects);
+            let err = check_stateless(&resign(t).to_string(), CHAIN).unwrap_err();
+            assert!(err.contains("not an object id"), "{objects:?}: {err}");
+        }
+
+        // Any encoding (key order, spacing, an unknown field, an empty proof)
+        // canonicalizes to one string, which is its own canonical form.
+        let canonical = canonicalize(&tx).unwrap();
+        let mut padded = plain.clone();
+        padded["junk"] = serde_json::json!("x".repeat(1_000));
+        padded["zkp_proof"] = serde_json::json!("");
+        let spaced = serde_json::to_string_pretty(&padded).unwrap();
+        assert_eq!(canonicalize(&spaced).unwrap(), canonical);
+        assert_eq!(canonicalize(&canonical).unwrap(), canonical);
+        assert!(canonical.len() < spaced.len());
+        assert!(canonical.starts_with("{\"chain_id\":"), "{canonical:.40}");
+        let sponsored = v.to_string();
+        let c = canonicalize(&sponsored).unwrap();
+        assert_eq!(canonicalize(&c).unwrap(), c);
+        check_stateless(&c, CHAIN).expect("the canonical form is the same transaction");
     }
 }

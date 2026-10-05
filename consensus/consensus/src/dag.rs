@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 // use serde::{Serialize, Deserialize}; // Unused
 use crate::ordering::OrderingEngine;
 use blockchain::Vertex;
-use crypto::accumulator::Accumulator;
 use executor::Executor;
 use mempool::Mempool;
 use storage::StateDB;
@@ -108,7 +107,6 @@ pub struct DagConsensus {
     /// when it starts and once when it clears.
     clock_alarm_logged: bool,
     qc_retry_cursor: String,
-    pub accumulator: Accumulator,
     /// G4 S1: the network task (gossip and committee sessions).
     pub p2p_tx: Option<tokio::sync::mpsc::Sender<network::Outbound>>,
     pub node_key: [u8; 32], // H4 FIX: Store the persistent Ed25519 key for BLS derivation
@@ -346,7 +344,6 @@ impl DagConsensus {
             clock_drift: (0, 0),
             clock_alarm_logged: false,
             qc_retry_cursor: String::new(),
-            accumulator: Accumulator::new(),
             p2p_tx,
             node_key,
             // Phase 2.8 (M-08): empty cache; first get_validator_set call
@@ -619,8 +616,10 @@ impl DagConsensus {
     /// the stored QC, at most once per `QC_WANT_EVERY_TICKS` per height (the
     /// oldest throttle entry is evicted, never the whole table) and at most
     /// `QC_ANSWERS_PER_TICK` answers per tick in all, so however asks are
-    /// spread over heights they cost a bounded number of answers.
-    fn answer_qc_want(&mut self, raw: &str) {
+    /// spread over heights they cost a bounded number of answers. B81: the
+    /// answer goes to the member that asked (its push names it); only an ask
+    /// with no named source is answered to everyone.
+    fn answer_qc_want(&mut self, raw: &str, asker: Option<&str>) {
         if raw.len() > 20 {
             return;
         }
@@ -658,7 +657,14 @@ impl DagConsensus {
         }
         self.qc_answered.insert(h, self.v4_ticks);
         self.qc_answer_budget.1 += 1;
-        self.v4_net().broadcast_wire(format!("{QC_CERT_PREFIX}{raw_qc}"));
+        let wire = format!("{QC_CERT_PREFIX}{raw_qc}");
+        match asker {
+            Some(address) => self.v4_net().emit(network::Outbound::To {
+                address: address.to_string(),
+                wire,
+            }),
+            None => self.v4_net().broadcast_wire(wire),
+        }
     }
 
     /// `QC_CERT:{qc}`: a QC for a block this node holds. Stored only if it
@@ -1330,10 +1336,9 @@ impl DagConsensus {
                 self.latest_block_round = commit.anchor_round;
                 self.last_adopted_height = self.latest_block_height;
 
-                // Update Accumulator and DB
-                if let Ok(bytes) = hex::decode(&new_block.header.hash) {
-                    self.accumulator.append(&bytes);
-                }
+                // B78: no Merkle accumulator here: nothing read its root,
+                // and each block recomputed it over every block hash since
+                // the process started, under the consensus write lock.
 
                 {
                     prune_history(
@@ -1777,7 +1782,7 @@ impl DagConsensus {
         if self.muted.get(source).is_some_and(|until| now < *until) {
             return;
         }
-        let ((), failed) = crate::work::failed_in(|| self.handle_message(msg));
+        let ((), failed) = crate::work::failed_in(|| self.handle_message_of(Some(source), msg));
         if failed == 0 {
             return;
         }
@@ -1809,6 +1814,12 @@ impl DagConsensus {
     }
 
     pub fn handle_message(&mut self, msg: &str) {
+        self.handle_message_of(None, msg);
+    }
+
+    /// `msg`, from `source` when the transport names it (B81: a `QC_WANT`
+    /// is answered to its asker).
+    fn handle_message_of(&mut self, source: Option<&str>, msg: &str) {
         // G5 S4c: only a V4 chain takes messages. `DAG_VERTEX:`,
         // `DOWNTIME_ATTEST:` and `EQUIV_PROOF:` (the deleted V3 DAG and its
         // evidence) are dropped unparsed: no V4 signature can appear in a V3
@@ -1817,7 +1828,7 @@ impl DagConsensus {
             return;
         }
         if let Some(h) = msg.strip_prefix(QC_WANT_PREFIX) {
-            self.answer_qc_want(h);
+            self.answer_qc_want(h, source);
             return;
         }
         if let Some(json) = msg.strip_prefix(QC_CERT_PREFIX) {

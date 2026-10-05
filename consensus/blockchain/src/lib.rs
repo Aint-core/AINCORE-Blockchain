@@ -186,16 +186,27 @@ impl Block {
     /// Verify `proposer_signature` against the proposer's Ed25519 public key
     /// (hex). Empty or malformed signatures verify as FALSE.
     pub fn verify_proposer_signature(&self, public_key_hex: &str) -> bool {
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        use ed25519_dalek::{Signature, VerifyingKey};
         if self.proposer_signature.is_empty() {
             return false;
         }
-        let Ok(sig_bytes) = hex::decode(&self.proposer_signature) else { return false };
-        let Ok(sig) = Signature::from_slice(&sig_bytes) else { return false };
-        let Ok(pk_bytes) = hex::decode(public_key_hex) else { return false };
-        let Ok(pk_arr) = <[u8; 32]>::try_from(pk_bytes.as_slice()) else { return false };
-        let Ok(vk) = VerifyingKey::from_bytes(&pk_arr) else { return false };
-        vk.verify(self.header.hash.as_bytes(), &sig).is_ok()
+        let Ok(sig_bytes) = hex::decode(&self.proposer_signature) else {
+            return false;
+        };
+        let Ok(sig) = Signature::from_slice(&sig_bytes) else {
+            return false;
+        };
+        let Ok(pk_bytes) = hex::decode(public_key_hex) else {
+            return false;
+        };
+        let Ok(pk_arr) = <[u8; 32]>::try_from(pk_bytes.as_slice()) else {
+            return false;
+        };
+        let Ok(vk) = VerifyingKey::from_bytes(&pk_arr) else {
+            return false;
+        };
+        // B86: strict (a small-order key would verify every header).
+        vk.verify_strict(self.header.hash.as_bytes(), &sig).is_ok()
     }
 }
 
@@ -936,7 +947,7 @@ impl Vertex {
 
     /// Verify the Ed25519 signature
     pub fn verify_ed25519_signature(&self, public_key_hex: &str) -> bool {
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        use ed25519_dalek::{Signature, VerifyingKey};
         if self.signature.is_empty() {
             return false;
         }
@@ -963,8 +974,9 @@ impl Vertex {
         };
         let signature = Signature::from_bytes(&sig_bytes);
 
+        // B86: strict (a small-order key would verify every vertex).
         verifying_key
-            .verify(self.hash.as_bytes(), &signature)
+            .verify_strict(self.hash.as_bytes(), &signature)
             .is_ok()
     }
 
@@ -1342,6 +1354,20 @@ mod bft_time_tests {
             !t.verify_proposer_signature(&pk),
             "re-hashed tampered block must not verify"
         );
+
+        // B86: under the small-order identity key, (R = identity, s = 0)
+        // verifies for every message non-strictly; no block or vertex takes it.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut forged = [0u8; 64];
+        forged[0] = 1;
+        let weak = hex::encode(identity);
+        let mut f = b.clone();
+        f.proposer_signature = hex::encode(forged);
+        assert!(!f.verify_proposer_signature(&weak), "a forged block");
+        let mut v = Vertex::new(1, "a".into(), vec![], vec![]);
+        v.signature = hex::encode(forged);
+        assert!(!v.verify_ed25519_signature(&weak), "a forged vertex");
     }
 
     /// The vertex hash — and therefore the author's signature — must BIND the

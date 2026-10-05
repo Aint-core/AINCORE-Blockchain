@@ -989,6 +989,183 @@ fn a_vertex_ahead_of_its_parent_certificates_is_staged_when_they_arrive() {
     c.assert_agree();
 }
 
+/// B68 witness: failed checks are charged only to the message that carried
+/// what failed. A Byzantine member signs a round-2 vertex that waits on an
+/// honest member's round-1 certificate and cites the other round-1 slots by
+/// fake digests with junk certificates of the right shape. The junk is
+/// charged to the Byzantine sender once, when it arrives; the honest
+/// certificate that wakes the vertex costs its sender nothing.
+#[test]
+fn a_waking_certificate_is_not_charged_for_the_vertex_it_wakes() {
+    let mut c = Cluster::new("wake-charge", 4, 0);
+    let me = c.members[0].info.address.clone();
+    let late_certs = move |e: &Envelope, to: usize| {
+        to == 0 && e.from != me && matches!(&e.msg, Msg::Cert(x) if x.body.round == 1)
+    };
+    c.tick_all();
+    c.deliver(&late_certs);
+    c.tick_all();
+    let byzantine = 1;
+    let honest = c.members[2].info.address.clone();
+    let mut forged =
+        c.q.borrow()
+            .iter()
+            .find_map(|e| match &e.msg {
+                Msg::Vertex(v) if v.round == 2 && e.from == c.members[byzantine].info.address => {
+                    Some(v.clone())
+                }
+                _ => None,
+            })
+            .expect("the Byzantine member's round-2 vertex");
+    let shape = c
+        .held
+        .iter()
+        .find_map(|e| match &e.msg {
+            Msg::Cert(x) => Some(x.compact()),
+            _ => None,
+        })
+        .expect("a held certificate");
+    let junk = blockchain::CompactCert {
+        signer_bitmap: shape.signer_bitmap.clone(),
+        aggregate_signature: vec![7u8; shape.aggregate_signature.len()],
+    };
+    let mut faked = 0;
+    for (i, r) in forged.parent_refs.iter_mut().enumerate() {
+        if r.author == honest {
+            r.cert = None;
+            continue;
+        }
+        r.digest = format!("{:064x}", 0xfa4e_u64 + i as u64);
+        forged.parents[i] = r.digest.clone();
+        r.cert = Some(junk.clone());
+        faked += 1;
+    }
+    assert!(faked >= 2, "vacuous: no junk refs");
+    forged.hash = forged.hash_v4_with_domain(CHAIN, GENESIS);
+    forged.sign_with_ed25519(&crypto::SigningKey::from_bytes(
+        &c.members[byzantine].node_key,
+    ));
+    let ((), charged) = crate::work::failed_in(|| c.receive(0, Msg::Vertex(forged.clone())));
+    assert_eq!(
+        charged, faked,
+        "the junk is charged to the sender that carried it"
+    );
+    assert!(!c.engine(0).is_staged(&forged.hash));
+    let pending = &mut c.engines[0].as_mut().unwrap().pending;
+    let held = pending
+        .remove(&forged.author, forged.round, &forged.hash)
+        .expect("the vertex waits");
+    pending.push(held.clone());
+    assert!(
+        held.parent_refs.iter().all(|r| r.cert.is_none()),
+        "the junk that failed is kept for a later wake to check again"
+    );
+
+    let wake = c
+        .held
+        .iter()
+        .find(|e| e.from == honest && matches!(&e.msg, Msg::Cert(x) if x.body.round == 1))
+        .map(|e| e.msg.clone())
+        .expect("the honest member's held round-1 certificate");
+    let ((), charged) = crate::work::failed_in(|| c.receive(0, wake));
+    assert_eq!(
+        charged, 0,
+        "the honest certificate was charged for the vertex it woke"
+    );
+}
+
+/// B68 witness at an epoch boundary: a vertex of E+1 buffered before
+/// activation was never checked; it is checked at activation, on behalf of
+/// whoever delivered it, so its junk certificates are not charged to the
+/// message that completed the epoch. Node 0's epoch is closed by hand (a
+/// standalone engine closes and activates in one call, so E+1's record
+/// would never be seen without activation).
+#[test]
+fn junk_buffered_for_the_next_epoch_is_not_charged_at_activation() {
+    let mut c = Cluster::new("wake-epoch", 4, 0);
+    c.run_until(40, |c| c.decisions[0].len() >= 2);
+    let (closing_round, anchor, _, _) = c.decisions[0]
+        .last()
+        .cloned()
+        .expect("vacuous: nothing decided");
+    let epoch_before = c.engine(0).epoch;
+    let committee = c.committee.clone();
+    c.engines[0]
+        .as_mut()
+        .unwrap()
+        .close_epoch(closing_round, &anchor, &"ab".repeat(32), &committee)
+        .unwrap();
+    let next = c.engine(0).next.clone().expect("E+1 scheduled");
+    let shape = c
+        .engine(0)
+        .certs
+        .values()
+        .next()
+        .expect("a held certificate")
+        .compact();
+    let junk = blockchain::CompactCert {
+        signer_bitmap: shape.signer_bitmap.clone(),
+        aggregate_signature: vec![7u8; shape.aggregate_signature.len()],
+    };
+    let byzantine = 1;
+    let author = c.members[byzantine].info.address.clone();
+    let template = lock(&c.engine(byzantine).dag)
+        .values()
+        .find(|v| v.author == author)
+        .expect("a vertex of the Byzantine member")
+        .clone();
+    let mut forged = template;
+    forged.epoch = next.epoch;
+    forged.round = next.first_round + 1;
+    forged.payload = vec![];
+    forged.parent_refs = next
+        .committee
+        .iter()
+        .enumerate()
+        .map(|(i, m)| blockchain::ParentRef {
+            round: next.first_round,
+            author: m.address.clone(),
+            digest: format!("{:064x}", 0xe4b0_u64 + i as u64),
+            proof: None,
+            cert: Some(junk.clone()),
+        })
+        .collect();
+    forged.parents = forged
+        .parent_refs
+        .iter()
+        .map(|r| r.digest.clone())
+        .collect();
+    forged.hash = forged.hash_v4_with_domain(CHAIN, GENESIS);
+    forged.sign_with_ed25519(&crypto::SigningKey::from_bytes(
+        &c.members[byzantine].node_key,
+    ));
+    let (forged_author, forged_round, forged_hash) =
+        (forged.author.clone(), forged.round, forged.hash.clone());
+    c.engines[0].as_mut().unwrap().pending.push(forged);
+    let net = c.net(0);
+    let (activated, charged) =
+        crate::work::failed_in(|| c.engines[0].as_mut().unwrap().activate_next(&net));
+    activated.unwrap();
+    assert!(
+        c.engine(0).epoch > epoch_before,
+        "vacuous: node 0 never activated"
+    );
+    let held = c.engines[0]
+        .as_mut()
+        .unwrap()
+        .pending
+        .remove(&forged_author, forged_round, &forged_hash)
+        .expect("vacuous: the forged vertex was not checked into waiting on its parents");
+    assert!(
+        held.parent_refs.iter().all(|r| r.cert.is_none()),
+        "vacuous: its junk certificates were not checked at activation"
+    );
+    assert_eq!(
+        charged, 0,
+        "junk buffered for E+1 was charged at activation"
+    );
+}
+
 /// OR-1: a certified vertex is orderable only once every parent is. Node 0
 /// holds round 2 certified but not the body of one round-1 parent.
 #[test]

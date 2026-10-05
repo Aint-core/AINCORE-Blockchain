@@ -127,17 +127,42 @@ pub fn is_consensus_message(wire: &str) -> bool {
 
 /// Frames are a u32 big-endian length and that many bytes of UTF-8. The
 /// length is checked against the cap before anything is read or allocated.
-#[derive(Debug, Clone, Copy)]
-pub struct FramedCodec {
+/// `Q` is the request's type: a `String`, or (B89) an `Arc<str>` for the
+/// consensus protocol, whose broadcast hands every member the same bytes
+/// (it cloned the wire, up to ~776 KiB, once per member, and the copies
+/// lived while slow members read).
+pub struct FramedCodec<Q = String> {
     request_cap: usize,
     response_cap: usize,
+    request: std::marker::PhantomData<fn() -> Q>,
 }
 
-impl FramedCodec {
+/// B89: the consensus protocol's codec.
+pub type ConsensusCodec = FramedCodec<Arc<str>>;
+
+impl<Q> Clone for FramedCodec<Q> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Q> Copy for FramedCodec<Q> {}
+
+impl<Q> std::fmt::Debug for FramedCodec<Q> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FramedCodec")
+            .field("request_cap", &self.request_cap)
+            .field("response_cap", &self.response_cap)
+            .finish()
+    }
+}
+
+impl<Q> FramedCodec<Q> {
     pub fn new(request_cap: usize, response_cap: usize) -> Self {
         Self {
             request_cap,
             response_cap,
+            request: std::marker::PhantomData,
         }
     }
 
@@ -191,16 +216,19 @@ pub async fn write_frame<T: AsyncWrite + Unpin + Send>(
 }
 
 #[async_trait]
-impl request_response::Codec for FramedCodec {
+impl<Q> request_response::Codec for FramedCodec<Q>
+where
+    Q: From<String> + AsRef<str> + Send + Sync + 'static,
+{
     type Protocol = StreamProtocol;
-    type Request = String;
+    type Request = Q;
     type Response = String;
 
-    async fn read_request<T>(&mut self, _: &StreamProtocol, io: &mut T) -> io::Result<String>
+    async fn read_request<T>(&mut self, _: &StreamProtocol, io: &mut T) -> io::Result<Q>
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_frame(io, self.request_cap).await
+        read_frame(io, self.request_cap).await.map(Q::from)
     }
 
     async fn read_response<T>(&mut self, _: &StreamProtocol, io: &mut T) -> io::Result<String>
@@ -210,16 +238,11 @@ impl request_response::Codec for FramedCodec {
         read_frame(io, self.response_cap).await
     }
 
-    async fn write_request<T>(
-        &mut self,
-        _: &StreamProtocol,
-        io: &mut T,
-        req: String,
-    ) -> io::Result<()>
+    async fn write_request<T>(&mut self, _: &StreamProtocol, io: &mut T, req: Q) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_frame(io, &req, self.request_cap).await
+        write_frame(io, req.as_ref(), self.request_cap).await
     }
 
     async fn write_response<T>(
@@ -236,9 +259,9 @@ impl request_response::Codec for FramedCodec {
 }
 
 /// The request-response behaviour of `/aincore/consensus/1`.
-pub fn consensus_behaviour() -> request_response::Behaviour<FramedCodec> {
+pub fn consensus_behaviour() -> request_response::Behaviour<ConsensusCodec> {
     request_response::Behaviour::with_codec(
-        FramedCodec::consensus(),
+        ConsensusCodec::consensus(),
         [(
             StreamProtocol::new(CONSENSUS_PROTOCOL),
             request_response::ProtocolSupport::Full,
@@ -262,7 +285,7 @@ pub fn consensus_behaviour() -> request_response::Behaviour<FramedCodec> {
 /// while its peer's membership changes; `misfiled` names it for the node to
 /// close, and the committee dial reconnects a new member.
 pub struct MembersOnly {
-    inner: request_response::Behaviour<FramedCodec>,
+    inner: request_response::Behaviour<ConsensusCodec>,
     book: Arc<RwLock<PeerBook>>,
     /// Handlers chosen, until the connection is established or fails.
     chosen: HashMap<libp2p::swarm::ConnectionId, bool>,
@@ -312,9 +335,9 @@ impl MembersOnly {
         connection_id: libp2p::swarm::ConnectionId,
         peer: PeerId,
         inner: impl FnOnce(
-            &mut request_response::Behaviour<FramedCodec>,
+            &mut request_response::Behaviour<ConsensusCodec>,
         ) -> Result<
-            libp2p::swarm::THandler<request_response::Behaviour<FramedCodec>>,
+            libp2p::swarm::THandler<request_response::Behaviour<ConsensusCodec>>,
             libp2p::swarm::ConnectionDenied,
         >,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
@@ -331,7 +354,7 @@ impl MembersOnly {
 }
 
 impl std::ops::Deref for MembersOnly {
-    type Target = request_response::Behaviour<FramedCodec>;
+    type Target = request_response::Behaviour<ConsensusCodec>;
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
@@ -345,10 +368,10 @@ impl std::ops::DerefMut for MembersOnly {
 
 impl libp2p::swarm::NetworkBehaviour for MembersOnly {
     type ConnectionHandler = libp2p::swarm::derive_prelude::Either<
-        libp2p::swarm::THandler<request_response::Behaviour<FramedCodec>>,
+        libp2p::swarm::THandler<request_response::Behaviour<ConsensusCodec>>,
         libp2p::swarm::dummy::ConnectionHandler,
     >;
-    type ToSwarm = request_response::Event<String, String>;
+    type ToSwarm = request_response::Event<Arc<str>, String>;
 
     fn handle_pending_inbound_connection(
         &mut self,
@@ -562,6 +585,120 @@ impl SessionWiring {
 /// together (Aptos `MAX_INBOUND_CONNECTIONS` = 50, counting unknown peers
 /// only). Members are never counted.
 pub const MAX_NON_MEMBER_INBOUND: usize = 50;
+
+/// B75: the network group of a host, as Bitcoin Core groups peers
+/// (`NetGroupManager::GetGroup`, read 2026-10-04): an IPv4 address by its
+/// /16, an IPv6 one by its /32; a name, or nothing, stands alone.
+pub fn net_group(host: &str) -> String {
+    use std::net::IpAddr;
+    let group_v4 = |o: [u8; 4]| format!("{}.{}", o[0], o[1]);
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => group_v4(v4.octets()),
+        Ok(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => group_v4(v4.octets()),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}", s[0], s[1])
+            }
+        },
+        Err(_) => host.to_string(),
+    }
+}
+
+/// B75: what a full table of inbound non-member connections does with a
+/// new one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundAdmission<C> {
+    Admitted,
+    /// Admitted in the place of this connection, which is closed.
+    Evicted(C),
+    Refused,
+}
+
+/// B75: the inbound non-member connections and their network groups. The
+/// slots were first come: 25 IPv4 hosts at two identities each held all 50
+/// and kept them with a request every 15 s. Full, a newcomer takes the slot
+/// of the youngest connection of the group with the most connections, when
+/// that group holds at least two more than the newcomer's (Bitcoin Core
+/// evicts from the network group with the most connections and keeps the
+/// half connected longest, `SelectNodeToEvict`); otherwise it is refused, so
+/// filling the slots for good takes as many groups as slots.
+#[derive(Debug)]
+pub struct NonMemberInbound<C> {
+    held: HashMap<C, (String, u64)>,
+    next: u64,
+}
+
+impl<C> Default for NonMemberInbound<C> {
+    fn default() -> Self {
+        Self {
+            held: HashMap::new(),
+            next: 0,
+        }
+    }
+}
+
+impl<C: std::hash::Hash + Eq + Clone> NonMemberInbound<C> {
+    pub fn admit(&mut self, id: C, group: &str) -> InboundAdmission<C> {
+        let mut admitted = InboundAdmission::Admitted;
+        if self.held.len() >= MAX_NON_MEMBER_INBOUND {
+            let mut counts: HashMap<&str, usize> = HashMap::new();
+            for (g, _) in self.held.values() {
+                *counts.entry(g.as_str()).or_insert(0) += 1;
+            }
+            let mine = counts.get(group).copied().unwrap_or(0);
+            let Some((largest, most)) = counts
+                .iter()
+                .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+                .map(|(g, n)| (g.to_string(), *n))
+            else {
+                return InboundAdmission::Refused;
+            };
+            if most < mine + 2 {
+                return InboundAdmission::Refused;
+            }
+            let Some(victim) = self
+                .held
+                .iter()
+                .filter(|(_, (g, _))| *g == largest)
+                .max_by_key(|(_, (_, seq))| *seq)
+                .map(|(c, _)| c.clone())
+            else {
+                return InboundAdmission::Refused;
+            };
+            self.held.remove(&victim);
+            admitted = InboundAdmission::Evicted(victim);
+        }
+        self.held.insert(id, (group.to_string(), self.next));
+        self.next += 1;
+        admitted
+    }
+
+    pub fn remove(&mut self, id: &C) {
+        self.held.remove(id);
+    }
+
+    pub fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+}
+
+/// B75: peers the operator names (`AINCORE_RESERVED_PEERS`, PeerIds,
+/// comma-separated: its own observers and RPC nodes), never counted against
+/// the non-member slots.
+pub fn reserved_peers_from_env() -> std::collections::HashSet<String> {
+    std::env::var("AINCORE_RESERVED_PEERS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect()
+}
 
 /// B40: outbound connections to peers no committee key names (Kademlia's
 /// bootstrap dials peers others named), all together. The same count as
@@ -804,6 +941,115 @@ impl libp2p::swarm::NetworkBehaviour for InboundGate {
     }
 }
 
+/// B90: the addresses this node dials a peer at by its PeerId (a member, in
+/// the committee dial): its bootnodes', the ones a dial reached, and the
+/// routable listen addresses a session's identify reported (G4: addresses
+/// come from the authenticated session or the operator's bootnodes). It
+/// replaces Kademlia, which held this table but also stored anyone's
+/// records, answered anyone's queries and bootstrapped every 5 minutes by
+/// dialling addresses peers supplied; nothing used those.
+#[derive(Debug, Default)]
+pub struct AddressBook {
+    addresses: HashMap<PeerId, Vec<libp2p::Multiaddr>>,
+    /// Peers in the order they were first added, for eviction.
+    order: std::collections::VecDeque<PeerId>,
+}
+
+/// B90: addresses kept per peer, the newest (a choice: a host's few
+/// interfaces and transports).
+pub const ADDRESSES_PER_PEER: usize = 8;
+/// B90: peers the book holds, the oldest leaving first (a choice: four
+/// times the largest committee, `MAX_COMMITTEE`).
+pub const MAX_BOOK_PEERS: usize = 1024;
+
+impl AddressBook {
+    pub fn add_address(&mut self, peer: &PeerId, address: libp2p::Multiaddr) {
+        if !self.addresses.contains_key(peer) {
+            if self.addresses.len() >= MAX_BOOK_PEERS {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.addresses.remove(&oldest);
+                }
+            }
+            self.order.push_back(*peer);
+        }
+        let list = self.addresses.entry(*peer).or_default();
+        list.retain(|a| *a != address);
+        if list.len() >= ADDRESSES_PER_PEER {
+            list.remove(0);
+        }
+        list.push(address);
+    }
+
+    pub fn addresses_of(&self, peer: &PeerId) -> &[libp2p::Multiaddr] {
+        self.addresses.get(peer).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn len(&self) -> usize {
+        self.addresses.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.addresses.is_empty()
+    }
+}
+
+impl libp2p::swarm::NetworkBehaviour for AddressBook {
+    type ConnectionHandler = libp2p::swarm::dummy::ConnectionHandler;
+    type ToSwarm = std::convert::Infallible;
+
+    fn handle_pending_outbound_connection(
+        &mut self,
+        _connection_id: libp2p::swarm::ConnectionId,
+        maybe_peer: Option<PeerId>,
+        _addresses: &[libp2p::Multiaddr],
+        _effective_role: libp2p::core::Endpoint,
+    ) -> Result<Vec<libp2p::Multiaddr>, libp2p::swarm::ConnectionDenied> {
+        Ok(maybe_peer
+            .map(|peer| self.addresses_of(&peer).to_vec())
+            .unwrap_or_default())
+    }
+
+    fn handle_established_inbound_connection(
+        &mut self,
+        _connection_id: libp2p::swarm::ConnectionId,
+        _peer: PeerId,
+        _local_addr: &libp2p::Multiaddr,
+        _remote_addr: &libp2p::Multiaddr,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        Ok(libp2p::swarm::dummy::ConnectionHandler)
+    }
+
+    fn handle_established_outbound_connection(
+        &mut self,
+        _connection_id: libp2p::swarm::ConnectionId,
+        _peer: PeerId,
+        _addr: &libp2p::Multiaddr,
+        _role_override: libp2p::core::Endpoint,
+        _port_use: libp2p::core::transport::PortUse,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        Ok(libp2p::swarm::dummy::ConnectionHandler)
+    }
+
+    fn on_swarm_event(&mut self, _event: libp2p::swarm::FromSwarm) {}
+
+    fn on_connection_handler_event(
+        &mut self,
+        _peer_id: PeerId,
+        _connection_id: libp2p::swarm::ConnectionId,
+        event: libp2p::swarm::THandlerOutEvent<Self>,
+    ) {
+        match event {}
+    }
+
+    fn poll(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>>
+    {
+        std::task::Poll::Pending
+    }
+}
+
 /// NI-3: what the network task holds for the node while the node is busy
 /// (it holds the consensus lock through a block's execution). The swarm
 /// never waits on the node: a message past this many bytes is dropped, and
@@ -917,13 +1163,21 @@ impl Inbox {
 /// A choice: the inbox's bound, six answers at the 10 MiB response cap.
 pub const OPEN_HELD_MAX_BYTES: usize = 64 << 20;
 
+/// B75: the held answers of one network group (`net_group`), at most. A
+/// choice: two answers at `SYNC_RESPONSE_CAP` in flight, as a reading
+/// client keeps them (one at a time refused an honest pipelined sync); four
+/// groups fill the pool, where two hosts that stopped reading filled it.
+pub const OPEN_HELD_PER_GROUP_BYTES: usize = 2 * SYNC_RESPONSE_CAP;
+
 /// B30: a requester that stops reading holds every answer it was sent
 /// until its request times out (60 s), and free identities on many hosts
 /// add up. An answer to a non-member counts from hand-off until it is
-/// written or fails; past `OPEN_HELD_MAX_BYTES` a new one is refused.
+/// written or fails; past `OPEN_HELD_MAX_BYTES` a new one is refused, and
+/// (B75) past `OPEN_HELD_PER_GROUP_BYTES` for its requester's group.
 #[derive(Debug)]
 pub struct HeldAnswers<K> {
-    held: HashMap<K, usize>,
+    held: HashMap<K, (String, usize)>,
+    by_group: HashMap<String, usize>,
     bytes: Arc<AtomicUsize>,
 }
 
@@ -932,26 +1186,38 @@ impl<K: std::hash::Hash + Eq> HeldAnswers<K> {
         bytes.store(0, Ordering::Relaxed);
         Self {
             held: HashMap::new(),
+            by_group: HashMap::new(),
             bytes,
         }
     }
 
-    /// Count `len` bytes for `id`; false (nothing counted) when that would
-    /// pass the bound.
-    pub fn admit(&mut self, id: K, len: usize) -> bool {
+    /// Count `len` bytes for `id`, an answer to a requester in `group`;
+    /// false (nothing counted) when that would pass either bound.
+    pub fn admit(&mut self, id: K, group: &str, len: usize) -> bool {
+        self.release(&id);
         let now = self.bytes.load(Ordering::Relaxed);
-        if now.saturating_add(len) > OPEN_HELD_MAX_BYTES {
+        let mine = self.by_group.get(group).copied().unwrap_or(0);
+        if now.saturating_add(len) > OPEN_HELD_MAX_BYTES
+            || mine.saturating_add(len) > OPEN_HELD_PER_GROUP_BYTES
+        {
             return false;
         }
-        let before = self.held.insert(id, len).unwrap_or(0);
-        self.bytes.store(now + len - before, Ordering::Relaxed);
+        self.held.insert(id, (group.to_string(), len));
+        *self.by_group.entry(group.to_string()).or_insert(0) += len;
+        self.bytes.store(now + len, Ordering::Relaxed);
         true
     }
 
     /// `id`'s answer was written, or failed: its bytes are free.
     pub fn release(&mut self, id: &K) {
-        if let Some(len) = self.held.remove(id) {
+        if let Some((group, len)) = self.held.remove(id) {
             self.bytes.fetch_sub(len, Ordering::Relaxed);
+            if let Some(held) = self.by_group.get_mut(&group) {
+                *held = held.saturating_sub(len);
+                if *held == 0 {
+                    self.by_group.remove(&group);
+                }
+            }
         }
     }
 
@@ -1305,19 +1571,111 @@ mod tests {
         let mut held: HeldAnswers<u32> = HeldAnswers::new(Arc::clone(&gauge));
         assert_eq!(held.bytes(), 0, "a new tracker starts the gauge at zero");
         let part = OPEN_HELD_MAX_BYTES / 4;
+        assert!(part <= OPEN_HELD_PER_GROUP_BYTES);
+        let group = |id: u32| format!("10.{id}");
         assert!(
-            (0..4).all(|id| held.admit(id, part)),
+            (0..4).all(|id| held.admit(id, &group(id), part)),
             "exactly the bound fits"
         );
-        assert!(!held.admit(4, 1), "past the bound");
+        assert!(!held.admit(4, &group(4), 1), "past the bound");
         assert_eq!(gauge.load(Ordering::Relaxed), OPEN_HELD_MAX_BYTES);
         held.release(&0);
         held.release(&0);
         held.release(&9);
         assert_eq!(held.bytes(), OPEN_HELD_MAX_BYTES - part);
-        assert!(held.admit(4, part), "freed bytes are admitted again");
+        assert!(
+            held.admit(4, &group(4), part),
+            "freed bytes are admitted again"
+        );
         (1..5).for_each(|id| held.release(&id));
         assert_eq!(gauge.load(Ordering::Relaxed), 0);
+    }
+
+    /// B90 witness: the address book dials a peer at what it was told,
+    /// newest kept, each address once, and holds at most `MAX_BOOK_PEERS`
+    /// peers (the oldest leave first), where Kademlia held anyone's.
+    #[test]
+    fn the_address_book_is_bounded_and_dials_what_it_holds() {
+        use libp2p::swarm::NetworkBehaviour;
+        let mut book = AddressBook::default();
+        let peer = PeerId::random();
+        let addr = |port: u16| -> libp2p::Multiaddr {
+            format!("/ip4/203.0.113.7/tcp/{port}").parse().unwrap()
+        };
+        for port in 0..(ADDRESSES_PER_PEER as u16 + 3) {
+            book.add_address(&peer, addr(port));
+        }
+        book.add_address(&peer, addr(10));
+        let held = book.addresses_of(&peer).to_vec();
+        assert_eq!(held.len(), ADDRESSES_PER_PEER);
+        assert_eq!(held.last(), Some(&addr(10)), "the newest last, once");
+        let dialled = book
+            .handle_pending_outbound_connection(
+                libp2p::swarm::ConnectionId::new_unchecked(1),
+                Some(peer),
+                &[],
+                libp2p::core::Endpoint::Dialer,
+            )
+            .unwrap();
+        assert_eq!(dialled, held);
+        for _ in 0..MAX_BOOK_PEERS {
+            book.add_address(&PeerId::random(), addr(1));
+        }
+        assert_eq!(book.len(), MAX_BOOK_PEERS);
+        assert!(book.addresses_of(&peer).is_empty(), "the oldest left");
+    }
+
+    /// B75 witness: one network group holds at most its share of the held
+    /// answers, whatever is left of the pool; its freed bytes are its own
+    /// again.
+    #[test]
+    fn one_group_cannot_hold_the_whole_pool() {
+        let mut held: HeldAnswers<u32> = HeldAnswers::new(Arc::default());
+        let answer = SYNC_RESPONSE_CAP;
+        assert!(held.admit(0, "203.0", answer), "an answer at the cap fits");
+        assert!(held.admit(1, "203.0", answer), "and a second in flight");
+        assert!(!held.admit(2, "203.0", answer), "past the group's share");
+        assert!(held.admit(3, "198.51", answer), "another group's own share");
+        held.release(&0);
+        assert!(held.admit(2, "203.0", answer), "freed for its group");
+        assert_eq!(held.bytes(), 3 * answer, "answers 1, 2 and 3");
+    }
+
+    /// B75 witness: the slots full of a few network groups, a newcomer from
+    /// another takes the youngest slot of the largest; one from the largest
+    /// group (or a group as large as it but one) is refused; a reserved peer
+    /// list parses.
+    #[test]
+    fn a_full_table_makes_room_for_new_network_groups() {
+        assert_eq!(net_group("203.0.113.7"), "203.0");
+        assert_eq!(net_group("::ffff:203.0.113.7"), "203.0");
+        assert_eq!(net_group("2001:db8:1:2::1"), "2001:db8");
+        assert_eq!(net_group("seed.example"), "seed.example");
+        let mut slots: NonMemberInbound<usize> = NonMemberInbound::default();
+        // 25 hosts at two identities in two /16s: 30 in one, 20 in another.
+        for id in 0..MAX_NON_MEMBER_INBOUND {
+            let group = if id < 30 { "10.1" } else { "10.2" };
+            assert_eq!(slots.admit(id, group), InboundAdmission::Admitted);
+        }
+        assert_eq!(
+            slots.admit(100, "192.0"),
+            InboundAdmission::Evicted(29),
+            "the youngest of the largest group"
+        );
+        assert_eq!(slots.len(), MAX_NON_MEMBER_INBOUND);
+        assert_eq!(slots.admit(101, "10.1"), InboundAdmission::Refused);
+        // Groups of 29 and 20: a newcomer of the second evicts from the
+        // first while it holds two more.
+        assert_eq!(slots.admit(102, "10.2"), InboundAdmission::Evicted(28));
+        // A table of single connections in distinct groups refuses.
+        let mut spread: NonMemberInbound<usize> = NonMemberInbound::default();
+        for id in 0..MAX_NON_MEMBER_INBOUND {
+            spread.admit(id, &format!("g{id}"));
+        }
+        assert_eq!(spread.admit(999, "new"), InboundAdmission::Refused);
+        std::env::set_var("AINCORE_RESERVED_PEERS", " a, b ,,");
+        assert_eq!(reserved_peers_from_env().len(), 2);
+        std::env::remove_var("AINCORE_RESERVED_PEERS");
     }
 
     /// B56 witness: with every slot other IPs may use held by silent
@@ -1425,7 +1783,7 @@ mod tests {
         assert!(futures::executor::block_on(write_frame(&mut sink, "abc", 2)).is_err());
     }
 
-    fn swarm(key: identity::Keypair) -> Swarm<request_response::Behaviour<FramedCodec>> {
+    fn swarm(key: identity::Keypair) -> Swarm<request_response::Behaviour<ConsensusCodec>> {
         let transport = MemoryTransport::default()
             .upgrade(upgrade::Version::V1)
             .authenticate(noise::Config::new(&key).unwrap())
@@ -1488,7 +1846,7 @@ mod tests {
                     }) = ev {
                         match admit_consensus_request(&book, &peer) {
                             Some(who) => {
-                                seen.push(Seen::Delivered(who.to_string(), request));
+                                seen.push(Seen::Delivered(who.to_string(), request.to_string()));
                                 let _ = server.behaviour_mut().send_response(channel, CONSENSUS_ACK.into());
                             }
                             None => {

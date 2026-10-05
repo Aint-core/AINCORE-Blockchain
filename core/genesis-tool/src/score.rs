@@ -7,9 +7,11 @@
 //! inputs: `allocations.json` (each qualified operator's bonded stake and
 //! bootstrap weight, for `gen-multi --allocations-file`), `accounts.json` (the
 //! public track, for `gen-multi --accounts-file`) and `report.json` (every
-//! number behind them). Run on any node's datadir at least W (7 days) past the
-//! snapshot, so every offense of the window has landed, it gives the same
-//! output.
+//! number behind them). Run on an archive node's datadir
+//! (`AINCORE_STORAGE_MODE=archive`: a full node prunes blocks and receipts
+//! past 100,000 blocks, B91) at least W (7 days) past the snapshot, so every
+//! offense of the window has landed, it gives the same output on any of
+//! them.
 
 use clap::Args;
 use consensus::v4::epoch;
@@ -38,7 +40,7 @@ pub const FOUNDER_MAX_BPS: u64 = 3_000;
 
 #[derive(Args, Debug)]
 pub struct ScoreArgs {
-    /// A stopped testnet node's datadir, or a copy of it.
+    /// A stopped testnet archive node's datadir, or a copy of it.
     #[arg(long)]
     pub datadir: String,
     /// The window's first block (IT-2: announced in advance).
@@ -155,8 +157,18 @@ fn classify(tx: &executor::Transaction) -> Action {
         return Action::None;
     }
     match (call.module.name().as_str(), call.function.as_str()) {
+        // B79: only AIN, and only an amount: a zero transfer, or one of
+        // another coin, made a Sybil's "funder" anyone it liked.
         ("coin", "transfer") => {
-            address_arg(&call, 1).map_or(Action::None, |to| Action::Transfer { to })
+            let ain = matches!(call.ty_args.as_slice(), [tag] if is_ain(tag));
+            let amount = call
+                .args
+                .get(2)
+                .and_then(|a| bcs::from_bytes::<u128>(a).ok());
+            match (ain, amount, address_arg(&call, 1)) {
+                (true, Some(n), Some(to)) if n > 0 => Action::Transfer { to },
+                _ => Action::None,
+            }
         }
         ("delegation", "delegate") => {
             address_arg(&call, 1).map_or(Action::None, |validator| Action::Delegate { validator })
@@ -175,6 +187,21 @@ fn classify(tx: &executor::Transaction) -> Action {
         _ => Action::None,
     }
 }
+
+/// B79: `0x1::staking::AincoreCoin`.
+fn is_ain(tag: &move_core_types::language_storage::TypeTag) -> bool {
+    matches!(tag, move_core_types::language_storage::TypeTag::Struct(s)
+        if s.address == vm_move::system_address()
+            && s.module.as_str() == "staking"
+            && s.name.as_str() == "AincoreCoin"
+            && s.type_params.is_empty())
+}
+
+/// B79: the cluster of every account whose funding does not lead back to
+/// the faucet (funded through a module, by an account outside the tree, or
+/// not at all): one cluster, capped once, so such accounts gain nothing by
+/// being many.
+pub const UNATTRIBUTED: &str = "unattributed";
 
 fn canonical(address: &str) -> String {
     address.trim_start_matches("0x").to_ascii_lowercase()
@@ -197,6 +224,17 @@ pub fn score(
         return Err(err(format!(
             "the founder's bootstrap weight {founder_bootstrap_ain} AIN is over 30 % of s_min"
         )));
+    }
+    // B91: the funding tree reads every block from 1 with its receipts, and
+    // a full node prunes blocks and their receipts past its retention
+    // (100,000 blocks by default): only an archive node holds them all.
+    for h in [1, to_height] {
+        if db.get(&format!("block_{h}"))?.is_none() {
+            return Err(err(format!(
+                "block {h} is missing: score an archive node's datadir \
+                 (AINCORE_STORAGE_MODE=archive); a full node prunes old blocks and receipts"
+            )));
+        }
     }
     let interval =
         epoch::epoch_interval(db).ok_or_else(|| err("the datadir pins no epoch length"))?;
@@ -374,7 +412,10 @@ pub fn score(
 
     // IT-6: the funding tree. Each account's funder is the sender of the
     // first successful transfer it received, from genesis on; its cluster is
-    // the account the faucet funded at the top of that chain.
+    // the account the faucet funded at the top of that chain. B79: an AIN
+    // transfer of some amount, or a paymaster sponsoring the account's
+    // transaction (it pays for the account); a chain that does not reach the
+    // faucet is `UNATTRIBUTED`.
     let succeeded = |raw: &str| -> Result<bool, Box<dyn std::error::Error>> {
         let key = format!("tx_receipt:{}", crypto::hash_hex(raw.as_bytes()));
         Ok(db
@@ -393,24 +434,37 @@ pub fn score(
             let Ok(tx) = serde_json::from_str::<executor::Transaction>(raw) else {
                 continue;
             };
-            if let Action::Transfer { to } = classify(&tx) {
-                let sender = canonical(&tx.sender);
-                if to != sender && !funder.contains_key(&to) && succeeded(raw)? {
-                    funder.insert(to, sender);
-                }
+            let sender = canonical(&tx.sender);
+            let payer = executor::admission::payer_address(&tx).map(|p| canonical(&p));
+            let sponsored = payer.filter(|p| *p != sender);
+            let transfer = match classify(&tx) {
+                Action::Transfer { to } if to != sender => Some(to),
+                _ => None,
+            };
+            if sponsored.is_none() && transfer.is_none() {
+                continue;
+            }
+            if !succeeded(raw)? {
+                continue;
+            }
+            if let Some(payer) = sponsored {
+                funder.entry(sender.clone()).or_insert(payer);
+            }
+            if let Some(to) = transfer {
+                funder.entry(to).or_insert(sender);
             }
         }
     }
     let cluster_of = |account: &str| -> String {
         let mut at = account.to_string();
         let mut seen = BTreeSet::new();
-        while let Some(f) = funder.get(&at) {
-            if *f == faucet || !seen.insert(at.clone()) {
-                break;
+        loop {
+            match funder.get(&at) {
+                Some(f) if *f == faucet => return at,
+                Some(f) if seen.insert(at.clone()) => at = f.clone(),
+                _ => return UNATTRIBUTED.to_string(),
             }
-            at = f.clone();
         }
-        at
     };
 
     // Points: each kind counts once per account and UTC day of block time;
@@ -639,16 +693,67 @@ mod tests {
     }
 
     fn transfer(from: u8, to: u8, nonce: u64) -> String {
-        tx(
+        coin_transfer(from, to, 1, ain(), nonce)
+    }
+
+    fn ain() -> move_core_types::language_storage::TypeTag {
+        coin_tag("staking", "AincoreCoin")
+    }
+
+    fn coin_tag(module: &str, name: &str) -> move_core_types::language_storage::TypeTag {
+        move_core_types::language_storage::TypeTag::Struct(Box::new(
+            move_core_types::language_storage::StructTag {
+                address: vm_move::system_address(),
+                module: move_core_types::identifier::Identifier::new(module).unwrap(),
+                name: move_core_types::identifier::Identifier::new(name).unwrap(),
+                type_params: vec![],
+            },
+        ))
+    }
+
+    fn coin_transfer(
+        from: u8,
+        to: u8,
+        amount: u128,
+        coin: move_core_types::language_storage::TypeTag,
+        nonce: u64,
+    ) -> String {
+        let raw = tx(
             from,
             "coin",
             "transfer",
             vec![
                 bcs::to_bytes(&move_address(to)).unwrap(),
-                bcs::to_bytes(&1u128).unwrap(),
+                bcs::to_bytes(&amount).unwrap(),
             ],
             nonce,
-        )
+        );
+        let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                vm_move::system_address(),
+                move_core_types::identifier::Identifier::new("coin").unwrap(),
+            ),
+            function: "transfer".into(),
+            ty_args: vec![coin],
+            args: vec![
+                bcs::to_bytes(&move_address(from)).unwrap(),
+                bcs::to_bytes(&move_address(to)).unwrap(),
+                bcs::to_bytes(&amount).unwrap(),
+            ],
+        };
+        v["payload"] = serde_json::json!(hex::encode(
+            bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap()
+        ));
+        v.to_string()
+    }
+
+    /// `raw` with `payer`'s key as its paymaster.
+    fn sponsored(raw: String, payer: u8) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        v["paymaster"] = serde_json::json!(hex::encode(key(payer).verifying_key().as_bytes()));
+        v["paymaster_signature"] = serde_json::json!("");
+        v.to_string()
     }
 
     /// A testnet of `stakes` (validators seeded 1..) over 3 epochs of I = 20
@@ -832,6 +937,28 @@ mod tests {
         assert!(refused.to_string().contains("not fair"), "{refused}");
     }
 
+    /// B91: a datadir whose first block was pruned is refused at once, naming
+    /// the archive node.
+    #[test]
+    fn a_pruned_datadir_is_refused_up_front() {
+        let (db, a) = testnet("pruned", &[1_000; 6], &[], &[]);
+        {
+            let _seed = db.seeding();
+            db.delete("block_1").unwrap();
+        }
+        let refused = score(
+            &db,
+            1,
+            60,
+            &[a[0].clone()],
+            &address_of(FAUCET),
+            18_500_000,
+            0,
+        )
+        .unwrap_err();
+        assert!(refused.to_string().contains("archive node"), "{refused}");
+    }
+
     /// A jail whose offense round is past the snapshot does not count.
     #[test]
     fn a_jail_counts_only_up_to_the_snapshot() {
@@ -947,5 +1074,52 @@ mod tests {
         assert_eq!(p(50).unwrap().ain, 625);
         assert_eq!(p(55).unwrap().ain, 375);
         assert_eq!(p(52).unwrap().ain, PUBLIC_CAP_AIN);
+    }
+
+    /// B79 witness: a zero transfer or another coin's transfer funds no
+    /// one, so accounts "funded" that way, or not at all, share one capped
+    /// cluster however many they are; a paymaster funds the accounts it
+    /// sponsors.
+    #[test]
+    fn sybils_outside_the_funding_tree_share_one_cap() {
+        let mut txs = vec![
+            (1, transfer(FAUCET, 50, 0)),
+            (1, coin_transfer(FAUCET, 60, 0, ain(), 1)),
+            (
+                1,
+                coin_transfer(FAUCET, 61, 5, coin_tag("bridge", "WBTC"), 2),
+            ),
+        ];
+        // 60, 61, 62 and 63 transact on three days; 62's transactions are
+        // sponsored by 50; 63 received nothing at all.
+        for (i, s) in [60u8, 61, 62, 63].into_iter().enumerate() {
+            for (n, day) in [10u64, 11, 12].into_iter().enumerate() {
+                let raw = transfer(s, 51, n as u64);
+                let raw = if s == 62 { sponsored(raw, 50) } else { raw };
+                txs.push((day + i as u64 * 5, raw));
+            }
+        }
+        let (db, a) = testnet("sybil", &[1_000; 7], &[], &txs);
+        let r = score(
+            &db,
+            1,
+            60,
+            &[a[0].clone()],
+            &address_of(FAUCET),
+            18_500_000,
+            5_550_000,
+        )
+        .unwrap();
+        let cluster = |seed: u8| r.public[&address_of(seed)].cluster.clone();
+        assert_eq!(cluster(60), UNATTRIBUTED, "a zero transfer funds no one");
+        assert_eq!(cluster(61), UNATTRIBUTED, "another coin funds no one");
+        assert_eq!(cluster(63), UNATTRIBUTED, "nothing received");
+        assert_eq!(cluster(62), address_of(50), "the paymaster funds it");
+        let shared: u64 = [60u8, 61, 63]
+            .iter()
+            .map(|s| r.public[&address_of(*s)].ain)
+            .sum();
+        assert!(shared <= PUBLIC_CAP_AIN, "{shared} AIN to the unattributed");
+        assert!(shared > 0, "vacuous: nothing paid to the unattributed");
     }
 }

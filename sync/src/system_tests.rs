@@ -1132,3 +1132,88 @@ fn kill_m37_a_held_block_without_its_qc_is_not_adopted() {
         "a block without a stored QC was adopted"
     );
 }
+
+/// B80 witness: a server that lacks one block's QC stops this node's batch
+/// at the block before it; the pass goes on to the next session (B33: up to
+/// `SYNC_PEERS_PER_PASS`), which has the QC, and the node reaches the
+/// certified tip in that one pass.
+#[test]
+fn a_server_without_a_blocks_qc_does_not_stall_the_pass() {
+    let (x, y) = (0, 3);
+    let mut sim = Sim::new("b80_qcless_server", &[181, 182, 183, 184], 1000);
+    assert!(sim.run_until(60, |s| s.height(y) >= 3));
+    sim.online[y] = false;
+    assert!(sim.run_until(200, |s| s.height(x) >= s.height(y) + 6));
+    let from = sim.height(y);
+    let full = sim.nodes[x]
+        .sync
+        .as_ref()
+        .unwrap()
+        .handle_sync_request(SyncRequest { from_height: from });
+    // The certified tip of the answer: blocks in a row that carry their QC.
+    let mut tip = from;
+    while full.blocks.iter().any(|b| b.header.height == tip + 1)
+        && full.qcs.iter().any(|q| q.block_height == tip + 1)
+    {
+        tip += 1;
+    }
+    let gap = from + 2;
+    assert!(
+        tip > gap,
+        "vacuous: the answer is not certified past the gap"
+    );
+    let (blocks, qcs) = (full.blocks.clone(), full.qcs.clone());
+    let (asks, mut queued) = tokio::sync::mpsc::channel::<network::SyncAsk>(64);
+    let (dials, _) = tokio::sync::mpsc::channel(1);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.spawn(async move {
+        while let Some(ask) = queued.recv().await {
+            let answer = if ask.wire == "GET_HEIGHT" {
+                Ok(format!("HEIGHT:{tip}"))
+            } else if let Some(req) = ask.wire.strip_prefix("SYNC_REQ:") {
+                let req: SyncRequest = serde_json::from_str(req).unwrap();
+                // The first session's server never got block `gap`'s QC.
+                let lacks = ask.peer == "12D3KooWa";
+                let resp = SyncResponse {
+                    blocks: blocks
+                        .iter()
+                        .filter(|b| b.header.height > req.from_height && b.header.height <= tip)
+                        .cloned()
+                        .collect(),
+                    finality: None,
+                    prune_horizon: None,
+                    qcs: qcs
+                        .iter()
+                        .filter(|q| !(lacks && q.block_height == gap))
+                        .cloned()
+                        .collect(),
+                };
+                Ok(format!(
+                    "SYNC_RESP:{}",
+                    serde_json::to_string(&resp).unwrap()
+                ))
+            } else {
+                Err("no".to_string())
+            };
+            let _ = ask.reply.send(answer);
+        }
+    });
+    let member = |peer: &str, member: &str| network::SessionPeer {
+        peer: peer.into(),
+        member: Some(member.into()),
+    };
+    let client = network::SessionClient {
+        asks,
+        dials,
+        table: Arc::new(std::sync::RwLock::new(vec![
+            member("12D3KooWa", &sim.committee[0].address),
+            member("12D3KooWb", &sim.committee[1].address),
+        ])),
+    };
+    let sync = ChainSync::new(Arc::clone(&sim.node(y).storage)).with_sessions(client);
+    let reached = rt.block_on(sync.sync_from_peers());
+    assert_eq!(
+        reached, tip,
+        "the pass stopped at the server without block {gap}'s QC"
+    );
+}

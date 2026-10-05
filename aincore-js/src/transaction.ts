@@ -566,13 +566,15 @@ export class Transaction {
     }
 
     /**
-     * Vote on a governance proposal
-     * Calls: 0x1::governance::vote(voter, proposal_id, approve)
+     * Vote on a governance proposal with `amount` quanta of AIN, locked
+     * until its voting ends (B71); `claimVoteTokens` takes it back after.
+     * Calls: 0x1::governance::vote(voter, proposal_id, approve, amount)
      */
     static vote(
         sender: Keypair,
         proposalId: number,
         approve: boolean,
+        amount: bigint,
         sequenceNumber: number = 0
     ): Transaction {
         const tx = new Transaction();
@@ -581,13 +583,15 @@ export class Transaction {
             bcsAddress(sender.address),
             bcsU64(BigInt(proposalId)),
             bcsBool(approve),
+            bcsU128(amount),
         ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
 
     /**
-     * Execute a passed governance proposal (after timelock)
+     * Resolve a passed governance proposal once its voting has ended (a
+     * signal: it records the outcome).
      * Calls: 0x1::governance::execute_proposal(executor, proposal_id)
      */
     static executeProposal(
@@ -600,6 +604,21 @@ export class Transaction {
         tx.payload = systemCall('governance', 'execute_proposal', [], [
             bcsAddress(sender.address),
             bcsU64(BigInt(proposalId)),
+        ]);
+        tx.sequenceNumber = sequenceNumber;
+        return tx;
+    }
+
+    /**
+     * Take back the AIN of every vote whose proposal's voting has ended,
+     * whatever the outcome (B71).
+     * Calls: 0x1::governance::claim_vote_tokens(voter)
+     */
+    static claimVoteTokens(sender: Keypair, sequenceNumber: number = 0): Transaction {
+        const tx = new Transaction();
+        tx.sender = sender.address;
+        tx.payload = systemCall('governance', 'claim_vote_tokens', [], [
+            bcsAddress(sender.address),
         ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
@@ -665,9 +684,14 @@ export class Transaction {
         return draft;
     }
 
-    /** The seven fields the sender signs (F4), as the node rebuilds them. */
+    /**
+     * The seven fields the sender signs (F4), as the node rebuilds them, and
+     * for a sponsored transaction an eighth, the paymaster's public key
+     * (B73: a relay could otherwise strip the paymaster and make the sender
+     * pay). Name the paymaster with `setPaymasterKey` before `sign`.
+     */
     private signingMessage(): string {
-        return [
+        const fields: Array<string | number | bigint> = [
             this.chainId,
             this.sender,
             this.payload,
@@ -675,7 +699,9 @@ export class Transaction {
             this.gasLimit,
             this.gasPrice,
             this.inputObjects.join(','),
-        ].join(':');
+        ];
+        if (this.paymaster !== undefined) fields.push(this.paymaster);
+        return fields.join(':');
     }
 
     /**

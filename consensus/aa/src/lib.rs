@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use storage::object::{Object, Owner};
 
@@ -90,7 +90,7 @@ impl AccountManager {
 
         let signature = Signature::from_bytes(&sig_array);
 
-        // 4. Verify
-        verifying_key.verify(tx_payload, &signature).is_ok()
+        // 4. Verify (B86: strict, as transactions are).
+        verifying_key.verify_strict(tx_payload, &signature).is_ok()
     }
 }
