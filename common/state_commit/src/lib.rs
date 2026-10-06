@@ -39,9 +39,11 @@ pub const MAX_CHUNK: usize = 10_000;
 /// so a missing or malformed row, or a hostile peer's input, can panic inside
 /// it. Every call into `jmt` goes through here and becomes an error instead.
 /// This relies on `panic = "unwind"`, the workspace default: a profile that
-/// sets `panic = "abort"` would turn these back into crashes.
+/// sets `panic = "abort"` would turn these back into crashes. B77's node
+/// hook aborts on panics; `panic_guard::caught` marks this one as caught,
+/// so the hook leaves it to unwind here.
 fn no_panic<T>(what: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+    match storage::panic_guard::caught(f) {
         Ok(result) => result,
         Err(_) => bail!("{what}: the state tree panicked (missing, corrupt or hostile tree data)"),
     }

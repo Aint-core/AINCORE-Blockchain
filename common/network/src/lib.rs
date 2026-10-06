@@ -54,6 +54,8 @@ pub struct SyncAsk {
 pub struct SyncServe {
     pub peer: String,
     pub member: Option<String>,
+    /// B114: a peer the operator reserved (`AINCORE_RESERVED_PEERS`).
+    pub reserved: bool,
     pub wire: String,
     pub reply: tokio::sync::oneshot::Sender<Option<String>>,
 }

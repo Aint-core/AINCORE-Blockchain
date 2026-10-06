@@ -216,10 +216,12 @@ impl AINCOREVM {
     /// verifier limits (`aptos_prod_verifier_config`, read 2026-10-04:
     /// loops 5 deep, 32 generic arguments, 128 parameters, 1,024 basic
     /// blocks, 256 type nodes, 10,000 pushes, 200 structs, 64 fields, 1,000
-    /// functions). The dependency depth is 100, the value move's verifier
-    /// suggests and its loader tests use; the verifier's metering keeps
-    /// move's default here (8,000,000 units a function and a module, a tenth
-    /// of Aptos's).
+    /// functions). The verifier's metering keeps move's default here
+    /// (8,000,000 units a function and a module, a tenth of Aptos's). B92:
+    /// no dependency depth here: the loader counts only modules its cache
+    /// does not hold, so in a parallel batch the check passed or failed by
+    /// thread timing; the executor bounds the depth from storage before the
+    /// VM runs (`deps::MAX_DEPENDENCY_DEPTH`).
     pub fn vm_config() -> move_vm_runtime::config::VMConfig {
         move_vm_runtime::config::VMConfig {
             verifier: move_bytecode_verifier::VerifierConfig {
@@ -229,7 +231,7 @@ impl AINCOREVM {
                 max_basic_blocks: Some(1024),
                 max_type_nodes: Some(256),
                 max_push_size: Some(10_000),
-                max_dependency_depth: Some(100),
+                max_dependency_depth: None,
                 max_struct_definitions: Some(200),
                 max_fields_in_struct: Some(64),
                 max_function_definitions: Some(1000),

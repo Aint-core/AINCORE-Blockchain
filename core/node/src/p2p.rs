@@ -1,7 +1,6 @@
 use crate::sessions::{self, PeerBook, SessionWiring};
 use libp2p::futures::StreamExt;
 use libp2p::{
-    autonat,
     core::upgrade,
     dcutr, identify,
     mdns::{tokio::Behaviour as Mdns, Config as MdnsConfig, Event as MdnsEvent},
@@ -126,8 +125,9 @@ pub async fn start_p2p(
     // B90: the address book members are dialled from (Kademlia is gone).
     let addresses = sessions::AddressBook::default();
 
-    // === AutoNAT ===
-    let autonat = autonat::Behaviour::new(local_peer_id, autonat::Config::default());
+    // B97: no AutoNAT. Nothing read it, and it kept every observed address an
+    // identify push reported, from anyone, without bound (and its server
+    // dialled back ports a stranger chose).
 
     // === Identify ===
     let identify = identify::Behaviour::new(identify::Config::new(
@@ -159,7 +159,6 @@ pub async fn start_p2p(
         limits: libp2p::connection_limits::Behaviour,
         mdns: Toggle<Mdns>,
         addresses: sessions::AddressBook,
-        autonat: autonat::Behaviour,
         identify: identify::Behaviour,
         pub dcutr: Toggle<dcutr::Behaviour>,
         pub relay: Toggle<relay::client::Behaviour>,
@@ -173,7 +172,6 @@ pub async fn start_p2p(
     let behaviour = P2PBehaviour {
         mdns: Toggle::from(mdns),
         addresses,
-        autonat,
         identify,
         consensus: sessions::MembersOnly::new(Arc::clone(&book)),
         sync: sessions::sync_behaviour(),
@@ -205,7 +203,7 @@ pub async fn start_p2p(
                 swarm
                     .behaviour_mut()
                     .addresses
-                    .add_address(&peer_id, multiaddr.clone());
+                    .pin_address(&peer_id, multiaddr.clone());
             }
             // Force dial
             if let Err(e) = swarm.dial(multiaddr) {
@@ -573,7 +571,13 @@ pub async fn start_p2p(
                             continue;
                         }
                         let (reply, answer) = tokio::sync::oneshot::channel();
-                        let open = member.is_none().then(|| OpenServe {
+                        // B103: the operator's reserved peers and forwarded
+                        // transactions' verdicts are not held to the
+                        // non-members' answer pool (four non-reading hosts
+                        // could fill it); they are still charged by bytes.
+                        let reserved_peer = reserved.contains(&peer.to_string());
+                        let tx_submit = request.starts_with(crate::forward::TX_SUBMIT);
+                        let open = (member.is_none() && !reserved_peer && !tx_submit).then(|| OpenServe {
                             busy: chain_sync::state_sync::busy_reply(&request),
                             key: budget_key.clone(),
                             group: peer_hosts
@@ -583,6 +587,7 @@ pub async fn start_p2p(
                         let serve = network::SyncServe {
                             peer: peer.to_string(),
                             member,
+                            reserved: reserved_peer,
                             wire: request,
                             reply,
                         };
@@ -637,7 +642,11 @@ pub async fn start_p2p(
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Mdns(MdnsEvent::Discovered(list))) => {
                         for (peer_id, multiaddr) in list {
                             println!("👀 mDNS discovered a new peer: {:?}", peer_id);
-                            swarm.behaviour_mut().addresses.add_address(&peer_id, multiaddr.clone());
+                            // B115: mDNS (any LAN host) names addresses for
+                            // committee members only.
+                            if book.read().is_ok_and(|b| b.member_of(&peer_id).is_some()) {
+                                swarm.behaviour_mut().addresses.add_address(&peer_id, multiaddr.clone());
+                            }
                         }
                     }
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Mdns(MdnsEvent::Expired(list))) => {
@@ -666,7 +675,7 @@ pub async fn start_p2p(
                             swarm
                                 .behaviour_mut()
                                 .addresses
-                                .add_address(&peer_id, sessions::without_peer(address));
+                                .pin_address(&peer_id, sessions::without_peer(address));
                         }
                         if num_established.get() > MAX_LIBP2P_CONNECTIONS_HARD {
                             eprintln!(
@@ -822,11 +831,19 @@ pub async fn start_p2p(
                             }
                         }
                     }
-                    SwarmEvent::Behaviour(P2PBehaviourEvent::Autonat(autonat::Event::StatusChanged { old, new })) => {
-                        println!("🔄 AutoNAT Status Changed: {:?} -> {:?}", old, new);
-                    }
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
-                        println!("🆔 Identify Received from {:?}: Agent={:?}, Addrs={:?}", peer_id, info.agent_version, info.listen_addrs);
+                        // B97/B102: only a committee member's report is kept or
+                        // logged (anyone may push identify as often as it likes,
+                        // with up to 4 KiB of text it chose), and the log line
+                        // is bounded.
+                        if !book.read().is_ok_and(|b| b.member_of(&peer_id).is_some()) {
+                            continue;
+                        }
+                        let agent: String = info.agent_version.chars().take(64).collect();
+                        println!(
+                            "🆔 Identify from member {peer_id}: agent {agent:?}, {} addresses",
+                            info.listen_addrs.len()
+                        );
                         // B22: a peer reached over the network is routed only at
                         // addresses another host can dial (its loopback is its
                         // own); a peer on this host keeps them all.

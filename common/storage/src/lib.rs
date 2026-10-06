@@ -2,6 +2,7 @@ pub use rocksdb;
 use rocksdb::DB; // Export for consumers
 pub mod class;
 pub mod object;
+pub mod panic_guard;
 mod transaction;
 pub use transaction::ReadStore;
 #[cfg(any(test, feature = "test-seeding"))]

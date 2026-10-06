@@ -166,6 +166,10 @@ pub struct Engine {
     /// OR-1: a parent digest → the certified children waiting on it.
     waiting: HashMap<String, HashSet<String>>,
     pending: PendingBuffer,
+    /// B95: per (epoch, round, author), the bodies whose payload passed its
+    /// checks (at most two plain ones, a third only if certified: a third
+    /// plain body is an equivocation and is not checked).
+    payload_slots: HashMap<(u64, u64, String), Vec<String>>,
     /// G5 BT-1: per member, the timestamp of its latest vertex refused as
     /// ahead of this node's clock (`Verdict::Early`); cleared when one of
     /// its vertices stages.
@@ -373,6 +377,7 @@ impl Engine {
             orderable: HashSet::new(),
             waiting: HashMap::new(),
             pending: PendingBuffer::default(),
+            payload_slots: HashMap::new(),
             early: HashMap::new(),
             own: BTreeMap::new(),
             collectors: BTreeMap::new(),
@@ -620,6 +625,44 @@ impl Engine {
         }
     }
 
+    /// B95: whether `v`'s payload must be checked: not when this body passed
+    /// before, and not for a third body of one (epoch, round, author).
+    /// A body this node holds a certificate for is checked whatever the
+    /// slot holds: a certified twin evicts a plain one, and a slot has at
+    /// most one certified body (Lemma U).
+    fn payload_gate(
+        slots: &HashMap<(u64, u64, String), Vec<String>>,
+        v: &Vertex,
+        certified: bool,
+    ) -> ingress_v4::PayloadGate {
+        match slots.get(&(v.epoch, v.round, v.author.clone())) {
+            Some(bodies) if bodies.contains(&v.hash) => ingress_v4::PayloadGate::Verified,
+            Some(bodies) if bodies.len() >= 2 && !certified => ingress_v4::PayloadGate::Full,
+            _ => ingress_v4::PayloadGate::Check,
+        }
+    }
+
+    /// B95: remember `v`'s body as checked; slots at or below the floor of
+    /// the active epoch (or of an older epoch) are forgotten when the map
+    /// grows.
+    fn remember_payload(&mut self, v: &Vertex) {
+        const PRUNE_AT: usize = 1 << 16;
+        if self.payload_slots.len() >= PRUNE_AT {
+            let (epoch, floor) = (self.epoch, self.gc_floor());
+            self.payload_slots
+                .retain(|(e, r, _), _| *e > epoch || (*e == epoch && *r > floor));
+        }
+        let bodies = self
+            .payload_slots
+            .entry((v.epoch, v.round, v.author.clone()))
+            .or_default();
+        // Two plain bodies, and a third only when it passed as certified
+        // (the gate lets no other third through).
+        if !bodies.contains(&v.hash) && bodies.len() < 3 {
+            bodies.push(v.hash.clone());
+        }
+    }
+
     /// IN-1, then ST and AT for a vertex that stages.
     pub fn on_vertex(&mut self, raw_len: usize, v: Vertex, net: &dyn ConsensusNet) {
         // A copy of a body already staged: nothing to verify or stage again,
@@ -643,9 +686,11 @@ impl Engine {
                 cursor: lock(&self.ordering).next_anchor_round,
             };
             let certs = &self.certs;
+            let slots = &self.payload_slots;
+            let epoch = self.epoch;
             // E4's cache: a ref whose certificate is already in the index was
             // verified when it got there (CE-3 ingests only verified ones).
-            ingress_v4::v4_verdict_cached(
+            ingress_v4::v4_verdict_gated(
                 raw_len,
                 &v,
                 &ctx,
@@ -655,8 +700,22 @@ impl Engine {
                         .get(&(r.round, r.author.clone()))
                         .is_some_and(|c| c.body.digest == r.digest)
                 },
+                |v: &Vertex| {
+                    let certified = v.epoch == epoch
+                        && certs
+                            .get(&(v.round, v.author.clone()))
+                            .is_some_and(|c| c.body.digest == v.hash);
+                    Self::payload_gate(slots, v, certified)
+                },
             )
         };
+        // B95: a body whose payload passed is remembered for its slot.
+        if matches!(
+            verdict,
+            Verdict::Stage | Verdict::PendingCert(_) | Verdict::PendingEpoch
+        ) {
+            self.remember_payload(&v);
+        }
         match verdict {
             Verdict::Stage => {
                 self.early.remove(&v.author);

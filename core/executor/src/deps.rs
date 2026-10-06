@@ -15,7 +15,7 @@ use move_binary_format::access::ModuleAccess;
 use move_binary_format::CompiledModule;
 use move_core_types::language_storage::{ModuleId, TypeTag};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Mutex;
 use storage::StateDB;
 
@@ -27,6 +27,12 @@ pub const MAX_DEPENDENCY_BYTES: u64 = 1024 * 1024 * 18 / 10;
 pub const GAS_PER_DEPENDENCY: u64 = 127;
 /// Module bytes loaded per gas: 5,880 / 420.
 pub const DEPENDENCY_BYTES_PER_GAS: u64 = 14;
+/// B92: the longest chain of modules a load may recurse through (move's
+/// suggested `max_dependency_depth`, 100). Enforced here, from storage: the
+/// VM's own depth check counts only modules its block-wide cache does not
+/// hold yet, so in a parallel batch it passed or failed by thread timing,
+/// and nodes could disagree on a block.
+pub const MAX_DEPENDENCY_DEPTH: u64 = 100;
 
 /// The modules a transaction loads.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -61,6 +67,82 @@ fn pulled_in(module: &CompiledModule) -> Vec<ModuleId> {
     let mut out = module.immediate_dependencies();
     out.extend(module.immediate_friends());
     out
+}
+
+/// B92: an upper bound on how deep the VM's loader recurses through these
+/// modules (dependencies and friends): the longest path through their
+/// strongly connected components, a component counted as all its modules
+/// (friends make cycles, as `coin` and its friends do). From storage alone,
+/// so every node computes the same bound whatever its module cache holds.
+fn load_depth(edges: &BTreeMap<ModuleId, Vec<ModuleId>>) -> u64 {
+    struct Tarjan<'a> {
+        edges: &'a BTreeMap<ModuleId, Vec<ModuleId>>,
+        index: BTreeMap<&'a ModuleId, usize>,
+        low: BTreeMap<&'a ModuleId, usize>,
+        stack: Vec<&'a ModuleId>,
+        on_stack: BTreeSet<&'a ModuleId>,
+        component: BTreeMap<&'a ModuleId, usize>,
+        depth: Vec<u64>,
+    }
+    impl<'a> Tarjan<'a> {
+        fn visit(&mut self, v: &'a ModuleId) {
+            let i = self.index.len();
+            self.index.insert(v, i);
+            self.low.insert(v, i);
+            self.stack.push(v);
+            self.on_stack.insert(v);
+            for w in self.edges.get(v).into_iter().flatten() {
+                let Some((w, _)) = self.edges.get_key_value(w) else {
+                    continue;
+                };
+                if !self.index.contains_key(w) {
+                    self.visit(w);
+                    let low = self.low[v].min(self.low[w]);
+                    self.low.insert(v, low);
+                } else if self.on_stack.contains(w) {
+                    let low = self.low[v].min(self.index[w]);
+                    self.low.insert(v, low);
+                }
+            }
+            if self.low[v] == self.index[v] {
+                let id = self.depth.len();
+                let mut members = Vec::new();
+                while let Some(w) = self.stack.pop() {
+                    self.on_stack.remove(w);
+                    self.component.insert(w, id);
+                    members.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                // Components reachable from this one were finished first.
+                let below = members
+                    .iter()
+                    .flat_map(|m| self.edges.get(*m).into_iter().flatten())
+                    .filter_map(|w| self.component.get(w))
+                    .filter(|c| **c != id)
+                    .map(|c| self.depth[*c])
+                    .max()
+                    .unwrap_or(0);
+                self.depth.push(members.len() as u64 + below);
+            }
+        }
+    }
+    let mut t = Tarjan {
+        edges,
+        index: BTreeMap::new(),
+        low: BTreeMap::new(),
+        stack: Vec::new(),
+        on_stack: BTreeSet::new(),
+        component: BTreeMap::new(),
+        depth: Vec::new(),
+    };
+    for v in edges.keys() {
+        if !t.index.contains_key(v) {
+            t.visit(v);
+        }
+    }
+    t.depth.into_iter().max().unwrap_or(0)
 }
 
 /// The modules naming the struct types in `tag`.
@@ -107,6 +189,7 @@ impl ModuleIndex {
         let mut seen = BTreeSet::new();
         let mut queue: VecDeque<ModuleId> = roots.into_iter().collect();
         let mut closure = Closure::default();
+        let mut edges: BTreeMap<ModuleId, Vec<ModuleId>> = BTreeMap::new();
         while let Some(id) = queue.pop_front() {
             if !seen.insert(id.clone()) {
                 continue;
@@ -128,7 +211,15 @@ impl ModuleIndex {
                      {MAX_DEPENDENCY_BYTES} bytes)"
                 ));
             }
-            queue.extend(next);
+            queue.extend(next.iter().cloned());
+            edges.insert(id, next);
+        }
+        let depth = load_depth(&edges);
+        if depth > MAX_DEPENDENCY_DEPTH {
+            return Err(format!(
+                "its modules exceed the dependency limits (a chain of {depth} modules, \
+                 at most {MAX_DEPENDENCY_DEPTH})"
+            ));
         }
         Ok(closure)
     }
@@ -150,5 +241,35 @@ impl ModuleIndex {
             cache.insert(digest, parsed.clone());
         }
         Ok(parsed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use move_core_types::account_address::AccountAddress;
+    use move_core_types::identifier::Identifier;
+
+    fn id(name: &str) -> ModuleId {
+        ModuleId::new(AccountAddress::ONE, Identifier::new(name).unwrap())
+    }
+
+    /// B93 witness: a cycle (friends make them) counts as all its modules,
+    /// and a module's depth is its deepest branch: x -> {a, d}, a -> b ->
+    /// c -> a, c -> d -> e: x, the 3-cycle, d, e = 6.
+    #[test]
+    fn a_cycle_counts_as_its_modules_and_the_deepest_branch_counts() {
+        let edges: BTreeMap<ModuleId, Vec<ModuleId>> = [
+            ("x", vec!["a", "d"]),
+            ("a", vec!["b"]),
+            ("b", vec!["c"]),
+            ("c", vec!["a", "d"]),
+            ("d", vec!["e"]),
+            ("e", vec![]),
+        ]
+        .into_iter()
+        .map(|(m, to)| (id(m), to.into_iter().map(id).collect()))
+        .collect();
+        assert_eq!(load_depth(&edges), 6);
     }
 }

@@ -129,12 +129,13 @@ mod tests {
         assert_eq!(one.to_vec().len(), 32);
     }
 
-    /// B69: the VM runs with a bounded dependency depth and Aptos's
-    /// production module limits, not move's unbounded defaults.
+    /// B69: the VM runs with Aptos's production module limits, not move's
+    /// unbounded defaults. B93: and no dependency depth of its own (it
+    /// depended on the module cache); the executor bounds it from storage.
     #[test]
     fn the_vm_runs_with_the_production_verifier_limits() {
         let config = crate::AINCOREVM::vm_config().verifier;
-        assert_eq!(config.max_dependency_depth, Some(100));
+        assert_eq!(config.max_dependency_depth, None);
         assert_eq!(config.max_loop_depth, Some(5));
         assert_eq!(config.max_generic_instantiation_length, Some(32));
         assert_eq!(config.max_function_parameters, Some(128));

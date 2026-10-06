@@ -3344,6 +3344,93 @@ mod tests {
         assert_eq!(gas_of(), alone, "the swap's gas grew with the registry");
     }
 
+    /// B99 witness: a full token registry (512 tokens) refuses another before
+    /// its fee is taken, so no call grows the registry past what a load can
+    /// pay for (unbounded, ~50 large tokens made every call abort for good).
+    /// The creator can afford the fee: without the cap the token is created.
+    #[test]
+    fn a_full_token_registry_refuses_another_token() {
+        const AIN: u128 = 1_000_000_000_000_000_000;
+        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let db = temp_db("b99_tokens");
+        let authority_key = SigningKey::from_bytes(&[71u8; 32]);
+        let authority = crypto::derive_address(authority_key.verifying_key().as_bytes()).unwrap();
+        let authority_pubkey = hex::encode(authority_key.verifying_key().as_bytes());
+        let path = single_validator_genesis(&authority, &authority_pubkey);
+        initialize_genesis_from(&db, &stdlib_path(), &path).expect("fresh genesis initializes");
+        let key = SigningKey::from_bytes(&[72u8; 32]);
+        let creator = create_account(&db, &key);
+        set_coin_store(&db, &creator, 200 * AIN);
+        #[derive(serde::Serialize)]
+        struct FakeToken {
+            token_id: Vec<u8>,
+            name: Vec<u8>,
+            symbol: Vec<u8>,
+            decimals: u8,
+            max_supply: u128,
+            current_supply: u128,
+            creator: AccountAddress,
+            is_mintable: bool,
+            icon_url: Vec<u8>,
+            project_url: Vec<u8>,
+        }
+        #[derive(serde::Serialize)]
+        struct Registry {
+            tokens: Vec<FakeToken>,
+        }
+        let tokens = (0..512u32)
+            .map(|i| FakeToken {
+                token_id: i.to_le_bytes().to_vec(),
+                name: b"t".to_vec(),
+                symbol: b"T".to_vec(),
+                decimals: 8,
+                max_supply: 1,
+                current_supply: 0,
+                creator: AccountAddress::ONE,
+                is_mintable: true,
+                icon_url: vec![],
+                project_url: vec![],
+            })
+            .collect();
+        let registry_key = system_resource_key("0x1::token_factory::TokenRegistry");
+        {
+            let _seed = db.seeding();
+            db.put(
+                &registry_key,
+                &hex::encode(bcs::to_bytes(&Registry { tokens }).unwrap()),
+            )
+            .unwrap();
+        }
+        let executor = Executor::new(db.clone());
+        let create = entry_payload(
+            "token_factory",
+            "create_token",
+            vec![],
+            vec![
+                bcs::to_bytes(&parse_move_addr(&creator).unwrap()).unwrap(),
+                bcs::to_bytes(&b"Name".to_vec()).unwrap(),
+                bcs::to_bytes(&b"SYM".to_vec()).unwrap(),
+                bcs::to_bytes(&8u8).unwrap(),
+                bcs::to_bytes(&1_000u128).unwrap(),
+                bcs::to_bytes(&0u128).unwrap(),
+                bcs::to_bytes(&Vec::<u8>::new()).unwrap(),
+                bcs::to_bytes(&Vec::<u8>::new()).unwrap(),
+            ],
+        );
+        let before = coin_balance(&db, &creator);
+        let (updates, gas) = executor
+            .execute_transaction(&signed_tx(&key, &creator, &create, 0, 2_000_000, 1))
+            .expect("charged");
+        apply_updates(&db, updates);
+        let held = hex::decode(db.get(&registry_key).unwrap().unwrap()).unwrap();
+        assert_eq!(&held[..2], &[0x80, 0x04], "still 512 tokens (ULEB128)");
+        assert_eq!(
+            coin_balance(&db, &creator),
+            before - gas,
+            "gas only: no fee burned"
+        );
+    }
+
     // ===== SEC-#30: genesis-hash pin =====
 
     /// The identity genesis stored. TA-1: it is computed once, in memory,

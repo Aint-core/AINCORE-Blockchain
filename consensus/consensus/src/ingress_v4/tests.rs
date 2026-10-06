@@ -471,6 +471,88 @@ fn layer_s_refuses_what_every_node_refuses() {
     );
 }
 
+/// B95 witness: the payload's checks (a signature or two an item) run only
+/// after Layer E's cheap filters, through the engine's gate: a copy dropped
+/// past the lead, early or below the floor never reaches them, a staging
+/// copy reaches them once, a third body of a slot is dropped unchecked, and
+/// an item repeated is refused.
+#[test]
+fn the_payload_is_checked_after_the_cheap_filters() {
+    let all = members();
+    let c = committee(&all);
+    let sentinel = sentinel(EPOCH);
+    let (v, _) = second_round(&all, 3, &[0, 1, 2]);
+    let ctx = |now: u64, floor: u64, cursor: u64| Context {
+        chain_id: CHAIN,
+        genesis_identity: GENESIS,
+        active: EpochRecord {
+            epoch: EPOCH,
+            first_round: FIRST,
+            closing_round: None,
+            sentinel: &sentinel,
+            committee: &c,
+        },
+        previous: None,
+        next: None,
+        now_secs: now,
+        gc_floor: floor,
+        cursor,
+    };
+    let gated = |cx: &Context<'_>, gate: &dyn Fn(&Vertex) -> PayloadGate| {
+        v4_verdict_gated(1_000, &v, cx, |_| None, |_| false, |x| gate(x))
+    };
+    let untouched = |_: &Vertex| -> PayloadGate { panic!("the payload was checked") };
+    let far = FIRST + 1 - LEAD - 1;
+    assert!(matches!(
+        gated(&ctx(NOW, 0, far), &untouched),
+        Verdict::Drop(_)
+    ));
+    assert_eq!(
+        gated(&ctx(v.timestamp - 31, 0, FIRST), &untouched),
+        Verdict::Early
+    );
+    assert_eq!(
+        gated(&ctx(NOW, FIRST + 1, FIRST), &untouched),
+        Verdict::Stale
+    );
+    let calls = std::cell::Cell::new(0);
+    let counted = |_: &Vertex| {
+        calls.set(calls.get() + 1);
+        PayloadGate::Check
+    };
+    assert_eq!(gated(&ctx(NOW, 0, FIRST), &counted), Verdict::Stage);
+    assert_eq!(calls.get(), 1);
+    assert!(matches!(
+        gated(&ctx(NOW, 0, FIRST), &|_| PayloadGate::Full),
+        Verdict::Drop(_)
+    ));
+    let mut twice = v.clone();
+    let item = twice.payload[0].clone();
+    twice.payload = vec![item.clone(), item];
+    seal(&mut twice, &all[3]);
+    assert!(invalid(v4_verdict(
+        1_000,
+        &twice,
+        &ctx(NOW, 0, FIRST),
+        |_| None
+    )));
+    // A bad payload on a copy the cheap filters drop is never looked at.
+    assert!(
+        matches!(
+            v4_verdict_gated(
+                1_000,
+                &twice,
+                &ctx(NOW, 0, far),
+                |_| None,
+                |_| false,
+                |_| PayloadGate::Check
+            ),
+            Verdict::Drop(_)
+        ),
+        "the payload was checked before the cheap filters"
+    );
+}
+
 #[test]
 fn layer_e_delays_but_never_refuses() {
     let all = members();

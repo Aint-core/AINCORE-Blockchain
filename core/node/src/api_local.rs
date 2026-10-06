@@ -2493,10 +2493,17 @@ fn session_counts(sessions: &network::SessionTable) -> (usize, usize) {
 /// 2^64 addresses), and keys fall into `RATE_LIMIT_BUCKETS` buckets by a
 /// per-process random hash, so the limiter's map, which actix-governor never
 /// shrinks, holds at most that many entries.
+///
+/// B104: trusted by address alone, any process on the proxy's host could set
+/// the header (a socket proxy reachable without the header-setting proxy
+/// passes the client's own). With `AINCORE_RPC_PROXY_PORT` the node also
+/// listens on that loopback port, for the proxy alone, and takes the header
+/// only from requests that arrived there.
 #[derive(Clone)]
 struct ClientIp {
     header: Option<String>,
     trusted: Vec<std::net::IpAddr>,
+    proxy_port: Option<u16>,
     buckets: std::collections::hash_map::RandomState,
 }
 
@@ -2548,18 +2555,26 @@ impl ClientIp {
                  in AINCORE_RPC_TRUSTED_PROXIES"
             );
         }
+        let proxy_port = std::env::var("AINCORE_RPC_PROXY_PORT")
+            .ok()
+            .and_then(|p| p.trim().parse().ok());
         Self {
             header,
             trusted,
+            proxy_port,
             buckets: Default::default(),
         }
     }
 
     fn address(&self, req: &actix_web::dev::ServiceRequest) -> Option<std::net::IpAddr> {
         let peer = req.peer_addr()?.ip();
+        let via_proxy_port = self
+            .proxy_port
+            .is_none_or(|port| req.app_config().local_addr().port() == port);
         let header = self
             .header
             .as_deref()
+            .filter(|_| via_proxy_port)
             .and_then(|name| req.headers().get(name)?.to_str().ok());
         Some(client_address(peer, header, &self.trusted))
     }
@@ -2606,6 +2621,7 @@ pub async fn start_api_server(
     // SECONDS, so per_second(100) throttled every IP to ~1 req/100s after a 200
     // burst — a frontend-bricking bug. per_millisecond(10) = true 100 req/s.
     let client_ip = ClientIp::from_env();
+    let proxy_port = client_ip.proxy_port;
     let governor_conf = GovernorConfigBuilder::default()
         .key_extractor(client_ip)
         .per_millisecond(10)
@@ -2660,7 +2676,12 @@ pub async fn start_api_server(
                     .route("/get_network_info", web::get().to(get_network_info_handler))
                     .route("/get_transaction", web::get().to(get_transaction_handler))
             })
-            .bind((bind_host.as_str(), api_port))?
+            .bind((bind_host.as_str(), api_port))
+            .and_then(|server| match proxy_port {
+                // B104: the listener only the header-setting proxy uses.
+                Some(port) => server.bind(("127.0.0.1", port)),
+                None => Ok(server),
+            })?
             .run(),
         )
         .await
@@ -2992,10 +3013,17 @@ mod tests {
         let named = ClientIp {
             header: Some("CF-Connecting-IP".into()),
             trusted: vec![proxy],
+            proxy_port: None,
             buckets: Default::default(),
         };
         let untrusted = ClientIp {
             trusted: vec![],
+            ..named.clone()
+        };
+        // B104: with a proxy port named, the header counts only on it (a test
+        // request arrives on 127.0.0.1:8080).
+        let on_port = |port: u16| ClientIp {
+            proxy_port: Some(port),
             ..named.clone()
         };
         let unnamed = ClientIp {
@@ -3015,6 +3043,22 @@ mod tests {
         assert_eq!(
             addr(&unnamed, request("127.0.0.1:5000", Some("203.0.113.7"))),
             "127.0.0.1"
+        );
+        assert_eq!(
+            addr(
+                &on_port(8080),
+                request("127.0.0.1:5000", Some("203.0.113.7"))
+            ),
+            "203.0.113.7",
+            "arrived on the proxy's port"
+        );
+        assert_eq!(
+            addr(
+                &on_port(9999),
+                request("127.0.0.1:5000", Some("203.0.113.7"))
+            ),
+            "127.0.0.1",
+            "arrived on another port: the header is not the proxy's"
         );
         // B74: a loopback peer that is not the named proxy is not trusted.
         assert_eq!(

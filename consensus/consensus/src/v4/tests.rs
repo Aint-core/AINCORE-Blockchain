@@ -2844,6 +2844,26 @@ fn dos_one_serve_answer_exceeds_the_node_wire_bound() {
     assert!(dos_node_wire_accepts(&msg), "serve built a {len}-byte answer the node transport drops");
 }
 
+/// B110 witness: a digest asked many times in one request is served once.
+#[test]
+fn a_digest_asked_twice_is_served_once() {
+    let mut c = Cluster::new("b110-dedup", 4, 0);
+    c.run(3);
+    let d = lock(&c.engine(1).dag)
+        .keys()
+        .next()
+        .cloned()
+        .expect("a held body");
+    let pull::Response::Vertices { bodies, unknown } = c
+        .engine(1)
+        .serve(&pull::Request::Vertices(vec![d.clone(); 32]))
+    else {
+        panic!("a vertices answer");
+    };
+    assert_eq!(bodies.len(), 1, "one body for one digest");
+    assert!(unknown.is_empty(), "{unknown:?}");
+}
+
 /// Deliver until quiet, pass by pass. In each pass the requests of one sender
 /// to one target are delivered highest `seq` first: what the node transport
 /// (one spawned TCP connection per message plus gossip) does at random, and
@@ -3460,7 +3480,9 @@ fn kill_m27_a_vertex_answer_respects_the_byte_cap() {
     let c = Cluster::new("kill-m27", 4, 0);
     let e = c.engine(0);
     let mut digests = Vec::new();
-    for k in 0..32u64 {
+    // 31 bodies of 100 KiB and, last, a small one: MAX_REQ_DIGESTS (32) in
+    // all, so every digest is looked at.
+    for k in 0..31u64 {
         let mut v = Vertex {
             epoch: EPOCH,
             round: 1,
@@ -3479,6 +3501,25 @@ fn kill_m27_a_vertex_answer_respects_the_byte_cap() {
         digests.push(v.hash.clone());
         lock(&e.dag).insert(v.hash.clone(), v);
     }
+    // B110: past the first body that does not fit nothing more is measured,
+    // so a small body asked after it is not served either.
+    let mut small = Vertex {
+        epoch: EPOCH,
+        round: 1,
+        author: c.members[2].info.address.clone(),
+        parents: vec![SENTINEL.into()],
+        parent_refs: vec![],
+        payload: vec![],
+        timestamp: NOW,
+        hash: String::new(),
+        signature: String::new(),
+        aggregated_signature: None,
+        payload_root: None,
+        parents_root: None,
+    };
+    small.hash = small.hash_v4_with_domain(CHAIN, GENESIS);
+    digests.push(small.hash.clone());
+    lock(&e.dag).insert(small.hash.clone(), small.clone());
     let pull::Response::Vertices { bodies, unknown } = e.serve(&pull::Request::Vertices(digests))
     else {
         panic!("wrong answer kind")
@@ -3486,6 +3527,7 @@ fn kill_m27_a_vertex_answer_respects_the_byte_cap() {
     let bytes: usize = bodies.iter().map(|v| serde_json::to_string(v).unwrap().len()).sum();
     assert!(bytes <= pull::MAX_RESP_BYTES, "{bytes} bytes answered");
     assert!(!unknown.is_empty(), "vacuous: everything fit");
+    assert!(unknown.contains(&small.hash), "measured past a full answer");
 }
 
 // ---------------------------------------- final review: remaining witnesses
@@ -3932,4 +3974,61 @@ fn v4_complete_signed_history_decides_after_retransmission_and_reopen() {
         assert_eq!(decision_row(&c, z, d.0), Some(format!("C:{}", d.1)));
     }
     c.assert_agree_except(Some(quiet));
+}
+
+/// B95 witness, end to end: the engine remembers each body whose payload it
+/// checked, so of three plain twins of one slot it checks two and drops the
+/// third unchecked.
+#[test]
+fn an_engine_checks_two_plain_twins_of_a_slot_and_not_a_third() {
+    let mut c = Cluster::new("payload-slots", 4, 0);
+    c.run(1);
+    let byz = c.leader(2);
+    let h0 = c.validators().find(|&i| i != byz).unwrap();
+    c.tick_all();
+    let a = c.engine(byz).own_proposal(2).unwrap().clone();
+    let b = twin_of(&a, &c.members[byz].node_key, "twin-b");
+    let cc = twin_of(&a, &c.members[byz].node_key, "twin-c");
+    let net = c.net(h0);
+    let checks = || ingress_v4::PAYLOAD_CHECKS.with(|n| n.get());
+    let before = checks();
+    for v in [&a, &b, &cc] {
+        let len = serde_json::to_string(v).unwrap().len();
+        c.engines[h0]
+            .as_mut()
+            .unwrap()
+            .on_vertex(len, v.clone(), &net);
+    }
+    assert!(c.engine(h0).is_staged(&a.hash), "vacuous: a did not stage");
+    assert_eq!(
+        checks() - before,
+        2,
+        "the third plain body's payload was checked"
+    );
+}
+
+/// B95 witness: the engine checks at most two bodies' payloads per (epoch,
+/// round, author), a third only when it is certified (a certified twin evicts
+/// a plain one), and a body checked before is not checked again (a wake).
+#[test]
+fn a_third_body_of_one_slot_is_not_checked() {
+    let v = Vertex::new(5, "author".into(), vec![], vec![]);
+    let mut slots: HashMap<(u64, u64, String), Vec<String>> = HashMap::new();
+    let gate =
+        |slots: &HashMap<(u64, u64, String), Vec<String>>| Engine::payload_gate(slots, &v, false);
+    assert_eq!(gate(&slots), ingress_v4::PayloadGate::Check);
+    slots.insert(
+        (v.epoch, v.round, v.author.clone()),
+        vec!["x".into(), "y".into()],
+    );
+    assert_eq!(gate(&slots), ingress_v4::PayloadGate::Full);
+    assert_eq!(
+        Engine::payload_gate(&slots, &v, true),
+        ingress_v4::PayloadGate::Check,
+        "a certified third body is checked"
+    );
+    slots
+        .get_mut(&(v.epoch, v.round, v.author.clone()))
+        .unwrap()[1] = v.hash.clone();
+    assert_eq!(gate(&slots), ingress_v4::PayloadGate::Verified);
 }

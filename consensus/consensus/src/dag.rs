@@ -167,8 +167,10 @@ pub struct DagConsensus {
     v4_ticks: u64,
     qc_want_next: u64,
     qc_want_boundary_next: u64,
-    qc_answered: HashMap<u64, u64>,
-    qc_answer_budget: (u64, u32),
+    /// B96: per (height, asker) the tick it was last answered, and per asker
+    /// its answers this tick ("*" for an ask with no named source).
+    qc_answered: HashMap<(u64, String), u64>,
+    qc_answer_budget: HashMap<String, (u64, u32)>,
     /// B51: each source's failed costly checks in its current window, and
     /// the sources not heard until a time.
     source_failures: HashMap<String, (std::time::Instant, u64)>,
@@ -370,7 +372,7 @@ impl DagConsensus {
             qc_want_next: 0,
             qc_want_boundary_next: 0,
             qc_answered: HashMap::new(),
-            qc_answer_budget: (0, 0),
+            qc_answer_budget: HashMap::new(),
             source_failures: HashMap::new(),
             muted: HashMap::new(),
             #[cfg(test)]
@@ -618,7 +620,10 @@ impl DagConsensus {
     /// `QC_ANSWERS_PER_TICK` answers per tick in all, so however asks are
     /// spread over heights they cost a bounded number of answers. B81: the
     /// answer goes to the member that asked (its push names it); only an ask
-    /// with no named source is answered to everyone.
+    /// with no named source is answered to everyone. B96: the throttle and
+    /// the budget are per asker: with one shared, the member that asked first
+    /// took the only answer for a height, and a slow member asking after it
+    /// got none (it could not activate the next epoch).
     fn answer_qc_want(&mut self, raw: &str, asker: Option<&str>) {
         if raw.len() > 20 {
             return;
@@ -629,16 +634,25 @@ impl DagConsensus {
         if h == 0 || h > self.latest_block_height {
             return;
         }
-        if self.qc_answer_budget.0 != self.v4_ticks {
-            self.qc_answer_budget = (self.v4_ticks, 0);
+        let who = asker.unwrap_or("*").to_string();
+        let tick = self.v4_ticks;
+        if self.qc_answer_budget.len() > QC_ANSWERED_CAP {
+            self.qc_answer_budget.retain(|_, (at, _)| *at == tick);
         }
-        if self.qc_answer_budget.1 >= QC_ANSWERS_PER_TICK {
+        let budget = self
+            .qc_answer_budget
+            .entry(who.clone())
+            .or_insert((tick, 0));
+        if budget.0 != tick {
+            *budget = (tick, 0);
+        }
+        if budget.1 >= QC_ANSWERS_PER_TICK {
             return;
         }
         if self
             .qc_answered
-            .get(&h)
-            .is_some_and(|t| self.v4_ticks < t + QC_WANT_EVERY_TICKS)
+            .get(&(h, who.clone()))
+            .is_some_and(|t| tick < t + QC_WANT_EVERY_TICKS)
         {
             return;
         }
@@ -649,14 +663,16 @@ impl DagConsensus {
             if let Some(oldest) = self
                 .qc_answered
                 .iter()
-                .min_by_key(|(height, tick)| (**tick, **height))
-                .map(|(height, _)| *height)
+                .min_by_key(|(key, tick)| (**tick, key.0, key.1.clone()))
+                .map(|(key, _)| key.clone())
             {
                 self.qc_answered.remove(&oldest);
             }
         }
-        self.qc_answered.insert(h, self.v4_ticks);
-        self.qc_answer_budget.1 += 1;
+        self.qc_answered.insert((h, who.clone()), tick);
+        if let Some(budget) = self.qc_answer_budget.get_mut(&who) {
+            budget.1 += 1;
+        }
         let wire = format!("{QC_CERT_PREFIX}{raw_qc}");
         match asker {
             Some(address) => self.v4_net().emit(network::Outbound::To {

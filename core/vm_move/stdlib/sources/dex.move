@@ -7,6 +7,8 @@ module 0x1::dex {
     use std::type_name;
     use std::vector;
     use 0x1::coin::{Self, Coin};
+    use 0x1::staking::AincoreCoin;
+    use 0x1::wbtc::WBTC;
 
     /// Error codes
     const EINVALID_LIQUIDITY: u64 = 1;
@@ -68,6 +70,10 @@ module 0x1::dex {
     /// Initialize a new canonical CPMM pool.
     public entry fun create_pool<X, Y>(creator: &signer) acquires PoolRegistry {
         let creator_addr = signer::address_of(creator);
+        // B100: a pool of the chain's coins only (AIN and wBTC, the two Move
+        // coin types): any type was accepted, so 256 junk pairs closed the
+        // registry to every real one.
+        assert!(is_coin<X>() && is_coin<Y>(), error::invalid_argument(EINVALID_PAIR));
         let (token_x_name, token_y_name) = canonical_token_names<X, Y>();
         let pool_key = make_pool_key(copy token_x_name, copy token_y_name);
 
@@ -285,6 +291,12 @@ module 0x1::dex {
     fun assert_registered_pool<X, Y>(pool_addr: address) {
         let (_, _) = canonical_token_names<X, Y>();
         assert!(exists<LiquidityPool<X, Y>>(pool_addr), error::not_found(EPOOL_NOT_FOUND));
+    }
+
+    /// B100: whether `T` is one of the chain's coin types.
+    fun is_coin<T>(): bool {
+        let t = type_name::get<T>();
+        t == type_name::get<AincoreCoin>() || t == type_name::get<WBTC>()
     }
 
     fun canonical_token_names<X, Y>(): (vector<u8>, vector<u8>) {

@@ -400,6 +400,13 @@ pub enum CollectOutcome {
     AfterCertified,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// B101 witness support: the pairings `CertCollector::add` ran on this
+    /// thread.
+    pub(crate) static PAIRINGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// CE-1, the author side: verify each attestation against the signer's
 /// registered BLS key, count only attestations of this exact body, and when the
 /// signers reach quorum aggregate them in canonical order and run CE-2 on the
@@ -457,12 +464,27 @@ impl CertCollector {
             .iter()
             .position(|v| v.address == att.signer)
             .ok_or_else(|| VcertError::SignerNotInCommittee(att.signer.clone()))?;
+        // B101: an exact copy of an attestation already verified needs no
+        // pairing (a replay used to cost one each time).
+        if let Some(first) = self.first_seen.get(&idx) {
+            if first.body == att.body && first.signature == att.signature {
+                return Ok(if att.body == self.body {
+                    CollectOutcome::Duplicate
+                } else {
+                    CollectOutcome::Foreign
+                });
+            }
+        }
         let pk = hex::decode(&self.committee[idx].bls_public_key)
             .map_err(|e| VcertError::BadSignature(format!("registered key undecodable: {e}")))?;
+        #[cfg(test)]
+        PAIRINGS.with(|p| p.set(p.get() + 1));
         let verifies = BLSEngine::consensus()
             .verify(&att.body.signing_bytes(), &att.signature, &pk)
             .unwrap_or(false);
         if !verifies {
+            // B101: a bad attestation is a failed costly check (B51).
+            crate::work::note_failed_check();
             return Err(VcertError::BadSignature(att.signer.clone()));
         }
 

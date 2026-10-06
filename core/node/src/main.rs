@@ -350,6 +350,11 @@ fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()
     file.sync_all()?;
     drop(file);
     std::fs::rename(&tmp, path)?;
+    // B112: the rename is durable once the directory is synced.
+    #[cfg(unix)]
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -361,6 +366,21 @@ fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()
             )));
         }
     }
+    Ok(())
+}
+
+/// B112: `path` (a secret) readable and writable by its owner only.
+fn owner_only(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -398,6 +418,12 @@ async fn main() {
     };
 
     let signing_key = if std::path::Path::new(key_path).exists() {
+        // B112: a key an older build wrote with the umask (0644) is narrowed
+        // to owner-only before it is read, or the node does not start.
+        if let Err(e) = owner_only(std::path::Path::new(key_path)) {
+            eprintln!("❌ FATAL: {key_path} cannot be made owner-only: {e}");
+            std::process::exit(1);
+        }
         match std::fs::read(key_path) {
             Ok(bytes) => {
                 let key_bytes = if bytes.len() == 32 {
@@ -787,16 +813,24 @@ async fn main() {
         const MEMBER_SERVES: usize = 4;
         const OPEN_SERVES: usize = 4;
         const TX_SUBMIT_SERVES: usize = 2;
+        // B114: the operator's reserved peers (its RPC nodes) forward on
+        // slots of their own.
+        const RESERVED_TX_SUBMIT_SERVES: usize = 2;
         let serve_sync = Arc::clone(&chain_sync);
         let serve_mempool = Arc::clone(&mempool);
         let serve_member = Arc::clone(&in_committee);
         let member_permits = Arc::new(tokio::sync::Semaphore::new(MEMBER_SERVES));
         let open_permits = Arc::new(tokio::sync::Semaphore::new(OPEN_SERVES));
         let tx_permits = Arc::new(tokio::sync::Semaphore::new(TX_SUBMIT_SERVES));
+        let reserved_tx_permits = Arc::new(tokio::sync::Semaphore::new(RESERVED_TX_SUBMIT_SERVES));
         tokio::spawn(async move {
             while let Some(request) = sync_serves.recv().await {
                 let permit = if request.wire.starts_with(node::forward::TX_SUBMIT) {
-                    Arc::clone(&tx_permits).try_acquire_owned()
+                    if request.reserved {
+                        Arc::clone(&reserved_tx_permits).try_acquire_owned()
+                    } else {
+                        Arc::clone(&tx_permits).try_acquire_owned()
+                    }
                 } else if request.member.is_some() {
                     // B88: members keep to their own slots (taking the open
                     // ones too, one member could hold all eight with 8 MiB
@@ -1645,7 +1679,7 @@ mod boot_identity_tests {
 
 #[cfg(test)]
 mod secret_file_tests {
-    use super::write_secret_file;
+    use super::{owner_only, write_secret_file};
 
     /// B87: node.key is owner-only from the first byte, under any umask,
     /// and a second write replaces it whole.
@@ -1666,6 +1700,15 @@ mod secret_file_tests {
         write_secret_file(&path, &[9u8; 32]).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), vec![9u8; 32]);
         assert!(!path.with_extension("tmp").exists());
+        // B112: a key an older build left world-readable is narrowed.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            owner_only(&path).unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "narrowed to {mode:o}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

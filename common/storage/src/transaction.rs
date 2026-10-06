@@ -524,6 +524,11 @@ impl StateDB {
                 "consensus state was written after the block's state root was sealed".into(),
             ));
         }
+        // B101: a transaction that wrote nothing commits nothing (a synced
+        // empty write per replayed vote was the cost of a free message).
+        if changes.is_empty() {
+            return Ok(result);
+        }
         let mut batch = WriteBatch::default();
         for (key, value) in changes.iter() {
             match value {

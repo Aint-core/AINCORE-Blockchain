@@ -303,8 +303,11 @@ fn block_crash_child() {
                 // no dependency charge the round-3 executor reproduces
                 // 9e6887ef... exactly, and so it does with the B69 charge;
                 // B71's governance.mv gives 1a91a159..., then B85's dex.mv
-                // a1f25c44....
-                "a1f25c44ea5298971cd280aefea6a586c522a175d45df77747a0573bdb358cc7",
+                // a1f25c44.... Round 4 moved it through the stdlib alone: with
+                // round 3's dex.mv and token_factory.mv the round-4 executor
+                // reproduces a1f25c44... exactly; B99's token_factory.mv gives
+                // 480958b3..., then B100's dex.mv 913b381f....
+                "913b381f244537461cb0945b93e33978256011204c9673caed4e02367518fbb0",
                 "clean execution must preserve the pre-staging fixture root"
             );
         }

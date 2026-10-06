@@ -1358,3 +1358,25 @@ fn measure_tree_bytes_per_key() {
         );
     }
 }
+
+/// B92 witness: `no_panic` marks its catch, so the node's abort-on-panic
+/// hook (B77), which spares a panic only while `panic_guard::catching()`,
+/// leaves a jmt panic to unwind into an error here.
+#[test]
+fn a_tree_panic_is_marked_as_caught() {
+    thread_local! {
+        static SEEN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        SEEN.with(|s| s.set(Some(storage::panic_guard::catching())));
+        previous(info);
+    }));
+    let out: Result<()> = no_panic("probe", || -> Result<()> { panic!("a jmt panic") });
+    assert!(out.is_err());
+    assert_eq!(
+        SEEN.with(|s| s.get()),
+        Some(true),
+        "the hook saw a panic not marked as caught"
+    );
+}

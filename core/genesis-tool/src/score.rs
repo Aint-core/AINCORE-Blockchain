@@ -451,7 +451,14 @@ pub fn score(
                 funder.entry(sender.clone()).or_insert(payer);
             }
             if let Some(to) = transfer {
-                funder.entry(to).or_insert(sender);
+                // B113: the faucet's own transfer makes an account a root,
+                // whoever sent it AIN first (one quantum sent ahead of the
+                // faucet put honest accounts in a griefer's capped cluster).
+                if sender == faucet {
+                    funder.insert(to, sender);
+                } else {
+                    funder.entry(to).or_insert(sender);
+                }
             }
         }
     }
@@ -1089,10 +1096,13 @@ mod tests {
                 1,
                 coin_transfer(FAUCET, 61, 5, coin_tag("bridge", "WBTC"), 2),
             ),
+            // B113: 50 sends 64 a quantum before the faucet funds it.
+            (2, transfer(50, 64, 0)),
+            (3, transfer(FAUCET, 64, 3)),
         ];
         // 60, 61, 62 and 63 transact on three days; 62's transactions are
         // sponsored by 50; 63 received nothing at all.
-        for (i, s) in [60u8, 61, 62, 63].into_iter().enumerate() {
+        for (i, s) in [60u8, 61, 62, 63, 64].into_iter().enumerate() {
             for (n, day) in [10u64, 11, 12].into_iter().enumerate() {
                 let raw = transfer(s, 51, n as u64);
                 let raw = if s == 62 { sponsored(raw, 50) } else { raw };
@@ -1115,6 +1125,11 @@ mod tests {
         assert_eq!(cluster(61), UNATTRIBUTED, "another coin funds no one");
         assert_eq!(cluster(63), UNATTRIBUTED, "nothing received");
         assert_eq!(cluster(62), address_of(50), "the paymaster funds it");
+        assert_eq!(
+            cluster(64),
+            address_of(64),
+            "the faucet's transfer makes a root"
+        );
         let shared: u64 = [60u8, 61, 63]
             .iter()
             .map(|s| r.public[&address_of(*s)].ain)

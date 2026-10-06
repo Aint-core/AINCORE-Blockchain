@@ -134,6 +134,12 @@ fn unsigned_parts_fixed(tx: &Transaction) -> Result<(), String> {
     if tx.paymaster.is_none() && tx.paymaster_signature.is_some() {
         return Err("a paymaster signature without a paymaster".to_string());
     }
+    // B105: no signature covers a proof, so a relay could add or strip one
+    // (its id and byte gas with it). None verifies today (B11); until proofs
+    // are signed, none is taken.
+    if tx.zkp_proof.as_deref().is_some_and(|p| !p.is_empty()) {
+        return Err("zkp_proof is not signed: send none".to_string());
+    }
     for object in &tx.input_objects {
         if object.is_empty() || object.len() > 64 || !is_lower_hex(object) {
             return Err(format!(
@@ -260,14 +266,7 @@ pub fn check_stateless(raw: &str, chain_id: &str) -> Result<CheckedTx, String> {
             execution_gas.min(MAX_GAS_LIMIT)
         ));
     }
-    if let Some(proof) = tx.zkp_proof.as_deref().filter(|p| !p.is_empty()) {
-        let canonical = format!(
-            "{}:{}:{}:{}",
-            tx.chain_id, tx.sender, tx.payload, tx.sequence_number
-        );
-        crypto::zkp::verify_tx_attached_proof(proof, canonical.as_bytes())
-            .map_err(|e| format!("ZKP proof rejected: {e}"))?;
-    }
+    // A non-empty `zkp_proof` was refused above (B105): proofs are not signed.
 
     let key = hex::decode(&tx.public_key).map_err(|_| "public key is not hex".to_string())?;
     let derived =

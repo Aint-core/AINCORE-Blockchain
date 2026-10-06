@@ -700,7 +700,9 @@ export class Transaction {
             this.gasPrice,
             this.inputObjects.join(','),
         ];
-        if (this.paymaster !== undefined) fields.push(this.paymaster);
+        // B106: the same condition as `toString`, so an empty paymaster is
+        // neither signed nor sent.
+        if (this.paymaster) fields.push(this.paymaster);
         return fields.join(':');
     }
 

@@ -18,6 +18,18 @@ module 0x1::token_factory {
     const EWALLET_NOT_INITIALIZED: u64 = 7;
     const EINVALID_AMOUNT: u64 = 8;
     const ESELF_TRANSFER: u64 = 9;
+    /// B99: a field longer than its bound, or the registry full.
+    const EFIELD_TOO_LONG: u64 = 10;
+    const ETOO_MANY_TOKENS: u64 = 11;
+
+    /// B99: every create, mint, burn and disable loads the whole registry,
+    /// so its size is bounded: these field lengths (bytes) and this many
+    /// tokens keep it under ~0.4 MB, a load well under the gas limit (a
+    /// choice; unbounded fields let ~50 tokens make every call abort).
+    const MAX_NAME_BYTES: u64 = 64;
+    const MAX_SYMBOL_BYTES: u64 = 16;
+    const MAX_URL_BYTES: u64 = 256;
+    const MAX_TOKENS: u64 = 512;
 
     /// Token creation fee (100 AIN, burned to create economic scarcity)
     const TOKEN_CREATION_FEE: u128 = 100_000_000_000_000_000_000; // 100 * 10^18
@@ -81,7 +93,20 @@ module 0x1::token_factory {
         
         // Validate max_supply > 0
         assert!(max_supply > 0, error::invalid_argument(EINVALID_AMOUNT));
+        assert!(
+            vector::length(&name) <= MAX_NAME_BYTES
+                && vector::length(&symbol) <= MAX_SYMBOL_BYTES
+                && vector::length(&icon_url) <= MAX_URL_BYTES
+                && vector::length(&project_url) <= MAX_URL_BYTES,
+            error::invalid_argument(EFIELD_TOO_LONG)
+        );
         
+        // B99: a full registry refuses before the fee is taken.
+        assert!(
+            vector::length(&borrow_global<TokenRegistry>(@0x1).tokens) < MAX_TOKENS,
+            error::resource_exhausted(ETOO_MANY_TOKENS)
+        );
+
         // Charge creation fee (100 AIN)
         let fee = coin::withdraw<AincoreCoin>(creator, TOKEN_CREATION_FEE);
         staking::burn_ain(fee); // Burn the fee and update canonical supply

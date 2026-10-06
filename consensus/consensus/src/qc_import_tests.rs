@@ -319,3 +319,35 @@ fn import_accepts_consistent_nonempty_body_commitments_after_reopen() {
     assert!(!import_finality_qc(&db, &cert).unwrap());
     assert_eq!(rows(&db), published);
 }
+
+/// B101 witness: a V4 import of a QC already stored, or of one for a height
+/// this node does not hold, runs no pairing (a replayed QC_CERT cost one and
+/// a synced commit each time).
+#[test]
+fn a_replayed_or_unheld_qc_costs_no_pairing() {
+    let dir = TestDir::new();
+    dir.seed(false);
+    let db = dir.open();
+    prepare_block(&db, 10);
+    let cert = certificate(&db, 10);
+    let staged = |cert: &QuorumCertificate| {
+        db.transaction(|view| {
+            stage_imported_certificate(&view, cert)
+                .map_err(storage::StorageError::DatabaseOperation)
+        })
+        .unwrap()
+    };
+    let pairings = || QC_PAIRINGS.with(|p| p.get());
+    let before = pairings();
+    assert!(staged(&cert), "the first import is stored");
+    assert_eq!(pairings() - before, 1, "vacuous: nothing was verified");
+    assert!(!staged(&cert));
+    let mut unheld = cert.clone();
+    unheld.block_height = 11;
+    assert!(!staged(&unheld));
+    assert_eq!(
+        pairings() - before,
+        1,
+        "a replay or an unheld height was verified"
+    );
+}

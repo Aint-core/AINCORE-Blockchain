@@ -150,6 +150,14 @@ fn signed_by_member(
 /// be accepted unread, so a member could fill each vertex with 768 KiB of
 /// anything and every block body would carry it for good.
 fn payload_admissible(v: &Vertex, chain_id: &str) -> Result<(), String> {
+    // B95: an item twice is refused before any signature is checked (one
+    // signed transaction repeated ~1,200 times filled a vertex with checks).
+    let mut seen = std::collections::HashSet::with_capacity(v.payload.len());
+    for (i, item) in v.payload.iter().enumerate() {
+        if !seen.insert(item.as_str()) {
+            return Err(format!("payload item {i} repeats an earlier one"));
+        }
+    }
     for (i, item) in v.payload.iter().enumerate() {
         match item.strip_prefix(crate::dag::SLASH_EVIDENCE_PREFIX) {
             Some(evidence) => {
@@ -171,7 +179,21 @@ fn payload_admissible(v: &Vertex, chain_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Layer S whole: what the boot re-check of staged bodies runs.
 pub(crate) fn layer_s(
+    v: &Vertex,
+    record: &EpochRecord<'_>,
+    chain_id: &str,
+    genesis_identity: &str,
+) -> Result<(), String> {
+    layer_s_head(v, record, chain_id, genesis_identity)?;
+    payload_admissible(v, chain_id)
+}
+
+/// Layer S without the payload: the hash, the author's signature, the
+/// round and the refs. B95: the payload's checks (a signature or two an
+/// item) run in `v4_verdict_gated` after Layer E's cheap filters.
+fn layer_s_head(
     v: &Vertex,
     record: &EpochRecord<'_>,
     chain_id: &str,
@@ -193,9 +215,6 @@ pub(crate) fn layer_s(
     if !lower_hex(&v.signature, 128) || !v.verify_ed25519_signature(&author.ed25519_public_key) {
         return Err("the author's signature does not verify".into());
     }
-    // After the signature, so the work is spent only on what a member signed,
-    // and INVALID then means the author signed a bad payload.
-    payload_admissible(v, chain_id)?;
     if v.round < record.first_round || v.round > ABSOLUTE_ROUND_CEILING {
         return Err(format!(
             "round {} outside {}..={ABSOLUTE_ROUND_CEILING}",
@@ -267,6 +286,63 @@ pub fn v4_verdict_cached(
     local_cert: impl Fn(&ParentRef) -> Option<CompactCert>,
     verified: impl Fn(&ParentRef) -> bool,
 ) -> Verdict {
+    v4_verdict_gated(raw_len, v, ctx, local_cert, verified, |_| {
+        PayloadGate::Check
+    })
+}
+
+/// B95: what the node does with a vertex's payload once the cheap checks
+/// passed (the engine's per-slot memory, `Engine::payload_gate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadGate {
+    /// Checked when this body was seen before: not again.
+    Verified,
+    /// Check it.
+    Check,
+    /// Two other bodies of this (epoch, round, author) took the check
+    /// already: the author equivocated, and a third is not checked.
+    Full,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// B95 witness support: the payload checks `payload_step` ran on this
+    /// thread.
+    pub(crate) static PAYLOAD_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The payload step: `None` to go on.
+fn payload_step(
+    v: &Vertex,
+    chain_id: &str,
+    gate: impl FnOnce(&Vertex) -> PayloadGate,
+) -> Option<Verdict> {
+    match gate(v) {
+        PayloadGate::Verified => None,
+        PayloadGate::Full => Some(Verdict::Drop(format!(
+            "round {} of {} holds two other bodies already",
+            v.round, v.author
+        ))),
+        PayloadGate::Check => {
+            #[cfg(test)]
+            PAYLOAD_CHECKS.with(|n| n.set(n.get() + 1));
+            payload_admissible(v, chain_id).err().map(Verdict::Invalid)
+        }
+    }
+}
+
+/// `v4_verdict_cached` with B95's order: Layer S without the payload, the
+/// epoch and Layer E's cheap filters, and only then the payload's checks,
+/// through `gate`. A vertex those filters drop or refuse as stale is not
+/// staged anyway; a later copy within the window gets the payload verdict.
+pub fn v4_verdict_gated(
+    raw_len: usize,
+    v: &Vertex,
+    ctx: &Context<'_>,
+    local_cert: impl Fn(&ParentRef) -> Option<CompactCert>,
+    verified: impl Fn(&ParentRef) -> bool,
+    gate: impl FnOnce(&Vertex) -> PayloadGate,
+) -> Verdict {
     let active = &ctx.active;
     // Layer S, the parts that need no epoch record.
     if raw_len > MAX_VERTEX_BYTES {
@@ -299,11 +375,12 @@ pub fn v4_verdict_cached(
             v.epoch
         ));
     };
-    if let Err(e) = layer_s(v, record, ctx.chain_id, ctx.genesis_identity) {
+    if let Err(e) = layer_s_head(v, record, ctx.chain_id, ctx.genesis_identity) {
         return Verdict::Invalid(e);
     }
     if v.epoch > active.epoch {
-        return Verdict::PendingEpoch;
+        // Buffered for activation: its payload is checked before it is kept.
+        return payload_step(v, ctx.chain_id, gate).unwrap_or(Verdict::PendingEpoch);
     }
     if v.epoch < active.epoch || active.closing_round.is_some_and(|r| v.round > r) {
         return Verdict::Stale;
@@ -321,6 +398,10 @@ pub fn v4_verdict_cached(
             "payload at round {}, beyond the cursor's lead",
             v.round
         ));
+    }
+    // B95: the payload's signatures only now, past the cheap filters.
+    if let Some(verdict) = payload_step(v, ctx.chain_id, gate) {
+        return verdict;
     }
     if v.round == active.first_round {
         return Verdict::Stage;

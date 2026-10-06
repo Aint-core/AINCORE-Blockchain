@@ -90,6 +90,26 @@ fn wall_secs() -> u64 {
 /// (`MempoolConfig::capacity_per_user`).
 pub const MAX_NONCE_AHEAD: u64 = 100;
 
+/// B98: how long a transaction may wait parked (behind a nonce gap, or under
+/// the base fee) before it leaves the pool. A choice: Aptos's mempool drops a
+/// transaction after `system_transaction_timeout_secs` (600).
+pub const PARKED_TTL_SECS: u64 = 600;
+
+/// B98: a waiting transaction may be replaced by one with the same sender
+/// and sequence number whose price is at least this many percent higher
+/// (geth's txpool `PriceBump`, 10).
+pub const REPLACE_PRICE_BUMP_PERCENT: u128 = 10;
+
+/// B94: what a block would do with a ready transaction.
+enum Payable {
+    /// Charged: offer it.
+    Yes,
+    /// Skipped for good (its pre-charge does not fit): it leaves the pool.
+    Never,
+    /// Its payer cannot cover it now: its sender's run stops here.
+    NotNow,
+}
+
 /// What admission parsed out of a waiting transaction, kept so selection never
 /// re-parses it and the payer's waiting total is a sum, not a scan of JSON.
 #[derive(Debug, Clone)]
@@ -135,6 +155,14 @@ pub struct Mempool {
     /// committed AIN). Production callers pass it via
     /// [`Mempool::with_storage`]; without it the gate is skipped.
     storage: Option<Arc<StateDB>>,
+    /// B98: each sender's committed next sequence number, read once per
+    /// committed height (`seq_cache_at`), not once per sender per pass under
+    /// the mempool and consensus locks.
+    seq_cache: std::collections::HashMap<String, u64>,
+    seq_cache_at: Option<String>,
+    /// B98: when each parked transaction was first seen parked (the caller's
+    /// clock); past `PARKED_TTL_SECS` it leaves.
+    parked_since: std::collections::HashMap<String, u64>,
 }
 
 impl Mempool {
@@ -149,6 +177,9 @@ impl Mempool {
             seen_order: VecDeque::new(),
             pending_nonces: HashSet::new(),
             storage: None,
+            seq_cache: std::collections::HashMap::new(),
+            seq_cache_at: None,
+            parked_since: std::collections::HashMap::new(),
         }
     }
 
@@ -164,6 +195,9 @@ impl Mempool {
             seen_order: VecDeque::new(),
             pending_nonces: HashSet::new(),
             storage: Some(storage),
+            seq_cache: std::collections::HashMap::new(),
+            seq_cache_at: None,
+            parked_since: std::collections::HashMap::new(),
         }
     }
 }
@@ -266,6 +300,41 @@ impl Mempool {
         if self.seen_txs.contains(&tx_hash) {
             return Err(format!("Duplicate transaction: {}", tx_hash));
         }
+        // B98: a sender:sequence already waiting is refused before anything
+        // else (it used to evict a parked transaction first, for free), or
+        // replaced when the new price is REPLACE_PRICE_BUMP_PERCENT higher
+        // and the old one is still queued (not on loan to a vertex).
+        let nonce_key = format!("{}:{}", parsed_tx.sender, parsed_tx.sequence_number);
+        let replacing = if self.pending_nonces.contains(&nonce_key) {
+            let old = self
+                .pending_txs
+                .iter()
+                .find(|raw| {
+                    self.meta.get(*raw).is_some_and(|m| {
+                        m.sender == parsed_tx.sender && m.seq == parsed_tx.sequence_number
+                    })
+                })
+                .cloned();
+            match old {
+                Some(old)
+                    if self.meta.get(&old).is_some_and(|m| {
+                        parsed_tx.gas_price.saturating_mul(100)
+                            >= m.gas_price.saturating_mul(100 + REPLACE_PRICE_BUMP_PERCENT)
+                    }) =>
+                {
+                    Some(old)
+                }
+                _ => {
+                    return Err(format!(
+                        "Duplicate pending nonce for sender {} sequence {} (a replacement \
+                         must pay {REPLACE_PRICE_BUMP_PERCENT}% more)",
+                        parsed_tx.sender, parsed_tx.sequence_number
+                    ));
+                }
+            }
+        } else {
+            None
+        };
 
         // Economic gate, after authentication so a bad signature is reported as
         // such. The executor reserves the full gas_limit * gas_price from the
@@ -308,9 +377,9 @@ impl Mempool {
                 .ok_or_else(|| "Gas limit times gas price overflows".to_string())?;
             let waiting: u128 = self
                 .meta
-                .values()
-                .filter(|m| m.payer == checked.payer)
-                .map(|m| m.cost)
+                .iter()
+                .filter(|(raw, m)| m.payer == checked.payer && Some(*raw) != replacing.as_ref())
+                .map(|(_, m)| m.cost)
                 .fold(0u128, u128::saturating_add);
             let need = waiting.saturating_add(gas_cost);
             match executor::committed_ain_balance(storage, &checked.payer) {
@@ -328,6 +397,22 @@ impl Mempool {
                     ));
                 }
             }
+            // B94: what a block charges before anything runs (object loads,
+            // the account writes) must fit the execution gas, or every block
+            // skips the transaction for nothing.
+            let execution = parsed_tx
+                .gas_limit
+                .saturating_sub(executor::admission::intrinsic_gas(tx.len()));
+            match executor::precharge_gas(storage, parsed_tx) {
+                Some(owed) if owed <= execution => {}
+                Some(owed) => {
+                    return Err(format!(
+                        "the gas limit leaves {execution} execution gas, under the {owed} \
+                         owed before execution (object loads and account writes)"
+                    ));
+                }
+                None => return Err("an account record does not parse".to_string()),
+            }
         }
 
         // RE-AUDIT HIGH: the cap must count LOANED transactions too, or a pull
@@ -336,17 +421,16 @@ impl Mempool {
         // parked one (behind a nonce gap, or priced under the base fee):
         // parked transactions are never offered to a block and pay nothing,
         // so they cannot hold the pool against transactions that can run.
-        if self.pending_txs.len() + self.inflight.len() >= MAX_PENDING_TXS {
-            let evicted = match &self.storage {
+        if replacing.is_none() && self.pending_txs.len() + self.inflight.len() >= MAX_PENDING_TXS {
+            let evicted = match self.storage.clone() {
                 Some(storage)
                     if self.is_ready(
-                        storage,
+                        &storage,
                         &parsed_tx.sender,
                         parsed_tx.sequence_number,
                         parsed_tx.gas_price,
                     ) =>
                 {
-                    let storage = Arc::clone(storage);
                     self.evict_parked(&storage)
                 }
                 _ => false,
@@ -361,12 +445,9 @@ impl Mempool {
             }
         }
 
-        let nonce_key = format!("{}:{}", parsed_tx.sender, parsed_tx.sequence_number);
-        if self.pending_nonces.contains(&nonce_key) {
-            return Err(format!(
-                "Duplicate pending nonce for sender {} sequence {}",
-                parsed_tx.sender, parsed_tx.sequence_number
-            ));
+        if let Some(old) = replacing {
+            self.drop_waiting(&old);
+            println!("🔁 Mempool: replaced a waiting transaction at a higher price");
         }
 
         // Bounded LRU-style eviction
@@ -473,14 +554,16 @@ impl Mempool {
         // A transaction whose sequence number is already used can never run:
         // it leaves the pool.
         let mut dead: Vec<String> = Vec::new();
-        if let Some(storage) = self.storage.clone() {
+        let storage = self.storage.clone();
+        if let Some(storage) = &storage {
             let loaned = self.loaned_seqs();
-            let base_fee = executor::committed_base_fee(&storage);
+            let base_fee = executor::committed_base_fee(storage);
             for (sender, q) in by_sender.iter_mut() {
-                let committed = executor::committed_sequence_number(&storage, sender);
+                let committed = self.committed_next(storage, sender);
                 let mut expected = committed;
                 let mut ready = Vec::with_capacity(q.len());
-                for &(seq, gas_price, idx) in q.iter() {
+                let mut parked_from = q.len();
+                for (at, &(seq, gas_price, idx)) in q.iter().enumerate() {
                     if seq < committed {
                         dead.push(raws[idx].clone());
                         continue;
@@ -489,14 +572,32 @@ impl Mempool {
                         expected += 1;
                     }
                     if seq != expected || gas_price < base_fee {
+                        parked_from = at;
                         break;
                     }
                     ready.push((seq, gas_price, idx));
                     expected += 1;
                 }
+                // B98: a parked transaction leaves after PARKED_TTL_SECS.
+                for &(_, _, idx) in &q[parked_from..] {
+                    let raw = &raws[idx];
+                    let since = *self.parked_since.entry(raw.clone()).or_insert(now_secs);
+                    if now_secs.saturating_sub(since) >= PARKED_TTL_SECS {
+                        dead.push(raw.clone());
+                    }
+                }
+                for &(_, _, idx) in &ready {
+                    self.parked_since.remove(&raws[idx]);
+                }
                 *q = ready;
             }
         }
+        // B94: what a block would skip for nothing is not offered: one whose
+        // pre-charge no longer fits (the state byte gas rose) leaves; a payer
+        // whose committed balance does not cover its run so far stops its
+        // senders' runs there.
+        let mut payer_left: std::collections::HashMap<String, u128> =
+            std::collections::HashMap::new();
 
         // Per-sender cursor into its nonce-ordered queue.
         let mut cursor: BTreeMap<String, usize> =
@@ -521,10 +622,28 @@ impl Mempool {
             }
             match best {
                 Some((_, idx, sender)) => {
-                    selected.push(idx);
-                    // advance the chosen sender's cursor
-                    if let Some(c) = cursor.get_mut(&sender) {
-                        *c += 1;
+                    let payable = match &storage {
+                        Some(storage) => self.payable(storage, &raws[idx], &mut payer_left),
+                        None => Payable::Yes,
+                    };
+                    match payable {
+                        Payable::Yes => {
+                            selected.push(idx);
+                            if let Some(c) = cursor.get_mut(&sender) {
+                                *c += 1;
+                            }
+                        }
+                        Payable::Never => {
+                            dead.push(raws[idx].clone());
+                            if let Some(c) = cursor.get_mut(&sender) {
+                                *c = usize::MAX;
+                            }
+                        }
+                        Payable::NotNow => {
+                            if let Some(c) = cursor.get_mut(&sender) {
+                                *c = usize::MAX;
+                            }
+                        }
                     }
                 }
                 None => break, // all sender queues exhausted
@@ -537,7 +656,13 @@ impl Mempool {
             self.remove_pending_nonce(raw);
             self.meta.remove(raw);
             self.requeue_attempts.remove(raw);
+            self.parked_since.remove(raw);
+            if let Ok(parsed) = serde_json::from_str::<executor::Transaction>(raw) {
+                self.seen_txs.remove(&Self::canonical_tx_hash(&parsed));
+            }
         }
+        self.parked_since
+            .retain(|raw, _| self.meta.contains_key(raw));
         let dead: HashSet<String> = dead.into_iter().collect();
         let now = now_secs;
         for raw in &result {
@@ -720,11 +845,44 @@ impl Mempool {
         out
     }
 
+    /// B94: whether the block would charge `raw` (its pre-charge fits its
+    /// execution gas, and its payer's committed balance covers it with what
+    /// this pass already offered of the payer's). `payer_left` holds each
+    /// payer's balance left in this pass.
+    fn payable(
+        &self,
+        storage: &StateDB,
+        raw: &str,
+        payer_left: &mut std::collections::HashMap<String, u128>,
+    ) -> Payable {
+        let (Some(m), Ok(tx)) = (
+            self.meta.get(raw),
+            serde_json::from_str::<executor::Transaction>(raw),
+        ) else {
+            return Payable::Never;
+        };
+        let execution = tx
+            .gas_limit
+            .saturating_sub(executor::admission::intrinsic_gas(raw.len()));
+        match executor::precharge_gas(storage, &tx) {
+            Some(owed) if owed <= execution => {}
+            _ => return Payable::Never,
+        }
+        let left = payer_left
+            .entry(m.payer.clone())
+            .or_insert_with(|| executor::committed_ain_balance(storage, &m.payer).unwrap_or(0));
+        if *left < m.cost {
+            return Payable::NotNow;
+        }
+        *left -= m.cost;
+        Payable::Yes
+    }
+
     /// B70: whether `sender`'s transaction `seq` at `gas_price` is ready: at
     /// least the base fee, and its sequence number the committed next or
     /// right after a run of the sender's waiting and loaned transactions that
     /// starts there.
-    fn is_ready(&self, storage: &StateDB, sender: &str, seq: u64, gas_price: u128) -> bool {
+    fn is_ready(&mut self, storage: &StateDB, sender: &str, seq: u64, gas_price: u128) -> bool {
         if gas_price < executor::committed_base_fee(storage) {
             return false;
         }
@@ -734,7 +892,7 @@ impl Mempool {
             .filter(|m| m.sender == sender)
             .map(|m| m.seq)
             .collect();
-        let mut expected = executor::committed_sequence_number(storage, sender);
+        let mut expected = self.committed_next(storage, sender);
         while expected < seq && held.contains(&expected) {
             expected += 1;
         }
@@ -747,6 +905,14 @@ impl Mempool {
     /// One pass: each sender's ready run is found once.
     fn evict_parked(&mut self, storage: &StateDB) -> bool {
         let base_fee = executor::committed_base_fee(storage);
+        let senders: HashSet<String> = self.meta.values().map(|m| m.sender.clone()).collect();
+        let committed_of: std::collections::HashMap<String, u64> = senders
+            .into_iter()
+            .map(|s| {
+                let next = self.committed_next(storage, &s);
+                (s, next)
+            })
+            .collect();
         let mut held: std::collections::HashMap<&str, HashSet<u64>> =
             std::collections::HashMap::new();
         for m in self.meta.values() {
@@ -756,7 +922,7 @@ impl Mempool {
         let mut runs: std::collections::HashMap<&str, (u64, u64)> =
             std::collections::HashMap::new();
         for (sender, seqs) in &held {
-            let committed = executor::committed_sequence_number(storage, sender);
+            let committed = committed_of[*sender];
             let mut end = committed;
             while seqs.contains(&end) {
                 end += 1;
@@ -781,15 +947,40 @@ impl Mempool {
             return false;
         };
         let raw = raw.to_string();
-        self.pending_txs.retain(|r| *r != raw);
-        self.remove_pending_nonce(&raw);
-        self.meta.remove(&raw);
-        self.requeue_attempts.remove(&raw);
-        if let Ok(parsed) = serde_json::from_str::<executor::Transaction>(&raw) {
-            self.seen_txs.remove(&Self::canonical_tx_hash(&parsed));
-        }
+        self.drop_waiting(&raw);
         println!("🧹 Mempool full: evicted a parked transaction for a ready one");
         true
+    }
+
+    /// Remove a queued transaction for good (evicted, replaced, expired);
+    /// its sender may submit it again.
+    fn drop_waiting(&mut self, raw: &str) {
+        self.pending_txs.retain(|r| r != raw);
+        self.remove_pending_nonce(raw);
+        self.meta.remove(raw);
+        self.requeue_attempts.remove(raw);
+        self.parked_since.remove(raw);
+        if let Ok(parsed) = serde_json::from_str::<executor::Transaction>(raw) {
+            self.seen_txs.remove(&Self::canonical_tx_hash(&parsed));
+        }
+    }
+
+    /// B98: the sender's committed next sequence number, read once per
+    /// committed height.
+    fn committed_next(&mut self, storage: &StateDB, sender: &str) -> u64 {
+        let height = storage.get("latest_height").ok().flatten();
+        if self.seq_cache_at != height {
+            self.seq_cache.clear();
+            self.seq_cache_at = height;
+        }
+        if let Some(next) = self.seq_cache.get(sender) {
+            return *next;
+        }
+        let next = executor::committed_sequence_number(storage, sender);
+        if self.seq_cache.len() < 2 * MAX_PENDING_TXS {
+            self.seq_cache.insert(sender.to_string(), next);
+        }
+        next
     }
 
     fn remove_pending_nonce(&mut self, tx: &str) {

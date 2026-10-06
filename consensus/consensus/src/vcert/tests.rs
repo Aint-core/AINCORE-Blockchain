@@ -679,6 +679,33 @@ fn collector_records_a_signer_who_attests_two_digests() {
     assert_eq!(collector.equivocations(), &[(twin_first, then_ours)][..]);
 }
 
+/// B101 witness: an exact replay of a verified attestation costs no
+/// pairing, and a bad one is a failed check charged to its sender (B51).
+#[test]
+fn a_replayed_attestation_is_not_verified_again_and_a_bad_one_is_counted() {
+    let members = committee4();
+    let committee = infos(&members);
+    let author = &members[1].info.address;
+    let a = body(&committee, 0, 26, author, &digest('a'));
+    let mut collector = CertCollector::new(a.clone(), &committee).unwrap();
+    let pairings = || PAIRINGS.with(|p| p.get());
+    let before = pairings();
+    let genuine = byzantine_attest(&members[0], &a);
+    assert!(matches!(
+        collector.add(&genuine).unwrap(),
+        CollectOutcome::Pending { .. }
+    ));
+    for _ in 0..3 {
+        assert_eq!(collector.add(&genuine).unwrap(), CollectOutcome::Duplicate);
+    }
+    assert_eq!(pairings() - before, 1, "a replay was verified again");
+    let mut forged = byzantine_attest(&members[0], &a);
+    forged.signer = members[2].info.address.clone();
+    let (out, failed) = crate::work::failed_in(|| collector.add(&forged));
+    assert!(matches!(out, Err(VcertError::BadSignature(_))));
+    assert_eq!(failed, 1, "a bad attestation was not counted");
+}
+
 #[test]
 fn collector_refuses_forged_foreign_and_wrong_slot_attestations() {
     let members = committee4();

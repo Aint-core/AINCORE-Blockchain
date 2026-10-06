@@ -888,7 +888,11 @@ impl libp2p::swarm::NetworkBehaviour for InboundGate {
                 ));
             }
         }
-        if !self.admit.spend(&ip, std::time::Instant::now()) {
+        // B111: a member's IP is not held to the per-IP admission rate (once
+        // that budget's key map was full, a reconnecting member's IP could be
+        // refused like any stranger's).
+        let member_ip = self.member_ips.read().is_ok_and(|m| m.contains(&ip));
+        if !member_ip && !self.admit.spend(&ip, std::time::Instant::now()) {
             return Err(denied("this IP opens connections too fast"));
         }
         self.pending.insert(connection_id, ip);
@@ -943,53 +947,102 @@ impl libp2p::swarm::NetworkBehaviour for InboundGate {
 
 /// B90: the addresses this node dials a peer at by its PeerId (a member, in
 /// the committee dial): its bootnodes', the ones a dial reached, and the
-/// routable listen addresses a session's identify reported (G4: addresses
+/// routable listen addresses a member's session reported (G4: addresses
 /// come from the authenticated session or the operator's bootnodes). It
 /// replaces Kademlia, which held this table but also stored anyone's
 /// records, answered anyone's queries and bootstrapped every 5 minutes by
 /// dialling addresses peers supplied; nothing used those.
+///
+/// B102: the operator's bootnode addresses and those a dial reached are
+/// pinned (never pushed out); session-reported ones are a member's only and
+/// rotate; a peer's entry is refreshed whenever it is added to, and a full
+/// book evicts the least recently refreshed peer with nothing pinned. The
+/// first version took any stranger's identify and evicted in insertion
+/// order, so churn pushed members out and a dropped link never redialled.
 #[derive(Debug, Default)]
 pub struct AddressBook {
-    addresses: HashMap<PeerId, Vec<libp2p::Multiaddr>>,
-    /// Peers in the order they were first added, for eviction.
+    entries: HashMap<PeerId, BookEntry>,
+    /// Least recently refreshed first.
     order: std::collections::VecDeque<PeerId>,
 }
 
-/// B90: addresses kept per peer, the newest (a choice: a host's few
+#[derive(Debug, Default)]
+struct BookEntry {
+    pinned: Vec<libp2p::Multiaddr>,
+    learned: Vec<libp2p::Multiaddr>,
+}
+
+/// B90: addresses kept per peer, of each kind (a choice: a host's few
 /// interfaces and transports).
 pub const ADDRESSES_PER_PEER: usize = 8;
-/// B90: peers the book holds, the oldest leaving first (a choice: four
-/// times the largest committee, `MAX_COMMITTEE`).
+/// B90: peers the book holds (a choice: four times the largest committee,
+/// `MAX_COMMITTEE`); past it, the least recently refreshed peer with nothing
+/// pinned leaves.
 pub const MAX_BOOK_PEERS: usize = 1024;
 
 impl AddressBook {
+    /// An address a member's session reported: the newest kept.
     pub fn add_address(&mut self, peer: &PeerId, address: libp2p::Multiaddr) {
-        if !self.addresses.contains_key(peer) {
-            if self.addresses.len() >= MAX_BOOK_PEERS {
-                if let Some(oldest) = self.order.pop_front() {
-                    self.addresses.remove(&oldest);
-                }
-            }
-            self.order.push_back(*peer);
+        self.touch(peer);
+        let entry = self.entries.entry(*peer).or_default();
+        if entry.pinned.contains(&address) {
+            return;
         }
-        let list = self.addresses.entry(*peer).or_default();
-        list.retain(|a| *a != address);
-        if list.len() >= ADDRESSES_PER_PEER {
-            list.remove(0);
+        entry.learned.retain(|a| *a != address);
+        if entry.learned.len() >= ADDRESSES_PER_PEER {
+            entry.learned.remove(0);
         }
-        list.push(address);
+        entry.learned.push(address);
     }
 
-    pub fn addresses_of(&self, peer: &PeerId) -> &[libp2p::Multiaddr] {
-        self.addresses.get(peer).map_or(&[], Vec::as_slice)
+    /// B102: an address the operator named (a bootnode's) or a dial reached:
+    /// kept for good.
+    pub fn pin_address(&mut self, peer: &PeerId, address: libp2p::Multiaddr) {
+        self.touch(peer);
+        let entry = self.entries.entry(*peer).or_default();
+        entry.learned.retain(|a| *a != address);
+        if !entry.pinned.contains(&address) {
+            if entry.pinned.len() >= ADDRESSES_PER_PEER {
+                entry.pinned.remove(0);
+            }
+            entry.pinned.push(address);
+        }
+    }
+
+    /// `peer` becomes the most recently refreshed; a new one in a full book
+    /// takes the place of the least recently refreshed peer with nothing
+    /// pinned.
+    fn touch(&mut self, peer: &PeerId) {
+        if self.entries.contains_key(peer) {
+            self.order.retain(|p| p != peer);
+        } else if self.entries.len() >= MAX_BOOK_PEERS {
+            if let Some(at) = self
+                .order
+                .iter()
+                .position(|p| self.entries.get(p).is_none_or(|e| e.pinned.is_empty()))
+            {
+                if let Some(gone) = self.order.remove(at) {
+                    self.entries.remove(&gone);
+                }
+            }
+        }
+        self.order.push_back(*peer);
+    }
+
+    /// Where `peer` is dialled: its pinned addresses, then the learned ones.
+    pub fn addresses_of(&self, peer: &PeerId) -> Vec<libp2p::Multiaddr> {
+        self.entries
+            .get(peer)
+            .map(|e| e.pinned.iter().chain(&e.learned).cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn len(&self) -> usize {
-        self.addresses.len()
+        self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.addresses.is_empty()
+        self.entries.is_empty()
     }
 }
 
@@ -1005,7 +1058,7 @@ impl libp2p::swarm::NetworkBehaviour for AddressBook {
         _effective_role: libp2p::core::Endpoint,
     ) -> Result<Vec<libp2p::Multiaddr>, libp2p::swarm::ConnectionDenied> {
         Ok(maybe_peer
-            .map(|peer| self.addresses_of(&peer).to_vec())
+            .map(|peer| self.addresses_of(&peer))
             .unwrap_or_default())
     }
 
@@ -1591,38 +1644,72 @@ mod tests {
         assert_eq!(gauge.load(Ordering::Relaxed), 0);
     }
 
-    /// B90 witness: the address book dials a peer at what it was told,
-    /// newest kept, each address once, and holds at most `MAX_BOOK_PEERS`
-    /// peers (the oldest leave first), where Kademlia held anyone's.
+    /// B90/B102 witness: the address book dials a peer at what it was told,
+    /// pinned addresses first, each address once, and holds at most
+    /// `MAX_BOOK_PEERS` peers; a full book pushes out the least recently
+    /// refreshed peer with nothing pinned, never a pinned one (a bootnode, an
+    /// address a dial reached), and a refreshed peer stays.
     #[test]
     fn the_address_book_is_bounded_and_dials_what_it_holds() {
         use libp2p::swarm::NetworkBehaviour;
         let mut book = AddressBook::default();
-        let peer = PeerId::random();
         let addr = |port: u16| -> libp2p::Multiaddr {
             format!("/ip4/203.0.113.7/tcp/{port}").parse().unwrap()
         };
+        let member = PeerId::random();
+        let bootnode = PeerId::random();
+        book.pin_address(&bootnode, addr(9001));
         for port in 0..(ADDRESSES_PER_PEER as u16 + 3) {
-            book.add_address(&peer, addr(port));
+            book.add_address(&member, addr(port));
         }
-        book.add_address(&peer, addr(10));
-        let held = book.addresses_of(&peer).to_vec();
-        assert_eq!(held.len(), ADDRESSES_PER_PEER);
-        assert_eq!(held.last(), Some(&addr(10)), "the newest last, once");
+        book.add_address(&member, addr(10));
+        book.pin_address(&member, addr(7000));
+        let held = book.addresses_of(&member);
+        assert_eq!(held.len(), ADDRESSES_PER_PEER + 1);
+        assert_eq!(held[0], addr(7000), "pinned first");
+        assert_eq!(
+            held.last(),
+            Some(&addr(10)),
+            "the newest learned last, once"
+        );
         let dialled = book
             .handle_pending_outbound_connection(
                 libp2p::swarm::ConnectionId::new_unchecked(1),
-                Some(peer),
+                Some(member),
                 &[],
                 libp2p::core::Endpoint::Dialer,
             )
             .unwrap();
         assert_eq!(dialled, held);
-        for _ in 0..MAX_BOOK_PEERS {
+        // A stranger flood: unpinned entries come and go, but the pinned
+        // bootnode and the member (pinned and refreshed) stay, and so does a
+        // peer known only by what it reported, while it keeps reporting
+        // (the least recently heard leaves first).
+        let early = PeerId::random();
+        book.add_address(&early, addr(1));
+        let talker = PeerId::random();
+        book.add_address(&talker, addr(21));
+        for i in 0..(2 * MAX_BOOK_PEERS) {
             book.add_address(&PeerId::random(), addr(1));
+            if i == MAX_BOOK_PEERS / 2 {
+                book.add_address(&member, addr(11));
+            }
+            if i % (MAX_BOOK_PEERS / 2) == MAX_BOOK_PEERS / 4 {
+                book.add_address(&talker, addr(22));
+            }
         }
         assert_eq!(book.len(), MAX_BOOK_PEERS);
-        assert!(book.addresses_of(&peer).is_empty(), "the oldest left");
+        assert_eq!(book.addresses_of(&bootnode), vec![addr(9001)]);
+        assert!(book.addresses_of(&member).contains(&addr(7000)));
+        assert_eq!(
+            book.addresses_of(&talker),
+            vec![addr(21), addr(22)],
+            "a peer heard from recently was evicted"
+        );
+        assert!(
+            book.addresses_of(&early).is_empty(),
+            "an unpinned stranger left"
+        );
     }
 
     /// B75 witness: one network group holds at most its share of the held
@@ -1718,6 +1805,25 @@ mod tests {
             gate.handle_pending_inbound_connection(id, &local, &from(member.to_string()))
                 .is_ok(),
             "a member's IP was kept out"
+        );
+        // B111: and it is not held to the per-IP admission rate: a member's
+        // IP opening more than the burst at once is still admitted.
+        let peer = PeerId::random();
+        let mut admitted = 0;
+        for i in 0..(ADMIT_BURST_PER_IP as usize + 8) {
+            let id = libp2p::swarm::ConnectionId::new_unchecked(2_000_000 + i);
+            if gate
+                .handle_pending_inbound_connection(id, &local, &from(member.to_string()))
+                .is_ok()
+            {
+                admitted += 1;
+                let _ = gate.handle_established_inbound_connection(id, peer, &local, &local);
+            }
+        }
+        assert_eq!(
+            admitted,
+            ADMIT_BURST_PER_IP as usize + 8,
+            "a member's IP was rate-limited"
         );
     }
 

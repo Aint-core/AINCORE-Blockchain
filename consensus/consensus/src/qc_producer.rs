@@ -366,13 +366,21 @@ fn produce_qc_staged(
     }
     // Legacy stores contain only a signature, not the signed context. Validate
     // it against this exact request; never overwrite a conflicting old vote.
+    // B101: the collected store holds `digest:signature`; a record for
+    // another digest is a conflicting old vote.
+    let digest = vote_digest(&vote);
     for key in [
         format!("consensus:qc_vote:{}:{}", ctx.anchor_round, node_address),
         collected_vote_key(ctx.anchor_round, node_address),
     ] {
         if let Some(raw) = storage.get(&key).map_err(|e| e.to_string())? {
-            let signature = hex::decode(raw).map_err(|e| e.to_string())?;
-            if !bls.verify(&signing_bytes, &signature, &public_key).unwrap_or(false) {
+            let (signed_digest, sig_hex) = split_stored_vote(&raw);
+            let signature = hex::decode(sig_hex).map_err(|e| e.to_string())?;
+            if signed_digest.is_some_and(|d| d != digest)
+                || !bls
+                    .verify(&signing_bytes, &signature, &public_key)
+                    .unwrap_or(false)
+            {
                 return Err("legacy local vote conflicts with requested signing bytes".to_string());
             }
             previous = Some(signature);
@@ -403,7 +411,18 @@ fn produce_qc_staged(
         // Persist our own vote into the aggregation store so an incoming peer
         // vote can combine with it. Self-store can race a same-round QC already
         // built (idempotent) — harmless.
-        store_collected_vote(storage, ctx.anchor_round, node_address, &message.signature)?;
+        store_collected_vote(
+            storage,
+            ctx.anchor_round,
+            node_address,
+            &format!("{digest}:{}", message.signature),
+        )?;
+        // B101: the peers' votes may all be here already (each stops sending
+        // once its own QC forms): ours may complete the quorum.
+        if let QcOutcome::Complete(qc) = aggregate_collected(storage, &vote, &validators, &digest)?
+        {
+            return Ok(QcOutcome::Complete(qc));
+        }
         return Ok(QcOutcome::Partial(message));
     }
 
@@ -802,6 +821,13 @@ pub fn stage_block_qc(view: &StateDB, cert: &QuorumCertificate) -> Result<bool, 
     stage_imported_certificate(view, cert)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// B101 witness support: the QC verifications an import ran on this
+    /// thread.
+    static QC_PAIRINGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn stage_imported_certificate(storage: &StateDB, cert: &QuorumCertificate) -> Result<bool, String> {
     let Some(epoch) = epoch_for_block_height(storage, cert.block_height) else {
         return Ok(false);
@@ -812,21 +838,26 @@ fn stage_imported_certificate(storage: &StateDB, cert: &QuorumCertificate) -> Re
     if cert.epoch != epoch {
         return Err("finality QC epoch is not its height's epoch".into());
     }
-    verify_qc(cert, &validators, &qc::expected_chain_id())
-        .map_err(|e| format!("finality QC verification failed: {e:?}"))?;
-    // Verified: a QC for another block at a held height is now a conflict.
-    check_held_block(storage, cert)?;
+    // B101: before any pairing, a QC with nothing to bind or add: its block
+    // is not held (no conflict is possible either), or it is stored already.
+    // A replay of a valid QC cost a pairing and a synced commit each time.
     let Some(raw) = storage
         .get(&format!("block_{}", cert.block_height))
         .map_err(|e| e.to_string())?
     else {
         return Ok(false);
     };
-    let block: blockchain::Block = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-    verify_block_qc(storage, &block, cert)?;
     if stored_qc(storage, cert.block_height).as_ref() == Some(cert) {
         return Ok(false);
     }
+    #[cfg(test)]
+    QC_PAIRINGS.with(|p| p.set(p.get() + 1));
+    verify_qc(cert, &validators, &qc::expected_chain_id())
+        .map_err(|e| format!("finality QC verification failed: {e:?}"))?;
+    // Verified: a QC for another block at a held height is now a conflict.
+    check_held_block(storage, cert)?;
+    let block: blockchain::Block = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    verify_block_qc(storage, &block, cert)?;
     store_certificate(storage, cert)?;
     Ok(true)
 }
@@ -971,6 +1002,22 @@ fn collect_vote_staged(
         Some(i) => i,
         None => return Ok(QcOutcome::Skipped), // signer not in the trusted set
     };
+    // B101: before any pairing, a vote with nothing left to add: the round
+    // has its QC, or this signer's vote is held (a replay cost a BLS check,
+    // and the aggregation re-checked every vote, each time).
+    if matches!(
+        storage.get(&format!("consensus:qc_by_round:{}", vote.anchor_round)),
+        Ok(Some(_))
+    ) {
+        return Ok(QcOutcome::Skipped);
+    }
+    if storage
+        .get(&collected_vote_key(vote.anchor_round, &msg.signer_address))
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
+        return Ok(QcOutcome::Skipped);
+    }
     let sig_bytes = match hex::decode(&msg.signature) {
         Ok(b) => b,
         Err(_) => return Ok(QcOutcome::Skipped),
@@ -990,37 +1037,84 @@ fn collect_vote_staged(
         }
     }
 
-    // (4) Dedup-persist this signer's vote for the round.
-    store_collected_vote(storage, vote.anchor_round, &msg.signer_address, &msg.signature)?;
+    // (4) Dedup-persist this signer's vote for the round, with the digest
+    // of the message it signs (B101: verified once, here).
+    let digest = vote_digest(vote);
+    store_collected_vote(
+        storage,
+        vote.anchor_round,
+        &msg.signer_address,
+        &format!("{digest}:{}", msg.signature),
+    )?;
 
-    // If a complete QC for this round already exists, nothing more to do.
+    // (5) Attempt deterministic aggregation over the collected vote set.
+    aggregate_collected(storage, vote, &validators, &digest)
+}
+
+/// B101: the digest of what a finality vote signs; a collected vote is
+/// stored with it, so aggregation needs no second verification.
+/// B101: a collected vote record, `digest:signature` (both hex), or a
+/// signature alone (a record from before B101).
+fn split_stored_vote(stored: &str) -> (Option<&str>, &str) {
+    match stored.split_once(':') {
+        Some((digest, signature)) => (Some(digest), signature),
+        None => (None, stored),
+    }
+}
+
+fn vote_digest(vote: &FinalityVote) -> String {
+    hex::encode(crypto::hash(&vote.to_signing_bytes()))
+}
+
+/// Build and store the QC for `vote` once the collected votes over exactly
+/// it (by digest) hold a stake quorum. A vote stored without a digest (an
+/// older record) is verified here instead.
+fn aggregate_collected(
+    storage: &StateDB,
+    vote: &FinalityVote,
+    validators: &[ValidatorInfo],
+    digest: &str,
+) -> Result<QcOutcome, String> {
     if matches!(
         storage.get(&format!("consensus:qc_by_round:{}", vote.anchor_round)),
         Ok(Some(_))
     ) {
         return Ok(QcOutcome::Skipped);
     }
-
-    // (5) Attempt deterministic aggregation over the collected vote set.
+    let ordered = qc::canonical_order(validators);
+    let bls = crypto::bls::BLSEngine::consensus();
+    let vote_bytes = vote.to_signing_bytes();
     let collected = collected_signers(storage, vote.anchor_round);
     let mut indices: Vec<usize> = Vec::with_capacity(collected.len());
     let mut sigs: Vec<Vec<u8>> = Vec::with_capacity(collected.len());
     let mut signed_stake: u128 = 0;
     let total_stake: u128 = ordered.iter().map(|v| v.stake as u128).sum();
-    for (addr, sig_hex) in &collected {
+    for (addr, stored) in &collected {
         // Re-resolve each collected signer against the trusted set; ignore any
         // that are no longer present (defensive — set is frozen per-epoch).
         let Some(idx) = ordered.iter().position(|v| &v.address == addr) else {
             continue;
         };
+        // Count only signatures over this exact vote; one equivocator's
+        // other message must not poison an otherwise sufficient honest
+        // quorum. B101: by the digest stored with it (verified once, when
+        // it arrived); a record without one is verified now.
+        let (signed_digest, sig_hex) = split_stored_vote(stored);
         let Ok(raw) = hex::decode(sig_hex) else {
             continue;
         };
-        // Old records only contain signatures, not full messages. Count only
-        // signatures over this exact vote; one equivocator's other message
-        // must not poison an otherwise sufficient honest quorum.
-        let Ok(public_key) = hex::decode(&ordered[idx].bls_public_key) else { continue };
-        if !bls.verify(&vote_bytes, &raw, &public_key).unwrap_or(false) { continue; }
+        match signed_digest {
+            Some(d) if d == digest => {}
+            Some(_) => continue,
+            None => {
+                let Ok(public_key) = hex::decode(&ordered[idx].bls_public_key) else {
+                    continue;
+                };
+                if !bls.verify(&vote_bytes, &raw, &public_key).unwrap_or(false) {
+                    continue;
+                }
+            }
+        }
         indices.push(idx);
         sigs.push(raw);
         signed_stake += ordered[idx].stake as u128;
@@ -1031,7 +1125,7 @@ fn collect_vote_staged(
         return Ok(QcOutcome::Skipped);
     }
 
-    let qc = match build_qc(vote, &validators, &indices, &sigs) {
+    let qc = match build_qc(vote, validators, &indices, &sigs) {
         Ok(q) => q,
         Err(e) => {
             eprintln!("🚨 [QC] aggregate build_qc failed: {e} — not storing");
@@ -1039,7 +1133,7 @@ fn collect_vote_staged(
         }
     };
     // NEVER store an unverifiable QC.
-    if let Err(e) = verify_qc(&qc, &validators, &qc::expected_chain_id()) {
+    if let Err(e) = verify_qc(&qc, validators, &qc::expected_chain_id()) {
         eprintln!("🚨 [QC] aggregate self-verify failed: {e} — not storing");
         return Err(e.to_string());
     }
@@ -1415,6 +1509,51 @@ mod tests {
         assert_eq!(
             storage.get("consensus:qc:latest_height").unwrap().as_deref(),
             Some("100")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B101 witness: a vote with nothing left to add costs no pairing (a
+    /// replay from a signer already held is skipped before its signature is
+    /// checked: junk in its place fails no check), and a node whose own vote
+    /// comes last forms the QC from the votes it already collected (it used
+    /// to wait for a peer vote that never came again).
+    #[test]
+    fn held_votes_are_not_rechecked_and_the_last_vote_completes() {
+        let dir = storage::test_dir::process_dir().join(format!("qc_b101_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = StateDB::open(dir.to_str().unwrap()).unwrap();
+        let (key_a, key_b) = ([11u8; 32], [12u8; 32]);
+        let set = vec![
+            validator_for(&key_a, 40, "aaaa"),
+            validator_for(&key_b, 40, "bbbb"),
+            validator_for(&[13u8; 32], 20, "cccc"),
+        ];
+        let _seed = storage.seeding();
+        storage
+            .put(
+                "genesis:validator_set:v1",
+                &serde_json::to_string(&set).unwrap(),
+            )
+            .unwrap();
+        let ctx = ctx_for(100);
+        let vote = vote_for(&ctx, &set);
+        let msg_a = signed_vote_msg(&key_a, "aaaa", &vote);
+        assert!(matches!(
+            collect_vote_and_try_aggregate(&storage, &msg_a, Some(&ctx.block_hash)),
+            QcOutcome::Skipped
+        ));
+        let mut replay = msg_a.clone();
+        replay.signature = hex::encode([7u8; 96]);
+        let (outcome, failed) = crate::work::failed_in(|| {
+            collect_vote_and_try_aggregate(&storage, &replay, Some(&ctx.block_hash))
+        });
+        assert!(matches!(outcome, QcOutcome::Skipped));
+        assert_eq!(failed, 0, "a held signer's replay was verified");
+        let got = produce_and_store_qc(&storage, &key_b, "bbbb", &ctx);
+        assert!(
+            matches!(got, QcOutcome::Complete(_)),
+            "the last vote did not complete the QC: {got:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

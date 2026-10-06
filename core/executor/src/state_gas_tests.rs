@@ -488,6 +488,34 @@ fn a_call_pays_for_the_modules_it_loads() {
     assert_eq!(receipt_status(&db, &tx), "success");
 }
 
+/// B93 witness: the loader's recursion depth is bounded from storage before
+/// the VM runs (the VM's own check depended on its module cache): a chain of
+/// 100 modules loads, one of 101 is refused, the same way on every call; the
+/// stdlib's friend cycles (`coin` and its friends) count once and load.
+#[test]
+fn the_dependency_depth_is_bounded_from_storage() {
+    let (db, _key, sender) = blob_chain("b93_depth", 70);
+    let index = deps::ModuleIndex::default();
+    let top = |n: usize| {
+        ModuleId::new(
+            AccountAddress::from_hex_literal("0xd0d").unwrap(),
+            Identifier::new(format!("m{}", n - 1)).unwrap(),
+        )
+    };
+    seed_chain(&db, &sender, 101, 0);
+    for _ in 0..2 {
+        let deep = index.closure(&db, [top(101)]).unwrap_err();
+        assert!(deep.contains("a chain of 101 modules"), "{deep}");
+        let fits = index.closure(&db, [top(100)]).expect("100 deep fits");
+        assert_eq!(fits.modules, 100);
+    }
+    let coin = ModuleId::new(AccountAddress::ONE, Identifier::new("coin").unwrap());
+    let stdlib = index
+        .closure(&db, [coin])
+        .expect("the stdlib's friend cycles load");
+    assert!(stdlib.modules > 3, "vacuous: {stdlib:?}");
+}
+
 /// B69 witness: a call whose closure is past Aptos's limits (768 modules,
 /// 1.8 MB) is charged and aborted before the VM loads any of it.
 #[test]

@@ -1716,6 +1716,99 @@ pub struct Executor {
     block_boundary_hook: Option<fn(u8, &StateDB)>,
 }
 
+/// The account writes a transaction's charge makes (see
+/// `Executor::charge_account_writes`); `require_next` holds its sequence
+/// number to the sender's next (a block's check), else it is priced as if it
+/// were (the mempool's, B94).
+fn account_writes_at(
+    db: &StateDB,
+    tx: &Transaction,
+    payer: &str,
+    require_next: bool,
+) -> Option<Vec<(String, Option<String>)>> {
+    // G3 FX-10: the ONE account constructor genesis uses too, so a
+    // logical account has one encoding in the state tree whichever path
+    // created it. KV-2: one spelling of the key, whatever case the client
+    // sent.
+    let sender_obj = db.get_object(&tx.sender).unwrap_or_else(|| {
+        aa::AccountManager::create_account(tx.sender.clone(), tx.public_key.to_ascii_lowercase())
+    });
+    // Replay protection.
+    let sender_data: aa::AccountData = serde_json::from_slice(&sender_obj.data).ok()?;
+    if require_next && tx.sequence_number != sender_data.sequence_number {
+        return None;
+    }
+    let mut payer_obj = if payer == tx.sender {
+        sender_obj.clone()
+    } else {
+        db.get_object(payer).unwrap_or_else(|| {
+            aa::AccountManager::create_account(
+                payer.to_string(),
+                tx.paymaster
+                    .clone()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+            )
+        })
+    };
+    let mut payer_data: aa::AccountData = serde_json::from_slice(&payer_obj.data).ok()?;
+    // ALWAYS increment the SENDER's sequence number, even if a paymaster
+    // pays the gas.
+    let next = sender_data.sequence_number.checked_add(1)?;
+    let mut writes = Vec::new();
+    if payer == tx.sender {
+        payer_data.sequence_number = next;
+    } else {
+        let mut sender_data = sender_data;
+        sender_data.sequence_number = next;
+        let mut updated_sender_obj = sender_obj;
+        if let Ok(new_sender_data) = serde_json::to_vec(&sender_data) {
+            updated_sender_obj.data = new_sender_data;
+            writes.push((
+                format!("obj:{}", updated_sender_obj.id),
+                Some(
+                    serde_json::to_string(&updated_sender_obj).unwrap_or_else(|_| "{}".to_string()),
+                ),
+            ));
+        }
+    }
+    // The payer's record (its nonce when it is the sender; gas is
+    // deducted through the Move VM).
+    if let Ok(new_data) = serde_json::to_vec(&payer_data) {
+        payer_obj.data = new_data;
+        writes.push((
+            format!("obj:{}", payer_obj.id),
+            Some(serde_json::to_string(&payer_obj).unwrap_or_else(|_| "{}".to_string())),
+        ));
+    }
+    Some(writes)
+}
+
+/// B65: the gas a transaction owes before anything runs: its object loads
+/// (N-2) and the account writes its charge makes, at the committed state
+/// byte gas.
+fn charge_gas_in(
+    db: &StateDB,
+    tx: &Transaction,
+    account_writes: &[(String, Option<String>)],
+) -> u64 {
+    let object_load = (tx.input_objects.len() as u64).saturating_mul(OBJECT_LOAD_GAS);
+    object_load.saturating_add(
+        state_gas::write_cost(db, account_writes).gas(state_gas::committed_state_byte_gas(db)),
+    )
+}
+
+/// B94: the execution gas `tx` owes before anything runs, against the
+/// committed state, as if its sequence number were its sender's next: what
+/// `can_pay` holds it to. `None` when an account record does not parse. The
+/// mempool admits and offers only what this fits, or every block would
+/// skip it for nothing.
+pub fn precharge_gas(db: &StateDB, tx: &Transaction) -> Option<u64> {
+    let payer = admission::payer_address(tx)?;
+    let writes = account_writes_at(db, tx, &payer, false)?;
+    Some(charge_gas_in(db, tx, &writes))
+}
+
 fn default_state_root() -> String {
     "0000000000000000000000000000000000000000000000000000000000000000".to_string()
 }
@@ -3164,8 +3257,14 @@ impl Executor {
         Ok(())
     }
 
+    /// B108: a queued share is keyed by the height it is next due at, zero
+    /// padded so keys sort by it.
+    fn sweep_key(due: u64, miner_addr: &str) -> String {
+        format!("sys:fee_sweep_queue:{due:020}:{miner_addr}")
+    }
+
     fn queue_fee_sweep(&self, miner_addr: &str, amount: u128, height: u64) {
-        let sweep_key = format!("sys:fee_sweep_queue:{height}:{miner_addr}");
+        let sweep_key = Self::sweep_key(height, miner_addr);
         let existing_amount = self
             .db
             .get(&sweep_key)
@@ -3185,13 +3284,25 @@ impl Executor {
         }
     }
 
-    fn process_fee_sweep_queue(&self) {
+    /// B108: the shares due by `height`, earliest first. One that fails again
+    /// is due again after 2^attempts blocks (at most 2^16): a failing share
+    /// used to stay at the head of the queue, retried and rewritten every
+    /// block, and 25 of them kept every later one waiting.
+    fn process_fee_sweep_queue(&self, height: u64) {
         // M-06 FIX: bound the scan at the storage layer rather than relying on
         // a downstream `.take(25)` that would otherwise materialise the entire
         // queue into a Vec first. The cap of 25 matches the original drain rate.
         let sweep_keys: Vec<_> = self.db.scan_prefix_limited("sys:fee_sweep_queue:", 25);
 
         for (key, raw) in sweep_keys {
+            let due = key
+                .strip_prefix("sys:fee_sweep_queue:")
+                .and_then(|rest| rest.split(':').next())
+                .and_then(|d| d.parse::<u64>().ok())
+                .unwrap_or(0);
+            if due > height {
+                break;
+            }
             let mut entry = match serde_json::from_str::<FeeSweepEntry>(&raw) {
                 Ok(entry) => entry,
                 Err(e) => {
@@ -3217,8 +3328,10 @@ impl Executor {
                 }
                 Err(e) => {
                     entry.attempts = entry.attempts.saturating_add(1);
+                    let next = height.saturating_add(1u64 << entry.attempts.min(16));
                     if let Ok(json) = serde_json::to_string(&entry) {
-                        let _ = self.logged_put(&key, &json);
+                        let _ = self.logged_delete(&key);
+                        let _ = self.logged_put(&Self::sweep_key(next, &entry.miner), &json);
                     }
                     eprintln!(
                         "⚠️ Fee sweep retry failed for {} AIN to {}: {}",
@@ -3794,7 +3907,7 @@ impl Executor {
         }
 
         // 6. Recover queued fee rewards whose recipient CoinStore is now valid.
-        self.process_fee_sweep_queue();
+        self.process_fee_sweep_queue(block_height);
 
         // B15: the next block's base fee, from this block's gas (EIP-1559).
         // Written only when it moves: an idle chain at the floor writes nothing.
@@ -4879,11 +4992,7 @@ impl Executor {
     /// loads (N-2) and the account writes its charge makes, at this block's
     /// state byte gas.
     fn charge_gas(&self, tx: &Transaction, account_writes: &[(String, Option<String>)]) -> u64 {
-        let object_load = (tx.input_objects.len() as u64).saturating_mul(OBJECT_LOAD_GAS);
-        object_load.saturating_add(
-            state_gas::write_cost(&self.db, account_writes)
-                .gas(state_gas::committed_state_byte_gas(&self.db)),
-        )
+        charge_gas_in(&self.db, tx, account_writes)
     }
 
     /// The account writes a transaction's charge makes before anything runs,
@@ -4921,66 +5030,7 @@ impl Executor {
         tx: &Transaction,
         payer: &str,
     ) -> Option<Vec<(String, Option<String>)>> {
-        // G3 FX-10: the ONE account constructor genesis uses too, so a
-        // logical account has one encoding in the state tree whichever path
-        // created it. KV-2: one spelling of the key, whatever case the client
-        // sent.
-        let sender_obj = self.db.get_object(&tx.sender).unwrap_or_else(|| {
-            aa::AccountManager::create_account(
-                tx.sender.clone(),
-                tx.public_key.to_ascii_lowercase(),
-            )
-        });
-        // Replay protection.
-        let sender_data: aa::AccountData = serde_json::from_slice(&sender_obj.data).ok()?;
-        if tx.sequence_number != sender_data.sequence_number {
-            return None;
-        }
-        let mut payer_obj = if payer == tx.sender {
-            sender_obj.clone()
-        } else {
-            self.db.get_object(payer).unwrap_or_else(|| {
-                aa::AccountManager::create_account(
-                    payer.to_string(),
-                    tx.paymaster
-                        .clone()
-                        .unwrap_or_default()
-                        .to_ascii_lowercase(),
-                )
-            })
-        };
-        let mut payer_data: aa::AccountData = serde_json::from_slice(&payer_obj.data).ok()?;
-        // ALWAYS increment the SENDER's sequence number, even if a paymaster
-        // pays the gas.
-        let next = sender_data.sequence_number.checked_add(1)?;
-        let mut writes = Vec::new();
-        if payer == tx.sender {
-            payer_data.sequence_number = next;
-        } else {
-            let mut sender_data = sender_data;
-            sender_data.sequence_number = next;
-            let mut updated_sender_obj = sender_obj;
-            if let Ok(new_sender_data) = serde_json::to_vec(&sender_data) {
-                updated_sender_obj.data = new_sender_data;
-                writes.push((
-                    format!("obj:{}", updated_sender_obj.id),
-                    Some(
-                        serde_json::to_string(&updated_sender_obj)
-                            .unwrap_or_else(|_| "{}".to_string()),
-                    ),
-                ));
-            }
-        }
-        // The payer's record (its nonce when it is the sender; gas is
-        // deducted through the Move VM).
-        if let Ok(new_data) = serde_json::to_vec(&payer_data) {
-            payer_obj.data = new_data;
-            writes.push((
-                format!("obj:{}", payer_obj.id),
-                Some(serde_json::to_string(&payer_obj).unwrap_or_else(|_| "{}".to_string())),
-            ));
-        }
-        Some(writes)
+        account_writes_at(&self.db, tx, payer, true)
     }
 
     fn schedule_batches(
@@ -12079,11 +12129,14 @@ mod tests {
             .map(|(k, _)| k)
             .collect();
         assert!(!queued.is_empty(), "positive control: a share was queued");
+        // Queued at height 1; the block's own sweep tried it once and it
+        // failed, so B108 makes it due at 1 + 2^1 (from latest_height, 0, it
+        // would be 2).
         assert!(
             queued
                 .iter()
-                .all(|k| k.starts_with("sys:fee_sweep_queue:1:")),
-            "keyed by the executing height 1: {queued:?}"
+                .all(|k| k.starts_with("sys:fee_sweep_queue:00000000000000000003:")),
+            "keyed from the executing height 1: {queued:?}"
         );
     }
 
@@ -13395,7 +13448,7 @@ mod tests {
         // Called directly, outside a block: test context.
         let _seed = db.seeding();
         executor.queue_fee_sweep("not_a_hex_address", amount, 42);
-        executor.process_fee_sweep_queue();
+        executor.process_fee_sweep_queue(42);
         let queued = db
             .scan_prefix("sys:fee_sweep_queue:")
             .into_iter()
@@ -13413,10 +13466,49 @@ mod tests {
         db.put(&queued.0, &serde_json::to_string(&recovered_entry).unwrap())
             .unwrap();
         set_coin_store(&db, &miner, 0);
-        executor.process_fee_sweep_queue();
+        executor.process_fee_sweep_queue(43);
+        assert!(
+            !db.scan_prefix("sys:fee_sweep_queue:").is_empty(),
+            "not due again until 2 blocks on"
+        );
+        executor.process_fee_sweep_queue(44);
 
         assert!(db.scan_prefix("sys:fee_sweep_queue:").is_empty());
         assert_eq!(coin_balance(&db, &miner), amount);
+    }
+
+    /// B108 witness: 25 failing shares at the head of the queue no longer
+    /// keep a later one waiting, and a failing share is not retried (nor
+    /// rewritten) before it is due again.
+    #[test]
+    fn failing_sweeps_back_off_and_do_not_block_the_queue() {
+        let db = temp_db("b108_sweep");
+        load_stdlib(&db);
+        let miner = create_account(&db, &SigningKey::from_bytes(&[28u8; 32]));
+        let executor = Executor::new(db.clone());
+        let _seed = db.seeding();
+        for h in 1..=25u64 {
+            executor.queue_fee_sweep(&format!("bad{h:02}"), 1, h);
+        }
+        set_coin_store(&db, &miner, 0);
+        executor.queue_fee_sweep(&miner, 500, 26);
+        executor.process_fee_sweep_queue(26);
+        executor.process_fee_sweep_queue(27);
+        assert_eq!(coin_balance(&db, &miner), 500, "the good share was paid");
+        let attempts: Vec<u64> = db
+            .scan_prefix("sys:fee_sweep_queue:")
+            .into_iter()
+            .map(|(_, raw)| {
+                serde_json::from_str::<FeeSweepEntry>(&raw)
+                    .unwrap()
+                    .attempts
+            })
+            .collect();
+        assert_eq!(attempts.len(), 25);
+        assert!(
+            attempts.iter().all(|a| *a == 1),
+            "retried before due: {attempts:?}"
+        );
     }
 
     /// B83 witness: a fee deposit that Move aborts (the recipient has no coin

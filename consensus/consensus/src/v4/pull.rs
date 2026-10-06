@@ -497,7 +497,20 @@ impl Engine {
                 let dag = lock(&self.dag);
                 let closed = self.closed.as_ref().map(|c| &c.bodies);
                 let (mut bodies, mut unknown, mut bytes) = (Vec::new(), Vec::new(), 0usize);
+                // B110: each digest served once, and nothing serialized once
+                // a held body did not fit (a member asking one 768 KiB body 32
+                // times a request had it serialized 32 times under the lock):
+                // at most the bodies sent and one more are measured.
+                let mut asked = std::collections::HashSet::new();
+                let mut full = false;
                 for d in digests.iter().take(MAX_REQ_DIGESTS) {
+                    if !asked.insert(d) {
+                        continue;
+                    }
+                    if full {
+                        unknown.push(d.clone());
+                        continue;
+                    }
                     let held = dag.get(d).or_else(|| closed.and_then(|c| c.get(d)));
                     let size = held
                         .and_then(|v| serde_json::to_string(v).ok())
@@ -506,6 +519,10 @@ impl Engine {
                         (Some(v), Some(n)) if bytes + n <= MAX_RESP_BYTES => {
                             bytes += n;
                             bodies.push(v.clone());
+                        }
+                        (Some(_), Some(_)) => {
+                            full = true;
+                            unknown.push(d.clone());
                         }
                         _ => unknown.push(d.clone()),
                     }

@@ -734,7 +734,13 @@ fn a_vote_counts_only_for_a_held_block_at_its_round() {
         .handle_message(&vote(height + 50, far, &"ee".repeat(32)));
     c.node_mut(0).handle_message(&vote(height, far + 1, &hash));
     assert_eq!(rows(&c), before, "a vote off a held block was written");
+    // B101: a round that has its QC takes no more votes, so the control
+    // round is one without a QC yet.
     c.node(0).storage.delete(&row(round)).unwrap();
+    c.node(0)
+        .storage
+        .delete(&format!("consensus:qc_by_round:{round}"))
+        .unwrap();
     c.node_mut(0).handle_message(&vote(height, round, &hash));
     assert!(
         c.node(0).storage.get(&row(round)).unwrap().is_some(),
@@ -1279,15 +1285,17 @@ fn dos_qc_want_throttle_is_bypassed_by_rotating_17_heights() {
 #[test]
 fn a_qc_want_is_answered_to_its_asker() {
     let mut c = Cluster::with_interval("qcwant-asker", &[75, 76, 77, 78], true, 4);
-    c.run_until(200, |c| c.node(1).latest_block_height >= 2);
+    c.run_until(400, |c| c.node(1).latest_block_height >= 4);
     assert!(
-        c.node(1).latest_block_height >= 2,
+        c.node(1).latest_block_height >= 4,
         "vacuous: too few blocks"
     );
-    c.node(1)
-        .storage
-        .put("consensus:qc:1", "{\"stand_in_for_qc\":1}")
-        .unwrap();
+    for h in 1..=4 {
+        c.node(1)
+            .storage
+            .put(&format!("consensus:qc:{h}"), "{\"stand_in_for_qc\":1}")
+            .unwrap();
+    }
     // Ticks with nothing delivered: the throttle and the per-tick budget the
     // run may have used have passed.
     for _ in 0..6 {
@@ -1312,6 +1320,33 @@ fn a_qc_want_is_answered_to_its_asker() {
         "answered to the asker, not to everyone: {:?}",
         answers[0]
     );
+    // B96: in the same tick, a member that keeps asking every height cannot
+    // take another member's answer: each asker has its own throttle and
+    // budget (one shared let the first asker starve the rest).
+    for _ in 0..3 {
+        for h in 1..=4 {
+            node.handle_message_from("greedy", &format!("{}{h}", crate::dag::QC_WANT_PREFIX));
+        }
+    }
+    node.handle_message_from("slow", &format!("{}1", crate::dag::QC_WANT_PREFIX));
+    let mut sent = Vec::new();
+    while let Ok(out) = rx.try_recv() {
+        sent.push(out);
+    }
+    let to = |who: &str| {
+        sent.iter()
+            .filter(|o| {
+                matches!(o, network::Outbound::To { address, wire }
+                if address == who && wire.starts_with(crate::dag::QC_CERT_PREFIX))
+            })
+            .count()
+    };
+    assert_eq!(
+        to("greedy"),
+        4,
+        "each height once per throttle window: {sent:?}"
+    );
+    assert_eq!(to("slow"), 1, "the slow member is answered: {sent:?}");
 }
 
 /// DOS-4: every copy of a staged body makes the node re-send its attestation

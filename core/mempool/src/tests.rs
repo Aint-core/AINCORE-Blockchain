@@ -460,16 +460,8 @@ fn test_zkp_garbage_hex_rejected_with_specific_diagnostic() {
         .add_transaction(tx)
         .expect_err("ZKP-tagged tx with garbage envelope must be rejected");
 
-    assert!(
-        err.contains("ZKP proof rejected"),
-        "error must come from the dispatcher, not a generic fail-closed gate. Got: {:?}",
-        err
-    );
-    assert!(
-        err.contains("STARKProofData") || err.contains("envelope") || err.contains("structure"),
-        "error must specifically call out the structural failure. Got: {:?}",
-        err
-    );
+    // B105: no signature covers a proof, so none is taken until they are.
+    assert!(err.contains("zkp_proof is not signed"), "{err}");
 }
 
 /// Phase 2.2 — REPLAY PROTECTION
@@ -529,11 +521,8 @@ fn test_zkp_replayed_proof_with_wrong_binding_rejected() {
         .add_transaction(tx)
         .expect_err("ZKP proof bound to a different tx must be rejected (replay block)");
 
-    assert!(
-        err.contains("public inputs") || err.contains("bind") || err.contains("replay"),
-        "error must explicitly call out the binding/replay violation. Got: {:?}",
-        err
-    );
+    // B105: refused before any binding is looked at: proofs are not signed.
+    assert!(err.contains("zkp_proof is not signed"), "{err}");
 }
 
 /// Phase 5B.11 / PWN-007 PROPER: dedup at the mempool layer must be
@@ -720,7 +709,18 @@ mod fee_market_admission {
 
     // A struct {value: u128} encodes in BCS identically to a bare u128, so the
     // executor's MoveCoin reader round-trips this.
+    /// `sender` holds `balance` AIN and an account record (so its first
+    /// transaction's pre-charge is a nonce bump, not an account's creation;
+    /// B94 prices both).
     pub(crate) fn fund(db: &Arc<StateDB>, sender: &str, balance: u128) {
+        if db.get_object(sender).is_none() {
+            executor::test_support::set_sequence_number(db, sender, &"00".repeat(32), 0);
+        }
+        fund_store(db, sender, balance);
+    }
+
+    /// `sender` holds `balance` AIN and nothing else (no account record yet).
+    pub(crate) fn fund_store(db: &Arc<StateDB>, sender: &str, balance: u128) {
         let _seed = db.seeding();
         db.put(
             &ain_store_key(sender),
@@ -1054,6 +1054,132 @@ mod fee_market_admission {
         assert_eq!(
             mp.get_pending_transactions(10),
             vec![executor::admission::canonicalize(&ready).unwrap()]
+        );
+    }
+
+    /// B94 witness: what a block would skip for nothing is neither admitted
+    /// nor offered. A limit that leaves no execution gas for the pre-charge
+    /// (here: a new account's record) is refused at admission; one whose
+    /// pre-charge stops fitting (the state byte gas rose) leaves at selection;
+    /// a payer whose balance fell offers nothing and keeps its transactions.
+    #[test]
+    fn what_a_block_would_skip_is_neither_admitted_nor_offered() {
+        let db = temp_db("b94_payable");
+        let (bare, sender) = signed_tx(91, 0, 0, 1);
+        fund_store(&db, &sender, 1_000_000_000_000_000_000);
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        let err = mp.add_transaction(bare).unwrap_err();
+        assert!(err.contains("owed before execution"), "{err}");
+        let (paid, _) = signed_tx(91, 0, 1_000_000, 1);
+        mp.add_transaction(paid)
+            .expect("a limit covering the new account");
+
+        let db = temp_db("b94_rise");
+        let (tx, sender) = signed_tx(92, 0, 1_000_000, 1);
+        fund_store(&db, &sender, 1_000_000_000_000_000_000);
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        mp.add_transaction(tx)
+            .expect("a new account's record fits at today's byte gas");
+        {
+            let _seed = db.seeding();
+            db.put(executor::state_gas::STATE_BYTE_GAS_KEY, "1000000000")
+                .unwrap();
+        }
+        assert!(mp.get_pending_transactions(10).is_empty(), "not offered");
+        assert_eq!(mp.len(), 0, "and gone: no block would charge it");
+
+        let db = temp_db("b94_balance");
+        let (tx, sender) = signed_tx(93, 0, 1_000, 1);
+        fund(&db, &sender, 1_000_000_000_000_000_000);
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        mp.add_transaction(tx).expect("admitted");
+        fund(&db, &sender, 1);
+        assert!(mp.get_pending_transactions(10).is_empty(), "not offered");
+        assert_eq!(mp.len(), 1, "kept: the balance may come back");
+    }
+
+    /// B98 witness: a same-nonce resubmission is refused before it can
+    /// evict anything (it evicted a parked transaction for free); a 10 %
+    /// higher price replaces the waiting one; a parked transaction leaves
+    /// after PARKED_TTL_SECS.
+    #[test]
+    fn duplicates_replacements_and_parked_expiry() {
+        let db = temp_db("b98_dup");
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        let per_sender = (MAX_NONCE_AHEAD - 1) as usize;
+        let senders = MAX_PENDING_TXS.div_ceil(per_sender);
+        let mut admitted = 0;
+        'fill: for s in 0..senders {
+            for seq in 1..=per_sender as u64 {
+                let (tx, sender) = signed_tx(100 + s as u8, seq, 100_000, 1);
+                if seq == 1 {
+                    fund(&db, &sender, 1_000_000_000_000_000_000_000);
+                }
+                mp.add_transaction(tx).expect("room");
+                admitted += 1;
+                if admitted == MAX_PENDING_TXS - 1 {
+                    break 'fill;
+                }
+            }
+        }
+        let (ready, sender) = signed_tx(98, 0, 100_000, 100);
+        fund(&db, &sender, 1_000_000_000_000_000_000_000);
+        mp.add_transaction(ready).expect("the last slot");
+        assert_eq!(mp.len(), MAX_PENDING_TXS);
+        let (again, _) = signed_tx(98, 0, 100_001, 100);
+        let err = mp.add_transaction(again).unwrap_err();
+        assert!(err.contains("Duplicate pending nonce"), "{err}");
+        assert_eq!(mp.len(), MAX_PENDING_TXS, "nothing was evicted for it");
+
+        let (cheap_bump, _) = signed_tx(98, 0, 100_000, 105);
+        assert!(mp.add_transaction(cheap_bump).is_err(), "5 % is not enough");
+        let (bump, _) = signed_tx(98, 0, 100_000, 110);
+        mp.add_transaction(bump.clone()).expect("10 % replaces");
+        assert_eq!(mp.len(), MAX_PENDING_TXS);
+        assert!(
+            mp.get_all_pending().iter().any(|r| *r == bump),
+            "the replacement waits"
+        );
+
+        let db = temp_db("b98_ttl");
+        let (gap, sender) = signed_tx(97, 3, 100_000, 1);
+        fund(&db, &sender, 1_000_000_000_000_000_000);
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        mp.add_transaction(gap).expect("parked behind a gap");
+        assert!(mp.get_pending_transactions_at(10, 1_000).is_empty());
+        assert_eq!(mp.len(), 1, "still parked");
+        assert!(mp
+            .get_pending_transactions_at(10, 1_000 + PARKED_TTL_SECS)
+            .is_empty());
+        assert_eq!(mp.len(), 0, "expired");
+    }
+
+    /// B98 witness: the committed sequence numbers are cached per committed
+    /// height and read again when a block commits (the commit writes the
+    /// accounts and `latest_height` in one transaction).
+    #[test]
+    fn the_committed_sequence_is_read_again_each_height() {
+        let db = temp_db("b98_cache");
+        let (next, sender) = signed_tx(96, 1, 100_000, 1);
+        fund(&db, &sender, 1_000_000_000_000_000_000);
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        mp.add_transaction(next.clone()).expect("parked behind 0");
+        assert!(mp.get_pending_transactions(10).is_empty(), "parked");
+        let key = ed25519_dalek::SigningKey::from_bytes(&[96u8; 32]);
+        executor::test_support::set_sequence_number(
+            &db,
+            &sender,
+            &hex::encode(key.verifying_key().to_bytes()),
+            1,
+        );
+        {
+            let _seed = db.seeding();
+            db.put("latest_height", "1").unwrap();
+        }
+        assert_eq!(
+            mp.get_pending_transactions(10),
+            vec![next],
+            "the new height's sequence number was not read"
         );
     }
 
