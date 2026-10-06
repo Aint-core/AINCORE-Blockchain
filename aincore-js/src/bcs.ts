@@ -18,7 +18,23 @@
 // Low-level BCS primitives
 // ============================================================
 
+// B129: an encoder throws on input it cannot encode exactly. Non-hex
+// characters used to become 0 bytes and out-of-range integers wrapped, so a
+// typo in an address sent funds to an address nobody controls.
+function checkUint(value: number, bits: number, what: string): void {
+    if (!Number.isSafeInteger(value) || value < 0 || (bits < 53 && value >= 2 ** bits)) {
+        throw new Error(`Invalid ${what}: ${value} is not a u${bits}`);
+    }
+}
+
+function checkUintBig(value: bigint, bits: number, what: string): void {
+    if (typeof value !== 'bigint' || value < 0n || value >= (1n << BigInt(bits))) {
+        throw new Error(`Invalid ${what}: ${value} is not a u${bits}`);
+    }
+}
+
 function writeULEB128(value: number): Uint8Array {
+    checkUint(value, 32, 'length');
     const bytes: number[] = [];
     while (value >= 0x80) {
         bytes.push((value & 0x7f) | 0x80);
@@ -29,10 +45,12 @@ function writeULEB128(value: number): Uint8Array {
 }
 
 function writeU8(value: number): Uint8Array {
+    checkUint(value, 8, 'u8');
     return new Uint8Array([value & 0xff]);
 }
 
 function writeU16(value: number): Uint8Array {
+    checkUint(value, 16, 'u16');
     const buf = new Uint8Array(2);
     buf[0] = value & 0xff;
     buf[1] = (value >>> 8) & 0xff;
@@ -40,6 +58,7 @@ function writeU16(value: number): Uint8Array {
 }
 
 function writeU32(value: number): Uint8Array {
+    checkUint(value, 32, 'u32');
     const buf = new Uint8Array(4);
     buf[0] = value & 0xff;
     buf[1] = (value >>> 8) & 0xff;
@@ -49,6 +68,7 @@ function writeU32(value: number): Uint8Array {
 }
 
 function writeU64(value: bigint): Uint8Array {
+    checkUintBig(value, 64, 'u64');
     const buf = new Uint8Array(8);
     for (let i = 0; i < 8; i++) {
         buf[i] = Number(value & 0xffn);
@@ -58,6 +78,7 @@ function writeU64(value: bigint): Uint8Array {
 }
 
 function writeU128(value: bigint): Uint8Array {
+    checkUintBig(value, 128, 'u128');
     const buf = new Uint8Array(16);
     for (let i = 0; i < 16; i++) {
         buf[i] = Number(value & 0xffn);
@@ -90,11 +111,7 @@ function writeAddress(hex: string): Uint8Array {
             `Invalid address length: expected ${ADDRESS_HEX_CHARS} hex chars, got ${clean.length}`
         );
     }
-    const bytes = new Uint8Array(ADDRESS_BYTES);
-    for (let i = 0; i < ADDRESS_BYTES; i++) {
-        bytes[i] = parseInt(clean.substring(i * 2, i * 2 + 2), 16);
-    }
-    return bytes;
+    return hexToBytes(clean);
 }
 
 function concat(...arrays: Uint8Array[]): Uint8Array {
@@ -296,9 +313,13 @@ export function bcsVectorU8(data: Uint8Array): Uint8Array {
     return writeBytes(data);
 }
 
-/** Convert hex string to Uint8Array */
+/** Convert hex string to Uint8Array; throws on anything but hex digits in
+ *  pairs (B129). */
 export function hexToBytes(hex: string): Uint8Array {
     const clean = hex.replace(/^0x/, '');
+    if (clean.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(clean)) {
+        throw new Error(`Invalid hex: ${JSON.stringify(hex.slice(0, 80))}`);
+    }
     const bytes = new Uint8Array(clean.length / 2);
     for (let i = 0; i < bytes.length; i++) {
         bytes[i] = parseInt(clean.substring(i * 2, i * 2 + 2), 16);

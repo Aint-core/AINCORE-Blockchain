@@ -40,6 +40,14 @@ pub const RESIDUAL_REQS_PER_TICK: u32 = 2;
 pub const PULL_DOMAIN: &[u8] = b"AINCORE_V4_PULL_V1";
 /// Request sequence numbers are reserved in blocks this size (`next_seq`).
 const SEQ_BLOCK: u64 = 1024;
+
+/// B125: the lowest request number a node starts at, from its clock: 2^30 a
+/// second, far more than a node sends, so a member whose database was lost
+/// (RC-3: it abstains, then resumes with its key) starts above every number
+/// it used before, which servers remember (`SeqWindow`) until they restart.
+pub(crate) fn seq_floor(now_secs: u64) -> u64 {
+    now_secs.saturating_mul(1 << 30)
+}
 const SEQ_KEY: &str = "consensus:pull_seq";
 /// B51: certificates answers may bring for one slot before this node asks
 /// for it again (a choice: the requests of a few ticks in flight at once).
@@ -392,8 +400,10 @@ impl Engine {
     }
 
     /// A strictly increasing request number, across restarts: numbers are
-    /// reserved durably in blocks, and a restart starts past the last block.
-    fn next_seq(&mut self) -> u64 {
+    /// reserved durably in blocks, and a restart starts past the last block
+    /// and past the clock (`seq_floor`), so a member that lost its database
+    /// still starts above every number it used (B125).
+    pub(super) fn next_seq(&mut self) -> u64 {
         if self.pull_seq >= self.pull_seq_reserved {
             let reserve = self.pull_seq + SEQ_BLOCK;
             if self.storage.put(SEQ_KEY, &reserve.to_string()).is_err() {
@@ -405,14 +415,16 @@ impl Engine {
         self.pull_seq
     }
 
-    /// Where a reopened node's request numbers start.
-    pub(super) fn load_seq(storage: &StateDB) -> u64 {
+    /// Where a reopened node's request numbers start: past its last durable
+    /// reservation and past `seq_floor(now_secs)`.
+    pub(super) fn load_seq(storage: &StateDB, now_secs: u64) -> u64 {
         storage
             .get(SEQ_KEY)
             .ok()
             .flatten()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0)
+            .max(seq_floor(now_secs))
     }
 
     fn request(&mut self, target: &str, req: Request, net: &dyn ConsensusNet) {

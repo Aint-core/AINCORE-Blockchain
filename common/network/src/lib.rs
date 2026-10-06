@@ -56,6 +56,9 @@ pub struct SyncServe {
     pub member: Option<String>,
     /// B114: a peer the operator reserved (`AINCORE_RESERVED_PEERS`).
     pub reserved: bool,
+    /// B131: the network group of the peer's host (`net_group`), which
+    /// snapshot serving charges a non-member to.
+    pub group: Option<String>,
     pub wire: String,
     pub reply: tokio::sync::oneshot::Sender<Option<String>>,
 }

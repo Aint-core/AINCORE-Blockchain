@@ -746,6 +746,20 @@ fn a_vote_counts_only_for_a_held_block_at_its_round() {
         c.node(0).storage.get(&row(round)).unwrap().is_some(),
         "control: the held block's vote was not kept"
     );
+    // B124: a vote already held, or from outside the committee, costs no
+    // block read.
+    let reads = || crate::dag::VOTE_BLOCK_READS.with(|n| n.get());
+    let before = reads();
+    c.node_mut(0).handle_message(&vote(height, round, &hash));
+    let mut outsider: serde_json::Value = serde_json::from_str(
+        vote(height, round + 2, &hash)
+            .strip_prefix("QC_VOTE:")
+            .unwrap(),
+    )
+    .unwrap();
+    outsider["signer_address"] = serde_json::json!("ff".repeat(32));
+    c.node_mut(0).handle_message(&format!("QC_VOTE:{outsider}"));
+    assert_eq!(reads(), before, "a vote that cannot count read its block");
 }
 
 /// B51 witness: a source whose messages fail costly checks is not heard once

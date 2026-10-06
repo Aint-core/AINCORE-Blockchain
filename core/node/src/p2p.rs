@@ -19,6 +19,42 @@ use tokio::sync::mpsc;
 // === START P2P ===
 use libp2p::swarm::behaviour::toggle::Toggle;
 
+/// The session transport and the relay client's behaviour.
+type SessionTransport = (
+    libp2p::core::transport::Boxed<(PeerId, libp2p::core::muxing::StreamMuxerBox)>,
+    relay::client::Behaviour,
+);
+
+/// The session transport: TCP behind a DNS layer (B130: a bootnode or a
+/// restore peer named by host is a `/dns4/...` address, which bare TCP
+/// refused, so such a node ran isolated), or the relay client, then Noise,
+/// yamux and B24's handshake timeout.
+pub(crate) fn build_transport(
+    local_key: &libp2p::identity::Keypair,
+    local_peer_id: PeerId,
+) -> Result<SessionTransport, Box<dyn Error>> {
+    let noise_config = noise::Config::new(local_key)?;
+    let (relay_transport, relay_behaviour) = relay::client::new(local_peer_id);
+    let tcp = || tcp::tokio::Transport::new(tcp::Config::default());
+    let tcp_with_dns = libp2p::dns::tokio::Transport::system(tcp()).unwrap_or_else(|e| {
+        eprintln!("⚠️ No system DNS configuration ({e}): host names use the default resolver");
+        libp2p::dns::tokio::Transport::custom(
+            tcp(),
+            libp2p::dns::ResolverConfig::default(),
+            libp2p::dns::ResolverOpts::default(),
+        )
+    });
+    let transport = tcp_with_dns
+        .or_transport(relay_transport)
+        .upgrade(upgrade::Version::V1)
+        .authenticate(noise_config)
+        .multiplex(yamux::Config::default())
+        // B24: a connection that does not finish its handshake is dropped.
+        .timeout(sessions::HANDSHAKE_TIMEOUT)
+        .boxed();
+    Ok((transport, relay_behaviour))
+}
+
 const MAX_LIBP2P_CONNECTIONS_PER_PEER: u32 = 2;
 /// A dial by PeerId tries the peer's addresses at once; the dialer keeps
 /// the first that opens and drops the rest, and the listener sees several
@@ -93,25 +129,7 @@ pub async fn start_p2p(
     let local_peer_id = PeerId::from(local_key.public());
     println!("🛰️ Local peer id: {:?}", local_peer_id);
 
-    // === Build Noise encryption (v0.45 style) ===
-    let noise_config = noise::Config::new(&local_key)?;
-
-    // === Relay Client (Hole Punching) ===
-    let (relay_transport, relay_behaviour_inner) = relay::client::new(local_peer_id);
-
-    // === Build transport (TCP + Noise + Yamux) ===
-    let tcp_config = tcp::Config::default();
-    // tcp_config.port_reuse(true); // Deprecated
-    let tcp_transport = tcp::tokio::Transport::new(tcp_config);
-
-    let transport = tcp_transport
-        .or_transport(relay_transport)
-        .upgrade(upgrade::Version::V1)
-        .authenticate(noise_config)
-        .multiplex(yamux::Config::default())
-        // B24: a connection that does not finish its handshake is dropped.
-        .timeout(sessions::HANDSHAKE_TIMEOUT)
-        .boxed();
+    let (transport, relay_behaviour_inner) = build_transport(&local_key, local_peer_id)?;
 
     // === mDNS behaviour (Optional) ===
     let mdns = if enable_mdns {
@@ -167,8 +185,11 @@ pub async fn start_p2p(
         sync: request_response::Behaviour<sessions::FramedCodec>,
     }
 
-    // B56: the IPs members connected from; the gate keeps slots for them.
-    let member_ips: sessions::MemberIps = Arc::default();
+    // B56/B116: the IPs the gate keeps slots for: the boot dial list's from
+    // the start, then the members' current ones.
+    let member_ips: sessions::MemberIps = Arc::new(std::sync::RwLock::new(
+        sessions::KeptIps::with_boot(sessions::boot_ips(&bootnodes)),
+    ));
     let behaviour = P2PBehaviour {
         mdns: Toggle::from(mdns),
         addresses,
@@ -588,6 +609,7 @@ pub async fn start_p2p(
                             peer: peer.to_string(),
                             member,
                             reserved: reserved_peer,
+                            group: peer_hosts.get(&peer).map(|h| sessions::net_group(h)),
                             wire: request,
                             reply,
                         };
@@ -698,13 +720,14 @@ pub async fn start_p2p(
                             libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => multiaddr_host(send_back_addr),
                         };
                         if let Some(host) = host {
-                            // B56: a member's IP gets the gate's kept slots.
-                            if book.read().is_ok_and(|b| b.member_of(&peer_id).is_some()) {
-                                if let (Ok(ip), Ok(mut ips)) =
-                                    (host.parse::<std::net::IpAddr>(), member_ips.write())
-                                {
-                                    if ips.len() < sessions::MAX_MEMBER_IPS {
-                                        ips.insert(ip);
+                            // B56/B116: a member's current IP gets the
+                            // gate's kept slots (one per member).
+                            if let Ok(b) = book.read() {
+                                if b.member_of(&peer_id).is_some() {
+                                    if let (Ok(ip), Ok(mut ips)) =
+                                        (host.parse::<std::net::IpAddr>(), member_ips.write())
+                                    {
+                                        ips.record_member(peer_id, ip, |p| b.member_of(p).is_some());
                                     }
                                 }
                             }
@@ -871,4 +894,28 @@ pub async fn start_p2p(
     });
 
     Ok((tx_out, rx_out))
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use libp2p::Transport;
+
+    /// B130 witness: the transport takes a `/dns4/...` address (a bootnode
+    /// named by host); the bare TCP transport refused it at once
+    /// (`MultiaddrNotSupported`). The dial is not awaited: nothing is sent.
+    #[tokio::test]
+    async fn a_peer_named_by_host_can_be_dialled() {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let (mut transport, _relay) =
+            super::build_transport(&key, libp2p::PeerId::from(key.public())).unwrap();
+        let addr: libp2p::Multiaddr = "/dns4/localhost/tcp/9".parse().unwrap();
+        let opts = libp2p::core::transport::DialOpts {
+            role: libp2p::core::Endpoint::Dialer,
+            port_use: libp2p::core::transport::PortUse::New,
+        };
+        assert!(
+            transport.dial(addr, opts).is_ok(),
+            "a /dns4 address is not supported"
+        );
+    }
 }

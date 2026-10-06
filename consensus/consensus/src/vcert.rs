@@ -121,6 +121,8 @@ pub fn verify_vertex_cert(
     expected_genesis_identity: &str,
     expected_epoch: u64,
 ) -> Result<(), VcertError> {
+    #[cfg(test)]
+    CERT_VERIFICATIONS.with(|n| n.set(n.get() + 1));
     if cert.version != CERT_VERSION {
         return Err(VcertError::UnsupportedVersion(cert.version));
     }
@@ -405,6 +407,9 @@ thread_local! {
     /// B101 witness support: the pairings `CertCollector::add` ran on this
     /// thread.
     pub(crate) static PAIRINGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// B119/B120 witness support: the certificates `verify_vertex_cert`
+    /// checked on this thread.
+    pub(crate) static CERT_VERIFICATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// CE-1, the author side: verify each attestation against the signer's
@@ -464,6 +469,21 @@ impl CertCollector {
             .iter()
             .position(|v| v.address == att.signer)
             .ok_or_else(|| VcertError::SignerNotInCommittee(att.signer.clone()))?;
+        // B126: a signer already recorded as an equivocator is not verified
+        // again (its evidence is held, and a certificate does not need it:
+        // the honest stake alone is a quorum). Its fresh attestations of
+        // other digests each cost a pairing.
+        if self
+            .evidence
+            .iter()
+            .any(|(first, _)| first.signer == att.signer)
+        {
+            return Ok(if self.ours.contains_key(&idx) && att.body == self.body {
+                CollectOutcome::Duplicate
+            } else {
+                CollectOutcome::Foreign
+            });
+        }
         // B101: an exact copy of an attestation already verified needs no
         // pairing (a replay used to cost one each time).
         if let Some(first) = self.first_seen.get(&idx) {

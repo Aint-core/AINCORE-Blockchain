@@ -1858,11 +1858,17 @@ fn handle_rpc_method(
                 let latest_height = data.storage.get_chain_height();
                 let mut found_block = None;
 
-                // Search recent blocks (last 1000) for matching hash
+                // Search recent blocks (last 1000) for matching hash; B127:
+                // at most MAX_BLOCKS_BYTES of blocks read a call.
                 let search_start = latest_height.saturating_sub(1000);
+                let mut read = 0usize;
                 for h in (search_start..=latest_height).rev() {
                     let key = format!("block_{}", h);
                     if let Ok(Some(block_json)) = data.storage.get(&key) {
+                        read += block_json.len();
+                        if read > MAX_BLOCKS_BYTES {
+                            break;
+                        }
                         if block_json.contains(&needle) {
                             if let Ok(block_obj) = serde_json::from_str::<serde_json::Value>(&block_json) {
                                 let own = block_obj["header"]["hash"].as_str().unwrap_or_default();
@@ -1984,15 +1990,28 @@ fn handle_rpc_method(
         "aincore_getTransactionsByAddress" => {
             // params: [address, limit (optional)]
             if let Some(address) = params.get(0).and_then(|v| v.as_str()) {
+                // B127: an address (A1n or 64 hex, made 64 hex above), not
+                // any substring: "" matched every block.
+                if address.len() != 64 || !address.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(JsonRpcError { code: -32602, message: "Invalid params: address must be an A1n or 64-hex address".into() });
+                }
                 let limit = std::cmp::min(params.get(1).and_then(|v| v.as_u64()).unwrap_or(20), MAX_QUERY_LIMIT) as usize;
                 let latest_height = data.storage.get_chain_height();
                 let mut txs = Vec::new();
+                // B127: the scan stops at MAX_BLOCKS_BYTES of blocks read,
+                // which bounds the answer too (B54's bound; up to 1,000
+                // transactions of 100 KiB were ~100 MiB).
+                let mut read = 0usize;
 
                 // Scan recent blocks for transactions involving this address
                 let search_start = latest_height.saturating_sub(500);
                 'block_scan: for h in (search_start..=latest_height).rev() {
                     let key = format!("block_{}", h);
                     if let Ok(Some(block_json)) = data.storage.get(&key) {
+                        read += block_json.len();
+                        if read > MAX_BLOCKS_BYTES {
+                            break 'block_scan;
+                        }
                         if block_json.contains(address) {
                             if let Ok(block) = serde_json::from_str::<serde_json::Value>(&block_json) {
                                 if let Some(transactions) = block.get("transactions").and_then(|t| t.as_array()) {
@@ -2435,28 +2454,30 @@ async fn get_transaction_handler(
     query: web::Query<TxQuery>,
     data: web::Data<AppState>,
 ) -> impl Responder {
-    let target_hash = &query.hash;
-    let latest_height = data.storage.get_chain_height();
-
-    // Naive scan (in production, use an indexer DB!)
-    // Limit scan to last 1000 blocks to avoid timeout
-    let start_index = latest_height.saturating_sub(1000);
-
-    for i in (start_index..=latest_height).rev() {
-        let key = format!("block_{}", i);
-        if let Ok(Some(block_json)) = data.storage.get(&key) {
-            // Check if block contains the string of the hash?
-            // Better: parse block and check header.tx_hash
-            // For now, simpler string check to be fast
-            if block_json.contains(target_hash) {
-                return HttpResponse::Ok()
-                    .content_type("application/json")
-                    .body(block_json); // Return the whole block containing the TX for now
-            }
-        }
+    // B127: the transaction index (`tx_index:{hash}`, written with each
+    // block), not a substring scan of 1,000 blocks: any fragment matched.
+    let target_hash = query
+        .hash
+        .trim()
+        .trim_start_matches("0x")
+        .to_ascii_lowercase();
+    if target_hash.len() != 64 || !target_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return HttpResponse::BadRequest().body("hash must be 64 hex characters");
     }
-
-    HttpResponse::NotFound().body("Transaction not found in recent blocks")
+    let block = data
+        .storage
+        .get(&format!("tx_index:{target_hash}"))
+        .ok()
+        .flatten()
+        .and_then(|h| h.parse::<u64>().ok())
+        .and_then(|h| data.storage.get(&format!("block_{h}")).ok().flatten());
+    match block {
+        // The whole block holding the transaction, as before.
+        Some(block_json) => HttpResponse::Ok()
+            .content_type("application/json")
+            .body(block_json),
+        None => HttpResponse::NotFound().body("Transaction not found"),
+    }
 }
 
 async fn metrics_handler() -> impl Responder {
@@ -2992,6 +3013,32 @@ mod tests {
             2,
             "three 3 MiB blocks pass 8 MiB at the third"
         );
+
+        // B127: an address's history takes an address, not any substring,
+        // and stops at 8 MiB: three 3 MiB transactions of one sender pass it
+        // at the third.
+        let sender = "ab".repeat(32);
+        let tx = serde_json::json!({ "sender": sender, "pad": "x".repeat(3 << 20) }).to_string();
+        let seed = db.seeding();
+        for h in 4..=6u64 {
+            let block = serde_json::json!({ "header": { "height": h }, "transactions": [tx] });
+            db.put(&format!("block_{h}"), &block.to_string()).unwrap();
+        }
+        db.put("latest_height", "6").unwrap();
+        drop(seed);
+        let history = handle_rpc_method(
+            "aincore_getTransactionsByAddress",
+            serde_json::json!([sender, 10]),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(history["count"], 2, "8 MiB stops the answer");
+        assert!(handle_rpc_method(
+            "aincore_getTransactionsByAddress",
+            serde_json::json!(["", 10]),
+            &state
+        )
+        .is_err());
     }
 
     /// B59 witness: behind the operator's proxy, with its header named, each

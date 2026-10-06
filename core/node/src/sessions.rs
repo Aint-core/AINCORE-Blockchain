@@ -69,6 +69,8 @@ pub struct PeerBook {
     epoch: u64,
     by_peer: HashMap<PeerId, String>,
     by_address: HashMap<String, PeerId>,
+    /// B122: the current committee's stake by member address.
+    stakes: HashMap<String, u64>,
 }
 
 impl PeerBook {
@@ -86,7 +88,17 @@ impl PeerBook {
                 book.by_address.insert(member.address.clone(), peer);
             }
         }
+        if let Some(current) = committees.first() {
+            for member in current.iter() {
+                book.stakes.insert(member.address.clone(), member.stake);
+            }
+        }
         book
+    }
+
+    /// B122: the current committee's stake by member address.
+    pub fn stakes(&self) -> &HashMap<String, u64> {
+        &self.stakes
     }
 
     pub fn epoch(&self) -> u64 {
@@ -814,10 +826,88 @@ pub const ADMIT_BURST_PER_IP: f64 = 16.0;
 pub const PENDING_KEPT_FOR_MEMBERS: usize = 16;
 /// B56: member IPs remembered at most.
 pub const MAX_MEMBER_IPS: usize = 1024;
+/// B116: unfinished handshakes from one network group (`net_group`: /16
+/// IPv4, /32 IPv6) outside the kept IPs, at once (a choice: two hosts'
+/// worth; the other IPs' 112 slots then take 14 groups to fill, where 28
+/// IPs of one provider's range did).
+pub const PENDING_PER_GROUP: usize = 2 * PENDING_PER_IP;
 
-/// B56: the IPs committee members connected from, which the network task
-/// adds to and the gate reads.
-pub type MemberIps = Arc<RwLock<std::collections::HashSet<std::net::IpAddr>>>;
+/// B56/B116: the IPs the gate keeps handshake slots for. The operator's
+/// bootnodes and saved members' are kept from boot: the set used to start
+/// empty and fill only from members' sessions, so at a cold start ~28 IPs
+/// holding silent handshakes kept every member out and the chain could not
+/// start. A committee member's IP is kept one per member PeerId, replaced
+/// when it connects from another and dropped once it leaves the committee:
+/// a member could record 32 addresses for good and hold every pending slot
+/// from them.
+#[derive(Debug, Default)]
+pub struct KeptIps {
+    boot: std::collections::HashSet<std::net::IpAddr>,
+    members: HashMap<PeerId, std::net::IpAddr>,
+    all: std::collections::HashSet<std::net::IpAddr>,
+}
+
+impl KeptIps {
+    /// The IPs kept from boot (the operator's bootnodes and saved members).
+    pub fn with_boot(boot: impl IntoIterator<Item = std::net::IpAddr>) -> Self {
+        let mut kept = Self {
+            boot: boot.into_iter().take(MAX_MEMBER_IPS).collect(),
+            ..Self::default()
+        };
+        kept.rebuild();
+        kept
+    }
+
+    /// Committee member `peer` connected from `ip`; `is_member` tells which
+    /// recorded members still are (those that left are dropped).
+    pub fn record_member(
+        &mut self,
+        peer: PeerId,
+        ip: std::net::IpAddr,
+        is_member: impl Fn(&PeerId) -> bool,
+    ) {
+        self.members.retain(|p, _| is_member(p));
+        if self.members.len() < MAX_MEMBER_IPS || self.members.contains_key(&peer) {
+            self.members.insert(peer, ip);
+        }
+        self.rebuild();
+    }
+
+    pub fn contains(&self, ip: &std::net::IpAddr) -> bool {
+        self.all.contains(ip)
+    }
+
+    fn rebuild(&mut self) {
+        self.all = self
+            .boot
+            .iter()
+            .chain(self.members.values())
+            .copied()
+            .collect();
+    }
+}
+
+/// B116: the IP literals of the boot dial list (bootnodes and saved member
+/// addresses, as multiaddrs or `ip:port`); host names are left out (no DNS
+/// lookup at boot).
+pub fn boot_ips(boot: &[String]) -> Vec<std::net::IpAddr> {
+    boot.iter()
+        .filter_map(|addr| {
+            let addr = addr.trim();
+            if let Ok(multiaddr) = addr.parse::<libp2p::Multiaddr>() {
+                return ip_of(&multiaddr);
+            }
+            addr.parse::<std::net::SocketAddr>()
+                .map(|s| s.ip())
+                .or_else(|_| addr.parse::<std::net::IpAddr>())
+                .ok()
+        })
+        .collect()
+}
+
+/// B56: the IPs the gate keeps slots for, which the network task adds to
+/// and the gate reads.
+pub type MemberIps = Arc<RwLock<KeptIps>>;
 
 /// B24: inbound admission before any handshake. Every cap of the network
 /// task runs once a connection is established, after the Noise handshake
@@ -874,18 +964,32 @@ impl libp2p::swarm::NetworkBehaviour for InboundGate {
         if self.pending.values().filter(|p| **p == ip).count() >= PENDING_PER_IP {
             return Err(denied("too many unfinished handshakes from this IP"));
         }
-        // B56: other IPs share all but the slots kept for members'.
-        if let Ok(members) = self.member_ips.read() {
-            let others = self
-                .pending
-                .values()
-                .filter(|p| !members.contains(p))
-                .count();
-            let limit = MAX_PENDING_INBOUND as usize - PENDING_KEPT_FOR_MEMBERS;
-            if !members.contains(&ip) && others >= limit {
-                return Err(denied(
-                    "the unfinished handshakes of other IPs are at their bound",
-                ));
+        // B56: other IPs share all but the slots kept for members'; B116:
+        // and one network group holds at most PENDING_PER_GROUP of them.
+        if let Ok(kept) = self.member_ips.read() {
+            if !kept.contains(&ip) {
+                let others: Vec<&std::net::IpAddr> = self
+                    .pending
+                    .values()
+                    .filter(|p| !kept.contains(p))
+                    .collect();
+                let limit = MAX_PENDING_INBOUND as usize - PENDING_KEPT_FOR_MEMBERS;
+                if others.len() >= limit {
+                    return Err(denied(
+                        "the unfinished handshakes of other IPs are at their bound",
+                    ));
+                }
+                let group = net_group(&ip.to_string());
+                if others
+                    .iter()
+                    .filter(|p| net_group(&p.to_string()) == group)
+                    .count()
+                    >= PENDING_PER_GROUP
+                {
+                    return Err(denied(
+                        "too many unfinished handshakes from this network group",
+                    ));
+                }
             }
         }
         // B111: a member's IP is not held to the per-IP admission rate (once
@@ -1772,14 +1876,18 @@ mod tests {
         use libp2p::swarm::NetworkBehaviour;
         let members = MemberIps::default();
         let member: std::net::IpAddr = "10.9.9.9".parse().unwrap();
-        members.write().unwrap().insert(member);
+        members
+            .write()
+            .unwrap()
+            .record_member(PeerId::random(), member, |_| true);
         let mut gate = InboundGate::with_member_ips(members);
         let local: libp2p::Multiaddr = "/ip4/10.0.0.1/tcp/9101".parse().unwrap();
         let from =
             |ip: String| -> libp2p::Multiaddr { format!("/ip4/{ip}/tcp/40000").parse().unwrap() };
         let (mut ok, mut next) = (0, 0usize);
+        // Two IPs in each of 32 network groups (B116 bounds a group).
         for i in 0..64u32 {
-            let ip = format!("192.0.2.{i}");
+            let ip = format!("{}.0.2.{}", 100 + i / 2, i % 2);
             for _ in 0..PENDING_PER_IP {
                 next += 1;
                 let id = libp2p::swarm::ConnectionId::new_unchecked(next);
@@ -1824,6 +1932,77 @@ mod tests {
             admitted,
             ADMIT_BURST_PER_IP as usize + 8,
             "a member's IP was rate-limited"
+        );
+    }
+
+    /// B116 witness: at a cold start no member has connected yet, and the
+    /// bootnodes' IPs are kept from boot, so silent handshakes from other IPs
+    /// cannot keep them out; a member's IP is kept one per member (its 32
+    /// addresses no longer hold every slot), until it leaves the committee;
+    /// and one network group cannot take the other IPs' share.
+    #[test]
+    fn the_kept_slots_hold_from_boot_and_one_ip_per_member() {
+        use libp2p::swarm::NetworkBehaviour;
+        let boot = boot_ips(&[
+            "/ip4/10.7.7.7/tcp/9101".into(),
+            "10.8.8.8:9101".into(),
+            "seed.example.org:9101".into(),
+        ]);
+        assert_eq!(boot.len(), 2, "IP literals only: {boot:?}");
+        let kept = MemberIps::new(RwLock::new(KeptIps::with_boot(boot)));
+        let mut gate = InboundGate::with_member_ips(Arc::clone(&kept));
+        let local: libp2p::Multiaddr = "/ip4/10.0.0.1/tcp/9101".parse().unwrap();
+        let from =
+            |ip: &str| -> libp2p::Multiaddr { format!("/ip4/{ip}/tcp/40000").parse().unwrap() };
+        let mut next = 0usize;
+        let mut try_from = |gate: &mut InboundGate, ip: &str| {
+            next += 1;
+            gate.handle_pending_inbound_connection(
+                libp2p::swarm::ConnectionId::new_unchecked(next),
+                &local,
+                &from(ip),
+            )
+            .is_ok()
+        };
+        // One group takes at most PENDING_PER_GROUP of the others' share.
+        let one_group = (0..12)
+            .filter(|i| try_from(&mut gate, &format!("198.51.{i}.1")))
+            .count();
+        assert_eq!(one_group, PENDING_PER_GROUP);
+        let mut others = one_group;
+        for g in 0..64u32 {
+            for host in 0..2u32 {
+                for _ in 0..PENDING_PER_IP {
+                    if try_from(&mut gate, &format!("{}.1.0.{host}", 20 + g)) {
+                        others += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            others,
+            MAX_PENDING_INBOUND as usize - PENDING_KEPT_FOR_MEMBERS,
+            "vacuous: the others' share is not full"
+        );
+        assert!(!try_from(&mut gate, "203.0.113.9"), "a new IP got in");
+        assert!(try_from(&mut gate, "10.7.7.7"), "a bootnode was kept out");
+        assert!(try_from(&mut gate, "10.8.8.8"), "a bootnode was kept out");
+        // One IP per member, the latest; none once it left the committee.
+        let member = PeerId::random();
+        let mut book = kept.write().unwrap();
+        for i in 0..32u8 {
+            book.record_member(member, std::net::IpAddr::from([10, 9, 0, i]), |_| true);
+        }
+        assert!(!book.contains(&std::net::IpAddr::from([10, 9, 0, 0])));
+        assert!(book.contains(&std::net::IpAddr::from([10, 9, 0, 31])));
+        book.record_member(
+            PeerId::random(),
+            std::net::IpAddr::from([10, 9, 1, 1]),
+            |p| *p != member,
+        );
+        assert!(
+            !book.contains(&std::net::IpAddr::from([10, 9, 0, 31])),
+            "a member that left kept its slot"
         );
     }
 

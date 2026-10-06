@@ -297,11 +297,21 @@ pub fn v4_verdict_cached(
 pub enum PayloadGate {
     /// Checked when this body was seen before: not again.
     Verified,
+    /// B117: refused when this body was seen before: refused again, unchecked.
+    Refused,
     /// Check it.
     Check,
     /// Two other bodies of this (epoch, round, author) took the check
     /// already: the author equivocated, and a third is not checked.
     Full,
+}
+
+/// B117: a payload check that ran, and its outcome, so the engine remembers
+/// the body either way (a refused body was checked again on every copy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadChecked {
+    Passed,
+    Refused,
 }
 
 #[cfg(test)]
@@ -311,14 +321,18 @@ thread_local! {
     pub(crate) static PAYLOAD_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// The payload step: `None` to go on.
+/// The payload step: `None` to go on. `checked` reports a check that ran.
 fn payload_step(
     v: &Vertex,
     chain_id: &str,
     gate: impl FnOnce(&Vertex) -> PayloadGate,
+    checked: &mut Option<PayloadChecked>,
 ) -> Option<Verdict> {
     match gate(v) {
         PayloadGate::Verified => None,
+        PayloadGate::Refused => Some(Verdict::Invalid(
+            "its payload was refused before".to_string(),
+        )),
         PayloadGate::Full => Some(Verdict::Drop(format!(
             "round {} of {} holds two other bodies already",
             v.round, v.author
@@ -326,15 +340,18 @@ fn payload_step(
         PayloadGate::Check => {
             #[cfg(test)]
             PAYLOAD_CHECKS.with(|n| n.set(n.get() + 1));
-            payload_admissible(v, chain_id).err().map(Verdict::Invalid)
+            let refused = payload_admissible(v, chain_id).err();
+            *checked = Some(if refused.is_some() {
+                PayloadChecked::Refused
+            } else {
+                PayloadChecked::Passed
+            });
+            refused.map(Verdict::Invalid)
         }
     }
 }
 
-/// `v4_verdict_cached` with B95's order: Layer S without the payload, the
-/// epoch and Layer E's cheap filters, and only then the payload's checks,
-/// through `gate`. A vertex those filters drop or refuse as stale is not
-/// staged anyway; a later copy within the window gets the payload verdict.
+/// `v4_verdict_checked` without the check's outcome.
 pub fn v4_verdict_gated(
     raw_len: usize,
     v: &Vertex,
@@ -342,6 +359,38 @@ pub fn v4_verdict_gated(
     local_cert: impl Fn(&ParentRef) -> Option<CompactCert>,
     verified: impl Fn(&ParentRef) -> bool,
     gate: impl FnOnce(&Vertex) -> PayloadGate,
+) -> Verdict {
+    v4_verdict_checked(raw_len, v, ctx, local_cert, verified, gate).0
+}
+
+/// `v4_verdict_cached` with B95's order: Layer S without the payload, the
+/// epoch and Layer E's cheap filters, the parents' certificates, and only
+/// then the payload's checks, through `gate`. B117: only a vertex that
+/// stages (or is buffered for the next epoch) has its payload checked: one
+/// waiting on parent certificates is checked when it wakes, so a vertex on
+/// invented parents never costs a check. Returns the verdict and the
+/// payload check that ran, if one did.
+pub fn v4_verdict_checked(
+    raw_len: usize,
+    v: &Vertex,
+    ctx: &Context<'_>,
+    local_cert: impl Fn(&ParentRef) -> Option<CompactCert>,
+    verified: impl Fn(&ParentRef) -> bool,
+    gate: impl FnOnce(&Vertex) -> PayloadGate,
+) -> (Verdict, Option<PayloadChecked>) {
+    let mut checked = None;
+    let verdict = v4_verdict_inner(raw_len, v, ctx, local_cert, verified, gate, &mut checked);
+    (verdict, checked)
+}
+
+fn v4_verdict_inner(
+    raw_len: usize,
+    v: &Vertex,
+    ctx: &Context<'_>,
+    local_cert: impl Fn(&ParentRef) -> Option<CompactCert>,
+    verified: impl Fn(&ParentRef) -> bool,
+    gate: impl FnOnce(&Vertex) -> PayloadGate,
+    checked: &mut Option<PayloadChecked>,
 ) -> Verdict {
     let active = &ctx.active;
     // Layer S, the parts that need no epoch record.
@@ -379,8 +428,14 @@ pub fn v4_verdict_gated(
         return Verdict::Invalid(e);
     }
     if v.epoch > active.epoch {
-        // Buffered for activation: its payload is checked before it is kept.
-        return payload_step(v, ctx.chain_id, gate).unwrap_or(Verdict::PendingEpoch);
+        // B117/B118: buffered for activation only within the next epoch's
+        // lead (its parents' existence is not checked here, so an E+1
+        // vertex at any round would otherwise be kept), and its payload is
+        // checked before it is kept.
+        if v.round > record.first_round.saturating_add(LEAD) {
+            return Verdict::Drop(format!("round {} beyond the next epoch's lead", v.round));
+        }
+        return payload_step(v, ctx.chain_id, gate, checked).unwrap_or(Verdict::PendingEpoch);
     }
     if v.epoch < active.epoch || active.closing_round.is_some_and(|r| v.round > r) {
         return Verdict::Stale;
@@ -399,12 +454,9 @@ pub fn v4_verdict_gated(
             v.round
         ));
     }
-    // B95: the payload's signatures only now, past the cheap filters.
-    if let Some(verdict) = payload_step(v, ctx.chain_id, gate) {
-        return verdict;
-    }
     if v.round == active.first_round {
-        return Verdict::Stage;
+        // B95: the payload's signatures only now, past the cheap filters.
+        return payload_step(v, ctx.chain_id, gate, checked).unwrap_or(Verdict::Stage);
     }
     let committee_hash = qc::validator_set_hash(active.committee);
     let n = active.committee.len();
@@ -447,7 +499,8 @@ pub fn v4_verdict_gated(
         .map(|(i, _)| i)
         .collect();
     if missing.is_empty() {
-        Verdict::Stage
+        // B95/B117: the payload's signatures last, for a vertex that stages.
+        payload_step(v, ctx.chain_id, gate, checked).unwrap_or(Verdict::Stage)
     } else if beyond_lead {
         // Past the lead a vertex is staged only on parents already certified:
         // it never makes this node wait or ask for certificates that may not

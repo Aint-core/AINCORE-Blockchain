@@ -47,9 +47,14 @@ pub const MAX_LEAF_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_CHUNK_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 /// Snapshot serving, apart from vertex serving: requests in flight and cost
 /// units per second (a leaf, or `UNIT_BYTES` read), globally and per client,
-/// so no one client takes more than its share. A client is the key its
-/// session authenticated (G4 S6).
+/// so no one client takes more than its share. B131: a committee member or
+/// a reserved peer is the key its session authenticated (G4 S6); anyone
+/// else is its network group (`net_group`), so one host's many keys share
+/// one client's budget, and `STATE_SERVE_IN_FLIGHT_KEPT` of the slots are
+/// theirs alone, so outsiders cannot keep their restores answered "busy".
 pub const STATE_SERVE_IN_FLIGHT: usize = 4;
+/// B131: in-flight slots only members and reserved peers take (a choice).
+pub const STATE_SERVE_IN_FLIGHT_KEPT: usize = 1;
 pub const STATE_SERVE_IN_FLIGHT_PER_CLIENT: usize = 1;
 pub const STATE_SERVE_UNITS_PER_SEC: f64 = 8_000.0;
 pub const STATE_SERVE_UNITS_PER_SEC_PER_CLIENT: f64 = 2_000.0;
@@ -302,7 +307,7 @@ struct Buckets {
 }
 
 /// Snapshot serving's budget: slots in flight and cost units, globally and
-/// per client IP. A burst is one second's worth. Bytes read are charged
+/// per client (see `STATE_SERVE_IN_FLIGHT`). A burst is one second's worth. Bytes read are charged
 /// after the fact and may leave a bucket in debt, which later requests wait
 /// out.
 pub struct StateBudget {
@@ -335,13 +340,19 @@ impl StateBudget {
 
     /// Let a request from `client` in (`None`: in process, global limits
     /// only), with up to `want` units both buckets hold. `None` when busy.
-    pub fn admit(&self, client: Option<&str>, want: usize) -> Option<Admission<'_>> {
-        self.admit_at_least(client, want, 1)
+    /// `kept`: a member or a reserved peer, which may take the kept slots.
+    pub fn admit(&self, client: Option<&str>, want: usize, kept: bool) -> Option<Admission<'_>> {
+        self.admit_at_least(client, want, 1, kept)
     }
 
     /// `admit`, only when both buckets hold all `units`.
-    pub fn admit_all(&self, client: Option<&str>, units: usize) -> Option<Admission<'_>> {
-        self.admit_at_least(client, units, units)
+    pub fn admit_all(
+        &self,
+        client: Option<&str>,
+        units: usize,
+        kept: bool,
+    ) -> Option<Admission<'_>> {
+        self.admit_at_least(client, units, units, kept)
     }
 
     fn admit_at_least(
@@ -349,11 +360,17 @@ impl StateBudget {
         client: Option<&str>,
         want: usize,
         least: usize,
+        kept: bool,
     ) -> Option<Admission<'_>> {
         let mut st = self.lock();
         let now = Instant::now();
         st.global.refill(STATE_SERVE_UNITS_PER_SEC, now);
-        if st.global.in_flight >= STATE_SERVE_IN_FLIGHT {
+        let slots = if kept {
+            STATE_SERVE_IN_FLIGHT
+        } else {
+            STATE_SERVE_IN_FLIGHT - STATE_SERVE_IN_FLIGHT_KEPT
+        };
+        if st.global.in_flight >= slots {
             return None;
         }
         let mut cap = st.global.tokens;
@@ -485,12 +502,23 @@ impl ChainSync {
         self.serve_state_chunk(req, None)
     }
 
+    /// `serve_state_chunk` for a client outside the kept slots.
+    pub fn serve_state_chunk(&self, req: ChunkRequest, peer: Option<&str>) -> ChunkResponse {
+        self.serve_state_chunk_as(req, peer, false)
+    }
+
     /// Serve one restore chunk (SN-2) of a version this node retains, to
     /// `peer`, within the protocol's limits (`ChunkBudget`): the leaves are
     /// read once, up to the first that does not fit. Charged a unit per leaf
     /// served and per `UNIT_BYTES` read (at most one second's worth), under
-    /// the global and the per-IP budget; the reads off the shared workers.
-    pub fn serve_state_chunk(&self, req: ChunkRequest, peer: Option<&str>) -> ChunkResponse {
+    /// the global and the client's budget; the reads off the shared workers.
+    /// `kept`: a member or a reserved peer (B131).
+    pub fn serve_state_chunk_as(
+        &self,
+        req: ChunkRequest,
+        peer: Option<&str>,
+        kept: bool,
+    ) -> ChunkResponse {
         let refuse = |why: &str| ChunkResponse {
             error: Some(why.to_string()),
             ..Default::default()
@@ -511,7 +539,7 @@ impl ChainSync {
         }
         let Some(admission) = self
             .state_budget
-            .admit(peer, req.max.clamp(1, MAX_CHUNK_ENTRIES))
+            .admit(peer, req.max.clamp(1, MAX_CHUNK_ENTRIES), kept)
         else {
             return refuse(BUSY);
         };
@@ -572,11 +600,21 @@ impl ChainSync {
         self.serve_state_value(req, None)
     }
 
+    /// `serve_state_value` for a client outside the kept slots.
+    pub fn serve_state_value(&self, req: ValueRequest, peer: Option<&str>) -> ValueResponse {
+        self.serve_state_value_as(req, peer, false)
+    }
+
     /// Serve `VALUE_PART_BYTES` of one leaf's value from `offset` to
     /// `peer`, for a value too large to travel inline. A part is let in only
     /// when its whole cost fits; reading a value that is not cached costs at
-    /// most one more second's worth.
-    pub fn serve_state_value(&self, req: ValueRequest, peer: Option<&str>) -> ValueResponse {
+    /// most one more second's worth. `kept`: a member or a reserved peer.
+    pub fn serve_state_value_as(
+        &self,
+        req: ValueRequest,
+        peer: Option<&str>,
+        kept: bool,
+    ) -> ValueResponse {
         let refuse = |why: &str| ValueResponse {
             error: Some(why.to_string()),
             ..Default::default()
@@ -587,7 +625,7 @@ impl ChainSync {
         if let Err(why) = self.state_servable(req.version) {
             return refuse(why);
         }
-        let Some(admission) = self.state_budget.admit_all(peer, PART_UNITS) else {
+        let Some(admission) = self.state_budget.admit_all(peer, PART_UNITS, kept) else {
             return refuse(BUSY);
         };
         blocking(|| {

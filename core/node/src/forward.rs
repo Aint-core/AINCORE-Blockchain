@@ -15,13 +15,20 @@
 //! goes to the next member and is
 //! dropped once `REFUSALS_TO_DROP` members refused it (B39); an unanswered
 //! batch goes to the next member, and back to the queue when none answers.
+//!
+//! B122: "enough members" is stake, not a count: a transaction is dropped
+//! once members holding more than a third of the committee's stake refused
+//! it (and at least `REFUSALS_TO_DROP` of them), so the Byzantine minority
+//! cannot drop it however it sits in the rotation. The groups of a pass are
+//! sent at once, and a member that did not answer is skipped for
+//! `SILENT_FOR` (one silent member used to cost every batch its timeout).
 
 use mempool::Mempool;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A batch of raw transactions, a JSON array of strings.
 pub const TX_SUBMIT: &str = "TX_SUBMIT:";
@@ -37,6 +44,48 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 /// A forwarded transaction no block settled is forwarded again after this
 /// long (consensus re-queues its own loans after the same 30 s).
 const FORWARD_RETRY_SECS: u64 = 30;
+/// B122: how long a member that did not answer is skipped (a choice: the
+/// retry period above).
+pub const SILENT_FOR: Duration = Duration::from_secs(FORWARD_RETRY_SECS);
+
+/// B122: the current committee's stake by member address (the PeerBook's),
+/// and the members that did not answer, skipped until the time kept.
+#[derive(Debug, Default)]
+pub struct ForwardState {
+    pub stakes: HashMap<String, u64>,
+    silent: Mutex<HashMap<String, Instant>>,
+}
+
+impl ForwardState {
+    pub fn with_stakes(stakes: HashMap<String, u64>) -> Self {
+        Self {
+            stakes,
+            silent: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn total_stake(&self) -> u128 {
+        self.stakes.values().map(|s| u128::from(*s)).sum()
+    }
+
+    fn stake_of(&self, member: &str) -> u128 {
+        self.stakes.get(member).map_or(0, |s| u128::from(*s))
+    }
+
+    fn silent(&self, peer: &str, now: Instant) -> bool {
+        self.silent
+            .lock()
+            .map(|s| s.get(peer).is_some_and(|until| now < *until))
+            .unwrap_or(false)
+    }
+
+    fn strike(&self, peer: &str, now: Instant) {
+        if let Ok(mut s) = self.silent.lock() {
+            s.retain(|_, until| now < *until);
+            s.insert(peer.to_string(), now + SILENT_FOR);
+        }
+    }
+}
 
 /// One transaction's verdict from the member's mempool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,7 +176,11 @@ fn batches(txs: Vec<String>, cap: usize) -> Vec<Vec<String>> {
 
 /// One forwarding pass: loan what the mempool holds, send it, settle the
 /// answers. Returns how many transactions a member accepted.
-pub async fn forward_once(mempool: &Arc<Mutex<Mempool>>, client: &network::SessionClient) -> usize {
+pub async fn forward_once(
+    mempool: &Arc<Mutex<Mempool>>,
+    client: &network::SessionClient,
+    state: &ForwardState,
+) -> usize {
     let loaned: Vec<(String, u8)> = match mempool.lock() {
         Ok(mut mp) => {
             let now = wall_secs();
@@ -162,40 +215,66 @@ pub async fn forward_once(mempool: &Arc<Mutex<Mempool>>, client: &network::Sessi
             None => groups.push((order, vec![tx])),
         }
     }
-    let mut accepted = 0;
-    for (order, txs) in groups {
-        for batch in batches(txs, crate::sessions::SYNC_REQUEST_CAP) {
-            accepted += send_batch(mempool, client, &order, batch).await;
+    // B122: the groups at once (each starts at another member), their
+    // batches in order within a group.
+    let member_of: HashMap<String, String> = sessions
+        .iter()
+        .filter_map(|s| Some((s.peer.clone(), s.member.clone()?)))
+        .collect();
+    let passes = groups.into_iter().map(|(order, txs)| {
+        let member_of = &member_of;
+        async move {
+            let mut accepted = 0;
+            for batch in batches(txs, crate::sessions::SYNC_REQUEST_CAP) {
+                accepted += send_batch(mempool, client, state, member_of, &order, batch).await;
+            }
+            accepted
         }
-    }
-    accepted
+    });
+    futures::future::join_all(passes).await.into_iter().sum()
 }
 
-/// B39: a transaction is dropped only once this many members refused it
-/// (f + 1 for a committee of four: one Byzantine member cannot censor a
-/// sender by refusing; a choice for larger committees).
+/// B39: a transaction is dropped only once at least this many members
+/// refused it (one member alone never drops it), and (B122) only once those
+/// members hold more than a third of the stake.
 pub const REFUSALS_TO_DROP: usize = 2;
 
 async fn send_batch(
     mempool: &Arc<Mutex<Mempool>>,
     client: &network::SessionClient,
+    state: &ForwardState,
+    member_of: &HashMap<String, String>,
     order: &[String],
     batch: Vec<String>,
 ) -> usize {
     let mut pending = batch;
-    let mut refusals: HashMap<String, usize> = HashMap::new();
+    let mut refusals: HashMap<String, (usize, u128)> = HashMap::new();
     let mut dropped = Vec::new();
     let mut accepted = 0;
+    // A committee whose stakes this node does not know counts each member
+    // as one.
+    let total = match state.total_stake() {
+        0 => member_of.len() as u128,
+        stake => stake,
+    };
     for peer in order {
         if pending.is_empty() {
             break;
+        }
+        if state.silent(peer, Instant::now()) {
+            continue;
         }
         let Ok(wire) = serde_json::to_string(&pending).map(|json| format!("{TX_SUBMIT}{json}"))
         else {
             break;
         };
         let Ok(reply) = client.ask(peer, &wire, FORWARD_TIMEOUT).await else {
+            state.strike(peer, Instant::now());
             continue;
+        };
+        let stake = match state.total_stake() {
+            0 => 1,
+            _ => member_of.get(peer).map_or(0, |m| state.stake_of(m)),
         };
         let Some(verdicts) = reply
             .strip_prefix(TX_RESULT)
@@ -209,9 +288,10 @@ async fn send_batch(
             match verdict {
                 Verdict::Accepted(_) => accepted += 1,
                 Verdict::Refused(_) => {
-                    let count = refusals.entry(tx.clone()).or_insert(0);
+                    let (count, refused) = refusals.entry(tx.clone()).or_insert((0, 0));
                     *count += 1;
-                    if *count >= REFUSALS_TO_DROP {
+                    *refused += stake;
+                    if *count >= REFUSALS_TO_DROP && *refused * 3 > total {
                         dropped.push(tx);
                     } else {
                         next.push(tx);
@@ -252,14 +332,21 @@ fn wall_secs() -> u64 {
 pub async fn run_forwarder(
     mempool: Arc<Mutex<Mempool>>,
     client: network::SessionClient,
+    book: Arc<std::sync::RwLock<crate::sessions::PeerBook>>,
     in_committee: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut tick = tokio::time::interval(FORWARD_EVERY);
+    let mut state = ForwardState::default();
     while !shutdown.load(Ordering::SeqCst) {
         tick.tick().await;
         if !in_committee.load(Ordering::SeqCst) {
-            forward_once(&mempool, &client).await;
+            if let Ok(b) = book.read() {
+                if *b.stakes() != state.stakes {
+                    state.stakes = b.stakes().clone();
+                }
+            }
+            forward_once(&mempool, &client, &state).await;
         }
     }
 }

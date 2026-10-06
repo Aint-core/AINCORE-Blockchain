@@ -503,16 +503,29 @@ fn forged_cert(
     digest: &str,
     signers: &[usize],
 ) -> VertexCertificate {
+    forged_cert_in(c, EPOCH, &c.committee, round, author, digest, signers)
+}
+
+/// `forged_cert` for `epoch` under `committee`.
+fn forged_cert_in(
+    c: &Cluster,
+    epoch: u64,
+    committee: &[ValidatorInfo],
+    round: u64,
+    author: &str,
+    digest: &str,
+    signers: &[usize],
+) -> VertexCertificate {
     let body = AttestBody {
         chain_id: CHAIN.into(),
         genesis_identity: GENESIS.into(),
-        epoch: EPOCH,
+        epoch,
         round,
         author: author.to_string(),
         digest: digest.to_string(),
-        committee_hash: qc::validator_set_hash(&c.committee),
+        committee_hash: qc::validator_set_hash(committee),
     };
-    let mut collector = CertCollector::new(body.clone(), &c.committee).unwrap();
+    let mut collector = CertCollector::new(body.clone(), committee).unwrap();
     let mut out = None;
     for &s in signers {
         let att = VertexAttestation {
@@ -4013,22 +4026,343 @@ fn an_engine_checks_two_plain_twins_of_a_slot_and_not_a_third() {
 #[test]
 fn a_third_body_of_one_slot_is_not_checked() {
     let v = Vertex::new(5, "author".into(), vec![], vec![]);
-    let mut slots: HashMap<(u64, u64, String), Vec<String>> = HashMap::new();
+    let key = (v.epoch, v.round, v.author.clone());
+    let mut slots: HashMap<(u64, u64, String), PayloadSlot> = HashMap::new();
     let gate =
-        |slots: &HashMap<(u64, u64, String), Vec<String>>| Engine::payload_gate(slots, &v, false);
+        |slots: &HashMap<(u64, u64, String), PayloadSlot>| Engine::payload_gate(slots, &v, false);
     assert_eq!(gate(&slots), ingress_v4::PayloadGate::Check);
     slots.insert(
-        (v.epoch, v.round, v.author.clone()),
-        vec!["x".into(), "y".into()],
+        key.clone(),
+        PayloadSlot {
+            passed: vec!["x".into()],
+            refused: vec!["y".into()],
+        },
     );
+    // B117: two checks fill a slot whatever their outcome.
     assert_eq!(gate(&slots), ingress_v4::PayloadGate::Full);
     assert_eq!(
         Engine::payload_gate(&slots, &v, true),
         ingress_v4::PayloadGate::Check,
         "a certified third body is checked"
     );
-    slots
-        .get_mut(&(v.epoch, v.round, v.author.clone()))
-        .unwrap()[1] = v.hash.clone();
+    slots.get_mut(&key).unwrap().refused[0] = v.hash.clone();
+    assert_eq!(gate(&slots), ingress_v4::PayloadGate::Refused);
+    slots.get_mut(&key).unwrap().refused.clear();
+    slots.get_mut(&key).unwrap().passed[0] = v.hash.clone();
     assert_eq!(gate(&slots), ingress_v4::PayloadGate::Verified);
+}
+
+/// `v` with its payload replaced, re-hashed and re-signed by `key`.
+fn with_payload(v: &Vertex, payload: Vec<String>, key: &[u8; 32]) -> Vertex {
+    let mut w = v.clone();
+    w.payload = payload;
+    w.hash = w.hash_v4_with_domain(CHAIN, GENESIS);
+    w.sign_with_ed25519(&crypto::SigningKey::from_bytes(key));
+    w
+}
+
+/// B117 witness: a refused payload is remembered, so its copies are not
+/// checked again, and the refusal is charged to whoever delivered it (B51);
+/// a vertex waiting on parent certificates (here, invented parents) has its
+/// payload checked only when it wakes, which never happens.
+#[test]
+fn a_refused_payload_is_checked_once_and_a_waiting_one_not_at_all() {
+    let mut c = Cluster::new("b117-refused", 4, 0);
+    c.run(1);
+    let byz = c.leader(2);
+    let h0 = c.validators().find(|&i| i != byz).unwrap();
+    c.tick_all();
+    let key = c.members[byz].node_key;
+    let a = c.engine(byz).own_proposal(2).unwrap().clone();
+    let bad = with_payload(&a, vec!["not a transaction".to_string()], &key);
+    let net = c.net(h0);
+    let checks = || ingress_v4::PAYLOAD_CHECKS.with(|n| n.get());
+    let before = checks();
+    let ((), failed) = crate::work::failed_in(|| {
+        for _ in 0..3 {
+            let len = serde_json::to_string(&bad).unwrap().len();
+            c.engines[h0]
+                .as_mut()
+                .unwrap()
+                .on_vertex(len, bad.clone(), &net);
+        }
+    });
+    assert_eq!(checks() - before, 1, "a refused payload was checked again");
+    assert_eq!(failed, 1, "the refusal was not charged once");
+
+    let invented: Vec<ParentRef> = (0..3)
+        .map(|i| ParentRef {
+            round: 1,
+            author: c.members[i].info.address.clone(),
+            digest: format!("{:064x}", 0xb117_u64 + i as u64),
+            proof: None,
+            cert: None,
+        })
+        .collect();
+    let waiting = recite(
+        &with_payload(&a, vec!["also not a transaction".to_string()], &key),
+        invented,
+        &key,
+    );
+    let before = checks();
+    let len = serde_json::to_string(&waiting).unwrap().len();
+    c.engines[h0]
+        .as_mut()
+        .unwrap()
+        .on_vertex(len, waiting.clone(), &net);
+    assert_eq!(
+        checks(),
+        before,
+        "a vertex on invented parents was payload-checked"
+    );
+    assert!(
+        c.engines[h0]
+            .as_mut()
+            .unwrap()
+            .pending
+            .remove(&waiting.author, waiting.round, &waiting.hash)
+            .is_some(),
+        "vacuous: the vertex does not wait on its parents"
+    );
+}
+
+/// B119 witness: a vertex buffered for E+1 keeps none of its embedded
+/// certificates, and activation ingests the early certificates without
+/// verifying them again: activating checks no certificate at all.
+#[test]
+fn activation_checks_no_certificate_twice_and_none_a_buffered_vertex_carried() {
+    let mut c = Cluster::new("b119-activation", 4, 0);
+    c.run_until(40, |c| c.decisions[0].len() >= 2);
+    let (closing_round, anchor, _, _) = c.decisions[0]
+        .last()
+        .cloned()
+        .expect("vacuous: nothing decided");
+    let epoch_before = c.engine(0).epoch;
+    let committee = c.committee.clone();
+    c.engines[0]
+        .as_mut()
+        .unwrap()
+        .close_epoch(closing_round, &anchor, &"ab".repeat(32), &committee)
+        .unwrap();
+    let next = c.engine(0).next.clone().expect("E+1 scheduled");
+    let shape = c
+        .engine(0)
+        .certs
+        .values()
+        .next()
+        .expect("a held certificate")
+        .compact();
+    let junk = blockchain::CompactCert {
+        signer_bitmap: shape.signer_bitmap.clone(),
+        aggregate_signature: vec![7u8; shape.aggregate_signature.len()],
+    };
+    let byzantine = 1;
+    let author = c.members[byzantine].info.address.clone();
+    let mut forged = lock(&c.engine(byzantine).dag)
+        .values()
+        .find(|v| v.author == author)
+        .expect("a vertex of the Byzantine member")
+        .clone();
+    forged.epoch = next.epoch;
+    forged.round = next.first_round + 1;
+    forged.payload = vec![];
+    forged.parent_refs = next
+        .committee
+        .iter()
+        .enumerate()
+        .map(|(i, m)| blockchain::ParentRef {
+            round: next.first_round,
+            author: m.address.clone(),
+            digest: format!("{:064x}", 0xb119_u64 + i as u64),
+            proof: None,
+            cert: Some(junk.clone()),
+        })
+        .collect();
+    forged.parents = forged
+        .parent_refs
+        .iter()
+        .map(|r| r.digest.clone())
+        .collect();
+    forged.hash = forged.hash_v4_with_domain(CHAIN, GENESIS);
+    forged.sign_with_ed25519(&crypto::SigningKey::from_bytes(
+        &c.members[byzantine].node_key,
+    ));
+    let early = forged_cert_in(
+        &c,
+        next.epoch,
+        &next.committee,
+        next.first_round,
+        &c.members[2].info.address,
+        &"cd".repeat(32),
+        &[0, 1, 2],
+    );
+    // B118: an E+1 vertex past the next epoch's lead is not buffered (its
+    // parents' existence is not checked before activation, so any round
+    // was kept, and remembered for good).
+    let far_round = next.first_round + ingress_v4::LEAD + 1;
+    let mut far = forged.clone();
+    far.round = far_round;
+    for r in &mut far.parent_refs {
+        r.round = far_round - 1;
+    }
+    far.hash = far.hash_v4_with_domain(CHAIN, GENESIS);
+    far.sign_with_ed25519(&crypto::SigningKey::from_bytes(
+        &c.members[byzantine].node_key,
+    ));
+    let net = c.net(0);
+    {
+        let e = c.engines[0].as_mut().unwrap();
+        e.on_cert(early, &net);
+        let len = serde_json::to_string(&forged).unwrap().len();
+        e.on_vertex(len, forged.clone(), &net);
+        let len = serde_json::to_string(&far).unwrap().len();
+        e.on_vertex(len, far.clone(), &net);
+        assert!(
+            e.pending
+                .remove(&far.author, far.round, &far.hash)
+                .is_none(),
+            "an E+1 vertex past the lead was buffered"
+        );
+    }
+    let verifications = || crate::vcert::CERT_VERIFICATIONS.with(|n| n.get());
+    let before = verifications();
+    c.engines[0].as_mut().unwrap().activate_next(&net).unwrap();
+    assert!(
+        c.engine(0).epoch > epoch_before,
+        "vacuous: node 0 never activated"
+    );
+    assert!(
+        c.engine(0)
+            .certs
+            .contains_key(&(next.first_round, c.members[2].info.address.clone())),
+        "vacuous: the early certificate was not ingested"
+    );
+    assert_eq!(
+        verifications(),
+        before,
+        "activation verified a certificate again or one a buffered vertex carried"
+    );
+}
+
+/// B120 witness: a certificate GC has forgotten (at or below g minus the
+/// retention slack) is not verified (a replay of one cost a pairing and a
+/// synced write).
+#[test]
+fn a_certificate_below_the_floor_is_not_verified() {
+    let mut c = Cluster::new("b120-floor", 4, 0);
+    c.run(3);
+    let old = c
+        .engine(0)
+        .certs
+        .values()
+        .find(|x| x.body.round == 2)
+        .cloned()
+        .expect("a round-2 certificate");
+    let past = 2 + staging::RETAIN_SLACK;
+    c.run_until(400, |c| c.engine(0).gc_floor() > past);
+    assert!(
+        c.engine(0).gc_floor() > past,
+        "vacuous: the floor never passed the old round's cut"
+    );
+    assert!(
+        !c.engine(0)
+            .certs
+            .contains_key(&(old.body.round, old.body.author.clone())),
+        "vacuous: the old certificate is still held"
+    );
+    let net = c.net(0);
+    let verifications = || crate::vcert::CERT_VERIFICATIONS.with(|n| n.get());
+    let before = verifications();
+    c.engines[0].as_mut().unwrap().on_cert(old, &net);
+    assert_eq!(
+        verifications(),
+        before,
+        "a forgotten certificate was verified"
+    );
+    // Between the cut and g certificates are still held: a second digest
+    // for a held slot there is verified, and is a conflict.
+    let g = c.engine(0).gc_floor();
+    let held = c
+        .engine(0)
+        .certs
+        .values()
+        .find(|x| x.body.round <= g && x.body.round > g - staging::RETAIN_SLACK)
+        .cloned()
+        .expect("a certificate between the cut and g");
+    let twin = forged_cert(
+        &c,
+        held.body.round,
+        &held.body.author,
+        &"ee".repeat(32),
+        &[0, 1, 2],
+    );
+    c.engines[0].as_mut().unwrap().on_cert(twin, &net);
+    assert!(
+        c.engine(0).halted.is_some(),
+        "a conflict between the cut and g went unseen"
+    );
+}
+
+/// B125 witness: a member that lost its database starts its pull request
+/// numbers above every number it used before (servers remember each
+/// member's highest and refused everything below it).
+#[test]
+fn a_member_that_lost_its_database_starts_above_its_old_request_numbers() {
+    let mut c = Cluster::new("b125-seq", 4, 0);
+    c.run(3);
+    let before = c.engines[1].as_mut().unwrap().next_seq();
+    c.engines[1] = None;
+    let _lost = std::mem::replace(&mut c.dirs[1], TempDb::new("b125-seq-lost"));
+    c.clock.fetch_add(1, AtomicOrdering::SeqCst);
+    c.open(1, true);
+    let after = c.engines[1].as_mut().unwrap().next_seq();
+    assert!(
+        after > before,
+        "{after} after a lost database, {before} before it"
+    );
+}
+
+/// B126 witness: the embedded certificates a waiting vertex carries that
+/// verify are ingested at once (each copy verified them again).
+#[test]
+fn a_waiting_vertex_hands_over_the_certificates_it_carries() {
+    let mut c = Cluster::new("b126-harvest", 4, 0);
+    c.run(3);
+    let byz = c.leader(4);
+    let h0 = c.validators().find(|&i| i != byz).unwrap();
+    let key = c.members[byz].node_key;
+    let template = c.engine(byz).own_proposal(2).unwrap().clone();
+    let held = cert_ref(&c, byz, 1, &c.members[byz].info.address.clone());
+    let mut refs = vec![held.clone()];
+    for i in (0..4).filter(|&i| i != byz).take(2) {
+        refs.push(ParentRef {
+            round: 1,
+            author: c.members[i].info.address.clone(),
+            digest: format!("{:064x}", 0xb126_u64 + i as u64),
+            proof: None,
+            cert: None,
+        });
+    }
+    let waiting = recite(&template, refs, &key);
+    let slot = (1, c.members[byz].info.address.clone());
+    c.engines[h0].as_mut().unwrap().certs.remove(&slot);
+    let net = c.net(h0);
+    let len = serde_json::to_string(&waiting).unwrap().len();
+    c.engines[h0]
+        .as_mut()
+        .unwrap()
+        .on_vertex(len, waiting.clone(), &net);
+    assert!(
+        c.engines[h0]
+            .as_mut()
+            .unwrap()
+            .pending
+            .remove(&waiting.author, waiting.round, &waiting.hash)
+            .is_some(),
+        "vacuous: the vertex does not wait"
+    );
+    assert!(
+        c.engine(h0).certs.contains_key(&slot),
+        "the certificate it carried was not ingested"
+    );
 }

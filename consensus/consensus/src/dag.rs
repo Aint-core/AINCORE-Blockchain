@@ -45,6 +45,13 @@ pub const CLOCK_DRIFT_ALARM_SECS: i64 = 60;
 pub const CLOCK_DRIFT_ALARM_BLOCKS: u32 = 3;
 const QC_ANSWERS_PER_TICK: u32 = 4;
 const QC_ANSWERED_CAP: usize = 256;
+
+#[cfg(test)]
+thread_local! {
+    /// B124 witness support: the blocks `handle_remote_qc_vote` read on this
+    /// thread.
+    pub(crate) static VOTE_BLOCK_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 /// Upper bound on evidence items carried per vertex and applied per block
 /// (matches executor::apply_slash_evidence's `.take(5)`).
 const MAX_EVIDENCE_PER_VERTEX: usize = 5;
@@ -1740,6 +1747,11 @@ impl DagConsensus {
         // vote every tick until the QC forms (`retry_qc_work`), so this node
         // counts it once it holds the block. Only the header is read, not
         // the whole block.
+        // B124: point reads first; the block is read only for a vote that
+        // can still count.
+        if !crate::qc_producer::vote_still_needed(&self.storage, &vote_msg) {
+            return;
+        }
         #[derive(serde::Deserialize)]
         struct Header {
             hash: String,
@@ -1749,6 +1761,8 @@ impl DagConsensus {
         struct HeaderOnly {
             header: Header,
         }
+        #[cfg(test)]
+        VOTE_BLOCK_READS.with(|n| n.set(n.get() + 1));
         let Some(held) = self
             .storage
             .get(&format!("block_{}", vote_msg.vote.block_height))

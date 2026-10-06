@@ -196,7 +196,10 @@ async fn an_observer_forwards_its_mempool_to_a_member() {
             _ => Err("connection reset".into()),
         }
     });
-    assert_eq!(forward_once(&observer, &client).await, 2);
+    assert_eq!(
+        forward_once(&observer, &client, &ForwardState::default()).await,
+        2
+    );
     {
         let held = |m: &Arc<Mutex<Mempool>>, t: &String| {
             m.lock().unwrap().get_all_pending().iter().any(|p| p == t)
@@ -236,7 +239,10 @@ async fn an_observer_forwards_its_mempool_to_a_member() {
         .cloned()
         .collect();
     let dead = fake_network(vec![session("down", true)], |_, _| Err("timeout".into()));
-    assert_eq!(forward_once(&lonely, &dead).await, 0);
+    assert_eq!(
+        forward_once(&lonely, &dead, &ForwardState::default()).await,
+        0
+    );
     let after: Vec<String> = lonely
         .lock()
         .unwrap()
@@ -278,7 +284,10 @@ async fn one_refusing_member_cannot_censor() {
         }
         _ => serve_tx_submit(&served, wire).ok_or_else(|| "refused".into()),
     });
-    assert_eq!(forward_once(&observer, &client).await, 1);
+    assert_eq!(
+        forward_once(&observer, &client, &ForwardState::default()).await,
+        1
+    );
     assert!(honest
         .lock()
         .unwrap()
@@ -319,12 +328,13 @@ async fn a_transaction_refused_in_every_pass_is_dropped_at_the_requeue_cap() {
             .unwrap()
             .any_pending(|t| storage::StateDB::raw_tx_hash(t) == raw)
     };
-    assert_eq!(forward_once(&observer, &client).await, 0);
+    let state = ForwardState::default();
+    assert_eq!(forward_once(&observer, &client, &state).await, 0);
     assert!(waiting(&observer), "one refusal does not drop it");
     let mut passes = 1;
     while waiting(&observer) {
         assert!(passes < 10, "still forwarded after {passes} passes");
-        forward_once(&observer, &client).await;
+        forward_once(&observer, &client, &state).await;
         passes += 1;
     }
 }
@@ -363,13 +373,103 @@ async fn an_accept_and_drop_member_cannot_censor() {
     });
     let held =
         |m: &Arc<Mutex<Mempool>>| m.lock().unwrap().get_all_pending().iter().any(|p| *p == tx);
-    assert_eq!(forward_once(&observer, &client).await, 1);
+    assert_eq!(
+        forward_once(&observer, &client, &ForwardState::default()).await,
+        1
+    );
     assert!(
         !held(&honest),
         "control: the first forward went to the dropper"
     );
     // No block settled it: the loan goes stale and returns to the queue.
     observer.lock().unwrap().requeue_stale_at(0, u64::MAX / 2);
-    forward_once(&observer, &client).await;
+    forward_once(&observer, &client, &ForwardState::default()).await;
     assert!(held(&honest), "the re-forward went to the same member");
+}
+
+/// A member answering every transaction of a batch with `verdict`.
+fn answer_all(wire: &str, verdict: Verdict) -> Result<String, String> {
+    let n = serde_json::from_str::<Vec<String>>(wire.strip_prefix(TX_SUBMIT).unwrap())
+        .unwrap()
+        .len();
+    Ok(format!(
+        "{TX_RESULT}{}",
+        serde_json::to_string(&vec![verdict; n]).unwrap()
+    ))
+}
+
+/// B122 witness: in a committee of seven, two refusing members next to each
+/// other in a sender's rotation hold less than a third of the stake: the
+/// transaction goes on to an honest member. Two refusals used to drop it.
+#[tokio::test]
+async fn a_byzantine_minority_cannot_drop_a_transaction_by_refusing() {
+    let names = ["a1", "a2", "b1", "b2", "b3", "b4", "b5"];
+    let members: Vec<network::SessionPeer> = names.iter().map(|n| session(n, true)).collect();
+    let tx = (9..=255)
+        .map(|seed| signed_tx(seed, 0))
+        .find(|t| members_for(&sender_of(t), &members)[..2] == ["a1", "a2"])
+        .expect("a sender whose rotation starts at the two liars");
+    let observer = Arc::new(Mutex::new(Mempool::new()));
+    observer
+        .lock()
+        .unwrap()
+        .add_transaction(tx.clone())
+        .unwrap();
+    let honest = Arc::new(Mutex::new(Mempool::new()));
+    let served = Arc::clone(&honest);
+    let client = fake_network(members.clone(), move |peer, wire| match peer {
+        "a1" | "a2" => answer_all(wire, Verdict::Refused("no".into())),
+        _ => serve_tx_submit(&served, wire).ok_or_else(|| "refused".into()),
+    });
+    let state = ForwardState::with_stakes(
+        members
+            .iter()
+            .map(|s| (s.member.clone().unwrap(), 100))
+            .collect(),
+    );
+    assert_eq!(forward_once(&observer, &client, &state).await, 1);
+    assert!(honest
+        .lock()
+        .unwrap()
+        .get_all_pending()
+        .iter()
+        .any(|p| *p == tx));
+}
+
+/// B122 witness: a member that does not answer is skipped for a while, not
+/// asked (and waited for) again in every pass.
+#[tokio::test]
+async fn a_silent_member_is_skipped_for_a_while() {
+    let members = vec![session("silent", true), session("honest", true)];
+    let txs: Vec<String> = (9..=255)
+        .map(|seed| signed_tx(seed, 0))
+        .filter(|t| members_for(&sender_of(t), &members)[0] == "silent")
+        .take(2)
+        .collect();
+    let observer = Arc::new(Mutex::new(Mempool::new()));
+    let honest = Arc::new(Mutex::new(Mempool::new()));
+    let served = Arc::clone(&honest);
+    let asked = Arc::new(Mutex::new(0usize));
+    let count = Arc::clone(&asked);
+    let client = fake_network(members, move |peer, wire| match peer {
+        "silent" => {
+            *count.lock().unwrap() += 1;
+            Err("timeout".into())
+        }
+        _ => serve_tx_submit(&served, wire).ok_or_else(|| "refused".into()),
+    });
+    let state = ForwardState::default();
+    for tx in &txs {
+        observer
+            .lock()
+            .unwrap()
+            .add_transaction(tx.clone())
+            .unwrap();
+        assert_eq!(forward_once(&observer, &client, &state).await, 1);
+    }
+    assert_eq!(
+        *asked.lock().unwrap(),
+        1,
+        "the silent member was asked again"
+    );
 }

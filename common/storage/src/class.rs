@@ -282,7 +282,9 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         ["sys", "bootstrap", "slots", e] if dec(e) => State,
         ["sys", "bootstrap", "vertices", e] if dec(e) => State,
         ["consensus", "epoch_start_height", e] if dec(e) => State,
-        ["sys", "fee_sweep_queue", h, miner] if dec(h) && seg(miner) => State,
+        // B108/B121: the height a share is next due at, zero padded so the
+        // queue sorts by it.
+        ["sys", "fee_sweep_queue", h, miner] if dec20(h) && seg(miner) => State,
         ["sys", "slashed", a, r] if seg(a) && dec(r) => State,
         ["sys", "pending_slash", a] if seg(a) => State,
         ["validator", "jailed", a] if seg(a) => State,
@@ -428,6 +430,11 @@ pub const STATE_PREFIXES: &[&str] = &[
     "sys:pending_module_upgrade:",
     "sys:committee:",
 ];
+
+/// B121: whether `key` lies under one of the state prefixes.
+pub fn under_state_prefix(key: &[u8]) -> bool {
+    STATE_PREFIXES.iter().any(|p| key.starts_with(p.as_bytes()))
+}
 
 // ---- Write observation (S0) and the WG-1 refusal (S3) --------------------
 
@@ -637,7 +644,7 @@ mod tests {
             ("sys:config:halving_interval".into(), State),
             ("sys:total_supply".into(), State),
             ("total_burned".into(), State),
-            (format!("sys:fee_sweep_queue:70016:{H64}"), State),
+            (format!("sys:fee_sweep_queue:00000000000000070016:{H64}"), State),
             (format!("sys:slashed:{H64}:77"), State),
             (format!("sys:pending_slash:{H64}"), State),
             (format!("validator:jailed:{H64}"), State),

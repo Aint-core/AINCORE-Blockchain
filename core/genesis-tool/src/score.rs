@@ -137,7 +137,7 @@ fn address_arg(call: &vm_move::EntryFunctionCall, index: usize) -> Option<String
 /// follow it.
 #[derive(Debug, PartialEq)]
 enum Action {
-    Transfer { to: String },
+    Transfer { to: String, amount: u128 },
     Delegate { validator: String },
     Undelegate { validator: String },
     Points { kind: &'static str, points: u64 },
@@ -166,7 +166,7 @@ fn classify(tx: &executor::Transaction) -> Action {
                 .get(2)
                 .and_then(|a| bcs::from_bytes::<u128>(a).ok());
             match (ain, amount, address_arg(&call, 1)) {
-                (true, Some(n), Some(to)) if n > 0 => Action::Transfer { to },
+                (true, Some(n), Some(to)) if n > 0 => Action::Transfer { to, amount: n },
                 _ => Action::None,
             }
         }
@@ -423,7 +423,14 @@ pub fn score(
             .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
             .is_some_and(|r| r["status"] == "success"))
     };
-    let mut funder: BTreeMap<String, String> = BTreeMap::new();
+    // B128: an account is funded by the sender that sent it the most AIN in
+    // all (the first sender was its funder, so one quantum sent ahead moved
+    // an honest account into the sender's cluster); a direct faucet transfer
+    // makes it a root (B113); a paymaster funds only an account no AIN
+    // transfer did.
+    let mut rooted: BTreeSet<String> = BTreeSet::new();
+    let mut received: BTreeMap<String, BTreeMap<String, u128>> = BTreeMap::new();
+    let mut sponsor: BTreeMap<String, String> = BTreeMap::new();
     for h in 1..=to_height {
         let block = if h >= from_height {
             blocks[(h - from_height) as usize].clone()
@@ -438,7 +445,7 @@ pub fn score(
             let payer = executor::admission::payer_address(&tx).map(|p| canonical(&p));
             let sponsored = payer.filter(|p| *p != sender);
             let transfer = match classify(&tx) {
-                Action::Transfer { to } if to != sender => Some(to),
+                Action::Transfer { to, amount } if to != sender => Some((to, amount)),
                 _ => None,
             };
             if sponsored.is_none() && transfer.is_none() {
@@ -448,19 +455,30 @@ pub fn score(
                 continue;
             }
             if let Some(payer) = sponsored {
-                funder.entry(sender.clone()).or_insert(payer);
+                sponsor.entry(sender.clone()).or_insert(payer);
             }
-            if let Some(to) = transfer {
-                // B113: the faucet's own transfer makes an account a root,
-                // whoever sent it AIN first (one quantum sent ahead of the
-                // faucet put honest accounts in a griefer's capped cluster).
+            if let Some((to, amount)) = transfer {
                 if sender == faucet {
-                    funder.insert(to, sender);
+                    rooted.insert(to);
                 } else {
-                    funder.entry(to).or_insert(sender);
+                    let sent = received.entry(to).or_default().entry(sender).or_insert(0);
+                    *sent = sent.saturating_add(amount);
                 }
             }
         }
+    }
+    let mut funder: BTreeMap<String, String> = sponsor;
+    for (to, senders) in received {
+        // The largest total; among equal totals, the smallest address.
+        if let Some((from, _)) = senders
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+        {
+            funder.insert(to, from.clone());
+        }
+    }
+    for to in rooted {
+        funder.insert(to, faucet.clone());
     }
     let cluster_of = |account: &str| -> String {
         let mut at = account.to_string();
@@ -497,7 +515,7 @@ pub fn score(
                 continue;
             }
             match action {
-                Action::Transfer { to } if to != sender => {
+                Action::Transfer { to, .. } if to != sender => {
                     earned
                         .entry(sender)
                         .or_default()
@@ -1099,10 +1117,14 @@ mod tests {
             // B113: 50 sends 64 a quantum before the faucet funds it.
             (2, transfer(50, 64, 0)),
             (3, transfer(FAUCET, 64, 3)),
+            // B128: 60 (unattributed) sends 65 a quantum, then 50 (funded
+            // by the faucet) sends it 100.
+            (4, transfer(60, 65, 9)),
+            (5, coin_transfer(50, 65, 100, ain(), 9)),
         ];
         // 60, 61, 62 and 63 transact on three days; 62's transactions are
         // sponsored by 50; 63 received nothing at all.
-        for (i, s) in [60u8, 61, 62, 63, 64].into_iter().enumerate() {
+        for (i, s) in [60u8, 61, 62, 63, 64, 65].into_iter().enumerate() {
             for (n, day) in [10u64, 11, 12].into_iter().enumerate() {
                 let raw = transfer(s, 51, n as u64);
                 let raw = if s == 62 { sponsored(raw, 50) } else { raw };
@@ -1129,6 +1151,11 @@ mod tests {
             cluster(64),
             address_of(64),
             "the faucet's transfer makes a root"
+        );
+        assert_eq!(
+            cluster(65),
+            address_of(50),
+            "the largest funder, not the first"
         );
         let shared: u64 = [60u8, 61, 63]
             .iter()

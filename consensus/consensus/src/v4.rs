@@ -130,6 +130,27 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// B95/B117: the bodies of one (epoch, round, author) whose payload was
+/// checked.
+#[derive(Debug, Default)]
+struct PayloadSlot {
+    passed: Vec<String>,
+    refused: Vec<String>,
+}
+
+impl PayloadSlot {
+    fn checks(&self) -> usize {
+        self.passed.len() + self.refused.len()
+    }
+}
+
+/// B118: payload slots kept at most. The active epoch's window (GC_DEPTH
+/// below the cursor to LEAD above it) and the next epoch's lead hold about
+/// 450 rounds x n slots, so a choice: 2^16 (~20 MB) covers committees up to
+/// ~145 members; past the cap the map is pruned, and a forgotten slot only
+/// costs its checks again.
+const PAYLOAD_SLOTS_CAP: usize = 1 << 16;
+
 /// The V4 engine of one node.
 pub struct Engine {
     cfg: Config,
@@ -166,10 +187,11 @@ pub struct Engine {
     /// OR-1: a parent digest → the certified children waiting on it.
     waiting: HashMap<String, HashSet<String>>,
     pending: PendingBuffer,
-    /// B95: per (epoch, round, author), the bodies whose payload passed its
-    /// checks (at most two plain ones, a third only if certified: a third
-    /// plain body is an equivocation and is not checked).
-    payload_slots: HashMap<(u64, u64, String), Vec<String>>,
+    /// B95/B117: per (epoch, round, author), the bodies whose payload was
+    /// checked, passed or refused (at most two checks a slot, a third only
+    /// for a certified body: a third plain body is an equivocation and is
+    /// not checked).
+    payload_slots: HashMap<(u64, u64, String), PayloadSlot>,
     /// G5 BT-1: per member, the timestamp of its latest vertex refused as
     /// ahead of this node's clock (`Verdict::Early`); cleared when one of
     /// its vertices stages.
@@ -356,7 +378,7 @@ impl Engine {
             prev_timestamp: 0,
         };
         let cfg = Config { committee, ..cfg };
-        let seq = Self::load_seq(&storage);
+        let seq = Self::load_seq(&storage, (now_secs)());
         let mut engine = Self {
             ordering: shared.ordering,
             self_decide,
@@ -555,7 +577,8 @@ impl Engine {
         }
     }
 
-    /// g. Always 0 until GC lands (S7).
+    /// g: the ordering engine's GC floor (B131: it advances with the
+    /// decided anchors, `ordering::gc_floor`).
     fn gc_floor(&self) -> u64 {
         lock(&self.ordering).gc_floor()
     }
@@ -625,41 +648,51 @@ impl Engine {
         }
     }
 
-    /// B95: whether `v`'s payload must be checked: not when this body passed
-    /// before, and not for a third body of one (epoch, round, author).
-    /// A body this node holds a certificate for is checked whatever the
-    /// slot holds: a certified twin evicts a plain one, and a slot has at
-    /// most one certified body (Lemma U).
+    /// B95/B117: whether `v`'s payload must be checked: not when this body
+    /// was checked before (it passed, or it is refused again unchecked), and
+    /// not once two bodies of its (epoch, round, author) were checked,
+    /// whatever their outcome. A body this node holds a certificate for is
+    /// checked whatever the slot holds: a certified twin evicts a plain one,
+    /// and a slot has at most one certified body (Lemma U).
     fn payload_gate(
-        slots: &HashMap<(u64, u64, String), Vec<String>>,
+        slots: &HashMap<(u64, u64, String), PayloadSlot>,
         v: &Vertex,
         certified: bool,
     ) -> ingress_v4::PayloadGate {
         match slots.get(&(v.epoch, v.round, v.author.clone())) {
-            Some(bodies) if bodies.contains(&v.hash) => ingress_v4::PayloadGate::Verified,
-            Some(bodies) if bodies.len() >= 2 && !certified => ingress_v4::PayloadGate::Full,
+            Some(slot) if slot.passed.contains(&v.hash) => ingress_v4::PayloadGate::Verified,
+            Some(slot) if slot.refused.contains(&v.hash) => ingress_v4::PayloadGate::Refused,
+            Some(slot) if slot.checks() >= 2 && !certified => ingress_v4::PayloadGate::Full,
             _ => ingress_v4::PayloadGate::Check,
         }
     }
 
-    /// B95: remember `v`'s body as checked; slots at or below the floor of
-    /// the active epoch (or of an older epoch) are forgotten when the map
-    /// grows.
-    fn remember_payload(&mut self, v: &Vertex) {
-        const PRUNE_AT: usize = 1 << 16;
-        if self.payload_slots.len() >= PRUNE_AT {
+    /// B95/B117: remember the outcome of `v`'s payload check. The map holds
+    /// at most `PAYLOAD_SLOTS_CAP` slots: past it, those at or below the
+    /// floor of the active epoch (or of an older one) are forgotten, and if
+    /// that is not enough, all (B118: E+1 slots are bounded by its lead, but
+    /// a cap must not rest on that; a forgotten slot only costs its checks
+    /// again).
+    fn remember_payload(&mut self, v: &Vertex, outcome: ingress_v4::PayloadChecked) {
+        if self.payload_slots.len() >= PAYLOAD_SLOTS_CAP {
             let (epoch, floor) = (self.epoch, self.gc_floor());
             self.payload_slots
                 .retain(|(e, r, _), _| *e > epoch || (*e == epoch && *r > floor));
+            if self.payload_slots.len() >= PAYLOAD_SLOTS_CAP {
+                self.payload_slots.clear();
+            }
         }
-        let bodies = self
+        let slot = self
             .payload_slots
             .entry((v.epoch, v.round, v.author.clone()))
             .or_default();
-        // Two plain bodies, and a third only when it passed as certified
-        // (the gate lets no other third through).
-        if !bodies.contains(&v.hash) && bodies.len() < 3 {
-            bodies.push(v.hash.clone());
+        // Two checks, and a third only of a certified body (the gate lets
+        // no other third through).
+        if slot.checks() < 3 && !slot.passed.contains(&v.hash) && !slot.refused.contains(&v.hash) {
+            match outcome {
+                ingress_v4::PayloadChecked::Passed => slot.passed.push(v.hash.clone()),
+                ingress_v4::PayloadChecked::Refused => slot.refused.push(v.hash.clone()),
+            }
         }
     }
 
@@ -690,7 +723,7 @@ impl Engine {
             let epoch = self.epoch;
             // E4's cache: a ref whose certificate is already in the index was
             // verified when it got there (CE-3 ingests only verified ones).
-            ingress_v4::v4_verdict_gated(
+            ingress_v4::v4_verdict_checked(
                 raw_len,
                 &v,
                 &ctx,
@@ -709,12 +742,18 @@ impl Engine {
                 },
             )
         };
-        // B95: a body whose payload passed is remembered for its slot.
-        if matches!(
-            verdict,
-            Verdict::Stage | Verdict::PendingCert(_) | Verdict::PendingEpoch
-        ) {
-            self.remember_payload(&v);
+        let (verdict, checked) = verdict;
+        // B95/B117: a body whose payload was checked is remembered for its
+        // slot, passed or refused. Its author signed it (the payload is
+        // checked only after the author's signature), so only the author can
+        // fill its own slot, and a refused payload is a failed costly check
+        // charged to whoever delivered it (B51): no honest node stages or
+        // serves one, as the checks are stateless.
+        if let Some(outcome) = checked {
+            self.remember_payload(&v, outcome);
+            if outcome == ingress_v4::PayloadChecked::Refused {
+                crate::work::note_failed_check();
+            }
         }
         match verdict {
             Verdict::Stage => {
@@ -737,15 +776,30 @@ impl Engine {
                 }
                 // RE-1 (c): ask for the certificates it waits on, and for the
                 // whole gap below them when this node is far behind.
-                for i in missing {
+                for &i in &missing {
                     if let Some(r) = v.parent_refs.get(i) {
                         self.want_cert(r.round, &r.author);
                     }
                 }
                 self.want_gap(v.round.saturating_sub(1));
+                // B126: the embedded certificates that verified are ingested
+                // now (each copy of a waiting vertex verified them again),
+                // and the buffered vertex keeps none.
+                self.harvest_certs(&v, net);
+                for r in &mut v.parent_refs {
+                    r.cert = None;
+                }
                 self.pending.push(v);
             }
             Verdict::PendingEpoch => {
+                // B119: its embedded certificates are not checked before the
+                // next epoch is active, and activation re-evaluates what was
+                // buffered uncounted: they are dropped (E+1's certificates
+                // arrive as early certificates or by pull).
+                let mut v = v;
+                for r in &mut v.parent_refs {
+                    r.cert = None;
+                }
                 self.pending.push(v);
             }
             Verdict::Ahead => {
@@ -931,6 +985,14 @@ impl Engine {
                 self.early_keys.insert(key);
                 self.early_certs.push(cert);
             }
+            return;
+        }
+        // B120: a certificate at or below GC's cut (g - RETAIN_SLACK, where
+        // GC-3 forgets certificates) is forgotten as soon as it is ingested:
+        // a replay of one cost a pairing, a synced write and a body request.
+        // Between the cut and g certificates are still held, so a second
+        // digest for a held slot there is still verified (a conflict).
+        if cert.body.round <= self.gc_floor().saturating_sub(staging::RETAIN_SLACK) {
             return;
         }
         // B51: a copy of a certificate already held costs nothing (each

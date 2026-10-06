@@ -10,9 +10,10 @@
     "test:address": "ts-node test_address.ts",
     "test:state-proof": "ts-node test_state_proof.ts",
     "test:da": "ts-node test_da_sample.ts",
+    "test:inputs": "ts-node test_sdk_inputs.ts",
     "test:phase05": "ts-node phase05_live_smoke.ts",
     "dex:seed": "ts-node dex_native_seed_e2e.ts",
-    "test": "npm run test:bcs && npm run test:address && npm run test:state-proof && npm run test:da"
+    "test": "npm run test:bcs && npm run test:address && npm run test:state-proof && npm run test:da && npm run test:inputs"
   },
   "keywords": [],
   "author": "",

@@ -23,7 +23,8 @@ struct Shared {
     /// transaction. The refusal itself is `ReadStore::write` (WG-1, S3).
     observer: Observer,
     /// Live `SeedingGuard`s (tests only): while nonzero, a base write of a
-    /// state key is allowed, so a fixture can write its own genesis state.
+    /// state key is allowed, so a fixture can write its own genesis state,
+    /// and so is a made-up key outside the state prefixes (B121).
     seeding: Arc<std::sync::atomic::AtomicUsize>,
     /// Declared after `raw` on purpose: fields drop in declaration order, so the
     /// directory becomes claimable again only after RocksDB has closed it.
@@ -180,18 +181,23 @@ impl ReadStore {
                 batch_len - visited
             )));
         }
-        if self.shared.seeding.load(Ordering::Acquire) > 0 {
-            return Ok(());
-        }
+        // Seeding lets a fixture write state outside the block (WG-1) and
+        // its own made-up keys. B121: a key under a state prefix that the
+        // classifier does not know is refused even then, so a state writer
+        // whose key format drifted from the classifier fails its tests (a
+        // zero-padded fee-sweep key was refused in production while every
+        // test, all of them seeding, passed).
+        let seeding = self.shared.seeding.load(Ordering::Acquire) > 0;
         for key in keys {
             match classify(key) {
+                None if seeding && !crate::class::under_state_prefix(key) => {}
                 None => {
                     return Err(StorageError::WriteGate(format!(
                         "unclassified key {} (CL-1)",
                         crate::class::mask(key)
                     )))
                 }
-                Some(KeyClass::State) if !ctx.may_write_state() => {
+                Some(KeyClass::State) if !seeding && !ctx.may_write_state() => {
                     return Err(StorageError::WriteGate(format!(
                         "state key {} written outside the block transaction ({} context)",
                         crate::class::mask(key),
@@ -591,6 +597,25 @@ mod tests {
             .iterator(IteratorMode::Start)
             .map(Result::unwrap)
             .collect()
+    }
+
+    /// B121 witness: seeding relaxes WG-1 and lets a fixture use made-up
+    /// keys, but a key under a state prefix that the classifier does not know
+    /// (a state writer whose key format drifted) is refused even then.
+    #[test]
+    fn seeding_refuses_an_unclassified_key_under_a_state_prefix() {
+        let dir = TempDir::new();
+        let db = dir.open();
+        let _seed = db.seeding();
+        db.put("sys:total_supply", "1")
+            .expect("state outside a block while seeding");
+        db.put("p:a", "1").expect("a fixture's own key");
+        db.put("sys:fee_sweep_queue:00000000000000070016:aa", "1")
+            .expect("the fee-sweep key's format");
+        assert!(matches!(
+            db.put("sys:fee_sweep_queue:70016:aa", "1"),
+            Err(StorageError::WriteGate(_))
+        ));
     }
 
     #[test]

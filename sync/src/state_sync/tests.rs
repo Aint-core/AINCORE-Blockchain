@@ -1510,7 +1510,7 @@ fn the_server_serves_only_what_it_retains() {
         Some("version not retained")
     );
     let held: Vec<_> = (0..STATE_SERVE_IN_FLIGHT)
-        .map(|_| sync.state_budget.admit(None, 1).expect("a slot"))
+        .map(|_| sync.state_budget.admit(None, 1, true).expect("a slot"))
         .collect();
     assert_eq!(value(H).error.as_deref(), Some("busy"));
     drop(held);
@@ -1530,7 +1530,7 @@ fn the_server_serves_only_what_it_retains() {
     }
     assert!(fresh
         .state_budget
-        .admit(None, 8_000)
+        .admit(None, 8_000, false)
         .is_some_and(|a| a.granted > 7_000));
 }
 
@@ -1548,7 +1548,7 @@ fn the_state_server_sheds_load() {
         })
     };
     let held: Vec<_> = (0..STATE_SERVE_IN_FLIGHT)
-        .map(|_| sync.state_budget.admit(None, 1).expect("a slot"))
+        .map(|_| sync.state_budget.admit(None, 1, true).expect("a slot"))
         .collect();
     assert_eq!(ask().error.as_deref(), Some("busy"), "no free slot");
     drop(held);
@@ -1604,7 +1604,7 @@ fn one_client_cannot_starve_the_others() {
     );
     // One request in flight per client.
     let third = "10.0.0.5";
-    let held = sync.state_budget.admit(Some(third), 1);
+    let held = sync.state_budget.admit(Some(third), 1, false);
     assert!(held.is_some());
     assert_eq!(ask([10, 0, 0, 5]).error.as_deref(), Some("busy"));
     drop(held);
@@ -1618,27 +1618,27 @@ fn the_client_table_forgets_idle_clients_only() {
     let budget = StateBudget::default();
     let ip = |i: u32| IpAddr::from(i.to_be_bytes()).to_string();
     for i in 0..MAX_TRACKED_CLIENTS as u32 {
-        drop(budget.admit(Some(&ip(i)), 1).expect("room"));
+        drop(budget.admit(Some(&ip(i)), 1, false).expect("room"));
     }
     std::thread::sleep(Duration::from_millis(5));
     assert!(
-        budget.admit(Some(&ip(1 << 20)), 1).is_some(),
+        budget.admit(Some(&ip(1 << 20)), 1, false).is_some(),
         "an idle client forgotten"
     );
     // A client with a request in flight is never forgotten, so it cannot
     // dodge its one-slot limit by being evicted.
     let pinned = StateBudget::default();
-    let held = pinned.admit(Some(&ip(0)), 1).expect("in flight");
+    let held = pinned.admit(Some(&ip(0)), 1, false).expect("in flight");
     for i in 1..MAX_TRACKED_CLIENTS as u32 {
-        drop(pinned.admit(Some(&ip(i)), 1).expect("room"));
+        drop(pinned.admit(Some(&ip(i)), 1, false).expect("room"));
     }
     std::thread::sleep(Duration::from_millis(5));
     assert!(
-        pinned.admit(Some(&ip(1 << 22)), 1).is_some(),
+        pinned.admit(Some(&ip(1 << 22)), 1, false).is_some(),
         "the table makes room"
     );
     assert!(
-        pinned.admit(Some(&ip(0)), 1).is_none(),
+        pinned.admit(Some(&ip(0)), 1, false).is_none(),
         "still one in flight"
     );
     drop(held);
@@ -1660,7 +1660,7 @@ fn the_client_table_forgets_idle_clients_only() {
         }
     }
     assert!(
-        debt.admit(Some(&ip(1 << 21)), 1).is_none(),
+        debt.admit(Some(&ip(1 << 21)), 1, false).is_none(),
         "every client in debt"
     );
     assert_eq!(
@@ -1676,21 +1676,21 @@ fn the_client_table_forgets_idle_clients_only() {
 fn a_bucket_holds_one_seconds_worth() {
     let budget = StateBudget::default();
     let ip = "10.0.0.1";
-    drop(budget.admit(Some(ip), 1));
+    drop(budget.admit(Some(ip), 1, false));
     {
         let mut st = budget.lock();
         let long_ago = Instant::now() - Duration::from_secs(60);
         st.global.last = long_ago;
         st.per_client.get_mut(ip).unwrap().last = long_ago;
     }
-    let client = budget.admit(Some(ip), usize::MAX).unwrap();
+    let client = budget.admit(Some(ip), usize::MAX, false).unwrap();
     assert_eq!(
         client.granted,
         STATE_SERVE_UNITS_PER_SEC_PER_CLIENT as usize
     );
     drop(client);
     budget.lock().global.last = Instant::now() - Duration::from_secs(60);
-    let global = budget.admit(None, usize::MAX).unwrap();
+    let global = budget.admit(None, usize::MAX, false).unwrap();
     assert_eq!(global.granted, STATE_SERVE_UNITS_PER_SEC as usize);
 }
 
@@ -3521,4 +3521,27 @@ async fn the_busy_wait_starts_over_after_a_delivery() {
         "{waits:?}"
     );
     assert_restored(&client, &a);
+}
+
+/// B131 witness: the kept slot is a member's or a reserved peer's alone:
+/// with every other slot held, an outsider is refused and a member served.
+#[test]
+fn a_snapshot_slot_is_kept_for_members() {
+    let budget = StateBudget::default();
+    let held: Vec<_> = (0..STATE_SERVE_IN_FLIGHT - STATE_SERVE_IN_FLIGHT_KEPT)
+        .map(|i| {
+            budget
+                .admit(Some(&format!("10.{i}")), 1, false)
+                .expect("an open slot")
+        })
+        .collect();
+    assert!(
+        budget.admit(Some("10.99"), 1, false).is_none(),
+        "an outsider took the kept slot"
+    );
+    assert!(
+        budget.admit(Some("member"), 1, true).is_some(),
+        "a member was kept out"
+    );
+    drop(held);
 }

@@ -543,7 +543,14 @@ export class Connection {
     }
 
     /**
-     * Wait for transaction confirmation
+     * Wait until a block executed the transaction.
+     *
+     * B123: this reads the receipt. `aincore_getTransaction` answers a pending
+     * transaction in the same shape as a committed one, and a transaction a
+     * block included can still have aborted (charged, nothing moved): both
+     * used to come back `confirmed`. `confirmed` is true only when a block
+     * executed it successfully; `status` says what is known ("success",
+     * "aborted", "pending", "not_found", ...).
      * @param txHash - Transaction hash to wait for
      * @param timeout - Timeout in milliseconds (default 30000)
      * @param pollInterval - Polling interval in milliseconds (default 1000)
@@ -552,23 +559,32 @@ export class Connection {
         txHash: string,
         timeout: number = 30000,
         pollInterval: number = 1000
-    ): Promise<{ confirmed: boolean; transaction?: any }> {
+    ): Promise<{ confirmed: boolean; status: string; receipt?: TransactionReceipt; transaction?: any }> {
         const startTime = Date.now();
+        let status = 'not_found';
 
         while (Date.now() - startTime < timeout) {
             try {
-                const tx = await this.getTransaction(txHash);
-                if (tx && tx !== null) {
-                    return { confirmed: true, transaction: tx };
+                const receipt = await this.getTransactionReceipt(txHash);
+                if (receipt && typeof receipt.status === 'string') {
+                    status = receipt.execution_receipt?.status ?? receipt.status;
+                    const included = receipt.block_height !== undefined && receipt.block_height !== null;
+                    if (included && status === 'success') {
+                        const transaction = await this.getTransaction(txHash).catch(() => undefined);
+                        return { confirmed: true, status, receipt, transaction };
+                    }
+                    if (included && status === 'aborted') {
+                        return { confirmed: false, status, receipt };
+                    }
                 }
             } catch {
-                // Transaction not found yet, continue polling
+                // Not answered yet: keep polling.
             }
 
             await new Promise(resolve => setTimeout(resolve, pollInterval));
         }
 
-        return { confirmed: false };
+        return { confirmed: false, status };
     }
 
     /**

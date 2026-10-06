@@ -869,6 +869,25 @@ fn qc_import_crash_boundary(boundary: u8) {
     }
 }
 
+/// B124: whether a peer's vote can still count, from point reads only: its
+/// signer is a member of the epoch it names, the round has no QC yet, and
+/// the signer's vote for the round is not held. The caller asks this before
+/// it reads the (possibly large) block the vote names: junk and repeated
+/// votes cost a block read each under the consensus lock.
+pub fn vote_still_needed(storage: &StateDB, msg: &QcVoteMessage) -> bool {
+    let round = msg.vote.anchor_round;
+    load_validator_set_for_epoch(storage, msg.vote.epoch)
+        .is_some_and(|set| set.iter().any(|v| v.address == msg.signer_address))
+        && !matches!(
+            storage.get(&format!("consensus:qc_by_round:{round}")),
+            Ok(Some(_))
+        )
+        && !matches!(
+            storage.get(&collected_vote_key(round, &msg.signer_address)),
+            Ok(Some(_))
+        )
+}
+
 /// Storage key prefix under which the per-(round, signer) collected votes live.
 /// Distinct from the legacy `consensus:qc_vote:{round}:{addr}` single-vote key so
 /// the Phase-3 aggregation store can be reasoned about / bounded independently.

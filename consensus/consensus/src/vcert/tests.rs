@@ -706,6 +706,43 @@ fn a_replayed_attestation_is_not_verified_again_and_a_bad_one_is_counted() {
     assert_eq!(failed, 1, "a bad attestation was not counted");
 }
 
+/// B126 witness: once a signer's equivocation is recorded, its further
+/// attestations are not verified (each fresh digest cost a pairing).
+#[test]
+fn a_recorded_equivocator_costs_no_more_pairings() {
+    let members = committee4();
+    let committee = infos(&members);
+    let author = &members[1].info.address;
+    let a = body(&committee, 0, 28, author, &digest('a'));
+    let b = body(&committee, 0, 28, author, &digest('b'));
+    let c = body(&committee, 0, 28, author, &digest('c'));
+    let mut collector = CertCollector::new(a.clone(), &committee).unwrap();
+    assert_eq!(
+        collector.add(&byzantine_attest(&members[3], &b)).unwrap(),
+        CollectOutcome::Foreign
+    );
+    assert!(matches!(
+        collector.add(&byzantine_attest(&members[3], &a)).unwrap(),
+        CollectOutcome::Pending { .. }
+    ));
+    assert_eq!(collector.equivocations().len(), 1, "vacuous: no evidence");
+    let pairings = || PAIRINGS.with(|p| p.get());
+    let before = pairings();
+    assert_eq!(
+        collector.add(&byzantine_attest(&members[3], &c)).unwrap(),
+        CollectOutcome::Foreign
+    );
+    assert_eq!(
+        collector.add(&byzantine_attest(&members[3], &a)).unwrap(),
+        CollectOutcome::Duplicate
+    );
+    assert_eq!(
+        pairings(),
+        before,
+        "a recorded equivocator was verified again"
+    );
+}
+
 #[test]
 fn collector_refuses_forged_foreign_and_wrong_slot_attestations() {
     let members = committee4();

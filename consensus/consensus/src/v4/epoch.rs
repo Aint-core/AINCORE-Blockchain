@@ -592,8 +592,10 @@ impl Engine {
         // B68: what was buffered for this epoch is checked now, on behalf of
         // whoever delivered it, not the message that completed the epoch.
         crate::work::uncounted(|| {
+            // B119: verified under C_{E+1} when they arrived (`on_cert`),
+            // so ingested without verifying them again.
             for cert in std::mem::take(&mut self.early_certs) {
-                self.on_cert(cert, net);
+                self.ingest_cert(cert, net);
             }
             for v in self.pending.take_all() {
                 let len = ingress_v4::canonical_body(&v).map_or(usize::MAX, |b| b.len());

@@ -1269,6 +1269,13 @@ impl ChainSync {
     /// `QC_CERT:{qc}` for a held height, so an observer can activate an
     /// epoch).
     pub fn serve_session(&self, msg: &str, peer: &str) -> Option<String> {
+        self.serve_session_from(msg, peer, false)
+    }
+
+    /// `serve_session` charged to `client` (B131: a member's or reserved
+    /// peer's key, `kept`, or another peer's network group).
+    pub fn serve_session_from(&self, msg: &str, client: &str, kept: bool) -> Option<String> {
+        let peer = client;
         if let Some(height) = msg.strip_prefix(consensus::dag::QC_WANT_PREFIX) {
             let height = height.parse::<u64>().ok()?;
             if height > self.get_local_height() {
@@ -1282,7 +1289,7 @@ impl ChainSync {
             ));
         }
         if Self::serves(msg) {
-            self.handle_request(msg, Some(peer))
+            self.handle_request(msg, Some(peer), kept)
         } else {
             None
         }
@@ -1290,12 +1297,12 @@ impl ChainSync {
 
     /// A request from an in-process caller (global limits only).
     pub fn handle_message(&self, msg: &str) -> Option<String> {
-        self.handle_request(msg, None)
+        self.handle_request(msg, None, false)
     }
 
-    /// A request charged to `client` (the key a session authenticated;
-    /// `None` is an in-process caller, global limits only).
-    fn handle_request(&self, msg: &str, client: Option<&str>) -> Option<String> {
+    /// A request charged to `client` (`None` is an in-process caller,
+    /// global limits only); `kept`: a member or a reserved peer (B131).
+    fn handle_request(&self, msg: &str, client: Option<&str>, kept: bool) -> Option<String> {
         // Handle Request Logic
         if msg == "GET_HEIGHT" {
             let h = self.get_local_height();
@@ -1311,12 +1318,12 @@ impl ChainSync {
 
         if let Some(req_json) = msg.strip_prefix(state_sync::CHUNK_REQ) {
             let req = serde_json::from_str::<state_sync::ChunkRequest>(req_json).ok()?;
-            let resp = serde_json::to_string(&self.serve_state_chunk(req, client)).ok()?;
+            let resp = serde_json::to_string(&self.serve_state_chunk_as(req, client, kept)).ok()?;
             return Some(format!("{}{}", state_sync::CHUNK_RESP, resp));
         }
         if let Some(req_json) = msg.strip_prefix(state_sync::VALUE_REQ) {
             let req = serde_json::from_str::<state_sync::ValueRequest>(req_json).ok()?;
-            let resp = serde_json::to_string(&self.serve_state_value(req, client)).ok()?;
+            let resp = serde_json::to_string(&self.serve_state_value_as(req, client, kept)).ok()?;
             return Some(format!("{}{}", state_sync::VALUE_RESP, resp));
         }
         if let Some(req_json) = msg.strip_prefix(state_sync::ANCHOR_REQ) {

@@ -856,7 +856,15 @@ async fn main() {
                             .then(|| node::forward::serve_tx_submit(&serve_mempool, &request.wire))
                             .flatten()
                     } else {
-                        serve_sync.serve_session(&request.wire, &request.peer)
+                        // B131: a member or reserved peer is charged by
+                        // its key and may take the kept snapshot slot;
+                        // anyone else by its network group.
+                        let kept = request.member.is_some() || request.reserved;
+                        let client = match (&request.group, kept) {
+                            (Some(group), false) => group.clone(),
+                            _ => request.peer.clone(),
+                        };
+                        serve_sync.serve_session_from(&request.wire, &client, kept)
                     };
                     let _ = request.reply.send(answer);
                     drop(permit);
@@ -893,6 +901,7 @@ async fn main() {
     tokio::spawn(node::forward::run_forwarder(
         Arc::clone(&mempool),
         session_client.clone(),
+        Arc::clone(&session_book),
         Arc::clone(&in_committee),
         Arc::clone(&shutdown),
     ));
