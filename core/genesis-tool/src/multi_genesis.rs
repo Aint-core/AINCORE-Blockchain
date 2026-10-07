@@ -184,8 +184,10 @@ pub struct GenMultiArgs {
     #[arg(short, long, default_value = "genesis.json")]
     pub out: PathBuf,
 
-    /// Chain ID embedded in genesis.json.
-    #[arg(long, default_value = "AINCORE-MAINNET-1")]
+    /// Chain ID embedded in genesis.json. B258: required (it defaulted to
+    /// the mainnet id, so a testnet built without it ran under mainnet's id
+    /// and its transactions were valid on mainnet).
+    #[arg(long)]
     pub chain_id: String,
 
     /// The block time measured on the release candidate, in milliseconds

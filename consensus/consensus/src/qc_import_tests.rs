@@ -351,3 +351,38 @@ fn a_replayed_or_unheld_qc_costs_no_pairing() {
         "a replay or an unheld height was verified"
     );
 }
+
+/// B225 witness: a QC naming a height this node cannot hold (pruned, or
+/// not reached) is dropped before the committee is looked up: B205 put the
+/// committee first, so each parsed the record, uncharged.
+#[test]
+fn a_qc_for_a_height_not_held_costs_no_committee_lookup() {
+    let dir = TestDir::new();
+    dir.seed(false);
+    let db = dir.open();
+    prepare_block(&db, 10);
+    let cert = certificate(&db, 10);
+    db.put("latest_height", "10").unwrap();
+    db.put(StateDB::BLOCK_PRUNE_CURSOR_KEY, "5").unwrap();
+    let staged = |cert: &QuorumCertificate| {
+        db.transaction(|view| {
+            stage_imported_certificate(&view, cert)
+                .map_err(storage::StorageError::DatabaseOperation)
+        })
+        .unwrap()
+    };
+    let lookups = || COMMITTEE_LOOKUPS.with(|n| n.get());
+    let before = lookups();
+    for height in [11, 4] {
+        let mut unheld = cert.clone();
+        unheld.block_height = height;
+        assert!(!staged(&unheld), "height {height}");
+    }
+    assert_eq!(
+        lookups(),
+        before,
+        "a height not held looked the committee up"
+    );
+    assert!(staged(&cert), "control: the held block's QC is stored");
+    assert_eq!(lookups() - before, 1, "vacuous: no lookup at all");
+}

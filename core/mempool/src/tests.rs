@@ -1098,6 +1098,442 @@ mod fee_market_admission {
         assert_eq!(mp.len(), 1, "kept: the balance may come back");
     }
 
+    /// B188 witness: a ready transaction its payer does not cover waits at
+    /// most PARKED_TTL_SECS, and a full pool evicts it for a ready one. Such
+    /// transactions were never offered, dropped, expired nor evicted, so a
+    /// payer that spent its balance after admission held the pool full.
+    #[test]
+    fn an_unpaid_transaction_leaves_like_a_parked_one() {
+        let db = temp_db("b188_ttl");
+        let (tx, sender) = signed_tx(94, 0, 1_000, 1);
+        let (next, _) = signed_tx(94, 1, 1_000, 1);
+        fund(&db, &sender, 1_000_000_000_000_000_000);
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        mp.add_transaction(tx).expect("admitted");
+        mp.add_transaction(next).expect("admitted");
+        fund(&db, &sender, 1);
+        assert!(mp.get_pending_transactions_at(10, 5_000).is_empty());
+        assert_eq!(mp.len(), 2, "kept while its payer may still pay");
+        // The run behind it waits on the same payer, as long.
+        assert!(mp
+            .get_pending_transactions_at(10, 5_000 + PARKED_TTL_SECS)
+            .is_empty());
+        assert_eq!(mp.len(), 0, "an unpaid run never left");
+
+        let db = temp_db("b188_full");
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        let per_sender = (MAX_NONCE_AHEAD - 1) as usize;
+        let senders = MAX_PENDING_TXS.div_ceil(per_sender);
+        let mut payers = Vec::new();
+        let mut admitted = 0;
+        'fill: for s in 0..senders {
+            for seq in 0..per_sender as u64 {
+                let (tx, sender) = signed_tx(150 + s as u8, seq, 100_000, 1);
+                if seq == 0 {
+                    fund(&db, &sender, 1_000_000_000_000_000_000_000);
+                    payers.push(sender);
+                }
+                mp.add_transaction(tx)
+                    .expect("a ready tx is admitted while there is room");
+                admitted += 1;
+                if admitted == MAX_PENDING_TXS {
+                    break 'fill;
+                }
+            }
+        }
+        for payer in &payers {
+            fund(&db, payer, 1);
+        }
+        assert!(
+            mp.get_pending_transactions_at(10, 7_000).is_empty(),
+            "vacuous: an unpaid transaction was offered"
+        );
+        assert_eq!(mp.len(), MAX_PENDING_TXS);
+        let (ready, sender) = signed_tx(99, 0, 100_000, 1);
+        fund(&db, &sender, 1_000_000_000_000_000_000);
+        mp.add_transaction(ready.clone())
+            .expect("a ready tx evicts an unpaid one");
+        assert_eq!(mp.len(), MAX_PENDING_TXS);
+        assert_eq!(
+            mp.get_pending_transactions_at(10, 7_001),
+            vec![executor::admission::canonicalize(&ready).unwrap()]
+        );
+    }
+
+    /// B193 witness: a run its payer covers again loses its unpaid stamps,
+    /// the part a pass did not reach too: a stamp left from the first
+    /// shortfall made a payable transaction evictable, and its TTL ran from
+    /// then, so the next shortfall dropped it at once.
+    #[test]
+    fn a_covered_run_is_unpaid_no_more() {
+        let db = temp_db("b193_covered");
+        let (tx, sender) = signed_tx(95, 0, 1_000, 1);
+        let (next, _) = signed_tx(95, 1, 1_000, 1);
+        let rich = 1_000_000_000_000_000_000u128;
+        fund(&db, &sender, rich);
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        mp.add_transaction(tx).expect("admitted");
+        mp.add_transaction(next).expect("admitted");
+        fund(&db, &sender, 1);
+        assert!(mp.get_pending_transactions_at(10, 5_000).is_empty());
+        fund(&db, &sender, rich);
+        // Covered again: one taken (the limit), the other not reached.
+        let at = 5_000 + PARKED_TTL_SECS - 1;
+        assert_eq!(mp.get_pending_transactions_at(1, at).len(), 1);
+        fund(&db, &sender, 1);
+        assert!(mp
+            .get_pending_transactions_at(10, 5_000 + PARKED_TTL_SECS)
+            .is_empty());
+        assert_eq!(mp.len(), 1, "short again, and dropped at once");
+    }
+
+    /// B206 witness: a head its payer cannot cover is not priced (a pricing
+    /// reads the sender's and payer's records), and the best head comes from
+    /// a heap: one drained paymaster sponsoring thousands of senders cost
+    /// every proposal a pricing and a scan of every sender a head.
+    #[test]
+    fn an_unpaid_head_is_not_priced() {
+        let db = temp_db("b206_unpriced");
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        let mut payer = String::new();
+        for s in 0..40u8 {
+            let (tx, sender, pm) = sponsored_tx(120 + s, 0, 5, 42);
+            fund(&db, &sender, 100);
+            fund(&db, &pm, 1_000_000_000_000_000_000);
+            mp.add_transaction(tx).expect("admitted");
+            payer = pm;
+        }
+        fund(&db, &payer, 1);
+        let priced = || PRICINGS.with(|n| n.get());
+        let before = priced();
+        assert!(mp.get_pending_transactions_at(10, 9_000).is_empty());
+        assert_eq!(priced(), before, "a head its payer cannot cover was priced");
+        fund(&db, &payer, 1_000_000_000_000_000_000);
+        assert_eq!(
+            mp.get_pending_transactions_at(10, 9_001).len(),
+            10,
+            "positive control: covered again, ten offered"
+        );
+    }
+
+    /// A transaction of `seed`'s at `seq` publishing a `module_bytes` module.
+    fn big_tx(seed: u8, seq: u64, module_bytes: usize) -> (String, String) {
+        priced_tx(seed, seq, module_bytes, 1)
+    }
+
+    /// `big_tx` at `gas_price`.
+    fn priced_tx(seed: u8, seq: u64, module_bytes: usize, gas_price: u128) -> (String, String) {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let sender = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let payload =
+            vm_move::TransactionPayload::PublishModule(vec![vec![seq as u8; module_bytes]]);
+        let tx = serde_json::json!({
+            "chain_id": blockchain::chain_id(),
+            "sender": sender,
+            "input_objects": [],
+            "payload": hex::encode(bcs::to_bytes(&payload).unwrap()),
+            "args": [],
+            "gas_price": gas_price,
+            "sequence_number": seq,
+            "public_key": hex::encode(key.verifying_key().to_bytes()),
+        });
+        (sign_ed25519(tx, &key, 100_000), sender)
+    }
+
+    /// B215 witness: the pool is bounded by its bytes too: every pass hashes
+    /// each held transaction a few times under the consensus lock, and 5,000
+    /// of up to 100 KiB could be held.
+    #[test]
+    fn the_pool_is_bounded_by_its_bytes() {
+        let db = temp_db("b215_bytes");
+        let (_, sender) = big_tx(77, 0, 1);
+        fund(&db, &sender, 1_000_000_000_000_000_000_000);
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        let mut refused = None;
+        for seq in 0..MAX_NONCE_AHEAD - 1 {
+            let (tx, _) = big_tx(77, seq, 45 * 1024);
+            if let Err(e) = mp.add_transaction(tx) {
+                refused = Some(e);
+                break;
+            }
+        }
+        let why = refused.expect("the bytes held were never bounded");
+        assert!(why.contains("bytes held"), "{why}");
+        assert!(
+            mp.len() < MAX_PENDING_TXS,
+            "vacuous: the count cap refused it"
+        );
+        assert!(mp.held_bytes() <= MAX_PENDING_BYTES, "{}", mp.held_bytes());
+    }
+
+    /// B231 witness: a full pool makes room for a ready transaction in one
+    /// scan, evicting at once the parked transactions that together make
+    /// room (B215 scanned the pool once a victim: ~250 scans for a 100 KiB
+    /// newcomer against small parked ones), and evicts none when they
+    /// cannot (B215 evicted them one by one, then refused the newcomer).
+    #[test]
+    fn a_full_pool_makes_room_in_one_scan_or_not_at_all() {
+        let scans = || EVICTION_SCANS.with(|n| n.get());
+        let fill = |mp: &mut Mempool, seed: u8, from: u64, module: usize| {
+            let mut admitted = 0;
+            for seq in from..from + MAX_NONCE_AHEAD - 1 {
+                if mp.add_transaction(big_tx(seed, seq, module).0).is_err() {
+                    break;
+                }
+                admitted += 1;
+            }
+            admitted
+        };
+        // Parked bodies (behind a nonce gap) fill the bytes; a ready 90 KiB
+        // newcomer takes several of them, in one scan.
+        let db = temp_db("b231_one_scan");
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        for seed in 81..=85 {
+            fund(&db, &big_tx(seed, 0, 1).1, 1_000_000_000_000_000_000_000);
+        }
+        let parked: usize = (81..=84)
+            .map(|seed| fill(&mut mp, seed, 1, 10 * 1024))
+            .sum();
+        assert!(
+            mp.held_bytes() + 90 * 1024 > MAX_PENDING_BYTES,
+            "vacuous: the bytes are not full ({parked} parked)"
+        );
+        let (len, before) = (mp.len(), scans());
+        mp.add_transaction(big_tx(85, 0, 45 * 1024).0)
+            .expect("a ready transaction evicts parked ones");
+        let evicted = len + 1 - mp.len();
+        assert!(evicted >= 2, "vacuous: {evicted} evicted");
+        assert_eq!(
+            scans() - before,
+            1,
+            "{evicted} evictions took more than one scan"
+        );
+        assert!(mp.held_bytes() <= MAX_PENDING_BYTES);
+        // Ready bodies fill the bytes and one small parked transaction waits:
+        // it cannot make room for a ready newcomer, so it stays.
+        let db = temp_db("b231_all_or_nothing");
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        for seed in 91..=93 {
+            fund(&db, &big_tx(seed, 0, 1).1, 1_000_000_000_000_000_000_000);
+        }
+        let (small, _) = big_tx(91, 5, 64);
+        mp.add_transaction(small.clone())
+            .expect("parked behind a gap");
+        let ready = fill(&mut mp, 92, 0, 45 * 1024);
+        assert!(ready > 1 && mp.held_bytes() + 90 * 1024 > MAX_PENDING_BYTES);
+        let len = mp.len();
+        let refused = mp.add_transaction(big_tx(93, 0, 45 * 1024).0).unwrap_err();
+        assert!(refused.contains("bytes held"), "{refused}");
+        assert_eq!(
+            mp.len(),
+            len,
+            "a parked transaction was evicted for nothing"
+        );
+        assert!(mp.get_all_pending().contains(&small));
+        // B239: refused again and again while nothing changed, the pool is
+        // not scanned again (each refusal for now scanned it, for free).
+        let before = scans();
+        for module in [45 * 1024 + 1, 45 * 1024 + 2, 45 * 1024 + 3] {
+            assert!(mp.add_transaction(big_tx(93, 0, module).0).is_err());
+        }
+        assert_eq!(scans(), before, "the pool was scanned again unchanged");
+    }
+
+    /// B239 witness: what a submission costs the pool is its own text, not
+    /// the pool's: a refused replacement and a refused admission to a full
+    /// pool hash the newcomer once, however many bytes are held (every map
+    /// was keyed by the transaction's text: a replacement's lookup and an
+    /// eviction's scan hashed up to `MAX_PENDING_BYTES`, refused for free);
+    /// a held transaction is still found by its text where callers name it.
+    #[test]
+    fn a_refused_submission_hashes_its_own_text_only() {
+        let hashed = || TEXT_HASHED.with(|n| n.get());
+        let db = temp_db("b239_text");
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        for seed in 101..=105 {
+            fund(&db, &big_tx(seed, 0, 1).1, 1_000_000_000_000_000_000_000);
+        }
+        // A pool of ready transactions full by its bytes.
+        let mut first = None;
+        'fill: for seed in 101..=104 {
+            for seq in 0..MAX_NONCE_AHEAD - 1 {
+                let (tx, _) = big_tx(seed, seq, 45 * 1024);
+                if mp.add_transaction(tx.clone()).is_err() {
+                    break 'fill;
+                }
+                first.get_or_insert(tx);
+            }
+        }
+        let held = mp.held_bytes();
+        assert!(held + 90 * 1024 > MAX_PENDING_BYTES, "vacuous: not full");
+        // A replacement of the first one at the same price: refused.
+        let (same_nonce, _) = big_tx(101, 0, 45 * 1024 + 1);
+        let before = hashed();
+        assert!(mp.add_transaction(same_nonce.clone()).is_err());
+        let replacement = hashed() - before;
+        // A ready newcomer the full pool cannot take (nothing is parked).
+        let (newcomer, _) = big_tx(105, 0, 45 * 1024);
+        let before = hashed();
+        let refused = mp.add_transaction(newcomer.clone()).unwrap_err();
+        assert!(refused.contains("bytes held"), "{refused}");
+        let full = hashed() - before;
+        assert!(
+            replacement <= 2 * same_nonce.len() as u64 && full <= 2 * newcomer.len() as u64,
+            "{replacement} and {full} bytes hashed against {held} held"
+        );
+        // Callers still name held transactions by their text.
+        let first = first.expect("vacuous: nothing admitted");
+        let loaned = mp.get_pending_transactions_at(1, 1_000);
+        assert_eq!(loaned, vec![first.clone()]);
+        mp.return_unshipped(&loaned);
+        assert!(mp.get_all_pending().contains(&first));
+        mp.mark_executed(std::slice::from_ref(&first));
+        assert!(!mp.any_pending(|t| t == first.as_str()));
+    }
+
+    /// B259 witness: a submitter waits while the consensus thread waits for
+    /// a pool's lock (`std::sync::Mutex` is not fair: a submit batch took the
+    /// lock again at once, and the proposal waited for the whole batch), and
+    /// the consensus thread's lock counts its wait.
+    #[test]
+    fn a_submitter_lets_a_waiting_consensus_thread_go_first() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let done = AtomicBool::new(false);
+        let waiting = ConsensusWaiting::begin();
+        std::thread::scope(|s| {
+            let submitter = s.spawn(|| {
+                yield_to_consensus();
+                done.store(true, Ordering::SeqCst);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let early = done.load(Ordering::SeqCst);
+            drop(waiting);
+            submitter.join().unwrap();
+            assert!(!early, "a submitter went before a waiting consensus thread");
+        });
+        assert!(done.load(Ordering::SeqCst));
+        let pool = std::sync::Mutex::new(Mempool::new());
+        let held = pool.lock().unwrap();
+        std::thread::scope(|s| {
+            let consensus = s.spawn(|| drop(lock_for_consensus(&pool).unwrap()));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while consensus_waits() == 0 && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let counted = consensus_waits() > 0;
+            drop(held);
+            consensus.join().unwrap();
+            assert!(counted, "the consensus thread's wait was not counted");
+        });
+    }
+
+    /// B244 witness: a sender's run whose head is priced under the base fee
+    /// is parked whole, as selection parks it, so a full pool evicts from
+    /// its tail for a ready newcomer (eviction counted the head alone: after
+    /// a base fee rise the tail was neither offered nor evictable for
+    /// PARKED_TTL_SECS).
+    #[test]
+    fn a_run_under_the_base_fee_is_parked_whole() {
+        let db = temp_db("b244_run");
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        let funded = |seed: u8| {
+            fund(
+                &db,
+                &priced_tx(seed, 0, 1, 9).1,
+                1_000_000_000_000_000_000_000,
+            )
+        };
+        funded(111);
+        let (head, _) = priced_tx(111, 0, 1, 1);
+        mp.add_transaction(head.clone()).expect("the head");
+        let mut tail = Vec::new();
+        for seq in 1..=49 {
+            let (tx, _) = priced_tx(111, seq, 1, 9);
+            mp.add_transaction(tx.clone()).expect("the tail");
+            tail.push(tx);
+        }
+        let mut seed = 112u8;
+        'fill: loop {
+            funded(seed);
+            for seq in 0..MAX_NONCE_AHEAD - 1 {
+                if mp.len() >= MAX_PENDING_TXS {
+                    break 'fill;
+                }
+                mp.add_transaction(priced_tx(seed, seq, 1, 9).0)
+                    .expect("room");
+            }
+            seed += 1;
+        }
+        {
+            let _seed = db.seeding();
+            db.put(executor::BASE_FEE_KEY, "5").unwrap();
+        }
+        funded(250);
+        mp.add_transaction(priced_tx(250, 0, 1, 9).0)
+            .expect("a ready newcomer evicts a parked one");
+        let last = tail.last().unwrap();
+        assert!(
+            !mp.any_pending(|t| t == last.as_str()),
+            "the run's tail was not parked"
+        );
+        assert!(
+            mp.any_pending(|t| t == head.as_str()),
+            "the head went first"
+        );
+    }
+
+    /// B245 witness: a replacement's victims never include the transaction
+    /// it replaces (counted out of the bytes held already): credited twice,
+    /// the pool ended up over `MAX_PENDING_BYTES`.
+    #[test]
+    fn a_replacement_does_not_evict_what_it_replaces() {
+        let db = temp_db("b245_replace");
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        for seed in 120..=124 {
+            fund(
+                &db,
+                &priced_tx(seed, 0, 1, 9).1,
+                1_000_000_000_000_000_000_000,
+            );
+        }
+        // The one to replace: priced 1, parked once the base fee rises.
+        let (old, _) = priced_tx(120, 0, 20 * 1024, 1);
+        mp.add_transaction(old.clone()).expect("admitted");
+        // Ready fillers up to the bytes, the last of them small.
+        'big: for seed in 121..=122 {
+            for seq in 0..MAX_NONCE_AHEAD - 1 {
+                if mp
+                    .add_transaction(priced_tx(seed, seq, 45 * 1024, 9).0)
+                    .is_err()
+                {
+                    break 'big;
+                }
+            }
+        }
+        for seq in 0..MAX_NONCE_AHEAD - 1 {
+            if mp.add_transaction(priced_tx(123, seq, 512, 9).0).is_err() {
+                break;
+            }
+        }
+        assert!(
+            MAX_PENDING_BYTES - mp.held_bytes() < 4 * 1024,
+            "vacuous: room left"
+        );
+        {
+            let _seed = db.seeding();
+            db.put(executor::BASE_FEE_KEY, "5").unwrap();
+        }
+        // A larger, ready replacement: only the one it replaces is parked.
+        let (new, _) = priced_tx(120, 0, 45 * 1024, 9);
+        let refused = mp.add_transaction(new).unwrap_err();
+        assert!(refused.contains("bytes held"), "{refused}");
+        assert!(mp.held_bytes() <= MAX_PENDING_BYTES, "{}", mp.held_bytes());
+        assert!(
+            mp.any_pending(|t| t == old.as_str()),
+            "the replaced one was evicted"
+        );
+    }
+
     /// B98 witness: a same-nonce resubmission is refused before it can
     /// evict anything (it evicted a parked transaction for free); a 10 %
     /// higher price replaces the waiting one; a parked transaction leaves
@@ -1137,7 +1573,7 @@ mod fee_market_admission {
         mp.add_transaction(bump.clone()).expect("10 % replaces");
         assert_eq!(mp.len(), MAX_PENDING_TXS);
         assert!(
-            mp.get_all_pending().iter().any(|r| *r == bump),
+            mp.get_all_pending().contains(&bump),
             "the replacement waits"
         );
 

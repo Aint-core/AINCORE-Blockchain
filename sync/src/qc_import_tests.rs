@@ -396,21 +396,25 @@ fn v4_sync_refuses_a_boundary_qc_binding_another_committee() {
 
 /// G0 on V4: the anchor is the last committed vertex. A validly signed block
 /// whose anchor is swapped for another hash (same header hash, same
-/// signature) is refused at validation, before any QC is looked at: the
-/// header's DA root binds the anchor (B1). A block resealed around the wrong
-/// anchor (every root and the hash recomputed, signed again) is refused by
-/// the G0 rule itself. The real block passes.
+/// signature) is refused at validation, before any QC is looked at: by the
+/// G0 rule, which B275 checks before the roots (the header's DA root binds
+/// the anchor too, B1, but costs an encode). A block resealed around the
+/// wrong anchor (every root and the hash recomputed, signed again) is
+/// refused by the G0 rule itself. The real block passes.
 #[test]
 fn v4_validation_refuses_an_anchor_that_is_not_the_last_committed_vertex() {
     let (sync, _) = v4_sync("g0_anchor");
     let real = block_at(&sync, 1, "genesis", &"ab".repeat(32));
-    assert!(real.anchor_is_bound(), "the fixture's anchor is its last vertex");
+    assert!(
+        real.anchor_is_bound(),
+        "the fixture's anchor is its last vertex"
+    );
     let mut swapped = real.clone();
     swapped.anchor_hash = "ef".repeat(32);
     assert_eq!(swapped.header.hash, real.header.hash);
     assert_eq!(swapped.proposer_signature, real.proposer_signature);
     let err = sync.validate_block(&swapped, 1, "genesis").unwrap_err();
-    assert!(err.contains("DA root mismatch"), "{err}");
+    assert!(err.contains("is not its last committed vertex"), "{err}");
 
     let h = &real.header;
     let mut resealed = Block::new_with_roots_at(

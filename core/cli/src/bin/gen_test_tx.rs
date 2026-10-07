@@ -69,7 +69,11 @@ fn main() {
     // 4. Sign
     // F4: Message format now chain_id:sender:payload:seq:gas_limit:gas_price:input_objects
     // gas_limit=10000, gas_price=1, input_objects=[] (must match tx below).
-    let chain_id = "AINCORE-MAINNET-1";
+    // B258: the chain is named, never assumed (it signed for mainnet).
+    let chain_id = std::env::var("AINCORE_CHAIN_ID")
+        .ok()
+        .filter(|c| !c.trim().is_empty())
+        .expect("AINCORE_CHAIN_ID names the chain to sign for");
     let message = format!(
         "{}:{}:{}:{}:{}:{}:{}",
         chain_id, sender_addr, payload, sequence_number, 10000u64, 1u128, ""

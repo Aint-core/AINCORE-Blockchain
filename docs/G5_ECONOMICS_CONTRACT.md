@@ -230,6 +230,13 @@ per epoch (DL-1). Tickets created after the slash are not cut twice.
 - **Pool side.** The pool closes for good when the evidence is accepted (SL-5). At
   settlement the active principal is cut, rounded up, and the pool records the slash as an
   event: E_i, its sequence number, the fraction, and how many unpaid tickets it may reach.
+  - The cut is the fraction of the active principal, but of no more than the pool had at
+    stake in C_{E_i}: its frozen delegated weight, plus the part of an AIN that whole-AIN
+    weights drop (B149, 2026-10-06). A delegation made after E_i began weighed nothing in
+    C_{E_i} and was burned too; Cosmos sizes a slash by the stake at the infraction height.
+  - Residual, bounded: a pool that both took deposits (n) and lost in-scope stake to
+    tickets (t) after E_i began is cut by at most f·min(n, t) too much at settlement, and a
+    later raise to 100 % (a certificate conflict) by at most min(n, the first cut).
   - A ticket records the pool's slash count when it is made, so it is cut only by later
     events, and only once.
   - Each ticket is cut when withdrawn. The cut is burned.

@@ -224,6 +224,14 @@ impl StateDB {
         self.db.seeding()
     }
 
+    /// Tests only: RocksDB's latest write sequence number, which a committed
+    /// write advances (B166's witness: a retry that changed nothing committed
+    /// nothing).
+    #[cfg(any(test, feature = "test-seeding"))]
+    pub fn write_sequence(&self) -> u64 {
+        self.db.write_sequence()
+    }
+
     pub fn put(&self, key: &str, value: &str) -> std::result::Result<(), StorageError> {
         // Base writes are synced. In a transaction view, Ok means staged;
         // durability is acknowledged only by the outer transaction's commit.
@@ -626,6 +634,30 @@ impl StateDB {
                 StorageError::SerializationError(format!("malformed kept pin blocks: {e}"))
             }),
         }
+    }
+
+    /// B225: whether block `height` may be held here, from point reads of
+    /// small rows: none is above the latest height, and none below the
+    /// prune cursor but those kept for a pin. `false` is exact; `true`
+    /// still needs the block's row. A finality QC naming a pruned or a
+    /// future height parsed a committee record first (~130 KB at 256
+    /// members), from any member, uncharged.
+    pub fn may_hold_block(&self, height: u64) -> bool {
+        let row = |key: &str| {
+            self.get(key)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok())
+        };
+        if row("latest_height").is_some_and(|latest| height > latest) {
+            return false;
+        }
+        if row(Self::BLOCK_PRUNE_CURSOR_KEY).is_some_and(|cursor| height < cursor) {
+            return self
+                .kept_pin_blocks()
+                .map_or(true, |kept| kept.contains(&height));
+        }
+        true
     }
 
     fn put_kept_pin_blocks(

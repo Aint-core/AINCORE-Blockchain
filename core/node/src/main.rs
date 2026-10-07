@@ -814,8 +814,10 @@ async fn main() {
         const OPEN_SERVES: usize = 4;
         const TX_SUBMIT_SERVES: usize = 2;
         // B114: the operator's reserved peers (its RPC nodes) forward on
-        // slots of their own.
+        // slots of their own; B187: and sync on slots of their own (they
+        // shared the open ones with every stranger).
         const RESERVED_TX_SUBMIT_SERVES: usize = 2;
+        const RESERVED_SERVES: usize = 2;
         let serve_sync = Arc::clone(&chain_sync);
         let serve_mempool = Arc::clone(&mempool);
         let serve_member = Arc::clone(&in_committee);
@@ -823,28 +825,38 @@ async fn main() {
         let open_permits = Arc::new(tokio::sync::Semaphore::new(OPEN_SERVES));
         let tx_permits = Arc::new(tokio::sync::Semaphore::new(TX_SUBMIT_SERVES));
         let reserved_tx_permits = Arc::new(tokio::sync::Semaphore::new(RESERVED_TX_SUBMIT_SERVES));
+        let reserved_permits = Arc::new(tokio::sync::Semaphore::new(RESERVED_SERVES));
         tokio::spawn(async move {
             while let Some(request) = sync_serves.recv().await {
-                let permit = if request.wire.starts_with(node::forward::TX_SUBMIT) {
-                    if request.reserved {
+                // B88: members keep to their own slots (taking the open ones
+                // too, one member could hold all eight with 8 MiB answers and
+                // starve every observer).
+                let pool = node::sessions::serve_pool(
+                    request.wire.starts_with(node::forward::TX_SUBMIT),
+                    request.member.is_some(),
+                    request.reserved,
+                );
+                let permit = match pool {
+                    node::sessions::ServePool::ReservedTxSubmit => {
                         Arc::clone(&reserved_tx_permits).try_acquire_owned()
-                    } else {
+                    }
+                    node::sessions::ServePool::TxSubmit => {
                         Arc::clone(&tx_permits).try_acquire_owned()
                     }
-                } else if request.member.is_some() {
-                    // B88: members keep to their own slots (taking the open
-                    // ones too, one member could hold all eight with 8 MiB
-                    // answers and starve every observer).
-                    Arc::clone(&member_permits).try_acquire_owned()
-                } else {
-                    Arc::clone(&open_permits).try_acquire_owned()
+                    node::sessions::ServePool::Member => {
+                        Arc::clone(&member_permits).try_acquire_owned()
+                    }
+                    node::sessions::ServePool::Reserved => {
+                        Arc::clone(&reserved_permits).try_acquire_owned()
+                    }
+                    node::sessions::ServePool::Open => {
+                        Arc::clone(&open_permits).try_acquire_owned()
+                    }
                 };
                 let Ok(permit) = permit else {
                     // A snapshot part waits a busy answer out; anything
                     // else is refused.
-                    let _ = request
-                        .reply
-                        .send(chain_sync::state_sync::busy_reply(&request.wire));
+                    let _ = request.reply.send(node::forward::busy_reply(&request.wire));
                     continue;
                 };
                 let serve_sync = Arc::clone(&serve_sync);
@@ -856,14 +868,14 @@ async fn main() {
                             .then(|| node::forward::serve_tx_submit(&serve_mempool, &request.wire))
                             .flatten()
                     } else {
-                        // B131: a member or reserved peer is charged by
-                        // its key and may take the kept snapshot slot;
-                        // anyone else by its network group.
-                        let kept = request.member.is_some() || request.reserved;
-                        let client = match (&request.group, kept) {
-                            (Some(group), false) => group.clone(),
-                            _ => request.peer.clone(),
-                        };
+                        // B131/B178: who the request is charged to, and
+                        // whether it may take the kept snapshot slot.
+                        let (client, kept) = node::sessions::snapshot_client(
+                            &request.peer,
+                            request.member.is_some(),
+                            request.reserved,
+                            request.group.as_deref(),
+                        );
                         serve_sync.serve_session_from(&request.wire, &client, kept)
                     };
                     let _ = request.reply.send(answer);
@@ -1013,18 +1025,12 @@ async fn main() {
         });
     }
 
-    // === INITIALIZE GOVERNANCE ===
-    let governance = Arc::new(Mutex::new(governance::GovernanceManager::new(Arc::clone(
-        &storage,
-    ))));
-
     // === START REST API SERVER ===
     {
         let api_consensus = Arc::clone(&consensus);
         let api_sessions = Arc::clone(&session_table);
         let api_mempool = Arc::clone(&mempool);
         let api_storage = Arc::clone(&storage);
-        let api_governance = Arc::clone(&governance);
 
         std::thread::spawn(move || {
             println!(
@@ -1045,7 +1051,6 @@ async fn main() {
                             api_sessions,
                             api_mempool,
                             api_storage,
-                            api_governance,
                         )
                         .await
                         {

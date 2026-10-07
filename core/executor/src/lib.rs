@@ -213,6 +213,14 @@ struct ValidatorSetV1Entry {
     bls_pop: String,
 }
 
+/// Whether `call` is `0x1::staking::join_validator_set`, whose proof of
+/// possession is checked in Rust before dispatch.
+fn is_join_validator_set(call: &vm_move::EntryFunctionCall) -> bool {
+    *call.module.address() == system_address()
+        && call.module.name().as_str() == "staking"
+        && call.function == "join_validator_set"
+}
+
 /// Extract the `sys:validator_set:v1` entry for a `join_validator_set` call, or
 /// `None` if this is not such a call. Mirrors the genesis `crypto_qc_validator_info`
 /// scaling (stake in 10^18 quanta -> whole-AIN u64). The PoP has already been
@@ -540,6 +548,26 @@ struct FeeSweepEntry {
     amount: String,
     reason: String,
     attempts: u64,
+}
+
+/// B195: the tries a queued fee share gets: the back-off reaches its cap
+/// (2^16 blocks) at the sixteenth, and one more try there: ~2^17 blocks in
+/// all (~10 days of 6.65 s blocks) for its recipient to hold an AIN store (a
+/// choice). Then it is burned. B218 (accepted): a row is one recipient's
+/// shares due at one height, and a share that joins a row takes the row's
+/// count (`merge_fee_sweep` keeps the larger), so it can be burned after
+/// fewer tries of its own; every burn still follows a deposit that failed,
+/// and the merge is what bounds a recipient's rows (one a back-off level).
+const FEE_SWEEP_ATTEMPTS: u64 = 17;
+
+/// B108/B195: when a share that failed its `attempts`-th try at `height` is
+/// due again: the next multiple of 2^attempts (at most 2^16) after `height`.
+/// Aligned, the shares of one recipient that failed as often join one row
+/// (B138), so a recipient that cannot take its shares has a row a level, not
+/// one a block (each block's share made its own chain of retries).
+fn next_sweep_due(height: u64, attempts: u64) -> u64 {
+    let step = 1u64 << attempts.min(16);
+    (height / step).saturating_add(1).saturating_mul(step)
 }
 
 /// Storage key of the Move `0x1::staking::ValidatorSet` resource. Pinned to
@@ -1256,8 +1284,42 @@ fn receipt_update(
     });
     (
         format!("tx_receipt:{}", tx_hash_hex(tx_json)),
-        Some(value.to_string()),
+        Some(sorted_json(&value)),
     )
+}
+
+/// B277: `value`'s text with every object's keys sorted, whatever
+/// serde_json's map keeps: with its `preserve_order` feature, which any
+/// crate in a build can switch on, the map keeps insertion order. Receipts
+/// are hashed into `receipts_root`, which QCs bind, so every build must
+/// write the same bytes (these are the bytes the sorted map wrote).
+fn sorted_json(value: &serde_json::Value) -> String {
+    struct Sorted<'a>(&'a serde_json::Value);
+    impl serde::Serialize for Sorted<'_> {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::{SerializeMap, SerializeSeq};
+            match self.0 {
+                serde_json::Value::Object(map) => {
+                    let mut keys: Vec<&String> = map.keys().collect();
+                    keys.sort();
+                    let mut out = s.serialize_map(Some(keys.len()))?;
+                    for key in keys {
+                        out.serialize_entry(key, &Sorted(&map[key]))?;
+                    }
+                    out.end()
+                }
+                serde_json::Value::Array(items) => {
+                    let mut out = s.serialize_seq(Some(items.len()))?;
+                    for item in items {
+                        out.serialize_element(&Sorted(item))?;
+                    }
+                    out.end()
+                }
+                other => other.serialize(s),
+            }
+        }
+    }
+    serde_json::to_string(&Sorted(value)).unwrap_or_default()
 }
 
 fn bcs_arg<T: serde::de::DeserializeOwned>(args: &[Vec<u8>], index: usize) -> Option<T> {
@@ -1544,8 +1606,9 @@ fn receipt_metadata(
 }
 
 /// The kind of a hex-encoded BCS `TransactionPayload`.
-/// The payload's kind, and the execution gas its size requires (a module
-/// bundle's publish floor, audit M-5; 0 for a call).
+/// The payload's kind, and the execution gas it requires before it runs (a
+/// module bundle's publish floor, audit M-5; a join's proof-of-possession
+/// check, B184; 0 for another call).
 pub(crate) fn payload_kind(payload: &str) -> Result<(admission::PayloadKind, u64), String> {
     use admission::PayloadKind;
     let bytes = hex::decode(payload.trim_start_matches("0x"))
@@ -1553,7 +1616,14 @@ pub(crate) fn payload_kind(payload: &str) -> Result<(admission::PayloadKind, u64
     match bcs::from_bytes::<vm_move::TransactionPayload>(&bytes)
         .map_err(|e| format!("Invalid BCS TransactionPayload: {e}"))?
     {
-        vm_move::TransactionPayload::EntryFunction(_) => Ok((PayloadKind::EntryFunction, 0)),
+        vm_move::TransactionPayload::EntryFunction(call) => Ok((
+            PayloadKind::EntryFunction,
+            if is_join_validator_set(&call) {
+                admission::POP_GAS
+            } else {
+                0
+            },
+        )),
         vm_move::TransactionPayload::PublishModule(modules) => Ok((
             PayloadKind::PublishModule,
             admission::publish_floor(&modules),
@@ -1714,6 +1784,17 @@ pub struct Executor {
     modules: deps::ModuleIndex,
     #[cfg(test)]
     block_boundary_hook: Option<fn(u8, &StateDB)>,
+    /// B140: the first system write of the block path that the write gate
+    /// refused. Such a write used to be dropped unseen (`let _ =`); it now
+    /// fails the block, on every node alike (the gate's verdict depends only
+    /// on the key), so no state is lost silently.
+    refused_write: std::sync::Mutex<Option<String>>,
+    /// B170: the module keys a batch of this block republished. Nothing
+    /// later in the block may load them (`deps::ModuleIndex::closure_in_block`):
+    /// the block's VM holds the code they replaced until the next block's
+    /// VM, and flushing its cache mid-block re-verified the stdlib per
+    /// upgrade, uncharged.
+    upgraded: std::sync::RwLock<std::collections::HashSet<String>>,
 }
 
 /// The account writes a transaction's charge makes (see
@@ -1753,8 +1834,12 @@ fn account_writes_at(
     };
     let mut payer_data: aa::AccountData = serde_json::from_slice(&payer_obj.data).ok()?;
     // ALWAYS increment the SENDER's sequence number, even if a paymaster
-    // pays the gas.
-    let next = sender_data.sequence_number.checked_add(1)?;
+    // pays the gas. B174: to the transaction's own number + 1, the record a
+    // block writes (with `require_next` the two agree): the mempool priced
+    // the committed number + 1, a digit short when a later number crosses a
+    // boundary (98 committed, 99 sent), so it admitted for less than every
+    // block then held it to, and every block skipped it for nothing.
+    let next = tx.sequence_number.checked_add(1)?;
     let mut writes = Vec::new();
     if payer == tx.sender {
         payer_data.sequence_number = next;
@@ -1786,16 +1871,18 @@ fn account_writes_at(
 
 /// B65: the gas a transaction owes before anything runs: its object loads
 /// (N-2) and the account writes its charge makes, at the committed state
-/// byte gas.
+/// byte gas, and (B141) its prologue's Move gas.
 fn charge_gas_in(
     db: &StateDB,
     tx: &Transaction,
     account_writes: &[(String, Option<String>)],
 ) -> u64 {
     let object_load = (tx.input_objects.len() as u64).saturating_mul(OBJECT_LOAD_GAS);
-    object_load.saturating_add(
-        state_gas::write_cost(db, account_writes).gas(state_gas::committed_state_byte_gas(db)),
-    )
+    object_load
+        .saturating_add(admission::PROLOGUE_GAS)
+        .saturating_add(
+            state_gas::write_cost(db, account_writes).gas(state_gas::committed_state_byte_gas(db)),
+        )
 }
 
 /// B94: the execution gas `tx` owes before anything runs, against the
@@ -1826,7 +1913,51 @@ impl Executor {
             modules: deps::ModuleIndex::default(),
             #[cfg(test)]
             block_boundary_hook: None,
+            refused_write: std::sync::Mutex::new(None),
+            upgraded: std::sync::RwLock::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// B69/B170: the closure `roots` load, refused when it holds a module
+    /// republished earlier in this block.
+    fn closure_in_block(
+        &self,
+        roots: impl IntoIterator<Item = move_core_types::language_storage::ModuleId>,
+    ) -> Result<deps::Closure, String> {
+        let upgraded = self.upgraded.read().unwrap_or_else(|e| e.into_inner());
+        self.modules.closure_in_block(&self.db, roots, &upgraded)
+    }
+
+    /// B140: a system write of the block path (a fee share, a supply
+    /// tracker, an epoch or slash record). One the gate refuses fails the
+    /// block (`take_refused_write`) instead of being dropped.
+    fn system_put(&self, key: &str, value: &str) {
+        if let Err(e) = self.logged_put(key, value) {
+            self.refuse_block(e);
+        }
+    }
+
+    /// B140: `system_put` for a delete.
+    fn system_delete(&self, key: &str) {
+        if let Err(e) = self.logged_delete(key) {
+            self.refuse_block(e);
+        }
+    }
+
+    fn refuse_block(&self, error: String) {
+        self.refused_write
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(error);
+    }
+
+    /// B140: the system write this executor could not stage, if one was
+    /// refused.
+    fn take_refused_write(&self) -> Option<String> {
+        self.refused_write
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// B1: keep `sys:validator_set:v1` live when a validator joins at runtime.
@@ -2176,7 +2307,7 @@ impl Executor {
             // logged update, so leaving it outside the root means a divergence
             // here is invisible until it resurfaces in a block that cannot
             // explain it.
-            let _ = self.logged_put("sys:total_supply", &new_supply.to_string());
+            self.system_put("sys:total_supply", &new_supply.to_string());
         }
 
         if let Some(old_supply) = old_supply {
@@ -2189,7 +2320,7 @@ impl Executor {
                     .flatten()
                     .and_then(|s| s.parse::<u128>().ok())
                     .unwrap_or(0);
-                let _ = self.logged_put(
+                self.system_put(
                     "total_burned",
                     &prev_burned.saturating_add(burned_delta).to_string(),
                 );
@@ -2281,6 +2412,8 @@ impl Executor {
                 self.append_supply_tracker_updates(&mut updates);
                 if let Err(err) = self.commit_kv_updates(updates, "epoch advance") {
                     eprintln!("🚨 [EPOCH_ADVANCE_COMMIT_FAIL] {}", err);
+                    // B150: fails the block (B140), never half applied.
+                    self.refuse_block(err);
                 } else {
                     self.sync_supply_trackers_from_validator_set();
                 }
@@ -2354,6 +2487,8 @@ impl Executor {
                 self.append_supply_tracker_updates(&mut updates);
                 if let Err(err) = self.commit_kv_updates(updates, "reward payout") {
                     eprintln!("🚨 [REWARD_PAYOUT_COMMIT_FAIL] {}", err);
+                    // B150: fails the block (B140), never half applied.
+                    self.refuse_block(err);
                 } else {
                     self.sync_supply_trackers_from_validator_set();
                 }
@@ -2391,6 +2526,8 @@ impl Executor {
                 self.append_supply_tracker_updates(&mut updates);
                 if let Err(err) = self.commit_kv_updates(updates, "offense settlement") {
                     eprintln!("🚨 [OFFENSE_SETTLEMENT_COMMIT_FAIL] {}", err);
+                    // B150: fails the block (B140), never half applied.
+                    self.refuse_block(err);
                 } else {
                     self.sync_supply_trackers_from_validator_set();
                 }
@@ -3009,8 +3146,8 @@ impl Executor {
                 )
                 .expect("CRITICAL: the churn state write failed");
         }
-        let _ = self.db.put("consensus:epoch", &new_epoch.to_string());
-        let _ = self.db.put(
+        self.system_put("consensus:epoch", &new_epoch.to_string());
+        self.system_put(
             &format!("consensus:epoch_start_height:{}", new_epoch),
             &boundary_height.saturating_add(1).to_string(),
         );
@@ -3041,15 +3178,11 @@ impl Executor {
                 .epoch_began(oldest + 1)
                 .is_some_and(|next| next.saturating_add(EVIDENCE_MAX_AGE_SECS) < now)
         {
-            let _ = self
-                .db
-                .delete(&format!("sys:validator_set:epoch:{}", oldest));
-            let _ = self.db.delete(&delegated_split_key(oldest));
-            let _ = self.db.delete(&bootstrap_split_key(oldest));
-            let _ = self.db.delete(&epoch_time_key(oldest));
-            let _ = self
-                .db
-                .delete(&format!("consensus:epoch_start_height:{}", oldest));
+            self.system_delete(&format!("sys:validator_set:epoch:{}", oldest));
+            self.system_delete(&delegated_split_key(oldest));
+            self.system_delete(&bootstrap_split_key(oldest));
+            self.system_delete(&epoch_time_key(oldest));
+            self.system_delete(&format!("consensus:epoch_start_height:{}", oldest));
             oldest += 1;
         }
         if oldest != from {
@@ -3071,7 +3204,7 @@ impl Executor {
             .flatten()
             .and_then(|s| s.parse::<u128>().ok())
             .unwrap_or(0);
-        let _ = self.logged_put(
+        self.system_put(
             "total_burned",
             &prev_burned.saturating_add(amount).to_string(),
         );
@@ -3079,9 +3212,7 @@ impl Executor {
         if let Ok(Some(total_supply_str)) = self.db.get("sys:total_supply") {
             if let Ok(total_supply) = total_supply_str.parse::<u128>() {
                 let adjusted_supply = total_supply.saturating_sub(amount);
-                let _ = self
-                    .db
-                    .put("sys:total_supply", &adjusted_supply.to_string());
+                self.system_put("sys:total_supply", &adjusted_supply.to_string());
             }
         }
 
@@ -3090,7 +3221,7 @@ impl Executor {
             if let Some(mut set) = decode_validator_set_hex(&value) {
                 set.total_supply = set.total_supply.saturating_sub(amount);
                 if let Some(encoded) = encode_validator_set_hex(&set) {
-                    let _ = self.logged_put(&key, &encoded);
+                    self.system_put(&key, &encoded);
                 }
             }
         }
@@ -3119,7 +3250,7 @@ impl Executor {
             cumulative_burned: prev_move_burned.saturating_add(amount),
         };
         if let Some(encoded) = encode_supply_stats_hex(&updated_stats) {
-            let _ = self.logged_put(&stats_key, &encoded);
+            self.system_put(&stats_key, &encoded);
         }
     }
 
@@ -3247,10 +3378,13 @@ impl Executor {
                 .unwrap_or_else(|| "deposit_fee_reward aborted".to_string()));
         }
 
+        // B179: the block's system writes, so a refused one fails the block
+        // (B140). `?` returned with the earlier writes staged, and the
+        // caller's retries and the sweep credited the recipient again.
         for (k, v) in vm_changes {
             match v {
-                Some(val) => self.logged_put(&k, &val).map_err(|e| e.to_string())?,
-                None => self.logged_delete(&k).map_err(|e| e.to_string())?,
+                Some(val) => self.system_put(&k, &val),
+                None => self.system_delete(&k),
             }
         }
 
@@ -3264,23 +3398,39 @@ impl Executor {
     }
 
     fn queue_fee_sweep(&self, miner_addr: &str, amount: u128, height: u64) {
-        let sweep_key = Self::sweep_key(height, miner_addr);
-        let existing_amount = self
+        self.merge_fee_sweep(
+            height,
+            FeeSweepEntry {
+                miner: miner_addr.to_string(),
+                amount: amount.to_string(),
+                reason: "vm_distribution_failed_3_attempts".to_string(),
+                attempts: 0,
+            },
+        );
+    }
+
+    /// B138: `entry` joins the share already queued for its miner at `due`,
+    /// if one is: the amounts add, and the larger attempt count is kept. A
+    /// rescheduled share used to overwrite whatever was queued there (block
+    /// 8's share failing again at 10 lands on 14; block 12's new share,
+    /// failing at once, is queued at 14 too), and the payers' coins were
+    /// gone for good.
+    fn merge_fee_sweep(&self, due: u64, mut entry: FeeSweepEntry) {
+        let key = Self::sweep_key(due, &entry.miner);
+        if let Some(queued) = self
             .db
-            .get(&sweep_key)
+            .get(&key)
             .ok()
             .flatten()
             .and_then(|raw| serde_json::from_str::<FeeSweepEntry>(&raw).ok())
-            .and_then(|entry| entry.amount.parse::<u128>().ok())
-            .unwrap_or(0);
-        let entry = FeeSweepEntry {
-            miner: miner_addr.to_string(),
-            amount: existing_amount.saturating_add(amount).to_string(),
-            reason: "vm_distribution_failed_3_attempts".to_string(),
-            attempts: 0,
-        };
+        {
+            let queued_amount = queued.amount.parse::<u128>().unwrap_or(0);
+            let amount = entry.amount.parse::<u128>().unwrap_or(0);
+            entry.amount = queued_amount.saturating_add(amount).to_string();
+            entry.attempts = entry.attempts.max(queued.attempts);
+        }
         if let Ok(json) = serde_json::to_string(&entry) {
-            let _ = self.logged_put(&sweep_key, &json);
+            self.system_put(&key, &json);
         }
     }
 
@@ -3313,14 +3463,14 @@ impl Executor {
             let amount = match entry.amount.parse::<u128>() {
                 Ok(amount) if amount > 0 => amount,
                 _ => {
-                    let _ = self.logged_delete(&key);
+                    self.system_delete(&key);
                     continue;
                 }
             };
 
             match self.deposit_fee_reward(&entry.miner, amount) {
                 Ok(()) => {
-                    let _ = self.logged_delete(&key);
+                    self.system_delete(&key);
                     println!(
                         "✅ Fee sweep recovered {} AIN for miner {}",
                         amount, entry.miner
@@ -3328,15 +3478,25 @@ impl Executor {
                 }
                 Err(e) => {
                     entry.attempts = entry.attempts.saturating_add(1);
-                    let next = height.saturating_add(1u64 << entry.attempts.min(16));
-                    if let Ok(json) = serde_json::to_string(&entry) {
-                        let _ = self.logged_delete(&key);
-                        let _ = self.logged_put(&Self::sweep_key(next, &entry.miner), &json);
+                    self.system_delete(&key);
+                    // B195: a share its recipient could not take in
+                    // `FEE_SWEEP_ATTEMPTS` tries is burned: deducted from its
+                    // payers, it was neither minted nor burned, so the
+                    // supply trackers overstated circulation for good.
+                    if entry.attempts >= FEE_SWEEP_ATTEMPTS {
+                        eprintln!(
+                            "🔥 Fee share of {} AIN to {} burned after {} tries: {}",
+                            amount, entry.miner, entry.attempts, e
+                        );
+                        self.burn_supply_trackers(amount);
+                        continue;
                     }
+                    let next = next_sweep_due(height, entry.attempts);
                     eprintln!(
                         "⚠️ Fee sweep retry failed for {} AIN to {}: {}",
                         amount, entry.miner, e
                     );
+                    self.merge_fee_sweep(next, entry);
                 }
             }
         }
@@ -3515,6 +3675,13 @@ impl Executor {
                     slash_evidence,
                     committed_authors,
                 );
+                // B140: a system write the gate refused fails the block, on
+                // every node alike, before anything is accepted.
+                if let Some(refused) = executor.take_refused_write() {
+                    return Err(storage::StorageError::WriteGate(format!(
+                        "a system write of block {block_height} was refused: {refused}"
+                    )));
+                }
                 if let BlockExecOutcome::Executed(summary) = &outcome {
                     accept(summary, &view).map_err(storage::StorageError::DatabaseOperation)?;
                 }
@@ -3598,8 +3765,18 @@ impl Executor {
         // 1. Parse all transactions. The per-block object limit (N-2) is
         // spent at execution, by what can pay (B16, step 3).
         let mut parsed_txs = Vec::new();
+        // B272: a transaction carried more than once (several vertices of
+        // the anchor's history hold it) is tried at its first copy only. A
+        // later copy ran when the first could not (its sequence number, its
+        // payer's balance), and the body put it at the first copy's place
+        // (`executed_in_order`), so the body, re-executed in its own order,
+        // reached another state: no node could import the block.
+        let mut carried: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
         for raw in &txs_json {
+            if !carried.insert(raw.as_str()) {
+                continue;
+            }
             match serde_json::from_str::<Transaction>(raw) {
                 Ok(tx) => {
                     // Per-TX limit (existing)
@@ -3763,6 +3940,20 @@ impl Executor {
                     objects_used += objects;
                     updates.sort_by(|left, right| left.0.cmp(&right.0));
                     for (key, val_opt) in updates {
+                        // B170: a module the chain held before this batch is
+                        // republished: the rest of the block may not load it.
+                        if key.starts_with("module_")
+                            && val_opt.is_some()
+                            && self
+                                .db
+                                .get(&key)
+                                .expect("CRITICAL: a module read for an upgrade failed")
+                                .is_some()
+                        {
+                            if let Ok(mut upgraded) = self.upgraded.write() {
+                                upgraded.insert(key.clone());
+                            }
+                        }
                         if let Some(prev_writer) = writer_of_key.get(&key) {
                             if prev_writer != &tx_hash {
                                 eprintln!(
@@ -4137,11 +4328,11 @@ impl Executor {
             });
 
             // Queue the real slash and the jail marker.
-            let _ = self.logged_put(
+            self.system_put(
                 &format!("sys:pending_slash:{}", offender),
                 &slash_event.to_string(),
             );
-            let _ = self.logged_put(
+            self.system_put(
                 &jail_key,
                 &serde_json::to_string(&reporters).unwrap_or_default(),
             );
@@ -4152,7 +4343,7 @@ impl Executor {
             // future epochs are untouched.
             let prefix = format!("sys:downtime_attestation:{}:{}:", offender, epoch);
             for (key, _) in self.db.scan_prefix(&prefix) {
-                let _ = self.logged_delete(&key);
+                self.system_delete(&key);
             }
 
             println!(
@@ -4284,7 +4475,12 @@ impl Executor {
         if epoch < retained_from {
             return Err(format!("the records of epoch {epoch} are pruned"));
         }
-        match self.epoch_began(epoch + 1) {
+        // B192: the item's own number (`epoch + 1` wrapped to 0 in release
+        // and panicked in debug).
+        let Some(next_epoch) = epoch.checked_add(1) else {
+            return Err(format!("no epoch follows {epoch}"));
+        };
+        match self.epoch_began(next_epoch) {
             Some(next)
                 if committed_chain_clock(&self.db).time
                     > next.saturating_add(EVIDENCE_MAX_AGE_SECS) =>
@@ -4293,7 +4489,7 @@ impl Executor {
             }
             Some(_) => {}
             None if epoch < self.executing_epoch() => {
-                return Err(format!("the records of epoch {} are pruned", epoch + 1));
+                return Err(format!("the records of epoch {next_epoch} are pruned"));
             }
             None => {}
         }
@@ -4488,7 +4684,7 @@ impl Executor {
                     "   ⏭️  Skipping already processed slash event: {}",
                     event_id
                 );
-                let _ = self.logged_delete(key);
+                self.system_delete(key);
                 return false;
             }
 
@@ -4506,7 +4702,7 @@ impl Executor {
                     "   ❌ No committee record places {} in epoch {}: refused",
                     validator_addr, epoch
                 );
-                let _ = self.logged_delete(key);
+                self.system_delete(key);
                 return false;
             };
             let vm_addr = match AccountAddress::from_hex_literal(&format!("0x{}", validator_addr)) {
@@ -4516,7 +4712,7 @@ impl Executor {
                         "   ❌ Invalid validator address for slash: {}",
                         validator_addr
                     );
-                    let _ = self.logged_delete(key);
+                    self.system_delete(key);
                     return false;
                 }
             };
@@ -4552,11 +4748,13 @@ impl Executor {
                 system_address(),
             ) {
                 Ok((_gas_used, vm_changes, status)) if status.success => {
+                    // B162: system writes (B140): a refused one fails the
+                    // block instead of leaving the offense half recorded.
                     for (k, v) in vm_changes {
-                        let _ = match v {
-                            Some(val) => self.logged_put(&k, &val),
-                            None => self.logged_delete(&k),
-                        };
+                        match v {
+                            Some(val) => self.system_put(&k, &val),
+                            None => self.system_delete(&k),
+                        }
                     }
                     self.sync_supply_trackers_from_validator_set();
                     println!("   ⚡ Offense recorded; the fraction settles by G5 SL-5");
@@ -4598,7 +4796,7 @@ impl Executor {
                     if slashed {
                         vals.retain(|(_, w)| *w > 0);
                         if let Ok(new_json) = serde_json::to_string(&vals) {
-                            let _ = self.logged_put("sys:validators", &new_json);
+                            self.system_put("sys:validators", &new_json);
                             println!(
                                 "   ⛓️  Validator set updated ({} -> {} validators)",
                                 before_len,
@@ -4622,7 +4820,7 @@ impl Executor {
                     v1.retain(|v| v.address != validator_addr);
                     if v1.len() != v1_before {
                         if let Ok(nj) = serde_json::to_string(&v1) {
-                            let _ = self.logged_put(validator_set_v1_key(), &nj);
+                            self.system_put(validator_set_v1_key(), &nj);
                             println!(
                                 "   🔻 Removed slashed validator from sys:validator_set:v1 ({} -> {})",
                                 v1_before,
@@ -4635,17 +4833,17 @@ impl Executor {
 
             // G5 SL-3: the offender is jailed for good (no payouts, no
             // committee, no rejoin). H-4 FIX: the tombstone stops a replay.
-            let _ = self.logged_put(
+            self.system_put(
                 &format!("validator:jailed:{}", validator_addr),
                 &round.to_string(),
             );
-            let _ = self.logged_put(&tombstone_key, "1");
+            self.system_put(&tombstone_key, "1");
             if full {
-                let _ = self.logged_put(&format!("validator:convicted_full:{validator_addr}"), "1");
+                self.system_put(&format!("validator:convicted_full:{validator_addr}"), "1");
             }
 
             // Delete the pending slash entry (processed)
-            let _ = self.logged_delete(key);
+            self.system_delete(key);
             println!("   ✅ Slash executed and cleared from queue.");
         }
         true
@@ -4912,10 +5110,31 @@ impl Executor {
                 recognized = true;
                 // AUDIT-B2: create_token burns the listing fee via staking::burn_ain.
                 deps.extend(Self::staking_global_keys());
-                deps.push(vm_move::state_keys::resource_key_str(
-                    &system_address(),
-                    "0x1::token_factory::TokenRegistry",
-                ));
+                // B135: each creator's registry is at its own address: the
+                // signer's (create_token, mint, disable_minting), and for a
+                // burn the creator it names; a mint credits its recipient's
+                // wallet. (The global registry is gone.)
+                deps.push(sender_resource("0x1::token_factory::CreatorTokens"));
+                let named = |index: usize| {
+                    call.args.get(index).and_then(|bytes| {
+                        bcs::from_bytes::<move_core_types::account_address::AccountAddress>(bytes)
+                            .ok()
+                    })
+                };
+                match (function, named(1), named(2)) {
+                    ("burn", Some(creator), _) => deps.push(vm_move::state_keys::resource_key_str(
+                        &creator,
+                        "0x1::token_factory::CreatorTokens",
+                    )),
+                    ("mint", _, Some(to)) => {
+                        deps.push(to.to_string());
+                        deps.push(vm_move::state_keys::resource_key_str(
+                            &to,
+                            "0x1::token_factory::TokenWallet",
+                        ));
+                    }
+                    _ => {}
+                }
                 deps.push(sender_resource("0x1::token_factory::TokenWallet"));
             } else if *module_addr == system_address() && module_name == "dex" {
                 recognized = true;
@@ -5276,9 +5495,25 @@ impl Executor {
         }
         let mut tx_status = "success".to_string();
         let mut tx_error: Option<String> = None;
+        // `$abort` is `charged_abort`, defined below (a macro sees the
+        // locals of its definition, not of its call).
         macro_rules! absorb_vm_result {
-            ($vm_changes:expr, $status:expr) => {{
-                for (k, v) in $vm_changes {
+            ($vm_changes:expr, $status:expr, $abort:expr) => {{
+                let vm_changes: Vec<(String, Option<String>)> = $vm_changes;
+                // B150: a write the state cannot hold (a key the classifier
+                // does not know, the one thing the block's write gate refuses:
+                // Move accepts a module or struct named `<SELF>`) was refused
+                // with its whole batch, and every validator panicked at that
+                // block for good. The transaction aborts, charged.
+                if vm_changes
+                    .iter()
+                    .any(|(key, _)| storage::class::classify(key.as_bytes()).is_none())
+                {
+                    return $abort(
+                        "a write the state cannot hold (a key no class names)".to_string(),
+                    );
+                }
+                for (k, v) in vm_changes {
                     updates.push((k, v));
                 }
                 self.append_supply_tracker_updates(&mut updates);
@@ -5364,6 +5599,18 @@ impl Executor {
 
         match parsed_payload {
             Ok(vm_move::TransactionPayload::EntryFunction(call)) => {
+                // B184: the proof-of-possession check is paid for before it
+                // runs (admission holds a join to the same floor).
+                let pop_gas = if is_join_validator_set(&call) {
+                    admission::POP_GAS
+                } else {
+                    0
+                };
+                if vm_limit < pop_gas {
+                    return charged_abort(format!(
+                        "execution gas {vm_limit} below the proof-of-possession check's {pop_gas}"
+                    ));
+                }
                 // SECURITY (B1): authoritative PoP gate. Move cannot run the
                 // BLS pairing check, so reject a join_validator_set whose
                 // proof-of-possession does not verify BEFORE dispatch.
@@ -5407,8 +5654,8 @@ impl Executor {
                 for tag in &call.ty_args {
                     deps::type_modules(tag, &mut roots);
                 }
-                let dependency_gas = match self.modules.closure(&self.db, roots) {
-                    Ok(closure) => closure.gas(),
+                let dependency_gas = match self.closure_in_block(roots) {
+                    Ok(closure) => closure.gas().saturating_add(pop_gas),
                     Err(e) => return charged_abort(e),
                 };
                 let Some(vm_budget) = vm_limit.checked_sub(dependency_gas) else {
@@ -5435,7 +5682,7 @@ impl Executor {
                 ) {
                     Ok((gas_used, vm_changes, status)) => {
                         vm_gas_used = gas_used.saturating_add(dependency_gas);
-                        if absorb_vm_result!(vm_changes, status) {
+                        if absorb_vm_result!(vm_changes, status, charged_abort) {
                             println!("✅ Move EntryFunction executed by {}", tx.sender);
                             // B1: keep sys:validator_set:v1 live on runtime join.
                             if let Some(info) = join_v1_entry {
@@ -5511,9 +5758,11 @@ impl Executor {
                     ));
                 }
                 // B69: the modules the bundle pulls in from the chain are
-                // paid for before the VM loads them.
+                // paid for before the VM loads them (B170: the versions it
+                // replaces too; one republished earlier in this block is
+                // refused).
                 let dependency_gas = match deps::bundle_roots(&modules)
-                    .and_then(|roots| self.modules.closure(&self.db, roots))
+                    .and_then(|roots| self.closure_in_block(roots))
                 {
                     Ok(closure) => closure.gas(),
                     Err(e) => return charged_abort(e),
@@ -5538,7 +5787,7 @@ impl Executor {
                 {
                     Ok((gas_used, vm_changes, status)) => {
                         vm_gas_used = gas_used.saturating_add(dependency_gas);
-                        if absorb_vm_result!(vm_changes, status) {
+                        if absorb_vm_result!(vm_changes, status, charged_abort) {
                             println!("✅ Move module published by {}", tx.sender);
                         } else {
                             println!(
@@ -5580,7 +5829,12 @@ impl Executor {
                 vm_gas: vm_gas_used.saturating_add(object_load_gas),
                 writes,
                 state_byte_gas: byte_gas,
-                floor: payload_kind(&tx.payload).map_or(0, |(_, floor)| floor),
+                // B141: and at least what admission holds back, or the limit
+                // an estimate gives could be refused (the prologue's
+                // allowance can be more than the prologue uses).
+                floor: payload_kind(&tx.payload)
+                    .map_or(0, |(_, floor)| floor)
+                    .max(charge_gas),
                 aborted: tx_error.clone(),
             };
         }
@@ -5757,6 +6011,25 @@ mod tests {
                 panic!("Deserialization failed: {}", e);
             }
         }
+    }
+
+    /// B277 witness: receipt text has its keys sorted at every depth, as the
+    /// sorted map wrote it, whatever order the value was built in (with
+    /// serde_json's `preserve_order` the bytes followed insertion order, and
+    /// `receipts_root` with them).
+    #[test]
+    fn receipt_text_sorts_its_keys_at_every_depth() {
+        let mut inner = serde_json::Map::new();
+        inner.insert("zeta".into(), serde_json::json!(1));
+        inner.insert("alpha".into(), serde_json::json!([{"y": 1, "b": 2}]));
+        let mut outer = serde_json::Map::new();
+        outer.insert("status".into(), serde_json::json!("success"));
+        outer.insert("metadata".into(), serde_json::Value::Object(inner));
+        outer.insert("error".into(), serde_json::Value::Null);
+        assert_eq!(
+            sorted_json(&serde_json::Value::Object(outer)),
+            r#"{"error":null,"metadata":{"alpha":[{"b":2,"y":1}],"zeta":1},"status":"success"}"#
+        );
     }
 
     #[test]
@@ -6588,13 +6861,6 @@ mod tests {
 
     fn validator_set_key() -> String {
         super::validator_set_key()
-    }
-
-    fn token_registry_key() -> String {
-        vm_move::state_keys::resource_key_str(
-            &system_address(),
-            "0x1::token_factory::TokenRegistry",
-        )
     }
 
     fn token_wallet_key(addr: &str) -> String {
@@ -8584,6 +8850,79 @@ mod tests {
         assert_eq!(g5_own_unbonding(&db, &v(1)), vec![(21, kept)]);
     }
 
+    /// B276 witness: a settlement call the cap (32 offenses) stopped prunes
+    /// nothing. One-hour blocks, R = 10. V0 (epoch 0) settles at 220 h; 32
+    /// light offenses and V1 (epoch 1, 20 h later: within D of V0) fall due
+    /// together at 240 h, past the time V0 is pruned by (236 h), so the cap
+    /// leaves V1 to the next call. V0 was dropped in the capped call, and V1
+    /// settled without its weight: (3 x 1,032 / 7,000)^2 = 19.57 % where
+    /// (3 x 2,032 / 7,000)^2 = 75.84 % is its fraction.
+    #[test]
+    fn g5_a_capped_settlement_keeps_what_a_later_offense_counts() {
+        use move_core_types::account_address::AccountAddress;
+        let ain = G5_AIN;
+        let hour = 3_600;
+        let seeds: Vec<(u8, u64)> = (180..187).map(|seed| (seed, 1_000)).collect();
+        let (mut chain, validators, _) = delegation_chain("g5_b276_cap", 10, hour, &seeds, &[]);
+        let db = chain.db.clone();
+        let v = |i: usize| validators[i].1.clone();
+        chain.run_to(21, vec![]);
+        g5_report(&chain, &v(0), 0, 1);
+        g5_report(&chain, &v(1), 1, 21);
+        assert_eq!(g5_offenses(&db).len(), 2);
+        let (s, u) = (g5_offense(&db, &v(0)), g5_offense(&db, &v(1)));
+        assert_eq!((s.epoch_began, u.epoch_began), (0, 20 * hour));
+        // 32 offenses of weight 1 in V1's epoch, ahead of it in the ledger.
+        let mut ledger = vec![s];
+        for i in 0..32u8 {
+            let mut bytes = [0u8; AccountAddress::LENGTH];
+            bytes[0] = 0xb2;
+            bytes[1] = 0x76;
+            bytes[AccountAddress::LENGTH - 1] = i;
+            ledger.push(TestOffense {
+                validator: AccountAddress::new(bytes),
+                weight: 1,
+                self_weight: 1,
+                delegated_weight: 0,
+                ..u.clone()
+            });
+        }
+        ledger.push(u);
+        {
+            let _seed = db.seeding();
+            db.put(
+                &vm_move::state_keys::resource_key_str(
+                    &system_address(),
+                    "0x1::delegation::Offenses",
+                ),
+                &hex::encode(bcs::to_bytes(&ledger).unwrap()),
+            )
+            .unwrap();
+        }
+        // Due once tau is past an offense's epoch start + D + I x C_tau + W.
+        let span = DAY + 20 * hour + 7 * DAY;
+        assert_eq!(span, 212 * hour);
+        chain.run_to(220, vec![]);
+        assert!(g5_offense(&db, &v(0)).settled, "V0 is due at 212 h");
+        assert!(!g5_offense(&db, &v(1)).settled);
+        chain.run_to(240, vec![]);
+        let light = g5_offenses(&db)
+            .into_iter()
+            .filter(|o| o.weight == 1 && o.settled)
+            .count();
+        assert_eq!(light, 32, "the 32 light offenses settle at 240 h");
+        assert!(
+            !g5_offense(&db, &v(1)).settled,
+            "vacuous: the cap did not stop the call"
+        );
+        assert_eq!(g5_own_unbonding(&db, &v(1)), vec![(21, 1_000 * ain)]);
+        chain.run_to(250, vec![]);
+        assert!(g5_offense(&db, &v(1)).settled);
+        // Q = 1,000 + 32 + 1,000 of 7,000: ceil(9e4 x 2,032^2 / 7,000^2).
+        let kept = 1_000 * ain - 1_000 * ain * 7_584 / 10_000;
+        assert_eq!(g5_own_unbonding(&db, &v(1)), vec![(21, kept)]);
+    }
+
     /// G5 SL-4, SL-5 through real blocks (R = 1, one-day blocks, 7 equal
     /// validators). Offenses count together when their epochs began within
     /// D. Two in epoch 0 cost (6/7)^2 = 73.47 % each, but only once
@@ -8830,6 +9169,113 @@ mod tests {
         assert_eq!(
             v6_pool.principal,
             v6_pool.active_coins + v6_pool.unbonding_coins
+        );
+    }
+
+    /// B149 witness: a pool is cut by its fraction of what it had at stake in
+    /// the offense's committee, not of what it holds when the slash settles
+    /// (a delegation made after the offense epoch began weighed nothing in
+    /// that committee, and was burned too). Five validators of 3,000 and V6
+    /// (own 1,000, pool 3,000) weigh 19,000 in epoch 1; V6 equivocates there
+    /// alone: f = ceil(9e4 x 4,000^2 / 19,000^2) = 3,989 bps, own 100 %,
+    /// pool ceil((3,989 x 4,000 - 10^4 x 1,000) / 3,000) = 1,986 bps. A
+    /// delegation of 10,000 made in epoch 1 is not cut.
+    #[test]
+    fn g5_a_pool_is_cut_by_what_it_had_at_stake() {
+        let ain = G5_AIN;
+        let mut seeds: Vec<(u8, u64)> = (180..185).map(|seed| (seed, 3_000)).collect();
+        seeds.push((185u8, 1_000u64));
+        let (mut chain, validators, delegators) = delegation_chain(
+            "b149_pool_cut",
+            1,
+            DAY,
+            &seeds,
+            &[(186, 3_100 * ain), (187, 10_100 * ain)],
+        );
+        let db = chain.db.clone();
+        let (v6_key, v6) = &validators[5];
+        let [(a_key, _), (b_key, _)] = <[_; 2]>::try_from(delegators).ok().unwrap();
+        let delegate = |chain: &mut G5Chain, key: &SigningKey, amount: u128| {
+            chain.tx(
+                key,
+                "delegation",
+                "delegate",
+                vec![move_addr_arg(v6), bcs::to_bytes(&amount).unwrap()],
+            )
+        };
+        let open = chain.tx(
+            v6_key,
+            "delegation",
+            "enable_delegation",
+            vec![bcs::to_bytes(&0u64).unwrap()],
+        );
+        chain.run_to(1, vec![open]);
+        let first = delegate(&mut chain, &a_key, 3_000 * ain);
+        chain.run_to(2, vec![first]);
+        chain.run_to(20, vec![]);
+        // Epoch 1 has begun: this delegation weighs nothing in its committee.
+        let late = delegate(&mut chain, &b_key, 10_000 * ain);
+        chain.run_to(21, vec![late]);
+        assert_eq!(
+            pool_of(&db, v6).active_coins,
+            13_000 * ain,
+            "vacuous: no late delegation"
+        );
+        g5_report(&chain, v6, 1, 21);
+        chain.run_to(49, vec![]);
+        assert!(g5_offense(&db, v6).settled, "vacuous: not settled");
+        // Cut: 1,986 bps of the 3,000 at stake (and the part of an AIN its
+        // whole-AIN weight drops), rounded up.
+        let cut = (3_001 * ain * 1_986).div_ceil(10_000);
+        assert_eq!(
+            pool_of(&db, v6).active_coins,
+            13_000 * ain - cut,
+            "the pool was cut by what it holds, not by what it had at stake"
+        );
+    }
+
+    /// B161 witness: a certificate conflict that moves an offense's scope to
+    /// an earlier epoch takes that epoch's split, what the pool had at stake
+    /// there (it kept the later offense's: a pool that grew between the two
+    /// had its later deposits burned).
+    #[test]
+    fn g5_a_raise_to_an_earlier_epoch_takes_its_split() {
+        let ain = G5_AIN;
+        let mut seeds: Vec<(u8, u64)> = (190..195).map(|seed| (seed, 3_000)).collect();
+        seeds.push((195u8, 1_000u64));
+        let (mut chain, validators, delegators) =
+            delegation_chain("b161_raise", 1, DAY, &seeds, &[(196, 3_100 * ain)]);
+        let db = chain.db.clone();
+        let (v6_key, v6) = &validators[5];
+        let (d_key, _) = &delegators[0];
+        let open = chain.tx(
+            v6_key,
+            "delegation",
+            "enable_delegation",
+            vec![bcs::to_bytes(&0u64).unwrap()],
+        );
+        chain.run_to(1, vec![open]);
+        let delegate = chain.tx(
+            d_key,
+            "delegation",
+            "delegate",
+            vec![move_addr_arg(v6), bcs::to_bytes(&(3_000 * ain)).unwrap()],
+        );
+        chain.run_to(2, vec![delegate]);
+        chain.run_to(21, vec![]);
+        // Its offense in epoch 1, where its pool weighed 3,000.
+        g5_report(&chain, v6, 1, 21);
+        assert_eq!(g5_offense(&db, v6).delegated_weight, 3_000, "vacuous");
+        // A conflict in epoch 0, where the pool weighed nothing.
+        {
+            let _seed = db.seeding();
+            assert!(chain.executor.execute_one_slash(v6, 0, 1, true));
+        }
+        let raised = g5_offense(&db, v6);
+        assert!(raised.full && raised.epoch == 0, "vacuous: not raised");
+        assert_eq!(
+            raised.delegated_weight, 0,
+            "the raise kept the later epoch's split"
         );
     }
 
@@ -9381,6 +9827,79 @@ mod tests {
     }
 
     /// The item a V4 node carries for twins (consensus `v4::evidence`).
+    /// B184 witness: a join pays at execution for its proof-of-possession
+    /// check with the modules it loads: one gas short of both, it aborts,
+    /// charged, before the VM runs (the check's gas was not counted, so a
+    /// join ran on the gas of its modules alone).
+    #[test]
+    fn a_join_pays_for_its_proof_of_possession_check() {
+        let ain = G5_AIN;
+        let mut keys = vec![];
+        let mut chain = G5Chain::new("b184_pop_paid", DAY, |db| {
+            keys.push(G5Chain::account(db, 214, 10_000 * ain));
+        });
+        let (key, sender) = keys[0].clone();
+        let (bls_public_key, bls_pop) = test_bls_identity(214);
+        let payload = entry_payload(
+            "staking",
+            "join_validator_set",
+            vec![],
+            vec![
+                bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
+                bcs::to_bytes(&(1_500 * ain)).unwrap(),
+                bcs::to_bytes(&key.verifying_key().to_bytes().to_vec()).unwrap(),
+                bcs::to_bytes(&bls_public_key).unwrap(),
+                bcs::to_bytes(&bls_pop).unwrap(),
+            ],
+        );
+        let staking = move_core_types::language_storage::ModuleId::new(
+            move_core_types::account_address::AccountAddress::ONE,
+            move_core_types::identifier::Identifier::new("staking").unwrap(),
+        );
+        let modules = chain.executor.closure_in_block([staking]).unwrap().gas();
+        let needed = modules + admission::POP_GAS;
+        let short = signed_tx(&key, &sender, &payload, 0, needed - 1, 1);
+        chain.run_to(1, vec![short.clone()]);
+        let receipt: serde_json::Value = serde_json::from_str(
+            &chain
+                .db
+                .get(&format!("tx_receipt:{}", tx_hash_hex(&short)))
+                .unwrap()
+                .expect("a receipt"),
+        )
+        .unwrap();
+        assert_eq!(receipt["status"], "aborted", "{receipt}");
+        assert!(
+            receipt["error"]
+                .as_str()
+                .is_some_and(|e| e.contains(&format!("costs {needed} gas"))),
+            "{receipt}"
+        );
+    }
+
+    /// B192: evidence of epoch `u64::MAX` is refused, since no epoch
+    /// follows it (`epoch + 1` wrapped to 0 in release, panicked in debug).
+    #[test]
+    fn evidence_of_the_last_epoch_is_refused_not_wrapped() {
+        let seeds: Vec<(u8, u64)> = (190..194).map(|seed| (seed, 1_000)).collect();
+        let (chain, validators, _) = delegation_chain("b192_last_epoch", 20, DAY, &seeds, &[]);
+        let gi = "b192-last-epoch-genesis";
+        {
+            let _seed = chain.db.seeding();
+            chain.db.put("genesis_identity", gi).unwrap();
+        }
+        let key = &validators[1].0;
+        let (a, b) = (
+            g5_v4_vertex(key, u64::MAX, 5, "a", gi),
+            g5_v4_vertex(key, u64::MAX, 5, "b", gi),
+        );
+        let refused = chain
+            .executor
+            .verify_slash_evidence(&consensus_evidence_item(&a, &b))
+            .unwrap_err();
+        assert!(refused.contains("no epoch follows"), "{refused}");
+    }
+
     fn consensus_evidence_item(a: &blockchain::Vertex, b: &blockchain::Vertex) -> String {
         let (first, second) = if a.hash < b.hash { (a, b) } else { (b, a) };
         serde_json::json!({
@@ -12110,33 +12629,37 @@ mod tests {
             &serde_json::to_string(&vec![good, bad]).unwrap(),
         )
         .unwrap();
-        let outcome = Executor::new(db.clone())
-            .execute_block_checked_at(
-                vec![tx_json],
-                &sender,
-                1,
-                block_time(1),
-                0,
-                &[],
-                &[],
-                |_, _| Ok(()),
-            )
-            .unwrap();
-        assert!(matches!(outcome, BlockExecOutcome::Executed(_)));
+        let executor = Executor::new(db.clone());
+        // Block 1 empty, so the share is queued while block 2 executes.
+        for (height, txs) in [(1, vec![]), (2, vec![tx_json])] {
+            let outcome = executor
+                .execute_block_checked_at(
+                    txs,
+                    &sender,
+                    height,
+                    block_time(height),
+                    0,
+                    &[],
+                    &[],
+                    |_, _| Ok(()),
+                )
+                .unwrap();
+            assert!(matches!(outcome, BlockExecOutcome::Executed(_)));
+        }
         let queued: Vec<String> = db
             .scan_prefix("sys:fee_sweep_queue:")
             .into_iter()
             .map(|(k, _)| k)
             .collect();
         assert!(!queued.is_empty(), "positive control: a share was queued");
-        // Queued at height 1; the block's own sweep tried it once and it
-        // failed, so B108 makes it due at 1 + 2^1 (from latest_height, 0, it
-        // would be 2).
+        // Queued at height 2; the block's own sweep tried it once and it
+        // failed, so it is due at the next multiple of 2^1 after 2, 4 (B195;
+        // from latest_height, 1, it would be 2).
         assert!(
             queued
                 .iter()
-                .all(|k| k.starts_with("sys:fee_sweep_queue:00000000000000000003:")),
-            "keyed from the executing height 1: {queued:?}"
+                .all(|k| k.starts_with("sys:fee_sweep_queue:00000000000000000004:")),
+            "keyed from the executing height 2: {queued:?}"
         );
     }
 
@@ -12276,6 +12799,63 @@ mod tests {
         };
         let full = run(&producer, vec![a.clone(), b, c.clone()]);
         assert_eq!(full.body, vec![a, c], "positive control: B did not pay");
+        let body = run(&follower, full.body.clone());
+        assert_eq!(body.body, full.body);
+        assert_eq!(body.state_root, full.state_root);
+        assert_eq!(body.receipts_root, full.receipts_root);
+    }
+
+    /// B272 witness: a transaction carried twice runs at its first copy
+    /// only, so the body is what ran, in the order it ran. X (sequence 1)
+    /// comes before Y (sequence 0) and again after it: the second copy ran
+    /// and the body put it first, where a node importing the body could not
+    /// run it, reaching another state root.
+    #[test]
+    fn a_transaction_carried_twice_runs_at_its_first_copy_only() {
+        let setup = |name: &str| {
+            let db = temp_db(name);
+            load_stdlib(&db);
+            {
+                let _seed = db.seeding();
+                db.set_federation_key("00000000000000000000000000000000")
+                    .unwrap();
+            }
+            let keys: Vec<SigningKey> = (0..2u8)
+                .map(|i| SigningKey::from_bytes(&[110 + i; 32]))
+                .collect();
+            let addrs: Vec<String> = keys.iter().map(|k| create_account(&db, k)).collect();
+            set_coin_store(&db, &addrs[0], 10_000_000);
+            set_coin_store(&db, &addrs[1], 0);
+            seed_genesis_tree(&db);
+            (db, keys, addrs)
+        };
+        let (producer, keys, addrs) = setup("b272_producer");
+        let (follower, _, _) = setup("b272_follower");
+        let transfer = |sequence: u64| {
+            let tx: Transaction = serde_json::from_str(&signed_tx(
+                &keys[0],
+                &addrs[0],
+                &coin_transfer_payload(&addrs[0], &addrs[1], 5),
+                sequence,
+                0,
+                1,
+            ))
+            .unwrap();
+            sign_covering(&keys[0], tx, 100_000)
+        };
+        let (y, x) = (transfer(0), transfer(1));
+        let run = |db: &Arc<StateDB>, txs: Vec<String>| {
+            let Ok(BlockExecOutcome::Executed(summary)) = Executor::new(db.clone())
+                .execute_block_checked_at(txs, &addrs[0], 1, block_time(1), 0, &[], &[], |_, _| {
+                    Ok(())
+                })
+            else {
+                panic!("block must execute");
+            };
+            summary
+        };
+        let full = run(&producer, vec![x.clone(), y.clone(), x]);
+        assert_eq!(full.body, vec![y], "only the first copy of X is tried");
         let body = run(&follower, full.body.clone());
         assert_eq!(body.body, full.body);
         assert_eq!(body.state_root, full.state_root);
@@ -13153,7 +13733,6 @@ mod tests {
         set_validator_set(&db, &sender, 0, 200_000_000_000_000_000_000);
         db.put("sys:total_supply", "200000000000000000000").unwrap();
         db.put("total_burned", "0").unwrap();
-        db.put(&token_registry_key(), "00").unwrap();
         db.put(&token_wallet_key(&sender), "00").unwrap();
 
         let call = vm_move::EntryFunctionCall {
@@ -13508,6 +14087,294 @@ mod tests {
         assert!(
             attempts.iter().all(|a| *a == 1),
             "retried before due: {attempts:?}"
+        );
+    }
+
+    /// B138 witness: a share rescheduled onto a height where its miner
+    /// already has one queued joins it (it overwrote it, and the coins queued
+    /// there were gone for good), keeping the larger attempt count.
+    #[test]
+    fn a_rescheduled_fee_share_joins_the_one_queued_where_it_lands() {
+        let db = temp_db("b138_sweep");
+        load_stdlib(&db);
+        let executor = Executor::new(db.clone());
+        let _seed = db.seeding();
+        let miner = "not_a_hex_address";
+        // Block 10's share fails at 10 (due at 12), then at 12 (due at 16).
+        executor.queue_fee_sweep(miner, 100, 10);
+        executor.process_fee_sweep_queue(10);
+        executor.process_fee_sweep_queue(12);
+        // Block 14's share fails at 14: due at 16 too.
+        executor.queue_fee_sweep(miner, 7, 14);
+        executor.process_fee_sweep_queue(14);
+        let queued = db.scan_prefix("sys:fee_sweep_queue:");
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(queued[0].0, Executor::sweep_key(16, miner));
+        let entry: FeeSweepEntry = serde_json::from_str(&queued[0].1).unwrap();
+        assert_eq!(entry.amount, "107", "a queued share was overwritten");
+        assert_eq!(entry.attempts, 2, "the larger attempt count is kept");
+    }
+
+    /// B195 witness: the shares a recipient can never take share their rows
+    /// (one a back-off level, not one a block) and are burned in the end:
+    /// deducted from their payers, they were neither minted nor burned, and
+    /// the supply trackers overstated circulation for good.
+    #[test]
+    fn an_unpayable_fee_share_is_burned_in_the_end() {
+        let db = temp_db("b195_burn");
+        load_stdlib(&db);
+        let executor = Executor::new(db.clone());
+        let _seed = db.seeding();
+        db.put("sys:total_supply", "1000000").unwrap();
+        let miner = "not_a_hex_address";
+        for height in 10..210u64 {
+            executor.queue_fee_sweep(miner, 1, height);
+            executor.process_fee_sweep_queue(height);
+        }
+        let rows = db.scan_prefix("sys:fee_sweep_queue:").len();
+        assert!(
+            rows <= 2 * FEE_SWEEP_ATTEMPTS as usize,
+            "{rows} rows for one recipient"
+        );
+        let due = |key: &str| -> u64 {
+            key.strip_prefix("sys:fee_sweep_queue:")
+                .and_then(|rest| rest.split(':').next())
+                .and_then(|d| d.parse().ok())
+                .unwrap()
+        };
+        // Bounded: each pass retries the earliest rows once.
+        for _ in 0..10_000 {
+            let Some((key, _)) = db.scan_prefix("sys:fee_sweep_queue:").first().cloned() else {
+                break;
+            };
+            executor.process_fee_sweep_queue(due(&key));
+        }
+        assert_eq!(
+            db.get("sys:total_supply").unwrap().unwrap(),
+            (1_000_000 - 200).to_string(),
+            "the unpaid shares were not burned"
+        );
+    }
+
+    /// B140 witness: a system write of the block path that the write gate
+    /// refuses fails the block, and nothing of it is published (it was
+    /// dropped unseen: here a fee share re-queued under a key the classifier
+    /// does not know was lost).
+    #[test]
+    fn a_refused_system_write_fails_the_block() {
+        let db = temp_db("b140_refused");
+        load_stdlib(&db);
+        let _seed = db.seeding();
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        let executor = Executor::new(db.clone());
+        let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
+        seed_genesis_tree(&db);
+        // A share due at block 1 whose miner, re-queued, makes a key the
+        // classifier does not know (a colon inside a segment).
+        let entry = FeeSweepEntry {
+            miner: "a:b".to_string(),
+            amount: "5".to_string(),
+            reason: "b140".to_string(),
+            attempts: 0,
+        };
+        db.put(
+            &Executor::sweep_key(1, "ab"),
+            &serde_json::to_string(&entry).unwrap(),
+        )
+        .unwrap();
+        let error = executor
+            .execute_block_checked_at(vec![], proposer, 1, block_time(1), 0, &[], &[], |_, _| {
+                Ok(())
+            })
+            .expect_err("a block whose system write was refused executed");
+        assert!(error.contains("was refused"), "{error}");
+        assert_eq!(
+            executor.last_executed_height(),
+            0,
+            "the block was published"
+        );
+    }
+
+    /// B139/B170 witness: a module republished in a block never runs in its
+    /// replaced form. Nothing later in that block may load it: the block's
+    /// VM holds the replaced code (move-vm marks its cache invalid on an
+    /// upgrade and never flushes it), and flushing that cache mid-block
+    /// re-verified the stdlib once per upgrade, uncharged. A call and a
+    /// second upgrade after it abort, charged; the next block runs the new
+    /// code.
+    #[test]
+    fn a_module_upgraded_in_a_block_runs_from_the_next_one() {
+        let db = temp_db("b139_upgrade");
+        load_stdlib(&db);
+        let key = SigningKey::from_bytes(&[91u8; 32]);
+        let owner = create_account(&db, &key);
+        let _seed = db.seeding();
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        set_coin_store(&db, &owner, 50_000_000);
+        seed_genesis_tree(&db);
+        let executor = Executor::new(db.clone());
+        let proposer = "0000000000000000000000000000000000000000000000000000000000000001";
+        let publish = |bytes: &[u8], seq: u64| {
+            let payload = vm_move::TransactionPayload::PublishModule(vec![bytes.to_vec()]);
+            let payload = hex::encode(bcs::to_bytes(&payload).unwrap());
+            signed_tx(&key, &owner, &payload, seq, 1_000_000, 1)
+        };
+        let mark = |seq: u64| {
+            let call = EntryFunctionCall {
+                module: move_core_types::language_storage::ModuleId::new(
+                    parse_move_address(&owner).unwrap(),
+                    move_core_types::identifier::Identifier::new("upgrade_probe").unwrap(),
+                ),
+                function: "mark".to_string(),
+                ty_args: vec![],
+                args: vec![bcs::to_bytes(&parse_move_address(&owner).unwrap()).unwrap()],
+            };
+            let payload = vm_move::TransactionPayload::EntryFunction(call);
+            let payload = hex::encode(bcs::to_bytes(&payload).unwrap());
+            signed_tx(&key, &owner, &payload, seq, 1_000_000, 1)
+        };
+        let v1 = include_bytes!("../tests/fixtures/upgrade_probe_v1.mv");
+        let v2 = include_bytes!("../tests/fixtures/upgrade_probe_v2.mv");
+        let run = |height: u64, txs: Vec<String>| match executor.execute_block_parallel_at(
+            txs,
+            proposer,
+            height,
+            block_time(height),
+            0,
+            &[],
+            &[],
+        ) {
+            BlockExecOutcome::Executed(s) => s,
+            other => panic!("block {height} must execute: {other:?}"),
+        };
+        run(1, vec![publish(v1, 0)]);
+        let receipt = |raw: &String| -> serde_json::Value {
+            let stored = db
+                .get(&format!("tx_receipt:{}", tx_hash_hex(raw)))
+                .unwrap()
+                .unwrap();
+            serde_json::from_str(&stored).unwrap()
+        };
+        let mark_key = vm_move::state_keys::resource_key_str(
+            &parse_move_address(&owner).unwrap(),
+            &format!("0x{owner}::upgrade_probe::Mark"),
+        );
+        let version = || -> u64 {
+            bcs::from_bytes(&hex::decode(db.get(&mark_key).unwrap().unwrap()).unwrap()).unwrap()
+        };
+        // Block 2: version 1 runs (and is cached), version 2 replaces it,
+        // and a call and a second upgrade after it abort.
+        let txs = vec![mark(1), publish(v2, 2), mark(3), publish(v1, 4)];
+        let summary = run(2, txs.clone());
+        assert_eq!(summary.executed_raws.len(), 4, "vacuous: not all ran");
+        for raw in &txs[..2] {
+            assert_eq!(
+                receipt(raw)["status"],
+                "success",
+                "vacuous: {}",
+                receipt(raw)
+            );
+        }
+        for raw in &txs[2..] {
+            let r = receipt(raw);
+            assert_eq!(r["status"], "aborted", "it ran in the upgrade's block: {r}");
+            assert!(
+                r["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("upgraded in this block")),
+                "aborted for another reason: {r}"
+            );
+        }
+        assert_eq!(version(), 1, "a call after the upgrade ran in its block");
+        // Block 3: the new code.
+        let next = vec![mark(5)];
+        run(3, next.clone());
+        assert_eq!(receipt(&next[0])["status"], "success");
+        assert_eq!(version(), 2, "the next block ran the replaced code");
+    }
+
+    /// B141: the gas prologue (`coin::deduct_gas`) fits the allowance the
+    /// precharge holds back for it, so a transaction a block reserved space
+    /// for always runs its prologue and is charged (one whose prologue ran
+    /// out of gas was refused uncharged). Prints the measured gas.
+    #[test]
+    fn the_gas_prologue_fits_its_allowance() {
+        let db = temp_db("b141_prologue");
+        load_stdlib(&db);
+        let key = SigningKey::from_bytes(&[93u8; 32]);
+        let payer = create_account(&db, &key);
+        let _seed = db.seeding();
+        set_coin_store(&db, &payer, u128::MAX);
+        let executor = Executor::new(db.clone());
+        let deduct = MoveAction::CallEntryFunction(EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                system_address(),
+                move_core_types::identifier::Identifier::new("coin").unwrap(),
+            ),
+            function: "deduct_gas".to_string(),
+            ty_args: vec![aincore_coin_type()],
+            args: vec![
+                bcs::to_bytes(&system_address()).unwrap(),
+                bcs::to_bytes(&parse_move_address(&payer).unwrap()).unwrap(),
+                bcs::to_bytes(&u128::MAX).unwrap(),
+            ],
+        });
+        let (used, _, status) = executor
+            .vm
+            .execute_transaction_actions(
+                vec![(deduct, true, system_address())],
+                parse_move_address(&payer).unwrap(),
+                MAX_GAS_LIMIT,
+            )
+            .expect("the prologue runs");
+        assert!(status.success, "vacuous: {status:?}");
+        println!("B141: the gas prologue used {used} gas");
+        assert!(
+            used <= admission::PROLOGUE_GAS,
+            "the prologue used {used} gas, over its allowance {}",
+            admission::PROLOGUE_GAS
+        );
+        // The precharge holds the allowance back on top of the writes.
+        let tx: Transaction =
+            serde_json::from_str(&signed_tx(&key, &payer, "00", 0, 0, 1)).unwrap();
+        let writes = account_writes_at(&db, &tx, &payer, false).unwrap();
+        let byte_gas = state_gas::committed_state_byte_gas(&db);
+        assert_eq!(
+            precharge_gas(&db, &tx),
+            Some(state_gas::write_cost(&db, &writes).gas(byte_gas) + admission::PROLOGUE_GAS),
+            "the precharge does not hold the prologue's allowance back"
+        );
+    }
+
+    /// B174 witness: the precharge prices the sender's record at the number
+    /// the block writes (the transaction's own + 1), so a transaction whose
+    /// number crosses a digit boundary (98 committed, 99 sent) is not
+    /// admitted for less than a block holds it to.
+    #[test]
+    fn the_precharge_prices_the_record_the_block_writes() {
+        let db = temp_db("b174_digits");
+        let key = SigningKey::from_bytes(&[94u8; 32]);
+        let sender = create_account(&db, &key);
+        let set_sequence = |sequence: u64| {
+            let _seed = db.seeding();
+            let mut object = db.get_object(&sender).expect("the account");
+            let mut data: aa::AccountData = serde_json::from_slice(&object.data).unwrap();
+            data.sequence_number = sequence;
+            object.data = serde_json::to_vec(&data).unwrap();
+            db.put_object(&object).expect("stored");
+        };
+        set_sequence(98);
+        let tx: Transaction =
+            serde_json::from_str(&signed_tx(&key, &sender, "00", 99, 0, 1)).unwrap();
+        let admitted = precharge_gas(&db, &tx).expect("a precharge");
+        set_sequence(99);
+        let writes = account_writes_at(&db, &tx, &sender, true).expect("its turn");
+        let held = charge_gas_in(&db, &tx, &writes);
+        assert!(
+            admitted >= held,
+            "admitted at {admitted}, a block holds it to {held}"
         );
     }
 

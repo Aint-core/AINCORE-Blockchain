@@ -1,5 +1,10 @@
 # AINCORE Emission Calibration — Pre-Genesis Research Report
 
+> **Superseded (2026-10-07, round 16 review):** the chain follows
+> `docs/G5_ECONOMICS_CONTRACT.md` (EM-1). Where this report differs, notably its
+> governance-tunable per-epoch rate and a separate delegation stream, the
+> contract and the code are authoritative; this report is kept as research history.
+
 > **Purpose:** decide the permanent-genesis emission calibration (DRAW_NUM), the block-time
 > pinning mechanism, delegation-at-launch, and DEX float sizing — with mathematical modeling,
 > real-chain empirical evidence, adversarial stress-testing, and academic grounding.

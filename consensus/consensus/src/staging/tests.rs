@@ -508,6 +508,75 @@ fn the_pending_buffer_evicts_the_highest_round() {
         .is_some());
 }
 
+/// B224 witness: `evicts` names exactly the vertex `push` would evict at
+/// once, a twin at a full share's top round included (an evicted body's
+/// copies skip Layer S only while it would be evicted again).
+#[test]
+fn evicts_predicts_what_push_evicts() {
+    let all = members();
+    let top = FIRST + PENDING_MAX_PER_AUTHOR as u64 - 1;
+    let author = all[0].info.address.clone();
+    let mut probes = vec![twin(&all[0], top + 1, "q"), twin(&all[0], FIRST - 1, "q")];
+    for tag in ["t1", "t2", "t3", "t4"] {
+        probes.push(twin(&all[0], top, tag));
+    }
+    let mut full = PendingBuffer::default();
+    for r in FIRST..=top {
+        assert!(full.push(twin(&all[0], r, "p")).is_none());
+    }
+    let mut seen = [false, false];
+    for v in probes {
+        let predicted = full.evicts(&author, v.round, &v.hash);
+        let mut probe = PendingBuffer::default();
+        for r in FIRST..=top {
+            probe.push(twin(&all[0], r, "p"));
+        }
+        let evicted = probe.push(v.clone()).map(|e| e.hash);
+        assert_eq!(
+            predicted,
+            evicted.as_deref() == Some(v.hash.as_str()),
+            "round {}",
+            v.round
+        );
+        seen[usize::from(predicted)] = true;
+    }
+    assert_eq!(seen, [true, true], "vacuous: one outcome only");
+    assert!(
+        !PendingBuffer::default().evicts(&author, top + 1, "x"),
+        "an empty share evicts nothing"
+    );
+}
+
+/// B257 witness: the buffer's digests follow every push, eviction, removal
+/// and drain (`contains` scanned every held vertex, once per body want and
+/// tick, under the consensus lock).
+#[test]
+fn pending_digests_follow_every_change() {
+    let all = members();
+    let top = FIRST + PENDING_MAX_PER_AUTHOR as u64 - 1;
+    let mut buf = PendingBuffer::default();
+    for r in FIRST..=top {
+        assert!(buf.push(twin(&all[0], r, "p")).is_none());
+    }
+    let evicted = buf
+        .push(twin(&all[0], top + 1, "q"))
+        .expect("a full share evicts");
+    assert!(!buf.contains(&evicted.hash), "an evicted digest is held");
+    let low = twin(&all[0], FIRST, "p");
+    assert!(buf.contains(&low.hash), "vacuous: the lowest is not held");
+    assert!(buf.remove(&low.author, low.round, &low.hash).is_some());
+    assert!(!buf.contains(&low.hash), "a removed digest is held");
+    let other = twin(&all[1], FIRST, "p");
+    assert!(buf.push(other.clone()).is_none());
+    assert!(buf.contains(&other.hash));
+    let drained = buf.take_all();
+    assert!(drained.iter().any(|v| v.hash == other.hash));
+    assert!(
+        drained.iter().all(|v| !buf.contains(&v.hash)),
+        "a drained digest is held"
+    );
+}
+
 /// S2 review 2: the stored body is canonical, without transport fields, so
 /// the first copy to arrive cannot pad what is stored and served.
 #[test]
@@ -775,7 +844,7 @@ fn ingress_and_boot_bound_the_same_bytes() {
         chain_id: CHAIN,
         genesis_identity: GENESIS,
         active: record(&c, &s),
-        previous: None,
+        gap_wanted_to: 0,
         next: None,
         now_secs: 2_000,
         gc_floor: 0,

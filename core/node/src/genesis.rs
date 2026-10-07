@@ -511,19 +511,15 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
     struct PoolRegistry {
         pools: Vec<PoolInfo>,
     }
-    // Mirror the Move field order of 0x1::wbtc::BridgeConfig and
-    // 0x1::token_factory::TokenRegistry so a datadir missing either resource
-    // fails fast at reopen instead of forking on the first wBTC / token_factory
-    // transaction. Genesis seeds both (added in the v2 bump above).
+    // Mirror the Move field order of 0x1::wbtc::BridgeConfig so a datadir
+    // missing it fails fast at reopen instead of forking on the first wBTC
+    // transaction. (B135: token_factory keeps each creator's tokens at the
+    // creator's address; there is no global registry to seed or check.)
     #[derive(serde::Deserialize)]
     struct WbtcBridgeConfig {
         authority: AccountAddress,
         total_minted: u128,
         total_burned: u128,
-    }
-    #[derive(serde::Deserialize)]
-    struct TokenFactoryRegistry {
-        tokens: Vec<Vec<u8>>,
     }
 
     let stored_modules = decode_stored_stdlib_modules(storage)?;
@@ -607,10 +603,6 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
         decode_resource(storage, &system_resource_key("0x1::dex::PoolRegistry"))?;
     let _bridge_config: WbtcBridgeConfig =
         decode_resource(storage, &system_resource_key("0x1::wbtc::BridgeConfig"))?;
-    let _token_registry: TokenFactoryRegistry = decode_resource(
-        storage,
-        &system_resource_key("0x1::token_factory::TokenRegistry"),
-    )?;
 
     Ok(())
 }
@@ -1740,33 +1732,8 @@ pub fn build_genesis(
         storage.put(&bridge_key, &hex::encode(bridge_bytes))?;
     }
 
-    // === Initialize Token Factory Registry ===
-    // create_token, mint, burn, transfer and disable_minting all reach for
-    // borrow_global_mut<TokenRegistry>(@0x1), and token_factory::initialize is a
-    // `public fun` that likewise needs an unobtainable 0x1 signer. Without this
-    // seed every token_factory entry function aborts for the life of the chain.
-    #[derive(serde::Serialize)]
-    struct TokenInfo {
-        token_id: Vec<u8>,
-        name: Vec<u8>,
-        symbol: Vec<u8>,
-        decimals: u8,
-        max_supply: u128,
-        current_supply: u128,
-        creator: AccountAddress,
-        is_mintable: bool,
-        icon_url: Vec<u8>,
-        project_url: Vec<u8>,
-    }
-    #[derive(serde::Serialize)]
-    struct TokenRegistry {
-        tokens: Vec<TokenInfo>,
-    }
-
-    let token_registry = TokenRegistry { tokens: vec![] };
-    let token_registry_key = system_resource_key("0x1::token_factory::TokenRegistry");
-    let token_registry_bytes = bcs::to_bytes(&token_registry)?;
-    storage.put(&token_registry_key, &hex::encode(token_registry_bytes))?;
+    // (B135: token_factory has no global registry to seed: each creator's
+    // tokens live at the creator's address, made by its first create_token.)
 
     // === FINAL CHECK: SET TOTAL SUPPLY ===
     // Bootstrap stake plus genesis accounts (B7: no treasury reserve).
@@ -1822,7 +1789,6 @@ mod tests {
             "0x1::universal_mining::OracleConfig",
             "0x1::dex::PoolRegistry",
             "0x1::wbtc::BridgeConfig",
-            "0x1::token_factory::TokenRegistry",
         ] {
             assert_eq!(
                 super::system_resource_key(tag),
@@ -2749,11 +2715,6 @@ mod tests {
         total_burned: u128,
     }
 
-    #[derive(serde::Deserialize)]
-    struct DecodedTokenRegistry {
-        tokens: Vec<Vec<u8>>,
-    }
-
     /// AincoreCoin and WBTC are the only two coin types this chain defines, so
     /// WBTC is the only asset a DEX pool can pair AIN against. wbtc::mint refuses
     /// to run unless BridgeConfig lives at @0x1, and wbtc::initialize requires a
@@ -2828,35 +2789,6 @@ mod tests {
         apply_updates(&db, updates);
 
         assert_eq!(wbtc_balance(&db, &holder), 5_000);
-    }
-
-    /// Every token_factory entry function reaches for TokenRegistry at @0x1 and
-    /// its initialize() is a `public fun` needing the same unobtainable 0x1
-    /// signer, so an unseeded registry means create_token aborts forever.
-    #[test]
-    fn test_fresh_genesis_seeds_token_registry() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
-        let db = temp_db("token_registry");
-        let key = SigningKey::from_bytes(&[33u8; 32]);
-        let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
-        let pubkey = hex::encode(key.verifying_key().as_bytes());
-
-        let path = single_validator_genesis(&addr, &pubkey);
-        let res = initialize_genesis_from(&db, &stdlib_path(), &path);
-        res.expect("fresh genesis initializes");
-
-        let raw = db
-            .get(&system_resource_key("0x1::token_factory::TokenRegistry"))
-            .expect("storage read")
-            .expect("genesis seeds token_factory::TokenRegistry");
-        let bytes = hex::decode(raw).expect("hex");
-        // An empty Move vector is a single uleb128 zero, so the element type does
-        // not matter for this decode -- only that the registry is present, empty,
-        // and consumes the whole value with nothing trailing.
-        assert_eq!(bytes, vec![0u8]);
-        let registry: DecodedTokenRegistry =
-            bcs::from_bytes(&bytes).expect("TokenRegistry decodes as an empty vector");
-        assert!(registry.tokens.is_empty());
     }
 
     // ===== DEX: first on-chain exercise of 0x1::dex =====
@@ -3344,23 +3276,30 @@ mod tests {
         assert_eq!(gas_of(), alone, "the swap's gas grew with the registry");
     }
 
-    /// B99 witness: a full token registry (512 tokens) refuses another before
-    /// its fee is taken, so no call grows the registry past what a load can
-    /// pay for (unbounded, ~50 large tokens made every call abort for good).
-    /// The creator can afford the fee: without the cap the token is created.
+    /// B99/B135 witness: a creator's own registry (64 tokens) refuses another
+    /// before its fee is taken, while another creator, with a registry of its
+    /// own, still creates one (one global registry, capped, could be filled
+    /// by anyone for 51,200 AIN and closed to everyone); and a token reaches
+    /// only a wallet that registered it (anyone could push balances into a
+    /// wallet).
     #[test]
-    fn a_full_token_registry_refuses_another_token() {
+    fn a_creators_full_registry_refuses_only_that_creator() {
         const AIN: u128 = 1_000_000_000_000_000_000;
         let _guard = GENESIS_ENV_LOCK.lock().unwrap();
-        let db = temp_db("b99_tokens");
+        let db = temp_db("b135_tokens");
         let authority_key = SigningKey::from_bytes(&[71u8; 32]);
         let authority = crypto::derive_address(authority_key.verifying_key().as_bytes()).unwrap();
         let authority_pubkey = hex::encode(authority_key.verifying_key().as_bytes());
         let path = single_validator_genesis(&authority, &authority_pubkey);
         initialize_genesis_from(&db, &stdlib_path(), &path).expect("fresh genesis initializes");
-        let key = SigningKey::from_bytes(&[72u8; 32]);
-        let creator = create_account(&db, &key);
-        set_coin_store(&db, &creator, 200 * AIN);
+        let account = |seed: u8| {
+            let key = SigningKey::from_bytes(&[seed; 32]);
+            let addr = create_account(&db, &key);
+            set_coin_store(&db, &addr, 400 * AIN);
+            (key, addr)
+        };
+        let ((key, creator), (other_key, other), (to_key, to)) =
+            (account(72), account(73), account(74));
         #[derive(serde::Serialize)]
         struct FakeToken {
             token_id: Vec<u8>,
@@ -3378,56 +3317,133 @@ mod tests {
         struct Registry {
             tokens: Vec<FakeToken>,
         }
-        let tokens = (0..512u32)
+        #[derive(serde::Deserialize)]
+        struct Balance {
+            token_id: Vec<u8>,
+            balance: u128,
+        }
+        #[derive(serde::Deserialize)]
+        struct Wallet {
+            balances: Vec<Balance>,
+        }
+        let creator_addr = parse_move_addr(&creator).unwrap();
+        let tokens = (0..64u32)
             .map(|i| FakeToken {
-                token_id: i.to_le_bytes().to_vec(),
+                token_id: [format!("T{i}").into_bytes(), creator_addr.to_vec()].concat(),
                 name: b"t".to_vec(),
-                symbol: b"T".to_vec(),
+                symbol: format!("T{i}").into_bytes(),
                 decimals: 8,
                 max_supply: 1,
                 current_supply: 0,
-                creator: AccountAddress::ONE,
+                creator: creator_addr,
                 is_mintable: true,
                 icon_url: vec![],
                 project_url: vec![],
             })
             .collect();
-        let registry_key = system_resource_key("0x1::token_factory::TokenRegistry");
+        let registry_of = |addr: &str| {
+            vm_move::state_keys::resource_key_str(
+                &parse_move_addr(addr).unwrap(),
+                "0x1::token_factory::CreatorTokens",
+            )
+        };
         {
             let _seed = db.seeding();
             db.put(
-                &registry_key,
+                &registry_of(&creator),
                 &hex::encode(bcs::to_bytes(&Registry { tokens }).unwrap()),
             )
             .unwrap();
         }
         let executor = Executor::new(db.clone());
-        let create = entry_payload(
-            "token_factory",
-            "create_token",
-            vec![],
-            vec![
-                bcs::to_bytes(&parse_move_addr(&creator).unwrap()).unwrap(),
-                bcs::to_bytes(&b"Name".to_vec()).unwrap(),
-                bcs::to_bytes(&b"SYM".to_vec()).unwrap(),
-                bcs::to_bytes(&8u8).unwrap(),
-                bcs::to_bytes(&1_000u128).unwrap(),
-                bcs::to_bytes(&0u128).unwrap(),
-                bcs::to_bytes(&Vec::<u8>::new()).unwrap(),
-                bcs::to_bytes(&Vec::<u8>::new()).unwrap(),
-            ],
-        );
+        let addr_arg = |a: &str| bcs::to_bytes(&parse_move_addr(a).unwrap()).unwrap();
+        let create = |who: &str, symbol: &[u8], initial: u128| {
+            entry_payload(
+                "token_factory",
+                "create_token",
+                vec![],
+                vec![
+                    addr_arg(who),
+                    bcs::to_bytes(&b"Name".to_vec()).unwrap(),
+                    bcs::to_bytes(&symbol.to_vec()).unwrap(),
+                    bcs::to_bytes(&8u8).unwrap(),
+                    bcs::to_bytes(&1_000u128).unwrap(),
+                    bcs::to_bytes(&initial).unwrap(),
+                    bcs::to_bytes(&Vec::<u8>::new()).unwrap(),
+                    bcs::to_bytes(&Vec::<u8>::new()).unwrap(),
+                ],
+            )
+        };
+        let run = |k: &SigningKey, who: &str, payload: &str, seq: u64| {
+            let (updates, gas) = executor
+                .execute_transaction(&signed_tx(k, who, payload, seq, 2_000_000, 1))
+                .expect("charged");
+            apply_updates(&db, updates);
+            gas
+        };
+        // A full registry refuses its own creator, before the fee.
         let before = coin_balance(&db, &creator);
-        let (updates, gas) = executor
-            .execute_transaction(&signed_tx(&key, &creator, &create, 0, 2_000_000, 1))
-            .expect("charged");
-        apply_updates(&db, updates);
-        let held = hex::decode(db.get(&registry_key).unwrap().unwrap()).unwrap();
-        assert_eq!(&held[..2], &[0x80, 0x04], "still 512 tokens (ULEB128)");
+        let gas = run(&key, &creator, &create(&creator, b"SYM", 0), 0);
+        let held = hex::decode(db.get(&registry_of(&creator)).unwrap().unwrap()).unwrap();
+        assert_eq!(held[0], 64, "still 64 tokens (ULEB128)");
         assert_eq!(
             coin_balance(&db, &creator),
             before - gas,
             "gas only: no fee burned"
+        );
+        // Another creator has a registry of its own.
+        let wallet =
+            |who: &str| entry_payload("token_factory", "init_wallet", vec![], vec![addr_arg(who)]);
+        run(&other_key, &other, &wallet(&other), 0);
+        let before = coin_balance(&db, &other);
+        let gas = run(&other_key, &other, &create(&other, b"OTH", 1_000), 1);
+        assert_eq!(
+            coin_balance(&db, &other),
+            before - gas - 100 * AIN,
+            "another creator's token was not created"
+        );
+        // A token reaches only a wallet that registered it.
+        let token_id = [b"OTH".to_vec(), parse_move_addr(&other).unwrap().to_vec()].concat();
+        let transfer = entry_payload(
+            "token_factory",
+            "transfer",
+            vec![],
+            vec![
+                addr_arg(&other),
+                bcs::to_bytes(&token_id).unwrap(),
+                addr_arg(&to),
+                bcs::to_bytes(&500u128).unwrap(),
+            ],
+        );
+        let wallet_key = |who: &str| {
+            vm_move::state_keys::resource_key_str(
+                &parse_move_addr(who).unwrap(),
+                "0x1::token_factory::TokenWallet",
+            )
+        };
+        let balance_of = |who: &str| -> u128 {
+            db.get(&wallet_key(who))
+                .unwrap()
+                .map(|raw| bcs::from_bytes::<Wallet>(&hex::decode(raw).unwrap()).unwrap())
+                .and_then(|w| w.balances.into_iter().find(|b| b.token_id == token_id))
+                .map_or(0, |b| b.balance)
+        };
+        run(&to_key, &to, &wallet(&to), 0);
+        run(&other_key, &other, &transfer, 2);
+        assert_eq!(balance_of(&to), 0, "a token reached an unregistered wallet");
+        assert_eq!(balance_of(&other), 1_000);
+        let register = entry_payload(
+            "token_factory",
+            "register",
+            vec![],
+            vec![addr_arg(&to), bcs::to_bytes(&token_id).unwrap()],
+        );
+        run(&to_key, &to, &register, 1);
+        run(&other_key, &other, &transfer, 3);
+        assert_eq!(
+            balance_of(&to),
+            500,
+            "a registered wallet did not receive it"
         );
     }
 

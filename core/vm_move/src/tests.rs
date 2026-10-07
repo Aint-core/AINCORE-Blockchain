@@ -150,4 +150,18 @@ mod tests {
             "verification is metered"
         );
     }
+
+    /// B211, B212, B214: the runtime checks Aptos runs in production: a
+    /// type check at every instruction (a type confusion the verifier let
+    /// through panicked outside move's unwinding guard), the bound on a
+    /// call's type-argument size, and the bytecode version pinned at the
+    /// stdlib's own (6), not a future move's maximum.
+    #[test]
+    fn the_vm_runs_with_the_production_runtime_checks() {
+        let config = crate::AINCOREVM::vm_config();
+        assert!(config.paranoid_type_checks, "no type check at run time");
+        assert!(config.type_size_limit, "no type-argument size bound");
+        assert_eq!(config.max_binary_format_version, 6);
+        assert!(config.enable_invariant_violation_check_in_swap_loc);
+    }
 }

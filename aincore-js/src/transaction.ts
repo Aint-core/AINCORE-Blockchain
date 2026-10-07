@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
 import { Keypair } from './keypair';
+import { toHexAddress } from './address';
 import {
     serializeTransactionPayload,
     TransactionPayload,
@@ -17,6 +18,16 @@ import {
     hexToBytes,
     bytesToHex,
 } from './bcs';
+
+/**
+ * A token_factory token's id: its symbol's bytes followed by its creator's
+ * 32 address bytes, as hex (the form the token methods take). The id holds
+ * raw address bytes, so it is not text: passing it as a UTF-8 string, as
+ * these methods once did, sent different bytes.
+ */
+export function tokenIdOf(symbol: string, creator: string): string {
+    return bytesToHex(new TextEncoder().encode(symbol)) + toHexAddress(creator);
+}
 
 // ============================================================
 // Helper: Build a standard 0x1 entry function call
@@ -332,7 +343,7 @@ export class Transaction {
     }
 
     /**
-     * Mint tokens (only token creator can mint)
+     * Mint tokens (only token creator can mint). `tokenId` is hex (`tokenIdOf`).
      * Calls: 0x1::token_factory::mint(admin, token_id, to, amount)
      */
     static mintToken(
@@ -346,7 +357,7 @@ export class Transaction {
         tx.sender = sender.address;
         tx.payload = systemCall('token_factory', 'mint', [], [
             bcsAddress(sender.address),
-            bcsVectorU8(new TextEncoder().encode(tokenId)),
+            bcsVectorU8(hexToBytes(tokenId)),
             bcsAddress(to),
             bcsU128(amount),
         ]);
@@ -355,11 +366,13 @@ export class Transaction {
     }
 
     /**
-     * Burn tokens
-     * Calls: 0x1::token_factory::burn(holder, token_id, amount)
+     * Burn tokens. `creator` names the token's registry (B135); `tokenId` is
+     * hex (`tokenIdOf`).
+     * Calls: 0x1::token_factory::burn(holder, creator, token_id, amount)
      */
     static burnToken(
         sender: Keypair,
+        creator: string,
         tokenId: string,
         amount: bigint,
         sequenceNumber: number = 0
@@ -368,7 +381,8 @@ export class Transaction {
         tx.sender = sender.address;
         tx.payload = systemCall('token_factory', 'burn', [], [
             bcsAddress(sender.address),
-            bcsVectorU8(new TextEncoder().encode(tokenId)),
+            bcsAddress(toHexAddress(creator)),
+            bcsVectorU8(hexToBytes(tokenId)),
             bcsU128(amount),
         ]);
         tx.sequenceNumber = sequenceNumber;
@@ -376,7 +390,8 @@ export class Transaction {
     }
 
     /**
-     * Transfer tokens to another address
+     * Transfer tokens to another address (which must have registered the
+     * token, `registerToken`). `tokenId` is hex (`tokenIdOf`).
      * Calls: 0x1::token_factory::transfer(from, token_id, to, amount)
      */
     static transferToken(
@@ -390,9 +405,30 @@ export class Transaction {
         tx.sender = sender.address;
         tx.payload = systemCall('token_factory', 'transfer', [], [
             bcsAddress(sender.address),
-            bcsVectorU8(new TextEncoder().encode(tokenId)),
+            bcsVectorU8(hexToBytes(tokenId)),
             bcsAddress(to),
             bcsU128(amount),
+        ]);
+        tx.sequenceNumber = sequenceNumber;
+        return tx;
+    }
+
+    /**
+     * Register a token in the sender's wallet (made if missing), so it can
+     * receive it (B135: a wallet takes only tokens its owner registered).
+     * `tokenId` is hex (`tokenIdOf`).
+     * Calls: 0x1::token_factory::register(account, token_id)
+     */
+    static registerToken(
+        sender: Keypair,
+        tokenId: string,
+        sequenceNumber: number = 0
+    ): Transaction {
+        const tx = new Transaction();
+        tx.sender = sender.address;
+        tx.payload = systemCall('token_factory', 'register', [], [
+            bcsAddress(sender.address),
+            bcsVectorU8(hexToBytes(tokenId)),
         ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;

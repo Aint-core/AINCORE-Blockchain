@@ -48,13 +48,14 @@ const QC_ANSWERED_CAP: usize = 256;
 
 #[cfg(test)]
 thread_local! {
-    /// B124 witness support: the blocks `handle_remote_qc_vote` read on this
-    /// thread.
+    /// B124 witness support: the costly reads a vote made on this thread
+    /// (once of a block; B190: of the committee record, after the pending
+    /// work and the point reads).
     pub(crate) static VOTE_BLOCK_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 /// Upper bound on evidence items carried per vertex and applied per block
 /// (matches executor::apply_slash_evidence's `.take(5)`).
-const MAX_EVIDENCE_PER_VERTEX: usize = 5;
+pub(crate) const MAX_EVIDENCE_PER_VERTEX: usize = 5;
 /// Rounds a carried-but-not-yet-included evidence item stays in flight before
 /// it is treated as orphaned/cap-dropped and re-carried. Local bookkeeping.
 pub const INFLIGHT_TTL_ROUNDS: u64 = 8;
@@ -574,7 +575,7 @@ impl DagConsensus {
             .filter(|p| !p.starts_with(SLASH_EVIDENCE_PREFIX))
             .collect();
         if !orphans.is_empty() {
-            if let Ok(mut mp) = self.mempool.lock() {
+            if let Ok(mut mp) = mempool::lock_for_consensus(&self.mempool) {
                 mp.return_unshipped(&orphans);
             }
         }
@@ -801,12 +802,12 @@ impl DagConsensus {
     }
 
     /// One V4 message through the engine, then the commit loop if O_E grew.
-    fn on_v4_message(&mut self, raw_len: usize, msg: crate::v4::Msg) {
+    fn on_v4_message(&mut self, source: Option<&str>, raw_len: usize, msg: crate::v4::Msg) {
         let Some(mut engine) = self.v4.take() else {
             return;
         };
         let net = self.v4_net();
-        engine.on_message(raw_len, msg, &net);
+        engine.on_message_from(source, raw_len, msg, &net);
         let progressed = engine.take_progress();
         self.current_round = self.current_round.max(engine.current_round());
         self.v4 = Some(engine);
@@ -850,7 +851,7 @@ impl DagConsensus {
                     .filter(|p| !p.starts_with(SLASH_EVIDENCE_PREFIX))
                     .collect();
                 if !txs.is_empty() {
-                    if let Ok(mut mp) = self.mempool.lock() {
+                    if let Ok(mut mp) = mempool::lock_for_consensus(&self.mempool) {
                         mp.return_unshipped(&txs);
                     }
                 }
@@ -1345,7 +1346,7 @@ impl DagConsensus {
                 // Orphan-loss fix: settle the mempool's loan ledger — only the
                 // transactions that actually EXECUTED leave it; the rest stay
                 // inflight and requeue_stale() returns them to pending later.
-                if let Ok(mut mp) = self.mempool.lock() {
+                if let Ok(mut mp) = mempool::lock_for_consensus(&self.mempool) {
                     mp.mark_executed(&execution_summary.executed_raws);
                 }
 
@@ -1393,7 +1394,7 @@ impl DagConsensus {
     /// transactions go back to the mempool.
     fn gather_payload(&mut self, round: u64, overhead: usize) -> Vec<String> {
         let mut payload = Vec::new();
-        if let Ok(mut mp) = self.mempool.lock() {
+        if let Ok(mut mp) = mempool::lock_for_consensus(&self.mempool) {
             // Orphan-loss fix: before pulling, reclaim loaned transactions
             // that never executed (orphaned vertex payloads and
             // nonce-deferred txs). 30s ≈ well past commit latency, well
@@ -1466,7 +1467,7 @@ impl DagConsensus {
                 }
             }
             if !trimmed_txs.is_empty() {
-                if let Ok(mut mp) = self.mempool.lock() {
+                if let Ok(mut mp) = mempool::lock_for_consensus(&self.mempool) {
                     mp.return_unshipped(&trimmed_txs);
                 }
                 println!(
@@ -1527,6 +1528,12 @@ impl DagConsensus {
     /// bookkeeping only -- never a state-root write.
     pub(crate) fn drain_evidence_for_vertex(&self, current_round: u64) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
+        // B192: the predicate every node's Layer S applies to the item, so
+        // this node never builds a vertex the others refuse.
+        let chain_id = self.resolve_chain_id();
+        let Some(genesis_identity) = self.storage.get("genesis_identity").ok().flatten() else {
+            return out;
+        };
         // The offender need not be in the live set (evidence is checked
         // against the committee of its epoch).
         use crate::v4::evidence as ev;
@@ -1573,6 +1580,11 @@ impl DagConsensus {
                 if in_flight {
                     continue;
                 }
+                if let Err(why) = ev::admissible_item(&item, &chain_id, &genesis_identity) {
+                    eprintln!("⚠️  evidence row {key} retired: {why}");
+                    let _ = self.storage.delete(&key);
+                    continue;
+                }
                 // G5 review: only what the executor accepts takes a slot. A
                 // row it can never accept again (older than W, its records
                 // pruned, its offenders jailed) is retired, so it neither
@@ -1603,8 +1615,7 @@ impl DagConsensus {
     /// output depends only on `carried` (from the committed sequence) and the
     /// executor's on-chain-state verifier.
     fn canonicalize_evidence(executor: &Executor, carried: &[(String, String)]) -> Vec<String> {
-        let items: Vec<String> = carried.iter().map(|(_, it)| it.clone()).collect();
-        Self::canonical_block_evidence(items, |it| {
+        Self::canonical_block_evidence(carried.to_vec(), |it| {
             executor.verify_slash_evidence(it).ok().map(|v| v.key())
         })
         .into_iter()
@@ -1683,18 +1694,38 @@ impl DagConsensus {
     /// equivocator used to be able to self-shield by planting a junk item
     /// under its own (offender, round) ahead of the real proof). Returns the
     /// surviving items and their verified keys, in order.
-    pub fn canonical_block_evidence<F>(items: Vec<String>, verify: F) -> Vec<(String, (String, u64))>
+    ///
+    /// B203: `items` are (carrier, item) in commit order. A carrier's items
+    /// past its first that fails are not verified in this block, nor an item
+    /// that failed already: a member's well-formed junk (a real certificate
+    /// paired with a forged one) cost every block builder a committee parse
+    /// and two pairings an item, five a vertex, every block. An honest
+    /// carrier verified what it carries, so its items fail only with the
+    /// state (an item past W): what it did not land is carried again.
+    pub fn canonical_block_evidence<F>(
+        items: Vec<(String, String)>,
+        verify: F,
+    ) -> Vec<(String, (String, u64))>
     where
         F: Fn(&str) -> Option<(String, u64)>,
     {
-        use std::collections::BTreeSet;
+        use std::collections::{BTreeSet, HashSet};
         let mut seen: BTreeSet<(String, u64)> = BTreeSet::new();
+        let mut failed_carriers: HashSet<String> = HashSet::new();
+        let mut failed_items: HashSet<String> = HashSet::new();
         let mut out: Vec<(String, (String, u64))> = Vec::new();
-        for item in items {
+        for (carrier, item) in items {
             if out.len() >= MAX_EVIDENCE_PER_VERTEX {
                 break;
             }
-            let Some(key) = verify(&item) else { continue };
+            if failed_carriers.contains(&carrier) || failed_items.contains(&item) {
+                continue;
+            }
+            let Some(key) = verify(&item) else {
+                failed_carriers.insert(carrier);
+                failed_items.insert(item);
+                continue;
+            };
             if seen.insert(key.clone()) {
                 out.push((item, key));
             }
@@ -1747,35 +1778,34 @@ impl DagConsensus {
         // vote every tick until the QC forms (`retry_qc_work`), so this node
         // counts it once it holds the block. Only the header is read, not
         // the whole block.
-        // B124: point reads first; the block is read only for a vote that
-        // can still count.
-        if !crate::qc_producer::vote_still_needed(&self.storage, &vote_msg) {
-            return;
-        }
-        #[derive(serde::Deserialize)]
-        struct Header {
-            hash: String,
-            round: u64,
-        }
-        #[derive(serde::Deserialize)]
-        struct HeaderOnly {
-            header: Header,
-        }
-        #[cfg(test)]
-        VOTE_BLOCK_READS.with(|n| n.set(n.get() + 1));
-        let Some(held) = self
-            .storage
-            .get(&format!("block_{}", vote_msg.vote.block_height))
-            .ok()
-            .flatten()
-            .and_then(|raw| serde_json::from_str::<HeaderOnly>(&raw).ok())
+        // B164: bound to this node's pending QC work at the vote's height
+        // (staged with the block it holds: its round, epoch and hash), by a
+        // point read of that bounded row; the block itself is not read
+        // (junk votes for fresh rounds read a whole block each). B190: and
+        // first, so a vote for work this node does not hold is dropped
+        // before the committee record is parsed (~130 KB at 256 members).
+        let Some(work) =
+            crate::qc_producer::pending_context(&self.storage, vote_msg.vote.block_height)
         else {
             return;
         };
-        if vote_msg.vote.anchor_round != held.header.round {
+        if vote_msg.vote.anchor_round != work.anchor_round || vote_msg.vote.epoch != work.epoch {
             return;
         }
-        let expected_block_hash = Some(held.header.hash);
+        // B205: the work's chain and block before the committee record is
+        // parsed (here, then again in the collection: two parses, two sorts
+        // and a hash a vote), charged: no honest member votes for another
+        // chain, or another block at this height and round.
+        if vote_msg.vote.chain_id != work.chain_id || vote_msg.vote.block_hash != work.block_hash {
+            crate::work::note_failed_check();
+            return;
+        }
+        // B124: point reads before the committee; the vote is counted only
+        // if it can still count.
+        if !crate::qc_producer::vote_still_needed(&self.storage, &vote_msg) {
+            return;
+        }
+        let expected_block_hash = Some(work.block_hash);
 
         let outcome = crate::qc_producer::collect_vote_and_try_aggregate(
             &self.storage,
@@ -1879,7 +1909,7 @@ impl DagConsensus {
                     crate::v4::Msg::Vertex(_) => content.len().saturating_sub(WRAP),
                     _ => content.len(),
                 };
-                self.on_v4_message(raw_len, m);
+                self.on_v4_message(source, raw_len, m);
             }
             return;
         }
@@ -1956,7 +1986,7 @@ impl DagConsensus {
                     // right notion of "done" here (a failed one would fail again
                     // and is bounded by the requeue cap anyway).
                     if !block.transactions.is_empty() {
-                        if let Ok(mut mp) = self.mempool.lock() {
+                        if let Ok(mut mp) = mempool::lock_for_consensus(&self.mempool) {
                             mp.mark_executed(&block.transactions);
                         }
                     }

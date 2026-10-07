@@ -22,6 +22,20 @@ pub(crate) fn lowest_pending_qc_height(storage: &StateDB) -> Option<u64> {
     key.strip_prefix(PREFIX)?.parse::<u64>().ok()
 }
 
+/// B164: this node's pending QC work at `height`, if it has some: the
+/// (round, epoch, block hash) a peer's vote for that height must name. A
+/// point read of a bounded row; reading the block itself let junk votes for
+/// fresh rounds cost a whole block each.
+pub(crate) fn pending_context(storage: &StateDB, height: u64) -> Option<CommitContext> {
+    let raw = storage.get(&key(height)).ok()??;
+    if raw.len() > MAX_CONTEXT_BYTES {
+        return None;
+    }
+    serde_json::from_str::<CommitContext>(&raw)
+        .ok()
+        .filter(|ctx| ctx.block_height == height)
+}
+
 pub(crate) fn stage_pending_qc(
     view: &StateDB,
     block: &blockchain::Block,
@@ -49,6 +63,7 @@ pub(crate) fn stage_pending_qc(
         // EP-4: the boundary block's vote binds the next committee, as this
         // node derived it earlier in this same transaction.
         next_validator_set_hash: next_committee_hash(view, block.header.height)?,
+        decision_floor: Some(info.decision_floor),
     };
     validate_held(view, &ctx, &ctx.chain_id)?;
     let encoded = serde_json::to_string(&ctx).map_err(|e| e.to_string())?;

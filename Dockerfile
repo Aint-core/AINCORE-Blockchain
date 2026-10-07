@@ -39,5 +39,11 @@ COPY --from=builder /usr/src/aincore/genesis.json /root/.aincore/genesis.json
 # Expose libp2p (base port 9002 + 100), API, and Indexer ports
 EXPOSE 9102 8002 3001
 
+# B269: the RPC listens on the container's interfaces (the node binds
+# 127.0.0.1 unless told otherwise, which inside a container no published port
+# or other container reaches). Behind a proxy, also set
+# AINCORE_RPC_TRUSTED_PROXIES and AINCORE_RPC_CLIENT_IP_HEADER.
+ENV AINCORE_RPC_BIND=0.0.0.0
+
 # Default command
 CMD ["node", "--port", "9002"]

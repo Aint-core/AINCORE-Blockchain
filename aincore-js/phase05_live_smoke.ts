@@ -3,7 +3,9 @@ import { Keypair } from './src/keypair';
 import { Transaction } from './src/transaction';
 
 const rpcUrl = process.env.AINCORE_RPC_URL || 'http://127.0.0.1:18102/rpc';
-const chainId = process.env.AINCORE_CHAIN_ID || 'AINCORE-MAINNET-1';
+// B258: the chain is named, never assumed.
+const chainId = process.env.AINCORE_CHAIN_ID ?? '';
+if (!chainId) throw new Error('AINCORE_CHAIN_ID names the chain to sign for');
 
 function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));

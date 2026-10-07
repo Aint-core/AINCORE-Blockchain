@@ -89,6 +89,8 @@ module 0x1::delegation {
     const MIN_REWARD_POINTS: u128 = 1000000000000000000;
     /// EM-2: the largest committee weight, in whole AIN: all of MAX_SUPPLY.
     const MAX_WEIGHT: u128 = 150000000;
+    /// One AIN in coin units (`staking::COIN_SCALE`): weights are whole AIN.
+    const COIN_SCALE: u128 = 1000000000000000000;
 
     /// SL-1: a slash recorded for the pool's unpaid tickets. It cuts a ticket
     /// created in `infraction_epoch` or later and before the slash
@@ -564,13 +566,26 @@ module 0x1::delegation {
                 };
                 entry.full = true;
                 if (epoch < entry.epoch) {
+                    // B161: and that scope's split, what the operator and
+                    // the pool had at stake then (the later offense's was
+                    // kept: a pool that grew between them had its later
+                    // deposits burned). Its weight and its time stay: they
+                    // place it among correlated offenses.
                     entry.epoch = epoch;
+                    entry.self_weight = self_weight;
+                    entry.delegated_weight = delegated_weight;
                 };
                 let scope = entry.epoch;
+                let at_stake = entry.delegated_weight;
                 if (entry.settled) {
                     staking::slash_unbonding(validator_addr, scope, MAX_BPS);
                     if (exists<Pool>(validator_addr)) {
-                        slash_pool(borrow_global_mut<Pool>(validator_addr), MAX_BPS, scope);
+                        slash_pool(
+                            borrow_global_mut<Pool>(validator_addr),
+                            MAX_BPS,
+                            scope,
+                            at_stake
+                        );
                     };
                 } else {
                     staking::freeze_payouts(account, validator_addr, scope);
@@ -688,6 +703,8 @@ module 0x1::delegation {
         // Q = the weight of list[lo..hi).
         let (lo, hi, q) = (0, 0, 0);
         let settled_now = 0;
+        // B276: an offense due but left for the next call by the cap.
+        let capped = false;
         let i = 0;
         while (i < len) {
             let began = vector::borrow(list, i).epoch_began;
@@ -700,13 +717,17 @@ module 0x1::delegation {
                 lo = lo + 1;
             };
             let offense = *vector::borrow(list, i);
-            if (!offense.settled && settled_now < MAX_SETTLE_PER_CALL) {
+            if (!offense.settled) {
                 let f = if (offense.full) {
                     MAX_BPS
                 } else {
                     equivocation_bps(q, offense.committee_weight)
                 };
-                if (f == MAX_BPS || now > offense.epoch_began + span) {
+                let due = f == MAX_BPS || now > offense.epoch_began + span;
+                if (due && settled_now >= MAX_SETTLE_PER_CALL) {
+                    capped = true;
+                };
+                if (due && settled_now < MAX_SETTLE_PER_CALL) {
                     let (own, pool_bps) =
                         waterfall(f, offense.self_weight, offense.delegated_weight);
                     staking::slash_unbonding(offense.validator, offense.epoch, own);
@@ -714,7 +735,8 @@ module 0x1::delegation {
                         slash_pool(
                             borrow_global_mut<Pool>(offense.validator),
                             pool_bps,
-                            offense.epoch
+                            offense.epoch,
+                            offense.delegated_weight
                         );
                     };
                     vector::borrow_mut(list, i).settled = true;
@@ -726,6 +748,10 @@ module 0x1::delegation {
         };
         // An unsettled offense within D of a settled one settles by that
         // one's time + 2D + I x C_tau + W at the latest. One pass, order kept.
+        // B276: but not in a call the cap stopped: an offense it left due may
+        // be within D of one past that time, and its Q needs that one's
+        // weight (it settled at the next call without it, under-slashed).
+        if (capped) return;
         let kept = vector::empty<Offense>();
         let i = 0;
         while (i < len) {
@@ -740,9 +766,16 @@ module 0x1::delegation {
 
     /// SL-1: cut a closed pool's active principal by `bps`, rounded up, and
     /// record the event its unpaid tickets meet when withdrawn. The work is
-    /// constant whatever the pool's size.
-    fun slash_pool(pool: &mut Pool, bps: u64, infraction_epoch: u64) {
-        let cut = math::mul_div_ceil(pool.active_coins, (bps as u128), (MAX_BPS as u128));
+    /// constant whatever the pool's size. B149: `bps` of what the pool had
+    /// at stake in the offense's committee at most (`at_stake`, its frozen
+    /// delegated weight rounded up to the next whole AIN), not of what it
+    /// holds now: a delegation made after the offense epoch began weighed
+    /// nothing in that committee, and was burned too (Cosmos sizes a slash
+    /// by the stake at the infraction height).
+    fun slash_pool(pool: &mut Pool, bps: u64, infraction_epoch: u64, at_stake: u64) {
+        let at_stake = ((at_stake as u128) + 1) * COIN_SCALE;
+        let base = if (pool.active_coins < at_stake) { pool.active_coins } else { at_stake };
+        let cut = math::mul_div_ceil(base, (bps as u128), (MAX_BPS as u128));
         if (cut > 0) {
             pool.active_coins = pool.active_coins - cut;
             staking::burn_ain(coin::extract(&mut pool.principal, cut));

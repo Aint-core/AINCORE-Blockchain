@@ -17,6 +17,8 @@ services:
     environment:
       - AINCORE_PORT=9002
       - AINCORE_API_PORT=8002
+      # B269: reachable from the published port and the indexer.
+      - AINCORE_RPC_BIND=0.0.0.0
       - RUST_LOG=info
     command: [ "node", "--port", "9002" ]
     networks:

@@ -1,4 +1,7 @@
 #!/bin/bash
+# STALE (round 16): this harness calls the faucet removed in FX-8, and its
+# notes refer to test_chain_id.py, deleted in B271 (it spoke the TCP channel
+# removed in G4 S6). Rebuild it with the V5 localnet gate before use.
 set -e
 
 # Colors

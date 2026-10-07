@@ -117,6 +117,22 @@ impl SessionClient {
         wire: &str,
         timeout: std::time::Duration,
     ) -> Result<String, String> {
+        self.ask_timed(peer, wire, timeout)
+            .await
+            .map_err(|e| match e {
+                AskError::Timeout => format!("no answer from {peer} within {timeout:?}"),
+                AskError::Failed(why) => why,
+            })
+    }
+
+    /// `ask`, telling a request no answer came for within `timeout` (the
+    /// wait it cost) from one refused or failed at once (B133).
+    pub async fn ask_timed(
+        &self,
+        peer: &str,
+        wire: &str,
+        timeout: std::time::Duration,
+    ) -> Result<String, AskError> {
         let (reply, answer) = tokio::sync::oneshot::channel();
         self.asks
             .send(SyncAsk {
@@ -125,13 +141,24 @@ impl SessionClient {
                 reply,
             })
             .await
-            .map_err(|_| "the network task is gone".to_string())?;
+            .map_err(|_| AskError::Failed("the network task is gone".to_string()))?;
         match tokio::time::timeout(timeout, answer).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err("the network task dropped the request".to_string()),
-            Err(_) => Err(format!("no answer from {peer} within {timeout:?}")),
+            Ok(Ok(result)) => result.map_err(AskError::Failed),
+            Ok(Err(_)) => Err(AskError::Failed(
+                "the network task dropped the request".to_string(),
+            )),
+            Err(_) => Err(AskError::Timeout),
         }
     }
+}
+
+/// Why `SessionClient::ask_timed` has no answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AskError {
+    /// None came within the timeout.
+    Timeout,
+    /// Refused or failed before it (the reason).
+    Failed(String),
 }
 
 #[cfg(test)]

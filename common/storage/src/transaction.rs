@@ -18,6 +18,8 @@ type ReadResult = Result<Row, rocksdb::Error>;
 
 struct Shared {
     raw: DB,
+    /// B254: `ReadStore::instance`.
+    instance: u64,
     writers: Mutex<()>,
     /// G3 S0: counts unclassified keys and state written outside the block
     /// transaction. The refusal itself is `ReadStore::write` (WG-1, S3).
@@ -69,11 +71,15 @@ pub struct ReadStore {
     stage: Option<Arc<Stage>>,
 }
 
+/// B254: the next store's number in this process.
+static NEXT_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl From<DB> for ReadStore {
     fn from(raw: DB) -> Self {
         Self {
             shared: Arc::new(Shared {
                 raw,
+                instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
                 writers: Mutex::new(()),
                 observer: Observer::default(),
                 seeding: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -91,6 +97,7 @@ impl ReadStore {
         Self {
             shared: Arc::new(Shared {
                 raw,
+                instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
                 writers: Mutex::new(()),
                 observer: Observer::default(),
                 seeding: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -102,6 +109,14 @@ impl ReadStore {
 }
 
 impl ReadStore {
+    /// B254: a number no other store opened in this process has (its
+    /// transaction views share it): what a process-wide memo of a store's
+    /// rows that never change once written keys them by (a directory can
+    /// be opened again, and an address used again).
+    pub fn instance(&self) -> u64 {
+        self.shared.instance
+    }
+
     pub(crate) fn invalid_read(&self) {
         if let Some(stage) = &self.stage {
             stage.read_failed.store(true, Ordering::Release);
@@ -186,11 +201,15 @@ impl ReadStore {
         // classifier does not know is refused even then, so a state writer
         // whose key format drifted from the classifier fails its tests (a
         // zero-padded fee-sweep key was refused in production while every
-        // test, all of them seeding, passed).
+        // test, all of them seeding, passed). B140: and so is any key the
+        // classifier does not know inside the block transaction, where only
+        // the chain's own writers run: one moving to a new prefix fails its
+        // tests too, where it would fail the block in production.
         let seeding = self.shared.seeding.load(Ordering::Acquire) > 0;
+        let fixture = seeding && !matches!(ctx, WriteContext::Block);
         for key in keys {
             match classify(key) {
-                None if seeding && !crate::class::under_state_prefix(key) => {}
+                None if fixture && !crate::class::under_state_prefix(key) => {}
                 None => {
                     return Err(StorageError::WriteGate(format!(
                         "unclassified key {} (CL-1)",
@@ -264,6 +283,12 @@ impl ReadStore {
                 .expect("storage writer gate poisoned");
             Ok(self.write_durable(batch)?)
         }
+    }
+
+    /// Tests only: see `StateDB::write_sequence`.
+    #[cfg(any(test, feature = "test-seeding"))]
+    pub(crate) fn write_sequence(&self) -> u64 {
+        self.shared.raw.latest_sequence_number()
     }
 
     /// Tests only: see `StateDB::seeding`.
@@ -616,6 +641,24 @@ mod tests {
             db.put("sys:fee_sweep_queue:70016:aa", "1"),
             Err(StorageError::WriteGate(_))
         ));
+    }
+
+    /// B140 witness: inside the block transaction, where only the chain's
+    /// own writers run, seeding exempts no key from CL-1: a block writer
+    /// moving to a prefix the classifier does not know fails its tests, as
+    /// it fails the block in production.
+    #[test]
+    fn seeding_exempts_no_unclassified_key_inside_the_block() {
+        let dir = TempDir::new();
+        let db = dir.open();
+        let _seed = db.seeding();
+        db.put("p:a", "1")
+            .expect("a fixture's own key, outside the block");
+        let refused = db.block_transaction(|view| view.put("p:b", "1"));
+        assert!(
+            matches!(refused, Err(StorageError::WriteGate(_))),
+            "{refused:?}"
+        );
     }
 
     #[test]

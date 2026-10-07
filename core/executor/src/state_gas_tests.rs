@@ -82,6 +82,86 @@ fn run(db: &StateDB, executor: &Executor, tx_json: &str) -> Option<()> {
     Some(())
 }
 
+/// B150 witness: a module named `<SELF>` (Move accepts the name; the
+/// state's classifier does not) aborts its own publish, charged. Its key
+/// reached the block's write batch, which the gate refused whole, and every
+/// validator panicked at that block for good.
+#[test]
+fn a_module_the_state_cannot_hold_aborts_its_publish() {
+    let (db, key, sender) = blob_chain("b150_self", 62);
+    let executor = Executor::new(db.clone());
+    let mut module = CompiledModule::deserialize(BLOB).expect("the fixture deserializes");
+    let handle = module.module_handles[module.self_module_handle_idx.0 as usize].clone();
+    module.identifiers[handle.name.0 as usize] =
+        Identifier::new("<SELF>").expect("Move accepts the name");
+    module.address_identifiers[handle.address.0 as usize] = parse_move_address(&sender).unwrap();
+    let mut bytes = Vec::new();
+    module.serialize(&mut bytes).expect("it serializes");
+    let payload = hex::encode(
+        bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![bytes])).unwrap(),
+    );
+    let tx = signed_tx(&key, &sender, &payload, 0, 1_000_000, 1);
+    let balance = coin_balance(&db, &sender);
+    let (updates, _) = executor
+        .execute_transaction(&tx)
+        .expect("executed, charged");
+    let unheld: Vec<&String> = updates
+        .iter()
+        .map(|(k, _)| k)
+        .filter(|k| storage::class::classify(k.as_bytes()).is_none())
+        .collect();
+    assert!(
+        unheld.is_empty(),
+        "a write the state cannot hold: {unheld:?}"
+    );
+    run_updates(&db, updates);
+    assert_eq!(receipt_status(&db, &tx), "aborted");
+    let receipt: serde_json::Value = serde_json::from_str(
+        &db.get(&format!("tx_receipt:{}", tx_hash_hex(&tx)))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        receipt["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("cannot hold")),
+        "vacuous: aborted for another reason: {receipt}"
+    );
+    assert!(
+        coin_balance(&db, &sender) < balance,
+        "the publish was not charged"
+    );
+}
+
+/// B170 witness: a republish pays for the version it replaces and that
+/// version's closure (its compatibility check loads them), and a module
+/// republished earlier in the block is refused to anything that loads it.
+#[test]
+fn a_republish_pays_for_what_it_replaces() {
+    let (db, _key, _sender) = blob_chain("b170_roots", 63);
+    let index = deps::ModuleIndex::default();
+    let blob = CompiledModule::deserialize(BLOB)
+        .expect("the fixture deserializes")
+        .self_id();
+    let roots = deps::bundle_roots(&[BLOB.to_vec()]).expect("it parses");
+    assert!(roots.contains(&blob), "the replaced module is not paid for");
+    let stored = index.closure(&db, roots.clone()).expect("a closure");
+    assert_eq!(stored.modules, 2, "blob as stored and the signer it loads");
+    let key = vm_move::state_keys::module_key(blob.address(), blob.name().as_str());
+    let upgraded: std::collections::HashSet<String> = [key].into_iter().collect();
+    let refused = index
+        .closure_in_block(&db, roots, &upgraded)
+        .expect_err("an upgraded module was loaded");
+    assert!(refused.contains("upgraded in this block"), "{refused}");
+}
+
+/// Applies `updates` as a block would (seeding: a test outside the block).
+fn run_updates(db: &StateDB, updates: Vec<(String, Option<String>)>) {
+    let _seed = db.seeding();
+    apply_updates(db, updates);
+}
+
 /// B65 witness: a new resource costs its key, its value and the tree's rows
 /// at the state byte gas, on top of execution. A limit one gas short of the
 /// estimate aborts, charged, and stores nothing; the estimate itself runs.

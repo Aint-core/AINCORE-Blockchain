@@ -207,10 +207,10 @@ mod tests {
             "control: the first pass goes to the highest"
         );
         sync.sync_from_peers().await;
+        let asked = block_asks.lock().unwrap().clone();
         assert!(
-            block_asks.lock().unwrap().iter().any(|p| p == "honest"),
-            "the honest session was never asked for blocks: {:?}",
-            block_asks.lock().unwrap()
+            asked.iter().any(|p| p == "honest"),
+            "the honest session was never asked for blocks: {asked:?}"
         );
     }
 
@@ -287,6 +287,30 @@ mod tests {
         let finality = resp.finality.expect("sync response includes finality");
         assert_eq!(finality.finalized_round, "4");
         assert_eq!(finality.last_anchor_hash, "anchor-hash");
+    }
+
+    /// B144 witness: a request from a height near u64::MAX gets nothing, and
+    /// no panic (`from_height + 500` overflowed: a release build wrapped and
+    /// served from block 0).
+    #[test]
+    fn a_request_from_the_top_of_the_height_range_gets_nothing() {
+        let sync = setup_sync("b144_top");
+        for height in 1..=3 {
+            let block = Block::new(
+                height,
+                height,
+                "prev".to_string(),
+                vec![],
+                "node_1".to_string(),
+            );
+            sync.storage
+                .save_block_json(height, &serde_json::to_string(&block).unwrap())
+                .unwrap();
+        }
+        for from_height in [u64::MAX, u64::MAX - 1, u64::MAX - 500] {
+            let resp = sync.handle_sync_request(SyncRequest { from_height });
+            assert!(resp.blocks.is_empty(), "served blocks from {from_height}");
+        }
     }
 
     #[test]
@@ -373,15 +397,239 @@ mod tests {
             2,
             "B3/NI-4: the answer is bounded by bytes"
         );
-        // One block over the whole budget still goes alone.
+    }
+
+    /// B263 witness: a turn is judged however it ended: a slow answer
+    /// strikes even a turn that reached its session's height, and a turn
+    /// that ended short of it without a full batch strikes though no answer
+    /// was slow (only a turn the clock ended could strike, so a session
+    /// ended its turn early to clear its strike); a full batch, in blocks or
+    /// in the server's bytes, never strikes, nor does a turn that ended well.
+    #[test]
+    fn a_turn_is_judged_however_it_ends() {
+        let turn = |brought: u64, bytes: usize, slow: bool, ended_well: bool| crate::Turn {
+            reached: 0,
+            brought,
+            bytes,
+            slow,
+            ended_well,
+            asked: true,
+            refused: false,
+        };
+        assert!(turn(1, 100, true, true).struck(), "a slow answer");
+        assert!(
+            turn(1, 100, false, false).struck(),
+            "ended short without a full batch"
+        );
+        assert!(!turn(1, 100, false, true).struck(), "ended well");
+        assert!(!turn(crate::SYNC_TURN_BLOCKS, 0, false, false).struck());
+        assert!(!turn(1, crate::FULL_BATCH_BYTES, false, false).struck());
+        // B275: a session that sent what no honest server sends is struck,
+        // however full and well ended its turn was.
+        let lied = crate::Turn {
+            refused: true,
+            ..turn(
+                crate::SYNC_TURN_BLOCKS,
+                crate::FULL_BATCH_BYTES,
+                false,
+                true,
+            )
+        };
+        assert!(lied.struck(), "a lie was not struck");
+    }
+
+    /// B274 witness: block turns go to members first whatever their
+    /// strikes, then to the fewest strikes, then to the most blocks brought,
+    /// then to the session that waited longest for a turn; a session's
+    /// claimed height orders nothing (it ordered sessions that brought
+    /// nothing, so three that claimed the most took every turn for good).
+    #[test]
+    fn turns_are_ordered_by_standing_not_by_claims() {
+        use crate::{turn_order, Standing};
+        let then = std::time::Instant::now();
+        let later = then + std::time::Duration::from_secs(1);
+        let s = |member, strikes, brought, turned| Standing {
+            resuming: false,
+            member,
+            strikes,
+            brought,
+            turned,
+        };
+        let order = |mut sessions: Vec<(String, Standing)>| {
+            sessions.sort_by(turn_order);
+            sessions.into_iter().map(|(p, _)| p).collect::<Vec<_>>()
+        };
+        let named = |p: &str, st: Standing| (p.to_string(), st);
+        // A member, though struck, before any non-member.
+        assert_eq!(
+            order(vec![
+                named("a", s(false, 0, 9, None)),
+                named("m", s(true, 3, 0, Some(later)))
+            ]),
+            ["m", "a"]
+        );
+        // Fewer strikes first, then more blocks brought.
+        assert_eq!(
+            order(vec![
+                named("a", s(true, 1, 9, None)),
+                named("b", s(true, 0, 1, None)),
+                named("c", s(true, 0, 5, Some(later))),
+            ]),
+            ["c", "b", "a"]
+        );
+        // B275: the session whose parted block this node is fetching, first.
+        let resuming = Standing {
+            resuming: true,
+            ..s(false, 2, 0, Some(later))
+        };
+        assert_eq!(
+            order(vec![named("m", s(true, 0, 9, None)), named("p", resuming)]),
+            ["p", "m"]
+        );
+        // Among equals, the one that waited longest (never asked first).
+        assert_eq!(
+            order(vec![
+                named("a", s(true, 0, 0, Some(later))),
+                named("b", s(true, 0, 0, Some(then))),
+                named("c", s(true, 0, 0, None)),
+            ]),
+            ["c", "b", "a"]
+        );
+    }
+
+    /// B274 witness: a QC-less block ends a turn well only within what an
+    /// honest server holds without QCs (`MAX_UNFINALIZED_BLOCKS` blocks
+    /// below the height it claims): one claiming far more is struck.
+    #[test]
+    fn a_qcless_block_is_a_tip_only_near_the_claimed_height() {
+        let bound = consensus::v4::MAX_UNFINALIZED_BLOCKS;
+        assert!(crate::qcless_tip(100, 100));
+        assert!(crate::qcless_tip(100, 100 + bound - 1));
+        assert!(!crate::qcless_tip(100, 100 + bound));
+        assert!(!crate::qcless_tip(100, u64::MAX));
+    }
+
+    /// B264 witness: a block over the whole batch budget is named, not sent
+    /// (it went alone, over the frame no client reads past, and no node
+    /// could block-sync beyond it), and its parts are exactly its stored
+    /// bytes, each but the last `BLOCK_PART_BYTES` long.
+    #[test]
+    fn a_block_too_large_for_a_batch_is_served_in_parts() {
+        let sync = setup_sync("b264_parts");
         let huge = "x".repeat(crate::SYNC_RESP_BLOCK_BYTES + 1);
-        let sync = setup_sync("sync_req_one_huge");
-        let block = Block::new(1, 1, "prev".into(), vec![huge], "node_1".into());
-        sync.storage
-            .save_block_json(1, &serde_json::to_string(&block).unwrap())
-            .unwrap();
-        let req = SyncRequest { from_height: 0 };
-        assert_eq!(sync.handle_sync_request(req).blocks.len(), 1);
+        let mut stored = Vec::new();
+        for (height, payload) in [
+            (1, "small".to_string()),
+            (2, huge),
+            (3, "small".to_string()),
+        ] {
+            let block = Block::new(
+                height,
+                height,
+                "prev".into(),
+                vec![payload],
+                "node_1".into(),
+            );
+            let json = serde_json::to_string(&block).unwrap();
+            sync.storage.save_block_json(height, &json).unwrap();
+            stored.push(json);
+        }
+        // B275: no part of a block before a batch answer named it (any
+        // height's block was read whole for a part request).
+        let refused = |sync: &ChainSync, height: u64, offset: u64| {
+            sync.handle_block_part(crate::BlockPartRequest { height, offset })
+                .error
+                .is_some()
+        };
+        assert!(refused(&sync, 2, 0), "a part of a block not named");
+        // The batch stops before it.
+        let before = sync.handle_sync_request(SyncRequest { from_height: 0 });
+        let heights: Vec<u64> = before.blocks.iter().map(|b| b.header.height).collect();
+        assert_eq!(heights, vec![1]);
+        assert!(before.oversized.is_none());
+        // Asked for it, the answer names it, with its header, and carries
+        // no block.
+        let named = sync.handle_sync_request(SyncRequest { from_height: 1 });
+        assert!(named.blocks.is_empty(), "an oversized block was sent whole");
+        let len = stored[1].len() as u64;
+        let big = named.oversized.expect("the block named");
+        let header = serde_json::from_str::<Block>(&stored[1]).unwrap().header;
+        assert_eq!((big.height, big.len), (2, len));
+        assert_eq!(big.header.hash, header.hash);
+        // Its parts, over the session, rebuild its stored bytes.
+        let mut bytes = Vec::new();
+        let mut parts = 0;
+        while (bytes.len() as u64) < len {
+            let req = crate::BlockPartRequest {
+                height: 2,
+                offset: bytes.len() as u64,
+            };
+            let wire = format!(
+                "{}{}",
+                crate::PART_REQ,
+                serde_json::to_string(&req).unwrap()
+            );
+            let answer = sync.serve_session(&wire, "12D3KooWparts").expect("routed");
+            let part: crate::BlockPartResponse =
+                serde_json::from_str(answer.strip_prefix(crate::PART_RESP).unwrap()).unwrap();
+            assert_eq!((part.error, part.len), (None, len));
+            let data = part.data.as_bytes().to_vec();
+            assert!(
+                data.len() == crate::BLOCK_PART_BYTES || bytes.len() + data.len() == len as usize
+            );
+            bytes.extend_from_slice(&data);
+            parts += 1;
+        }
+        assert_eq!(parts, 3);
+        assert_eq!(bytes, stored[1].as_bytes());
+        // Past its end, and a block a batch holds, are refused.
+        assert!(refused(&sync, 2, len));
+        assert!(refused(&sync, 1, 0));
+        assert!(refused(&sync, 9, 0));
+        // The batch after it goes on.
+        let after = sync.handle_sync_request(SyncRequest { from_height: 2 });
+        assert_eq!(after.blocks.len(), 1);
+        assert!(after.oversized.is_none());
+        // B275: over the answer budget a part is told busy (it was
+        // dropped, and the client's fetch failed).
+        let wire = format!("{}{{}}", crate::PART_REQ);
+        let busy = crate::state_sync::busy_reply(&wire).expect("a busy part answer");
+        let busy: crate::BlockPartResponse =
+            serde_json::from_str(busy.strip_prefix(crate::PART_RESP).unwrap()).unwrap();
+        assert_eq!(busy.error.as_deref(), Some("busy"));
+    }
+
+    /// B275 witness: a part whose block is no longer kept reads it again
+    /// only a second after the last such read, and is told busy meanwhile
+    /// (clients fetching several large blocks made every part a whole
+    /// block's read).
+    #[test]
+    fn a_block_read_for_its_parts_waits_its_turn() {
+        let sync = setup_sync("b275_reads").with_batch_bytes(64);
+        for height in 1..=6 {
+            let block = Block::new(height, height, "prev".into(), vec![], "node_1".into());
+            let json = serde_json::to_string(&block).unwrap();
+            sync.storage.save_block_json(height, &json).unwrap();
+        }
+        // Each block is named in turn (and kept: the last four stay).
+        for from_height in 0..6 {
+            let named = sync.handle_sync_request(SyncRequest { from_height });
+            assert_eq!(
+                named.oversized.map(|b| b.height),
+                Some(from_height + 1),
+                "vacuous: block {} not parted",
+                from_height + 1
+            );
+        }
+        let part = |height: u64| {
+            sync.handle_block_part(crate::BlockPartRequest { height, offset: 0 })
+                .error
+        };
+        // Kept: no read.
+        assert_eq!(part(6), None);
+        // Not kept: one read now, then busy until a second has passed.
+        assert_eq!(part(1), None);
+        assert_eq!(part(2).as_deref(), Some("busy"));
     }
 
     #[test]

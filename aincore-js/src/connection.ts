@@ -117,6 +117,55 @@ const FAUCET_REMOVED =
     'aincore_faucet and aincore_testMintWbtc were removed from the node: they wrote ' +
     'balances outside consensus. Fund the account with a signed transfer from a funded account.';
 
+/** A token as the node reports it (`aincore_getToken`, `aincore_getTokens`). */
+export interface TokenInfo {
+    tokenId: string;
+    name: string;
+    symbol: string;
+    decimals: number;
+    maxSupply: string;
+    currentSupply: string;
+    creator: string;
+    isMintable: boolean;
+}
+
+/** B177: the node's answer as a `TokenInfo`; only a missing field defaults
+ * (a token of 0 decimals was reported as 18). */
+function toTokenInfo(result: any, tokenId?: string): TokenInfo {
+    return {
+        tokenId: result.token_id ?? tokenId ?? '',
+        name: result.name ?? '',
+        symbol: result.symbol ?? '',
+        decimals: result.decimals ?? 18,
+        maxSupply: result.max_supply ?? '0',
+        currentSupply: result.current_supply ?? '0',
+        creator: result.creator ?? '',
+        isMintable: result.is_mintable !== false,
+    };
+}
+
+/** B260: the node's JSON-RPC code for a call refused for now (busy). */
+const BUSY_CODE = -32005;
+
+/**
+ * B267: the calls the node runs one at a time a client (its reads and dry
+ * runs: `READ_METHODS` and `DRY_METHODS` in the node's api_local.rs). A
+ * Connection sends them one at a time, so a dapp's parallel calls queue
+ * here instead of being refused as busy by the node.
+ */
+const HEAVY_METHODS = new Set([
+    'aincore_getBlocks',
+    'aincore_getBlockByHash',
+    'aincore_getTransactionsByAddress',
+    'aincore_getDag',
+    'aincore_getTransaction',
+    'aincore_getDaStatus',
+    'aincore_sampleDA',
+    'aincore_getStateProof',
+    'aincore_estimateGas',
+    'aincore_verifyQuorumCertificate',
+]);
+
 export class Connection {
     private rpcUrl: string;
     private client: AxiosInstance;
@@ -134,9 +183,52 @@ export class Connection {
     }
 
     /**
-     * Generic JSON-RPC call
+     * B260: busy answers (-32005: the node's heavy-call slots are taken, or
+     * this client's last heavy call still runs: one at a time a client) are
+     * asked again this many times, after a wait doubling from
+     * `busyBackoffMs`. They failed at once, so a dapp's parallel receipts
+     * failed against the node's admission rules.
+     */
+    busyRetries = 4;
+    busyBackoffMs = 250;
+
+    /**
+     * B267: how long one request may take before it fails (axios had no
+     * timeout, so a stalled node held a call, and `waitForConfirmation`'s
+     * own timeout, for good).
+     */
+    timeoutMs = 30_000;
+
+    /** B267: the heavy call this Connection sent last (`HEAVY_METHODS`). */
+    private heavyTail: Promise<void> = Promise.resolve();
+
+    /**
+     * B267: the wait before busy retry `attempt`: half of
+     * `busyBackoffMs * 2^attempt`, plus up to as much again at random, so
+     * clients refused together do not all ask again at the same instant.
+     */
+    backoffMs(attempt: number): number {
+        const wait = this.busyBackoffMs * 2 ** attempt;
+        return wait / 2 + Math.random() * (wait / 2);
+    }
+
+    /**
+     * Generic JSON-RPC call. B267: heavy calls one at a time.
      */
     async request(method: string, params: any[] = []): Promise<any> {
+        if (!HEAVY_METHODS.has(method)) {
+            return this.send(method, params);
+        }
+        const run = () => this.send(method, params);
+        const result = this.heavyTail.then(run, run);
+        this.heavyTail = result.then(
+            () => undefined,
+            () => undefined,
+        );
+        return result;
+    }
+
+    private async send(method: string, params: any[]): Promise<any> {
         const payload = {
             jsonrpc: '2.0',
             id: 1,
@@ -144,19 +236,26 @@ export class Connection {
             params,
         };
 
-        try {
-            const response = await this.client.post('', payload);
-            if (response.data.error) {
-                throw new Error(`RPC Error: ${response.data.error.message}`);
+        for (let attempt = 0; ; attempt++) {
+            try {
+                const response = await this.client.post('', payload, { timeout: this.timeoutMs });
+                const error = response.data.error;
+                if (error) {
+                    if (error.code === BUSY_CODE && attempt < this.busyRetries) {
+                        await new Promise((resolve) => setTimeout(resolve, this.backoffMs(attempt)));
+                        continue;
+                    }
+                    throw new Error(`RPC Error: ${error.message}`);
+                }
+                return response.data.result;
+            } catch (error: any) {
+                console.error("RPC Request Failed:", error.message);
+                if (error.response) {
+                    console.error("Status:", error.response.status);
+                    console.error("Data:", error.response.data);
+                }
+                throw new Error(`Connection Error: ${error.message}`);
             }
-            return response.data.result;
-        } catch (error: any) {
-            console.error("RPC Request Failed:", error.message);
-            if (error.response) {
-                console.error("Status:", error.response.status);
-                console.error("Data:", error.response.data);
-            }
-            throw new Error(`Connection Error: ${error.message}`);
         }
     }
 
@@ -333,7 +432,7 @@ export class Connection {
             return [];
         }
         try {
-            const response = await axios.get(`${this.indexerUrl}/history/${address}`);
+            const response = await axios.get(`${this.indexerUrl}/history/${address}`, { timeout: this.timeoutMs });
             return response.data;
         } catch (e) {
             console.error("Failed to fetch history from indexer", e);
@@ -472,6 +571,7 @@ export class Connection {
         try {
             const response = await axios.get(`${this.indexerUrl}/api/v1/trades`, {
                 params: { base: tokenIn, quote: tokenOut, limit },
+                timeout: this.timeoutMs,
             });
             return response.data || [];
         } catch (e) {
@@ -496,6 +596,7 @@ export class Connection {
         try {
             const response = await axios.get(`${this.indexerUrl}/api/v1/ohlc`, {
                 params: { base: tokenIn, quote: tokenOut, resolution, limit },
+                timeout: this.timeoutMs,
             });
             return response.data || [];
         } catch (e) {
@@ -515,6 +616,7 @@ export class Connection {
         try {
             const response = await axios.get(`${this.indexerUrl}/api/v1/pair_summary`, {
                 params: { base: tokenIn, quote: tokenOut },
+                timeout: this.timeoutMs,
             });
             return response.data || null;
         } catch (e) {
@@ -534,6 +636,7 @@ export class Connection {
         try {
             const response = await axios.get(`${this.indexerUrl}/api/v1/markets`, {
                 params: { limit },
+                timeout: this.timeoutMs,
             });
             return response.data || [];
         } catch (e) {
@@ -598,53 +701,69 @@ export class Connection {
     /**
      * Get list of validators with their stake
      */
+    /**
+     * The node's active validators, as `/get_validators` answers them
+     * (B236): it throws when the node cannot be reached or answers no list.
+     * It used to answer [] on any failure, and typed a `voting_power` the
+     * node never sends.
+     */
     async getValidators(): Promise<Array<{
         address: string;
         stake: number;
-        voting_power: number;
+        status: string;
     }>> {
-        // Use REST endpoint for validators
-        try {
-            const baseUrl = this.rpcUrl.replace('/rpc', '');
-            const response = await axios.get(`${baseUrl}/get_validators`);
-            return response.data.validators || [];
-        } catch {
-            // Fallback: return empty if endpoint not available
-            return [];
+        const response = await axios.get(`${this.restBase()}/get_validators`, { timeout: this.timeoutMs });
+        const validators = response.data?.validators;
+        if (!Array.isArray(validators)) {
+            throw new Error('get_validators answered no validator list');
         }
+        return validators;
     }
 
     /**
-     * Get network information (supply, stats, etc.)
+     * B236: the node's REST root: the RPC endpoint without a trailing
+     * `/rpc`. Cutting the first "/rpc" anywhere in it turned
+     * `https://rpc.example/rpc` into `https:/.example/rpc`.
+     */
+    restBase(): string {
+        return this.rpcUrl.replace(/\/rpc\/?$/, '');
+    }
+
+    /**
+     * The node's network information, as the node answers it (B223): the
+     * chain it runs (`chain_id`, the node's `network`), its latest block,
+     * its peers and committee sessions, the recent TPS. It throws when the
+     * node cannot be reached: it used to answer a guessed object instead,
+     * with `chain_id` 'AINCORE-MAINNET-1' whatever the node runs, so a
+     * client that took its chain id from here signed for mainnet.
      */
     async getNetworkInfo(): Promise<{
         chain_id: string;
-        total_supply: number;
-        circulating_supply: number;
-        total_staked: number;
-        validator_count: number;
+        /** `null` when the node's consensus was busy answering. */
+        node_id: string | null;
         block_height: number;
+        /** `null` when the node's consensus was busy answering. */
+        current_round: number | null;
+        peer_count: number;
+        committee_sessions: number;
         tps: number;
+        protocol_version: number;
     }> {
-        try {
-            const baseUrl = this.rpcUrl.replace('/rpc', '');
-            const response = await axios.get(`${baseUrl}/get_network_info`);
-            return response.data;
-        } catch {
-            // Fallback with defaults
-            const status = await this.getNodeStatus();
-            return {
-                chain_id: 'AINCORE-MAINNET-1',
-                total_supply: 0,
-                circulating_supply: 0,
-                total_staked: 0,
-                // The committee sessions plus this node; peers_count counts
-                // observers too.
-                validator_count: (status.committee_sessions ?? status.peers_count) + 1,
-                block_height: parseInt(status.latest_height) || 0,
-                tps: 0,
-            };
+        const response = await axios.get(`${this.restBase()}/get_network_info`, { timeout: this.timeoutMs });
+        const info = response.data;
+        if (typeof info?.network !== 'string' || info.network === '') {
+            throw new Error('get_network_info answered no chain id');
         }
+        return {
+            chain_id: info.network,
+            node_id: info.node_id ?? null,
+            block_height: Number(info.latest_block),
+            current_round: info.current_round == null ? null : Number(info.current_round),
+            peer_count: Number(info.peer_count),
+            committee_sessions: Number(info.committee_sessions),
+            tps: Number(info.tps),
+            protocol_version: Number(info.protocol_version),
+        };
     }
 
     /**
@@ -652,8 +771,7 @@ export class Connection {
      */
     async checkHealth(): Promise<boolean> {
         try {
-            const baseUrl = this.rpcUrl.replace('/rpc', '');
-            const response = await axios.get(`${baseUrl}/health`, { timeout: 5000 });
+            const response = await axios.get(`${this.restBase()}/health`, { timeout: 5000 });
             return response.status === 200;
         } catch {
             return false;
@@ -666,6 +784,8 @@ export class Connection {
 
     /**
      * Create a governance proposal
+     * @deprecated The node refuses `aincore_createProposal`: submit a signed
+     * transaction calling `0x1::governance::create_proposal` (sendTransaction).
      * @param id - Unique proposal ID
      * @param title - Proposal title
      * @param description - Proposal description
@@ -684,6 +804,8 @@ export class Connection {
 
     /**
      * Vote on a governance proposal
+     * @deprecated The node refuses `aincore_vote`: submit a signed transaction
+     * calling `0x1::governance::vote` (sendTransaction).
      * @param proposalId - Proposal ID
      * @param voter - Voter address
      * @param approve - true = approve, false = reject
@@ -693,18 +815,22 @@ export class Connection {
     }
 
     /**
-     * Get proposal details
-     * @param proposalId - Proposal ID
+     * A proposal as `0x1::governance` holds it on chain (B194): `id`,
+     * `proposer`, `description`, `votes_for` / `votes_against` (decimal
+     * strings), `executed`, `action_type`, `voting_ends` (consensus time,
+     * seconds). `null` when there is no such proposal.
+     * @param proposalId - Proposal id (a number, or its decimal string)
      */
-    async getProposal(proposalId: string): Promise<any> {
+    async getProposal(proposalId: number | string): Promise<any> {
         return await this.request('aincore_getProposal', [proposalId]);
     }
 
     /**
-     * Tally votes for a proposal
-     * @param proposalId - Proposal ID
+     * The votes of a proposal as the chain holds them (B194): `id`,
+     * `votes_for`, `votes_against`, `executed`, `voting_ends`. Read-only.
+     * @param proposalId - Proposal id (a number, or its decimal string)
      */
-    async tally(proposalId: string): Promise<any> {
+    async tally(proposalId: number | string): Promise<any> {
         return await this.request('aincore_tally', [proposalId]);
     }
 
@@ -842,52 +968,31 @@ export class Connection {
 
     /**
      * Get token info by token ID
-     * @param tokenId - Token ID (symbol)
+     * @param tokenId - Token ID: the hex of the symbol's bytes followed by the
+     * creator's 32-byte address (`tokenIdOf`)
      * @returns Token info or null if not found
      */
-    async getToken(tokenId: string): Promise<{
-        tokenId: string;
-        name: string;
-        symbol: string;
-        decimals: number;
-        maxSupply: string;
-        currentSupply: string;
-        creator: string;
-        isMintable: boolean;
-    } | null> {
+    async getToken(tokenId: string): Promise<TokenInfo | null> {
         const result = await this.request('aincore_getToken', [tokenId]);
         if (!result) return null;
-        return {
-            tokenId: result.token_id || tokenId,
-            name: result.name || '',
-            symbol: result.symbol || '',
-            decimals: result.decimals || 18,
-            maxSupply: result.max_supply || '0',
-            currentSupply: result.current_supply || '0',
-            creator: result.creator || '',
-            isMintable: result.is_mintable !== false
-        };
+        return toTokenInfo(result, tokenId);
     }
 
     /**
-     * Get all tokens created on the network
+     * Get the tokens a creator made (the node keeps a registry per creator;
+     * there is no network-wide list)
+     * @param creator - The creator's address (A1n or 64 hex)
      * @returns Array of token info
      */
-    async getTokens(): Promise<Array<{
-        tokenId: string;
-        name: string;
-        symbol: string;
-        decimals: number;
-        currentSupply: string;
-    }>> {
-        const result = await this.request('aincore_getTokens', []);
-        return result || [];
+    async getTokens(creator: string): Promise<TokenInfo[]> {
+        const result = await this.request('aincore_getTokens', [creator]);
+        return (result || []).map((token: any) => toTokenInfo(token));
     }
 
     /**
      * Get token balance for an address
      * @param address - Wallet address
-     * @param tokenId - Token ID (symbol)
+     * @param tokenId - Token ID (`tokenIdOf`)
      * @returns Token balance
      */
     async getTokenBalance(address: string, tokenId: string): Promise<string> {

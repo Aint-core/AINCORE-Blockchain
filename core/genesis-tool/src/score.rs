@@ -427,10 +427,14 @@ pub fn score(
     // all (the first sender was its funder, so one quantum sent ahead moved
     // an honest account into the sender's cluster); a direct faucet transfer
     // makes it a root (B113); a paymaster funds only an account no AIN
-    // transfer did.
+    // transfer did. B143: only what reached it before its first scored
+    // action counts (and the sponsor of that action): testnet AIN is free,
+    // so any account sending more later became an active account's funder
+    // and pulled it into its cluster.
     let mut rooted: BTreeSet<String> = BTreeSet::new();
     let mut received: BTreeMap<String, BTreeMap<String, u128>> = BTreeMap::new();
     let mut sponsor: BTreeMap<String, String> = BTreeMap::new();
+    let mut acted: BTreeSet<String> = BTreeSet::new();
     for h in 1..=to_height {
         let block = if h >= from_height {
             blocks[(h - from_height) as usize].clone()
@@ -444,26 +448,35 @@ pub fn score(
             let sender = canonical(&tx.sender);
             let payer = executor::admission::payer_address(&tx).map(|p| canonical(&p));
             let sponsored = payer.filter(|p| *p != sender);
-            let transfer = match classify(&tx) {
-                Action::Transfer { to, amount } if to != sender => Some((to, amount)),
-                _ => None,
-            };
-            if sponsored.is_none() && transfer.is_none() {
+            let action = classify(&tx);
+            if sponsored.is_none() && action == Action::None {
                 continue;
             }
             if !succeeded(raw)? {
                 continue;
             }
             if let Some(payer) = sponsored {
-                sponsor.entry(sender.clone()).or_insert(payer);
-            }
-            if let Some((to, amount)) = transfer {
-                if sender == faucet {
-                    rooted.insert(to);
-                } else {
-                    let sent = received.entry(to).or_default().entry(sender).or_insert(0);
-                    *sent = sent.saturating_add(amount);
+                if !acted.contains(&sender) {
+                    sponsor.entry(sender.clone()).or_insert(payer);
                 }
+            }
+            match &action {
+                Action::Transfer { to, .. } if *to == sender => {}
+                Action::Transfer { to, .. } if sender == faucet => {
+                    rooted.insert(to.clone());
+                }
+                Action::Transfer { to, amount } if !acted.contains(to) => {
+                    let sent = received
+                        .entry(to.clone())
+                        .or_default()
+                        .entry(sender.clone())
+                        .or_insert(0);
+                    *sent = sent.saturating_add(*amount);
+                }
+                _ => {}
+            }
+            if action != Action::None {
+                acted.insert(sender);
             }
         }
     }
@@ -1099,6 +1112,41 @@ mod tests {
         assert_eq!(p(50).unwrap().ain, 625);
         assert_eq!(p(55).unwrap().ain, 375);
         assert_eq!(p(52).unwrap().ain, PUBLIC_CAP_AIN);
+    }
+
+    /// B143 witness: a transfer an account receives after its first scored
+    /// action does not make its funder (testnet AIN is free: the largest
+    /// sender could be anyone who sent more later, pulling an active account
+    /// into its own cluster).
+    #[test]
+    fn a_transfer_after_an_accounts_first_action_does_not_fund_it() {
+        let mut txs = vec![
+            (1, transfer(FAUCET, 50, 0)),
+            (1, transfer(FAUCET, 64, 1)),
+            // 64 funds 66 a quantum; 66 acts from block 10 on.
+            (2, transfer(64, 66, 0)),
+            // 50 sends it 100 after its first action.
+            (20, coin_transfer(50, 66, 100, ain(), 0)),
+        ];
+        for (n, day) in [10u64, 11, 12].into_iter().enumerate() {
+            txs.push((day, transfer(66, 51, n as u64)));
+        }
+        let (db, a) = testnet("b143", &[1_000; 7], &[], &txs);
+        let r = score(
+            &db,
+            1,
+            60,
+            &[a[0].clone()],
+            &address_of(FAUCET),
+            18_500_000,
+            5_550_000,
+        )
+        .unwrap();
+        assert_eq!(
+            r.public[&address_of(66)].cluster,
+            address_of(64),
+            "a transfer after its first action made its funder"
+        );
     }
 
     /// B79 witness: a zero transfer or another coin's transfer funds no

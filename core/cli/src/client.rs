@@ -58,4 +58,23 @@ impl RpcClient {
 
         Ok(body.result.unwrap_or(Value::Null))
     }
+
+    /// B243: the chain the node runs, the `network` of its
+    /// `/get_network_info` (the REST root is the RPC URL without a trailing
+    /// `/rpc`).
+    pub fn network(&self) -> Result<String> {
+        let root = self.url.strip_suffix('/').unwrap_or(&self.url);
+        let root = root.strip_suffix("/rpc").unwrap_or(root);
+        let info: Value = self
+            .client
+            .get(format!("{root}/get_network_info"))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        info.get("network")
+            .and_then(Value::as_str)
+            .filter(|network| !network.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("get_network_info named no chain"))
+    }
 }

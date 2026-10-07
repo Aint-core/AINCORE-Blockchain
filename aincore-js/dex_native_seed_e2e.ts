@@ -5,7 +5,9 @@ import { AINCORE_COIN_TYPE, structTypeTag } from './src/bcs';
 
 const rpcUrl = process.env.AINCORE_RPC_URL || 'http://192.168.18.202:8012/rpc';
 const indexerUrl = process.env.AINCORE_INDEXER_URL || 'http://192.168.18.202:3012';
-const chainId = process.env.AINCORE_CHAIN_ID || 'AINCORE-MAINNET-1';
+// B258: the chain is named, never assumed.
+const chainId = process.env.AINCORE_CHAIN_ID ?? '';
+if (!chainId) throw new Error('AINCORE_CHAIN_ID names the chain to sign for');
 
 const AIN = 10n ** 18n;
 const WBTC = 10n ** 8n;

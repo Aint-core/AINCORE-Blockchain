@@ -1187,6 +1187,7 @@ fn a_server_without_a_blocks_qc_does_not_stall_the_pass() {
                         .filter(|q| !(lacks && q.block_height == gap))
                         .cloned()
                         .collect(),
+                    oversized: None,
                 };
                 Ok(format!(
                     "SYNC_RESP:{}",
@@ -1215,5 +1216,730 @@ fn a_server_without_a_blocks_qc_does_not_stall_the_pass() {
     assert_eq!(
         reached, tip,
         "the pass stopped at the server without block {gap}'s QC"
+    );
+}
+
+/// B256 witness: a session that serves a block a batch, slowly, holds a
+/// pass for one turn (`SYNC_TURN`), not for as long as it brings a block
+/// (one just inside the request timeout held every pass, at a block a
+/// minute, and no other session was asked): the next session is asked in
+/// that pass and brings the node to the certified tip, and the slow one is
+/// asked after the others from then on.
+#[test]
+fn a_slow_server_holds_a_pass_for_one_turn() {
+    let (x, y) = (0, 3);
+    let mut sim = Sim::new("b256_slow_server", &[191, 192, 193, 194], 1000);
+    assert!(sim.run_until(60, |s| s.height(y) >= 3));
+    sim.online[y] = false;
+    assert!(sim.run_until(400, |s| s.height(x) >= s.height(y) + 12));
+    let from = sim.height(y);
+    let full = sim.nodes[x]
+        .sync
+        .as_ref()
+        .unwrap()
+        .handle_sync_request(SyncRequest { from_height: from });
+    let mut tip = from;
+    while full.blocks.iter().any(|b| b.header.height == tip + 1)
+        && full.qcs.iter().any(|q| q.block_height == tip + 1)
+    {
+        tip += 1;
+    }
+    assert!(tip >= from + 6, "vacuous: few certified blocks to serve");
+    let (blocks, qcs) = (full.blocks.clone(), full.qcs.clone());
+    let block_asks = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = Arc::clone(&block_asks);
+    let (asks, mut queued) = tokio::sync::mpsc::channel::<network::SyncAsk>(64);
+    let (dials, _) = tokio::sync::mpsc::channel(1);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.spawn(async move {
+        while let Some(ask) = queued.recv().await {
+            let slow = ask.peer == "12D3KooWslow";
+            let (blocks, qcs) = (blocks.clone(), qcs.clone());
+            let log = Arc::clone(&log);
+            tokio::spawn(async move {
+                let answer = if ask.wire == "GET_HEIGHT" {
+                    Ok(format!("HEIGHT:{}", if slow { u64::MAX / 2 } else { tip }))
+                } else if let Some(req) = ask.wire.strip_prefix("SYNC_REQ:") {
+                    log.lock().unwrap().push(ask.peer.clone());
+                    let req: SyncRequest = serde_json::from_str(req).unwrap();
+                    // The slow one: a single block a batch, after most of a
+                    // turn's time.
+                    let last = if slow { req.from_height + 1 } else { tip };
+                    if slow {
+                        tokio::time::sleep(crate::SYNC_TURN / 3).await;
+                    }
+                    let resp = SyncResponse {
+                        blocks: blocks
+                            .iter()
+                            .filter(|b| {
+                                b.header.height > req.from_height && b.header.height <= last
+                            })
+                            .cloned()
+                            .collect(),
+                        finality: None,
+                        prune_horizon: None,
+                        qcs: qcs.clone(),
+                        oversized: None,
+                    };
+                    Ok(format!(
+                        "SYNC_RESP:{}",
+                        serde_json::to_string(&resp).unwrap()
+                    ))
+                } else {
+                    Err("no".to_string())
+                };
+                let _ = ask.reply.send(answer);
+            });
+        }
+    });
+    let member = |peer: &str, member: &str| network::SessionPeer {
+        peer: peer.into(),
+        member: Some(member.into()),
+    };
+    let client = network::SessionClient {
+        asks,
+        dials,
+        table: Arc::new(std::sync::RwLock::new(vec![
+            member("12D3KooWslow", &sim.committee[1].address),
+            member("12D3KooWfast", &sim.committee[2].address),
+        ])),
+    };
+    let sync = ChainSync::new(Arc::clone(&sim.node(y).storage)).with_sessions(client);
+    let reached = rt.block_on(sync.sync_from_peers());
+    assert_eq!(reached, tip, "the pass did not reach the certified tip");
+    let asked = block_asks.lock().unwrap().clone();
+    assert!(
+        asked.iter().any(|p| p == "12D3KooWfast"),
+        "the slow session held the pass: {asked:?}"
+    );
+    assert!(
+        sync.stalls
+            .lock()
+            .unwrap()
+            .get("12D3KooWslow")
+            .map_or(0, |(n, _)| *n)
+            > 0,
+        "the slow session was not struck"
+    );
+}
+
+/// B263 witness support: node `y` of a four-node `Sim` left behind the
+/// others' certified blocks by at least `gap`, with `x`'s answer to it:
+/// (sim, y, its height, the certified tip above it, the blocks, their QCs).
+fn left_behind(
+    tag: &str,
+    seeds: &[u8],
+    gap: u64,
+) -> (
+    Sim,
+    usize,
+    u64,
+    u64,
+    Vec<Block>,
+    Vec<consensus::qc::QuorumCertificate>,
+) {
+    let (x, y) = (0, 3);
+    let mut sim = Sim::new(tag, seeds, 1000);
+    assert!(sim.run_until(60, |s| s.height(y) >= 3));
+    sim.online[y] = false;
+    assert!(sim.run_until(400, |s| s.height(x) >= s.height(y) + gap + 2));
+    let from = sim.height(y);
+    let full = sim.nodes[x]
+        .sync
+        .as_ref()
+        .unwrap()
+        .handle_sync_request(SyncRequest { from_height: from });
+    let mut tip = from;
+    while full.blocks.iter().any(|b| b.header.height == tip + 1)
+        && full.qcs.iter().any(|q| q.block_height == tip + 1)
+    {
+        tip += 1;
+    }
+    assert!(tip >= from + gap, "vacuous: few certified blocks to serve");
+    (sim, y, from, tip, full.blocks.clone(), full.qcs.clone())
+}
+
+/// B263 witness support: sessions answering as `serve` says, each answer
+/// on its own task; the peers asked for blocks, in order, are logged.
+fn sessions_serving(
+    rt: &tokio::runtime::Runtime,
+    table: Vec<network::SessionPeer>,
+    serve: impl Fn(&str, &str) -> Option<(std::time::Duration, String)> + Send + Sync + 'static,
+) -> (network::SessionClient, Arc<std::sync::Mutex<Vec<String>>>) {
+    let block_asks = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = Arc::clone(&block_asks);
+    let serve = Arc::new(serve);
+    let (asks, mut queued) = tokio::sync::mpsc::channel::<network::SyncAsk>(64);
+    let (dials, _) = tokio::sync::mpsc::channel(1);
+    rt.spawn(async move {
+        while let Some(ask) = queued.recv().await {
+            if ask.wire.starts_with("SYNC_REQ:") {
+                log.lock().unwrap().push(ask.peer.clone());
+            }
+            let serve = Arc::clone(&serve);
+            tokio::spawn(async move {
+                let answer = match serve(&ask.peer, &ask.wire) {
+                    Some((wait, answer)) => {
+                        tokio::time::sleep(wait).await;
+                        Ok(answer)
+                    }
+                    None => Err("no".to_string()),
+                };
+                let _ = ask.reply.send(answer);
+            });
+        }
+    });
+    let client = network::SessionClient {
+        asks,
+        dials,
+        table: Arc::new(std::sync::RwLock::new(table)),
+    };
+    (client, block_asks)
+}
+
+/// The `SYNC_RESP` of `blocks` above `from` up to `last`, with `qcs`.
+fn sync_answer(
+    blocks: &[Block],
+    qcs: &[consensus::qc::QuorumCertificate],
+    from: u64,
+    last: u64,
+) -> String {
+    let resp = SyncResponse {
+        blocks: blocks
+            .iter()
+            .filter(|b| b.header.height > from && b.header.height <= last)
+            .cloned()
+            .collect(),
+        finality: None,
+        prune_horizon: None,
+        qcs: qcs.to_vec(),
+        oversized: None,
+    };
+    format!("SYNC_RESP:{}", serde_json::to_string(&resp).unwrap())
+}
+
+/// B263 witness: a session that brought one block slowly and then answered
+/// empty at once keeps its strike (B256 judged only a turn the clock ended,
+/// so ending it early cleared the strike, and the session kept the first
+/// turn of every pass).
+#[test]
+fn a_session_ending_its_turn_early_is_struck() {
+    let (sim, y, from, tip, blocks, qcs) = left_behind("b263_early_end", &[201, 202, 203, 204], 6);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = Arc::clone(&served);
+    let (client, _) = sessions_serving(
+        &rt,
+        vec![network::SessionPeer {
+            peer: "12D3KooWslow".into(),
+            member: Some(sim.committee[1].address.clone()),
+        }],
+        move |_, wire| {
+            if wire == "GET_HEIGHT" {
+                return Some((std::time::Duration::ZERO, format!("HEIGHT:{}", tip + 1_000)));
+            }
+            let req: SyncRequest = serde_json::from_str(wire.strip_prefix("SYNC_REQ:")?).ok()?;
+            if count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                // One real block, slowly.
+                let last = req.from_height + 1;
+                return Some((
+                    crate::SLOW_ANSWER * 2,
+                    sync_answer(&blocks, &qcs, req.from_height, last),
+                ));
+            }
+            // Then nothing, at once.
+            Some((std::time::Duration::ZERO, sync_answer(&blocks, &qcs, 0, 0)))
+        },
+    );
+    let sync = ChainSync::new(Arc::clone(&sim.node(y).storage)).with_sessions(client);
+    let reached = rt.block_on(sync.sync_from_peers());
+    assert_eq!(reached, from + 1, "vacuous: the block was not taken");
+    assert!(
+        sync.stalls
+            .lock()
+            .unwrap()
+            .get("12D3KooWslow")
+            .is_some_and(|(n, _)| *n > 0),
+        "a session that ended its turn early cleared its strike"
+    );
+}
+
+/// B263 witness: sessions advertising this node's own height take no block
+/// turn, and a member with strikes is asked before them (they took a turn
+/// each and were never struck, so three of them held every turn once the
+/// members had a strike: the node never synced).
+#[test]
+fn sessions_at_this_nodes_height_take_no_turn() {
+    let (sim, y, from, tip, blocks, qcs) = left_behind("b263_level", &[211, 212, 213, 214], 6);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let sybil = |p: &str| network::SessionPeer {
+        peer: p.into(),
+        member: None,
+    };
+    let (client, block_asks) = sessions_serving(
+        &rt,
+        vec![
+            sybil("12D3KooWsybil1"),
+            sybil("12D3KooWsybil2"),
+            sybil("12D3KooWsybil3"),
+            network::SessionPeer {
+                peer: "12D3KooWmember".into(),
+                member: Some(sim.committee[1].address.clone()),
+            },
+        ],
+        move |peer, wire| {
+            let height = if peer == "12D3KooWmember" { tip } else { from };
+            if wire == "GET_HEIGHT" {
+                return Some((std::time::Duration::ZERO, format!("HEIGHT:{height}")));
+            }
+            let req: SyncRequest = serde_json::from_str(wire.strip_prefix("SYNC_REQ:")?).ok()?;
+            Some((
+                std::time::Duration::ZERO,
+                sync_answer(&blocks, &qcs, req.from_height, height),
+            ))
+        },
+    );
+    let sync = ChainSync::new(Arc::clone(&sim.node(y).storage)).with_sessions(client);
+    sync.stalls
+        .lock()
+        .unwrap()
+        .insert("12D3KooWmember".into(), (3, std::time::Instant::now()));
+    let reached = rt.block_on(sync.sync_from_peers());
+    let asked = block_asks.lock().unwrap().clone();
+    assert!(
+        asked.iter().all(|p| p == "12D3KooWmember"),
+        "a session at this node's height took a turn: {asked:?}"
+    );
+    assert_eq!(reached, tip, "the member was not asked");
+}
+
+/// B263 witness: a member whose newest block has no QC yet is not struck
+/// for it: this node takes what it certified and stops there (it was struck
+/// whenever its tip lacked a QC, and sat behind sessions never struck).
+#[test]
+fn a_member_at_its_tip_without_a_qc_is_not_struck() {
+    let (sim, y, from, tip, blocks, qcs) = left_behind("b263_tip", &[221, 222, 223, 224], 6);
+    // This node holds everything but the tip already.
+    let below: Vec<Block> = blocks
+        .iter()
+        .filter(|b| b.header.height < tip)
+        .cloned()
+        .collect();
+    let held = sim.nodes[y]
+        .sync
+        .as_ref()
+        .unwrap()
+        .process_blocks_with_qcs(below, &qcs, from);
+    assert_eq!(
+        held,
+        tip - 1,
+        "vacuous: the blocks below the tip were not taken"
+    );
+    // The member's newest block, `tip`, comes without its QC.
+    let uncertified: Vec<consensus::qc::QuorumCertificate> = qcs
+        .iter()
+        .filter(|q| q.block_height != tip)
+        .cloned()
+        .collect();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (client, _) = sessions_serving(
+        &rt,
+        vec![network::SessionPeer {
+            peer: "12D3KooWmember".into(),
+            member: Some(sim.committee[1].address.clone()),
+        }],
+        move |_, wire| {
+            if wire == "GET_HEIGHT" {
+                return Some((std::time::Duration::ZERO, format!("HEIGHT:{tip}")));
+            }
+            let req: SyncRequest = serde_json::from_str(wire.strip_prefix("SYNC_REQ:")?).ok()?;
+            Some((
+                std::time::Duration::ZERO,
+                sync_answer(&blocks, &uncertified, req.from_height, tip),
+            ))
+        },
+    );
+    let sync = ChainSync::new(Arc::clone(&sim.node(y).storage)).with_sessions(client);
+    let reached = rt.block_on(sync.sync_from_peers());
+    assert_eq!(reached, tip - 1);
+    assert!(
+        !sync.stalls.lock().unwrap().contains_key("12D3KooWmember"),
+        "a member was struck for a newest block without a QC"
+    );
+}
+
+/// B264/B275 witness support: the byte cut at which node x's server and
+/// node y's client part blocks (a Sim block is a few KB: every block is
+/// parted, in parts of half this).
+const CUT: usize = 640;
+
+/// B264/B275 witness support: how one member session, serving node `y` from
+/// node `x`'s real blocks parted at `CUT`, misbehaves.
+#[derive(Clone, Copy, Default)]
+struct Parted {
+    /// Each part but a block's last, ten bytes short (past the three a
+    /// server's cut at a character boundary may leave).
+    short: bool,
+    /// The oversized answer without its block's QC.
+    no_qc: bool,
+    /// Its QC with another block hash.
+    junk_qc: bool,
+    /// The length named, when not the block's.
+    len: Option<u64>,
+    /// One space after the block's text (every length raised to match).
+    pad: bool,
+    /// The second part asked answered busy (a fetch under way).
+    busy_once: bool,
+    /// Each part answered after this many milliseconds.
+    part_delay_ms: u64,
+    /// The passes run (fewer once the certified tip is reached).
+    passes: usize,
+}
+
+/// What `sync_past_oversized` saw.
+struct PartedRun {
+    reached: u64,
+    /// The (height, offset) of each part asked for, in order.
+    offsets: Vec<(u64, u64)>,
+    strikes: u32,
+}
+
+/// B264/B275 witness support: node `y` of a `left_behind` cluster syncing
+/// to the certified tip from one member session that serves node 0's blocks
+/// in parts, as `how` says.
+fn sync_past_oversized(sim: &Sim, y: usize, tip: u64, how: Parted) -> PartedRun {
+    let server = Arc::new(ChainSync::new(Arc::clone(&sim.node(0).storage)).with_batch_bytes(CUT));
+    let offsets = Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
+    let asked = Arc::clone(&offsets);
+    let parts_asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (client, _) = sessions_serving(
+        &rt,
+        vec![network::SessionPeer {
+            peer: "12D3KooWbig".into(),
+            member: Some(sim.committee[1].address.clone()),
+        }],
+        move |_, wire| {
+            let now = std::time::Duration::ZERO;
+            if wire == "GET_HEIGHT" {
+                return Some((now, format!("HEIGHT:{tip}")));
+            }
+            if let Some(req) = wire.strip_prefix(crate::PART_REQ) {
+                let req: crate::BlockPartRequest = serde_json::from_str(req).ok()?;
+                asked.lock().unwrap().push((req.height, req.offset));
+                let wait = std::time::Duration::from_millis(how.part_delay_ms);
+                let nth = parts_asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if how.busy_once && nth == 1 {
+                    return Some((wait, crate::state_sync::busy_reply(wire)?));
+                }
+                let answer = server.handle_message(wire)?;
+                let mut part: crate::BlockPartResponse =
+                    serde_json::from_str(answer.strip_prefix(crate::PART_RESP)?).ok()?;
+                let last = req.offset + part.data.len() as u64 >= part.len;
+                if how.short && !last {
+                    let mut cut = part.data.len().saturating_sub(10);
+                    while !part.data.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    part.data.truncate(cut);
+                }
+                if how.pad {
+                    if last {
+                        part.data.push(' ');
+                    }
+                    part.len += 1;
+                }
+                let json = serde_json::to_string(&part).unwrap();
+                return Some((wait, format!("{}{json}", crate::PART_RESP)));
+            }
+            let answer = server.handle_message(wire)?;
+            let Some(json) = answer.strip_prefix("SYNC_RESP:") else {
+                return Some((now, answer));
+            };
+            let mut resp: SyncResponse = serde_json::from_str(json).ok()?;
+            if let Some(big) = resp.oversized.as_mut() {
+                if how.no_qc {
+                    resp.qcs.retain(|q| q.block_height != big.height);
+                }
+                if how.junk_qc {
+                    for q in resp.qcs.iter_mut().filter(|q| q.block_height == big.height) {
+                        q.block_hash = "ab".repeat(32);
+                    }
+                }
+                if let Some(len) = how.len {
+                    big.len = len;
+                }
+                if how.pad {
+                    big.len += 1;
+                }
+            }
+            Some((
+                now,
+                format!("SYNC_RESP:{}", serde_json::to_string(&resp).unwrap()),
+            ))
+        },
+    );
+    let sync = ChainSync::new(Arc::clone(&sim.node(y).storage))
+        .with_batch_bytes(CUT)
+        .with_sessions(client);
+    let mut reached = 0;
+    for _ in 0..how.passes.max(1) {
+        reached = rt.block_on(sync.sync_from_peers());
+        if reached >= tip {
+            break;
+        }
+    }
+    let strikes = sync
+        .stalls
+        .lock()
+        .unwrap()
+        .get("12D3KooWbig")
+        .map_or(0, |(n, _)| *n);
+    let offsets = offsets.lock().unwrap().clone();
+    PartedRun {
+        reached,
+        offsets,
+        strikes,
+    }
+}
+
+/// B264/B275 witness: blocks a server names as too large for a batch are
+/// fetched in parts, each checked against its QC first, and imported, to
+/// the certified tip. The server sent such a block alone, over the frame no
+/// client reads past, so no node could block-sync beyond it.
+#[test]
+fn a_block_named_oversized_is_fetched_in_parts() {
+    let (sim, y, from, tip, _, _) = left_behind("b264_fetch", &[231, 232, 233, 234], 4);
+    let how = Parted {
+        passes: 8,
+        ..Parted::default()
+    };
+    let run = sync_past_oversized(&sim, y, tip, how);
+    assert!(
+        run.offsets.len() > 2,
+        "vacuous: {} parts",
+        run.offsets.len()
+    );
+    assert_eq!(
+        run.reached, tip,
+        "syncing did not go past the parted blocks"
+    );
+    assert_eq!(run.strikes, 0);
+    assert!(run.offsets.iter().any(|(h, _)| *h == from + 1));
+}
+
+/// B264 witness: a part shorter than due ends the fetch at once: nothing is
+/// imported, and the session is struck.
+#[test]
+fn a_short_block_part_ends_the_fetch() {
+    let (sim, y, from, tip, _, _) = left_behind("b264_short", &[241, 242, 243, 244], 4);
+    let how = Parted {
+        short: true,
+        passes: 1,
+        ..Parted::default()
+    };
+    let run = sync_past_oversized(&sim, y, tip, how);
+    assert_eq!(
+        run.offsets,
+        vec![(from + 1, 0)],
+        "a short part did not end the fetch"
+    );
+    assert_eq!(run.reached, from);
+    assert!(
+        run.strikes > 0,
+        "a session sending short parts was not struck"
+    );
+}
+
+/// B264 witness: a block named too large for a batch without its QC is its
+/// server's newest: no part is asked for, and the session is not struck.
+#[test]
+fn an_oversized_block_without_its_qc_is_not_fetched() {
+    let (sim, y, from, tip, _, _) = left_behind("b264_noqc", &[251, 252, 253, 254], 4);
+    let how = Parted {
+        no_qc: true,
+        passes: 1,
+        ..Parted::default()
+    };
+    let run = sync_past_oversized(&sim, y, tip, how);
+    assert!(run.offsets.is_empty(), "a block without its QC was fetched");
+    assert_eq!(run.reached, from);
+    assert_eq!(run.strikes, 0, "a server was struck for its newest block");
+}
+
+/// B275 witness: a block named with a QC that does not bind its header, or
+/// with a length no server parts (one a batch holds, one past what a client
+/// imports), is refused before any part is asked for, and its server is
+/// struck (any QC naming the height started a fetch of up to 512 MiB).
+#[test]
+fn a_parted_block_is_checked_before_any_part() {
+    let (sim, y, from, tip, _, _) = left_behind("b275_named", &[5, 6, 7, 8], 4);
+    for how in [
+        Parted {
+            junk_qc: true,
+            ..Parted::default()
+        },
+        Parted {
+            len: Some(CUT as u64),
+            ..Parted::default()
+        },
+        Parted {
+            len: Some(crate::MAX_PARTED_BLOCK_BYTES + 1),
+            ..Parted::default()
+        },
+    ] {
+        let run = sync_past_oversized(&sim, y, tip, how);
+        assert!(
+            run.offsets.is_empty(),
+            "a part was asked for: {:?}",
+            run.offsets
+        );
+        assert_eq!(run.reached, from);
+        assert!(run.strikes > 0);
+    }
+}
+
+/// B275 witness: a parted block must be the text its server stores: one
+/// padded (it still parses to the block, and filled a turn's bytes) is
+/// refused, and its server struck.
+#[test]
+fn a_padded_parted_block_is_refused() {
+    let (sim, y, from, tip, _, _) = left_behind("b264_padded", &[15, 16, 17, 18], 4);
+    let how = Parted {
+        pad: true,
+        passes: 1,
+        ..Parted::default()
+    };
+    let run = sync_past_oversized(&sim, y, tip, how);
+    assert!(run.offsets.len() > 1, "vacuous: the block was not fetched");
+    assert_eq!(run.reached, from, "a padded block was imported");
+    assert!(run.strikes > 0, "padding was not struck");
+}
+
+/// B275 witness: a busy part answer is waited out, and the fetch goes on
+/// from that part (the server's answer budget refused the next part, and
+/// the fetch failed), and a block that outlasts a turn is resumed at the
+/// next from where it stopped (it began again from 0, so no block longer
+/// than a turn could arrive).
+#[test]
+fn a_parted_fetch_waits_out_busy_and_resumes_across_turns() {
+    let (sim, y, from, tip, _, _) = left_behind("b275_resume", &[35, 36, 37, 38], 4);
+    let how = Parted {
+        busy_once: true,
+        part_delay_ms: crate::SYNC_TURN.as_millis() as u64 / 3,
+        passes: 40,
+        ..Parted::default()
+    };
+    let run = sync_past_oversized(&sim, y, tip, how);
+    // Every block here takes more parts than a turn's time holds, so one
+    // fetched at all was resumed.
+    assert!(run.reached > from, "nothing was fetched");
+    // A part in flight when a turn ends is asked again at the next; a
+    // block once begun is never begun again.
+    let mut at = std::collections::HashMap::new();
+    for &(height, offset) in &run.offsets {
+        let before = at.insert(height, offset).unwrap_or(0);
+        assert!(
+            offset >= before,
+            "block {height} began again at {offset} after {before}: {:?}",
+            run.offsets
+        );
+    }
+    assert!(
+        run.offsets.iter().any(|(h, o)| *h == from + 1 && *o > 0),
+        "vacuous: no block took more than one part"
+    );
+}
+
+/// B263/B274 witness: block turns go by standing: members first whatever
+/// their strikes, then the fewest strikes still counting (they expire after
+/// `STRIKE_TTL`), then the most blocks brought, then the session that waited
+/// longest; three take a turn, and every turn is recorded.
+#[test]
+fn turns_go_to_members_then_live_strikes_then_yield() {
+    let path = format!(
+        "{}/b263_order_{}",
+        storage::test_dir::process_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_dir_all(&path);
+    let db = Arc::new(StateDB::open(&path).unwrap());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let session = |peer: &str, member: Option<&str>| network::SessionPeer {
+        peer: peer.into(),
+        member: member.map(str::to_string),
+    };
+    let (client, block_asks) = sessions_serving(
+        &rt,
+        vec![
+            session("12D3KooWa", None),
+            session("12D3KooWb", None),
+            session("12D3KooWc", None),
+            session("12D3KooWd", None),
+            session("12D3KooWm", Some(&"ee".repeat(32))),
+        ],
+        |_, wire| {
+            if wire == "GET_HEIGHT" {
+                return Some((std::time::Duration::ZERO, "HEIGHT:100".to_string()));
+            }
+            wire.strip_prefix("SYNC_REQ:")?;
+            Some((std::time::Duration::ZERO, sync_answer(&[], &[], 0, 0)))
+        },
+    );
+    let sync = ChainSync::new(db).with_sessions(client);
+    let now = std::time::Instant::now();
+    let long_ago = now.checked_sub(crate::STRIKE_TTL * 2).unwrap();
+    {
+        let mut stalls = sync.stalls.lock().unwrap();
+        // a's strikes expired; b's count.
+        stalls.insert("12D3KooWa".into(), (5, long_ago));
+        stalls.insert("12D3KooWb".into(), (1, now));
+        stalls.insert("12D3KooWm".into(), (2, now));
+        let mut yields = sync.yields.lock().unwrap();
+        yields.insert("12D3KooWa".into(), (9, now));
+        yields.insert("12D3KooWc".into(), (7, now));
+    }
+    rt.block_on(sync.sync_from_peers());
+    let asked = block_asks.lock().unwrap().clone();
+    // m (a member, struck); a (its strikes expired, most brought); c.
+    assert_eq!(asked, vec!["12D3KooWm", "12D3KooWa", "12D3KooWc"]);
+    assert!(
+        sync.turns.lock().unwrap().contains_key("12D3KooWc"),
+        "a turn was not recorded"
+    );
+}
+
+/// B263 witness: a session at this node's height takes no block turn but is
+/// asked for its finality artifact (it was asked at the end of a turn, and
+/// such a session no longer gets one, so a node level with its peers never
+/// imported their QCs).
+#[test]
+fn a_session_at_this_nodes_height_gives_its_finality() {
+    let (sim, y, from, _tip, _blocks, _qcs) = left_behind("b263_finality", &[25, 26, 27, 28], 4);
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = Arc::clone(&asked);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (client, block_asks) = sessions_serving(
+        &rt,
+        vec![network::SessionPeer {
+            peer: "12D3KooWlevel".into(),
+            member: Some(sim.committee[1].address.clone()),
+        }],
+        move |_, wire| {
+            log.lock().unwrap().push(wire.to_string());
+            let now = std::time::Duration::ZERO;
+            (wire == "GET_HEIGHT").then(|| (now, format!("HEIGHT:{from}")))
+        },
+    );
+    let sync = ChainSync::new(Arc::clone(&sim.node(y).storage)).with_sessions(client);
+    rt.block_on(sync.sync_from_peers());
+    assert!(
+        block_asks.lock().unwrap().is_empty(),
+        "a level session took a block turn"
+    );
+    let asked = asked.lock().unwrap().clone();
+    assert!(
+        asked.iter().any(|w| w == "GET_FINALITY"),
+        "a level session was not asked for its finality: {asked:?}"
     );
 }

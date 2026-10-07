@@ -20,8 +20,16 @@ async fn main() {
     info!("🌉 AINCORE Bridge Service (Rust) Starting...");
 
     // Configuration
+    // B258: the node's API port is 8002 (the default was 8001).
     let aincore_rpc =
-        env::var("AINCORE_RPC").unwrap_or_else(|_| "http://localhost:8001/rpc".to_string());
+        env::var("AINCORE_RPC").unwrap_or_else(|_| "http://localhost:8002/rpc".to_string());
+    // B258: the chain is named, never assumed (the default was mainnet).
+    if aincore_client::configured_chain_id().is_none() {
+        error!(
+            "❌ AINCORE_CHAIN_ID is not set: name the chain whose certificates this bridge accepts"
+        );
+        std::process::exit(1);
+    }
     let evm_rpc = env::var("EVM_RPC").unwrap_or_else(|_| "https://rpc.sepolia.org".to_string());
     let contract_addr = env::var("CONTRACT_ADDRESS")
         .unwrap_or_else(|_| "0x0000000000000000000000000000000000000000".to_string());

@@ -14,6 +14,8 @@ use super::*;
 
 /// RE-3: digests per `VERTEX_REQ`.
 pub const MAX_REQ_DIGESTS: usize = 32;
+/// Rounds `want_gap` wants at once, from one past the highest round held.
+const MAX_GAP_ROUNDS: u64 = 256;
 /// Slots per `CERT_REQ`.
 pub const MAX_REQ_SLOTS: usize = 64;
 /// RE-5: bytes of bodies per answer. The whole answer (bodies, `unknown`
@@ -36,6 +38,11 @@ pub const T_FETCH_MAX: u64 = 8;
 pub const MEMBER_REQS_PER_TICK: u32 = 4;
 /// RE-6: requests served per tick to everyone outside the committee, together.
 pub const RESIDUAL_REQS_PER_TICK: u32 = 2;
+/// B191: the body bytes a member's answers carry per tick (outsiders', all
+/// together, as much): one maximal answer (a choice). Each of a member's
+/// four requests a tick could take 768 KiB of bodies, read and serialized
+/// under the consensus lock and uploaded, at about 2 KB to the asker.
+pub const RESP_BYTES_PER_TICK: usize = MAX_RESP_BYTES;
 /// The signing domain of a pull request.
 pub const PULL_DOMAIN: &[u8] = b"AINCORE_V4_PULL_V1";
 /// Request sequence numbers are reserved in blocks this size (`next_seq`).
@@ -52,6 +59,10 @@ const SEQ_KEY: &str = "consensus:pull_seq";
 /// B51: certificates answers may bring for one slot before this node asks
 /// for it again (a choice: the requests of a few ticks in flight at once).
 pub const MAX_ANSWERS_PER_SLOT: u8 = 4;
+/// B250: the members whose answers a wanted slot still takes: the last this
+/// many asked (a choice: an answer later than four more asks of its slot is
+/// dropped, and the slot asked again).
+pub const MAX_ASKED_PER_SLOT: usize = 4;
 /// RE-1 (d): ticks without a new certificate before this node asks everyone
 /// for the certificates of its current and previous rounds.
 pub const STALL_TICKS: u64 = 4;
@@ -142,6 +153,21 @@ pub(crate) struct Budget {
     /// Per member: the request numbers seen, and requests served this tick.
     members: HashMap<String, (SeqWindow, u32)>,
     residual: u32,
+    /// B191: body bytes served this tick, per member (`None`: outsiders).
+    bytes: HashMap<Option<String>, usize>,
+}
+
+impl Budget {
+    /// B191: the body bytes `who` (`None`: outsiders, together) may still
+    /// be sent this tick.
+    pub(crate) fn bytes_left(&self, who: &Option<String>) -> usize {
+        RESP_BYTES_PER_TICK.saturating_sub(self.bytes.get(who).copied().unwrap_or(0))
+    }
+
+    pub(crate) fn spend_bytes(&mut self, who: Option<String>, n: usize) {
+        let used = self.bytes.entry(who).or_default();
+        *used = used.saturating_add(n);
+    }
 }
 
 /// Anti-replay for one member's signed requests: each `seq` is accepted once,
@@ -315,14 +341,14 @@ impl Engine {
         let mut requests_left = CLIENT_REQS_PER_TICK.saturating_sub(self.sent.1);
         let mut bodies: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (digest, want) in self.body_wants.iter_mut() {
-            // A body already received and waiting on its parents' certificates
-            // is not asked for again.
-            if self.pending.contains(digest) {
-                continue;
-            }
             let Some(target) = want.peek(now) else {
                 continue;
             };
+            // A body already received and waiting on its parents' certificates
+            // is not asked for again. B257: asked of due wants only.
+            if self.pending.contains(digest) {
+                continue;
+            }
             let open = bodies.get(target).map_or(0, Vec::len);
             if open.is_multiple_of(MAX_REQ_DIGESTS) {
                 if requests_left == 0 {
@@ -356,10 +382,24 @@ impl Engine {
         for (target, slots) in slots {
             for batch in slots.chunks(MAX_REQ_SLOTS) {
                 // B51: each request lets one answer bring one certificate
-                // per slot asked (at most `MAX_ANSWERS_PER_SLOT` owed).
+                // per slot asked (at most `MAX_ANSWERS_PER_SLOT` owed). B248:
+                // from the member asked. B250: of the last
+                // `MAX_ASKED_PER_SLOT` members asked only: kept per member,
+                // the map grew to every member asked for every slot of a
+                // stuck node's gap (n times its wants).
                 for slot in batch {
-                    let owed = self.cert_answers.entry(slot.clone()).or_insert(0);
-                    *owed = owed.saturating_add(1).min(MAX_ANSWERS_PER_SLOT);
+                    let asked = self.cert_answers.entry(slot.clone()).or_default();
+                    match asked.iter_mut().find(|(member, _)| *member == target) {
+                        Some((_, owed)) => {
+                            *owed = owed.saturating_add(1).min(MAX_ANSWERS_PER_SLOT);
+                        }
+                        None => {
+                            if asked.len() >= MAX_ASKED_PER_SLOT {
+                                asked.remove(0);
+                            }
+                            asked.push((target.clone(), 1));
+                        }
+                    }
                 }
                 let req = Request::Certs {
                     epoch: self.epoch,
@@ -372,13 +412,10 @@ impl Engine {
         self.cert_answers.retain(|slot, _| wants.contains_key(slot));
     }
 
-    /// A node far behind learns what it misses one level at a time through
-    /// PENDING, which can be slower than the chain grows. So when a vertex
-    /// waits on certificates at `upto` far above O_E, the certificates of
-    /// every author for the whole gap are wanted at once (bounded), and their
-    /// bodies follow through RE-1 (a).
-    pub(super) fn want_gap(&mut self, upto: u64) {
-        const MAX_GAP_ROUNDS: u64 = 256;
+    /// `want_gap`'s first round (one past the highest round held, or the
+    /// floor), and the round through which it wants nothing more: what it
+    /// wanted already, or `u64::MAX` once that reaches `MAX_GAP_ROUNDS`.
+    fn gap_bounds(&self) -> (u64, u64) {
         let top = lock(&self.round_index)
             .keys()
             .max()
@@ -386,8 +423,30 @@ impl Engine {
             .unwrap_or(0)
             .max(self.gc_floor());
         let from = top + 1;
+        let wanted = self.gap_high.max(from);
+        let wanted_to = if from + MAX_GAP_ROUNDS <= wanted {
+            u64::MAX
+        } else {
+            wanted
+        };
+        (from, wanted_to)
+    }
+
+    /// B171: the round through which `want_gap` wants nothing new (an
+    /// `Ahead` vertex at a round no higher than one past it shows nothing).
+    pub(super) fn gap_wanted_to(&self) -> u64 {
+        self.gap_bounds().1
+    }
+
+    /// A node far behind learns what it misses one level at a time through
+    /// PENDING, which can be slower than the chain grows. So when a vertex
+    /// waits on certificates at `upto` far above O_E, the certificates of
+    /// every author for the whole gap are wanted at once (bounded), and their
+    /// bodies follow through RE-1 (a).
+    pub(super) fn want_gap(&mut self, upto: u64) {
+        let (from, wanted_to) = self.gap_bounds();
         let upto = upto.min(from + MAX_GAP_ROUNDS);
-        if upto <= self.gap_high.max(from) {
+        if upto <= wanted_to {
             return;
         }
         let authors: Vec<String> = self.stakes.iter().map(|(a, _)| a.clone()).collect();
@@ -456,6 +515,7 @@ impl Engine {
         if self.budget.tick != self.tick {
             self.budget.tick = self.tick;
             self.budget.residual = 0;
+            self.budget.bytes.clear();
             for (_, used) in self.budget.members.values_mut() {
                 *used = 0;
             }
@@ -466,16 +526,16 @@ impl Engine {
             .iter()
             .find(|m| m.address == signed.from)
             .map(|m| m.ed25519_public_key.clone());
+        let is_member = member.is_some();
         match member {
             Some(pk) => {
+                // B224: charged (B51): a member signs its own requests, and
+                // no one relays them.
                 if !signed.verifies(&self.cfg.chain_id, &self.cfg.genesis_identity, &pk) {
+                    crate::work::note_failed_check();
                     return;
                 }
-                let (window, used) = self
-                    .budget
-                    .members
-                    .entry(signed.from.clone())
-                    .or_default();
+                let (window, used) = self.budget.members.entry(signed.from.clone()).or_default();
                 if !window.admit(signed.seq) {
                     return;
                 }
@@ -491,7 +551,14 @@ impl Engine {
                 self.budget.residual += 1;
             }
         }
-        let resp = self.serve(&signed.req);
+        // B191: within its bytes this tick.
+        let who = is_member.then(|| signed.from.clone());
+        let left = self.budget.bytes_left(&who);
+        if left == 0 {
+            return;
+        }
+        let (resp, bytes) = self.serve_within(&signed.req, left);
+        self.budget.spend_bytes(who, bytes);
         net.send(
             &signed.from,
             Msg::Resp {
@@ -504,6 +571,13 @@ impl Engine {
     /// RE-5: read-only answers. Bodies are the staged canonical bodies; a
     /// digest not held, or over the byte budget, is `unknown`.
     pub fn serve(&self, req: &Request) -> Response {
+        self.serve_within(req, MAX_RESP_BYTES).0
+    }
+
+    /// `serve` with at most `cap` bytes of bodies (and `MAX_RESP_BYTES`), and
+    /// the body bytes it sent (B191).
+    pub fn serve_within(&self, req: &Request, cap: usize) -> (Response, usize) {
+        let cap = cap.min(MAX_RESP_BYTES);
         match req {
             Request::Vertices(digests) => {
                 let dag = lock(&self.dag);
@@ -528,7 +602,7 @@ impl Engine {
                         .and_then(|v| serde_json::to_string(v).ok())
                         .map(|j| j.len());
                     match (held, size) {
-                        (Some(v), Some(n)) if bytes + n <= MAX_RESP_BYTES => {
+                        (Some(v), Some(n)) if bytes + n <= cap => {
                             bytes += n;
                             bodies.push(v.clone());
                         }
@@ -539,7 +613,7 @@ impl Engine {
                         _ => unknown.push(d.clone()),
                     }
                 }
-                Response::Vertices { bodies, unknown }
+                (Response::Vertices { bodies, unknown }, bytes)
             }
             Request::Certs { epoch, slots } => {
                 // The closed epoch's tail stays servable until the next
@@ -559,7 +633,7 @@ impl Engine {
                         None => unknown.push(slot.clone()),
                     }
                 }
-                Response::Certs { certs, unknown }
+                (Response::Certs { certs, unknown }, 0)
             }
         }
     }
@@ -567,7 +641,12 @@ impl Engine {
     /// RE-4: a returned body is taken only if it was wanted, and then goes
     /// through the same IN-1 path as a gossiped one (its hash is the digest).
     /// Certificates are verified by CE-2 on ingest. `unknown` changes nothing.
-    pub(super) fn on_response(&mut self, resp: Response, net: &dyn ConsensusNet) {
+    pub(super) fn on_response(
+        &mut self,
+        resp: Response,
+        source: Option<&str>,
+        net: &dyn ConsensusNet,
+    ) {
         match resp {
             Response::Vertices { bodies, .. } => {
                 for v in bodies {
@@ -589,9 +668,24 @@ impl Engine {
                     if !self.cert_wants.contains_key(&slot) || self.certs.contains_key(&slot) {
                         continue;
                     }
-                    match self.cert_answers.get_mut(&slot) {
-                        Some(owed) if *owed > 0 => *owed -= 1,
-                        _ => continue,
+                    // B248: a certificate of another epoch than the one
+                    // asked (`on_cert` drops it for free) takes no turn, and
+                    // a turn is the asked member's: the budget was the
+                    // slot's, so any member's unsolicited answers used it up
+                    // and the asked member's honest answer was dropped; a
+                    // node that missed rounds never got their certificates.
+                    // In process (no source) any asked member's turn serves.
+                    if c.body.epoch != self.epoch {
+                        continue;
+                    }
+                    let turn = self.cert_answers.get_mut(&slot).and_then(|asked| {
+                        asked.iter_mut().find(|(member, owed)| {
+                            *owed > 0 && source.is_none_or(|s| member.as_str() == s)
+                        })
+                    });
+                    match turn {
+                        Some((_, owed)) => *owed -= 1,
+                        None => continue,
                     }
                     self.on_cert(c, net);
                 }

@@ -32,7 +32,7 @@ async function main() {
         throw new Error(`Invalid key length: ${secretBytes.length} bytes (Expected 32 or 64)`);
     }
 
-    const connection = new Connection('http://127.0.0.1:8001/rpc');
+    const connection = new Connection('http://127.0.0.1:8002/rpc');
 
     // Payload: mining_proof:DEVICE_ID:BQI
     const payload = `mining_proof:${deviceId}:${bqi}`;

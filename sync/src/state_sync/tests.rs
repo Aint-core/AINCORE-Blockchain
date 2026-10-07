@@ -1530,8 +1530,8 @@ fn the_server_serves_only_what_it_retains() {
     }
     assert!(fresh
         .state_budget
-        .admit(None, 8_000, false)
-        .is_some_and(|a| a.granted > 7_000));
+        .admit(None, usize::MAX, false)
+        .is_some_and(|a| a.granted as f64 > STATE_SERVE_UNITS_PER_SEC_SHARED - 1_000.0));
 }
 
 /// Review H3: snapshot serving has its own bounded budget: slots and units
@@ -1668,7 +1668,11 @@ fn the_client_table_forgets_idle_clients_only() {
         MAX_TRACKED_CLIENTS,
         "none forgotten"
     );
-    assert_eq!(debt.balance(None), STATE_SERVE_UNITS_PER_SEC, "not global");
+    assert_eq!(
+        debt.balance(None),
+        STATE_SERVE_UNITS_PER_SEC_SHARED,
+        "not global"
+    );
 }
 
 /// A bucket holds one second's worth at most, however long it was idle.
@@ -1691,7 +1695,7 @@ fn a_bucket_holds_one_seconds_worth() {
     drop(client);
     budget.lock().global.last = Instant::now() - Duration::from_secs(60);
     let global = budget.admit(None, usize::MAX, false).unwrap();
-    assert_eq!(global.granted, STATE_SERVE_UNITS_PER_SEC as usize);
+    assert_eq!(global.granted, STATE_SERVE_UNITS_PER_SEC_SHARED as usize);
 }
 
 /// Post-fix review MEDIUM 3, as charged since review 3: a part costs its
@@ -1758,7 +1762,11 @@ fn value_reads_are_charged_by_their_bytes() {
     let client_balance = fresh.state_budget.balance(heavy);
     assert_eq!(client_balance, STATE_SERVE_UNITS_PER_SEC_PER_CLIENT - cost);
     let global_balance = fresh.state_budget.balance(None);
-    assert_eq!(global_balance, STATE_SERVE_UNITS_PER_SEC - cost, "global");
+    assert_eq!(
+        global_balance,
+        STATE_SERVE_UNITS_PER_SEC_SHARED - cost,
+        "global"
+    );
     // Its next part is cached: the part alone, for any client.
     let reader_ip = "10.0.0.5";
     let reader = Some(reader_ip);
@@ -3521,6 +3529,56 @@ async fn the_busy_wait_starts_over_after_a_delivery() {
         "{waits:?}"
     );
     assert_restored(&client, &a);
+}
+
+/// B145 witness: outsiders draw on the shared units only, so however hard
+/// they pull (charged after the fact, into debt), a member's value part (all
+/// its units at once) is still admitted: one shared bucket was the only one,
+/// and outsiders drained it.
+#[test]
+fn outsiders_cannot_take_the_members_units() {
+    let budget = StateBudget::default();
+    for group in 0..8 {
+        if let Some(a) = budget.admit(Some(&format!("10.{group}")), 2_000, false) {
+            a.charge(2_000 * UNIT_BYTES);
+        }
+    }
+    assert!(
+        budget.balance(None) < PART_UNITS as f64,
+        "vacuous: the shared units were not drained"
+    );
+    assert!(
+        budget.admit_all(Some("member"), PART_UNITS, true).is_some(),
+        "a member's part was refused"
+    );
+    assert!(
+        budget.admit_all(Some("10.99"), PART_UNITS, false).is_none(),
+        "an outsider drew on the members' units"
+    );
+}
+
+/// B159 witness: one kept client pulling (and charged) all it may cannot
+/// hold the kept units: another member's value part is still admitted while
+/// outsiders hold the shared units in debt.
+#[test]
+fn one_kept_client_cannot_take_the_kept_units() {
+    let budget = StateBudget::default();
+    for group in 0..8 {
+        if let Some(a) = budget.admit(Some(&format!("10.{group}")), 2_000, false) {
+            a.charge(2_000 * UNIT_BYTES);
+        }
+    }
+    for _ in 0..8 {
+        if let Some(a) = budget.admit(Some("12D3KooWbyzantine"), 2_000, true) {
+            a.charge(2_000 * UNIT_BYTES);
+        }
+    }
+    assert!(
+        budget
+            .admit_all(Some("12D3KooWhonest"), PART_UNITS, true)
+            .is_some(),
+        "one member took the members' units"
+    );
 }
 
 /// B131 witness: the kept slot is a member's or a reserved peer's alone:

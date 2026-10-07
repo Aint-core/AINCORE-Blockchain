@@ -321,22 +321,10 @@ impl BLSEngine {
             .validate(false)
             .map_err(|e| BLSError::InvalidSignature(format!("Subgroup check failed: {:?}", e)))?;
 
-        // Decompress and validate all public keys
+        // Decompress and validate all public keys (B203: once per key).
         let mut pks = Vec::with_capacity(public_keys.len());
         for (i, pk_bytes) in public_keys.iter().enumerate() {
-            let pk = blst::min_pk::PublicKey::uncompress(pk_bytes).map_err(|e| {
-                BLSError::InvalidPublicKey(format!(
-                    "Public key {} decompression failed: {:?}",
-                    i, e
-                ))
-            })?;
-            pk.validate().map_err(|e| {
-                BLSError::InvalidPublicKey(format!(
-                    "Public key {} subgroup check failed: {:?}",
-                    i, e
-                ))
-            })?;
-            pks.push(pk);
+            pks.push(validated_key(i, pk_bytes)?);
         }
 
         let pk_refs: Vec<&blst::min_pk::PublicKey> = pks.iter().collect();
@@ -390,9 +378,85 @@ impl Default for BLSEngine {
     }
 }
 
+/// B203: keys that passed decompression and the subgroup check, kept (a
+/// choice: four committees of `MAX_COMMITTEE`). Every aggregate (a vertex
+/// certificate, a finality QC, a certificate in evidence) validated each
+/// signer's key again: about 2n/3 G1 decompressions and subgroup checks an
+/// aggregate, a few aggregates a member a round. A key's check depends on
+/// its bytes alone, so a kept one is exact; only committee keys reach it.
+const VALIDATED_KEYS_CAP: usize = 1_024;
+
+#[cfg(test)]
+thread_local! {
+    /// Keys decompressed and checked on this thread (B203 witness).
+    static KEY_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `pk_bytes` decompressed and subgroup-checked, from `VALIDATED_KEYS` when
+/// it was before. `i` names it in an error.
+fn validated_key(i: usize, pk_bytes: &[u8]) -> Result<blst::min_pk::PublicKey, BLSError> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    static VALIDATED_KEYS: LazyLock<Mutex<HashMap<Vec<u8>, blst::min_pk::PublicKey>>> =
+        LazyLock::new(Default::default);
+    if let Some(pk) = VALIDATED_KEYS
+        .lock()
+        .ok()
+        .and_then(|keys| keys.get(pk_bytes).cloned())
+    {
+        return Ok(pk);
+    }
+    #[cfg(test)]
+    KEY_CHECKS.with(|n| n.set(n.get() + 1));
+    let pk = blst::min_pk::PublicKey::uncompress(pk_bytes).map_err(|e| {
+        BLSError::InvalidPublicKey(format!("Public key {} decompression failed: {:?}", i, e))
+    })?;
+    pk.validate().map_err(|e| {
+        BLSError::InvalidPublicKey(format!("Public key {} subgroup check failed: {:?}", i, e))
+    })?;
+    if let Ok(mut keys) = VALIDATED_KEYS.lock() {
+        if keys.len() >= VALIDATED_KEYS_CAP {
+            if let Some(old) = keys.keys().next().cloned() {
+                keys.remove(&old);
+            }
+        }
+        keys.insert(pk_bytes.to_vec(), pk);
+    }
+    Ok(pk)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B203 witness: a key is decompressed and checked once, then kept (an
+    /// aggregate validated every signer's key each time); a key that fails is
+    /// never kept; the table stays within its cap.
+    #[test]
+    fn a_signers_key_is_checked_once() {
+        let bls = BLSEngine::consensus();
+        let message = b"b203 aggregate";
+        let keys: Vec<(blst::min_pk::SecretKey, Vec<u8>)> = (200..203).map(make_keypair).collect();
+        let sigs: Vec<Vec<u8>> = keys.iter().map(|(sk, _)| bls.sign(message, sk)).collect();
+        let agg = bls.aggregate_signatures(&sigs).unwrap();
+        let pks: Vec<Vec<u8>> = keys.iter().map(|(_, pk)| pk.clone()).collect();
+        let checks = || KEY_CHECKS.with(|n| n.get());
+        let before = checks();
+        assert!(bls.fast_aggregate_verify(message, &pks, &agg).unwrap());
+        let first = checks() - before;
+        assert!(first <= 3, "{first} checks for three keys");
+        assert!(bls.fast_aggregate_verify(message, &pks, &agg).unwrap());
+        assert!(!bls.fast_aggregate_verify(b"another", &pks, &agg).unwrap());
+        assert_eq!(checks() - before, first, "a kept key was checked again");
+        // Not a point: refused each time, never kept.
+        let junk = vec![0x11u8; 48];
+        for _ in 0..2 {
+            assert!(bls
+                .fast_aggregate_verify(message, std::slice::from_ref(&junk), &agg)
+                .is_err());
+        }
+        assert_eq!(checks() - before, first + 2, "a key that failed was kept");
+    }
 
     fn make_keypair(seed: u8) -> (blst::min_pk::SecretKey, Vec<u8>) {
         let bls = BLSEngine::default();

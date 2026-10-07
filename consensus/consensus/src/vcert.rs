@@ -484,8 +484,16 @@ impl CertCollector {
                 CollectOutcome::Foreign
             });
         }
+        // B165: nor a copy of the attestation this collector already counts
+        // (its body and signature): `first_seen` may hold another one.
+        if att.body == self.body && self.ours.get(&idx) == Some(&att.signature) {
+            return Ok(CollectOutcome::Duplicate);
+        }
         // B101: an exact copy of an attestation already verified needs no
-        // pairing (a replay used to cost one each time).
+        // pairing (a replay used to cost one each time). B147: nor does one
+        // that cannot count here (another body) and names the digest its
+        // signer was first seen with, so it is no evidence either: each
+        // committee-hash variant of one digest cost a pairing.
         if let Some(first) = self.first_seen.get(&idx) {
             if first.body == att.body && first.signature == att.signature {
                 return Ok(if att.body == self.body {
@@ -493,6 +501,9 @@ impl CertCollector {
                 } else {
                     CollectOutcome::Foreign
                 });
+            }
+            if att.body != self.body && first.body.digest == att.body.digest {
+                return Ok(CollectOutcome::Foreign);
             }
         }
         let pk = hex::decode(&self.committee[idx].bls_public_key)

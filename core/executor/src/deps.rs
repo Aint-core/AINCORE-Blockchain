@@ -15,7 +15,7 @@ use move_binary_format::access::ModuleAccess;
 use move_binary_format::CompiledModule;
 use move_core_types::language_storage::{ModuleId, TypeTag};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use storage::StateDB;
 
@@ -160,7 +160,10 @@ pub fn type_modules(tag: &TypeTag, out: &mut Vec<ModuleId>) {
 }
 
 /// The modules a bundle being published pulls in from the chain: its
-/// modules' dependencies and friends that are not in the bundle.
+/// modules' dependencies and friends that are not in the bundle, and (B170)
+/// its own modules' stored versions: a republish's compatibility check loads
+/// the version it replaces with that version's closure, which the publish
+/// did not pay for. A new module is not stored, so the closure skips it.
 pub fn bundle_roots(bundle: &[Vec<u8>]) -> Result<Vec<ModuleId>, String> {
     let modules = bundle
         .iter()
@@ -173,6 +176,7 @@ pub fn bundle_roots(bundle: &[Vec<u8>]) -> Result<Vec<ModuleId>, String> {
         .iter()
         .flat_map(pulled_in)
         .filter(|id| !own.contains(id))
+        .chain(own.iter().cloned())
         .collect())
 }
 
@@ -186,6 +190,20 @@ impl ModuleIndex {
         db: &StateDB,
         roots: impl IntoIterator<Item = ModuleId>,
     ) -> Result<Closure, String> {
+        self.closure_in_block(db, roots, &HashSet::new())
+    }
+
+    /// `closure`, refusing (B170) a module republished earlier in the block
+    /// (`upgraded`, its module keys): it runs from the next block. The
+    /// block's VM still holds the code it replaced, and flushing that cache
+    /// mid-block made every later transaction load and verify the stdlib
+    /// again, uncharged, once per upgrade.
+    pub fn closure_in_block(
+        &self,
+        db: &StateDB,
+        roots: impl IntoIterator<Item = ModuleId>,
+        upgraded: &HashSet<String>,
+    ) -> Result<Closure, String> {
         let mut seen = BTreeSet::new();
         let mut queue: VecDeque<ModuleId> = roots.into_iter().collect();
         let mut closure = Closure::default();
@@ -195,6 +213,11 @@ impl ModuleIndex {
                 continue;
             }
             let key = vm_move::state_keys::module_key(id.address(), id.name().as_str());
+            if upgraded.contains(&key) {
+                return Err(format!(
+                    "module {id} was upgraded in this block: it runs from the next one"
+                ));
+            }
             let Some(stored) = db
                 .get(&key)
                 .expect("CRITICAL: a module read for the dependency charge failed")

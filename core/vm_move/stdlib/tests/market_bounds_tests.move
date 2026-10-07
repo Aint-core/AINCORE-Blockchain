@@ -6,9 +6,11 @@
 /// Abort codes are std::error categories: (category << 16) | reason.
 ///   0x1000a invalid_argument(token_factory::EFIELD_TOO_LONG)
 ///   0x10006 invalid_argument(dex::EINVALID_PAIR)
-/// The token count cap needs 512 tokens' fees; the node's genesis tests
-/// cover it with a seeded registry.
+///   0x9000d resource_exhausted(token_factory::EWALLET_FULL)
+/// The per-creator token cap needs 64 tokens' fees; the node's genesis tests
+/// cover it with a seeded registry (B135).
 module 0xcafe::market_bounds_tests {
+    use std::bcs;
     use std::vector;
     use 0x1::dex;
     use 0x1::staking::AincoreCoin;
@@ -48,5 +50,34 @@ module 0xcafe::market_bounds_tests {
     fun the_ain_wbtc_pool_is_created(system: signer, creator: signer) {
         dex::initialize(&system);
         dex::create_pool<AincoreCoin, WBTC>(&creator);
+    }
+
+    fun id(i: u64): vector<u8> {
+        bcs::to_bytes(&i)
+    }
+
+    fun fill_wallet(owner: &signer) {
+        let i = 1;
+        while (i <= 256) {
+            token_factory::register(owner, id(i));
+            i = i + 1;
+        };
+    }
+
+    /// B135: a wallet registers at most 256 tokens, its owner's choice (a
+    /// token reaches only a wallet that registered it).
+    #[test(owner = @0xb0b)]
+    #[expected_failure(abort_code = 0x9000d, location = 0x1::token_factory)]
+    fun a_wallet_registers_at_most_its_limit(owner: signer) {
+        fill_wallet(&owner);
+        token_factory::register(&owner, id(300));
+    }
+
+    /// B135: registering a token again is a no-op, even in a full wallet.
+    #[test(owner = @0xb0b)]
+    fun registering_again_takes_no_room(owner: signer) {
+        fill_wallet(&owner);
+        token_factory::register(&owner, id(1));
+        token_factory::register(&owner, id(256));
     }
 }

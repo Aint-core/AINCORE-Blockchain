@@ -303,3 +303,86 @@ async fn rpc_preserves_invalid_params_errors_and_rejects_zero_height() {
         assert_eq!(value["error"]["code"], -32602, "{value}");
     }
 }
+
+/// B182 witness: with every verification slot busy, `getQuorumCert` still
+/// answers with the stored certificate, its verification unknown (an error
+/// in its place stalled every client that verifies it itself, the bridge
+/// among them, for as long as the slots were kept busy).
+#[actix_web::test]
+async fn a_busy_node_still_serves_a_stored_certificate() {
+    let dir = QcDir::new();
+    let db = dir.open();
+    let qc = cert(&db, 1, 37);
+    db.put("consensus:qc:37", &serde_json::to_string(&qc).unwrap())
+        .unwrap();
+    let data = web::Data::new(state(db.clone()));
+    let held: Vec<_> = (0..DRY_RUNS_AT_ONCE)
+        .map(|_| DryRun::begin(&data.dry_runs).expect("a free slot"))
+        .collect();
+    let answer = handle_rpc_method("aincore_getQuorumCert", serde_json::json!([37]), &data)
+        .expect("the certificate, not an error");
+    assert_eq!(answer["available"], true, "{answer}");
+    assert!(answer["verified"].is_null(), "{answer}");
+    assert_eq!(
+        answer["quorum_certificate"],
+        serde_json::to_value(&qc).unwrap()
+    );
+    drop(held);
+    let answer = handle_rpc_method("aincore_getQuorumCert", serde_json::json!([37]), &data)
+        .expect("an answer");
+    assert_eq!(answer["verified"], true, "{answer}");
+    // B240: the slots are the dry runs' queue's too: with its permits held
+    // (estimates waiting their turn), a certificate not remembered is
+    // answered unverified, not verified on a slot the queue counts on.
+    let other = cert(&db, 1, 38);
+    db.put("consensus:qc:38", &serde_json::to_string(&other).unwrap())
+        .unwrap();
+    let permits: Vec<_> = (0..DRY_RUNS_AT_ONCE)
+        .map(|_| {
+            Arc::clone(&data.queues.dry)
+                .try_acquire_owned()
+                .expect("a permit")
+        })
+        .collect();
+    let answer = handle_rpc_method("aincore_getQuorumCert", serde_json::json!([38]), &data)
+        .expect("the certificate, not an error");
+    assert!(answer["verified"].is_null(), "{answer}");
+    drop(permits);
+    let answer = handle_rpc_method("aincore_getQuorumCert", serde_json::json!([38]), &data)
+        .expect("an answer");
+    assert_eq!(answer["verified"], true, "{answer}");
+}
+
+/// B254 witness: a stored certificate not remembered is verified only on a
+/// turn of its client's network group free now: with that group's dry gate
+/// held it is answered unverified (its certificate all the same) while a
+/// client of another group has it verified (one client or group missing on
+/// past epochs held both dry permits, a pairing each).
+#[test]
+fn a_stored_certificate_is_verified_on_its_groups_turn() {
+    use std::net::{IpAddr, Ipv4Addr};
+    let dir = QcDir::new();
+    let db = dir.open();
+    let qc = cert(&db, 1, 39);
+    db.put("consensus:qc:39", &serde_json::to_string(&qc).unwrap())
+        .unwrap();
+    let data = state(db.clone());
+    let busy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let _held = data
+        .queues
+        .gate(heavy_group(busy), true)
+        .try_acquire_owned()
+        .expect("a free gate");
+    let neighbour = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+    let answer =
+        stored_certificate(&data, &serde_json::json!([39]), neighbour).expect("the certificate");
+    assert!(answer["verified"].is_null(), "{answer}");
+    assert_eq!(
+        answer["quorum_certificate"],
+        serde_json::to_value(&qc).unwrap()
+    );
+    let other = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2)));
+    let answer =
+        stored_certificate(&data, &serde_json::json!([39]), other).expect("the certificate");
+    assert_eq!(answer["verified"], true, "{answer}");
+}

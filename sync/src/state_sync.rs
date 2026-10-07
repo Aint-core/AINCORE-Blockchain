@@ -47,16 +47,31 @@ pub const MAX_LEAF_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_CHUNK_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 /// Snapshot serving, apart from vertex serving: requests in flight and cost
 /// units per second (a leaf, or `UNIT_BYTES` read), globally and per client,
-/// so no one client takes more than its share. B131: a committee member or
-/// a reserved peer is the key its session authenticated (G4 S6); anyone
-/// else is its network group (`net_group`), so one host's many keys share
-/// one client's budget, and `STATE_SERVE_IN_FLIGHT_KEPT` of the slots are
-/// theirs alone, so outsiders cannot keep their restores answered "busy".
+/// so no one client takes more than its share. B131: a kept client is the
+/// key its session authenticated (G4 S6); anyone else is its network group
+/// (`net_group`), so one host's many keys share one client's budget, and
+/// `STATE_SERVE_IN_FLIGHT_KEPT` of the slots are theirs alone, so outsiders
+/// cannot keep their restores answered "busy". B178: the node keeps its
+/// reserved peers (`node::sessions::snapshot_client`); members were kept
+/// too, but a node whose key a committee records never restores (SN-6).
 pub const STATE_SERVE_IN_FLIGHT: usize = 4;
-/// B131: in-flight slots only members and reserved peers take (a choice).
+/// B131: in-flight slots only kept clients take (a choice).
 pub const STATE_SERVE_IN_FLIGHT_KEPT: usize = 1;
 pub const STATE_SERVE_IN_FLIGHT_PER_CLIENT: usize = 1;
 pub const STATE_SERVE_UNITS_PER_SEC: f64 = 8_000.0;
+/// B145: of those, the units only kept clients draw on (a choice: a
+/// quarter), so a kept client's value part (`PART_UNITS` at once) is
+/// admitted within a second however hard outsiders pull: one shared bucket,
+/// charged after the fact, was drained into debt by five outsider groups.
+pub const STATE_SERVE_UNITS_PER_SEC_KEPT: f64 = STATE_SERVE_UNITS_PER_SEC / 4.0;
+/// B159: the most of the kept units one request takes, granted and charged
+/// after the fact (a choice: a quarter, above a value part's `PART_UNITS`):
+/// a kept client's own rate equals the kept rate, so one member pulling at
+/// it held the kept units in debt and another's value part was busy.
+pub const STATE_SERVE_KEPT_PER_REQUEST: f64 = STATE_SERVE_UNITS_PER_SEC_KEPT / 4.0;
+/// B145: the units everyone draws on.
+pub const STATE_SERVE_UNITS_PER_SEC_SHARED: f64 =
+    STATE_SERVE_UNITS_PER_SEC - STATE_SERVE_UNITS_PER_SEC_KEPT;
 pub const STATE_SERVE_UNITS_PER_SEC_PER_CLIENT: f64 = 2_000.0;
 pub const UNIT_BYTES: u64 = 4 * 1024;
 /// Clients remembered at once; idle ones are forgotten first.
@@ -192,7 +207,7 @@ pub struct ValueResponse {
     pub error: Option<String>,
 }
 
-const BUSY: &str = "busy";
+pub(crate) const BUSY: &str = "busy";
 const NOT_SERVED: &str = "snapshots not served here";
 /// The units a value part costs: a request and its bytes.
 const PART_UNITS: usize = 1 + VALUE_PART_BYTES / UNIT_BYTES as usize;
@@ -210,7 +225,7 @@ pub struct ValueCache {
 }
 
 impl ValueCache {
-    fn get(&mut self, version: u64, key: &str) -> Option<Arc<Vec<u8>>> {
+    pub(crate) fn get(&mut self, version: u64, key: &str) -> Option<Arc<Vec<u8>>> {
         let at = self
             .entries
             .iter()
@@ -221,7 +236,7 @@ impl ValueCache {
         Some(value)
     }
 
-    fn put(&mut self, version: u64, key: &str, value: Arc<Vec<u8>>) {
+    pub(crate) fn put(&mut self, version: u64, key: &str, value: Arc<Vec<u8>>) {
         self.entries
             .retain(|(v, k, _)| !(*v == version && k == key));
         self.entries.push((version, key.to_string(), value));
@@ -302,7 +317,11 @@ impl Bucket {
 }
 
 struct Buckets {
+    /// The shared units (`STATE_SERVE_UNITS_PER_SEC_SHARED`) and every slot
+    /// in flight.
     global: Bucket,
+    /// B145: kept clients' own units.
+    kept: Bucket,
     per_client: HashMap<String, Bucket>,
 }
 
@@ -318,7 +337,8 @@ impl Default for StateBudget {
     fn default() -> Self {
         Self {
             buckets: Mutex::new(Buckets {
-                global: Bucket::full(STATE_SERVE_UNITS_PER_SEC),
+                global: Bucket::full(STATE_SERVE_UNITS_PER_SEC_SHARED),
+                kept: Bucket::full(STATE_SERVE_UNITS_PER_SEC_KEPT),
                 per_client: HashMap::new(),
             }),
         }
@@ -330,6 +350,8 @@ pub struct Admission<'a> {
     budget: &'a StateBudget,
     client: Option<String>,
     pub granted: usize,
+    /// B145: drawn on the kept units, where its charges go too.
+    from_kept: bool,
 }
 
 impl StateBudget {
@@ -340,7 +362,8 @@ impl StateBudget {
 
     /// Let a request from `client` in (`None`: in process, global limits
     /// only), with up to `want` units both buckets hold. `None` when busy.
-    /// `kept`: a member or a reserved peer, which may take the kept slots.
+    /// `kept`: a kept client (B178: a reserved peer), which may take the
+    /// kept slots.
     pub fn admit(&self, client: Option<&str>, want: usize, kept: bool) -> Option<Admission<'_>> {
         self.admit_at_least(client, want, 1, kept)
     }
@@ -364,7 +387,8 @@ impl StateBudget {
     ) -> Option<Admission<'_>> {
         let mut st = self.lock();
         let now = Instant::now();
-        st.global.refill(STATE_SERVE_UNITS_PER_SEC, now);
+        st.global.refill(STATE_SERVE_UNITS_PER_SEC_SHARED, now);
+        st.kept.refill(STATE_SERVE_UNITS_PER_SEC_KEPT, now);
         let slots = if kept {
             STATE_SERVE_IN_FLIGHT
         } else {
@@ -373,7 +397,14 @@ impl StateBudget {
         if st.global.in_flight >= slots {
             return None;
         }
-        let mut cap = st.global.tokens;
+        // B145: a kept client draws on whichever of its two
+        // pools holds more; anyone else on the shared one only.
+        let from_kept = kept && st.kept.tokens > st.global.tokens;
+        let mut cap = if from_kept {
+            st.kept.tokens.min(STATE_SERVE_KEPT_PER_REQUEST)
+        } else {
+            st.global.tokens
+        };
         if let Some(client) = client {
             if !st.per_client.contains_key(client) && st.per_client.len() >= MAX_TRACKED_CLIENTS {
                 // A bucket that has refilled and is idle is the same as a
@@ -402,7 +433,11 @@ impl StateBudget {
         if granted < least.max(1) as f64 {
             return None;
         }
-        st.global.tokens -= granted;
+        if from_kept {
+            st.kept.tokens -= granted;
+        } else {
+            st.global.tokens -= granted;
+        }
         st.global.in_flight += 1;
         if let Some(bucket) = client.and_then(|c| st.per_client.get_mut(c)) {
             bucket.tokens -= granted;
@@ -412,6 +447,7 @@ impl StateBudget {
             budget: self,
             client: client.map(str::to_string),
             granted: granted as usize,
+            from_kept,
         })
     }
 }
@@ -435,7 +471,12 @@ impl Admission<'_> {
     fn charge(&self, bytes: u64) {
         let units = (bytes.div_ceil(UNIT_BYTES) as f64).min(STATE_SERVE_UNITS_PER_SEC_PER_CLIENT);
         let mut st = self.budget.lock();
-        st.global.tokens -= units;
+        if self.from_kept {
+            // B159: the rest of it falls on the client's own bucket.
+            st.kept.tokens -= units.min(STATE_SERVE_KEPT_PER_REQUEST);
+        } else {
+            st.global.tokens -= units;
+        }
         if let Some(bucket) = self
             .client
             .as_deref()
@@ -449,7 +490,11 @@ impl Admission<'_> {
     fn refund(&self, units: usize) {
         let units = units as f64;
         let mut st = self.budget.lock();
-        st.global.tokens = (st.global.tokens + units).min(STATE_SERVE_UNITS_PER_SEC);
+        if self.from_kept {
+            st.kept.tokens = (st.kept.tokens + units).min(STATE_SERVE_UNITS_PER_SEC_KEPT);
+        } else {
+            st.global.tokens = (st.global.tokens + units).min(STATE_SERVE_UNITS_PER_SEC_SHARED);
+        }
         if let Some(bucket) = self
             .client
             .as_deref()
@@ -512,7 +557,7 @@ impl ChainSync {
     /// read once, up to the first that does not fit. Charged a unit per leaf
     /// served and per `UNIT_BYTES` read (at most one second's worth), under
     /// the global and the client's budget; the reads off the shared workers.
-    /// `kept`: a member or a reserved peer (B131).
+    /// `kept`: a kept client (B131, B178: a reserved peer).
     pub fn serve_state_chunk_as(
         &self,
         req: ChunkRequest,
@@ -608,7 +653,7 @@ impl ChainSync {
     /// Serve `VALUE_PART_BYTES` of one leaf's value from `offset` to
     /// `peer`, for a value too large to travel inline. A part is let in only
     /// when its whole cost fits; reading a value that is not cached costs at
-    /// most one more second's worth. `kept`: a member or a reserved peer.
+    /// most one more second's worth. `kept`: a kept client (a reserved peer).
     pub fn serve_state_value_as(
         &self,
         req: ValueRequest,
@@ -1592,6 +1637,20 @@ pub fn busy_reply(wire: &str) -> Option<String> {
         };
         return Some(format!(
             "{VALUE_RESP}{}",
+            serde_json::to_string(&busy).ok()?
+        ));
+    }
+    // B275: a block part too (it was dropped, so a client's next part was
+    // lost whenever the server's answer budget was spent, which each part
+    // spends: no block over a batch could be fetched).
+    if wire.starts_with(crate::PART_REQ) {
+        let busy = crate::BlockPartResponse {
+            error: Some(BUSY.into()),
+            ..Default::default()
+        };
+        return Some(format!(
+            "{}{}",
+            crate::PART_RESP,
             serde_json::to_string(&busy).ok()?
         ));
     }

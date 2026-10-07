@@ -1,7 +1,7 @@
 import { Connection, Keypair, Transaction } from './src';
 
 async function main() {
-    const connection = new Connection('http://127.0.0.1:8001/rpc');
+    const connection = new Connection('http://127.0.0.1:8002/rpc');
     console.log('🚀 Starting Load Test (Spamming Transactions)...');
 
     // Generate a random sender

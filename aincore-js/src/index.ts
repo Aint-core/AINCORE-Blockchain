@@ -1,6 +1,7 @@
 export { Keypair } from './keypair';
-export { Transaction } from './transaction';
+export { Transaction, tokenIdOf } from './transaction';
 export { Connection } from './connection';
+export type { TokenInfo } from './connection';
 export type {
   DexPool,
   DexQuote,

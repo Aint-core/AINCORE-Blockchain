@@ -19,9 +19,33 @@ const MAX_DAG_VERTICES: usize = 256;
 /// vertex.
 const MAX_DAG_BYTES: usize = MAX_BLOCKS_BYTES;
 
+/// B54/B127/B142: the blocks at `heights`, in that order, parsed, until
+/// `MAX_BLOCKS_BYTES` of them were read (at least one block). Every answer
+/// that lists blocks reads through it: `/get_latest_blocks` parsed 50 full
+/// blocks a call (~25 MB at 500 KB bodies), 100 calls a second per IP.
+fn blocks_within_budget(
+    storage: &StateDB,
+    heights: impl Iterator<Item = u64>,
+) -> Vec<serde_json::Value> {
+    let mut blocks = Vec::new();
+    let mut bytes = 0usize;
+    for height in heights {
+        let Ok(Some(block_json)) = storage.get(&format!("block_{height}")) else {
+            continue;
+        };
+        bytes += block_json.len();
+        if bytes > MAX_BLOCKS_BYTES && !blocks.is_empty() {
+            break;
+        }
+        if let Ok(block) = serde_json::from_str::<serde_json::Value>(&block_json) {
+            blocks.push(block);
+        }
+    }
+    blocks
+}
+
 // --- Shared State ---
 use consensus::DagConsensus;
-use governance::GovernanceManager;
 use storage::StateDB;
 
 fn permissive_cors_enabled() -> bool {
@@ -62,6 +86,153 @@ struct DexLiquidityPool {
 #[derive(Deserialize, Serialize)]
 struct DexLPToken {
     balance: u128,
+}
+
+/// B153: `0x1::token_factory`'s state as Move stores it (BCS), read by the
+/// token RPCs. They read `token:` and `token_balance:` rows nothing writes,
+/// so they answered null, `[]` and "0" for every token (B10's class).
+#[derive(Deserialize, Serialize)]
+struct MoveTokenInfo {
+    token_id: Vec<u8>,
+    name: Vec<u8>,
+    symbol: Vec<u8>,
+    decimals: u8,
+    max_supply: u128,
+    current_supply: u128,
+    creator: move_core_types::account_address::AccountAddress,
+    is_mintable: bool,
+    icon_url: Vec<u8>,
+    project_url: Vec<u8>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct MoveCreatorTokens {
+    tokens: Vec<MoveTokenInfo>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct MoveTokenBalance {
+    token_id: Vec<u8>,
+    balance: u128,
+}
+
+#[derive(Deserialize, Serialize)]
+struct MoveTokenWallet {
+    balances: Vec<MoveTokenBalance>,
+}
+
+/// A `0x1::token_factory` resource at `owner`, if it is there.
+fn token_resource<T: serde::de::DeserializeOwned>(
+    storage: &StateDB,
+    owner: &move_core_types::account_address::AccountAddress,
+    name: &str,
+) -> Option<T> {
+    let key = vm_move::state_keys::resource_key_str(owner, &format!("0x1::token_factory::{name}"));
+    let raw = storage.get(&key).ok()??;
+    bcs::from_bytes(&hex::decode(raw).ok()?).ok()
+}
+
+fn token_json(t: &MoveTokenInfo) -> serde_json::Value {
+    serde_json::json!({
+        "token_id": hex::encode(&t.token_id),
+        "name": String::from_utf8_lossy(&t.name),
+        "symbol": String::from_utf8_lossy(&t.symbol),
+        "decimals": t.decimals,
+        "max_supply": t.max_supply.to_string(),
+        "current_supply": t.current_supply.to_string(),
+        "creator": t.creator.to_hex(),
+        "is_mintable": t.is_mintable,
+        "icon_url": String::from_utf8_lossy(&t.icon_url),
+        "project_url": String::from_utf8_lossy(&t.project_url),
+    })
+}
+
+/// B194: `0x1::governance::Proposal` as BCS lays it out.
+#[derive(Deserialize, Serialize)]
+struct MoveProposal {
+    id: u64,
+    proposer: move_core_types::account_address::AccountAddress,
+    description: Vec<u8>,
+    votes_for: u128,
+    votes_against: u128,
+    executed: bool,
+    action_type: u8,
+    #[allow(dead_code)]
+    action_value: u64,
+    voting_ends: u64,
+}
+
+/// B194: `0x1::governance::GovernanceState`, at 0x1.
+#[derive(Deserialize, Serialize)]
+struct MoveGovernanceState {
+    proposals: Vec<MoveProposal>,
+    #[allow(dead_code)]
+    next_proposal_id: u64,
+}
+
+/// B194: proposal `id` as the chain holds it, if it is there.
+fn governance_proposal(storage: &StateDB, id: u64) -> Option<MoveProposal> {
+    let key = vm_move::state_keys::resource_key_str(
+        &move_core_types::account_address::AccountAddress::ONE,
+        "0x1::governance::GovernanceState",
+    );
+    let raw = storage.get(&key).ok()??;
+    let state: MoveGovernanceState = bcs::from_bytes(&hex::decode(raw).ok()?).ok()?;
+    state.proposals.into_iter().find(|p| p.id == id)
+}
+
+fn proposal_json(p: &MoveProposal) -> serde_json::Value {
+    serde_json::json!({
+        "id": p.id,
+        "proposer": p.proposer.to_hex(),
+        "description": String::from_utf8_lossy(&p.description),
+        "votes_for": p.votes_for.to_string(),
+        "votes_against": p.votes_against.to_string(),
+        "executed": p.executed,
+        "action_type": p.action_type,
+        "voting_ends": p.voting_ends,
+    })
+}
+
+/// B194: a proposal id, a number or its decimal string.
+fn proposal_id_param(params: &serde_json::Value) -> Result<u64, JsonRpcError> {
+    let id = params.get(0);
+    id.and_then(|v| v.as_u64())
+        .or_else(|| id.and_then(|v| v.as_str()).and_then(|s| s.parse().ok()))
+        .ok_or_else(|| JsonRpcError {
+            code: -32602,
+            message: "Invalid params: [proposal id]".into(),
+        })
+}
+
+/// An address parameter (64 hex once `normalize_address_params` ran).
+fn parse_move_address(address: &str) -> Option<move_core_types::account_address::AccountAddress> {
+    move_core_types::account_address::AccountAddress::from_hex_literal(&format!(
+        "0x{}",
+        address.trim_start_matches("0x")
+    ))
+    .ok()
+}
+
+/// A token id's bytes (hex: its symbol, then its creator's 32 address
+/// bytes, `tokenIdOf` in the SDK) and that creator.
+fn token_id_param(
+    value: Option<&serde_json::Value>,
+) -> Result<(Vec<u8>, move_core_types::account_address::AccountAddress), JsonRpcError> {
+    let invalid = || JsonRpcError {
+        code: -32602,
+        message: "Invalid params: a token id, the hex of its symbol and its creator's address"
+            .into(),
+    };
+    let id = value
+        .and_then(|v| v.as_str())
+        .and_then(|s| hex::decode(s.trim_start_matches("0x")).ok())
+        .filter(|id| id.len() > 32)
+        .ok_or_else(invalid)?;
+    let creator =
+        move_core_types::account_address::AccountAddress::from_bytes(&id[id.len() - 32..])
+            .map_err(|_| invalid())?;
+    Ok((id, creator))
 }
 
 fn move_coin_store_key(addr: move_core_types::account_address::AccountAddress) -> String {
@@ -510,7 +681,8 @@ fn estimate_payload_gas(payload: &str) -> u64 {
                 ("delegation", "enable_delegation") => 50_000,
                 ("token_factory", "create_token") => 100_000,
                 ("token_factory", "mint") | ("token_factory", "burn") => 40_000,
-                ("token_factory", "transfer") => 25_000,
+                // Registering touches one resource, as a transfer's side does.
+                ("token_factory", "transfer") | ("token_factory", "register") => 25_000,
                 ("dex", "create_pool") => 120_000,
                 ("dex", "add_liquidity") | ("dex", "remove_liquidity") => 150_000,
                 ("dex", "swap_x_to_y") | ("dex", "swap_y_to_x") => 120_000,
@@ -561,17 +733,228 @@ pub struct AppState {
     /// G4 S6: the sessions the network task holds.
     pub sessions: network::SessionTable,
     pub mempool: Arc<Mutex<mempool::Mempool>>,
-    pub governance: Arc<Mutex<GovernanceManager>>,
     pub storage: Arc<StateDB>,
     /// B65: dry runs executing now (`DRY_RUNS_AT_ONCE` at most).
     pub dry_runs: Arc<AtomicUsize>,
+    /// B217: the clients with a heavy call running (`HeavyLease`).
+    pub heavy_clients: Arc<Mutex<std::collections::HashSet<std::net::IpAddr>>>,
+    /// B217: how a request's client is named (the rate limiter's rule);
+    /// `None` in process.
+    client_ip: Option<ClientIp>,
+    /// B220: reads executing now (`READS_AT_ONCE` at most).
+    pub reads: Arc<AtomicUsize>,
+    /// B220: the heavy calls waiting for a slot, in arrival order.
+    queues: HeavyQueues,
+    /// B241: the recent TPS and the height it was computed at.
+    tps: Arc<Mutex<Option<(u64, f64)>>>,
+}
+
+/// B220: a FIFO wait for each pool's slots, at the HTTP layer. B253: behind
+/// a gate per network group and pool (`heavy_group`), so a group runs one
+/// call of a pool at a time.
+#[derive(Clone)]
+struct HeavyQueues {
+    dry: Arc<tokio::sync::Semaphore>,
+    reads: Arc<tokio::sync::Semaphore>,
+    gates: Arc<Mutex<HeavyGates>>,
+}
+
+/// B253: each (network group, dry pool or not)'s gate of one permit.
+type HeavyGates = std::collections::HashMap<(std::net::IpAddr, bool), Arc<tokio::sync::Semaphore>>;
+
+/// B253: the gates kept before idle ones (held and awaited by no call) are
+/// dropped (a choice: a few hundred KB).
+const MAX_HEAVY_GATES: usize = 4096;
+
+impl Default for HeavyQueues {
+    fn default() -> Self {
+        Self {
+            dry: Arc::new(tokio::sync::Semaphore::new(DRY_RUNS_AT_ONCE)),
+            reads: Arc::new(tokio::sync::Semaphore::new(READS_AT_ONCE)),
+            gates: Arc::default(),
+        }
+    }
+}
+
+/// B253: the network group a client's heavy calls share a turn with: an
+/// IPv4 address's /24, an IPv6 address's /48 (a site's allocation, the
+/// least a tunnel broker hands out). A client is an IPv4 address or an
+/// IPv6 /64 (B74), and one host with a /56 (256 clients) or a /48 (65,536)
+/// kept both slots of a pool taken and every other client's heavy calls
+/// busy.
+fn heavy_group(client: std::net::IpAddr) -> std::net::IpAddr {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    match client {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            IpAddr::V4(Ipv4Addr::new(a, b, c, 0))
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], 0, 0, 0, 0, 0))
+        }
+    }
+}
+
+/// B220/B253: a heavy call's turn: its group's gate and a pool's slot.
+struct HeavyTurn {
+    _gate: Option<tokio::sync::OwnedSemaphorePermit>,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl HeavyQueues {
+    /// B253: the gate of `group` for the dry pool (`dry`) or the reads'.
+    fn gate(&self, group: std::net::IpAddr, dry: bool) -> Arc<tokio::sync::Semaphore> {
+        let mut gates = self.gates.lock().unwrap_or_else(|p| p.into_inner());
+        if gates.len() >= MAX_HEAVY_GATES {
+            gates.retain(|_, gate| Arc::strong_count(gate) > 1);
+        }
+        Arc::clone(
+            gates
+                .entry((group, dry))
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1))),
+        )
+    }
+
+    /// B220/B253: a turn in the dry pool (`dry`) or the reads' for a call of
+    /// `client`, waited for at most `HEAVY_WAIT`: its network group's gate,
+    /// then a slot, each in arrival order. `None`: busy.
+    async fn turn(&self, dry: bool, client: Option<std::net::IpAddr>) -> Option<HeavyTurn> {
+        let gate = client.map(|ip| self.gate(heavy_group(ip), dry));
+        let pool = Arc::clone(if dry { &self.dry } else { &self.reads });
+        let wait = async move {
+            let gate = match gate {
+                Some(gate) => Some(gate.acquire_owned().await.ok()?),
+                None => None,
+            };
+            let slot = pool.acquire_owned().await.ok()?;
+            Some(HeavyTurn {
+                _gate: gate,
+                _slot: slot,
+            })
+        };
+        tokio::time::timeout(HEAVY_WAIT, wait).await.ok().flatten()
+    }
 }
 
 /// B65: dry runs (`aincore_estimateGas`) executing at once. One executes
 /// Move up to MAX_GAS_LIMIT; two at most leave the node's other cores to
 /// consensus whatever the request rate (geth bounds `eth_estimateGas` by a
-/// gas cap and a timeout for the same reason).
+/// gas cap and a timeout for the same reason). B175: and the QC
+/// verifications not remembered.
 const DRY_RUNS_AT_ONCE: usize = 2;
+
+/// B197/B220: the reads whose work one request does not bound
+/// (`READ_METHODS`) executing at once, on slots of their own (a choice, as
+/// dry runs'): they shared the dry runs' two, so one client holding them
+/// stalled estimates, QC verification and the bridge's block reads at once.
+const READS_AT_ONCE: usize = 2;
+
+/// B220: how long a heavy call waits for a slot, in arrival order (a
+/// choice): an instant "busy" let a client resubmitting as its call ended
+/// keep the slots from everyone who asked meanwhile.
+const HEAVY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// B197/B219: the reads that run on the blocking pool, each on a slot of
+/// `READS_AT_ONCE`: up to 8 MiB of blocks parsed (`aincore_getBlocks`,
+/// `aincore_getBlockByHash`, `aincore_getTransactionsByAddress`, the DAG's
+/// vertices copied, `aincore_getDag`), a whole block parsed (a transaction,
+/// its receipt, a block's DA status) or its erasure code re-encoded
+/// (`aincore_sampleDA`), the state tree walked (`aincore_getStateProof`).
+/// The rate limit counts requests, not work: one client alternating them
+/// kept every RPC worker busy, and a validator's consensus competed for the
+/// cores. B267: a receipt is not among them: since B253 it is a few point
+/// reads (its block's header, when the block has no certificate yet, takes
+/// a read's slot); in the pool it waited behind 8 MiB block reads, and a
+/// client's second call was refused (one heavy call at a time a client), so
+/// a wallet's confirmations failed whenever the reads were busy.
+const READ_METHODS: [&str; 8] = [
+    "aincore_getBlocks",
+    "aincore_getBlockByHash",
+    "aincore_getTransactionsByAddress",
+    "aincore_getDag",
+    "aincore_getTransaction",
+    "aincore_getDaStatus",
+    "aincore_sampleDA",
+    "aincore_getStateProof",
+];
+
+/// B65/B234: the calls that wait in the dry runs' queue (`DRY_RUNS_AT_ONCE`
+/// slots): an estimate executes Move, and a client's certificate costs a
+/// pairing. B240: a stored certificate is not among them: it is answered at
+/// once, verified when its outcome is remembered or a slot is free, and
+/// unverified otherwise (B182); waiting in the queue, it was an error
+/// whenever the queue was long, which stalled the bridge.
+const DRY_METHODS: [&str; 2] = ["aincore_estimateGas", "aincore_verifyQuorumCertificate"];
+
+/// B197/B219/B220: a heavy method's static name and whether it is a dry
+/// run (else a read).
+fn heavy_method(method: &str) -> Option<(&'static str, bool)> {
+    if let Some(dry) = DRY_METHODS.iter().find(|m| **m == method) {
+        return Some((dry, true));
+    }
+    READ_METHODS
+        .iter()
+        .find(|m| **m == method)
+        .map(|m| (*m, false))
+}
+
+/// B220: a read's slot, given back when dropped.
+struct ReadSlot(Arc<AtomicUsize>);
+
+impl ReadSlot {
+    fn begin(running: &Arc<AtomicUsize>) -> Option<Self> {
+        let before = running.fetch_add(1, Ordering::SeqCst);
+        let slot = ReadSlot(Arc::clone(running));
+        (before < READS_AT_ONCE).then_some(slot)
+    }
+}
+
+impl Drop for ReadSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// B217: a client's one heavy call at a time (`heavy_method`): the slots
+/// are every client's, and one client within its rate limit held both, so
+/// every other client's heavy reads (a light client's DA sampling among
+/// them) were busy. A call with no client (in process) takes no lease.
+struct HeavyLease(Option<(HeavyClients, std::net::IpAddr)>);
+
+type HeavyClients = Arc<Mutex<std::collections::HashSet<std::net::IpAddr>>>;
+
+impl HeavyLease {
+    fn begin(clients: &HeavyClients, client: Option<std::net::IpAddr>) -> Option<Self> {
+        let Some(ip) = client else {
+            return Some(Self(None));
+        };
+        let mut running = clients.lock().unwrap_or_else(|p| p.into_inner());
+        if !running.insert(ip) {
+            return None;
+        }
+        Some(Self(Some((Arc::clone(clients), ip))))
+    }
+}
+
+impl Drop for HeavyLease {
+    fn drop(&mut self) {
+        if let Some((clients, ip)) = self.0.take() {
+            clients
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&ip);
+        }
+    }
+}
+
+/// B197/B220: a read's slot for `what`, or busy.
+fn read_slot(data: &AppState, what: &str) -> Result<ReadSlot, JsonRpcError> {
+    ReadSlot::begin(&data.reads).ok_or_else(|| JsonRpcError {
+        code: -32005,
+        message: format!("{what} is busy; retry"),
+    })
+}
 
 /// A dry run's slot, given back when dropped.
 struct DryRun(Arc<AtomicUsize>);
@@ -711,6 +1094,7 @@ fn address_param_positions(method: &str) -> &'static [usize] {
         | "aincore_getTransactionsByAddress"
         | "aincore_getDexLpBalance"
         | "aincore_getTokenBalance"
+        | "aincore_getTokens"
         | "aincore_getDelegations"
         | "aincore_getUnbondingDelegations"
         | "aincore_getValidatorPool" => &[0],
@@ -810,11 +1194,17 @@ fn handle_rpc_method(
             if let Some(tx_str) = tx_str_opt {
                 // B54: the signature and proof checks run before the mempool
                 // lock (the consensus tick needs it); under it, only the
-                // stateful gates.
-                let checked = mempool::Mempool::check_admissible(&tx_str).map_err(|reason| JsonRpcError {
-                    code: -32010,
-                    message: format!("Transaction rejected by mempool: {}", reason),
-                })?;
+                // stateful gates. B173: a copy of one the mempool has seen
+                // is refused before its signature is checked.
+                let (tx_str, checked) = node::forward::check_from_outside(&data.mempool, vec![tx_str])
+                    .pop()
+                    .unwrap_or_else(|| Err("nothing to check".to_string()))
+                    .map_err(|reason| JsonRpcError {
+                        code: -32010,
+                        message: format!("Transaction rejected by mempool: {}", reason),
+                    })?;
+                // B259: a waiting consensus thread goes first.
+                mempool::yield_to_consensus();
                 let mut mempool = data.mempool.lock()
                     .map_err(|e| JsonRpcError { code: -32000, message: format!("Mempool lock error: {}", e) })?;
                 // `tx_hash` is the key this transaction can be LOOKED UP by: blocks
@@ -950,53 +1340,8 @@ fn handle_rpc_method(
             }))
         },
         "aincore_getQuorumCert" | "aincore_getLatestQuorumCertificate" | "aincore_getQuorumCertificate" => {
-            // Verify the stored certificate against local epoch/committee
-            // metadata. This is not a proof of execution or epoch transitions.
-            let height = params.get(0).and_then(|v| v.as_u64()).or_else(|| {
-                data.storage
-                    .get("consensus:qc:latest_height")
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.parse::<u64>().ok())
-            });
-            match height {
-                None => Ok(serde_json::json!({
-                    "available": false,
-                    "reason": "no quorum certificate produced yet"
-                })),
-                Some(h) => match data.storage.get(&format!("consensus:qc:{}", h)) {
-                    Ok(Some(qc_json)) => {
-                        match serde_json::from_str::<consensus::qc::QuorumCertificate>(&qc_json) {
-                            Ok(qc) => {
-                                let (verified, verify_error) =
-                                    match node::qc_rpc::verify(&data.storage, &qc, Some(h)) {
-                                        Ok(()) => (true, String::new()),
-                                        Err(e) => (false, e.to_string()),
-                                    };
-                                Ok(serde_json::json!({
-                                    "available": true,
-                                    "height": h,
-                                    "verified": verified,
-                                    "verification_scope": node::qc_rpc::VERIFICATION_SCOPE,
-                                    "verify_error": verify_error,
-                                    "quorum_certificate": qc,
-                                }))
-                            }
-                            Err(e) => Ok(serde_json::json!({
-                                "available": false,
-                                "height": h,
-                                "reason": format!("corrupt QC at height: {e}")
-                            })),
-                        }
-                    }
-                    _ => Ok(serde_json::json!({
-                        "available": false,
-                        "height": h,
-                        "reason": "no quorum certificate at height"
-                    })),
-                },
-            }
-        },
+            stored_certificate(data, &params, None)
+        }
         "aincore_getStateProof" => {
             // G3 PF-1: params [key, height?]. The value of a consensus-state
             // key (or its absence) with a proof against the state root at
@@ -1014,6 +1359,7 @@ fn handle_rpc_method(
                     message: format!("{key} is not a consensus-state key; only those are proven"),
                 });
             }
+            let _slot = read_slot(data, "aincore_getStateProof")?;
             let stored_u64 = |k: &str| {
                 data.storage.get(k).ok().flatten().and_then(|s| s.parse::<u64>().ok())
             };
@@ -1078,7 +1424,16 @@ fn handle_rpc_method(
                     code: -32602,
                     message: format!("Invalid quorum certificate: {e}"),
                 })?;
-            match node::qc_rpc::verify(&data.storage, &qc, None) {
+            // B167: a client's certificate costs a pairing: on the dry-run
+            // slots (`DRY_RUNS_AT_ONCE`), which estimates take too (B175:
+            // only when its outcome is not remembered).
+            match node::qc_rpc::verify_with(&data.storage, &qc, None, || {
+                DryRun::begin(&data.dry_runs)
+            }) {
+                Err(node::qc_rpc::VerificationError::Busy) => Err(JsonRpcError {
+                    code: -32005,
+                    message: "verifications are busy; retry".into(),
+                }),
                 Err(node::qc_rpc::VerificationError::Unavailable(message)) => Err(JsonRpcError {
                     code: -32000,
                     message: message.into(),
@@ -1095,6 +1450,7 @@ fn handle_rpc_method(
             }
         },
         "aincore_getDag" => {
+            let _slot = read_slot(data, "aincore_getDag")?;
             let consensus = try_consensus(data)?.ok_or_else(consensus_busy)?;
             let dag = consensus.dag.lock().map_err(|e| JsonRpcError { code: -32000, message: format!("DAG lock error: {}", e) })?;
 
@@ -1121,6 +1477,7 @@ fn handle_rpc_method(
         "aincore_getTransaction" => {
             // params: [tx_hash]
             if let Some(target_hash) = params.get(0).and_then(|v| v.as_str()) {
+                let _slot = read_slot(data, "aincore_getTransaction")?;
                 // M4 FIX: Use O(1) indexed lookup instead of O(N) DAG scan
                 if let Some(block_height) = data.storage.get_tx_block_height(target_hash) {
                     let block_key = format!("block_{}", block_height);
@@ -1180,6 +1537,7 @@ fn handle_rpc_method(
             // is missing, the old "latest N" behaviour is preserved.
             let limit = params.get(0).and_then(|v| v.as_u64()).unwrap_or(10);
             let limit = std::cmp::min(limit, MAX_QUERY_LIMIT); // S3: DoS prevention
+            let _slot = read_slot(data, "aincore_getBlocks")?;
 
             // Optional start_height parameter for range queries.
             let start_height_param = params.get(1).and_then(|v| v.as_u64());
@@ -1221,43 +1579,17 @@ fn handle_rpc_method(
                         "🔍 [RPC] getBlocks range: {}..={} (latest={})",
                         start_height, end_height, latest_height
                     );
-                    let mut bytes = 0usize;
-                    for i in start_height..=end_height {
-                        let key = format!("block_{}", i);
-                        if let Ok(Some(block_json)) = data.storage.get(&key) {
-                            // B54: the answer stops at MAX_BLOCKS_BYTES (at
-                            // least one block); the caller asks again from
-                            // the next height.
-                            bytes += block_json.len();
-                            if bytes > MAX_BLOCKS_BYTES && !blocks.is_empty() {
-                                break;
-                            }
-                            if let Ok(block_obj) =
-                                serde_json::from_str::<serde_json::Value>(&block_json)
-                            {
-                                blocks.push(block_obj);
-                            }
-                        }
-                    }
+                    // B54: the answer stops at MAX_BLOCKS_BYTES; the caller
+                    // asks again from the next height.
+                    blocks = blocks_within_budget(&data.storage, start_height..=end_height);
                 }
                 None => {
                     println!("🔍 [RPC] getBlocks latest: head={} limit={}", latest_height, limit);
                     let start_index = latest_height.saturating_sub(limit);
-                    let mut bytes = 0usize;
-                    for i in (start_index + 1..=latest_height).rev() {
-                        let key = format!("block_{}", i);
-                        if let Ok(Some(block_json)) = data.storage.get(&key) {
-                            bytes += block_json.len();
-                            if bytes > MAX_BLOCKS_BYTES && !blocks.is_empty() {
-                                break;
-                            }
-                            if let Ok(block_obj) =
-                                serde_json::from_str::<serde_json::Value>(&block_json)
-                            {
-                                blocks.push(block_obj);
-                            }
-                        }
-                    }
+                    blocks = blocks_within_budget(
+                        &data.storage,
+                        (start_index + 1..=latest_height).rev(),
+                    );
                 }
             }
 
@@ -1302,32 +1634,28 @@ fn handle_rpc_method(
             })
         },
         "aincore_getProposal" => {
-            if let Some(pid) = params.get(0).and_then(|v| v.as_str()) {
-                 let governance = data.governance.lock().map_err(|e| JsonRpcError { code: -32000, message: format!("Governance lock error: {}", e) })?;
-                 if let Some(p) = governance.get_proposal(pid) {
-                     Ok(serde_json::json!(p))
-                 } else {
-                     Ok(serde_json::json!(null))
-                 }
-            } else {
-                 Err(JsonRpcError { code: -32602, message: "Invalid params".into() })
-            }
+            // B194: from `0x1::governance::GovernanceState`, where proposals
+            // live (it read the Rust GovernanceManager's rows, which nothing
+            // on the node writes: every real proposal read as null).
+            let id = proposal_id_param(&params)?;
+            Ok(governance_proposal(&data.storage, id)
+                .map_or(serde_json::Value::Null, |p| proposal_json(&p)))
         },
         "aincore_tally" => {
-             if let Some(pid) = params.get(0).and_then(|v| v.as_str()) {
-                 let governance = data.governance.lock().map_err(|e| JsonRpcError { code: -32000, message: format!("Governance lock error: {}", e) })?;
-                 // SEC-#32: READ-ONLY. Previously this called the mutating tally(),
-                 // letting any unauthenticated caller flip a proposal Active->Queued/
-                 // Rejected and persist it. The status transition must be driven
-                 // deterministically on-chain (epoch tick) — see governance-execution
-                 // task. Here we only REPORT the current persisted status.
-                 match governance.get_proposal(pid) {
-                     Some(p) => Ok(serde_json::json!({ "id": pid, "status": p.status })),
-                     None => Err(JsonRpcError { code: -32602, message: "Unknown proposal".into() }),
-                 }
-             } else {
-                 Err(JsonRpcError { code: -32602, message: "Missing proposal ID".into() })
-             }
+            // B194: the votes as the chain holds them. READ-ONLY (SEC-#32):
+            // `0x1::governance` decides a proposal on chain.
+            let id = proposal_id_param(&params)?;
+            let p = governance_proposal(&data.storage, id).ok_or_else(|| JsonRpcError {
+                code: -32602,
+                message: "Unknown proposal".into(),
+            })?;
+            Ok(serde_json::json!({
+                "id": p.id,
+                "votes_for": p.votes_for.to_string(),
+                "votes_against": p.votes_against.to_string(),
+                "executed": p.executed,
+                "voting_ends": p.voting_ends,
+            }))
         },
         "aincore_getGasPrice" => {
             // B15: the committed base fee, quanta per gas, as a string (it can
@@ -1355,6 +1683,7 @@ fn handle_rpc_method(
                 })?,
                 None => data.storage.get_chain_height(),
             };
+            let _slot = read_slot(data, "aincore_getDaStatus")?;
             let block = held_block(&data.storage, height)?;
             let layout = da::Layout::of(block.body_bytes().len() as u64);
             Ok(serde_json::json!({
@@ -1494,40 +1823,28 @@ fn handle_rpc_method(
         // ============ TOKEN FACTORY QUERY METHODS ============
 
         "aincore_getToken" => {
-            // params: [token_id]
-            if let Some(token_id) = params.get(0).and_then(|v| v.as_str()) {
-                let key = format!("token:{}", token_id);
-                match data.storage.get(&key) {
-                    Ok(Some(token_str)) => {
-                        if let Ok(token_data) = serde_json::from_str::<serde_json::Value>(&token_str) {
-                            Ok(token_data)
-                        } else {
-                            Ok(serde_json::json!(null))
-                        }
-                    },
-                    _ => Ok(serde_json::json!(null))
-                }
-            } else {
-                Err(JsonRpcError { code: -32602, message: "Invalid params: [token_id]".into() })
-            }
+            // params: [token_id] (hex). B153: from its creator's registry.
+            let (id, creator) = token_id_param(params.get(0))?;
+            let found = token_resource::<MoveCreatorTokens>(&data.storage, &creator, "CreatorTokens")
+                .and_then(|registry| registry.tokens.into_iter().find(|t| t.token_id == id));
+            Ok(found.map_or(serde_json::Value::Null, |t| token_json(&t)))
         },
 
         "aincore_getTokens" => {
-            // No params, returns all tokens.
-            // Phase 2.11: bounded scan, see aincore_getDelegations.
-            let mut tokens = Vec::new();
-            let prefix = "token:";
-            const API_PREFIX_CAP: usize = 1000;
-            for (_key_str, raw_value) in
-                data.storage.scan_prefix_limited(prefix, API_PREFIX_CAP)
-            {
-                if let Ok(token_data) =
-                    serde_json::from_str::<serde_json::Value>(&raw_value)
-                {
-                    tokens.push(token_data);
-                }
-            }
-
+            // params: [creator]. B153: a creator's tokens, from its registry
+            // (64 at most); there is no global list to read.
+            let creator = params
+                .get(0)
+                .and_then(|v| v.as_str())
+                .and_then(parse_move_address)
+                .ok_or_else(|| JsonRpcError {
+                    code: -32602,
+                    message: "Invalid params: [creator address]".into(),
+                })?;
+            let tokens: Vec<serde_json::Value> =
+                token_resource::<MoveCreatorTokens>(&data.storage, &creator, "CreatorTokens")
+                    .map(|registry| registry.tokens.iter().map(token_json).collect())
+                    .unwrap_or_default();
             Ok(serde_json::json!(tokens))
         },
 
@@ -1644,25 +1961,23 @@ fn handle_rpc_method(
         },
 
         "aincore_getTokenBalance" => {
-            // params: [address, token_id]
-            if let (Some(address), Some(token_id)) = (
-                params.get(0).and_then(|v| v.as_str()),
-                params.get(1).and_then(|v| v.as_str())
-            ) {
-                let key = format!("token_balance:{}:{}", address, token_id);
-                match data.storage.get(&key) {
-                    Ok(Some(balance_str)) => {
-                        if let Ok(balance) = balance_str.parse::<u128>() {
-                            Ok(serde_json::json!({ "balance": balance.to_string() }))
-                        } else {
-                            Ok(serde_json::json!({ "balance": "0" }))
-                        }
-                    },
-                    _ => Ok(serde_json::json!({ "balance": "0" }))
-                }
-            } else {
-                Err(JsonRpcError { code: -32602, message: "Invalid params: [address, token_id]".into() })
-            }
+            // params: [address, token_id]. B153: from the address's wallet;
+            // `registered` says whether it can receive the token.
+            let owner = params
+                .get(0)
+                .and_then(|v| v.as_str())
+                .and_then(parse_move_address)
+                .ok_or_else(|| JsonRpcError {
+                    code: -32602,
+                    message: "Invalid params: [address, token_id]".into(),
+                })?;
+            let (id, _) = token_id_param(params.get(1))?;
+            let held = token_resource::<MoveTokenWallet>(&data.storage, &owner, "TokenWallet")
+                .and_then(|wallet| wallet.balances.into_iter().find(|b| b.token_id == id));
+            Ok(serde_json::json!({
+                "balance": held.as_ref().map_or(0, |b| b.balance).to_string(),
+                "registered": held.is_some(),
+            }))
         },
 
         // ============ CRITICAL WALLET ENDPOINTS ============
@@ -1720,12 +2035,7 @@ fn handle_rpc_method(
                 let execution_receipt = stored_tx_receipt(&data.storage, tx_hash);
                 // Use indexed lookup (O(1))
                 if let Some(block_height) = data.storage.get_tx_block_height(tx_hash) {
-                    // Fetch the block to get confirmation details
-                    let block_key = format!("block_{}", block_height);
-                    let block_data = match data.storage.get(&block_key) {
-                        Ok(Some(b)) => serde_json::from_str::<serde_json::Value>(&b).ok(),
-                        _ => None,
-                    };
+                    let block_hash = block_hash_at(&data.storage, block_height, &data.reads)?;
                     let latest_height = data.storage.get_chain_height();
                     let confirmations = latest_height.saturating_sub(block_height);
                     let status = execution_receipt
@@ -1740,11 +2050,7 @@ fn handle_rpc_method(
                         "confirmations": confirmations,
                         "status": status,
                         "execution_receipt": execution_receipt,
-                        "block_hash": block_data.as_ref()
-                            .and_then(|b| b.get("header"))
-                            .and_then(|h| h.get("hash"))
-                            .and_then(|h| h.as_str())
-                            .unwrap_or("")
+                        "block_hash": block_hash.unwrap_or_default()
                     }))
                 } else if let Some(receipt) = execution_receipt {
                     let status = receipt
@@ -1854,6 +2160,7 @@ fn handle_rpc_method(
                 if target.len() != 64 || !target.bytes().all(|b| b.is_ascii_hexdigit()) {
                     return Err(JsonRpcError { code: -32602, message: "Invalid params: block_hash must be 64 hex characters".into() });
                 }
+                let _slot = read_slot(data, "aincore_getBlockByHash")?;
                 let needle = format!("\"hash\":\"{target}\"");
                 let latest_height = data.storage.get_chain_height();
                 let mut found_block = None;
@@ -1965,6 +2272,7 @@ fn handle_rpc_method(
             ) else {
                 return Err(JsonRpcError { code: -32602, message: "Invalid params: [height, index]".into() });
             };
+            let _slot = read_slot(data, "aincore_sampleDA")?;
             let block = held_block(&data.storage, height)?;
             let extended = extended_body(&block)?;
             let sample = extended.sample(index).ok_or_else(|| JsonRpcError {
@@ -1996,6 +2304,7 @@ fn handle_rpc_method(
                     return Err(JsonRpcError { code: -32602, message: "Invalid params: address must be an A1n or 64-hex address".into() });
                 }
                 let limit = std::cmp::min(params.get(1).and_then(|v| v.as_u64()).unwrap_or(20), MAX_QUERY_LIMIT) as usize;
+                let _slot = read_slot(data, "aincore_getTransactionsByAddress")?;
                 let latest_height = data.storage.get_chain_height();
                 let mut txs = Vec::new();
                 // B127: the scan stops at MAX_BLOCKS_BYTES of blocks read,
@@ -2185,27 +2494,69 @@ fn handle_rpc_method(
     }
 }
 
+/// B59/B176: what a request logs: bounded prefixes of its method and its
+/// params (a request may carry 2 MiB of either; the method was logged
+/// whole).
+fn request_log_line(method: &str, params: &serde_json::Value) -> String {
+    let method: String = method.chars().take(64).collect();
+    let shown: String = params.to_string().chars().take(256).collect();
+    format!("📥 JSON-RPC Request: {method} {shown}")
+}
+
 async fn json_rpc_handler(
+    http: actix_web::HttpRequest,
     req: web::Json<JsonRpcRequest>,
     data: web::Data<AppState>,
 ) -> impl Responder {
     let method = req.method.as_str();
     let params = req.params.clone().unwrap_or(serde_json::Value::Null);
 
-    // B59: a bounded prefix (a request may carry 2 MiB of params).
-    let shown: String = params.to_string().chars().take(256).collect();
-    println!("📥 JSON-RPC Request: {} {}", method, shown);
+    println!("{}", request_log_line(method, &params));
 
-    // B65: a dry run executes Move, so it runs on the blocking pool, not on
-    // this worker (`DRY_RUNS_AT_ONCE` bounds how many).
-    let result = if method == "aincore_estimateGas" {
+    // B65/B197: a dry run executes Move, and the heavy reads parse or encode
+    // megabytes, so they run on the blocking pool, not on this worker
+    // (`DRY_RUNS_AT_ONCE` and `READS_AT_ONCE` bound how many). B217: one a
+    // client at a time; B220: waiting for a slot in arrival order.
+    let result = if STORED_CERTIFICATE_METHODS.contains(&method) {
+        // B254: off the worker: a miss reads a committee and runs a pairing.
+        let client = data.client_ip.as_ref().and_then(|c| c.address_of(&http));
         let state = data.clone();
-        match web::block(move || handle_rpc_method("aincore_estimateGas", params, &state)).await {
-            Ok(result) => result,
-            Err(_) => Err(JsonRpcError {
-                code: -32603,
-                message: "the estimate failed".into(),
+        web::block(move || stored_certificate(&state, &params, client))
+            .await
+            .unwrap_or_else(|_| {
+                Err(JsonRpcError {
+                    code: -32603,
+                    message: format!("{method} failed"),
+                })
+            })
+    } else if let Some((heavy, dry)) = heavy_method(method) {
+        let client = data.client_ip.as_ref().and_then(|c| c.address_of(&http));
+        match HeavyLease::begin(&data.heavy_clients, client) {
+            None => Err(JsonRpcError {
+                code: -32005,
+                message: format!("{heavy}: this client's last heavy call is running; retry"),
             }),
+            Some(lease) => match data.queues.turn(dry, client).await {
+                Some(turn) => {
+                    let state = data.clone();
+                    match web::block(move || {
+                        let _held = (lease, turn);
+                        handle_rpc_method(heavy, params, &state)
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(JsonRpcError {
+                            code: -32603,
+                            message: format!("{heavy} failed"),
+                        }),
+                    }
+                }
+                None => Err(JsonRpcError {
+                    code: -32005,
+                    message: format!("{heavy} is busy; retry"),
+                }),
+            },
         }
     } else {
         handle_rpc_method(method, params, &data)
@@ -2246,7 +2597,39 @@ struct BlockQuery {
 }
 
 // GET /get_block?height=N
+/// B220/B235: a REST read of whole blocks, admitted as the JSON-RPC reads
+/// are: one at a time a client (B217), in arrival order on a read's slot
+/// (B220), off the worker. `Err` is the answer to send. B235: `/get_block`
+/// and `/get_transaction` read a whole block each on the worker, on no
+/// slot, 100 calls a second an IP.
+async fn admitted_read<T: Send + 'static>(
+    http: &actix_web::HttpRequest,
+    data: &web::Data<AppState>,
+    read: impl FnOnce(&StateDB) -> T + Send + 'static,
+) -> Result<T, HttpResponse> {
+    let client = data.client_ip.as_ref().and_then(|c| c.address_of(http));
+    let Some(lease) = HeavyLease::begin(&data.heavy_clients, client) else {
+        return Err(
+            HttpResponse::ServiceUnavailable().body("this client's last read is running; retry")
+        );
+    };
+    let Some(turn) = data.queues.turn(false, client).await else {
+        return Err(HttpResponse::ServiceUnavailable().body("block reads are busy; retry"));
+    };
+    let Some(slot) = ReadSlot::begin(&data.reads) else {
+        return Err(HttpResponse::ServiceUnavailable().body("block reads are busy; retry"));
+    };
+    let storage = Arc::clone(&data.storage);
+    web::block(move || {
+        let _held = (slot, lease, turn);
+        read(storage.as_ref())
+    })
+    .await
+    .map_err(|_| HttpResponse::InternalServerError().body("the block read failed"))
+}
+
 async fn get_block_handler(
+    http: actix_web::HttpRequest,
     query: web::Query<BlockQuery>,
     data: web::Data<AppState>,
 ) -> impl Responder {
@@ -2266,12 +2649,13 @@ async fn get_block_handler(
         ));
     }
     let key = format!("block_{}", query.height);
-    match data.storage.get(&key) {
-        Ok(Some(block_json)) => HttpResponse::Ok()
+    match admitted_read(&http, &data, move |storage| storage.get(&key)).await {
+        Err(answer) => answer,
+        Ok(Ok(Some(block_json))) => HttpResponse::Ok()
             .content_type("application/json")
             .body(block_json),
-        Ok(None) => HttpResponse::NotFound().body("Block not found"),
-        Err(e) => HttpResponse::InternalServerError().body(format!("Error: {}", e)),
+        Ok(Ok(None)) => HttpResponse::NotFound().body("Block not found"),
+        Ok(Err(e)) => HttpResponse::InternalServerError().body(format!("Error: {}", e)),
     }
 }
 
@@ -2282,6 +2666,7 @@ struct LimitQuery {
 }
 
 async fn get_latest_blocks_handler(
+    http: actix_web::HttpRequest,
     query: web::Query<LimitQuery>,
     data: web::Data<AppState>,
 ) -> impl Responder {
@@ -2303,24 +2688,17 @@ async fn get_latest_blocks_handler(
         latest_height, limit
     );
 
-    let mut blocks = Vec::new();
     let start_index = latest_height.saturating_sub(limit);
-
-    // Loop inclusive
-    for i in (start_index + 1..=latest_height).rev() {
-        let key = format!("block_{}", i);
-        match data.storage.get(&key) {
-            Ok(Some(block_json)) => {
-                if let Ok(block_obj) = serde_json::from_str::<serde_json::Value>(&block_json) {
-                    blocks.push(block_obj);
-                } else {
-                    println!("❌ [API] Failed to parse block_{}", i);
-                }
-            }
-            Ok(None) => println!("⚠️ [API] Block key {} missing in DB", key),
-            Err(e) => println!("❌ [API] DB Error reading {}: {}", key, e),
-        }
-    }
+    // B197/B217/B220: one at a time a client, on a read's slot, off this
+    // worker (`admitted_read`).
+    let blocks = match admitted_read(&http, &data, move |storage| {
+        blocks_within_budget(storage, (start_index + 1..=latest_height).rev())
+    })
+    .await
+    {
+        Ok(blocks) => blocks,
+        Err(answer) => return answer,
+    };
 
     println!("✅ [API] Returning {} blocks", blocks.len());
     HttpResponse::Ok().json(blocks)
@@ -2379,52 +2757,22 @@ async fn get_network_info_handler(data: web::Data<AppState>) -> impl Responder {
         }
     };
     let height = data.storage.get_chain_height();
-
-    // CALCULATE TPS (Transactions per Second)
-    // Look back 10 blocks or 100 blocks
-    let lookback = 20;
-    let start_block = height.saturating_sub(lookback);
-    let mut total_txs = 0;
-    let mut start_time = 0;
-    let mut end_time = 0;
-
-    // Fetch latest block for end time
-    if let Ok(Some(b)) = data.storage.get(&format!("block_{}", height)) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&b) {
-            end_time = json["header"]["timestamp"].as_u64().unwrap_or(0);
-        }
-    }
-
-    // Fetch start block for start time
-    if start_block > 0 {
-        if let Ok(Some(b)) = data.storage.get(&format!("block_{}", start_block)) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&b) {
-                start_time = json["header"]["timestamp"].as_u64().unwrap_or(0);
+    // B241: computed once a height (it read two whole blocks and 21
+    // transaction lists each call, on the worker, 100 calls a second an IP).
+    let cached = data
+        .tps
+        .lock()
+        .ok()
+        .and_then(|c| c.filter(|(at, _)| *at == height).map(|(_, tps)| tps));
+    let tps = match cached {
+        Some(tps) => tps,
+        None => {
+            let tps = recent_tps(&data.storage, height);
+            if let Ok(mut c) = data.tps.lock() {
+                *c = Some((height, tps));
             }
+            tps
         }
-    }
-
-    // Capture TX count in window
-    if end_time > start_time {
-        for i in start_block..=height {
-            if let Ok(Some(b)) = data.storage.get(&format!("block_{}", i)) {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&b) {
-                    if let Some(txs) = json["transactions"].as_array() {
-                        total_txs += txs.len();
-                    }
-                }
-            }
-        }
-    }
-
-    // Determine TPS
-    // Block timestamps are unix SECONDS (the BFT median of vertex timestamps).
-    // This used to divide by 1000 as if they were milliseconds, reporting a TPS
-    // a thousand times too high.
-    let tps = if end_time > start_time {
-        total_txs as f64 / end_time.saturating_sub(start_time) as f64
-    } else {
-        0.0
     };
 
     let info = serde_json::json!({
@@ -2444,6 +2792,202 @@ async fn get_network_info_handler(data: web::Data<AppState>) -> impl Responder {
     HttpResponse::Ok().json(info)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// B241 witness: the TPS computations on this thread.
+    static TPS_COMPUTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Transactions per second over the 20 blocks below `height`.
+fn recent_tps(storage: &StateDB, height: u64) -> f64 {
+    #[cfg(test)]
+    TPS_COMPUTED.with(|n| n.set(n.get() + 1));
+    let lookback = 20;
+    let start_block = height.saturating_sub(lookback);
+    let mut total_txs = 0;
+
+    // B142: the two blocks' timestamps from their headers alone, and each
+    // block's transactions counted from its `block_txs:{h}` row (their
+    // hashes, written with the block; none for a block without any): it
+    // parsed the 21 whole blocks.
+    let end_time = block_timestamp(storage, height).unwrap_or(0);
+    let start_time = if start_block > 0 {
+        block_timestamp(storage, start_block).unwrap_or(0)
+    } else {
+        0
+    };
+    if end_time > start_time {
+        for i in start_block..=height {
+            if let Ok(Some(hashes)) = storage.get(&format!("block_txs:{i}")) {
+                total_txs += serde_json::from_str::<Vec<String>>(&hashes).map_or(0, |h| h.len());
+            }
+        }
+    }
+
+    // Block timestamps are unix SECONDS (the BFT median of vertex timestamps).
+    // This used to divide by 1000 as if they were milliseconds, reporting a TPS
+    // a thousand times too high.
+    if end_time > start_time {
+        total_txs as f64 / end_time.saturating_sub(start_time) as f64
+    } else {
+        0.0
+    }
+}
+
+/// B253: block `height`'s hash for a receipt: from its certificate's row
+/// (about 2 KB) when this node holds it, else from the block's header (the
+/// whole block was parsed into a value for that one field, on every receipt).
+/// B267: the header is read on one of `reads`' slots, or the call is busy.
+fn block_hash_at(
+    storage: &StateDB,
+    height: u64,
+    reads: &Arc<AtomicUsize>,
+) -> Result<Option<String>, JsonRpcError> {
+    #[derive(Deserialize)]
+    struct Certified {
+        block_height: u64,
+        block_hash: String,
+    }
+    #[derive(Deserialize)]
+    struct Headed {
+        header: Head,
+    }
+    #[derive(Deserialize)]
+    struct Head {
+        hash: String,
+    }
+    let certified = storage
+        .get(&format!("consensus:qc:{height}"))
+        .ok()
+        .flatten()
+        .and_then(|row| serde_json::from_str::<Certified>(&row).ok())
+        .filter(|c| c.block_height == height);
+    if let Some(c) = certified {
+        return Ok(Some(c.block_hash));
+    }
+    let _slot = ReadSlot::begin(reads).ok_or_else(|| JsonRpcError {
+        code: -32005,
+        message: "aincore_getTransactionReceipt is busy; retry".into(),
+    })?;
+    let Some(raw) = storage.get(&format!("block_{height}")).ok().flatten() else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_str::<Headed>(&raw)
+        .ok()
+        .map(|b| b.header.hash))
+}
+
+/// B240/B254: the stored-certificate calls, answered at once with the
+/// certificate, run off the worker (`json_rpc_handler`).
+const STORED_CERTIFICATE_METHODS: [&str; 3] = [
+    "aincore_getQuorumCert",
+    "aincore_getLatestQuorumCertificate",
+    "aincore_getQuorumCertificate",
+];
+
+/// A stored certificate (`params`: its height, else the latest), verified
+/// when its outcome is remembered or a verification turn is free now, and
+/// unverified otherwise (B182, B240). B254: the turn is `client`'s network
+/// group's dry gate, a dry permit and a dry-run slot, all free now: with
+/// none, one client (or group) missing on past epochs held both dry
+/// permits, a pairing each, on the actix worker.
+fn stored_certificate(
+    data: &AppState,
+    params: &serde_json::Value,
+    client: Option<std::net::IpAddr>,
+) -> Result<serde_json::Value, JsonRpcError> {
+    // Verify the stored certificate against local epoch/committee
+    // metadata. This is not a proof of execution or epoch transitions.
+    let height = params.get(0).and_then(|v| v.as_u64()).or_else(|| {
+        data.storage
+            .get("consensus:qc:latest_height")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u64>().ok())
+    });
+    match height {
+        None => Ok(serde_json::json!({
+            "available": false,
+            "reason": "no quorum certificate produced yet"
+        })),
+        Some(h) => match data.storage.get(&format!("consensus:qc:{}", h)) {
+            Ok(Some(qc_json)) => {
+                match serde_json::from_str::<consensus::qc::QuorumCertificate>(&qc_json) {
+                    Ok(qc) => {
+                        // B175: a certificate not remembered costs a
+                        // pairing, on a dry-run slot.
+                        // B240: a slot only if one of the dry
+                        // runs' queue is free now (it never waits,
+                        // and never takes a slot the queue counts
+                        // on: an estimate that waited its turn
+                        // found the slots taken).
+                        let (verified, verify_error) =
+                            match node::qc_rpc::verify_with(&data.storage, &qc, Some(h), || {
+                                let gate = match client {
+                                    Some(ip) => Some(
+                                        data.queues
+                                            .gate(heavy_group(ip), true)
+                                            .try_acquire_owned()
+                                            .ok()?,
+                                    ),
+                                    None => None,
+                                };
+                                let permit =
+                                    Arc::clone(&data.queues.dry).try_acquire_owned().ok()?;
+                                DryRun::begin(&data.dry_runs).map(|slot| (gate, permit, slot))
+                            }) {
+                                Ok(()) => (serde_json::json!(true), String::new()),
+                                // B182: the certificate all the same (a
+                                // client verifies it itself); refusing it
+                                // stalled the bridge for as long as the
+                                // slots were kept busy.
+                                Err(node::qc_rpc::VerificationError::Busy) => (
+                                    serde_json::Value::Null,
+                                    node::qc_rpc::VerificationError::Busy.to_string(),
+                                ),
+                                Err(e) => (serde_json::json!(false), e.to_string()),
+                            };
+                        Ok(serde_json::json!({
+                            "available": true,
+                            "height": h,
+                            "verified": verified,
+                            "verification_scope": node::qc_rpc::VERIFICATION_SCOPE,
+                            "verify_error": verify_error,
+                            "quorum_certificate": qc,
+                        }))
+                    }
+                    Err(e) => Ok(serde_json::json!({
+                        "available": false,
+                        "height": h,
+                        "reason": format!("corrupt QC at height: {e}")
+                    })),
+                }
+            }
+            _ => Ok(serde_json::json!({
+                "available": false,
+                "height": h,
+                "reason": "no quorum certificate at height"
+            })),
+        },
+    }
+}
+
+/// B142: a stored block's header timestamp, without building the block.
+fn block_timestamp(storage: &StateDB, height: u64) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Stamped {
+        header: Stamp,
+    }
+    #[derive(Deserialize)]
+    struct Stamp {
+        timestamp: u64,
+    }
+    let raw = storage.get(&format!("block_{height}")).ok()??;
+    serde_json::from_str::<Stamped>(&raw)
+        .ok()
+        .map(|b| b.header.timestamp)
+}
+
 // GET /get_transaction?hash=...
 #[derive(Deserialize)]
 struct TxQuery {
@@ -2451,6 +2995,7 @@ struct TxQuery {
 }
 
 async fn get_transaction_handler(
+    http: actix_web::HttpRequest,
     query: web::Query<TxQuery>,
     data: web::Data<AppState>,
 ) -> impl Responder {
@@ -2464,19 +3009,23 @@ async fn get_transaction_handler(
     if target_hash.len() != 64 || !target_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return HttpResponse::BadRequest().body("hash must be 64 hex characters");
     }
-    let block = data
-        .storage
-        .get(&format!("tx_index:{target_hash}"))
-        .ok()
-        .flatten()
-        .and_then(|h| h.parse::<u64>().ok())
-        .and_then(|h| data.storage.get(&format!("block_{h}")).ok().flatten());
+    // B235: the whole block read on a read's slot (`admitted_read`).
+    let block = admitted_read(&http, &data, move |storage| {
+        storage
+            .get(&format!("tx_index:{target_hash}"))
+            .ok()
+            .flatten()
+            .and_then(|h| h.parse::<u64>().ok())
+            .and_then(|h| storage.get(&format!("block_{h}")).ok().flatten())
+    })
+    .await;
     match block {
+        Err(answer) => answer,
         // The whole block holding the transaction, as before.
-        Some(block_json) => HttpResponse::Ok()
+        Ok(Some(block_json)) => HttpResponse::Ok()
             .content_type("application/json")
             .body(block_json),
-        None => HttpResponse::NotFound().body("Transaction not found"),
+        Ok(None) => HttpResponse::NotFound().body("Transaction not found"),
     }
 }
 
@@ -2534,13 +3083,16 @@ struct ClientIp {
 const RATE_LIMIT_BUCKETS: u32 = 1 << 16;
 
 /// B74: the address a request counts under: the trusted proxy's last
-/// forwarded hop, else the peer; an IPv6 address by its /64.
+/// forwarded hop, else the peer; an IPv6 address by its /64. B266: the peer
+/// as IPv4 when it is an IPv4-mapped IPv6 address (a dual-stack listener
+/// sees an IPv4 proxy so, and it never matched the trusted list).
 fn client_address(
     peer: std::net::IpAddr,
     header: Option<&str>,
     trusted: &[std::net::IpAddr],
 ) -> std::net::IpAddr {
     use std::net::{IpAddr, Ipv6Addr};
+    let peer = peer.to_canonical();
     let client = if trusted.contains(&peer) {
         header
             .and_then(|h| h.rsplit(',').next()?.trim().parse().ok())
@@ -2568,7 +3120,8 @@ impl ClientIp {
         let trusted: Vec<std::net::IpAddr> = std::env::var("AINCORE_RPC_TRUSTED_PROXIES")
             .unwrap_or_default()
             .split(',')
-            .filter_map(|a| a.trim().parse().ok())
+            .filter_map(|a| a.trim().parse::<std::net::IpAddr>().ok())
+            .map(|a| a.to_canonical())
             .collect();
         if header.is_some() && trusted.is_empty() {
             eprintln!(
@@ -2588,15 +3141,36 @@ impl ClientIp {
     }
 
     fn address(&self, req: &actix_web::dev::ServiceRequest) -> Option<std::net::IpAddr> {
-        let peer = req.peer_addr()?.ip();
-        let via_proxy_port = self
-            .proxy_port
-            .is_none_or(|port| req.app_config().local_addr().port() == port);
+        self.address_from(
+            req.peer_addr()?.ip(),
+            req.app_config().local_addr().port(),
+            req.headers(),
+        )
+    }
+
+    /// B217: `address` of a handler's request (the same rule).
+    fn address_of(&self, req: &actix_web::HttpRequest) -> Option<std::net::IpAddr> {
+        self.address_from(
+            req.peer_addr()?.ip(),
+            req.app_config().local_addr().port(),
+            req.headers(),
+        )
+    }
+
+    fn address_from(
+        &self,
+        peer: std::net::IpAddr,
+        local_port: u16,
+        headers: &actix_web::http::header::HeaderMap,
+    ) -> Option<std::net::IpAddr> {
+        let via_proxy_port = self.proxy_port.is_none_or(|port| local_port == port);
+        // B266: the last line of the header (a proxy that adds its own line
+        // appends it, after the client's; `get` read the first).
         let header = self
             .header
             .as_deref()
             .filter(|_| via_proxy_port)
-            .and_then(|name| req.headers().get(name)?.to_str().ok());
+            .and_then(|name| headers.get_all(name).last()?.to_str().ok());
         Some(client_address(peer, header, &self.trusted))
     }
 }
@@ -2623,17 +3197,21 @@ pub async fn start_api_server(
     sessions: network::SessionTable,
     mempool: Arc<Mutex<mempool::Mempool>>,
     storage: Arc<StateDB>,
-    governance: Arc<Mutex<GovernanceManager>>,
 ) -> std::io::Result<()> {
     println!("🌐 Starting REST API server on port {}...", api_port);
 
+    let client_ip = ClientIp::from_env();
     let app_state = web::Data::new(AppState {
         consensus,
         sessions,
         mempool,
-        governance,
         storage,
         dry_runs: Arc::default(),
+        heavy_clients: Arc::default(),
+        client_ip: Some(client_ip.clone()),
+        reads: Arc::default(),
+        queues: HeavyQueues::default(),
+        tps: Arc::default(),
     });
 
     // M1: Rate limiter — 100 requests/second per IP, burst up to 200.
@@ -2641,7 +3219,6 @@ pub async fn start_api_server(
     // NOTE: actix-governor 0.4 `per_second(n)` = replenish one cell every n
     // SECONDS, so per_second(100) throttled every IP to ~1 req/100s after a 200
     // burst — a frontend-bricking bug. per_millisecond(10) = true 100 req/s.
-    let client_ip = ClientIp::from_env();
     let proxy_port = client_ip.proxy_port;
     let governor_conf = GovernorConfigBuilder::default()
         .key_extractor(client_ip)
@@ -2723,6 +3300,20 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use std::sync::Mutex;
 
+    /// B176 witness: a request logs bounded prefixes of its method and its
+    /// params, however long either is.
+    #[test]
+    fn a_request_logs_a_bounded_line() {
+        let long = "m".repeat(2 << 20);
+        let line = request_log_line(&long, &serde_json::json!(["p".repeat(2 << 20)]));
+        assert!(
+            line.chars().count() <= 64 + 256 + 32,
+            "{} chars",
+            line.chars().count()
+        );
+        assert!(line.contains(&"m".repeat(64)), "vacuous: no method");
+    }
+
     /// Writes a CoinStore balance straight into the test database.
     fn seed_coin(db: &StateDB, key: String, value: u128) {
         let coin = bcs::to_bytes(&MoveCoin { value }).unwrap();
@@ -2759,16 +3350,17 @@ mod tests {
             [3u8; 32],
         )));
         let sessions: network::SessionTable = Arc::default();
-        let governance = Arc::new(Mutex::new(governance::GovernanceManager::new(Arc::clone(
-            &db,
-        ))));
         AppState {
             consensus,
             sessions,
             mempool: Arc::new(Mutex::new(mempool::Mempool::new())),
-            governance,
             storage: db,
             dry_runs: Arc::default(),
+            heavy_clients: Arc::default(),
+            client_ip: None,
+            reads: Arc::default(),
+            queues: HeavyQueues::default(),
+            tps: Arc::default(),
         }
     }
 
@@ -2789,6 +3381,81 @@ mod tests {
             .expect_err("a malformed transaction");
         assert_eq!(err.code, -32602, "{}", err.message);
         assert_eq!(state.dry_runs.load(Ordering::SeqCst), 0);
+    }
+
+    /// B197/B219/B220 witness: every read whose work one request does not
+    /// bound takes a read slot, so with every read slot held they answer
+    /// busy while a light method answers, and a dry run still runs (the
+    /// reads and the dry runs shared two slots); a freed slot serves them
+    /// again.
+    #[test]
+    fn heavy_reads_take_a_slot() {
+        let state = test_state(temp_db("b197_heavy"));
+        let held: Vec<_> = (0..READS_AT_ONCE)
+            .map(|_| ReadSlot::begin(&state.reads).expect("a free slot"))
+            .collect();
+        let hash = "ab".repeat(32);
+        for (method, params) in [
+            ("aincore_getBlocks", serde_json::json!([10])),
+            ("aincore_sampleDA", serde_json::json!([1, 0])),
+            ("aincore_getStateProof", serde_json::json!(["sys:chain_id"])),
+            ("aincore_getBlockByHash", serde_json::json!([hash])),
+            (
+                "aincore_getTransactionsByAddress",
+                serde_json::json!([hash]),
+            ),
+            ("aincore_getDag", serde_json::json!([])),
+            ("aincore_getTransaction", serde_json::json!([hash])),
+            ("aincore_getDaStatus", serde_json::json!([1])),
+        ] {
+            assert!(
+                heavy_method(method).is_some(),
+                "{method} is not routed as heavy"
+            );
+            let err = handle_rpc_method(method, params, &state).unwrap_err();
+            assert_eq!(err.code, -32005, "{method}: {}", err.message);
+        }
+        assert!(handle_rpc_method("aincore_getGasPrice", serde_json::json!([]), &state).is_ok());
+        let tx = serde_json::json!({ "sender": "ab" });
+        let err =
+            handle_rpc_method("aincore_estimateGas", serde_json::json!([tx]), &state).unwrap_err();
+        assert_eq!(
+            err.code, -32602,
+            "a dry run waited on the reads: {}",
+            err.message
+        );
+        drop(held);
+        assert!(handle_rpc_method("aincore_getBlocks", serde_json::json!([10]), &state).is_ok());
+        assert_eq!(state.reads.load(Ordering::SeqCst), 0);
+    }
+
+    /// B217 witness: a client holds one heavy call at a time: its second is
+    /// refused while another client's goes on, and a finished call frees it
+    /// (one client within its rate limit held both shared slots).
+    #[test]
+    fn a_client_holds_one_heavy_call_at_a_time() {
+        let clients = HeavyClients::default();
+        let (a, b): (std::net::IpAddr, std::net::IpAddr) = (
+            "198.51.100.1".parse().unwrap(),
+            "198.51.100.2".parse().unwrap(),
+        );
+        let first = HeavyLease::begin(&clients, Some(a)).expect("a free client");
+        assert!(
+            HeavyLease::begin(&clients, Some(a)).is_none(),
+            "a second call for one client"
+        );
+        let other = HeavyLease::begin(&clients, Some(b)).expect("another client");
+        assert!(
+            HeavyLease::begin(&clients, None).is_some(),
+            "in process: no lease"
+        );
+        drop(first);
+        assert!(
+            HeavyLease::begin(&clients, Some(a)).is_some(),
+            "a finished call stayed held"
+        );
+        drop(other);
+        assert!(clients.lock().unwrap().is_empty());
     }
 
     /// B65 witness: `aincore_estimateGas` on a whole transaction runs it, so a
@@ -3041,12 +3708,402 @@ mod tests {
         .is_err());
     }
 
-    /// B59 witness: behind the operator's proxy, with its header named, each
-    /// client is counted under its own address; a header from any other
+    /// B241 witness: `/get_network_info` computes the recent TPS once a
+    /// height (it read two whole blocks and 21 transaction lists a call, on
+    /// the worker), and again at a new height.
+    #[actix_web::test]
+    async fn the_network_info_reads_its_blocks_once_a_height() {
+        let db = temp_db("b241_tps");
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_state(Arc::clone(&db))))
+                .route("/get_network_info", web::get().to(get_network_info_handler)),
+        )
+        .await;
+        let computed = || TPS_COMPUTED.with(|n| n.get());
+        let seed = db.seeding();
+        db.put("latest_height", "3").unwrap();
+        drop(seed);
+        let before = computed();
+        for _ in 0..5 {
+            let request = actix_web::test::TestRequest::get()
+                .uri("/get_network_info")
+                .to_request();
+            let _: serde_json::Value =
+                actix_web::test::call_and_read_body_json(&app, request).await;
+        }
+        assert_eq!(computed() - before, 1, "computed again at one height");
+        let seed = db.seeding();
+        db.put("latest_height", "4").unwrap();
+        drop(seed);
+        let request = actix_web::test::TestRequest::get()
+            .uri("/get_network_info")
+            .to_request();
+        let _: serde_json::Value = actix_web::test::call_and_read_body_json(&app, request).await;
+        assert_eq!(computed() - before, 2, "not computed at a new height");
+    }
+
+    /// B235 witness: `/get_block` and `/get_transaction` read their block
+    /// on a read's slot (each read a whole block on the worker, on none):
+    /// with every slot held they answer busy, and with one free they answer.
+    #[actix_web::test]
+    async fn rest_block_reads_take_a_read_slot() {
+        let db = temp_db("b235_rest");
+        let state = web::Data::new(test_state(Arc::clone(&db)));
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/get_block", web::get().to(get_block_handler))
+                .route("/get_transaction", web::get().to(get_transaction_handler)),
+        )
+        .await;
+        let hash = "ab".repeat(32);
+        let seed = db.seeding();
+        db.put("block_1", r#"{"header":{"height":1}}"#).unwrap();
+        db.put(&format!("tx_index:{hash}"), "1").unwrap();
+        db.put("latest_height", "1").unwrap();
+        drop(seed);
+        let uris = [
+            "/get_block?height=1".to_string(),
+            format!("/get_transaction?hash={hash}"),
+        ];
+        let held: Vec<_> = (0..READS_AT_ONCE)
+            .map(|_| ReadSlot::begin(&state.reads).expect("a free slot"))
+            .collect();
+        for uri in &uris {
+            let request = actix_web::test::TestRequest::get().uri(uri).to_request();
+            let answer = actix_web::test::call_service(&app, request).await;
+            assert_eq!(
+                answer.status(),
+                actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+                "{uri} read its block on no slot"
+            );
+        }
+        drop(held);
+        for uri in &uris {
+            let request = actix_web::test::TestRequest::get().uri(uri).to_request();
+            let answer = actix_web::test::call_service(&app, request).await;
+            assert!(
+                answer.status().is_success(),
+                "vacuous: {uri} did not answer"
+            );
+        }
+        assert_eq!(state.reads.load(Ordering::SeqCst), 0, "a slot was kept");
+    }
+
+    /// B234/B240 witness: a client's certificate waits in the dry runs'
+    /// queue, on the client's lease, as estimates do (it took the dry-run
+    /// slots outside both, so an estimate that waited its turn found them
+    /// taken); a stored certificate is answered at once (in the queue, it
+    /// was an error whenever the queue was long).
+    #[test]
+    fn certificate_calls_queue_with_the_dry_runs() {
+        for method in ["aincore_verifyQuorumCertificate", "aincore_estimateGas"] {
+            assert_eq!(heavy_method(method), Some((method, true)), "{method}");
+        }
+        for method in [
+            "aincore_getQuorumCert",
+            "aincore_getLatestQuorumCertificate",
+            "aincore_getQuorumCertificate",
+        ] {
+            assert_eq!(heavy_method(method), None, "{method} waits in a queue");
+        }
+    }
+
+    /// B253 witness: a network group takes one slot of a pool at a time,
+    /// whatever its clients (a host's /48 holds 65,536): its next client
+    /// waits for the group's turn while another group's call takes the
+    /// pool's other slot at once (one host's clients held both slots, and
+    /// every other client's heavy calls were busy).
+    #[actix_web::test]
+    async fn a_network_group_takes_one_slot_of_a_pool() {
+        use std::net::{IpAddr, Ipv6Addr};
+        let queues = HeavyQueues::default();
+        let host = |i: u16| Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 7, i, 0, 0, 0, 0)));
+        let first = queues.turn(false, host(1)).await.expect("a turn");
+        let mut second = Box::pin(queues.turn(false, host(2)));
+        assert!(
+            futures::poll!(&mut second).is_pending(),
+            "a second client of the group ran at once"
+        );
+        let other = Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 8, 1, 0, 0, 0, 0)));
+        let theirs = queues
+            .turn(false, other)
+            .await
+            .expect("another group's call was busy");
+        drop(first);
+        drop(theirs);
+        assert!(second.await.is_some(), "the group's next call never ran");
+        assert_eq!(
+            heavy_group(IpAddr::from([10, 1, 2, 3])),
+            IpAddr::from([10, 1, 2, 0])
+        );
+    }
+
+    /// B253 witness: a receipt's block hash is read from the block's
+    /// certificate row when held (the block was parsed whole for it), else
+    /// from the block's header.
+    #[test]
+    fn a_receipts_block_hash_is_read_from_the_certificate_row() {
+        let db = temp_db("b253_block_hash");
+        db.put(
+            "block_7",
+            r#"{"header":{"hash":"from-header","height":7},"transactions":["x"]}"#,
+        )
+        .unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let hash = |height| block_hash_at(&db, height, &reads).unwrap();
+        assert_eq!(hash(7).as_deref(), Some("from-header"));
+        db.put(
+            "consensus:qc:7",
+            r#"{"block_height":7,"block_hash":"from-certificate"}"#,
+        )
+        .unwrap();
+        assert_eq!(hash(7).as_deref(), Some("from-certificate"));
+        db.put(
+            "consensus:qc:8",
+            r#"{"block_height":9,"block_hash":"misfiled"}"#,
+        )
+        .unwrap();
+        assert_eq!(hash(8), None);
+    }
+
+    /// B267 witness: a receipt waits in no read pool and takes no client's
+    /// lease: with every read slot held it is answered from its block's
+    /// certificate row; only its block's header, read when the block has no
+    /// certificate yet, takes a slot (it waited behind 8 MiB block reads, and
+    /// a client's second receipt was refused while its first ran).
+    #[test]
+    fn a_receipt_takes_no_read_slot_while_its_block_is_certified() {
+        let db = temp_db("b267_receipt");
+        let hash = "cd".repeat(32);
+        db.index_transaction(&hash, 7).unwrap();
+        db.put(
+            "block_7",
+            r#"{"header":{"hash":"from-header","height":7},"transactions":[]}"#,
+        )
+        .unwrap();
+        let state = test_state(Arc::clone(&db));
+        assert!(
+            heavy_method("aincore_getTransactionReceipt").is_none(),
+            "a receipt waits in the read pool"
+        );
+        let held: Vec<_> = (0..READS_AT_ONCE)
+            .map(|_| ReadSlot::begin(&state.reads).expect("a free slot"))
+            .collect();
+        let receipt = || {
+            handle_rpc_method(
+                "aincore_getTransactionReceipt",
+                serde_json::json!([hash]),
+                &state,
+            )
+        };
+        assert_eq!(
+            receipt().unwrap_err().code,
+            -32005,
+            "the header took no slot"
+        );
+        db.put(
+            "consensus:qc:7",
+            r#"{"block_height":7,"block_hash":"from-certificate"}"#,
+        )
+        .unwrap();
+        let answered = receipt().expect("a certified block's receipt waited for a read slot");
+        assert_eq!(answered["block_hash"], "from-certificate");
+        assert_eq!(answered["block_height"], 7);
+        drop(held);
+        assert_eq!(state.reads.load(Ordering::SeqCst), 0);
+    }
+
+    /// B142 witness: `/get_latest_blocks` stops at `MAX_BLOCKS_BYTES` as
+    /// `getBlocks` does (it parsed up to 50 whole blocks a call), and
+    /// `/get_network_info` counts transactions from the `block_txs` rows,
+    /// not by parsing the blocks (here the rows say five a block, the bodies
+    /// one).
+    #[actix_web::test]
+    async fn rest_block_answers_are_bounded_by_bytes() {
+        let db = temp_db("b142_rest");
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_state(Arc::clone(&db))))
+                .route(
+                    "/get_latest_blocks",
+                    web::get().to(get_latest_blocks_handler),
+                )
+                .route("/get_network_info", web::get().to(get_network_info_handler)),
+        )
+        .await;
+        let big = "x".repeat(3 << 20);
+        let seed = db.seeding();
+        for h in 1..=3u64 {
+            let block = serde_json::json!({
+                "header": { "height": h, "timestamp": 100 + 10 * h },
+                "transactions": [big],
+            });
+            db.put(&format!("block_{h}"), &block.to_string()).unwrap();
+            let hashes: Vec<String> = (0..5).map(|i| format!("{:064x}", h * 10 + i)).collect();
+            db.put(
+                &format!("block_txs:{h}"),
+                &serde_json::to_string(&hashes).unwrap(),
+            )
+            .unwrap();
+        }
+        db.put("latest_height", "3").unwrap();
+        drop(seed);
+        let request = actix_web::test::TestRequest::get()
+            .uri("/get_latest_blocks?limit=10")
+            .to_request();
+        let blocks: serde_json::Value =
+            actix_web::test::call_and_read_body_json(&app, request).await;
+        assert_eq!(
+            blocks.as_array().unwrap().len(),
+            2,
+            "three 3 MiB blocks pass 8 MiB at the third"
+        );
+        let request = actix_web::test::TestRequest::get()
+            .uri("/get_network_info")
+            .to_request();
+        let info: serde_json::Value = actix_web::test::call_and_read_body_json(&app, request).await;
+        // Heights 0..=3 from time 0 to the tip's 130 s: 15 transactions.
+        // Within a rounding: serde_json reads a float back to within an ulp.
+        let tps = info["tps"].as_f64().unwrap();
+        assert!(
+            (tps - 15.0 / 130.0).abs() < 1e-12,
+            "the transactions were not counted from the block_txs rows: {tps}"
+        );
+    }
+
+    /// B153 witness: the token RPCs answer from token_factory's Move state
+    /// (they read rows nothing writes, and answered null, [] and "0").
+    #[test]
+    fn token_answers_come_from_the_move_state() {
+        let db = temp_db("b153_tokens");
+        let state = test_state(Arc::clone(&db));
+        let (creator, holder) = ("ab".repeat(32), "cd".repeat(32));
+        let creator_addr = parse_move_address(&creator).unwrap();
+        let mut id = b"SYM".to_vec();
+        id.extend(creator_addr.to_vec());
+        let info = MoveTokenInfo {
+            token_id: id.clone(),
+            name: b"Symbol".to_vec(),
+            symbol: b"SYM".to_vec(),
+            decimals: 6,
+            max_supply: 1_000,
+            current_supply: 400,
+            creator: creator_addr,
+            is_mintable: true,
+            icon_url: vec![],
+            project_url: vec![],
+        };
+        let key = |owner: &str, name: &str| {
+            vm_move::state_keys::resource_key_str(
+                &parse_move_address(owner).unwrap(),
+                &format!("0x1::token_factory::{name}"),
+            )
+        };
+        let seed = db.seeding();
+        db.put(
+            &key(&creator, "CreatorTokens"),
+            &hex::encode(bcs::to_bytes(&MoveCreatorTokens { tokens: vec![info] }).unwrap()),
+        )
+        .unwrap();
+        let wallet = MoveTokenWallet {
+            balances: vec![MoveTokenBalance {
+                token_id: id.clone(),
+                balance: 75,
+            }],
+        };
+        db.put(
+            &key(&holder, "TokenWallet"),
+            &hex::encode(bcs::to_bytes(&wallet).unwrap()),
+        )
+        .unwrap();
+        drop(seed);
+        let id_hex = hex::encode(&id);
+        let ask = |method: &str, params: serde_json::Value| {
+            handle_rpc_method(method, params, &state).unwrap()
+        };
+        let token = ask("aincore_getToken", serde_json::json!([id_hex]));
+        assert_eq!(token["current_supply"], "400");
+        assert_eq!(token["decimals"], 6);
+        assert_eq!(token["creator"], creator);
+        let tokens = ask("aincore_getTokens", serde_json::json!([creator]));
+        assert_eq!(tokens.as_array().map(Vec::len), Some(1));
+        let held = ask(
+            "aincore_getTokenBalance",
+            serde_json::json!([holder, id_hex]),
+        );
+        assert_eq!(held["balance"], "75");
+        assert_eq!(held["registered"], true);
+        let none = ask(
+            "aincore_getTokenBalance",
+            serde_json::json!([creator, id_hex]),
+        );
+        assert_eq!(
+            (none["balance"].clone(), none["registered"].clone()),
+            ("0".into(), false.into())
+        );
+        assert!(handle_rpc_method("aincore_getToken", serde_json::json!(["zz"]), &state).is_err());
+    }
+
+    /// B194 witness: a proposal is read from `0x1::governance` on chain, by
+    /// number or decimal string, and so are its votes (both RPCs read the
+    /// Rust GovernanceManager's rows, which nothing on the node writes, so
+    /// every real proposal read as null).
+    #[test]
+    fn proposals_come_from_the_move_state() {
+        let db = temp_db("b194_proposals");
+        let state = test_state(Arc::clone(&db));
+        let proposer = "ab".repeat(32);
+        let governance = MoveGovernanceState {
+            proposals: vec![MoveProposal {
+                id: 3,
+                proposer: parse_move_address(&proposer).unwrap(),
+                description: b"raise the floor".to_vec(),
+                votes_for: 7,
+                votes_against: 2,
+                executed: false,
+                action_type: 0,
+                action_value: 0,
+                voting_ends: 99,
+            }],
+            next_proposal_id: 4,
+        };
+        let key = vm_move::state_keys::resource_key_str(
+            &move_core_types::account_address::AccountAddress::ONE,
+            "0x1::governance::GovernanceState",
+        );
+        let seed = db.seeding();
+        db.put(&key, &hex::encode(bcs::to_bytes(&governance).unwrap()))
+            .unwrap();
+        drop(seed);
+        let ask =
+            |method: &str, params: serde_json::Value| handle_rpc_method(method, params, &state);
+        for id in [serde_json::json!(3), serde_json::json!("3")] {
+            let p = ask("aincore_getProposal", serde_json::json!([id])).unwrap();
+            assert_eq!(p["description"], "raise the floor");
+            assert_eq!(p["proposer"], proposer);
+        }
+        let votes = ask("aincore_tally", serde_json::json!([3])).unwrap();
+        assert_eq!(
+            (votes["votes_for"].clone(), votes["votes_against"].clone()),
+            ("7".into(), "2".into())
+        );
+        assert!(ask("aincore_getProposal", serde_json::json!([4]))
+            .unwrap()
+            .is_null());
+        assert!(ask("aincore_tally", serde_json::json!([4])).is_err());
+        assert!(ask("aincore_getProposal", serde_json::json!(["x"])).is_err());
+    }
+
+    /// B59/B266 witness: behind the operator's proxy, with its header named,
+    /// each client is counted under its own address; a header from any other
     /// peer is ignored (it is the client's to forge), as it is with no header
     /// named. B74: a loopback peer the operator did not name is such a peer
     /// (a socket proxy passes the client's header through); the last hop is
-    /// taken; an IPv6 client counts by its /64; the keys are bounded.
+    /// taken; an IPv6 client counts by its /64; the keys are bounded. B266:
+    /// the header's last line is read, and a peer named as an IPv4-mapped
+    /// address is the IPv4 proxy the operator named.
     #[test]
     fn the_rate_limit_counts_each_client_behind_a_proxy() {
         let request = |peer: &str, header: Option<&str>| {
@@ -3117,6 +4174,27 @@ mod tests {
             addr(
                 &named,
                 request("127.0.0.1:5000", Some("1.2.3.4, 203.0.113.7"))
+            ),
+            "203.0.113.7"
+        );
+        // B266: a proxy that adds its own line: the last hop of the last
+        // line, not of the client's line.
+        let mut two_lines = actix_web::test::TestRequest::default()
+            .peer_addr("127.0.0.1:5000".parse().unwrap())
+            .to_srv_request();
+        for line in ["198.18.0.1", "1.2.3.4, 203.0.113.7"] {
+            two_lines.headers_mut().append(
+                actix_web::http::header::HeaderName::from_static("cf-connecting-ip"),
+                actix_web::http::header::HeaderValue::from_static(line),
+            );
+        }
+        assert_eq!(addr(&named, two_lines), "203.0.113.7");
+        // B266: an IPv4 proxy through a dual-stack listener (an IPv4-mapped
+        // peer) is the proxy the operator named.
+        assert_eq!(
+            addr(
+                &named,
+                request("[::ffff:127.0.0.1]:5000", Some("203.0.113.7"))
             ),
             "203.0.113.7"
         );
@@ -3947,16 +5025,17 @@ mod tests {
             [1u8; 32],
         )));
         let sessions: network::SessionTable = Arc::default();
-        let governance = Arc::new(Mutex::new(governance::GovernanceManager::new(Arc::clone(
-            &db,
-        ))));
         let state = AppState {
             consensus,
             sessions,
             mempool: Arc::new(Mutex::new(mempool::Mempool::new())),
-            governance,
             storage: Arc::clone(&db),
             dry_runs: Arc::default(),
+            heavy_clients: Arc::default(),
+            client_ip: None,
+            reads: Arc::default(),
+            queues: HeavyQueues::default(),
+            tps: Arc::default(),
         };
 
         let status = handle_rpc_method("aincore_getFinalityStatus", serde_json::json!([]), &state)
@@ -4119,16 +5198,17 @@ mod tests {
             [2u8; 32],
         )));
         let sessions: network::SessionTable = Arc::default();
-        let governance = Arc::new(Mutex::new(governance::GovernanceManager::new(Arc::clone(
-            &db,
-        ))));
         let state = AppState {
             consensus,
             sessions,
             mempool: Arc::new(Mutex::new(mempool::Mempool::new())),
-            governance,
             storage: db,
             dry_runs: Arc::default(),
+            heavy_clients: Arc::default(),
+            client_ip: None,
+            reads: Arc::default(),
+            queues: HeavyQueues::default(),
+            tps: Arc::default(),
         };
 
         let err = handle_rpc_method("submit_transaction_with_key", serde_json::json!([]), &state)

@@ -22,18 +22,64 @@ pub struct AincoreClient {
     // trusted set, never taken from the RPC: a hostile RPC could otherwise
     // name another chain the same validators sign for.
     chain_id: String,
+    // B270: the blocks the next range read asks for (`next_chunk`).
+    chunk: u64,
 }
 
-/// The chain the bridge follows: `AINCORE_CHAIN_ID`, else the mainnet id.
-/// The node itself no longer reads this env (G3 FX-6: it installs the id from
-/// `sys:chain_id`), but the bridge is a separate process and a client, so the
-/// env is its configuration.
-fn configured_chain_id() -> String {
-    std::env::var("AINCORE_CHAIN_ID")
-        .ok()
-        .map(|c| c.trim().to_string())
-        .filter(|c| !c.is_empty())
-        .unwrap_or_else(|| blockchain::DEFAULT_CHAIN_ID.to_string())
+/// The chain the bridge follows: `AINCORE_CHAIN_ID`. The node itself no
+/// longer reads this env (G3 FX-6: it installs the id from `sys:chain_id`),
+/// but the bridge is a separate process and a client, so the env is its
+/// configuration. B258: required (the bridge refuses to start without it);
+/// it defaulted to the mainnet id.
+pub(crate) fn configured_chain_id() -> Option<String> {
+    chain_id_from(std::env::var("AINCORE_CHAIN_ID").ok())
+}
+
+fn chain_id_from(env: Option<String>) -> Option<String> {
+    env.map(|c| c.trim().to_string()).filter(|c| !c.is_empty())
+}
+
+/// B261: how many of `blocks` (the node's answer for a range from `start`)
+/// are at `start`, `start + 1`, ... by their own headers. The answer skips
+/// heights the node does not hold, and the i-th block was taken to be at
+/// `start + i`: past such a gap every certificate was looked up at another
+/// height, and the bridge never advanced.
+fn leading_run(blocks: &[Block], start: u64) -> usize {
+    blocks
+        .iter()
+        .zip(start..)
+        .take_while(|(block, height)| block.header.height == *height)
+        .count()
+}
+
+/// B260: how long a call to the node may take before it is an error (a
+/// choice, the indexer's). The client had no timeout, so one half-open
+/// connection stalled the bridge's one-at-a-time scan for good.
+const NODE_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The most blocks one range read asks for.
+const MAX_SCAN_CHUNK: u64 = 100;
+
+/// B270: the blocks the next range read asks for: half as many after a read
+/// the node did not answer (a range's answer, up to 8 MiB, outlasts the
+/// call's 30 s over a link under about 2.2 Mbit/s, and the same range was
+/// asked again whole for good), twice as many after one it answered, within
+/// `1..=most`.
+fn next_chunk(current: u64, answered: bool, most: u64) -> u64 {
+    if answered {
+        current.saturating_mul(2).min(most)
+    } else {
+        (current / 2).max(1)
+    }
+}
+
+/// B260: a client whose connects and calls end after `timeout`.
+fn client_with_timeout(timeout: std::time::Duration) -> Client {
+    Client::builder()
+        .connect_timeout(timeout)
+        .timeout(timeout)
+        .build()
+        .expect("the HTTP client")
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,14 +255,16 @@ impl AincoreClient {
                 None
             }
         };
-        let chain_id = configured_chain_id();
+        // B258: an empty id (none configured) matches no certificate.
+        let chain_id = configured_chain_id().unwrap_or_default();
         info!("🔗 bridge follows chain {} (AINCORE_CHAIN_ID)", chain_id);
         Self {
             rpc_url,
-            client: Client::new(),
+            client: client_with_timeout(NODE_CALL_TIMEOUT),
             last_processed_height: 0,
             trusted_validators,
             chain_id,
+            chunk: MAX_SCAN_CHUNK,
         }
     }
 
@@ -226,10 +274,11 @@ impl AincoreClient {
     pub fn with_trusted_validators(rpc_url: String, trusted: TrustedValidatorSet) -> Self {
         Self {
             rpc_url,
-            client: Client::new(),
+            client: client_with_timeout(NODE_CALL_TIMEOUT),
             last_processed_height: 0,
             trusted_validators: Some(trusted),
-            chain_id: configured_chain_id(),
+            chain_id: configured_chain_id().unwrap_or_default(),
+            chunk: MAX_SCAN_CHUNK,
         }
     }
 
@@ -305,6 +354,14 @@ impl AincoreClient {
         Ok(rpc_resp.result.unwrap_or_default())
     }
 
+    /// B270: `get_blocks_range`, its answer adapting the next read's size
+    /// (`next_chunk`).
+    async fn read_range(&mut self, start: u64, limit: u64) -> Result<Vec<Block>, Box<dyn Error>> {
+        let read = self.get_blocks_range(start, limit).await;
+        self.chunk = next_chunk(self.chunk, read.is_ok(), MAX_SCAN_CHUNK);
+        read
+    }
+
     /// Get latest block height from node
     pub async fn get_latest_height(&self) -> Result<u64, Box<dyn Error>> {
         let payload = serde_json::json!({
@@ -322,14 +379,11 @@ impl AincoreClient {
             .await?;
 
         let rpc_resp: RpcResponse<serde_json::Value> = resp.json().await?;
-
-        if let Some(result) = rpc_resp.result
-            && let Some(height) = result.get("block_height").and_then(|h| h.as_u64())
-        {
-            return Ok(height);
+        if let Some(err) = rpc_resp.error {
+            return Err(format!("aincore_getStatus: {err:?}").into());
         }
-
-        Ok(0)
+        latest_height_of(rpc_resp.result.as_ref())
+            .ok_or_else(|| "aincore_getStatus named no latest_height".into())
     }
 
     /// Get finalized block height (latest - FINALITY_DEPTH)
@@ -407,10 +461,11 @@ impl AincoreClient {
         }
 
         // Calculate scan window. Process in chunks of up to 100 blocks per
-        // RPC call; the rest will be picked up in the next polling cycle.
+        // RPC call (B270: fewer after a read the node did not answer); the
+        // rest will be picked up in the next polling cycle.
         let scan_start = self.last_processed_height + 1;
         let backlog = finalized_height - self.last_processed_height;
-        let chunk_size = std::cmp::min(backlog, 100);
+        let chunk_size = std::cmp::min(backlog, self.chunk);
         let scan_end = scan_start + chunk_size - 1;
 
         info!(
@@ -419,15 +474,23 @@ impl AincoreClient {
         );
 
         // FIX: range-based fetch — no more "latest N" silent skip.
-        let blocks = self.get_blocks_range(scan_start, chunk_size).await?;
+        let blocks = self.read_range(scan_start, chunk_size).await?;
 
         let mut events = Vec::new();
         let mut blocks_actually_returned: u64 = 0;
 
         // RPC returns blocks in ASCENDING order when start_height is given.
-        // Map them back to absolute heights: scan_start, scan_start+1, ...
-        for (block_offset, block) in blocks.iter().enumerate() {
-            let block_height = scan_start + block_offset as u64;
+        // B261: each at its header's height, the scan stopping at a height
+        // the node did not answer.
+        let run = leading_run(&blocks, scan_start);
+        if run < blocks.len() {
+            warn!(
+                "⚠️ the node answered no block {} — halting scan there; bridge will retry",
+                scan_start + run as u64
+            );
+        }
+        for block in &blocks[..run] {
+            let block_height = block.header.height;
 
             // SEC-#18: require a verified QC binding this block's (height, hash) to
             // >2/3-stake finality before emitting ANY lock event from it. A node
@@ -501,6 +564,147 @@ impl AincoreClient {
         );
 
         Ok(events)
+    }
+}
+
+/// B236: a status answer's `latest_height` (the node sends it as a decimal
+/// string). The bridge read `block_height`, which the node never sends, as
+/// 0, and so never processed a block.
+fn latest_height_of(status: Option<&serde_json::Value>) -> Option<u64> {
+    let height = status?.get("latest_height")?;
+    height.as_u64().or_else(|| height.as_str()?.parse().ok())
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::{
+        AincoreClient, Block, MAX_SCAN_CHUNK, chain_id_from, client_with_timeout, latest_height_of,
+        leading_run, next_chunk,
+    };
+    use serde_json::json;
+
+    /// B270 witness: a range read the node did not answer halves the next
+    /// read, down to one block; one it answered doubles it back, up to the
+    /// most (an 8 MiB answer that outlasted the call was asked again whole,
+    /// and a slow link's bridge never advanced).
+    #[tokio::test]
+    async fn a_range_read_that_times_out_asks_for_fewer_blocks() {
+        assert_eq!(next_chunk(100, false, 100), 50);
+        assert_eq!(next_chunk(1, false, 100), 1);
+        assert_eq!(next_chunk(50, true, 100), 100);
+        assert_eq!(next_chunk(80, true, 100), 100);
+        let client_at = |addr: std::net::SocketAddr| AincoreClient {
+            rpc_url: format!("http://{addr}/rpc"),
+            client: client_with_timeout(std::time::Duration::from_millis(200)),
+            last_processed_height: 0,
+            trusted_validators: None,
+            chain_id: String::new(),
+            chunk: MAX_SCAN_CHUNK,
+        };
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut bridge = client_at(silent.local_addr().unwrap());
+        assert!(bridge.read_range(1, 100).await.is_err());
+        assert_eq!(bridge.chunk, 50);
+        assert!(bridge.read_range(1, 50).await.is_err());
+        assert_eq!(bridge.chunk, 25);
+        let node = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        bridge.rpc_url = format!("http://{}/rpc", node.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut conn, _) = node.accept().unwrap();
+            let (mut request, mut buf) = (Vec::new(), [0u8; 1024]);
+            loop {
+                let n = conn.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                    let body = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + body {
+                        break;
+                    }
+                }
+            }
+            let answer = r#"{"jsonrpc":"2.0","result":[],"id":1}"#;
+            let _ = conn.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}",
+                    answer.len()
+                )
+                .as_bytes(),
+            );
+        });
+        assert!(bridge.read_range(1, 25).await.is_ok());
+        assert_eq!(bridge.chunk, 50);
+    }
+
+    /// B261 witness: a scan takes the node's blocks at their own heights and
+    /// stops at one it skipped (the i-th block was taken to be at
+    /// `start + i`, and past a skipped height the bridge never advanced).
+    #[test]
+    fn a_scan_stops_at_a_height_the_node_skipped() {
+        let at = |height: u64| Block {
+            header: blockchain::BlockHeader {
+                height,
+                ..Default::default()
+            },
+            transactions: vec![],
+        };
+        assert_eq!(leading_run(&[at(5), at(6), at(7)], 5), 3);
+        assert_eq!(leading_run(&[at(5), at(7), at(8)], 5), 1);
+        assert_eq!(leading_run(&[at(6)], 5), 0);
+        assert_eq!(leading_run(&[], 5), 0);
+    }
+
+    /// B260 witness: a call to a node that takes the connection and never
+    /// answers ends in an error (the client had no timeout: one half-open
+    /// connection stalled the bridge's scan for good).
+    #[tokio::test]
+    async fn a_silent_node_is_an_error_not_a_stall() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = silent.local_addr().unwrap();
+        let client = client_with_timeout(std::time::Duration::from_millis(200));
+        let call = client.get(format!("http://{addr}/status")).send();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), call).await;
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "a silent node stalled the call"
+        );
+    }
+
+    /// B258 witness: the bridge's chain is the one configured, and none is
+    /// assumed when it is not (it defaulted to the mainnet id).
+    #[test]
+    fn the_bridge_follows_only_a_named_chain() {
+        assert_eq!(chain_id_from(None), None);
+        assert_eq!(chain_id_from(Some("  ".into())), None);
+        assert_eq!(
+            chain_id_from(Some(" AINCORE-TESTNET-V4 ".into())).as_deref(),
+            Some("AINCORE-TESTNET-V4")
+        );
+    }
+
+    /// B236 witness: the latest height is the node's `latest_height`, sent
+    /// as a decimal string (the bridge read `block_height`, never sent, as
+    /// 0); a status without it names none.
+    #[test]
+    fn the_latest_height_is_read_from_the_node_status() {
+        assert_eq!(
+            latest_height_of(Some(&json!({"latest_height": "42"}))),
+            Some(42)
+        );
+        assert_eq!(
+            latest_height_of(Some(&json!({"latest_height": 42}))),
+            Some(42)
+        );
+        assert_eq!(latest_height_of(Some(&json!({"block_height": 42}))), None);
+        assert_eq!(latest_height_of(None), None);
     }
 }
 

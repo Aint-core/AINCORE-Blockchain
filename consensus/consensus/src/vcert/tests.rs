@@ -743,6 +743,82 @@ fn a_recorded_equivocator_costs_no_more_pairings() {
     );
 }
 
+/// B147 witness: an attestation of the digest its signer was first seen
+/// with, under another committee hash, cannot count and is no evidence: it
+/// is not verified (each such variant cost a pairing).
+#[test]
+fn committee_hash_variants_of_one_digest_cost_no_pairing() {
+    let members = committee4();
+    let committee = infos(&members);
+    let author = &members[1].info.address;
+    let a = body(&committee, 0, 29, author, &digest('a'));
+    let mut collector = CertCollector::new(a.clone(), &committee).unwrap();
+    assert!(matches!(
+        collector.add(&byzantine_attest(&members[3], &a)).unwrap(),
+        CollectOutcome::Pending { .. }
+    ));
+    let pairings = || PAIRINGS.with(|p| p.get());
+    let before = pairings();
+    for i in 0..3u8 {
+        let mut variant = a.clone();
+        variant.committee_hash = format!("{i:064x}");
+        assert_eq!(
+            collector
+                .add(&byzantine_attest(&members[3], &variant))
+                .unwrap(),
+            CollectOutcome::Foreign
+        );
+    }
+    assert_eq!(
+        pairings(),
+        before,
+        "a committee-hash variant of a seen digest was verified"
+    );
+    // Another digest is still verified: it is evidence.
+    let b = body(&committee, 0, 29, author, &digest('b'));
+    collector.add(&byzantine_attest(&members[3], &b)).unwrap();
+    assert_eq!(
+        collector.equivocations().len(),
+        1,
+        "an equivocation went unseen"
+    );
+}
+
+/// B165 witness: a variant seen first does not make the counted attestation
+/// cost a pairing on each replay (the free copy compared only with the
+/// first one seen).
+#[test]
+fn a_counted_attestation_costs_no_pairing_again() {
+    let members = committee4();
+    let committee = infos(&members);
+    let author = &members[1].info.address;
+    let a = body(&committee, 0, 30, author, &digest('a'));
+    let mut collector = CertCollector::new(a.clone(), &committee).unwrap();
+    let mut variant = a.clone();
+    variant.committee_hash = format!("{:064x}", 7);
+    assert_eq!(
+        collector
+            .add(&byzantine_attest(&members[3], &variant))
+            .unwrap(),
+        CollectOutcome::Foreign
+    );
+    let genuine = byzantine_attest(&members[3], &a);
+    assert!(matches!(
+        collector.add(&genuine).unwrap(),
+        CollectOutcome::Pending { .. }
+    ));
+    let pairings = || PAIRINGS.with(|p| p.get());
+    let before = pairings();
+    for _ in 0..3 {
+        assert_eq!(collector.add(&genuine).unwrap(), CollectOutcome::Duplicate);
+    }
+    assert_eq!(
+        pairings(),
+        before,
+        "a counted attestation was verified again"
+    );
+}
+
 #[test]
 fn collector_refuses_forged_foreign_and_wrong_slot_attestations() {
     let members = committee4();

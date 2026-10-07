@@ -212,6 +212,8 @@ taken by the implementer under the founder's delegation:
   - The accept-slot exhaustion in P2-G (`DEFECT_REGISTER.md:35`) must also be closed.
 - **LA-6 (catch-up path).**
   - A lagging honest node is within `GC_DEPTH + RETAIN_SLACK` rounds of the network, or it catches up by QC-gated block sync within block retention.
+  - B255: a member keeps, and serves, every round above the floor of its lowest block without a QC less `RETAIN_SLACK` (`retention_floor`), and proposes nothing with `MAX_UNFINALIZED_BLOCKS` (50) blocks above that block. A node too far behind to rebuild from rounds GC deleted needs QC-gated block sync, and while f members withhold their votes no QC forms without it: without this rule the chain stopped finalizing for good, and halted at the next boundary.
+  - B262: that floor is the one the block's decision walked down to (the floor in force before its anchor, recorded in its pending QC row as `decision_floor`), not its own anchor less `GC_DEPTH`: after a run of skipped anchors the two differ by the run's length, and a member rebuilding the block needed rounds every peer had deleted. Rounds per block are unbounded (C1), so a member also proposes nothing while that floor is below g and its round is `MAX_KEPT_ROUNDS` (`GC_DEPTH + RETAIN_SLACK + LEAD`, 300) above it; while it waits it sends its newest vertex again every 4 ticks, so a member coming back learns the whole gap at once.
   - Beyond block retention it needs G3 state rejoin (H7).
 - **LA-7 (execution).** Honest nodes execute identical blocks identically (G3/G5). A violation halts QC formation and epoch activation; it never forks.
 - **LA-8 (leader schedule).**
@@ -744,7 +746,10 @@ restart, the flood witness (a Byzantine member, a spoofer of the honest fetcher 
   - OR-3: when g rises, every waiting child is re-evaluated, and wants and PENDING vertices
     at or below g retire.
   - GC-3: rows and memory at or below g − `RETAIN_SLACK` are deleted, and the plain-body
-    budget gets its bytes back (review LOW-6).
+    budget gets its bytes back (review LOW-6). B255/B262: never above the floor the
+    decision of the node's lowest block without a QC walked to, less `RETAIN_SLACK` (LA-6);
+    g itself, the decision's, is unchanged, so nodes may delete at different times but
+    decide the same.
 - Catch-up, found by the 200-round witness: a node cut off for 40 rounds learned its gap one
   level per round trip. That is slower than the chain grows, so its gap left the retention
   window. Now new wants are sent as soon as an answer reveals them, a batch never drops a

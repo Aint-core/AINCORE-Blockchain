@@ -93,15 +93,81 @@ pub fn read_start_from(storage: &StateDB, epoch: u64) -> Result<Option<EpochStar
 /// C_E on a V4 chain: the genesis committee for epoch 0, E's record after.
 /// Never the live set, and never the executor's snapshots (EP-1).
 pub fn committee_of(storage: &StateDB, epoch: u64) -> Option<Vec<ValidatorInfo>> {
-    if epoch == 0 {
-        let raw = storage.get("genesis:validator_set:v1").ok()??;
-        let set: Vec<ValidatorInfo> = serde_json::from_str(&raw).ok()?;
-        return (!set.is_empty()).then_some(set);
+    committee(storage, epoch).map(|c| c.set.clone())
+}
+
+/// B225: C_E with its hash, parsed from its record once. Each message
+/// naming an epoch parsed the record (~130 KB at 256 members, 2-3 ms on a
+/// Pi; a finality vote twice, with two sorts and a hash), junk included.
+#[derive(Debug)]
+pub struct Committee {
+    /// The record it was parsed from: a record written again (a restore,
+    /// an aborted transaction's, another database in the process) is
+    /// parsed again.
+    record: String,
+    /// C_E, as its record holds it.
+    pub set: Vec<ValidatorInfo>,
+    /// `qc::validator_set_hash(&set)`.
+    pub hash: String,
+}
+
+impl Committee {
+    /// A committee read from no record (a V3 chain's).
+    pub fn new(set: Vec<ValidatorInfo>) -> Self {
+        Self::parsed(String::new(), set)
     }
-    read_start_from(storage, epoch)
-        .ok()
-        .flatten()
-        .map(|s| s.committee)
+
+    fn parsed(record: String, set: Vec<ValidatorInfo>) -> Self {
+        let hash = qc::validator_set_hash(&set);
+        Self { record, set, hash }
+    }
+}
+
+/// Committees remembered (a choice: an epoch, its neighbours, a spare).
+const REMEMBERED_COMMITTEES: usize = 4;
+
+#[cfg(test)]
+thread_local! {
+    /// B225 witness support: the committee records parsed on this thread.
+    pub(crate) static COMMITTEE_PARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `committee_of`, remembered against its record's bytes (B225).
+pub fn committee(storage: &StateDB, epoch: u64) -> Option<Arc<Committee>> {
+    static MEMO: std::sync::LazyLock<Mutex<HashMap<u64, Arc<Committee>>>> =
+        std::sync::LazyLock::new(Default::default);
+    let key = if epoch == 0 {
+        "genesis:validator_set:v1".to_string()
+    } else {
+        epoch_start_key(epoch)
+    };
+    let record = storage.get(&key).ok()??;
+    if let Some(known) = MEMO.lock().ok().and_then(|memo| memo.get(&epoch).cloned()) {
+        if known.record == record {
+            return Some(known);
+        }
+    }
+    #[cfg(test)]
+    COMMITTEE_PARSES.with(|n| n.set(n.get() + 1));
+    let set = if epoch == 0 {
+        let set: Vec<ValidatorInfo> = serde_json::from_str(&record).ok()?;
+        if set.is_empty() {
+            return None;
+        }
+        set
+    } else {
+        serde_json::from_str::<EpochStart>(&record).ok()?.committee
+    };
+    let committee = Arc::new(Committee::parsed(record, set));
+    if let Ok(mut memo) = MEMO.lock() {
+        if memo.len() >= REMEMBERED_COMMITTEES && !memo.contains_key(&epoch) {
+            if let Some(oldest) = memo.keys().min().copied() {
+                memo.remove(&oldest);
+            }
+        }
+        memo.insert(epoch, Arc::clone(&committee));
+    }
+    Some(committee)
 }
 
 /// B50: C_E as a restored state records it. A snapshot carries state rows
@@ -473,6 +539,7 @@ impl Engine {
     fn adopt_close(&mut self, next: EpochStart) {
         self.closing_round = Some(next.prev_closing_round);
         lock(&self.ordering).close_epoch_at(next.prev_closing_round);
+        self.next_committee_hash = qc::validator_set_hash(&next.committee);
         self.next = Some(next);
     }
 
@@ -521,6 +588,7 @@ impl Engine {
         let Some(next) = self.next.take() else {
             return Ok(());
         };
+        self.next_committee_hash.clear();
         self.storage
             .put(EPOCH_ACTIVE_KEY, &next.epoch.to_string())
             .map_err(|e| e.to_string())?;
@@ -589,6 +657,7 @@ impl Engine {
             self.delete_epoch_rows(old, u64::MAX);
         }
         self.early_keys.clear();
+        self.next_checks.clear();
         // B68: what was buffered for this epoch is checked now, on behalf of
         // whoever delivered it, not the message that completed the epoch.
         crate::work::uncounted(|| {
@@ -611,9 +680,11 @@ impl Engine {
         let Some(record) = self.previous_record() else {
             return Ok(());
         };
+        // B255: and what GC kept for a block without a QC.
         let floor = self
             .previous_closing
-            .saturating_sub(crate::ordering::GC_DEPTH);
+            .saturating_sub(crate::ordering::GC_DEPTH)
+            .min(self.finality_floor);
         let loaded = staging::load(
             &self.storage,
             &record,

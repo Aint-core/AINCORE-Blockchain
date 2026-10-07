@@ -30,9 +30,6 @@ members = [
     # --- Data Availability ---
     "da",
     
-    # --- Governance ---
-    "governance/governance",
-    
     # --- DePIN, Bridge, Oracle ---
     "depin/bridge-rust",
     "depin/btc-bridge",

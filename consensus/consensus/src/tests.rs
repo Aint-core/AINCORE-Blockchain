@@ -182,6 +182,12 @@ mod tests {
                 v.get("round")?.as_u64()?,
             ))
         };
+        // Each from its own carrier (B203 stops a carrier at its first failure).
+        let input: Vec<(String, String)> = input
+            .into_iter()
+            .enumerate()
+            .map(|(i, it)| (format!("carrier-{i}"), it))
+            .collect();
         let out: Vec<String> = DagConsensus::canonical_block_evidence(input.clone(), parse)
             .into_iter()
             .map(|(it, _)| it)
@@ -216,6 +222,33 @@ mod tests {
         assert_eq!(strict_out.len(), 5);
         assert_eq!(strict_out[0], mk("B", 1, "b"));
         assert!(strict_out.iter().all(|x| !x.contains("\"offender\":\"A\"")));
+    }
+
+    /// B203 witness: a carrier's items stop being verified at its first that
+    /// fails, and an item that failed is not verified again in the block:
+    /// well-formed junk a member carried (a real certificate paired with a
+    /// forged one) cost every block builder pairings, five items a vertex.
+    #[test]
+    fn a_carriers_junk_is_verified_once_a_block() {
+        let calls = std::cell::Cell::new(0);
+        let verify = |it: &str| -> Option<(String, u64)> {
+            calls.set(calls.get() + 1);
+            it.strip_prefix("good:").map(|o| (o.to_string(), 1))
+        };
+        let carried: Vec<(String, String)> = [
+            ("byz", "junk-1"),
+            ("byz", "junk-2"),
+            ("byz", "good:X"),
+            ("other", "junk-1"),
+            ("honest", "good:Y"),
+        ]
+        .iter()
+        .map(|(c, it)| (c.to_string(), it.to_string()))
+        .collect();
+        let out = DagConsensus::canonical_block_evidence(carried, verify);
+        let items: Vec<&str> = out.iter().map(|(it, _)| it.as_str()).collect();
+        assert_eq!(items, vec!["good:Y"]);
+        assert_eq!(calls.get(), 2, "junk was verified past its carrier's first");
     }
 
     /// Only equivocation items may ride through the DAG. A "downtime" item

@@ -48,7 +48,6 @@ rm -f audit_tokenomics.py verify_halving.py attack_network.py # User classified 
 mkdir -p scripts/ops_tools
 mv attack_network.py scripts/ops_tools/ 2>/dev/null
 mv audit_tokenomics.py scripts/ops_tools/ 2>/dev/null
-mv test_chain_id.py scripts/ops_tools/ 2>/dev/null
 mv watch_mining.sh scripts/ops_tools/ 2>/dev/null
 mv start.sh scripts/ops_tools/ 2>/dev/null
 mv stop-nodes.sh scripts/ops_tools/ 2>/dev/null

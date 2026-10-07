@@ -44,11 +44,12 @@ fn load_wallet(pqc_seed: &Option<String>, keyfile: &str) -> anyhow::Result<Walle
 fn signed_tx_json(
     client: &RpcClient,
     wallet: &Wallet,
-    chain_id: &str,
+    chain_id: &Option<String>,
     payload: String,
     sequence_number: u64,
     execution: Option<u64>,
 ) -> anyhow::Result<String> {
+    let chain_id = signing_chain(chain_id, &client.network()?)?;
     let price = client.call("aincore_getGasPrice", json!([]))?;
     let gas_price: u128 = match &price {
         serde_json::Value::String(s) => s.parse()?,
@@ -127,8 +128,8 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// RPC URL of the node
-    #[arg(short, long, default_value = "http://127.0.0.1:8001/rpc")]
+    /// RPC URL of the node (B243: the node's default API port is 8002)
+    #[arg(short, long, default_value = "http://127.0.0.1:8002/rpc")]
     rpc: String,
 
     /// Path to wallet key file
@@ -140,9 +141,12 @@ struct Cli {
     #[arg(long)]
     pqc_seed: Option<String>,
 
-    /// Chain ID used in signed transactions (or AINCORE_CHAIN_ID env)
-    #[arg(long, default_value = "AINCORE-MAINNET-1")]
-    chain_id: String,
+    /// Chain ID used in signed transactions (or AINCORE_CHAIN_ID env). B243:
+    /// required to sign, and it must be the chain the node runs: a default
+    /// of AINCORE-MAINNET-1 signed mainnet-valid transactions for a user who
+    /// forgot the flag on a testnet.
+    #[arg(long)]
+    chain_id: Option<String>,
 
     /// Execution gas for every signed transaction; the node's estimate
     /// (`aincore_estimateGas`) when not given (B65)
@@ -213,14 +217,29 @@ enum KeysSubcommand {
     },
 }
 
+/// B243: the chain id to sign for: the one named (`--chain-id` or
+/// `AINCORE_CHAIN_ID`), and only if it is the chain the node runs. Nothing
+/// is signed without one: a default signed for mainnet.
+fn signing_chain<'a>(named: &'a Option<String>, node: &str) -> anyhow::Result<&'a str> {
+    let Some(named) = named.as_deref() else {
+        anyhow::bail!(
+            "name the chain to sign for: --chain-id or AINCORE_CHAIN_ID (the node runs {node})"
+        );
+    };
+    if named != node {
+        anyhow::bail!("the node runs {node}, not {named}: refusing to sign");
+    }
+    Ok(named)
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let client = RpcClient::new(&cli.rpc);
-    let chain_id = if cli.chain_id == "AINCORE-MAINNET-1" {
-        std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| cli.chain_id.clone())
-    } else {
-        cli.chain_id.clone()
-    };
+    let chain_id = cli
+        .chain_id
+        .clone()
+        .or_else(|| std::env::var("AINCORE_CHAIN_ID").ok())
+        .filter(|id| !id.is_empty());
 
     match cli.command {
         Commands::Keygen => {
@@ -632,5 +651,24 @@ mod address_tests {
     #[test]
     fn display_uses_a1n() {
         assert_eq!(a1n(HEX), A1N);
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    /// B243 witness: a transaction is signed only for the chain named, and
+    /// only if the node runs that chain (with nothing named it was signed
+    /// for mainnet, whatever chain the node ran).
+    #[test]
+    fn a_transaction_is_signed_only_for_the_named_chain_the_node_runs() {
+        let named = Some("AINCORE-TESTNET-V4".to_string());
+        assert_eq!(
+            signing_chain(&named, "AINCORE-TESTNET-V4").unwrap(),
+            "AINCORE-TESTNET-V4"
+        );
+        assert!(signing_chain(&named, "AINCORE-MAINNET-1").is_err());
+        assert!(signing_chain(&None, "AINCORE-MAINNET-1").is_err());
     }
 }

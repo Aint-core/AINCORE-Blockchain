@@ -41,7 +41,9 @@
 use crate::qc::{self, build_qc, verify_qc, FinalityVote, QuorumCertificate, ValidatorInfo};
 
 mod recovery;
-pub(crate) use recovery::{lowest_pending_qc_height, retry_pending_qcs, stage_pending_qc};
+pub(crate) use recovery::{
+    lowest_pending_qc_height, pending_context, retry_pending_qcs, stage_pending_qc,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage::StateDB;
@@ -128,6 +130,29 @@ pub fn load_validator_set_for_epoch(storage: &StateDB, epoch: u64) -> Option<Vec
     None
 }
 
+#[cfg(test)]
+thread_local! {
+    /// B225 witness support: the committee lookups a message caused on this
+    /// thread.
+    pub(crate) static COMMITTEE_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// B225: `epoch`'s committee with its hash; on a V4 chain parsed once per
+/// record (`v4::epoch::committee`): a finality vote parsed it twice, with
+/// two sorts and a hash.
+pub fn epoch_committee(
+    storage: &StateDB,
+    epoch: u64,
+) -> Option<std::sync::Arc<crate::v4::epoch::Committee>> {
+    #[cfg(test)]
+    COMMITTEE_LOOKUPS.with(|n| n.set(n.get() + 1));
+    if crate::v4::is_v4_chain(storage) {
+        return crate::v4::epoch::committee(storage, epoch);
+    }
+    load_validator_set_for_epoch(storage, epoch)
+        .map(|set| std::sync::Arc::new(crate::v4::epoch::Committee::new(set)))
+}
+
 /// Resolve the committee epoch for a block, not the epoch of the current tip.
 /// The executor activates each new epoch at boundary_height + 1. Missing or
 /// malformed retained boundaries are not permission to use today's committee.
@@ -175,25 +200,38 @@ pub fn verify_block_qc(
     block: &blockchain::Block,
     qc: &QuorumCertificate,
 ) -> Result<(), String> {
-    let h = block.header.height;
+    if qc.anchor_hash != block.anchor_hash {
+        return Err("the QC does not bind this block's anchor hash".into());
+    }
+    verify_header_qc(storage, &block.header, qc)
+}
+
+/// B275: `verify_block_qc` for a block known by its header alone (all it
+/// binds but the anchor hash, a body field): checked before a client asks
+/// for the parts of a block too large for a sync answer. The cheap field
+/// checks come before the pairing.
+pub fn verify_header_qc(
+    storage: &StateDB,
+    header: &blockchain::BlockHeader,
+    qc: &QuorumCertificate,
+) -> Result<(), String> {
+    let h = header.height;
     let epoch = epoch_for_block_height(storage, h).ok_or("no epoch for this height")?;
-    let validators =
-        load_validator_set_for_epoch(storage, epoch).ok_or("no committee for this epoch")?;
-    crate::qc::verify_qc(qc, &validators, &crate::qc::expected_chain_id())
-        .map_err(|e| format!("the QC does not verify: {e}"))?;
     let checks = [
         (qc.epoch == epoch, "epoch"),
         (qc.block_height == h, "height"),
-        (qc.block_hash == block.header.hash, "block hash"),
-        (qc.anchor_round == block.header.round, "anchor round"),
-        (qc.anchor_hash == block.anchor_hash, "anchor hash"),
-        (qc.state_root == block.header.state_root, "state root"),
-        (qc.receipts_root == block.header.receipts_root, "receipts root"),
+        (qc.block_hash == header.hash, "block hash"),
+        (qc.anchor_round == header.round, "anchor round"),
+        (qc.state_root == header.state_root, "state root"),
+        (qc.receipts_root == header.receipts_root, "receipts root"),
     ];
-    match checks.iter().find(|(ok, _)| !ok) {
-        Some((_, field)) => Err(format!("the QC does not bind this block's {field}")),
-        None => Ok(()),
+    if let Some((_, field)) = checks.iter().find(|(ok, _)| !ok) {
+        return Err(format!("the QC does not bind this block's {field}"));
     }
+    let validators =
+        load_validator_set_for_epoch(storage, epoch).ok_or("no committee for this epoch")?;
+    crate::qc::verify_qc(qc, &validators, &crate::qc::expected_chain_id())
+        .map_err(|e| format!("the QC does not verify: {e}"))
 }
 
 /// The stored QC of height `h`, if any.
@@ -225,6 +263,10 @@ pub struct CommitContext {
     /// this node derived it in H_E's transaction; empty otherwise.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub next_validator_set_hash: String,
+    /// B262: the GC floor the block's decision walked down to
+    /// (`CommitInfo::decision_floor`), what is kept while this QC is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_floor: Option<u64>,
 }
 
 /// Outcome of contributing THIS node's signature to a committed block.
@@ -295,6 +337,59 @@ fn qc_crash_boundary(boundary: u8, outcome: &QcOutcome) {
 
 // Only called inside the storage transaction. No signature may leave this
 // callback until its signing guards and public records are durably committed.
+#[cfg(test)]
+thread_local! {
+    /// B166 witness support: the own stored signatures verified on this
+    /// thread (not the cached ones).
+    pub(crate) static OWN_VOTE_VERIFIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// B166: whether this node's own stored signature in row `key` (holding
+/// `raw`) verifies under `public_key` over `signing_bytes`, checked once a
+/// process: a pending QC is retried several times a second, and each retry
+/// verified its rows again (four pairings). Cached by a hash of the row,
+/// the key and the bytes it was checked against (B180: a legacy row holds
+/// a bare signature, whose verdict depends on the vote asked for), so a
+/// changed row or another vote is checked anew.
+fn own_signature_verifies(
+    key: &str,
+    raw: &str,
+    public_key: &[u8],
+    signing_bytes: &[u8],
+    verify: impl FnOnce() -> bool,
+) -> bool {
+    static VERIFIED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<Vec<u8>>>> =
+        std::sync::LazyLock::new(Default::default);
+    let id = crypto::hash(
+        &[
+            key.as_bytes(),
+            &[0],
+            raw.as_bytes(),
+            &[0],
+            public_key,
+            &[0],
+            signing_bytes,
+        ]
+        .concat(),
+    );
+    if VERIFIED.lock().is_ok_and(|v| v.contains(&id)) {
+        return true;
+    }
+    #[cfg(test)]
+    OWN_VOTE_VERIFIES.with(|n| n.set(n.get() + 1));
+    let verified = verify();
+    if verified {
+        if let Ok(mut v) = VERIFIED.lock() {
+            // A bound, a choice: far more rows than a node keeps pending.
+            if v.len() >= 4_096 {
+                v.clear();
+            }
+            v.insert(id);
+        }
+    }
+    verified
+}
+
 fn produce_qc_staged(
     storage: &StateDB,
     node_key: &[u8; 32],
@@ -351,18 +446,28 @@ fn produce_qc_staged(
     let signing_bytes = vote.to_signing_bytes();
     let guard_keys = signing_guard_keys(&vote, &our_pk);
     let mut previous = None;
+    // B166: what each guard row holds, so an unchanged one is not rewritten.
+    let mut guards_held: Vec<Option<String>> = Vec::with_capacity(guard_keys.len());
     for key in &guard_keys {
-        if let Some(raw) = storage.get(key).map_err(|e| e.to_string())? {
-            let message: QcVoteMessage = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        let held = storage.get(key).map_err(|e| e.to_string())?;
+        if let Some(raw) = &held {
+            let message: QcVoteMessage = serde_json::from_str(raw).map_err(|e| e.to_string())?;
             if message.vote != vote || message.signer_address != node_address {
-                return Err("conflicting local vote at an already-signed height or anchor round".to_string());
+                return Err(
+                    "conflicting local vote at an already-signed height or anchor round"
+                        .to_string(),
+                );
             }
             let signature = hex::decode(&message.signature).map_err(|e| e.to_string())?;
-            if !bls.verify(&signing_bytes, &signature, &public_key).unwrap_or(false) {
+            if !own_signature_verifies(key, raw, &public_key, &signing_bytes, || {
+                bls.verify(&signing_bytes, &signature, &public_key)
+                    .unwrap_or(false)
+            }) {
                 return Err("invalid persisted local signature".to_string());
             }
             previous = Some(signature);
         }
+        guards_held.push(held);
     }
     // Legacy stores contain only a signature, not the signed context. Validate
     // it against this exact request; never overwrite a conflicting old vote.
@@ -377,9 +482,10 @@ fn produce_qc_staged(
             let (signed_digest, sig_hex) = split_stored_vote(&raw);
             let signature = hex::decode(sig_hex).map_err(|e| e.to_string())?;
             if signed_digest.is_some_and(|d| d != digest)
-                || !bls
-                    .verify(&signing_bytes, &signature, &public_key)
-                    .unwrap_or(false)
+                || !own_signature_verifies(&key, &raw, &public_key, &signing_bytes, || {
+                    bls.verify(&signing_bytes, &signature, &public_key)
+                        .unwrap_or(false)
+                })
             {
                 return Err("legacy local vote conflicts with requested signing bytes".to_string());
             }
@@ -393,8 +499,10 @@ fn produce_qc_staged(
         vote: vote.clone(), signer_address: node_address.to_string(), signature: hex::encode(&sig),
     };
     let encoded = serde_json::to_string(&message).map_err(|e| e.to_string())?;
-    for key in guard_keys {
-        storage.put(&key, &encoded).map_err(|e| e.to_string())?;
+    for (key, held) in guard_keys.iter().zip(&guards_held) {
+        if held.as_deref() != Some(encoded.as_str()) {
+            storage.put(key, &encoded).map_err(|e| e.to_string())?;
+        }
     }
 
     // Does our stake alone meet the strict >2/3 quorum (single-validator or
@@ -407,7 +515,13 @@ fn produce_qc_staged(
     if !qc::stake_quorum_met(my_stake, total_stake) {
         // Legacy single-vote key (kept for backward-compat / forensics).
         let key = format!("consensus:qc_vote:{}:{}", ctx.anchor_round, node_address);
-        storage.put(&key, &message.signature).map_err(|e| e.to_string())?;
+        if storage.get(&key).map_err(|e| e.to_string())?.as_deref()
+            != Some(message.signature.as_str())
+        {
+            storage
+                .put(&key, &message.signature)
+                .map_err(|e| e.to_string())?;
+        }
         // Persist our own vote into the aggregation store so an incoming peer
         // vote can combine with it. Self-store can race a same-round QC already
         // built (idempotent) — harmless.
@@ -832,27 +946,44 @@ fn stage_imported_certificate(storage: &StateDB, cert: &QuorumCertificate) -> Re
     let Some(epoch) = epoch_for_block_height(storage, cert.block_height) else {
         return Ok(false);
     };
-    let Some(validators) = load_validator_set_for_epoch(storage, epoch) else {
-        return Ok(false);
-    };
     if cert.epoch != epoch {
         return Err("finality QC epoch is not its height's epoch".into());
     }
     // B101: before any pairing, a QC with nothing to bind or add: its block
     // is not held (no conflict is possible either), or it is stored already.
     // A replay of a valid QC cost a pairing and a synced commit each time.
+    // B190: and before the committee record is parsed.
+    if stored_qc(storage, cert.block_height).as_ref() == Some(cert) {
+        return Ok(false);
+    }
+    // B225: a height this node cannot hold (pruned, or not reached), from
+    // small rows, before the committee: B205 put the committee first, so
+    // a member's QC naming such a height parsed the record, uncharged.
+    if !storage.may_hold_block(cert.block_height) {
+        return Ok(false);
+    }
+    // B205: the committee before the held block (up to a whole block read),
+    // and a QC bound to another committee refused before
+    // `verify_stake_aggregate` sorts and hashes it again, charged.
+    let Some(committee) = epoch_committee(storage, epoch) else {
+        return Ok(false);
+    };
+    if cert.validator_set_hash != committee.hash {
+        crate::work::note_failed_check();
+        return Err(format!(
+            "finality QC is bound to another committee: {} (epoch {epoch}'s is {})",
+            cert.validator_set_hash, committee.hash
+        ));
+    }
     let Some(raw) = storage
         .get(&format!("block_{}", cert.block_height))
         .map_err(|e| e.to_string())?
     else {
         return Ok(false);
     };
-    if stored_qc(storage, cert.block_height).as_ref() == Some(cert) {
-        return Ok(false);
-    }
     #[cfg(test)]
     QC_PAIRINGS.with(|p| p.set(p.get() + 1));
-    verify_qc(cert, &validators, &qc::expected_chain_id())
+    verify_qc(cert, &committee.set, &qc::expected_chain_id())
         .map_err(|e| format!("finality QC verification failed: {e:?}"))?;
     // Verified: a QC for another block at a held height is now a conflict.
     check_held_block(storage, cert)?;
@@ -876,16 +1007,32 @@ fn qc_import_crash_boundary(boundary: u8) {
 /// votes cost a block read each under the consensus lock.
 pub fn vote_still_needed(storage: &StateDB, msg: &QcVoteMessage) -> bool {
     let round = msg.vote.anchor_round;
-    load_validator_set_for_epoch(storage, msg.vote.epoch)
-        .is_some_and(|set| set.iter().any(|v| v.address == msg.signer_address))
-        && !matches!(
-            storage.get(&format!("consensus:qc_by_round:{round}")),
-            Ok(Some(_))
-        )
-        && !matches!(
-            storage.get(&collected_vote_key(round, &msg.signer_address)),
-            Ok(Some(_))
-        )
+    // B190: the point reads before the committee record is parsed.
+    if matches!(
+        storage.get(&format!("consensus:qc_by_round:{round}")),
+        Ok(Some(_))
+    ) || matches!(
+        storage.get(&collected_vote_key(round, &msg.signer_address)),
+        Ok(Some(_))
+    ) {
+        return false;
+    }
+    #[cfg(test)]
+    crate::dag::VOTE_BLOCK_READS.with(|n| n.set(n.get() + 1));
+    let Some(committee) = epoch_committee(storage, msg.vote.epoch) else {
+        return false;
+    };
+    // B225: a vote under a name outside the committee is charged: no
+    // honest node votes unless it is a member of the epoch (`retry_one`),
+    // and each named a fresh signer to pass the point reads above.
+    let member = committee
+        .set
+        .iter()
+        .any(|v| v.address == msg.signer_address);
+    if !member {
+        crate::work::note_failed_check();
+    }
+    member
 }
 
 /// Storage key prefix under which the per-(round, signer) collected votes live.
@@ -983,15 +1130,10 @@ fn collect_vote_staged(
         return Ok(QcOutcome::Skipped);
     }
 
-    // (1) Frozen validator set for the vote's epoch.
-    let validators = match load_validator_set_for_epoch(storage, vote.epoch) {
-        Some(v) => v,
-        None => return Ok(QcOutcome::Skipped),
-    };
-    let ordered = qc::canonical_order(&validators);
-
-    // (2) Bind to the exact set this node verifies against.
-    let expected_set_hash = qc::validator_set_hash(&validators);
+    // B205: the fields that need no committee record first (a vote naming a
+    // pending height and round cost two parses of the record, two sorts and
+    // a hash before it was skipped), and a mismatch is charged (B51): no
+    // honest member votes for another chain, block or committee.
     // RE-AUDIT MEDIUM: bind every remote vote to THIS chain before it can
     // contribute to a QC. A vote set from a foreign chain (same validator keys,
     // e.g. a testnet reusing mainnet identities) could otherwise aggregate into
@@ -1002,24 +1144,36 @@ fn collect_vote_staged(
             vote.chain_id,
             qc::expected_chain_id()
         );
-        return Ok(QcOutcome::Skipped);
-    }
-    if vote.validator_set_hash != expected_set_hash {
-        // Vote is over a different validator set — cannot aggregate into a QC
-        // that verifies against ours.
+        crate::work::note_failed_check();
         return Ok(QcOutcome::Skipped);
     }
     // Bind to THIS node's committed block at this round when known.
     if let Some(bh) = expected_block_hash {
         if vote.block_hash != bh {
+            crate::work::note_failed_check();
             return Ok(QcOutcome::Skipped);
         }
     }
 
-    // (3) Locate signer + verify the single BLS signature against its key.
-    let signer_idx = match ordered.iter().position(|v| v.address == msg.signer_address) {
-        Some(i) => i,
-        None => return Ok(QcOutcome::Skipped), // signer not in the trusted set
+    // (1) Frozen validator set for the vote's epoch (B225: parsed once
+    // per record, with its hash).
+    let Some(committee) = epoch_committee(storage, vote.epoch) else {
+        return Ok(QcOutcome::Skipped);
+    };
+    let validators = &committee.set;
+
+    // (2) Bind to the exact set this node verifies against.
+    if vote.validator_set_hash != committee.hash {
+        // Vote is over a different validator set — cannot aggregate into a QC
+        // that verifies against ours.
+        crate::work::note_failed_check();
+        return Ok(QcOutcome::Skipped);
+    }
+
+    // (3) Locate signer + verify the single BLS signature against its key
+    // (members' addresses are distinct, EP-2: no sort is needed to find it).
+    let Some(signer) = validators.iter().find(|v| v.address == msg.signer_address) else {
+        return Ok(QcOutcome::Skipped); // signer not in the trusted set
     };
     // B101: before any pairing, a vote with nothing left to add: the round
     // has its QC, or this signer's vote is held (a replay cost a BLS check,
@@ -1041,7 +1195,7 @@ fn collect_vote_staged(
         Ok(b) => b,
         Err(_) => return Ok(QcOutcome::Skipped),
     };
-    let pk_bytes = match hex::decode(&ordered[signer_idx].bls_public_key) {
+    let pk_bytes = match hex::decode(&signer.bls_public_key) {
         Ok(b) => b,
         Err(_) => return Ok(QcOutcome::Skipped),
     };
@@ -1067,7 +1221,7 @@ fn collect_vote_staged(
     )?;
 
     // (5) Attempt deterministic aggregation over the collected vote set.
-    aggregate_collected(storage, vote, &validators, &digest)
+    aggregate_collected(storage, vote, validators, &digest)
 }
 
 /// B101: the digest of what a finality vote signs; a collected vote is
@@ -1165,6 +1319,36 @@ fn aggregate_collected(
 mod tests {
     use super::*;
     use crate::qc::ValidatorInfo;
+
+    /// B180 witness: a remembered verification of an own signature counts
+    /// only for the bytes it was checked against: the same row asked for
+    /// another vote is verified anew.
+    #[test]
+    fn an_own_signature_is_remembered_per_vote() {
+        let verifies = || OWN_VOTE_VERIFIES.with(|n| n.get());
+        let row = format!("consensus:qc_vote:7:{}", "b180".repeat(16));
+        let before = verifies();
+        assert!(own_signature_verifies(
+            &row,
+            "sig",
+            b"pk",
+            b"vote a",
+            || true
+        ));
+        assert!(own_signature_verifies(
+            &row,
+            "sig",
+            b"pk",
+            b"vote a",
+            || true
+        ));
+        assert_eq!(verifies() - before, 1, "vacuous: not remembered");
+        assert!(
+            !own_signature_verifies(&row, "sig", b"pk", b"vote b", || false),
+            "another vote took the remembered verdict"
+        );
+        assert_eq!(verifies() - before, 2);
+    }
 
     /// G4 NI-4: a vote with every field at its longest fits its pre-parse cap
     /// four times over.
@@ -1310,6 +1494,7 @@ mod tests {
             receipts_root: "12".repeat(32),
             finality_digest: "34".repeat(32),
             next_validator_set_hash: String::new(),
+            decision_floor: None,
         }
     }
 

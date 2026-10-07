@@ -37,7 +37,9 @@ impl Engine {
         for v in keep {
             self.pending.push(v);
         }
-        self.collect_garbage(g.saturating_sub(staging::RETAIN_SLACK), net);
+        // B255: never above the rounds kept for a block without a QC.
+        let cut = self.retention_cut();
+        self.collect_garbage(cut, net);
     }
 
     /// GC-3: delete every row of this epoch at or below `cut`, and forget it

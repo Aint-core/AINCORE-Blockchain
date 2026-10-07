@@ -211,12 +211,20 @@ impl Cluster {
     }
 
     fn receive(&mut self, i: usize, msg: Msg) {
+        self.receive_from(i, None, msg);
+    }
+
+    /// `receive` from `from`, as the transport names a session (B248).
+    fn receive_from(&mut self, i: usize, from: Option<&str>, msg: Msg) {
         let len = match &msg {
             Msg::Vertex(v) => serde_json::to_string(v).unwrap().len(),
             _ => 0,
         };
         let net = self.net(i);
-        self.engines[i].as_mut().unwrap().on_message(len, msg, &net);
+        self.engines[i]
+            .as_mut()
+            .unwrap()
+            .on_message_from(from, len, msg, &net);
         self.collect(i);
     }
 
@@ -241,7 +249,7 @@ impl Cluster {
                         msg: env.msg.clone(),
                     });
                 } else {
-                    self.receive(i, env.msg.clone());
+                    self.receive_from(i, Some(&env.from), env.msg.clone());
                 }
             }
         }
@@ -262,7 +270,7 @@ impl Cluster {
             };
             for i in receivers {
                 if let Some(msg) = map(&env, i) {
-                    self.receive(i, msg);
+                    self.receive_from(i, Some(&env.from), msg);
                 }
             }
         }
@@ -1006,7 +1014,8 @@ fn a_vertex_ahead_of_its_parent_certificates_is_staged_when_they_arrive() {
 /// what failed. A Byzantine member signs a round-2 vertex that waits on an
 /// honest member's round-1 certificate and cites the other round-1 slots by
 /// fake digests with junk certificates of the right shape. The junk is
-/// charged to the Byzantine sender once, when it arrives; the honest
+/// charged to the Byzantine sender once, when it arrives (B226: the first
+/// junk certificate that fails stops the checks of the rest); the honest
 /// certificate that wakes the vertex costs its sender nothing.
 #[test]
 fn a_waking_certificate_is_not_charged_for_the_vertex_it_wakes() {
@@ -1060,8 +1069,8 @@ fn a_waking_certificate_is_not_charged_for_the_vertex_it_wakes() {
     ));
     let ((), charged) = crate::work::failed_in(|| c.receive(0, Msg::Vertex(forged.clone())));
     assert_eq!(
-        charged, faked,
-        "the junk is charged to the sender that carried it"
+        charged, 1,
+        "the junk is charged to the sender that carried it, its first failure only"
     );
     assert!(!c.engine(0).is_staged(&forged.hash));
     let pending = &mut c.engines[0].as_mut().unwrap().pending;
@@ -3040,6 +3049,72 @@ fn junk_answers_cost_one_check_per_request_sent() {
     );
 }
 
+/// B171 witness: an `Ahead` copy is authenticated only while it shows a gap
+/// this node does not want yet: the same copy again, a lower one, or one
+/// past the bound of what it ever wants at once runs no check (each cost a
+/// hash over the body and a signature check, uncounted).
+#[test]
+fn an_ahead_copy_is_authenticated_only_for_a_new_gap() {
+    let mut members: Vec<Member> = (1..=4).map(member).collect();
+    members.sort_by(|a, b| a.info.address.cmp(&b.info.address));
+    let committee: Vec<ValidatorInfo> = members.iter().map(|m| m.info.clone()).collect();
+    let db = TempDb::new("b171-ahead");
+    let storage = Arc::new(StateDB::open(db.0.to_str().unwrap()).unwrap());
+    let cfg = Config {
+        chain_id: CHAIN.into(),
+        genesis_identity: GENESIS.into(),
+        committee,
+        node_key: members[0].node_key,
+        address: members[0].info.address.clone(),
+        b_auth: staging::B_AUTH,
+        epoch_interval: 0,
+    };
+    let mut engine = Engine::open(storage, cfg, true, Arc::new(|| NOW)).unwrap();
+    let ahead = |round: u64| {
+        let mut v = Vertex {
+            epoch: 1,
+            round,
+            author: members[1].info.address.clone(),
+            parents: vec!["a".repeat(64)],
+            parent_refs: vec![],
+            payload: vec![],
+            timestamp: NOW,
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
+        };
+        v.hash = v.hash_v4_with_domain(CHAIN, GENESIS);
+        v.sign_with_ed25519(&crypto::SigningKey::from_bytes(&members[1].node_key));
+        v
+    };
+    let q: Queue = Rc::new(RefCell::new(VecDeque::new()));
+    let net = Net {
+        from: members[0].info.address.clone(),
+        q: Rc::clone(&q),
+    };
+    let send = |engine: &mut Engine, v: Vertex| {
+        let len = serde_json::to_string(&v).unwrap().len();
+        engine.on_message(len, Msg::Vertex(v), &net);
+    };
+    let runs = || crate::ingress_v4::SIGNED_BY_MEMBER_RUNS.with(|n| n.get());
+    let before = runs();
+    send(&mut engine, ahead(1_000));
+    assert_eq!(runs() - before, 1, "vacuous: not authenticated");
+    let wants = engine.cert_wants.len();
+    assert!(wants > 0, "vacuous: no gap wanted");
+    for round in [1_000, 900, 5_000] {
+        send(&mut engine, ahead(round));
+    }
+    assert_eq!(
+        runs() - before,
+        1,
+        "a copy that shows nothing new was authenticated"
+    );
+    assert_eq!(engine.cert_wants.len(), wants);
+}
+
 /// DOS-6: one Byzantine member's signed E+1 vertex (verdict `Ahead`) makes
 /// every honest node want every author's certificate for 257 rounds, each
 /// want holding its own copy of the n−1 member addresses; all of them are
@@ -4036,6 +4111,7 @@ fn a_third_body_of_one_slot_is_not_checked() {
         PayloadSlot {
             passed: vec!["x".into()],
             refused: vec!["y".into()],
+            ..PayloadSlot::default()
         },
     );
     // B117: two checks fill a slot whatever their outcome.
@@ -4062,9 +4138,10 @@ fn with_payload(v: &Vertex, payload: Vec<String>, key: &[u8; 32]) -> Vertex {
 }
 
 /// B117 witness: a refused payload is remembered, so its copies are not
-/// checked again, and the refusal is charged to whoever delivered it (B51);
-/// a vertex waiting on parent certificates (here, invented parents) has its
-/// payload checked only when it wakes, which never happens.
+/// checked again, and each copy is charged to whoever delivered it (B51;
+/// B136/B148: dropped before Layer S); a vertex waiting on parent
+/// certificates (here, invented parents) has its payload checked only when
+/// it wakes, which never happens.
 #[test]
 fn a_refused_payload_is_checked_once_and_a_waiting_one_not_at_all() {
     let mut c = Cluster::new("b117-refused", 4, 0);
@@ -4088,7 +4165,7 @@ fn a_refused_payload_is_checked_once_and_a_waiting_one_not_at_all() {
         }
     });
     assert_eq!(checks() - before, 1, "a refused payload was checked again");
-    assert_eq!(failed, 1, "the refusal was not charged once");
+    assert_eq!(failed, 3, "a copy of the refused body was not charged");
 
     let invented: Vec<ParentRef> = (0..3)
         .map(|i| ParentRef {
@@ -4244,6 +4321,82 @@ fn activation_checks_no_certificate_twice_and_none_a_buffered_vertex_carried() {
     );
 }
 
+/// B137 witness: before activation, an author's next-epoch vertices take at
+/// most `PENDING_MAX_PER_AUTHOR` payload checks, what the buffer keeps of one
+/// author (sent highest round first, each one used to be checked and kept,
+/// up to two bodies a round over the lead). The count restarts at
+/// activation.
+#[test]
+fn a_next_epoch_author_takes_no_more_checks_than_the_buffer_keeps() {
+    let mut c = Cluster::new("b137-next-checks", 4, 0);
+    c.run_until(40, |c| c.decisions[0].len() >= 2);
+    let (closing_round, anchor, _, _) = c.decisions[0]
+        .last()
+        .cloned()
+        .expect("vacuous: nothing decided");
+    let committee = c.committee.clone();
+    c.engines[0]
+        .as_mut()
+        .unwrap()
+        .close_epoch(closing_round, &anchor, &"ab".repeat(32), &committee)
+        .unwrap();
+    let next = c.engine(0).next.clone().expect("E+1 scheduled");
+    let byzantine = 1;
+    let author = c.members[byzantine].info.address.clone();
+    let template = lock(&c.engine(byzantine).dag)
+        .values()
+        .find(|v| v.author == author)
+        .expect("a vertex of the Byzantine member")
+        .clone();
+    let key = c.members[byzantine].node_key;
+    let sent = staging::PENDING_MAX_PER_AUTHOR as u64 + 4;
+    let net = c.net(0);
+    let checks = || ingress_v4::PAYLOAD_CHECKS.with(|n| n.get());
+    let runs = || ingress_v4::LAYER_S_RUNS.with(|n| n.get());
+    let before = checks();
+    let runs_before = runs();
+    for round in (next.first_round + 1..=next.first_round + sent).rev() {
+        let mut v = template.clone();
+        v.epoch = next.epoch;
+        v.round = round;
+        v.payload = vec![crate::test_txs::tagged(CHAIN, &format!("b137-{round}"))];
+        v.parent_refs = next
+            .committee
+            .iter()
+            .enumerate()
+            .map(|(i, m)| ParentRef {
+                round: round - 1,
+                author: m.address.clone(),
+                digest: format!("{:064x}", 0xb137_u64 + i as u64),
+                proof: None,
+                cert: None,
+            })
+            .collect();
+        v.parents = v.parent_refs.iter().map(|r| r.digest.clone()).collect();
+        v.hash = v.hash_v4_with_domain(CHAIN, GENESIS);
+        v.sign_with_ed25519(&crypto::SigningKey::from_bytes(&key));
+        let len = serde_json::to_string(&v).unwrap().len();
+        c.engines[0].as_mut().unwrap().on_vertex(len, v, &net);
+    }
+    assert_eq!(
+        checks() - before,
+        staging::PENDING_MAX_PER_AUTHOR as u64,
+        "a next-epoch author took more payload checks than the buffer keeps of it"
+    );
+    // B229: and once they are spent, its next bodies run no Layer S (each
+    // was authenticated, then dropped as spent, every tick to activation).
+    assert_eq!(
+        runs() - runs_before,
+        staging::PENDING_MAX_PER_AUTHOR as u64,
+        "a spent author's next-epoch body ran Layer S"
+    );
+    c.engines[0].as_mut().unwrap().activate_next(&net).unwrap();
+    assert!(
+        c.engine(0).next_checks.is_empty(),
+        "the next-epoch check count did not restart at activation"
+    );
+}
+
 /// B120 witness: a certificate GC has forgotten (at or below g minus the
 /// retention slack) is not verified (a replay of one cost a pairing and a
 /// synced write).
@@ -4301,6 +4454,374 @@ fn a_certificate_below_the_floor_is_not_verified() {
         c.engine(0).halted.is_some(),
         "a conflict between the cut and g went unseen"
     );
+}
+
+/// B136 witness: the certificates E4 verified are kept whatever the
+/// verdict, without a second check (a refused copy threw them away, so each
+/// replay paid their pairings again), and (B148) a copy of a body refused
+/// before is dropped, and charged, before Layer S, so before any
+/// certificate it carries is checked.
+#[test]
+fn a_refused_copy_keeps_what_it_proved_and_checks_nothing_again() {
+    let mut c = Cluster::new("b136-memo", 4, 0);
+    c.run(3);
+    let byz = c.leader(4);
+    let h0 = c.validators().find(|&i| i != byz).unwrap();
+    let key = c.members[byz].node_key;
+    let template = c.engine(byz).own_proposal(2).unwrap().clone();
+    let mut refs = vec![cert_ref(&c, byz, 1, &c.members[byz].info.address.clone())];
+    for i in (0..4).filter(|&i| i != byz).take(2) {
+        refs.push(cert_ref(&c, byz, 1, &c.members[i].info.address.clone()));
+    }
+    let bad = recite(
+        &with_payload(&template, vec!["not a transaction".to_string()], &key),
+        refs,
+        &key,
+    );
+    // The Byzantine member's own round-1 certificate, withheld from h0.
+    let slot = (1, c.members[byz].info.address.clone());
+    c.engines[h0].as_mut().unwrap().certs.remove(&slot);
+    let net = c.net(h0);
+    let verifications = || crate::vcert::CERT_VERIFICATIONS.with(|n| n.get());
+    let before = verifications();
+    let len = serde_json::to_string(&bad).unwrap().len();
+    let ((), failed) = crate::work::failed_in(|| {
+        c.engines[h0]
+            .as_mut()
+            .unwrap()
+            .on_vertex(len, bad.clone(), &net)
+    });
+    assert_eq!(failed, 1, "vacuous: the payload was not refused");
+    assert_eq!(
+        verifications() - before,
+        1,
+        "the carried certificate was not checked exactly once"
+    );
+    assert!(
+        c.engine(h0).certs.contains_key(&slot),
+        "a refused copy threw away the certificate it proved"
+    );
+    // Another copy of the refused body, its certificate replaced with junk
+    // by a relay, for a slot h0 does not hold: refused before any check.
+    c.engines[h0].as_mut().unwrap().certs.remove(&slot);
+    let mut junk = bad.clone();
+    junk.parent_refs[0]
+        .cert
+        .as_mut()
+        .unwrap()
+        .aggregate_signature = vec![7u8; 96];
+    let before = verifications();
+    let ((), failed) = crate::work::failed_in(|| {
+        c.engines[h0]
+            .as_mut()
+            .unwrap()
+            .on_vertex(len, junk.clone(), &net)
+    });
+    assert_eq!(
+        verifications(),
+        before,
+        "a copy of a refused body had its certificates checked"
+    );
+    assert_eq!(failed, 1, "a copy of a refused body was not charged");
+}
+
+/// B148 witness: a copy of a body held pending is dropped before Layer S
+/// (each copy re-ran the hash, two serializations and the signature check,
+/// uncounted).
+#[test]
+fn a_copy_of_a_pending_body_is_dropped_before_layer_s() {
+    let mut c = Cluster::new("b148-pending", 4, 0);
+    c.run(3);
+    let byz = c.leader(4);
+    let h0 = c.validators().find(|&i| i != byz).unwrap();
+    let key = c.members[byz].node_key;
+    let template = c.engine(byz).own_proposal(2).unwrap().clone();
+    let invented: Vec<ParentRef> = (0..3)
+        .map(|i| ParentRef {
+            round: 1,
+            author: c.members[i].info.address.clone(),
+            digest: format!("{:064x}", 0xb148_u64 + i as u64),
+            proof: None,
+            cert: None,
+        })
+        .collect();
+    let waiting = recite(&template, invented, &key);
+    let net = c.net(h0);
+    let len = serde_json::to_string(&waiting).unwrap().len();
+    c.engines[h0]
+        .as_mut()
+        .unwrap()
+        .on_vertex(len, waiting.clone(), &net);
+    assert!(
+        c.engine(h0).pending.contains(&waiting.hash),
+        "vacuous: the vertex does not wait"
+    );
+    let runs = || ingress_v4::LAYER_S_RUNS.with(|n| n.get());
+    let before = runs();
+    for _ in 0..3 {
+        c.engines[h0]
+            .as_mut()
+            .unwrap()
+            .on_vertex(len, waiting.clone(), &net);
+    }
+    assert_eq!(runs(), before, "a copy of a pending body ran Layer S");
+    assert!(
+        c.engine(h0).pending.contains(&waiting.hash),
+        "the pending body was lost"
+    );
+}
+
+/// B190/B202/B224 witness: a body the pending buffer cannot keep (an
+/// author's seventeenth waiting one) is dropped before Layer S on its next
+/// copies, a later tick's too, while it would be evicted again (each ran
+/// Layer S and E4 again, uncounted; B202 evaluated one a tick, so an author
+/// re-sending its bodies past its share each tick cost every node their
+/// hashes and signatures each tick), and kept once the buffer has room:
+/// remembered for good, a body whose certificate needed this node's
+/// attestation stalled its round for good.
+#[test]
+fn a_body_the_buffer_cannot_keep_costs_its_copies_nothing() {
+    let mut c = Cluster::new("b190-evicted", 4, 0);
+    c.run(3);
+    let byz = c.leader(4);
+    let h0 = c.validators().find(|&i| i != byz).unwrap();
+    let key = c.members[byz].node_key;
+    let template = c.engine(byz).own_proposal(2).unwrap().clone();
+    let net = c.net(h0);
+    let waiting = |round: u64| {
+        let mut t = template.clone();
+        t.round = round;
+        let refs: Vec<ParentRef> = (0..3)
+            .map(|i| ParentRef {
+                round: round - 1,
+                author: c.members[i].info.address.clone(),
+                digest: format!("{:064x}", 0xb190_0000_u64 + round * 8 + i as u64),
+                proof: None,
+                cert: None,
+            })
+            .collect();
+        recite(&t, refs, &key)
+    };
+    let mut last = None;
+    for round in 10..10 + crate::staging::PENDING_MAX_PER_AUTHOR as u64 + 1 {
+        let v = waiting(round);
+        let len = serde_json::to_string(&v).unwrap().len();
+        c.engines[h0]
+            .as_mut()
+            .unwrap()
+            .on_vertex(len, v.clone(), &net);
+        last = Some((len, v));
+    }
+    let (len, evicted) = last.unwrap();
+    assert!(
+        !c.engine(h0).pending.contains(&evicted.hash),
+        "vacuous: the buffer kept the highest round"
+    );
+    let runs = || ingress_v4::LAYER_S_RUNS.with(|n| n.get());
+    let deliver = |c: &mut Cluster| {
+        c.engines[h0]
+            .as_mut()
+            .unwrap()
+            .on_vertex(len, evicted.clone(), &net)
+    };
+    let before = runs();
+    for _ in 0..3 {
+        deliver(&mut c);
+    }
+    assert_eq!(runs(), before, "a copy of an evicted body ran Layer S");
+    c.tick(h0);
+    deliver(&mut c);
+    assert_eq!(
+        runs(),
+        before,
+        "a later tick's copy ran Layer S, to be evicted again"
+    );
+    // The buffer drains (its bodies' certificates came): kept next time.
+    drop(c.engines[h0].as_mut().unwrap().pending.take_all());
+    deliver(&mut c);
+    assert_eq!(runs(), before + 1, "vacuous: not evaluated");
+    assert!(
+        c.engine(h0).pending.contains(&evicted.hash),
+        "an evicted body was refused for good"
+    );
+}
+
+/// B224 witness: a slot's second authenticated digest is twin evidence
+/// though neither body stages (both wait on invented parents: twins were
+/// recorded only when both staged, so such bodies were never slashed), and
+/// a third digest is not authenticated (each cost every node the hash and
+/// the signature, uncharged).
+#[test]
+fn a_slots_second_digest_convicts_and_its_third_is_not_authenticated() {
+    let mut c = Cluster::new("b224-twins", 4, 0);
+    c.run(3);
+    let byz = c.leader(4);
+    let h0 = c.validators().find(|&i| i != byz).unwrap();
+    let key = c.members[byz].node_key;
+    let template = c.engine(byz).own_proposal(2).unwrap().clone();
+    // A slot its author has not reached: no other body of it is held.
+    let waiting = |salt: u64| {
+        let mut t = template.clone();
+        t.round = 12;
+        let refs: Vec<ParentRef> = (0..3)
+            .map(|i| ParentRef {
+                round: 11,
+                author: c.members[i].info.address.clone(),
+                digest: format!("{:064x}", 0xb224_0000_u64 + salt * 8 + i as u64),
+                proof: None,
+                cert: None,
+            })
+            .collect();
+        recite(&t, refs, &key)
+    };
+    let net = c.net(h0);
+    let deliver = |c: &mut Cluster, v: &Vertex| {
+        let len = serde_json::to_string(v).unwrap().len();
+        c.engines[h0]
+            .as_mut()
+            .unwrap()
+            .on_vertex(len, v.clone(), &net);
+    };
+    let (a, b, third) = (waiting(1), waiting(2), waiting(3));
+    let seen = evidence::seen_key(&a.author, a.epoch, a.round);
+    let recorded = |c: &Cluster| c.engine(h0).storage.get(&seen).unwrap().is_some();
+    deliver(&mut c, &a);
+    assert!(
+        c.engine(h0).pending.contains(&a.hash),
+        "vacuous: the first body does not wait"
+    );
+    assert!(!recorded(&c), "one body is no evidence");
+    deliver(&mut c, &b);
+    assert!(
+        c.engine(h0).pending.contains(&b.hash),
+        "vacuous: the second body does not wait"
+    );
+    assert!(recorded(&c), "two signed bodies of one slot, no evidence");
+    let runs = || ingress_v4::LAYER_S_RUNS.with(|n| n.get());
+    let before = runs();
+    deliver(&mut c, &third);
+    assert_eq!(runs(), before, "a third digest ran Layer S");
+    assert!(!c.engine(h0).pending.contains(&third.hash));
+}
+
+/// B229/B224 witness: past the lead, a body citing a parent certified
+/// neither here nor in the copy is dropped before Layer S (each, a fresh
+/// slot, cost every node the hash and the signature, uncharged); one whose
+/// copy carries a certificate for each such parent is authenticated, its
+/// failed certificate charged once, and its copies that tick are dropped
+/// before Layer S (dropped after it), evaluated again the next tick.
+#[test]
+fn a_body_past_the_lead_runs_layer_s_only_with_its_parents_certified() {
+    let mut c = Cluster::new("b224-lead", 4, 0);
+    c.run(3);
+    let byz = c.leader(4);
+    let h0 = c.validators().find(|&i| i != byz).unwrap();
+    let key = c.members[byz].node_key;
+    let mut template = c.engine(byz).own_proposal(2).unwrap().clone();
+    template.payload.clear();
+    template.round = lock(&c.engine(h0).ordering).next_anchor_round + ingress_v4::LEAD + 5;
+    let refs: Vec<ParentRef> = (0..3)
+        .map(|i| ParentRef {
+            round: template.round - 1,
+            author: c.members[i].info.address.clone(),
+            digest: format!("{:064x}", 0xb224_1000_u64 + i as u64),
+            proof: None,
+            cert: None,
+        })
+        .collect();
+    let bare = recite(&template, refs, &key);
+    // The same body, each ref carrying a certificate of another slot: the
+    // right shape, failing its check.
+    let junk = c
+        .engine(h0)
+        .certs
+        .values()
+        .next()
+        .expect("a certificate")
+        .compact();
+    let mut padded = bare.clone();
+    for r in &mut padded.parent_refs {
+        r.cert = Some(junk.clone());
+    }
+    let net = c.net(h0);
+    let deliver = |c: &mut Cluster, v: &Vertex| {
+        let len = serde_json::to_string(v).unwrap().len();
+        crate::work::failed_in(|| {
+            c.engines[h0]
+                .as_mut()
+                .unwrap()
+                .on_vertex(len, v.clone(), &net)
+        })
+        .1
+    };
+    let runs = || ingress_v4::LAYER_S_RUNS.with(|n| n.get());
+    let before = runs();
+    assert_eq!(deliver(&mut c, &bare), 0, "a bare body was charged");
+    assert_eq!(
+        runs(),
+        before,
+        "a body on parents certified nowhere ran Layer S"
+    );
+    assert_eq!(
+        deliver(&mut c, &padded),
+        1,
+        "a failed certificate was not charged once"
+    );
+    assert_eq!(
+        runs(),
+        before + 1,
+        "vacuous: the padded copy was not authenticated"
+    );
+    deliver(&mut c, &padded);
+    deliver(&mut c, &padded);
+    assert_eq!(runs(), before + 1, "a copy of a dropped body ran Layer S");
+    c.tick(h0);
+    deliver(&mut c, &padded);
+    assert_eq!(runs(), before + 2, "a later tick's copy was not evaluated");
+}
+
+/// B155 witness: a body that passed every check and could not be staged (a
+/// full slot's third, reachable once a restart forgot the slot's payload
+/// checks) is dropped before Layer S on its next copies: each one ran Layer
+/// S again, read the slot's other bodies and checked this node's guard (a
+/// pairing), uncounted.
+#[test]
+fn an_unstageable_body_costs_its_copies_nothing() {
+    let mut c = Cluster::new("b155-unstaged", 4, 0);
+    c.run(1);
+    let byz = c.leader(2);
+    let h0 = c.validators().find(|&i| i != byz).unwrap();
+    c.tick_all();
+    let a = c.engine(byz).own_proposal(2).unwrap().clone();
+    let b = twin_of(&a, &c.members[byz].node_key, "b155-b");
+    let third = twin_of(&a, &c.members[byz].node_key, "b155-c");
+    let net = c.net(h0);
+    let deliver = |c: &mut Cluster, v: &Vertex| {
+        let len = serde_json::to_string(v).unwrap().len();
+        c.engines[h0]
+            .as_mut()
+            .unwrap()
+            .on_vertex(len, v.clone(), &net);
+    };
+    deliver(&mut c, &a);
+    deliver(&mut c, &b);
+    assert!(
+        c.engine(h0).is_staged(&a.hash) && c.engine(h0).is_staged(&b.hash),
+        "vacuous: the slot is not full"
+    );
+    // A restart forgets which bodies' payloads were checked.
+    c.engines[h0].as_mut().unwrap().payload_slots.clear();
+    deliver(&mut c, &third);
+    assert!(
+        !c.engine(h0).is_staged(&third.hash),
+        "vacuous: it was staged"
+    );
+    let runs = || ingress_v4::LAYER_S_RUNS.with(|n| n.get());
+    let before = runs();
+    for _ in 0..3 {
+        deliver(&mut c, &third);
+    }
+    assert_eq!(runs(), before, "a copy of an unstageable body ran Layer S");
 }
 
 /// B125 witness: a member that lost its database starts its pull request
@@ -4364,5 +4885,626 @@ fn a_waiting_vertex_hands_over_the_certificates_it_carries() {
     assert!(
         c.engine(h0).certs.contains_key(&slot),
         "the certificate it carried was not ingested"
+    );
+}
+
+/// B191: a member's answers carry at most `RESP_BYTES_PER_TICK` of bodies a
+/// tick in all (each of its four requests could take a maximal answer), the
+/// outsiders' answers as much together, neither charges the other, and the
+/// next tick serves again.
+#[test]
+fn a_tick_of_answers_carries_one_answers_bytes() {
+    let mut c = Cluster::new("b191-bytes", 4, 0);
+    c.run(2);
+    let (me, server) = (0usize, 1usize);
+    let from = c.members[me].info.address.clone();
+    let to = c.members[server].info.address.clone();
+    let key = c.members[me].node_key;
+    // 15 bodies of 200 KiB: three fit one answer.
+    let mut digests = Vec::new();
+    for k in 0..15u64 {
+        let mut v = Vertex {
+            epoch: EPOCH,
+            round: 1,
+            author: c.members[2].info.address.clone(),
+            parents: vec![SENTINEL.into()],
+            parent_refs: vec![],
+            payload: vec!["x".repeat(200 * 1024)],
+            timestamp: NOW + k,
+            hash: String::new(),
+            signature: String::new(),
+            aggregated_signature: None,
+            payload_root: None,
+            parents_root: None,
+        };
+        v.hash = v.hash_v4_with_domain(CHAIN, GENESIS);
+        digests.push(v.hash.clone());
+        lock(&c.engine(server).dag).insert(v.hash.clone(), v);
+    }
+    let ask = |who: &str, key: &[u8; 32], seq: u64, k: usize| {
+        Msg::Req(pull::SignedRequest::sign(
+            CHAIN,
+            GENESIS,
+            key,
+            who,
+            &to,
+            seq,
+            pull::Request::Vertices(digests[3 * k..3 * k + 3].to_vec()),
+        ))
+    };
+    let sent = |c: &Cluster, who: &str| -> usize {
+        c.q.borrow()
+            .iter()
+            .filter_map(|e| match &e.msg {
+                Msg::Resp {
+                    to: t,
+                    resp: pull::Response::Vertices { bodies, .. },
+                } if t == who => Some(
+                    bodies
+                        .iter()
+                        .map(|v| serde_json::to_string(v).unwrap().len())
+                        .sum::<usize>(),
+                ),
+                _ => None,
+            })
+            .sum()
+    };
+    // Two outsiders first: their bucket is shared, and not the member's.
+    let outsiders = ["ee".repeat(32), "dd".repeat(32)];
+    for (i, o) in outsiders.iter().enumerate() {
+        c.receive(server, ask(o, &[7u8 + i as u8; 32], 1, i));
+    }
+    let theirs: usize = outsiders.iter().map(|o| sent(&c, o)).sum();
+    assert!(theirs > 0, "vacuous: no outsider was served");
+    assert!(
+        theirs <= pull::RESP_BYTES_PER_TICK,
+        "outsiders took {theirs} bytes in one tick"
+    );
+    for (seq, k) in (1..=pull::MEMBER_REQS_PER_TICK as u64).zip(1..) {
+        c.receive(server, ask(&from, &key, seq, k));
+    }
+    let mine = sent(&c, &from);
+    assert!(mine > 0, "the outsiders charged the member");
+    assert!(
+        mine <= pull::RESP_BYTES_PER_TICK,
+        "{mine} bytes to one member in one tick"
+    );
+    assert!(
+        pull::MEMBER_REQS_PER_TICK as usize * 3 * 200 * 1024 > pull::RESP_BYTES_PER_TICK,
+        "vacuous: everything asked fits one tick"
+    );
+    // The budget is a tick's, not the node's lifetime.
+    c.q.borrow_mut().clear();
+    c.tick(server);
+    c.q.borrow_mut().clear();
+    c.receive(server, ask(&from, &key, 100, 0));
+    assert!(sent(&c, &from) > 0, "the next tick served nothing");
+}
+
+/// B204 witness: a body refused past its author's signature for a field
+/// the author signed (here a parent outside the committee), and a body Layer
+/// E found early, cost their copies no Layer S (each ran the hash and the
+/// signature again, uncharged and unremembered): the refused one's copies are
+/// charged, and the early one is evaluated again once it is due.
+#[test]
+fn a_signed_refusal_and_an_early_body_cost_their_copies_nothing() {
+    let mut c = Cluster::new("b204-copies", 4, 0);
+    c.run(3);
+    let byz = c.leader(4);
+    let h0 = c.validators().find(|&i| i != byz).unwrap();
+    let key = c.members[byz].node_key;
+    let template = c.engine(byz).own_proposal(2).unwrap().clone();
+    let net = c.net(h0);
+    let runs = || ingress_v4::LAYER_S_RUNS.with(|n| n.get());
+    let deliver = |c: &mut Cluster, v: &Vertex| {
+        let len = serde_json::to_string(v).unwrap().len();
+        c.engines[h0]
+            .as_mut()
+            .unwrap()
+            .on_vertex(len, v.clone(), &net)
+    };
+    let addresses: Vec<String> = c.members.iter().map(|m| m.info.address.clone()).collect();
+    let refs = |round: u64, outsider: bool| -> Vec<ParentRef> {
+        (0..3)
+            .map(|i| ParentRef {
+                round,
+                author: if outsider && i == 0 {
+                    "ee".repeat(32)
+                } else {
+                    addresses[i].clone()
+                },
+                digest: format!("{:064x}", 0xb204_0000_u64 + round * 8 + i as u64),
+                proof: None,
+                cert: None,
+            })
+            .collect()
+    };
+    let mut t = template.clone();
+    t.round = 5;
+    let refused = recite(&t, refs(4, true), &key);
+    let before = runs();
+    let ((), failed) = crate::work::failed_in(|| deliver(&mut c, &refused));
+    assert_eq!((runs() - before, failed), (1, 1), "the first copy");
+    let ((), failed) = crate::work::failed_in(|| {
+        for _ in 0..3 {
+            deliver(&mut c, &refused);
+        }
+    });
+    assert_eq!(runs() - before, 1, "a copy of a signed refusal ran Layer S");
+    assert_eq!(failed, 3, "the copies of a signed refusal were not charged");
+
+    let mut e = template.clone();
+    e.round = 6;
+    e.timestamp = NOW + 10_000;
+    let early = recite(&e, refs(5, false), &key);
+    let before = runs();
+    for _ in 0..3 {
+        deliver(&mut c, &early);
+    }
+    assert_eq!(runs() - before, 1, "a copy of an early body ran Layer S");
+    c.clock.store(NOW + 10_000, AtomicOrdering::SeqCst);
+    deliver(&mut c, &early);
+    assert_eq!(runs() - before, 2, "a due body was not evaluated again");
+}
+
+/// B205 witness: a certificate of the active epoch bound to another
+/// committee is refused before it is verified (the committee was sorted and
+/// hashed again for it), and charged.
+#[test]
+fn a_certificate_of_another_committee_is_refused_unverified() {
+    let mut c = Cluster::new("b205-cert", 4, 0);
+    c.run(3);
+    let mut cert = c.engine(0).certs.values().next().unwrap().clone();
+    cert.body.round += 50;
+    cert.body.committee_hash = "ab".repeat(32);
+    let verifications = || crate::vcert::CERT_VERIFICATIONS.with(|n| n.get());
+    let before = verifications();
+    let ((), failed) = crate::work::failed_in(|| c.receive(1, Msg::Cert(cert)));
+    assert_eq!(
+        failed, 1,
+        "a certificate of another committee was not charged"
+    );
+    assert_eq!(verifications(), before, "it was verified");
+}
+
+/// B205 witness: a copy of a staged body is answered for the staged body's
+/// slot, whatever slot the copy names (it is matched by its digest alone, so
+/// each invented round or author cost a key derivation and a guard read).
+#[test]
+fn a_staged_copy_is_answered_for_its_own_slot() {
+    let mut c = Cluster::new("b205-resend", 4, 0);
+    c.run(3);
+    let author = 1usize;
+    let h0 = 2usize;
+    let staged = c.engine(author).own_proposal(2).unwrap().clone();
+    assert!(c.engine(h0).is_staged(&staged.hash), "vacuous: not staged");
+    let mut copy = staged.clone();
+    copy.round += 77;
+    c.q.borrow_mut().clear();
+    c.tick(h0);
+    c.q.borrow_mut().clear();
+    c.receive(h0, Msg::Vertex(copy));
+    let to = c.members[author].info.address.clone();
+    let sent =
+        c.q.borrow()
+            .iter()
+            .filter(|e| {
+                matches!(&e.msg, Msg::Attest(a)
+                if a.body.round == staged.round && a.body.digest == staged.hash)
+                    && matches!(&e.to, To::One(t) if *t == to)
+            })
+            .count();
+    assert_eq!(sent, 1, "the staged slot's attestation was not sent again");
+}
+
+/// B225 witness: an epoch's committee is parsed once per record (each
+/// message naming the epoch parsed it), and again when the record is
+/// written again; no record, no committee.
+#[test]
+fn a_committee_record_is_parsed_once() {
+    let db = TempDb::new("b225-committee");
+    let storage = StateDB::open(db.0.to_str().unwrap()).unwrap();
+    // An epoch no other test's record shares in this process.
+    let epoch = 1_000_003;
+    let start = |seeds: &[u8]| {
+        let committee: Vec<ValidatorInfo> = seeds.iter().map(|s| member(*s).info).collect();
+        epoch::EpochStart {
+            epoch,
+            first_round: 7,
+            sentinel: "s".into(),
+            committee: qc::canonical_order(&committee),
+            prev_closing_round: 5,
+            prev_anchor: "aa".repeat(32),
+            prev_block_hash: "bb".repeat(32),
+            prev_height: 9,
+            prev_timestamp: 11,
+        }
+    };
+    let parses = || epoch::COMMITTEE_PARSES.with(|n| n.get());
+    assert!(epoch::committee(&storage, epoch).is_none(), "no record");
+    let first = start(&[1, 2, 3]);
+    let key = epoch::epoch_start_key(epoch);
+    storage
+        .put(&key, &serde_json::to_string(&first).unwrap())
+        .unwrap();
+    let before = parses();
+    for _ in 0..3 {
+        let c = epoch::committee(&storage, epoch).expect("a committee");
+        assert_eq!(c.set, first.committee);
+        assert_eq!(c.hash, qc::validator_set_hash(&first.committee));
+    }
+    assert_eq!(parses() - before, 1, "a record was parsed again");
+    let second = start(&[4, 5, 6, 7]);
+    storage
+        .put(&key, &serde_json::to_string(&second).unwrap())
+        .unwrap();
+    assert_eq!(
+        epoch::committee_of(&storage, epoch),
+        Some(second.committee.clone()),
+        "a record written again was not read again"
+    );
+    assert_eq!(parses() - before, 2);
+    storage.delete(&key).unwrap();
+    assert!(
+        epoch::committee(&storage, epoch).is_none(),
+        "a deleted record"
+    );
+}
+
+/// B224 witness: a pull request in a member's name whose signature fails is
+/// charged (a member signs its own requests, and no one relays them); the
+/// member's own is answered, uncharged.
+#[test]
+fn a_request_in_a_members_name_that_fails_its_signature_is_charged() {
+    let mut c = Cluster::new("b224-pull", 4, 0);
+    c.run(2);
+    let from = c.members[0].info.address.clone();
+    let to = c.members[1].info.address.clone();
+    let ask = |key: &[u8; 32], seq: u64| {
+        Msg::Req(pull::SignedRequest::sign(
+            CHAIN,
+            GENESIS,
+            key,
+            &from,
+            &to,
+            seq,
+            pull::Request::Certs {
+                epoch: 0,
+                slots: vec![(1, to.clone())],
+            },
+        ))
+    };
+    let forged = ask(&[0xee; 32], 1);
+    let failed = crate::work::failed_in(|| c.receive(1, forged)).1;
+    assert_eq!(failed, 1, "a request failing its signature was not charged");
+    let own = ask(&c.members[0].node_key, 2);
+    let failed = crate::work::failed_in(|| c.receive(1, own)).1;
+    assert_eq!(failed, 0, "the member's own request was charged");
+    assert!(
+        c.q.borrow()
+            .iter()
+            .any(|e| matches!(&e.msg, Msg::Resp { to: t, .. } if *t == from)),
+        "vacuous: the member's own request was not answered"
+    );
+}
+
+/// B229/B230 witness: a certificate that fails is charged once whatever
+/// failed: one of E below the quorum (refused after a sort of the committee,
+/// uncharged), one of E+1 bound to another committee (refused before C_{E+1}
+/// is sorted and hashed, and charged: each replay cost both and the hash),
+/// and one of E+1 whose signature fails (charged once, not twice).
+#[test]
+fn a_failing_certificate_is_charged_once_in_either_epoch() {
+    let mut c = Cluster::new("b230-certs", 4, 0);
+    c.run_until(40, |c| c.decisions[0].len() >= 2);
+    let net = c.net(0);
+    let real = c
+        .engine(0)
+        .certs
+        .values()
+        .max_by_key(|k| k.body.round)
+        .expect("a certificate")
+        .clone();
+    let charged = |c: &mut Cluster, cert: VertexCertificate| {
+        crate::work::failed_in(|| c.engines[0].as_mut().unwrap().on_cert(cert, &net)).1
+    };
+    let mut thin = real.clone();
+    thin.body.round += 1;
+    thin.signer_bitmap = vec![0; thin.signer_bitmap.len()];
+    thin.signer_bitmap[0] = 1;
+    assert_eq!(
+        charged(&mut c, thin),
+        1,
+        "a certificate below the quorum was not charged"
+    );
+    let (closing_round, anchor, _, _) = c.decisions[0].last().cloned().unwrap();
+    let committee = c.committee.clone();
+    c.engines[0]
+        .as_mut()
+        .unwrap()
+        .close_epoch(closing_round, &anchor, &"ab".repeat(32), &committee)
+        .unwrap();
+    let next = c.engine(0).next.clone().expect("E+1 scheduled");
+    let mut early = real.clone();
+    early.body.epoch = next.epoch;
+    early.body.committee_hash = "ff".repeat(32);
+    let checks = || crate::vcert::CERT_VERIFICATIONS.with(|n| n.get());
+    let before = checks();
+    assert_eq!(
+        charged(&mut c, early.clone()),
+        1,
+        "another committee's E+1 certificate was not charged"
+    );
+    assert_eq!(
+        checks(),
+        before,
+        "another committee's E+1 certificate was verified"
+    );
+    early.body.committee_hash = qc::validator_set_hash(&next.committee);
+    assert_eq!(
+        charged(&mut c, early),
+        1,
+        "a failed E+1 certificate was not charged once"
+    );
+    assert_eq!(
+        checks(),
+        before + 1,
+        "vacuous: the E+1 certificate was not verified"
+    );
+    assert!(
+        c.engine(0).early_certs.is_empty(),
+        "a failed certificate was kept"
+    );
+}
+
+/// B248 witness: a pull answer brings a certificate only for a slot this
+/// node asked of its sender, and only of the epoch asked: a member's
+/// unsolicited answers, or the asked member's certificates of another epoch
+/// (which `on_cert` drops for free), used up the slot's answer turns, the
+/// asked member's honest answer that followed was dropped, and a node that
+/// missed rounds never got their certificates.
+#[test]
+fn an_unsolicited_answer_takes_no_turn_of_an_asked_member() {
+    let mut c = Cluster::new("b248-turns", 4, 0);
+    c.run(3);
+    let me = 0usize;
+    let author = c.members[2].info.address.clone();
+    let slot = (1u64, author.clone());
+    let real = c
+        .engine(me)
+        .certs
+        .get(&slot)
+        .expect("a certificate of round 1")
+        .clone();
+    c.engines[me].as_mut().unwrap().certs.remove(&slot);
+    c.q.borrow_mut().clear();
+    c.engines[me].as_mut().unwrap().want_cert(slot.0, &slot.1);
+    c.tick(me);
+    let me_addr = c.members[me].info.address.clone();
+    let asked = c
+        .q
+        .borrow()
+        .iter()
+        .find_map(|e| match (&e.msg, &e.to) {
+            (Msg::Req(r), To::One(to)) if e.from == me_addr && matches!(&r.req, pull::Request::Certs { slots, .. } if slots.contains(&slot)) => {
+                Some(to.clone())
+            }
+            _ => None,
+        })
+        .expect("vacuous: the certificate was not asked for");
+    let other = c
+        .members
+        .iter()
+        .map(|m| m.info.address.clone())
+        .find(|a| *a != asked && *a != me_addr)
+        .unwrap();
+    let answer = |certs: Vec<VertexCertificate>| Msg::Resp {
+        to: me_addr.clone(),
+        resp: pull::Response::Certs {
+            certs,
+            unknown: vec![],
+        },
+    };
+    // Another member's junk of this epoch (a certificate of another digest).
+    let mut forged = real.clone();
+    forged.body.digest = "ab".repeat(32);
+    c.receive_from(me, Some(&other), answer(vec![forged; 4]));
+    // The asked member's certificates of another epoch.
+    let mut later = real.clone();
+    later.body.epoch += 5;
+    c.receive_from(me, Some(&asked), answer(vec![later; 4]));
+    // Then the asked member's honest answer.
+    c.deliver(&|_, _| false);
+    assert_eq!(
+        c.engine(me).certs.get(&slot).map(|k| k.body.digest.clone()),
+        Some(real.body.digest.clone()),
+        "the asked member's answer was dropped"
+    );
+}
+
+/// B250 witness: a wanted slot keeps the answer turns of its last
+/// `MAX_ASKED_PER_SLOT` members asked only (kept per member asked, the map
+/// grew to every member asked for every slot of a stuck node's gap): the
+/// first member asked, after more than that many others, has no turn left,
+/// and the last one asked still has.
+#[test]
+fn a_slot_keeps_the_turns_of_its_last_members_asked() {
+    let mut c = Cluster::new("b250-turns", 7, 0);
+    c.run(3);
+    let me = 0usize;
+    let author = c.members[2].info.address.clone();
+    let slot = (1u64, author.clone());
+    let real = c
+        .engine(me)
+        .certs
+        .get(&slot)
+        .expect("a certificate of round 1")
+        .clone();
+    c.engines[me].as_mut().unwrap().certs.remove(&slot);
+    c.q.borrow_mut().clear();
+    c.engines[me].as_mut().unwrap().want_cert(slot.0, &slot.1);
+    let me_addr = c.members[me].info.address.clone();
+    let mut asked: Vec<String> = Vec::new();
+    for _ in 0..100 {
+        c.tick(me);
+        for e in c.q.borrow().iter() {
+            if let (Msg::Req(r), To::One(to)) = (&e.msg, &e.to) {
+                if e.from == me_addr
+                    && matches!(&r.req, pull::Request::Certs { slots, .. } if slots.contains(&slot))
+                {
+                    asked.push(to.clone());
+                }
+            }
+        }
+        c.q.borrow_mut().clear();
+        if asked.len() > pull::MAX_ASKED_PER_SLOT {
+            break;
+        }
+    }
+    assert!(
+        asked.len() > pull::MAX_ASKED_PER_SLOT && asked[0] != *asked.last().unwrap(),
+        "vacuous: the slot was asked of {asked:?}"
+    );
+    assert!(c.engine(me).cert_answers[&slot].len() <= pull::MAX_ASKED_PER_SLOT);
+    let answer = |certs: Vec<VertexCertificate>| Msg::Resp {
+        to: me_addr.clone(),
+        resp: pull::Response::Certs {
+            certs,
+            unknown: vec![],
+        },
+    };
+    c.receive_from(me, Some(&asked[0]), answer(vec![real.clone()]));
+    assert!(
+        !c.engine(me).certs.contains_key(&slot),
+        "the answer of a member asked before the last ones took a turn"
+    );
+    c.receive_from(
+        me,
+        asked.last().map(String::as_str),
+        answer(vec![real.clone()]),
+    );
+    assert_eq!(
+        c.engine(me).certs.get(&slot).map(|k| k.body.digest.clone()),
+        Some(real.body.digest.clone()),
+        "the last member asked had no turn"
+    );
+}
+
+/// B262 witness: a member proposes nothing while it runs more than
+/// `MAX_KEPT_ROUNDS` rounds above the floor kept for its lowest block
+/// without a QC (below g), however few blocks lack one, and it sends its
+/// newest vertex again every few ticks while it waits. Bounded in blocks
+/// alone, what was kept grew without bound when anchors were rare; and a
+/// member coming back learned how far the DAG got one round at a time.
+#[test]
+fn rounds_kept_for_a_block_without_a_qc_are_bounded() {
+    let mut c = Cluster::new("b262-rounds", 4, 0);
+    c.run_until(3000, |c| {
+        c.engine(0).current_round() > MAX_KEPT_ROUNDS + 8 && c.engine(0).floor() > 2
+    });
+    assert!(
+        c.engine(0).current_round() > MAX_KEPT_ROUNDS + 8,
+        "vacuous: round {}",
+        c.engine(0).current_round()
+    );
+    // One block without a QC, its decision's floor at round 1 (below g).
+    let ctx = crate::qc_producer::CommitContext {
+        chain_id: crate::qc::expected_chain_id(),
+        epoch: 0,
+        finalized_round: 3,
+        anchor_round: 3,
+        anchor_hash: "aa".repeat(32),
+        block_height: 5,
+        block_hash: "bb".repeat(32),
+        state_root: "cc".repeat(32),
+        receipts_root: "dd".repeat(32),
+        finality_digest: "ee".repeat(32),
+        next_validator_set_hash: String::new(),
+        decision_floor: Some(1),
+    };
+    let row = format!("consensus:qc_pending:{:020}", 5);
+    c.engine(0)
+        .storage
+        .put(&row, &serde_json::to_string(&ctx).unwrap())
+        .unwrap();
+    // The others certify what node 0 proposed before; node 0 proposes on no
+    // further round.
+    let me = c.members[0].info.address.clone();
+    let newest = |c: &Cluster| *c.engine(0).own.keys().next_back().unwrap();
+    let first = newest(&c);
+    c.run(6);
+    assert_eq!(newest(&c), first, "a member proposed past the kept rounds");
+    assert_eq!(c.engine(0).finality_floor(), 1);
+    // Waiting, it sends its newest vertex again.
+    c.q.borrow_mut().clear();
+    let mut resent = 0;
+    for _ in 0..2 * FINALITY_REBROADCAST_TICKS {
+        c.tick(0);
+        resent +=
+            c.q.borrow()
+                .iter()
+                .filter(|e| e.from == me && matches!(&e.msg, Msg::Vertex(v) if v.round == first))
+                .count();
+        c.q.borrow_mut().clear();
+    }
+    assert!(resent > 0, "its newest vertex was not sent again");
+    // The QC arrives (the work leaves): it proposes again.
+    c.engine(0).storage.delete(&row).unwrap();
+    c.run(6);
+    assert!(newest(&c) > first, "it never proposed again");
+}
+
+/// B273 witness: a block's pending work written as its anchor raises g is
+/// read before GC cuts, by the first message after it: the floor was read
+/// only at a tick, so that message cut at g - RETAIN_SLACK and deleted the
+/// rounds the block's decision walked (above its floor), everywhere.
+#[test]
+fn the_floor_of_new_pending_work_is_read_before_the_next_cut() {
+    let mut c = Cluster::new("b273-floor", 4, 0);
+    c.run_until(3000, |c| c.engine(0).floor() > 80);
+    let g0 = c.engine(0).floor();
+    assert!(g0 > 80, "vacuous: floor {g0}");
+    let kept = g0 - staging::RETAIN_SLACK + 1;
+    assert!(
+        c.engine(0).certs.keys().any(|(r, _)| *r == kept),
+        "vacuous: nothing held at round {kept}"
+    );
+    // A block decided at floor g0 has no QC yet: its row is written, and no
+    // tick of node 0 reads it.
+    let ctx = crate::qc_producer::CommitContext {
+        chain_id: crate::qc::expected_chain_id(),
+        epoch: 0,
+        finalized_round: g0,
+        anchor_round: g0 + crate::ordering::GC_DEPTH,
+        anchor_hash: "aa".repeat(32),
+        block_height: 5,
+        block_hash: "bb".repeat(32),
+        state_root: "cc".repeat(32),
+        receipts_root: "dd".repeat(32),
+        finality_digest: "ee".repeat(32),
+        next_validator_set_hash: String::new(),
+        decision_floor: Some(g0),
+    };
+    c.engine(0)
+        .storage
+        .put(
+            &format!("consensus:qc_pending:{:020}", 5),
+            &serde_json::to_string(&ctx).unwrap(),
+        )
+        .unwrap();
+    // The others go on; node 0 only hears them, and g rises.
+    for _ in 0..200 {
+        if c.engine(0).floor() > g0 + 2 {
+            break;
+        }
+        for i in 1..4 {
+            c.tick(i);
+        }
+        c.deliver(&|_, _| false);
+    }
+    assert!(c.engine(0).floor() > g0 + 2, "vacuous: g did not rise");
+    assert!(
+        c.engine(0).certs.keys().any(|(r, _)| *r == kept),
+        "round {kept}, above the pending block's floor less RETAIN_SLACK, was deleted"
     );
 }

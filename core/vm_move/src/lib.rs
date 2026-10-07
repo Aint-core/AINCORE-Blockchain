@@ -237,6 +237,19 @@ impl AINCOREVM {
                 max_function_definitions: Some(1000),
                 ..move_bytecode_verifier::VerifierConfig::default()
             },
+            // B211: a type check at every instruction, as Aptos runs in
+            // production: the interpreter trusted the verifier alone, and a
+            // type confusion it let through would panic outside move's
+            // catch_unwind (the interpreter is not the verifier's state), so
+            // every node re-executing the block would abort (B92).
+            paranoid_type_checks: true,
+            // B212: the 128-node bound on a call's type arguments before
+            // they are instantiated (Aptos production; the loader built the
+            // tree before gas was metered).
+            type_size_limit: true,
+            // B214: the bytecode version every stdlib module is (6), not
+            // whatever a future move's VERSION_MAX becomes.
+            max_binary_format_version: move_binary_format::file_format_common::VERSION_6,
             ..move_vm_runtime::config::VMConfig::default()
         }
     }

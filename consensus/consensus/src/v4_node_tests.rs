@@ -683,6 +683,211 @@ fn the_boundary_qc_is_asked_on_its_own_throttle() {
     assert!(asked(8), "the boundary QC waited behind the pending height");
 }
 
+/// Stages QC work for `height` at `round` and `hash` (epoch 0), as block
+/// acceptance does: what a peer's vote for that height is bound to (B164).
+fn pend(c: &Cluster, height: u64, round: u64, hash: &str) {
+    let work = crate::qc_producer::CommitContext {
+        chain_id: crate::qc::expected_chain_id(),
+        epoch: 0,
+        finalized_round: round + 2,
+        anchor_round: round,
+        anchor_hash: "aa".repeat(32),
+        block_height: height,
+        block_hash: hash.to_string(),
+        state_root: "bb".repeat(32),
+        receipts_root: "cc".repeat(32),
+        finality_digest: "dd".repeat(32),
+        next_validator_set_hash: String::new(),
+        decision_floor: None,
+    };
+    c.node(0)
+        .storage
+        .put(
+            &format!("consensus:qc_pending:{height:020}"),
+            &serde_json::to_string(&work).unwrap(),
+        )
+        .unwrap();
+}
+
+/// B164 witness: a peer's vote is bound to this node's pending QC work at
+/// its height (round, epoch, block hash) by a point read of that work: no
+/// block is read, so here the block is not even held. Junk votes for fresh
+/// rounds read a whole block each.
+#[test]
+fn a_vote_is_bound_by_the_pending_work_not_the_block() {
+    let mut c = Cluster::new("votes-pending", &[111, 112, 113, 114], true);
+    c.run(6);
+    let height = c.node(0).latest_block_height + 1;
+    let (round, hash) = (10_001, "ef".repeat(32));
+    assert!(
+        c.node(0)
+            .storage
+            .get(&format!("block_{height}"))
+            .unwrap()
+            .is_none(),
+        "vacuous: the block is held"
+    );
+    pend(&c, height, round, &hash);
+    let signer = validator_info(112).address;
+    let set_hash = crate::qc::validator_set_hash(&c.committee);
+    let vote = |round: u64| {
+        let vote = crate::qc::FinalityVote {
+            chain_id: crate::qc::expected_chain_id(),
+            epoch: 0,
+            finalized_round: round + 2,
+            anchor_round: round,
+            anchor_hash: "aa".repeat(32),
+            block_height: height,
+            block_hash: hash.clone(),
+            state_root: "bb".repeat(32),
+            receipts_root: "cc".repeat(32),
+            finality_digest: "dd".repeat(32),
+            validator_set_hash: set_hash.clone(),
+            next_validator_set_hash: String::new(),
+        };
+        let signature = BLSEngine::consensus().sign_raw(
+            &vote.to_signing_bytes(),
+            &derive_validator_bls_seed(&[112; 32]),
+        );
+        let message = crate::qc_producer::QcVoteMessage {
+            vote,
+            signer_address: signer.clone(),
+            signature: hex::encode(signature),
+        };
+        format!("QC_VOTE:{}", serde_json::to_string(&message).unwrap())
+    };
+    let row = |round: u64| format!("consensus:qc_vote_agg:{round}:{signer}");
+    c.node_mut(0).handle_message(&vote(round + 2));
+    assert!(
+        c.node(0).storage.get(&row(round + 2)).unwrap().is_none(),
+        "a vote for another round than the pending work's was kept"
+    );
+    c.node_mut(0).handle_message(&vote(round));
+    assert!(
+        c.node(0).storage.get(&row(round)).unwrap().is_some(),
+        "a vote bound by the pending work was not kept"
+    );
+}
+
+/// B205 witness: a vote for the pending work's height and round but another
+/// block, or another chain, is refused before the committee record is
+/// parsed, and charged: each cost two parses of the record, two sorts and a
+/// hash, free.
+#[test]
+fn a_vote_for_another_block_costs_no_committee_parse() {
+    let mut c = Cluster::new("b205-votes", &[111, 112, 113, 114], true);
+    c.run(6);
+    let height = c.node(0).latest_block_height + 1;
+    let (round, hash) = (10_003, "ef".repeat(32));
+    pend(&c, height, round, &hash);
+    let signer = validator_info(112).address;
+    let set_hash = crate::qc::validator_set_hash(&c.committee);
+    let vote = |block_hash: &str, chain_id: String| {
+        let vote = crate::qc::FinalityVote {
+            chain_id,
+            epoch: 0,
+            finalized_round: round + 2,
+            anchor_round: round,
+            anchor_hash: "aa".repeat(32),
+            block_height: height,
+            block_hash: block_hash.to_string(),
+            state_root: "bb".repeat(32),
+            receipts_root: "cc".repeat(32),
+            finality_digest: "dd".repeat(32),
+            validator_set_hash: set_hash.clone(),
+            next_validator_set_hash: String::new(),
+        };
+        let signature = BLSEngine::consensus().sign_raw(
+            &vote.to_signing_bytes(),
+            &derive_validator_bls_seed(&[112; 32]),
+        );
+        let message = crate::qc_producer::QcVoteMessage {
+            vote,
+            signer_address: signer.clone(),
+            signature: hex::encode(signature),
+        };
+        format!("QC_VOTE:{}", serde_json::to_string(&message).unwrap())
+    };
+    let chain = crate::qc::expected_chain_id();
+    let reads = || crate::dag::VOTE_BLOCK_READS.with(|n| n.get());
+    let before = reads();
+    for wire in [
+        vote(&"ab".repeat(32), chain.clone()),
+        vote(&hash, format!("{chain}-OTHER")),
+    ] {
+        let failed = crate::work::failed_in(|| c.node_mut(0).handle_message(&wire)).1;
+        assert_eq!(
+            failed, 1,
+            "a vote for another block or chain was not charged"
+        );
+    }
+    assert_eq!(
+        reads(),
+        before,
+        "a vote for another block reached the committee"
+    );
+    c.node_mut(0).handle_message(&vote(&hash, chain));
+    assert_eq!(
+        reads(),
+        before + 1,
+        "vacuous: the bound vote did not reach it"
+    );
+}
+
+/// B225 witness: a vote for the pending work under a name outside the
+/// committee is charged (each named a fresh signer to pass the point
+/// reads, then parsed the committee record, uncharged); a member's is not.
+#[test]
+fn a_vote_from_outside_the_committee_is_charged() {
+    let mut c = Cluster::new("b225-votes", &[111, 112, 113, 114], true);
+    c.run(6);
+    let height = c.node(0).latest_block_height + 1;
+    let (round, hash) = (10_005, "ef".repeat(32));
+    pend(&c, height, round, &hash);
+    let set_hash = crate::qc::validator_set_hash(&c.committee);
+    let vote = |seed: u8| {
+        let vote = crate::qc::FinalityVote {
+            chain_id: crate::qc::expected_chain_id(),
+            epoch: 0,
+            finalized_round: round + 2,
+            anchor_round: round,
+            anchor_hash: "aa".repeat(32),
+            block_height: height,
+            block_hash: hash.clone(),
+            state_root: "bb".repeat(32),
+            receipts_root: "cc".repeat(32),
+            finality_digest: "dd".repeat(32),
+            validator_set_hash: set_hash.clone(),
+            next_validator_set_hash: String::new(),
+        };
+        let signature = BLSEngine::consensus().sign_raw(
+            &vote.to_signing_bytes(),
+            &derive_validator_bls_seed(&[seed; 32]),
+        );
+        let message = crate::qc_producer::QcVoteMessage {
+            vote,
+            signer_address: validator_info(seed).address,
+            signature: hex::encode(signature),
+        };
+        format!("QC_VOTE:{}", serde_json::to_string(&message).unwrap())
+    };
+    for seed in [200, 201] {
+        let failed = crate::work::failed_in(|| c.node_mut(0).handle_message(&vote(seed))).1;
+        assert_eq!(failed, 1, "an outsider's vote ({seed}) was not charged");
+    }
+    let failed = crate::work::failed_in(|| c.node_mut(0).handle_message(&vote(112))).1;
+    assert_eq!(failed, 0, "a member's vote was charged");
+    let signer = validator_info(112).address;
+    assert!(
+        c.node(0)
+            .storage
+            .get(&format!("consensus:qc_vote_agg:{round}:{signer}"))
+            .unwrap()
+            .is_some(),
+        "vacuous: the member's vote was not kept"
+    );
+}
+
 /// B52 witness: a member's finality vote is kept only for a block this node
 /// holds, at that block's round. Votes for a block not held (any round) and
 /// for a held block at another round write nothing; the control (the held
@@ -735,12 +940,13 @@ fn a_vote_counts_only_for_a_held_block_at_its_round() {
     c.node_mut(0).handle_message(&vote(height, far + 1, &hash));
     assert_eq!(rows(&c), before, "a vote off a held block was written");
     // B101: a round that has its QC takes no more votes, so the control
-    // round is one without a QC yet.
+    // round is one without a QC yet; B164: its QC work pending again.
     c.node(0).storage.delete(&row(round)).unwrap();
     c.node(0)
         .storage
         .delete(&format!("consensus:qc_by_round:{round}"))
         .unwrap();
+    pend(&c, height, round, &hash);
     c.node_mut(0).handle_message(&vote(height, round, &hash));
     assert!(
         c.node(0).storage.get(&row(round)).unwrap().is_some(),
@@ -2606,4 +2812,116 @@ fn pruning_a_block_takes_its_finality_rows() {
         .get(&format!("consensus:qc_by_round:{kept_round}"))
         .unwrap()
         .is_some());
+}
+
+/// B255 witness: with one member never voting for finality, an honest member
+/// cut off for longer than the GC window rebuilds the blocks it missed from
+/// the rounds kept for them, votes, and every one of them gets its QC. GC
+/// deleted those rounds: every QC needed that member's vote, the member
+/// could not rebuild a block, and no QC formed again (the next epoch never
+/// activating).
+#[test]
+fn a_member_cut_off_past_the_gc_window_rebuilds_and_votes() {
+    let mut c = Cluster::new("b255-finality", &[81, 82, 83, 84], true);
+    c.run_until(80, |c| (0..4).all(|i| c.node(i).latest_block_height >= 3));
+    let start = c.node(1).latest_block_height;
+    // Node 3 never votes and shares no certificate (it assembles them from
+    // the others' votes: answering their QC_WANT with one, it formed every
+    // QC for them); node 0 is cut off: it does not tick, and every message
+    // to or from it is lost.
+    let withheld = |from: usize, wire: &str| {
+        from == 3 && (wire.starts_with("QC_VOTE:") || wire.starts_with(crate::dag::QC_CERT_PREFIX))
+    };
+    for _ in 0..300 {
+        for i in 1..4 {
+            c.node_mut(i).try_create_vertex();
+        }
+        c.deliver_filtered(&|from, to, wire| from == 0 || to == 0 || withheld(from, wire));
+    }
+    let tip = c.node(1).latest_block_height;
+    assert!(
+        tip > start + 10,
+        "vacuous: few blocks while node 0 was away ({start} to {tip})"
+    );
+    assert!(
+        c.qc(1, tip).is_none(),
+        "vacuous: a QC formed without node 0's vote"
+    );
+    // What is kept for node 0 is bounded: the members stop proposing.
+    assert!(
+        tip <= start + crate::v4::MAX_UNFINALIZED_BLOCKS + 4,
+        "blocks went on past the bound without QCs: {start} to {tip}"
+    );
+    // Node 0 comes back; node 3 still never votes.
+    let done = |c: &Cluster| {
+        c.node(0).latest_block_height >= tip && (start + 1..=tip).all(|h| c.qc(1, h).is_some())
+    };
+    for _ in 0..800 {
+        if done(&c) {
+            break;
+        }
+        for i in 0..4 {
+            c.node_mut(i).try_create_vertex();
+        }
+        c.deliver_filtered(&|from, _, wire| withheld(from, wire));
+    }
+    assert!(
+        c.node(0).latest_block_height >= tip,
+        "node 0 never rebuilt the blocks it missed: height {}, tip {tip}",
+        c.node(0).latest_block_height
+    );
+    let missing: Vec<u64> = (start + 1..=tip)
+        .filter(|h| c.qc(1, *h).is_none())
+        .collect();
+    assert!(missing.is_empty(), "blocks without a QC: {missing:?}");
+}
+
+/// B262 witness: a block's pending QC work records the floor its decision
+/// walked down to (the floor before its anchor), and a member keeps the
+/// rounds above that floor for it: the block's own anchor less GC_DEPTH was
+/// kept, too high after skipped anchors for a member rebuilding the block.
+#[test]
+fn a_blocks_pending_work_keeps_the_floor_its_decision_walked_to() {
+    let mut c = Cluster::new("b262-floor", &[91, 92, 93, 94], true);
+    c.run_until(200, |c| {
+        c.node(1).latest_block_height >= 4
+            && c.block(1, c.node(1).latest_block_height)
+                .is_some_and(|(round, _)| round > crate::ordering::GC_DEPTH + 4)
+    });
+    // From here no finality vote or QC arrives: the blocks' QC work stays.
+    let finality = |_: usize, _: usize, wire: &str| {
+        wire.starts_with("QC_VOTE:") || wire.starts_with(crate::dag::QC_CERT_PREFIX)
+    };
+    let before = c.node(1).latest_block_height;
+    for _ in 0..60 {
+        if c.node(1).latest_block_height >= before + 3 {
+            break;
+        }
+        for i in 0..4 {
+            c.node_mut(i).try_create_vertex();
+        }
+        c.deliver_filtered(&finality);
+    }
+    let db = &c.node(1).storage;
+    let low =
+        crate::qc_producer::lowest_pending_qc_height(db).expect("vacuous: no pending QC work");
+    let ctx = crate::qc_producer::pending_context(db, low).unwrap();
+    let previous_anchor = c.block(1, low - 1).map(|(round, _)| round).unwrap();
+    let floor = ctx
+        .decision_floor
+        .expect("the decision's floor is recorded");
+    assert_eq!(
+        floor,
+        previous_anchor.saturating_sub(crate::ordering::GC_DEPTH)
+    );
+    assert!(
+        floor < ctx.anchor_round.saturating_sub(crate::ordering::GC_DEPTH),
+        "vacuous: the floors coincide"
+    );
+    c.node_mut(1).try_create_vertex();
+    assert_eq!(
+        c.node(1).v4.as_ref().unwrap().finality_floor(),
+        floor,
+        "the kept floor is not the decision's"
+    );
 }

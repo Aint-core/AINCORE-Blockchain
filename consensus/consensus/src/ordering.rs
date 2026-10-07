@@ -137,6 +137,10 @@ pub struct CommitInfo {
     pub anchor_round: u64,
     pub anchor_hash: String,
     pub finality_digest: String,
+    /// B262: the GC floor the decision walked down to, its floor before this
+    /// anchor: a member rebuilding the block needs every round above it
+    /// (after skipped anchors it is far below this anchor less GC_DEPTH).
+    pub decision_floor: u64,
 }
 
 /// A decision without side effects. The caller must hold the engine lock from
@@ -1116,8 +1120,12 @@ impl OrderingEngine {
         let digest = Self::fold_finality_digest(&self.finality_digest, &sequence);
         PreparedAnchor {
             info: CommitInfo {
-                sequence, leader, anchor_round,
-                anchor_hash: anchor_vertex_hash.to_string(), finality_digest: digest,
+                sequence,
+                leader,
+                anchor_round,
+                anchor_hash: anchor_vertex_hash.to_string(),
+                finality_digest: digest,
+                decision_floor: self.gc_floor,
             },
             previous_finalized_round: self.finalized_round,
             previous_next_anchor_round: self.next_anchor_round,

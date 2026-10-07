@@ -162,7 +162,7 @@ fn verdict_with(
         chain_id: CHAIN,
         genesis_identity: GENESIS,
         active: record(1),
-        previous: Some(record(0)),
+        gap_wanted_to: 0,
         next: Some(record(2)),
         now_secs: NOW,
         gc_floor: 0,
@@ -199,7 +199,8 @@ fn a_tampered_epoch_is_invalid() {
     v.epoch -= 2;
     // The hash binds the epoch: another epoch is not the signed vertex.
     assert!(invalid(verdict(&v_next, &c)), "{:?}", verdict(&v_next, &c));
-    assert!(invalid(verdict(&v, &c)));
+    // B171: the closed epoch's copy is dropped before Layer S.
+    assert_eq!(verdict(&v, &c), Verdict::Stale);
 }
 
 #[test]
@@ -209,7 +210,9 @@ fn a_certificate_of_another_epoch_leaves_the_vertex_pending() {
     let (mut v, parents) = second_round(&all, 3, &[0, 1, 2]);
     // Genuine signatures, for the same slot in the previous epoch.
     v.parent_refs[1].cert = Some(certify(&all, &parents[1], EPOCH - 1, &[0, 1, 2]));
-    assert_eq!(verdict(&v, &c), Verdict::PendingCert(vec![1]));
+    // B226: past a failed embedded certificate, the copy's others are not
+    // checked (ref 2 waits too, for its own certificate).
+    assert_eq!(verdict(&v, &c), Verdict::PendingCert(vec![1, 2]));
 }
 
 #[test]
@@ -438,11 +441,21 @@ fn layer_s_refuses_what_every_node_refuses() {
     assert!(invalid(verdict(&ok, &zero)), "no stake");
     let v = vertex(&all[0], EPOCH, FIRST - 1, vec![sentinel(EPOCH)], vec![]);
     assert!(refused(&v), "below the first round");
-    let (parents, refs) = claims(ABSOLUTE_ROUND_CEILING, 3);
-    let v = vertex(&all[0], EPOCH, ABSOLUTE_ROUND_CEILING + 1, parents, refs);
+    // Payload-free: B158's lead filter drops a payload that far ahead
+    // before Layer S, whatever it is.
+    let past_the_lead = |round: u64| {
+        let (parents, refs) = claims(round - 1, 3);
+        let mut v = vertex(&all[0], EPOCH, round, parents, refs);
+        v.payload.clear();
+        seal(&mut v, &all[0]);
+        v
+    };
+    // B249: over the ceiling is refused in every context, before the lead
+    // filters (B229's drop of a body past the lead with uncertified parents
+    // made it a context's `Drop`).
+    let v = past_the_lead(ABSOLUTE_ROUND_CEILING + 1);
     assert!(refused(&v), "over the ceiling: {:?}", verdict(&v, &c));
-    let (parents, refs) = claims(ABSOLUTE_ROUND_CEILING - 1, 3);
-    let v = vertex(&all[0], EPOCH, ABSOLUTE_ROUND_CEILING, parents, refs);
+    let v = past_the_lead(ABSOLUTE_ROUND_CEILING);
     assert!(!refused(&v), "at the ceiling: {:?}", verdict(&v, &c));
     let sentinel = sentinel(EPOCH);
     let ctx = Context {
@@ -455,7 +468,7 @@ fn layer_s_refuses_what_every_node_refuses() {
             sentinel: &sentinel,
             committee: &c,
         },
-        previous: None,
+        gap_wanted_to: 0,
         next: None,
         now_secs: NOW,
         gc_floor: 0,
@@ -492,7 +505,7 @@ fn the_payload_is_checked_after_the_cheap_filters() {
             sentinel: &sentinel,
             committee: &c,
         },
-        previous: None,
+        gap_wanted_to: 0,
         next: None,
         now_secs: now,
         gc_floor: floor,
@@ -553,6 +566,182 @@ fn the_payload_is_checked_after_the_cheap_filters() {
     );
 }
 
+/// B136 witness: what the node remembers of the payload is read before E4,
+/// so a copy of a body refused before (or a full slot's third) verifies none
+/// of the certificates it carries: each copy paid a pairing per carried
+/// certificate the node did not hold.
+#[test]
+fn the_payload_memo_is_read_before_any_certificate_is_checked() {
+    let all = members();
+    let c = committee(&all);
+    let sentinel = sentinel(EPOCH);
+    let (v, _) = second_round(&all, 3, &[0, 1, 2]);
+    let ctx = Context {
+        chain_id: CHAIN,
+        genesis_identity: GENESIS,
+        active: EpochRecord {
+            epoch: EPOCH,
+            first_round: FIRST,
+            closing_round: None,
+            sentinel: &sentinel,
+            committee: &c,
+        },
+        gap_wanted_to: 0,
+        next: None,
+        now_secs: NOW,
+        gc_floor: 0,
+        cursor: FIRST,
+    };
+    let verifications = || crate::vcert::CERT_VERIFICATIONS.with(|n| n.get());
+    for memo in [PayloadGate::Refused, PayloadGate::Full] {
+        let before = verifications();
+        let verdict = v4_verdict_gated(1_000, &v, &ctx, |_| None, |_| false, |_| memo);
+        assert!(
+            matches!(verdict, Verdict::Invalid(_) | Verdict::Drop(_)),
+            "{verdict:?}"
+        );
+        assert_eq!(
+            verifications(),
+            before,
+            "{memo:?}: a certificate was checked before the memo"
+        );
+    }
+    let before = verifications();
+    let (verdict, ran) =
+        v4_verdict_checked(1_000, &v, &ctx, |_| None, |_| false, |_| PayloadGate::Check);
+    assert_eq!(verdict, Verdict::Stage);
+    assert_eq!(verifications() - before, 3, "vacuous: E4 checked nothing");
+    assert_eq!(ran.certified, vec![0, 1, 2], "the verified certificates");
+}
+
+/// B158 witness: the filters that need no authentication (the floor, a
+/// payload past the lead) drop a copy before Layer S; a hash or signature
+/// that fails is a failed costly check (B51).
+#[test]
+fn the_cheap_filters_run_before_layer_s() {
+    let all = members();
+    let c = committee(&all);
+    let sentinel = sentinel(EPOCH);
+    let (v, _) = second_round(&all, 3, &[0, 1, 2]);
+    let ctx = |floor: u64, cursor: u64| Context {
+        chain_id: CHAIN,
+        genesis_identity: GENESIS,
+        active: EpochRecord {
+            epoch: EPOCH,
+            first_round: FIRST,
+            closing_round: None,
+            sentinel: &sentinel,
+            committee: &c,
+        },
+        gap_wanted_to: 0,
+        next: None,
+        now_secs: NOW,
+        gc_floor: floor,
+        cursor,
+    };
+    let runs = || LAYER_S_RUNS.with(|n| n.get());
+    let before = runs();
+    assert_eq!(
+        v4_verdict(1_000, &v, &ctx(FIRST + 1, FIRST), |_| None),
+        Verdict::Stale
+    );
+    let far = FIRST + 1 - LEAD - 1;
+    assert!(matches!(
+        v4_verdict(1_000, &v, &ctx(0, far), |_| None),
+        Verdict::Drop(_)
+    ));
+    assert_eq!(runs(), before, "a copy the cheap filters drop ran Layer S");
+    let mut forged = v.clone();
+    forged.signature = "00".repeat(64);
+    let (verdict, failed) =
+        crate::work::failed_in(|| v4_verdict(1_000, &forged, &ctx(0, FIRST), |_| None));
+    assert!(invalid(verdict));
+    assert_eq!(failed, 1, "a failed signature check was not charged");
+    // B181: a body naming no staked member is refused, charged, before it
+    // is hashed (its hash is wrong too: the author is what is reported).
+    let mut stranger = v.clone();
+    stranger.author = member(9).info.address.clone();
+    stranger.hash = "ab".repeat(32);
+    let (verdict, failed) =
+        crate::work::failed_in(|| v4_verdict(1_000, &stranger, &ctx(0, FIRST), |_| None));
+    assert!(
+        matches!(&verdict, Verdict::Invalid(why) if why.contains("staked member")),
+        "{verdict:?}"
+    );
+    assert_eq!(failed, 1, "an unknown author was not charged");
+    // B208: so is a body of the wrong form (no honest author sends one).
+    let mut aggregated = v.clone();
+    aggregated.aggregated_signature = Some("ab".repeat(48));
+    let (verdict, failed) =
+        crate::work::failed_in(|| v4_verdict(1_000, &aggregated, &ctx(0, FIRST), |_| None));
+    assert!(invalid(verdict));
+    assert_eq!(failed, 1, "a body of the wrong form was not charged");
+}
+
+/// B171 witness: a closed epoch's copy runs no check, forged or not; a
+/// next-epoch copy that shows no more gap than is wanted is not
+/// authenticated; the next-epoch check charges a failed hash and an active
+/// member's failed signature, but not an author of the next committee only.
+#[test]
+fn a_neighbouring_epochs_copy_costs_no_free_check() {
+    let all = members();
+    let c = committee(&all);
+    let sentinels = [sentinel(EPOCH - 1), sentinel(EPOCH), sentinel(EPOCH + 1)];
+    let at = |m: &Member, epoch| vertex(m, epoch, FIRST, vec![sentinel(epoch)], vec![]);
+    let runs = || {
+        (
+            LAYER_S_RUNS.with(|n| n.get()),
+            SIGNED_BY_MEMBER_RUNS.with(|n| n.get()),
+        )
+    };
+    let ctx = context(&c, &sentinels, false);
+    let before = runs();
+    let mut old = at(&all[0], EPOCH - 1);
+    old.signature = "00".repeat(64);
+    let (verdict, failed) = crate::work::failed_in(|| v4_verdict(1_000, &old, &ctx, |_| None));
+    assert_eq!(verdict, Verdict::Stale);
+    assert_eq!(
+        (runs(), failed),
+        (before, 0),
+        "a closed epoch's copy ran a check"
+    );
+    let ahead = at(&all[0], EPOCH + 1);
+    let mut wanted = context(&c, &sentinels, false);
+    wanted.gap_wanted_to = FIRST - 1;
+    assert!(matches!(
+        v4_verdict(1_000, &ahead, &wanted, |_| None),
+        Verdict::Drop(_)
+    ));
+    assert_eq!(
+        runs(),
+        before,
+        "a copy that shows nothing new was authenticated"
+    );
+    wanted.gap_wanted_to = FIRST - 2;
+    assert_eq!(v4_verdict(1_000, &ahead, &wanted, |_| None), Verdict::Ahead);
+    assert_eq!(runs().1, before.1 + 1, "vacuous: not authenticated");
+    let mut bad_hash = ahead.clone();
+    bad_hash.hash = "ab".repeat(32);
+    let mut bad_signature = ahead.clone();
+    bad_signature.signature = "00".repeat(64);
+    for v in [&bad_hash, &bad_signature] {
+        let (verdict, failed) = crate::work::failed_in(|| v4_verdict(1_000, v, &ctx, |_| None));
+        assert!(matches!(verdict, Verdict::Drop(_)), "{verdict:?}");
+        assert_eq!(failed, 1, "a failed next-epoch check was not charged");
+    }
+    let newcomer = member(5);
+    let (verdict, failed) =
+        crate::work::failed_in(|| v4_verdict(1_000, &at(&newcomer, EPOCH + 1), &ctx, |_| None));
+    assert!(matches!(verdict, Verdict::Drop(_)), "{verdict:?}");
+    assert_eq!(failed, 0, "a next committee's author was charged");
+    // B181: its author is looked up before its body is hashed.
+    let mut unhashed = at(&newcomer, EPOCH + 1);
+    unhashed.hash = "ab".repeat(32);
+    let (verdict, failed) = crate::work::failed_in(|| v4_verdict(1_000, &unhashed, &ctx, |_| None));
+    assert!(matches!(verdict, Verdict::Drop(_)), "{verdict:?}");
+    assert_eq!(failed, 0, "a next committee's author was hashed first");
+}
+
 #[test]
 fn layer_e_delays_but_never_refuses() {
     let all = members();
@@ -570,7 +759,7 @@ fn layer_e_delays_but_never_refuses() {
                 sentinel: &sentinel,
                 committee: &c,
             },
-            previous: None,
+            gap_wanted_to: 0,
             next: None,
             now_secs: now,
             gc_floor: floor,
@@ -620,6 +809,9 @@ fn layer_e_delays_but_never_refuses() {
     }
 }
 
+/// Layer S's verdict does not depend on the context. B158: a copy the cheap
+/// filters drop (at or below the floor, a payload past the lead) never
+/// reaches it, whatever it is, so the contexts here pass them.
 #[test]
 fn layer_s_verdicts_do_not_depend_on_the_context() {
     let all = members();
@@ -627,7 +819,11 @@ fn layer_s_verdicts_do_not_depend_on_the_context() {
     let sentinel = sentinel(EPOCH);
     let mut bad = first_round(&all[0]);
     bad.timestamp += 1;
-    for (now, floor, cursor) in [(0, 0, 0), (NOW, u64::MAX, u64::MAX), (u64::MAX, 5, FIRST)] {
+    for (now, floor, cursor) in [
+        (0, 0, FIRST),
+        (NOW, FIRST - 1, u64::MAX),
+        (u64::MAX, 5, FIRST - LEAD),
+    ] {
         let ctx = Context {
             chain_id: CHAIN,
             genesis_identity: GENESIS,
@@ -638,7 +834,7 @@ fn layer_s_verdicts_do_not_depend_on_the_context() {
                 sentinel: &sentinel,
                 committee: &c,
             },
-            previous: None,
+            gap_wanted_to: 0,
             next: None,
             now_secs: now,
             gc_floor: floor,
@@ -653,7 +849,6 @@ fn layer_s_verdicts_do_not_depend_on_the_context() {
 fn context<'a>(
     committee: &'a [ValidatorInfo],
     sentinels: &'a [String; 3],
-    previous: bool,
     next: bool,
 ) -> Context<'a> {
     let record = |i: usize| EpochRecord {
@@ -667,16 +862,17 @@ fn context<'a>(
         chain_id: CHAIN,
         genesis_identity: GENESIS,
         active: record(1),
-        previous: previous.then(|| record(0)),
         next: next.then(|| record(2)),
+        gap_wanted_to: 0,
         now_secs: NOW,
         gc_floor: 0,
         cursor: FIRST,
     }
 }
 
-/// MEDIUM-1: a vertex of an adjacent epoch is authenticated under that
+/// MEDIUM-1: a vertex of the next epoch is authenticated under that
 /// epoch's record before it is kept; without the record it is dropped.
+/// B171: one of the closed epoch is dropped before Layer S, forged or not.
 #[test]
 fn adjacent_epochs_are_authenticated_before_they_are_kept() {
     let all = members();
@@ -688,42 +884,31 @@ fn adjacent_epochs_are_authenticated_before_they_are_kept() {
         v.sign_with_ed25519(&crypto::SigningKey::from_bytes(&all[1].node_key));
         v
     };
-    let judge = |v: &Vertex, previous, next| {
-        v4_verdict(1_000, v, &context(&c, &sentinels, previous, next), |_| None)
-    };
-    assert_eq!(judge(&at(EPOCH + 1), true, true), Verdict::PendingEpoch);
+    let judge = |v: &Vertex, next| v4_verdict(1_000, v, &context(&c, &sentinels, next), |_| None);
+    assert_eq!(judge(&at(EPOCH + 1), true), Verdict::PendingEpoch);
     assert!(
-        invalid(judge(&forged(EPOCH + 1), true, true)),
+        invalid(judge(&forged(EPOCH + 1), true)),
         "a forged next-epoch vertex"
     );
     // Without the next record the vertex cannot be kept, but a member's
     // signature on it proves the network is past the boundary (Ahead); a
     // forged one proves nothing.
-    assert_eq!(judge(&at(EPOCH + 1), true, false), Verdict::Ahead);
+    assert_eq!(judge(&at(EPOCH + 1), false), Verdict::Ahead);
     assert!(
-        matches!(judge(&forged(EPOCH + 1), true, false), Verdict::Drop(_)),
+        matches!(judge(&forged(EPOCH + 1), false), Verdict::Drop(_)),
         "a forged next-epoch vertex without the next record"
     );
-    assert_eq!(judge(&at(EPOCH - 1), true, true), Verdict::Stale);
-    assert!(
-        invalid(judge(&forged(EPOCH - 1), true, true)),
+    assert_eq!(judge(&at(EPOCH - 1), true), Verdict::Stale);
+    assert_eq!(
+        judge(&forged(EPOCH - 1), true),
+        Verdict::Stale,
         "a forged old-epoch vertex"
     );
-    assert!(
-        matches!(judge(&at(EPOCH - 1), false, true), Verdict::Drop(_)),
-        "no previous record"
-    );
-    assert!(matches!(
-        judge(&at(EPOCH + 2), true, true),
-        Verdict::Drop(_)
-    ));
-    assert!(matches!(
-        judge(&at(EPOCH - 2), true, true),
-        Verdict::Drop(_)
-    ));
+    assert!(matches!(judge(&at(EPOCH + 2), true), Verdict::Drop(_)));
+    assert!(matches!(judge(&at(EPOCH - 2), true), Verdict::Drop(_)));
     // The active epoch at the edge of u64: no overflow, no panic.
     let edge = [sentinel(EPOCH - 1), sentinel(EPOCH), sentinel(EPOCH + 1)];
-    let mut ctx = context(&c, &edge, false, false);
+    let mut ctx = context(&c, &edge, false);
     ctx.active.epoch = u64::MAX;
     let mut v = at(EPOCH);
     v.epoch = u64::MAX;
@@ -754,7 +939,7 @@ fn a_vertex_above_the_closing_round_is_stale() {
     let c = committee(&all);
     let sentinels = [sentinel(EPOCH - 1), sentinel(EPOCH), sentinel(EPOCH + 1)];
     let (v, _) = second_round(&all, 3, &[0, 1, 2]);
-    let mut ctx = context(&c, &sentinels, true, true);
+    let mut ctx = context(&c, &sentinels, true);
     ctx.active.closing_round = Some(FIRST + 1);
     assert_eq!(
         v4_verdict(1_000, &v, &ctx, |_| None),
@@ -779,7 +964,7 @@ fn past_the_lead_only_certified_parents_are_staged() {
     let (mut v, _) = second_round(&all, 3, &[0, 1, 2]);
     v.payload.clear();
     seal(&mut v, &all[3]);
-    let mut ctx = context(&c, &sentinels, true, true);
+    let mut ctx = context(&c, &sentinels, true);
     ctx.cursor = 0;
     assert_eq!(v4_verdict(1_000, &v, &ctx, |_| None), Verdict::Stage);
     v.parent_refs[1].cert = None;
@@ -948,6 +1133,78 @@ fn transport_padding_is_refused_per_copy() {
     );
 }
 
+/// B224 witness: a transport field no honest V4 node adds (a V3 proof, a
+/// certificate of the wrong shape) is refused before the author's signature
+/// is checked, and charged: refused after it, each copy ran the hash and
+/// the signature first, uncharged.
+#[test]
+fn transport_padding_is_refused_before_the_signature_and_charged() {
+    let all = members();
+    let c = committee(&all);
+    let (v, _) = second_round(&all, 3, &[0, 1, 2]);
+    let mut bitmap = v.clone();
+    bitmap.parent_refs[1]
+        .cert
+        .as_mut()
+        .unwrap()
+        .signer_bitmap
+        .push(0);
+    let mut proof = v.clone();
+    proof.parent_refs[0].proof = Some(blockchain::ParentIdentityProof {
+        timestamp: 1,
+        payload_root: "0".repeat(64),
+        parents_root: "0".repeat(64),
+        public_key: "0".repeat(64),
+        signature: "0".repeat(128),
+    });
+    let runs = || LAYER_S_RUNS.with(|n| n.get());
+    for padded in [bitmap, proof] {
+        let before = runs();
+        let (outcome, failed) = crate::work::failed_in(|| verdict(&padded, &c));
+        assert!(invalid(outcome));
+        assert_eq!(runs(), before, "a padded copy was authenticated");
+        assert_eq!(failed, 1, "a padded copy was not charged");
+    }
+    assert_eq!(verdict(&v, &c), Verdict::Stage, "control");
+}
+
+/// B226 witness: once one embedded certificate fails, a copy's others are
+/// not checked (each was a pairing, up to one a ref, before its sender was
+/// muted): the copy waits on every ref, at one verification.
+#[test]
+fn one_failed_embedded_certificate_stops_the_rest() {
+    let all = members();
+    let c = committee(&all);
+    let (mut v, _) = second_round(&all, 3, &[0, 1, 2]);
+    for r in &mut v.parent_refs {
+        r.cert.as_mut().unwrap().aggregate_signature[5] ^= 1;
+    }
+    let checks = || crate::vcert::CERT_VERIFICATIONS.with(|n| n.get());
+    let before = checks();
+    let (outcome, failed) = crate::work::failed_in(|| verdict(&v, &c));
+    assert_eq!(outcome, Verdict::PendingCert(vec![0, 1, 2]));
+    assert_eq!(
+        checks() - before,
+        1,
+        "a failed copy's other certificates were checked"
+    );
+    assert_eq!(failed, 1);
+    // B229: a certificate failing before any pairing (a bitmap below the
+    // quorum, after a committee hash and two sorts) is charged once too.
+    let (mut thin, _) = second_round(&all, 3, &[0, 1, 2]);
+    for r in &mut thin.parent_refs {
+        let cert = r.cert.as_mut().unwrap();
+        cert.signer_bitmap = vec![0; cert.signer_bitmap.len()];
+        cert.signer_bitmap[0] = 1;
+    }
+    let (outcome, failed) = crate::work::failed_in(|| verdict(&thin, &c));
+    assert_eq!(outcome, Verdict::PendingCert(vec![0, 1, 2]));
+    assert_eq!(
+        failed, 1,
+        "a certificate below the quorum was not charged once"
+    );
+}
+
 /// MEDIUM-1, pinned: an adjacent epoch is judged by ITS committee and ITS
 /// first round, not the active ones.
 #[test]
@@ -960,7 +1217,7 @@ fn an_adjacent_epoch_is_judged_by_its_own_committee_and_first_round() {
     next_committee.push(newcomer.info.clone());
     next_committee.sort_by(|a, b| a.address.cmp(&b.address));
     let sentinels = [sentinel(EPOCH - 1), sentinel(EPOCH), sentinel(EPOCH + 1)];
-    let mut ctx = context(&active, &sentinels, true, true);
+    let mut ctx = context(&active, &sentinels, true);
     if let Some(next) = ctx.next.as_mut() {
         next.committee = &next_committee;
         next.first_round = FIRST + 7;
@@ -1104,4 +1361,122 @@ fn the_bitmap_length_is_members_rounded_up_to_bytes() {
     };
     assert_eq!(layer_s(&with_bitmap(1), &record, CHAIN, GENESIS), Ok(()));
     assert!(layer_s(&with_bitmap(2), &record, CHAIN, GENESIS).is_err());
+}
+
+/// B192: Layer S takes an evidence item only as the bytes an honest node
+/// builds from its parts, and only up to `max_item_bytes` (an item passed on
+/// its kind alone, at any size, its proofs carrying their payloads, and every
+/// block verified it). The largest honest items are measured here: every
+/// number at its widest, a full committee's bitmap.
+#[test]
+fn evidence_is_admitted_only_as_its_parts_build_it() {
+    use crate::v4::evidence;
+    use blockchain::attest::{AttestBody, VertexCertificate};
+    let proof = |digit: char, payload: Vec<String>| Vertex {
+        epoch: u64::MAX,
+        round: u64::MAX,
+        author: "a".repeat(64),
+        parents: vec![],
+        parent_refs: vec![],
+        payload,
+        timestamp: u64::MAX,
+        hash: digit.to_string().repeat(64),
+        signature: "c".repeat(128),
+        aggregated_signature: None,
+        payload_root: None,
+        parents_root: None,
+    };
+    let twin = evidence::twin_item(&proof('d', vec![]), &proof('e', vec![])).unwrap();
+    assert_eq!(twin.len(), 1_426);
+    let cert = |digit: char| VertexCertificate {
+        version: u8::MAX,
+        body: AttestBody {
+            chain_id: CHAIN.into(),
+            genesis_identity: GENESIS.into(),
+            epoch: u64::MAX,
+            round: u64::MAX,
+            author: "a".repeat(64),
+            digest: digit.to_string().repeat(64),
+            committee_hash: "f".repeat(64),
+        },
+        signer_bitmap: vec![u8::MAX; blockchain::committee::MAX_COMMITTEE.div_ceil(8)],
+        signed_stake: u64::MAX.into(),
+        total_stake: u64::MAX.into(),
+        aggregate_signature: vec![u8::MAX; 96],
+    };
+    let conflict = evidence::cert_conflict_item(&cert('d'), &cert('e')).unwrap();
+    // 2,221 with 39-digit stakes and empty strings: 19 digits fewer on each
+    // of four stakes, and each certificate's two strings.
+    assert_eq!(
+        conflict.len(),
+        2_221 - 4 * 19 + 2 * (CHAIN.len() + GENESIS.len())
+    );
+    for item in [&twin, &conflict] {
+        assert!(item.len() <= evidence::max_item_bytes(CHAIN, GENESIS));
+        assert_eq!(evidence::admissible_item(item, CHAIN, GENESIS), Ok(()));
+    }
+    let refused = |item: &str| evidence::admissible_item(item, CHAIN, GENESIS).is_err();
+    // The same parts in another encoding, order or form.
+    assert!(refused(&format!(" {twin}")));
+    assert!(refused(&twin.replacen(':', ": ", 1)));
+    let (d, e) = (
+        proof('d', vec![]).to_compact_proof_v4(),
+        proof('e', vec![]).to_compact_proof_v4(),
+    );
+    let envelope = |a: &Vertex, b: &Vertex| evidence::twin_json(a, b).unwrap();
+    assert_eq!(envelope(&d, &e), twin, "vacuous: the envelope differs");
+    // B210: one encoding, the fields in their declared order (a `json!`
+    // object's order follows serde_json's `preserve_order` feature).
+    assert!(
+        twin.starts_with(r#"{"kind":"equivocation_v4","offender":"#),
+        "{twin}"
+    );
+    assert!(conflict.starts_with(r#"{"kind":"certificate_conflict","offender":"#));
+    assert!(refused(&envelope(&e, &d)), "out of hash order");
+    let (full_d, full_e) = (
+        proof('d', vec!["x".repeat(100)]),
+        proof('e', vec!["x".repeat(100)]),
+    );
+    // Refused as such, before a payload is hashed.
+    let why = |item: &str| evidence::admissible_item(item, CHAIN, GENESIS).unwrap_err();
+    let full = why(&envelope(&full_d, &full_e));
+    assert!(full.contains("compact"), "proofs with payloads: {full}");
+    let mut with_payload = d.clone();
+    with_payload.payload = vec!["x".repeat(100)];
+    let both = why(&envelope(&with_payload, &e));
+    assert!(both.contains("compact"), "a root and a payload: {both}");
+    // Bounded before it is parsed.
+    let most = evidence::max_item_bytes(CHAIN, GENESIS);
+    let huge = why(&format!("{twin}{}", " ".repeat(most)));
+    assert!(huge.contains("over"), "{huge}");
+    // The kind alone, or no ordered kind.
+    assert!(refused(
+        r#"{"kind":"equivocation_v4","offender":"x","epoch":2,"round":1}"#
+    ));
+    assert!(refused(&twin.replace(evidence::KIND, "downtime")));
+    // Layer S refuses the vertex that carries one, and takes the honest one.
+    let carrying = |item: &str| {
+        let mut v = proof('d', vec![]);
+        v.payload = vec![format!("{}{item}", crate::dag::SLASH_EVIDENCE_PREFIX)];
+        payload_admissible(&v, CHAIN, GENESIS)
+    };
+    assert_eq!(carrying(&twin), Ok(()));
+    assert_eq!(carrying(&conflict), Ok(()));
+    assert!(carrying(&format!(" {twin}")).is_err());
+    assert!(carrying(&envelope(&full_d, &full_e)).is_err());
+    // No more items than a block takes from one vertex.
+    let digits: Vec<char> = "0123456789ab".chars().collect();
+    let items: Vec<String> = digits
+        .chunks(2)
+        .map(|p| {
+            let item = evidence::twin_item(&proof(p[0], vec![]), &proof(p[1], vec![])).unwrap();
+            format!("{}{item}", crate::dag::SLASH_EVIDENCE_PREFIX)
+        })
+        .collect();
+    assert_eq!(items.len(), crate::dag::MAX_EVIDENCE_PER_VERTEX + 1);
+    let mut v = proof('d', vec![]);
+    v.payload = items[1..].to_vec();
+    assert_eq!(payload_admissible(&v, CHAIN, GENESIS), Ok(()));
+    v.payload = items;
+    assert!(payload_admissible(&v, CHAIN, GENESIS).is_err());
 }

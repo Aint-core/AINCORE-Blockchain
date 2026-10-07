@@ -25,6 +25,7 @@ fn pending(db: &StateDB, height: u64) {
         leader: "local".into(),
         sequence: block.committed_vertices.clone(),
         finality_digest: "34".repeat(32),
+        decision_floor: 0,
     };
     db.transaction(|view| {
         view.save_block_json(height, &serde_json::to_string(&block).unwrap())?;
@@ -71,6 +72,41 @@ fn partial_replays_after_reopen_until_complete_aggregation() {
     ));
     assert!(db.get(PENDING).unwrap().is_none());
     assert!(retry(&db, &mut String::new()).is_empty());
+}
+
+/// B166 witness: a Partial retried again verifies none of its own stored
+/// signatures anew and commits nothing (each retry cost four pairings and
+/// rewrote three unchanged rows, synced, several times a second). The first
+/// retry signs and writes the rows; the second verifies them once; from the
+/// third on a retry is free.
+#[test]
+fn a_partial_retried_again_costs_no_pairing_and_no_write() {
+    let dir = TestDir::new();
+    dir.seed(true);
+    let db = dir.open();
+    pending(&db, 1);
+    for _ in 0..2 {
+        assert!(
+            matches!(retry(&db, &mut String::new())[0], QcOutcome::Partial(_)),
+            "vacuous: not a partial"
+        );
+    }
+    let verifies = || crate::qc_producer::OWN_VOTE_VERIFIES.with(|n| n.get());
+    let (verified, sequence) = (verifies(), db.write_sequence());
+    assert!(matches!(
+        retry(&db, &mut String::new())[0],
+        QcOutcome::Partial(_)
+    ));
+    assert_eq!(
+        verifies(),
+        verified,
+        "its own signatures were verified again"
+    );
+    assert_eq!(
+        db.write_sequence(),
+        sequence,
+        "an unchanged retry committed"
+    );
 }
 
 #[test]

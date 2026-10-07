@@ -130,13 +130,50 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// B229: a costly check that failed is charged once (B51), whether or not
+/// it charged itself (a failed pairing does; a cheaper refusal of a peer's
+/// certificate did not). No honest node sends a certificate that fails.
+fn charged_once(check: impl FnOnce() -> bool) -> bool {
+    let (passed, failed) = crate::work::failed_in(check);
+    if !passed && failed == 0 {
+        crate::work::note_failed_check();
+    }
+    passed
+}
+
 /// B95/B117: the bodies of one (epoch, round, author) whose payload was
 /// checked.
 #[derive(Debug, Default)]
 struct PayloadSlot {
     passed: Vec<String>,
     refused: Vec<String>,
+    /// B155: bodies that passed every check and could not be staged (a full
+    /// slot's third, or past the author's plain-body budget), at most
+    /// `UNSTAGED_PER_SLOT`.
+    unstaged: Vec<String>,
+    /// B224: the digests Layer S authenticated, at most
+    /// `AUTHENTICATED_PER_SLOT`: an honest author signs one body a slot, so
+    /// a second is twin evidence, and a third is not authenticated unless it
+    /// is certified here.
+    authenticated: Vec<String>,
+    /// B202/B224: those the pending buffer evicted: a copy runs Layer S
+    /// again only once it could be kept or staged (`evicted_again`).
+    evicted: Vec<String>,
 }
+
+/// B155: unstageable bodies remembered per slot (a choice: an author has two
+/// staged bodies a slot; more twins than this are evidence enough).
+const UNSTAGED_PER_SLOT: usize = 4;
+
+/// B224: authenticated digests remembered per slot (`PayloadSlot`).
+const AUTHENTICATED_PER_SLOT: usize = 2;
+
+/// B224: bodies dropped after Layer S remembered in one tick (a choice;
+/// past it a copy is evaluated, as every copy was before B190).
+const DROPPED_CAP: usize = 1_024;
+
+/// B204: early digests remembered (a choice, as `DROPPED_CAP`).
+const EARLY_DIGESTS_CAP: usize = 1_024;
 
 impl PayloadSlot {
     fn checks(&self) -> usize {
@@ -151,6 +188,30 @@ impl PayloadSlot {
 /// costs its checks again.
 const PAYLOAD_SLOTS_CAP: usize = 1 << 16;
 
+/// B255: the blocks this node may hold above its lowest block without a QC
+/// before it proposes nothing more (a choice), so a lagging member has few
+/// blocks to rebuild and vote on from what is kept for it
+/// (`retention_floor`). GC deleted what a member cut off past the window
+/// needed, and with f members withholding their votes every QC needed that
+/// member's: no QC formed again, and the next epoch never activated.
+pub const MAX_UNFINALIZED_BLOCKS: u64 = 50;
+
+/// B262: the rounds this node may run above the floor kept for its lowest
+/// block without a QC (while that floor is below g) before it proposes
+/// nothing more: the GC window and the lead (a body's payload rides at most
+/// `LEAD` above the cursor). Bounded in blocks alone, it kept every round
+/// for as long as f members let one anchor commit every few hundred rounds
+/// (rounds per block are unbounded, contract correction C1): their
+/// payloads, attested and so outside the plain-body budget, grew memory
+/// without bound.
+pub const MAX_KEPT_ROUNDS: u64 =
+    crate::ordering::GC_DEPTH + staging::RETAIN_SLACK + ingress_v4::LEAD;
+
+/// B262: how often a member waiting on finality sends its newest vertex
+/// again (ticks): nothing new is pushed while proposals wait, so a member
+/// coming back learned how far the DAG got one round at a time.
+const FINALITY_REBROADCAST_TICKS: u64 = 4;
+
 /// The V4 engine of one node.
 pub struct Engine {
     cfg: Config,
@@ -159,6 +220,8 @@ pub struct Engine {
     stakes: Vec<(String, u64)>,
     committee_hash: String,
     ed25519_pk: String,
+    /// This node's BLS public key (hex), derived once (B205).
+    bls_pk: String,
     /// AT-1: a staked member whose derived BLS key is the registered one.
     can_sign: bool,
     /// RC-3: guard continuity held at boot.
@@ -187,11 +250,29 @@ pub struct Engine {
     /// OR-1: a parent digest → the certified children waiting on it.
     waiting: HashMap<String, HashSet<String>>,
     pending: PendingBuffer,
+    /// B224: the bodies Layer S authenticated this tick and dropped (past
+    /// the lead on parents not certified here, a full slot's third, an
+    /// author's spent next-epoch checks): their copies this tick are dropped
+    /// before Layer S (each ran the hash and the signature again,
+    /// unremembered). A later tick's copy is evaluated again: the cursor and
+    /// the certificates move. Cleared every tick; at most `DROPPED_CAP`.
+    /// (The buffer's evictions are remembered in their slots, B202.)
+    dropped: HashSet<String>,
+    /// B204: bodies Layer S authenticated and Layer E found early, by
+    /// digest, with their timestamps: their copies are dropped before Layer
+    /// S until they are due (each ran the hash and the signature again).
+    /// At most `EARLY_DIGESTS_CAP`; the due ones leave at the next tick.
+    early_digests: HashMap<String, u64>,
     /// B95/B117: per (epoch, round, author), the bodies whose payload was
     /// checked, passed or refused (at most two checks a slot, a third only
     /// for a certified body: a third plain body is an equivocation and is
     /// not checked).
     payload_slots: HashMap<(u64, u64, String), PayloadSlot>,
+    /// B137: per author, the payload checks its next-epoch vertices took
+    /// since the last activation. At most `PENDING_MAX_PER_AUTHOR`, what the
+    /// buffer keeps of one author: an author sending lower rounds first had
+    /// every one checked and kept (up to two bodies a round over the lead).
+    next_checks: HashMap<String, usize>,
     /// G5 BT-1: per member, the timestamp of its latest vertex refused as
     /// ahead of this node's clock (`Verdict::Early`); cleared when one of
     /// its vertices stages.
@@ -215,8 +296,9 @@ pub struct Engine {
     /// RE-1 (b, c, d): certificates this node lacks, by slot.
     cert_wants: BTreeMap<(u64, String), pull::Want>,
     /// B51: certificates an answer may still bring per wanted slot, one per
-    /// request this node sent for it (answers are unauthenticated).
-    cert_answers: HashMap<(u64, String), u8>,
+    /// request this node sent for it (answers are unauthenticated); B248:
+    /// per member asked; B250: the last `pull::MAX_ASKED_PER_SLOT` asked.
+    cert_answers: HashMap<(u64, String), Vec<(String, u8)>>,
     /// The tick at which a certificate last arrived (RE-1 d).
     last_cert_tick: u64,
     /// This node's last request number and the durable reservation above it.
@@ -226,6 +308,11 @@ pub struct Engine {
     budget: pull::Budget,
     /// The GC floor this engine last acted on (OR-3, GC-3).
     last_floor: u64,
+    /// B255: the anchor round of the lowest block this node holds without a
+    /// QC, less GC_DEPTH (`u64::MAX`: none), refreshed every tick.
+    finality_floor: u64,
+    /// B273: the g at which `finality_floor` was last read.
+    floor_read_at: u64,
     /// The active epoch E (EP-1): its number, first round and sentinel, and
     /// r* once it has closed (EP-3). `cfg.committee` is C_E.
     epoch: u64,
@@ -234,6 +321,8 @@ pub struct Engine {
     closing_round: Option<u64>,
     /// E+1's record once E has closed and until activation (EP-2, EP-4).
     next: Option<epoch::EpochStart>,
+    /// B230: `validator_set_hash` of `next`'s committee while it is held.
+    next_committee_hash: String,
     /// E−1 and its closing round, for classifying its late messages (EP-5).
     previous: Option<epoch::EpochStart>,
     previous_closing: u64,
@@ -387,6 +476,7 @@ impl Engine {
             stakes,
             committee_hash,
             ed25519_pk,
+            bls_pk,
             can_sign,
             guards_continuous,
             resume_after,
@@ -399,7 +489,10 @@ impl Engine {
             orderable: HashSet::new(),
             waiting: HashMap::new(),
             pending: PendingBuffer::default(),
+            dropped: HashSet::new(),
+            early_digests: HashMap::new(),
             payload_slots: HashMap::new(),
+            next_checks: HashMap::new(),
             early: HashMap::new(),
             own: BTreeMap::new(),
             collectors: BTreeMap::new(),
@@ -415,6 +508,8 @@ impl Engine {
             pull_seq_reserved: seq,
             budget: pull::Budget::default(),
             last_floor: 0,
+            finality_floor: u64::MAX,
+            floor_read_at: u64::MAX,
             gap_high: 0,
             closed: None,
             sent: (0, 0),
@@ -426,6 +521,7 @@ impl Engine {
             sentinel: SENTINEL.to_string(),
             closing_round: None,
             next: None,
+            next_committee_hash: String::new(),
             previous: None,
             previous_closing: 0,
             genesis,
@@ -465,7 +561,10 @@ impl Engine {
     /// RC-1 steps 2 to 6.
     fn boot(&mut self) -> Result<(), String> {
         self.load_epoch_state()?;
+        // B255: what GC kept for a block without a QC is loaded back.
+        self.refresh_finality_floor();
         self.load_closed()?;
+        let floor = self.retention_floor();
         let loaded = {
             let record = self.record();
             staging::load(
@@ -473,7 +572,7 @@ impl Engine {
                 &record,
                 &self.cfg.chain_id,
                 &self.cfg.genesis_identity,
-                self.gc_floor(),
+                floor,
             )?
         };
         {
@@ -583,6 +682,53 @@ impl Engine {
         lock(&self.ordering).gc_floor()
     }
 
+    /// B255: the floor GC-3 deletes and forgets below (less RETAIN_SLACK):
+    /// g, but never above `finality_floor`, so the rounds a member needs to
+    /// rebuild a block that has no QC yet, and vote on it, are kept and
+    /// served until its QC forms. g itself (the decision's) is unchanged.
+    /// B273: `finality_floor` is read again whenever g has moved since it was
+    /// read. A block's pending row is written as its anchor raises g, and
+    /// the first message after that cut with the floor of the last tick:
+    /// the rounds that block's decision walked were deleted everywhere.
+    fn retention_floor(&mut self) -> u64 {
+        let g = self.gc_floor();
+        if g != self.floor_read_at {
+            self.refresh_finality_floor();
+        }
+        g.min(self.finality_floor)
+    }
+
+    /// GC-3's cut: rounds at or below it are deleted and forgotten.
+    fn retention_cut(&mut self) -> u64 {
+        self.retention_floor().saturating_sub(staging::RETAIN_SLACK)
+    }
+
+    /// B255: `finality_floor` from this node's pending QC work. B262: the
+    /// floor that block's decision walked down to (its anchor less GC_DEPTH
+    /// was too high after skipped anchors: a member rebuilding it found the
+    /// rounds below deleted everywhere).
+    fn refresh_finality_floor(&mut self) {
+        self.floor_read_at = self.gc_floor();
+        self.finality_floor = crate::qc_producer::lowest_pending_qc_height(&self.storage)
+            .and_then(|h| crate::qc_producer::pending_context(&self.storage, h))
+            .map_or(u64::MAX, |ctx| {
+                ctx.decision_floor
+                    .unwrap_or_else(|| ctx.anchor_round.saturating_sub(crate::ordering::GC_DEPTH))
+            });
+    }
+
+    /// B255: whether this node holds `MAX_UNFINALIZED_BLOCKS` blocks above
+    /// its lowest block without a QC, or (B262) runs `MAX_KEPT_ROUNDS`
+    /// rounds above the floor kept for it while that floor is below g.
+    fn finality_lags(&self) -> bool {
+        let Some(low) = crate::qc_producer::lowest_pending_qc_height(&self.storage) else {
+            return false;
+        };
+        self.storage.get_chain_height().saturating_sub(low) >= MAX_UNFINALIZED_BLOCKS
+            || (self.finality_floor < self.gc_floor()
+                && self.current_round().saturating_sub(self.finality_floor) > MAX_KEPT_ROUNDS)
+    }
+
     fn attest_body(&self, round: u64, author: &str, digest: &str) -> AttestBody {
         AttestBody {
             chain_id: self.cfg.chain_id.clone(),
@@ -609,12 +755,10 @@ impl Engine {
     }
 
     fn read_own_attestation(&self, body: &AttestBody) -> Result<Option<VertexAttestation>, String> {
-        let bls_pk = hex::encode(
-            BLSEngine::consensus().pubkey_raw(&qc::derive_validator_bls_seed(&self.cfg.node_key)),
-        );
+        // B205: the key derived once, at construction.
         let row = self
             .storage
-            .get(&vcert::attest_guard_key(body, &bls_pk))
+            .get(&vcert::attest_guard_key(body, &self.bls_pk))
             .map_err(|e| e.to_string())?;
         Ok(row
             .and_then(|r| serde_json::from_str::<VertexAttestation>(&r).ok())
@@ -629,12 +773,25 @@ impl Engine {
     // ----------------------------------------------------------------- ingress
 
     pub fn on_message(&mut self, raw_len: usize, msg: Msg, net: &dyn ConsensusNet) {
-        self.dispatch(raw_len, msg, net);
+        self.on_message_from(None, raw_len, msg, net);
+    }
+
+    /// `on_message` from `source`, the member the transport names (`None`
+    /// in process). B248: a pull answer brings certificates only for what
+    /// was asked of its source.
+    pub fn on_message_from(
+        &mut self,
+        source: Option<&str>,
+        raw_len: usize,
+        msg: Msg,
+        net: &dyn ConsensusNet,
+    ) {
+        self.dispatch(source, raw_len, msg, net);
         self.observe_floor(net);
         self.finish_call(net);
     }
 
-    fn dispatch(&mut self, raw_len: usize, msg: Msg, net: &dyn ConsensusNet) {
+    fn dispatch(&mut self, source: Option<&str>, raw_len: usize, msg: Msg, net: &dyn ConsensusNet) {
         match msg {
             Msg::Vertex(v) => self.on_vertex(raw_len, v, net),
             Msg::Attest(a) => self.on_attestation(a, net),
@@ -642,7 +799,7 @@ impl Engine {
             Msg::Req(signed) => self.on_request(signed, net),
             Msg::Resp { to, resp } => {
                 if to == self.cfg.address {
-                    self.on_response(resp, net);
+                    self.on_response(resp, source, net);
                 }
             }
         }
@@ -674,6 +831,20 @@ impl Engine {
     /// a cap must not rest on that; a forgotten slot only costs its checks
     /// again).
     fn remember_payload(&mut self, v: &Vertex, outcome: ingress_v4::PayloadChecked) {
+        let slot = self.payload_slot(v);
+        // Two checks, and a third only of a certified body (the gate lets
+        // no other third through).
+        if slot.checks() < 3 && !slot.passed.contains(&v.hash) && !slot.refused.contains(&v.hash) {
+            match outcome {
+                ingress_v4::PayloadChecked::Passed => slot.passed.push(v.hash.clone()),
+                ingress_v4::PayloadChecked::Refused => slot.refused.push(v.hash.clone()),
+            }
+        }
+    }
+
+    /// `v`'s slot in `payload_slots`, made if missing. The map holds at most
+    /// `PAYLOAD_SLOTS_CAP` slots (see `remember_payload`).
+    fn payload_slot(&mut self, v: &Vertex) -> &mut PayloadSlot {
         if self.payload_slots.len() >= PAYLOAD_SLOTS_CAP {
             let (epoch, floor) = (self.epoch, self.gc_floor());
             self.payload_slots
@@ -682,17 +853,87 @@ impl Engine {
                 self.payload_slots.clear();
             }
         }
-        let slot = self
-            .payload_slots
+        self.payload_slots
             .entry((v.epoch, v.round, v.author.clone()))
-            .or_default();
-        // Two checks, and a third only of a certified body (the gate lets
-        // no other third through).
-        if slot.checks() < 3 && !slot.passed.contains(&v.hash) && !slot.refused.contains(&v.hash) {
-            match outcome {
-                ingress_v4::PayloadChecked::Passed => slot.passed.push(v.hash.clone()),
-                ingress_v4::PayloadChecked::Refused => slot.refused.push(v.hash.clone()),
+            .or_default()
+    }
+
+    /// `v` waits in the pending buffer. B202/B224: a body the buffer evicts
+    /// (an author's past `PENDING_MAX_PER_AUTHOR`) is remembered in its
+    /// slot, and its copies skip Layer S while they would be evicted again
+    /// (`evicted_again`). B202 cleared the memory every tick, so an author's
+    /// bodies past its share, re-sent every tick, ran the hash and the
+    /// signature again each tick.
+    fn keep_pending(&mut self, v: Vertex) {
+        if let Some(evicted) = self.pending.push(v) {
+            let slot = self.payload_slot(&evicted);
+            if slot.evicted.len() < AUTHENTICATED_PER_SLOT && !slot.evicted.contains(&evicted.hash)
+            {
+                slot.evicted.push(evicted.hash);
             }
+        }
+    }
+
+    /// B224: whether a copy of `v`, a body the buffer evicted, would be
+    /// evicted again: it waits (a next-epoch body, or a parent it cites
+    /// certified neither here nor in the copy), and its author's share of
+    /// the buffer would evict it at once (full, and it its last). A
+    /// certificate that arrives, or room the buffer makes, lets the next
+    /// copy through (B202: a body whose certificate needs this node's
+    /// attestation must be kept once it can be).
+    fn evicted_again(&self, v: &Vertex) -> bool {
+        self.pending.evicts(&v.author, v.round, &v.hash)
+            && (v.epoch > self.epoch
+                || v.parent_refs.iter().any(|r| {
+                    r.cert.is_none()
+                        && self
+                            .certs
+                            .get(&(r.round, r.author.clone()))
+                            .is_none_or(|c| c.body.digest != r.digest)
+                }))
+    }
+
+    /// B224: Layer S authenticated `v`'s digest. It is counted for its slot
+    /// (at most `AUTHENTICATED_PER_SLOT`), and a second digest is
+    /// proposer-twin evidence (G1 EQ-1) against the first, wherever this
+    /// node holds it, staged or pending: twins were recorded only when both
+    /// staged, so an author whose bodies waited on invented parents signed
+    /// any number of them for one slot, each authenticated by every node,
+    /// and was never slashed.
+    fn note_authenticated(&mut self, v: &Vertex) {
+        let slot = self.payload_slot(v);
+        if slot.authenticated.contains(&v.hash) {
+            return;
+        }
+        let first = slot.authenticated.first().cloned();
+        if slot.authenticated.len() < AUTHENTICATED_PER_SLOT {
+            slot.authenticated.push(v.hash.clone());
+        }
+        let Some(first) = first else {
+            return;
+        };
+        let held = self
+            .pending
+            .get(&v.author, v.round, &first)
+            .cloned()
+            .or_else(|| {
+                let raw = self
+                    .storage
+                    .get(&format!("vertex:{first}"))
+                    .ok()
+                    .flatten()?;
+                serde_json::from_str::<Vertex>(&raw).ok()
+            });
+        if let Some(other) = held {
+            evidence::record_twin(&self.storage, &other, v);
+        }
+    }
+
+    /// B155: `v` passed every check and could not be staged.
+    fn remember_unstaged(&mut self, v: &Vertex) {
+        let slot = self.payload_slot(v);
+        if slot.unstaged.len() < UNSTAGED_PER_SLOT && !slot.unstaged.contains(&v.hash) {
+            slot.unstaged.push(v.hash.clone());
         }
     }
 
@@ -707,19 +948,101 @@ impl Engine {
             self.resend_attestation(&v, net);
             return;
         }
+        // B148: nor one held pending, or whose payload was refused, before
+        // Layer S (each copy re-ran the hash, two serializations and the
+        // signature check, uncounted). Both sets hold only authenticated
+        // digests (Layer S passed for each), so a copy that claims one is
+        // that body or a lie; a refused one is still charged (B136). A
+        // later copy of a pending body may carry certificates the first did
+        // not: they come by pull (RE-1) like any other.
+        if self.pending.contains(&v.hash) {
+            return;
+        }
+        // B224: nor a copy of a body dropped after Layer S this tick.
+        if self.dropped.contains(&v.hash) {
+            return;
+        }
+        // B229: nor a next-epoch body whose author's checks are spent until
+        // activation, unless its payload was checked: Layer S, then the
+        // payload gate, dropped it as spent, and each copy ran Layer S again
+        // every tick until E+1 activated.
+        if v.epoch > self.epoch
+            && self.next_checks.get(&v.author).copied().unwrap_or(0)
+                >= staging::PENDING_MAX_PER_AUTHOR
+            && Self::payload_gate(&self.payload_slots, &v, false) == ingress_v4::PayloadGate::Check
+        {
+            return;
+        }
+        // B204: nor one that was early, while it still is (not charged: its
+        // author's clock may run ahead).
+        if let Some(&at) = self.early_digests.get(&v.hash) {
+            let due = (self.now_secs)().saturating_add(ingress_v4::MAX_FUTURE_DRIFT_SECS);
+            if at > due {
+                return;
+            }
+            self.early_digests.remove(&v.hash);
+        }
+        if self
+            .payload_slots
+            .get(&(v.epoch, v.round, v.author.clone()))
+            .is_some_and(|slot| slot.refused.contains(&v.hash))
+        {
+            crate::work::note_failed_check();
+            return;
+        }
+        // B155: nor a copy of a body that passed every check and could not
+        // be staged, unless it is certified here now (a certified body
+        // takes its slot): each copy ran Layer S again, read the slot's
+        // other bodies and checked this node's guard (a pairing), uncounted.
+        // Not charged: its sender may be its honest author retrying.
+        let certified_here = self
+            .certs
+            .get(&(v.round, v.author.clone()))
+            .is_some_and(|c| c.body.digest == v.hash);
+        if let Some(slot) = self
+            .payload_slots
+            .get(&(v.epoch, v.round, v.author.clone()))
+        {
+            if !certified_here && slot.unstaged.contains(&v.hash) {
+                return;
+            }
+            // B224: nor a third digest for the slot, unless it is certified
+            // here: its author signed two others (twin evidence already),
+            // and each cost every node the hash and the signature,
+            // uncharged. Not charged: a node that staged it may serve it.
+            if !certified_here
+                && slot.authenticated.len() >= AUTHENTICATED_PER_SLOT
+                && !slot.authenticated.contains(&v.hash)
+            {
+                return;
+            }
+            // B224: nor a copy of an evicted body while it would be
+            // evicted again.
+            if slot.evicted.contains(&v.hash) && self.evicted_again(&v) {
+                return;
+            }
+        }
         let verdict = {
             let ctx = Context {
                 chain_id: &self.cfg.chain_id,
                 genesis_identity: &self.cfg.genesis_identity,
                 active: self.record(),
-                previous: self.previous_record(),
                 next: self.next_record(),
+                // Read only for a next-epoch vertex while E+1's record is
+                // not held (it scans the round index).
+                gap_wanted_to: if Some(v.epoch) == self.epoch.checked_add(1) && self.next.is_none()
+                {
+                    self.gap_wanted_to()
+                } else {
+                    u64::MAX
+                },
                 now_secs: (self.now_secs)(),
                 gc_floor: self.gc_floor(),
                 cursor: lock(&self.ordering).next_anchor_round,
             };
             let certs = &self.certs;
             let slots = &self.payload_slots;
+            let next_checks = &self.next_checks;
             let epoch = self.epoch;
             // E4's cache: a ref whose certificate is already in the index was
             // verified when it got there (CE-3 ingests only verified ones).
@@ -738,42 +1061,64 @@ impl Engine {
                         && certs
                             .get(&(v.round, v.author.clone()))
                             .is_some_and(|c| c.body.digest == v.hash);
-                    Self::payload_gate(slots, v, certified)
+                    match Self::payload_gate(slots, v, certified) {
+                        ingress_v4::PayloadGate::Check
+                            if v.epoch > epoch
+                                && next_checks.get(&v.author).copied().unwrap_or(0)
+                                    >= staging::PENDING_MAX_PER_AUTHOR =>
+                        {
+                            ingress_v4::PayloadGate::Spent
+                        }
+                        gate => gate,
+                    }
                 },
             )
         };
-        let (verdict, checked) = verdict;
+        let (verdict, ran) = verdict;
+        // B224: an authenticated digest counts for its slot (a second is
+        // twin evidence), whatever the verdict; one dropped after Layer S is
+        // remembered for the tick.
+        if ran.authenticated {
+            self.note_authenticated(&v);
+            if matches!(verdict, Verdict::Drop(_)) && self.dropped.len() < DROPPED_CAP {
+                self.dropped.insert(v.hash.clone());
+            }
+        }
         // B95/B117: a body whose payload was checked is remembered for its
         // slot, passed or refused. Its author signed it (the payload is
         // checked only after the author's signature), so only the author can
         // fill its own slot, and a refused payload is a failed costly check
         // charged to whoever delivered it (B51): no honest node stages or
-        // serves one, as the checks are stateless.
-        if let Some(outcome) = checked {
+        // serves one, as the checks are stateless (and so is each copy of
+        // it after, above, B136/B148).
+        // B204: refused, past its author's signature, for a field it signed:
+        // its copies are refused before Layer S, charged, as a refused
+        // payload's are (the digest is authenticated).
+        if ran.signed_refusal {
+            self.remember_payload(&v, ingress_v4::PayloadChecked::Refused);
+        }
+        if let Some(outcome) = ran.payload {
             self.remember_payload(&v, outcome);
+            if v.epoch > self.epoch {
+                *self.next_checks.entry(v.author.clone()).or_default() += 1;
+            }
             if outcome == ingress_v4::PayloadChecked::Refused {
                 crate::work::note_failed_check();
             }
         }
+        // B126/B136: the embedded certificates E4 verified are ingested
+        // whatever the verdict, and not verified again: a copy refused or
+        // dropped after E4 threw them away, so each replay paid their
+        // pairings again.
+        self.ingest_carried(&v, &ran.certified, net);
         match verdict {
             Verdict::Stage => {
                 self.early.remove(&v.author);
-                self.harvest_certs(&v, net);
                 self.stage_and_attest(v, net);
             }
             Verdict::PendingCert(missing) => {
                 // Past the clock check: its author is not early any more.
                 self.early.remove(&v.author);
-                // B68: the embedded certificates that failed were charged to
-                // whoever delivered this vertex; they are dropped so a later
-                // wake does not check (and charge) them again. A transport
-                // field: the digest does not cover them.
-                let mut v = v;
-                for &i in &missing {
-                    if let Some(r) = v.parent_refs.get_mut(i) {
-                        r.cert = None;
-                    }
-                }
                 // RE-1 (c): ask for the certificates it waits on, and for the
                 // whole gap below them when this node is far behind.
                 for &i in &missing {
@@ -782,14 +1127,16 @@ impl Engine {
                     }
                 }
                 self.want_gap(v.round.saturating_sub(1));
-                // B126: the embedded certificates that verified are ingested
-                // now (each copy of a waiting vertex verified them again),
-                // and the buffered vertex keeps none.
-                self.harvest_certs(&v, net);
+                // B68/B126: the buffered vertex keeps no embedded
+                // certificate: those that verified are ingested above, and
+                // those that failed were charged to whoever delivered it and
+                // must not be checked (and charged) again at a wake. A
+                // transport field: the digest does not cover them.
+                let mut v = v;
                 for r in &mut v.parent_refs {
                     r.cert = None;
                 }
-                self.pending.push(v);
+                self.keep_pending(v);
             }
             Verdict::PendingEpoch => {
                 // B119: its embedded certificates are not checked before the
@@ -800,7 +1147,7 @@ impl Engine {
                 for r in &mut v.parent_refs {
                     r.cert = None;
                 }
-                self.pending.push(v);
+                self.keep_pending(v);
             }
             Verdict::Ahead => {
                 // The network activated E+1 and this node has not closed E:
@@ -810,30 +1157,35 @@ impl Engine {
             Verdict::Early => {
                 let ts = self.early.entry(v.author.clone()).or_insert(v.timestamp);
                 *ts = (*ts).max(v.timestamp);
+                if self.early_digests.len() < EARLY_DIGESTS_CAP {
+                    self.early_digests.insert(v.hash.clone(), v.timestamp);
+                }
             }
             Verdict::Invalid(_) | Verdict::Drop(_) | Verdict::Stale => {}
         }
     }
 
-    /// CE-3 for the parent certificates a vertex carries: each one that
-    /// verifies and is not yet in the index is ingested (with the conflict
-    /// check), so a lost `DAG_CERT` never leaves this node unable to order a
-    /// parent it can see certified in its children.
-    fn harvest_certs(&mut self, v: &Vertex, net: &dyn ConsensusNet) {
-        for r in &v.parent_refs {
+    /// CE-3 for the parent certificates a vertex carried that E4 verified
+    /// (`refs`, indices), so a lost `DAG_CERT` never leaves this node unable
+    /// to order a parent it can see certified in its children. E4 verified
+    /// each against the body `attest_body` builds and the active committee,
+    /// so it is not verified again (B136: it was, once per certificate).
+    fn ingest_carried(&mut self, v: &Vertex, refs: &[usize], net: &dyn ConsensusNet) {
+        for &i in refs {
+            let Some(r) = v.parent_refs.get(i) else {
+                continue;
+            };
             let Some(compact) = &r.cert else {
                 continue;
             };
-            let known = self
-                .certs
-                .get(&(r.round, r.author.clone()))
-                .is_some_and(|c| c.body.digest == r.digest);
-            if known {
+            // B120: nothing at or below GC's cut is kept (B255: the
+            // retention cut).
+            if r.round <= self.retention_cut() {
                 continue;
             }
             let body = self.attest_body(r.round, &r.author, &r.digest);
             let cert = VertexCertificate::from_compact(body, compact, &self.cfg.committee);
-            self.on_cert(cert, net);
+            self.ingest_cert(cert, net);
         }
     }
 
@@ -848,17 +1200,26 @@ impl Engine {
         if self.resent.0 != self.tick {
             self.resent = (self.tick, HashSet::new());
         }
-        if !self.resent.1.insert((v.round, v.author.clone())) {
+        // B205: the slot of the staged body, not the copy's claim (a copy is
+        // matched by its digest alone, so each invented (round, author) cost
+        // a key derivation and a guard read a tick).
+        let Some((round, author)) = lock(&self.dag)
+            .get(&v.hash)
+            .map(|staged| (staged.round, staged.author.clone()))
+        else {
+            return;
+        };
+        if !self.resent.1.insert((round, author.clone())) {
             return;
         }
-        let body = self.attest_body(v.round, &v.author, &v.hash);
+        let body = self.attest_body(round, &author, &v.hash);
         let Ok(Some(a)) = self.read_own_attestation(&body) else {
             return;
         };
-        if v.author == self.cfg.address {
+        if author == self.cfg.address {
             self.on_attestation(a, net);
         } else {
-            net.send(&v.author, Msg::Attest(a));
+            net.send(&author, Msg::Attest(a));
         }
     }
 
@@ -875,9 +1236,13 @@ impl Engine {
         // it cannot be certified, and beyond f it would help a second one.
         // EP-3: nothing of E is attested once E has closed (its anchors are
         // decided; what is still staged is kept for serving only).
+        // B155: and not a twin of the digest this node attested for the
+        // slot (its guard would refuse it, after a pairing on each copy).
         let sign = self.may_sign()
             && self.closing_round.is_none()
-            && certified.as_deref().is_none_or(|d| d == v.hash);
+            && certified.as_deref().is_none_or(|d| d == v.hash)
+            && staging::self_attested_digest(&self.storage, v.epoch, v.round, &v.author)
+                .is_none_or(|d| d == v.hash);
         // G1 EQ-1 / G5 SL-3: a second digest for the slot is proposer-twin
         // evidence. Read the slot's other bodies first: staging may evict one.
         let twins = evidence::other_bodies(&self.storage, &v);
@@ -917,6 +1282,9 @@ impl Engine {
         let Ok((attestation, staged)) = result else {
             return;
         };
+        if matches!(staged, StageOutcome::EvidenceOnly(_)) {
+            self.remember_unstaged(&v);
+        }
         {
             let mut dag = lock(&self.dag);
             match staged {
@@ -970,18 +1338,28 @@ impl Engine {
             if self.early_keys.contains(&key) || self.early_certs.len() >= EARLY_CERT_CAP {
                 return;
             }
-            let keep = self.next.as_ref().is_some_and(|next| {
-                cert.body.epoch == next.epoch
-                    && vcert::verify_vertex_cert(
-                        &cert,
-                        &next.committee,
-                        &self.cfg.chain_id,
-                        &self.cfg.genesis_identity,
-                        next.epoch,
-                    )
-                    .is_ok()
+            let Some(next) = self.next.as_ref().filter(|n| n.epoch == cert.body.epoch) else {
+                return;
+            };
+            // B230: as B205 for E's: bound to another committee, refused
+            // before C_{E+1} is sorted and hashed, and a failed check
+            // charged (no honest member sends one that fails under C_{E+1});
+            // each replay of one cost both sorts and the hash, uncharged.
+            if cert.body.committee_hash != self.next_committee_hash {
+                crate::work::note_failed_check();
+                return;
+            }
+            let verified = charged_once(|| {
+                vcert::verify_vertex_cert(
+                    &cert,
+                    &next.committee,
+                    &self.cfg.chain_id,
+                    &self.cfg.genesis_identity,
+                    next.epoch,
+                )
+                .is_ok()
             });
-            if keep {
+            if verified {
                 self.early_keys.insert(key);
                 self.early_certs.push(cert);
             }
@@ -992,7 +1370,7 @@ impl Engine {
         // a replay of one cost a pairing, a synced write and a body request.
         // Between the cut and g certificates are still held, so a second
         // digest for a held slot there is still verified (a conflict).
-        if cert.body.round <= self.gc_floor().saturating_sub(staging::RETAIN_SLACK) {
+        if cert.body.round <= self.retention_cut() {
             return;
         }
         // B51: a copy of a certificate already held costs nothing (each
@@ -1005,15 +1383,27 @@ impl Engine {
         {
             return;
         }
-        if vcert::verify_vertex_cert(
-            &cert,
-            &self.cfg.committee,
-            &self.cfg.chain_id,
-            &self.cfg.genesis_identity,
-            self.epoch,
-        )
-        .is_err()
-        {
+        // B205: bound to another committee, refused before the committee is
+        // sorted and hashed again (`verify_stake_aggregate`), and charged: an
+        // honest certificate of E names C_E's hash.
+        if cert.body.committee_hash != self.committee_hash {
+            crate::work::note_failed_check();
+            return;
+        }
+        // B229: any failure charged once (a failed pairing charged itself;
+        // a bitmap below the quorum or a stake mismatch, after a sort of the
+        // committee, did not).
+        let verified = charged_once(|| {
+            vcert::verify_vertex_cert(
+                &cert,
+                &self.cfg.committee,
+                &self.cfg.chain_id,
+                &self.cfg.genesis_identity,
+                self.epoch,
+            )
+            .is_ok()
+        });
+        if !verified {
             return;
         }
         self.ingest_cert(cert, net);
@@ -1276,6 +1666,10 @@ impl Engine {
     /// `propose`.
     pub fn tick(&mut self, net: &dyn ConsensusNet) -> Option<Slot> {
         self.tick += 1;
+        self.dropped.clear();
+        self.refresh_finality_floor();
+        let due = (self.now_secs)().saturating_add(ingress_v4::MAX_FUTURE_DRIFT_SECS);
+        self.early_digests.retain(|_, at| *at > due);
         if self.halted.is_some() {
             return None;
         }
@@ -1289,6 +1683,21 @@ impl Engine {
         self.fetch(net);
         // EP-3: after its boundary block, epoch E proposes nothing more.
         if !self.may_sign() || self.closing_round.is_some() {
+            return None;
+        }
+        // B255: nor with `MAX_UNFINALIZED_BLOCKS` blocks above this node's
+        // lowest block without a QC (B262: or `MAX_KEPT_ROUNDS` rounds above
+        // its floor): what a lagging member needs to rebuild and vote on is
+        // kept (`retention_floor`), and proposing on would grow it without
+        // bound. B262: the newest own vertex goes out again now and then, so
+        // a member coming back sees how far the DAG got and asks for the
+        // whole gap at once.
+        if self.finality_lags() {
+            if self.tick.is_multiple_of(FINALITY_REBROADCAST_TICKS) {
+                if let Some(v) = self.own.values().next_back() {
+                    net.broadcast(Msg::Vertex(v.clone()));
+                }
+            }
             return None;
         }
         let owed = self.anchor_owed();
@@ -1542,6 +1951,12 @@ impl Engine {
     /// GC-1's g, as the ordering engine holds it.
     pub fn floor(&self) -> u64 {
         self.gc_floor()
+    }
+
+    /// B262: the floor kept for this node's lowest block without a QC
+    /// (`u64::MAX`: none), as of the last tick.
+    pub fn finality_floor(&self) -> u64 {
+        self.finality_floor
     }
 
     pub fn cursor(&self) -> u64 {

@@ -49,6 +49,32 @@ pub const SYNC_REQUEST_CAP: usize = 256 << 10;
 /// `chain_sync::SYNC_RESP_BLOCK_BYTES`, 8 MiB, under it).
 pub const SYNC_RESPONSE_CAP: usize = 10 << 20;
 
+/// B200: the largest answer to a height, finality or QC request: a few KB
+/// (a height, or one QC: fixed-width hashes, a bitmap of at most 32 bytes, a
+/// 96-byte aggregate), so 64 KiB (a choice). Every answer took
+/// `SYNC_RESPONSE_CAP`, read on to the 60 s timeout after the asker gave up:
+/// a peer answering each GET_HEIGHT with a slow 10 MiB frame held up to 80
+/// MiB a session.
+pub const SMALL_ANSWER_CAP: usize = 64 << 10;
+
+/// B200: the largest answer to a forwarded batch: `FORWARD_BATCH` verdicts,
+/// each a hash or a reason of a few hundred bytes (a choice).
+pub const SUBMIT_ANSWER_CAP: usize = 256 << 10;
+
+/// B200: the cap of the answer to `request`, at most `cap`.
+pub fn answer_cap(request: &str, cap: usize) -> usize {
+    let small = request == "GET_HEIGHT"
+        || request == "GET_FINALITY"
+        || request.starts_with(consensus::dag::QC_WANT_PREFIX);
+    if small {
+        cap.min(SMALL_ANSWER_CAP)
+    } else if request.starts_with(crate::forward::TX_SUBMIT) {
+        cap.min(SUBMIT_ANSWER_CAP)
+    } else {
+        cap
+    }
+}
+
 /// The node's libp2p keypair: its node key.
 pub fn local_keypair(node_key: &[u8; 32]) -> identity::Keypair {
     identity::Keypair::ed25519_from_bytes(*node_key)
@@ -146,6 +172,10 @@ pub fn is_consensus_message(wire: &str) -> bool {
 pub struct FramedCodec<Q = String> {
     request_cap: usize,
     response_cap: usize,
+    /// B200: the cap of the answer to the request this stream sent (each
+    /// outbound stream writes its request, then reads the answer, with one
+    /// clone of the codec).
+    answer_cap: usize,
     request: std::marker::PhantomData<fn() -> Q>,
 }
 
@@ -174,6 +204,7 @@ impl<Q> FramedCodec<Q> {
         Self {
             request_cap,
             response_cap,
+            answer_cap: response_cap,
             request: std::marker::PhantomData,
         }
     }
@@ -247,13 +278,14 @@ where
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_frame(io, self.response_cap).await
+        read_frame(io, self.answer_cap).await
     }
 
     async fn write_request<T>(&mut self, _: &StreamProtocol, io: &mut T, req: Q) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
+        self.answer_cap = answer_cap(req.as_ref(), self.response_cap);
         write_frame(io, req.as_ref(), self.request_cap).await
     }
 
@@ -703,13 +735,37 @@ impl<C: std::hash::Hash + Eq + Clone> NonMemberInbound<C> {
 /// comma-separated: its own observers and RPC nodes), never counted against
 /// the non-member slots.
 pub fn reserved_peers_from_env() -> std::collections::HashSet<String> {
-    std::env::var("AINCORE_RESERVED_PEERS")
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .collect()
+    reserved_peers(&std::env::var("AINCORE_RESERVED_PEERS").unwrap_or_default()).0
+}
+
+/// The reserved peers a comma-separated list names: PeerIds, or (B132)
+/// multiaddrs ending in `/p2p/{PeerId}`, whose IP literals the gate keeps
+/// slots for (a PeerId is unknown before the handshake, so a reserved peer
+/// given by PeerId alone was kept out with every stranger). Returns the
+/// PeerIds and those addresses.
+pub fn reserved_peers(list: &str) -> (std::collections::HashSet<String>, Vec<String>) {
+    let mut peers = std::collections::HashSet::new();
+    let mut addresses = Vec::new();
+    for entry in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        match entry.parse::<libp2p::Multiaddr>() {
+            Ok(addr) => {
+                if let Some(libp2p::multiaddr::Protocol::P2p(peer)) = addr.iter().last() {
+                    peers.insert(peer.to_string());
+                    addresses.push(entry.to_string());
+                }
+            }
+            Err(_) => {
+                peers.insert(entry.to_string());
+            }
+        }
+    }
+    (peers, addresses)
+}
+
+/// B132: the reserved peers' addresses (`reserved_peers`) from the
+/// environment.
+pub fn reserved_addresses_from_env() -> Vec<String> {
+    reserved_peers(&std::env::var("AINCORE_RESERVED_PEERS").unwrap_or_default()).1
 }
 
 /// B40: outbound connections to peers no committee key names (Kademlia's
@@ -729,6 +785,133 @@ pub const MAX_SAVED_PEERS: usize = 64;
 /// traffic.
 pub const MEMBER_MSG_BURST: f64 = 4.0 * (blockchain::committee::MAX_COMMITTEE as f64 + 2.0);
 pub const MEMBER_MSGS_PER_SEC: f64 = 400.0;
+
+/// B148: an honest member's consensus bytes to one node in a round, at
+/// most: its vertex and one retry of it, and the answers to this node's
+/// pull requests of a tick (`CLIENT_REQS_PER_TICK`), each at most
+/// `MAX_WIRE_BYTES`, and a kibibyte for each of its other messages.
+pub const MEMBER_ROUND_BYTES: f64 = ((2 + consensus::v4::pull::CLIENT_REQS_PER_TICK)
+    * consensus::v4::MAX_WIRE_BYTES
+    + (blockchain::committee::MAX_COMMITTEE + 2) * 1024) as f64;
+/// B148: consensus bytes a member may send a second, and in a burst: four
+/// rounds' worth, and as many rounds a second as the message budget allows.
+/// The message count alone let a member push 400 bodies of 768 KiB a
+/// second, each a parse, two serializations, a hash and a signature check
+/// (15-25 ms on the Pi), uncounted.
+pub const MEMBER_BYTE_BURST: f64 = 4.0 * MEMBER_ROUND_BYTES;
+pub const MEMBER_BYTES_PER_SEC: f64 =
+    MEMBER_MSGS_PER_SEC / (blockchain::committee::MAX_COMMITTEE as f64 + 2.0) * MEMBER_ROUND_BYTES;
+
+/// NI-3/B148: what a member's consensus push costs: a message, and its
+/// bytes.
+#[derive(Debug)]
+pub struct MemberBudget {
+    msgs: Budget<String>,
+    bytes: Budget<String>,
+}
+
+impl Default for MemberBudget {
+    fn default() -> Self {
+        Self {
+            msgs: Budget::new(MEMBER_MSGS_PER_SEC, MEMBER_MSG_BURST),
+            bytes: Budget::new(MEMBER_BYTES_PER_SEC, MEMBER_BYTE_BURST),
+        }
+    }
+}
+
+impl MemberBudget {
+    /// Spend a push of `len` bytes from `member` at `now`; false when it
+    /// is over either budget.
+    pub fn admit(&mut self, member: &str, len: usize, now: std::time::Instant) -> bool {
+        let key = member.to_string();
+        self.msgs.spend(&key, now) && self.bytes.spend_amount(&key, len as f64, now)
+    }
+}
+
+/// B157: transactions one forwarding host (or member) may submit to this
+/// node a second, on a quota of their own. A batch of 64 cost its sender
+/// one token of the sync quota (12.8 a second, shared with block sync,
+/// B156) while its signatures cost this node 64 checks. The rate is an
+/// observer's full mempool every re-forward period (5,000 / 30 s, ~167 a
+/// second).
+pub const TX_SUBMIT_PER_SEC: f64 =
+    mempool::MAX_PENDING_TXS as f64 / crate::forward::FORWARD_RETRY_SECS as f64;
+/// B172/B183: the quota in bytes, priced by the length alone, so the swarm
+/// task reads nothing of a batch before it is charged (counting its
+/// transactions parsed the whole request there first, and a refused one
+/// for free): `TX_SUBMIT_PER_SEC` signature checks' worth a second at
+/// `forward::MIN_WIRE_PER_CHECK` bytes a check, so at most that many
+/// checks; the burst is four requests at the cap (a pass's loan to one
+/// member), so the largest batch an honest forwarder sends fits it.
+pub const TX_SUBMIT_BYTES_PER_SEC: f64 =
+    TX_SUBMIT_PER_SEC * crate::forward::MIN_WIRE_PER_CHECK as f64;
+pub const TX_SUBMIT_BYTE_BURST: f64 = (4 * SYNC_REQUEST_CAP) as f64;
+
+/// B157: what a `TX_SUBMIT` costs its sender: its bytes (B172).
+#[derive(Debug)]
+pub struct SubmitBudget(Budget<String>);
+
+impl Default for SubmitBudget {
+    fn default() -> Self {
+        Self(Budget::new(TX_SUBMIT_BYTES_PER_SEC, TX_SUBMIT_BYTE_BURST))
+    }
+}
+
+impl SubmitBudget {
+    /// Spend `wire`'s length from `key`'s quota at `now`; false when it
+    /// holds less.
+    pub fn admit(&mut self, key: &str, wire: &str, now: std::time::Instant) -> bool {
+        self.0
+            .spend_amount(&key.to_string(), wire.len() as f64, now)
+    }
+}
+
+/// B34/B114/B187: the serving slots a session's request takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServePool {
+    /// A member's sync request (B88: members keep to their own).
+    Member,
+    /// A reserved peer's sync request (B187: they shared the open slots with
+    /// every stranger, so a host holding those starved the operator's RPC
+    /// nodes of block sync and QC_WANT).
+    Reserved,
+    /// Anyone else's.
+    Open,
+    /// A forwarded batch (B31).
+    TxSubmit,
+    /// A reserved peer's forwarded batch (B114).
+    ReservedTxSubmit,
+}
+
+/// The pool a request takes its serving slot from.
+pub fn serve_pool(tx_submit: bool, member: bool, reserved: bool) -> ServePool {
+    match (tx_submit, member, reserved) {
+        (true, _, true) => ServePool::ReservedTxSubmit,
+        (true, _, false) => ServePool::TxSubmit,
+        (false, true, _) => ServePool::Member,
+        (false, false, true) => ServePool::Reserved,
+        (false, false, false) => ServePool::Open,
+    }
+}
+
+/// B131/B178: who a snapshot request is charged to, and whether it may take
+/// the kept snapshot slot and units (`chain_sync::state_sync`): a reserved
+/// peer by its key, kept; a member by its key, not kept: a node whose key a
+/// committee records never restores (SN-6, S6 refuses it), so a member has
+/// no use for them, and two Byzantine members kept them drained; anyone else
+/// by its network group (`group`), when known.
+pub fn snapshot_client(
+    peer: &str,
+    member: bool,
+    reserved: bool,
+    group: Option<&str>,
+) -> (String, bool) {
+    let client = match group {
+        Some(group) if !member && !reserved => group.to_string(),
+        _ => peer.to_string(),
+    };
+    (client, reserved)
+}
 
 /// NI-3: sync requests a session may send (Lighthouse's quota for
 /// blocks-by-range: 128 per 10 s).
@@ -760,6 +943,12 @@ impl<K: std::hash::Hash + Eq + Clone> Budget<K> {
 
     /// Spend one token of `key` at `now`; false when its bucket is empty.
     pub fn spend(&mut self, key: &K, now: std::time::Instant) -> bool {
+        self.spend_amount(key, 1.0, now)
+    }
+
+    /// B148: spend `amount` tokens of `key` at `now`; false (and nothing
+    /// spent) when its bucket holds fewer.
+    pub fn spend_amount(&mut self, key: &K, amount: f64, now: std::time::Instant) -> bool {
         if self.buckets.len() >= BUDGET_KEYS && !self.buckets.contains_key(key) {
             let (rate, burst) = (self.rate, self.burst);
             // A bucket idle long enough is full again: forgetting it is exact.
@@ -773,8 +962,8 @@ impl<K: std::hash::Hash + Eq + Clone> Budget<K> {
         let (tokens, at) = self.buckets.entry(key.clone()).or_insert((self.burst, now));
         *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * self.rate).min(self.burst);
         *at = now;
-        if *tokens >= 1.0 {
-            *tokens -= 1.0;
+        if *tokens >= amount {
+            *tokens -= amount;
             true
         } else {
             false
@@ -819,13 +1008,57 @@ pub const PENDING_PER_IP: usize = 4;
 /// times per boot).
 pub const ADMIT_PER_IP_PER_SEC: f64 = 2.0;
 pub const ADMIT_BURST_PER_IP: f64 = 16.0;
+/// B221: a kept IP's own admission rate (choices: twice a stranger's): a
+/// kept IP skipped the rate (B111: the shared budget's key map, once full,
+/// refused a reconnecting member like a stranger), and a member names the
+/// IP it reports, so a host it controls cost every node a Noise handshake
+/// (a keygen, two X25519, a signature) as fast as it could reconnect. Its
+/// map holds kept IPs only (`MAX_KEPT_IPS`).
+pub const ADMIT_KEPT_PER_SEC: f64 = 2.0 * ADMIT_PER_IP_PER_SEC;
+pub const ADMIT_KEPT_BURST: f64 = 2.0 * ADMIT_BURST_PER_IP;
 /// B56: unfinished handshakes kept for IPs members connected from (a
 /// choice: four members reconnecting at once, `PENDING_PER_IP` each). The
 /// rest of `MAX_PENDING_INBOUND` is all other IPs': ~28 IPs holding silent
 /// handshakes used to fill every slot and keep a restarted member out.
 pub const PENDING_KEPT_FOR_MEMBERS: usize = 16;
-/// B56: member IPs remembered at most.
-pub const MAX_MEMBER_IPS: usize = 1024;
+/// B132: IPs kept per committee member: its latest connection's and its
+/// latest identify-reported one (a choice).
+pub const MEMBER_IPS_KEPT: usize = 2;
+/// B152: a member's kept IP is replaced at most this often (a choice: the
+/// handshake timeout, so an IP left behind holds its unfinished handshakes
+/// no longer than its successor has been kept). A member rotating the IPs
+/// it reports gave each new one its own slots, ~1,300 IPs filled the total
+/// in one timeout, and every inbound connection was refused.
+pub const KEPT_IP_HOLD: std::time::Duration = HANDSHAKE_TIMEOUT;
+
+/// B152: where a member's kept IP came from. Each source has its own slot:
+/// a member reporting two interfaces pushed out the IP it connects from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpSource {
+    /// An authenticated connection's remote address.
+    Connected,
+    /// An address it reported (identify).
+    Reported,
+}
+
+/// A member's kept IPs, one per source, each with when it was kept.
+#[derive(Debug, Default, Clone)]
+struct MemberSlots {
+    connected: Option<(std::net::IpAddr, std::time::Instant)>,
+    reported: Option<(std::net::IpAddr, std::time::Instant)>,
+}
+/// B132: IPs kept from the boot list (literals, and its host names resolved).
+pub const MAX_BOOT_IPS: usize = 128;
+/// B132: kept IPs at most: the boot list's, and the members' of the current
+/// and next committees.
+pub const MAX_KEPT_IPS: usize =
+    2 * MAX_BOOT_IPS + 2 * blockchain::committee::MAX_COMMITTEE * MEMBER_IPS_KEPT;
+/// B132: unfinished inbound handshakes at once, in all: the others' share
+/// and `PENDING_PER_IP` for every kept IP. Each kept IP has its own slots:
+/// with sixteen shared, Byzantine members filled them from their own kept
+/// IPs while strangers held the rest, and no honest member could reconnect.
+pub const MAX_PENDING_TOTAL: u32 = (MAX_PENDING_INBOUND as usize - PENDING_KEPT_FOR_MEMBERS
+    + PENDING_PER_IP * MAX_KEPT_IPS) as u32;
 /// B116: unfinished handshakes from one network group (`net_group`: /16
 /// IPv4, /32 IPv6) outside the kept IPs, at once (a choice: two hosts'
 /// worth; the other IPs' 112 slots then take 14 groups to fill, where 28
@@ -843,32 +1076,56 @@ pub const PENDING_PER_GROUP: usize = 2 * PENDING_PER_IP;
 #[derive(Debug, Default)]
 pub struct KeptIps {
     boot: std::collections::HashSet<std::net::IpAddr>,
-    members: HashMap<PeerId, std::net::IpAddr>,
+    /// B132: the boot list's host names, resolved (replaced at each lookup).
+    resolved: std::collections::HashSet<std::net::IpAddr>,
+    members: HashMap<PeerId, MemberSlots>,
     all: std::collections::HashSet<std::net::IpAddr>,
 }
 
 impl KeptIps {
-    /// The IPs kept from boot (the operator's bootnodes and saved members).
+    /// The IPs kept from boot (the operator's bootnodes, saved members and
+    /// reserved peers given with addresses).
     pub fn with_boot(boot: impl IntoIterator<Item = std::net::IpAddr>) -> Self {
         let mut kept = Self {
-            boot: boot.into_iter().take(MAX_MEMBER_IPS).collect(),
+            boot: boot.into_iter().take(MAX_BOOT_IPS).collect(),
             ..Self::default()
         };
         kept.rebuild();
         kept
     }
 
-    /// Committee member `peer` connected from `ip`; `is_member` tells which
-    /// recorded members still are (those that left are dropped).
+    /// B132: the IPs the boot list's host names resolve to now.
+    pub fn set_resolved(&mut self, ips: impl IntoIterator<Item = std::net::IpAddr>) {
+        self.resolved = ips.into_iter().take(MAX_BOOT_IPS).collect();
+        self.rebuild();
+    }
+
+    /// Committee member `peer` connected from, or reported, `ip` at `now`:
+    /// kept in that source's slot, unless the slot changed less than
+    /// `KEPT_IP_HOLD` ago (B152); `is_member` tells which recorded members
+    /// still are (those that left are dropped).
     pub fn record_member(
         &mut self,
         peer: PeerId,
         ip: std::net::IpAddr,
+        source: IpSource,
+        now: std::time::Instant,
         is_member: impl Fn(&PeerId) -> bool,
     ) {
         self.members.retain(|p, _| is_member(p));
-        if self.members.len() < MAX_MEMBER_IPS || self.members.contains_key(&peer) {
-            self.members.insert(peer, ip);
+        if self.members.len() < 2 * blockchain::committee::MAX_COMMITTEE
+            || self.members.contains_key(&peer)
+        {
+            let slots = self.members.entry(peer).or_default();
+            let slot = match source {
+                IpSource::Connected => &mut slots.connected,
+                IpSource::Reported => &mut slots.reported,
+            };
+            match slot {
+                Some((held, _)) if *held == ip => {}
+                Some((_, since)) if now.saturating_duration_since(*since) < KEPT_IP_HOLD => {}
+                _ => *slot = Some((ip, now)),
+            }
         }
         self.rebuild();
     }
@@ -877,14 +1134,131 @@ impl KeptIps {
         self.all.contains(ip)
     }
 
+    pub fn len(&self) -> usize {
+        self.all.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.all.is_empty()
+    }
+
     fn rebuild(&mut self) {
         self.all = self
             .boot
             .iter()
-            .chain(self.members.values())
+            .chain(&self.resolved)
+            .chain(self.members.values().flat_map(|slots| {
+                slots
+                    .connected
+                    .iter()
+                    .chain(slots.reported.iter())
+                    .map(|(ip, _)| ip)
+            }))
             .copied()
             .collect();
     }
+}
+
+/// B132: the boot list's host names to resolve (`/dns*` multiaddrs and
+/// `host:port`), with their ports. A host name had no kept slots (only IP
+/// literals did), and the documented mainnet bootnodes are host names.
+pub fn boot_hosts(boot: &[String]) -> Vec<(String, u16)> {
+    use libp2p::multiaddr::Protocol;
+    let mut out = Vec::new();
+    for entry in boot.iter().map(|e| e.trim()) {
+        if let Ok(addr) = entry.parse::<libp2p::Multiaddr>() {
+            let host = addr.iter().find_map(|p| match p {
+                Protocol::Dns(h) | Protocol::Dns4(h) | Protocol::Dns6(h) => Some(h.to_string()),
+                _ => None,
+            });
+            let port = addr.iter().find_map(|p| match p {
+                Protocol::Tcp(port) => Some(port),
+                _ => None,
+            });
+            if let (Some(host), Some(port)) = (host, port) {
+                out.push((host, port));
+            }
+        } else if entry.parse::<std::net::SocketAddr>().is_err() {
+            if let Some((host, port)) = entry.rsplit_once(':') {
+                if let Ok(port) = port.parse::<u16>() {
+                    if !host.is_empty() && host.parse::<std::net::IpAddr>().is_err() {
+                        out.push((host.to_string(), port));
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// B163: each boot name's last answer. A failed (or empty) lookup keeps
+/// the previous one: a resolver hiccup cleared every bootnode's kept slots.
+#[derive(Debug, Default)]
+pub struct ResolvedNames {
+    /// B185: ordered, so the names that keep the boot slots are the same at
+    /// every lookup (HashMap order gave them to whichever came first).
+    last: std::collections::BTreeMap<(String, u16), Vec<std::net::IpAddr>>,
+}
+
+/// B185: the IPs one boot name keeps (a choice: a DNS seed's answer of a
+/// few hosts). A name answering 128 rotating IPs held every kept boot slot.
+pub const MAX_IPS_PER_NAME: usize = 8;
+
+impl ResolvedNames {
+    /// `host:port`'s lookup: `None` when it failed.
+    pub fn record(&mut self, host: &str, port: u16, found: Option<Vec<std::net::IpAddr>>) {
+        if let Some(mut ips) = found.filter(|ips| !ips.is_empty()) {
+            ips.truncate(MAX_IPS_PER_NAME);
+            self.last.insert((host.to_string(), port), ips);
+        }
+    }
+
+    /// The IPs every name resolved to, last time it did, in name order.
+    pub fn ips(&self) -> Vec<std::net::IpAddr> {
+        self.last.values().flatten().copied().collect()
+    }
+}
+
+/// B160: whether the peer a connection's remote host (`multiaddr_host`)
+/// names runs on this host: a loopback connection. Decided from this node's
+/// own connection, never from what the peer reports.
+pub fn on_this_host(host: Option<&str>) -> bool {
+    host.and_then(|h| h.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|ip| ip.is_loopback())
+}
+
+/// B146: `learned_address_ok` for a peer on this host (its loopback is
+/// fine): an IP literal, no name.
+pub fn learned_address_ok_on_this_host(addr: &libp2p::Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    addr.iter()
+        .any(|p| matches!(p, Protocol::Ip4(_) | Protocol::Ip6(_)))
+        && !addr.iter().any(|p| {
+            matches!(
+                p,
+                Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_)
+            )
+        })
+}
+
+/// B146: whether an address a peer reported (identify, mDNS) is kept: an IP
+/// literal another host can dial. A name a peer reports is never resolved
+/// (it could name loopback or a Docker bridge behind the IP filter, or fan
+/// out through `/dnsaddr`); only names the operator gave are.
+pub fn learned_address_ok(addr: &libp2p::Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    routable_for_others(addr)
+        && addr
+            .iter()
+            .any(|p| matches!(p, Protocol::Ip4(_) | Protocol::Ip6(_)))
+        && !addr.iter().any(|p| {
+            matches!(
+                p,
+                Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_)
+            )
+        })
 }
 
 /// B116: the IP literals of the boot dial list (bootnodes and saved member
@@ -916,8 +1290,13 @@ pub type MemberIps = Arc<RwLock<KeptIps>>;
 /// before the handshake starts.
 #[derive(Debug)]
 pub struct InboundGate {
-    pending: HashMap<libp2p::swarm::ConnectionId, std::net::IpAddr>,
+    /// Unfinished handshakes: the IP, and whether it took a kept IP's slots
+    /// (B199: counted in that bucket until it finishes, whatever the kept
+    /// set becomes meanwhile).
+    pending: HashMap<libp2p::swarm::ConnectionId, (std::net::IpAddr, bool)>,
     admit: Budget<std::net::IpAddr>,
+    /// B221: kept IPs' own admission rate, by exact IP.
+    admit_kept: Budget<std::net::IpAddr>,
     member_ips: MemberIps,
 }
 
@@ -933,12 +1312,31 @@ impl InboundGate {
         Self {
             pending: HashMap::new(),
             admit: Budget::new(ADMIT_PER_IP_PER_SEC, ADMIT_BURST_PER_IP),
+            admit_kept: Budget::new(ADMIT_KEPT_PER_SEC, ADMIT_KEPT_BURST),
             member_ips,
         }
     }
 }
 
-fn ip_of(addr: &libp2p::Multiaddr) -> Option<std::net::IpAddr> {
+/// B187: what a host's connections count under: an IPv6 address by its /64
+/// (one host routes 2^64 of them, and each counted as a host of its own), a
+/// mapped IPv4 one as IPv4, loopback as itself; as the RPC's limiter keys a
+/// client (B74).
+pub fn host_key(ip: std::net::IpAddr) -> std::net::IpAddr {
+    use std::net::{IpAddr, Ipv6Addr};
+    match ip {
+        IpAddr::V6(v6) if !v6.is_loopback() => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let s = v6.segments();
+                IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+            }
+        },
+        _ => ip,
+    }
+}
+
+pub fn ip_of(addr: &libp2p::Multiaddr) -> Option<std::net::IpAddr> {
     addr.iter().find_map(|p| match p {
         libp2p::multiaddr::Protocol::Ip4(ip) => Some(ip.into()),
         libp2p::multiaddr::Protocol::Ip6(ip) => Some(ip.into()),
@@ -961,45 +1359,73 @@ impl libp2p::swarm::NetworkBehaviour for InboundGate {
         };
         let denied =
             |why: &str| libp2p::swarm::ConnectionDenied::new(io::Error::other(why.to_string()));
-        if self.pending.values().filter(|p| **p == ip).count() >= PENDING_PER_IP {
+        // B187: per host: an IPv6 one by its /64. B207: a member's kept IP by
+        // itself (kept IPs are exact): a host sharing the member's /64 used
+        // up the member's own handshake slots. B199: each handshake counts in
+        // the bucket it was admitted to (a member that rotated its reported
+        // IP moved its unfinished handshakes into the shared slots).
+        let key = host_key(ip);
+        let kept_ip = self.member_ips.read().is_ok_and(|kept| kept.contains(&ip));
+        if self
+            .pending
+            .values()
+            .filter(|(p, kept)| {
+                if kept_ip {
+                    *kept && *p == ip
+                } else {
+                    !*kept && host_key(*p) == key
+                }
+            })
+            .count()
+            >= PENDING_PER_IP
+        {
             return Err(denied("too many unfinished handshakes from this IP"));
+        }
+        // B132: the backstop over all: the others' share and each kept IP's
+        // own slots (`connection_limits` holds the same bound).
+        if self.pending.len() >= MAX_PENDING_TOTAL as usize {
+            return Err(denied("too many unfinished handshakes in all"));
         }
         // B56: other IPs share all but the slots kept for members'; B116:
         // and one network group holds at most PENDING_PER_GROUP of them.
-        if let Ok(kept) = self.member_ips.read() {
-            if !kept.contains(&ip) {
-                let others: Vec<&std::net::IpAddr> = self
-                    .pending
-                    .values()
-                    .filter(|p| !kept.contains(p))
-                    .collect();
-                let limit = MAX_PENDING_INBOUND as usize - PENDING_KEPT_FOR_MEMBERS;
-                if others.len() >= limit {
-                    return Err(denied(
-                        "the unfinished handshakes of other IPs are at their bound",
-                    ));
-                }
-                let group = net_group(&ip.to_string());
-                if others
-                    .iter()
-                    .filter(|p| net_group(&p.to_string()) == group)
-                    .count()
-                    >= PENDING_PER_GROUP
-                {
-                    return Err(denied(
-                        "too many unfinished handshakes from this network group",
-                    ));
-                }
+        if !kept_ip {
+            let others: Vec<&std::net::IpAddr> = self
+                .pending
+                .values()
+                .filter(|(_, kept)| !*kept)
+                .map(|(p, _)| p)
+                .collect();
+            let limit = MAX_PENDING_INBOUND as usize - PENDING_KEPT_FOR_MEMBERS;
+            if others.len() >= limit {
+                return Err(denied(
+                    "the unfinished handshakes of other IPs are at their bound",
+                ));
+            }
+            let group = net_group(&ip.to_string());
+            if others
+                .iter()
+                .filter(|p| net_group(&p.to_string()) == group)
+                .count()
+                >= PENDING_PER_GROUP
+            {
+                return Err(denied(
+                    "too many unfinished handshakes from this network group",
+                ));
             }
         }
         // B111: a member's IP is not held to the per-IP admission rate (once
         // that budget's key map was full, a reconnecting member's IP could be
-        // refused like any stranger's).
-        let member_ip = self.member_ips.read().is_ok_and(|m| m.contains(&ip));
-        if !member_ip && !self.admit.spend(&ip, std::time::Instant::now()) {
+        // refused like any stranger's). B221: but to a rate of its own.
+        let now = std::time::Instant::now();
+        let admitted = if kept_ip {
+            self.admit_kept.spend(&ip, now)
+        } else {
+            self.admit.spend(&key, now)
+        };
+        if !admitted {
             return Err(denied("this IP opens connections too fast"));
         }
-        self.pending.insert(connection_id, ip);
+        self.pending.insert(connection_id, (ip, kept_ip));
         Ok(())
     }
 
@@ -1502,15 +1928,81 @@ pub fn boot_dial_list(bootnodes: &[String], saved: &[String]) -> Vec<String> {
             Err(e) => eprintln!("⚠️ bootnode ignored: {e}"),
         }
     }
+    // B185: a saved row is dialled only as an IP literal: only the
+    // operator's own boot list names hosts (a saved name was resolved at boot
+    // as if the operator had given it).
     for addr in saved {
-        let routable = addr
+        let literal = addr
             .parse::<libp2p::Multiaddr>()
-            .is_ok_and(|a| routable_for_others(&a));
-        if routable && !out.contains(addr) {
+            .is_ok_and(|a| learned_address_ok(&a));
+        if literal && !out.contains(addr) {
             out.push(addr.clone());
         }
     }
     out
+}
+
+/// B198: the members a QC_WANT asks over sync at its `turn`: two of the
+/// connected ones, the next two in key order each turn, so every member is
+/// asked within `ceil(m / 2)` turns. It asked the first two of the book's
+/// hash order every time, which a node waiting at a boundary never rebuilt:
+/// two Byzantine members there that never answer held it in its epoch.
+pub fn qc_want_peers(mut connected: Vec<PeerId>, turn: usize) -> Vec<PeerId> {
+    if connected.is_empty() {
+        return connected;
+    }
+    connected.sort_by_key(|p| p.to_bytes());
+    let start = turn.wrapping_mul(2) % connected.len();
+    let take = connected.len().min(2);
+    connected
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(take)
+        .copied()
+        .collect()
+}
+
+/// B222: how long a saved peer address stands unwritten while it is
+/// unchanged (a choice: B43 dials the newest rows first, and a member
+/// reconnecting rewrote its unchanged row each time).
+pub const PEER_ROW_FRESH_SECS: u64 = 3_600;
+
+/// B222: `peer`'s saved row holds `addr`, saved less than
+/// `PEER_ROW_FRESH_SECS` before `now_secs`.
+pub fn peer_row_is_fresh(
+    storage: &storage::StateDB,
+    peer: &str,
+    addr: &str,
+    now_secs: u64,
+) -> bool {
+    storage
+        .get(&format!("peer_addr:{peer}"))
+        .ok()
+        .flatten()
+        .and_then(|row| {
+            let (at, saved) = row.split_once(' ')?;
+            Some((at.parse::<u64>().ok()?, saved.to_string()))
+        })
+        .is_some_and(|(at, saved)| {
+            saved == addr && now_secs.saturating_sub(at) < PEER_ROW_FRESH_SECS
+        })
+}
+
+/// Seconds since the epoch (0 if the clock is before it).
+pub fn wall_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// B186: the key `addr` pins (its trailing `/p2p/<PeerId>`), if any.
+pub fn pinned_peer(addr: &libp2p::Multiaddr) -> Option<PeerId> {
+    match addr.iter().last() {
+        Some(libp2p::multiaddr::Protocol::P2p(peer)) => Some(peer),
+        _ => None,
+    }
 }
 
 /// `addr` without a trailing `/p2p/<PeerId>`.
@@ -1876,10 +2368,13 @@ mod tests {
         use libp2p::swarm::NetworkBehaviour;
         let members = MemberIps::default();
         let member: std::net::IpAddr = "10.9.9.9".parse().unwrap();
-        members
-            .write()
-            .unwrap()
-            .record_member(PeerId::random(), member, |_| true);
+        members.write().unwrap().record_member(
+            PeerId::random(),
+            member,
+            IpSource::Connected,
+            std::time::Instant::now(),
+            |_| true,
+        );
         let mut gate = InboundGate::with_member_ips(members);
         let local: libp2p::Multiaddr = "/ip4/10.0.0.1/tcp/9101".parse().unwrap();
         let from =
@@ -1933,6 +2428,19 @@ mod tests {
             ADMIT_BURST_PER_IP as usize + 8,
             "a member's IP was rate-limited"
         );
+        // B221: but held to a rate of its own (a member names the IP it
+        // reports): past that burst, at one instant, it is refused.
+        let refused = (0..ADMIT_KEPT_BURST as usize).any(|i| {
+            let id = libp2p::swarm::ConnectionId::new_unchecked(3_000_000 + i);
+            let ok = gate
+                .handle_pending_inbound_connection(id, &local, &from(member.to_string()))
+                .is_ok();
+            if ok {
+                let _ = gate.handle_established_inbound_connection(id, peer, &local, &local);
+            }
+            !ok
+        });
+        assert!(refused, "a kept IP opened connections without bound");
     }
 
     /// B116 witness: at a cold start no member has connected yet, and the
@@ -1987,23 +2495,152 @@ mod tests {
         assert!(!try_from(&mut gate, "203.0.113.9"), "a new IP got in");
         assert!(try_from(&mut gate, "10.7.7.7"), "a bootnode was kept out");
         assert!(try_from(&mut gate, "10.8.8.8"), "a bootnode was kept out");
-        // One IP per member, the latest; none once it left the committee.
-        let member = PeerId::random();
-        let mut book = kept.write().unwrap();
-        for i in 0..32u8 {
-            book.record_member(member, std::net::IpAddr::from([10, 9, 0, i]), |_| true);
+        // B132: each kept IP has its own slots: kept IPs holding sixteen
+        // between them (all the old shared reservation) and the others'
+        // share full, another kept IP still gets in.
+        {
+            let mut k = kept.write().unwrap();
+            for i in 0..5u8 {
+                k.record_member(
+                    PeerId::random(),
+                    std::net::IpAddr::from([10, 6, 0, i]),
+                    IpSource::Connected,
+                    std::time::Instant::now(),
+                    |_| true,
+                );
+            }
         }
-        assert!(!book.contains(&std::net::IpAddr::from([10, 9, 0, 0])));
-        assert!(book.contains(&std::net::IpAddr::from([10, 9, 0, 31])));
+        for i in 0..4u8 {
+            for _ in 0..PENDING_PER_IP {
+                assert!(
+                    try_from(&mut gate, &format!("10.6.0.{i}")),
+                    "a kept IP's own slots"
+                );
+            }
+        }
+        assert!(
+            try_from(&mut gate, "10.6.0.4"),
+            "a kept IP shared sixteen slots with the others"
+        );
+        // B152: per member, its connection's IP and its reported one, each
+        // replaced at most once a `KEPT_IP_HOLD`; none once it left the
+        // committee. A member rotating its reported IPs gave each its own
+        // slots, and two reported interfaces pushed out the connection's.
+        let member = PeerId::random();
+        let ip = |d: u8| std::net::IpAddr::from([10, 9, 0, d]);
+        let t0 = std::time::Instant::now();
+        let mut book = kept.write().unwrap();
+        book.record_member(member, ip(0), IpSource::Connected, t0, |_| true);
+        for i in 1..32u8 {
+            book.record_member(member, ip(i), IpSource::Reported, t0, |_| true);
+        }
+        assert!(book.contains(&ip(0)), "the connection's IP was pushed out");
+        assert!(book.contains(&ip(1)), "vacuous: no reported IP kept");
+        assert!(
+            !book.contains(&ip(31)),
+            "a reported IP was replaced within the hold"
+        );
+        let later = t0 + KEPT_IP_HOLD;
+        book.record_member(member, ip(31), IpSource::Reported, later, |_| true);
+        assert!(book.contains(&ip(31)) && !book.contains(&ip(1)));
+        assert!(book.contains(&ip(0)));
         book.record_member(
             PeerId::random(),
             std::net::IpAddr::from([10, 9, 1, 1]),
+            IpSource::Connected,
+            later,
             |p| *p != member,
         );
         assert!(
-            !book.contains(&std::net::IpAddr::from([10, 9, 0, 31])),
+            !book.contains(&ip(31)) && !book.contains(&ip(0)),
             "a member that left kept its slot"
         );
+        // B132: the boot list's host names are resolved into the kept set;
+        // reserved peers may be given with addresses, kept like bootnodes.
+        assert_eq!(
+            boot_hosts(&[
+                format!("/dns4/node1.example.org/tcp/9101/p2p/{}", PeerId::random()),
+                "seed.example.org:9101".into(),
+                "10.8.8.8:9101".into(),
+            ]),
+            vec![
+                ("node1.example.org".to_string(), 9101),
+                ("seed.example.org".to_string(), 9101)
+            ]
+        );
+        book.set_resolved([std::net::IpAddr::from([10, 5, 5, 5])]);
+        assert!(book.contains(&std::net::IpAddr::from([10, 5, 5, 5])));
+        let peer = PeerId::random();
+        let (peers, addresses) =
+            reserved_peers(&format!(" {peer}, /ip4/10.4.4.4/tcp/9101/p2p/{peer} ,"));
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            boot_ips(&addresses),
+            vec![std::net::IpAddr::from([10, 4, 4, 4])]
+        );
+    }
+
+    /// B178 witness: a member is charged by its key but takes no kept
+    /// snapshot slot or units; a reserved peer does; anyone else is its
+    /// network group.
+    #[test]
+    fn only_a_reserved_peer_is_kept_for_snapshots() {
+        let client = |member, reserved, group| snapshot_client("peer", member, reserved, group);
+        assert_eq!(
+            client(true, false, Some("10.1")),
+            ("peer".to_string(), false)
+        );
+        assert_eq!(
+            client(false, true, Some("10.2")),
+            ("peer".to_string(), true)
+        );
+        assert_eq!(client(true, true, None), ("peer".to_string(), true));
+        assert_eq!(
+            client(false, false, Some("10.3")),
+            ("10.3".to_string(), false)
+        );
+        assert_eq!(client(false, false, None), ("peer".to_string(), false));
+    }
+
+    /// B163 witness: a failed or empty lookup keeps a name's last answer;
+    /// a new one replaces it.
+    #[test]
+    fn a_failed_lookup_keeps_the_last_answer() {
+        let ip = |d: u8| std::net::IpAddr::from([10, 5, 5, d]);
+        let mut names = ResolvedNames::default();
+        names.record("seed.example.org", 9101, Some(vec![ip(1)]));
+        names.record("seed.example.org", 9101, None);
+        names.record("seed.example.org", 9101, Some(vec![]));
+        assert_eq!(names.ips(), vec![ip(1)], "a failed lookup cleared it");
+        names.record("seed.example.org", 9101, Some(vec![ip(2)]));
+        assert_eq!(names.ips(), vec![ip(2)]);
+    }
+
+    /// B160 witness: a peer is on this host only when this node's own
+    /// connection to it is a loopback one (it was what the peer reported).
+    #[test]
+    fn on_this_host_is_this_nodes_connection() {
+        assert!(on_this_host(Some("127.0.0.1")));
+        assert!(on_this_host(Some("::1")));
+        assert!(!on_this_host(Some("172.17.0.2")));
+        assert!(!on_this_host(Some("203.0.113.7")));
+        assert!(!on_this_host(Some("localhost")));
+        assert!(!on_this_host(None));
+    }
+
+    /// B146 witness: an address a peer reports is kept only as an IP
+    /// literal another host can dial; a name it reports is never resolved.
+    #[test]
+    fn a_reported_name_is_not_kept() {
+        let ok = |a: &str| learned_address_ok(&a.parse::<libp2p::Multiaddr>().unwrap());
+        assert!(ok("/ip4/203.0.113.7/tcp/9101"));
+        assert!(!ok("/dns4/localhost/tcp/9101"));
+        assert!(!ok("/dnsaddr/example.org"));
+        assert!(!ok("/ip4/127.0.0.1/tcp/9101"));
+        let here =
+            |a: &str| learned_address_ok_on_this_host(&a.parse::<libp2p::Multiaddr>().unwrap());
+        assert!(here("/ip4/127.0.0.1/tcp/9101"));
+        assert!(!here("/dns4/localhost/tcp/9101"));
     }
 
     /// NI-3: a budget spends its burst, refuses past it, refills at its
@@ -2033,6 +2670,77 @@ mod tests {
         let round = (blockchain::committee::MAX_COMMITTEE + 2) as f64;
         assert!(MEMBER_MSG_BURST >= 4.0 * round);
         assert!(MEMBER_MSGS_PER_SEC >= 4.0 * round / 3.0);
+        // B148: and its bytes, its largest messages at their cap.
+        let largest = consensus::v4::MAX_WIRE_BYTES as f64;
+        let bytes = (2.0 + consensus::v4::pull::CLIENT_REQS_PER_TICK as f64) * largest;
+        assert!(MEMBER_BYTE_BURST >= 4.0 * bytes);
+        assert!(MEMBER_BYTES_PER_SEC >= 4.0 * bytes / 3.0);
+    }
+
+    /// B157/B172 witness: a forwarding host's batches are charged their
+    /// bytes, read unparsed, on a quota apart from block sync's: at one
+    /// instant a burst's worth, whatever the batch holds (one that does not
+    /// parse costs the same), at least a token a signature check, and the
+    /// largest request fits a fresh quota (a batch of 64 cost one token).
+    #[test]
+    fn a_submit_is_charged_its_bytes() {
+        let now = std::time::Instant::now();
+        let tx = "t".repeat(crate::forward::MIN_WIRE_PER_CHECK - 3);
+        let batch = format!(
+            "{}{}",
+            crate::forward::TX_SUBMIT,
+            serde_json::to_string(&vec![tx; crate::forward::FORWARD_BATCH]).unwrap()
+        );
+        let junk = format!(
+            "{}{}",
+            crate::forward::TX_SUBMIT,
+            "[".repeat(batch.len() - crate::forward::TX_SUBMIT.len())
+        );
+        assert!(
+            batch.len() >= crate::forward::FORWARD_BATCH * crate::forward::MIN_WIRE_PER_CHECK,
+            "a batch of 64 costs less than 64 checks' worth"
+        );
+        let fits = (TX_SUBMIT_BYTE_BURST / batch.len() as f64) as usize;
+        assert!((1..64).contains(&fits), "vacuous: {fits}");
+        for wire in [&batch, &junk] {
+            let mut budget = SubmitBudget::default();
+            let admitted = (0..64)
+                .filter(|_| budget.admit("host:198.51.100.7", wire, now))
+                .count();
+            assert_eq!(admitted, fits, "a submit was not charged its bytes");
+            assert!(
+                SubmitBudget::default().admit("host:198.51.100.8", wire, now),
+                "another host's quota is its own"
+            );
+        }
+        let largest = "x".repeat(SYNC_REQUEST_CAP);
+        assert!(
+            SubmitBudget::default().admit("host:198.51.100.9", &largest, now),
+            "the largest request does not fit a fresh quota"
+        );
+    }
+
+    /// B148 witness: a member's pushes are charged their bytes, so at one
+    /// instant it gets in at most a burst's worth of maximal bodies, though
+    /// its message tokens would let in a thousand.
+    #[test]
+    fn a_members_pushes_are_charged_their_bytes() {
+        let mut budget = MemberBudget::default();
+        let member = "12D3KooWmember".to_string();
+        let now = std::time::Instant::now();
+        let largest = consensus::v4::MAX_WIRE_BYTES;
+        let admitted = (0..MEMBER_MSG_BURST as usize)
+            .filter(|_| budget.admit(&member, largest, now))
+            .count();
+        let fits = (MEMBER_BYTE_BURST / largest as f64) as usize;
+        assert_eq!(
+            admitted, fits,
+            "maximal pushes were not charged their bytes"
+        );
+        assert!(
+            budget.admit("12D3KooWother", largest, now),
+            "another member's budget is its own"
+        );
     }
 
     /// W9: a frame over the cap is refused after its 4-byte length, before
@@ -2264,6 +2972,254 @@ mod tests {
                 format!("/ip4/192.168.18.66/tcp/9514/p2p/{id}"),
             ]
         );
+    }
+
+    /// B187 witness: an IPv6 host counts by its /64 (loopback and mapped
+    /// IPv4 as themselves); a reserved peer syncs on slots of its own.
+    #[test]
+    fn a_host_is_its_slash_64_and_reserved_peers_sync_apart() {
+        use libp2p::swarm::NetworkBehaviour;
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert_eq!(host_key(ip("2001:db8:1:2:aaaa::1")), ip("2001:db8:1:2::"));
+        assert_eq!(host_key(ip("::1")), ip("::1"));
+        assert_eq!(host_key(ip("::ffff:192.0.2.7")), ip("192.0.2.7"));
+        assert_eq!(host_key(ip("192.0.2.7")), ip("192.0.2.7"));
+        // One /64's addresses share the per-host handshake bound.
+        let mut gate = InboundGate::with_member_ips(MemberIps::default());
+        let local: libp2p::Multiaddr = "/ip6/2001:db8::1/tcp/9101".parse().unwrap();
+        let admitted = (0..2 * PENDING_PER_IP)
+            .filter(|i| {
+                let from: libp2p::Multiaddr = format!("/ip6/2001:db8:7:7::{:x}/tcp/40000", i + 1)
+                    .parse()
+                    .unwrap();
+                let id = libp2p::swarm::ConnectionId::new_unchecked(*i);
+                gate.handle_pending_inbound_connection(id, &local, &from)
+                    .is_ok()
+            })
+            .count();
+        assert_eq!(admitted, PENDING_PER_IP, "each address of a /64 was a host");
+        assert_eq!(serve_pool(false, false, true), ServePool::Reserved);
+        assert_eq!(serve_pool(false, true, true), ServePool::Member);
+        assert_eq!(serve_pool(false, false, false), ServePool::Open);
+        assert_eq!(serve_pool(true, false, true), ServePool::ReservedTxSubmit);
+        assert_eq!(serve_pool(true, true, false), ServePool::TxSubmit);
+    }
+
+    /// B198 witness: successive QC_WANTs ask successive pairs, so every
+    /// connected member is asked within `ceil(m / 2)` turns (it asked the
+    /// same two every time).
+    #[test]
+    fn a_qc_want_asks_every_member_in_turn() {
+        let peers: Vec<PeerId> = (1..=5u8)
+            .map(|s| local_keypair(&[s; 32]).public().to_peer_id())
+            .collect();
+        let mut asked = std::collections::HashSet::new();
+        for turn in 0..3 {
+            let pair = qc_want_peers(peers.clone(), turn);
+            assert_eq!(pair.len(), 2);
+            assert_ne!(pair[0], pair[1]);
+            asked.extend(pair);
+        }
+        assert_eq!(asked.len(), 5, "a member was never asked");
+        let mut reversed = peers.clone();
+        reversed.reverse();
+        assert_eq!(
+            qc_want_peers(reversed, 1),
+            qc_want_peers(peers.clone(), 1),
+            "the turn depends on the book's order"
+        );
+        assert_eq!(qc_want_peers(peers[..1].to_vec(), 7), peers[..1].to_vec());
+        assert!(qc_want_peers(Vec::new(), 3).is_empty());
+    }
+
+    /// B207 witness: a member's kept IPv6 address has handshake slots of its
+    /// own: a host in the same /64 holding the /64's bound does not keep the
+    /// member out (the kept IP was recorded as the /64, shared with it).
+    #[test]
+    fn a_members_slots_are_its_own_in_a_shared_slash_64() {
+        use libp2p::swarm::NetworkBehaviour;
+        let members = MemberIps::default();
+        let member: std::net::IpAddr = "2001:db8:5:5::10".parse().unwrap();
+        members.write().unwrap().record_member(
+            PeerId::random(),
+            member,
+            IpSource::Connected,
+            std::time::Instant::now(),
+            |_| true,
+        );
+        let mut gate = InboundGate::with_member_ips(members);
+        let local: libp2p::Multiaddr = "/ip6/2001:db8::1/tcp/9101".parse().unwrap();
+        let mut next = 0usize;
+        let mut open = |gate: &mut InboundGate, ip: String| {
+            next += 1;
+            let from: libp2p::Multiaddr = format!("/ip6/{ip}/tcp/40000").parse().unwrap();
+            let id = libp2p::swarm::ConnectionId::new_unchecked(next);
+            gate.handle_pending_inbound_connection(id, &local, &from)
+                .is_ok()
+        };
+        let neighbour = (0..2 * PENDING_PER_IP)
+            .filter(|i| open(&mut gate, format!("2001:db8:5:5::{:x}", 0x100 + i)))
+            .count();
+        assert_eq!(neighbour, PENDING_PER_IP, "vacuous: the /64's bound");
+        let admitted = (0..PENDING_PER_IP)
+            .filter(|_| open(&mut gate, member.to_string()))
+            .count();
+        assert_eq!(
+            admitted, PENDING_PER_IP,
+            "a host in its /64 took the member's slots"
+        );
+    }
+
+    /// B199 witness: a handshake counts in the bucket it was admitted to: a
+    /// member whose kept IP leaves the kept set (it reported another) leaves
+    /// that IP's unfinished handshakes in the members' slots, not in the
+    /// shared ones (rotating its IP took four shared slots a member).
+    #[test]
+    fn a_handshake_stays_in_its_bucket() {
+        use libp2p::swarm::NetworkBehaviour;
+        let members = MemberIps::default();
+        let peer = PeerId::random();
+        let t0 = std::time::Instant::now();
+        let a: std::net::IpAddr = "10.9.9.9".parse().unwrap();
+        members
+            .write()
+            .unwrap()
+            .record_member(peer, a, IpSource::Reported, t0, |_| true);
+        let mut gate = InboundGate::with_member_ips(Arc::clone(&members));
+        let local: libp2p::Multiaddr = "/ip4/10.0.0.1/tcp/9101".parse().unwrap();
+        let from =
+            |ip: String| -> libp2p::Multiaddr { format!("/ip4/{ip}/tcp/40000").parse().unwrap() };
+        let mut next = 0usize;
+        let mut open = |gate: &mut InboundGate, ip: String| {
+            next += 1;
+            let id = libp2p::swarm::ConnectionId::new_unchecked(next);
+            gate.handle_pending_inbound_connection(id, &local, &from(ip))
+                .is_ok()
+        };
+        let kept = (0..PENDING_PER_IP)
+            .filter(|_| open(&mut gate, a.to_string()))
+            .count();
+        assert_eq!(kept, PENDING_PER_IP);
+        members.write().unwrap().record_member(
+            peer,
+            "10.8.8.8".parse().unwrap(),
+            IpSource::Reported,
+            t0 + KEPT_IP_HOLD + std::time::Duration::from_secs(1),
+            |_| true,
+        );
+        assert!(!members.read().unwrap().contains(&a), "vacuous: still kept");
+        let mut others = 0;
+        for i in 0..64u32 {
+            let ip = format!("{}.0.2.{}", 100 + i / 2, i % 2);
+            for _ in 0..PENDING_PER_IP {
+                if open(&mut gate, ip.clone()) {
+                    others += 1;
+                }
+            }
+        }
+        assert_eq!(
+            others,
+            MAX_PENDING_INBOUND as usize - PENDING_KEPT_FOR_MEMBERS,
+            "a former kept IP's handshakes took the shared slots"
+        );
+    }
+
+    /// B200 witness: an answer is read under its request's cap: a height's,
+    /// a finality's or a QC's over `SMALL_ANSWER_CAP` is refused, a block
+    /// request's of that size is read (every answer took the 10 MiB cap).
+    #[test]
+    fn an_answer_is_capped_by_its_request() {
+        use request_response::Codec;
+        let protocol = StreamProtocol::new(SYNC_PROTOCOL);
+        let frame = |len: usize| {
+            let mut out = (len as u32).to_be_bytes().to_vec();
+            out.extend(std::iter::repeat_n(b'x', len));
+            out
+        };
+        let read = |request: &str, len: usize| {
+            futures::executor::block_on(async {
+                let mut codec = FramedCodec::<String>::new(SYNC_REQUEST_CAP, SYNC_RESPONSE_CAP);
+                let mut sink = libp2p::futures::io::Cursor::new(Vec::new());
+                codec
+                    .write_request(&protocol, &mut sink, request.to_string())
+                    .await
+                    .unwrap();
+                let mut io = libp2p::futures::io::Cursor::new(frame(len));
+                codec
+                    .read_response(&protocol, &mut io)
+                    .await
+                    .map(|r| r.len())
+            })
+        };
+        let big = SMALL_ANSWER_CAP + 1;
+        for request in ["GET_HEIGHT", "GET_FINALITY", "QC_WANT:7"] {
+            assert!(read(request, big).is_err(), "{request}");
+        }
+        assert_eq!(read("GET_HEIGHT", 40).unwrap(), 40);
+        assert_eq!(read("SYNC_REQ:{}", big).unwrap(), big);
+        assert!(read("TX_SUBMIT:[]", SUBMIT_ANSWER_CAP + 1).is_err());
+    }
+
+    /// B222 witness: an unchanged peer row saved within the hour is fresh
+    /// (not written again on each reconnect); a changed or stale one is not.
+    #[test]
+    fn an_unchanged_peer_row_is_kept() {
+        let dir = storage::test_dir::process_dir()
+            .join(format!("aincore_b222_peer_rows_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = storage::StateDB::open(dir.to_str().unwrap()).unwrap();
+        let addr = "/ip4/203.0.113.9/tcp/9100";
+        db.save_peer_addr_at("12D3KooWpeer", addr, 1_000).unwrap();
+        assert!(peer_row_is_fresh(&db, "12D3KooWpeer", addr, 1_000 + 60));
+        assert!(!peer_row_is_fresh(
+            &db,
+            "12D3KooWpeer",
+            "/ip4/203.0.113.10/tcp/9100",
+            1_060
+        ));
+        assert!(!peer_row_is_fresh(
+            &db,
+            "12D3KooWpeer",
+            addr,
+            1_000 + PEER_ROW_FRESH_SECS
+        ));
+        assert!(!peer_row_is_fresh(&db, "12D3KooWother", addr, 1_060));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B186 witness: the key an address pins is read off it (a restore peer
+    /// given with its key is answered from the open session to that key).
+    #[test]
+    fn an_address_names_the_key_it_pins() {
+        let id = local_keypair(&[7; 32]).public().to_peer_id();
+        let pinned: libp2p::Multiaddr = format!("/ip4/203.0.113.9/tcp/9100/p2p/{id}")
+            .parse()
+            .unwrap();
+        assert_eq!(pinned_peer(&pinned), Some(id));
+        let bare: libp2p::Multiaddr = "/ip4/203.0.113.9/tcp/9100".parse().unwrap();
+        assert_eq!(pinned_peer(&bare), None);
+    }
+
+    /// B185 witness: a saved row naming a host is neither dialled nor then
+    /// resolved as a boot name (only the operator's list names hosts), and
+    /// one name keeps at most `MAX_IPS_PER_NAME` IPs.
+    #[test]
+    fn a_saved_name_is_not_a_boot_name() {
+        let id = local_keypair(&[6; 32]).public().to_peer_id();
+        let saved = vec![
+            format!("/dns4/m.attacker.example/tcp/9100/p2p/{id}"),
+            format!("/ip4/203.0.113.9/tcp/9100/p2p/{id}"),
+        ];
+        let list = boot_dial_list(&[], &saved);
+        assert_eq!(list, vec![format!("/ip4/203.0.113.9/tcp/9100/p2p/{id}")]);
+        assert!(boot_hosts(&list).is_empty(), "a saved name was resolved");
+        let mut names = ResolvedNames::default();
+        let answer: Vec<std::net::IpAddr> = (0..100u8)
+            .map(|d| std::net::IpAddr::from([10, 7, 0, d]))
+            .collect();
+        names.record("seed.example.org", 9101, Some(answer));
+        assert_eq!(names.ips().len(), MAX_IPS_PER_NAME);
     }
 
     /// B22: a bootnode without a PeerId is redialled, backing off from 5 s

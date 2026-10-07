@@ -3,7 +3,6 @@ use libp2p::futures::StreamExt;
 use libp2p::{
     core::upgrade,
     dcutr, identify,
-    mdns::{tokio::Behaviour as Mdns, Config as MdnsConfig, Event as MdnsEvent},
     multiaddr::Protocol,
     noise, relay, request_response,
     swarm::{dial_opts::DialOpts, dial_opts::PeerCondition, Swarm, SwarmEvent},
@@ -75,10 +74,12 @@ const MAX_LIBP2P_CONNECTIONS_HARD: u32 = 16;
 /// redialled in a loop (rehearsal, 2026-10-04: ~70 a minute a node).
 const MAX_INBOUND_PEERS_PER_HOST: usize = 2;
 
+/// The host a connection counts under (budgets, identities per host,
+/// locality, network groups): B187, an IPv6 one by its /64.
 fn multiaddr_host(addr: &Multiaddr) -> Option<String> {
     addr.iter().find_map(|protocol| match protocol {
         Protocol::Ip4(ip) => Some(ip.to_string()),
-        Protocol::Ip6(ip) => Some(ip.to_string()),
+        Protocol::Ip6(ip) => Some(sessions::host_key(ip.into()).to_string()),
         Protocol::Dns(host) | Protocol::Dns4(host) | Protocol::Dns6(host) => Some(host.to_string()),
         _ => None,
     })
@@ -98,6 +99,8 @@ struct OpenServe {
 /// How often the network task dials the committee members it is not
 /// connected to.
 const COMMITTEE_DIAL_EVERY: Duration = Duration::from_secs(5);
+/// B132: how often the boot list's host names are resolved again (a choice).
+const BOOT_RESOLVE_EVERY: Duration = Duration::from_secs(60);
 
 #[allow(clippy::too_many_arguments)] // the node's network inputs
 pub async fn start_p2p(
@@ -131,14 +134,13 @@ pub async fn start_p2p(
 
     let (transport, relay_behaviour_inner) = build_transport(&local_key, local_peer_id)?;
 
-    // === mDNS behaviour (Optional) ===
-    let mdns = if enable_mdns {
-        println!("👀 mDNS Discovery Enabled");
-        Some(Mdns::new(MdnsConfig::default(), local_peer_id)?)
-    } else {
-        println!("🚫 mDNS Discovery Disabled");
-        None
-    };
+    // B209: no mDNS. libp2p-mdns keeps every address any LAN host
+    // advertises for a PeerId and offers it to every dial of that PeerId (the
+    // committee dial among them), past `learned_address_ok`, as identify's
+    // cache did (B185). The boot list and the address book name peers.
+    if enable_mdns {
+        eprintln!("⚠️ mDNS discovery is ignored: it was removed (B209)");
+    }
 
     // B90: the address book members are dialled from (Kademlia is gone).
     let addresses = sessions::AddressBook::default();
@@ -148,10 +150,16 @@ pub async fn start_p2p(
     // dialled back ports a stranger chose).
 
     // === Identify ===
-    let identify = identify::Behaviour::new(identify::Config::new(
-        "/aincore/1.0.0".to_string(),
-        local_key.public(),
-    ));
+    // B185: no address cache. identify 0.45 keeps every listen address any
+    // peer reports (100 peers by default) and hands it to the swarm, which
+    // dials a PeerId through it and through both request-response
+    // behaviours' copies (`NewExternalAddrOfPeer`): reported names, loopback
+    // and bridge addresses bypassed `learned_address_ok`, and a member's
+    // planted DNS name was saved and resolved as a boot name. Addresses are
+    // learned only through the address book (`learned_address_ok`).
+    let identify = identify::Behaviour::new(
+        identify::Config::new("/aincore/1.0.0".to_string(), local_key.public()).with_cache_size(0),
+    );
 
     let relay_behaviour = if enable_nat {
         Some(relay_behaviour_inner)
@@ -175,7 +183,6 @@ pub async fn start_p2p(
         // set up state for it (the derive asks the fields in this order).
         gate: sessions::InboundGate,
         limits: libp2p::connection_limits::Behaviour,
-        mdns: Toggle<Mdns>,
         addresses: sessions::AddressBook,
         identify: identify::Behaviour,
         pub dcutr: Toggle<dcutr::Behaviour>,
@@ -187,11 +194,40 @@ pub async fn start_p2p(
 
     // B56/B116: the IPs the gate keeps slots for: the boot dial list's from
     // the start, then the members' current ones.
+    // B132: and the operator's reserved peers given with addresses, and the
+    // boot list's host names, resolved now and again (`BOOT_RESOLVE_EVERY`).
+    let reserved_addresses = sessions::reserved_addresses_from_env();
+    let kept_from_boot: Vec<String> = bootnodes
+        .iter()
+        .chain(&reserved_addresses)
+        .cloned()
+        .collect();
     let member_ips: sessions::MemberIps = Arc::new(std::sync::RwLock::new(
-        sessions::KeptIps::with_boot(sessions::boot_ips(&bootnodes)),
+        sessions::KeptIps::with_boot(sessions::boot_ips(&kept_from_boot)),
     ));
+    let boot_hosts = sessions::boot_hosts(&kept_from_boot);
+    if !boot_hosts.is_empty() {
+        let kept = Arc::clone(&member_ips);
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(BOOT_RESOLVE_EVERY);
+            let mut resolved = sessions::ResolvedNames::default();
+            loop {
+                every.tick().await;
+                for (host, port) in &boot_hosts {
+                    let lookup = tokio::net::lookup_host((host.as_str(), *port));
+                    let found = match tokio::time::timeout(Duration::from_secs(5), lookup).await {
+                        Ok(Ok(found)) => Some(found.map(|a| a.ip()).collect()),
+                        _ => None,
+                    };
+                    resolved.record(host, *port, found);
+                }
+                if let Ok(mut kept) = kept.write() {
+                    kept.set_resolved(resolved.ips());
+                }
+            }
+        });
+    }
     let behaviour = P2PBehaviour {
-        mdns: Toggle::from(mdns),
         addresses,
         identify,
         consensus: sessions::MembersOnly::new(Arc::clone(&book)),
@@ -201,7 +237,7 @@ pub async fn start_p2p(
         gate: sessions::InboundGate::with_member_ips(Arc::clone(&member_ips)),
         limits: libp2p::connection_limits::Behaviour::new(
             libp2p::connection_limits::ConnectionLimits::default()
-                .with_max_pending_incoming(Some(sessions::MAX_PENDING_INBOUND)),
+                .with_max_pending_incoming(Some(sessions::MAX_PENDING_TOTAL)),
         ),
     };
 
@@ -298,14 +334,14 @@ pub async fn start_p2p(
             tokio::sync::oneshot::Sender<Result<String, String>>,
         > = std::collections::HashMap::new();
         // G4 NI-3: per-member consensus budget, per-session sync quota.
-        let mut member_budget: sessions::Budget<String> =
-            sessions::Budget::new(sessions::MEMBER_MSGS_PER_SEC, sessions::MEMBER_MSG_BURST);
+        let mut member_budget = sessions::MemberBudget::default();
         // B34: members by key, everyone else by host (a host's free
         // identities share one budget).
         let mut sync_budget: sessions::Budget<String> = sessions::Budget::new(
             sessions::SYNC_REQUESTS_PER_SEC,
             sessions::SYNC_REQUEST_BURST,
         );
+        let mut submit_budget = sessions::SubmitBudget::default();
         // G4 NI-3: messages bound for the node; the swarm never waits on it.
         let mut inbox = sessions::Inbox::default();
         // The open connections to each peer, with when each opened.
@@ -334,25 +370,38 @@ pub async fn start_p2p(
                 .map(|b| b.peers().copied().filter(|p| *p != local_peer_id).collect())
                 .unwrap_or_default()
         };
+        // B198: which pair of members the next QC_WANT asks.
+        let mut qc_want_turn: usize = 0;
 
         loop {
             tokio::select! {
                 Some(out) = rx_in.recv() => match out {
-                    // B25: a node outside the committee asks members for a
-                    // boundary QC over sync and takes the answer as if a
-                    // member had pushed it.
-                    Outbound::Broadcast(wire)
-                        if wire.starts_with(consensus::dag::QC_WANT_PREFIX)
-                            && book.read().is_ok_and(|b| b.member_of(&local_peer_id).is_none()) =>
-                    {
-                        let asked: Vec<PeerId> = members(&book)
+                    // B25: a QC is asked of members over sync, whose server
+                    // answers any session, and the answer taken as if a
+                    // member had pushed it. B189: by every node, a member
+                    // too (pushed as well, below): one that left the
+                    // committee at a boundary still names itself a member
+                    // until it activates, while the members already past it
+                    // refuse its consensus sessions, and sync never serves
+                    // the boundary block's QC again: it waited for good.
+                    Outbound::Broadcast(wire) if wire.starts_with(consensus::dag::QC_WANT_PREFIX) => {
+                        let connected: Vec<PeerId> = members(&book)
                             .into_iter()
                             .filter(|p| swarm.is_connected(p))
-                            .take(2)
                             .collect();
+                        let asked = sessions::qc_want_peers(connected, qc_want_turn);
+                        qc_want_turn = qc_want_turn.wrapping_add(1);
                         for peer in asked {
                             let id = swarm.behaviour_mut().sync.send_request(&peer, wire.clone());
                             inbox_asks.insert(id);
+                        }
+                        if book.read().is_ok_and(|b| b.member_of(&local_peer_id).is_some()) {
+                            let wire: Arc<str> = Arc::from(wire);
+                            for peer in members(&book) {
+                                if swarm.is_connected(&peer) {
+                                    swarm.behaviour_mut().consensus.send_request(&peer, Arc::clone(&wire));
+                                }
+                            }
                         }
                     }
                     // B48: pushed on every connected member session, and
@@ -397,6 +446,17 @@ pub async fn start_p2p(
                 }
                 Some(dial) = sync_dials.recv() => {
                     match dial.addr.parse::<Multiaddr>() {
+                        // B186: a session to the key the address pins is
+                        // open already: that is the session asked for. The
+                        // dial was refused while one was open (the swarm's
+                        // default condition), so a restore from a pinned
+                        // peer the node was connected to failed every ask.
+                        Ok(addr)
+                            if sessions::pinned_peer(&addr).is_some_and(|p| swarm.is_connected(&p)) =>
+                        {
+                            let peer = sessions::pinned_peer(&addr).map(|p| p.to_string());
+                            let _ = dial.reply.send(peer.ok_or_else(|| "no pinned key".to_string()));
+                        }
                         Ok(addr) => {
                             let opts = match addr.iter().last() {
                                 Some(Protocol::P2p(peer)) => {
@@ -535,9 +595,10 @@ pub async fn start_p2p(
                             .read()
                             .ok()
                             .and_then(|b| sessions::admit_consensus_request(&b, &peer).map(str::to_string));
-                        let within_budget = member
-                            .as_ref()
-                            .is_some_and(|m| member_budget.spend(m, std::time::Instant::now()));
+                        // B148: charged its bytes as well as a message.
+                        let within_budget = member.as_ref().is_some_and(|m| {
+                            member_budget.admit(m, request.len(), std::time::Instant::now())
+                        });
                         // B26: acknowledged only once queued; a push the full
                         // inbox drops fails at its sender, which sends it again.
                         // B55: each member's pushes queue apart.
@@ -579,11 +640,19 @@ pub async fn start_p2p(
                             (None, Some(host)) => format!("host:{host}"),
                             _ => peer.to_string(),
                         };
-                        if !sync_budget.spend(&budget_key, std::time::Instant::now()) {
+                        // B157: a batch of transactions on a quota of its
+                        // own, a token a transaction.
+                        let tx_submit = request.starts_with(crate::forward::TX_SUBMIT);
+                        let within = if tx_submit {
+                            submit_budget.admit(&budget_key, &request, std::time::Instant::now())
+                        } else {
+                            sync_budget.spend(&budget_key, std::time::Instant::now())
+                        };
+                        if !within {
                             // NI-3: over its sync quota. A snapshot part is told
                             // "busy" (its client waits it out without losing
                             // its place); anything else is refused.
-                            match chain_sync::state_sync::busy_reply(&request) {
+                            match crate::forward::busy_reply(&request) {
                                 Some(busy) => {
                                     let _ = swarm.behaviour_mut().sync.send_response(channel, busy);
                                 }
@@ -597,7 +666,7 @@ pub async fn start_p2p(
                         // non-members' answer pool (four non-reading hosts
                         // could fill it); they are still charged by bytes.
                         let reserved_peer = reserved.contains(&peer.to_string());
-                        let tx_submit = request.starts_with(crate::forward::TX_SUBMIT);
+                        let saturated = crate::forward::busy_reply(&request);
                         let open = (member.is_none() && !reserved_peer && !tx_submit).then(|| OpenServe {
                             busy: chain_sync::state_sync::busy_reply(&request),
                             key: budget_key.clone(),
@@ -625,7 +694,14 @@ pub async fn start_p2p(
                                 let _ = served_tx.send((request_id, answer)).await;
                             });
                         } else {
-                            drop(channel); // the node is saturated: refuse
+                            // The node is saturated: refuse (B133: a batch
+                            // is told busy).
+                            match saturated {
+                                Some(busy) => {
+                                    let _ = swarm.behaviour_mut().sync.send_response(channel, busy);
+                                }
+                                None => drop(channel),
+                            }
                         }
                     }
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Sync(request_response::Event::Message {
@@ -660,21 +736,6 @@ pub async fn start_p2p(
                         request_id, ..
                     })) => {
                         held_answers.release(&request_id);
-                    }
-                    SwarmEvent::Behaviour(P2PBehaviourEvent::Mdns(MdnsEvent::Discovered(list))) => {
-                        for (peer_id, multiaddr) in list {
-                            println!("👀 mDNS discovered a new peer: {:?}", peer_id);
-                            // B115: mDNS (any LAN host) names addresses for
-                            // committee members only.
-                            if book.read().is_ok_and(|b| b.member_of(&peer_id).is_some()) {
-                                swarm.behaviour_mut().addresses.add_address(&peer_id, multiaddr.clone());
-                            }
-                        }
-                    }
-                    SwarmEvent::Behaviour(P2PBehaviourEvent::Mdns(MdnsEvent::Expired(list))) => {
-                        for (peer_id, _multiaddr) in list {
-                            println!("👋 mDNS peer expired: {:?}", peer_id);
-                        }
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         println!("🌐 P2P Listening on {:?}", address);
@@ -719,15 +780,24 @@ pub async fn start_p2p(
                             libp2p::core::ConnectedPoint::Dialer { address, .. } => multiaddr_host(address),
                             libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => multiaddr_host(send_back_addr),
                         };
+                        // B207: the exact IP (`host` is a /64 for IPv6).
+                        let exact = match &endpoint {
+                            libp2p::core::ConnectedPoint::Dialer { address, .. } => sessions::ip_of(address),
+                            libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => sessions::ip_of(send_back_addr),
+                        };
                         if let Some(host) = host {
                             // B56/B116: a member's current IP gets the
                             // gate's kept slots (one per member).
                             if let Ok(b) = book.read() {
                                 if b.member_of(&peer_id).is_some() {
-                                    if let (Ok(ip), Ok(mut ips)) =
-                                        (host.parse::<std::net::IpAddr>(), member_ips.write())
-                                    {
-                                        ips.record_member(peer_id, ip, |p| b.member_of(p).is_some());
+                                    if let (Some(ip), Ok(mut ips)) = (exact, member_ips.write()) {
+                                        ips.record_member(
+                                            peer_id,
+                                            ip,
+                                            sessions::IpSource::Connected,
+                                            std::time::Instant::now(),
+                                            |p| b.member_of(p).is_some(),
+                                        );
                                     }
                                 }
                             }
@@ -760,8 +830,22 @@ pub async fn start_p2p(
                                 // B43: only a member's or a bootnode's address is
                                 // saved for the next boot (rows grew with every
                                 // peer Kademlia ever dialled).
-                                if (is_member || was_bootnode) && sessions::routable_for_others(&address) {
-                                    let _ = storage.save_peer_addr(&peer_id.to_string(), &address.to_string());
+                                // B185: an IP literal only (a name a member
+                                // reported was saved, then resolved at boot as
+                                // the operator's, into up to 128 kept IPs).
+                                if (is_member || was_bootnode) && sessions::learned_address_ok(&address) {
+                                    // B222: off this task (the write waits on
+                                    // the storage writer gate, which a block
+                                    // holds through its execution: no push was
+                                    // read meanwhile), and an unchanged row
+                                    // saved within the hour is kept.
+                                    let storage = Arc::clone(&storage);
+                                    let (peer, addr) = (peer_id.to_string(), address.to_string());
+                                    tokio::task::spawn_blocking(move || {
+                                        if !sessions::peer_row_is_fresh(&storage, &peer, &addr, sessions::wall_secs()) {
+                                            let _ = storage.save_peer_addr(&peer, &addr);
+                                        }
+                                    });
                                 }
                             }
                             libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => {
@@ -869,11 +953,40 @@ pub async fn start_p2p(
                         );
                         // B22: a peer reached over the network is routed only at
                         // addresses another host can dial (its loopback is its
-                        // own); a peer on this host keeps them all.
-                        let local_peer = !sessions::routable_for_others(&info.observed_addr);
+                        // own); a peer on this host keeps them all. B160: on
+                        // this host is what this node's own connection shows
+                        // (loopback), not `observed_addr`, which the peer
+                        // writes: a member reporting a loopback one had its
+                        // loopback and bridge addresses dialled by every node.
+                        let local_peer = sessions::on_this_host(peer_hosts.get(&peer_id).map(String::as_str));
                         for addr in info.listen_addrs {
-                            if !local_peer && !sessions::routable_for_others(&addr) {
+                            // B146: an IP literal only: a name a peer reports
+                            // is never resolved.
+                            let ip = addr.iter().find_map(|p| match p {
+                                Protocol::Ip4(ip) => Some(std::net::IpAddr::from(ip)),
+                                Protocol::Ip6(ip) => Some(std::net::IpAddr::from(ip)),
+                                _ => None,
+                            });
+                            let usable = if local_peer {
+                                ip.is_some() && sessions::learned_address_ok_on_this_host(&addr)
+                            } else {
+                                sessions::learned_address_ok(&addr)
+                            };
+                            if !usable {
                                 continue;
+                            }
+                            // B132: a member's reported IP gets kept slots
+                            // (an outbound dial names its host, not its IP).
+                            if let (Some(ip), false) = (ip, local_peer) {
+                                if let (Ok(b), Ok(mut kept)) = (book.read(), member_ips.write()) {
+                                    kept.record_member(
+                                        peer_id,
+                                        ip,
+                                        sessions::IpSource::Reported,
+                                        std::time::Instant::now(),
+                                        |p| b.member_of(p).is_some(),
+                                    );
+                                }
                             }
                             swarm.behaviour_mut().addresses.add_address(&peer_id, addr);
                         }

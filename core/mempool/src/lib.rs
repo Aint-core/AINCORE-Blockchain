@@ -3,74 +3,62 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use storage::StateDB;
 
-/// B1 (best-effort): early-reject a `0x1::staking::join_validator_set` whose BLS
-/// proof-of-possession does not verify, before it enters the mempool. The
-/// executor pre-dispatch gate is authoritative; this mirrors it for early reject.
-/// `join_validator_set(account: &signer, stake_amount: u128, public_key,
-/// bls_public_key, bls_pop)` -> args[2]=public_key, args[3]=bls_public_key,
-/// args[4]=bls_pop.
-fn verify_join_validator_pop_mempool(
-    call: &vm_move::EntryFunctionCall,
-    tx_public_key_hex: &str,
-) -> Result<(), String> {
-    // 0x1 system address renders as 31 zero bytes + 01 in hex (no direct
-    // move_core_types dep in mempool, so compare via the canonical Display form).
-    let is_system = format!("{}", call.module.address())
-        .trim_start_matches("0x")
-        .trim_start_matches('0')
-        == "1";
-    if !is_system
-        || call.module.name().as_str() != "staking"
-        || call.function != "join_validator_set"
-    {
-        return Ok(());
-    }
-    if call.args.len() < 5 {
-        return Err(format!(
-            "join_validator_set: expected 5 args, got {}",
-            call.args.len()
-        ));
-    }
-    let public_key: Vec<u8> = bcs::from_bytes(&call.args[2])
-        .map_err(|e| format!("join_validator_set: malformed public_key arg: {}", e))?;
-    let bls_public_key: Vec<u8> = bcs::from_bytes(&call.args[3])
-        .map_err(|e| format!("join_validator_set: malformed bls_public_key arg: {}", e))?;
-    let bls_pop: Vec<u8> = bcs::from_bytes(&call.args[4])
-        .map_err(|e| format!("join_validator_set: malformed bls_pop arg: {}", e))?;
-    let tx_public_key = hex::decode(tx_public_key_hex.trim_start_matches("0x"))
-        .map_err(|e| format!("join_validator_set: malformed tx public_key hex: {}", e))?;
-    if public_key.len() != 32 {
-        return Err(format!(
-            "join_validator_set: public_key must be 32 bytes, got {}",
-            public_key.len()
-        ));
-    }
-    if public_key != tx_public_key {
-        return Err("join_validator_set: public_key arg must equal tx.public_key".into());
-    }
-    if bls_public_key.len() != 48 {
-        return Err(format!(
-            "join_validator_set: bls_public_key must be 48 bytes, got {}",
-            bls_public_key.len()
-        ));
-    }
-    if bls_pop.len() != 96 {
-        return Err(format!(
-            "join_validator_set: bls_pop must be 96 bytes, got {}",
-            bls_pop.len()
-        ));
-    }
-    match crypto::bls::BLSEngine::consensus().verify_possession(&bls_public_key, &bls_pop) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err("join_validator_set: BLS proof-of-possession failed verification".into()),
-        Err(e) => Err(format!(
-            "join_validator_set: BLS PoP verification error: {:?}",
-            e
-        )),
+/// B259: the consensus thread's waits for a pool's lock. A submitter lets
+/// each go first (`yield_to_consensus`): `std::sync::Mutex` is not fair, and
+/// a submit batch's loop took the lock again ~100 ns after giving it back,
+/// so the proposal, waiting under the consensus lock, waited for the batch.
+static CONSENSUS_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// B259: the consensus thread waiting for a pool's lock, while held.
+pub struct ConsensusWaiting(());
+
+impl ConsensusWaiting {
+    pub fn begin() -> Self {
+        CONSENSUS_WAITING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(())
     }
 }
 
-const MAX_PENDING_TXS: usize = 5000;
+impl Drop for ConsensusWaiting {
+    fn drop(&mut self) {
+        CONSENSUS_WAITING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// B259: the consensus thread's lock of `pool`: submitters let it go first.
+pub fn lock_for_consensus(
+    pool: &std::sync::Mutex<Mempool>,
+) -> std::sync::LockResult<std::sync::MutexGuard<'_, Mempool>> {
+    let _waiting = ConsensusWaiting::begin();
+    pool.lock()
+}
+
+/// B259: a submitter's turn: it waits while the consensus thread waits for
+/// a pool's lock. Never called holding a pool's lock.
+pub fn yield_to_consensus() {
+    while CONSENSUS_WAITING.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        std::thread::yield_now();
+    }
+}
+
+/// B259 witness support: the consensus thread's waits counted now.
+#[cfg(test)]
+fn consensus_waits() -> usize {
+    CONSENSUS_WAITING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub const MAX_PENDING_TXS: usize = 5000;
+/// B215: the raw bytes the pool holds, queued and on loan (a choice: the
+/// count cap's 5,000 at ~1.7 KB each, where a transfer is ~0.7 KB). Every
+/// pass of the selection hashes each held transaction a few times under the
+/// consensus lock (its maps are keyed by the transaction), and 5,000 of up
+/// to 100 KiB could be held: several hundred MB hashed a pass.
+pub const MAX_PENDING_BYTES: usize = 8 << 20;
+
+/// B231: parked transactions one admission may evict at most: a maximal
+/// transaction (`MAX_TX_BYTES`, 100 KiB) fits after 251 of the smallest
+/// (408 bytes, B183), so 256 bound the work without refusing a fit.
+pub const MAX_EVICTIONS_PER_ADMISSION: usize = 256;
 /// How many times a loaned transaction may return to the queue before it is
 /// dropped for good (orphaned payloads need one; a permanently failing tx must
 /// not loop forever).
@@ -94,6 +82,23 @@ pub const MAX_NONCE_AHEAD: u64 = 100;
 /// the base fee) before it leaves the pool. A choice: Aptos's mempool drops a
 /// transaction after `system_transaction_timeout_secs` (600).
 pub const PARKED_TTL_SECS: u64 = 600;
+
+#[cfg(test)]
+thread_local! {
+    /// B206 witness: transactions `payable` priced on this thread.
+    static PRICINGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// B231 witness: the scans for parked transactions to evict.
+    static EVICTION_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// B239 witness: the bytes of transaction text hashed to find held ones.
+    static TEXT_HASHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `StateDB::raw_tx_hash`, counted for the B239 witness.
+fn raw_hash_of(raw: &str) -> String {
+    #[cfg(test)]
+    TEXT_HASHED.with(|n| n.set(n.get() + raw.len() as u64));
+    StateDB::raw_tx_hash(raw)
+}
 
 /// B98: a waiting transaction may be replaced by one with the same sender
 /// and sequence number whose price is at least this many percent higher
@@ -124,33 +129,125 @@ struct TxMeta {
     /// B54: `StateDB::raw_tx_hash` of the raw string, the key RPC lookups
     /// use, hashed once here and never again under the lock.
     raw_hash: String,
+    /// B188: what `payable` prices, kept at admission: the transaction
+    /// without its payload and args (the pre-charge reads neither), and the
+    /// raw length (its intrinsic gas). Each pass parsed every stuck sender's
+    /// head again, up to 100 KB each, under the consensus lock.
+    charge: executor::Transaction,
+    raw_len: usize,
+    /// B239: its `canonical_tx_hash` (the dedup identity), kept so it can
+    /// leave `seen_txs` without parsing the transaction again.
+    dedup: String,
+}
+
+/// B239: a held transaction's id: every map and the queue are keyed by it.
+/// They were keyed by the raw transaction (up to 100 KiB), so every lookup
+/// under the lock hashed the whole transaction, and a scan of the pool
+/// (a replacement's lookup, an eviction, a selection pass) hashed up to
+/// `MAX_PENDING_BYTES`.
+type TxId = u64;
+
+/// B239: an eviction scan's outcome: the parked transactions in eviction
+/// order (`(ahead, raw hash, bytes, id)`), valid while nothing changed.
+struct ParkedScan {
+    version: u64,
+    height: Option<String>,
+    base_fee: u128,
+    parked: Vec<(u64, String, usize, TxId)>,
+}
+
+/// B239: one transaction the pool holds, queued or on loan, with all it
+/// keeps of it.
+struct Held {
+    raw: String,
+    meta: TxMeta,
+    /// B98: when it was first seen parked (the caller's clock); past
+    /// `PARKED_TTL_SECS` it leaves.
+    parked_since: Option<u64>,
+    /// B188: when its payer first did not cover it (the caller's clock):
+    /// past `PARKED_TTL_SECS` it leaves, and a full pool evicts it for a
+    /// ready one.
+    unpaid_since: Option<u64>,
+    /// The attempts carried from a requeue into its next loan.
+    requeue_attempts: u8,
+    /// On loan to a vertex: (loaned at, in the caller's clock; attempts).
+    loan: Option<(u64, u8)>,
+}
+
+/// B201: why `add_checked` did not admit a transaction, and whether only
+/// for now (the fee, the pool's room, a nonce gap, the payer's balance, the
+/// pre-charge at today's byte gas). A forwarder keeps a transaction refused
+/// for now until its TTL: two such refusals dropped it for good, after the
+/// RPC had answered "sent".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub reason: String,
+    pub for_now: bool,
+}
+
+impl Refusal {
+    fn for_now(reason: String) -> Self {
+        Self {
+            reason,
+            for_now: true,
+        }
+    }
+}
+
+impl From<String> for Refusal {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            for_now: false,
+        }
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
 }
 
 pub struct Mempool {
-    pending_txs: VecDeque<String>,
-    seen_txs: HashSet<String>,       // Deduplication
-    seen_order: VecDeque<String>,    // Bounded cache tracking
-    pending_nonces: HashSet<String>, // sender:sequence_number in the pending queue
-    /// LOANED, NOT GONE (orphan-loss fix): transactions handed to consensus by
-    /// `get_pending_transactions` move HERE instead of vanishing. They leave for
-    /// good only when `mark_executed` reports them executed in a committed
-    /// block; anything still here after `requeue_stale`'s age limit goes back to
-    /// `pending_txs`. Before this, a vertex that never committed (a node
-    /// briefly behind the network orphans its own vertex) silently destroyed
-    /// its whole payload — the sender's nonce sequence then had a permanent
-    /// hole, every later transaction died with "Invalid Sequence", and the
-    /// account was wedged forever. Keyed by the RAW transaction string; value is
-    /// (loaned at, in the caller's clock's seconds; attempts). The clock is the
-    /// caller's (consensus passes its injectable `now_secs`), so a simulated
-    /// cluster never re-queues by the wall clock (BUG_LEDGER B9).
-    inflight: std::collections::HashMap<String, (u64, u8)>,
-    /// RE-AUDIT MEDIUM (perf): parsed metadata per raw tx, filled once at
-    /// admission so selection never re-parses every pending transaction under
-    /// the mempool lock on every tick. Queued and loaned transactions both
-    /// have an entry until they execute or are dropped.
-    meta: std::collections::HashMap<String, TxMeta>,
-    /// Attempt counter carried from `requeue_stale` back into the next pull.
-    requeue_attempts: std::collections::HashMap<String, u8>,
+    /// The queue, in order: the transactions not on loan (B239: by id).
+    pending_txs: VecDeque<TxId>,
+    seen_txs: HashSet<String>,    // Deduplication
+    seen_order: VecDeque<String>, // Bounded cache tracking
+    /// sender:sequence_number → the queued transaction (B239: so a
+    /// replacement finds the one it replaces by a point lookup; it walked
+    /// the queue).
+    pending_nonces: std::collections::HashMap<String, TxId>,
+    /// B239: every transaction held, queued or on loan, by id. LOANED, NOT
+    /// GONE (orphan-loss fix): transactions handed to consensus by
+    /// `get_pending_transactions` stay here, on loan, instead of vanishing.
+    /// They leave for good only when `mark_executed` reports them executed
+    /// in a committed block; one still on loan after `requeue_stale`'s age
+    /// limit goes back to the queue. Before this, a vertex that never
+    /// committed (a node briefly behind the network orphans its own vertex)
+    /// silently destroyed its whole payload — the sender's nonce sequence
+    /// then had a permanent hole, every later transaction died with
+    /// "Invalid Sequence", and the account was wedged forever. The loan's
+    /// clock is the caller's (consensus passes its injectable `now_secs`),
+    /// so a simulated cluster never re-queues by the wall clock (B9).
+    held: std::collections::HashMap<TxId, Held>,
+    /// B239: `StateDB::raw_tx_hash` → id, how callers name a transaction.
+    by_hash: std::collections::HashMap<String, TxId>,
+    next_id: TxId,
+    /// B239: each sender's held transactions by sequence number, the
+    /// payers' waiting costs and the bytes held, kept as transactions come
+    /// and go: an admission refused for now read each of them by a scan of
+    /// the pool, for free and again on every copy.
+    by_sender: std::collections::HashMap<String, std::collections::BTreeMap<u64, Vec<TxId>>>,
+    payer_waiting: std::collections::HashMap<String, u128>,
+    bytes_held: usize,
+    /// B239: bumped by every change to what the pool holds, so the parked
+    /// transactions found by the last eviction scan are found again only
+    /// when something changed (`parked_scan`).
+    version: u64,
+    /// B239: the last eviction scan's parked transactions, eviction order
+    /// first, with the version, height and base fee it was made at.
+    parked_scan: Option<ParkedScan>,
     /// Optional storage handle for the admission balance gate (the payer's
     /// committed AIN). Production callers pass it via
     /// [`Mempool::with_storage`]; without it the gate is skipped.
@@ -160,9 +257,6 @@ pub struct Mempool {
     /// the mempool and consensus locks.
     seq_cache: std::collections::HashMap<String, u64>,
     seq_cache_at: Option<String>,
-    /// B98: when each parked transaction was first seen parked (the caller's
-    /// clock); past `PARKED_TTL_SECS` it leaves.
-    parked_since: std::collections::HashMap<String, u64>,
 }
 
 impl Mempool {
@@ -171,15 +265,19 @@ impl Mempool {
         Self {
             pending_txs: VecDeque::new(),
             seen_txs: HashSet::new(),
-            inflight: std::collections::HashMap::new(),
-            meta: std::collections::HashMap::new(),
-            requeue_attempts: std::collections::HashMap::new(),
             seen_order: VecDeque::new(),
-            pending_nonces: HashSet::new(),
+            pending_nonces: std::collections::HashMap::new(),
+            held: std::collections::HashMap::new(),
+            by_hash: std::collections::HashMap::new(),
+            next_id: 0,
+            by_sender: std::collections::HashMap::new(),
+            payer_waiting: std::collections::HashMap::new(),
+            bytes_held: 0,
+            version: 0,
+            parked_scan: None,
             storage: None,
             seq_cache: std::collections::HashMap::new(),
             seq_cache_at: None,
-            parked_since: std::collections::HashMap::new(),
         }
     }
 
@@ -187,17 +285,8 @@ impl Mempool {
     /// node code uses, so the balance gate runs.
     pub fn with_storage(storage: Arc<StateDB>) -> Self {
         Self {
-            pending_txs: VecDeque::new(),
-            seen_txs: HashSet::new(),
-            inflight: std::collections::HashMap::new(),
-            meta: std::collections::HashMap::new(),
-            requeue_attempts: std::collections::HashMap::new(),
-            seen_order: VecDeque::new(),
-            pending_nonces: HashSet::new(),
             storage: Some(storage),
-            seq_cache: std::collections::HashMap::new(),
-            seq_cache_at: None,
-            parked_since: std::collections::HashMap::new(),
+            ..Self::new()
         }
     }
 }
@@ -221,6 +310,30 @@ impl Mempool {
     /// entry points in one place: api_local.rs, api.rs, P2P TX inbound,
     /// and any future RPC method. None of them can submit a "different"
     /// version of a TX that has already been seen.
+    /// B173: the identity `raw` is deduplicated by (`canonical_tx_hash`),
+    /// read without checking any signature; `None` when it does not parse
+    /// or is too large (its check refuses it as cheaply).
+    pub fn dedup_key(raw: &str) -> Option<String> {
+        if raw.len() > executor::admission::MAX_TX_BYTES {
+            return None;
+        }
+        serde_json::from_str::<executor::Transaction>(raw)
+            .ok()
+            .map(|tx| Self::canonical_tx_hash(&tx))
+    }
+
+    /// B173: whether this mempool has seen a transaction of identity `key`
+    /// (`dedup_key`).
+    pub fn has_seen(&self, key: &str) -> bool {
+        self.seen_txs.contains(key)
+    }
+
+    /// B154: the `StateDB::raw_tx_hash` of each transaction this mempool
+    /// holds, waiting or on loan (the forwarder keeps a record per held one).
+    pub fn held_raw_hashes(&self) -> HashSet<String> {
+        self.by_hash.keys().cloned().collect()
+    }
+
     fn canonical_tx_hash(tx: &executor::Transaction) -> String {
         // F4: dedup identity must match the signed canonical form, which now
         // also binds gas_limit, gas_price, and input_objects (B73: and the
@@ -252,7 +365,7 @@ impl Mempool {
         }
 
         let checked = Self::check_admissible(&tx)?;
-        self.add_checked(tx, checked)
+        self.add_checked(tx, checked).map_err(|r| r.reason)
     }
 
     /// The stateless half of admission, which needs no mempool state: run it
@@ -262,24 +375,16 @@ impl Mempool {
     /// `sys:chain_id`, gas bounds, payload kind with scripts disabled, ZK
     /// proof, the sender's signature in Ed25519 or ML-DSA-65, and the
     /// paymaster's) is the one predicate vertex ingress and the executor run
-    /// too. `payer` is whoever pays the gas. B1 (best-effort early reject): a
-    /// join_validator_set call's BLS proof-of-possession is checked here so a
-    /// rogue-key join never enters the mempool; the executor's pre-dispatch
-    /// gate is the authoritative one.
+    /// too. `payer` is whoever pays the gas. B173: a join_validator_set
+    /// call's BLS proof-of-possession is not checked here: the executor's
+    /// pre-dispatch gate refuses a bad one, charged (B1), while here it cost
+    /// a pairing for every copy and was refused for free.
     ///
     /// B73: what it checks is `tx` in its canonical encoding, the one the
     /// mempool keeps (`add_checked`).
     pub fn check_admissible(tx: &str) -> Result<executor::admission::CheckedTx, String> {
         let canonical = executor::admission::canonicalize(tx)?;
-        let checked = executor::admission::check_stateless(&canonical, &blockchain::chain_id())?;
-        let payload_bytes = hex::decode(checked.tx.payload.trim_start_matches("0x"))
-            .map_err(|_| "Invalid payload hex: expected BCS TransactionPayload".to_string())?;
-        if let Ok(vm_move::TransactionPayload::EntryFunction(call)) =
-            bcs::from_bytes::<vm_move::TransactionPayload>(&payload_bytes)
-        {
-            verify_join_validator_pop_mempool(&call, &checked.tx.public_key)?;
-        }
-        Ok(checked)
+        executor::admission::check_stateless(&canonical, &blockchain::chain_id())
     }
 
     /// Admit `tx`, whose `check_admissible` already passed as `checked`: the
@@ -291,36 +396,36 @@ impl Mempool {
         &mut self,
         _arrived_as: String,
         checked: executor::admission::CheckedTx,
-    ) -> Result<String, String> {
+    ) -> Result<String, Refusal> {
         // B73: kept, offered and forwarded in its canonical encoding only,
         // whatever encoding it arrived in (vertex ingress takes no other).
         let tx = executor::admission::canonical_json(&checked.tx);
         let parsed_tx = &checked.tx;
         let tx_hash = Self::canonical_tx_hash(parsed_tx);
         if self.seen_txs.contains(&tx_hash) {
-            return Err(format!("Duplicate transaction: {}", tx_hash));
+            return Err(format!("Duplicate transaction: {}", tx_hash).into());
+        }
+        // B239: held already under this exact text (its identity left the
+        // bounded `seen_txs` while it waited).
+        let raw_hash = raw_hash_of(&tx);
+        if self.by_hash.contains_key(&raw_hash) {
+            return Err(format!("Duplicate transaction: {}", tx_hash).into());
         }
         // B98: a sender:sequence already waiting is refused before anything
         // else (it used to evict a parked transaction first, for free), or
         // replaced when the new price is REPLACE_PRICE_BUMP_PERCENT higher
         // and the old one is still queued (not on loan to a vertex).
+        // B239: the waiting one found by a point lookup (it walked the
+        // queue, hashing every transaction ahead of it, for free).
         let nonce_key = format!("{}:{}", parsed_tx.sender, parsed_tx.sequence_number);
-        let replacing = if self.pending_nonces.contains(&nonce_key) {
-            let old = self
-                .pending_txs
-                .iter()
-                .find(|raw| {
-                    self.meta.get(*raw).is_some_and(|m| {
-                        m.sender == parsed_tx.sender && m.seq == parsed_tx.sequence_number
-                    })
-                })
-                .cloned();
-            match old {
-                Some(old)
-                    if self.meta.get(&old).is_some_and(|m| {
-                        parsed_tx.gas_price.saturating_mul(100)
-                            >= m.gas_price.saturating_mul(100 + REPLACE_PRICE_BUMP_PERCENT)
-                    }) =>
+        let replacing = if let Some(&old) = self.pending_nonces.get(&nonce_key) {
+            match self.held.get(&old) {
+                Some(waiting)
+                    if parsed_tx.gas_price.saturating_mul(100)
+                        >= waiting
+                            .meta
+                            .gas_price
+                            .saturating_mul(100 + REPLACE_PRICE_BUMP_PERCENT) =>
                 {
                     Some(old)
                 }
@@ -329,7 +434,8 @@ impl Mempool {
                         "Duplicate pending nonce for sender {} sequence {} (a replacement \
                          must pay {REPLACE_PRICE_BUMP_PERCENT}% more)",
                         parsed_tx.sender, parsed_tx.sequence_number
-                    ));
+                    )
+                    .into());
                 }
             }
         } else {
@@ -348,10 +454,10 @@ impl Mempool {
             // B15: below the committed base fee the executor would refuse it.
             let base_fee = executor::committed_base_fee(storage);
             if parsed_tx.gas_price < base_fee {
-                return Err(format!(
+                return Err(Refusal::for_now(format!(
                     "Gas price {} is below the base fee {}",
                     parsed_tx.gas_price, base_fee
-                ));
+                )));
             }
             // B16: a transaction the executor refuses for its nonce pays
             // nothing, so it is not admitted. Below the committed sequence
@@ -361,13 +467,14 @@ impl Mempool {
                 return Err(format!(
                     "Sequence number {} is already used: the sender's next is {}",
                     parsed_tx.sequence_number, next_seq
-                ));
+                )
+                .into());
             }
             if parsed_tx.sequence_number - next_seq >= MAX_NONCE_AHEAD {
-                return Err(format!(
+                return Err(Refusal::for_now(format!(
                     "Sequence number {} is {} or more above the sender's next, {}",
                     parsed_tx.sequence_number, MAX_NONCE_AHEAD, next_seq
-                ));
+                )));
             }
             // B16: the payer must cover every transaction of its still
             // waiting, not each one alone, or a balance for one buys many
@@ -375,26 +482,31 @@ impl Mempool {
             let gas_cost = (parsed_tx.gas_limit as u128)
                 .checked_mul(parsed_tx.gas_price)
                 .ok_or_else(|| "Gas limit times gas price overflows".to_string())?;
+            // B239: kept per payer (a scan of the pool an admission).
+            let replaced_cost = replacing
+                .and_then(|id| self.held.get(&id))
+                .filter(|h| h.meta.payer == checked.payer)
+                .map_or(0, |h| h.meta.cost);
             let waiting: u128 = self
-                .meta
-                .iter()
-                .filter(|(raw, m)| m.payer == checked.payer && Some(*raw) != replacing.as_ref())
-                .map(|(_, m)| m.cost)
-                .fold(0u128, u128::saturating_add);
+                .payer_waiting
+                .get(&checked.payer)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(replaced_cost);
             let need = waiting.saturating_add(gas_cost);
             match executor::committed_ain_balance(storage, &checked.payer) {
                 Some(balance) if balance < need => {
-                    return Err(format!(
+                    return Err(Refusal::for_now(format!(
                         "Insufficient balance for gas: have {}, need {} (gas_limit {} × gas_price {}, plus {} for the payer's waiting transactions)",
                         balance, need, parsed_tx.gas_limit, parsed_tx.gas_price, waiting
-                    ));
+                    )));
                 }
                 Some(_) => {}
                 None => {
-                    return Err(format!(
+                    return Err(Refusal::for_now(format!(
                         "Gas payer {} has no AIN balance to pay gas (no CoinStore)",
                         checked.payer
-                    ));
+                    )));
                 }
             }
             // B94: what a block charges before anything runs (object loads,
@@ -406,12 +518,12 @@ impl Mempool {
             match executor::precharge_gas(storage, parsed_tx) {
                 Some(owed) if owed <= execution => {}
                 Some(owed) => {
-                    return Err(format!(
+                    return Err(Refusal::for_now(format!(
                         "the gas limit leaves {execution} execution gas, under the {owed} \
                          owed before execution (object loads and account writes)"
-                    ));
+                    )));
                 }
-                None => return Err("an account record does not parse".to_string()),
+                None => return Err("an account record does not parse".to_string().into()),
             }
         }
 
@@ -421,8 +533,23 @@ impl Mempool {
         // parked one (behind a nonce gap, or priced under the base fee):
         // parked transactions are never offered to a block and pay nothing,
         // so they cannot hold the pool against transactions that can run.
-        if replacing.is_none() && self.pending_txs.len() + self.inflight.len() >= MAX_PENDING_TXS {
-            let evicted = match self.storage.clone() {
+        // B215: and by the bytes held (a replacement counts without the
+        // transaction it replaces). B231: the parked transactions that must
+        // go are chosen in one scan, and evicted only if together they make
+        // room: B215 scanned the whole pool once a victim (a 100 KiB
+        // newcomer against 400-byte parked ones, ~250 scans hashing up to
+        // 8 MiB each) under the mempool lock the proposal waits on.
+        let replaced_len = replacing
+            .and_then(|id| self.held.get(&id))
+            .map_or(0, |h| h.meta.raw_len);
+        // Every held transaction is queued or on loan.
+        let full_count = replacing.is_none() && self.held.len() >= MAX_PENDING_TXS;
+        let held = self.held_bytes().saturating_sub(replaced_len);
+        let over_bytes = held
+            .saturating_add(tx.len())
+            .saturating_sub(MAX_PENDING_BYTES);
+        if full_count || over_bytes > 0 {
+            let victims = match self.storage.clone() {
                 Some(storage)
                     if self.is_ready(
                         &storage,
@@ -431,22 +558,31 @@ impl Mempool {
                         parsed_tx.gas_price,
                     ) =>
                 {
-                    self.evict_parked(&storage)
+                    self.parked_victims(&storage, usize::from(full_count), over_bytes, replacing)
                 }
-                _ => false,
+                _ => None,
             };
-            if !evicted {
-                return Err(format!(
-                    "Mempool full ({}+{} inflight / {})",
-                    self.pending_txs.len(),
-                    self.inflight.len(),
-                    MAX_PENDING_TXS
-                ));
-            }
+            let Some(victims) = victims else {
+                return Err(Refusal::for_now(if full_count {
+                    format!(
+                        "Mempool full ({}+{} inflight / {})",
+                        self.pending_txs.len(),
+                        self.held.len().saturating_sub(self.pending_txs.len()),
+                        MAX_PENDING_TXS
+                    )
+                } else {
+                    format!("Mempool full ({held} bytes held / {MAX_PENDING_BYTES})")
+                }));
+            };
+            self.drop_all_waiting(&victims);
+            println!(
+                "🧹 Mempool full: evicted {} parked transaction(s) for a ready one",
+                victims.len()
+            );
         }
 
         if let Some(old) = replacing {
-            self.drop_waiting(&old);
+            self.drop_waiting(old);
             println!("🔁 Mempool: replaced a waiting transaction at a higher price");
         }
 
@@ -459,19 +595,47 @@ impl Mempool {
 
         self.seen_txs.insert(tx_hash.clone());
         self.seen_order.push_back(tx_hash.clone());
-        self.pending_nonces.insert(nonce_key);
-        self.meta.insert(
-            tx.clone(),
-            TxMeta {
-                sender: parsed_tx.sender.clone(),
-                seq: parsed_tx.sequence_number,
-                gas_price: parsed_tx.gas_price,
-                cost: (parsed_tx.gas_limit as u128).saturating_mul(parsed_tx.gas_price),
-                payer: checked.payer,
-                raw_hash: StateDB::raw_tx_hash(&tx),
+        let id = self.next_id;
+        self.next_id += 1;
+        self.pending_nonces.insert(nonce_key, id);
+        self.by_hash.insert(raw_hash.clone(), id);
+        let meta = TxMeta {
+            sender: parsed_tx.sender.clone(),
+            seq: parsed_tx.sequence_number,
+            gas_price: parsed_tx.gas_price,
+            cost: (parsed_tx.gas_limit as u128).saturating_mul(parsed_tx.gas_price),
+            payer: checked.payer,
+            raw_hash,
+            charge: executor::Transaction {
+                payload: String::new(),
+                args: Vec::new(),
+                ..parsed_tx.clone()
+            },
+            raw_len: tx.len(),
+            dedup: tx_hash.clone(),
+        };
+        self.by_sender
+            .entry(meta.sender.clone())
+            .or_default()
+            .entry(meta.seq)
+            .or_default()
+            .push(id);
+        let waiting = self.payer_waiting.entry(meta.payer.clone()).or_default();
+        *waiting = waiting.saturating_add(meta.cost);
+        self.bytes_held = self.bytes_held.saturating_add(meta.raw_len);
+        self.version += 1;
+        self.held.insert(
+            id,
+            Held {
+                raw: tx,
+                meta,
+                parked_since: None,
+                unpaid_since: None,
+                requeue_attempts: 0,
+                loan: None,
             },
         );
-        self.pending_txs.push_back(tx.clone());
+        self.pending_txs.push_back(id);
 
         println!(
             "📥 Added transaction to mempool: {}",
@@ -488,23 +652,31 @@ impl Mempool {
     /// non-empty", which reported every unknown hash as pending whenever
     /// anyone else had a transaction waiting.
     pub fn any_pending(&self, matches: impl Fn(&str) -> bool) -> bool {
-        self.pending_txs.iter().any(|tx| matches(tx)) || self.inflight.keys().any(|tx| matches(tx))
+        self.held.values().any(|h| matches(&h.raw))
     }
 
     /// B54: the raw transaction queued or on loan whose `StateDB::raw_tx_hash`
     /// is `hash`, without hashing anything under the lock.
     pub fn pending_with_raw_hash(&self, hash: &str) -> Option<&str> {
-        self.meta
-            .iter()
-            .find(|(_, m)| m.raw_hash == hash)
-            .map(|(raw, _)| raw.as_str())
+        self.by_hash
+            .get(hash)
+            .and_then(|id| self.held.get(id))
+            .map(|h| h.raw.as_str())
     }
 
     /// How many times a loaned transaction was handed back to the queue and
     /// loaned again (0 for its first loan). B53: an observer forwards each
     /// new loan of a transaction to the next member.
     pub fn loan_attempts(&self, raw: &str) -> u8 {
-        self.inflight.get(raw).map_or(0, |(_, attempts)| *attempts)
+        self.id_of(raw)
+            .and_then(|id| self.held.get(&id))
+            .and_then(|h| h.loan)
+            .map_or(0, |(_, attempts)| attempts)
+    }
+
+    /// B239: the id of the held transaction `raw` (one hash of it).
+    fn id_of(&self, raw: &str) -> Option<TxId> {
+        self.by_hash.get(&raw_hash_of(raw)).copied()
     }
 
     /// `get_pending_transactions_at` with the wall clock.
@@ -528,18 +700,20 @@ impl Mempool {
         // self-consistent; every node executes the block in the order it ships.
         use std::collections::BTreeMap;
 
-        let raws: Vec<String> = self.pending_txs.iter().cloned().collect();
+        // B188: the queue moved out and back, not copied. B239: it holds ids,
+        // and each is looked up by its id, not by its text.
+        let ids: Vec<TxId> = std::mem::take(&mut self.pending_txs).into_iter().collect();
+        self.version += 1;
 
         // sender -> [(sequence_number, gas_price, original_index)], nonce-ordered.
         let mut by_sender: BTreeMap<String, Vec<(u64, u128, usize)>> = BTreeMap::new();
-        for (idx, raw) in raws.iter().enumerate() {
-            // Metadata was parsed once at admission (see `meta`); a raw without
-            // it (should not happen) is simply never selected rather than dropped.
-            if let Some(m) = self.meta.get(raw) {
-                by_sender
-                    .entry(m.sender.clone())
-                    .or_default()
-                    .push((m.seq, m.gas_price, idx));
+        for (idx, id) in ids.iter().enumerate() {
+            if let Some(h) = self.held.get(id) {
+                by_sender.entry(h.meta.sender.clone()).or_default().push((
+                    h.meta.seq,
+                    h.meta.gas_price,
+                    idx,
+                ));
             }
         }
         for q in by_sender.values_mut() {
@@ -553,7 +727,7 @@ impl Mempool {
         // parked here instead of riding in vertices for free.
         // A transaction whose sequence number is already used can never run:
         // it leaves the pool.
-        let mut dead: Vec<String> = Vec::new();
+        let mut dead: Vec<TxId> = Vec::new();
         let storage = self.storage.clone();
         if let Some(storage) = &storage {
             let loaned = self.loaned_seqs();
@@ -565,7 +739,7 @@ impl Mempool {
                 let mut parked_from = q.len();
                 for (at, &(seq, gas_price, idx)) in q.iter().enumerate() {
                     if seq < committed {
-                        dead.push(raws[idx].clone());
+                        dead.push(ids[idx]);
                         continue;
                     }
                     while loaned.get(sender).is_some_and(|s| s.contains(&expected)) {
@@ -580,14 +754,17 @@ impl Mempool {
                 }
                 // B98: a parked transaction leaves after PARKED_TTL_SECS.
                 for &(_, _, idx) in &q[parked_from..] {
-                    let raw = &raws[idx];
-                    let since = *self.parked_since.entry(raw.clone()).or_insert(now_secs);
-                    if now_secs.saturating_sub(since) >= PARKED_TTL_SECS {
-                        dead.push(raw.clone());
+                    if let Some(h) = self.held.get_mut(&ids[idx]) {
+                        let since = *h.parked_since.get_or_insert(now_secs);
+                        if now_secs.saturating_sub(since) >= PARKED_TTL_SECS {
+                            dead.push(ids[idx]);
+                        }
                     }
                 }
                 for &(_, _, idx) in &ready {
-                    self.parked_since.remove(&raws[idx]);
+                    if let Some(h) = self.held.get_mut(&ids[idx]) {
+                        h.parked_since = None;
+                    }
                 }
                 *q = ready;
             }
@@ -603,43 +780,70 @@ impl Mempool {
         let mut cursor: BTreeMap<String, usize> =
             by_sender.keys().map(|s| (s.clone(), 0usize)).collect();
 
-        let mut selected: Vec<usize> = Vec::with_capacity(limit.min(raws.len()));
+        let mut selected: Vec<usize> = Vec::with_capacity(limit.min(ids.len()));
+        // B193: the senders whose payer covered their head this pass.
+        let mut covered: HashSet<String> = HashSet::new();
+        // B206: every sender's head in a heap (highest gas_price, then FIFO
+        // index): picking the best scanned every sender, and an unpayable
+        // head ended one pick, so one drained payer sponsoring 5,000 senders
+        // cost ~25M lookups a pass.
+        let mut heads: std::collections::BinaryHeap<(u128, std::cmp::Reverse<usize>, String)> =
+            by_sender
+                .iter()
+                .filter_map(|(sender, q)| {
+                    q.first()
+                        .map(|&(_, gp, idx)| (gp, std::cmp::Reverse(idx), sender.clone()))
+                })
+                .collect();
         while selected.len() < limit {
-            // Highest-gas_price eligible head; tie-break by FIFO index.
-            let mut best: Option<(u128, usize, String)> = None;
-            for (sender, q) in by_sender.iter() {
-                let c = cursor[sender];
-                if c < q.len() {
-                    let (_, gp, idx) = q[c];
-                    let take = match &best {
-                        None => true,
-                        Some((bgp, bidx, _)) => gp > *bgp || (gp == *bgp && idx < *bidx),
-                    };
-                    if take {
-                        best = Some((gp, idx, sender.clone()));
-                    }
-                }
-            }
-            match best {
-                Some((_, idx, sender)) => {
+            match heads.pop() {
+                Some((_, std::cmp::Reverse(idx), sender)) => {
                     let payable = match &storage {
-                        Some(storage) => self.payable(storage, &raws[idx], &mut payer_left),
+                        Some(storage) => self.payable(storage, ids[idx], &mut payer_left),
                         None => Payable::Yes,
                     };
                     match payable {
                         Payable::Yes => {
+                            // B193: its payer covers it, so the run's earlier
+                            // shortfall is over, the part this pass does not
+                            // reach too (a stamp left there made a payable
+                            // transaction evictable, and its TTL ran from the
+                            // first shortfall). One that falls short again is
+                            // stamped anew.
+                            if covered.insert(sender.clone()) {
+                                let from = cursor.get(&sender).copied().unwrap_or(usize::MAX);
+                                for &(_, _, i) in by_sender[&sender].get(from..).unwrap_or(&[]) {
+                                    if let Some(h) = self.held.get_mut(&ids[i]) {
+                                        h.unpaid_since = None;
+                                    }
+                                }
+                            }
                             selected.push(idx);
                             if let Some(c) = cursor.get_mut(&sender) {
                                 *c += 1;
+                                if let Some(&(_, gp, next)) = by_sender[&sender].get(*c) {
+                                    heads.push((gp, std::cmp::Reverse(next), sender.clone()));
+                                }
                             }
                         }
                         Payable::Never => {
-                            dead.push(raws[idx].clone());
+                            dead.push(ids[idx]);
                             if let Some(c) = cursor.get_mut(&sender) {
                                 *c = usize::MAX;
                             }
                         }
                         Payable::NotNow => {
+                            // B188: the rest of the sender's run waits on
+                            // its payer, at most PARKED_TTL_SECS.
+                            let from = cursor.get(&sender).copied().unwrap_or(usize::MAX);
+                            for &(_, _, i) in by_sender[&sender].get(from..).unwrap_or(&[]) {
+                                if let Some(h) = self.held.get_mut(&ids[i]) {
+                                    let since = *h.unpaid_since.get_or_insert(now_secs);
+                                    if now_secs.saturating_sub(since) >= PARKED_TTL_SECS {
+                                        dead.push(ids[i]);
+                                    }
+                                }
+                            }
                             if let Some(c) = cursor.get_mut(&sender) {
                                 *c = usize::MAX;
                             }
@@ -650,37 +854,43 @@ impl Mempool {
             }
         }
 
+        // What can never run leaves, and its sender may submit it again.
+        let dead: HashSet<TxId> = dead.into_iter().collect();
+        for &id in &dead {
+            self.forget_unseen(id);
+        }
         let selected_set: HashSet<usize> = selected.iter().copied().collect();
-        let result: Vec<String> = selected.iter().map(|&i| raws[i].clone()).collect();
-        for raw in &dead {
-            self.remove_pending_nonce(raw);
-            self.meta.remove(raw);
-            self.requeue_attempts.remove(raw);
-            self.parked_since.remove(raw);
-            if let Ok(parsed) = serde_json::from_str::<executor::Transaction>(raw) {
-                self.seen_txs.remove(&Self::canonical_tx_hash(&parsed));
+        let mut result: Vec<String> = Vec::with_capacity(selected.len());
+        for &i in &selected {
+            let id = ids[i];
+            let Some(h) = self.held.get_mut(&id) else {
+                continue;
+            };
+            // Loaned, not gone: see `held`. Attempts carry over across
+            // re-queues so a permanently failing tx is bounded.
+            h.unpaid_since = None;
+            let attempts = std::mem::take(&mut h.requeue_attempts);
+            h.loan = Some((now_secs, attempts));
+            result.push(h.raw.clone());
+            let key = format!("{}:{}", h.meta.sender, h.meta.seq);
+            if self.pending_nonces.get(&key) == Some(&id) {
+                self.pending_nonces.remove(&key);
             }
         }
-        self.parked_since
-            .retain(|raw, _| self.meta.contains_key(raw));
-        let dead: HashSet<String> = dead.into_iter().collect();
-        let now = now_secs;
-        for raw in &result {
-            self.remove_pending_nonce(raw);
-            // Loaned, not gone: see the `inflight` field doc. Attempts carry
-            // over across re-queues so a permanently failing tx is bounded.
-            let attempts = self.requeue_attempts.remove(raw).unwrap_or(0);
-            self.inflight.insert(raw.clone(), (now, attempts));
-        }
         // Keep unselected txs in their original FIFO order for the next round.
-        self.pending_txs = raws
+        self.pending_txs = ids
             .into_iter()
             .enumerate()
-            .filter(|(i, r)| !selected_set.contains(i) && !dead.contains(r))
-            .map(|(_, r)| r)
+            .filter(|(i, id)| !selected_set.contains(i) && !dead.contains(id))
+            .map(|(_, id)| id)
             .collect();
 
         result
+    }
+
+    /// B215: the raw bytes held, queued and on loan.
+    fn held_bytes(&self) -> usize {
+        self.bytes_held
     }
 
     pub fn is_empty(&self) -> bool {
@@ -691,8 +901,13 @@ impl Mempool {
         self.pending_txs.len()
     }
 
-    pub fn get_all_pending(&self) -> &VecDeque<String> {
-        &self.pending_txs
+    /// The queued transactions, in order (not those on loan).
+    pub fn get_all_pending(&self) -> Vec<String> {
+        self.pending_txs
+            .iter()
+            .filter_map(|id| self.held.get(id))
+            .map(|h| h.raw.clone())
+            .collect()
     }
 
     /// Orphan-loss fix: consensus reports the raw transactions that actually
@@ -702,20 +917,18 @@ impl Mempool {
         if raws.is_empty() {
             return;
         }
-        let done: std::collections::HashSet<&str> = raws.iter().map(|s| s.as_str()).collect();
-        for raw in raws {
-            self.inflight.remove(raw);
-            // Also clear the nonce guard: an executed tx must not keep blocking
-            // a resubmission of the same sender:sequence.
-            self.remove_pending_nonce(raw);
-            self.meta.remove(raw);
-            self.requeue_attempts.remove(raw);
+        // Its nonce guard goes too: an executed tx must not keep blocking a
+        // resubmission of the same sender:sequence. Its dedup identity stays.
+        let done: HashSet<TxId> = raws.iter().filter_map(|raw| self.id_of(raw)).collect();
+        for &id in &done {
+            self.forget(id);
         }
-        // An executed tx can also be sitting in pending_txs (returned by
+        // An executed tx can also be sitting in the queue (returned by
         // return_unshipped or requeue_stale, then executed via another
-        // validator's vertex). Without meta it can never be selected again, so
-        // leaving it there pins it forever and it counts against MAX_PENDING_TXS.
-        self.pending_txs.retain(|r| !done.contains(r.as_str()));
+        // validator's vertex): it leaves the queue too.
+        if !done.is_empty() {
+            self.pending_txs.retain(|id| !done.contains(id));
+        }
     }
 
     /// Return loaned transactions that never executed within `max_age` to the
@@ -741,25 +954,22 @@ impl Mempool {
     /// so pushing to the front in THAT order restores the original sequence.
     pub fn return_unshipped(&mut self, raws: &[String]) {
         for raw in raws.iter() {
-            let Some((_, attempts)) = self.inflight.remove(raw) else {
-                // Not on loan (already executed or re-queued elsewhere): ignore.
+            // Not held (executed, or dropped) or not on loan (re-queued
+            // elsewhere): ignore.
+            let Some(id) = self.id_of(raw) else {
                 continue;
             };
-            if attempts > 0 {
-                self.requeue_attempts.insert(raw.clone(), attempts);
-            }
-            // A raw with no live `meta` is unselectable: get_pending_transactions
-            // builds its per-sender queues only from raws that have one, and
-            // mark_executed removes meta when the tx lands via another
-            // validator's vertex. Re-queuing it would pin it in pending_txs
-            // forever, so drop it instead.
-            let Some(m) = self.meta.get(raw) else {
-                self.requeue_attempts.remove(raw);
+            let Some(h) = self.held.get_mut(&id) else {
                 continue;
             };
-            self.pending_nonces
-                .insert(format!("{}:{}", m.sender, m.seq));
-            self.pending_txs.push_front(raw.clone());
+            let Some((_, attempts)) = h.loan.take() else {
+                continue;
+            };
+            h.requeue_attempts = attempts;
+            let key = format!("{}:{}", h.meta.sender, h.meta.seq);
+            self.pending_nonces.insert(key, id);
+            self.pending_txs.push_front(id);
+            self.version += 1;
         }
     }
 
@@ -770,23 +980,66 @@ impl Mempool {
     /// forever. `raws` in reverse order, as `return_unshipped` takes them.
     pub fn return_refused(&mut self, raws: &[String]) {
         for raw in raws.iter() {
-            let Some((_, attempts)) = self.inflight.remove(raw) else {
+            let Some(id) = self.id_of(raw) else {
                 continue;
             };
-            let Some(m) = self.meta.get(raw) else {
-                self.requeue_attempts.remove(raw);
+            let Some(h) = self.held.get_mut(&id) else {
+                continue;
+            };
+            let Some((_, attempts)) = h.loan.take() else {
                 continue;
             };
             if attempts + 1 >= MAX_REQUEUE_ATTEMPTS {
-                self.meta.remove(raw);
-                self.requeue_attempts.remove(raw);
+                self.forget(id);
                 continue;
             }
-            self.pending_nonces
-                .insert(format!("{}:{}", m.sender, m.seq));
-            self.requeue_attempts.insert(raw.clone(), attempts + 1);
-            self.pending_txs.push_front(raw.clone());
+            h.requeue_attempts = attempts + 1;
+            let key = format!("{}:{}", h.meta.sender, h.meta.seq);
+            self.pending_nonces.insert(key, id);
+            self.pending_txs.push_front(id);
+            self.version += 1;
         }
+    }
+
+    /// B133/B134: `requeue_stale_at` for a forwarding node: a stale loan
+    /// goes back to the queue whatever its count (its forwarder bounds it by
+    /// age and decides by stake when to give up; three re-forwards reached
+    /// three members, all of which could be Byzantine).
+    pub fn requeue_stale_uncapped_at(&mut self, max_age_secs: u64, now_secs: u64) -> usize {
+        let stale = self.stale_loans(max_age_secs, now_secs);
+        for &(id, attempts) in &stale {
+            self.requeue(id, attempts.saturating_add(1));
+        }
+        stale.len()
+    }
+
+    /// B239: the loans at least `max_age_secs` old at `now_secs`, with their
+    /// attempts, in the order they were admitted (they came back in the
+    /// loan table's hash order).
+    fn stale_loans(&self, max_age_secs: u64, now_secs: u64) -> Vec<(TxId, u8)> {
+        let mut stale: Vec<(TxId, u8)> = self
+            .held
+            .iter()
+            .filter_map(|(&id, h)| {
+                let (at, attempts) = h.loan?;
+                (now_secs.saturating_sub(at) >= max_age_secs).then_some((id, attempts))
+            })
+            .collect();
+        stale.sort_unstable();
+        stale
+    }
+
+    /// A loaned transaction back at the end of the queue, `attempts` carried.
+    fn requeue(&mut self, id: TxId, attempts: u8) {
+        let Some(h) = self.held.get_mut(&id) else {
+            return;
+        };
+        h.loan = None;
+        h.requeue_attempts = attempts;
+        let key = format!("{}:{}", h.meta.sender, h.meta.seq);
+        self.pending_nonces.insert(key, id);
+        self.pending_txs.push_back(id);
+        self.version += 1;
     }
 
     /// `requeue_stale_at` with the wall clock.
@@ -797,31 +1050,19 @@ impl Mempool {
     /// Re-queue loans at least `max_age_secs` old at `now_secs`, in the same
     /// clock the loans were stamped with.
     pub fn requeue_stale_at(&mut self, max_age_secs: u64, now_secs: u64) -> usize {
-        let stale: Vec<(String, u8)> = self
-            .inflight
-            .iter()
-            .filter(|(_, (at, _))| now_secs.saturating_sub(*at) >= max_age_secs)
-            .map(|(raw, (_, n))| (raw.clone(), *n))
-            .collect();
+        let stale = self.stale_loans(max_age_secs, now_secs);
         let mut requeued = 0usize;
         let mut dropped = 0usize;
-        for (raw, attempts) in &stale {
-            self.inflight.remove(raw);
+        for &(id, attempts) in &stale {
             // RE-AUDIT HIGH: bounded. A tx that keeps failing (bad nonce forever,
             // unpayable gas) must not become an immortal 30s loop that burns
             // every validator's CPU and block space.
-            if *attempts + 1 >= MAX_REQUEUE_ATTEMPTS {
-                self.meta.remove(raw);
-                self.requeue_attempts.remove(raw);
+            if attempts + 1 >= MAX_REQUEUE_ATTEMPTS {
+                self.forget(id);
                 dropped += 1;
                 continue;
             }
-            self.requeue_attempts.insert(raw.clone(), attempts + 1);
-            if let Some(m) = self.meta.get(raw) {
-                self.pending_nonces
-                    .insert(format!("{}:{}", m.sender, m.seq));
-            }
-            self.pending_txs.push_back(raw.clone());
+            self.requeue(id, attempts + 1);
             requeued += 1;
         }
         if requeued > 0 || dropped > 0 {
@@ -837,10 +1078,10 @@ impl Mempool {
     fn loaned_seqs(&self) -> std::collections::HashMap<String, HashSet<u64>> {
         let mut out: std::collections::HashMap<String, HashSet<u64>> =
             std::collections::HashMap::new();
-        for raw in self.inflight.keys() {
-            if let Some(m) = self.meta.get(raw) {
-                out.entry(m.sender.clone()).or_default().insert(m.seq);
-            }
+        for h in self.held.values().filter(|h| h.loan.is_some()) {
+            out.entry(h.meta.sender.clone())
+                .or_default()
+                .insert(h.meta.seq);
         }
         out
     }
@@ -852,27 +1093,31 @@ impl Mempool {
     fn payable(
         &self,
         storage: &StateDB,
-        raw: &str,
+        id: TxId,
         payer_left: &mut std::collections::HashMap<String, u128>,
     ) -> Payable {
-        let (Some(m), Ok(tx)) = (
-            self.meta.get(raw),
-            serde_json::from_str::<executor::Transaction>(raw),
-        ) else {
+        let Some(m) = self.held.get(&id).map(|h| &h.meta) else {
             return Payable::Never;
         };
-        let execution = tx
-            .gas_limit
-            .saturating_sub(executor::admission::intrinsic_gas(raw.len()));
-        match executor::precharge_gas(storage, &tx) {
-            Some(owed) if owed <= execution => {}
-            _ => return Payable::Never,
-        }
+        // B206: the payer's balance first (one read a payer a pass): a head
+        // it cannot cover is not priced (a pricing reads the sender's and the
+        // payer's records). One whose pre-charge no longer fits leaves once
+        // its payer can pay again, or at PARKED_TTL_SECS.
         let left = payer_left
             .entry(m.payer.clone())
             .or_insert_with(|| executor::committed_ain_balance(storage, &m.payer).unwrap_or(0));
         if *left < m.cost {
             return Payable::NotNow;
+        }
+        let execution = m
+            .charge
+            .gas_limit
+            .saturating_sub(executor::admission::intrinsic_gas(m.raw_len));
+        #[cfg(test)]
+        PRICINGS.with(|n| n.set(n.get() + 1));
+        match executor::precharge_gas(storage, &m.charge) {
+            Some(owed) if owed <= execution => {}
+            _ => return Payable::Never,
         }
         *left -= m.cost;
         Payable::Yes
@@ -886,82 +1131,175 @@ impl Mempool {
         if gas_price < executor::committed_base_fee(storage) {
             return false;
         }
-        let held: HashSet<u64> = self
-            .meta
-            .values()
-            .filter(|m| m.sender == sender)
-            .map(|m| m.seq)
-            .collect();
         let mut expected = self.committed_next(storage, sender);
-        while expected < seq && held.contains(&expected) {
+        // B239: the sender's own transactions, not a scan of the pool.
+        let held = self.by_sender.get(sender);
+        while expected < seq && held.is_some_and(|h| h.contains_key(&expected)) {
             expected += 1;
         }
         expected == seq
     }
 
-    /// B70: evict one parked transaction (not ready, still waiting): the one
-    /// furthest above its sender's next sequence number, ties by its raw
-    /// string, so the choice is deterministic. Its sender may submit it again.
-    /// One pass: each sender's ready run is found once.
-    fn evict_parked(&mut self, storage: &StateDB) -> bool {
+    /// B70/B231: the parked transactions (not ready, still waiting) to evict
+    /// so that `slots` more fit and `bytes` more are free, `exclude` (B245:
+    /// the transaction a replacement replaces, already counted out) apart:
+    /// the furthest above their senders' next sequence numbers first, ties
+    /// by their raw hashes (deterministic), at most
+    /// `MAX_EVICTIONS_PER_ADMISSION`. `None`, and nothing evicted, when they
+    /// cannot make that room. B239: the scan is remembered until the pool,
+    /// the committed height or the base fee changes, so admissions refused
+    /// for now do not scan the pool again and again.
+    fn parked_victims(
+        &mut self,
+        storage: &StateDB,
+        slots: usize,
+        bytes: usize,
+        exclude: Option<TxId>,
+    ) -> Option<Vec<TxId>> {
         let base_fee = executor::committed_base_fee(storage);
-        let senders: HashSet<String> = self.meta.values().map(|m| m.sender.clone()).collect();
-        let committed_of: std::collections::HashMap<String, u64> = senders
-            .into_iter()
-            .map(|s| {
-                let next = self.committed_next(storage, &s);
-                (s, next)
-            })
-            .collect();
-        let mut held: std::collections::HashMap<&str, HashSet<u64>> =
-            std::collections::HashMap::new();
-        for m in self.meta.values() {
-            held.entry(m.sender.as_str()).or_default().insert(m.seq);
+        let height = storage.get("latest_height").ok().flatten();
+        let fresh = self.parked_scan.as_ref().is_some_and(|scan| {
+            scan.version == self.version && scan.height == height && scan.base_fee == base_fee
+        });
+        if !fresh {
+            let parked = self.scan_parked(storage, &height, base_fee);
+            self.parked_scan = Some(ParkedScan {
+                version: self.version,
+                height,
+                base_fee,
+                parked,
+            });
         }
-        // Per sender: its committed next and the end of its ready run.
-        let mut runs: std::collections::HashMap<&str, (u64, u64)> =
-            std::collections::HashMap::new();
-        for (sender, seqs) in &held {
-            let committed = committed_of[*sender];
+        let scan = self.parked_scan.as_ref()?;
+        let (mut freed, mut victims) = (0usize, Vec::new());
+        for &(_, _, len, id) in &scan.parked {
+            if victims.len() >= slots && freed >= bytes {
+                break;
+            }
+            if Some(id) == exclude {
+                continue;
+            }
+            if victims.len() == MAX_EVICTIONS_PER_ADMISSION {
+                return None;
+            }
+            freed = freed.saturating_add(len);
+            victims.push(id);
+        }
+        (victims.len() >= slots && freed >= bytes).then_some(victims)
+    }
+
+    /// B70/B244: the queued transactions selection parks, in eviction
+    /// order. A sender's ready run starts at its committed next and goes on
+    /// over its held transactions (loaned or queued) while each is held, and
+    /// stops at a queued one priced under the base fee: selection offers
+    /// nothing of the sender from there, so all of it is parked (only that
+    /// one transaction was, and the rest of its run was neither offered nor
+    /// evictable). And one whose payer did not cover it at the last pass
+    /// (B188).
+    fn scan_parked(
+        &mut self,
+        storage: &StateDB,
+        height: &Option<String>,
+        base_fee: u128,
+    ) -> Vec<(u64, String, usize, TxId)> {
+        #[cfg(test)]
+        EVICTION_SCANS.with(|n| n.set(n.get() + 1));
+        let senders: Vec<String> = self.by_sender.keys().cloned().collect();
+        let mut runs: std::collections::HashMap<String, (u64, u64)> =
+            std::collections::HashMap::with_capacity(senders.len());
+        for sender in senders {
+            let committed = self.committed_next_at(storage, height, &sender);
             let mut end = committed;
-            while seqs.contains(&end) {
-                end += 1;
+            if let Some(seqs) = self.by_sender.get(&sender) {
+                while let Some(ids) = seqs.get(&end) {
+                    let stops = ids.iter().any(|id| {
+                        self.held
+                            .get(id)
+                            .is_some_and(|h| h.loan.is_none() && h.meta.gas_price < base_fee)
+                    });
+                    if stops {
+                        break;
+                    }
+                    end += 1;
+                }
             }
             runs.insert(sender, (committed, end));
         }
-        let mut victim: Option<(u64, &str)> = None;
-        for raw in &self.pending_txs {
-            let Some(m) = self.meta.get(raw) else {
+        let mut parked: Vec<(u64, String, usize, TxId)> = Vec::new();
+        for id in &self.pending_txs {
+            let Some(h) = self.held.get(id) else {
                 continue;
             };
-            let Some(&(committed, end)) = runs.get(m.sender.as_str()) else {
+            let m = &h.meta;
+            let Some(&(committed, end)) = runs.get(&m.sender) else {
                 continue;
             };
-            let parked = m.gas_price < base_fee || m.seq >= end;
-            let ahead = m.seq.saturating_sub(committed);
-            if parked && victim.is_none_or(|(a, r)| (ahead, raw.as_str()) > (a, r)) {
-                victim = Some((ahead, raw.as_str()));
+            if m.seq >= end || h.unpaid_since.is_some() {
+                parked.push((
+                    m.seq.saturating_sub(committed),
+                    m.raw_hash.clone(),
+                    m.raw_len,
+                    *id,
+                ));
             }
         }
-        let Some((_, raw)) = victim else {
-            return false;
-        };
-        let raw = raw.to_string();
-        self.drop_waiting(&raw);
-        println!("🧹 Mempool full: evicted a parked transaction for a ready one");
-        true
+        parked.sort_unstable_by(|a, b| (b.0, &b.1).cmp(&(a.0, &a.1)));
+        parked
+    }
+
+    /// B231: `drop_waiting` for several, the queue filtered once.
+    fn drop_all_waiting(&mut self, ids: &[TxId]) {
+        let gone: HashSet<TxId> = ids.iter().copied().collect();
+        self.pending_txs.retain(|id| !gone.contains(id));
+        for &id in ids {
+            self.forget_unseen(id);
+        }
     }
 
     /// Remove a queued transaction for good (evicted, replaced, expired);
     /// its sender may submit it again.
-    fn drop_waiting(&mut self, raw: &str) {
-        self.pending_txs.retain(|r| r != raw);
-        self.remove_pending_nonce(raw);
-        self.meta.remove(raw);
-        self.requeue_attempts.remove(raw);
-        self.parked_since.remove(raw);
-        if let Ok(parsed) = serde_json::from_str::<executor::Transaction>(raw) {
-            self.seen_txs.remove(&Self::canonical_tx_hash(&parsed));
+    fn drop_waiting(&mut self, id: TxId) {
+        self.pending_txs.retain(|x| *x != id);
+        self.forget_unseen(id);
+    }
+
+    /// B239: a transaction leaves the pool (executed, or dropped after its
+    /// requeues): its entry, its hash and its nonce guard. Its dedup identity
+    /// stays (an executed one must not be replayed).
+    fn forget(&mut self, id: TxId) -> Option<Held> {
+        let h = self.held.remove(&id)?;
+        self.version += 1;
+        self.by_hash.remove(&h.meta.raw_hash);
+        if let Some(seqs) = self.by_sender.get_mut(&h.meta.sender) {
+            if let Some(ids) = seqs.get_mut(&h.meta.seq) {
+                ids.retain(|x| *x != id);
+                if ids.is_empty() {
+                    seqs.remove(&h.meta.seq);
+                }
+            }
+            if seqs.is_empty() {
+                self.by_sender.remove(&h.meta.sender);
+            }
+        }
+        if let Some(waiting) = self.payer_waiting.get_mut(&h.meta.payer) {
+            *waiting = waiting.saturating_sub(h.meta.cost);
+            if *waiting == 0 {
+                self.payer_waiting.remove(&h.meta.payer);
+            }
+        }
+        self.bytes_held = self.bytes_held.saturating_sub(h.meta.raw_len);
+        let key = format!("{}:{}", h.meta.sender, h.meta.seq);
+        if self.pending_nonces.get(&key) == Some(&id) {
+            self.pending_nonces.remove(&key);
+        }
+        Some(h)
+    }
+
+    /// `forget`, and its dedup identity too: its sender may submit it again
+    /// (evicted, replaced, expired, or never able to run).
+    fn forget_unseen(&mut self, id: TxId) {
+        if let Some(h) = self.forget(id) {
+            self.seen_txs.remove(&h.meta.dedup);
         }
     }
 
@@ -969,9 +1307,20 @@ impl Mempool {
     /// committed height.
     fn committed_next(&mut self, storage: &StateDB, sender: &str) -> u64 {
         let height = storage.get("latest_height").ok().flatten();
-        if self.seq_cache_at != height {
+        self.committed_next_at(storage, &height, sender)
+    }
+
+    /// `committed_next` at a committed height read once by the caller
+    /// (B231: a scan read it once a sender).
+    fn committed_next_at(
+        &mut self,
+        storage: &StateDB,
+        height: &Option<String>,
+        sender: &str,
+    ) -> u64 {
+        if self.seq_cache_at != *height {
             self.seq_cache.clear();
-            self.seq_cache_at = height;
+            self.seq_cache_at = height.clone();
         }
         if let Some(next) = self.seq_cache.get(sender) {
             return *next;
@@ -981,15 +1330,6 @@ impl Mempool {
             self.seq_cache.insert(sender.to_string(), next);
         }
         next
-    }
-
-    fn remove_pending_nonce(&mut self, tx: &str) {
-        if let Ok(parsed_tx) = serde_json::from_str::<executor::Transaction>(tx) {
-            self.pending_nonces.remove(&format!(
-                "{}:{}",
-                parsed_tx.sender, parsed_tx.sequence_number
-            ));
-        }
     }
 }
 

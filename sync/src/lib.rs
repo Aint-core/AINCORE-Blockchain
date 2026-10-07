@@ -31,7 +31,49 @@ pub struct SyncResponse {
     /// block only together with its QC (IM-1). Empty from older peers.
     #[serde(default)]
     pub qcs: Vec<consensus::qc::QuorumCertificate>,
+    /// B264: the next block, when no batch can hold it (its encoded bytes
+    /// pass `SYNC_RESP_BLOCK_BYTES`: the vertices a block commits are not
+    /// bounded). The answer then carries no block; this one travels in
+    /// `SYNC_PART`s, and its QC, when held, is in `qcs`. `None` from older
+    /// peers.
+    #[serde(default)]
+    pub oversized: Option<OversizedBlock>,
 }
+
+/// B264: a block too large for a batch, as a `SYNC_RESP` names it. B275:
+/// with its header, which the client checks against the block's QC before
+/// it asks for any part (any block's height was enough to start a fetch).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OversizedBlock {
+    pub height: u64,
+    /// Its encoded bytes.
+    pub len: u64,
+    pub header: blockchain::BlockHeader,
+}
+
+/// `SYNC_PART` (B264): `BLOCK_PART_BYTES` of the stored block at `height`,
+/// from `offset`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockPartRequest {
+    pub height: u64,
+    pub offset: u64,
+}
+
+/// `SYNC_PART_RESP` (B264): one part, or why none was served.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlockPartResponse {
+    /// B275: the part, the block's stored text from `offset`, cut at a
+    /// character boundary (hex doubled it, and the server's answer budget,
+    /// a token each 64 KiB, held block parts to about 0.4 MiB/s).
+    pub data: String,
+    /// The whole block's encoded length.
+    pub len: u64,
+    pub error: Option<String>,
+}
+
+/// B264: the wire prefixes of a block part's request and answer.
+pub const PART_REQ: &str = "SYNC_PART:";
+pub const PART_RESP: &str = "SYNC_PART_RESP:";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FinalityArtifact {
@@ -66,10 +108,33 @@ pub struct ChainSync {
     /// only serve.
     sessions: Option<network::SessionClient>,
     /// B33 review: passes in which each session advertised a height above
-    /// this node's and delivered nothing. Those sessions are asked after
-    /// the others, so peers that advertise a height they never serve cannot
-    /// hold every one of a pass's slots.
-    stalls: Mutex<HashMap<String, u32>>,
+    /// this node's and delivered nothing (B256/B263: struck turns), and
+    /// when the last was (B263: they expire). Those sessions are asked
+    /// after the others, so peers that advertise a height they never serve
+    /// cannot hold every one of a pass's slots.
+    stalls: Mutex<HashMap<String, (u32, std::time::Instant)>>,
+    /// B263: the blocks each session's last turn that asked for blocks
+    /// brought, and when; sessions that brought more are asked first.
+    /// B274: kept across a session's reconnects (it was dropped with the
+    /// session, so a reconnect made a struck server a fresh one), for
+    /// `STRIKE_TTL`, at most `MAX_STANDINGS` sessions.
+    yields: Mutex<HashMap<String, (u64, std::time::Instant)>>,
+    /// B274: when each session last had a turn; among equals the one that
+    /// waited longest goes first (the height a session advertised ordered
+    /// them, and it is the session's own unauthenticated claim).
+    turns: Mutex<HashMap<String, std::time::Instant>>,
+    /// B264: the blocks last served in parts, so a block's parts cost one
+    /// read. Only blocks too large for a batch are kept.
+    parted_blocks: Mutex<state_sync::ValueCache>,
+    /// B275: the blocks known to be too large for a batch, by height.
+    oversized_known: Mutex<std::collections::BTreeMap<u64, OversizedBlock>>,
+    /// B275: the parted block being fetched, kept across turns.
+    parted_partial: Mutex<Option<PartialBlock>>,
+    /// B275: when a part last needed its block read from storage.
+    parted_read_at: Mutex<Option<std::time::Instant>>,
+    /// The encoded bytes a batch's blocks stop at (`SYNC_RESP_BLOCK_BYTES`;
+    /// tests make it small, so real blocks are parted).
+    batch_bytes: usize,
     #[cfg(test)]
     before_execution_hook: Option<fn(&StateDB)>,
 }
@@ -82,9 +147,207 @@ const QUICK_ASK_TIMEOUT: Duration = Duration::from_secs(5);
 /// B33: the sessions a pass takes blocks from, the highest first (a choice).
 const SYNC_PEERS_PER_PASS: usize = 3;
 
-/// NI-4: the blocks of one SYNC_RESP stop at this many bytes (at least one
-/// block is sent), so the answer stays under the 10 MiB a client reads.
+/// B256: how long one session's turn of a pass may take (a choice: a sync
+/// request's timeout). A session kept its turn while each batch made any
+/// progress, so one serving a block a batch just inside the request timeout
+/// held every pass of every catching-up node at about a block a minute, and
+/// the other sessions were never asked.
+#[cfg(not(test))]
+const SYNC_TURN: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const SYNC_TURN: Duration = Duration::from_secs(2);
+
+/// B256: a full batch in blocks (`handle_sync_request` answers up to 500
+/// blocks or `SYNC_RESP_BLOCK_BYTES` of them). A turn that brought one is
+/// never struck, however it ended.
+const SYNC_TURN_BLOCKS: u64 = 500;
+
+/// B263: a full batch in the server's unit, its blocks' encoded bytes
+/// (half the server's cut: a batch the bytes cut holds more, or its next
+/// block is larger than this and fills the following one). B256 counted the
+/// transactions' bytes, so a full batch of real blocks was never full.
+const FULL_BATCH_BYTES: usize = SYNC_RESP_BLOCK_BYTES / 2;
+
+/// B263: an answer that took longer than this and carried less than a full
+/// batch is slow, and strikes its session (a choice: well above a round
+/// trip and the reading of a small batch; a full batch over a slow link
+/// takes longer, and is never slow).
+#[cfg(not(test))]
+const SLOW_ANSWER: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const SLOW_ANSWER: Duration = Duration::from_millis(500);
+
+/// B263: how long a strike counts (a choice): strikes never expired, so a
+/// member struck once (an answer lost, its tip without a QC) sat behind any
+/// session never struck, Sybils advertising this node's height included.
+const STRIKE_TTL: Duration = Duration::from_secs(600);
+
+/// B274: the most sessions whose standing (strikes, yield, last turn) is
+/// kept; past it the one updated longest ago goes (a choice: well above any
+/// node's sessions, a few hundred KB).
+const MAX_STANDINGS: usize = 1024;
+
+/// B274: a session's standing for block turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Standing {
+    /// B275: it holds the parted block this node is fetching (only it can
+    /// finish it: each node's copy of a block differs in its signature).
+    resuming: bool,
+    member: bool,
+    /// Strikes still counting (`STRIKE_TTL`).
+    strikes: u32,
+    /// Blocks its last turn that asked for blocks brought (0 if none).
+    brought: u64,
+    /// When it last had a turn (`None`: never).
+    turned: Option<std::time::Instant>,
+}
+
+/// B274: the order block turns go in: (B275) the session whose parted
+/// block this node is fetching; members, whatever their strikes; then the
+/// fewest strikes still counting; then the most blocks brought at the last
+/// turn; then the one that waited longest for a turn. Nothing a session
+/// merely claims (its height) orders it.
+fn turn_order(a: &(String, Standing), b: &(String, Standing)) -> std::cmp::Ordering {
+    let ((pa, sa), (pb, sb)) = (a, b);
+    sb.resuming
+        .cmp(&sa.resuming)
+        .then(sb.member.cmp(&sa.member))
+        .then(sa.strikes.cmp(&sb.strikes))
+        .then(sb.brought.cmp(&sa.brought))
+        .then(sa.turned.cmp(&sb.turned))
+        .then(pa.cmp(pb))
+}
+
+/// B274: insert `value` under `key`, the entry updated longest ago (`at`)
+/// going first when `MAX_STANDINGS` are kept.
+fn keep_standing<V>(
+    map: &mut HashMap<String, V>,
+    key: String,
+    value: V,
+    at: impl Fn(&V) -> std::time::Instant,
+) {
+    if !map.contains_key(&key) && map.len() >= MAX_STANDINGS {
+        if let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, v)| at(v))
+            .map(|(k, _)| k.clone())
+        {
+            map.remove(&oldest);
+        }
+    }
+    map.insert(key, value);
+}
+
+/// B263: what a session's turn did, to judge it by.
+struct Turn {
+    /// The height this node reached.
+    reached: u64,
+    /// The blocks this node took, and their encoded bytes.
+    brought: u64,
+    bytes: usize,
+    /// An answer took over `SLOW_ANSWER` and carried less than a full batch.
+    slow: bool,
+    /// The turn ended at the session's height, or at the block it offered
+    /// without its QC (an honest server's newest), rather than on an error,
+    /// an empty, refused or junk answer, or the turn's time.
+    ended_well: bool,
+    /// B274: the turn asked for blocks (it did not find this node already
+    /// at the session's height).
+    asked: bool,
+    /// B275: the session sent what no honest server sends (a parted block
+    /// that does not check, or does not import).
+    refused: bool,
+}
+
+impl Turn {
+    /// B263: whether the turn strikes its session: a slow answer, or an end
+    /// short of the session's certified blocks without a full batch. B256
+    /// judged only a turn the clock ended, so one that brought a block
+    /// slowly and then answered empty cleared its strike.
+    fn struck(&self) -> bool {
+        let full = self.brought >= SYNC_TURN_BLOCKS || self.bytes >= FULL_BATCH_BYTES;
+        self.slow || self.refused || !(self.ended_well || full)
+    }
+}
+
+/// B274: whether a block offered without its QC, at `height`, can be its
+/// server's newest work: members propose nothing with
+/// `MAX_UNFINALIZED_BLOCKS` blocks without a QC, so an honest server holds
+/// fewer than that above its first block without one. A server claiming
+/// far more ended its turn on its own word, and was never struck.
+fn qcless_tip(height: u64, claimed: u64) -> bool {
+    claimed.saturating_sub(height) < consensus::v4::MAX_UNFINALIZED_BLOCKS
+}
+
+/// NI-4: the blocks of one SYNC_RESP stop at this many bytes, so the answer
+/// stays under the 10 MiB a client reads. B264: a block larger than this is
+/// never in a batch; it is named (`SyncResponse::oversized`) and sent in
+/// parts.
 pub const SYNC_RESP_BLOCK_BYTES: usize = 8 << 20;
+
+/// B264: the bytes of one block part (B275: of a batch's cut, half, as text
+/// with its escapes it fits the frame as a batch does). Every part but a
+/// block's last is this long but for the bytes of a character cut short
+/// (at most 3), so a server that sends less is caught at once.
+pub const BLOCK_PART_BYTES: usize = SYNC_RESP_BLOCK_BYTES / 2;
+
+/// B264: the largest block a client fetches in parts. An import holds about
+/// six copies of a block's bytes at once (the parts, the parsed block, its
+/// body bytes and their Reed-Solomon extension, the stored row), so 512 MiB
+/// keeps one within half the documented 8 GB minimum. A block this large
+/// lists about four million committed vertices at 134 bytes each, and every
+/// node that built it held each of them in its DAG at a kilobyte or more:
+/// half that minimum as well.
+pub const MAX_PARTED_BLOCK_BYTES: u64 = 512 << 20;
+
+/// B264: the key a block is kept under for its parts (the cache's version
+/// is its height).
+const PARTED_KEY: &str = "block";
+
+/// B275: the blocks a server knows are too large for a batch, by height,
+/// at most this many (a choice; such blocks are rare): a request beside one
+/// is answered from what is known, not by reading the block again.
+const MAX_OVERSIZED_KNOWN: usize = 64;
+
+/// B275: how long a client waits after a busy part answer (the server's
+/// answer budget refills 12.8 tokens a second, a part's text about 74).
+const PART_BUSY_WAIT: Duration = Duration::from_secs(1);
+
+/// B275: a part that needs its block read from storage (not kept) waits
+/// this long after the last such read, answered busy meanwhile: clients
+/// fetching two large blocks at once made every part a whole block's read.
+const PARTED_READ_EVERY: Duration = Duration::from_secs(1);
+
+/// B275: why a parted fetch stopped short.
+enum PartFailure {
+    /// No answer (a timeout, a lost session): proves nothing; what came is
+    /// kept for the session's next turn.
+    Lost(String),
+    /// An answer no honest server sends: its session is struck.
+    Lied(String),
+}
+
+/// B275: a parted block's bytes so far, from one session, kept across that
+/// session's turns (a part waits on the server's answer budget, so a large
+/// block takes more than a turn). Only that session resumes it: each node's
+/// copy of a block carries its own proposer signature.
+struct PartialBlock {
+    peer: String,
+    height: u64,
+    hash: String,
+    len: u64,
+    bytes: Vec<u8>,
+}
+
+/// B275: the header a block's stored text starts with (`{"header":{..}`),
+/// read without the rest.
+fn header_of(json: &str) -> Option<blockchain::BlockHeader> {
+    let rest = json.strip_prefix("{\"header\":")?;
+    serde_json::Deserializer::from_str(rest)
+        .into_iter::<blockchain::BlockHeader>()
+        .next()?
+        .ok()
+}
 
 /// A seed's finality tip as this node can judge it.
 enum Tip {
@@ -107,10 +370,6 @@ enum SyncLink {
 }
 
 impl SyncLink {
-    async fn ask(&mut self, msg: &str) -> Result<String, String> {
-        self.ask_within(msg, SYNC_ASK_TIMEOUT).await
-    }
-
     async fn ask_within(&mut self, msg: &str, timeout: Duration) -> Result<String, String> {
         match self {
             Self::Session { client, peer } => client.ask(peer, msg, timeout).await,
@@ -128,6 +387,13 @@ impl ChainSync {
             retention: StateDB::block_pruning_policy_from_env(),
             sessions: None,
             stalls: Mutex::default(),
+            yields: Mutex::default(),
+            turns: Mutex::default(),
+            parted_blocks: Mutex::default(),
+            oversized_known: Mutex::default(),
+            parted_partial: Mutex::default(),
+            parted_read_at: Mutex::default(),
+            batch_bytes: SYNC_RESP_BLOCK_BYTES,
             #[cfg(test)]
             before_execution_hook: None,
         }
@@ -138,6 +404,18 @@ impl ChainSync {
     pub(crate) fn with_retention(mut self, retention: Option<(u64, u64)>) -> Self {
         self.retention = retention;
         self
+    }
+
+    /// Tests only: a batch's byte cut other than `SYNC_RESP_BLOCK_BYTES`.
+    #[cfg(test)]
+    pub(crate) fn with_batch_bytes(mut self, bytes: usize) -> Self {
+        self.batch_bytes = bytes;
+        self
+    }
+
+    /// The bytes of one block part (`BLOCK_PART_BYTES` at the default cut).
+    fn part_bytes(&self) -> usize {
+        self.batch_bytes / 2
     }
 
     /// Serve state snapshots (G3 S6), whatever `AINCORE_SERVE_SNAPSHOTS` says.
@@ -386,6 +664,17 @@ impl ChainSync {
             ));
         }
         Self::verify_proposer_signature_in(storage, block)?;
+        // G0 (V4): the anchor is the sequence's last vertex, which the header
+        // binds; a substituted anchor under a reused signature stops here.
+        // B275: before the roots: only the DA root covers `anchor_hash`, so
+        // one padded to megabytes cost a whole Reed-Solomon encode first.
+        if consensus::v4::is_v4_chain(storage) && !block.anchor_is_bound() {
+            return Err(format!(
+                "block {}'s anchor {} is not its last committed vertex",
+                block.header.height,
+                block.anchor_hash.chars().take(80).collect::<String>()
+            ));
+        }
         // B41: the costly checks last, once a validator's signature binds the
         // header (the DA root's encode costs up to ~0.6 s a batch).
         // Every header root against the body: transactions, the committed
@@ -394,14 +683,6 @@ impl ChainSync {
         // root must mean an empty list, or a peer could attach vertices to a
         // block that has none.
         block.check_commitments()?;
-        // G0 (V4): the anchor is the sequence's last vertex, which the header
-        // binds; a substituted anchor under a reused signature stops here.
-        if consensus::v4::is_v4_chain(storage) && !block.anchor_is_bound() {
-            return Err(format!(
-                "block {}'s anchor {} is not its last committed vertex",
-                block.header.height, block.anchor_hash
-            ));
-        }
         Ok(())
     }
 
@@ -670,8 +951,6 @@ impl ChainSync {
         // QUICK_ASK_TIMEOUT; then blocks from the highest few, members first.
         // Asked one after another with 60 s timeouts, one stalling peer cost
         // every pass about two minutes.
-        let sessions_now: std::collections::HashSet<String> =
-            sessions.iter().map(|s| s.peer.clone()).collect();
         let mut asks = tokio::task::JoinSet::new();
         for session in sessions {
             let client = client.clone();
@@ -687,26 +966,99 @@ impl ChainSync {
                 (session, height)
             });
         }
-        // Peers at this node's height too: their finality artifact may carry
-        // the QC of the tip.
-        let mut ahead = Vec::new();
+        // B263: block turns go to sessions above this node's height only; a
+        // session at it has no block to give, and is asked for its finality
+        // artifact alone (the tip's QC), outside the turns. It took a turn
+        // and was never struck, so Sybils advertising this node's height
+        // held every turn once the members had a strike.
+        let mut above = Vec::new();
+        let mut level = Vec::new();
         while let Some(joined) = asks.join_next().await {
             if let Ok((session, Some(height))) = joined {
-                if height >= final_height {
-                    ahead.push((session, height));
+                if height > final_height {
+                    above.push((session, height));
+                } else if height == final_height {
+                    level.push(session);
                 }
             }
         }
-        let stalls = self.stalls.lock().map(|s| s.clone()).unwrap_or_default();
-        let stalled = |peer: &str| stalls.get(peer).copied().unwrap_or(0);
-        ahead.sort_by(|(a, ha), (b, hb)| {
-            stalled(&a.peer)
-                .cmp(&stalled(&b.peer))
-                .then(b.member.is_some().cmp(&a.member.is_some()))
-                .then(hb.cmp(ha))
+        level.sort_by(|a, b| {
+            b.member
+                .is_some()
+                .cmp(&a.member.is_some())
                 .then(a.peer.cmp(&b.peer))
         });
-        for (session, advertised) in ahead.into_iter().take(SYNC_PEERS_PER_PASS) {
+        let mut finality = tokio::task::JoinSet::new();
+        for session in level.into_iter().take(SYNC_PEERS_PER_PASS) {
+            let client = client.clone();
+            finality.spawn(async move {
+                client
+                    .ask(&session.peer, "GET_FINALITY", QUICK_ASK_TIMEOUT)
+                    .await
+                    .ok()
+            });
+        }
+        while let Some(joined) = finality.join_next().await {
+            let artifact = joined
+                .ok()
+                .flatten()
+                .and_then(|r| r.strip_prefix("FINALITY:").map(str::to_string))
+                .and_then(|json| serde_json::from_str::<FinalityArtifact>(&json).ok());
+            if let Some(artifact) = artifact {
+                if let Err(e) = self.apply_finality_artifact(&artifact) {
+                    eprintln!("🚨 [SECURITY][SYNC_FINALITY_REJECT] {}", e);
+                }
+            }
+        }
+        // B263/B274: the order of `turn_order`, from standings that expire
+        // after `STRIKE_TTL` and outlive a session's reconnects.
+        let now = std::time::Instant::now();
+        let fresh = |at: &std::time::Instant| now.duration_since(*at) < STRIKE_TTL;
+        let stalls = self
+            .stalls
+            .lock()
+            .map(|mut s| {
+                s.retain(|_, (_, at)| fresh(at));
+                s.clone()
+            })
+            .unwrap_or_default();
+        let yields = self
+            .yields
+            .lock()
+            .map(|mut y| {
+                y.retain(|_, (_, at)| fresh(at));
+                y.clone()
+            })
+            .unwrap_or_default();
+        let turns = self
+            .turns
+            .lock()
+            .map(|mut t| {
+                t.retain(|_, at| fresh(at));
+                t.clone()
+            })
+            .unwrap_or_default();
+        let resuming = self
+            .parted_partial
+            .lock()
+            .ok()
+            .and_then(|p| p.as_ref().map(|p| p.peer.clone()));
+        let mut ranked: Vec<((String, Standing), (network::SessionPeer, u64))> = above
+            .into_iter()
+            .map(|(session, advertised)| {
+                let label = session.member.as_deref().unwrap_or(&session.peer);
+                let standing = Standing {
+                    resuming: resuming.as_deref() == Some(label),
+                    member: session.member.is_some(),
+                    strikes: stalls.get(&session.peer).map_or(0, |(n, _)| *n),
+                    brought: yields.get(&session.peer).map_or(0, |(n, _)| *n),
+                    turned: turns.get(&session.peer).copied(),
+                };
+                ((session.peer.clone(), standing), (session, advertised))
+            })
+            .collect();
+        ranked.sort_by(|(a, _), (b, _)| turn_order(a, b));
+        for (_, (session, advertised)) in ranked.into_iter().take(SYNC_PEERS_PER_PASS) {
             let label = session
                 .member
                 .clone()
@@ -717,37 +1069,64 @@ impl ChainSync {
                 peer: session.peer,
             };
             let before = self.get_local_height();
-            let reached = self.sync_over(&mut link, &label, before).await;
-            final_height = final_height.max(reached);
-            if let Ok(mut stalls) = self.stalls.lock() {
-                if reached > before {
-                    stalls.remove(&peer);
-                } else if advertised > before {
-                    let n = stalls.entry(peer).or_insert(0);
-                    *n = n.saturating_add(1);
+            let turn = self.sync_over(&mut link, &label, before, advertised).await;
+            final_height = final_height.max(turn.reached);
+            let at = std::time::Instant::now();
+            if let Ok(mut turns) = self.turns.lock() {
+                keep_standing(&mut turns, peer.clone(), at, |t| *t);
+            }
+            // B274: a turn that found this node already at the session's
+            // height asked for nothing, and says nothing of its yield.
+            if turn.asked {
+                if let Ok(mut yields) = self.yields.lock() {
+                    keep_standing(&mut yields, peer.clone(), (turn.brought, at), |(_, t)| *t);
                 }
             }
-        }
-        if let Ok(mut stalls) = self.stalls.lock() {
-            stalls.retain(|peer, _| sessions_now.contains(peer));
+            if let Ok(mut stalls) = self.stalls.lock() {
+                if turn.struck() {
+                    let n = stalls.get(&peer).map_or(0, |(n, _)| *n);
+                    keep_standing(&mut stalls, peer, (n.saturating_add(1), at), |(_, t)| *t);
+                } else {
+                    stalls.remove(&peer);
+                }
+            }
         }
         final_height
     }
 
-    /// One peer's blocks over `link`: its height, then batches up to it, then
-    /// its finality artifact. Returns the height reached.
-    async fn sync_over(&self, link: &mut SyncLink, peer_id: &str, my_height: u64) -> u64 {
-        let mut final_height = my_height;
+    /// One peer's blocks over `link`: its height, then batches up to it
+    /// (B256: within `SYNC_TURN`), then its finality artifact. B263: what
+    /// the turn did, to judge the session by (`Turn::struck`). B274:
+    /// `advertised` is the height the session claimed for this pass; a turn
+    /// ends well on its word only when that claim is borne out or plausible
+    /// (`qcless_tip`).
+    async fn sync_over(
+        &self,
+        link: &mut SyncLink,
+        peer_id: &str,
+        my_height: u64,
+        advertised: u64,
+    ) -> Turn {
+        let mut turn = Turn {
+            reached: my_height,
+            brought: 0,
+            bytes: 0,
+            slow: false,
+            ended_well: false,
+            asked: false,
+            refused: false,
+        };
+        let turn_ends = tokio::time::Instant::now() + SYNC_TURN;
         // 2. Request Chain Height
         let Ok(resp) = link.ask_within("GET_HEIGHT", QUICK_ASK_TIMEOUT).await else {
-            return final_height;
+            return turn;
         };
         // Parse Height response e.g. "HEIGHT:100"
         let Some(peer_height) = resp
             .strip_prefix("HEIGHT:")
             .and_then(|h| h.trim().parse::<u64>().ok())
         else {
-            return final_height;
+            return turn;
         };
         println!("📊 [ChainSync] Peer Height: {}", peer_height);
 
@@ -765,8 +1144,20 @@ impl ChainSync {
                         break;
                     }
                 };
-                // 4. Receive Blocks Batch
-                let data_resp = match link.ask(&format!("SYNC_REQ:{}", req_json)).await {
+                // 4. Receive Blocks Batch, within the turn (B256).
+                let asked_at = tokio::time::Instant::now();
+                let left = turn_ends.saturating_duration_since(asked_at);
+                if left.is_zero() {
+                    break;
+                }
+                turn.asked = true;
+                let asked = link
+                    .ask_within(
+                        &format!("SYNC_REQ:{}", req_json),
+                        left.min(SYNC_ASK_TIMEOUT),
+                    )
+                    .await;
+                let data_resp = match asked {
                     Ok(data_resp) => data_resp,
                     Err(e) => {
                         eprintln!(
@@ -776,6 +1167,7 @@ impl ChainSync {
                         break;
                     }
                 };
+                let took = asked_at.elapsed();
                 let Some(json_data) = data_resp.strip_prefix("SYNC_RESP:") else {
                     eprintln!(
                         "❌ [ChainSync] Unexpected sync response prefix: {}",
@@ -791,6 +1183,68 @@ impl ChainSync {
                     break;
                 };
                 let finality = sync_resp.finality.clone();
+                // B264: the next block is too large for a batch: it comes in
+                // parts, then through the import like any other block. B275:
+                // its header and QC are checked first, the parts wait out the
+                // server's answer budget, and what the turn could not fetch is
+                // fetched at this session's next turn.
+                if let Some(big) = sync_resp.oversized {
+                    turn.slow |= took > SLOW_ANSWER;
+                    if big.height != current + 1 {
+                        break;
+                    }
+                    let qc = sync_resp.qcs.iter().find(|q| q.block_height == big.height);
+                    if consensus::v4::is_v4_chain(&self.storage) && qc.is_none() {
+                        // Its server's newest block, without its QC yet.
+                        turn.ended_well = qcless_tip(big.height, peer_height.max(advertised));
+                        break;
+                    }
+                    if let Err(e) = self.check_named(&big, qc) {
+                        eprintln!(
+                            "❌ [ChainSync] Block #{} named in parts by {}: {}",
+                            big.height, peer_id, e
+                        );
+                        turn.refused = true;
+                        break;
+                    }
+                    let block = match self
+                        .fetch_parted_block(link, peer_id, &big, turn_ends, &mut turn)
+                        .await
+                    {
+                        Ok(Some(block)) => block,
+                        // The turn ended; the next resumes it.
+                        Ok(None) => break,
+                        Err(PartFailure::Lost(e)) => {
+                            eprintln!(
+                                "❌ [ChainSync] Block #{} in parts from {}: {}",
+                                big.height, peer_id, e
+                            );
+                            break;
+                        }
+                        Err(PartFailure::Lied(e)) => {
+                            eprintln!(
+                                "🚨 [ChainSync] Block #{} in parts from {}: {}",
+                                big.height, peer_id, e
+                            );
+                            turn.refused = true;
+                            break;
+                        }
+                    };
+                    let synced = self.process_blocks_with_qcs(vec![block], &sync_resp.qcs, current);
+                    if synced <= current {
+                        turn.refused = true;
+                        break;
+                    }
+                    turn.brought += 1;
+                    current = synced;
+                    turn.reached = synced;
+                    if let Some(finality) = finality {
+                        if let Err(e) = self.apply_finality_artifact(&finality) {
+                            eprintln!("🚨 [SECURITY][SYNC_FINALITY_REJECT] {}", e);
+                        }
+                    }
+                    continue;
+                }
                 if sync_resp.blocks.is_empty() {
                     if let Some(finality) = finality {
                         if let Err(e) = self.apply_finality_artifact(&finality) {
@@ -813,9 +1267,41 @@ impl ChainSync {
                     }
                     break; // No more blocks
                 }
+                // B256/B263: what the answer brought, in the server's unit
+                // (each block's encoded bytes), and whether its next block
+                // came without its QC (an honest server's newest block).
+                let sizes: Vec<(u64, usize)> = sync_resp
+                    .blocks
+                    .iter()
+                    .filter(|b| b.header.height > current)
+                    .map(|b| {
+                        (
+                            b.header.height,
+                            serde_json::to_string(b).map_or(0, |j| j.len()),
+                        )
+                    })
+                    .collect();
+                let offered: Vec<u64> = sync_resp.blocks.iter().map(|b| b.header.height).collect();
+                let certified: Vec<u64> = sync_resp.qcs.iter().map(|q| q.block_height).collect();
                 let synced =
                     self.process_blocks_with_qcs(sync_resp.blocks, &sync_resp.qcs, current);
+                let (got, got_bytes) = sizes
+                    .iter()
+                    .filter(|(h, _)| *h <= synced)
+                    .fold((0u64, 0usize), |(n, b), (_, len)| {
+                        (n + 1, b.saturating_add(*len))
+                    });
+                turn.brought += got;
+                turn.bytes = turn.bytes.saturating_add(got_bytes);
+                if took > SLOW_ANSWER && got < SYNC_TURN_BLOCKS && got_bytes < FULL_BATCH_BYTES {
+                    turn.slow = true;
+                }
                 if synced <= current {
+                    // The server's next block has no QC yet: what it could
+                    // certify, this node holds.
+                    turn.ended_well |= offered.contains(&(synced + 1))
+                        && !certified.contains(&(synced + 1))
+                        && qcless_tip(synced + 1, peer_height.max(advertised));
                     eprintln!(
                         "⚠️ [ChainSync] Batch made no progress from height {}",
                         current
@@ -823,15 +1309,27 @@ impl ChainSync {
                     break; // No progress made
                 }
                 current = synced;
-                final_height = synced;
+                turn.reached = synced;
                 if let Some(finality) = finality {
                     if let Err(e) = self.apply_finality_artifact(&finality) {
                         eprintln!("🚨 [SECURITY][SYNC_FINALITY_REJECT] {}", e);
                     }
                 }
+                if current < peer_height
+                    && offered.contains(&(current + 1))
+                    && !certified.contains(&(current + 1))
+                {
+                    turn.ended_well = qcless_tip(current + 1, peer_height.max(advertised));
+                    break;
+                }
             }
+            turn.ended_well |= turn.reached >= peer_height;
         } else {
             println!("✅ [ChainSync] Already caught up with peer {}", peer_id);
+            // B274: borne out only if this node reached the height the
+            // session claimed for the pass (another session brought it); a
+            // session that claimed more and now claims less ends badly.
+            turn.ended_well = my_height >= advertised;
         }
 
         if let Ok(finality_resp) = link.ask_within("GET_FINALITY", QUICK_ASK_TIMEOUT).await {
@@ -843,7 +1341,138 @@ impl ChainSync {
                 }
             }
         }
-        final_height
+        turn
+    }
+
+    /// B275: whether `big` may be fetched: a length no batch holds and no
+    /// more than a client imports, its header's own hash at its height, and
+    /// (on V4) a QC that verifies under the height's committee and binds the
+    /// header. Checked before any part is asked for: a fetch started on any
+    /// QC that merely named the height.
+    fn check_named(
+        &self,
+        big: &OversizedBlock,
+        qc: Option<&consensus::qc::QuorumCertificate>,
+    ) -> Result<(), String> {
+        if big.len <= self.batch_bytes as u64 || big.len > MAX_PARTED_BLOCK_BYTES {
+            return Err(format!("a parted block of {} bytes", big.len));
+        }
+        if big.header.height != big.height {
+            return Err(format!(
+                "a header of #{} named #{}",
+                big.header.height, big.height
+            ));
+        }
+        if blockchain::calculate_header_hash(&big.header) != big.header.hash {
+            return Err("a header that does not hash to its hash".into());
+        }
+        match qc {
+            Some(qc) => consensus::qc_producer::verify_header_qc(&self.storage, &big.header, qc),
+            None => Ok(()),
+        }
+    }
+
+    /// B264/B275: the block `big` names, in parts over `link`, within the
+    /// turn (`turn_ends`): resumed from what this session sent at its last
+    /// turns, a busy answer waited out, each part but the last `part_bytes`
+    /// long but for a character cut short. `None`: the turn ended first.
+    /// The whole must be the text the server stores for the header checked
+    /// (`check_named`): padding is refused.
+    async fn fetch_parted_block(
+        &self,
+        link: &mut SyncLink,
+        peer: &str,
+        big: &OversizedBlock,
+        turn_ends: tokio::time::Instant,
+        turn: &mut Turn,
+    ) -> Result<Option<Block>, PartFailure> {
+        let part_bytes = self.part_bytes() as u64;
+        let resumed = self
+            .parted_partial
+            .lock()
+            .map(|mut p| p.take())
+            .unwrap_or_default()
+            .filter(|p| {
+                p.peer == peer
+                    && p.height == big.height
+                    && p.hash == big.header.hash
+                    && p.len == big.len
+            });
+        let mut partial = resumed.unwrap_or_else(|| PartialBlock {
+            peer: peer.to_string(),
+            height: big.height,
+            hash: big.header.hash.clone(),
+            len: big.len,
+            bytes: Vec::new(),
+        });
+        let keep = |partial: PartialBlock| {
+            if let Ok(mut kept) = self.parted_partial.lock() {
+                *kept = Some(partial);
+            }
+        };
+        let lied = PartFailure::Lied;
+        while (partial.bytes.len() as u64) < big.len {
+            let left = turn_ends.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                keep(partial);
+                return Ok(None);
+            }
+            let req = serde_json::to_string(&BlockPartRequest {
+                height: big.height,
+                offset: partial.bytes.len() as u64,
+            })
+            .map_err(|e| PartFailure::Lost(e.to_string()))?;
+            // No answer proves nothing: what came is kept for the next turn.
+            let answer = match link
+                .ask_within(&format!("{PART_REQ}{req}"), left.min(SYNC_ASK_TIMEOUT))
+                .await
+            {
+                Ok(answer) => answer,
+                Err(e) => {
+                    keep(partial);
+                    return Err(PartFailure::Lost(e));
+                }
+            };
+            let part = answer
+                .strip_prefix(PART_RESP)
+                .and_then(|json| serde_json::from_str::<BlockPartResponse>(json).ok())
+                .ok_or_else(|| lied("a garbled block part".into()))?;
+            match part.error.as_deref() {
+                Some(state_sync::BUSY) => {
+                    tokio::time::sleep(PART_BUSY_WAIT.min(left)).await;
+                    continue;
+                }
+                Some(e) => return Err(lied(format!("a part of a block it named refused: {e}"))),
+                None => {}
+            }
+            let due = big.len - partial.bytes.len() as u64;
+            let n = part.data.len() as u64;
+            let whole = n > 0 && n <= due.min(part_bytes) && (n == due || n + 3 >= part_bytes);
+            if part.len != big.len || !whole {
+                return Err(lied(format!(
+                    "a block part of {n} bytes of {}, where up to {} of {} were due",
+                    part.len,
+                    due.min(part_bytes),
+                    big.len
+                )));
+            }
+            partial.bytes.extend_from_slice(part.data.as_bytes());
+            turn.bytes = turn.bytes.saturating_add(n as usize);
+        }
+        let block = serde_json::from_slice::<Block>(&partial.bytes)
+            .map_err(|e| lied(format!("a parted block that does not parse: {e}")))?;
+        if block.header.hash != big.header.hash {
+            return Err(lied(format!(
+                "parts of block {}, not {}",
+                block.header.hash, big.header.hash
+            )));
+        }
+        if serde_json::to_vec(&block).map_err(|e| lied(e.to_string()))? != partial.bytes {
+            return Err(lied(
+                "a parted block that is not the text its server stores".into(),
+            ));
+        }
+        Ok(Some(block))
     }
 
     /// A peer's finalized tip over `link`, iff its QC verifies against the
@@ -1255,6 +1884,7 @@ impl ChainSync {
             || msg == "GET_FINALITY"
             || [
                 "SYNC_REQ:",
+                PART_REQ,
                 state_sync::ANCHOR_REQ,
                 state_sync::CHUNK_REQ,
                 state_sync::VALUE_REQ,
@@ -1272,8 +1902,9 @@ impl ChainSync {
         self.serve_session_from(msg, peer, false)
     }
 
-    /// `serve_session` charged to `client` (B131: a member's or reserved
-    /// peer's key, `kept`, or another peer's network group).
+    /// `serve_session` charged to `client` (B131: a member's or a reserved
+    /// peer's key, or another peer's network group); `kept`: a reserved
+    /// peer (B178).
     pub fn serve_session_from(&self, msg: &str, client: &str, kept: bool) -> Option<String> {
         let peer = client;
         if let Some(height) = msg.strip_prefix(consensus::dag::QC_WANT_PREFIX) {
@@ -1301,7 +1932,8 @@ impl ChainSync {
     }
 
     /// A request charged to `client` (`None` is an in-process caller,
-    /// global limits only); `kept`: a member or a reserved peer (B131).
+    /// global limits only); `kept`: a kept client (B131, B178: a reserved
+    /// peer).
     fn handle_request(&self, msg: &str, client: Option<&str>, kept: bool) -> Option<String> {
         // Handle Request Logic
         if msg == "GET_HEIGHT" {
@@ -1339,7 +1971,115 @@ impl ChainSync {
                 }
             }
         }
+        if let Some(req_json) = msg.strip_prefix(PART_REQ) {
+            let req = serde_json::from_str::<BlockPartRequest>(req_json).ok()?;
+            let resp = serde_json::to_string(&self.handle_block_part(req)).ok()?;
+            return Some(format!("{PART_RESP}{resp}"));
+        }
         None
+    }
+
+    /// `SYNC_PART` (B264): `part_bytes` of the stored block at `height`
+    /// from `offset`. B275: only a block known to be too large for a batch
+    /// (a batch answer named it) is served in parts, and nothing is read
+    /// for any other (a request for any height read its whole block); it is
+    /// read once for all its parts (kept in `parted_blocks`). The part is the
+    /// block's text, cut at a character boundary.
+    pub fn handle_block_part(&self, req: BlockPartRequest) -> BlockPartResponse {
+        let refuse = |why: &str| BlockPartResponse {
+            error: Some(why.to_string()),
+            ..Default::default()
+        };
+        let Some(big) = self
+            .oversized_known
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&req.height)
+            .cloned()
+        else {
+            return refuse("not a block served in parts");
+        };
+        if req.offset >= big.len {
+            return refuse("offset past the block");
+        }
+        let kept = self
+            .parted_blocks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(req.height, PARTED_KEY);
+        let block = match kept {
+            Some(block) => block,
+            None => {
+                {
+                    let mut last = self
+                        .parted_read_at
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let now = std::time::Instant::now();
+                    if last.is_some_and(|at| now.duration_since(at) < PARTED_READ_EVERY) {
+                        return refuse(state_sync::BUSY);
+                    }
+                    *last = Some(now);
+                }
+                match self.storage.get(&format!("block_{}", req.height)) {
+                    Ok(Some(json)) if json.len() as u64 == big.len => {
+                        self.keep_parted(req.height, json.into_bytes())
+                    }
+                    _ => return refuse("no such block"),
+                }
+            }
+        };
+        // A continuation byte (10xxxxxx) starts no character.
+        let boundary = |i: usize| i >= block.len() || block[i] & 0xC0 != 0x80;
+        let start = req.offset as usize;
+        if !boundary(start) {
+            return refuse("offset inside a character");
+        }
+        let mut end = block.len().min(start + self.part_bytes());
+        while !boundary(end) {
+            end -= 1;
+        }
+        match std::str::from_utf8(&block[start..end]) {
+            Ok(data) if end > start => BlockPartResponse {
+                data: data.to_string(),
+                len: big.len,
+                error: None,
+            },
+            _ => refuse("no whole character to send"),
+        }
+    }
+
+    /// B264: keep a block's bytes for its parts.
+    fn keep_parted(&self, height: u64, block: Vec<u8>) -> Arc<Vec<u8>> {
+        let block = Arc::new(block);
+        self.parted_blocks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(height, PARTED_KEY, Arc::clone(&block));
+        block
+    }
+
+    /// B275: a block at `height`, read as `json`, is too large for a batch:
+    /// known from now on by its length and header, and kept for its parts.
+    fn learn_oversized(&self, height: u64, json: String) -> Option<OversizedBlock> {
+        let header = header_of(&json).filter(|h| h.height == height)?;
+        let big = OversizedBlock {
+            height,
+            len: json.len() as u64,
+            header,
+        };
+        {
+            let mut known = self
+                .oversized_known
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !known.contains_key(&height) && known.len() >= MAX_OVERSIZED_KNOWN {
+                known.pop_first();
+            }
+            known.insert(height, big.clone());
+        }
+        self.keep_parted(height, json.into_bytes());
+        Some(big)
     }
 
     pub fn handle_sync_request(&self, req: SyncRequest) -> SyncResponse {
@@ -1347,15 +2087,43 @@ impl ChainSync {
         let local_height = self.get_local_height();
 
         // Limit batch size to avoid huge messages (Optimized to 500 for Production Performance)
-        let end_height = std::cmp::min(local_height, req.from_height + 500);
+        // B144: saturating, as the height is the peer's: near u64::MAX it
+        // wrapped (a release build served from 0) or panicked (overflow
+        // checks).
+        let end_height = std::cmp::min(local_height, req.from_height.saturating_add(500));
         // NI-4: and by bytes, so the answer fits what a client reads (500
-        // full blocks would be far over it); at least one block goes.
+        // full blocks would be far over it).
         let mut bytes = 0usize;
+        let mut oversized = None;
 
-        for height in (req.from_height + 1)..=end_height {
+        for height in req.from_height.saturating_add(1)..=end_height {
+            // B275: a block known to be too large is named without a read
+            // (each request beside one read it whole, for a few bytes).
+            let known = self
+                .oversized_known
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&height)
+                .cloned();
+            if let Some(big) = known {
+                if blocks_to_send.is_empty() {
+                    oversized = Some(big);
+                }
+                break;
+            }
             let key = format!("block_{}", height);
             if let Ok(Some(block_data)) = self.storage.get(&key) {
-                if !blocks_to_send.is_empty() && bytes + block_data.len() > SYNC_RESP_BLOCK_BYTES {
+                // B264: a block no batch holds is never in one (it went
+                // alone, over the frame, and no client could read it): the
+                // answer names it, and it is kept for the parts asked next.
+                if block_data.len() > self.batch_bytes {
+                    let big = self.learn_oversized(height, block_data);
+                    if blocks_to_send.is_empty() {
+                        oversized = big;
+                    }
+                    break;
+                }
+                if bytes + block_data.len() > self.batch_bytes {
                     break;
                 }
                 if let Ok(block) = serde_json::from_str::<Block>(&block_data) {
@@ -1383,13 +2151,16 @@ impl ChainSync {
         };
         let qcs = blocks_to_send
             .iter()
-            .filter_map(|b| consensus::qc_producer::stored_qc(&self.storage, b.header.height))
+            .map(|b| b.header.height)
+            .chain(oversized.as_ref().map(|big| big.height))
+            .filter_map(|height| consensus::qc_producer::stored_qc(&self.storage, height))
             .collect();
         SyncResponse {
             blocks: blocks_to_send,
             finality: Some(self.collect_finality_artifact()),
             prune_horizon,
             qcs,
+            oversized,
         }
     }
 

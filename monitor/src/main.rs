@@ -59,73 +59,42 @@ fn main() {
         let mut node_data = Vec::new();
 
         for &port in &nodes {
-            // RPC URL (assuming standard port mapping: 9001 -> 8001, 9002 -> 8002, etc.)
-            // Or if ports are direct RPC ports. Let's assume standard AINCORE RPC ports are 8000 + (port - 9000)
-            // Actually, based on previous context, RPC is on 8002.
-            // Let's try to guess RPC port from Node port.
-            // Node 9001 -> RPC 8001
-            // Node 9002 -> RPC 8002
             let rpc_port = rpc_ports_override
                 .as_ref()
                 .and_then(|ports| ports.get(node_data.len()).copied())
-                .unwrap_or_else(|| port.saturating_sub(999));
+                .unwrap_or_else(|| rpc_port_of(port));
             let url = format!("http://localhost:{}/rpc", rpc_port);
 
             let mut status = "Offline".to_string();
             let mut height = 0;
             let mut peers = 0;
-            let mut version = "Unknown".to_string();
 
-            // JSON-RPC Request for Status
+            // B269: the node's status call. `get_status` (and the fallback,
+            // `get_block_height`) are served by no node; the answer's
+            // `"result": null` was read as Active at height 0, so a halted
+            // node never showed.
             let body = serde_json::json!({
                 "jsonrpc": "2.0",
-                "method": "get_status",
+                "method": "aincore_getStatus",
                 "params": [],
                 "id": 1
             });
 
-            match client.post(&url).json(&body).send() {
-                Ok(resp) => {
-                    if let Ok(json) = resp.json::<Value>() {
-                        if let Some(result) = json.get("result") {
-                            status = "Active".to_string();
-                            height = result["block_height"].as_u64().unwrap_or(0);
-                            peers = result["peer_count"].as_u64().unwrap_or(0);
-                            version = result["version"].as_str().unwrap_or("0.1.0").to_string();
-
-                            if height > max_height {
-                                max_height = height;
-                            }
-                        }
-                    }
-                }
-                Err(_) => {
-                    // Try get_block_height if get_status fails (fallback)
-                    let body_h = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "method": "get_block_height",
-                        "params": [],
-                        "id": 1
-                    });
-                    if let Ok(resp) = client.post(&url).json(&body_h).send() {
-                        if let Ok(json) = resp.json::<Value>() {
-                            if let Some(res) = json.get("result") {
-                                status = "Active".to_string();
-                                height = res.as_u64().unwrap_or(0);
-                                if height > max_height {
-                                    max_height = height;
-                                }
-                            }
-                        }
-                    }
+            if let Ok(resp) = client.post(&url).json(&body).send() {
+                status = "No status".to_string();
+                if let Some((h, p)) = resp.json::<Value>().ok().as_ref().and_then(node_status) {
+                    status = "Active".to_string();
+                    height = h;
+                    peers = p;
+                    max_height = max_height.max(height);
                 }
             }
 
-            node_data.push((port, rpc_port, status, height, peers, version));
+            node_data.push((port, rpc_port, status, height, peers));
         }
 
         // Display Data
-        for (port, rpc_port, status, height, peers, version) in &node_data {
+        for (port, rpc_port, status, height, peers) in &node_data {
             let (status_icon, color_status) = match status.as_str() {
                 "Active" => ("🟢", "green"),
                 _ => ("🔴", "red"),
@@ -146,13 +115,13 @@ fn main() {
             };
 
             println!(
-                "{} {} (RPC: {}) | Peers: {} | Height: {} | v{}",
+                "{} {} (RPC: {}) | {} | Peers: {} | Height: {}",
                 color_fn(status_icon.into()),
                 format!("Node {}", port).bold(),
                 rpc_port,
+                status,
                 peers,
                 height_color_fn(height.to_string().bold()),
-                version.dimmed()
             );
 
             // Progress Bar
@@ -183,5 +152,53 @@ fn main() {
         );
 
         thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// B278: a node's RPC port when only its P2P port is named: the node's own
+/// rule (`NodeConfig`: the API port is the node port less 1000). It was
+/// less 999, one above every node's RPC, so every node showed no status.
+fn rpc_port_of(node_port: u16) -> u16 {
+    node_port.saturating_sub(1000)
+}
+
+/// B269: the height and session count an `aincore_getStatus` answer
+/// carries; `None` for any other answer (an error, a null result).
+fn node_status(answer: &Value) -> Option<(u64, u64)> {
+    let result = answer.get("result")?;
+    let height = match &result["latest_height"] {
+        Value::String(h) => h.parse().ok()?,
+        other => other.as_u64()?,
+    };
+    Some((height, result["peers_count"].as_u64().unwrap_or(0)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{node_status, rpc_port_of};
+    use serde_json::json;
+
+    /// B278 witness: the RPC port guessed from a node port is the node's
+    /// (9002 serves RPC on 8002; the guess was 8003).
+    #[test]
+    fn the_rpc_port_is_the_node_port_less_1000() {
+        assert_eq!(rpc_port_of(9002), 8002);
+        assert_eq!(rpc_port_of(9000), 8000);
+    }
+
+    /// B269 witness: a node's status is its `aincore_getStatus` answer; an
+    /// error or a null result is no status (the null answer to `get_status`,
+    /// which no node serves, was read as Active at height 0).
+    #[test]
+    fn a_status_is_the_nodes_answer_or_none() {
+        assert_eq!(
+            node_status(&json!({"result": {"latest_height": "42", "peers_count": 3}})),
+            Some((42, 3))
+        );
+        assert_eq!(node_status(&json!({"result": null})), None);
+        assert_eq!(
+            node_status(&json!({"error": {"code": -32601, "message": "Method not found"}})),
+            None
+        );
     }
 }

@@ -306,8 +306,15 @@ fn block_crash_child() {
                 // a1f25c44.... Round 4 moved it through the stdlib alone: with
                 // round 3's dex.mv and token_factory.mv the round-4 executor
                 // reproduces a1f25c44... exactly; B99's token_factory.mv gives
-                // 480958b3..., then B100's dex.mv 913b381f....
-                "913b381f244537461cb0945b93e33978256011204c9673caed4e02367518fbb0",
+                // 480958b3..., then B100's dex.mv 913b381f.... Rounds 6-8
+                // moved it through the stdlib alone: with round 5's bytecode
+                // the round-8 executor reproduces 913b381f... exactly; B135's
+                // token_factory.mv gives 5036e2d6..., then B149/B161's
+                // delegation.mv cc7f01a0.... Rounds 9-16 moved it through the
+                // stdlib alone: with round 8's bytecode the round-16 executor
+                // reproduces cc7f01a0... exactly; B276's delegation.mv gives
+                // f949d282....
+                "f949d282210ae13f5d782a42ee4a4987a9c3ca9ebeb2937d2a77ddb213034e18",
                 "clean execution must preserve the pre-staging fixture root"
             );
         }

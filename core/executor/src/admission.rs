@@ -128,6 +128,14 @@ fn is_lower_hex(s: &str) -> bool {
 /// keys, signatures and object ids are lowercase hex (`hex::decode` reads
 /// either case, so a relay could change the case and the bytes).
 fn unsigned_parts_fixed(tx: &Transaction) -> Result<(), String> {
+    // B70: the count first (a structural bound, whatever the gas). B196: here,
+    // so an estimate (`check_unsigned`) refuses what admission refuses.
+    if tx.input_objects.len() > MAX_INPUT_OBJECTS {
+        return Err(format!(
+            "{} input objects, the most is {MAX_INPUT_OBJECTS}",
+            tx.input_objects.len()
+        ));
+    }
     if !tx.args.is_empty() {
         return Err("args are not signed (scripts are disabled): send none".to_string());
     }
@@ -171,6 +179,13 @@ pub fn paymaster_message(tx: &Transaction) -> [u8; 32] {
 
 /// Gas charged up front per input object (N-2).
 pub const OBJECT_LOAD_GAS: u64 = 100;
+/// B141: the Move gas of the charge's prologue (`coin::deduct_gas`), held
+/// back before anything runs so the prologue always fits the limit: a
+/// transaction a block reserved space for and whose prologue ran out of gas
+/// was refused uncharged. Measured at 167 (2026-10-06, the round-8 stdlib),
+/// rounded up to a choice with room for the stdlib's next change; pinned by
+/// `the_gas_prologue_fits_its_allowance`.
+pub const PROLOGUE_GAS: u64 = 200;
 /// The most input objects a transaction may name: a block skips one with
 /// more (B70: admission refuses it, so it never waits for free).
 pub const MAX_INPUT_OBJECTS: usize = 128;
@@ -178,6 +193,15 @@ pub const MAX_INPUT_OBJECTS: usize = 128;
 /// (audit M-5: verification work scales with the bundle).
 pub const PUBLISH_GAS_PER_BYTE: u64 = 10;
 pub const PUBLISH_GAS_PER_MODULE: u64 = 5_000;
+
+/// B184: the execution gas a `0x1::staking::join_validator_set` carries for
+/// its proof-of-possession check (subgroup checks, hash-to-G2 and a pairing,
+/// run in Rust before dispatch), at Aptos's price: `bls12381.base` 5,510,
+/// `per_pubkey_deserialize` 4,006,840, `per_sig_deserialize` 8,160,720 and
+/// `per_pop_verify` 378,628,000 internal units (aptos-core gas schedule,
+/// read 2026-10-06), over its `add` (5,880), rounded up. The check cost
+/// every node a pairing for the gas of the transaction's bytes.
+pub const POP_GAS: u64 = 66_463;
 
 /// The execution gas publishing `modules` requires.
 pub fn publish_floor(modules: &[Vec<u8>]) -> u64 {
@@ -212,13 +236,6 @@ pub fn check_stateless(raw: &str, chain_id: &str) -> Result<CheckedTx, String> {
             chain_id, tx.chain_id
         ));
     }
-    // B70: the count first (a structural bound, whatever the gas).
-    if tx.input_objects.len() > MAX_INPUT_OBJECTS {
-        return Err(format!(
-            "{} input objects, the most is {MAX_INPUT_OBJECTS}",
-            tx.input_objects.len()
-        ));
-    }
     unsigned_parts_fixed(&tx)?;
     if tx.gas_price < MIN_GAS_PRICE {
         return Err(format!(
@@ -246,7 +263,7 @@ pub fn check_stateless(raw: &str, chain_id: &str) -> Result<CheckedTx, String> {
             tx.gas_limit
         ));
     }
-    let (kind, publish_floor) = crate::payload_kind(&tx.payload)?;
+    let (kind, floor) = crate::payload_kind(&tx.payload)?;
     match kind {
         PayloadKind::EntryFunction | PayloadKind::PublishModule => {}
         PayloadKind::Script => return Err("Raw script payloads are disabled".to_string()),
@@ -260,9 +277,10 @@ pub fn check_stateless(raw: &str, chain_id: &str) -> Result<CheckedTx, String> {
             tx.input_objects.len()
         ));
     }
-    if publish_floor > execution_gas.min(MAX_GAS_LIMIT) {
+    // A module bundle's floor, or a join's proof-of-possession check (B184).
+    if floor > execution_gas.min(MAX_GAS_LIMIT) {
         return Err(format!(
-            "the module bundle needs {publish_floor} execution gas, the limit leaves {}",
+            "the payload needs {floor} execution gas, the limit leaves {}",
             execution_gas.min(MAX_GAS_LIMIT)
         ));
     }
@@ -628,6 +646,61 @@ mod tests {
         }
     }
 
+    /// B184 witness: a join carries its proof-of-possession check's gas, as a
+    /// module bundle carries its floor: one a gas short is refused here (the
+    /// check cost every node a pairing for the gas of the join's bytes).
+    #[test]
+    fn a_join_carries_its_proof_of_possession_gas() {
+        let call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                move_core_types::account_address::AccountAddress::ONE,
+                move_core_types::identifier::Identifier::new("staking").unwrap(),
+            ),
+            function: "join_validator_set".to_string(),
+            ty_args: vec![],
+            args: vec![],
+        };
+        let payload =
+            hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
+        let join = |execution: u64| {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&signed_publish_with([1; 32], CHAIN, 0, vec![9], 0, 1))
+                    .unwrap();
+            v["payload"] = serde_json::json!(payload);
+            v["gas_limit"] = serde_json::json!(0);
+            let unsized_len =
+                canonical_json(&serde_json::from_value::<Transaction>(v.clone()).unwrap()).len();
+            v["gas_limit"] = serde_json::json!(gas_limit_covering(unsized_len, execution));
+            canonical_json(&serde_json::from_value::<Transaction>(resign(v)).unwrap())
+        };
+        let err = check_stateless(&join(POP_GAS - 1), CHAIN).unwrap_err();
+        assert!(
+            err.contains(&format!("the payload needs {POP_GAS}")),
+            "{err}"
+        );
+        check_stateless(&join(POP_GAS), CHAIN).expect("positive control: the check is paid for");
+    }
+
+    /// B196 witness: an estimate refuses what admission refuses: more input
+    /// objects than `MAX_INPUT_OBJECTS` (the estimate skipped the count, so
+    /// a client was told its transaction was covered, then refused).
+    #[test]
+    fn an_estimate_refuses_too_many_objects() {
+        let objects =
+            |n: usize| serde_json::json!((0..n).map(|i| format!("{i:x}")).collect::<Vec<_>>());
+        let mut v: serde_json::Value =
+            serde_json::from_str(&signed_publish_with([1; 32], CHAIN, 0, vec![9], 0, 1)).unwrap();
+        v["input_objects"] = objects(MAX_INPUT_OBJECTS + 1);
+        let raw = v.to_string();
+        for err in [check_unsigned(&raw, CHAIN), check_stateless(&raw, CHAIN)]
+            .map(|r| r.map(|_| ()).unwrap_err())
+        {
+            assert!(err.contains("input objects"), "{err}");
+        }
+        v["input_objects"] = objects(MAX_INPUT_OBJECTS);
+        check_unsigned(&v.to_string(), CHAIN).expect("positive control: the most is taken");
+    }
+
     /// B27 witness: what execution refuses before it charges (objects that
     /// need more gas than the limit leaves, a module bundle under its
     /// publish floor) is refused here, so vertex ingress keeps it out of
@@ -638,7 +711,7 @@ mod tests {
         assert_eq!(publish_floor(&[vec![1; 2_000]]), 25_000);
         let tx = signed_publish_with([1; 32], CHAIN, 0, vec![1; 2_000], 20_000, 1);
         let err = check_stateless(&tx, CHAIN).unwrap_err();
-        assert!(err.contains("module bundle needs"), "{err}");
+        assert!(err.contains("the payload needs 25000"), "{err}");
         let ok = signed_publish_with([1; 32], CHAIN, 0, vec![1; 2_000], 25_000, 1);
         check_stateless(&ok, CHAIN).expect("positive control: the floor is met");
 

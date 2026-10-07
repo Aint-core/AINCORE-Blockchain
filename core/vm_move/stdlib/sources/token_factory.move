@@ -18,24 +18,30 @@ module 0x1::token_factory {
     const EWALLET_NOT_INITIALIZED: u64 = 7;
     const EINVALID_AMOUNT: u64 = 8;
     const ESELF_TRANSFER: u64 = 9;
-    /// B99: a field longer than its bound, or the registry full.
+    /// B99: a field longer than its bound, or the creator's registry full.
     const EFIELD_TOO_LONG: u64 = 10;
     const ETOO_MANY_TOKENS: u64 = 11;
+    /// B135: the wallet has not registered the token, or holds its maximum.
+    const ENOT_REGISTERED: u64 = 12;
+    const EWALLET_FULL: u64 = 13;
 
-    /// B99: every create, mint, burn and disable loads the whole registry,
-    /// so its size is bounded: these field lengths (bytes) and this many
-    /// tokens keep it under ~0.4 MB, a load well under the gas limit (a
-    /// choice; unbounded fields let ~50 tokens make every call abort).
+    /// B99: field lengths (bytes), so a registry stays small to load.
     const MAX_NAME_BYTES: u64 = 64;
     const MAX_SYMBOL_BYTES: u64 = 16;
     const MAX_URL_BYTES: u64 = 256;
-    const MAX_TOKENS: u64 = 512;
+    /// B135: tokens one creator may hold (a choice: its registry, loaded by
+    /// each of its creates, mints, burns and disables, stays under ~26 KB).
+    /// Each creator has its own registry: one global one, capped, could be
+    /// filled by anyone for 51,200 AIN and closed to everyone for good.
+    const MAX_TOKENS_PER_CREATOR: u64 = 64;
+    /// B135: tokens one wallet may register (its owner's choice).
+    const MAX_WALLET_TOKENS: u64 = 256;
 
     /// Token creation fee (100 AIN, burned to create economic scarcity)
     const TOKEN_CREATION_FEE: u128 = 100_000_000_000_000_000_000; // 100 * 10^18
 
     /// Token metadata
-    struct TokenInfo has key, store, copy, drop {
+    struct TokenInfo has store, copy, drop {
         token_id: vector<u8>,
         name: vector<u8>,
         symbol: vector<u8>,
@@ -48,8 +54,8 @@ module 0x1::token_factory {
         project_url: vector<u8>, // URL to project website
     }
 
-    /// Global registry of all tokens
-    struct TokenRegistry has key {
+    /// B135: one creator's tokens, at the creator's address.
+    struct CreatorTokens has key {
         tokens: vector<TokenInfo>,
     }
 
@@ -59,16 +65,11 @@ module 0x1::token_factory {
         balance: u128,
     }
 
-    /// User's token balances (multiple tokens)
+    /// User's token balances (multiple tokens). B135: only the tokens its
+    /// owner registered (anyone could push balances of any number of tokens
+    /// into a wallet, and every later operation of its owner scanned them).
     struct TokenWallet has key {
         balances: vector<TokenBalance>,
-    }
-
-    /// Initialize the registry (called once at genesis)
-    public fun initialize(admin: &signer) {
-        move_to(admin, TokenRegistry {
-            tokens: vector::empty(),
-        });
     }
 
     /// Create a new token
@@ -82,7 +83,7 @@ module 0x1::token_factory {
         initial_supply: u128,
         icon_url: vector<u8>,    // New argument
         project_url: vector<u8>  // New argument
-    ) acquires TokenRegistry, TokenWallet {
+) acquires CreatorTokens, TokenWallet {
         let creator_addr = signer::address_of(creator);
         
         // Validate decimals (max 18)
@@ -101,9 +102,13 @@ module 0x1::token_factory {
             error::invalid_argument(EFIELD_TOO_LONG)
         );
         
-        // B99: a full registry refuses before the fee is taken.
+        // B99/B135: a full registry refuses before the fee is taken.
+        if (!exists<CreatorTokens>(creator_addr)) {
+            move_to(creator, CreatorTokens { tokens: vector::empty() });
+        };
         assert!(
-            vector::length(&borrow_global<TokenRegistry>(@0x1).tokens) < MAX_TOKENS,
+            vector::length(&borrow_global<CreatorTokens>(creator_addr).tokens)
+                < MAX_TOKENS_PER_CREATOR,
             error::resource_exhausted(ETOO_MANY_TOKENS)
         );
 
@@ -120,7 +125,7 @@ module 0x1::token_factory {
         vector::append(&mut token_id, creator_bytes);
         
         // Check token doesn't exist
-        let registry = borrow_global_mut<TokenRegistry>(@0x1);
+        let registry = borrow_global_mut<CreatorTokens>(creator_addr);
         let len = vector::length(&registry.tokens);
         let i = 0;
         while (i < len) {
@@ -145,10 +150,36 @@ module 0x1::token_factory {
         
         vector::push_back(&mut registry.tokens, token_info);
         
-        // Mint initial supply to creator
+        // Mint initial supply to creator (its wallet registers the token).
         if (initial_supply > 0) {
+            register_internal(creator_addr, copy token_id);
             mint_internal(creator_addr, token_id, initial_supply);
         }
+    }
+
+    /// B135: register `token_id` in the account's wallet (made if missing),
+    /// so the wallet can receive it.
+    public entry fun register(account: &signer, token_id: vector<u8>) acquires TokenWallet {
+        let addr = signer::address_of(account);
+        if (!exists<TokenWallet>(addr)) {
+            move_to(account, TokenWallet { balances: vector::empty() });
+        };
+        register_internal(addr, token_id);
+    }
+
+    fun register_internal(owner: address, token_id: vector<u8>) acquires TokenWallet {
+        assert!(exists<TokenWallet>(owner), error::invalid_state(EWALLET_NOT_INITIALIZED));
+        let wallet = borrow_global_mut<TokenWallet>(owner);
+        let len = vector::length(&wallet.balances);
+        let i = 0;
+        while (i < len) {
+            if (vector::borrow(&wallet.balances, i).token_id == token_id) {
+                return
+            };
+            i = i + 1;
+        };
+        assert!(len < MAX_WALLET_TOKENS, error::resource_exhausted(EWALLET_FULL));
+        vector::push_back(&mut wallet.balances, TokenBalance { token_id, balance: 0 });
     }
 
     /// Mint tokens (only token creator can mint)
@@ -157,12 +188,14 @@ module 0x1::token_factory {
         token_id: vector<u8>,
         to: address,
         amount: u128
-    ) acquires TokenRegistry, TokenWallet {
+    ) acquires CreatorTokens, TokenWallet {
         // Validate amount > 0
         assert!(amount > 0, error::invalid_argument(EINVALID_AMOUNT));
         let admin_addr = signer::address_of(admin);
         
-        let registry = borrow_global_mut<TokenRegistry>(@0x1);
+        // B135: the token is in its creator's registry, the signer's.
+        assert!(exists<CreatorTokens>(admin_addr), error::not_found(ETOKEN_NOT_FOUND));
+        let registry = borrow_global_mut<CreatorTokens>(admin_addr);
         let len = vector::length(&registry.tokens);
         let i = 0;
         let found = false;
@@ -189,7 +222,7 @@ module 0x1::token_factory {
         mint_internal(to, token_id, amount);
     }
 
-    /// Internal mint helper
+    /// Internal mint helper: credit a wallet that registered the token.
     fun mint_internal(to: address, token_id: vector<u8>, amount: u128) acquires TokenWallet {
         // CRITICAL: Fail if wallet not initialized to prevent token loss
         assert!(exists<TokenWallet>(to), error::invalid_state(EWALLET_NOT_INITIALIZED));
@@ -209,20 +242,18 @@ module 0x1::token_factory {
             i = i + 1;
         };
         
-        if (!found) {
-            vector::push_back(&mut wallet.balances, TokenBalance {
-                token_id,
-                balance: amount,
-            });
-        }
+        // B135: only a token the wallet's owner registered.
+        assert!(found, error::invalid_state(ENOT_REGISTERED));
     }
 
-    /// Burn tokens
+    /// Burn tokens. B135: `creator` names the token's registry (the address
+    /// `token_id` ends with).
     public entry fun burn(
         owner: &signer,
+        creator: address,
         token_id: vector<u8>,
         amount: u128
-    ) acquires TokenRegistry, TokenWallet {
+    ) acquires CreatorTokens, TokenWallet {
         let owner_addr = signer::address_of(owner);
         
         // Deduct from user's balance
@@ -244,18 +275,22 @@ module 0x1::token_factory {
         
         assert!(found, error::not_found(ETOKEN_NOT_FOUND));
         
-        // Update total supply
-        let registry = borrow_global_mut<TokenRegistry>(@0x1);
+        // Update total supply, in the token's own registry.
+        assert!(exists<CreatorTokens>(creator), error::not_found(ETOKEN_NOT_FOUND));
+        let registry = borrow_global_mut<CreatorTokens>(creator);
         let reg_len = vector::length(&registry.tokens);
         let j = 0;
+        let listed = false;
         while (j < reg_len) {
             let t = vector::borrow_mut(&mut registry.tokens, j);
             if (t.token_id == token_id) {
                 t.current_supply = t.current_supply - amount;
+                listed = true;
                 break
             };
             j = j + 1;
         };
+        assert!(listed, error::not_found(ETOKEN_NOT_FOUND));
     }
 
     /// Transfer tokens between accounts
@@ -306,9 +341,10 @@ module 0x1::token_factory {
         }
     }
 
-    /// Get token info
-    public fun get_token_info(token_id: vector<u8>): TokenInfo acquires TokenRegistry {
-        let registry = borrow_global<TokenRegistry>(@0x1);
+    /// Get token info (B135: from its creator's registry).
+    public fun get_token_info(creator: address, token_id: vector<u8>): TokenInfo acquires CreatorTokens {
+        assert!(exists<CreatorTokens>(creator), error::not_found(ETOKEN_NOT_FOUND));
+        let registry = borrow_global<CreatorTokens>(creator);
         let len = vector::length(&registry.tokens);
         let i = 0;
         
@@ -345,10 +381,11 @@ module 0x1::token_factory {
     }
 
     /// Disable minting for a token (irreversible)
-    public entry fun disable_minting(admin: &signer, token_id: vector<u8>) acquires TokenRegistry {
+    public entry fun disable_minting(admin: &signer, token_id: vector<u8>) acquires CreatorTokens {
         let admin_addr = signer::address_of(admin);
         
-        let registry = borrow_global_mut<TokenRegistry>(@0x1);
+        assert!(exists<CreatorTokens>(admin_addr), error::not_found(ETOKEN_NOT_FOUND));
+        let registry = borrow_global_mut<CreatorTokens>(admin_addr);
         let len = vector::length(&registry.tokens);
         let i = 0;
         

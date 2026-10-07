@@ -51,9 +51,11 @@ struct Args {
     #[arg(long, default_value = "http://localhost:8002/rpc")]
     rpc: String,
 
-    /// Chain id the signature is bound to (must match the node)
-    #[arg(long, default_value = "AINCORE-MAINNET-1")]
-    chain_id: String,
+    /// Chain id the signature is bound to (or AINCORE_CHAIN_ID). B258: it
+    /// must be named and be the chain the node runs; it signed for mainnet
+    /// by default, with the operator's funded key.
+    #[arg(long)]
+    chain_id: Option<String>,
 
     /// Hex Ed25519 secret key (64 hex chars) of a FUNDED account, or a path to a
     /// key file. This account pays for the fan-out.
@@ -214,36 +216,20 @@ async fn rpc(client: &Client, url: &str, method: &str, params: Value) -> Option<
     Some(v)
 }
 
-/// Read an account's on-chain sequence number (0 if the account does not exist).
-///
-/// The nonce is NOT a top-level field of aincore_getBalance: it lives inside
-/// `result.data`, a byte array holding the AccountData JSON
-/// (`{"sequence_number":N,...}`). The first version of this function read
-/// `result.sequence_number`, which does not exist, so it always returned 0 —
-/// and every run on a fresh chain still worked, because a fresh funder's nonce
-/// IS 0. The first rerun against a used chain then had all its funding txs
-/// rejected with "Invalid Sequence Number". A default that coincides with the
-/// happy path is the worst kind of bug: this now decodes the real value.
-async fn fetch_seq(client: &Client, url: &str, address: &str) -> u64 {
-    match rpc(client, url, "aincore_getBalance", json!([address])).await {
-        Some(v) => {
-            let r = &v["result"];
-            if let Some(bytes) = r["data"].as_array() {
-                let raw: Vec<u8> = bytes
-                    .iter()
-                    .filter_map(|b| b.as_u64().map(|x| x as u8))
-                    .collect();
-                if let Ok(inner) = serde_json::from_slice::<Value>(&raw) {
-                    if let Some(seq) = inner["sequence_number"].as_u64() {
-                        return seq;
-                    }
-                }
-            }
-            // Fallbacks: a future top-level field, else 0 (account not yet on chain).
-            r["sequence_number"].as_u64().unwrap_or(0)
-        }
-        None => 0,
-    }
+/// B268: an account's next sequence number, as the node's
+/// `aincore_getAccountNonce` answers it (the CLI's source). It was decoded
+/// from `aincore_getBalance`'s `data` as a byte array, which the node has
+/// sent as text since B66, so it fell back to 0 and every rerun with a used
+/// funder had its funding refused. `None` when the node does not answer it:
+/// no default stands in for a sequence number.
+async fn fetch_seq(client: &Client, url: &str, address: &str) -> Option<u64> {
+    let answer = rpc(client, url, "aincore_getAccountNonce", json!([address])).await?;
+    nonce_from(&answer)
+}
+
+/// B268: the sequence number an `aincore_getAccountNonce` answer carries.
+fn nonce_from(answer: &Value) -> Option<u64> {
+    answer["result"]["sequence_number"].as_u64()
 }
 
 async fn fetch_balance(client: &Client, url: &str, address: &str) -> u128 {
@@ -256,12 +242,49 @@ async fn fetch_balance(client: &Client, url: &str, address: &str) -> u128 {
     }
 }
 
-/// Submit one transaction; returns true if the node ACCEPTED it into the mempool.
-async fn submit(client: &Client, url: &str, tx_json: String) -> bool {
-    match rpc(client, url, "aincore_sendTransaction", json!([tx_json])).await {
-        Some(v) => v.get("error").map(|e| e.is_null()).unwrap_or(true) && v["result"].is_object()
-            || v["result"].is_string(),
-        None => false,
+/// B268: what became of one submitted transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Submitted {
+    /// The node took it into its mempool.
+    Accepted,
+    /// The node answered and refused it.
+    Refused,
+    /// The node's per-client rate limit turned the request away (HTTP 429):
+    /// this tool's pace, not a verdict on the transaction. It was counted as
+    /// a mempool rejection.
+    RateLimited,
+    /// No answer, or one that is not JSON-RPC.
+    Failed,
+}
+
+/// Submit one transaction.
+async fn submit(client: &Client, url: &str, tx_json: String) -> Submitted {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "aincore_sendTransaction",
+        "params": [tx_json],
+    });
+    let Ok(resp) = client.post(url).json(&body).send().await else {
+        return Submitted::Failed;
+    };
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Submitted::RateLimited;
+    }
+    match resp.json::<Value>().await {
+        Ok(answer) => submitted_from(&answer),
+        Err(_) => Submitted::Failed,
+    }
+}
+
+/// The verdict a JSON-RPC answer to `aincore_sendTransaction` carries.
+fn submitted_from(answer: &Value) -> Submitted {
+    if answer.get("error").is_some_and(|e| !e.is_null()) {
+        Submitted::Refused
+    } else if answer["result"].is_object() || answer["result"].is_string() {
+        Submitted::Accepted
+    } else {
+        Submitted::Failed
     }
 }
 
@@ -281,14 +304,72 @@ fn load_funder_key(spec: &str) -> SigningKey {
     SigningKey::from_bytes(&arr)
 }
 
+/// B258: the chain to sign for: the one named (`--chain-id` or
+/// `AINCORE_CHAIN_ID`), and only if it is the chain the node runs.
+fn signing_chain(named: Option<String>, node: &str) -> Result<String, String> {
+    let named = named
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "name the chain to sign for: --chain-id or AINCORE_CHAIN_ID (the node runs {node})"
+            )
+        })?;
+    if named != node {
+        return Err(format!(
+            "the node runs {node}, not {named}: refusing to sign"
+        ));
+    }
+    Ok(named)
+}
+
+/// B258: the chain the node at `rpc` runs (`network` of its
+/// `/get_network_info`; the REST root is the RPC URL without a trailing
+/// `/rpc`).
+async fn node_chain(client: &Client, rpc: &str) -> Result<String, String> {
+    let root = rpc.strip_suffix('/').unwrap_or(rpc);
+    let root = root.strip_suffix("/rpc").unwrap_or(root);
+    let info: Value = client
+        .get(format!("{root}/get_network_info"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    info.get("network")
+        .and_then(Value::as_str)
+        .filter(|network| !network.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "get_network_info named no chain".to_string())
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    let client = Client::new();
+    let named = args
+        .chain_id
+        .clone()
+        .or_else(|| std::env::var("AINCORE_CHAIN_ID").ok());
+    let chain_id = match node_chain(&client, &args.rpc)
+        .await
+        .and_then(|node| signing_chain(named, &node))
+    {
+        Ok(chain_id) => chain_id,
+        Err(e) => {
+            eprintln!("{} {e}", "❌".red());
+            std::process::exit(1);
+        }
+    };
 
     println!("{}", "🚀 AINCORE Load Generator (BCS)".bold().cyan());
-    println!("{}", "─────────────────────────────────────────────".dimmed());
+    println!(
+        "{}",
+        "─────────────────────────────────────────────".dimmed()
+    );
     println!("Target      : {}", args.rpc);
-    println!("Chain ID    : {}", args.chain_id);
+    println!("Chain ID    : {}", chain_id);
     println!(
         "Plan        : {} accounts x {} txs = {} total, {}% deliberately aborting",
         args.accounts,
@@ -296,9 +377,11 @@ async fn main() {
         args.accounts * args.per_account,
         args.abort_rate
     );
-    println!("{}", "─────────────────────────────────────────────".dimmed());
+    println!(
+        "{}",
+        "─────────────────────────────────────────────".dimmed()
+    );
 
-    let client = Client::new();
     let funder = Account::from_key(load_funder_key(&args.funder_key));
     println!("Funder      : {}", funder.address);
 
@@ -325,7 +408,13 @@ async fn main() {
     // landed transactions; here it is a one-time setup cost, not the load itself.
     println!("\n{} Funding {} accounts…", "💰".yellow(), args.accounts);
     let accounts: Vec<Account> = (0..args.accounts).map(|_| Account::random()).collect();
-    let mut seq = fetch_seq(&client, &args.rpc, &funder.address).await;
+    let Some(mut seq) = fetch_seq(&client, &args.rpc, &funder.address).await else {
+        eprintln!(
+            "{} the node did not answer the funder's sequence number (aincore_getAccountNonce)",
+            "❌".red()
+        );
+        std::process::exit(1);
+    };
     let pb = ProgressBar::new(args.accounts as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -337,26 +426,27 @@ async fn main() {
     let price = base_fee(&client, &args.rpc).await;
     println!("base fee: {price} quanta per gas");
     let mut funded = 0usize;
+    let mut limited = 0usize;
     for acct in &accounts {
         let payload = transfer_payload(&funder.address, &acct.address, args.fund_amount);
-        let tx = signed_tx(
-            &funder,
-            &args.chain_id,
-            &payload,
-            seq,
-            args.gas_limit,
-            price,
-        );
-        if submit(&client, &args.rpc, tx).await {
-            funded += 1;
-            seq += 1;
+        let tx = signed_tx(&funder, &chain_id, &payload, seq, args.gas_limit, price);
+        match submit(&client, &args.rpc, tx).await {
+            Submitted::Accepted => {
+                funded += 1;
+                seq += 1;
+            }
+            Submitted::RateLimited => limited += 1,
+            Submitted::Refused | Submitted::Failed => {}
         }
         pb.inc(1);
         // Give the mempool/consensus a moment so the nonce advances on chain.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     pb.finish_and_clear();
-    println!("   accepted {}/{} funding txs", funded, args.accounts);
+    println!(
+        "   accepted {}/{} funding txs ({} turned away by the node's rate limit)",
+        funded, args.accounts, limited
+    );
 
     // Poll instead of a fixed wait: a fixed 15s produced false "0 accounts
     // funded" verdicts whenever commit latency was merely slow, which then
@@ -385,8 +475,13 @@ async fn main() {
     for acct in &accounts {
         let bal = fetch_balance(&client, &args.rpc, &acct.address).await;
         if bal > 0 {
-            let s = fetch_seq(&client, &args.rpc, &acct.address).await;
-            live.push((acct.clone(), s));
+            match fetch_seq(&client, &args.rpc, &acct.address).await {
+                Some(s) => live.push((acct.clone(), s)),
+                None => eprintln!(
+                    "   {}: sequence number not answered; left out",
+                    acct.address
+                ),
+            }
         }
     }
     println!(
@@ -437,6 +532,7 @@ async fn main() {
 
     let start = Instant::now();
     let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rate_limited = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut inflight = Vec::new();
     let mut submitted = 0usize;
 
@@ -444,11 +540,12 @@ async fn main() {
         for (acct, base_seq) in &live {
             let client = client.clone();
             let rpc_url = args.rpc.clone();
-            let chain_id = args.chain_id.clone();
+            let chain_id = chain_id.clone();
             let acct = acct.clone();
             let seq = base_seq + i as u64;
             let gas_limit = args.gas_limit;
             let accepted = Arc::clone(&accepted);
+            let rate_limited = Arc::clone(&rate_limited);
 
             // Deterministic spread of aborting txs across the run.
             let should_abort = (i * 100 / args.per_account.max(1)) < args.abort_rate as usize;
@@ -468,8 +565,14 @@ async fn main() {
             inflight.push(tokio::spawn(async move {
                 let payload = transfer_payload(&acct.address, &dest, amount);
                 let tx = signed_tx(&acct, &chain_id, &payload, seq, gas_limit, price);
-                if submit(&client, &rpc_url, tx).await {
-                    accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match submit(&client, &rpc_url, tx).await {
+                    Submitted::Accepted => {
+                        accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Submitted::RateLimited => {
+                        rate_limited.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Submitted::Refused | Submitted::Failed => {}
                 }
             }));
             submitted += 1;
@@ -489,17 +592,23 @@ async fn main() {
 
     let elapsed = start.elapsed();
     let accepted_n = accepted.load(std::sync::atomic::Ordering::Relaxed);
+    let limited_n = rate_limited.load(std::sync::atomic::Ordering::Relaxed);
     let tps = submitted as f64 / elapsed.as_secs_f64();
 
-    println!("{}", "─────────────────────────────────────────────".dimmed());
+    println!(
+        "{}",
+        "─────────────────────────────────────────────".dimmed()
+    );
     println!("{} Load complete", "✅".green());
     println!("Submitted   : {}", submitted);
-    println!("Accepted    : {} ({} rejected)", accepted_n, submitted - accepted_n);
-    println!("Elapsed     : {:.2?}", elapsed);
     println!(
-        "Submission  : {} TPS",
-        format!("{:.1}", tps).bold().green()
+        "Accepted    : {} ({} refused or unanswered, {} turned away by the node's rate limit)",
+        accepted_n,
+        submitted - accepted_n - limited_n,
+        limited_n
     );
+    println!("Elapsed     : {:.2?}", elapsed);
+    println!("Submission  : {} TPS", format!("{:.1}", tps).bold().green());
 
     if args.verify {
         // Same principle for the landed-state check: poll until every live
@@ -546,5 +655,84 @@ async fn main() {
             );
         }
     }
-    println!("{}", "─────────────────────────────────────────────".dimmed());
+    println!(
+        "{}",
+        "─────────────────────────────────────────────".dimmed()
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B258 witness: a load is signed only for the chain named, and only if
+    /// the node runs that chain (it signed for mainnet by default).
+    #[test]
+    fn a_load_is_signed_only_for_the_named_chain_the_node_runs() {
+        let named = Some("AINCORE-TESTNET-V4".to_string());
+        assert_eq!(
+            signing_chain(named.clone(), "AINCORE-TESTNET-V4").as_deref(),
+            Ok("AINCORE-TESTNET-V4")
+        );
+        assert!(signing_chain(named, "AINCORE-MAINNET-1").is_err());
+        assert!(signing_chain(None, "AINCORE-MAINNET-1").is_err());
+        assert!(signing_chain(Some(" ".into()), "AINCORE-MAINNET-1").is_err());
+    }
+
+    /// B268 witness: the sequence number is read from the node's nonce
+    /// answer, and an answer without one is no number (a missing one read
+    /// as 0, so a rerun's funding was refused); a rate-limited submission is
+    /// told from a refused one (both counted as mempool rejections).
+    #[tokio::test]
+    async fn the_nonce_is_the_nodes_and_a_rate_limit_is_not_a_rejection() {
+        assert_eq!(
+            nonce_from(&json!({"result": {"nonce": 7, "sequence_number": 7}})),
+            Some(7)
+        );
+        assert_eq!(nonce_from(&json!({"result": null})), None);
+        assert_eq!(
+            nonce_from(&json!({"error": {"code": -32005, "message": "busy"}})),
+            None
+        );
+        assert_eq!(
+            submitted_from(&json!({"error": {"code": -32000, "message": "nonce"}})),
+            Submitted::Refused
+        );
+        assert_eq!(
+            submitted_from(&json!({"result": "ab"})),
+            Submitted::Accepted
+        );
+        let node = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/rpc", node.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut conn, _) = node.accept().unwrap();
+            // The whole request first: a socket closed on unread bytes is
+            // reset, and the client would see no answer at all.
+            let (mut request, mut buf) = (Vec::new(), [0u8; 1024]);
+            loop {
+                let n = conn.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                    let body = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + body {
+                        break;
+                    }
+                }
+            }
+            let _ = conn.write_all(
+                b"HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            );
+        });
+        let verdict = submit(&Client::new(), &url, "{}".into()).await;
+        assert_eq!(verdict, Submitted::RateLimited);
+    }
 }

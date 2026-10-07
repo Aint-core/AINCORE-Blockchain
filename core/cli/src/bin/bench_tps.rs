@@ -52,10 +52,17 @@ struct Transaction {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // B258: the node's JSON-RPC (its API port is 8002; this posted to a
+    // `/submit_tx` the node no longer serves, on port 3030), and the chain
+    // named, never assumed (it signed for mainnet).
     let target_url = args
         .get(1)
         .map(|s| s.as_str())
-        .unwrap_or("http://127.0.0.1:3030");
+        .unwrap_or("http://127.0.0.1:8002/rpc");
+    let chain_id = std::env::var("AINCORE_CHAIN_ID")
+        .ok()
+        .filter(|c| !c.trim().is_empty())
+        .expect("AINCORE_CHAIN_ID names the chain to sign for");
     let tx_count: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1000);
 
     println!("╔══════════════════════════════════════════╗");
@@ -84,7 +91,6 @@ fn main() {
         // Sign with full message format
         // F4: chain_id:sender:payload:seq:gas_limit:gas_price:input_objects
         // gas_limit=10000, gas_price=1, input_objects=[] (must match tx below).
-        let chain_id = "AINCORE-MAINNET-1";
         let message = format!(
             "{}:{}:{}:{}:{}:{}:{}",
             chain_id, sender_addr, payload, sequence_number, 10000u64, 1u128, ""
@@ -115,7 +121,6 @@ fn main() {
 
     // 2. Fire all transactions as fast as possible
     println!("🚀 FIRING {} transactions at {}...", tx_count, target_url);
-    let submit_url = format!("{}/submit_tx", target_url);
 
     let start = Instant::now();
     let mut success = 0u64;
@@ -127,14 +132,18 @@ fn main() {
         .expect("Failed to build HTTP client");
 
     for (i, tx_json) in txs.iter().enumerate() {
-        match client
-            .post(&submit_url)
-            .header("Content-Type", "application/json")
-            .body(tx_json.clone())
-            .send()
-        {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "aincore_sendTransaction",
+            "params": [tx_json],
+            "id": 1,
+        });
+        match client.post(target_url).json(&request).send() {
             Ok(resp) => {
-                if resp.status().is_success() {
+                let accepted = resp
+                    .json::<serde_json::Value>()
+                    .is_ok_and(|answer| answer.get("result").is_some_and(|r| !r.is_null()));
+                if accepted {
                     success += 1;
                 } else {
                     failures += 1;

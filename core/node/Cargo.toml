@@ -25,9 +25,6 @@ chain_sync = { path = "../../sync" }
 da = { path = "../../da" }
 
 
-# --- Governance ---
-governance = { path = "../../governance/governance" }
-
 # --- Utility & Frameworks ---
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -51,6 +51,20 @@ pub fn slot_digests(storage: &StateDB, epoch: u64, round: u64, author: &str) -> 
         .unwrap_or_default()
 }
 
+/// B155: the digest this node attested for a slot (AT-2), if it staged one.
+pub fn self_attested_digest(
+    storage: &StateDB,
+    epoch: u64,
+    round: u64,
+    author: &str,
+) -> Option<String> {
+    read_slot(storage, &vslot_key(epoch, round, author))
+        .ok()?
+        .into_iter()
+        .find(|e| e.role == Role::SelfAttested)
+        .map(|e| e.digest)
+}
+
 pub fn vcert_key(epoch: u64, round: u64, author: &str) -> String {
     format!("consensus:vcert:v1:{epoch:020}:{round:020}:{author}")
 }
@@ -291,6 +305,10 @@ pub fn load(
 pub struct PendingBuffer {
     per_author:
         std::collections::HashMap<String, std::collections::BTreeMap<(u64, String), Vertex>>,
+    /// B257: the digests held, kept with every change: `contains` scanned
+    /// every held vertex, once per body want, every tick, under the
+    /// consensus lock (members fill the buffer for free, 16 each).
+    digests: std::collections::HashSet<String>,
 }
 
 impl PendingBuffer {
@@ -298,32 +316,56 @@ impl PendingBuffer {
     /// `v` itself, when it is the highest round).
     pub fn push(&mut self, v: Vertex) -> Option<Vertex> {
         let held = self.per_author.entry(v.author.clone()).or_default();
+        self.digests.insert(v.hash.clone());
         held.insert((v.round, v.hash.clone()), v);
         if held.len() > PENDING_MAX_PER_AUTHOR {
             let highest = *held.keys().next_back().map(|(r, _)| r)?;
             let key = held.keys().rev().find(|(r, _)| *r == highest)?.clone();
-            return held.remove(&key);
+            let evicted = held.remove(&key)?;
+            self.digests.remove(&evicted.hash);
+            return Some(evicted);
         }
         None
     }
 
-    /// Whether a vertex with this digest is held (bounded: at most
-    /// `PENDING_MAX_PER_AUTHOR` per author).
-    pub fn contains(&self, digest: &str) -> bool {
+    /// B224: the held vertex of `author` at `round` with this digest.
+    pub fn get(&self, author: &str, round: u64, digest: &str) -> Option<&Vertex> {
         self.per_author
-            .values()
-            .any(|held| held.keys().any(|(_, d)| d == digest))
+            .get(author)?
+            .get(&(round, digest.to_string()))
+    }
+
+    /// B224: whether `push` would evict this vertex of `author` at once: the
+    /// author's share is full, and it would be the share's last by (round,
+    /// digest), the one `push` evicts.
+    pub fn evicts(&self, author: &str, round: u64, digest: &str) -> bool {
+        self.per_author.get(author).is_some_and(|held| {
+            held.len() >= PENDING_MAX_PER_AUTHOR
+                && held
+                    .keys()
+                    .next_back()
+                    .is_some_and(|(r, d)| (*r, d.as_str()) < (round, digest))
+        })
+    }
+
+    /// Whether a vertex with this digest is held.
+    pub fn contains(&self, digest: &str) -> bool {
+        self.digests.contains(digest)
     }
 
     pub fn remove(&mut self, author: &str, round: u64, digest: &str) -> Option<Vertex> {
-        self.per_author
+        let removed = self
+            .per_author
             .get_mut(author)?
-            .remove(&(round, digest.to_string()))
+            .remove(&(round, digest.to_string()))?;
+        self.digests.remove(&removed.hash);
+        Some(removed)
     }
 
     /// Every held vertex, lowest round first per author, leaving the buffer
     /// empty: what a trigger re-evaluates (a new certificate or epoch).
     pub fn take_all(&mut self) -> Vec<Vertex> {
+        self.digests.clear();
         let mut out: Vec<Vertex> = self
             .per_author
             .drain()

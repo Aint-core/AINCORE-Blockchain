@@ -441,6 +441,55 @@ mod tests {
         assert_eq!(db.get_chain_height(), 3, "latest_height must not be pruned");
     }
 
+    /// B254 witness: each store opened in a process has its own instance
+    /// number, a directory opened again a new one, and a store's transaction
+    /// views share its number (a process-wide memo of a store's rows that
+    /// never change once written keys them by it).
+    #[test]
+    fn a_store_is_named_by_its_instance_not_its_directory() {
+        let first = temp_db("b254_instance");
+        let id = first.db.instance();
+        let seen = first.transaction(|view| Ok(view.db.instance())).unwrap();
+        assert_eq!(seen, id, "a view named another store");
+        let other = temp_db("b254_instance_other");
+        assert_ne!(other.db.instance(), id);
+        drop(first);
+        let again = temp_db("b254_instance");
+        assert_ne!(
+            again.db.instance(),
+            id,
+            "a directory opened again took the old number"
+        );
+    }
+
+    /// B225 witness: a block above the latest height, or pruned, is known
+    /// not held from small rows; a held one, a pinned one below the
+    /// cursor, and any height of a database without the rows may be.
+    #[test]
+    fn a_block_not_held_is_known_from_small_rows() {
+        let db = temp_db("may_hold_block");
+        assert!(db.may_hold_block(5), "no rows: it may be held");
+        for h in 1..=8u64 {
+            let json = format!(r#"{{"header":{{"hash":"h{h}","height":{h}}},"transactions":[]}}"#);
+            db.save_block_json(h, &json).unwrap();
+        }
+        assert!(db.may_hold_block(8) && db.may_hold_block(1));
+        assert!(!db.may_hold_block(9), "a future height");
+        let pinned: BTreeSet<u64> = [3].into();
+        assert_eq!(
+            db.prune_old_blocks(8, 4, 10, &pinned).unwrap(),
+            2,
+            "1 and 2"
+        );
+        for h in 1..=8u64 {
+            assert_eq!(
+                db.may_hold_block(h),
+                db.get(&format!("block_{h}")).unwrap().is_some(),
+                "height {h}"
+            );
+        }
+    }
+
     /// G3 SN-4: a pinned block survives the prune cursor, is recorded as
     /// kept, and goes once no longer pinned, with its tx index, however the
     /// pins moved (a retention change included).
