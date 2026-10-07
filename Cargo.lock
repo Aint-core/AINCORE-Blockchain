@@ -3264,19 +3264,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "governance"
-version = "0.1.0"
-dependencies = [
- "hex",
- "move-binary-format",
- "move-core-types",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "storage",
-]
-
-[[package]]
 name = "governor"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4971,6 +4958,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "colored",
+ "config",
  "crossterm 0.27.0",
  "reqwest",
  "serde",
@@ -5615,7 +5603,6 @@ dependencies = [
  "ed25519-dalek",
  "executor",
  "futures",
- "governance",
  "hex",
  "lazy_static",
  "libp2p",

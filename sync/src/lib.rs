@@ -126,15 +126,30 @@ pub struct ChainSync {
     /// B264: the blocks last served in parts, so a block's parts cost one
     /// read. Only blocks too large for a batch are kept.
     parted_blocks: Mutex<state_sync::ValueCache>,
-    /// B275: the blocks known to be too large for a batch, by height.
-    oversized_known: Mutex<std::collections::BTreeMap<u64, OversizedBlock>>,
-    /// B275: the parted block being fetched, kept across turns.
-    parted_partial: Mutex<Option<PartialBlock>>,
-    /// B275: when a part last needed its block read from storage.
-    parted_read_at: Mutex<Option<std::time::Instant>>,
+    /// B275: the blocks known to be too large for a batch, by height, and
+    /// (B288) when each was last asked for: the least recently asked goes
+    /// first (the lowest height went, the one a lagging client fetches).
+    oversized_known: Mutex<std::collections::BTreeMap<u64, (OversizedBlock, std::time::Instant)>>,
+    /// B275: the parted blocks being fetched, kept across turns. B285: one
+    /// per session (each session's copy of a block differs in its
+    /// signature, so a second session's turn threw the first's away, and no
+    /// block much over two turns' worth arrived with two sessions serving
+    /// it), within `MAX_PARTED_BLOCK_BYTES` in all.
+    parted: Mutex<HashMap<String, PartialBlock>>,
+    /// B275: when a part may next need its block read from storage (B291:
+    /// later the more bytes the last read took).
+    parted_read_due: Mutex<Option<std::time::Instant>>,
+    /// B286: when each session was first and last seen above this node.
+    seen: Mutex<HashMap<String, (std::time::Instant, std::time::Instant)>>,
+    /// B286: this node's key for ordering sessions alike in every other
+    /// respect (their PeerIds, which a Sybil grinds, ordered them).
+    turn_salt: [u8; 16],
     /// The encoded bytes a batch's blocks stop at (`SYNC_RESP_BLOCK_BYTES`;
     /// tests make it small, so real blocks are parted).
     batch_bytes: usize,
+    /// B285: the bytes all parted fetches may hold together
+    /// (`MAX_PARTED_BLOCK_BYTES`; tests make it small).
+    parted_budget: u64,
     #[cfg(test)]
     before_execution_hook: Option<fn(&StateDB)>,
 }
@@ -192,30 +207,40 @@ const MAX_STANDINGS: usize = 1024;
 struct Standing {
     /// B275: it holds the parted block this node is fetching (only it can
     /// finish it: each node's copy of a block differs in its signature).
+    /// B287: the largest such fetch only.
     resuming: bool,
     member: bool,
     /// Strikes still counting (`STRIKE_TTL`).
     strikes: u32,
     /// Blocks its last turn that asked for blocks brought (0 if none).
     brought: u64,
-    /// When it last had a turn (`None`: never).
-    turned: Option<std::time::Instant>,
+    /// B286: since when it waits for a turn: its last turn, or, never given
+    /// one (or not within `STRIKE_TTL`), when this node first saw it.
+    waited_since: std::time::Instant,
+    /// B286: its PeerId hashed under this node's `turn_salt`.
+    salted: u64,
 }
 
-/// B274: the order block turns go in: (B275) the session whose parted
-/// block this node is fetching; members, whatever their strikes; then the
-/// fewest strikes still counting; then the most blocks brought at the last
-/// turn; then the one that waited longest for a turn. Nothing a session
-/// merely claims (its height) orders it.
+/// B274: the order block turns go in: members, whatever their strikes;
+/// (B275, B287: within its class) the session whose parted block, the
+/// largest under way, this node is fetching; then the fewest strikes still
+/// counting; then the most blocks brought at the last turn; then (B286) the
+/// one that has waited longest, a session never given a turn since this
+/// node first saw it; then by `salted`. Nothing a session merely claims
+/// (its height) orders it. B286: "never given a turn" went first and ties
+/// went by PeerId, so three fresh identities a pass, ground to sort low,
+/// took every turn from honest non-members (an observer's only sources).
+/// B287: a fetch's holder went before the members (one junk part a turn,
+/// and it held every pass's first turn for good).
 fn turn_order(a: &(String, Standing), b: &(String, Standing)) -> std::cmp::Ordering {
-    let ((pa, sa), (pb, sb)) = (a, b);
-    sb.resuming
-        .cmp(&sa.resuming)
-        .then(sb.member.cmp(&sa.member))
+    let ((_, sa), (_, sb)) = (a, b);
+    sb.member
+        .cmp(&sa.member)
+        .then(sb.resuming.cmp(&sa.resuming))
         .then(sa.strikes.cmp(&sb.strikes))
         .then(sb.brought.cmp(&sa.brought))
-        .then(sa.turned.cmp(&sb.turned))
-        .then(pa.cmp(pb))
+        .then(sa.waited_since.cmp(&sb.waited_since))
+        .then(sa.salted.cmp(&sb.salted))
 }
 
 /// B274: insert `value` under `key`, the entry updated longest ago (`at`)
@@ -257,6 +282,11 @@ struct Turn {
     /// B275: the session sent what no honest server sends (a parted block
     /// that does not check, or does not import).
     refused: bool,
+    /// B287: the turn added to a parted fetch it left under way. Such a turn
+    /// (bringing no whole block) neither strikes its session nor clears its
+    /// strikes: a part's bytes made it full, so one junk part a turn kept a
+    /// session clear while its fetch never ended.
+    mid_fetch: bool,
 }
 
 impl Turn {
@@ -271,13 +301,20 @@ impl Turn {
 }
 
 /// B274: whether a block offered without its QC, at `height`, can be its
-/// server's newest work: members propose nothing with
-/// `MAX_UNFINALIZED_BLOCKS` blocks without a QC, so an honest server holds
-/// fewer than that above its first block without one. A server claiming
-/// far more ended its turn on its own word, and was never struck.
+/// server's newest work. A server claiming far more ended its turn on its
+/// own word, and was never struck. B289: members stop proposing once they
+/// hold `MAX_UNFINALIZED_BLOCKS` blocks above their lowest without a QC
+/// (so an honest server in a stall holds that many, not fewer), and the
+/// anchors already supported then still commit: twice that is allowed.
+/// Under `MAX_UNFINALIZED_BLOCKS` every honest member was struck on every
+/// pass of a stall.
 fn qcless_tip(height: u64, claimed: u64) -> bool {
-    claimed.saturating_sub(height) < consensus::v4::MAX_UNFINALIZED_BLOCKS
+    claimed.saturating_sub(height) <= QCLESS_TIP_BLOCKS
 }
+
+/// B289: how far above a block offered without its QC its server's claimed
+/// height may be for the block to be its newest work.
+const QCLESS_TIP_BLOCKS: u64 = 2 * consensus::v4::MAX_UNFINALIZED_BLOCKS;
 
 /// NI-4: the blocks of one SYNC_RESP stop at this many bytes, so the answer
 /// stays under the 10 MiB a client reads. B264: a block larger than this is
@@ -305,9 +342,10 @@ pub const MAX_PARTED_BLOCK_BYTES: u64 = 512 << 20;
 const PARTED_KEY: &str = "block";
 
 /// B275: the blocks a server knows are too large for a batch, by height,
-/// at most this many (a choice; such blocks are rare): a request beside one
-/// is answered from what is known, not by reading the block again.
-const MAX_OVERSIZED_KNOWN: usize = 64;
+/// at most this many (a choice; such blocks are rare, an entry is a
+/// header): a request beside one is answered from what is known, not by
+/// reading the block again.
+const MAX_OVERSIZED_KNOWN: usize = 256;
 
 /// B275: how long a client waits after a busy part answer (the server's
 /// answer budget refills 12.8 tokens a second, a part's text about 74).
@@ -318,25 +356,44 @@ const PART_BUSY_WAIT: Duration = Duration::from_secs(1);
 /// fetching two large blocks at once made every part a whole block's read.
 const PARTED_READ_EVERY: Duration = Duration::from_secs(1);
 
+/// B291: and longer after a large read, at this many bytes a second (a
+/// choice, under a spinning disk's rate): one read a second of up to
+/// 512 MiB each was a disk's whole rate.
+const PARTED_READ_BYTES_PER_SEC: u64 = 64 << 20;
+
+/// B291: how long after reading a block of `len` bytes for its parts the
+/// next such read waits.
+fn parted_read_wait(len: u64) -> Duration {
+    PARTED_READ_EVERY.max(Duration::from_millis(
+        len.saturating_mul(1000) / PARTED_READ_BYTES_PER_SEC,
+    ))
+}
+
 /// B275: why a parted fetch stopped short.
 enum PartFailure {
-    /// No answer (a timeout, a lost session): proves nothing; what came is
-    /// kept for the session's next turn.
+    /// No answer (a timeout, a lost session), or (B288) a refusal an honest
+    /// server can give (a block it no longer indexes or holds): proves
+    /// nothing; what came is kept for the session's next turn.
     Lost(String),
     /// An answer no honest server sends: its session is struck.
     Lied(String),
+    /// B285: larger fetches hold the bytes all fetches share; this one gave
+    /// way. Nothing against its server.
+    Crowded,
 }
 
 /// B275: a parted block's bytes so far, from one session, kept across that
 /// session's turns (a part waits on the server's answer budget, so a large
 /// block takes more than a turn). Only that session resumes it: each node's
-/// copy of a block carries its own proposer signature.
+/// copy of a block carries its own proposer signature. B287: dropped once
+/// this node holds its height, or after `STRIKE_TTL` without a byte.
 struct PartialBlock {
     peer: String,
     height: u64,
     hash: String,
     len: u64,
     bytes: Vec<u8>,
+    progressed: std::time::Instant,
 }
 
 /// B275: the header a block's stored text starts with (`{"header":{..}`),
@@ -391,9 +448,12 @@ impl ChainSync {
             turns: Mutex::default(),
             parted_blocks: Mutex::default(),
             oversized_known: Mutex::default(),
-            parted_partial: Mutex::default(),
-            parted_read_at: Mutex::default(),
+            parted: Mutex::default(),
+            parted_read_due: Mutex::default(),
+            seen: Mutex::default(),
+            turn_salt: rand::random(),
             batch_bytes: SYNC_RESP_BLOCK_BYTES,
+            parted_budget: MAX_PARTED_BLOCK_BYTES,
             #[cfg(test)]
             before_execution_hook: None,
         }
@@ -413,9 +473,40 @@ impl ChainSync {
         self
     }
 
+    /// Tests only: a parted-fetch budget other than `MAX_PARTED_BLOCK_BYTES`.
+    #[cfg(test)]
+    pub(crate) fn with_parted_budget(mut self, bytes: u64) -> Self {
+        self.parted_budget = bytes;
+        self
+    }
+
+    /// Tests only: a turn salt other than a random one.
+    #[cfg(test)]
+    pub(crate) fn with_turn_salt(mut self, salt: [u8; 16]) -> Self {
+        self.turn_salt = salt;
+        self
+    }
+
+    /// B286: `peer` hashed under this node's `turn_salt`.
+    fn salted(&self, peer: &str) -> u64 {
+        let mut input = self.turn_salt.to_vec();
+        input.extend_from_slice(peer.as_bytes());
+        let digest = crypto::hash(&input);
+        u64::from_le_bytes(<[u8; 8]>::try_from(&digest[..8]).unwrap_or_default())
+    }
+
     /// The bytes of one block part (`BLOCK_PART_BYTES` at the default cut).
     fn part_bytes(&self) -> usize {
         self.batch_bytes / 2
+    }
+
+    /// B288: the bytes a parted block's text may run past its encoding here
+    /// (1 MiB at the default cut): fields a newer release adds, which this
+    /// one drops. Exact equality refused every block a newer server sent
+    /// during a rolling upgrade, and struck the server; past this it is
+    /// padding.
+    fn text_slack(&self) -> u64 {
+        self.batch_bytes as u64 / 8
     }
 
     /// Serve state snapshots (G3 S6), whatever `AINCORE_SERVE_SNAPSHOTS` says.
@@ -982,11 +1073,13 @@ impl ChainSync {
                 }
             }
         }
+        // B286: members first, then by this node's salt, not the PeerId.
+        let salted = |peer: &str| self.salted(peer);
         level.sort_by(|a, b| {
             b.member
                 .is_some()
                 .cmp(&a.member.is_some())
-                .then(a.peer.cmp(&b.peer))
+                .then(salted(&a.peer).cmp(&salted(&b.peer)))
         });
         let mut finality = tokio::task::JoinSet::new();
         for session in level.into_iter().take(SYNC_PEERS_PER_PASS) {
@@ -1038,21 +1131,48 @@ impl ChainSync {
                 t.clone()
             })
             .unwrap_or_default();
-        let resuming = self
-            .parted_partial
+        // B286: when each session above was first seen (kept while it is
+        // seen again within `STRIKE_TTL`).
+        let seen = self
+            .seen
             .lock()
-            .ok()
-            .and_then(|p| p.as_ref().map(|p| p.peer.clone()));
+            .map(|mut seen| {
+                seen.retain(|_, (_, last)| fresh(last));
+                for (session, _) in &above {
+                    match seen.get_mut(&session.peer) {
+                        Some((_, last)) => *last = now,
+                        None => keep_standing(
+                            &mut seen,
+                            session.peer.clone(),
+                            (now, now),
+                            |(_, last)| *last,
+                        ),
+                    }
+                }
+                seen.clone()
+            })
+            .unwrap_or_default();
+        // B287: fetches this node holds the height of, or that took no byte
+        // within `STRIKE_TTL`, are dropped; the largest left goes first.
+        let resuming = self.parted.lock().ok().and_then(|mut parted| {
+            parted.retain(|_, p| p.height > final_height && fresh(&p.progressed));
+            parted
+                .values()
+                .max_by_key(|p| (p.bytes.len(), std::cmp::Reverse(p.peer.clone())))
+                .map(|p| p.peer.clone())
+        });
         let mut ranked: Vec<((String, Standing), (network::SessionPeer, u64))> = above
             .into_iter()
             .map(|(session, advertised)| {
                 let label = session.member.as_deref().unwrap_or(&session.peer);
+                let first_seen = seen.get(&session.peer).map_or(now, |(first, _)| *first);
                 let standing = Standing {
                     resuming: resuming.as_deref() == Some(label),
                     member: session.member.is_some(),
                     strikes: stalls.get(&session.peer).map_or(0, |(n, _)| *n),
                     brought: yields.get(&session.peer).map_or(0, |(n, _)| *n),
-                    turned: turns.get(&session.peer).copied(),
+                    waited_since: turns.get(&session.peer).copied().unwrap_or(first_seen),
+                    salted: self.salted(&session.peer),
                 };
                 ((session.peer.clone(), standing), (session, advertised))
             })
@@ -1083,7 +1203,9 @@ impl ChainSync {
                 }
             }
             if let Ok(mut stalls) = self.stalls.lock() {
-                if turn.struck() {
+                if turn.mid_fetch && turn.brought == 0 {
+                    // B287: a fetch under way judges nothing yet.
+                } else if turn.struck() {
                     let n = stalls.get(&peer).map_or(0, |(n, _)| *n);
                     keep_standing(&mut stalls, peer, (n.saturating_add(1), at), |(_, t)| *t);
                 } else {
@@ -1115,6 +1237,7 @@ impl ChainSync {
             ended_well: false,
             asked: false,
             refused: false,
+            mid_fetch: false,
         };
         let turn_ends = tokio::time::Instant::now() + SYNC_TURN;
         // 2. Request Chain Height
@@ -1227,6 +1350,10 @@ impl ChainSync {
                                 big.height, peer_id, e
                             );
                             turn.refused = true;
+                            break;
+                        }
+                        Err(PartFailure::Crowded) => {
+                            turn.ended_well = true;
                             break;
                         }
                     };
@@ -1387,34 +1514,45 @@ impl ChainSync {
         turn: &mut Turn,
     ) -> Result<Option<Block>, PartFailure> {
         let part_bytes = self.part_bytes() as u64;
-        let resumed = self
-            .parted_partial
+        let lied = PartFailure::Lied;
+        // B285: this session's own fetch. B287: the block it named before at
+        // another length is a lie (a renamed length restarted the fetch, at
+        // no cost).
+        let held = self
+            .parted
             .lock()
-            .map(|mut p| p.take())
-            .unwrap_or_default()
-            .filter(|p| {
-                p.peer == peer
-                    && p.height == big.height
-                    && p.hash == big.header.hash
-                    && p.len == big.len
-            });
-        let mut partial = resumed.unwrap_or_else(|| PartialBlock {
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(peer)
+            .filter(|p| p.height == big.height && p.hash == big.header.hash);
+        if let Some(p) = &held {
+            if p.len != big.len {
+                return Err(lied(format!(
+                    "block #{} named at {} bytes, then at {}",
+                    big.height, p.len, big.len
+                )));
+            }
+        }
+        let mut partial = held.unwrap_or_else(|| PartialBlock {
             peer: peer.to_string(),
             height: big.height,
             hash: big.header.hash.clone(),
             len: big.len,
             bytes: Vec::new(),
+            progressed: std::time::Instant::now(),
         });
-        let keep = |partial: PartialBlock| {
-            if let Ok(mut kept) = self.parted_partial.lock() {
-                *kept = Some(partial);
+        let start = partial.bytes.len();
+        // What came is kept for the session's next turn; a turn that added
+        // to it is under way (B287).
+        let keep = |partial: PartialBlock, turn: &mut Turn| {
+            turn.mid_fetch |= partial.bytes.len() > start;
+            if let Ok(mut parted) = self.parted.lock() {
+                parted.insert(partial.peer.clone(), partial);
             }
         };
-        let lied = PartFailure::Lied;
         while (partial.bytes.len() as u64) < big.len {
             let left = turn_ends.saturating_duration_since(tokio::time::Instant::now());
             if left.is_zero() {
-                keep(partial);
+                keep(partial, turn);
                 return Ok(None);
             }
             let req = serde_json::to_string(&BlockPartRequest {
@@ -1429,7 +1567,7 @@ impl ChainSync {
             {
                 Ok(answer) => answer,
                 Err(e) => {
-                    keep(partial);
+                    keep(partial, turn);
                     return Err(PartFailure::Lost(e));
                 }
             };
@@ -1442,7 +1580,14 @@ impl ChainSync {
                     tokio::time::sleep(PART_BUSY_WAIT.min(left)).await;
                     continue;
                 }
-                Some(e) => return Err(lied(format!("a part of a block it named refused: {e}"))),
+                // B288: an honest server refuses a block it no longer
+                // indexes (its index is bounded) or holds (pruned): not a
+                // lie (it was struck as one).
+                Some(e) => {
+                    let why = format!("a part refused: {e}");
+                    keep(partial, turn);
+                    return Err(PartFailure::Lost(why));
+                }
                 None => {}
             }
             let due = big.len - partial.bytes.len() as u64;
@@ -1456,7 +1601,14 @@ impl ChainSync {
                     big.len
                 )));
             }
+            // B285: within the bytes all fetches share; the smallest gives
+            // way, so the largest (an honest server's, at its full rate)
+            // completes.
+            if !self.make_room(peer, partial.bytes.len() as u64 + n) {
+                return Err(PartFailure::Crowded);
+            }
             partial.bytes.extend_from_slice(part.data.as_bytes());
+            partial.progressed = std::time::Instant::now();
             turn.bytes = turn.bytes.saturating_add(n as usize);
         }
         let block = serde_json::from_slice::<Block>(&partial.bytes)
@@ -1467,12 +1619,42 @@ impl ChainSync {
                 block.header.hash, big.header.hash
             )));
         }
-        if serde_json::to_vec(&block).map_err(|e| lied(e.to_string()))? != partial.bytes {
-            return Err(lied(
-                "a parted block that is not the text its server stores".into(),
-            ));
+        let encoded = serde_json::to_vec(&block)
+            .map_err(|e| lied(e.to_string()))?
+            .len() as u64;
+        if big.len > encoded.saturating_add(self.text_slack()) {
+            return Err(lied(format!(
+                "a parted block of {} bytes whose encoding is {encoded}: padded",
+                big.len
+            )));
         }
         Ok(Some(block))
+    }
+
+    /// B285: room for a fetch under way (out of `parted` while it runs) to
+    /// hold `want` bytes, within `parted_budget` with every other session's
+    /// fetch: the smallest fetch gives way, this one included (false: this
+    /// one).
+    fn make_room(&self, peer: &str, want: u64) -> bool {
+        let mut parted = self.parted.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let others: u64 = parted.values().map(|p| p.bytes.len() as u64).sum();
+            if others.saturating_add(want) <= self.parted_budget {
+                return true;
+            }
+            let Some((smallest, held)) = parted
+                .iter()
+                .filter(|(other, _)| other.as_str() != peer)
+                .map(|(other, p)| (other.clone(), p.bytes.len() as u64))
+                .min_by_key(|(other, held)| (*held, other.clone()))
+            else {
+                return true;
+            };
+            if held >= want {
+                return false;
+            }
+            parted.remove(&smallest);
+        }
     }
 
     /// A peer's finalized tip over `link`, iff its QC verifies against the
@@ -1994,8 +2176,11 @@ impl ChainSync {
             .oversized_known
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&req.height)
-            .cloned()
+            .get_mut(&req.height)
+            .map(|(big, used)| {
+                *used = std::time::Instant::now();
+                big.clone()
+            })
         else {
             return refuse("not a block served in parts");
         };
@@ -2011,15 +2196,15 @@ impl ChainSync {
             Some(block) => block,
             None => {
                 {
-                    let mut last = self
-                        .parted_read_at
+                    let mut due = self
+                        .parted_read_due
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     let now = std::time::Instant::now();
-                    if last.is_some_and(|at| now.duration_since(at) < PARTED_READ_EVERY) {
+                    if due.is_some_and(|at| now < at) {
                         return refuse(state_sync::BUSY);
                     }
-                    *last = Some(now);
+                    *due = Some(now + parted_read_wait(big.len));
                 }
                 match self.storage.get(&format!("block_{}", req.height)) {
                     Ok(Some(json)) if json.len() as u64 == big.len => {
@@ -2073,10 +2258,18 @@ impl ChainSync {
                 .oversized_known
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            // B288: the one asked for longest ago goes (the lowest height
+            // went: the very block a lagging client was fetching).
             if !known.contains_key(&height) && known.len() >= MAX_OVERSIZED_KNOWN {
-                known.pop_first();
+                if let Some(stale) = known
+                    .iter()
+                    .min_by_key(|(_, (_, used))| *used)
+                    .map(|(height, _)| *height)
+                {
+                    known.remove(&stale);
+                }
             }
-            known.insert(height, big.clone());
+            known.insert(height, (big.clone(), std::time::Instant::now()));
         }
         self.keep_parted(height, json.into_bytes());
         Some(big)
@@ -2104,7 +2297,7 @@ impl ChainSync {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&height)
-                .cloned();
+                .map(|(big, _)| big.clone());
             if let Some(big) = known {
                 if blocks_to_send.is_empty() {
                     oversized = Some(big);

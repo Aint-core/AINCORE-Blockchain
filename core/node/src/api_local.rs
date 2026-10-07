@@ -3277,7 +3277,16 @@ pub async fn start_api_server(
             .bind((bind_host.as_str(), api_port))
             .and_then(|server| match proxy_port {
                 // B104: the listener only the header-setting proxy uses.
-                Some(port) => server.bind(("127.0.0.1", port)),
+                // B294: bound where `AINCORE_RPC_PROXY_BIND` says (loopback
+                // unless named): inside a container no proxy on the host
+                // reaches loopback, so operators trusted the bridge gateway
+                // on the public port instead, which every client of a
+                // published port on an IPv6 host arrives from.
+                Some(port) => {
+                    let host = std::env::var("AINCORE_RPC_PROXY_BIND")
+                        .unwrap_or_else(|_| "127.0.0.1".to_string());
+                    server.bind((host, port))
+                }
                 None => Ok(server),
             })?
             .run(),

@@ -25,7 +25,7 @@ services:
       - "8002:8002"   # REST API / RPC
     volumes:
       - ./nas_data:/root/.aincore/data
-      - ./genesis.json:/root/.aincore/genesis.json:ro
+      - ${AINCORE_GENESIS_FILE:?set AINCORE_GENESIS_FILE to the genesis.json of the chain this node joins}:/root/.aincore/genesis.json:ro
     environment:
       - AINCORE_PORT=9002
       - AINCORE_API_PORT=8002
@@ -82,24 +82,9 @@ services:
     networks:
       - aincore-net
 
-  # ──────────────────────────────────────────────
-  # Watchtower (Auto-update containers)
-  # ──────────────────────────────────────────────
-  watchtower:
-    image: containrrr/watchtower
-    container_name: aincore-watchtower
-    restart: unless-stopped
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      - WATCHTOWER_CLEANUP=true
-      - WATCHTOWER_POLL_INTERVAL=86400    # Check daily
-      - WATCHTOWER_LABEL_ENABLE=false
-    deploy:
-      resources:
-        limits:
-          cpus: "0.1"
-          memory: 64M
+  # No Watchtower: it held the Docker socket and replaced every container on
+  # this validator host from an unpinned `latest` image (a registry
+  # compromise was root here). Update by hand, from a reviewed build.
 
 volumes:
   aincore-data:

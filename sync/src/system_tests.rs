@@ -1573,8 +1573,8 @@ fn a_member_at_its_tip_without_a_qc_is_not_struck() {
 /// parted, in parts of half this).
 const CUT: usize = 640;
 
-/// B264/B275 witness support: how one member session, serving node `y` from
-/// node `x`'s real blocks parted at `CUT`, misbehaves.
+/// B264/B275 witness support: how the member sessions serving node `y` from
+/// node `x`'s real blocks parted at `CUT` misbehave.
 #[derive(Clone, Copy, Default)]
 struct Parted {
     /// Each part but a block's last, ten bytes short (past the three a
@@ -1586,12 +1586,23 @@ struct Parted {
     junk_qc: bool,
     /// The length named, when not the block's.
     len: Option<u64>,
-    /// One space after the block's text (every length raised to match).
-    pad: bool,
+    /// This many spaces after the block's text (the length named to match).
+    pad: usize,
+    /// An unknown field in the block's text, as a newer release writes it
+    /// (the length named to match).
+    extra_field: bool,
+    /// Each later naming of a block a byte longer (its text padded to match).
+    rename: bool,
     /// The second part asked answered busy (a fetch under way).
     busy_once: bool,
+    /// The second part asked refused as no longer indexed.
+    refuse_once: bool,
     /// Each part answered after this many milliseconds.
     part_delay_ms: u64,
+    /// The member sessions serving (1 when 0).
+    sessions: usize,
+    /// The strikes the first session holds before the run.
+    struck_before: u32,
     /// The passes run (fewer once the certified tip is reached).
     passes: usize,
 }
@@ -1599,91 +1610,161 @@ struct Parted {
 /// What `sync_past_oversized` saw.
 struct PartedRun {
     reached: u64,
-    /// The (height, offset) of each part asked for, in order.
-    offsets: Vec<(u64, u64)>,
+    /// Each part asked for, in order: (pass, session, height, offset).
+    asks: Vec<(usize, String, u64, u64)>,
+    /// The first session's strikes.
     strikes: u32,
 }
 
+impl PartedRun {
+    /// The (height, offset) of each part asked for, in order.
+    fn offsets(&self) -> Vec<(u64, u64)> {
+        self.asks.iter().map(|(_, _, h, o)| (*h, *o)).collect()
+    }
+
+    /// B285: no session's fetch of a block began again after a part of it
+    /// arrived (a part in flight when a turn ends is asked again).
+    fn never_restarted(&self) -> Result<(), String> {
+        let mut at = std::collections::HashMap::new();
+        for (_, peer, height, offset) in &self.asks {
+            let before = at.insert((peer.clone(), *height), *offset).unwrap_or(0);
+            if *offset < before {
+                return Err(format!(
+                    "{peer}'s block {height} began again at {offset} after {before}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// B264/B275 witness support: node `y` of a `left_behind` cluster syncing
-/// to the certified tip from one member session that serves node 0's blocks
-/// in parts, as `how` says.
+/// to the certified tip from member sessions that serve node 0's blocks in
+/// parts, as `how` says.
 fn sync_past_oversized(sim: &Sim, y: usize, tip: u64, how: Parted) -> PartedRun {
-    let server = Arc::new(ChainSync::new(Arc::clone(&sim.node(0).storage)).with_batch_bytes(CUT));
-    let offsets = Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
-    let asked = Arc::clone(&offsets);
+    let stored = Arc::clone(&sim.node(0).storage);
+    let server = Arc::new(ChainSync::new(Arc::clone(&stored)).with_batch_bytes(CUT));
+    let asks = Arc::new(std::sync::Mutex::new(
+        Vec::<(usize, String, u64, u64)>::new(),
+    ));
+    let asked = Arc::clone(&asks);
+    let pass = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let pass_now = Arc::clone(&pass);
     let parts_asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // The spaces after each block's text as last named.
+    let namings = Arc::new(std::sync::Mutex::new(
+        std::collections::HashMap::<u64, usize>::new(),
+    ));
+    let tampered = how.pad > 0 || how.extra_field || how.rename;
+    // The text a tampering server serves for block `height`.
+    let text = move |height: u64, spaces: usize| -> Option<String> {
+        let mut t = stored.get(&format!("block_{height}")).ok()??;
+        if how.extra_field {
+            t.pop();
+            t.push_str(",\"future\":0}");
+        }
+        t.push_str(&" ".repeat(spaces));
+        Some(t)
+    };
+    let sessions: Vec<network::SessionPeer> = (0..how.sessions.max(1))
+        .map(|i| network::SessionPeer {
+            peer: format!("12D3KooWbig{i}"),
+            member: Some(sim.committee[1 + i].address.clone()),
+        })
+        .collect();
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (client, _) = sessions_serving(
-        &rt,
-        vec![network::SessionPeer {
-            peer: "12D3KooWbig".into(),
-            member: Some(sim.committee[1].address.clone()),
-        }],
-        move |_, wire| {
-            let now = std::time::Duration::ZERO;
-            if wire == "GET_HEIGHT" {
-                return Some((now, format!("HEIGHT:{tip}")));
+    let (client, _) = sessions_serving(&rt, sessions, move |peer, wire| {
+        let now = std::time::Duration::ZERO;
+        if wire == "GET_HEIGHT" {
+            return Some((now, format!("HEIGHT:{tip}")));
+        }
+        if let Some(req) = wire.strip_prefix(crate::PART_REQ) {
+            let req: crate::BlockPartRequest = serde_json::from_str(req).ok()?;
+            asked.lock().unwrap().push((
+                pass_now.load(std::sync::atomic::Ordering::SeqCst),
+                peer.to_string(),
+                req.height,
+                req.offset,
+            ));
+            let wait = std::time::Duration::from_millis(how.part_delay_ms);
+            let nth = parts_asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if how.busy_once && nth == 1 {
+                return Some((wait, crate::state_sync::busy_reply(wire)?));
             }
-            if let Some(req) = wire.strip_prefix(crate::PART_REQ) {
-                let req: crate::BlockPartRequest = serde_json::from_str(req).ok()?;
-                asked.lock().unwrap().push((req.height, req.offset));
-                let wait = std::time::Duration::from_millis(how.part_delay_ms);
-                let nth = parts_asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if how.busy_once && nth == 1 {
-                    return Some((wait, crate::state_sync::busy_reply(wire)?));
+            let mut part = if how.refuse_once && nth == 1 {
+                crate::BlockPartResponse {
+                    error: Some("not a block served in parts".into()),
+                    ..Default::default()
                 }
+            } else if tampered {
+                let spaces = namings.lock().unwrap().get(&req.height).copied()?;
+                let t = text(req.height, spaces)?;
+                let start = (req.offset as usize).min(t.len());
+                let end = t.len().min(start + CUT / 2);
+                crate::BlockPartResponse {
+                    data: t[start..end].to_string(),
+                    len: t.len() as u64,
+                    error: None,
+                }
+            } else {
                 let answer = server.handle_message(wire)?;
-                let mut part: crate::BlockPartResponse =
-                    serde_json::from_str(answer.strip_prefix(crate::PART_RESP)?).ok()?;
-                let last = req.offset + part.data.len() as u64 >= part.len;
-                if how.short && !last {
-                    let mut cut = part.data.len().saturating_sub(10);
-                    while !part.data.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
-                    part.data.truncate(cut);
-                }
-                if how.pad {
-                    if last {
-                        part.data.push(' ');
-                    }
-                    part.len += 1;
-                }
-                let json = serde_json::to_string(&part).unwrap();
-                return Some((wait, format!("{}{json}", crate::PART_RESP)));
-            }
-            let answer = server.handle_message(wire)?;
-            let Some(json) = answer.strip_prefix("SYNC_RESP:") else {
-                return Some((now, answer));
+                serde_json::from_str(answer.strip_prefix(crate::PART_RESP)?).ok()?
             };
-            let mut resp: SyncResponse = serde_json::from_str(json).ok()?;
-            if let Some(big) = resp.oversized.as_mut() {
-                if how.no_qc {
-                    resp.qcs.retain(|q| q.block_height != big.height);
+            let last = req.offset + part.data.len() as u64 >= part.len;
+            if how.short && !last && part.error.is_none() {
+                let mut cut = part.data.len().saturating_sub(10);
+                while !part.data.is_char_boundary(cut) {
+                    cut -= 1;
                 }
-                if how.junk_qc {
-                    for q in resp.qcs.iter_mut().filter(|q| q.block_height == big.height) {
-                        q.block_hash = "ab".repeat(32);
-                    }
-                }
-                if let Some(len) = how.len {
-                    big.len = len;
-                }
-                if how.pad {
-                    big.len += 1;
+                part.data.truncate(cut);
+            }
+            let json = serde_json::to_string(&part).unwrap();
+            return Some((wait, format!("{}{json}", crate::PART_RESP)));
+        }
+        let answer = server.handle_message(wire)?;
+        let Some(json) = answer.strip_prefix("SYNC_RESP:") else {
+            return Some((now, answer));
+        };
+        let mut resp: SyncResponse = serde_json::from_str(json).ok()?;
+        if let Some(big) = resp.oversized.as_mut() {
+            if how.no_qc {
+                resp.qcs.retain(|q| q.block_height != big.height);
+            }
+            if how.junk_qc {
+                for q in resp.qcs.iter_mut().filter(|q| q.block_height == big.height) {
+                    q.block_hash = "ab".repeat(32);
                 }
             }
-            Some((
-                now,
-                format!("SYNC_RESP:{}", serde_json::to_string(&resp).unwrap()),
-            ))
-        },
-    );
+            if let Some(len) = how.len {
+                big.len = len;
+            }
+            if tampered {
+                let mut namings = namings.lock().unwrap();
+                let spaces = match namings.get(&big.height) {
+                    Some(last) if how.rename => last + 1,
+                    _ => how.pad,
+                };
+                namings.insert(big.height, spaces);
+                big.len = text(big.height, spaces)?.len() as u64;
+            }
+        }
+        Some((
+            now,
+            format!("SYNC_RESP:{}", serde_json::to_string(&resp).unwrap()),
+        ))
+    });
     let sync = ChainSync::new(Arc::clone(&sim.node(y).storage))
         .with_batch_bytes(CUT)
         .with_sessions(client);
+    if how.struck_before > 0 {
+        sync.stalls.lock().unwrap().insert(
+            "12D3KooWbig0".into(),
+            (how.struck_before, std::time::Instant::now()),
+        );
+    }
     let mut reached = 0;
-    for _ in 0..how.passes.max(1) {
+    for i in 0..how.passes.max(1) {
+        pass.store(i, std::sync::atomic::Ordering::SeqCst);
         reached = rt.block_on(sync.sync_from_peers());
         if reached >= tip {
             break;
@@ -1693,12 +1774,12 @@ fn sync_past_oversized(sim: &Sim, y: usize, tip: u64, how: Parted) -> PartedRun 
         .stalls
         .lock()
         .unwrap()
-        .get("12D3KooWbig")
+        .get("12D3KooWbig0")
         .map_or(0, |(n, _)| *n);
-    let offsets = offsets.lock().unwrap().clone();
+    let asks = asks.lock().unwrap().clone();
     PartedRun {
         reached,
-        offsets,
+        asks,
         strikes,
     }
 }
@@ -1715,17 +1796,13 @@ fn a_block_named_oversized_is_fetched_in_parts() {
         ..Parted::default()
     };
     let run = sync_past_oversized(&sim, y, tip, how);
-    assert!(
-        run.offsets.len() > 2,
-        "vacuous: {} parts",
-        run.offsets.len()
-    );
+    assert!(run.asks.len() > 2, "vacuous: {} parts", run.asks.len());
     assert_eq!(
         run.reached, tip,
         "syncing did not go past the parted blocks"
     );
     assert_eq!(run.strikes, 0);
-    assert!(run.offsets.iter().any(|(h, _)| *h == from + 1));
+    assert!(run.offsets().iter().any(|(h, _)| *h == from + 1));
 }
 
 /// B264 witness: a part shorter than due ends the fetch at once: nothing is
@@ -1740,7 +1817,7 @@ fn a_short_block_part_ends_the_fetch() {
     };
     let run = sync_past_oversized(&sim, y, tip, how);
     assert_eq!(
-        run.offsets,
+        run.offsets(),
         vec![(from + 1, 0)],
         "a short part did not end the fetch"
     );
@@ -1762,7 +1839,7 @@ fn an_oversized_block_without_its_qc_is_not_fetched() {
         ..Parted::default()
     };
     let run = sync_past_oversized(&sim, y, tip, how);
-    assert!(run.offsets.is_empty(), "a block without its QC was fetched");
+    assert!(run.asks.is_empty(), "a block without its QC was fetched");
     assert_eq!(run.reached, from);
     assert_eq!(run.strikes, 0, "a server was struck for its newest block");
 }
@@ -1789,11 +1866,7 @@ fn a_parted_block_is_checked_before_any_part() {
         },
     ] {
         let run = sync_past_oversized(&sim, y, tip, how);
-        assert!(
-            run.offsets.is_empty(),
-            "a part was asked for: {:?}",
-            run.offsets
-        );
+        assert!(run.asks.is_empty(), "a part was asked for: {:?}", run.asks);
         assert_eq!(run.reached, from);
         assert!(run.strikes > 0);
     }
@@ -1801,17 +1874,18 @@ fn a_parted_block_is_checked_before_any_part() {
 
 /// B275 witness: a parted block must be the text its server stores: one
 /// padded (it still parses to the block, and filled a turn's bytes) is
-/// refused, and its server struck.
+/// refused, and its server struck. B288: past the slack a newer release's
+/// fields may take (an eighth of a batch).
 #[test]
 fn a_padded_parted_block_is_refused() {
     let (sim, y, from, tip, _, _) = left_behind("b264_padded", &[15, 16, 17, 18], 4);
     let how = Parted {
-        pad: true,
+        pad: 2 * CUT / 8,
         passes: 1,
         ..Parted::default()
     };
     let run = sync_past_oversized(&sim, y, tip, how);
-    assert!(run.offsets.len() > 1, "vacuous: the block was not fetched");
+    assert!(run.asks.len() > 1, "vacuous: the block was not fetched");
     assert_eq!(run.reached, from, "a padded block was imported");
     assert!(run.strikes > 0, "padding was not struck");
 }
@@ -1836,19 +1910,121 @@ fn a_parted_fetch_waits_out_busy_and_resumes_across_turns() {
     assert!(run.reached > from, "nothing was fetched");
     // A part in flight when a turn ends is asked again at the next; a
     // block once begun is never begun again.
-    let mut at = std::collections::HashMap::new();
-    for &(height, offset) in &run.offsets {
-        let before = at.insert(height, offset).unwrap_or(0);
-        assert!(
-            offset >= before,
-            "block {height} began again at {offset} after {before}: {:?}",
-            run.offsets
-        );
-    }
+    run.never_restarted().unwrap();
     assert!(
-        run.offsets.iter().any(|(h, o)| *h == from + 1 && *o > 0),
+        run.offsets().iter().any(|(h, o)| *h == from + 1 && *o > 0),
         "vacuous: no block took more than one part"
     );
+}
+
+/// B285 witness: a parted block two sessions serve arrives though it takes
+/// more turns than one pass gives either. Each session's copy differs in
+/// its signature, and the one fetch kept went to the session whose turn
+/// came last: each turn of the other began again from 0, so no fetch held
+/// more than two turns' worth, and the block never arrived.
+#[test]
+fn a_parted_block_two_sessions_serve_arrives() {
+    let (sim, y, from, tip, _, _) = left_behind("b285_two", &[45, 46, 47, 48], 4);
+    let how = Parted {
+        sessions: 2,
+        part_delay_ms: crate::SYNC_TURN.as_millis() as u64 / 3,
+        passes: 40,
+        ..Parted::default()
+    };
+    let run = sync_past_oversized(&sim, y, tip, how);
+    assert!(run.reached > from, "the block never arrived");
+    run.never_restarted().unwrap();
+    for i in 0..2 {
+        assert!(
+            run.asks
+                .iter()
+                .any(|(_, peer, h, o)| *peer == format!("12D3KooWbig{i}")
+                    && *h == from + 1
+                    && *o > 0),
+            "vacuous: session {i} did not fetch past a part"
+        );
+    }
+}
+
+/// B287 witness: a session naming, mid-fetch, the block it is sending at
+/// another length is refused at once and struck: no part is asked of it in
+/// the pass it renames (the fetch began again, unpunished, each time).
+#[test]
+fn a_renamed_parted_block_is_refused_at_once() {
+    let (sim, y, from, tip, _, _) = left_behind("b287_rename", &[55, 56, 57, 58], 4);
+    let how = Parted {
+        rename: true,
+        part_delay_ms: crate::SYNC_TURN.as_millis() as u64 / 3,
+        passes: 2,
+        ..Parted::default()
+    };
+    let run = sync_past_oversized(&sim, y, tip, how);
+    assert!(
+        run.asks.iter().any(|(pass, ..)| *pass == 0),
+        "vacuous: no part asked in the first pass"
+    );
+    assert!(
+        !run.asks.iter().any(|(pass, ..)| *pass == 1),
+        "parts were asked of a renamed block: {:?}",
+        run.asks
+    );
+    assert_eq!(run.reached, from);
+    assert_eq!(
+        run.strikes, 1,
+        "the rename was not struck, or the first turn was"
+    );
+}
+
+/// B287 witness: a turn that leaves a parted fetch under way neither
+/// strikes its session nor clears a strike it holds (a part's bytes made
+/// the turn full, so one junk part a turn kept a session clear).
+#[test]
+fn a_turn_left_mid_fetch_neither_strikes_nor_clears() {
+    let (sim, y, from, tip, _, _) = left_behind("b287_mid", &[65, 66, 67, 68], 4);
+    let how = Parted {
+        struck_before: 1,
+        part_delay_ms: crate::SYNC_TURN.as_millis() as u64 / 3,
+        passes: 1,
+        ..Parted::default()
+    };
+    let run = sync_past_oversized(&sim, y, tip, how);
+    assert_eq!(run.reached, from, "vacuous: the block arrived in one turn");
+    assert!(!run.asks.is_empty(), "vacuous: no part asked");
+    assert_eq!(run.strikes, 1);
+}
+
+/// B288 witness: a part refused as a block no longer indexed (an honest
+/// server's index is bounded) ends the turn's fetch without a strike, and
+/// the next turn goes on from that part. It was taken for a lie: the
+/// server was struck and the fetch began again.
+#[test]
+fn a_part_an_honest_server_refuses_is_asked_again() {
+    let (sim, y, from, tip, _, _) = left_behind("b288_refused", &[75, 76, 77, 78], 4);
+    let how = Parted {
+        refuse_once: true,
+        passes: 8,
+        ..Parted::default()
+    };
+    let run = sync_past_oversized(&sim, y, tip, how);
+    assert!(run.reached > from, "the block never arrived");
+    run.never_restarted().unwrap();
+    assert_eq!(run.strikes, 0, "an honest refusal was struck");
+}
+
+/// B288 witness: a parted block whose text carries a field this release
+/// does not know (a newer server's) is imported, its server not struck: the
+/// text had to equal this release's encoding byte for byte.
+#[test]
+fn a_parted_block_with_a_newer_field_is_imported() {
+    let (sim, y, from, tip, _, _) = left_behind("b288_field", &[85, 86, 87, 88], 4);
+    let how = Parted {
+        extra_field: true,
+        passes: 8,
+        ..Parted::default()
+    };
+    let run = sync_past_oversized(&sim, y, tip, how);
+    assert!(run.reached > from, "the block was refused");
+    assert_eq!(run.strikes, 0);
 }
 
 /// B263/B274 witness: block turns go by standing: members first whatever
@@ -1907,6 +2083,61 @@ fn turns_go_to_members_then_live_strikes_then_yield() {
         sync.turns.lock().unwrap().contains_key("12D3KooWc"),
         "a turn was not recorded"
     );
+}
+
+/// B286 witness: a non-member session this node has seen for minutes, never
+/// given a turn, goes before fresh identities that claim the same: a
+/// session never given a turn went first and ties went by PeerId, so three
+/// fresh identities a pass, ground to sort low, took every turn from the
+/// honest non-members an observer depends on. Here the salt puts the honest
+/// session last among equals, so only the time it has waited puts it first.
+#[test]
+fn a_session_waiting_longest_goes_before_fresh_identities() {
+    let path = format!(
+        "{}/b286_order_{}",
+        storage::test_dir::process_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_dir_all(&path);
+    let db = Arc::new(StateDB::open(&path).unwrap());
+    let honest = "12D3KooWhonest".to_string();
+    let sybils: Vec<String> = (0..9).map(|i| format!("12D3KooWsybil{i}")).collect();
+    // A salt under which the honest session sorts after every Sybil.
+    let salt = (0..=255u8)
+        .map(|i| [i; 16])
+        .find(|salt| {
+            let probe = ChainSync::new(Arc::clone(&db)).with_turn_salt(*salt);
+            sybils
+                .iter()
+                .all(|s| probe.salted(s) < probe.salted(&honest))
+        })
+        .expect("a salt");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let table: Vec<network::SessionPeer> = std::iter::once(&honest)
+        .chain(&sybils)
+        .map(|peer| network::SessionPeer {
+            peer: peer.clone(),
+            member: None,
+        })
+        .collect();
+    let (client, block_asks) = sessions_serving(&rt, table, |_, wire| {
+        if wire == "GET_HEIGHT" {
+            return Some((std::time::Duration::ZERO, "HEIGHT:100".to_string()));
+        }
+        wire.strip_prefix("SYNC_REQ:")?;
+        Some((std::time::Duration::ZERO, sync_answer(&[], &[], 0, 0)))
+    });
+    let sync = ChainSync::new(db)
+        .with_sessions(client)
+        .with_turn_salt(salt);
+    let now = std::time::Instant::now();
+    sync.seen.lock().unwrap().insert(
+        honest.clone(),
+        (now - std::time::Duration::from_secs(300), now),
+    );
+    rt.block_on(sync.sync_from_peers());
+    let asked = block_asks.lock().unwrap().clone();
+    assert_eq!(asked.first(), Some(&honest), "{asked:?}");
 }
 
 /// B263 witness: a session at this node's height takes no block turn but is

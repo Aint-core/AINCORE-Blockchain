@@ -156,10 +156,11 @@ fn main() {
 }
 
 /// B278: a node's RPC port when only its P2P port is named: the node's own
-/// rule (`NodeConfig`: the API port is the node port less 1000). It was
-/// less 999, one above every node's RPC, so every node showed no status.
+/// rule. It was less 999, one above every node's RPC, so every node showed
+/// no status; then (B296) less 1000 for the default port too, whose RPC is
+/// 8002 when the node is left to its default.
 fn rpc_port_of(node_port: u16) -> u16 {
-    node_port.saturating_sub(1000)
+    config::api_port_for(node_port)
 }
 
 /// B269: the height and session count an `aincore_getStatus` answer
@@ -184,6 +185,7 @@ mod tests {
     fn the_rpc_port_is_the_node_port_less_1000() {
         assert_eq!(rpc_port_of(9002), 8002);
         assert_eq!(rpc_port_of(9000), 8000);
+        assert_eq!(rpc_port_of(9001), 8002, "B296: the default port's RPC");
     }
 
     /// B269 witness: a node's status is its `aincore_getStatus` answer; an

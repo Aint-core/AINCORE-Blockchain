@@ -198,14 +198,20 @@ pub const MAX_UNFINALIZED_BLOCKS: u64 = 50;
 
 /// B262: the rounds this node may run above the floor kept for its lowest
 /// block without a QC (while that floor is below g) before it proposes
-/// nothing more: the GC window and the lead (a body's payload rides at most
-/// `LEAD` above the cursor). Bounded in blocks alone, it kept every round
-/// for as long as f members let one anchor commit every few hundred rounds
-/// (rounds per block are unbounded, contract correction C1): their
-/// payloads, attested and so outside the plain-body budget, grew memory
-/// without bound.
-pub const MAX_KEPT_ROUNDS: u64 =
-    crate::ordering::GC_DEPTH + staging::RETAIN_SLACK + ingress_v4::LEAD;
+/// nothing more. Bounded in blocks alone, it kept every round for as long
+/// as f members let one anchor commit every few hundred rounds (rounds per
+/// block are unbounded, contract correction C1): their payloads, attested
+/// and so outside the plain-body budget, grew memory without bound.
+///
+/// B283: the GC window and the lead, so the newest vertex a waiting member
+/// sends again stays within the lead of a member coming back. That floor is
+/// the g before the block's anchor, the anchor before it less `GC_DEPTH`;
+/// a member that adopted the blocks before has its cursor one past that
+/// anchor, so its lead reaches floor + `GC_DEPTH` + 1 + `LEAD`. With
+/// `RETAIN_SLACK` added the newest vertex, payload and all, was past that
+/// lead and dropped before Layer S: the member never learned the gap, never
+/// rebuilt the block, and with f members withholding votes no QC formed.
+pub const MAX_KEPT_ROUNDS: u64 = crate::ordering::GC_DEPTH + ingress_v4::LEAD;
 
 /// B262: how often a member waiting on finality sends its newest vertex
 /// again (ticks): nothing new is pushed while proposals wait, so a member
@@ -544,6 +550,7 @@ impl Engine {
             .is_none_or(|h| h == "0");
         let no_rows = [
             "consensus:vproposed:",
+            "consensus:vproposed_high:",
             "consensus:vattest:",
             "consensus:vslot:",
         ]
@@ -752,6 +759,38 @@ impl Engine {
 
     fn proposed_key(&self, round: u64) -> String {
         format!("{}{round:020}", self.proposed_prefix())
+    }
+
+    /// B282: the highest round this node proposed in its epoch, kept for the
+    /// whole epoch (GC-3 deletes the per-round guards at or below its cut).
+    fn proposed_high_key(&self) -> String {
+        format!(
+            "consensus:vproposed_high:v1:{}:{}:{}",
+            vcert::chain_genesis_tag(&self.cfg.chain_id, &self.cfg.genesis_identity),
+            self.ed25519_pk,
+            self.epoch
+        )
+    }
+
+    /// B282: whether this node may sign a body for its slot at `round`: above
+    /// g (a body at or below it is stale everywhere), above every round it
+    /// proposed in this epoch, and not proposed. GC-3 deletes the per-round
+    /// guards at or below its cut and forgets the certificates there, and
+    /// `current_round` falls back to the epoch's first round while no quorum
+    /// round is held: a member coming back past the GC window signed a
+    /// second body for its first slot, a twin any member holding the first
+    /// could carry as evidence (slashed in full, jailed). A read error
+    /// refuses.
+    fn may_propose(&self, round: u64) -> bool {
+        let high = match self.storage.get(&self.proposed_high_key()) {
+            Ok(None) => 0,
+            Ok(Some(h)) => h.parse::<u64>().unwrap_or(u64::MAX),
+            Err(_) => u64::MAX,
+        };
+        round > self.gc_floor()
+            && round > high
+            && !self.own.contains_key(&round)
+            && matches!(self.storage.get(&self.proposed_key(round)), Ok(None))
     }
 
     fn read_own_attestation(&self, body: &AttestBody) -> Result<Option<VertexAttestation>, String> {
@@ -1702,12 +1741,8 @@ impl Engine {
         }
         let owed = self.anchor_owed();
         let round = owed.unwrap_or_else(|| self.current_round());
-        if self.own.contains_key(&round) {
+        if !self.may_propose(round) {
             return None;
-        }
-        match self.storage.get(&self.proposed_key(round)) {
-            Ok(None) => {}
-            _ => return None,
         }
         let prev = round - 1;
         if round > self.first_round && prev >= 2 && prev.is_multiple_of(2) {
@@ -1840,6 +1875,10 @@ impl Engine {
     /// Returns false when nothing was proposed, so the caller keeps its
     /// payload.
     pub fn propose(&mut self, round: u64, payload: Vec<String>, net: &dyn ConsensusNet) -> bool {
+        // B282: never at or below g, whatever the caller asked.
+        if round <= self.gc_floor() {
+            return false;
+        }
         let (parents, parent_refs) = self.parents_for(round);
         let mut v = Vertex {
             epoch: self.epoch,
@@ -1864,6 +1903,7 @@ impl Engine {
         }
         let body = self.attest_body(round, &self.cfg.address, &v.hash);
         let guard = self.proposed_key(round);
+        let high = self.proposed_high_key();
         let (committee, key, address, budget) = (
             &self.cfg.committee,
             &self.cfg.node_key,
@@ -1874,12 +1914,22 @@ impl Engine {
             if view.get(&guard).map_err(storage_err)?.is_some() {
                 return Err(storage_err("this round was already proposed"));
             }
+            // B282: and never at or below a round proposed before in this
+            // epoch (its guard may be gone), in the guard's transaction.
+            let proposed_above = view
+                .get(&high)
+                .map_err(storage_err)?
+                .is_some_and(|h| h.parse::<u64>().map_or(true, |h| round <= h));
+            if proposed_above {
+                return Err(storage_err("a round at or above it was proposed"));
+            }
             let staged = staging::stage_in(&view, &v, Role::SelfAttested, None, budget)
                 .map_err(storage_err)?;
             if matches!(staged, StageOutcome::EvidenceOnly(_)) {
                 return Err(storage_err("the node's own body was not staged"));
             }
             view.put(&guard, &v.hash).map_err(storage_err)?;
+            view.put(&high, &round.to_string()).map_err(storage_err)?;
             match vcert::attest_slot_in(&view, &body, committee, key, address)
                 .map_err(storage_err)?
             {

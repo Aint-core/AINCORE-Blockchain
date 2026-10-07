@@ -25,7 +25,7 @@ services:
       - "8012:8002"   # REST API / RPC
     volumes:
       - ./nas_data_parallel:/root/.aincore/data
-      - ./genesis.json:/root/.aincore/genesis.json:ro
+      - ${AINCORE_GENESIS_FILE:?set AINCORE_GENESIS_FILE to the genesis.json of the chain this node joins}:/root/.aincore/genesis.json:ro
     environment:
       - AINCORE_PORT=9002
       - AINCORE_API_PORT=8002

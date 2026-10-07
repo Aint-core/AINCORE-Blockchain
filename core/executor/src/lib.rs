@@ -1288,6 +1288,23 @@ fn receipt_update(
     )
 }
 
+/// B292: the bytes of a stored receipt that `receipts_root` covers: the
+/// receipt without its error text. That text is a VM's message (move-vm's
+/// `Display` or `Debug` of its error) or the executor's, which a move-vm
+/// bump, a toolchain or a reworded reason changes: an upgraded node computed
+/// another root for a certified block, and stopped there, during a rolling
+/// deploy. The status, the gas charged and the metadata stay bound; the
+/// stored receipt keeps the text.
+fn receipt_root_bytes(stored: &[u8]) -> Vec<u8> {
+    match serde_json::from_slice::<serde_json::Value>(stored) {
+        Ok(serde_json::Value::Object(mut receipt)) => {
+            receipt.remove("error");
+            sorted_json(&serde_json::Value::Object(receipt)).into_bytes()
+        }
+        _ => stored.to_vec(),
+    }
+}
+
 /// B277: `value`'s text with every object's keys sorted, whatever
 /// serde_json's map keeps: with its `preserve_order` feature, which any
 /// crate in a build can switch on, the map keeps insertion order. Receipts
@@ -1698,7 +1715,8 @@ pub struct BlockExecutionSummary {
     /// nonce-deferred transaction is a delay, never a permanent loss.
     pub executed_raws: Vec<String>,
     /// B14: the block body. The transactions that executed and paid, in the
-    /// block's order; a raw transaction carried twice counts once at most.
+    /// block's order; a raw transaction carried twice counts once at most, at
+    /// the place of the copy that ran (B284).
     /// The receipts root is over this list, and a block's body must equal
     /// it: what did not execute (over the gas ceiling, a wrong nonce, a payer
     /// who cannot pay) is not stored and paid nothing.
@@ -1756,25 +1774,6 @@ pub fn next_base_fee(base: u128, min: u128, gas_used: u64) -> u128 {
         )
     };
     next.max(min)
-}
-
-/// The transactions of `all` that executed, in `all`'s order: each executed
-/// raw string keeps as many occurrences as it executed, the first ones.
-fn executed_in_order(all: &[String], executed: &[String]) -> Vec<String> {
-    let mut left: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for raw in executed {
-        *left.entry(raw.as_str()).or_default() += 1;
-    }
-    all.iter()
-        .filter(|raw| match left.get_mut(raw.as_str()) {
-            Some(n) if *n > 0 => {
-                *n -= 1;
-                true
-            }
-            _ => false,
-        })
-        .cloned()
-        .collect()
 }
 
 pub struct Executor {
@@ -2191,7 +2190,7 @@ impl Executor {
             let tx_hash = tx_hash_hex(tx_json);
             hasher.update(tx_hash.as_bytes());
             match self.db.staged_get(&format!("tx_receipt:{}", tx_hash)) {
-                Some(Some(receipt)) => hasher.update(&receipt),
+                Some(Some(receipt)) => hasher.update(receipt_root_bytes(&receipt)),
                 _ => hasher.update(b"NO_RECEIPT"),
             }
         }
@@ -3764,19 +3763,20 @@ impl Executor {
 
         // 1. Parse all transactions. The per-block object limit (N-2) is
         // spent at execution, by what can pay (B16, step 3).
+        //
+        // B272/B284: a transaction carried more than once (several vertices
+        // of the anchor's history hold it) runs at most once, at the first
+        // copy that can run, and stands in the body where that copy is. The
+        // body put it at its first copy's place, where a node importing the
+        // body could not run it (B272: another state root); B272 then tried
+        // the first copy only, so a member copying a sender's queued
+        // transactions ahead of the honest copies (where their sequence
+        // numbers could not run yet, at no cost) had the honest copies
+        // dropped, and the sender's chain forgotten after three loans (B284).
+        // Each copy carries its place in the list.
         let mut parsed_txs = Vec::new();
-        // B272: a transaction carried more than once (several vertices of
-        // the anchor's history hold it) is tried at its first copy only. A
-        // later copy ran when the first could not (its sequence number, its
-        // payer's balance), and the body put it at the first copy's place
-        // (`executed_in_order`), so the body, re-executed in its own order,
-        // reached another state: no node could import the block.
-        let mut carried: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
-        for raw in &txs_json {
-            if !carried.insert(raw.as_str()) {
-                continue;
-            }
+        for (place, raw) in txs_json.iter().enumerate() {
             match serde_json::from_str::<Transaction>(raw) {
                 Ok(tx) => {
                     // Per-TX limit (existing)
@@ -3793,7 +3793,7 @@ impl Executor {
                     if (tx.input_objects.len() as u64).saturating_mul(OBJECT_LOAD_GAS) > execution {
                         continue;
                     }
-                    parsed_txs.push((tx, raw.clone()));
+                    parsed_txs.push((tx, (raw.clone(), place)));
                 }
                 Err(_e) => {}
             }
@@ -3843,6 +3843,9 @@ impl Executor {
         let mut total_fees: u128 = 0;
 
         let mut executed_raws: Vec<String> = Vec::new();
+        // B284: what ran, at the place of the copy that ran.
+        let mut executed_at: Vec<(usize, String)> = Vec::new();
+        let mut ran: std::collections::HashSet<String> = std::collections::HashSet::new();
         // B15: the gas this block charged (whole limits, bytes included).
         let mut gas_used: u64 = 0;
         // (write log already armed at step 0, before apply_slash_evidence)
@@ -3880,7 +3883,9 @@ impl Executor {
             let (mut reserved_gas, mut reserved_objects) = (0u64, 0usize);
             let mut runnable = Vec::with_capacity(batch.len());
             for item in batch.iter() {
-                if !self.can_pay(&item.0, &item.1) {
+                // B284: a copy of a transaction that ran is not tried (its
+                // copies share a sender, so no two are in one batch).
+                if ran.contains(&item.1 .0) || !self.can_pay(&item.0, &item.1 .0) {
                     continue;
                 }
                 let gas = gas_used
@@ -3899,16 +3904,16 @@ impl Executor {
             #[allow(clippy::type_complexity)] // intrinsic to parallel TX result shape
             let mut results: Vec<(
                 String,
-                String,
+                (String, usize),
                 u64,
                 usize,
                 Option<(Vec<(String, Option<String>)>, u128)>,
             )> = runnable
                 .par_iter()
-                .map(|(tx, raw)| {
+                .map(|(tx, (raw, place))| {
                     (
                         tx_hash_hex(raw),
-                        raw.clone(),
+                        (raw.clone(), *place),
                         tx.gas_limit,
                         tx.input_objects.len(),
                         self.execute_transaction(raw),
@@ -3931,10 +3936,12 @@ impl Executor {
             let mut writer_of_key: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
 
-            for (tx_hash, raw_tx, gas_limit, objects, res) in results {
+            for (tx_hash, (raw_tx, place), gas_limit, objects, res) in results {
                 if let Some((mut updates, gas_charged)) = res {
                     state_bytes_added = state_bytes_added
                         .saturating_add(state_gas::write_cost(&self.db, &updates).new_bytes);
+                    ran.insert(raw_tx.clone());
+                    executed_at.push((place, raw_tx.clone()));
                     executed_raws.push(raw_tx);
                     gas_used = gas_used.saturating_add(gas_limit);
                     objects_used += objects;
@@ -4174,7 +4181,8 @@ impl Executor {
             hook(3, &self.db);
         }
 
-        let body = executed_in_order(&txs_json, &executed_raws);
+        executed_at.sort_by_key(|(place, _)| *place);
+        let body: Vec<String> = executed_at.into_iter().map(|(_, raw)| raw).collect();
         let summary = BlockExecutionSummary {
             state_root,
             receipts_root: self.receipts_root_for_block(&body),
@@ -5252,12 +5260,9 @@ impl Executor {
         account_writes_at(&self.db, tx, payer, true)
     }
 
-    fn schedule_batches(
-        &self,
-        parsed_txs: Vec<(Transaction, String)>,
-    ) -> Vec<Vec<(Transaction, String)>> {
-        let mut batches: Vec<Vec<(Transaction, String)>> = Vec::new();
-        let mut current_batch: Vec<(Transaction, String)> = Vec::new();
+    fn schedule_batches<T>(&self, parsed_txs: Vec<(Transaction, T)>) -> Vec<Vec<(Transaction, T)>> {
+        let mut batches: Vec<Vec<(Transaction, T)>> = Vec::new();
+        let mut current_batch: Vec<(Transaction, T)> = Vec::new();
         let mut locked_objects: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
@@ -6029,6 +6034,44 @@ mod tests {
         assert_eq!(
             sorted_json(&serde_json::Value::Object(outer)),
             r#"{"error":null,"metadata":{"alpha":[{"b":2,"y":1}],"zeta":1},"status":"success"}"#
+        );
+    }
+
+    /// B292 witness: `receipts_root` covers a receipt's status, gas and
+    /// metadata, not its error text (a move-vm or toolchain change rewords
+    /// it, and an upgraded node refused every certified block holding an
+    /// aborted transaction).
+    #[test]
+    fn a_receipts_error_text_is_outside_the_root() {
+        let receipt = |error: &str, gas: &str| {
+            sorted_json(&serde_json::json!({
+                "status": "aborted",
+                "gas_charged": gas,
+                "error": error,
+                "metadata": {"function": "transfer"},
+            }))
+        };
+        let root = |text: String| receipt_root_bytes(text.as_bytes());
+        assert_eq!(
+            root(receipt(
+                "VMError { major_status: ABORTED, sub_status: Some(1) }",
+                "5"
+            )),
+            root(receipt("Move abort in 0x1::coin: 1", "5"))
+        );
+        assert_ne!(
+            root(receipt("x", "5")),
+            root(receipt("x", "6")),
+            "gas unbound"
+        );
+        assert_eq!(
+            root(receipt("x", "5")),
+            sorted_json(&serde_json::json!({
+                "status": "aborted",
+                "gas_charged": "5",
+                "metadata": {"function": "transfer"},
+            }))
+            .into_bytes()
         );
     }
 
@@ -12805,13 +12848,16 @@ mod tests {
         assert_eq!(body.receipts_root, full.receipts_root);
     }
 
-    /// B272 witness: a transaction carried twice runs at its first copy
-    /// only, so the body is what ran, in the order it ran. X (sequence 1)
-    /// comes before Y (sequence 0) and again after it: the second copy ran
-    /// and the body put it first, where a node importing the body could not
-    /// run it, reaching another state root.
+    /// B272/B284 witness: a transaction carried twice runs once, at the
+    /// first copy that can run, and the body is what ran, in the order it
+    /// ran. X (sequence 1) comes before Y (sequence 0) and again after it,
+    /// and Y once more after that. B272: the second copy of X ran and the
+    /// body put it first, where a node importing the body could not run it
+    /// (another state root). B284: B272's fix tried the first copy only, so
+    /// copies placed ahead of a sender's queue, where they could not run
+    /// yet, had the honest copies dropped (the body was [Y]).
     #[test]
-    fn a_transaction_carried_twice_runs_at_its_first_copy_only() {
+    fn a_transaction_carried_twice_runs_once_where_it_can() {
         let setup = |name: &str| {
             let db = temp_db(name);
             load_stdlib(&db);
@@ -12854,8 +12900,8 @@ mod tests {
             };
             summary
         };
-        let full = run(&producer, vec![x.clone(), y.clone(), x]);
-        assert_eq!(full.body, vec![y], "only the first copy of X is tried");
+        let full = run(&producer, vec![x.clone(), y.clone(), x.clone(), y.clone()]);
+        assert_eq!(full.body, vec![y, x], "X runs at its second copy, Y once");
         let body = run(&follower, full.body.clone());
         assert_eq!(body.body, full.body);
         assert_eq!(body.state_root, full.state_root);

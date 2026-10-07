@@ -33,8 +33,11 @@ COPY --from=builder /usr/src/aincore/target/release/indexer /usr/local/bin/index
 RUN mkdir -p /root/.aincore/vm_move/stdlib/bytecode
 COPY --from=builder /usr/src/aincore/core/vm_move/stdlib/bytecode /root/.aincore/vm_move/stdlib/bytecode
 
-# Copy the Genesis configuration
-COPY --from=builder /usr/src/aincore/genesis.json /root/.aincore/genesis.json
+# No genesis is baked in: the repository's genesis.json predates the current
+# format and is refused (no stdlib_hash, a treasury reserve, no pinned
+# intervals). Mount the genesis.json of the chain the node joins (the compose
+# files take it from AINCORE_GENESIS_FILE); without one the node stops with
+# "genesis.json not found".
 
 # Expose libp2p (base port 9002 + 100), API, and Indexer ports
 EXPOSE 9102 8002 3001

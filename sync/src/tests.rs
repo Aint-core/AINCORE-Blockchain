@@ -415,6 +415,7 @@ mod tests {
             ended_well,
             asked: true,
             refused: false,
+            mid_fetch: false,
         };
         assert!(turn(1, 100, true, true).struck(), "a slow answer");
         assert!(
@@ -438,22 +439,27 @@ mod tests {
         assert!(lied.struck(), "a lie was not struck");
     }
 
-    /// B274 witness: block turns go to members first whatever their
-    /// strikes, then to the fewest strikes, then to the most blocks brought,
-    /// then to the session that waited longest for a turn; a session's
-    /// claimed height orders nothing (it ordered sessions that brought
-    /// nothing, so three that claimed the most took every turn for good).
+    /// B274/B286/B287 witness: block turns go to members first whatever
+    /// their strikes, then (within its class) to the largest parted fetch's
+    /// session, then to the fewest strikes, then to the most blocks brought,
+    /// then to the session that has waited longest: since its last turn, or
+    /// since this node first saw it. A session's claimed height orders
+    /// nothing (B274: it ordered sessions that brought nothing). B286: a
+    /// session never given a turn went first, so three fresh identities a
+    /// pass took every turn from honest non-members. B287: a fetch's session
+    /// went before the members.
     #[test]
     fn turns_are_ordered_by_standing_not_by_claims() {
         use crate::{turn_order, Standing};
-        let then = std::time::Instant::now();
-        let later = then + std::time::Duration::from_secs(1);
-        let s = |member, strikes, brought, turned| Standing {
+        let now = std::time::Instant::now();
+        let ago = |secs: u64| now - std::time::Duration::from_secs(secs);
+        let s = |member, strikes, brought, waited: u64| Standing {
             resuming: false,
             member,
             strikes,
             brought,
-            turned,
+            waited_since: ago(waited),
+            salted: 0,
         };
         let order = |mut sessions: Vec<(String, Standing)>| {
             sessions.sort_by(turn_order);
@@ -463,50 +469,131 @@ mod tests {
         // A member, though struck, before any non-member.
         assert_eq!(
             order(vec![
-                named("a", s(false, 0, 9, None)),
-                named("m", s(true, 3, 0, Some(later)))
+                named("a", s(false, 0, 9, 500)),
+                named("m", s(true, 3, 0, 0))
             ]),
             ["m", "a"]
         );
         // Fewer strikes first, then more blocks brought.
         assert_eq!(
             order(vec![
-                named("a", s(true, 1, 9, None)),
-                named("b", s(true, 0, 1, None)),
-                named("c", s(true, 0, 5, Some(later))),
+                named("a", s(true, 1, 9, 500)),
+                named("b", s(true, 0, 1, 500)),
+                named("c", s(true, 0, 5, 0)),
             ]),
             ["c", "b", "a"]
         );
-        // B275: the session whose parted block this node is fetching, first.
-        let resuming = Standing {
+        // B275/B287: the session whose parted block this node is fetching
+        // goes first within its class only.
+        let resuming = |member| Standing {
             resuming: true,
-            ..s(false, 2, 0, Some(later))
+            ..s(member, 2, 0, 0)
         };
         assert_eq!(
-            order(vec![named("m", s(true, 0, 9, None)), named("p", resuming)]),
+            order(vec![
+                named("m", s(true, 0, 9, 500)),
+                named("p", resuming(true))
+            ]),
             ["p", "m"]
         );
-        // Among equals, the one that waited longest (never asked first).
         assert_eq!(
             order(vec![
-                named("a", s(true, 0, 0, Some(later))),
-                named("b", s(true, 0, 0, Some(then))),
-                named("c", s(true, 0, 0, None)),
+                named("p", resuming(false)),
+                named("m", s(true, 3, 0, 0))
             ]),
-            ["c", "b", "a"]
+            ["m", "p"]
+        );
+        // B286: among equals, the one that has waited longest: a session
+        // never given a turn waits from when it was first seen, so one
+        // fresh this pass goes after one that had its turn a while ago.
+        assert_eq!(
+            order(vec![
+                named("fresh", s(false, 0, 0, 0)),
+                named("turned", s(false, 0, 0, 60)),
+                named("old", s(false, 0, 0, 300)),
+            ]),
+            ["old", "turned", "fresh"]
+        );
+        // B286: ties go by the salted PeerId, not the PeerId.
+        let salted = |salt| Standing {
+            salted: salt,
+            ..s(false, 0, 0, 10)
+        };
+        assert_eq!(
+            order(vec![named("a", salted(2)), named("z", salted(1))]),
+            ["z", "a"]
         );
     }
 
-    /// B274 witness: a QC-less block ends a turn well only within what an
-    /// honest server holds without QCs (`MAX_UNFINALIZED_BLOCKS` blocks
-    /// below the height it claims): one claiming far more is struck.
+    /// B274/B289 witness: a QC-less block ends a turn well only within what
+    /// an honest server holds without QCs: members stop proposing at
+    /// `MAX_UNFINALIZED_BLOCKS` blocks above their lowest without one, and
+    /// supported anchors still commit, so twice that. One claiming far more
+    /// is struck. B289: under `MAX_UNFINALIZED_BLOCKS` every honest member
+    /// was struck on every pass of a stall.
     #[test]
     fn a_qcless_block_is_a_tip_only_near_the_claimed_height() {
-        let bound = consensus::v4::MAX_UNFINALIZED_BLOCKS;
+        let stop = consensus::v4::MAX_UNFINALIZED_BLOCKS;
         assert!(crate::qcless_tip(100, 100));
-        assert!(crate::qcless_tip(100, 100 + bound - 1));
-        assert!(!crate::qcless_tip(100, 100 + bound));
+        assert!(crate::qcless_tip(100, 100 + stop), "an honest stall");
+        assert!(crate::qcless_tip(100, 100 + 2 * stop));
+        assert!(!crate::qcless_tip(100, 100 + 2 * stop + 1));
         assert!(!crate::qcless_tip(100, u64::MAX));
+    }
+
+    /// B285 witness: the parted fetches of several sessions share one budget,
+    /// and when one would pass it the smallest gives way: another fetch
+    /// smaller than the one growing is dropped, and a fetch smaller than
+    /// every other stops (so the largest, an honest server's at its full
+    /// rate, completes).
+    #[test]
+    fn the_smallest_parted_fetch_gives_way() {
+        let sync = setup_sync("b285_room").with_parted_budget(100);
+        let held = |peer: &str, bytes: usize| crate::PartialBlock {
+            peer: peer.to_string(),
+            height: 1,
+            hash: "ab".repeat(32),
+            len: 1_000,
+            bytes: vec![b'x'; bytes],
+            progressed: std::time::Instant::now(),
+        };
+        {
+            let mut parted = sync.parted.lock().unwrap();
+            parted.insert("a".into(), held("a", 60));
+            parted.insert("b".into(), held("b", 30));
+        }
+        let kept = |sync: &crate::ChainSync| {
+            let mut peers: Vec<String> = sync.parted.lock().unwrap().keys().cloned().collect();
+            peers.sort();
+            peers
+        };
+        // Within the budget: nothing gives way.
+        assert!(sync.make_room("c", 10));
+        assert_eq!(kept(&sync), ["a", "b"]);
+        // c is the smallest: it gives way.
+        assert!(!sync.make_room("c", 20));
+        assert_eq!(kept(&sync), ["a", "b"]);
+        // c outgrows b: b gives way.
+        assert!(sync.make_room("c", 40));
+        assert_eq!(kept(&sync), ["a"]);
+    }
+
+    /// B291 witness: a server reads a block from storage for its parts at
+    /// most once a second, and a large one only after its bytes at
+    /// `PARTED_READ_BYTES_PER_SEC` (one read a second of up to 512 MiB each
+    /// was a disk's whole rate).
+    #[test]
+    fn a_large_read_for_parts_waits_for_its_bytes() {
+        let second = std::time::Duration::from_secs(1);
+        assert_eq!(crate::parted_read_wait(1_000), second);
+        assert_eq!(
+            crate::parted_read_wait(crate::PARTED_READ_BYTES_PER_SEC),
+            second
+        );
+        assert_eq!(
+            crate::parted_read_wait(crate::MAX_PARTED_BLOCK_BYTES),
+            second * (crate::MAX_PARTED_BLOCK_BYTES / crate::PARTED_READ_BYTES_PER_SEC) as u32
+        );
     }
 
     /// B264 witness: a block over the whole batch budget is named, not sent

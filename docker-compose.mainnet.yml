@@ -13,7 +13,7 @@ services:
       - "8002:8002" # API
     volumes:
       - ./aincore_data:/root/.aincore/data
-      - ./genesis.json:/root/.aincore/genesis.json
+      - ${AINCORE_GENESIS_FILE:?set AINCORE_GENESIS_FILE to the genesis.json of the chain this node joins}:/root/.aincore/genesis.json:ro
     environment:
       - AINCORE_PORT=9002
       - AINCORE_API_PORT=8002
@@ -31,7 +31,8 @@ services:
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
-      - "19090:9090"
+      # Unauthenticated: this host only.
+      - "127.0.0.1:19090:9090"
     networks:
       - aincore-net
 

@@ -180,7 +180,13 @@ enum Commands {
     /// Transfer funds (Real Transaction)
     Transfer {
         to: String,
-        amount: u64,
+        /// Amount in AIN, up to 18 decimals (B296: it was taken as quanta,
+        /// so `transfer <addr> 1010` sent 1,010 quanta, and no more than
+        /// about 18.4 AIN could be sent).
+        amount: String,
+        /// The amount is in quanta (10^-18 AIN), a whole number.
+        #[arg(long)]
+        quanta: bool,
         /// Execution gas; the node's estimate when not given (B65).
         #[arg(long)]
         gas_limit: Option<u64>,
@@ -382,9 +388,23 @@ fn main() -> anyhow::Result<()> {
         Commands::Transfer {
             to,
             amount,
+            quanta,
             gas_limit,
         } => {
             let to = require_address_hex(&to)?;
+            let amount_quanta = if quanta {
+                amount
+                    .trim()
+                    .parse::<u128>()
+                    .map_err(|e| anyhow::anyhow!("an amount in quanta: {e}"))?
+            } else {
+                parse_ain(&amount)?
+            };
+            let amount = if quanta {
+                format!("{amount} quanta")
+            } else {
+                format!("{amount} AIN")
+            };
             let wallet = load_wallet(&cli.pqc_seed, &cli.keyfile)?;
             let sender = wallet.address();
 
@@ -418,7 +438,7 @@ fn main() -> anyhow::Result<()> {
                 args: vec![
                     bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap(),
                     bcs::to_bytes(&parse_move_address(&to).unwrap()).unwrap(),
-                    bcs::to_bytes(&(amount as u128)).unwrap(),
+                    bcs::to_bytes(&amount_quanta).unwrap(),
                 ],
             };
             let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
@@ -622,6 +642,49 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// One AIN in quanta (the coin's 18 decimals).
+const QUANTA_PER_AIN: u128 = 1_000_000_000_000_000_000;
+
+/// B296: an amount in AIN with up to 18 decimals ("1010", "0.25"), in quanta.
+fn parse_ain(text: &str) -> anyhow::Result<u128> {
+    let text = text.trim();
+    let (whole, frac) = text.split_once('.').unwrap_or((text, ""));
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if (whole.is_empty() && frac.is_empty()) || !digits(whole) || !digits(frac) || frac.len() > 18 {
+        anyhow::bail!("{text:?} is not an amount of AIN (up to 18 decimals)");
+    }
+    let whole: u128 = if whole.is_empty() { 0 } else { whole.parse()? };
+    let frac: u128 = if frac.is_empty() {
+        0
+    } else {
+        format!("{frac:0<18}").parse()?
+    };
+    whole
+        .checked_mul(QUANTA_PER_AIN)
+        .and_then(|w| w.checked_add(frac))
+        .ok_or_else(|| anyhow::anyhow!("{text} AIN is past what a u128 of quanta holds"))
+}
+
+#[cfg(test)]
+mod amount_tests {
+    /// B296 witness: a transfer's amount is in AIN, as the faucet's and the
+    /// funding script's are (it was taken as quanta).
+    #[test]
+    fn a_transfer_amount_is_in_ain() {
+        let ain = super::QUANTA_PER_AIN;
+        assert_eq!(super::parse_ain("1010").unwrap(), 1010 * ain);
+        assert_eq!(super::parse_ain("0.5").unwrap(), ain / 2);
+        assert_eq!(super::parse_ain("1.000000000000000001").unwrap(), ain + 1);
+        assert!(
+            super::parse_ain("1.0000000000000000001").is_err(),
+            "19 decimals"
+        );
+        assert!(super::parse_ain("").is_err());
+        assert!(super::parse_ain("-1").is_err());
+        assert!(super::parse_ain("1e3").is_err());
+    }
 }
 
 #[cfg(test)]

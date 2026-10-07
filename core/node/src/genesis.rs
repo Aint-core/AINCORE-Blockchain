@@ -29,9 +29,15 @@ pub const GENESIS_TIME_KEY: &str = "sys:genesis_time";
 /// it, and the AINCORE_EPOCH_BLOCK_INTERVAL env is never read. Folded into the
 /// genesis identity hash so it is forge-proof.
 const GENESIS_EPOCH_BLOCK_INTERVAL_KEY: &str = "sys:config:epoch_block_interval";
-/// Canonical default for the epoch-block interval when genesis.json does not
-/// specify one. MUST match `Executor::DEFAULT_EPOCH_BLOCK_INTERVAL`.
-const DEFAULT_EPOCH_BLOCK_INTERVAL: u64 = 20;
+/// The epoch-block interval of `ChainParams::DEFAULT` (genesis.json must pin
+/// its own: G5 review). B290: at least `MIN_EPOCH_BLOCKS`; the executor's
+/// default (20) serves only databases that never ran genesis (its unit
+/// tests).
+const DEFAULT_EPOCH_BLOCK_INTERVAL: u64 = MIN_EPOCH_BLOCKS;
+/// B290: the shortest epoch genesis accepts: twice the blocks a member holds
+/// without a QC before it proposes nothing more, so an epoch's rows outlive
+/// any of its blocks still waiting on its QC.
+pub const MIN_EPOCH_BLOCKS: u64 = 2 * consensus::v4::MAX_UNFINALIZED_BLOCKS;
 /// FX-7: the value `StateDB::get_burn_percentage` fell back to.
 const DEFAULT_BURN_PERCENTAGE: u8 = 10;
 /// FX-7: the value `ChainSync::tip_agreement_n` fell back to.
@@ -1212,6 +1218,18 @@ pub fn build_genesis(
                 "genesis.json epoch_block_interval must be greater than 0".to_string(),
             ));
         }
+        // B290: GC-3 by epoch deletes epoch E's rows at E+2's activation,
+        // whatever the finality floor, and members stop proposing only
+        // `MAX_UNFINALIZED_BLOCKS` blocks above their lowest without a QC.
+        // A shorter epoch let E+2 activate first: a block of E without its QC
+        // lost the rounds a member needs to rebuild it and vote, and with f
+        // members withholding votes no QC formed again (B255's halt).
+        if genesis_epoch_block_interval < MIN_EPOCH_BLOCKS {
+            return Err(GenesisError::InvalidData(format!(
+                "genesis.json epoch_block_interval {genesis_epoch_block_interval} is under \
+                 {MIN_EPOCH_BLOCKS}, twice the blocks members hold without a QC"
+            )));
+        }
         // G5 P-1: one epoch everywhere (the Move parameter is the pinned
         // interval).
         chain_params = ChainParams {
@@ -2226,7 +2244,7 @@ mod tests {
             _ => String::new(),
         };
         let json = format!(
-            "{{\"chain_id\":\"AINCORE-MAINNET-1\",\"validators\":[{{\"address\":\"{}\",\"public_key\":\"{}\",\"stake\":\"1000000000000000000000\"{}}}],\"treasury_reserve\":\"0\",\"epoch_duration\":10,\"epoch_block_interval\":20,\"reward_period_blocks\":20,\"max_block_interval_secs\":14,\"stdlib_hash\":\"{}\"}}",
+            "{{\"chain_id\":\"AINCORE-MAINNET-1\",\"validators\":[{{\"address\":\"{}\",\"public_key\":\"{}\",\"stake\":\"1000000000000000000000\"{}}}],\"treasury_reserve\":\"0\",\"epoch_duration\":10,\"epoch_block_interval\":100,\"reward_period_blocks\":20,\"max_block_interval_secs\":14,\"stdlib_hash\":\"{}\"}}",
             addr, pubkey, bls_fields, test_stdlib_hash()
         );
         fs::write(&path, json).expect("write genesis.json");
@@ -3631,7 +3649,8 @@ mod tests {
     }
 
     /// SEC-#13: genesis writes the canonical epoch-block interval to
-    /// sys:config:epoch_block_interval (default 20 when genesis.json omits it).
+    /// sys:config:epoch_block_interval (the test genesis.json pins the
+    /// default).
     #[test]
     fn test_genesis_writes_epoch_block_interval_pin() {
         let _guard = GENESIS_ENV_LOCK.lock().unwrap();
@@ -3767,6 +3786,23 @@ mod tests {
         load_genesis_file(&path).unwrap()
     }
 
+    /// B290 witness: genesis refuses an epoch under `MIN_EPOCH_BLOCKS`,
+    /// twice the blocks a member holds without a QC before it proposes
+    /// nothing more: with a shorter epoch, GC-3 by epoch deleted the rows a
+    /// block still waiting on its QC needs before members stopped (B255's
+    /// halt, by epoch).
+    #[test]
+    fn an_epoch_under_twice_the_unfinalized_blocks_is_refused() {
+        let base = s3_genesis_file();
+        let mut short = base.clone();
+        short.epoch_block_interval = Some(MIN_EPOCH_BLOCKS - 20);
+        let err = build_genesis(&short, &stdlib()).expect_err("a short epoch");
+        assert!(err.to_string().contains("twice the blocks"), "{err}");
+        let mut least = base;
+        least.epoch_block_interval = Some(MIN_EPOCH_BLOCKS);
+        build_genesis(&least, &stdlib()).expect("the shortest epoch genesis takes");
+    }
+
     fn write_file(name: &str, file: &GenesisFile) -> PathBuf {
         let path = temp_dir(&format!("s3_{name}")).join("genesis.json");
         fs::write(&path, serde_json::to_string(file).unwrap()).unwrap();
@@ -3799,7 +3835,7 @@ mod tests {
         // One valid change per field; each is stored and moves the identity.
         type Edit = fn(&mut GenesisFile);
         let edits: [(&str, Edit); 3] = [
-            ("epoch_blocks", |f| f.epoch_block_interval = Some(40)),
+            ("epoch_blocks", |f| f.epoch_block_interval = Some(120)),
             ("reward_period", |f| f.reward_period_blocks = Some(10)),
             ("max_block_interval_secs", |f| {
                 f.max_block_interval_secs = Some(15)
@@ -3839,17 +3875,17 @@ mod tests {
         );
 
         // P-1's constraints hold at genesis, not only in Move. (I + R) x
-        // C_tau + W + D may not exceed U (G5 SL-5): (20 + 20) x 28,080 s =
-        // U - W - D exactly is allowed.
+        // C_tau + W + D may not exceed U (G5 SL-5): (100 + 20) x 9,360 s =
+        // U - W - D exactly is allowed (B290: the test epoch is 100 blocks).
         let mut edge = base.clone();
-        edge.max_block_interval_secs = Some(28_080);
+        edge.max_block_interval_secs = Some(9_360);
         build_genesis(&edge, &stdlib()).expect("(I + R) x C_tau = U - W - D is allowed");
         let refused: [(&str, Edit); 4] = [
             ("R does not divide I", |f| f.reward_period_blocks = Some(7)),
             ("a zero reward period", |f| f.reward_period_blocks = Some(0)),
             ("a zero clock cap", |f| f.max_block_interval_secs = Some(0)),
             ("a slash that could settle after its stake unlocks", |f| {
-                f.max_block_interval_secs = Some(28_081)
+                f.max_block_interval_secs = Some(9_361)
             }),
         ];
         for (name, edit) in refused {

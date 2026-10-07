@@ -19,10 +19,15 @@ cd aincore
 ```
 
 ### 2. Run the Node
-Run the following command to build and start the node:
+The image carries no genesis: give it the `genesis.json` of the chain the
+node joins (the one its operators publish; the repository's own predates the
+current format and is refused). Then build and start the node:
 ```bash
+export AINCORE_GENESIS_FILE=/path/to/genesis.json
 docker compose -f docker-compose.mainnet.yml up --build -d
 ```
+Keep secrets (`node.key`, `.env`) out of the build context: `.dockerignore`
+excludes them, the data directories and databases.
 
 ### 3. Verify
 Check if it's running:

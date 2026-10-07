@@ -678,6 +678,47 @@ fn the_cheap_filters_run_before_layer_s() {
     assert_eq!(failed, 1, "a body of the wrong form was not charged");
 }
 
+/// B283 witness: a member waiting on finality proposes up to the floor kept
+/// for its lowest block without a QC plus `MAX_KEPT_ROUNDS`, and sends that
+/// newest vertex, payload and all, again while it waits. A member coming
+/// back adopted the blocks before that block, so its cursor is one past
+/// their anchor (the floor plus `GC_DEPTH`) and its g the floor: the vertex
+/// is within its lead, and shows it the gap. At `GC_DEPTH + RETAIN_SLACK +
+/// LEAD` it was past the lead and dropped before Layer S: the member never
+/// learned the gap, never rebuilt the block, and with f members withholding
+/// votes no QC formed again.
+#[test]
+fn a_waiting_members_newest_vertex_is_within_a_returning_members_lead() {
+    let all = members();
+    let c = committee(&all);
+    let sentinel = sentinel(EPOCH);
+    let floor = FIRST + 10;
+    let newest = floor + crate::v4::MAX_KEPT_ROUNDS;
+    let v = vertex(&all[0], EPOCH, newest, vec!["ab".repeat(32)], vec![]);
+    assert!(!v.payload.is_empty(), "vacuous: no payload");
+    let ctx = Context {
+        chain_id: CHAIN,
+        genesis_identity: GENESIS,
+        active: EpochRecord {
+            epoch: EPOCH,
+            first_round: FIRST,
+            closing_round: None,
+            sentinel: &sentinel,
+            committee: &c,
+        },
+        gap_wanted_to: 0,
+        next: None,
+        now_secs: NOW,
+        gc_floor: floor,
+        cursor: floor + crate::ordering::GC_DEPTH + 1,
+    };
+    let verdict = v4_verdict(1_000, &v, &ctx, |_| None);
+    assert!(
+        !matches!(&verdict, Verdict::Drop(why) if why.contains("lead")),
+        "{verdict:?}"
+    );
+}
+
 /// B171 witness: a closed epoch's copy runs no check, forged or not; a
 /// next-epoch copy that shows no more gap than is wanted is not
 /// authenticated; the next-epoch check charges a failed hash and an active

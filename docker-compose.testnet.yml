@@ -10,15 +10,16 @@ services:
     restart: always
     ports:
       - "9100:9100" # libp2p: consensus + sync sessions (base port + 100)
-      - "8545:8000" # API/RPC
+      - "8545:8002" # API/RPC (and /metrics)
     volumes:
       - ./testnet_data:/root/.aincore/data
+      - ${AINCORE_GENESIS_FILE:?set AINCORE_GENESIS_FILE to the genesis.json of the chain this node joins}:/root/.aincore/genesis.json:ro
     environment:
       - AINCORE_PORT=9000
-      - AINCORE_API_PORT=8000
+      - AINCORE_API_PORT=8002
       # The chain id comes from genesis.json (sys:chain_id), G3 FX-6.
       - RUST_LOG=info
-    command: [ "node", "--port", "9000", "--rpc-port", "8000", "--datadir", "/root/.aincore/data", "--enable-mdns" ]
+    command: [ "node", "--port", "9000", "--rpc-port", "8002", "--datadir", "/root/.aincore/data" ]
     networks:
       - aincore-testnet
 
@@ -29,14 +30,16 @@ services:
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
-      - "19090:9090"
+      # Unauthenticated: this host only.
+      - "127.0.0.1:19090:9090"
     networks:
       - aincore-testnet
 
-    networks:
-      - aincore-testnet
-
-  # Playit.gg P2P Tunnel Agent
+  # Playit.gg tunnel agent. For the RPC only: a TCP tunnel delivers every
+  # peer from one address, and the node's P2P admission is per address (its
+  # handshake, identity and sync budgets), so one stranger through the tunnel
+  # could hold what every other tunnelled peer needs. Publish the P2P port
+  # directly.
   playit:
     image: ghcr.io/playit-cloud/playit-agent:0.17
     container_name: aincore-playit-agent

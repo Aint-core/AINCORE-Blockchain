@@ -7,11 +7,19 @@
 target
 **/target
 
-# Runtime data must never be baked into the image.
+# Runtime data and secrets must never be baked into the image, nor sent as
+# build context (`COPY . .`): data directories, keys, the .env that holds the
+# tunnel key, databases and logs, at any depth.
 nas_data*
-*.db
-*.sqlite
-*.log
+**/*_data
+**/*_data_*
+**/data
+.env
+.env.*
+**/*.key
+**/*.db
+**/*.sqlite
+**/*.log
 
 # Frontend/package-manager caches are not needed for the Rust node image.
 node_modules

@@ -12,11 +12,30 @@ pub struct NodeConfig {
     pub enable_nat: bool,
 }
 
+/// The P2P port a node runs on when none is named.
+pub const DEFAULT_PORT: u16 = 9001;
+/// The RPC port of a node on `DEFAULT_PORT`.
+pub const DEFAULT_API_PORT: u16 = 8002;
+
+/// B296: a node's RPC port when only its P2P port is named, the one rule
+/// the node and every tool read: the default port's RPC is
+/// `DEFAULT_API_PORT`, any other port's is the port less 1000 (below 1001:
+/// `DEFAULT_API_PORT`). A node named on the default port explicitly ran its
+/// RPC on 8001, one left to its default on 8002, and the monitor guessed
+/// one of the two.
+pub fn api_port_for(port: u16) -> u16 {
+    if port == DEFAULT_PORT || port <= 1000 {
+        DEFAULT_API_PORT
+    } else {
+        port - 1000
+    }
+}
+
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            port: 9001,
-            api_port: 8002,
+            port: DEFAULT_PORT,
+            api_port: DEFAULT_API_PORT,
             datadir: "data".to_string(),
             initial_peers: Vec::new(),
             bootnodes: Vec::new(),
@@ -98,18 +117,28 @@ impl NodeConfig {
             }
         }
 
-        // Auto-configure API port if not set but Node port is set
-        // Convention: API = Node - 1000 (e.g., 9000 -> 8000)
-        // Original logic: api_port = port - 1000;
+        // Auto-configure API port if not set but Node port is set (B296:
+        // `api_port_for`, the rule every tool reads).
         if port_set && !api_port_set {
-            if config.port > 1000 {
-                config.api_port = config.port - 1000;
-            } else {
-                // Fallback if port is too low
-                config.api_port = 8002;
-            }
+            config.api_port = api_port_for(config.port);
         }
 
         config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// B296 witness: one rule maps a node's P2P port to its RPC port, the
+    /// default port included (named, it gave 8001; left to default, 8002).
+    #[test]
+    fn the_rpc_port_follows_one_rule() {
+        assert_eq!(
+            super::api_port_for(super::DEFAULT_PORT),
+            super::DEFAULT_API_PORT
+        );
+        assert_eq!(super::api_port_for(9002), 8002);
+        assert_eq!(super::api_port_for(9000), 8000);
+        assert_eq!(super::api_port_for(1000), super::DEFAULT_API_PORT);
     }
 }

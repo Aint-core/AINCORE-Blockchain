@@ -2067,6 +2067,83 @@ fn guards_are_deleted_only_where_ingress_refuses_everything() {
     assert_eq!(signed.get(), 0, "a twin above g was signed");
 }
 
+/// B282 witness: a member whose g rises past the GC window while it holds no
+/// quorum round above the cut (it was away; block sync raised g) signs no
+/// second body for a slot it signed. GC-3 deleted its producer guards and
+/// forgot its certificates, `current_round` fell back to the epoch's first
+/// round, and it proposed there again with a later timestamp: a twin of its
+/// own first vertex, which any member holding the first could carry as
+/// evidence (slashed in full, jailed).
+#[test]
+fn a_member_back_past_the_gc_window_signs_no_slot_again() {
+    let mut c = Cluster::new("b282-twin", 4, 0);
+    c.run(1);
+    let first = c
+        .engine(0)
+        .own_proposal(FIRST_ROUND)
+        .expect("vacuous: no first proposal")
+        .clone();
+    // Node 0 is away: the others run past the GC window without it.
+    for _ in 0..400 {
+        if c.engine(1).floor() > FIRST_ROUND + staging::RETAIN_SLACK + 10 {
+            break;
+        }
+        for i in 1..4 {
+            c.tick(i);
+        }
+        c.deliver(&|_, to| to == 0);
+        c.held.clear();
+    }
+    assert!(c.engine(1).floor() > FIRST_ROUND + staging::RETAIN_SLACK + 10);
+    // Back, it adopts the others' decisions, as block sync would.
+    let stakes = c.engine(0).stakes().to_vec();
+    let stuck = c.decisions[0].len();
+    let ahead: Vec<Decision> = c.decisions[1].clone();
+    for d in ahead.iter().skip(stuck) {
+        let mut ord = lock(&c.engine(0).ordering);
+        if ord.gc_floor() > FIRST_ROUND + staging::RETAIN_SLACK + 5 {
+            break;
+        }
+        ord.adopt_synced_anchor(d.0, &d.1, &d.2, &stakes);
+    }
+    let g = c.engine(0).floor();
+    assert!(g > FIRST_ROUND + staging::RETAIN_SLACK, "vacuous: g = {g}");
+    // Time has passed, so a body signed now differs from the first.
+    c.clock.store(NOW + 120, AtomicOrdering::SeqCst);
+    c.tick(0);
+    assert!(
+        c.engine(0).current_round() <= g,
+        "vacuous: node 0 holds a quorum round above g"
+    );
+    assert!(
+        matches!(
+            c.engine(0)
+                .storage
+                .get(&c.engine(0).proposed_key(FIRST_ROUND)),
+            Ok(None)
+        ),
+        "vacuous: the first round's guard survived GC"
+    );
+    let resigned: Vec<(u64, String)> =
+        c.q.borrow()
+            .iter()
+            .filter(|e| e.from == first.author)
+            .filter_map(|e| match &e.msg {
+                Msg::Vertex(v) if v.round <= g => Some((v.round, v.hash.clone())),
+                _ => None,
+            })
+            .collect();
+    assert!(
+        resigned.is_empty(),
+        "node 0 signed at or below g = {g}: {resigned:?} (its first was {})",
+        first.hash
+    );
+    assert!(c
+        .engine(0)
+        .own_proposal(FIRST_ROUND)
+        .is_none_or(|v| v.hash == first.hash));
+}
+
 /// ST-3 after GC-3: a Byzantine leader's uncertified twin is staged as a
 /// plain body and counts against its author's budget; once g passes its
 /// round, GC deletes it and gives the bytes back.

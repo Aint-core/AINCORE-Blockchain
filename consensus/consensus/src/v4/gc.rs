@@ -104,6 +104,16 @@ impl Engine {
                 _ => break, // rows are in round order
             }
         }
+        // B282: the producer's high-water mark goes with its whole epoch only.
+        if cut == u64::MAX {
+            doomed.push(
+                format!(
+                    "consensus:vproposed_high:v1:{cg}:{}:{epoch}",
+                    self.ed25519_pk
+                )
+                .into_bytes(),
+            );
+        }
         for (prefix, at_end) in [(&certs, false), (&proposed, true), (&guards, true)] {
             for row in self.storage.db.prefix_iterator(prefix.as_bytes()) {
                 let Ok((key, _)) = row else { break };

@@ -340,6 +340,8 @@ pub fn classify(key: &[u8]) -> Option<KeyClass> {
         {
             Local
         }
+        // B282: the highest round the producer proposed in an epoch.
+        ["consensus", "vproposed_high", "v1", cg, pk, e] if hex64(cg) && hex(pk) && dec(e) => Local,
         ["consensus", "vcollect", "v1", e, r, author, digest, signer]
             if dec20(e) && dec20(r) && seg(author) && hex64(digest) && seg(signer) =>
         {
@@ -696,6 +698,7 @@ mod tests {
             (format!("consensus:vcert:v1:00000000000000000003:00000000000000153030:{H64}"), Local),
             (format!("consensus:vbytes:v1:00000000000000000003:{H64}"), Local),
             (format!("consensus:vproposed:v1:{H64}:{H64}:3:00000000000000153030"), Local),
+            (format!("consensus:vproposed_high:v1:{H64}:{H64}:3"), Local),
             (
                 format!("consensus:vcollect:v1:00000000000000000003:00000000000000153030:{H64}:{H64}:{H64}"),
                 Local,

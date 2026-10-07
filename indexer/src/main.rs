@@ -980,6 +980,9 @@ struct Reads {
     slots: Arc<Semaphore>,
     gates: Mutex<HashMap<IpAddr, Arc<Semaphore>>>,
     summaries: Mutex<HashMap<String, (Instant, u16, serde_json::Value)>>,
+    /// B293: the markets list, in a slot of its own (a full summary cache
+    /// refused it, so every markets request read a day of trades a pool).
+    markets: Mutex<Option<(Instant, serde_json::Value)>>,
 }
 
 impl Reads {
@@ -997,6 +1000,7 @@ impl Reads {
             readers,
             gates: Mutex::default(),
             summaries: Mutex::default(),
+            markets: Mutex::default(),
         })
     }
 
@@ -1025,14 +1029,40 @@ impl Reads {
         (at.elapsed() < SUMMARY_TTL).then(|| (*status, body.clone()))
     }
 
+    /// B293: a pair's summary is kept only when the pair traded (a 404 for
+    /// any pair a client names was kept, so one client filled the cache with
+    /// random pairs and every real summary was read again each time), and a
+    /// full cache drops its oldest entry, not the newest.
     fn remember(&self, key: String, status: u16, body: &serde_json::Value) {
+        if status != 200 {
+            return;
+        }
         let mut summaries = self.summaries.lock().unwrap_or_else(|e| e.into_inner());
-        if summaries.len() >= MAX_SUMMARIES {
+        if !summaries.contains_key(&key) && summaries.len() >= MAX_SUMMARIES {
             summaries.retain(|_, (at, _, _)| at.elapsed() < SUMMARY_TTL);
+            if summaries.len() >= MAX_SUMMARIES {
+                if let Some(oldest) = summaries
+                    .iter()
+                    .min_by_key(|(_, (at, _, _))| *at)
+                    .map(|(key, _)| key.clone())
+                {
+                    summaries.remove(&oldest);
+                }
+            }
         }
-        if summaries.len() < MAX_SUMMARIES {
-            summaries.insert(key, (Instant::now(), status, body.clone()));
-        }
+        summaries.insert(key, (Instant::now(), status, body.clone()));
+    }
+
+    /// B293: the markets list cached less than `SUMMARY_TTL` ago.
+    fn fresh_markets(&self) -> Option<serde_json::Value> {
+        let markets = self.markets.lock().unwrap_or_else(|e| e.into_inner());
+        let (at, body) = markets.as_ref()?;
+        (at.elapsed() < SUMMARY_TTL).then(|| body.clone())
+    }
+
+    fn remember_markets(&self, body: &serde_json::Value) {
+        *self.markets.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Instant::now(), body.clone()));
     }
 }
 
@@ -1052,6 +1082,14 @@ fn summary_response(status: u16, body: serde_json::Value) -> HttpResponse {
 struct ClientIp {
     header: Option<String>,
     trusted: Vec<IpAddr>,
+    /// B294: with `AINCORE_INDEXER_PROXY_PORT`, the indexer also listens on
+    /// that port (bound at `AINCORE_INDEXER_PROXY_BIND`, loopback unless
+    /// named), for the proxy alone, and takes the header only from requests
+    /// that arrived there. Trusted by address alone, a proxy reaching the
+    /// indexer through Docker arrives from the bridge gateway, as does every
+    /// client of a published port on an IPv6 host: each could name itself
+    /// anew, request by request.
+    proxy_port: Option<u16>,
 }
 
 impl ClientIp {
@@ -1065,13 +1103,26 @@ impl ClientIp {
             .filter_map(|a| a.trim().parse::<IpAddr>().ok())
             .map(|a| a.to_canonical())
             .collect();
-        Self { header, trusted }
+        let proxy_port = env::var("AINCORE_INDEXER_PROXY_PORT")
+            .ok()
+            .and_then(|p| p.trim().parse().ok());
+        Self {
+            header,
+            trusted,
+            proxy_port,
+        }
     }
 
-    /// The client of a request from `peer` with `headers`.
-    fn address(&self, peer: IpAddr, headers: &actix_web::http::header::HeaderMap) -> IpAddr {
+    /// The client of a request from `peer` with `headers`, arrived on the
+    /// indexer's `local_port`.
+    fn address(
+        &self,
+        peer: IpAddr,
+        local_port: u16,
+        headers: &actix_web::http::header::HeaderMap,
+    ) -> IpAddr {
         let peer = peer.to_canonical();
-        if !self.trusted.contains(&peer) {
+        if !self.trusted.contains(&peer) || self.proxy_port.is_some_and(|port| port != local_port) {
             return peer;
         }
         self.header
@@ -1103,7 +1154,10 @@ fn client_group(data: &AppState, req: &HttpRequest) -> IpAddr {
     let peer = req
         .peer_addr()
         .map_or(IpAddr::from([0u8, 0, 0, 0]), |addr| addr.ip());
-    net_group(data.client_ip.address(peer, req.headers()))
+    net_group(
+        data.client_ip
+            .address(peer, req.app_config().local_addr().port(), req.headers()),
+    )
 }
 
 /// B265: run `query` on a reader on `group`'s turn, off the server's
@@ -1526,16 +1580,16 @@ async fn get_markets(
     let limit = query.limit.unwrap_or(50).clamp(1, MAX_MARKETS);
     // B280: one list, of the most markets any request may ask for, sliced
     // for each (a key per `limit` gave 500 keys: varying it skipped the
-    // cache, and every request read a day of trades a pool).
-    let key = "markets".to_string();
+    // cache, and every request read a day of trades a pool). B293: in its
+    // own slot.
     let first = |body: serde_json::Value| match body {
         serde_json::Value::Array(all) => {
             serde_json::Value::Array(all.into_iter().take(limit as usize).collect())
         }
         other => other,
     };
-    if let Some((status, body)) = data.reads.fresh(&key) {
-        return summary_response(status, first(body));
+    if let Some(body) = data.reads.fresh_markets() {
+        return summary_response(200, first(body));
     }
     let outcome = read(
         &data.reads,
@@ -1547,7 +1601,7 @@ async fn get_markets(
     )
     .await;
     respond(outcome, |body| {
-        data.reads.remember(key, 200, &body);
+        data.reads.remember_markets(&body);
         summary_response(200, first(body))
     })
 }
@@ -1592,10 +1646,9 @@ async fn main() -> std::io::Result<()> {
 
     println!("🚀 Indexer API running on port 3001");
 
-    let app_state = web::Data::new(AppState {
-        reads,
-        client_ip: ClientIp::from_env(),
-    });
+    let client_ip = ClientIp::from_env();
+    let proxy_port = client_ip.proxy_port;
+    let app_state = web::Data::new(AppState { reads, client_ip });
 
     HttpServer::new(move || {
         let cors = if permissive_cors_enabled() {
@@ -1619,7 +1672,16 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v1/pair_summary", web::get().to(get_pair_summary))
             .route("/api/v1/markets", web::get().to(get_markets))
     })
-    .bind(("0.0.0.0", 3001))?
+    .bind(("0.0.0.0", 3001))
+    .and_then(|server| match proxy_port {
+        // B294: the listener only the header-setting proxy uses.
+        Some(port) => {
+            let host =
+                env::var("AINCORE_INDEXER_PROXY_BIND").unwrap_or_else(|_| "127.0.0.1".into());
+            server.bind((host, port))
+        }
+        None => Ok(server),
+    })?
     .run()
     .await
 }
@@ -2222,9 +2284,10 @@ mod tests {
     #[test]
     fn a_client_behind_a_trusted_proxy_is_its_own() {
         let proxy: IpAddr = "10.0.0.1".parse().unwrap();
-        let client_ip = super::ClientIp {
+        let mut client_ip = super::ClientIp {
             header: Some("X-Forwarded-For".into()),
             trusted: vec![proxy],
+            proxy_port: None,
         };
         let mut headers = actix_web::http::header::HeaderMap::new();
         for line in ["198.18.0.1", "1.2.3.4, 203.0.113.7"] {
@@ -2233,14 +2296,23 @@ mod tests {
                 actix_web::http::header::HeaderValue::from_static(line),
             );
         }
-        let at = |peer: &str| {
+        let at = |client_ip: &super::ClientIp, peer: &str, port: u16| {
             client_ip
-                .address(peer.parse().unwrap(), &headers)
+                .address(peer.parse().unwrap(), port, &headers)
                 .to_string()
         };
-        assert_eq!(at("10.0.0.1"), "203.0.113.7");
-        assert_eq!(at("::ffff:10.0.0.1"), "203.0.113.7");
-        assert_eq!(at("10.0.0.2"), "10.0.0.2", "an untrusted peer's header");
+        assert_eq!(at(&client_ip, "10.0.0.1", 3001), "203.0.113.7");
+        assert_eq!(at(&client_ip, "::ffff:10.0.0.1", 3001), "203.0.113.7");
+        assert_eq!(
+            at(&client_ip, "10.0.0.2", 3001),
+            "10.0.0.2",
+            "an untrusted peer's header"
+        );
+        // B294: with a proxy port, the header counts there only: the public
+        // port's clients may arrive from the proxy's address too.
+        client_ip.proxy_port = Some(3101);
+        assert_eq!(at(&client_ip, "10.0.0.1", 3101), "203.0.113.7");
+        assert_eq!(at(&client_ip, "10.0.0.1", 3001), "10.0.0.1");
         assert_eq!(
             super::net_group("203.0.113.7".parse().unwrap()).to_string(),
             "203.0.113.0"
@@ -2272,32 +2344,41 @@ mod tests {
             let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, req).await;
             assert_eq!(body.as_array().map(Vec::len), Some(1), "limit {limit}");
         }
-        assert_eq!(
-            state.reads.summaries.lock().unwrap().len(),
-            1,
+        assert!(state.reads.markets.lock().unwrap().is_some());
+        assert!(
+            state.reads.summaries.lock().unwrap().is_empty(),
             "a markets list per limit"
         );
     }
 
-    /// B265 witness: a summary is answered from the cache while it is fresh,
-    /// and the cache holds at most `MAX_SUMMARIES` (its keys are request
-    /// parameters).
+    /// B265/B293 witness: a summary is answered from the cache while it is
+    /// fresh, and the cache holds at most `MAX_SUMMARIES` (its keys are
+    /// request parameters). B293: an answer for a pair that never traded is
+    /// not kept, and a full cache drops its oldest entry: 404s for random
+    /// pairs filled it, and it refused every real summary after them.
     #[test]
     fn a_summary_is_served_from_the_cache_while_fresh() {
         let db = TempDb::new("b265_cache");
         let reads = Reads::open(&db.path, 1).unwrap();
         assert!(reads.cached("pair").is_none());
+        reads.remember("pair".into(), 200, &serde_json::json!({"price": 1}));
+        let hit = reads.cached("pair").expect("a fresh summary is cached");
+        assert_eq!(hit.status().as_u16(), 200);
         reads.remember(
-            "pair".into(),
+            "nowhere".into(),
             404,
             &serde_json::json!({"error": "pair_not_found"}),
         );
-        let hit = reads.cached("pair").expect("a fresh summary is cached");
-        assert_eq!(hit.status().as_u16(), 404);
+        assert!(reads.cached("nowhere").is_none(), "a 404 was kept");
         for i in 0..super::MAX_SUMMARIES + 10 {
             reads.remember(format!("k{i}"), 200, &serde_json::json!(i));
         }
         assert!(reads.summaries.lock().unwrap().len() <= super::MAX_SUMMARIES);
+        let newest = format!("k{}", super::MAX_SUMMARIES + 9);
+        assert!(
+            reads.cached(&newest).is_some(),
+            "a full cache refused the newest"
+        );
     }
 
     /// B265 witness: a network group's second query waits for its first,
