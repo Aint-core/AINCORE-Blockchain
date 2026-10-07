@@ -181,6 +181,32 @@ async function main(): Promise<void> {
     if ((await busy.request('aincore_getTransactionReceipt', []).then(() => true, () => false)) || posts !== 1) {
         throw new Error(`a refused call was asked ${posts} times`);
     }
+    // B308: a rate limit (HTTP 429) is asked again too; another HTTP error
+    // is not.
+    posts = 0;
+    (busy as any).client.post = async () => {
+        posts += 1;
+        if (posts < 3) {
+            const limited: any = new Error('Request failed with status code 429');
+            limited.response = { status: 429, data: 'Too Many Requests' };
+            throw limited;
+        }
+        return { status: 200, data: { result: 'done' } };
+    };
+    const limitedAnswer = await busy.request('aincore_getTransactionReceipt', ['ab']);
+    if (limitedAnswer !== 'done' || posts !== 3) {
+        throw new Error(`a rate-limited call was not asked again: ${JSON.stringify([limitedAnswer, posts])}`);
+    }
+    posts = 0;
+    (busy as any).client.post = async () => {
+        posts += 1;
+        const failed: any = new Error('Request failed with status code 500');
+        failed.response = { status: 500, data: 'boom' };
+        throw failed;
+    };
+    if ((await busy.request('aincore_getTransactionReceipt', ['ab']).then(() => true, () => false)) || posts !== 1) {
+        throw new Error(`a failed call was asked ${posts} times`);
+    }
 
     // B267: a Connection sends heavy calls one at a time (the node refused a
     // client's second at once, so a dapp's parallel reads failed), light

@@ -365,11 +365,12 @@ SHA-256 of the key, as for Ed25519. Nothing is registered on chain first.
 ### Generate a key
 
 ```bash
-aincore-cli pqc-keygen --out ./pqc_keys
-# writes ./pqc_keys/mldsa65.seed (32 bytes, hex, mode 0600), mldsa65.pub, mldsa65_address.txt
+aincore-cli pqc-keygen
+# writes ~/.aincore/pqc_keys/mldsa65.seed (32 bytes, hex, mode 0600), mldsa65.pub,
+# mldsa65_address.txt (keep the seed outside any repository checkout: B307)
 
 # sign any command with it instead of wallet.key
-aincore-cli --pqc-seed ./pqc_keys/mldsa65.seed transfer ...
+aincore-cli --pqc-seed ~/.aincore/pqc_keys/mldsa65.seed transfer ...
 ```
 
 ### ML-DSA-65 sizes (FIPS 204, Table 2)

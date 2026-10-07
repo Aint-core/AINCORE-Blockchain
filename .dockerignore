@@ -8,15 +8,25 @@ target
 **/target
 
 # Runtime data and secrets must never be baked into the image, nor sent as
-# build context (`COPY . .`): data directories, keys, the .env that holds the
-# tunnel key, databases and logs, at any depth.
+# build context (`COPY . .`): data directories, keys and seeds, every .env
+# (the tunnel key's, the bridge's, the contracts' deployer key), databases
+# and logs, at any depth (B307: a pattern without `**/` matches the root
+# only).
 nas_data*
 **/*_data
 **/*_data_*
 **/data
-.env
-.env.*
+**/.env
+**/.env.*
 **/*.key
+**/*.seed
+**/pqc_keys
+**/*.pem
+**/*.p12
+**/*.keystore
+**/*.secret
+**/seed_phrase*
+**/private_key*
 **/*.db
 **/*.sqlite
 **/*.log

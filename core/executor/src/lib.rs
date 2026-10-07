@@ -1288,6 +1288,18 @@ fn receipt_update(
     )
 }
 
+/// B298: whether `tag` names a struct of a module outside 0x1, at any depth.
+fn names_a_type_outside_0x1(tag: &move_core_types::language_storage::TypeTag) -> bool {
+    use move_core_types::language_storage::TypeTag;
+    match tag {
+        TypeTag::Struct(s) => {
+            s.address != system_address() || s.type_params.iter().any(names_a_type_outside_0x1)
+        }
+        TypeTag::Vector(inner) => names_a_type_outside_0x1(inner),
+        _ => false,
+    }
+}
+
 /// B292: the bytes of a stored receipt that `receipts_root` covers: the
 /// receipt without its error text. That text is a VM's message (move-vm's
 /// `Display` or `Debug` of its error) or the executor's, which a move-vm
@@ -5041,6 +5053,15 @@ impl Executor {
         }
 
         if let vm_move::TransactionPayload::EntryFunction(call) = payload {
+            // B298: a call whose type arguments name a type outside 0x1 runs
+            // alone, recognized or not. move-vm's type-layout cache returns a
+            // layout it holds without its depth and node checks, so in one
+            // parallel batch whether such a call passes could depend on which
+            // thread laid the type out first. Every recognized call keeps its
+            // type parameter phantom today; this keeps that from mattering.
+            if call.ty_args.iter().any(names_a_type_outside_0x1) {
+                return (deps, false);
+            }
             let module_addr = call.module.address();
             let module_name = call.module.name().as_str();
             let function = call.function.as_str();
@@ -6745,7 +6766,7 @@ mod tests {
 
     /// SEC-#1: a call whose write set is not statically recognized (unlisted
     /// module / undecodable payload) must be serialized into its own singleton
-    /// batch; recognized disjoint calls still parallelize.
+    /// batch; recognized disjoint calls still parallelize. B298 witness too.
     #[test]
     fn sec1_unknown_calls_serialized_known_calls_parallel() {
         let db = temp_db("sec1_sched");
@@ -6769,7 +6790,37 @@ mod tests {
         let xfer = entry_payload("coin", "transfer", vec![], vec![]);
         let unknown = entry_payload("universal_mining", "mine", vec![], vec![]);
         // Recognition gate.
-        assert!(exec.analyze_tx(&mk(&"a".repeat(32), &xfer)).1, "coin::transfer recognized");
+        assert!(
+            exec.analyze_tx(&mk(&"a".repeat(32), &xfer)).1,
+            "coin::transfer recognized"
+        );
+        // B298: a recognized call naming a type outside 0x1, at any depth,
+        // runs alone (move-vm's layout cache skips its bounds for a layout it
+        // holds, so in a parallel batch the outcome could follow thread
+        // timing); 0x1's own types still parallelize.
+        let user = |depth: u8| {
+            let mut tag = move_core_types::language_storage::TypeTag::Struct(Box::new(
+                move_core_types::language_storage::StructTag {
+                    address: parse_move_address(&"ab".repeat(32)).unwrap(),
+                    module: move_core_types::identifier::Identifier::new("m").unwrap(),
+                    name: move_core_types::identifier::Identifier::new("T").unwrap(),
+                    type_params: vec![],
+                },
+            ));
+            for _ in 0..depth {
+                tag = move_core_types::language_storage::TypeTag::Vector(Box::new(tag));
+            }
+            tag
+        };
+        for depth in [0, 2] {
+            let theirs = entry_payload("coin", "transfer", vec![user(depth)], vec![]);
+            assert!(
+                !exec.analyze_tx(&mk(&"a".repeat(32), &theirs)).1,
+                "a call on a type outside 0x1 was recognized (depth {depth})"
+            );
+        }
+        let ours = entry_payload("coin", "transfer", vec![aincore_coin_type()], vec![]);
+        assert!(exec.analyze_tx(&mk(&"a".repeat(32), &ours)).1);
         assert!(
             !exec.analyze_tx(&mk(&"a".repeat(32), &unknown)).1,
             "unlisted module must NOT be recognized"

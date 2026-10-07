@@ -993,6 +993,24 @@ pub fn answer_tokens(len: usize) -> f64 {
     (len / SYNC_ANSWER_TOKEN_BYTES) as f64
 }
 
+/// B299: a non-member's answer, built, charged its bytes to `key` (B60)
+/// whether the held-answer bound (B30) keeps it or refuses it; true when it
+/// may be sent. A refused one was free, though the server had read, parsed
+/// and serialized it in full: a stranger whose group's share was held got
+/// that work at one token a request.
+pub fn charge_then_hold<K: std::hash::Hash + Eq>(
+    budget: &mut Budget<String>,
+    held: &mut HeldAnswers<K>,
+    id: K,
+    key: &str,
+    group: &str,
+    len: usize,
+    now: std::time::Instant,
+) -> bool {
+    budget.charge(&key.to_string(), answer_tokens(len), now);
+    held.admit(id, group, len)
+}
+
 /// B24: how long a connection may take to finish Noise and yamux. A
 /// handshake is ~1.5 round trips; 10 s is a choice far above any honest
 /// one. The transport had no timeout: a connection that never finished
@@ -2718,6 +2736,33 @@ mod tests {
             SubmitBudget::default().admit("host:198.51.100.9", &largest, now),
             "the largest request does not fit a fresh quota"
         );
+    }
+
+    /// B299 witness: a non-member's built answer is charged its bytes
+    /// whether the held-answer bound keeps it or refuses it (a refused one
+    /// was free, though the server had read, parsed and serialized it).
+    #[test]
+    fn a_refused_answer_is_charged_its_bytes() {
+        let now = std::time::Instant::now();
+        let mut budget: Budget<String> = Budget::new(0.0, 40.0);
+        let key = "12D3KooWstranger".to_string();
+        assert!(budget.spend(&key, now), "its request");
+        let mut held: HeldAnswers<u32> = HeldAnswers::new(Arc::default());
+        assert!(
+            held.admit(1, "g", OPEN_HELD_PER_GROUP_BYTES),
+            "the group's share, held"
+        );
+        let len = 16 * SYNC_ANSWER_TOKEN_BYTES;
+        assert!(
+            !charge_then_hold(&mut budget, &mut held, 2, &key, "g", len, now),
+            "vacuous: the answer was not refused"
+        );
+        // 40 - 1 - 16 left: 23, not 24.
+        assert!(
+            !budget.spend_amount(&key, 24.0, now),
+            "the refused answer cost nothing"
+        );
+        assert!(budget.spend_amount(&key, 23.0, now));
     }
 
     /// B148 witness: a member's pushes are charged their bytes, so at one

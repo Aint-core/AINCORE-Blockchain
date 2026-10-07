@@ -1126,18 +1126,45 @@ impl Mempool {
     /// B70: whether `sender`'s transaction `seq` at `gas_price` is ready: at
     /// least the base fee, and its sequence number the committed next or
     /// right after a run of the sender's waiting and loaned transactions that
-    /// starts there.
+    /// starts there. B297: the run as selection reads it (`ready_run_end`):
+    /// it stepped over every held number whatever its price, so behind a
+    /// waiting head priced under the base fee (parked by selection, with all
+    /// after it) a newcomer counted as ready and evicted other senders'
+    /// parked transactions from a full pool, for one no block would take.
     fn is_ready(&mut self, storage: &StateDB, sender: &str, seq: u64, gas_price: u128) -> bool {
-        if gas_price < executor::committed_base_fee(storage) {
+        let base_fee = executor::committed_base_fee(storage);
+        if gas_price < base_fee {
             return false;
         }
-        let mut expected = self.committed_next(storage, sender);
-        // B239: the sender's own transactions, not a scan of the pool.
-        let held = self.by_sender.get(sender);
-        while expected < seq && held.is_some_and(|h| h.contains_key(&expected)) {
-            expected += 1;
+        let committed = self.committed_next(storage, sender);
+        self.ready_run_end(sender, committed, base_fee, seq) == seq
+    }
+
+    /// B297: where `sender`'s ready run ends, the rule selection parks by:
+    /// from `committed` (its next sequence number) through every number it
+    /// holds (B239: its own transactions, not a scan of the pool), up to the
+    /// first that is waiting and priced under `base_fee`, and not past
+    /// `limit`. Selection, the eviction scan and a newcomer's readiness all
+    /// read it (B244 made two of them agree).
+    fn ready_run_end(&self, sender: &str, committed: u64, base_fee: u128, limit: u64) -> u64 {
+        let mut end = committed;
+        if let Some(seqs) = self.by_sender.get(sender) {
+            while end < limit {
+                let Some(ids) = seqs.get(&end) else {
+                    break;
+                };
+                let stops = ids.iter().any(|id| {
+                    self.held
+                        .get(id)
+                        .is_some_and(|h| h.loan.is_none() && h.meta.gas_price < base_fee)
+                });
+                if stops {
+                    break;
+                }
+                end += 1;
+            }
         }
-        expected == seq
+        end
     }
 
     /// B70/B231: the parked transactions (not ready, still waiting) to evict
@@ -1209,20 +1236,7 @@ impl Mempool {
             std::collections::HashMap::with_capacity(senders.len());
         for sender in senders {
             let committed = self.committed_next_at(storage, height, &sender);
-            let mut end = committed;
-            if let Some(seqs) = self.by_sender.get(&sender) {
-                while let Some(ids) = seqs.get(&end) {
-                    let stops = ids.iter().any(|id| {
-                        self.held
-                            .get(id)
-                            .is_some_and(|h| h.loan.is_none() && h.meta.gas_price < base_fee)
-                    });
-                    if stops {
-                        break;
-                    }
-                    end += 1;
-                }
-            }
+            let end = self.ready_run_end(&sender, committed, base_fee, u64::MAX);
             runs.insert(sender, (committed, end));
         }
         let mut parked: Vec<(u64, String, usize, TxId)> = Vec::new();

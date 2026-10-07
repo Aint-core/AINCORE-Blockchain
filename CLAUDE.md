@@ -17,8 +17,8 @@ Arsitektur: **Modular** — terinspirasi Narwhal/Tusk (DAG consensus) + Sui Move
 - **Network:** libp2p only (Noise + yamux, gossipsub, request-response sessions bound to node keys)
 - **Token:** AIN, cap 150 juta; emisi 1,90 %/tahun dari sisa cadangan menurut waktu konsensus (G5)
 - **Chain ID:** `AINCORE-MAINNET-1` (env: `AINCORE_CHAIN_ID`)
-- **API Port:** 8002 (default), `port - 1000` jika custom port
-- **P2P Port:** base 9001 (default); libp2p listens on base + 100
+- **API Port:** 8002 (default), selalu `port - 1000` (B305: satu aturan, `config::api_port_for`)
+- **P2P Port:** base 9002 (default, B305); libp2p listens on base + 100
 
 ---
 

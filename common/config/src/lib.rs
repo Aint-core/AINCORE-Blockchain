@@ -12,19 +12,21 @@ pub struct NodeConfig {
     pub enable_nat: bool,
 }
 
-/// The P2P port a node runs on when none is named.
-pub const DEFAULT_PORT: u16 = 9001;
+/// The P2P port a node runs on when none is named (B305: its RPC, the
+/// port less 1000, is `DEFAULT_API_PORT`, as for every other port).
+pub const DEFAULT_PORT: u16 = 9002;
 /// The RPC port of a node on `DEFAULT_PORT`.
-pub const DEFAULT_API_PORT: u16 = 8002;
+pub const DEFAULT_API_PORT: u16 = DEFAULT_PORT - 1000;
 
-/// B296: a node's RPC port when only its P2P port is named, the one rule
-/// the node and every tool read: the default port's RPC is
-/// `DEFAULT_API_PORT`, any other port's is the port less 1000 (below 1001:
-/// `DEFAULT_API_PORT`). A node named on the default port explicitly ran its
-/// RPC on 8001, one left to its default on 8002, and the monitor guessed
-/// one of the two.
+/// B296/B305: a node's RPC port when only its P2P port is named, the one
+/// rule the node and every tool read: the port less 1000 (below 1001:
+/// `DEFAULT_API_PORT`). B296 found a node named on the default port (9001)
+/// ran its RPC on 8001 and one left to it on 8002; it mapped the default
+/// to 8002 as a special case, so 9001 and 9002 both took 8002 (B305: the
+/// second node of a one-host bring-up ran with no RPC). The default port is
+/// now the one whose port less 1000 is 8002.
 pub fn api_port_for(port: u16) -> u16 {
-    if port == DEFAULT_PORT || port <= 1000 {
+    if port <= 1000 {
         DEFAULT_API_PORT
     } else {
         port - 1000
@@ -59,7 +61,7 @@ impl NodeConfig {
             match args[i].as_str() {
                 "--port" => {
                     if i + 1 < args.len() {
-                        config.port = args[i + 1].parse().unwrap_or(9001);
+                        config.port = args[i + 1].parse().unwrap_or(DEFAULT_PORT);
                         port_set = true;
                         i += 2;
                     } else {
@@ -129,16 +131,22 @@ impl NodeConfig {
 
 #[cfg(test)]
 mod tests {
-    /// B296 witness: one rule maps a node's P2P port to its RPC port, the
-    /// default port included (named, it gave 8001; left to default, 8002).
+    /// B296/B305 witness: one rule maps a node's P2P port to its RPC port,
+    /// the default port included, and no two ports to one (B296's special
+    /// case mapped 9001 and 9002 both to 8002).
     #[test]
     fn the_rpc_port_follows_one_rule() {
         assert_eq!(
             super::api_port_for(super::DEFAULT_PORT),
             super::DEFAULT_API_PORT
         );
+        assert_eq!(super::api_port_for(9001), 8001);
         assert_eq!(super::api_port_for(9002), 8002);
-        assert_eq!(super::api_port_for(9000), 8000);
+        assert_eq!(super::api_port_for(9003), 8003);
         assert_eq!(super::api_port_for(1000), super::DEFAULT_API_PORT);
+        assert_eq!(
+            super::NodeConfig::default().api_port,
+            super::DEFAULT_API_PORT
+        );
     }
 }

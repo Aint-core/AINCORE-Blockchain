@@ -44,8 +44,10 @@ EXPOSE 9102 8002 3001
 
 # B269: the RPC listens on the container's interfaces (the node binds
 # 127.0.0.1 unless told otherwise, which inside a container no published port
-# or other container reaches). Behind a proxy, also set
-# AINCORE_RPC_TRUSTED_PROXIES and AINCORE_RPC_CLIENT_IP_HEADER.
+# or other container reaches). B303: behind a proxy, give the proxy its own
+# listener (AINCORE_RPC_PROXY_PORT, bound at AINCORE_RPC_PROXY_BIND, published
+# to the proxy alone) and set AINCORE_RPC_TRUSTED_PROXIES and
+# AINCORE_RPC_CLIENT_IP_HEADER: the header counts on that listener only.
 ENV AINCORE_RPC_BIND=0.0.0.0
 
 # Default command

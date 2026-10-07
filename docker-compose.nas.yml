@@ -21,8 +21,13 @@ services:
     container_name: aincore-validator
     restart: unless-stopped
     ports:
-      - "9102:9102"   # libp2p: consensus + sync sessions (base port + 100)
-      - "8002:8002"   # REST API / RPC
+      # B304: IPv4 only. Docker's userland proxy hands every IPv6 client of a
+      # published port to the container from the bridge gateway, one address
+      # for all, and the node's admission (handshakes, identities, sync and
+      # RPC budgets) is per address. For IPv6, run the node with
+      # network_mode: host.
+      - "0.0.0.0:9102:9102"   # libp2p: consensus + sync sessions (base port + 100)
+      - "0.0.0.0:8002:8002"   # REST API / RPC
     volumes:
       - ./nas_data:/root/.aincore/data
       - ${AINCORE_GENESIS_FILE:?set AINCORE_GENESIS_FILE to the genesis.json of the chain this node joins}:/root/.aincore/genesis.json:ro
@@ -66,7 +71,7 @@ services:
       - NODE_RPC_URL=http://aincore-node:8002/rpc
       - RUST_LOG=info
     ports:
-      - "3001:3001"   # Indexer API
+      - "0.0.0.0:3001:3001"   # Indexer API
     depends_on:
       - aincore-node
     deploy:

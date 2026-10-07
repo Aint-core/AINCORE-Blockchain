@@ -57,8 +57,10 @@ struct Args {
     #[arg(long)]
     chain_id: Option<String>,
 
-    /// Hex Ed25519 secret key (64 hex chars) of a FUNDED account, or a path to a
-    /// key file. This account pays for the fan-out.
+    /// Path to the key file of a FUNDED account (its 32 raw bytes, as the
+    /// node writes node.key, or 64 hex characters). This account pays for
+    /// the fan-out. B308: a file only (a secret given inline showed in argv
+    /// and the shell's history).
     #[arg(long)]
     funder_key: String,
 
@@ -288,20 +290,22 @@ fn submitted_from(answer: &Value) -> Submitted {
     }
 }
 
-fn load_funder_key(spec: &str) -> SigningKey {
-    // Accept either a raw 64-hex secret key or a path to a file containing one.
-    let raw = if std::path::Path::new(spec).exists() {
-        std::fs::read_to_string(spec).expect("read funder key file")
-    } else {
-        spec.to_string()
+/// B308: the funder's key, from a file only: its 32 raw bytes (the node's
+/// node.key) or 64 hex characters. It took the secret inline too (argv,
+/// shell history) and panicked on a raw key file.
+fn load_funder_key(path: &str) -> Result<SigningKey, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read the funder key {path}: {e}"))?;
+    let secret = match <[u8; 32]>::try_from(bytes.as_slice()) {
+        Ok(raw) => raw,
+        Err(_) => {
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| format!("{path}: neither 32 raw bytes nor hex"))?;
+            let decoded = hex::decode(text.trim()).map_err(|e| format!("{path}: {e}"))?;
+            <[u8; 32]>::try_from(decoded.as_slice())
+                .map_err(|_| format!("{path}: a key is 32 bytes (64 hex characters)"))?
+        }
     };
-    let trimmed = raw.trim();
-    let bytes = hex::decode(trimmed).expect("funder key must be hex");
-    let arr: [u8; 32] = bytes
-        .as_slice()
-        .try_into()
-        .expect("funder key must be 32 bytes (64 hex chars)");
-    SigningKey::from_bytes(&arr)
+    Ok(SigningKey::from_bytes(&secret))
 }
 
 /// B258: the chain to sign for: the one named (`--chain-id` or
@@ -382,7 +386,10 @@ async fn main() {
         "─────────────────────────────────────────────".dimmed()
     );
 
-    let funder = Account::from_key(load_funder_key(&args.funder_key));
+    let funder = Account::from_key(load_funder_key(&args.funder_key).unwrap_or_else(|e| {
+        eprintln!("❌ {e}");
+        std::process::exit(2)
+    }));
     println!("Funder      : {}", funder.address);
 
     let funder_balance = fetch_balance(&client, &args.rpc, &funder.address).await;
@@ -664,6 +671,32 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B308 witness: the funder's key comes from a file, its 32 raw bytes
+    /// (as the node writes node.key) or 64 hex characters; a secret given
+    /// inline is refused, as is a file of another length.
+    #[test]
+    fn the_funder_key_comes_from_a_file_raw_or_hex() {
+        let dir = std::env::temp_dir().join(format!("b308_key_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = [7u8; 32];
+        let raw = dir.join("node.key");
+        std::fs::write(&raw, secret).unwrap();
+        let text = dir.join("funder.hex");
+        std::fs::write(&text, format!("{}\n", hex::encode(secret))).unwrap();
+        let short = dir.join("short.key");
+        std::fs::write(&short, [7u8; 31]).unwrap();
+        let expected = SigningKey::from_bytes(&secret).verifying_key();
+        let key = |p: &std::path::Path| super::load_funder_key(p.to_str().unwrap());
+        assert_eq!(key(&raw).unwrap().verifying_key(), expected);
+        assert_eq!(key(&text).unwrap().verifying_key(), expected);
+        assert!(key(&short).is_err());
+        assert!(
+            super::load_funder_key(&hex::encode(secret)).is_err(),
+            "an inline secret was taken"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// B258 witness: a load is signed only for the chain named, and only if
     /// the node runs that chain (it signed for mainnet by default).

@@ -1603,6 +1603,8 @@ struct Parted {
     sessions: usize,
     /// The strikes the first session holds before the run.
     struck_before: u32,
+    /// The client's parted-fetch budget (`MAX_PARTED_BLOCK_BYTES` when 0).
+    budget: u64,
     /// The passes run (fewer once the certified tip is reached).
     passes: usize,
 }
@@ -1753,9 +1755,12 @@ fn sync_past_oversized(sim: &Sim, y: usize, tip: u64, how: Parted) -> PartedRun 
             format!("SYNC_RESP:{}", serde_json::to_string(&resp).unwrap()),
         ))
     });
-    let sync = ChainSync::new(Arc::clone(&sim.node(y).storage))
+    let mut sync = ChainSync::new(Arc::clone(&sim.node(y).storage))
         .with_batch_bytes(CUT)
         .with_sessions(client);
+    if how.budget > 0 {
+        sync = sync.with_parted_budget(how.budget);
+    }
     if how.struck_before > 0 {
         sync.stalls.lock().unwrap().insert(
             "12D3KooWbig0".into(),
@@ -1946,6 +1951,32 @@ fn a_parted_block_two_sessions_serve_arrives() {
     }
 }
 
+/// B301 witness: two sessions' fetches of one block under a budget that
+/// holds one and a half of it: the one that gives way keeps what it holds
+/// and goes on from there (it was dropped, so a fetch kept largest held
+/// every other below the budget less its bytes, for good).
+#[test]
+fn a_crowded_parted_fetch_keeps_what_it_holds() {
+    let (sim, y, from, tip, _, _) = left_behind("b301_crowded", &[95, 96, 97, 98], 4);
+    let len = sim
+        .node(0)
+        .storage
+        .get(&format!("block_{}", from + 1))
+        .unwrap()
+        .expect("the block")
+        .len() as u64;
+    let how = Parted {
+        sessions: 2,
+        budget: len + len / 2,
+        part_delay_ms: crate::SYNC_TURN.as_millis() as u64 / 3,
+        passes: 40,
+        ..Parted::default()
+    };
+    let run = sync_past_oversized(&sim, y, tip, how);
+    assert!(run.reached > from, "the block never arrived");
+    run.never_restarted().unwrap();
+}
+
 /// B287 witness: a session naming, mid-fetch, the block it is sending at
 /// another length is refused at once and struck: no part is asked of it in
 /// the pass it renames (the fetch began again, unpunished, each time).
@@ -2106,10 +2137,9 @@ fn a_session_waiting_longest_goes_before_fresh_identities() {
     let salt = (0..=255u8)
         .map(|i| [i; 16])
         .find(|salt| {
-            let probe = ChainSync::new(Arc::clone(&db)).with_turn_salt(*salt);
             sybils
                 .iter()
-                .all(|s| probe.salted(s) < probe.salted(&honest))
+                .all(|s| crate::salted_with(salt, s) < crate::salted_with(salt, &honest))
         })
         .expect("a salt");
     let rt = tokio::runtime::Runtime::new().unwrap();

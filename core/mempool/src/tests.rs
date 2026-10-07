@@ -1482,6 +1482,58 @@ mod fee_market_admission {
         );
     }
 
+    /// B297 witness: behind a waiting head priced under the base fee, a
+    /// newcomer at the base fee is not ready (selection parks the sender
+    /// from its head), so a full pool refuses it for now and evicts nothing:
+    /// it counted as ready and evicted other senders' parked transactions for
+    /// one no block would take.
+    #[test]
+    fn a_newcomer_behind_an_underpriced_head_evicts_nothing() {
+        let db = temp_db("b297_ready");
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        let funded = |seed: u8| {
+            fund(
+                &db,
+                &priced_tx(seed, 0, 1, 9).1,
+                1_000_000_000_000_000_000_000,
+            )
+        };
+        funded(131);
+        mp.add_transaction(priced_tx(131, 0, 1, 1).0)
+            .expect("the head");
+        let mut tail = Vec::new();
+        for seq in 1..=9 {
+            let (tx, _) = priced_tx(131, seq, 1, 9);
+            mp.add_transaction(tx.clone()).expect("the tail");
+            tail.push(tx);
+        }
+        let mut seed = 132u8;
+        'fill: loop {
+            funded(seed);
+            for seq in 0..MAX_NONCE_AHEAD - 1 {
+                if mp.len() >= MAX_PENDING_TXS {
+                    break 'fill;
+                }
+                mp.add_transaction(priced_tx(seed, seq, 1, 9).0)
+                    .expect("room");
+            }
+            seed += 1;
+        }
+        {
+            let _seed = db.seeding();
+            db.put(executor::BASE_FEE_KEY, "5").unwrap();
+        }
+        let held = mp.len();
+        let refused = mp.add_transaction(priced_tx(131, 10, 1, 9).0);
+        assert!(
+            refused.is_err(),
+            "a newcomer behind a parked head was admitted"
+        );
+        assert_eq!(mp.len(), held, "something was evicted for it");
+        let last = tail.last().unwrap();
+        assert!(mp.any_pending(|t| t == last.as_str()));
+    }
+
     /// B245 witness: a replacement's victims never include the transaction
     /// it replaces (counted out of the bytes held already): credited twice,
     /// the pool ended up over `MAX_PENDING_BYTES`.

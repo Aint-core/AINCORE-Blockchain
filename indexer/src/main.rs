@@ -1040,14 +1040,13 @@ impl Reads {
         let mut summaries = self.summaries.lock().unwrap_or_else(|e| e.into_inner());
         if !summaries.contains_key(&key) && summaries.len() >= MAX_SUMMARIES {
             summaries.retain(|_, (at, _, _)| at.elapsed() < SUMMARY_TTL);
-            if summaries.len() >= MAX_SUMMARIES {
-                if let Some(oldest) = summaries
+            if summaries.len() >= MAX_SUMMARIES
+                && let Some(oldest) = summaries
                     .iter()
                     .min_by_key(|(_, (at, _, _))| *at)
                     .map(|(key, _)| key.clone())
-                {
-                    summaries.remove(&oldest);
-                }
+            {
+                summaries.remove(&oldest);
             }
         }
         summaries.insert(key, (Instant::now(), status, body.clone()));
@@ -1122,7 +1121,8 @@ impl ClientIp {
         headers: &actix_web::http::header::HeaderMap,
     ) -> IpAddr {
         let peer = peer.to_canonical();
-        if !self.trusted.contains(&peer) || self.proxy_port.is_some_and(|port| port != local_port) {
+        // B303: on the proxy listener only (with none named, nowhere).
+        if !self.trusted.contains(&peer) || self.proxy_port != Some(local_port) {
             return peer;
         }
         self.header
@@ -2287,7 +2287,7 @@ mod tests {
         let mut client_ip = super::ClientIp {
             header: Some("X-Forwarded-For".into()),
             trusted: vec![proxy],
-            proxy_port: None,
+            proxy_port: Some(3101),
         };
         let mut headers = actix_web::http::header::HeaderMap::new();
         for line in ["198.18.0.1", "1.2.3.4, 203.0.113.7"] {
@@ -2301,18 +2301,20 @@ mod tests {
                 .address(peer.parse().unwrap(), port, &headers)
                 .to_string()
         };
-        assert_eq!(at(&client_ip, "10.0.0.1", 3001), "203.0.113.7");
-        assert_eq!(at(&client_ip, "::ffff:10.0.0.1", 3001), "203.0.113.7");
+        assert_eq!(at(&client_ip, "10.0.0.1", 3101), "203.0.113.7");
+        assert_eq!(at(&client_ip, "::ffff:10.0.0.1", 3101), "203.0.113.7");
         assert_eq!(
-            at(&client_ip, "10.0.0.2", 3001),
+            at(&client_ip, "10.0.0.2", 3101),
             "10.0.0.2",
             "an untrusted peer's header"
         );
-        // B294: with a proxy port, the header counts there only: the public
-        // port's clients may arrive from the proxy's address too.
-        client_ip.proxy_port = Some(3101);
-        assert_eq!(at(&client_ip, "10.0.0.1", 3101), "203.0.113.7");
+        // B294: the header counts on the proxy port only: the public port's
+        // clients may arrive from the proxy's address too.
         assert_eq!(at(&client_ip, "10.0.0.1", 3001), "10.0.0.1");
+        // B303: with no proxy port, nowhere.
+        client_ip.proxy_port = None;
+        assert_eq!(at(&client_ip, "10.0.0.1", 3001), "10.0.0.1");
+        assert_eq!(at(&client_ip, "10.0.0.1", 3101), "10.0.0.1");
         assert_eq!(
             super::net_group("203.0.113.7".parse().unwrap()).to_string(),
             "203.0.113.0"

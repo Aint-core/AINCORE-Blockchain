@@ -123,8 +123,9 @@ The node will start producing blocks and expose the JSON-RPC API at `http://loca
 ### Run Stress Test (Bench-TPS)
 
 ```bash
-# Fire 1000 transactions at your local node
-cargo run --release --bin bench_tps -- http://127.0.0.1:3030 1000
+# Load your local node from a funded account's key file (B308: a file only)
+cargo run --release -p bench-tps -- --rpc http://127.0.0.1:8002/rpc \
+  --chain-id "$AINCORE_CHAIN_ID" --funder-key ./funder.key
 ```
 
 ---

@@ -164,6 +164,8 @@ mod tests {
     /// this node's and never serve a block hold the pass's three slots only
     /// once; the next pass asks the honest session for blocks. Ordered by
     /// membership and height alone, they held every slot of every pass.
+    /// (B274: claims order nothing now; the salt here puts the honest
+    /// session last among equals, so the liars take the first pass.)
     #[tokio::test]
     async fn sessions_that_never_serve_lose_their_slots() {
         let (asks, mut queued) = tokio::sync::mpsc::channel::<network::SyncAsk>(16);
@@ -199,18 +201,69 @@ mod tests {
                 session("honest"),
             ])),
         };
-        let sync = setup_sync("never_serve").with_sessions(client);
+        let salt = (0..=255u8)
+            .map(|i| [i; 16])
+            .find(|salt| {
+                ["liar1", "liar2", "liar3"]
+                    .iter()
+                    .all(|liar| crate::salted_with(salt, liar) < crate::salted_with(salt, "honest"))
+            })
+            .expect("a salt");
+        let sync = setup_sync("never_serve")
+            .with_sessions(client)
+            .with_turn_salt(salt);
         sync.storage.put("latest_height", "4").unwrap();
         sync.sync_from_peers().await;
         assert!(
             !block_asks.lock().unwrap().iter().any(|p| p == "honest"),
-            "control: the first pass goes to the highest"
+            "control: the first pass goes to the liars"
         );
         sync.sync_from_peers().await;
         let asked = block_asks.lock().unwrap().clone();
         assert!(
             asked.iter().any(|p| p == "honest"),
             "the honest session was never asked for blocks: {asked:?}"
+        );
+    }
+
+    /// B311 witness: a pass started while another runs returns at once, at
+    /// this node's height, asking nothing (the boot sync and the periodic
+    /// loop ran together, each fetching the same top session's block, each
+    /// holding a parted fetch the other's budget did not count).
+    #[tokio::test]
+    async fn a_second_pass_waits_for_none() {
+        let (asks, mut queued) = tokio::sync::mpsc::channel::<network::SyncAsk>(16);
+        let (dials, _) = tokio::sync::mpsc::channel(1);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        tokio::spawn(async move {
+            while let Some(ask) = queued.recv().await {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = ask.reply.send(Err("no".to_string()));
+            }
+        });
+        let client = network::SessionClient {
+            asks,
+            dials,
+            table: Arc::new(std::sync::RwLock::new(vec![network::SessionPeer {
+                peer: "12D3KooWsome".into(),
+                member: None,
+            }])),
+        };
+        let sync = setup_sync("one_pass").with_sessions(client);
+        sync.storage.put("latest_height", "4").unwrap();
+        let held = sync.pass.lock().await;
+        assert_eq!(sync.sync_from_peers().await, 4);
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a second pass asked a session"
+        );
+        drop(held);
+        sync.sync_from_peers().await;
+        assert!(
+            count.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "vacuous: no pass asked"
         );
     }
 
@@ -415,7 +468,7 @@ mod tests {
             ended_well,
             asked: true,
             refused: false,
-            mid_fetch: false,
+            unjudged: false,
         };
         assert!(turn(1, 100, true, true).struck(), "a slow answer");
         assert!(
@@ -439,22 +492,21 @@ mod tests {
         assert!(lied.struck(), "a lie was not struck");
     }
 
-    /// B274/B286/B287 witness: block turns go to members first whatever
-    /// their strikes, then (within its class) to the largest parted fetch's
-    /// session, then to the fewest strikes, then to the most blocks brought,
-    /// then to the session that has waited longest: since its last turn, or
-    /// since this node first saw it. A session's claimed height orders
-    /// nothing (B274: it ordered sessions that brought nothing). B286: a
-    /// session never given a turn went first, so three fresh identities a
-    /// pass took every turn from honest non-members. B287: a fetch's session
-    /// went before the members.
+    /// B274/B286/B309 witness: block turns go to members first whatever
+    /// their strikes, then to the fewest strikes, then to the most blocks
+    /// brought, then to the session that has waited longest: since its last
+    /// turn, or since this node first saw it. A session's claimed height
+    /// orders nothing (B274: it ordered sessions that brought nothing).
+    /// B286: a session never given a turn went first, so three fresh
+    /// identities a pass took every turn from honest non-members. B309: a
+    /// parted fetch's session is in no way first (`Standing` has no such
+    /// term: a liar's fetch, the largest, held every pass's first turn).
     #[test]
     fn turns_are_ordered_by_standing_not_by_claims() {
         use crate::{turn_order, Standing};
         let now = std::time::Instant::now();
         let ago = |secs: u64| now - std::time::Duration::from_secs(secs);
         let s = |member, strikes, brought, waited: u64| Standing {
-            resuming: false,
             member,
             strikes,
             brought,
@@ -482,26 +534,6 @@ mod tests {
                 named("c", s(true, 0, 5, 0)),
             ]),
             ["c", "b", "a"]
-        );
-        // B275/B287: the session whose parted block this node is fetching
-        // goes first within its class only.
-        let resuming = |member| Standing {
-            resuming: true,
-            ..s(member, 2, 0, 0)
-        };
-        assert_eq!(
-            order(vec![
-                named("m", s(true, 0, 9, 500)),
-                named("p", resuming(true))
-            ]),
-            ["p", "m"]
-        );
-        assert_eq!(
-            order(vec![
-                named("p", resuming(false)),
-                named("m", s(true, 3, 0, 0))
-            ]),
-            ["m", "p"]
         );
         // B286: among equals, the one that has waited longest: a session
         // never given a turn waits from when it was first seen, so one
@@ -556,6 +588,7 @@ mod tests {
             len: 1_000,
             bytes: vec![b'x'; bytes],
             progressed: std::time::Instant::now(),
+            started: std::time::Instant::now(),
         };
         {
             let mut parted = sync.parted.lock().unwrap();
@@ -576,6 +609,81 @@ mod tests {
         // c outgrows b: b gives way.
         assert!(sync.make_room("c", 40));
         assert_eq!(kept(&sync), ["a"]);
+    }
+
+    /// B302 witness: a turn ending at its server's block without a QC ends
+    /// well within `qcless_tip`'s bound and is unjudged beyond it (neither
+    /// strike nor clear: a direct commit after a stall builds a block for
+    /// every anchor it decides, and B289's bound struck honest servers every
+    /// pass).
+    #[test]
+    fn a_turn_past_the_qcless_bound_is_unjudged() {
+        let fresh = || crate::Turn {
+            reached: 0,
+            brought: 0,
+            bytes: 0,
+            slow: false,
+            ended_well: false,
+            asked: true,
+            refused: false,
+            unjudged: false,
+        };
+        let stop = consensus::v4::MAX_UNFINALIZED_BLOCKS;
+        let mut near = fresh();
+        crate::judge_qcless_tip(&mut near, 100, 100 + stop);
+        assert!(near.ended_well && !near.unjudged);
+        let mut far = fresh();
+        crate::judge_qcless_tip(&mut far, 100, 100 + 2 * stop + 1);
+        assert!(!far.ended_well && far.unjudged);
+        assert!(
+            far.struck(),
+            "struck() alone still strikes it: the pass skips it"
+        );
+    }
+
+    /// B301 witness: a parted fetch fed a byte now and then is still
+    /// dropped at its deadline (it held the bytes every other fetch needed
+    /// for good), and a large one has longer than `STRIKE_TTL`.
+    #[test]
+    fn a_parted_fetch_past_its_deadline_is_dropped() {
+        let start = std::time::Instant::now();
+        let second = std::time::Duration::from_secs(1);
+        let fetch = |len: u64, last_byte: std::time::Instant| crate::PartialBlock {
+            peer: "p".into(),
+            height: 10,
+            hash: "h".into(),
+            len,
+            bytes: Vec::new(),
+            progressed: last_byte,
+            started: start,
+        };
+        let small = fetch(1 << 20, start);
+        assert!(crate::parted_kept(&small, 9, start + second));
+        assert!(
+            !crate::parted_kept(&small, 10, start + second),
+            "a fetch of a height held is kept"
+        );
+        assert!(
+            !crate::parted_kept(&small, 9, start + crate::STRIKE_TTL),
+            "a fetch without a byte for STRIKE_TTL is kept"
+        );
+        let deadline = crate::parted_deadline(crate::MAX_PARTED_BLOCK_BYTES);
+        assert!(deadline > crate::STRIKE_TTL);
+        let before = start + deadline - second;
+        assert!(crate::parted_kept(
+            &fetch(crate::MAX_PARTED_BLOCK_BYTES, before - second),
+            9,
+            before
+        ));
+        let after = start + deadline;
+        assert!(
+            !crate::parted_kept(
+                &fetch(crate::MAX_PARTED_BLOCK_BYTES, after - second),
+                9,
+                after
+            ),
+            "a fetch fed a byte now and then outlived its deadline"
+        );
     }
 
     /// B291 witness: a server reads a block from storage for its parts at

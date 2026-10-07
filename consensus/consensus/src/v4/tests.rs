@@ -1695,6 +1695,165 @@ fn a_node_cut_off_for_several_rounds_catches_up_by_pull() {
     assert!(c.decisions[0].len() > ahead, "node 0 caught up and went on");
 }
 
+/// B300 witness: a node that learns a quorum of certificates far above the
+/// rounds it holds bodies for wants the whole gap below them at its next
+/// tick, and catches up from it. It wanted only what a vertex waiting on
+/// its parents showed (PENDING, Ahead) and, stalled, the top two rounds:
+/// past its lead a frontier staged on carried certificates hid the gap, so
+/// a member coming back never rebuilt a block without its QC.
+#[test]
+fn a_quorum_of_certificates_far_above_the_bodies_held_wants_the_gap() {
+    let mut c = Cluster::new("b300-gap", 4, 0);
+    c.run(2);
+    let cut = c.members[0].info.address.clone();
+    let isolate = move |e: &Envelope, to: usize| to == 0 || e.from == cut;
+    for _ in 0..12 {
+        c.tick_all();
+        c.deliver(&isolate);
+        c.held.clear();
+    }
+    let top = c.engine(0).current_round();
+    let frontier = c.engine(1).current_round();
+    assert!(frontier > top + 6, "vacuous: {top} vs {frontier}");
+    // Node 0 learns only the certificates of the round below the frontier.
+    let certs: Vec<VertexCertificate> = c
+        .engine(1)
+        .certs
+        .iter()
+        .filter(|((round, _), _)| *round == frontier - 1)
+        .map(|(_, cert)| cert.clone())
+        .collect();
+    for cert in certs {
+        c.receive(0, Msg::Cert(cert));
+    }
+    assert_eq!(
+        c.engine(0).current_round(),
+        frontier,
+        "vacuous: no quorum learned"
+    );
+    c.q.borrow_mut().clear();
+    c.tick(0);
+    let middle = top + (frontier - top) / 2;
+    assert!(
+        c.engine(0)
+            .cert_wants
+            .keys()
+            .any(|(round, _)| *round == middle),
+        "the gap below the certificates was not wanted (round {middle})"
+    );
+    // Then, with the network back, it decides again.
+    let before = c.decisions[0].len();
+    c.run(24);
+    assert!(c.decisions[0].len() > before, "node 0 never caught up");
+    c.assert_agree();
+}
+
+/// B300 witness: a stalled member whose `current_round` fell back below g
+/// (GC forgot every certificate it held) asks for the certificates above g:
+/// it asked for its fallen-back round, deleted everywhere, and learned
+/// nothing more.
+#[test]
+fn a_stalled_member_asks_above_g() {
+    let mut c = Cluster::new("b300-above-g", 4, 0);
+    c.run(1);
+    for _ in 0..400 {
+        if c.engine(1).floor() > FIRST_ROUND + staging::RETAIN_SLACK + 10 {
+            break;
+        }
+        for i in 1..4 {
+            c.tick(i);
+        }
+        c.deliver(&|_, to| to == 0);
+        c.held.clear();
+    }
+    let stakes = c.engine(0).stakes().to_vec();
+    let stuck = c.decisions[0].len();
+    let ahead: Vec<Decision> = c.decisions[1].clone();
+    for d in ahead.iter().skip(stuck) {
+        let mut ord = lock(&c.engine(0).ordering);
+        if ord.gc_floor() > FIRST_ROUND + staging::RETAIN_SLACK + 5 {
+            break;
+        }
+        ord.adopt_synced_anchor(d.0, &d.1, &d.2, &stakes);
+    }
+    let g = c.engine(0).floor();
+    assert!(g > FIRST_ROUND + staging::RETAIN_SLACK, "vacuous: g = {g}");
+    for _ in 0..=crate::v4::pull::STALL_TICKS {
+        c.tick(0);
+    }
+    c.q.borrow_mut().clear();
+    assert!(
+        c.engine(0).current_round() <= g,
+        "vacuous: node 0 holds a quorum round above g"
+    );
+    assert!(
+        c.engine(0)
+            .cert_wants
+            .keys()
+            .any(|(round, _)| *round == g + 1),
+        "a stalled member did not ask above g = {g}"
+    );
+}
+
+/// B300 witness: a member whose epoch closed (EP-3) while a block of its
+/// own waits on its QC still sends its newest vertex again now and then:
+/// the boundary block's QC was the one missing, the epoch had closed, and a
+/// member coming back learned nothing of the DAG.
+#[test]
+fn a_closed_member_awaiting_a_qc_sends_its_newest_vertex_again() {
+    let mut c = Cluster::new("b300-closed", 4, 0);
+    c.run(4);
+    let newest = *c
+        .engine(0)
+        .own
+        .keys()
+        .next_back()
+        .expect("vacuous: nothing proposed");
+    // An uncertified proposal goes out again every tick anyway.
+    assert!(
+        c.engine(0).collectors.is_empty(),
+        "vacuous: a proposal of member 0 is still uncertified"
+    );
+    c.engines[0].as_mut().unwrap().closing_round = Some(newest);
+    let ctx = crate::qc_producer::CommitContext {
+        chain_id: crate::qc::expected_chain_id(),
+        epoch: 0,
+        finalized_round: 3,
+        anchor_round: 3,
+        anchor_hash: "aa".repeat(32),
+        block_height: 5,
+        block_hash: "bb".repeat(32),
+        state_root: "cc".repeat(32),
+        receipts_root: "dd".repeat(32),
+        finality_digest: "ee".repeat(32),
+        next_validator_set_hash: String::new(),
+        decision_floor: Some(1),
+    };
+    c.engine(0)
+        .storage
+        .put(
+            &format!("consensus:qc_pending:{:020}", 5),
+            &serde_json::to_string(&ctx).unwrap(),
+        )
+        .unwrap();
+    c.q.borrow_mut().clear();
+    let me = c.members[0].info.address.clone();
+    let mut resent = 0;
+    for _ in 0..2 * FINALITY_REBROADCAST_TICKS {
+        c.tick(0);
+        resent +=
+            c.q.borrow()
+                .iter()
+                .filter(|e| e.from == me && matches!(&e.msg, Msg::Vertex(v) if v.round == newest))
+                .count();
+        c.q.borrow_mut().clear();
+    }
+    assert!(
+        resent > 0,
+        "a closed member awaiting a QC sent nothing again"
+    );
+}
+
 /// RE-1 (d): a node that receives no push at all (no vertex, attestation or
 /// certificate reaches it) learns everything by pull: stalled, it asks for
 /// the certificates of its rounds, then for their bodies, and decides the

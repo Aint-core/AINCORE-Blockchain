@@ -237,18 +237,16 @@ export class Connection {
         };
 
         for (let attempt = 0; ; attempt++) {
+            let response: any;
             try {
-                const response = await this.client.post('', payload, { timeout: this.timeoutMs });
-                const error = response.data.error;
-                if (error) {
-                    if (error.code === BUSY_CODE && attempt < this.busyRetries) {
-                        await new Promise((resolve) => setTimeout(resolve, this.backoffMs(attempt)));
-                        continue;
-                    }
-                    throw new Error(`RPC Error: ${error.message}`);
-                }
-                return response.data.result;
+                response = await this.client.post('', payload, { timeout: this.timeoutMs });
             } catch (error: any) {
+                // B308: a rate limit (HTTP 429) is asked again, as a busy
+                // answer is (it was thrown at once).
+                if (error.response?.status === 429 && attempt < this.busyRetries) {
+                    await new Promise((resolve) => setTimeout(resolve, this.backoffMs(attempt)));
+                    continue;
+                }
                 console.error("RPC Request Failed:", error.message);
                 if (error.response) {
                     console.error("Status:", error.response.status);
@@ -256,6 +254,15 @@ export class Connection {
                 }
                 throw new Error(`Connection Error: ${error.message}`);
             }
+            const error = response.data.error;
+            if (error) {
+                if (error.code === BUSY_CODE && attempt < this.busyRetries) {
+                    await new Promise((resolve) => setTimeout(resolve, this.backoffMs(attempt)));
+                    continue;
+                }
+                throw new Error(`Connection Error: RPC Error: ${error.message}`);
+            }
+            return response.data.result;
         }
     }
 

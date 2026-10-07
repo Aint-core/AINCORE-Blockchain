@@ -2503,6 +2503,12 @@ fn request_log_line(method: &str, params: &serde_json::Value) -> String {
     format!("📥 JSON-RPC Request: {method} {shown}")
 }
 
+/// B306: whether each JSON-RPC request is logged (`AINCORE_LOG_RPC=1`).
+fn log_rpc_requests() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AINCORE_LOG_RPC").as_deref() == Ok("1"))
+}
+
 async fn json_rpc_handler(
     http: actix_web::HttpRequest,
     req: web::Json<JsonRpcRequest>,
@@ -2511,7 +2517,11 @@ async fn json_rpc_handler(
     let method = req.method.as_str();
     let params = req.params.clone().unwrap_or(serde_json::Value::Null);
 
-    println!("{}", request_log_line(method, &params));
+    // B306: a line a request (~350 B) at 100 requests a second per client
+    // filled a disk; logged only with `AINCORE_LOG_RPC=1`.
+    if log_rpc_requests() {
+        println!("{}", request_log_line(method, &params));
+    }
 
     // B65/B197: a dry run executes Move, and the heavy reads parse or encode
     // megabytes, so they run on the blocking pool, not on this worker
@@ -3132,6 +3142,13 @@ impl ClientIp {
         let proxy_port = std::env::var("AINCORE_RPC_PROXY_PORT")
             .ok()
             .and_then(|p| p.trim().parse().ok());
+        // B303: the header counts only on the proxy's own listener.
+        if header.is_some() && proxy_port.is_none() {
+            eprintln!(
+                "⚠️ AINCORE_RPC_CLIENT_IP_HEADER is ignored: set AINCORE_RPC_PROXY_PORT (and \
+                 AINCORE_RPC_PROXY_BIND) for the proxy's own listener"
+            );
+        }
         Self {
             header,
             trusted,
@@ -3163,7 +3180,11 @@ impl ClientIp {
         local_port: u16,
         headers: &actix_web::http::header::HeaderMap,
     ) -> Option<std::net::IpAddr> {
-        let via_proxy_port = self.proxy_port.is_none_or(|port| local_port == port);
+        // B303: on the proxy's own listener only. Believed on any port when
+        // none was named, a client of the public port arriving from the
+        // trusted address (Docker's bridge gateway, every IPv6 client of a
+        // published port) named itself anew each request.
+        let via_proxy_port = self.proxy_port == Some(local_port);
         // B266: the last line of the header (a proxy that adds its own line
         // appends it, after the client's; `get` read the first).
         let header = self
@@ -4105,7 +4126,7 @@ mod tests {
         assert!(ask("aincore_getProposal", serde_json::json!(["x"])).is_err());
     }
 
-    /// B59/B266 witness: behind the operator's proxy, with its header named,
+    /// B59/B266/B303 witness: behind the operator's proxy, with its header named,
     /// each client is counted under its own address; a header from any other
     /// peer is ignored (it is the client's to forge), as it is with no header
     /// named. B74: a loopback peer the operator did not name is such a peer
@@ -4123,11 +4144,17 @@ mod tests {
             req.to_srv_request()
         };
         let proxy: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        // A test request arrives on 127.0.0.1:8080: the proxy's port here.
         let named = ClientIp {
             header: Some("CF-Connecting-IP".into()),
             trusted: vec![proxy],
-            proxy_port: None,
+            proxy_port: Some(8080),
             buckets: Default::default(),
+        };
+        // B303: with no proxy port the header counts nowhere.
+        let no_port = ClientIp {
+            proxy_port: None,
+            ..named.clone()
         };
         let untrusted = ClientIp {
             trusted: vec![],
@@ -4156,6 +4183,11 @@ mod tests {
         assert_eq!(
             addr(&unnamed, request("127.0.0.1:5000", Some("203.0.113.7"))),
             "127.0.0.1"
+        );
+        assert_eq!(
+            addr(&no_port, request("127.0.0.1:5000", Some("203.0.113.7"))),
+            "127.0.0.1",
+            "B303: believed without a proxy port"
         );
         assert_eq!(
             addr(

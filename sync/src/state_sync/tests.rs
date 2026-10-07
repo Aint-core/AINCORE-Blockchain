@@ -2996,8 +2996,11 @@ fn the_value_cache_keeps_the_most_recently_used() {
     assert!(cache.get(8, "small").is_some());
 }
 
-/// Snapshot serving is off unless asked for (`AINCORE_SERVE_SNAPSHOTS=1`):
-/// a validator's disk serves consensus first. Anchors are always served.
+/// B299 witness, and snapshot serving off unless asked for
+/// (`AINCORE_SERVE_SNAPSHOTS=1`): a validator's disk serves consensus
+/// first. B299: anchors too, for a retained version, a block a batch could
+/// not hold never parsed for one (they were always served, any height, so
+/// anyone made every node read and parse whole blocks).
 #[test]
 fn a_node_serves_snapshots_only_when_asked_to() {
     let a = chain("optin_a", MEMBER);
@@ -3025,13 +3028,32 @@ fn a_node_serves_snapshots_only_when_asked_to() {
         off.handle_state_value(value()).error.as_deref(),
         Some(NOT_SERVED)
     );
+    // B299: and anchors too (every node read, parsed and re-serialized any
+    // height's block for anyone).
     assert!(off
         .handle_state_anchor(AnchorRequest { height: H })
         .block
-        .is_some());
+        .is_none());
     let on = off.with_snapshot_serving(true);
     assert!(on.handle_state_chunk(chunk()).error.is_none());
     assert!(on.handle_state_value(value()).error.is_none());
+    let anchor = on.handle_state_anchor(AnchorRequest { height: H });
+    assert!(anchor.block.is_some() && anchor.quorum_certificate.is_some());
+    // B299: a block a batch could not hold is not parsed for an anchor.
+    let small = on.with_batch_bytes(64);
+    assert!(small
+        .handle_state_anchor(AnchorRequest { height: H })
+        .block
+        .is_none());
+    // B299: and only for a version it retains (any height was answered).
+    state_commit::prune(&a.db, TIP, &Default::default(), usize::MAX).unwrap();
+    let all = small.with_batch_bytes(usize::MAX);
+    assert!(
+        all.handle_state_anchor(AnchorRequest { height: H })
+            .block
+            .is_none(),
+        "an anchor answered for a version not retained"
+    );
 }
 
 /// The node's session layer routes by `serve_session`: chain sync's

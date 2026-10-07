@@ -301,7 +301,10 @@ impl Engine {
         // RE-1 (d): no certificate for a while, so this node may be below the
         // round quorum without knowing what it misses.
         if now >= self.last_cert_tick + STALL_TICKS {
-            let round = self.current_round();
+            // B300: never below g: once GC forgot every certificate held,
+            // `current_round` fell back to the epoch's first round, and the
+            // rounds asked for were deleted everywhere.
+            let round = self.current_round().max(self.gc_floor() + 1);
             let authors: Vec<String> = self.stakes.iter().map(|(a, _)| a.clone()).collect();
             for r in [round.saturating_sub(1), round] {
                 if r >= self.first_round {
@@ -311,6 +314,19 @@ impl Engine {
                 }
             }
             self.last_cert_tick = now;
+        }
+        // B300: certificates of a quorum held above the rounds this node
+        // holds bodies for prove the rounds between exist: the whole gap is
+        // wanted, window by window, whatever the lead. A frontier vertex past
+        // the lead staged on its carried certificates, RE-1 (d) then asked
+        // only for the top two rounds, and their bodies, past the lead on
+        // parents not certified here, were dropped: a member coming back
+        // never fetched what a block without its QC needs, and with f
+        // members withholding votes no QC formed again (B283 assumed the
+        // newest vertex came within the lead).
+        let round = self.current_round();
+        if round > self.gap_bounds().0 + 1 {
+            self.want_gap(round - 1);
         }
         // RE-4: a want retires only when satisfied.
         let staged: HashSet<String> = {

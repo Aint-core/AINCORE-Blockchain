@@ -521,10 +521,22 @@ impl Drop for Admission<'_> {
 
 impl ChainSync {
     /// Serve the block and QC at a height, straight from storage.
+    /// B299: answered only by a node that serves snapshots, for a version
+    /// it retains (what a restore anchors on), and a block a batch could not
+    /// hold is not parsed for it. Every node read, parsed and re-serialized
+    /// any height's block for anyone, a missed instance of B275's class.
     pub fn handle_state_anchor(&self, req: AnchorRequest) -> AnchorResponse {
+        let none = AnchorResponse {
+            block: None,
+            quorum_certificate: None,
+        };
+        if !self.serves_snapshots || self.state_servable(req.height).is_err() {
+            return none;
+        }
         let read = |key: String| self.storage.get(&key).ok().flatten();
         AnchorResponse {
             block: read(format!("block_{}", req.height))
+                .filter(|json| json.len() <= self.batch_bytes)
                 .and_then(|json| serde_json::from_str(&json).ok()),
             quorum_certificate: read(format!("consensus:qc:{}", req.height))
                 .and_then(|json| serde_json::from_str(&json).ok()),

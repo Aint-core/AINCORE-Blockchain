@@ -160,9 +160,11 @@ enum Commands {
     Keygen,
     /// Generate a post-quantum key (ML-DSA-65, FIPS 204)
     PqcKeygen {
-        /// Output directory for keys
-        #[arg(long, default_value = "./pqc_keys")]
-        out: String,
+        /// Output directory for keys (B307: `$HOME/.aincore/pqc_keys` when
+        /// not given; it was `./pqc_keys`, inside whatever checkout the
+        /// command ran in, where `git add -A` published the spending seed)
+        #[arg(long)]
+        out: Option<String>,
     },
     /// Get node status
     Info,
@@ -259,6 +261,14 @@ fn main() -> anyhow::Result<()> {
         Commands::PqcKeygen { out } => {
             use rand::RngCore;
 
+            let out = match out {
+                Some(out) => out,
+                None => {
+                    let home = std::env::var("HOME")
+                        .map_err(|_| anyhow::anyhow!("no HOME: name the directory with --out"))?;
+                    format!("{home}/.aincore/pqc_keys")
+                }
+            };
             std::fs::create_dir_all(&out)?;
             // ML-DSA.KeyGen_internal(ξ) (FIPS 204): the 32-byte seed is the
             // whole secret; the key pair is recomputed from it.

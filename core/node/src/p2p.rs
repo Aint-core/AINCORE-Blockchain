@@ -504,10 +504,19 @@ pub async fn start_p2p(
                                 }
                                 // B30: when non-members already hold too many
                                 // unread answers, a snapshot part is told busy
-                                // and anything else is refused.
-                                let refused = open
-                                    .as_ref()
-                                    .is_some_and(|o| !held_answers.admit(id, &o.group, answer.len()));
+                                // and anything else is refused. B60/B299: the
+                                // answer is charged its bytes either way.
+                                let refused = open.as_ref().is_some_and(|o| {
+                                    !sessions::charge_then_hold(
+                                        &mut sync_budget,
+                                        &mut held_answers,
+                                        id,
+                                        &o.key,
+                                        &o.group,
+                                        answer.len(),
+                                        std::time::Instant::now(),
+                                    )
+                                });
                                 if refused {
                                     match open.and_then(|o| o.busy) {
                                         Some(busy) => {
@@ -515,18 +524,8 @@ pub async fn start_p2p(
                                         }
                                         None => drop(channel),
                                     }
-                                } else {
-                                    // B60: and by its bytes.
-                                    if let Some(open) = &open {
-                                        sync_budget.charge(
-                                            &open.key,
-                                            sessions::answer_tokens(answer.len()),
-                                            std::time::Instant::now(),
-                                        );
-                                    }
-                                    if swarm.behaviour_mut().sync.send_response(channel, answer).is_err() {
-                                        held_answers.release(&id);
-                                    }
+                                } else if swarm.behaviour_mut().sync.send_response(channel, answer).is_err() {
+                                    held_answers.release(&id);
                                 }
                             }
                             None => drop(channel),

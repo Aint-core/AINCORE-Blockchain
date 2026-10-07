@@ -1720,6 +1720,19 @@ impl Engine {
         self.observe_floor(net);
         self.finish_call(net);
         self.fetch(net);
+        // B262: the newest own vertex goes out again now and then while a
+        // block of this node's waits on its QC, so a member coming back sees
+        // how far the DAG got and wants the whole gap (B300). B300: whether
+        // or not this node may still propose: the boundary block closed the
+        // epoch (EP-3) before its QC formed, nothing was sent again, and a
+        // member coming back learned nothing.
+        if self.tick.is_multiple_of(FINALITY_REBROADCAST_TICKS)
+            && crate::qc_producer::lowest_pending_qc_height(&self.storage).is_some()
+        {
+            if let Some(v) = self.own.values().next_back() {
+                net.broadcast(Msg::Vertex(v.clone()));
+            }
+        }
         // EP-3: after its boundary block, epoch E proposes nothing more.
         if !self.may_sign() || self.closing_round.is_some() {
             return None;
@@ -1728,15 +1741,8 @@ impl Engine {
         // lowest block without a QC (B262: or `MAX_KEPT_ROUNDS` rounds above
         // its floor): what a lagging member needs to rebuild and vote on is
         // kept (`retention_floor`), and proposing on would grow it without
-        // bound. B262: the newest own vertex goes out again now and then, so
-        // a member coming back sees how far the DAG got and asks for the
-        // whole gap at once.
+        // bound.
         if self.finality_lags() {
-            if self.tick.is_multiple_of(FINALITY_REBROADCAST_TICKS) {
-                if let Some(v) = self.own.values().next_back() {
-                    net.broadcast(Msg::Vertex(v.clone()));
-                }
-            }
             return None;
         }
         let owed = self.anchor_owed();

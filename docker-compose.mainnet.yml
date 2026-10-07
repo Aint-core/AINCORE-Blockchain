@@ -9,8 +9,13 @@ services:
     container_name: aincore-validator-1
     restart: always
     ports:
-      - "9102:9102" # libp2p: consensus + sync sessions (base port + 100)
-      - "8002:8002" # API
+      # B304: IPv4 only. Docker's userland proxy hands every IPv6 client of a
+      # published port to the container from the bridge gateway, one address
+      # for all, and the node's admission (handshakes, identities, sync and
+      # RPC budgets) is per address. For IPv6, run the node with
+      # network_mode: host.
+      - "0.0.0.0:9102:9102" # libp2p: consensus + sync sessions (base port + 100)
+      - "0.0.0.0:8002:8002" # API
     volumes:
       - ./aincore_data:/root/.aincore/data
       - ${AINCORE_GENESIS_FILE:?set AINCORE_GENESIS_FILE to the genesis.json of the chain this node joins}:/root/.aincore/genesis.json:ro
@@ -21,6 +26,12 @@ services:
       - AINCORE_RPC_BIND=0.0.0.0
       - RUST_LOG=info
     command: [ "node", "--port", "9002" ]
+    # B306: bounded logs (a full disk stops the validator's writes).
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     networks:
       - aincore-net
 
@@ -33,6 +44,11 @@ services:
     ports:
       # Unauthenticated: this host only.
       - "127.0.0.1:19090:9090"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     networks:
       - aincore-net
 
@@ -47,9 +63,14 @@ services:
       - NODE_RPC_URL=http://aincore-node:8002/rpc
       - RUST_LOG=info
     ports:
-      - "3001:3001"
+      - "0.0.0.0:3001:3001"
     depends_on:
       - aincore-node
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     networks:
       - aincore-net
 

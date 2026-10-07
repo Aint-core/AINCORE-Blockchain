@@ -144,6 +144,8 @@ pub struct ChainSync {
     /// B286: this node's key for ordering sessions alike in every other
     /// respect (their PeerIds, which a Sybil grinds, ordered them).
     turn_salt: [u8; 16],
+    /// B311: held for a whole pass (`sync_from_peers`).
+    pass: tokio::sync::Mutex<()>,
     /// The encoded bytes a batch's blocks stop at (`SYNC_RESP_BLOCK_BYTES`;
     /// tests make it small, so real blocks are parted).
     batch_bytes: usize,
@@ -205,10 +207,6 @@ const MAX_STANDINGS: usize = 1024;
 /// B274: a session's standing for block turns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Standing {
-    /// B275: it holds the parted block this node is fetching (only it can
-    /// finish it: each node's copy of a block differs in its signature).
-    /// B287: the largest such fetch only.
-    resuming: bool,
     member: bool,
     /// Strikes still counting (`STRIKE_TTL`).
     strikes: u32,
@@ -222,25 +220,33 @@ struct Standing {
 }
 
 /// B274: the order block turns go in: members, whatever their strikes;
-/// (B275, B287: within its class) the session whose parted block, the
-/// largest under way, this node is fetching; then the fewest strikes still
-/// counting; then the most blocks brought at the last turn; then (B286) the
-/// one that has waited longest, a session never given a turn since this
-/// node first saw it; then by `salted`. Nothing a session merely claims
-/// (its height) orders it. B286: "never given a turn" went first and ties
-/// went by PeerId, so three fresh identities a pass, ground to sort low,
-/// took every turn from honest non-members (an observer's only sources).
-/// B287: a fetch's holder went before the members (one junk part a turn,
-/// and it held every pass's first turn for good).
+/// then the fewest strikes still counting; then the most blocks brought at
+/// the last turn; then (B286) the one that has waited longest, a session
+/// never given a turn since this node first saw it; then by `salted`.
+/// Nothing a session merely claims (its height) orders it. B286: "never
+/// given a turn" went first and ties went by PeerId, so three fresh
+/// identities a pass, ground to sort low, took every turn from honest
+/// non-members (an observer's only sources). B309: a parted fetch's session
+/// gets no turn before its turn comes (B275 put it first; B287 first within
+/// its class; a server naming a real header at the largest length, its
+/// parts unchecked until the whole arrives, then held every pass's first
+/// turn): each session's fetch waits for its turn, kept (B285).
 fn turn_order(a: &(String, Standing), b: &(String, Standing)) -> std::cmp::Ordering {
     let ((_, sa), (_, sb)) = (a, b);
     sb.member
         .cmp(&sa.member)
-        .then(sb.resuming.cmp(&sa.resuming))
         .then(sa.strikes.cmp(&sb.strikes))
         .then(sb.brought.cmp(&sa.brought))
         .then(sa.waited_since.cmp(&sb.waited_since))
         .then(sa.salted.cmp(&sb.salted))
+}
+
+/// B286: `peer` hashed under `salt`.
+fn salted_with(salt: &[u8; 16], peer: &str) -> u64 {
+    let mut input = salt.to_vec();
+    input.extend_from_slice(peer.as_bytes());
+    let digest = crypto::hash(&input);
+    u64::from_le_bytes(<[u8; 8]>::try_from(&digest[..8]).unwrap_or_default())
 }
 
 /// B274: insert `value` under `key`, the entry updated longest ago (`at`)
@@ -282,11 +288,15 @@ struct Turn {
     /// B275: the session sent what no honest server sends (a parted block
     /// that does not check, or does not import).
     refused: bool,
-    /// B287: the turn added to a parted fetch it left under way. Such a turn
-    /// (bringing no whole block) neither strikes its session nor clears its
-    /// strikes: a part's bytes made it full, so one junk part a turn kept a
-    /// session clear while its fetch never ended.
-    mid_fetch: bool,
+    /// The turn says nothing either way; bringing no whole block, it neither
+    /// strikes its session nor clears its strikes. B287: it added to a parted
+    /// fetch it left under way (a part's bytes made it full, so one junk part
+    /// a turn kept a session clear while its fetch never ended). B302: it
+    /// ended at a block without its QC further below the claimed height than
+    /// `qcless_tip` allows (a direct commit after a stall builds a block for
+    /// every anchor it decides, so an honest server can hold any number
+    /// without their QCs, and B289's bound struck it every pass).
+    unjudged: bool,
 }
 
 impl Turn {
@@ -310,6 +320,17 @@ impl Turn {
 /// pass of a stall.
 fn qcless_tip(height: u64, claimed: u64) -> bool {
     claimed.saturating_sub(height) <= QCLESS_TIP_BLOCKS
+}
+
+/// B302: judge a turn that ends at its server's block `height` offered
+/// without its QC, the server claiming `claimed`: well when that block can
+/// be its newest work (`qcless_tip`), else unjudged (`Turn::unjudged`).
+fn judge_qcless_tip(turn: &mut Turn, height: u64, claimed: u64) {
+    if qcless_tip(height, claimed) {
+        turn.ended_well = true;
+    } else {
+        turn.unjudged = true;
+    }
 }
 
 /// B289: how far above a block offered without its QC its server's claimed
@@ -394,6 +415,30 @@ struct PartialBlock {
     len: u64,
     bytes: Vec<u8>,
     progressed: std::time::Instant,
+    /// B301: when it began (`parted_deadline`).
+    started: std::time::Instant,
+}
+
+/// B301: an honest server's slowest pace for parts, to a client that gives
+/// it a turn a pass, with room to spare (its answer budget sends about
+/// 0.8 MiB/s; a pass gives a session about a third of the time).
+const PARTED_MIN_BYTES_PER_SEC: u64 = 128 << 10;
+
+/// B301: how long a parted fetch of `len` bytes may run: at the slowest
+/// honest pace, at least `STRIKE_TTL`. Past it the fetch goes: one kept
+/// large and fed a part a turn held the bytes every other fetch needed, so
+/// no fetch of a block over half the budget finished.
+fn parted_deadline(len: u64) -> Duration {
+    STRIKE_TTL.max(Duration::from_secs(len / PARTED_MIN_BYTES_PER_SEC))
+}
+
+/// B287/B301: whether a parted fetch is kept at `now` for a later turn:
+/// above `final_height` (this node holds that height otherwise), given a
+/// byte within `STRIKE_TTL`, and within its deadline.
+fn parted_kept(p: &PartialBlock, final_height: u64, now: std::time::Instant) -> bool {
+    p.height > final_height
+        && now.duration_since(p.progressed) < STRIKE_TTL
+        && now.duration_since(p.started) < parted_deadline(p.len)
 }
 
 /// B275: the header a block's stored text starts with (`{"header":{..}`),
@@ -452,6 +497,7 @@ impl ChainSync {
             parted_read_due: Mutex::default(),
             seen: Mutex::default(),
             turn_salt: rand::random(),
+            pass: tokio::sync::Mutex::new(()),
             batch_bytes: SYNC_RESP_BLOCK_BYTES,
             parted_budget: MAX_PARTED_BLOCK_BYTES,
             #[cfg(test)]
@@ -489,10 +535,7 @@ impl ChainSync {
 
     /// B286: `peer` hashed under this node's `turn_salt`.
     fn salted(&self, peer: &str) -> u64 {
-        let mut input = self.turn_salt.to_vec();
-        input.extend_from_slice(peer.as_bytes());
-        let digest = crypto::hash(&input);
-        u64::from_le_bytes(<[u8; 8]>::try_from(&digest[..8]).unwrap_or_default())
+        salted_with(&self.turn_salt, peer)
     }
 
     /// The bytes of one block part (`BLOCK_PART_BYTES` at the default cut).
@@ -941,6 +984,13 @@ impl ChainSync {
     /// Sync over the network sessions (G4 S1).
     /// Returns the final synced height (0 if no sync happened)
     pub async fn sync_from_peers(&self) -> u64 {
+        // B311: one pass at a time. A lagging node's boot sync and its
+        // periodic loop ran together: each took the same top session's block,
+        // and each held a parted fetch outside `parted`, so neither counted
+        // the other's against the budget (twice the bytes).
+        let Ok(_pass) = self.pass.try_lock() else {
+            return self.get_local_height();
+        };
         println!("🔄 [ChainSync] Starting sync over network sessions...");
 
         // Audit #3: `sync:halt_reason` stops syncing while it is present. No
@@ -1152,22 +1202,17 @@ impl ChainSync {
                 seen.clone()
             })
             .unwrap_or_default();
-        // B287: fetches this node holds the height of, or that took no byte
-        // within `STRIKE_TTL`, are dropped; the largest left goes first.
-        let resuming = self.parted.lock().ok().and_then(|mut parted| {
-            parted.retain(|_, p| p.height > final_height && fresh(&p.progressed));
-            parted
-                .values()
-                .max_by_key(|p| (p.bytes.len(), std::cmp::Reverse(p.peer.clone())))
-                .map(|p| p.peer.clone())
-        });
+        // B287/B301: fetches this node holds the height of, that took no
+        // byte within `STRIKE_TTL`, or that ran past their deadline, are
+        // dropped.
+        if let Ok(mut parted) = self.parted.lock() {
+            parted.retain(|_, p| parted_kept(p, final_height, now));
+        }
         let mut ranked: Vec<((String, Standing), (network::SessionPeer, u64))> = above
             .into_iter()
             .map(|(session, advertised)| {
-                let label = session.member.as_deref().unwrap_or(&session.peer);
                 let first_seen = seen.get(&session.peer).map_or(now, |(first, _)| *first);
                 let standing = Standing {
-                    resuming: resuming.as_deref() == Some(label),
                     member: session.member.is_some(),
                     strikes: stalls.get(&session.peer).map_or(0, |(n, _)| *n),
                     brought: yields.get(&session.peer).map_or(0, |(n, _)| *n),
@@ -1203,8 +1248,8 @@ impl ChainSync {
                 }
             }
             if let Ok(mut stalls) = self.stalls.lock() {
-                if turn.mid_fetch && turn.brought == 0 {
-                    // B287: a fetch under way judges nothing yet.
+                if turn.unjudged && turn.brought == 0 {
+                    // B287/B302: nothing to judge the session by.
                 } else if turn.struck() {
                     let n = stalls.get(&peer).map_or(0, |(n, _)| *n);
                     keep_standing(&mut stalls, peer, (n.saturating_add(1), at), |(_, t)| *t);
@@ -1237,7 +1282,7 @@ impl ChainSync {
             ended_well: false,
             asked: false,
             refused: false,
-            mid_fetch: false,
+            unjudged: false,
         };
         let turn_ends = tokio::time::Instant::now() + SYNC_TURN;
         // 2. Request Chain Height
@@ -1319,7 +1364,7 @@ impl ChainSync {
                     let qc = sync_resp.qcs.iter().find(|q| q.block_height == big.height);
                     if consensus::v4::is_v4_chain(&self.storage) && qc.is_none() {
                         // Its server's newest block, without its QC yet.
-                        turn.ended_well = qcless_tip(big.height, peer_height.max(advertised));
+                        judge_qcless_tip(&mut turn, big.height, peer_height.max(advertised));
                         break;
                     }
                     if let Err(e) = self.check_named(&big, qc) {
@@ -1426,9 +1471,9 @@ impl ChainSync {
                 if synced <= current {
                     // The server's next block has no QC yet: what it could
                     // certify, this node holds.
-                    turn.ended_well |= offered.contains(&(synced + 1))
-                        && !certified.contains(&(synced + 1))
-                        && qcless_tip(synced + 1, peer_height.max(advertised));
+                    if offered.contains(&(synced + 1)) && !certified.contains(&(synced + 1)) {
+                        judge_qcless_tip(&mut turn, synced + 1, peer_height.max(advertised));
+                    }
                     eprintln!(
                         "⚠️ [ChainSync] Batch made no progress from height {}",
                         current
@@ -1446,7 +1491,7 @@ impl ChainSync {
                     && offered.contains(&(current + 1))
                     && !certified.contains(&(current + 1))
                 {
-                    turn.ended_well = qcless_tip(current + 1, peer_height.max(advertised));
+                    judge_qcless_tip(&mut turn, current + 1, peer_height.max(advertised));
                     break;
                 }
             }
@@ -1539,12 +1584,13 @@ impl ChainSync {
             len: big.len,
             bytes: Vec::new(),
             progressed: std::time::Instant::now(),
+            started: std::time::Instant::now(),
         });
         let start = partial.bytes.len();
         // What came is kept for the session's next turn; a turn that added
         // to it is under way (B287).
         let keep = |partial: PartialBlock, turn: &mut Turn| {
-            turn.mid_fetch |= partial.bytes.len() > start;
+            turn.unjudged |= partial.bytes.len() > start;
             if let Ok(mut parted) = self.parted.lock() {
                 parted.insert(partial.peer.clone(), partial);
             }
@@ -1605,6 +1651,11 @@ impl ChainSync {
             // way, so the largest (an honest server's, at its full rate)
             // completes.
             if !self.make_room(peer, partial.bytes.len() as u64 + n) {
+                // B301: what it holds is kept (within the budget as it
+                // stands): it was dropped, so a fetch kept largest by a part
+                // a turn held every other one below the budget less its own
+                // bytes, for good.
+                keep(partial, turn);
                 return Err(PartFailure::Crowded);
             }
             partial.bytes.extend_from_slice(part.data.as_bytes());

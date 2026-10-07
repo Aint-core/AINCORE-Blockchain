@@ -7,9 +7,10 @@ use std::time::Duration;
 
 fn main() {
     // L2 FIX: Configurable node list via AINCORE_NODES env var
-    // Example: AINCORE_NODES=9000,9001,9002,9003
+    // Example: AINCORE_NODES=9001,9002,9003 (B305: the default is a node
+    // left to its default port).
     let nodes: Vec<u16> = std::env::var("AINCORE_NODES")
-        .unwrap_or_else(|_| "9000".to_string())
+        .unwrap_or_else(|_| config::DEFAULT_PORT.to_string())
         .split(',')
         .filter_map(|s| s.trim().parse().ok())
         .collect();
@@ -185,7 +186,8 @@ mod tests {
     fn the_rpc_port_is_the_node_port_less_1000() {
         assert_eq!(rpc_port_of(9002), 8002);
         assert_eq!(rpc_port_of(9000), 8000);
-        assert_eq!(rpc_port_of(9001), 8002, "B296: the default port's RPC");
+        assert_eq!(rpc_port_of(9001), 8001, "B305: one port, one RPC");
+        assert_eq!(rpc_port_of(config::DEFAULT_PORT), 8002, "the default's");
     }
 
     /// B269 witness: a node's status is its `aincore_getStatus` answer; an

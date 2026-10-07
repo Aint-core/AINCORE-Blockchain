@@ -1054,7 +1054,11 @@ async fn main() {
                         )
                         .await
                         {
-                            eprintln!("❌ API Server CRASHED: {}", e);
+                            // B305: a node whose RPC cannot listen (its port
+                            // taken) stops: it ran on with no RPC, and every
+                            // tool reading it saw nothing or another node.
+                            eprintln!("❌ FATAL: the API server on port {api_port} failed: {e}");
+                            std::process::exit(1);
                         } else {
                             println!("🌍 API Server exited normally (Unexpected).");
                         }
