@@ -38,6 +38,50 @@ The B458 pricing change and its limitations are described below. No live
 database, service, signing key, or genesis was changed. Bytecode/gas changes
 still need an explicitly approved, coordinated activation plan.
 
+### Verification outcome
+
+Code checkpoint: `8f453b5b`, source tree
+`07bd8513972546907eff9058cea4995d5d26eb3a`. Local macOS ARM64 verification
+used Rust 1.90.0, locked offline dependencies, and serial test execution.
+
+Completed library results, across separate runs (not one green workspace run):
+
+| Package | Passed | Failed | Ignored |
+| --- | ---: | ---: | ---: |
+| blockchain | 82 | 0 | 0 |
+| chain_sync | 253 | 0 | 1 |
+| consensus | 416 | 0 | 7 |
+| executor, after the final fixture repairs | 218 | 0 | 2 |
+| vm_move | 31 | 0 | 0 |
+
+The executor results include the 13 crash/replay tests and gas-estimation
+regressions; do not count those subsets again. The VM run includes regenerated
+bytecode/source equality. The gate's Python controls passed 10/10. SDK tests,
+block identity vectors, and the 12-check synthetic DR roundtrip also passed;
+the latter is not evidence of a successful recovery from a live backup.
+
+The broad eight-package run compiled before the final two executor fixture
+repairs and reported those two failures. A subsequent complete executor Cargo
+run passed 218/218 non-ignored tests. The broad run was stopped at node binary
+startup: a process sample remained in `_dyld_start`, before test output. Host
+swap usage was approximately 29 GB; the underlying startup cause is not proven.
+Node, storage and state_commit full-suite completion is therefore unverified
+in this run. No failed result has been relabeled as passing.
+
+The first diagnostic witness gate reported 119 passing witnesses of 121 and
+four errors: two pre-repair executor failures and two unclassified measurement
+tests. The measurement-only exclusions now state their limits explicitly;
+neither is evidence of a storage bound or validated gas calibration. The
+current manifest requires 128 witnesses. Its final rerun was canceled during
+compilation after the host startup stall, and produced no final JSON report.
+**The complete release witness gate is NOT established as passing.**
+
+Strict clippy was also canceled during native dependency compilation and is
+not a pass. Fresh release binaries, the hosted Linux workflow, full integration
+and feature-matrix testing, independent review, physical crash testing, and
+multi-operator operational evidence remain required before release. Only local
+verification processes were terminated; no live service was changed.
+
 ## Run locally
 
 From the repository root, with Rust 1.90.0 and Python 3 available:
